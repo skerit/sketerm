@@ -283,9 +283,12 @@ const Session = struct {
     /// GPU opt-in (SpawnReq.gpu): the session's compositor announces
     /// linux-dmabuf and the child keeps its real GL driver.
     gpu: bool = false,
-    /// The compositor advertised modifier-backed dmabufs, whose live request
-    /// stream and pending state require state-sync v7 readers.
-    native_requires_v7: bool = false,
+    /// Lowest state-sync version a replica must speak to render this
+    /// session's forwarded apps. Raised past the legacy floor by
+    /// compositor features an older replica cannot parse: v7 for
+    /// modifier-backed dmabufs, v8 for linux-dmabuf v4 feedback. A
+    /// viewer below it simply never gets the native channel.
+    native_state_min: u8 = wire.LEGACY_NATIVE_STATE_VERSION,
     /// Compiled xkb keymap for this session's app keyboards (points
     /// at an embedded wlhost/keymaps.zig blob; never freed).
     kb_keymap: []const u8 = wlcomp.us_keymap,
@@ -1530,6 +1533,9 @@ pub const Daemon = struct {
     dmabuf_importer: ?dmabuf_egl.Importer = null,
     dmabuf_capabilities: std.ArrayList(dmabuf.Capability) = .empty,
     dmabuf_initialized: bool = false,
+    /// linux-dmabuf v4 `main_device` (0 = none); see dmabufMainDevice.
+    drm_device: u64 = 0,
+    drm_device_probed: bool = false,
     /// Worker teardown grace: once its session is gone, a worker with
     /// undelivered client bytes (the post-mortem log push + `.exit`
     /// behind an MCP client's between-tool-calls backlog) keeps
@@ -5038,7 +5044,7 @@ pub const Daemon = struct {
     fn nativeViewer(cl: *const Client, s: *const Session) bool {
         return cl.attached == s and !cl.dead and
             cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION and
-            (!s.native_requires_v7 or cl.native_state_max >= wire.NATIVE_STATE_VERSION);
+            cl.native_state_max >= s.native_state_min;
     }
 
     fn audioViewer(cl: *const Client, s: *const Session) bool {
@@ -5149,6 +5155,18 @@ pub const Daemon = struct {
         return self.dmabuf_capabilities.items;
     }
 
+    /// dev_t clients should allocate dmabufs on, resolved once per
+    /// daemon (0 = none, which keeps linux-dmabuf at v3).
+    fn dmabufMainDevice(self: *Daemon) u64 {
+        if (!self.drm_device_probed) {
+            self.drm_device_probed = true;
+            self.drm_device = @import("drmdev.zig").mainDevice() orelse 0;
+            if (self.drm_device == 0)
+                log.info("dmabuf feedback: no usable DRM render node, announcing linux-dmabuf v3", .{});
+        }
+        return self.drm_device;
+    }
+
     /// Bridge one accepted app connection as a session-owned channel.
     fn openAppChannel(self: *Daemon, s: *Session, fd: c_int) void {
         const native = self.allocator.create(Native) catch {
@@ -5184,9 +5202,13 @@ pub const Daemon = struct {
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
         if (brain.advertise_dmabuf) {
             brain.dmabuf_capabilities = self.dmabufCapabilities();
+            // linux-dmabuf v4 needs a main device to point clients at;
+            // without one the brain announces v3 (mpv and other
+            // feedback-only clients then fail to bind a video output).
+            brain.dmabuf_main_device = self.dmabufMainDevice();
             for (brain.dmabuf_capabilities) |capability| {
                 if (capability.modifier != dmabuf.DRM_FORMAT_MOD_LINEAR) {
-                    s.native_requires_v7 = true;
+                    s.native_state_min = @max(s.native_state_min, wire.DMABUF_MODIFIER_STATE_VERSION);
                     break;
                 }
             }
@@ -5429,6 +5451,22 @@ pub const Daemon = struct {
             nv.brain.feed(brain_in.items) catch {
                 fail = true;
             };
+            // The app bound linux-dmabuf at v4 or created a feedback
+            // object: pre-v8 replicas cap the global at 3 and lack
+            // the feedback interface, so either request is fatal to
+            // them — stop shipping this session's app channels
+            // there. Keyed on the app's requests, not on the
+            // advertisement: announcing v4 costs old viewers nothing
+            // until an app actually binds it.
+            if (nv.brain.used_dmabuf_feedback) {
+                if (ch.session) |s|
+                    s.native_state_min = @max(s.native_state_min, wire.DMABUF_FEEDBACK_STATE_VERSION);
+            }
+            // Likewise for the post-v8 core requests.
+            if (nv.brain.used_post_v8_request) {
+                if (ch.session) |s|
+                    s.native_state_min = @max(s.native_state_min, wire.CORE_BUMP_STATE_VERSION);
+            }
             self.flushBrain(ch);
         }
         if (units.items.len > 0 and !ch.dead) self.queueUnits(ch, units.items);
@@ -6132,6 +6170,42 @@ pub const Daemon = struct {
                 b.putUint(format);
                 // 'h' fd arg: no bytes on the wire
                 b.putUint(@intCast(blob.len + 1));
+                const msg = b.finish() catch {
+                    _ = c.close(fd);
+                    return;
+                };
+                ch.pending.appendSlice(ch.allocator, msg) catch {
+                    _ = c.close(fd);
+                    self.closeChannel(ch, true);
+                    return;
+                };
+                nv.out_fds.append(nv.allocator, fd) catch {
+                    _ = c.close(fd);
+                };
+            },
+            .dmabuf_feedback => {
+                // u32 feedback object id, then the format table.
+                // Materialize an anon fd and emit the real
+                // zwp_linux_dmabuf_feedback_v1.format_table(fd, size).
+                const pl = payload;
+                if (pl.len < 4) return;
+                const obj = std.mem.readInt(u32, pl[0..4], .little);
+                const table = pl[4..];
+                const fd = @import("../util/platform.zig").anonFileFd(table.len);
+                if (fd < 0) return;
+                var written: usize = 0;
+                while (written < table.len) {
+                    const w = c.write(fd, table.ptr + written, table.len - written);
+                    if (w <= 0) {
+                        _ = c.close(fd);
+                        return;
+                    }
+                    written += @intCast(w);
+                }
+                var mbuf: [16]u8 = undefined;
+                var b = wlwire.Builder.init(&mbuf, obj, 1); // format_table
+                // 'h' fd arg: no bytes on the wire
+                b.putUint(@intCast(table.len));
                 const msg = b.finish() catch {
                     _ = c.close(fd);
                     return;
@@ -7251,7 +7325,7 @@ pub const Daemon = struct {
             }
         }
         if (cl.native_state_max < wire.LEGACY_NATIVE_STATE_VERSION or
-            (s.native_requires_v7 and cl.native_state_max < wire.NATIVE_STATE_VERSION)) return;
+            cl.native_state_max < s.native_state_min) return;
         for (self.channels.items) |ch| {
             if (ch.session != s or ch.dead) continue;
             const nv = ch.native orelse continue;

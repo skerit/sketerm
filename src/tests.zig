@@ -134,6 +134,7 @@ comptime {
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/opuscodec.zig");
     _ = @import("mux/dmabuf_egl.zig");
+    _ = @import("mux/drmdev.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/shell.zig");
     _ = @import("mux/desktop.zig");

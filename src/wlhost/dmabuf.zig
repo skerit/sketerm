@@ -1,6 +1,8 @@
-//! Pure-Zig linux-dmabuf v3 metadata and parameter validation.
+//! Pure-Zig linux-dmabuf metadata, parameter validation and v4
+//! feedback format tables.
 
 const std = @import("std");
+const native_endian = @import("builtin").cpu.arch.endian();
 
 pub const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'AR24'
 pub const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // 'XR24'
@@ -72,6 +74,49 @@ pub const linear_capabilities = [_]Capability{
     .{ .format = DRM_FORMAT_ARGB8888, .modifier = DRM_FORMAT_MOD_LINEAR },
     .{ .format = DRM_FORMAT_XRGB8888, .modifier = DRM_FORMAT_MOD_LINEAR },
 };
+
+/// Bytes per zwp_linux_dmabuf_feedback_v1 format-table entry:
+/// u32 format, u32 padding, u64 modifier (host byte order).
+pub const table_entry_size = 16;
+
+/// A capability that belongs in the v4 format table: MOD_INVALID
+/// exists only for the pre-v3 legacy announcement and has no meaning
+/// in a table, and a format we cannot turn into CPU pixels would
+/// invite allocations that create_immed then rejects.
+fn tableEligible(capability: Capability) bool {
+    return capability.modifier != DRM_FORMAT_MOD_INVALID and
+        shmFormat(capability.format) != null;
+}
+
+/// Number of entries appendFormatTable would write. Zero means the
+/// v4 feedback would be empty, so v4 must not be announced at all.
+pub fn tableEntryCount(capabilities: []const Capability) usize {
+    var n: usize = 0;
+    for (capabilities) |capability| {
+        if (tableEligible(capability)) n += 1;
+    }
+    return n;
+}
+
+/// Serialize capabilities as the v4 feedback format table. Entry i
+/// corresponds to index i in a tranche_formats array.
+pub fn appendFormatTable(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    capabilities: []const Capability,
+) !void {
+    for (capabilities) |capability| {
+        if (!tableEligible(capability)) continue;
+        // The client mmaps this table and reads it as a C struct
+        // array, so entries are HOST byte order (like the Wayland
+        // wire format itself), not the pipe's little-endian fields.
+        var entry: [table_entry_size]u8 = undefined;
+        std.mem.writeInt(u32, entry[0..4], capability.format, native_endian);
+        std.mem.writeInt(u32, entry[4..8], 0, native_endian);
+        std.mem.writeInt(u64, entry[8..16], capability.modifier, native_endian);
+        try out.appendSlice(allocator, &entry);
+    }
+}
 
 pub fn shmFormat(format: u32) ?u32 {
     return switch (format) {

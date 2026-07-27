@@ -134,6 +134,13 @@ pub const Tag = enum(u8) {
     /// address — a client committing a buffer from a displaced pool
     /// incarnation (Wine's DirectDraw mode switches) keeps updating.
     pool_update_s = 36,
+    /// u32 feedback object id, then the linux-dmabuf v4 format
+    /// table bytes. Brain → daemon: materialize an anon fd and emit
+    /// the real zwp_linux_dmabuf_feedback_v1.format_table(fd, size)
+    /// event, exactly like the keymap unit. The remaining feedback
+    /// events are plain wl_msg units around it, so this unit must
+    /// keep its position in the stream.
+    dmabuf_feedback = 37,
     _,
 };
 

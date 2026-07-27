@@ -28,6 +28,7 @@ const pipe = @import("pipe.zig");
 const pixcodec = @import("pixcodec.zig");
 const vcodec = @import("vcodec.zig");
 const build_options = @import("build_options");
+const native_endian = @import("builtin").cpu.arch.endian();
 
 /// Default pc105/us xkb keymap; alternatives in keymaps.zig, chosen
 /// per session via the spawn `kb_layout` option (Compositor.keymap).
@@ -200,18 +201,25 @@ const Drag = struct {
 const globals = [_]Global{
     // v6: surfaces get preferred_buffer_scale/transform on creation
     // (GTK4 at v6 sizes buffers from it instead of wl_output scale).
-    .{ .name = 1, .iface = &protocol.wl_compositor, .version = 6 },
+    // v7: release, so a client can drop the global without leaking a
+    // server object. Adds no events.
+    .{ .name = 1, .iface = &protocol.wl_compositor, .version = 7 },
     // GTK3 maps tooltips / tree-view type-ahead popups as subsurfaces;
     // without this its GdkDisplay->subcompositor is NULL and it crashes
     // (wl_proxy_get_version(NULL)) the first time it shows one.
     .{ .name = 11, .iface = &protocol.wl_subcompositor, .version = 1 },
-    .{ .name = 2, .iface = &protocol.wl_shm, .version = 1 },
+    // v2: release (destructor only).
+    .{ .name = 2, .iface = &protocol.wl_shm, .version = 2 },
     // v4: keyboards get repeat_info — held keys repeat client-side.
     // v5: pointer events are frame-grouped (JBR hard-requires >= 5
     // and binds 5 unconditionally; v5-bound clients queue pointer
     // events until the frame, so every injection emits one).
     // v8: wheel scrolls carry axis_value120.
-    .{ .name = 3, .iface = &protocol.wl_seat, .version = 8 },
+    // v9: every axis event is preceded by axis_relative_direction.
+    // v10: wl_keyboard.key may report the `repeated` state — we never
+    // repeat server-side (clients do, from repeat_info), which is
+    // exactly what the enum's absence means.
+    .{ .name = 3, .iface = &protocol.wl_seat, .version = 10 },
     // v4: name/description events at bind.
     .{ .name = 4, .iface = &protocol.wl_output, .version = 4 },
     // v3 popup reposition; v4 configure_bounds; v5 wm_capabilities
@@ -221,7 +229,8 @@ const globals = [_]Global{
     // WITHIN-APP dnd (start_drag drives a real drag state machine —
     // both ends are the same client, so data flows daemon-locally);
     // cross-app dnd stays out of scope.
-    .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 3 },
+    // v4: release (destructor only; no new offer/source/device events).
+    .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 4 },
     // Surface-less clipboard: wl-copy/wl-paste set/read the selection
     // without a throwaway focus surface (no taskbar flash). v1 =
     // selection only, no primary selection.
@@ -258,13 +267,17 @@ const globals = [_]Global{
     // gesture objects never fire (no gestures detected — legal).
     .{ .name = 19, .iface = &protocol.zwp_idle_inhibit_manager_v1, .version = 1 },
     .{ .name = 20, .iface = &protocol.zwp_pointer_gestures_v1, .version = 3 },
-    // linux-dmabuf v3 (v4 needs a main DRM device we don't have).
-    // Format/modifier announcements come from the daemon importer's
-    // capability slice; replicas restore the synthetic CPU pixels.
-    .{ .name = 22, .iface = &protocol.zwp_linux_dmabuf_v1, .version = 3 },
+    // linux-dmabuf. Format/modifier announcements come from the
+    // daemon importer's capability slice; replicas restore the
+    // synthetic CPU pixels. The version actually announced is
+    // Compositor.dmabufVersion() — v4 only with a main DRM device.
+    .{ .name = 22, .iface = &protocol.zwp_linux_dmabuf_v1, .version = 4 },
     // xdg-output: wl_output's LOGICAL geometry. SDL probes for it and
     // logs a scary "protocol missing: disabling" without it.
     .{ .name = 23, .iface = &protocol.zxdg_output_manager_v1, .version = 3 },
+    // wl_registry has no destructor of its own; this is how a client
+    // drops one without leaking a server object.
+    .{ .name = 24, .iface = &protocol.wl_fixes, .version = 1 },
 };
 
 const Pool = struct {
@@ -338,6 +351,10 @@ const Surface = struct {
     ph: i32 = 0,
     /// wl_callback ids awaiting frame done.
     frame_cbs: std.ArrayList(u32) = .empty,
+    /// wl_surface.get_release callbacks (v7): double-buffered state
+    /// bound to the pending buffer, fired with the wl_buffer.release
+    /// of the commit that consumed it.
+    release_cbs: std.ArrayList(u32) = .empty,
     /// wp_presentation_feedback ids answered at the next commit.
     feedbacks: std.ArrayList(u32) = .empty,
     /// Initial configure sent (xdg dance).
@@ -367,6 +384,7 @@ const Surface = struct {
 
     fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
         self.frame_cbs.deinit(a);
+        self.release_cbs.deinit(a);
         self.feedbacks.deinit(a);
         self.input_rects.deinit(a);
         if (self.title) |s| a.free(s);
@@ -456,6 +474,11 @@ pub const Compositor = struct {
     /// turns into a plain Buffer whose pool is the buffer's own id
     /// (a synthetic pool the pipe units fill like any shm pool).
     dmabuf_params: std.AutoHashMapUnmanaged(u32, dmabuf.Params) = .empty,
+    /// Live zwp_linux_dmabuf_feedback_v1 objects (v4). Value = the
+    /// wl_surface a per-surface feedback was requested for, 0 for the
+    /// default feedback; we answer both with the same tranche, but a
+    /// re-send on capability change would need the distinction.
+    dmabuf_feedbacks: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -556,6 +579,24 @@ pub const Compositor = struct {
     /// Format/modifier pairs announced at bind and accepted by the
     /// authoritative brain. Replicas deliberately ignore this policy.
     dmabuf_capabilities: []const dmabuf.Capability = &dmabuf.linear_capabilities,
+    /// dev_t of the DRM node clients should allocate on, as the v4
+    /// feedback `main_device`. Zero = unknown, which caps the
+    /// advertised linux-dmabuf at v3: a v4 client that gets no usable
+    /// main device has nowhere to allocate from. The daemon resolves
+    /// it (mux/drmdev.zig) on the APP's host, which is also the
+    /// importer's host, so it is always a device the app can open.
+    dmabuf_main_device: u64 = 0,
+    /// The app actually created a v4 feedback object. Only then does
+    /// the request stream contain something a pre-v8 replica cannot
+    /// parse — advertising v4 costs nothing to a client that never
+    /// uses it, so the viewer gate keys on this, not on the
+    /// announcement.
+    used_dmabuf_feedback: bool = false,
+    /// The app used a request added after the state-sync v8 tables
+    /// (wl_compositor/wl_shm/wl_data_device_manager release,
+    /// wl_fixes, wl_surface.get_release). Same purpose as
+    /// `used_dmabuf_feedback`, one version later.
+    used_post_v8_request: bool = false,
     /// The daemon brain tracks pool identity but has no pixel consumer;
     /// replicas retain the default and allocate their renderable copy.
     materialize_dmabuf_pools: bool = true,
@@ -654,6 +695,7 @@ pub const Compositor = struct {
         self.vscratch.deinit(a);
         self.buffers.deinit(a);
         self.dmabuf_params.deinit(a);
+        self.dmabuf_feedbacks.deinit(a);
         var sit = self.surfaces.valueIterator();
         while (sit.next()) |s| s.freeOwned(a);
         self.surfaces.deinit(a);
@@ -814,6 +856,17 @@ pub const Compositor = struct {
         if (self.pointer_focus == 0 or self.drag.active) return;
         for (self.pointers.items) |p| {
             const pv = self.objVersion(p);
+            // v9 guarantees each axis_relative_direction is followed
+            // by exactly one axis event for the same axis inside the
+            // frame, so it goes FIRST. Injected scroll is never
+            // natural-scroll inverted: always `identical`.
+            if (pv >= 9) {
+                var rbuf: [16]u8 = undefined;
+                var rb = wire.Builder.init(&rbuf, p, 10); // axis_relative_direction
+                rb.putUint(axis);
+                rb.putUint(0); // identical
+                try self.send(try rb.finish());
+            }
             if (value120 != 0) {
                 if (pv >= 8) {
                     var vbuf: [16]u8 = undefined;
@@ -1525,7 +1578,10 @@ pub const Compositor = struct {
                     var b = wire.Builder.init(&buf, reg, 0); // global
                     b.putUint(g.name);
                     b.putString(g.iface.name);
-                    b.putUint(g.version);
+                    b.putUint(if (g.iface == &protocol.zwp_linux_dmabuf_v1)
+                        self.dmabufVersion()
+                    else
+                        g.version);
                     try self.send(try b.finish());
                 }
             },
@@ -1545,12 +1601,32 @@ pub const Compositor = struct {
             if (g.iface == &protocol.zwp_linux_dmabuf_v1 and
                 !self.advertise_dmabuf and !self.lenient)
                 return Error.Protocol;
+            // A brain that announced v3 must refuse a v4 bind: the
+            // client would then wait for feedback events we have no
+            // main device for. Replicas validate against the static
+            // table, since the authoritative bind already happened.
+            if (g.iface == &protocol.zwp_linux_dmabuf_v1 and
+                !self.lenient and ver > self.dmabufVersion())
+                return Error.Protocol;
             if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version) {
                 std.debug.print("wlhost: bad bind {s} v{d} (advertised {s} v{d})\n", .{ iname, ver, g.iface.name, g.version });
                 return Error.Protocol;
             }
             try self.register(id, g.iface);
             self.obj_versions.put(self.allocator, id, ver) catch return Error.OutOfMemory;
+            // Old replica tables cap these binds lower (seat 8,
+            // compositor 6, shm 1, ddm 3, dmabuf 3; no wl_fixes at
+            // all) and bindGlobal's version check is not lenient, so
+            // the bind ALONE kills them — the viewer gate must latch
+            // here, not just on the post-bump requests.
+            if (g.iface == &protocol.zwp_linux_dmabuf_v1 and ver >= 4)
+                self.used_dmabuf_feedback = true;
+            if ((g.iface == &protocol.wl_seat and ver >= 9) or
+                (g.iface == &protocol.wl_compositor and ver >= 7) or
+                (g.iface == &protocol.wl_shm and ver >= 2) or
+                (g.iface == &protocol.wl_data_device_manager and ver >= 4) or
+                g.iface == &protocol.wl_fixes)
+                self.used_post_v8_request = true;
             if (g.iface == &protocol.wl_seat) self.seat_version = ver;
             if (g.iface == &protocol.wl_compositor) self.compositor_version = ver;
             if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
@@ -1577,6 +1653,19 @@ pub const Compositor = struct {
             1 => { // create_region — tracked, contents ignored
                 const id = (try it.next()).?.new_id;
                 try self.register(id, &protocol.wl_region);
+            },
+            // release (v7): drops the global ONLY. Surfaces and
+            // regions it made stay alive and usable, per the spec.
+            2 => try self.destroyPostV8(hdr.object),
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wl_fixes) switch (hdr.opcode) {
+            0 => try self.destroyPostV8(hdr.object), // destroy
+            1 => { // destroy_registry(registry)
+                const reg = (try it.next()).?.object;
+                if (self.objects.get(reg)) |ri| {
+                    if (ri != &protocol.wl_registry) return Error.Protocol;
+                } else if (!self.lenient) return Error.Protocol;
+                try self.destroyPostV8(reg);
             },
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_subcompositor) switch (hdr.opcode) {
@@ -1655,7 +1744,9 @@ pub const Compositor = struct {
                 // displaced incarnation via their serial.
                 _ = try self.freshPool(id, @intCast(size));
             },
-            else => return Error.Protocol, // release is since-2; we advertise 1
+            // release (v2): drops the global; live pools survive it.
+            1 => try self.destroyPostV8(hdr.object),
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_shm_pool) switch (hdr.opcode) {
             0 => { // create_buffer
                 const id = (try it.next()).?.new_id;
@@ -1727,6 +1818,21 @@ pub const Compositor = struct {
                 const id = (try it.next()).?.new_id;
                 try self.register(id, &protocol.zwp_linux_buffer_params_v1);
                 try self.dmabuf_params.put(self.allocator, id, .{});
+            },
+            2 => { // get_default_feedback(id)
+                const id = (try it.next()).?.new_id;
+                try self.newDmabufFeedback(id, 0);
+            },
+            3 => { // get_surface_feedback(id, surface)
+                const id = (try it.next()).?.new_id;
+                const surface = (try it.next()).?.object;
+                try self.newDmabufFeedback(id, surface);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_linux_dmabuf_feedback_v1) switch (hdr.opcode) {
+            0 => { // destroy
+                _ = self.dmabuf_feedbacks.remove(hdr.object);
+                try self.destroyObject(hdr.object);
             },
             else => return Error.Protocol,
         } else if (iface == &protocol.zwp_linux_buffer_params_v1) switch (hdr.opcode) {
@@ -1977,6 +2083,9 @@ pub const Compositor = struct {
                 try self.register(id, &protocol.wl_data_device);
                 try self.data_devices.append(self.allocator, id);
             },
+            // release (v4): drops the global; live sources and
+            // devices keep working.
+            2 => try self.destroyPostV8(hdr.object),
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_data_source) switch (hdr.opcode) {
             0 => { // offer(mime)
@@ -2538,6 +2647,12 @@ pub const Compositor = struct {
                 const cb = (try it.next()).?.new_id;
                 try surf.frame_cbs.append(self.allocator, cb);
             },
+            11 => { // get_release(callback) — v7 buffer-release callback
+                const cb = (try it.next()).?.new_id;
+                self.used_post_v8_request = true;
+                try self.register(cb, &protocol.wl_callback);
+                try surf.release_cbs.append(self.allocator, cb);
+            },
             5 => { // set_input_region(?region) — staged until commit
                 const region = (try it.next()).?.object;
                 surf.input_pending = true;
@@ -2710,6 +2825,15 @@ pub const Compositor = struct {
         // the client's cairo surface refcount and aborts the app
         // (cairo_surface_reference assertion).
         const took_buffer = surf.has_pending;
+        // get_release is only legal in a content update that attaches
+        // a non-null buffer; otherwise nothing would ever release and
+        // the callback would dangle forever.
+        if (surf.release_cbs.items.len > 0 and
+            !(surf.has_pending and surf.pending_buffer != 0))
+        {
+            try self.fatalCode(sid, 5, "wl_surface.get_release without an attached buffer");
+            return;
+        }
         if (surf.has_pending) {
             surf.committed_buffer = surf.pending_buffer;
             surf.has_pending = false;
@@ -2783,6 +2907,15 @@ pub const Compositor = struct {
                 var b = wire.Builder.init(&buf, surf.committed_buffer, 0); // release
                 try self.send(try b.finish());
             }
+            // Same instant as the buffer release, by definition.
+            for (surf.release_cbs.items) |cb| {
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, cb, 0); // done
+                b.putUint(0); // callback_data is unused, always zero
+                try self.send(try b.finish());
+                try self.deleteId(cb);
+            }
+            surf.release_cbs.clearRetainingCapacity();
         }
 
         // Frame callbacks: done + delete_id, in request order.
@@ -3117,6 +3250,88 @@ pub const Compositor = struct {
 
     // ── server plumbing ─────────────────────────────────────────
 
+    /// linux-dmabuf version this compositor may announce. v4's
+    /// feedback events are only answerable with a main DRM device.
+    fn dmabufVersion(self: *const Compositor) u32 {
+        if (self.dmabuf_main_device == 0) return 3;
+        // An empty format table is not a legal feedback answer, and
+        // a v4 client has no other way to learn our formats.
+        if (dmabuf.tableEntryCount(self.dmabuf_capabilities) == 0) return 3;
+        return 4;
+    }
+
+    /// Register a v4 feedback object and answer it once. Feedback is
+    /// static here: the capability set is fixed for the session, so
+    /// there is never a second `done` (the protocol allows re-sends
+    /// but does not require them).
+    fn newDmabufFeedback(self: *Compositor, id: u32, surface: u32) Error!void {
+        try self.register(id, &protocol.zwp_linux_dmabuf_feedback_v1);
+        // Latched, never cleared: a replica that cannot parse this
+        // request must stay excluded for the rest of the session,
+        // even after the app drops the object again.
+        self.used_dmabuf_feedback = true;
+        try self.dmabuf_feedbacks.put(self.allocator, id, surface);
+        // Replica output is discarded by the viewer; only the
+        // authoritative brain answers the app.
+        if (self.lenient) return;
+        try self.sendDmabufFeedback(id);
+    }
+
+    fn sendDmabufFeedback(self: *Compositor, id: u32) Error!void {
+        var table: std.ArrayList(u8) = .empty;
+        defer table.deinit(self.allocator);
+        try dmabuf.appendFormatTable(self.allocator, &table, self.dmabuf_capabilities);
+        const entries: u32 = @intCast(table.items.len / dmabuf.table_entry_size);
+
+        // format_table carries an fd, so it rides a side-band unit
+        // the daemon materializes (see pipe.Tag.dmabuf_feedback).
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, id, .little);
+        try unit.appendSlice(self.allocator, &idb);
+        try unit.appendSlice(self.allocator, table.items);
+        try pipe.appendUnit(&self.out, self.allocator, .dmabuf_feedback, unit.items);
+
+        var dev: [8]u8 = undefined;
+        std.mem.writeInt(u64, &dev, self.dmabuf_main_device, native_endian);
+        var mbuf: [24]u8 = undefined;
+        var mb = wire.Builder.init(&mbuf, id, 2); // main_device
+        mb.putArray(&dev);
+        try self.send(try mb.finish());
+
+        // One tranche: everything we can import, from the same
+        // device, with no scanout promise.
+        var tbuf: [24]u8 = undefined;
+        var tb = wire.Builder.init(&tbuf, id, 4); // tranche_target_device
+        tb.putArray(&dev);
+        try self.send(try tb.finish());
+
+        const indices = try self.allocator.alloc(u8, entries * 2);
+        defer self.allocator.free(indices);
+        for (0..entries) |i| {
+            std.mem.writeInt(u16, indices[i * 2 ..][0..2], @intCast(i), native_endian);
+        }
+        const fmt_msg = try self.allocator.alloc(u8, wire.header_size + 4 + ((indices.len + 3) & ~@as(usize, 3)));
+        defer self.allocator.free(fmt_msg);
+        var fb = wire.Builder.init(fmt_msg, id, 5); // tranche_formats
+        fb.putArray(indices);
+        try self.send(try fb.finish());
+
+        var flbuf: [16]u8 = undefined;
+        var flb = wire.Builder.init(&flbuf, id, 6); // tranche_flags
+        flb.putUint(0);
+        try self.send(try flb.finish());
+
+        var tdbuf: [8]u8 = undefined;
+        var tdb = wire.Builder.init(&tdbuf, id, 3); // tranche_done
+        try self.send(try tdb.finish());
+
+        var dbuf: [8]u8 = undefined;
+        var db = wire.Builder.init(&dbuf, id, 0); // done
+        try self.send(try db.finish());
+    }
+
     fn boundGlobal(self: *Compositor, id: u32, iface: *const protocol.Interface, ver: u32) Error!void {
         if (iface == &protocol.wp_presentation) {
             var buf: [16]u8 = undefined;
@@ -3132,6 +3347,9 @@ pub const Compositor = struct {
                 try self.send(try b.finish());
             }
         } else if (iface == &protocol.zwp_linux_dmabuf_v1) {
+            // v4 deprecates both announcements: the spec forbids
+            // sending them, and the client waits for feedback instead.
+            if (ver >= 4) return;
             for (self.dmabuf_capabilities, 0..) |capability, i| {
                 if (ver < 3) {
                     // Pre-v3 clients cannot name an explicit modifier.
@@ -3238,6 +3456,16 @@ pub const Compositor = struct {
         return self.serial;
     }
 
+    /// destroyObject for a request that did not exist in the protocol
+    /// tables shipped with state-sync v8 (the core destructors and
+    /// wl_fixes). A pre-v9 replica re-parsing it would take it as a
+    /// fatal unknown opcode, so latch the fact for the daemon's
+    /// viewer gate — same contract as `used_dmabuf_feedback`.
+    fn destroyPostV8(self: *Compositor, id: u32) Error!void {
+        self.used_post_v8_request = true;
+        try self.destroyObject(id);
+    }
+
     fn send(self: *Compositor, msg: []const u8) Error!void {
         try pipe.appendUnit(&self.out, self.allocator, .wl_msg, msg);
     }
@@ -3258,7 +3486,15 @@ pub const Compositor = struct {
     // v7 (mux protocol 6) stores all pending dmabuf planes, their
     // modifiers, and the single-use bit; older snapshots carried only
     // a LINEAR plane 0.
-    const state_sync_version: u8 = 7;
+    // v8 adds no fields. It is the capability signal for
+    // linux-dmabuf v4: a v7 replica's protocol tables have no
+    // feedback interface, so re-parsing the app's
+    // get_default_feedback would be a fatal unknown opcode there.
+    // v9 adds the surface's pending get_release callbacks and is the
+    // capability signal for the core version bumps (wl_compositor 7,
+    // wl_shm 2, wl_data_device_manager 4, wl_seat 10, wl_fixes): a v8
+    // replica's tables lack those requests.
+    const state_sync_version: u8 = 9;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -3331,7 +3567,8 @@ pub const Compositor = struct {
         return self.serializeStateVersion(a, state_sync_version);
     }
 
-    /// Serialize state for a v6 or newer replica, downgrading only the v7 dmabuf tail.
+    /// Serialize state for a v6 or newer replica, downgrading only
+    /// the v7 dmabuf tail (v8 is a pure capability bump).
     pub fn serializeStateVersion(self: *const Compositor, a: std.mem.Allocator, max_version: u8) Error![]u8 {
         if (max_version < 6) return Error.Protocol;
         const version = @min(max_version, state_sync_version);
@@ -3414,6 +3651,10 @@ pub const Compositor = struct {
             try putU32(&out, a, s.tl_parent);
             try putU32(&out, a, @intCast(s.frame_cbs.items.len));
             for (s.frame_cbs.items) |cb| try putU32(&out, a, cb);
+            if (version >= 9) {
+                try putU32(&out, a, @intCast(s.release_cbs.items.len));
+                for (s.release_cbs.items) |cb| try putU32(&out, a, cb);
+            }
             try putU32(&out, a, @intCast(s.input_rects.items.len));
             for (s.input_rects.items) |r| {
                 try putI32(&out, a, r.x);
@@ -3692,6 +3933,10 @@ pub const Compositor = struct {
             s.tl_parent = try r.u32v();
             const n_cbs = try r.u32v();
             for (0..n_cbs) |_| try s.frame_cbs.append(a, try r.u32v());
+            if (ver >= 9) {
+                const n_rel = try r.u32v();
+                for (0..n_rel) |_| try s.release_cbs.append(a, try r.u32v());
+            }
             const n_rects = try r.u32v();
             for (0..n_rects) |_| try s.input_rects.append(a, .{
                 .x = try r.i32v(),
@@ -3996,10 +4241,16 @@ pub const Compositor = struct {
     /// client recognizes; code 1 = invalid_method is close enough
     /// for every v1 refusal.
     fn fatal(self: *Compositor, object: u32, text: []const u8) Error!void {
+        try self.fatalCode(object, 1, text);
+    }
+
+    /// fatal with the erroring interface's own error code (wl_surface
+    /// no_buffer = 5, and so on) — clients log the code, not the text.
+    fn fatalCode(self: *Compositor, object: u32, code: u32, text: []const u8) Error!void {
         var buf: [128]u8 = undefined;
         var b = wire.Builder.init(&buf, 1, 0); // wl_display.error
         b.putObject(object);
-        b.putUint(1);
+        b.putUint(code);
         b.putString(text);
         try self.send(try b.finish());
         self.dead = true;
@@ -5884,6 +6135,232 @@ test "seat v8: wheel scrolls carry axis_value120" {
     try t.expectEqualSlices([2]u32, &smooth_expect, evs.items);
 }
 
+test "seat v9: every axis event is preceded by axis_relative_direction" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 3, "wl_seat", 9, 3);
+    // Seat 9/10 adds no requests, so the bind is the ONLY thing an
+    // old replica (tables cap seat at 8) chokes on — it must latch
+    // the viewer gate by itself.
+    try t.expect(comp.used_post_v8_request);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    { // surface 5, pointer 6 (v9), plus a v8 pointer 7 from a v8 seat
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 3, 0);
+        b2.putNewId(6);
+        try req(&comp, try b2.finish());
+    }
+    try bindGlobal(&comp, 3, "wl_seat", 8, 8);
+    {
+        var b = wire.Builder.init(&buf, 8, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+    }
+    try comp.pointerEnter(5, 1, 1);
+    comp.clearOut();
+
+    try comp.pointerAxis(0, 20.0, 240);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // The v9 pointer leads with direction (spec: it is always
+    // followed by exactly one axis event for that axis in the frame);
+    // the v8 pointer must never see opcode 10 — its listener slot is
+    // NULL and libwayland aborts the client.
+    const expect = [_][2]u32{
+        .{ 6, 10 }, // axis_relative_direction
+        .{ 6, 9 }, // axis_value120
+        .{ 6, 4 }, // axis
+        .{ 6, 5 }, // frame
+        .{ 7, 9 }, // v8 pointer: value120
+        .{ 7, 4 },
+        .{ 7, 5 },
+    };
+    try t.expectEqualSlices([2]u32, &expect, evs.items);
+
+    // Smooth scroll carries the direction too (it is coupled to the
+    // axis event, not to the discrete info).
+    try comp.pointerAxis(1, 3.5, 0);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const smooth = [_][2]u32{ .{ 6, 10 }, .{ 6, 4 }, .{ 6, 5 }, .{ 7, 4 }, .{ 7, 5 } };
+    try t.expectEqualSlices([2]u32, &smooth, evs.items);
+}
+
+test "core destructors: release drops the global, not what it made" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    // Pre-v9 replica tables cap these binds at 6/1/3, so binding
+    // above that must latch the viewer gate by itself.
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 30);
+    try t.expect(!comp.used_post_v8_request);
+    try bindGlobal(&comp, 1, "wl_compositor", 7, 3);
+    try t.expect(comp.used_post_v8_request);
+    try bindGlobal(&comp, 2, "wl_shm", 2, 4);
+    try bindGlobal(&comp, 6, "wl_data_device_manager", 4, 5);
+
+    { // a surface (3) and a data source (5) that must outlive their factories
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 0);
+        b2.putNewId(7);
+        try req(&comp, try b2.finish());
+    }
+
+    { // wl_compositor.release
+        var b = wire.Builder.init(&buf, 3, 2);
+        try req(&comp, try b.finish());
+    }
+    { // wl_shm.release
+        var b = wire.Builder.init(&buf, 4, 1);
+        try req(&comp, try b.finish());
+    }
+    { // wl_data_device_manager.release
+        var b = wire.Builder.init(&buf, 5, 2);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(!comp.dead);
+    try t.expect(comp.objects.get(3) == null);
+    try t.expect(comp.objects.get(4) == null);
+    try t.expect(comp.objects.get(5) == null);
+    // The children are untouched: the surface still exists and the
+    // data source still takes offers.
+    try t.expect(comp.surfaces.get(6) != null);
+    {
+        var b = wire.Builder.init(&buf, 7, 0); // wl_data_source.offer
+        b.putString("text/plain");
+        try req(&comp, try b.finish());
+    }
+    try t.expect(!comp.dead);
+    // Pre-v9 replicas have no such requests in their tables.
+    try t.expect(comp.used_post_v8_request);
+}
+
+test "wl_fixes: destroy_registry frees the registry, rejects other objects" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 24, "wl_fixes", 1, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 7, 4);
+
+    { // destroy_registry on the compositor, not a registry: refused
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putObject(4);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.dead);
+
+    var tv2 = TestView{};
+    var comp2 = try Compositor.init(t.allocator, tv2.view());
+    defer comp2.deinit();
+    try getRegistry(&comp2);
+    try bindGlobal(&comp2, 24, "wl_fixes", 1, 3);
+    { // destroy_registry(2)
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putObject(2);
+        try req(&comp2, try b.finish());
+    }
+    try t.expect(!comp2.dead);
+    try t.expect(comp2.objects.get(2) == null);
+    // Binding through the dead registry is now a protocol error.
+    try bindGlobal(&comp2, 1, "wl_compositor", 7, 5);
+    try t.expect(comp2.dead);
+}
+
+test "wl_surface.get_release: done rides the buffer release, no_buffer otherwise" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 7, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 2, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+    { // surface 6 + xdg dance + first commit
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2);
+        b2.putNewId(7);
+        b2.putObject(6);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 1);
+        b3.putNewId(8);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b4.finish());
+    }
+    { // pool 9 (2x2 xrgb) + buffer 10
+        // create_pool sig "nhi": the fd occupies no wire bytes.
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 9, 0);
+        b2.putNewId(10);
+        b2.putInt(0);
+        b2.putInt(2);
+        b2.putInt(2);
+        b2.putInt(8);
+        b2.putUint(1);
+        try req(&comp, try b2.finish());
+    }
+
+    { // attach(10) + get_release(11) + commit
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 11);
+        b2.putNewId(11);
+        try req(&comp, try b2.finish());
+    }
+    comp.clearOut();
+    {
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // wl_buffer.release, then the release callback's done, then its
+    // delete_id on wl_display.
+    try t.expect(!comp.dead);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{
+        .{ 10, 0 }, // wl_buffer.release
+        .{ 11, 0 }, // wl_callback.done
+        .{ 1, 1 }, // wl_display.delete_id
+    }, evs.items);
+    try t.expect(comp.objects.get(11) == null);
+    try t.expect(comp.used_post_v8_request);
+
+    // A content update with no attached buffer is the no_buffer error.
+    {
+        var b = wire.Builder.init(&buf, 6, 11);
+        b.putNewId(12);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 6); // commit, nothing attached
+        try req(&comp, try b2.finish());
+    }
+    try t.expect(comp.dead);
+}
+
 test "relative pointer + pointer lock: locked suppresses absolute motion" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
@@ -6994,6 +7471,173 @@ test "linux-dmabuf: modifiers at bind, create_immed pixels + release, create fai
         try req(&comp, try b.finish());
     }
     try t.expect(comp.pools.get(10) == null);
+}
+
+/// Peel every unit, returning the announced version of the
+/// zwp_linux_dmabuf_v1 global (0 = not announced).
+fn announcedDmabufVersion(comp: *Compositor) !u32 {
+    var pos: usize = 0;
+    var found: u32 = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        pos += p.consumed;
+        if (p.unit.tag != .wl_msg) continue;
+        const body = p.unit.payload[wire.header_size..];
+        var it = wire.ArgIter.init(body, "usu");
+        _ = try it.next();
+        const iname = (try it.next()).?.string orelse continue;
+        if (!std.mem.eql(u8, iname, "zwp_linux_dmabuf_v1")) continue;
+        found = (try it.next()).?.uint;
+    }
+    comp.clearOut();
+    return found;
+}
+
+test "linux-dmabuf v4 is announced only with a main device" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.advertise_dmabuf = true;
+
+    // No main device: v3, and a v4 bind is a protocol error (the
+    // client would wait forever for feedback we cannot answer).
+    try getRegistry(&comp);
+    try t.expectEqual(@as(u32, 3), try announcedDmabufVersion(&comp));
+    try bindGlobal(&comp, 22, "zwp_linux_dmabuf_v1", 4, 3);
+    try t.expect(comp.dead);
+
+    var tv2 = TestView{};
+    var comp2 = try Compositor.init(t.allocator, tv2.view());
+    defer comp2.deinit();
+    comp2.advertise_dmabuf = true;
+    comp2.dmabuf_main_device = 0xe280; // any nonzero dev_t
+    try getRegistry(&comp2);
+    try t.expectEqual(@as(u32, 4), try announcedDmabufVersion(&comp2));
+
+    // A main device with nothing importable stays at v3: an empty
+    // format table is not a legal feedback answer.
+    var tv3 = TestView{};
+    var comp3 = try Compositor.init(t.allocator, tv3.view());
+    defer comp3.deinit();
+    comp3.advertise_dmabuf = true;
+    comp3.dmabuf_main_device = 0xe280;
+    comp3.dmabuf_capabilities = &.{};
+    try getRegistry(&comp3);
+    try t.expectEqual(@as(u32, 3), try announcedDmabufVersion(&comp3));
+}
+
+test "dmabuf v4 feedback answers with a table, a device and one tranche" {
+    // mpv/mesa bind v4 and block until `done`; a v3-only compositor
+    // makes --vo=dmabuf-wayland refuse to initialize.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.advertise_dmabuf = true;
+    comp.dmabuf_main_device = 0xe280;
+
+    try getRegistry(&comp);
+    comp.clearOut();
+    // Announcing v4 must not exclude pre-v8 replicas from the
+    // session; a v4 BIND must, since their protocol tables cap the
+    // global at 3 and the bind alone kills them.
+    try t.expect(!comp.used_dmabuf_feedback);
+    try bindGlobal(&comp, 22, "zwp_linux_dmabuf_v1", 4, 3);
+    try t.expect(!comp.dead);
+    try t.expect(comp.used_dmabuf_feedback);
+
+    // v4 forbids the legacy format/modifier announcements.
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 0), evs.items.len);
+
+    { // get_default_feedback(4)
+        var buf: [32]u8 = undefined;
+        var b = wire.Builder.init(&buf, 3, 2);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.used_dmabuf_feedback);
+
+    var table: ?[]const u8 = null;
+    var opcodes: std.ArrayList(u16) = .empty;
+    defer opcodes.deinit(t.allocator);
+    var main_device: u64 = 0;
+    var tranche_indices: std.ArrayList(u16) = .empty;
+    defer tranche_indices.deinit(t.allocator);
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        pos += p.consumed;
+        switch (p.unit.tag) {
+            .dmabuf_feedback => {
+                try t.expectEqual(@as(u32, 4), std.mem.readInt(u32, p.unit.payload[0..4], .little));
+                table = p.unit.payload[4..];
+                try opcodes.append(t.allocator, 1); // format_table
+            },
+            .wl_msg => {
+                const hdr = (try wire.parseHeader(p.unit.payload)).?;
+                try t.expectEqual(@as(u32, 4), hdr.object);
+                try opcodes.append(t.allocator, hdr.opcode);
+                const body = p.unit.payload[wire.header_size..];
+                if (hdr.opcode == 2) { // main_device
+                    var it = wire.ArgIter.init(body, "a");
+                    const arr = (try it.next()).?.array;
+                    try t.expectEqual(@as(usize, 8), arr.len);
+                    main_device = std.mem.readInt(u64, arr[0..8], native_endian);
+                } else if (hdr.opcode == 5) { // tranche_formats
+                    var it = wire.ArgIter.init(body, "a");
+                    const arr = (try it.next()).?.array;
+                    var i: usize = 0;
+                    while (i + 2 <= arr.len) : (i += 2)
+                        try tranche_indices.append(t.allocator, std.mem.readInt(u16, arr[i..][0..2], native_endian));
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Spec order: format_table, main_device, then the tranche
+    // (target_device, formats, flags, done), then done.
+    try t.expectEqualSlices(u16, &[_]u16{ 1, 2, 4, 5, 6, 3, 0 }, opcodes.items);
+    try t.expectEqual(@as(u64, 0xe280), main_device);
+
+    // Default capabilities: ARGB + XRGB, both LINEAR.
+    const tbl = table.?;
+    try t.expectEqual(@as(usize, 2 * dmabuf.table_entry_size), tbl.len);
+    try t.expectEqualSlices(u16, &[_]u16{ 0, 1 }, tranche_indices.items);
+    try t.expectEqual(
+        dmabuf.DRM_FORMAT_ARGB8888,
+        std.mem.readInt(u32, tbl[0..4], native_endian),
+    );
+    try t.expectEqual(
+        dmabuf.DRM_FORMAT_MOD_LINEAR,
+        std.mem.readInt(u64, tbl[8..16], native_endian),
+    );
+    try t.expectEqual(
+        dmabuf.DRM_FORMAT_XRGB8888,
+        std.mem.readInt(u32, tbl[16..20], native_endian),
+    );
+
+    // Per-surface feedback answers identically, and destroy releases
+    // the object without touching the default feedback.
+    { // get_surface_feedback(5, surface 0) — no surface needed here
+        var buf: [32]u8 = undefined;
+        var b = wire.Builder.init(&buf, 3, 3);
+        b.putNewId(5);
+        b.putObject(0);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 2), comp.dmabuf_feedbacks.count());
+    comp.clearOut();
+    {
+        var buf: [16]u8 = undefined;
+        var b = wire.Builder.init(&buf, 5, 0); // destroy
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), comp.dmabuf_feedbacks.count());
+    try t.expect(comp.objects.get(5) == null);
+    try t.expect(!comp.dead);
 }
 
 test "current state_sync: dmabuf buffer survives replica restore with pixels" {

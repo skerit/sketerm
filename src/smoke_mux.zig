@@ -13,6 +13,8 @@ const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
 const wlpixcodec = @import("wlhost/pixcodec.zig");
 const wlprotocol = @import("wlhost/protocol.zig");
+const wldmabuf = @import("wlhost/dmabuf.zig");
+const native_endian = @import("builtin").cpu.arch.endian();
 const snapshot = @import("mux/snapshot.zig");
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
@@ -731,8 +733,10 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     }
 }
 
-/// Waits for the advertised linux-dmabuf global on a scripted app socket.
-fn awaitDmabufGlobal(allocator: std.mem.Allocator, app_fd: c_int) void {
+/// Waits for the advertised linux-dmabuf global on a scripted app
+/// socket and returns the version it was announced at (4 only where
+/// the daemon resolved a DRM render node).
+fn awaitDmabufGlobal(allocator: std.mem.Allocator, app_fd: c_int) u32 {
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(allocator);
     while (true) {
@@ -748,7 +752,10 @@ fn awaitDmabufGlobal(allocator: std.mem.Allocator, app_fd: c_int) void {
                 if (iface_len > 0 and 8 + padded + 4 <= body.len) {
                     const iface = body[8 .. 8 + iface_len - 1];
                     const version = std.mem.readInt(u32, body[8 + padded ..][0..4], .little);
-                    if (name == 22 and version == 3 and std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) return;
+                    if (name == 22 and std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) {
+                        if (version < 3) fail("linux-dmabuf announced below v3");
+                        return version;
+                    }
                 }
             }
             pos += h.size;
@@ -763,6 +770,140 @@ fn awaitDmabufGlobal(allocator: std.mem.Allocator, app_fd: c_int) void {
         if (n <= 0) fail("linux-dmabuf global was not advertised");
         raw.appendSlice(allocator, chunk[0..@intCast(n)]) catch fail("oom");
     }
+}
+
+/// Scripted linux-dmabuf v4 feedback: bind v4, ask for the default
+/// feedback and prove the daemon materialized a real format-table fd
+/// whose contents are the tranche the tranche_formats indices point
+/// at. This is the mpv/mesa path (they bind v4 and block on `done`),
+/// and the fd side-band it needs cannot be covered by unit tests.
+fn feedbackStage(allocator: std.mem.Allocator, app_fd: c_int) void {
+    const dmabuf_id: u32 = 100;
+    const feedback_id: u32 = 101;
+    var mbuf: [256]u8 = undefined;
+    {
+        var b = wlwire.Builder.init(&mbuf, 2, 0); // bind(22, v4, 100)
+        b.putUint(22);
+        b.putString("zwp_linux_dmabuf_v1");
+        b.putUint(4);
+        b.putNewId(dmabuf_id);
+        const m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dmabuf v4 bind write");
+    }
+    {
+        var b = wlwire.Builder.init(&mbuf, dmabuf_id, 2); // get_default_feedback
+        b.putNewId(feedback_id);
+        const m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dmabuf feedback write");
+    }
+
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(allocator);
+    var table_fd: c_int = -1;
+    defer if (table_fd >= 0) {
+        _ = c.close(table_fd);
+    };
+    var table_size: u32 = 0;
+    var main_device: u64 = 0;
+    var indices: usize = 0;
+    var saw_done = false;
+    var saw_tranche_done = false;
+    while (!saw_done) {
+        var pos: usize = 0;
+        while (true) {
+            const h = (wlwire.parseHeader(raw.items[pos..]) catch fail("feedback header")) orelse break;
+            if (raw.items[pos..].len < h.size) break;
+            const body = raw.items[pos + wlwire.header_size .. pos + h.size];
+            if (h.object == feedback_id) switch (h.opcode) {
+                0 => saw_done = true,
+                1 => { // format_table(fd, size) — fd came via SCM_RIGHTS
+                    var it = wlwire.ArgIter.init(body, "u");
+                    table_size = ((it.next() catch fail("format_table size")) orelse fail("format_table size")).uint;
+                },
+                2, 4 => { // main_device / tranche_target_device
+                    var it = wlwire.ArgIter.init(body, "a");
+                    const arr = ((it.next() catch fail("device array")) orelse fail("device array")).array;
+                    if (arr.len != 8) fail("device array is not a dev_t");
+                    const dev = std.mem.readInt(u64, arr[0..8], native_endian);
+                    if (dev == 0) fail("feedback announced a null main device");
+                    if (h.opcode == 2) main_device = dev else if (dev != main_device)
+                        fail("tranche targets a device other than the main one");
+                },
+                3 => saw_tranche_done = true,
+                5 => { // tranche_formats
+                    var it = wlwire.ArgIter.init(body, "a");
+                    const arr = ((it.next() catch fail("tranche_formats")) orelse fail("tranche_formats")).array;
+                    if (arr.len % 2 != 0) fail("tranche_formats is not a u16 array");
+                    indices = arr.len / 2;
+                    var i: usize = 0;
+                    while (i < indices) : (i += 1) {
+                        const idx = std.mem.readInt(u16, arr[i * 2 ..][0..2], native_endian);
+                        if (idx != i) fail("tranche index does not address the table");
+                    }
+                },
+                else => {},
+            };
+            pos += h.size;
+        }
+        if (pos > 0) {
+            const rem = raw.items.len - pos;
+            std.mem.copyForwards(u8, raw.items[0..rem], raw.items[pos..]);
+            raw.shrinkRetainingCapacity(rem);
+        }
+        if (saw_done) break;
+        var data: [4096]u8 = undefined;
+        var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = undefined;
+        var iov = c.struct_iovec{ .iov_base = &data, .iov_len = data.len };
+        var mh = std.mem.zeroes(c.struct_msghdr);
+        mh.msg_iov = @ptrCast(&iov);
+        mh.msg_iovlen = 1;
+        mh.msg_control = &cbuf;
+        mh.msg_controllen = cbuf.len;
+        const n = c.recvmsg(app_fd, &mh, 0);
+        if (n <= 0) fail("dmabuf feedback timed out");
+        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+        var off: usize = 0;
+        const clen: usize = @intCast(mh.msg_controllen);
+        while (off + hdr_size <= clen) {
+            const chdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(cbuf[off..].ptr));
+            const cl: usize = @intCast(chdr.cmsg_len);
+            if (cl < hdr_size or off + cl > clen) break;
+            if (chdr.cmsg_level == c.SOL_SOCKET and chdr.cmsg_type == c.SCM_RIGHTS) {
+                var got: c_int = undefined;
+                @memcpy(std.mem.asBytes(&got), cbuf[off + hdr_size ..][0..@sizeOf(c_int)]);
+                if (table_fd >= 0) fail("more than one feedback fd");
+                table_fd = got;
+            }
+            off += (cl + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
+        }
+        raw.appendSlice(allocator, data[0..@intCast(n)]) catch fail("oom");
+    }
+
+    if (!saw_tranche_done) fail("feedback done without a tranche");
+    if (table_fd < 0) fail("format_table arrived without an fd");
+    if (table_size == 0 or table_size % wldmabuf.table_entry_size != 0)
+        fail("format_table size is not a whole number of entries");
+    if (indices != table_size / wldmabuf.table_entry_size)
+        fail("tranche does not cover the table");
+
+    const mapped = c.mmap(null, table_size, c.PROT_READ, c.MAP_PRIVATE, table_fd, 0);
+    if (mapped == c.MAP_FAILED) fail("format_table fd is not mappable");
+    defer _ = c.munmap(mapped, table_size);
+    const bytes = @as([*]const u8, @ptrCast(mapped))[0..table_size];
+    var saw_linear_xrgb = false;
+    var entry: usize = 0;
+    while (entry < indices) : (entry += 1) {
+        const at = entry * wldmabuf.table_entry_size;
+        const format = std.mem.readInt(u32, bytes[at..][0..4], native_endian);
+        const modifier = std.mem.readInt(u64, bytes[at + 8 ..][0..8], native_endian);
+        if (format == wldmabuf.DRM_FORMAT_XRGB8888 and modifier == wldmabuf.DRM_FORMAT_MOD_LINEAR)
+            saw_linear_xrgb = true;
+    }
+    if (!saw_linear_xrgb) fail("format table lacks the guaranteed LINEAR XRGB tuple");
+    std.debug.print(
+        "smoke-mux: linux-dmabuf v4 feedback ok ({d} table entries, main_device {d})\n",
+        .{ indices, main_device },
+    );
 }
 
 /// Waits for one Wayland event while safely skipping unrelated events.
@@ -811,7 +952,11 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
         b.putNewId(2);
         const m = b.finish() catch unreachable;
         if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dmabuf registry write");
-        awaitDmabufGlobal(allocator, app_fd);
+        const version = awaitDmabufGlobal(allocator, app_fd);
+        // v4 feedback rides its own object; check it before the v3
+        // import script below re-uses id 3 for a v3 bind.
+        if (version >= 4) feedbackStage(allocator, app_fd) else
+            std.debug.print("smoke-mux: linux-dmabuf v3 (no DRM render node) — feedback stage skipped\n", .{});
     }
 
     var stream: std.ArrayList(u8) = .empty;
@@ -2108,6 +2253,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Pin "off" so the suite runs the Linux-equivalent paths; the
     // winstream stage opts back in explicitly.
     _ = c.setenv("SKETERM_WINSTREAM", "off", 1);
+
+    // linux-dmabuf v4 feedback needs a main DRM device, and CI hosts
+    // (and this repo's own containers) have no /dev/dri. /dev/null is
+    // a character device every host has: only its dev_t travels, and
+    // the smoke never allocates from it — pinning it here means the
+    // feedback stage runs everywhere instead of silently skipping.
+    if (c.getenv("SKETERM_MUX_DRM_DEVICE") == null)
+        _ = c.setenv("SKETERM_MUX_DRM_DEVICE", "/dev/null", 1);
 
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
