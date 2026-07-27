@@ -498,7 +498,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 p.staged.deinit(self.allocator);
                 self.commitNavigation(p.tab, p.hc, p.dir, intent, rep.path);
                 self.allocator.destroy(p);
-                return true;
+                // commitNavigation just rendered the tab; reporting
+                // dirty here would rebuild the same listing a second
+                // time in the same drain.
+                return false;
             }
             self.dropPending(i);
             return true;
