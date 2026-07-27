@@ -14,6 +14,8 @@ const query_mod = @import("../../filebrowser/query.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
+const menuButton = @import("menu.zig").menuButton;
+const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 
 /// Heap ctx on each places row (freed with the row).
 pub const PlaceCtx = struct {
@@ -53,8 +55,23 @@ pub fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) 
 pub fn sectionCollapsed(self: *BrowserView, name: []const u8) bool {
     for (self.collapsed.items) |s| {
         if (std.mem.eql(u8, s, name)) return true;
+        // The top section used to be called "Places"; a fold saved
+        // under the old name keeps working.
+        if (std.mem.eql(u8, name, "Local Places") and std.mem.eql(u8, s, "Places")) return true;
     }
     return false;
+}
+
+/// "user@box" / "udp:box" as a section title: the bare host name,
+/// first letter upcased ("Archdev Places").
+pub fn hostSectionTitle(host: []const u8, buf: []u8) []const u8 {
+    var name = host;
+    if (std.mem.lastIndexOfScalar(u8, name, '@')) |at| name = name[at + 1 ..];
+    if (std.mem.startsWith(u8, name, "udp:")) name = name["udp:".len..];
+    if (name.len == 0) name = host;
+    const text = std.fmt.bufPrint(buf, "{s} Places", .{name}) catch return "Remote Places";
+    if (text.len > 0) text[0] = std.ascii.toUpper(text[0]);
+    return text;
 }
 
 /// Fold a section open or shut and persist it. The caller re-renders:
@@ -208,13 +225,44 @@ pub fn renderPlaces(self: *BrowserView) void {
     while (c.gtk_list_box_get_row_at_index(self.places_list, 0)) |row| {
         c.gtk_list_box_remove(self.places_list, @ptrCast(row));
     }
-    self.placeHeader("Places");
-    if (!sectionCollapsed(self, "Places")) {
+    // Always the LOCAL machine, whatever host the current tab shows:
+    // specs are "local:"-qualified so a click can never resolve
+    // against the remote tab's host.
+    self.placeHeader("Local Places");
+    if (!sectionCollapsed(self, "Local Places")) {
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
-        self.placeRow("user-home-symbolic", "Home", home, false);
+        var home_spec_buf: [4200]u8 = undefined;
+        if (std.fmt.bufPrint(&home_spec_buf, "local:{s}", .{home})) |hs|
+            self.placeRow("user-home-symbolic", "Home", hs, false)
+        else |_|
+            self.placeRow("user-home-symbolic", "Home", home, false);
         self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
         var trash_buf: [4200]u8 = undefined;
         if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+    }
+    // Browsing another machine adds ITS places right below, under its
+    // own name — the two systems are never conflated in one section.
+    if (self.currentTab()) |tab| {
+        if (tab.hc.host) |host| {
+            var title_buf: [160]u8 = undefined;
+            var title_z: [160:0]u8 = undefined;
+            const title = hostSectionTitle(host, &title_buf);
+            const tn = @min(title.len, title_z.len - 1);
+            @memcpy(title_z[0..tn], title[0..tn]);
+            title_z[tn] = 0;
+            self.placeHeader(&title_z);
+            if (!sectionCollapsed(self, title_z[0..tn])) {
+                var spec_buf: [4600]u8 = undefined;
+                if (tab.hc.home_dir) |hd| {
+                    if (std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ host, hd })) |hs|
+                        self.placeRow("user-home-symbolic", "Home", hs, false)
+                    else |_| {}
+                }
+                if (std.fmt.bufPrint(&spec_buf, "{s}:/", .{host})) |rs|
+                    self.placeRow("drive-harddisk-symbolic", "File System", rs, false)
+                else |_| {}
+            }
+        }
     }
     const store = self.regStore();
     if (store.count() > 0) {
@@ -294,9 +342,177 @@ pub fn renderPlaces(self: *BrowserView) void {
             if (devices_folded) break;
         }
         // /proc/mounts octal-escapes spaces; show raw (rare).
-        self.placeRow("drive-harddisk-symbolic", mp, mp, false);
+        // "local:"-qualified: /proc/mounts is THIS machine's table,
+        // and a bare path would resolve against a remote tab's host.
+        var mp_spec_buf: [1200]u8 = undefined;
+        const mp_spec = std.fmt.bufPrint(&mp_spec_buf, "local:{s}", .{mp}) catch mp;
+        self.placeRow("drive-harddisk-symbolic", mp, mp_spec, false);
         shown += 1;
     }
+}
+
+// ── row context menu ─────────────────────────────────────────────
+
+/// Heap ctx for one open places menu; owned by its popover.
+const PlacesMenuCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    /// The row's spec, copied: renderPlaces may destroy the row (and
+    /// its PlaceCtx) while this menu is still up.
+    spec: []u8,
+    popover: *c.GtkWidget,
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.free(ctx.spec);
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+/// True when `spec` is one of the recent-location rows.
+fn isRecentSpec(self: *BrowserView, spec: []const u8) bool {
+    for (self.recent.items) |r| {
+        if (std.mem.eql(u8, r, spec)) return true;
+    }
+    return false;
+}
+
+pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const row = c.gtk_list_box_get_row_at_y(self.places_list, @intFromFloat(y)) orelse return;
+    const data = c.g_object_get_data(@ptrCast(row), "sketerm-place") orelse return;
+    const pctx: *PlaceCtx = @ptrCast(@alignCast(data));
+    if (pctx.spec.len == 0 or std.mem.startsWith(u8, pctx.spec, "section:")) return;
+
+    const ctx = self.allocator.create(PlacesMenuCtx) catch return;
+    const spec_owned = self.allocator.dupe(u8, pctx.spec) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
+    const popover = c.gtk_popover_new();
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .spec = spec_owned,
+        .popover = popover,
+    };
+    c.g_object_set_data_full(@ptrCast(popover), "sketerm-placesmenu", @ptrCast(ctx), @ptrCast(&PlacesMenuCtx.free));
+
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    const is_search = std.mem.startsWith(u8, ctx.spec, "search:");
+    const is_register = std.mem.startsWith(u8, ctx.spec, "register:");
+    if (is_search) {
+        menuButton(box, "Run Query", &onPlacesMenuOpen, @ptrCast(ctx), false);
+        menuButton(box, "Remove Saved Query", &onPlacesMenuRemove, @ptrCast(ctx), true);
+    } else if (is_register) {
+        menuButton(box, "Open Register", &onPlacesMenuOpen, @ptrCast(ctx), false);
+    } else {
+        menuButton(box, "Open in New Tab", &onPlacesMenuOpenTab, @ptrCast(ctx), false);
+        menuButton(box, "Open Here", &onPlacesMenuOpen, @ptrCast(ctx), false);
+        menuButton(box, "Copy Location", &onPlacesMenuCopy, @ptrCast(ctx), false);
+        if (pctx.is_bookmark)
+            menuButton(box, "Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx), true)
+        else if (isRecentSpec(self, ctx.spec))
+            menuButton(box, "Remove from Recent", &onPlacesMenuRemove, @ptrCast(ctx), true)
+        else
+            menuButton(box, "Add Bookmark", &onPlacesMenuBookmark, @ptrCast(ctx), false);
+    }
+    c.gtk_popover_set_child(@ptrCast(popover), box);
+    c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(self.places_list)));
+    connectPopoverAutoUnparent(popover);
+    const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+    c.gtk_popover_popup(@ptrCast(popover));
+}
+
+/// Activate the row exactly as a click would (navigate here, run the
+/// query, open the register).
+fn onPlacesMenuOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    var buf: [4600]u8 = undefined;
+    if (ctx.spec.len >= buf.len) return;
+    @memcpy(buf[0..ctx.spec.len], ctx.spec);
+    const spec = buf[0..ctx.spec.len];
+    if (std.mem.startsWith(u8, spec, "search:")) {
+        const idx = std.fmt.parseInt(usize, spec[7..], 10) catch return;
+        self.runSavedSearch(idx);
+        return;
+    }
+    if (std.mem.startsWith(u8, spec, "register:")) {
+        _ = self.registerTab(spec["register:".len..]);
+        return;
+    }
+    const tab = self.currentTab() orelse {
+        _ = self.newTabSpec(spec);
+        return;
+    };
+    self.navigateSpec(tab, spec);
+}
+
+fn onPlacesMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    var buf: [4600]u8 = undefined;
+    if (ctx.spec.len >= buf.len) return;
+    @memcpy(buf[0..ctx.spec.len], ctx.spec);
+    _ = self.newTabSpec(buf[0..ctx.spec.len]);
+}
+
+fn onPlacesMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    var z: [4600:0]u8 = undefined;
+    const n = @min(ctx.spec.len, z.len - 1);
+    @memcpy(z[0..n], ctx.spec[0..n]);
+    z[n] = 0;
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.view.places_list)));
+    c.gdk_clipboard_set_text(clip, &z);
+    ctx.view.setStatus("location copied");
+}
+
+fn onPlacesMenuBookmark(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    var buf: [4600]u8 = undefined;
+    if (ctx.spec.len >= buf.len) return;
+    @memcpy(buf[0..ctx.spec.len], ctx.spec);
+    self.addBookmark(buf[0..ctx.spec.len]);
+}
+
+/// Remove the row from whichever durable list owns it (bookmark,
+/// saved query, recent location).
+fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    if (std.mem.startsWith(u8, ctx.spec, "search:")) {
+        const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
+        if (idx < self.saved_searches.items.len) {
+            self.saved_searches.items[idx].deinitOwned(self.allocator);
+            _ = self.saved_searches.orderedRemove(idx);
+        }
+    } else {
+        var i: usize = 0;
+        while (i < self.bookmarks.items.len) {
+            if (std.mem.eql(u8, self.bookmarks.items[i], ctx.spec)) {
+                self.allocator.free(self.bookmarks.items[i]);
+                _ = self.bookmarks.orderedRemove(i);
+            } else i += 1;
+        }
+        i = 0;
+        while (i < self.recent.items.len) {
+            if (std.mem.eql(u8, self.recent.items[i], ctx.spec)) {
+                self.allocator.free(self.recent.items[i]);
+                _ = self.recent.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+    self.savePlaces();
+    self.renderPlaces();
 }
 
 pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
@@ -463,4 +679,13 @@ pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
     places_mod.recordRecent(self.allocator, &self.recent, spec, places_mod.RECENT_CAP);
     self.savePlaces();
     if (self.places_on) self.renderPlaces();
+}
+
+test "hostSectionTitle titleizes the bare host name" {
+    const t = std.testing;
+    var buf: [160]u8 = undefined;
+    try t.expectEqualStrings("Archdev Places", hostSectionTitle("archdev", &buf));
+    try t.expectEqualStrings("Box Places", hostSectionTitle("skerit@box", &buf));
+    try t.expectEqualStrings("Box Places", hostSectionTitle("udp:box", &buf));
+    try t.expectEqualStrings("Aeor Places", hostSectionTitle("user@aeor", &buf));
 }
