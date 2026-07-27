@@ -218,6 +218,29 @@ pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkW
     const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onTabDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(label_box, @ptrCast(dropt));
+
+    // Scroll on a tab label switches tabs, like the main terminal
+    // tab bar. CAPTURE so the notebook's own strip panning never
+    // eats the event first.
+    const scr = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+    c.gtk_event_controller_set_propagation_phase(@ptrCast(scr), c.GTK_PHASE_CAPTURE);
+    _ = c.g_signal_connect_data(scr, "scroll", @ptrCast(&onTabStripScroll), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(label_box, @ptrCast(scr));
+}
+
+/// Scroll over the tab strip: down/right = next tab, up/left =
+/// previous. Touchpad smooth-scroll bursts accumulate so each ~1.0
+/// of delta moves exactly one tab (same rule as the terminal bar).
+pub fn onTabStripScroll(_: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const self = tab.view;
+    const delta = if (dy != 0) dy else dx;
+    if (delta == 0) return 0;
+    self.tab_scroll_accum += delta;
+    const nb = self.notebook;
+    while (self.tab_scroll_accum >= 1.0) : (self.tab_scroll_accum -= 1.0) _ = c.gtk_notebook_next_page(nb);
+    while (self.tab_scroll_accum <= -1.0) : (self.tab_scroll_accum += 1.0) _ = c.gtk_notebook_prev_page(nb);
+    return 1;
 }
 
 /// The icon grid's half of installTabConveniences (the flow box is
