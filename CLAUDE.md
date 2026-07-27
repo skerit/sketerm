@@ -31,7 +31,7 @@ zig build                       # GUI binary at zig-out/bin/sketerm
 zig build run -- [args]         # build + run with optional CLI args
 zig build mux                   # sketerm-mux session daemon (libc-only)
 zig build mux-portable          # static-musl baseline-CPU daemon for scp-to-server
-zig build test                  # full test suite (currently 720 tests)
+zig build test                  # full test suite (currently ~1060 tests)
 zig build test --summary all    # show test count + timings
 zig build smoke-mux             # mux daemon end-to-end smoke (headless)
 zig build smoke-mcp             # `sketerm mcp` isolation + headless-terminal smoke (headless)

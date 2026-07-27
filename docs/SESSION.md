@@ -10561,3 +10561,97 @@ commit-timing, linux-drm-syncobj-v1, colour management. Advertising a
 protocol we do not honour is worse than not having it -- a client
 that binds wp_fifo and waits on barriers we never release stalls,
 where the same client with no fifo global just uses frame callbacks.
+
+## 2026-07-27: files — Nemo parity batch (clipboard, rename, selection, menus)
+
+Eleven browser gaps closed against Nemo as the reference:
+
+- Copy/cut now also lands on the GDK clipboard: newline-delimited
+  absolute paths as text (pastes into editors, no file:// noise) plus
+  x-special/gnome-copied-files with the copy/cut verb + URIs, so
+  Nautilus/Nemo can paste the actual files. Internal paste unchanged;
+  remote-host copies deliberately not exported.
+- Inline rename: F2 or the context menu swaps the row's name label
+  for a borderless GtkText in place (stem preselected, extension
+  kept); Enter commits through the same daemon rename op + undo
+  record (`commitRename`), Escape/focus-out cancels. Grid falls back
+  to the old popover.
+- Zebra stripes (optional, persisted in places.json) + a hover value
+  distinctly stronger than the stripe.
+- Uniform row heights: one icon/thumbnail size per zoom step (the old
+  thumb size, the height the user preferred); async thumbs can no
+  longer grow their row.
+- Context menus start with "Open with <Default>" and an "Open With"
+  hover submenu (up to 20 apps + Other Application...); the chooser
+  dialog survives as the "always use"/host-apps path.
+- Quick Look: generator output (ffprobe/pdfinfo) is prettified
+  client-side (duration as a clock, TAG: lines labelled) and rendered
+  as a styled note, never a raw text dump.
+- Right-click outside a selection collapses it first (list + grid).
+- Rubber-band selection on empty listing space (drawing-area overlay,
+  scrolls with content); drags on rows stay file DnD.
+- Properties: taller default, no horizontal scrollbars, ellipsized
+  heading/labels.
+- Toolbar: bundled preview-pane icon, "Split pane" wording, a visible
+  Close Pane button; Close Pane also on entry right-clicks.
+
+## 2026-07-27 (later): files — the "best file manager" overhaul
+
+Dolphin and Nemo both mined for their best parts; the browser's
+column system rebuilt for real this time.
+
+- Full column set: 17 stat columns (coarse Type a la Nemo, detailed
+  type, MIME, extension, permissions, octal, owner, group, links,
+  size, on-disk, the four timestamps incl. btime via statx, location,
+  target). The daemon resolves owner/group NAMES on the owning host
+  (memoized getpwuid/getgrgid) and ships btime_ms; wire-compatible
+  additive fields. New SortKeys + grouping buckets for all of them.
+- The ~40 known metadata columns (media.*, tag.*, exif.*, doc.*) are
+  now one-click checkboxes in a scrollable, grouped column picker
+  (File / Media / Audio tags / Camera / Document), Dolphin's
+  "Additional Information" style; free-form user.* entry stays.
+  Extra-column cap raised to 16 (xattr-sourced still 8, the daemon's
+  per-listing budget); name-keyed add/remove helpers so picker
+  checkboxes cannot act on stale indices.
+- Column resize is LIVE: cells are tagged with their column ref and
+  follow the grip per motion frame (no rebuild); the Name column
+  gained its own grip (auto "take the leftover" mode until dragged,
+  double-click resets), persisted per folder + in tab state.
+- Header/rows are structurally linked: the header rides a
+  scrollbar-less GtkScrolledWindow LOCKED to the listing's horizontal
+  adjustment, so an over-wide column set scrolls as one surface.
+  Rows wrap everything left of the data cells in one name-area box
+  (fixed and indent-compensated when Name is pinned). Two GTK
+  landmines documented in render.zig: GtkBox hands spare width to
+  children up to their NATURAL size even without hexpand (so cell
+  and name labels cap natural via max-width-chars), and ellipsized
+  name labels are END now, like Nemo.
+- Dolphin-style Information panel replaces the old preview side box:
+  lives in a GtkPaned (user-owned width, persisted; content can never
+  resize it), fixed-height preview stage (texture or themed icon),
+  bold centered wrapping name, small-font key/value grid (stat facts
+  + cached media fields), folder summary when nothing is selected,
+  "N items selected" aggregate for multi-selections, content head /
+  hexdump in a sideways-scrolling card.
+- Optional compact info card at the bottom of the places sidebar
+  ("now playing" style: thumb/icon + name + two fact lines),
+  independent of the full panel, fetch-free, persisted.
+- Toolbar decluttered per Dolphin's philosophy: only Places,
+  Information, selection menu, view options, search and shell remain
+  as buttons; hidden files, view-mode cycle, new tab, split, close
+  pane and go-to-shell-cwd moved into the always-visible hamburger.
+  View mode is also a radio group at the top of the view-options
+  menu.
+- Tree keys: Right expands the focused directory, Left collapses it
+  or jumps to the parent row (Dolphin behavior), details view only.
+- Header restyled: real padding, bottom border, wider cell insets.
+
+Verified: suite 1052/5 (same skip set), mux-portable, smoke-e2e PASS,
+plus a full manual Xvfb GUI drive (columns, live resize incl. Name,
+picker groups, info panel incl. multi-select + long-name wrap,
+sidebar card, hamburger, tree keys, F2 inline rename on disk).
+
+Known limitations: no horizontal scrollbar UI for over-wide column
+sets yet (the shared adjustment scrolls via touchpad/shift-wheel);
+media columns need the media_meta job to have answered (blank until
+then); the picker's custom-row list closes the popover on remove.
