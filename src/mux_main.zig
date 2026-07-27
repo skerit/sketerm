@@ -158,7 +158,7 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
             _ = cc.setsid();
             if (cc.fork() == 0) {
                 var self_buf: [4096:0]u8 = undefined;
-                if (platform.exePathZ(&self_buf)) |_| {
+                if (platform.selfExecPathZ(&self_buf)) |_| {
                     const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
                     _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
                 }
@@ -494,7 +494,7 @@ fn connectDaemonRetry(allocator: std.mem.Allocator) ?c_int {
         _ = cc.setsid();
         if (cc.fork() == 0) {
             var self_buf: [4096:0]u8 = undefined;
-            if (platform.exePathZ(&self_buf)) |_| {
+            if (platform.selfExecPathZ(&self_buf)) |_| {
                 const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
                 _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
             }
