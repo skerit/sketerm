@@ -205,6 +205,230 @@ pub fn findSentinel(text: []const u8, nonce: []const u8) SentinelParse {
     return .{ .pending = .{ .begin_after = begin_after } };
 }
 
+/// Build the ssh forced-command that bootstraps OSC 133 shell
+/// integration into a REMOTE login shell (term_open host sessions,
+/// where the local spawn-time injection cannot reach).
+///
+/// The outer command uses only syntax every login-shell family parses
+/// (fish/csh included: no quotes, no `$(...)`, no `${...}`) and the
+/// real bootstrap travels base64-encoded, same transport as
+/// buildExecLine. The bootstrap self-deletes, then re-execs the
+/// user's $SHELL: bash via `--rcfile` (the rcfile emulates the login
+/// profile chain a plain `ssh host` would have run, then sources the
+/// integration), zsh via a temp ZDOTDIR (the shipped .zshenv shim,
+/// which chains the user's own startup files), anything else plainly
+/// with no integration — the session works either way. Needs `base64`
+/// on the remote, like term_exec already does.
+pub fn buildSshBootstrap(
+    allocator: std.mem.Allocator,
+    nonce: []const u8,
+    bash_script: []const u8,
+    zsh_env: []const u8,
+    zsh_script: []const u8,
+) ![]u8 {
+    const script = try buildBootstrapScript(allocator, nonce, bash_script, zsh_env, zsh_script);
+    defer allocator.free(script);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, enc.calcSize(script.len));
+    defer allocator.free(b64);
+    _ = enc.encode(b64, script);
+    return std.fmt.allocPrint(
+        allocator,
+        "echo {s} | base64 -d >/tmp/.sk_ssh_{s} && sh /tmp/.sk_ssh_{s}",
+        .{ b64, nonce, nonce },
+    );
+}
+
+/// The inner bootstrap (plain `sh` script): resolve the account's
+/// login shell (SKETERM_REMOTE_SHELL override → getent → dscl →
+/// $SHELL, same ladder as mux/shell.zig's remote launcher — a
+/// daemon-spawned session can't trust an inherited $SHELL), announce
+/// it, and exec it with integration injected where supported. Shared
+/// by both remote transports: base64-wrapped as an ssh forced command
+/// (buildSshBootstrap), or passed VERBATIM as `sh -c` spawn argv on a
+/// remote sketerm-mux daemon (nothing typed, nothing on the wire to
+/// clean up).
+pub fn buildBootstrapScript(
+    allocator: std.mem.Allocator,
+    nonce: []const u8,
+    bash_script: []const u8,
+    zsh_env: []const u8,
+    zsh_script: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\rm -f /tmp/.sk_ssh_{s}
+        \\d=`mktemp -d /tmp/.sketerm.XXXXXX 2>/dev/null` || {{ d=/tmp/.sketerm_{s}; mkdir -p "$d" && chmod 700 "$d" || exec sh -l; }}
+        \\s=''
+        \\if [ -n "${{SKETERM_REMOTE_SHELL:-}}" ] && [ -x "$SKETERM_REMOTE_SHELL" ]; then
+        \\  s="$SKETERM_REMOTE_SHELL"
+        \\elif command -v getent >/dev/null 2>&1; then
+        \\  s=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7)
+        \\elif command -v dscl >/dev/null 2>&1; then
+        \\  s=$(dscl . -read "/Users/$USER" UserShell 2>/dev/null | cut -d' ' -f2-)
+        \\fi
+        \\if [ -z "$s" ] || [ ! -x "$s" ]; then s="${{SHELL:-/bin/sh}}"; fi
+        \\if [ ! -x "$s" ]; then s=/bin/sh; fi
+        \\export SHELL="$s"
+        \\case "${{s##*/}}" in
+        \\bash)
+        \\cat > "$d/rc.bash" <<'SK_RC_{s}'
+        \\command rm -rf -- "${{SKETERM_REMOTE_TMP:?}}" 2>/dev/null
+        \\unset SKETERM_REMOTE_TMP
+        \\if ! shopt -q login_shell 2>/dev/null; then
+        \\  [ -r /etc/profile ] && . /etc/profile
+        \\  for __sk_f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+        \\    [ -r "$__sk_f" ] && {{ . "$__sk_f"; break; }}
+        \\  done
+        \\  unset __sk_f
+        \\fi
+        \\{s}
+        \\SK_RC_{s}
+        \\echo "[sketerm] remote shell: ${{s##*/}} (integration injected)"
+        \\SKETERM_REMOTE_TMP="$d" TERM_PROGRAM=sketerm exec "$s" --rcfile "$d/rc.bash"
+        \\;;
+        \\zsh)
+        \\cat > "$d/.zshenv" <<'SK_ZE_{s}'
+        \\{s}
+        \\SK_ZE_{s}
+        \\cat > "$d/sketerm.zsh" <<'SK_ZI_{s}'
+        \\{s}
+        \\[ -n "$SKETERM_REMOTE_TMP" ] && command rm -rf -- "$SKETERM_REMOTE_TMP" 2>/dev/null
+        \\unset SKETERM_REMOTE_TMP
+        \\SK_ZI_{s}
+        \\[ -n "$ZDOTDIR" ] && export SKETERM_ORIG_ZDOTDIR="$ZDOTDIR"
+        \\echo "[sketerm] remote shell: ${{s##*/}} (integration injected)"
+        \\ZDOTDIR="$d" SKETERM_SHELL_INTEGRATION="$d/sketerm.zsh" SKETERM_REMOTE_TMP="$d" TERM_PROGRAM=sketerm exec "$s" -l
+        \\;;
+        \\*)
+        \\rm -rf "$d"
+        \\echo "[sketerm] remote shell: ${{s##*/}} (no integration)"
+        \\exec "$s" -l
+        \\;;
+        \\esac
+        \\
+    , .{ nonce, nonce, nonce, bash_script, nonce, nonce, zsh_env, nonce, nonce, zsh_script, nonce });
+}
+
+/// Read a whole file (bounded), libc IO like the rest of this module.
+fn readScriptFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var pbuf: [4096]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const f = c.fopen(path_z.ptr, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            return null;
+        };
+        if (out.items.len > 256 * 1024) {
+            out.deinit(allocator);
+            return null;
+        }
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+fn buildBootstrapVia(allocator: std.mem.Allocator, comptime wrapped: bool) ?[]u8 {
+    const shellintegration = @import("../util/shellintegration.zig");
+    var base_buf: [4096]u8 = undefined;
+    const base = shellintegration.baseDir(&base_buf) orelse return null;
+    var raw: [6]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) != 0) return null;
+    var nonce: [12]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        nonce[i * 2] = hex[b >> 4];
+        nonce[i * 2 + 1] = hex[b & 0xf];
+    }
+    var paths_buf: [4096]u8 = undefined;
+    const bash_path = std.fmt.bufPrint(&paths_buf, "{s}/sketerm.bash", .{base}) catch return null;
+    const bash_script = readScriptFile(allocator, bash_path) orelse return null;
+    defer allocator.free(bash_script);
+    const zsh_env_path = std.fmt.bufPrint(&paths_buf, "{s}/zsh/.zshenv", .{base}) catch return null;
+    const zsh_env = readScriptFile(allocator, zsh_env_path) orelse return null;
+    defer allocator.free(zsh_env);
+    const zsh_path = std.fmt.bufPrint(&paths_buf, "{s}/sketerm.zsh", .{base}) catch return null;
+    const zsh_script = readScriptFile(allocator, zsh_path) orelse return null;
+    defer allocator.free(zsh_script);
+    return if (wrapped)
+        buildSshBootstrap(allocator, &nonce, bash_script, zsh_env, zsh_script) catch null
+    else
+        buildBootstrapScript(allocator, &nonce, bash_script, zsh_env, zsh_script) catch null;
+}
+
+/// Resolve the shipped integration scripts and build the remote
+/// bootstrap command for an ssh term. Null when the script dir is
+/// missing (feature unavailable) — the caller falls back to a plain
+/// login shell, exactly the old behavior.
+pub fn sshIntegrationCommand(allocator: std.mem.Allocator) ?[]u8 {
+    return buildBootstrapVia(allocator, true);
+}
+
+/// Same resolution, but the INNER script — spawn argv material for a
+/// remote sketerm-mux daemon (`sh -c <script>`).
+pub fn integrationBootstrapScript(allocator: std.mem.Allocator) ?[]u8 {
+    return buildBootstrapVia(allocator, false);
+}
+
+test "buildSshBootstrap ships a quote-free outer command and shell-cased bootstrap" {
+    const t = std.testing;
+    const boot = try buildSshBootstrap(t.allocator, "aabbccddeeff", "BASH_MARKER", "ZSHENV_MARKER", "ZSHRC_MARKER");
+    defer t.allocator.free(boot);
+    // The outer command is parsed by an UNKNOWN remote login shell
+    // (could be fish/csh): no quotes, no $-expansion, no subshells.
+    for (boot) |ch| {
+        try t.expect(ch != '\'' and ch != '"' and ch != '$' and ch != '(' and ch != '{');
+    }
+    try t.expect(std.mem.startsWith(u8, boot, "echo "));
+    try t.expect(std.mem.indexOf(u8, boot, "| base64 -d >/tmp/.sk_ssh_aabbccddeeff && sh /tmp/.sk_ssh_aabbccddeeff") != null);
+    const b64 = boot["echo ".len..std.mem.indexOf(u8, boot, " |").?];
+    const dec = std.base64.standard.Decoder;
+    const buf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(b64));
+    defer t.allocator.free(buf);
+    try dec.decode(buf, b64);
+    // Self-deletes, cases on the login shell, embeds all three scripts.
+    try t.expect(std.mem.startsWith(u8, buf, "rm -f /tmp/.sk_ssh_aabbccddeeff\n"));
+    try t.expect(std.mem.indexOf(u8, buf, "case \"${s##*/}\" in") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "\nBASH_MARKER\n") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "\nZSHENV_MARKER\n") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "\nZSHRC_MARKER\n") != null);
+    // bash: login-profile emulation + rcfile injection, TERM_PROGRAM
+    // exported so the integration script's gate passes remotely.
+    try t.expect(std.mem.indexOf(u8, buf, "exec \"$s\" --rcfile \"$d/rc.bash\"") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "TERM_PROGRAM=sketerm") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "shopt -q login_shell") != null);
+    // zsh: temp ZDOTDIR carrying the shim, login shell preserved.
+    try t.expect(std.mem.indexOf(u8, buf, "ZDOTDIR=\"$d\"") != null);
+    // Unknown shells fall back to a plain login shell.
+    try t.expect(std.mem.indexOf(u8, buf, "exec \"$s\" -l") != null);
+    // Every arm announces the detected shell so term_open can report
+    // it without a second tool call.
+    try t.expect(std.mem.indexOf(u8, buf, "echo \"[sketerm] remote shell: ${s##*/} (integration injected)\"") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "echo \"[sketerm] remote shell: ${s##*/} (no integration)\"") != null);
+    // Heredoc delimiters are nonce-suffixed so script content can
+    // never terminate them early.
+    try t.expect(std.mem.indexOf(u8, buf, "<<'SK_RC_aabbccddeeff'") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "<<'SK_ZE_aabbccddeeff'") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "<<'SK_ZI_aabbccddeeff'") != null);
+}
+
+test "sshIntegrationCommand resolves the dev-tree scripts" {
+    const t = std.testing;
+    // The dev tree ships the scripts next to the test binary's cwd
+    // path resolution; when resolution fails (bare CI env) null is the
+    // documented graceful answer.
+    if (sshIntegrationCommand(t.allocator)) |cmd| {
+        defer t.allocator.free(cmd);
+        try t.expect(std.mem.startsWith(u8, cmd, "echo "));
+        try t.expect(std.mem.indexOf(u8, cmd, "base64 -d") != null);
+    }
+}
+
 test "buildExecLine wraps and quote-splits markers" {
     const t = std.testing;
     const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false, false, null);
@@ -298,6 +522,23 @@ pub const Term = struct {
     exit_status_known: bool = false,
     app_cursor: bool = false,
     integration: bool = false,
+    /// Basename of the shell driving this term. Local terms know it
+    /// at spawn; ssh terms get it from the bootstrap's announce line
+    /// (scanShellAnnounce). Null = not (yet) known.
+    shell_name: ?[]u8 = null,
+    /// An ssh bootstrap was injected: an announce line is expected.
+    remote_shell_pending: bool = false,
+    /// The announce line has been parsed; shell_name is authoritative.
+    shell_announced: bool = false,
+    /// Session lives on THIS host's own sketerm-mux daemon (spawned
+    /// over connectSsh). Non-null enables the transparent one-shot
+    /// reattach on transport loss — the remote daemon keeps the
+    /// session alive across connection drops.
+    remote_host: ?[]u8 = null,
+    /// One reattach already failed: transport loss is final. Never
+    /// retried, so a dead host costs ONE bounded connect attempt, not
+    /// one per drain.
+    reattach_spent: bool = false,
     /// One full-length first-prompt wait already expired with no mark:
     /// later commandToken calls fail fast instead of re-burning it.
     /// Never blocks success — a mark that shows up later still wins.
@@ -356,6 +597,47 @@ pub const Term = struct {
         errdefer pool.deinit();
         const self = allocator.create(Term) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool, .integration = si != null };
+        self.shell_name = allocator.dupe(u8, std.fs.path.basename(shell)) catch null;
+        self.applySnapshot(snap.payload) catch {};
+        return self;
+    }
+
+    /// Spawn a session on `host`'s OWN sketerm-mux daemon (found via
+    /// `ssh host sketerm-mux --proxy`; requires key auth + the binary
+    /// in the remote PATH — the caller falls back to plain ssh when
+    /// this errors). The session survives connection drops on the
+    /// remote daemon; ttl_secs bounds orphans if this client dies
+    /// without a kill.
+    pub fn spawnRemoteMux(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        argv: []const []const u8,
+        cols: u16,
+        rows: u16,
+    ) Error!*Term {
+        var conn = muxclient.Conn.connectSsh(allocator, host) catch return Error.SpawnFailed;
+        errdefer conn.deinit();
+        // connectSsh already proved hello → welcome; just bound reads.
+        conn.setNonBlocking();
+
+        name_counter += 1;
+        const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
+            return Error.OutOfMemory;
+        errdefer allocator.free(name);
+
+        conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600 }) catch return Error.SpawnFailed;
+        (conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
+        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
+        defer snap.deinit(allocator);
+
+        const pool = allocator.create(Pool) catch return Error.OutOfMemory;
+        errdefer allocator.destroy(pool);
+        pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
+        errdefer pool.deinit();
+        const self = allocator.create(Term) catch return Error.OutOfMemory;
+        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool };
+        self.remote_host = allocator.dupe(u8, host) catch null;
         self.applySnapshot(snap.payload) catch {};
         return self;
     }
@@ -363,6 +645,8 @@ pub const Term = struct {
     pub fn deinit(self: *Term) void {
         const a = self.allocator;
         if (!self.exited) self.conn.sendJson(.kill, .{ .name = self.name }) catch {};
+        if (self.shell_name) |s| a.free(s);
+        if (self.remote_host) |h| a.free(h);
         self.conn.deinit();
         if (self.screen) |s| s.deinit();
         self.pool.deinit();
@@ -428,7 +712,7 @@ pub const Term = struct {
         if (self.takeOne()) return true;
         if (!pollIn(self.conn.fd, wait_ms)) return false;
         if (!self.conn.fillAvailable()) {
-            self.exited = true;
+            self.transportLost();
             return false;
         }
         return self.takeOne();
@@ -436,12 +720,50 @@ pub const Term = struct {
 
     fn takeOne(self: *Term) bool {
         const f = (self.conn.takeFrame() catch {
-            self.exited = true;
+            self.transportLost();
             return false;
         }) orelse return false;
         defer f.deinit(self.allocator);
         self.handleFrame(f.ftype, f.payload);
         return true;
+    }
+
+    /// The connection died WITHOUT an .exit frame. A remote-mux
+    /// session survives on its daemon, so try one bounded reattach
+    /// (fresh ssh + attach + snapshot resync) — transparent to the
+    /// caller, which just sees the mirror continue. A failed attempt
+    /// is final for THIS drop (exited); success re-arms the shot for
+    /// the next drop. Local terms share their daemon's fate: exited.
+    fn transportLost(self: *Term) void {
+        const host = self.remote_host orelse {
+            self.exited = true;
+            return;
+        };
+        if (self.reattach_spent) {
+            self.exited = true;
+            return;
+        }
+        self.reattach_spent = true;
+        var conn = muxclient.Conn.connectSshOnce(self.allocator, host) catch {
+            self.exited = true;
+            return;
+        };
+        conn.setNonBlocking();
+        conn.sendJson(.attach, .{ .name = self.name, .kind = "mcp" }) catch {
+            conn.deinit();
+            self.exited = true;
+            return;
+        };
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch {
+            conn.deinit();
+            self.exited = true;
+            return;
+        };
+        defer snap.deinit(self.allocator);
+        self.conn.deinit();
+        self.conn = conn;
+        self.applySnapshot(snap.payload) catch {};
+        self.reattach_spent = false;
     }
 
     /// Time-boxed like appdrive.drain: a flooding shell (`cat` of a
@@ -512,6 +834,9 @@ pub const Term = struct {
         self.drain();
         if (self.exited) return Error.NotConnected;
         if (self.screen == null) return Error.NotConnected;
+        // A late remote announce may have flipped integration off
+        // (dash/fish remote): pick it up before deciding.
+        _ = self.scanShellAnnounce();
         if (!self.integration) return .unsupported;
         const deadline = nowMs() + wait_ms;
         while (true) {
@@ -534,6 +859,53 @@ pub const Term = struct {
         if (screen.pending_output_start_id != 0 or screen.pending_output_awaits_nl)
             return .busy;
         return .{ .token = commandTokenFor(screen) };
+    }
+
+    /// SSH terms: the local argv[0] ("ssh") is NOT the session's
+    /// shell — clear it. With `expect_announce` the injected
+    /// bootstrap's announce line (scanShellAnnounce) fills it in once
+    /// the remote side reports; without, it stays unknown.
+    pub fn setRemoteShellPending(self: *Term, expect_announce: bool) void {
+        if (self.shell_name) |s| self.allocator.free(s);
+        self.shell_name = null;
+        self.remote_shell_pending = expect_announce;
+    }
+
+    /// Parse the ssh bootstrap's "[sketerm] remote shell: <name>
+    /// (integration injected|no integration)" line out of the mirror
+    /// and cache it. A "no integration" verdict flips `integration`
+    /// off so command mode refuses cleanly instead of burning the
+    /// first-prompt wait. Returns true once known.
+    pub fn scanShellAnnounce(self: *Term) bool {
+        if (self.shell_announced) return true;
+        if (!self.remote_shell_pending) return false;
+        self.drain();
+        const screen = self.screen orelse return false;
+        const text = screen.extractScrollback(self.allocator) catch return false;
+        defer self.allocator.free(text);
+        const prefix = "[sketerm] remote shell: ";
+        const idx = std.mem.indexOf(u8, text, prefix) orelse return false;
+        const rest = text[idx + prefix.len ..];
+        const eol = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = std.mem.trimEnd(u8, rest[0..eol], " \r");
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return false;
+        const name = line[0..sp];
+        if (name.len == 0 or name.len > 64) return false;
+        const integrated = std.mem.indexOf(u8, line, "(integration injected)") != null;
+        if (self.shell_name) |old| self.allocator.free(old);
+        self.shell_name = self.allocator.dupe(u8, name) catch null;
+        self.shell_announced = true;
+        if (!integrated) self.integration = false;
+        return true;
+    }
+
+    /// True when the mirrored screen shows an OSC 133 command zone
+    /// still open — a foreground command (or a mark-less program like
+    /// a REPL) is running. Only meaningful when integration is active.
+    pub fn foregroundRunning(self: *Term) bool {
+        self.drain();
+        const screen = self.screen orelse return false;
+        return screen.pending_output_start_id != 0 or screen.pending_output_awaits_nl;
     }
 
     pub fn trackCommand(self: *Term, token: CommandToken) void {
