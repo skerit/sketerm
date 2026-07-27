@@ -3,7 +3,8 @@
 //! client staples (selections incl. primary, relative pointer +
 //! constraints, text-input v3, xdg-activation, presentation-time,
 //! idle-inhibit, pointer gestures). Buffers are shm plus an opt-in
-//! linux-dmabuf v3 path (SKETERM_MUX_DMABUF); advertised format and
+//! linux-dmabuf path (SKETERM_MUX_DMABUF), v3 or v4 depending on
+//! whether a main DRM device resolved; advertised format and
 //! modifier capabilities are selected by the daemon's importer.
 //!
 //! Signature letters match wire.zig's ArgIter:
@@ -110,10 +111,11 @@ pub const wl_callback = Interface{
 // bound at <=6 can never legally send them.
 pub const wl_compositor = Interface{
     .name = "wl_compositor",
-    .version = 6,
+    .version = 7,
     .requests = &.{
         .{ .name = "create_surface", .sig = "n", .new_id_iface = &wl_surface },
         .{ .name = "create_region", .sig = "n", .new_id_iface = &wl_region },
+        .{ .name = "release", .sig = "", .since = 7 },
     },
 };
 
@@ -172,19 +174,44 @@ pub const wl_buffer = Interface{
     },
 };
 
-/// linux-dmabuf at v3 exactly: v4's feedback objects need a main DRM
-/// device identity we don't have. Import policy follows the daemon's
-/// advertised format/modifier capabilities.
+/// linux-dmabuf up to v4. Import policy follows the daemon's
+/// advertised format/modifier capabilities; v4 is announced only when
+/// the daemon resolved a main DRM device (Compositor.dmabuf_main_device),
+/// since the feedback events are meaningless without one.
 pub const zwp_linux_dmabuf_v1 = Interface{
     .name = "zwp_linux_dmabuf_v1",
-    .version = 3,
+    .version = 4,
     .requests = &.{
         .{ .name = "destroy", .sig = "" },
         .{ .name = "create_params", .sig = "n", .new_id_iface = &zwp_linux_buffer_params_v1 },
+        .{ .name = "get_default_feedback", .sig = "n", .since = 4, .new_id_iface = &zwp_linux_dmabuf_feedback_v1 },
+        .{ .name = "get_surface_feedback", .sig = "no", .since = 4, .new_id_iface = &zwp_linux_dmabuf_feedback_v1 },
     },
     .events = &.{
+        // Deprecated at v4: feedback replaces them and the spec
+        // forbids sending either to a v4 client.
         .{ .name = "format", .sig = "u" },
         .{ .name = "modifier", .sig = "uuu", .since = 3 },
+    },
+};
+
+/// Per-client (or per-surface) format advertisement. `format_table`
+/// carries an fd, so the daemon materializes it from the brain's
+/// `dmabuf_feedback` pipe unit — the same trick as wl_keyboard.keymap.
+pub const zwp_linux_dmabuf_feedback_v1 = Interface{
+    .name = "zwp_linux_dmabuf_feedback_v1",
+    .version = 4,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "done", .sig = "" },
+        .{ .name = "format_table", .sig = "hu" },
+        .{ .name = "main_device", .sig = "a" },
+        .{ .name = "tranche_done", .sig = "" },
+        .{ .name = "tranche_target_device", .sig = "a" },
+        .{ .name = "tranche_formats", .sig = "a" },
+        .{ .name = "tranche_flags", .sig = "u" },
     },
 };
 
@@ -211,7 +238,7 @@ pub const DRM_FORMAT_MOD_INVALID = dmabuf.DRM_FORMAT_MOD_INVALID;
 
 pub const wl_surface = Interface{
     .name = "wl_surface",
-    .version = 6,
+    .version = 7,
     .requests = &.{
         .{ .name = "destroy", .sig = "" },
         .{ .name = "attach", .sig = "?oii" },
@@ -224,6 +251,7 @@ pub const wl_surface = Interface{
         .{ .name = "set_buffer_scale", .sig = "i", .since = 3 },
         .{ .name = "damage_buffer", .sig = "iiii", .since = 4 },
         .{ .name = "offset", .sig = "ii", .since = 5 },
+        .{ .name = "get_release", .sig = "n", .since = 7, .new_id_iface = &wl_callback },
     },
     .events = &.{
         .{ .name = "enter", .sig = "o" },
@@ -233,9 +261,21 @@ pub const wl_surface = Interface{
     },
 };
 
+/// The registry-leak fix: without it a client that creates and drops
+/// registries (GTK does, per display re-probe) leaks a server object
+/// each time, because wl_registry has no destructor of its own.
+pub const wl_fixes = Interface{
+    .name = "wl_fixes",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "destroy_registry", .sig = "o" },
+    },
+};
+
 pub const wl_region = Interface{
     .name = "wl_region",
-    .version = 1,
+    .version = 7,
     .requests = &.{
         .{ .name = "destroy", .sig = "" },
         .{ .name = "add", .sig = "iiii" },
@@ -245,7 +285,7 @@ pub const wl_region = Interface{
 
 pub const wl_seat = Interface{
     .name = "wl_seat",
-    .version = 9,
+    .version = 10,
     .requests = &.{
         .{ .name = "get_pointer", .sig = "n", .new_id_iface = &wl_pointer },
         .{ .name = "get_keyboard", .sig = "n", .new_id_iface = &wl_keyboard },
@@ -260,7 +300,7 @@ pub const wl_seat = Interface{
 
 pub const wl_pointer = Interface{
     .name = "wl_pointer",
-    .version = 9,
+    .version = 10,
     .requests = &.{
         .{ .name = "set_cursor", .sig = "u?oii" },
         .{ .name = "release", .sig = "", .since = 3 },
@@ -282,7 +322,7 @@ pub const wl_pointer = Interface{
 
 pub const wl_keyboard = Interface{
     .name = "wl_keyboard",
-    .version = 9,
+    .version = 10,
     .requests = &.{
         .{ .name = "release", .sig = "", .since = 3 },
     },
@@ -298,7 +338,7 @@ pub const wl_keyboard = Interface{
 
 pub const wl_touch = Interface{
     .name = "wl_touch",
-    .version = 9,
+    .version = 10,
     .requests = &.{
         .{ .name = "release", .sig = "", .since = 3 },
     },
@@ -360,7 +400,7 @@ pub const zxdg_output_v1 = Interface{
 
 pub const wl_data_offer = Interface{
     .name = "wl_data_offer",
-    .version = 3,
+    .version = 4,
     .requests = &.{
         .{ .name = "accept", .sig = "u?s" },
         .{ .name = "receive", .sig = "sh" },
@@ -377,7 +417,7 @@ pub const wl_data_offer = Interface{
 
 pub const wl_data_source = Interface{
     .name = "wl_data_source",
-    .version = 3,
+    .version = 4,
     .requests = &.{
         .{ .name = "offer", .sig = "s" },
         .{ .name = "destroy", .sig = "" },
@@ -395,7 +435,7 @@ pub const wl_data_source = Interface{
 
 pub const wl_data_device = Interface{
     .name = "wl_data_device",
-    .version = 3,
+    .version = 4,
     .requests = &.{
         .{ .name = "start_drag", .sig = "?oo?ou" },
         .{ .name = "set_selection", .sig = "?ou" },
@@ -415,10 +455,11 @@ pub const wl_data_device = Interface{
 
 pub const wl_data_device_manager = Interface{
     .name = "wl_data_device_manager",
-    .version = 3,
+    .version = 4,
     .requests = &.{
         .{ .name = "create_data_source", .sig = "n", .new_id_iface = &wl_data_source },
         .{ .name = "get_data_device", .sig = "no", .new_id_iface = &wl_data_device },
+        .{ .name = "release", .sig = "", .since = 4 },
     },
 };
 
@@ -935,7 +976,8 @@ pub const all = [_]*const Interface{
     &xdg_activation_v1,              &xdg_activation_token_v1,                 &wp_presentation,                 &wp_presentation_feedback,
     &zwp_idle_inhibit_manager_v1,    &zwp_idle_inhibitor_v1,                   &zwp_pointer_gestures_v1,         &zwp_pointer_gesture_swipe_v1,
     &zwp_pointer_gesture_pinch_v1,   &zwp_pointer_gesture_hold_v1,             &zwp_linux_dmabuf_v1,             &zwp_linux_buffer_params_v1,
-    &zxdg_output_manager_v1,         &zxdg_output_v1,
+    &zwp_linux_dmabuf_feedback_v1,   &zxdg_output_manager_v1,                  &zxdg_output_v1,
+    &wl_fixes,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
