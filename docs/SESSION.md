@@ -10456,3 +10456,108 @@ by the menu root). menuButton survives for the non-menu popovers
 incl. the tail section, hover flyouts, item activation (entry Copy,
 places Open-in-New-Tab), submenu labels with '_' escaped. Suite
 1043/5/0 (new classicmenu escape test), smoke-e2e PASS.
+
+## linux-dmabuf v4 feedback (2026-07-27)
+
+mpv on a forwarded session refused every GPU video output:
+"Compositor doesn't support the zwp_linux_dmabuf_v1 (ver. 4)
+protocol!". The brain advertised v3, and mesa/mpv only learn formats
+through v4 feedback objects -- the deprecated format/modifier events
+are not a fallback for them.
+
+The compositor now speaks v4: get_default_feedback and
+get_surface_feedback create zwp_linux_dmabuf_feedback_v1 objects
+answered with format_table + main_device + one tranche
+(target_device, formats, flags, done) + done. The table is 16-byte
+entries (format, pad, u64 modifier) built from the same importer
+capability slice the v3 announcements used, so what a client may
+allocate still matches exactly what create_immed accepts.
+
+format_table carries an fd, which the brain cannot: it emits a new
+`dmabuf_feedback` pipe unit (object id + table bytes) and the daemon
+materializes an anon fd and sends the real event -- the same
+side-band trick as wl_keyboard.keymap.
+
+main_device is a real dev_t or there is no v4: mux/drmdev.zig picks
+the first /dev/dri/renderD* this process can read+write
+(SKETERM_MUX_DRM_DEVICE overrides). No render node, or an empty
+format table, and the announcement stays at v3 -- a v4 client with
+no device to allocate on is worse than a v3 client. A v4 bind
+against a v3 announcement is a protocol error, and v4 binds get no
+format/modifier events (the spec forbids them).
+
+Replica compatibility: a pre-v8 replica has no feedback interface in
+its protocol tables, so re-parsing the app's get_default_feedback
+would be a fatal unknown opcode there. State-sync/native-state
+version bumped to 8, and Session.native_requires_v7 became
+Session.native_state_min (6 legacy, 7 dmabuf modifiers, 8 feedback).
+The gate keys on the app's requests, not on the advertisement: a v4
+BIND or a feedback object latches Compositor.used_dmabuf_feedback
+(pre-v8 tables cap the global at 3, so the bind alone is fatal
+there). Old viewers keep rendering GPU sessions whose apps stay at
+v3.
+
+Verified: suite 1048/5/0, smoke-mux/broker/mcp/e2e PASS,
+mux-portable + ldd clean. smoke-mux gained a scripted v4 stage that
+binds v4, requests feedback, receives the fd over SCM_RIGHTS, mmaps
+the table and checks the tranche indices address it; it pins
+SKETERM_MUX_DRM_DEVICE=/dev/null so hosts without /dev/dri (this
+dev box, CI) run the stage instead of skipping it.
+
+## Core Wayland version bumps: compositor 7, shm 2, ddm 4, seat 10, wl_fixes (2026-07-27)
+
+The globals table's "deliberately low versions" stance is right for
+protocols we haven't implemented, but wrong for versions whose only
+addition is a destructor: a client that binds unconditionally above
+what we advertise gets a protocol error and dies. The table already
+records two apps that do exactly that (JBR binds wl_seat 5 and
+wl_data_device_manager 3 unconditionally), so this is an observed
+failure mode, not a theoretical one. Advertise the highest version we
+can honestly serve; the obligations are what decide "honestly".
+
+Bumped, with every obligation implemented:
+
+- wl_compositor 6 -> 7, wl_shm 1 -> 2, wl_data_device_manager 3 -> 4:
+  each adds only `release`. Handled as destroy-the-global-only --
+  surfaces, pools, sources and devices deliberately survive their
+  factory, per spec.
+- wl_seat 8 -> 10. v9 obliges `wl_pointer.axis_relative_direction`,
+  which now precedes every axis event on v9+ pointer objects (the
+  spec guarantees it is followed by exactly one axis event for that
+  axis in the frame). Always `identical` -- injected scroll is never
+  natural-scroll inverted. Gated per pointer object, like
+  axis_value120: a v8 pointer receiving opcode 10 is a NULL listener
+  slot and an aborted client. v10's `key_state.repeated` needs
+  nothing: we never repeat server-side, which is what its absence
+  means.
+- wl_surface 6 -> 7 (`get_release`): per-commit buffer-release
+  callbacks, double-buffered with the pending buffer and fired at the
+  same instant as wl_buffer.release. get_release in a content update
+  that attaches no buffer is the spec's no_buffer error, which needed
+  `fatalCode` -- the old `fatal` hardcoded code 1.
+- wl_fixes (new global): `destroy_registry`, so clients that create
+  and drop registries stop leaking a server object each time.
+
+Replica compatibility, same shape as the dmabuf-v4 gate one commit
+earlier: a pre-v9 replica's tables lack these requests and would take
+them as a fatal unknown opcode. State-sync/native-state version 9
+(it also carries the surface's pending release callbacks), and
+Session.native_state_min rises to 9 only when the app ACTUALLY sends
+one of them (Compositor.used_post_v8_request). Review follow-up: the
+BIND is fatal to old replicas too (their tables cap seat at 8,
+compositor at 6, shm at 1, ddm at 3, and have no wl_fixes), and
+bindGlobal's version check is not lenient -- so binding seat 9+,
+compositor 7, shm 2, ddm 4 or wl_fixes latches the flag as well.
+Advertising still costs old viewers nothing until an app binds high.
+
+Verified: suite 1049/5/0 (four new tests: v9 axis direction incl. the
+v8-pointer exclusion, the three release destructors incl. children
+surviving, wl_fixes destroy_registry incl. refusing a non-registry
+object, get_release both ways), smoke-mux/broker/mcp/e2e PASS,
+mux-portable + ldd clean.
+
+Still deliberately absent, and not a version question: wp_fifo_v1,
+commit-timing, linux-drm-syncobj-v1, colour management. Advertising a
+protocol we do not honour is worse than not having it -- a client
+that binds wp_fifo and waits on barriers we never release stalls,
+where the same client with no fifo global just uses frame callbacks.
