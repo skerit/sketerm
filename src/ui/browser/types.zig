@@ -521,6 +521,10 @@ pub const BTab = struct {
     navigation_generation: u64 = 0,
     selected: std.ArrayList([]u8) = .empty,
     rendering: bool = false,
+    /// Hash of the listing the last render showed; a re-render of the
+    /// SAME listing keeps its scroll position (render.zig
+    /// keepScrollPosition), a navigation starts at the top.
+    scroll_path_hash: u64 = 0,
     show_hidden: bool = false,
     view_mode: browser_model.ViewMode = .details,
     sort_key: browser_model.SortKey = .name,

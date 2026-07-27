@@ -15,6 +15,7 @@ const query_mod = @import("../../filebrowser/query.zig");
 const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
 const classicmenu = @import("classicmenu.zig");
+const iconload = @import("iconload.zig");
 
 /// Heap ctx on each places row (freed with the row).
 pub const PlaceCtx = struct {
@@ -158,7 +159,7 @@ fn recentRow(self: *BrowserView, spec: []const u8) void {
 fn placeRowMarkup(self: *BrowserView, icon: [*:0]const u8, markup: [*:0]const u8, spec: []const u8) void {
     const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_margin_start(hbox, 10);
-    c.gtk_box_append(@ptrCast(hbox), c.gtk_image_new_from_icon_name(icon));
+    c.gtk_box_append(@ptrCast(hbox), iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), icon, 16));
     const lab = c.gtk_label_new(null);
     c.gtk_label_set_markup(@ptrCast(lab), markup);
     c.gtk_label_set_xalign(@ptrCast(lab), 0);
@@ -186,7 +187,7 @@ fn placeRowMarkup(self: *BrowserView, icon: [*:0]const u8, markup: [*:0]const u8
 pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec: []const u8, is_bookmark: bool) void {
     const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_margin_start(hbox, 10);
-    const img = c.gtk_image_new_from_icon_name(icon);
+    const img = iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), icon, 16);
     c.gtk_box_append(@ptrCast(hbox), img);
     var lz: [256:0]u8 = undefined;
     const n = @min(label.len, lz.len - 1);

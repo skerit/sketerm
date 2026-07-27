@@ -763,7 +763,11 @@ pub fn onDeleteConfirmed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn entryDialog(self: *BrowserView, tab: *BTab, mode: @TypeOf(@as(MenuCtx, undefined).mode), rename_path: ?[]const u8) void {
     const popover = c.gtk_popover_new();
     const entry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(entry), if (mode == .mkdir) "folder name" else "new name");
+    c.gtk_entry_set_placeholder_text(@ptrCast(entry), switch (mode) {
+        .mkdir => "folder name",
+        .newfile => "file name",
+        else => "new name",
+    });
     if (rename_path) |rp| {
         var z: [512:0]u8 = undefined;
         const base = std.fs.path.basename(rp);
@@ -812,6 +816,15 @@ pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c)
             const req = self.nextReq();
             self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rmdir_created, w.buffered(), "", ""));
             self.sendOp(ctx.tab.hc, .{ .req = req, .op = "mkdir", .path = w.buffered() });
+        },
+        .newfile => {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            const dir = ctx.tab.root.path;
+            w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+            const req = self.nextReq();
+            self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .delete_created, w.buffered(), "", ""));
+            self.sendOp(ctx.tab.hc, .{ .req = req, .op = "create", .path = w.buffered() });
         },
         .rename => {
             const old = ctx.path orelse return menuDone(ctx);

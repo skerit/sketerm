@@ -10,7 +10,9 @@ const fsserve = @import("../../mux/fsserve.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
+const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
+const WireReply = @import("types.zig").WireReply;
 const MenuCtx = @import("menu.zig").MenuCtx;
 const PendingJob = @import("types.zig").PendingJob;
 const WireJobEv = @import("types.zig").WireJobEv;
@@ -366,6 +368,14 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         self.setStatus("properties: entry is no longer in the listing");
         return;
     };
+    showProperties(self, tab, path, e);
+}
+
+/// Build and present the non-modal properties dialog for `e`.
+/// `e` is only read during the call (the async sections re-fetch by
+/// path), so a borrowed entry -- one synthesized from a `stat` reply
+/// -- is fine.
+pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *const Entry) void {
     // An AdwWindow (not a bare GtkWindow) so the dialog carries its
     // own header bar: the window is a real toplevel, and its title
     // and close button are drawn by the app rather than left to
@@ -903,4 +913,57 @@ pub fn parseId(entry: *c.GtkWidget) ?u32 {
     const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     if (txt.len == 0) return null;
     return std.fmt.parseInt(u32, txt, 10) catch null;
+}
+
+// ── background-click (folder) properties ─────────────────────────
+
+/// Properties of the folder a background click landed in: the folder
+/// is not in its own listing, so its entry is stat'ed from the
+/// daemon first and the dialog opens on the reply.
+pub fn folderProperties(self: *BrowserView, tab: *BTab) void {
+    if (tab.hc.state != .ready) {
+        self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+        return;
+    }
+    self.props_stat_req = self.nextReq();
+    self.props_stat_tab = tab;
+    self.sendOp(tab.hc, .{ .req = self.props_stat_req, .op = "stat", .path = tab.root.path });
+}
+
+/// Route the folder-properties stat reply.
+/// @return true when the reply was ours.
+pub fn feedFolderProps(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
+    if (self.props_stat_req == 0 or rep.req != self.props_stat_req) return false;
+    self.props_stat_req = 0;
+    const tab = self.props_stat_tab orelse return true;
+    self.props_stat_tab = null;
+    if (!self.tabAlive(tab) or tab.hc != hc) return true;
+    if (!rep.ok or rep.entry == null) {
+        self.setStatusFmt("properties: {s}", .{rep.@"error"});
+        return true;
+    }
+    // A borrowed Entry over the reply arena; showProperties only
+    // reads it during the call.
+    const we = rep.entry.?;
+    var e = Entry{
+        .name = @constCast(we.name),
+        .kind = @constCast(we.kind),
+        .size = we.size,
+        .mode = we.mode,
+        .mtime_ms = we.mtime_ms,
+        .atime_ms = we.atime_ms,
+        .ctime_ms = we.ctime_ms,
+        .uid = we.uid,
+        .gid = we.gid,
+        .owner = @constCast(we.owner),
+        .group = @constCast(we.group),
+        .btime_ms = we.btime_ms,
+        .nlink = we.nlink,
+        .blocks = we.blocks,
+        .children = we.children,
+        .target = if (we.target) |t| @constCast(t) else null,
+        .tdir = we.tdir,
+    };
+    showProperties(self, tab, tab.root.path, &e);
+    return true;
 }

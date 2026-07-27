@@ -13,6 +13,7 @@ const views = @import("views.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
+const iconload = @import("iconload.zig");
 const format = @import("../../filebrowser/format.zig");
 const mediacols = @import("mediacols.zig");
 
@@ -117,8 +118,12 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  background: alpha(green, 0.25);
         \\}
         \\text.sketerm-fb-rename {
-        \\  padding: 0;
+        \\  padding: 0 2px;
         \\  min-height: 0;
+        \\  border-radius: 3px;
+        \\  background-color: @theme_base_color;
+        \\  color: @theme_text_color;
+        \\  caret-color: @theme_text_color;
         \\}
     ;
     const provider = c.gtk_css_provider_new();
@@ -134,29 +139,26 @@ fn installCss(any_widget: *c.GtkWidget) void {
 /// content, which for a remote entry would mean reading the file. That
 /// is how the user's icon theme (Papirus, Breeze, ...) ends up
 /// deciding what a .png or a .zip looks like, exactly as in Nemo.
-fn entryIconImage(e: Entry, px: i32) ?*c.GtkWidget {
-    const img: ?*c.GtkWidget = blk: {
-        if (fileicon.folderIconName(e.kind, e.tdir)) |name| {
-            var fz: [32:0]u8 = undefined;
-            break :blk c.gtk_image_new_from_icon_name(copyZN(&fz, name));
-        }
-        var nz: [512:0]u8 = undefined;
-        _ = copyZN(&nz, e.name);
-        var uncertain: c.gboolean = 0;
-        const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
-        if (ctype == null) break :blk null;
+fn entryIconImage(anchor: *c.GtkWidget, e: Entry, px: i32) ?*c.GtkWidget {
+    if (fileicon.folderIconName(e.kind, e.tdir)) |name| {
+        var fz: [32:0]u8 = undefined;
+        return iconload.newImageIcon(anchor, copyZN(&fz, name), px);
+    }
+    var nz: [512:0]u8 = undefined;
+    _ = copyZN(&nz, e.name);
+    var uncertain: c.gboolean = 0;
+    const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
+    if (ctype != null) {
         defer c.g_free(ctype);
         // g_content_type_get_icon hands back a ref we own; the image
         // takes its own, so ours is dropped right after.
-        const gicon = c.g_content_type_get_icon(ctype) orelse break :blk null;
-        defer c.g_object_unref(gicon);
-        break :blk c.gtk_image_new_from_gicon(gicon);
-    } orelse fallback: {
-        var gz: [32:0]u8 = undefined;
-        break :fallback c.gtk_image_new_from_icon_name(copyZN(&gz, fileicon.GENERIC_ICON));
-    };
-    if (img) |i| c.gtk_image_set_pixel_size(@ptrCast(i), px);
-    return img;
+        if (c.g_content_type_get_icon(ctype)) |gicon| {
+            defer c.g_object_unref(gicon);
+            return iconload.newImageGicon(anchor, @ptrCast(gicon), px);
+        }
+    }
+    var gz: [32:0]u8 = undefined;
+    return iconload.newImageIcon(anchor, copyZN(&gz, fileicon.GENERIC_ICON), px);
 }
 
 pub fn renderCurrent(self: *BrowserView) void {
@@ -478,19 +480,21 @@ pub fn onHeaderRightClick(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64,
     showColumnPicker(ctx.tab, btn);
 }
 
-/// The Name header. By default it takes all leftover width (no fixed
-/// size); once dragged it behaves like any other sizeable column,
-/// and a double-click on its grip puts it back on auto.
+/// The Name header. Nemo's rule: Name is the expand column, so it
+/// ALWAYS absorbs whatever width the fixed columns leave over -- the
+/// listing never ends in a dead strip of unowned pixels. Dragging its
+/// grip sets a MINIMUM width (the size request below), which only
+/// matters once the pane is narrower than the columns want;
+/// double-click puts the minimum back to its default.
 pub fn nameHeaderButton(self: *BrowserView, tab: *BTab, mark: SortMark) void {
-    const fixed = tab.name_width > 0;
     const slot = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
-    c.gtk_widget_set_hexpand(slot, @intFromBool(!fixed));
+    c.gtk_widget_set_hexpand(slot, 1);
     const btn = c.gtk_button_new();
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
     c.gtk_widget_set_can_focus(btn, 0);
     headerLabel(btn.?, "Name", mark);
-    c.gtk_widget_set_hexpand(btn, @intFromBool(!fixed));
-    if (fixed) c.gtk_widget_set_size_request(btn, columnWidthOf(tab, .name) - GRIP_PX, -1);
+    c.gtk_widget_set_hexpand(btn, 1);
+    if (tab.name_width > 0) c.gtk_widget_set_size_request(btn, columnWidthOf(tab, .name) - GRIP_PX, -1);
     const ctx = self.allocator.create(HeaderCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onHeaderClicked), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
@@ -564,8 +568,20 @@ pub const GripCtx = struct {
     /// The slot box around it (Name needs its hexpand dropped when a
     /// drag takes it out of auto mode).
     slot: *c.GtkWidget,
+    /// The grip widget itself (coordinate anchor for the drag math).
+    grip: *c.GtkWidget = undefined,
     /// Column width when this drag began.
     start: i32 = 0,
+    /// Pointer x at drag begin, in grip coords (GTK's gesture space).
+    begin_x: f64 = 0,
+    /// Pointer x at drag begin, translated to header_box coords.
+    ///
+    /// The drag offset GTK reports is relative to the GRIP, and the
+    /// grip MOVES as the column resizes -- trusting `dx` alone makes
+    /// every drag land at roughly half the pointer's travel. The
+    /// header box does not move, so the pointer is re-translated into
+    /// its space on every update and the delta taken there.
+    start_hdr_x: f64 = 0,
     /// The drag crossed the motion threshold: a stationary press
     /// must neither pin an auto-width Name column nor re-render
     /// (which would kill the second press of a double-click).
@@ -584,7 +600,15 @@ fn makeGrip(self: *BrowserView, tab: *BTab, ref: ColumnRef, button: *c.GtkWidget
     const grip = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_add_css_class(grip, "sketerm-fb-grip");
     c.gtk_widget_set_size_request(grip, GRIP_PX, -1);
-    c.gtk_widget_set_tooltip_text(grip, "Drag to resize this column; double-click to reset it");
+    // The separator line inside expands to FILL the grip; without an
+    // explicit no here, that hexpand propagates to the grip box and
+    // the Name slot's leftover gets SPLIT between button and grip --
+    // a fat invisible grip whose visible line sits far right of the
+    // button edge, and drags that move the divider at ~60% speed.
+    c.gtk_widget_set_hexpand(grip, 0);
+    // No tooltip here: it pops up under the pointer mid-drag and
+    // reads as a ghost rectangle chasing the divider. The col-resize
+    // cursor is the affordance.
     c.gtk_widget_set_cursor_from_name(grip, "col-resize");
     const line = c.gtk_separator_new(c.GTK_ORIENTATION_VERTICAL);
     c.gtk_widget_set_halign(line, c.GTK_ALIGN_CENTER);
@@ -604,7 +628,7 @@ fn makeGrip(self: *BrowserView, tab: *BTab, ref: ColumnRef, button: *c.GtkWidget
     return grip.?;
 }
 
-pub fn onGripDragBegin(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+pub fn onGripDragBegin(gesture: *c.GtkGestureDrag, x: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx: *GripCtx = @ptrCast(@alignCast(user.?));
     ctx.moved = false;
     ctx.start = columnWidthOf(ctx.tab, ctx.ref);
@@ -612,6 +636,19 @@ pub fn onGripDragBegin(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) 
     // from wherever the leftover currently puts its edge.
     if (ctx.ref == .name and ctx.start <= 0)
         ctx.start = c.gtk_widget_get_width(ctx.button) + GRIP_PX;
+    if (c.gtk_event_controller_get_widget(@ptrCast(gesture))) |g| ctx.grip = g;
+    ctx.begin_x = x;
+    ctx.start_hdr_x = gripToHeaderX(ctx, x);
+}
+
+/// Translate a grip-space x into header_box coords; falls back to the
+/// raw value when the widgets are not in one tree (mid-teardown).
+fn gripToHeaderX(ctx: *GripCtx, x: f64) f64 {
+    var src = c.graphene_point_t{ .x = @floatCast(x), .y = 0 };
+    var dst = c.graphene_point_t{ .x = 0, .y = 0 };
+    if (c.gtk_widget_compute_point(ctx.grip, ctx.tab.header_box, &src, &dst) != 0)
+        return @floatCast(dst.x);
+    return x;
 }
 
 /// Live feedback while dragging: the header AND every row cell track
@@ -622,16 +659,20 @@ pub fn onGripDragUpdate(_: *c.GtkGestureDrag, dx: f64, _: f64, user: ?*anyopaque
 }
 
 fn dragTo(ctx: *GripCtx, dx: f64) void {
-    if (@abs(dx) >= 2) ctx.moved = true;
+    // The true pointer travel, measured in header_box space: the
+    // grip's current position accounts for however far the column has
+    // already grown, so this self-corrects instead of compounding.
+    const travel = gripToHeaderX(ctx, ctx.begin_x + dx) - ctx.start_hdr_x;
+    if (c.getenv("SKETERM_DEBUG_GRIP") != null) {
+        std.debug.print("grip: dx={d:.1} begin_x={d:.1} start_hdr={d:.1} now_hdr={d:.1} travel={d:.1} start={d}\n", .{
+            dx, ctx.begin_x, ctx.start_hdr_x, gripToHeaderX(ctx, ctx.begin_x + dx), travel, ctx.start,
+        });
+    }
+    if (@abs(travel) >= 2) ctx.moved = true;
     if (!ctx.moved) return;
     const min: i32 = if (ctx.ref == .name) MIN_NAME_WIDTH else browser_model.MIN_COLUMN_WIDTH;
-    const width = @max(ctx.start + @as(i32, @intFromFloat(dx)), min);
+    const width = @max(ctx.start + @as(i32, @intFromFloat(travel)), min);
     setColumnWidth(ctx.tab, ctx.ref, width);
-    if (ctx.ref == .name) {
-        // The first drag takes Name out of take-the-leftover mode.
-        c.gtk_widget_set_hexpand(ctx.button, 0);
-        c.gtk_widget_set_hexpand(ctx.slot, 0);
-    }
     c.gtk_widget_set_size_request(ctx.button, width - GRIP_PX, -1);
     liveResizeCells(ctx.tab, ctx.ref);
 }
@@ -671,7 +712,6 @@ fn liveResizeCells(tab: *BTab, ref: ColumnRef) void {
                 .name => {
                     const d = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-celldepth"));
                     const depth: i32 = if (d == 0) 0 else @intCast(d - 1);
-                    c.gtk_widget_set_hexpand(w, 0);
                     c.gtk_widget_set_size_request(w, nameBoxWidth(tab, depth), -1);
                 },
                 else => c.gtk_widget_set_size_request(w, columnWidthOf(tab, ref), -1),
@@ -1104,6 +1144,9 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     if (self.inline_rename) |ir| {
         if (ir.tab == tab) @import("ops.zig").finishInlineRenameDeferred(ir, false);
     }
+    // BEFORE the rows are removed: emptying the list clamps the
+    // adjustment to 0 synchronously, so a later read sees nothing.
+    const keep_scroll = scrollToKeep(tab);
     // Full rebuild — simple and correct; fine for the row counts
     // a human browses. (Optimization: diff rows later.)
     tab.rendering = true;
@@ -1114,6 +1157,17 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     if (c.gtk_widget_has_css_class(listbox, "sketerm-fb-list") == 0) {
         c.gtk_widget_add_css_class(listbox, "sketerm-fb-list");
         installCss(listbox);
+        // The viewport must NOT chase the focus: rebuilding the rows
+        // makes focus fall back to a selected row, and the chase
+        // yanked the view there on every expand/refresh. Keyboard
+        // navigation still scrolls because the listbox is handed the
+        // adjustment itself (it does NOT pick it up on its own) and
+        // scrolls only on real cursor moves.
+        if (c.gtk_scrolled_window_get_child(@ptrCast(@alignCast(tab.scroller)))) |vp| {
+            if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(vp)), c.gtk_viewport_get_type()) != 0)
+                c.gtk_viewport_set_scroll_to_focus(@ptrCast(@alignCast(vp)), 0);
+        }
+        c.gtk_list_box_set_adjustment(tab.listbox, c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(tab.scroller))));
     }
     // The stripes are pure CSS (nth-child); only the class is toggled.
     if (self.zebra) {
@@ -1136,6 +1190,58 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
             }
         }
     }
+    if (keep_scroll) |value| restoreScroll(tab, value);
+}
+
+/// The scroll position to pin across the rebuild, or null when this
+/// render is a navigation (different listing -> start at the top).
+///
+/// Destroying the focused row makes focus fall back into the list,
+/// which re-focuses a selected row, which the viewport then scrolls
+/// to (scroll-to-focus) -- so expanding a folder anywhere yanked the
+/// view back to wherever the selection was.
+fn scrollToKeep(tab: *BTab) ?f64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (tab.hc.host) |h| hasher.update(h);
+    hasher.update(":");
+    hasher.update(tab.root.path);
+    const hash = hasher.final();
+    if (hash != tab.scroll_path_hash) {
+        tab.scroll_path_hash = hash;
+        return null;
+    }
+    const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(tab.scroller))) orelse return null;
+    const value = c.gtk_adjustment_get_value(vadj);
+    if (c.getenv("SKETERM_DEBUG_SCROLL") != null)
+        std.debug.print("scrollToKeep: value={d:.1} upper={d:.1}\n", .{ value, c.gtk_adjustment_get_upper(vadj) });
+    return if (value > 0) value else null;
+}
+
+/// Re-assert the captured value from an idle: the viewport's
+/// focus-scroll and the clamp both happen during the next layout,
+/// which runs before default-priority idles.
+fn restoreScroll(tab: *BTab, value: f64) void {
+    const vadj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(tab.scroller))) orelse return;
+    const ctx = tab.view.allocator.create(ScrollKeep) catch return;
+    ctx.* = .{ .allocator = tab.view.allocator, .adj = vadj, .value = value };
+    _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(vadj)));
+    _ = c.g_idle_add(@ptrCast(&scrollKeepIdle), @ptrCast(ctx));
+}
+
+const ScrollKeep = struct {
+    allocator: std.mem.Allocator,
+    adj: *c.GtkAdjustment,
+    value: f64,
+};
+
+fn scrollKeepIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const ctx: *ScrollKeep = @ptrCast(@alignCast(user.?));
+    c.gtk_adjustment_set_value(ctx.adj, ctx.value);
+    if (c.getenv("SKETERM_DEBUG_SCROLL") != null)
+        std.debug.print("scrollKeepIdle: want={d:.1} got={d:.1} upper={d:.1}\n", .{ ctx.value, c.gtk_adjustment_get_value(ctx.adj), c.gtk_adjustment_get_upper(ctx.adj) });
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.adj)));
+    ctx.allocator.destroy(ctx);
+    return 0;
 }
 
 pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
@@ -1232,7 +1338,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
     } else {
         thumb_pending = std.mem.eql(u8, e.kind, "file") and isPreviewMediaName(e.name);
     }
-    if (icon == null) icon = entryIconImage(e, step.tile_icon_px);
+    if (icon == null) icon = entryIconImage(@ptrCast(@alignCast(fb)), e, step.tile_icon_px);
     c.gtk_box_append(@ptrCast(tile), icon);
 
     var name_z: [256:0]u8 = undefined;
@@ -1380,8 +1486,7 @@ pub fn renderMillerCols(self: *BrowserView, tab: *BTab) void {
             if (!e.tdir) continue; // ancestor columns list directories only
             const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
             c.gtk_widget_set_margin_start(row_box, 6);
-            const icon = c.gtk_image_new_from_icon_name("folder");
-            c.gtk_image_set_pixel_size(@ptrCast(icon), 16);
+            const icon = iconload.newImageIcon(@ptrCast(@alignCast(tab.listbox)), "folder", 16);
             c.gtk_box_append(@ptrCast(row_box), icon);
             var nz: [256:0]u8 = undefined;
             const nn = @min(e.name.len, nz.len - 1);
@@ -1625,12 +1730,12 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     // narrow pinned Name column; clipping keeps the data cells on
     // their header's pixel no matter what.
     c.gtk_widget_set_overflow(name_area, c.GTK_OVERFLOW_HIDDEN);
-    if (tab.view_mode == .details and tab.name_width > 0) {
-        c.gtk_widget_set_hexpand(name_area, 0);
+    // Always expanding, like the header's Name slot: the leftover
+    // width belongs to the name in every row, and a dragged width is
+    // only its minimum (see nameHeaderButton).
+    c.gtk_widget_set_hexpand(name_area, 1);
+    if (tab.view_mode == .details and tab.name_width > 0)
         c.gtk_widget_set_size_request(name_area, nameBoxWidth(tab, @intCast(depth)), -1);
-    } else {
-        c.gtk_widget_set_hexpand(name_area, 1);
-    }
     c.g_object_set_data(@ptrCast(@alignCast(name_area)), "sketerm-cellref", @ptrFromInt(cellRefCode(.name)));
     c.g_object_set_data(@ptrCast(@alignCast(name_area)), "sketerm-celldepth", @ptrFromInt(depth + 1));
     if (c.getenv("SKETERM_DEBUG_NAMECOL") != null) c.gtk_widget_add_css_class(name_area, "sketerm-fb-namearea-debug");
@@ -1677,7 +1782,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     } else {
         thumb_pending = std.mem.eql(u8, e.kind, "file") and isPreviewMediaName(e.name);
     }
-    if (icon == null) icon = entryIconImage(e, step.icon_px);
+    if (icon == null) icon = entryIconImage(@ptrCast(@alignCast(tab.listbox)), e, step.icon_px);
     c.gtk_box_append(@ptrCast(name_area), icon);
 
     if (self.emblemFor(tab, e)) |emblem| {
@@ -2135,19 +2240,5 @@ pub fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
     tab.view.updateSortHeader(tab);
     views.rememberFolder(tab.view, tab);
     tab.view.renderTab(tab);
-}
-
-pub fn onViewModeClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    const tab = self.currentTab() orelse return;
-    tab.view_mode = switch (tab.view_mode) {
-        .details => .compact,
-        .compact => .icons,
-        .icons => .miller,
-        .miller => .details,
-    };
-    self.setStatusFmt("view: {s}", .{@tagName(tab.view_mode)});
-    views.rememberFolder(self, tab);
-    self.renderTab(tab);
 }
 

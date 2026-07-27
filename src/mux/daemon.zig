@@ -3438,6 +3438,15 @@ pub const Daemon = struct {
             const rc = if (std.mem.eql(u8, r.op, "rmdir")) c.rmdir(p) else c.unlink(p);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "create")) {
+            // Empty-file create, O_EXCL so an existing file can never
+            // be clobbered (the browser's Empty Document).
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            const fd = c.open(p, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o644));
+            if (fd < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(fd));
+            _ = c.close(fd);
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "attr_list")) {
             var z: [4096]u8 = undefined;
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
