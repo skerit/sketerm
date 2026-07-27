@@ -32,9 +32,15 @@ pub const Facts = struct {
     size: u64 = 0,
     mtime_ms: i64 = 0,
     ctime_ms: i64 = 0,
+    atime_ms: i64 = 0,
+    btime_ms: i64 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    owner: []const u8 = "",
+    group: []const u8 = "",
     mode: u32 = 0,
+    nlink: u64 = 1,
+    blocks: u64 = 0,
     is_dir: bool = false,
 };
 
@@ -66,11 +72,28 @@ pub fn groupOf(key: model.SortKey, f: Facts, now_ms: i64) Group {
         .size => sizeGroup(f.size),
         .mtime => timeGroup(f.mtime_ms, now_ms),
         .ctime => timeGroup(f.ctime_ms, now_ms),
+        .atime => timeGroup(f.atime_ms, now_ms),
+        .btime => timeGroup(f.btime_ms, now_ms),
         .kind => make("{s}", .{if (f.kind.len > 0) f.kind else "unknown"}),
-        .owner => make("uid {d}", .{f.uid}),
-        .group => make("gid {d}", .{f.gid}),
+        .extension => if (extOf(f.name).len > 0)
+            make(".{s}", .{extOf(f.name)})
+        else
+            make("No extension", .{}),
+        .owner => if (f.owner.len > 0) make("{s}", .{f.owner}) else make("uid {d}", .{f.uid}),
+        .group => if (f.group.len > 0) make("{s}", .{f.group}) else make("gid {d}", .{f.gid}),
         .permissions => make("mode {o:0>4}", .{f.mode & 0o7777}),
+        .allocated => sizeGroup(f.blocks * 512),
+        .nlink => make("{d} links", .{f.nlink}),
     };
+}
+
+/// Extension after the last dot ("" for dotless and dotfile names).
+/// Mirrors ui/browser/types.zig extensionOf, which this GTK-free
+/// module cannot import.
+fn extOf(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
+    if (dot == 0 or dot + 1 == name.len) return "";
+    return name[dot + 1 ..];
 }
 
 fn nameGroup(name: []const u8) Group {

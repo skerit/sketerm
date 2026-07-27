@@ -215,6 +215,87 @@ pub fn onGridStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, 
     tab.view.setStatusFmt("{d} selected (sticky)", .{tab.selected.items.len});
 }
 
+// -- rubber-band selection ---------------------------------------
+
+/// Drag-to-select: a button-1 drag STARTING on empty listing space
+/// (below the last row) selects every row the band crosses; a drag
+/// starting on a row stays what it always was — file drag-and-drop.
+pub fn installRubberBand(tab: *BTab, listbox: *c.GtkWidget) void {
+    const drag = c.gtk_gesture_drag_new();
+    c.gtk_gesture_single_set_button(@ptrCast(drag), 1);
+    _ = c.g_signal_connect_data(drag, "drag-begin", @ptrCast(&onBandBegin), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(drag, "drag-update", @ptrCast(&onBandUpdate), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(drag, "drag-end", @ptrCast(&onBandEnd), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(listbox, @ptrCast(drag));
+}
+
+fn onBandBegin(gesture: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    // A drag that starts ON a row belongs to the row's drag source.
+    if (c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y)) != null) {
+        _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_DENIED);
+        return;
+    }
+    tab.rubber = .{ .active = true, .x0 = x, .y0 = y, .x1 = x, .y1 = y };
+}
+
+fn onBandUpdate(gesture: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    if (!tab.rubber.active) return;
+    _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    tab.rubber.x1 = tab.rubber.x0 + dx;
+    tab.rubber.y1 = tab.rubber.y0 + dy;
+    applyBand(tab);
+    if (tab.rubber_area) |area| {
+        c.gtk_widget_set_visible(area, 1);
+        c.gtk_widget_queue_draw(area);
+    }
+}
+
+fn onBandEnd(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    if (!tab.rubber.active) return;
+    tab.rubber.active = false;
+    if (tab.rubber_area) |area| c.gtk_widget_set_visible(area, 0);
+    if (tab.selected.items.len > 0)
+        tab.view.setStatusFmt("{d} selected", .{tab.selected.items.len});
+}
+
+/// Select exactly the rows whose vertical extent crosses the band.
+fn applyBand(tab: *BTab) void {
+    const lo = @min(tab.rubber.y0, tab.rubber.y1);
+    const hi = @max(tab.rubber.y0, tab.rubber.y1);
+    var i: c_int = 0;
+    while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
+        // Group headers carry no entry; they stay out of selections.
+        if (c.g_object_get_data(@ptrCast(row), "sketerm-row") == null) continue;
+        var bounds: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(@ptrCast(row), @ptrCast(@alignCast(tab.listbox)), &bounds) == 0) continue;
+        const top: f64 = bounds.origin.y;
+        const bottom: f64 = top + bounds.size.height;
+        if (bottom >= lo and top <= hi) {
+            c.gtk_list_box_select_row(tab.listbox, row);
+        } else {
+            c.gtk_list_box_unselect_row(tab.listbox, row);
+        }
+    }
+}
+
+pub fn drawRubberBand(_: *c.GtkDrawingArea, cr: ?*c.cairo_t, _: c_int, _: c_int, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    if (!tab.rubber.active) return;
+    const x = @min(tab.rubber.x0, tab.rubber.x1);
+    const y = @min(tab.rubber.y0, tab.rubber.y1);
+    const w = @abs(tab.rubber.x1 - tab.rubber.x0);
+    const h = @abs(tab.rubber.y1 - tab.rubber.y0);
+    c.cairo_rectangle(cr, x, y, w, h);
+    c.cairo_set_source_rgba(cr, 0.28, 0.51, 0.9, 0.18);
+    c.cairo_fill_preserve(cr);
+    c.cairo_set_source_rgba(cr, 0.28, 0.51, 0.9, 0.85);
+    c.cairo_set_line_width(cr, 1.0);
+    c.cairo_stroke(cr);
+}
+
 pub fn toggleSticky(self: *BrowserView, tab: *BTab) void {
     tab.sel.sticky = !tab.sel.sticky;
     if (tab.sel.sticky) {
@@ -367,11 +448,19 @@ pub fn cancelVisual(self: *BrowserView, tab: *BTab) void {
 /// to the cursor row on the way; Ctrl+Space OPENS the focused file).
 pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
     const tab: *BTab = @ptrCast(@alignCast(user.?));
+    // This runs in the CAPTURE phase, i.e. before an inline-rename
+    // editor inside a row sees its own keys; while one is up, every
+    // key belongs to it.
+    if (tab.view.inline_rename != null) return 0;
     const mods = state & (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK);
     if (tab.view.currentTab() == tab) {
         const mark = (mods == 0 and keyval == c.GDK_KEY_Insert) or
             (mods == c.GDK_CONTROL_MASK and (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space));
         if (mark) return @intFromBool(toggleMarkFocused(tab.view));
+        // Dolphin-style tree keys: Right expands the focused
+        // directory, Left collapses it (or jumps to its parent row).
+        if (mods == 0 and (keyval == c.GDK_KEY_Right or keyval == c.GDK_KEY_Left))
+            return @intFromBool(treeArrowKey(tab, keyval == c.GDK_KEY_Right));
     }
     const anchor = tab.sel.anchor orelse return 0;
     if (mods != 0) return 0;
@@ -396,6 +485,50 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
     };
     applyVisualRange(self, tab, std.math.clamp(next, 0, last));
     return 1;
+}
+
+/// Right/Left tree navigation on the focused row (details view,
+/// Dolphin-style): Right expands a collapsed directory, Left
+/// collapses an expanded one or moves focus to the parent row.
+/// @return true when the key was consumed.
+fn treeArrowKey(tab: *BTab, expand: bool) bool {
+    if (tab.view_mode != .details or tab.root.flat) return false;
+    const row = focusedRow(tab) orelse return false;
+    const data = c.g_object_get_data(@ptrCast(@alignCast(row)), "sketerm-row") orelse return false;
+    const ctx: *RowCtx = @ptrCast(@alignCast(data));
+    const self = tab.view;
+    const expanded = tab.subdirByPath(ctx.path) != null;
+    // toggleExpand's collapse path re-renders and frees every RowCtx;
+    // the path must not be read from `ctx` past that call.
+    var buf: [4096]u8 = undefined;
+    if (ctx.path.len >= buf.len) return false;
+    @memcpy(buf[0..ctx.path.len], ctx.path);
+    const path = buf[0..ctx.path.len];
+    if (expand) {
+        if (!ctx.is_dir or expanded) return false;
+        self.toggleExpand(tab, path);
+        return true;
+    }
+    if (ctx.is_dir and expanded) {
+        self.toggleExpand(tab, path);
+        return true;
+    }
+    // Collapsed (or a file): Left walks to the parent row, if that
+    // parent is itself a row (the root directory has none).
+    const parent = std.fs.path.dirname(path) orelse return false;
+    if (std.mem.eql(u8, parent, tab.root.path)) return false;
+    var r = c.gtk_widget_get_first_child(@ptrCast(@alignCast(tab.listbox)));
+    while (r) |w| : (r = c.gtk_widget_get_next_sibling(w)) {
+        const d = c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-row") orelse continue;
+        const rc: *RowCtx = @ptrCast(@alignCast(d));
+        if (!std.mem.eql(u8, rc.path, parent)) continue;
+        const lbr: *c.GtkListBoxRow = @ptrCast(@alignCast(w));
+        c.gtk_list_box_unselect_all(tab.listbox);
+        c.gtk_list_box_select_row(tab.listbox, lbr);
+        _ = c.gtk_widget_grab_focus(w);
+        return true;
+    }
+    return false;
 }
 
 /// Drop visual mode when the rows under it are about to go away
@@ -730,7 +863,9 @@ pub fn deleteRegister(self: *BrowserView, name: []const u8) void {
 /// Add the selection button to the toolbar. Called once from attach,
 /// so buildUi stays a plain widget tree.
 pub fn installSelectionMenu(self: *BrowserView) void {
-    const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.hidden_toggle))) orelse return;
+    // Into the collapsible cluster, right after the Places toggle
+    // (the old hidden-files anchor moved into the hamburger menu).
+    const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.places_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("edit-select-all-symbolic");
     // Same treatment view.zig's `flatten` gives every other toolbar
     // button; without it this one framed itself on hover while its
@@ -738,7 +873,7 @@ pub fn installSelectionMenu(self: *BrowserView) void {
     BrowserView.flatten(btn.?);
     c.gtk_widget_set_tooltip_text(btn, "Selection: sticky clicks, visual range mode, persistent registers");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSelectionMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.hidden_toggle)));
+    c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.places_toggle)));
 }
 
 pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

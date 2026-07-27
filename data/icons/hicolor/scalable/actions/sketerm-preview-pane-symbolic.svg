@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- A framed picture (sun + mountains): the preview panel toggle.
+       Distinct on purpose from the split panes AND from the theme's
+       view-reveal eye used by the hidden-files toggle. Monochrome
+       symbolic icon: GTK recolours the fill via the -symbolic name. -->
+  <g fill="#2e3436">
+    <path fill-rule="evenodd" d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9A1.5 1.5 0 0 1 2.5 2zm0 1.5v9h11v-9z"/>
+    <circle cx="5.4" cy="6" r="1.3"/>
+    <path d="M3.2 11.5l3.4-4 2.4 2.6 1.9-2 2 3.4z"/>
+  </g>
+</svg>

@@ -41,6 +41,8 @@ const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
 const guessMime = @import("open.zig").guessMime;
+const render_mod = @import("render.zig");
+const fileicon = @import("../../filebrowser/fileicon.zig");
 const isImageName = @import("../../filebrowser/paths.zig").isImageName;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const isWorkerImageName = @import("../../filebrowser/paths.zig").isWorkerImageName;
@@ -835,6 +837,7 @@ pub fn clearThumbCache(self: *BrowserView) void {
 
 pub fn clearPreviewContent(self: *BrowserView) void {
     c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), null);
+    showPanelPic(self, false);
     c.gtk_label_set_text(self.preview_text, "");
     if (self.preview_state.ql) |ql| ql.clearContent();
 }
@@ -913,32 +916,421 @@ fn describeEntry(buf: []u8, path: []const u8, entry: ?*Entry) []const u8 {
     return w.buffered();
 }
 
-/// Refresh the preview panel and the overlay from the current target.
-/// Every call is a new generation: results from the previous one are
-/// dropped rather than painted over the new entry.
+// ── the Information panel (Dolphin-style) ───────────────────────
+
+/// Build the Information panel and wire its widgets onto the view.
+/// The caller (buildUi) parents the returned root into the paned
+/// whose divider gives the panel its width.
+pub fn buildInfoPanel(self: *BrowserView) *c.GtkWidget {
+    const panel = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    c.gtk_widget_set_size_request(panel, 220, -1);
+
+    const sw = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(sw), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_widget_set_vexpand(sw, 1);
+
+    const inner = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
+    c.gtk_widget_set_margin_start(inner, 10);
+    c.gtk_widget_set_margin_end(inner, 10);
+    c.gtk_widget_set_margin_top(inner, 10);
+    c.gtk_widget_set_margin_bottom(inner, 10);
+
+    // The preview stage has a FIXED height: images scale into it, so
+    // selecting a huge photo can never change the panel's geometry.
+    const stage = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    c.gtk_widget_set_size_request(stage, -1, 240);
+    const ppic = c.gtk_picture_new();
+    c.gtk_picture_set_content_fit(@ptrCast(ppic), c.GTK_CONTENT_FIT_CONTAIN);
+    c.gtk_picture_set_can_shrink(@ptrCast(ppic), 1);
+    c.gtk_widget_set_vexpand(ppic, 1);
+    c.gtk_widget_set_visible(ppic, 0);
+    const picon = c.gtk_image_new();
+    c.gtk_image_set_pixel_size(@ptrCast(picon), 128);
+    c.gtk_widget_set_vexpand(picon, 1);
+    c.gtk_box_append(@ptrCast(stage), ppic);
+    c.gtk_box_append(@ptrCast(stage), picon);
+    c.gtk_box_append(@ptrCast(inner), stage);
+
+    // Bold, centered, selectable name that wraps anywhere.
+    const pname = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(pname, "heading");
+    c.gtk_label_set_wrap(@ptrCast(pname), 1);
+    c.gtk_label_set_wrap_mode(@ptrCast(pname), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_justify(@ptrCast(pname), c.GTK_JUSTIFY_CENTER);
+    c.gtk_widget_set_halign(pname, c.GTK_ALIGN_CENTER);
+    c.gtk_label_set_selectable(@ptrCast(pname), 1);
+    c.gtk_box_append(@ptrCast(inner), pname);
+
+    c.gtk_box_append(@ptrCast(inner), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
+    // Two-column key/value grid in the small caption font, exactly
+    // Dolphin's metadata list.
+    const grid = c.gtk_grid_new();
+    c.gtk_grid_set_row_spacing(@ptrCast(grid), 3);
+    c.gtk_grid_set_column_spacing(@ptrCast(grid), 10);
+    c.gtk_box_append(@ptrCast(inner), grid);
+
+    // Free-form note: no-selection text, directory summaries,
+    // generator metadata, failure notes.
+    const pmeta = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(pmeta), 0);
+    c.gtk_label_set_wrap(@ptrCast(pmeta), 1);
+    c.gtk_label_set_selectable(@ptrCast(pmeta), 1);
+    c.gtk_widget_add_css_class(pmeta, "dim-label");
+    c.gtk_widget_add_css_class(pmeta, "caption");
+    c.gtk_box_append(@ptrCast(inner), pmeta);
+
+    // Content head (text/hex). Vertical growth belongs to the outer
+    // scroller; this inner one only ever scrolls a hexdump sideways.
+    const ptext_scroll = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(ptext_scroll), c.GTK_POLICY_NEVER, c.GTK_POLICY_NEVER);
+    const ptext = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(ptext), 0);
+    c.gtk_label_set_yalign(@ptrCast(ptext), 0);
+    c.gtk_label_set_wrap(@ptrCast(ptext), 1);
+    c.gtk_label_set_selectable(@ptrCast(ptext), 1);
+    c.gtk_widget_add_css_class(ptext, "monospace");
+    c.gtk_widget_add_css_class(ptext, "caption");
+    c.gtk_scrolled_window_set_child(@ptrCast(ptext_scroll), ptext);
+    c.gtk_box_append(@ptrCast(inner), ptext_scroll);
+
+    c.gtk_scrolled_window_set_child(@ptrCast(sw), inner);
+    c.gtk_box_append(@ptrCast(panel), sw);
+
+    self.preview_box = panel.?;
+    self.preview_pic = ppic.?;
+    self.preview_icon = picon.?;
+    self.preview_name = @ptrCast(@alignCast(pname));
+    self.preview_grid = grid.?;
+    self.preview_text = @ptrCast(@alignCast(ptext));
+    self.preview_text_scroll = ptext_scroll.?;
+    self.preview_meta = @ptrCast(@alignCast(pmeta));
+    return panel.?;
+}
+
+/// Build the compact sidebar info card ("now playing" style): a
+/// thumbnail beside a name and two fact lines, pinned under the
+/// places list. Hidden until the user opts in (side_info).
+pub fn buildSideCard(self: *BrowserView) *c.GtkWidget {
+    const card = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+    c.gtk_widget_add_css_class(card, "card");
+    c.gtk_widget_set_margin_start(card, 6);
+    c.gtk_widget_set_margin_end(card, 6);
+    c.gtk_widget_set_margin_top(card, 6);
+    c.gtk_widget_set_margin_bottom(card, 6);
+    const pad = 8;
+    const img = c.gtk_image_new();
+    c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+    c.gtk_widget_set_margin_start(img, pad);
+    c.gtk_widget_set_margin_top(img, pad);
+    c.gtk_widget_set_margin_bottom(img, pad);
+    c.gtk_box_append(@ptrCast(card), img);
+    const col = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 1);
+    c.gtk_widget_set_hexpand(col, 1);
+    c.gtk_widget_set_valign(col, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_margin_end(col, pad);
+    c.gtk_widget_set_margin_top(col, pad);
+    c.gtk_widget_set_margin_bottom(col, pad);
+    const title = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(title), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_widget_add_css_class(title, "caption-heading");
+    c.gtk_box_append(@ptrCast(col), title);
+    const sub = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(sub), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(sub, "caption");
+    c.gtk_widget_add_css_class(sub, "dim-label");
+    c.gtk_box_append(@ptrCast(col), sub);
+    const sub2 = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(sub2), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(sub2), c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(sub2, "caption");
+    c.gtk_widget_add_css_class(sub2, "dim-label");
+    c.gtk_box_append(@ptrCast(col), sub2);
+    c.gtk_box_append(@ptrCast(card), col);
+    c.gtk_widget_set_visible(card, 0);
+
+    self.side_card = card.?;
+    self.side_card_img = img.?;
+    self.side_card_title = @ptrCast(@alignCast(title));
+    self.side_card_sub = @ptrCast(@alignCast(sub));
+    self.side_card_sub2 = @ptrCast(@alignCast(sub2));
+    return card.?;
+}
+
+fn setCardLabel(label: *c.GtkLabel, text: []const u8) void {
+    var z: [512:0]u8 = undefined;
+    const n = @min(text.len, z.len - 1);
+    @memcpy(z[0..n], text[0..n]);
+    z[n] = 0;
+    c.gtk_label_set_text(label, &z);
+}
+
+/// Refresh the sidebar card from the current selection. Cheap and
+/// fetch-free: cached row thumbnail or themed icon, stat facts only.
+pub fn updateSideCard(self: *BrowserView) void {
+    if (!self.side_info) return;
+    const tab = self.currentTab() orelse return;
+    var type_buf: [256:0]u8 = undefined;
+    var sz: [48:0]u8 = undefined;
+    var tz: [40:0]u8 = undefined;
+    var line: [128]u8 = undefined;
+    if (tab.selected.items.len > 1) {
+        setCardLabel(self.side_card_title, std.fmt.bufPrint(&line, "{d} items selected", .{tab.selected.items.len}) catch "");
+        setCardLabel(self.side_card_sub, "");
+        setCardLabel(self.side_card_sub2, "");
+        c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(self.side_card_img)), "dialog-information-symbolic");
+        return;
+    }
+    const path = if (tab.selected.items.len == 1) tab.selected.items[0] else tab.root.path;
+    const entry = entryForPath(tab, path);
+    const base = std.fs.path.basename(path);
+    setCardLabel(self.side_card_title, if (base.len > 0) base else path);
+    if (entry) |e| {
+        const type_s = std.mem.span(render_mod.coarseTypeZ(e.*, &type_buf));
+        if (e.tdir) {
+            var items: [32]u8 = undefined;
+            setCardLabel(self.side_card_sub, std.fmt.bufPrint(&line, "{s}  {s}", .{ type_s, fileicon.fmtItems(&items, e.children) }) catch type_s);
+        } else {
+            setCardLabel(self.side_card_sub, std.fmt.bufPrint(&line, "{s}  {s}", .{ type_s, fmtSize(&sz, e.size) }) catch type_s);
+        }
+        setCardLabel(self.side_card_sub2, if (e.mtime_ms != 0) std.mem.span(fmtTimeZ(&tz, e.mtime_ms)) else "");
+        if (self.thumbLookup(tab.hc, path, e.*)) |tex| {
+            c.gtk_image_set_from_paintable(@ptrCast(@alignCast(self.side_card_img)), @ptrCast(tex));
+        } else {
+            setImageEntryIcon(self.side_card_img, e.name, e.tdir);
+        }
+    } else {
+        // The current folder (no selection): honest folder facts.
+        var items: [32]u8 = undefined;
+        setCardLabel(self.side_card_sub, std.fmt.bufPrint(&line, "Folder  {s}", .{
+            fileicon.fmtItems(&items, @intCast(tab.root.entries.items.len)),
+        }) catch "Folder");
+        setCardLabel(self.side_card_sub2, "");
+        setImageEntryIcon(self.side_card_img, "", true);
+    }
+}
+
+/// Themed icon for name/kind into an existing GtkImage.
+fn setImageEntryIcon(img: *c.GtkWidget, name: []const u8, is_dir: bool) void {
+    if (is_dir) return c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(img)), "folder");
+    var nz: [512:0]u8 = undefined;
+    const n = @min(name.len, nz.len - 1);
+    @memcpy(nz[0..n], name[0..n]);
+    nz[n] = 0;
+    var uncertain: c.gboolean = 0;
+    const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
+    if (ctype != null) {
+        defer c.g_free(ctype);
+        if (c.g_content_type_get_icon(ctype)) |gicon| {
+            defer c.g_object_unref(gicon);
+            c.gtk_image_set_from_gicon(@ptrCast(@alignCast(img)), gicon);
+            return;
+        }
+    }
+    c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(img)), "text-x-generic");
+}
+
+/// The card view toggle (View options menu).
+pub fn onSideInfoToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const want = c.gtk_check_button_get_active(check) != 0;
+    if (want == self.side_info) return;
+    self.side_info = want;
+    c.gtk_widget_set_visible(self.side_card, @intFromBool(want));
+    if (want) updateSideCard(self);
+    self.savePlaces();
+}
+
+fn clearInfoGrid(self: *BrowserView) void {
+    while (c.gtk_widget_get_first_child(self.preview_grid)) |child|
+        c.gtk_grid_remove(@ptrCast(@alignCast(self.preview_grid)), child);
+    self.preview_grid_rows = 0;
+}
+
+/// One key/value row; a valueless row is simply not shown.
+fn addInfoRow(self: *BrowserView, key: [*:0]const u8, value: []const u8) void {
+    if (value.len == 0) return;
+    const k = c.gtk_label_new(key);
+    c.gtk_label_set_xalign(@ptrCast(k), 1);
+    c.gtk_widget_set_halign(k, c.GTK_ALIGN_END);
+    c.gtk_widget_set_valign(k, c.GTK_ALIGN_START);
+    c.gtk_widget_add_css_class(k, "dim-label");
+    c.gtk_widget_add_css_class(k, "caption");
+    var vz: [512:0]u8 = undefined;
+    const n = @min(value.len, vz.len - 1);
+    @memcpy(vz[0..n], value[0..n]);
+    vz[n] = 0;
+    const v = c.gtk_label_new(&vz);
+    c.gtk_label_set_xalign(@ptrCast(v), 0);
+    c.gtk_widget_set_hexpand(v, 1);
+    c.gtk_label_set_wrap(@ptrCast(v), 1);
+    c.gtk_label_set_wrap_mode(@ptrCast(v), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_selectable(@ptrCast(v), 1);
+    c.gtk_widget_add_css_class(v, "caption");
+    c.gtk_grid_attach(@ptrCast(@alignCast(self.preview_grid)), k, 0, self.preview_grid_rows, 1, 1);
+    c.gtk_grid_attach(@ptrCast(@alignCast(self.preview_grid)), v, 1, self.preview_grid_rows, 1, 1);
+    self.preview_grid_rows += 1;
+}
+
+fn setPanelName(self: *BrowserView, text: []const u8) void {
+    var z: [512:0]u8 = undefined;
+    const n = @min(text.len, z.len - 1);
+    @memcpy(z[0..n], text[0..n]);
+    z[n] = 0;
+    c.gtk_label_set_text(self.preview_name, &z);
+    c.gtk_widget_set_visible(@ptrCast(@alignCast(self.preview_name)), @intFromBool(n > 0));
+}
+
+fn setPanelIconName(self: *BrowserView, name: [*:0]const u8) void {
+    c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(self.preview_icon)), name);
+}
+
+/// Themed stage icon for an entry (used until/unless a real preview
+/// texture lands).
+fn setPanelIcon(self: *BrowserView, name: []const u8, is_dir: bool) void {
+    setImageEntryIcon(self.preview_icon, name, is_dir);
+}
+
+/// Exactly one of texture/icon shows in the stage.
+fn showPanelPic(self: *BrowserView, has_pic: bool) void {
+    c.gtk_widget_set_visible(self.preview_pic, @intFromBool(has_pic));
+    c.gtk_widget_set_visible(self.preview_icon, @intFromBool(!has_pic));
+}
+
+/// The single-entry metadata rows: stat facts first, then whatever
+/// media fields the columns already cached. Never a fetch.
+fn fillEntryPanel(self: *BrowserView, tab: *BTab, path: []const u8, entry: ?*Entry) void {
+    setPanelName(self, std.fs.path.basename(path));
+    const e = entry orelse {
+        setPanelIcon(self, std.fs.path.basename(path), false);
+        return;
+    };
+    setPanelIcon(self, e.name, e.tdir);
+    var buf: [256:0]u8 = undefined;
+    var sz: [48:0]u8 = undefined;
+    var tz: [40:0]u8 = undefined;
+    var mz: [16:0]u8 = undefined;
+    addInfoRow(self, "Type", std.mem.span(render_mod.coarseTypeZ(e.*, &buf)));
+    if (e.tdir) {
+        var items: [32]u8 = undefined;
+        addInfoRow(self, "Items", fileicon.fmtItems(&items, e.children));
+    } else {
+        addInfoRow(self, "Size", fmtSize(&sz, e.size));
+    }
+    if (e.mtime_ms != 0) addInfoRow(self, "Modified", std.mem.span(fmtTimeZ(&tz, e.mtime_ms)));
+    if (e.btime_ms != 0) addInfoRow(self, "Created", std.mem.span(fmtTimeZ(&tz, e.btime_ms)));
+    if (e.owner.len > 0) {
+        addInfoRow(self, "Owner", e.owner);
+    } else {
+        addInfoRow(self, "Owner", std.fmt.bufPrint(buf[0..64], "{d}", .{e.uid}) catch "");
+    }
+    if (e.group.len > 0) addInfoRow(self, "Group", e.group);
+    // Dolphin's combined permissions form: symbolic (octal).
+    var perm: [32]u8 = undefined;
+    const perm_s = std.fmt.bufPrint(&perm, "{s} ({o:0>3})", .{
+        std.mem.span(fmtModeZ(&mz, e.mode, e.tdir)), e.mode,
+    }) catch "";
+    addInfoRow(self, "Permissions", perm_s);
+    if (e.target) |t| addInfoRow(self, "Links to", t);
+    if (e.tags.len > 0) addInfoRow(self, "Tags", e.tags);
+
+    const interesting = [_][]const u8{
+        "media.format",           "media.width",  "media.height", "media.duration_ms",
+        "media.bitrate_kbps",     "tag.title",    "tag.artist",   "tag.album",
+        "exif.datetime_original", "exif.model",   "doc.pages",    "doc.author",
+    };
+    const estimated = if (mediacols.lookup(self, tab.hc, path, e.mtime_ms, "media.duration_estimated")) |v|
+        std.mem.eql(u8, v, "1")
+    else
+        false;
+    for (interesting) |key| {
+        const raw = mediacols.lookup(self, tab.hc, path, e.mtime_ms, key) orelse continue;
+        var disp: [192]u8 = undefined;
+        var kz: [64:0]u8 = undefined;
+        const label_z = std.fmt.bufPrintZ(&kz, "{s}", .{colkeys.label(key)}) catch continue;
+        addInfoRow(self, label_z, colkeys.display(key, raw, estimated, false, &disp));
+    }
+}
+
+/// Nothing selected: the panel describes the folder itself (Dolphin's
+/// behavior), so it is never a dead box.
+fn showFolderSummary(self: *BrowserView, tab: *BTab) void {
+    const path = tab.root.path;
+    const base = std.fs.path.basename(path);
+    setPanelName(self, if (base.len > 0) base else path);
+    setPanelIcon(self, "", true);
+    addInfoRow(self, "Type", "Folder");
+    var items: [32]u8 = undefined;
+    addInfoRow(self, "Items", fileicon.fmtItems(&items, @intCast(tab.root.entries.items.len)));
+    addInfoRow(self, "Location", path);
+    startPreview(self, tab.hc, path, 0, true, false);
+}
+
+/// N entries selected: an aggregate, like Dolphin's "N items".
+fn showMultiSummary(self: *BrowserView, tab: *BTab) void {
+    var total: u64 = 0;
+    var files: usize = 0;
+    var dirs: usize = 0;
+    for (tab.selected.items) |p| {
+        const e = entryForPath(tab, p) orelse continue;
+        if (e.tdir) {
+            dirs += 1;
+        } else {
+            files += 1;
+            total += e.size;
+        }
+    }
+    var nb: [64]u8 = undefined;
+    setPanelName(self, std.fmt.bufPrint(&nb, "{d} items selected", .{tab.selected.items.len}) catch "");
+    setPanelIconName(self, "dialog-information-symbolic");
+    var b: [48]u8 = undefined;
+    if (files > 0) addInfoRow(self, "Files", std.fmt.bufPrint(&b, "{d}", .{files}) catch "");
+    var b2: [48]u8 = undefined;
+    if (dirs > 0) addInfoRow(self, "Folders", std.fmt.bufPrint(&b2, "{d}", .{dirs}) catch "");
+    var sz: [48:0]u8 = undefined;
+    if (total > 0) addInfoRow(self, "Total size", fmtSize(&sz, total));
+}
+
+/// Refresh the Information panel and the overlay from the current
+/// target. Every call is a new generation: results from the previous
+/// one are dropped rather than painted over the new entry.
 pub fn updatePreview(self: *BrowserView) void {
+    // The sidebar card follows every selection change, even with the
+    // full panel off; it is deliberately fetch-free.
+    updateSideCard(self);
     if (!self.preview_on and self.preview_state.ql == null) return;
     self.preview_generation +%= 1;
     if (self.preview_generation == 0) self.preview_generation = 1;
     self.abandonPreviewRead();
     self.clearPreviewContent();
+    clearInfoGrid(self);
+    setPanelName(self, "");
+    setPreviewMeta(self, "");
+    showPanelPic(self, false);
+    setPanelIconName(self, "text-x-generic");
 
-    const tab = self.currentTab() orelse {
-        setPreviewMeta(self, "");
+    const tab = self.currentTab() orelse return;
+    // A multi-selection gets an aggregate panel; the overlay is
+    // excluded because its cursor is always exactly one entry.
+    if (self.preview_state.ql == null and tab.selected.items.len > 1) {
+        showMultiSummary(self, tab);
         return;
-    };
+    }
     const path = previewTargetPath(self, tab) orelse {
-        setPreviewMeta(self, "No selection");
+        showFolderSummary(self, tab);
         return;
     };
     const entry = entryForPath(tab, path);
-    var meta_buf: [1024]u8 = undefined;
-    var described = describeEntry(&meta_buf, path, entry);
-    // Structured media fields already read for the listing columns
-    // are shown here for free. Never a fetch: the panel's own
-    // content read is the only round trip a selection may cost.
-    if (entry) |e| described = appendMediaLines(self, tab, path, e.mtime_ms, &meta_buf, described);
-    setPreviewMeta(self, described);
+    fillEntryPanel(self, tab, path, entry);
+    // The overlay header still rides the compact text form.
+    if (self.preview_state.ql != null) {
+        var meta_buf: [1024]u8 = undefined;
+        var described = describeEntry(&meta_buf, path, entry);
+        if (entry) |e| described = appendMediaLines(self, tab, path, e.mtime_ms, &meta_buf, described);
+        setPreviewMeta(self, described);
+    }
 
     const is_dir = if (entry) |e| e.tdir else false;
     startPreview(self, tab.hc, path, if (entry) |e| e.mtime_ms else 0, is_dir, false);
@@ -985,6 +1377,7 @@ fn setPreviewMeta(self: *BrowserView, text: []const u8) void {
     @memcpy(z[0..n], text[0..n]);
     z[n] = 0;
     c.gtk_label_set_text(self.preview_meta, &z);
+    c.gtk_widget_set_visible(@ptrCast(@alignCast(self.preview_meta)), @intFromBool(n > 0));
     if (self.preview_state.ql) |ql| {
         // The overlay's header renders the name line and the details
         // as two differently styled labels.
@@ -1086,6 +1479,63 @@ fn startPreview(
         },
         .host_command => |cmd| startHostPreviewer(self, pr, cmd, handler.output),
     }
+}
+
+/// Rewrite the preview generator's raw metadata (ffprobe `duration=…`
+/// and `TAG:name=…` lines) into readable "Label: value" lines.
+/// Unrecognized lines (pdfinfo output is already labelled) pass
+/// through unchanged.
+/// @return null when nothing was rewritten (caller keeps the raw
+/// text) or on allocation failure.
+fn prettifyGeneratorNote(allocator: std.mem.Allocator, raw: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var rewrote = false;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (out.items.len > 0) out.append(allocator, '\n') catch return null;
+        if (std.mem.startsWith(u8, line, "duration=")) {
+            if (std.fmt.parseFloat(f64, line["duration=".len..])) |secs| {
+                var msbuf: [24]u8 = undefined;
+                var dbuf: [64]u8 = undefined;
+                const ms = std.fmt.bufPrint(&msbuf, "{d}", .{
+                    @as(u64, @intFromFloat(@max(secs, 0) * 1000.0)),
+                }) catch "";
+                out.appendSlice(allocator, "Duration: ") catch return null;
+                out.appendSlice(allocator, colkeys.display("media.duration_ms", ms, false, false, &dbuf)) catch return null;
+                rewrote = true;
+                continue;
+            } else |_| {}
+        } else if (std.mem.startsWith(u8, line, "TAG:")) {
+            const rest = line["TAG:".len..];
+            if (std.mem.indexOfScalar(u8, rest, '=')) |eq| {
+                if (eq > 0 and rest.len > eq + 1) {
+                    for (rest[0..eq], 0..) |ch, i| {
+                        const chr: u8 = if (ch == '_') ' ' else if (i == 0) std.ascii.toUpper(ch) else ch;
+                        out.append(allocator, chr) catch return null;
+                    }
+                    out.appendSlice(allocator, ": ") catch return null;
+                    out.appendSlice(allocator, rest[eq + 1 ..]) catch return null;
+                    rewrote = true;
+                    continue;
+                }
+            }
+        }
+        out.appendSlice(allocator, line) catch return null;
+    }
+    if (!rewrote) return null;
+    return allocator.dupe(u8, out.items) catch null;
+}
+
+test "prettifyGeneratorNote formats ffprobe output and keeps pdfinfo" {
+    const t = std.testing;
+    const pretty = prettifyGeneratorNote(t.allocator, "duration=1440.410000\nTAG:title=My Video\nTAG:album_artist=Someone\n").?;
+    defer t.allocator.free(pretty);
+    try t.expectEqualStrings("Duration: 24:00\nTitle: My Video\nAlbum artist: Someone", pretty);
+    // pdfinfo output is already labelled: nothing rewritten, keep raw.
+    try t.expect(prettifyGeneratorNote(t.allocator, "Pages: 3\nProducer: LibreOffice\n") == null);
 }
 
 /// An honest one-line summary for a directory: the metadata header
@@ -1205,9 +1655,11 @@ fn feedReadSlot(
             }
             if (std.mem.eql(u8, ev.ev, "done")) {
                 // The generator's own metadata (ffprobe/pdfinfo output)
-                // is worth showing next to its image.
+                // is worth showing next to its image — formatted, not
+                // as the raw key=value dump.
                 if (ev.text.len > 0 and pr.note.len == 0)
-                    pr.note = self.allocator.dupe(u8, ev.text) catch &.{};
+                    pr.note = prettifyGeneratorNote(self.allocator, ev.text) orelse
+                        (self.allocator.dupe(u8, ev.text) catch &.{});
                 const asset = if (ev.path.len > 0) ev.path else pr.temp;
                 if (asset.len == 0) {
                     if (pr.note.len > 0) deliverRead(self, pr) else failRead(self, pr, "the previewer produced no output");
@@ -1390,15 +1842,36 @@ fn paintPreview(self: *BrowserView, item: *const CacheItem) void {
     @memcpy(z[0..n], body[0..n]);
     z[n] = 0;
     c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(item.texture));
-    // A hex dump's columns only survive unwrapped; prose still wraps
-    // into the narrow side panel.
+    showPanelPic(self, item.texture != null);
+    // A hex dump's columns only survive unwrapped (and scroll
+    // sideways in their own card); prose still wraps into the panel.
     c.gtk_label_set_wrap(self.preview_text, @intFromBool(!item.hex));
+    c.gtk_scrolled_window_set_policy(
+        @ptrCast(@alignCast(self.preview_text_scroll)),
+        if (item.hex) c.GTK_POLICY_AUTOMATIC else c.GTK_POLICY_NEVER,
+        c.GTK_POLICY_NEVER,
+    );
     c.gtk_label_set_text(self.preview_text, &z);
     if (self.preview_state.ql) |ql| {
         c.gtk_picture_set_paintable(@ptrCast(ql.picture), @ptrCast(item.texture));
         c.gtk_widget_set_visible(ql.picture, @intFromBool(item.texture != null));
-        c.gtk_label_set_text(ql.text, &z);
-        c.gtk_widget_set_visible(ql.text_scroll, @intFromBool(n > 0));
+        // The code card is for CONTENT (text head, hexdump). A note
+        // (generator metadata, failure text) reads as a styled line
+        // under the stage instead of a text dump.
+        const card: []const u8 = item.text orelse "";
+        var cz: [@max(PREVIEW_TEXT_CAP, hexdump.renderedSize(hexdump.DEFAULT_CAP)) + 1:0]u8 = undefined;
+        const cn = @min(card.len, cz.len - 1);
+        @memcpy(cz[0..cn], card[0..cn]);
+        cz[cn] = 0;
+        c.gtk_label_set_text(ql.text, &cz);
+        c.gtk_widget_set_visible(ql.text_scroll, @intFromBool(cn > 0));
+        const note: []const u8 = if (item.text == null) (item.note orelse "") else "";
+        var nz: [2048:0]u8 = undefined;
+        const nn = @min(note.len, nz.len - 1);
+        @memcpy(nz[0..nn], note[0..nn]);
+        nz[nn] = 0;
+        c.gtk_label_set_text(ql.note, &nz);
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.note)), @intFromBool(nn > 0));
         c.gtk_label_set_text(ql.status, if (item.failed) "preview unavailable" else "");
     }
 }
@@ -1413,8 +1886,10 @@ fn showPreviewNote(self: *BrowserView, note: []const u8) void {
     c.gtk_label_set_text(self.preview_text, &z);
     if (self.preview_state.ql) |ql| {
         c.gtk_widget_set_visible(ql.picture, 0);
-        c.gtk_widget_set_visible(ql.text_scroll, 1);
-        c.gtk_label_set_text(ql.text, &z);
+        c.gtk_widget_set_visible(ql.text_scroll, 0);
+        c.gtk_label_set_text(ql.text, "");
+        c.gtk_label_set_text(ql.note, &z);
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.note)), 1);
         c.gtk_label_set_text(ql.status, "");
     }
 }
@@ -1424,6 +1899,11 @@ pub fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c)
     self.preview_on = c.gtk_toggle_button_get_active(btn) != 0;
     c.gtk_widget_set_visible(self.preview_box, @intFromBool(self.preview_on));
     if (self.preview_on) {
+        // GtkPaned forgets a position set while the end child was
+        // hidden; re-assert the persisted panel width on every show.
+        const total = c.gtk_widget_get_width(self.info_paned);
+        if (total > 0)
+            c.gtk_paned_set_position(@ptrCast(@alignCast(self.info_paned)), @max(total - self.preview_px, 100));
         self.updatePreview();
     } else {
         self.abandonPreviewRead();
@@ -1549,6 +2029,9 @@ pub const QuickLook = struct {
     /// Everything below the name line of the metadata block.
     meta: *c.GtkLabel,
     picture: *c.GtkWidget,
+    /// Generator metadata / summary line under the image (formatted
+    /// "Label: value" text, never the raw dump).
+    note: *c.GtkLabel,
     text_scroll: *c.GtkWidget,
     text: *c.GtkLabel,
     status: *c.GtkLabel,
@@ -1558,6 +2041,8 @@ pub const QuickLook = struct {
     fn clearContent(self: *QuickLook) void {
         c.gtk_picture_set_paintable(@ptrCast(self.picture), null);
         c.gtk_widget_set_visible(self.picture, 0);
+        c.gtk_label_set_text(self.note, "");
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(self.note)), 0);
         c.gtk_label_set_text(self.text, "");
         c.gtk_label_set_text(self.status, "");
     }
@@ -1673,6 +2158,17 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_widget_add_css_class(picture, "sketerm-ql-stage");
     c.gtk_box_append(@ptrCast(box), picture);
 
+    // Media/document metadata under the stage: formatted lines, not
+    // the generator's raw key=value dump in a code card.
+    const note = c.gtk_label_new("");
+    c.gtk_label_set_wrap(@ptrCast(note), 1);
+    c.gtk_label_set_justify(@ptrCast(note), c.GTK_JUSTIFY_CENTER);
+    c.gtk_label_set_selectable(@ptrCast(note), 1);
+    c.gtk_widget_set_halign(note, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(note, "dim-label");
+    c.gtk_widget_set_visible(note, 0);
+    c.gtk_box_append(@ptrCast(box), note);
+
     const text_scroll = c.gtk_scrolled_window_new();
     c.gtk_scrolled_window_set_policy(@ptrCast(text_scroll), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
     c.gtk_widget_set_hexpand(text_scroll, 1);
@@ -1714,6 +2210,7 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         .title = @ptrCast(@alignCast(title)),
         .meta = @ptrCast(@alignCast(meta)),
         .picture = picture,
+        .note = @ptrCast(@alignCast(note)),
         .text_scroll = text_scroll,
         .text = @ptrCast(@alignCast(text)),
         .status = @ptrCast(@alignCast(status)),

@@ -16,6 +16,8 @@ const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
+const launchLocal = @import("open.zig").launchLocal;
+const launchLocalWithApp = @import("open.zig").launchLocalWithApp;
 const onMenuBatchRename = @import("ops.zig").onMenuBatchRename;
 const onMenuDelete = @import("ops.zig").onMenuDelete;
 const onMenuEditorRename = @import("ops.zig").onMenuEditorRename;
@@ -114,8 +116,12 @@ pub fn onAreaRightClick(_: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, u
 /// chance to do it.
 fn keepOrSelect(gesture: *c.GtkGestureClick, tab: *BTab, row: *c.GtkListBoxRow) void {
     _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
-    if (c.gtk_list_box_row_is_selected(row) == 0)
+    if (c.gtk_list_box_row_is_selected(row) == 0) {
+        // OUTSIDE the selection: the click retargets — select only
+        // the clicked row (select_row alone ADDS in multiple mode).
+        c.gtk_list_box_unselect_all(tab.listbox);
         c.gtk_list_box_select_row(tab.listbox, row);
+    }
 }
 
 /// Build and pop the entry context menu. Takes ownership of
@@ -203,11 +209,11 @@ pub fn showEntryMenu(
             const utxt = std.fmt.bufPrint(&ubuf, "Undo ({s})", .{last.describe()}) catch "Undo";
             tail.item(classicmenu.escapeLabel(utxt, &uz), &onMenuUndo, ctx);
         }
-        // Un-split: the background menu is the only place a browser
-        // pane can be closed from -- its face has no pane titlebar and
-        // no terminal right-click menu.
-        if (!on_entry)
-            tail.item("Close Pane", &onMenuClosePane, ctx);
+        // Un-split: offered on every listing right-click (entry or
+        // background) -- the browser face has no pane titlebar and no
+        // terminal right-click menu, so the context menu and the
+        // toolbar button are the only places to close a pane from.
+        tail.item("Close Pane", &onMenuClosePane, ctx);
     }
 
     const popover = root.popupVia(parent, self.root_box, x, y);
@@ -228,7 +234,7 @@ fn buildOpen(
     if (is_dir) {
         m.item("Open in New Browser Tab", &onMenuOpenTab, ctx);
     } else {
-        m.item("Open With…", &onMenuOpenWith, ctx);
+        buildOpenWith(self, ctx, m);
     }
     const has_more = (is_dir and (is_local or self.on_host_term != null)) or
         (!is_dir and !is_local and self.on_host_open != null);
@@ -241,6 +247,112 @@ fn buildOpen(
     } else if (!is_local and self.on_host_open != null) {
         p.item("Open on Host (app forward)", &onMenuHostOpen, ctx);
     }
+}
+
+/// Per-item context for a direct "open with app X" row; owned by the
+/// menu root, not the popover's MenuCtx.
+const OpenAppCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    tab: *BTab,
+    path: []u8,
+    /// null = default handler.
+    appid: ?[]u8,
+};
+
+fn openAppCleanup(user: ?*anyopaque) callconv(.c) void {
+    const a: *OpenAppCtx = @ptrCast(@alignCast(user.?));
+    a.allocator.free(a.path);
+    if (a.appid) |s| a.allocator.free(s);
+    a.allocator.destroy(a);
+}
+
+fn onOpenAppActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const actx: *OpenAppCtx = @ptrCast(@alignCast(user.?));
+    const self = actx.view;
+    if (actx.tab.hc.host != null) {
+        self.openRemoteFile(actx.tab, actx.path, if (actx.appid) |id| id else null);
+    } else if (actx.appid) |id| {
+        launchLocalWithApp(id, actx.path);
+    } else {
+        launchLocal(actx.path);
+    }
+}
+
+fn addOpenAppItem(
+    self: *BrowserView,
+    ctx: *MenuCtx,
+    m: classicmenu.Menu,
+    label: []const u8,
+    appid: ?[]const u8,
+) void {
+    const path = ctx.path orelse return;
+    const actx = self.allocator.create(OpenAppCtx) catch return;
+    actx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .tab = ctx.tab,
+        .path = self.allocator.dupe(u8, path) catch {
+            self.allocator.destroy(actx);
+            return;
+        },
+        .appid = if (appid) |id| (self.allocator.dupe(u8, id) catch null) else null,
+    };
+    m.root.own(&openAppCleanup, @ptrCast(actx));
+    var ebuf: [320]u8 = undefined;
+    m.item(classicmenu.escapeLabel(label, &ebuf), &onOpenAppActivated, @ptrCast(actx));
+}
+
+/// Nemo-style open block for a file: "Open with <Default>" launches
+/// directly, then an "Open With" hover submenu lists every candidate
+/// plus "Other Application…" (the full chooser, with the always-use
+/// checkbox and host-side apps).
+///
+/// On a remote tab the candidates are still LOCAL applications — the
+/// launch downloads a cache copy first (openRemoteFile), same as the
+/// chooser dialog's local section.
+fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
+    const path = ctx.path orelse return;
+    var namez: [512:0]u8 = undefined;
+    var ct: [*c]c.gchar = null;
+    if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(path)})) |bz| {
+        var uncertain: c.gboolean = 0;
+        ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+    } else |_| {}
+    defer if (ct != null) c.g_free(ct);
+
+    if (ct != null) {
+        if (c.g_app_info_get_default_for_type(ct, 0)) |info| {
+            defer c.g_object_unref(@as(?*anyopaque, @ptrCast(info)));
+            if (c.g_app_info_get_name(info)) |nm| {
+                var lbl: [192]u8 = undefined;
+                if (std.fmt.bufPrint(&lbl, "Open with {s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(nm)))})) |ltxt| {
+                    const id: ?[]const u8 = if (c.g_app_info_get_id(info)) |i|
+                        std.mem.span(@as([*:0]const u8, @ptrCast(i)))
+                    else
+                        null;
+                    addOpenAppItem(self, ctx, m, ltxt, id);
+                } else |_| {}
+            }
+        }
+    }
+
+    const ow = m.submenu("Open With");
+    var count: usize = 0;
+    if (ct != null) {
+        const apps = c.g_app_info_get_all_for_type(ct);
+        var it = apps;
+        while (it != null and count < 20) : (it = it.*.next) {
+            const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
+            const id = c.g_app_info_get_id(app) orelse continue;
+            const nm = c.g_app_info_get_name(app) orelse continue;
+            addOpenAppItem(self, ctx, ow, std.mem.span(nm), std.mem.span(id));
+            count += 1;
+        }
+        if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
+    }
+    const tail = if (count > 0) ow.section() else ow;
+    tail.item("Other Application…", &onMenuOpenWith, ctx);
 }
 
 fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu) void {
@@ -612,9 +724,18 @@ fn pasteAsLink(ctx: *MenuCtx, hard: bool) void {
 
 pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const path = ctx.path orelse return menuDone(ctx);
-    ctx.view.entryDialog(ctx.tab, .rename, path);
+    const self = ctx.view;
+    const tab = ctx.tab;
+    const orig = ctx.path orelse return menuDone(ctx);
+    // Close the menu FIRST: its popdown moves focus, and a focus
+    // change after the editor grabbed focus would instantly cancel
+    // the inline edit.
+    var pbuf: [4096]u8 = undefined;
+    if (orig.len >= pbuf.len) return menuDone(ctx);
+    @memcpy(pbuf[0..orig.len], orig);
+    const path = pbuf[0..orig.len];
     menuDone(ctx);
+    self.startInlineRename(tab, path);
 }
 
 pub fn onMenuBrowseArchive(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

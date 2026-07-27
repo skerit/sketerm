@@ -28,10 +28,10 @@ const showColumnPicker = @import("render.zig").showColumnPicker;
 /// thumbnail cache key is (path, mtime) and carries no size, zooming
 /// never invalidates a single cached texture.
 pub const Step = struct {
-    /// Symbolic row icon size in the details/compact lists.
+    /// Row icon AND row thumbnail size in the details/compact lists
+    /// (one size so thumbnailed rows stay the same height as the
+    /// rest; drives row height together with row_pad).
     icon_px: i32,
-    /// Row thumbnail size (drives row height together with row_pad).
-    thumb_px: i32,
     /// Tile icon/thumbnail size in the grid.
     tile_icon_px: i32,
     /// Tile width in the grid.
@@ -46,11 +46,11 @@ pub const Step = struct {
 /// min-height are zeroed for the browser listing by the stylesheet
 /// render.installCss puts up, so nothing is added on top of them.
 pub const ZOOM_STEPS = [_]Step{
-    .{ .icon_px = 12, .thumb_px = 16, .tile_icon_px = 32, .tile_px = 72, .row_pad = 1 },
-    .{ .icon_px = 16, .thumb_px = 24, .tile_icon_px = 48, .tile_px = 96, .row_pad = 2 },
-    .{ .icon_px = 24, .thumb_px = 32, .tile_icon_px = 64, .tile_px = 120, .row_pad = 4 },
-    .{ .icon_px = 32, .thumb_px = 48, .tile_icon_px = 96, .tile_px = 152, .row_pad = 7 },
-    .{ .icon_px = 48, .thumb_px = 64, .tile_icon_px = 128, .tile_px = 184, .row_pad = 10 },
+    .{ .icon_px = 16, .tile_icon_px = 32, .tile_px = 72, .row_pad = 1 },
+    .{ .icon_px = 24, .tile_icon_px = 48, .tile_px = 96, .row_pad = 2 },
+    .{ .icon_px = 32, .tile_icon_px = 64, .tile_px = 120, .row_pad = 4 },
+    .{ .icon_px = 48, .tile_icon_px = 96, .tile_px = 152, .row_pad = 7 },
+    .{ .icon_px = 64, .tile_icon_px = 128, .tile_px = 184, .row_pad = 10 },
 };
 
 /// The step a tab starts at (and what a pre-zoom state file loads as):
@@ -256,9 +256,15 @@ pub fn groupFor(tab: *BTab, e: Entry, now_ms: i64) grouping.Group {
         .size = e.size,
         .mtime_ms = e.mtime_ms,
         .ctime_ms = e.ctime_ms,
+        .atime_ms = e.atime_ms,
+        .btime_ms = e.btime_ms,
         .uid = e.uid,
         .gid = e.gid,
+        .owner = e.owner,
+        .group = e.group,
         .mode = e.mode,
+        .nlink = e.nlink,
+        .blocks = e.blocks,
         .is_dir = e.tdir,
     }, now_ms);
 }
@@ -383,6 +389,7 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
     tab.dirs_first = rec.dirs_first;
     tab.vs.grouped = rec.grouped;
     tab.vs.zoom = @min(rec.zoom, ZOOM_STEPS.len - 1);
+    tab.name_width = rec.name_width;
     if (rec.columns.len > 0) {
         tab.columns = .initEmpty();
         for (rec.columns) |col| tab.columns.insert(col);
@@ -422,6 +429,7 @@ pub fn rememberFolder(self: *BrowserView, tab: *BTab) void {
         .zoom = tab.vs.zoom,
         .columns = cols[0..n],
         .col_widths = widths[0..n],
+        .name_width = tab.name_width,
     });
     store.save();
 }
@@ -449,15 +457,42 @@ pub fn forgetAllFolders(self: *BrowserView) void {
 /// Add the view-options button to the toolbar. Called once, from
 /// attach, so buildUi stays a plain widget tree.
 pub fn installViewMenu(self: *BrowserView) void {
-    const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.hidden_toggle))) orelse return;
+    // First slot of the collapsible cluster (whose parent is read off
+    // the Places toggle; the old anchor, the hidden-files toggle, now
+    // lives in the hamburger menu).
+    const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.places_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("view-list-symbolic");
     // Same treatment view.zig's `flatten` gives every other toolbar
     // button: flat, out of the focus chain, so the right cluster
     // reads as one row of icons.
     BrowserView.flatten(btn.?);
-    c.gtk_widget_set_tooltip_text(btn, "View options: columns, grouping, zoom, filter, flat view, folder memory");
+    c.gtk_widget_set_tooltip_text(btn, "View options: view mode, columns, grouping, zoom, filter, flat view, folder memory");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onViewMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.hidden_toggle)));
+    c.gtk_box_insert_child_after(@ptrCast(bar), btn, null);
+}
+
+/// Heap context for one view-mode radio in the View options menu.
+const ModeCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    mode: browser_model.ViewMode,
+
+    fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const ctx: *ModeCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+pub fn onViewModeChosen(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+    if (c.gtk_check_button_get_active(check) == 0) return;
+    const ctx: *ModeCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const tab = self.currentTab() orelse return;
+    if (tab.view_mode == ctx.mode) return;
+    tab.view_mode = ctx.mode;
+    self.setStatusFmt("view: {s}", .{@tagName(ctx.mode)});
+    rememberFolder(self, tab);
+    self.renderTab(tab);
 }
 
 fn updateZoomLabel(self: *BrowserView, tab: *BTab) void {
@@ -477,6 +512,29 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     c.gtk_widget_set_margin_top(box, 10);
     c.gtk_widget_set_margin_bottom(box, 10);
 
+    // View-mode radios first, like Dolphin's view_settings dropdown.
+    const mode_rows = [_]struct { label: [*:0]const u8, mode: browser_model.ViewMode }{
+        .{ .label = "Details list", .mode = .details },
+        .{ .label = "Compact list", .mode = .compact },
+        .{ .label = "Icon grid", .mode = .icons },
+        .{ .label = "Miller columns", .mode = .miller },
+    };
+    var mode_group: ?*c.GtkCheckButton = null;
+    for (mode_rows) |m| {
+        const rb = c.gtk_check_button_new_with_label(m.label);
+        if (mode_group == null) {
+            mode_group = @ptrCast(@alignCast(rb));
+        } else {
+            c.gtk_check_button_set_group(@ptrCast(rb), mode_group);
+        }
+        c.gtk_check_button_set_active(@ptrCast(rb), @intFromBool(tab.view_mode == m.mode));
+        const mctx = self.allocator.create(ModeCtx) catch continue;
+        mctx.* = .{ .allocator = self.allocator, .view = self, .mode = m.mode };
+        _ = c.g_signal_connect_data(rb, "toggled", @ptrCast(&onViewModeChosen), @ptrCast(mctx), @ptrCast(&ModeCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), rb);
+    }
+    c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
     var gbuf: [96:0]u8 = undefined;
     const gtxt: [*:0]const u8 = if (std.fmt.bufPrintZ(&gbuf, "Group by {s}", .{@tagName(tab.sort_key)})) |v| v.ptr else |_| "Group";
     const group = c.gtk_check_button_new_with_label(gtxt);
@@ -490,6 +548,18 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     c.gtk_check_button_set_active(@ptrCast(flat), @intFromBool(flatOn(tab)));
     _ = c.g_signal_connect_data(flat, "toggled", @ptrCast(&onFlatToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(box), flat);
+
+    const zebra = c.gtk_check_button_new_with_label("Zebra stripes");
+    c.gtk_widget_set_tooltip_text(zebra, "Slight alternating row background (all browser panes)");
+    c.gtk_check_button_set_active(@ptrCast(zebra), @intFromBool(self.zebra));
+    _ = c.g_signal_connect_data(zebra, "toggled", @ptrCast(&onZebraToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_box_append(@ptrCast(box), zebra);
+
+    const side_info = c.gtk_check_button_new_with_label("Sidebar info card");
+    c.gtk_widget_set_tooltip_text(side_info, "Compact selection summary at the bottom of the places sidebar");
+    c.gtk_check_button_set_active(@ptrCast(side_info), @intFromBool(self.side_info));
+    _ = c.g_signal_connect_data(side_info, "toggled", @ptrCast(&@import("preview.zig").onSideInfoToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_box_append(@ptrCast(box), side_info);
 
     const zoom_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
     const zoom_out = c.gtk_button_new_from_icon_name("zoom-out-symbolic");
@@ -559,6 +629,23 @@ pub fn onFlatToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) v
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want == flatOn(tab)) return;
     toggleFlat(self, tab);
+}
+
+pub fn onZebraToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const want = c.gtk_check_button_get_active(check) != 0;
+    if (want == self.zebra) return;
+    self.zebra = want;
+    // Pure CSS class flip on every tab's listbox — no re-render.
+    for (self.tabs.items) |tab| {
+        const listbox: *c.GtkWidget = @ptrCast(@alignCast(tab.listbox));
+        if (want) {
+            c.gtk_widget_add_css_class(listbox, "sketerm-fb-zebra");
+        } else {
+            c.gtk_widget_remove_css_class(listbox, "sketerm-fb-zebra");
+        }
+    }
+    self.savePlaces();
 }
 
 pub fn onZoomIn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

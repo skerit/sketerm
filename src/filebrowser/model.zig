@@ -42,43 +42,82 @@ pub fn parseSpec(spec: []const u8, current_host: []const u8) ParsedSpec {
 
 pub const LocationKind = enum { directory, search, collection, panel };
 pub const ViewMode = enum { details, icons, compact, miller };
-pub const SortKey = enum { name, size, kind, mtime, ctime, owner, group, permissions };
+pub const SortKey = enum {
+    name,
+    size,
+    kind,
+    mtime,
+    ctime,
+    owner,
+    group,
+    permissions,
+    atime,
+    btime,
+    extension,
+    allocated,
+    nlink,
+};
 
 /// Optional details-view columns; the name column is always present.
 /// Render order is declaration order.
 pub const Column = enum {
     kind,
+    detailed_type,
+    mime,
+    extension,
     permissions,
+    octal,
     owner,
     group,
+    nlink,
     size,
+    allocated,
     mtime,
     ctime,
+    atime,
+    btime,
+    where,
     target,
 
     pub fn sortKey(self: Column) SortKey {
         return switch (self) {
             .kind => .kind,
-            .permissions => .permissions,
+            // Type strings derive from the extension, so that IS
+            // their natural order.
+            .detailed_type, .mime, .extension => .extension,
+            .permissions, .octal => .permissions,
             .owner => .owner,
             .group => .group,
+            .nlink => .nlink,
             .size => .size,
+            .allocated => .allocated,
             .mtime => .mtime,
             .ctime => .ctime,
-            // Symlink targets have no meaningful order of their own.
-            .target => .name,
+            .atime => .atime,
+            .btime => .btime,
+            // Symlink targets / locations have no order of their own.
+            .where, .target => .name,
         };
     }
 
     pub fn title(self: Column) [*:0]const u8 {
         return switch (self) {
-            .kind => "Kind",
-            .permissions => "Perms",
+            .kind => "Type",
+            .detailed_type => "Detailed type",
+            .mime => "MIME type",
+            .extension => "Extension",
+            .permissions => "Permissions",
+            .octal => "Octal",
             .owner => "Owner",
             .group => "Group",
+            .nlink => "Links",
             .size => "Size",
+            .allocated => "On disk",
             .mtime => "Modified",
             .ctime => "Changed",
+            .atime => "Accessed",
+            .btime => "Created",
+            .where => "Location",
             .target => "Target",
         };
     }
@@ -90,12 +129,27 @@ pub const Column = enum {
     /// (TabState.col_widths).
     pub fn width(self: Column) i32 {
         return switch (self) {
-            .kind => 76,
+            .kind => 96,
+            .detailed_type => 160,
+            .mime => 150,
+            .extension => 76,
             .permissions => 104,
-            .owner, .group => 84,
+            .octal => 64,
+            .owner, .group => 92,
+            .nlink => 60,
             .size => 100,
-            .mtime, .ctime => 160,
+            .allocated => 100,
+            .mtime, .ctime, .atime, .btime => 160,
+            .where => 200,
             .target => 212,
+        };
+    }
+
+    /// Cell/header text alignment; numeric columns read best ragged-left.
+    pub fn xalign(self: Column) f32 {
+        return switch (self) {
+            .size, .allocated, .nlink, .octal => 1.0,
+            else => 0.0,
         };
     }
 };
@@ -129,6 +183,8 @@ pub const TabState = struct {
     /// Dragged widths of the extra columns, parallel to
     /// `attr_columns`, same 0-means-default convention.
     attr_col_widths: []const i32 = &.{},
+    /// Dragged Name-column width; 0 = auto (take the leftover).
+    name_width: i32 = 0,
     sort: SortKey = .name,
     descending: bool = false,
     dirs_first: bool = true,
