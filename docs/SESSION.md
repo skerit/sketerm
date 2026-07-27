@@ -10258,3 +10258,29 @@ pre-existing; NOT reproducible on master via the canonical save ->
 --restore flow (browser tab restored fine, screenshot-verified) --
 treat as that rig's artifact. Known small gap: a dragged attr-column
 width persists per tab but not in viewmem (fixed columns only there).
+
+## Files taskbar identity: a real sketerm-files binary (2026-07-27)
+
+Third report of Plasma merging Sketerm Files into the terminal's
+taskbar entry, despite proven-correct app_id/WM_CLASS and current
+desktop files. Root cause finally accepted as Plasma-side heuristics:
+libtaskmanager falls back to matching by process cmdline/executable,
+and both identities ran /usr/bin/sketerm (files desktop entry was
+Exec=sketerm files), which resolves to the terminal's desktop entry.
+
+Fix: ship the file manager as its own executable. /usr/bin/sketerm-
+files is a HARDLINK to sketerm (PKGBUILD ln; zig-out gets a copy via
+a second addInstallArtifact); filebrowser/entry.zig treats argv[0]
+basename "sketerm-files" as the files subcommand. Desktop entry now
+TryExec/Exec=sketerm-files, and Window.openInFilesApp prefers the
+sibling binary when present. Every surface a taskbar can match is
+now distinct: exe path, cmdline[0], comm, WM_CLASS/app_id.
+
+Verified under Xvfb + private session bus: sketerm-files window has
+WM_CLASS dev.sker.sketerm.files with comm/cmdline/exe all sketerm-
+files; repeat invocations of BOTH spellings (sketerm-files, sketerm
+files) forward into the one files primary (same _NET_WM_PID, one
+process); plain sketerm windows keep WM_CLASS "sketerm" alongside.
+Unit suite 1039/5/0 (new: "the sketerm-files binary name IS the
+subcommand"); mux + mux-portable build, ldd libc/libm only;
+smoke-e2e PASS. Requires reinstall (cd dist && ./install.sh).
