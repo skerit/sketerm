@@ -6,7 +6,6 @@
 const std = @import("std");
 
 comptime {
-    _ = @import("util/ring.zig");
     _ = @import("util/utf8.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/pathz.zig");

@@ -756,22 +756,20 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         // Teardown order matters. Steps:
         //
-        // 1. Null every Terminal sink + user_ctx so any
-        //    `g_main_context_invoke(mainDrain, …)` already queued by
-        //    a worker thread can't reach into a Pane via stale
-        //    callback pointers — the dispatched mainDrain will see
-        //    the cleared callbacks and produce no calls into Pane.
-        // 2. Deinit terminals (joins their worker threads, drains
-        //    the ring, frees PTY + parser + screen + style pool).
-        //    After this returns, no further worker activity is
+        // 1. Null every Terminal sink + user_ctx so any idle/deferred
+        //    callback already queued on the main loop can't reach into
+        //    a Pane via stale callback pointers — it sees the cleared
+        //    sinks and produces no calls into Pane.
+        // 2. Deinit terminals (removes fd watches and timers, detaches
+        //    the daemon connections, frees parser + screen + pool).
+        //    After this returns, no further terminal activity is
         //    possible against any of these terminals.
         // 3. Deinit panes (GL passes, atlas, IM context, arenas,
         //    GObject unrefs). Safe now that the terminal-side
         //    machinery is fully quiesced.
         //
         // Reversing #2 and #3 — the obvious order — would let a
-        // late mainDrain dispatch into a freed Pane, since worker
-        // joins happen inside Terminal.deinit, not before it.
+        // late queued callback dispatch into a freed Pane.
         if (self.ack_timer_id != 0) {
             _ = c.g_source_remove(self.ack_timer_id);
             self.ack_timer_id = 0;
@@ -8738,10 +8736,10 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
                 }
             }
             // Pane.terminal sinks reach into Terminal/Pane state that
-            // we're about to free — null them now so any in-flight
-            // `g_main_context_invoke(mainDrainEvents, …)` from the
-            // PTY worker that fires before the deferred teardown runs
-            // sees a quiesced Terminal and produces no callbacks.
+            // we're about to free — null them now so any callback
+            // already queued on the main loop that fires before the
+            // deferred teardown runs sees a quiesced Terminal and
+            // produces no callbacks.
             // Same story for the IM context: its widget dies when the
             // detached page drops its last ref, before the deferred
             // Pane.deinit idle runs.

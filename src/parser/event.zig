@@ -1,11 +1,11 @@
-//! Events emitted by the VT parser to the main-thread consumer.
+//! Events emitted by the VT parser to its consumer.
 //!
-//! Parser runs on the worker thread. Events flow through the SPSC
-//! ring (`util/ring.zig`) and are applied by the main thread to the
+//! The parser runs in the mux daemon; events ride the wire protocol
+//! (mux/wire.zig) to attached clients, which apply them to the
 //! Screen / ImageStore / etc.
 //!
 //! Owned-payload events (`osc`, `apc`, `dcs_data`) carry heap slices
-//! whose ownership transfers across threads. The consumer must free
+//! whose ownership transfers to the consumer. The consumer must free
 //! them after processing.
 
 const std = @import("std");

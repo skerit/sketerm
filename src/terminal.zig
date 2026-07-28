@@ -13,7 +13,6 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
-const ring_mod = @import("util/ring.zig");
 const Pty = @import("pty.zig").Pty;
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
@@ -29,14 +28,6 @@ const profile_util = @import("util/profile.zig");
 fn nextReconnectDelay(delay_ms: u32) u32 {
     return @min(delay_ms * 2, 30_000);
 }
-
-/// SPSC ring capacity — power of 2; one Event per slot. Sized to
-/// absorb roughly 100ms of worker throughput at 16384 × 96B = 1.5MB.
-/// When the main thread is briefly stalled (input handling, GTK
-/// frame work), the worker can keep parsing instead of spin-waiting.
-pub const RING_CAP: usize = 16384;
-
-pub const EventRing = ring_mod.Ring(Event, RING_CAP);
 
 /// Stable trampoline target for `g_main_context_invoke` callbacks.
 /// Lives independently of Terminal so a callback that fires AFTER
@@ -82,7 +73,7 @@ pub const Terminal = struct {
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// OSC 52 read query (only fired when the screen allows reads).
     on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
-    /// Fires once at the end of `mainDrain` when events left
+    /// Fires once at the end of a socket drain when events left
     /// `screen.dirty = true` (and we're not in DECSET 2026 sync
     /// mode). UI uses it to schedule a GL render directly from the
     /// drain instead of waiting for the next 60 Hz tick to notice

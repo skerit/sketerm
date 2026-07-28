@@ -4128,7 +4128,19 @@ pub const Daemon = struct {
                 return;
             }
         }
-        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches, .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 }, .{ .conflict = r.conflict, .dir_mode = r.dir_mode }) catch
+        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, .{
+            .src = r.path,
+            .dst = r.to,
+            .pattern = r.pattern,
+            .src_host = r.src_host,
+            .dst_host = r.dst_host,
+            .client_token = r.client_token,
+            .resumable = r.@"resume",
+            .within_ms = r.within_ms,
+            .max_matches = r.max_matches,
+            .perm = .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 },
+            .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode },
+        }) catch
             return fsReplyErr(cl, r.req, "cannot start job");
         self.next_fs_job_id = job.id + 1;
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
@@ -4148,23 +4160,34 @@ pub const Daemon = struct {
     /// Copy-collision arguments, forwarded verbatim to the helper.
     const CopyArgs = struct { conflict: []const u8 = "", dir_mode: []const u8 = "" };
 
-    fn spawnFsJob(
-        self: *Daemon,
-        owner: ?*Client,
-        op: FsJob.Op,
-        id: u64,
-        src: []const u8,
-        dst: []const u8,
-        pattern: []const u8,
-        src_host: []const u8,
-        dst_host: []const u8,
-        client_token: []const u8,
-        resumable: bool,
-        within_ms: u64,
-        max_matches: u64,
-        perm: PermArgs,
-        copy: CopyArgs,
-    ) !*FsJob {
+    /// Everything a job run needs beyond its op and id. One struct so
+    /// call sites name what they set and default the rest.
+    const FsJobArgs = struct {
+        src: []const u8 = "",
+        dst: []const u8 = "",
+        pattern: []const u8 = "",
+        src_host: []const u8 = "",
+        dst_host: []const u8 = "",
+        client_token: []const u8 = "",
+        resumable: bool = false,
+        within_ms: u64 = 0,
+        max_matches: u64 = 0,
+        perm: PermArgs = .{},
+        copy: CopyArgs = .{},
+    };
+
+    fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: FsJobArgs) !*FsJob {
+        const src = args.src;
+        const dst = args.dst;
+        const pattern = args.pattern;
+        const src_host = args.src_host;
+        const dst_host = args.dst_host;
+        const client_token = args.client_token;
+        const resumable = args.resumable;
+        const within_ms = args.within_ms;
+        const max_matches = args.max_matches;
+        const perm = args.perm;
+        const copy = args.copy;
         var exe_buf: [4096:0]u8 = undefined;
         const exe = @import("../util/platform.zig").selfExecPathZ(&exe_buf) orelse return error.NoExecutable;
         var spec_aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -4420,7 +4443,16 @@ pub const Daemon = struct {
                 // already replaced before any bytes moved, so a
                 // restart merges into the partial result instead of
                 // destroying it.
-                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0, .{}, .{ .conflict = rec.conflict }) catch {
+                _ = self.spawnFsJob(null, op, rec.id, .{
+                    .src = rec.src,
+                    .dst = rec.dst,
+                    .pattern = rec.pattern,
+                    .src_host = rec.src_host,
+                    .dst_host = rec.dst_host,
+                    .client_token = rec.client_token,
+                    .resumable = true,
+                    .copy = .{ .conflict = rec.conflict },
+                }) catch {
                     const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                     job.setMessage("could not resume after daemon restart");
                     self.saveFsJob(job) catch { job.terminal_pending = true; };
