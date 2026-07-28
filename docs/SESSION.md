@@ -10906,3 +10906,32 @@ Verified per commit: build, mux-portable, suite (1056 pass / 5 skip —
 two util/ring tests removed with the module), smoke-mux, Xvfb
 smoke-e2e (which drives the moved ipcDispatch and the daemon-backed
 pane path end to end).
+
+## 2026-07-28: god-file split (round 2) + smoke-mcp isolation fix
+
+Every multi-responsibility file is now split along its own section
+banners using one pattern (functions keep their receiver, moved to a
+sibling file, aliased back into the owning struct so call sites read
+unchanged): window.zig 8854 -> 3687 across ui/{muxtabs,remotectl,
+modes,winlayout,winconfig,termsinks,tabchrome}.zig; daemon.zig
+8427 -> 3951 across mux/daemon_{serve,fsjobs,native,sessions}.zig;
+mcp.zig 7658 -> 3897 across ipc/mcp_{browser,term,app}.zig (shared
+server state stays in mcp.zig and is referenced through it);
+screen.zig's CSI/cursor/erase/scroll/modes/SGR ops moved to
+grid/screen_ops.zig and compositor.zig's request dispatch to
+wlhost/requests.zig — both those files are roughly half unit tests,
+which stayed put and cover the moved code directly. Every remaining
+3-4k file is one cohesive core (grid model, compositor brain, daemon
+loop+types, MCP server state, window shell) plus tests.
+
+Found en route: smoke-mcp was failing on machines whose real
+~/.bashrc loads a prompt manager — the headless bash sourced it and
+oh-my-posh replaced the prompt hooks, killing the injected OSC 133
+marks. The smoke now runs with an isolated empty HOME (and prints
+both replies on failure). NOTE the underlying product gap is real
+and unfixed: sketerm's bash integration loses its command marks
+under oh-my-posh/starship on real user machines.
+
+Verified per split commit: build, mux-portable (sketerm-mux still
+libc-only), suite 1056 pass / 5 skip, smoke-mux, smoke-broker,
+smoke-mcp, Xvfb smoke-e2e.
