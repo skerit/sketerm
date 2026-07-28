@@ -29,7 +29,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const Dir = @import("types.zig").Dir;
 const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
-const RowCtx = @import("render.zig").RowCtx;
+const colview = @import("colview.zig");
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
@@ -443,23 +443,23 @@ fn pump(self: *BrowserView) void {
 /// is only a scan bound: the REQUEST bound is fetchWindow's.
 const ROW_SCAN_MAX: usize = 4096;
 
-/// Rows currently in the listbox, in display order. The listbox IS
-/// the display model (grouping, filtering, expanded subdirs and flat
+/// Rows currently in the item model, in display order. The model IS
+/// the display (grouping, filtering, expanded subdirs and flat
 /// search results all resolve into it), so reading it avoids a
 /// second, divergent idea of what the user sees.
 fn collectRows(tab: *BTab, index: *const PathIndex, out: []Candidate) []Candidate {
     var n: usize = 0;
-    var i: c_int = 0;
-    while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
+    const total = colview.itemCount(tab);
+    var i: c.guint = 0;
+    while (i < total) : (i += 1) {
         if (n >= out.len) break;
-        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
-        const ctx: *RowCtx = @ptrCast(@alignCast(data));
-        if (ctx.is_dir) continue;
+        const d = colview.itemDataAt(tab, i) orelse continue;
+        if (d.kind != .entry or d.is_dir) continue;
         // Only files the host-side extractor covers. Asking about a
         // source tree's worth of .zig files would be host IO spent
         // to learn nothing.
-        if (!isPreviewMediaName(ctx.path)) continue;
-        out[n] = .{ .path = ctx.path, .mtime_ms = index.mtimeOf(ctx.path) };
+        if (!isPreviewMediaName(d.path)) continue;
+        out[n] = .{ .path = d.path, .mtime_ms = index.mtimeOf(d.path) };
         n += 1;
     }
     return out[0..n];
@@ -467,25 +467,28 @@ fn collectRows(tab: *BTab, index: *const PathIndex, out: []Candidate) []Candidat
 
 const VisibleRange = struct { first: usize, count: usize };
 
-/// Which of `total` listbox rows the viewport shows. Before GTK has
-/// allocated the rows (the first frame after a navigation) nothing
-/// has bounds yet, so the range degrades to the TOP of the list --
-/// still a fixed-size window, and the next settle corrects it.
+/// Which of `total` candidate rows the viewport shows. Only BOUND
+/// cells have geometry (the column view recycles); scrolled-away
+/// candidates simply have no bound cell, which is exactly "not
+/// visible". Before the first allocation nothing is bound yet, so
+/// the range degrades to the TOP of the list -- still a fixed-size
+/// window, and the next settle corrects it.
 fn visibleRange(tab: *BTab, total: usize) VisibleRange {
     const height = c.gtk_widget_get_height(tab.scroller);
     if (height <= 0) return .{ .first = 0, .count = 0 };
     var first: ?usize = null;
     var last: usize = 0;
-    var i: c_int = 0;
+    const n = colview.itemCount(tab);
+    var i: c.guint = 0;
     var idx: usize = 0;
-    while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
-        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
-        const ctx: *RowCtx = @ptrCast(@alignCast(data));
-        if (ctx.is_dir or !isPreviewMediaName(ctx.path)) continue;
+    while (i < n) : (i += 1) {
+        const d = colview.itemDataAt(tab, i) orelse continue;
+        if (d.kind != .entry or d.is_dir or !isPreviewMediaName(d.path)) continue;
         defer idx += 1;
         if (idx >= total) break;
+        const root = tab.name_cells.get(d.path) orelse continue;
         var bounds: c.graphene_rect_t = undefined;
-        if (c.gtk_widget_compute_bounds(@ptrCast(row), tab.scroller, &bounds) == 0) continue;
+        if (c.gtk_widget_compute_bounds(root, tab.scroller, &bounds) == 0) continue;
         const top = bounds.origin.y;
         const bottom = top + bounds.size.height;
         if (bottom <= 0 or top >= @as(f32, @floatFromInt(height))) continue;

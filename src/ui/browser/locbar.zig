@@ -505,7 +505,7 @@ pub fn showCrumbFace(self: *BrowserView) bool {
     self.cancelPathCompletion();
     c.gtk_widget_set_visible(@ptrCast(@alignCast(self.path_entry)), 0);
     c.gtk_widget_set_visible(sw, 1);
-    if (self.currentTab()) |tab| _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.listbox)));
+    if (self.currentTab()) |tab| _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview)));
     return true;
 }
 

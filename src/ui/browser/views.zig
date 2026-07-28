@@ -636,13 +636,15 @@ pub fn onZebraToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) 
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want == self.zebra) return;
     self.zebra = want;
-    // Pure CSS class flip on every tab's listbox — no re-render.
+    // Pure CSS class flip on every tab's column view — the cells
+    // carry their parity class permanently, this decides whether it
+    // paints. No re-render.
     for (self.tabs.items) |tab| {
-        const listbox: *c.GtkWidget = @ptrCast(@alignCast(tab.listbox));
+        const cv: *c.GtkWidget = @ptrCast(@alignCast(tab.colview));
         if (want) {
-            c.gtk_widget_add_css_class(listbox, "sketerm-fb-zebra");
+            c.gtk_widget_add_css_class(cv, "sketerm-fb-zebra");
         } else {
-            c.gtk_widget_remove_css_class(listbox, "sketerm-fb-zebra");
+            c.gtk_widget_remove_css_class(cv, "sketerm-fb-zebra");
         }
     }
     self.savePlaces();
@@ -669,7 +671,7 @@ pub fn onColumnsMenu(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const tab = self.currentTab() orelse return;
     if (c.gtk_widget_get_ancestor(@ptrCast(@alignCast(btn)), c.gtk_popover_get_type())) |pop|
         c.gtk_popover_popdown(@ptrCast(pop));
-    showColumnPicker(tab, tab.header_box);
+    showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)));
 }
 
 pub fn onForgetFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

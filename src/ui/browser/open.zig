@@ -55,7 +55,7 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
         self.setStatus("download is not restart-durable (the recovery ledger directory is unwritable)");
         return;
     };
-    service.submitDownload(host, path, dst, appid);
+    service.submitDownload(host, path, dst, appid, @ptrCast(self));
     self.setStatusFmt("durable download queued: {s}", .{std.fs.path.basename(path)});
     self.renderJobs();
 }

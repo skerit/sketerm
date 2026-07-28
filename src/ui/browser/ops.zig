@@ -13,7 +13,7 @@ const HistoryDirection = @import("types.zig").HistoryDirection;
 const HostConn = @import("types.zig").HostConn;
 const MenuCtx = @import("menu.zig").MenuCtx;
 const PendingJob = @import("types.zig").PendingJob;
-const RowCtx = @import("render.zig").RowCtx;
+const colview = @import("colview.zig");
 const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
@@ -136,7 +136,7 @@ fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
     const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
     var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
     const both = c.gdk_content_provider_new_union(&providers, providers.len);
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.listbox)));
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview)));
     _ = c.gdk_clipboard_set_content(clip, both);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(both)));
 }
@@ -638,14 +638,11 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
         return menuDone(ctx);
     }
     var renamed: usize = 0;
-    var rows = c.gtk_list_box_get_selected_rows(tab.listbox);
-    const head = rows;
-    while (rows != null) : (rows = rows.*.next) {
-        const row: *c.GtkListBoxRow = @ptrCast(@alignCast(rows.*.data));
-        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
-        const rctx: *RowCtx = @ptrCast(@alignCast(data));
-        const base = std.fs.path.basename(rctx.path);
-        const parent = std.fs.path.dirname(rctx.path) orelse continue;
+    // The path mirror IS the selection (synced from the model on
+    // every change), so the batch reads it directly.
+    for (tab.selected.items) |sel_path| {
+        const base = std.fs.path.basename(sel_path);
+        const parent = std.fs.path.dirname(sel_path) orelse continue;
         // Replace ALL occurrences of `find` in the basename.
         var nb: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&nb);
@@ -663,10 +660,9 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
         const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
             if (parent.len == 1) "" else parent, w.buffered(),
         }) catch continue;
-        self.sendOp(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = rctx.path, .to = to });
+        self.sendOp(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to });
         renamed += 1;
     }
-    if (head != null) c.g_list_free(head);
     self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
     menuDone(ctx);
 }
@@ -866,28 +862,19 @@ pub const InlineRename = struct {
     commit: bool = false,
 };
 
-fn rowForPath(tab: *BTab, path: []const u8) ?*c.GtkListBoxRow {
-    var i: c_int = 0;
-    while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
-        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
-        const rctx: *RowCtx = @ptrCast(@alignCast(data));
-        if (std.mem.eql(u8, rctx.path, path)) return row;
-    }
-    return null;
-}
-
 /// Rename `path` in place: the row's name label is swapped for a
-/// GtkText right in the row. Enter commits, Escape or focus loss
-/// cancels. Views without a visible row for the entry (grid, a
-/// filtered-out row) fall back to the popover dialog.
+/// GtkText right in the cell. Enter commits, Escape or focus loss
+/// cancels. Views without a bound row for the entry (grid, a
+/// scrolled-away or filtered-out row) fall back to the popover
+/// dialog. The entry is scrolled into view first so its cell is
+/// bound by the time the label is looked up.
 pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void {
     if (self.inline_rename) |ir| finishInlineRenameDeferred(ir, false);
     const base = std.fs.path.basename(path);
     if (base.len == 0 or base.len > 511) return self.entryDialog(tab, .rename, path);
-    const row = rowForPath(tab, path) orelse return self.entryDialog(tab, .rename, path);
-    const label_data = c.g_object_get_data(@ptrCast(row), "sketerm-name-label") orelse
+    const row = colview.nameCellForPath(tab, path) orelse return self.entryDialog(tab, .rename, path);
+    const label = colview.labelOfNameCellRoot(row) orelse
         return self.entryDialog(tab, .rename, path);
-    const label: *c.GtkWidget = @ptrCast(@alignCast(label_data));
     const box = c.gtk_widget_get_parent(label) orelse
         return self.entryDialog(tab, .rename, path);
 
@@ -991,10 +978,10 @@ fn inlineRenameIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     if (self.inline_rename == ctx) self.inline_rename = null;
     self.allocator.free(ctx.path);
     self.allocator.destroy(ctx);
-    // Focus back onto the row (if it still lives in the listing) so
-    // the browser's chords keep working after the edit.
-    if (c.gtk_widget_get_parent(row) != null)
-        _ = c.gtk_widget_grab_focus(row);
+    // Focus back into the listing so the browser's chords keep
+    // working after the edit (the cell root itself is not focusable).
+    if (tabAlive(self, tab))
+        _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview)));
     c.g_object_unref(@as(?*anyopaque, @ptrCast(row)));
     return 0;
 }
@@ -1332,7 +1319,6 @@ pub fn onListDrop(
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     _ = target;
-    _ = x;
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     const self = tab.view;
     const cstr = c.g_value_get_string(value) orelse return 0;
@@ -1340,15 +1326,10 @@ pub fn onListDrop(
 
     var dst_dir: []const u8 = tab.root.path;
     var dbuf: [4096]u8 = undefined;
-    if (c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y))) |row| {
-        if (c.g_object_get_data(@ptrCast(row), "sketerm-row")) |data| {
-            const rctx: *RowCtx = @ptrCast(@alignCast(data));
-            if (rctx.is_dir) {
-                if (rctx.path.len < dbuf.len) {
-                    @memcpy(dbuf[0..rctx.path.len], rctx.path);
-                    dst_dir = dbuf[0..rctx.path.len];
-                }
-            }
+    if (colview.pickItem(tab, x, y)) |p| {
+        if (p.data.kind == .entry and p.data.is_dir and p.data.path.len < dbuf.len) {
+            @memcpy(dbuf[0..p.data.path.len], p.data.path);
+            dst_dir = dbuf[0..p.data.path.len];
         }
     }
     return @intFromBool(dropSpecInto(self, tab, spec, dst_dir));

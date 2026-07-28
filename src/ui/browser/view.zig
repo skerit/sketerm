@@ -866,7 +866,7 @@ pub const BrowserView = struct {
             else if (tab.view_mode == .icons and tab.flowbox != null)
                 @ptrCast(@alignCast(tab.flowbox.?))
             else
-                @ptrCast(@alignCast(tab.listbox));
+                @ptrCast(@alignCast(tab.colview));
             if (c.gtk_widget_grab_focus(target) != 0) return;
         }
         _ = c.gtk_widget_child_focus(self.root_box, c.GTK_DIR_TAB_FORWARD);
@@ -1266,7 +1266,7 @@ pub const BrowserView = struct {
     /// clicked rather than wherever focus happened to sit.
     pub fn focusOwnPane(self: *BrowserView) void {
         if (self.currentTab()) |tab| {
-            if (c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.listbox))) != 0) return;
+            if (c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview))) != 0) return;
         }
         _ = c.gtk_widget_grab_focus(self.root_box);
     }

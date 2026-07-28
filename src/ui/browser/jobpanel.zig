@@ -201,7 +201,7 @@ fn hostQualified(arena: std.mem.Allocator, host: []const u8, path: []const u8) [
 
 fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
     const service = self.transfer_service orelse return;
-    const rows = service.rows(arena) catch return;
+    const rows = service.rows(arena, @ptrCast(self)) catch return;
     for (rows) |d| {
         const terminal = d.state == .done or d.state == .failed or d.state == .canceled;
         const state: RowState = switch (d.state) {

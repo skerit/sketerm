@@ -79,6 +79,12 @@ const Intent = struct {
     done: u64 = 0,
     total: u64 = 0,
     resumed_from: u64 = 0,
+    /// The view (driver ctx) that submitted this record, or null for
+    /// records without one (restart recovery, watch sync-backs).
+    /// Volatile on purpose: it routes the PANEL ROW to the pane that
+    /// started the transfer, so a split view does not show every
+    /// download twice; ownership/recovery ignore it.
+    origin: ?*anyopaque = null,
 
     fn record(self: *const Intent) store.Record {
         return .{
@@ -932,7 +938,7 @@ pub const Service = struct {
         return null;
     }
 
-    pub fn submitDownload(self: *Service, host: []const u8, remote_path: []const u8, cache_path: []const u8, app_id: ?[]const u8) void {
+    pub fn submitDownload(self: *Service, host: []const u8, remote_path: []const u8, cache_path: []const u8, app_id: ?[]const u8, origin: ?*anyopaque) void {
         for (self.watches.items) |w| {
             if (!std.mem.eql(u8, w.host, host) or !std.mem.eql(u8, w.remote_path, remote_path)) continue;
             const current = fingerprint(w.cache_path);
@@ -966,15 +972,16 @@ pub const Service = struct {
         }
         const watch_token = self.newToken() catch return;
         defer self.allocator.free(watch_token);
-        self.appendIntent(.download, host, remote_path, "", cache_path, app_id orelse "", watch_token, 0);
+        self.appendIntent(.download, host, remote_path, "", cache_path, app_id orelse "", watch_token, 0, origin);
     }
 
-    fn appendIntent(self: *Service, kind: store.Kind, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, app_id: []const u8, watch_token: []const u8, generation: u64) void {
+    fn appendIntent(self: *Service, kind: store.Kind, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, app_id: []const u8, watch_token: []const u8, generation: u64, origin: ?*anyopaque) void {
         if (self.durability_error) {
             self.notify("transfer not started because recovery state is unavailable", .{});
             return;
         }
         const it = self.createIntent(kind, src_host, src_path, dst_host, dst_path, app_id, watch_token, generation) catch return;
+        it.origin = origin;
         self.intents.append(self.allocator, it) catch {
             it.handle.destroyRecord();
             it.destroy(self.allocator);
@@ -1167,12 +1174,35 @@ pub const Service = struct {
         return true;
     }
 
-    pub fn rows(self: *Service, allocator: std.mem.Allocator) ![]QueueRow {
+    /// True when `viewer` is the view that should render rows nobody
+    /// claims: the first registered driver (or anyone, with none).
+    fn viewerIsPrimary(self: *Service, viewer: ?*anyopaque) bool {
+        if (self.drivers.items.len == 0) return true;
+        return viewer != null and self.drivers.items[0].ctx == viewer.?;
+    }
+
+    /// Whether `origin` names a view that still renders a panel.
+    fn originLive(self: *Service, origin: ?*anyopaque) bool {
+        const o = origin orelse return false;
+        for (self.drivers.items) |d| {
+            if (d.ctx == o) return true;
+        }
+        return false;
+    }
+
+    pub fn rows(self: *Service, allocator: std.mem.Allocator, viewer: ?*anyopaque) ![]QueueRow {
         var out: std.ArrayList(QueueRow) = .empty;
         for (self.intents.items) |it| {
             // Retired records are bookkeeping, and mediated ones are
             // rendered by the view that runs them.
             if (it.retired or it.mediated) continue;
+            // One panel per record: the pane that submitted it, or --
+            // for records without a living submitter (recovery,
+            // watch sync-backs, a closed pane) -- the primary view.
+            // Without this a split view showed every download twice.
+            if (self.originLive(it.origin)) {
+                if (it.origin.? != viewer) continue;
+            } else if (!self.viewerIsPrimary(viewer)) continue;
             try out.append(allocator, .{
                 .token = it.token,
                 .label = std.fs.path.basename(it.dst_path),
@@ -1410,7 +1440,7 @@ pub const Service = struct {
                 active = true;
                 break;
             };
-            if (!active) self.appendIntent(.upload, "", w.cache_path, w.host, w.remote_path, "", w.token, w.dirty_generation);
+            if (!active) self.appendIntent(.upload, "", w.cache_path, w.host, w.remote_path, "", w.token, w.dirty_generation, null);
         }
     }
 };

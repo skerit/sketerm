@@ -958,7 +958,11 @@ pub fn buildInfoPanel(self: *BrowserView) *c.GtkWidget {
     c.gtk_label_set_wrap(@ptrCast(pname), 1);
     c.gtk_label_set_wrap_mode(@ptrCast(pname), c.PANGO_WRAP_WORD_CHAR);
     c.gtk_label_set_justify(@ptrCast(pname), c.GTK_JUSTIFY_CENTER);
-    c.gtk_widget_set_halign(pname, c.GTK_ALIGN_CENTER);
+    // FILL + max_width_chars, not CENTER: the label must wrap at the
+    // panel's width, never report the whole filename as its natural
+    // width (a huge natural/minimum forces the paned divider open).
+    c.gtk_widget_set_halign(pname, c.GTK_ALIGN_FILL);
+    c.gtk_label_set_max_width_chars(@ptrCast(pname), 1);
     c.gtk_label_set_selectable(@ptrCast(pname), 1);
     c.gtk_box_append(@ptrCast(inner), pname);
 
@@ -976,6 +980,10 @@ pub fn buildInfoPanel(self: *BrowserView) *c.GtkWidget {
     const pmeta = c.gtk_label_new("");
     c.gtk_label_set_xalign(@ptrCast(pmeta), 0);
     c.gtk_label_set_wrap(@ptrCast(pmeta), 1);
+    // WORD_CHAR: a long unbreakable token (path, URL) must not set the
+    // label's minimum width — that is what let content widen the panel.
+    c.gtk_label_set_wrap_mode(@ptrCast(pmeta), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_max_width_chars(@ptrCast(pmeta), 1);
     c.gtk_label_set_selectable(@ptrCast(pmeta), 1);
     c.gtk_widget_add_css_class(pmeta, "dim-label");
     c.gtk_widget_add_css_class(pmeta, "caption");
@@ -989,6 +997,8 @@ pub fn buildInfoPanel(self: *BrowserView) *c.GtkWidget {
     c.gtk_label_set_xalign(@ptrCast(ptext), 0);
     c.gtk_label_set_yalign(@ptrCast(ptext), 0);
     c.gtk_label_set_wrap(@ptrCast(ptext), 1);
+    c.gtk_label_set_wrap_mode(@ptrCast(ptext), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_max_width_chars(@ptrCast(ptext), 1);
     c.gtk_label_set_selectable(@ptrCast(ptext), 1);
     c.gtk_widget_add_css_class(ptext, "monospace");
     c.gtk_widget_add_css_class(ptext, "caption");
@@ -1169,6 +1179,7 @@ fn addInfoRow(self: *BrowserView, key: [*:0]const u8, value: []const u8) void {
     c.gtk_widget_set_hexpand(v, 1);
     c.gtk_label_set_wrap(@ptrCast(v), 1);
     c.gtk_label_set_wrap_mode(@ptrCast(v), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_max_width_chars(@ptrCast(v), 1);
     c.gtk_label_set_selectable(@ptrCast(v), 1);
     c.gtk_widget_add_css_class(v, "caption");
     c.gtk_grid_attach(@ptrCast(@alignCast(self.preview_grid)), k, 0, self.preview_grid_rows, 1, 1);
