@@ -7,6 +7,49 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
 
+pub const Transport = enum { local, ssh, udp };
+pub const RemoteMode = enum { auto, ssh, udp };
+
+pub const RemoteSpec = struct {
+    host: []const u8,
+    mode: RemoteMode,
+
+    pub fn parse(spec: []const u8) RemoteSpec {
+        if (std.mem.startsWith(u8, spec, "udp:")) return .{ .host = spec[4..], .mode = .udp };
+        if (std.mem.startsWith(u8, spec, "ssh:")) return .{ .host = spec[4..], .mode = .ssh };
+        return .{ .host = spec, .mode = .auto };
+    }
+};
+
+fn monotonicMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
+
+/// Reap a bootstrap SSH that should exit immediately after announcing.
+fn reapBootstrapChild(pid: c.pid_t) void {
+    var status: c_int = 0;
+    var deadline = monotonicMs() + 500;
+    while (monotonicMs() < deadline) {
+        const r = c.waitpid(pid, &status, c.WNOHANG);
+        if (r == pid or (r < 0 and std.posix.errno(r) != .INTR)) return;
+        _ = c.usleep(10_000);
+    }
+    _ = c.kill(pid, c.SIGTERM);
+    deadline = monotonicMs() + 250;
+    while (monotonicMs() < deadline) {
+        const r = c.waitpid(pid, &status, c.WNOHANG);
+        if (r == pid or (r < 0 and std.posix.errno(r) != .INTR)) return;
+        _ = c.usleep(10_000);
+    }
+    _ = c.kill(pid, c.SIGKILL);
+    while (true) {
+        const r = c.waitpid(pid, &status, 0);
+        if (r >= 0 or std.posix.errno(r) != .INTR) break;
+    }
+}
+
 /// Resolve the sketerm-mux binary: sibling of our own executable
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
@@ -28,6 +71,7 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
+    transport: Transport = .local,
     rbuf: std.ArrayList(u8) = .empty,
     /// Complete frames queued by GUI main-loop producers. These are
     /// flushed incrementally without polling so backpressure cannot freeze
@@ -187,8 +231,43 @@ pub const Conn = struct {
 
     pub fn deinit(self: *Conn) void {
         _ = c.close(self.fd);
+        self.fd = -1;
         self.rbuf.deinit(self.allocator);
         self.wbuf.deinit(self.allocator);
+    }
+
+    /// Connect to a remote daemon using the requested transport policy.
+    pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, port_range: ?[]const u8) !Conn {
+        if (std.mem.startsWith(u8, spec, "sock:")) return connectProbed(allocator, spec[5..]);
+        return connectRemoteUsing(allocator, spec, port_range, connectUdpAuto, connectUdp, connectSshWithRange);
+    }
+
+    const RemoteConnector = *const fn (std.mem.Allocator, []const u8, ?[]const u8) anyerror!Conn;
+
+    fn connectSshWithRange(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
+        return connectSsh(allocator, host);
+    }
+
+    fn connectUdpAuto(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
+        return connectUdpFor(allocator, host, port_range, 6_000);
+    }
+
+    fn connectRemoteUsing(
+        allocator: std.mem.Allocator,
+        spec: []const u8,
+        port_range: ?[]const u8,
+        auto_udp_connect: RemoteConnector,
+        forced_udp_connect: RemoteConnector,
+        ssh_connect: RemoteConnector,
+    ) !Conn {
+        const remote = RemoteSpec.parse(spec);
+        if (remote.host.len == 0) return error.BadPath;
+        return switch (remote.mode) {
+            .udp => forced_udp_connect(allocator, remote.host, port_range),
+            .ssh => ssh_connect(allocator, remote.host, port_range),
+            .auto => auto_udp_connect(allocator, remote.host, port_range) catch
+                ssh_connect(allocator, remote.host, port_range),
+        };
     }
 
     /// Mosh-style UDP transport: bootstrap over SSH (run
@@ -199,12 +278,17 @@ pub const Conn = struct {
     /// the plain SSH transport — but the live connection is
     /// encrypted UDP with roaming + retransmission (rudp.zig).
     pub fn connectUdp(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
-        // 1. Bootstrap: ssh prints the announcement on a pipe.
-        var pipe_fds: [2]c_int = undefined;
-        if (c.pipe(&pipe_fds) != 0) return error.SocketFailed;
+        return connectUdpFor(allocator, host, port_range, 20_000);
+    }
 
+    fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
+        const deadline = monotonicMs() + timeout_ms;
+        // 1. Bootstrap: ssh prints the announcement on a pipe.
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
+        var pipe_fds: [2]c_int = undefined;
+        if (c.pipe(&pipe_fds) != 0) return error.SocketFailed;
+        for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const ssh_env = c.getenv("SKETERM_SSH");
         const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
 
@@ -233,12 +317,21 @@ pub const Conn = struct {
         }
         _ = c.close(pipe_fds[1]);
 
-        // Read the announcement line (bounded; ssh chatter before it
-        // is skipped line by line).
+        // Read the announcement line with one absolute deadline; an
+        // old remote binary or wedged SSH must reach the SSH fallback.
         var line_buf: [512]u8 = undefined;
         var line_len: usize = 0;
         var announce: ?[]const u8 = null;
         outer: while (line_len < line_buf.len) {
+            const remain = deadline - monotonicMs();
+            if (remain <= 0) break;
+            var pfd = c.struct_pollfd{ .fd = pipe_fds[0], .events = c.POLLIN, .revents = 0 };
+            const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
+            if (pr < 0) {
+                if (std.posix.errno(pr) == .INTR) continue;
+                break;
+            }
+            if (pr == 0) continue;
             const n = c.read(pipe_fds[0], line_buf[line_len..].ptr, line_buf.len - line_len);
             if (n <= 0) break;
             line_len += @intCast(n);
@@ -257,8 +350,7 @@ pub const Conn = struct {
             }
         }
         _ = c.close(pipe_fds[0]);
-        var st: c_int = 0;
-        _ = c.waitpid(pid, &st, 0);
+        reapBootstrapChild(pid);
         const ann = announce orelse return error.SshTransportFailed;
 
         // "SKETERM-UDP <port> <keyhex>"
@@ -286,9 +378,12 @@ pub const Conn = struct {
         errdefer conn.deinit();
 
         conn.sendHello() catch return error.SshTransportFailed;
-        const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
+        const remain = deadline - monotonicMs();
+        if (remain <= 0) return error.SshTransportFailed;
+        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
+        conn.transport = .udp;
         return conn;
     }
 
@@ -379,6 +474,7 @@ pub const Conn = struct {
         const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
+        conn.transport = .ssh;
         return conn;
     }
 
@@ -681,6 +777,51 @@ test "transport fd is close-on-exec so it cannot leak into a later child" {
     const flags = c.fcntl(conn.fd, c.F_GETFD);
     try std.testing.expect(flags >= 0);
     try std.testing.expect(flags & c.FD_CLOEXEC != 0);
+}
+
+test "remote transport specs default to auto and preserve forced modes" {
+    const t = std.testing;
+    const automatic = RemoteSpec.parse("user@box");
+    try t.expectEqual(RemoteMode.auto, automatic.mode);
+    try t.expectEqualStrings("user@box", automatic.host);
+    const udp = RemoteSpec.parse("udp:user@box");
+    try t.expectEqual(RemoteMode.udp, udp.mode);
+    try t.expectEqualStrings("user@box", udp.host);
+    const ssh = RemoteSpec.parse("ssh:user@box");
+    try t.expectEqual(RemoteMode.ssh, ssh.mode);
+    try t.expectEqualStrings("user@box", ssh.host);
+}
+
+fn fakeUdpSuccess(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
+    if (!std.mem.eql(u8, host, "box")) return error.BadPath;
+    return .{ .allocator = allocator, .fd = -1, .transport = .udp };
+}
+
+fn fakeUdpFailure(_: std.mem.Allocator, _: []const u8, _: ?[]const u8) !Conn {
+    return error.SshTransportFailed;
+}
+
+fn fakeSshSuccess(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
+    if (!std.mem.eql(u8, host, "box")) return error.BadPath;
+    return .{ .allocator = allocator, .fd = -1, .transport = .ssh };
+}
+
+test "automatic remote transport prefers UDP and falls back to SSH" {
+    const t = std.testing;
+    const udp = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    try t.expectEqual(Transport.udp, udp.transport);
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess);
+    try t.expectEqual(Transport.ssh, ssh.transport);
+}
+
+test "explicit remote transport never falls back" {
+    const t = std.testing;
+    try t.expectError(
+        error.SshTransportFailed,
+        Conn.connectRemoteUsing(t.allocator, "udp:box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess),
+    );
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "ssh:box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    try t.expectEqual(Transport.ssh, ssh.transport);
 }
 
 test "welcome records older and future daemon profiles without rejecting either" {

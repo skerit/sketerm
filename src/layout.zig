@@ -34,8 +34,8 @@ pub const PaneSpec = struct {
     /// plain local PTY pane. On restore the session is attached if
     /// it still exists, or recreated under the same name.
     mux_session: []const u8 = "",
-    /// Transport-prefixed host for mux panes ("" = local daemon,
-    /// "user@box" = ssh, "udp:box" = mosh-style UDP).
+    /// Transport host for mux panes ("" = local, bare = automatic,
+    /// "udp:"/"ssh:" = forced transport).
     mux_host: []const u8 = "",
     /// File-browser face: paths of the browser's internal tabs (in
     /// order). Empty = the pane has no browser. Restore reattaches

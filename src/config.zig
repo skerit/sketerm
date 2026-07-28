@@ -135,18 +135,21 @@ pub const Profile = struct {
 /// `[domain.<name>]` sections — named remote mux endpoints, so the
 /// palette / `sketerm mux <name>` can offer "new tab on devbox"
 /// without retyping hosts.
+pub const DomainTransport = enum { auto, ssh, udp };
+
 pub const Domain = struct {
     name: []const u8,
     /// SSH endpoint, "host" or "user@host". Empty = section ignored.
     host: []const u8 = "",
-    /// How to reach the remote daemon after the SSH bootstrap.
-    transport: enum { ssh, udp } = .ssh,
+    /// Auto probes roaming UDP first and falls back to SSH.
+    transport: DomainTransport = .auto,
 
     /// Allocate the transport-prefixed host string the durable-tab
-    /// plumbing speaks ("udp:host" / "host").
+    /// plumbing speaks (bare = auto, "udp:"/"ssh:" = forced).
     pub fn hostSpec(self: *const Domain, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
         return switch (self.transport) {
-            .ssh => allocator.dupe(u8, self.host),
+            .auto => allocator.dupe(u8, self.host),
+            .ssh => std.fmt.allocPrint(allocator, "ssh:{s}", .{self.host}),
             .udp => std.fmt.allocPrint(allocator, "udp:{s}", .{self.host}),
         };
     }
@@ -830,7 +833,7 @@ pub const Config = struct {
         for (self.domains.items) |dom| {
             try w.print("\n[domain.{s}]\n", .{dom.name});
             if (dom.host.len > 0) try w.print("host = {s}\n", .{dom.host});
-            if (dom.transport != .ssh) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
+            if (dom.transport != .auto) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
         }
     }
 
@@ -1007,7 +1010,9 @@ fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value:
     if (std.mem.eql(u8, key, "host")) {
         dom.host = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "transport")) {
-        if (std.mem.eql(u8, value, "ssh")) {
+        if (std.mem.eql(u8, value, "auto")) {
+            dom.transport = .auto;
+        } else if (std.mem.eql(u8, value, "ssh")) {
             dom.transport = .ssh;
         } else if (std.mem.eql(u8, value, "udp")) {
             dom.transport = .udp;
@@ -1761,14 +1766,19 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
         \\[domain.work]
         \\host = build.example.com
         \\
+        \\[domain.legacy]
+        \\host = old.example.com
+        \\transport = ssh
+        \\
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), cfg.domains.items.len);
+    try std.testing.expectEqual(@as(usize, 3), cfg.domains.items.len);
     try std.testing.expectEqualStrings("skerit@192.168.1.2", cfg.domains.items[0].host);
     try std.testing.expectEqual(.udp, cfg.domains.items[0].transport);
-    try std.testing.expectEqual(.ssh, cfg.domains.items[1].transport);
+    try std.testing.expectEqual(.auto, cfg.domains.items[1].transport);
+    try std.testing.expectEqual(.ssh, cfg.domains.items[2].transport);
 
     const spec = cfg.resolveDomain("devbox", std.testing.allocator).?;
     defer std.testing.allocator.free(spec);
@@ -1776,6 +1786,9 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     const spec2 = cfg.resolveDomain("work", std.testing.allocator).?;
     defer std.testing.allocator.free(spec2);
     try std.testing.expectEqualStrings("build.example.com", spec2);
+    const spec3 = cfg.resolveDomain("legacy", std.testing.allocator).?;
+    defer std.testing.allocator.free(spec3);
+    try std.testing.expectEqualStrings("ssh:old.example.com", spec3);
     try std.testing.expect(cfg.resolveDomain("nope", std.testing.allocator) == null);
 
     // Round-trip via serialise.
@@ -1784,8 +1797,10 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     try cfg.serialise(&w);
     var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer cfg2.deinit();
-    try std.testing.expectEqual(@as(usize, 2), cfg2.domains.items.len);
+    try std.testing.expectEqual(@as(usize, 3), cfg2.domains.items.len);
     try std.testing.expectEqual(.udp, cfg2.domains.items[0].transport);
+    try std.testing.expectEqual(.auto, cfg2.domains.items[1].transport);
+    try std.testing.expectEqual(.ssh, cfg2.domains.items[2].transport);
     try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
 }
 

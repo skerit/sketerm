@@ -33,6 +33,10 @@ pub const ConnectCtx = struct {
     allocator: std.mem.Allocator,
     hc: *HostConn,
     host: []u8,
+    /// Owned copy of Config.mux_udp_port_range (empty = unset); the
+    /// worker cannot touch the config arena, which may be swapped
+    /// by a reload while the connect is in flight.
+    port_range: []u8 = &.{},
     result: ?muxclient.Conn = null,
 };
 
@@ -80,7 +84,13 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
             return hc;
         },
     };
+    var cfg = @import("../../config.zig").Config.load(self.allocator);
+    defer cfg.deinit();
+    if (cfg.mux_udp_port_range.len > 0) {
+        ctx.port_range = self.allocator.dupe(u8, cfg.mux_udp_port_range) catch &.{};
+    }
     const th = std.Thread.spawn(.{}, connectThreadMain, .{ctx}) catch {
+        if (ctx.port_range.len > 0) self.allocator.free(ctx.port_range);
         self.allocator.free(ctx.host);
         self.allocator.destroy(ctx);
         hc.state = .dead;
@@ -94,10 +104,11 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
 
 pub fn connectThreadMain(ctx: *ConnectCtx) void {
     const alloc = std.heap.c_allocator;
-    const result = if (std.mem.startsWith(u8, ctx.host, "udp:"))
-        muxclient.Conn.connectUdp(alloc, ctx.host[4..], null)
-    else
-        muxclient.Conn.connectSsh(alloc, ctx.host);
+    const result = muxclient.Conn.connectRemote(
+        alloc,
+        ctx.host,
+        if (ctx.port_range.len > 0) ctx.port_range else null,
+    );
     if (result) |conn| {
         ctx.result = conn;
     } else |_| {
@@ -111,6 +122,7 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const hc = ctx.hc;
     const allocator = ctx.allocator;
     defer {
+        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
         allocator.free(ctx.host);
         allocator.destroy(ctx);
     }
@@ -127,7 +139,12 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     if (ctx.result) |conn| {
         hc.conn = conn;
         view.wireReady(hc);
-        view.setStatusFmt("connected to {s}", .{hc.label()});
+        const remote = muxclient.RemoteSpec.parse(ctx.host);
+        if (remote.mode == .auto and conn.transport == .ssh) {
+            view.setStatusFmt("UDP unavailable; connected to {s} over SSH", .{remote.host});
+        } else {
+            view.setStatusFmt("connected to {s} over {s}", .{ remote.host, @tagName(conn.transport) });
+        }
     } else {
         hc.state = .dead;
         view.setStatusFmt("cannot connect to {s}", .{hc.label()});

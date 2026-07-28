@@ -51,9 +51,10 @@ instead of prompting. Test with `ssh -o BatchMode=yes server true`.
 ## Usage
 
 ```
-sketerm ssh server          # durable remote shell as a new tab (SSH transport)
-sketerm ssh -u server       # same, over encrypted UDP (mosh-style)
+sketerm ssh server          # automatic UDP, with SSH fallback
+sketerm ssh -u server       # force encrypted UDP (mosh-style)
 sketerm mux server          # TUI picker: list/attach/create/kill sessions
+sketerm mux ssh:server      # force the SSH-pipe transport
 sketerm mux server list     # scriptable variants: list | attach <name> | new | kill <name>
 ```
 
@@ -66,7 +67,7 @@ Named endpoints go in `~/.config/sketerm/config.conf`:
 ```
 [domain.devbox]
 host = user@192.168.1.2
-transport = udp        # ssh (default) | udp
+transport = auto       # auto (default) | ssh | udp
 ```
 
 after which `sketerm ssh devbox` works, and the command palette
@@ -74,7 +75,11 @@ gains a "New Tab on devbox" entry.
 
 ## UDP transport and firewalls
 
-`sketerm ssh -u` (or `transport = udp`) does one SSH round to start
+Bare hosts select UDP automatically and fall back to the SSH pipe when
+the probe cannot complete. Interactive GUI connections bootstrap over
+SSH so the UDP probe cannot add a multi-second main-loop stall, then
+move the live attachment to UDP in the background. `sketerm ssh -u` (or
+`transport = udp`) forces UDP: it does one SSH round to start
 the bootstrap, then switches to ChaCha20-Poly1305-sealed datagrams:
 lower latency, loss recovery by retransmission, and roaming — the
 session survives IP changes (Wi-Fi → LTE, suspend/resume) without
@@ -91,9 +96,9 @@ mux_udp_port_range = 60000:61000
 
 The remote bootstrap then binds the first free port in that range
 (`sketerm-mux --udp-listen --udp-port 60000:61000`). If the UDP
-path is blocked, the client prints a warning after 5 s and gives up
-after 15 s — fall back to plain `sketerm ssh server`, which needs
-nothing beyond the SSH connection itself.
+path is blocked, automatic mode continues over SSH (CLI commands also
+report the fallback). Forced UDP prints a warning after 5 s and gives up
+after 15 s.
 
 Typing feel on high-latency links: printable keystrokes are echoed
 predictively (underlined until the server confirms), mosh-style.

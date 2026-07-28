@@ -7,8 +7,8 @@
 //! renders each window locally. There is therefore one hard
 //! requirement: a sketerm window must already be open on this desktop.
 //!
-//! Transports mirror `sketerm mux`: SSH by default, encrypted roaming
-//! UDP with `-u`. `$SKETERM_SSH` overrides the ssh binary (tests fake
+//! Transports mirror `sketerm mux`: automatic UDP with SSH fallback;
+//! `-u` forces roaming UDP. `$SKETERM_SSH` overrides the ssh binary (tests fake
 //! a remote host); key/agent auth is required (BatchMode — no password
 //! prompts on a non-tty pipe).
 
@@ -29,8 +29,8 @@ const USAGE =
     \\renders the forwarded windows. The remote needs key/agent SSH
     \\auth and `sketerm-mux` installed.
     \\
-    \\  -u    mosh-style: bootstrap over SSH, then run over encrypted
-    \\        UDP with roaming — the app survives network changes.
+    \\  -u    force mosh-style encrypted UDP. Without it, sketerm
+    \\        probes UDP automatically and falls back to SSH.
     \\  -i    isolate: run under a private runtime dir + no shared D-Bus
     \\        bus, so single-instance apps (pcmanfm, GApplication) open
     \\        here instead of handing off to a copy already rendering on
@@ -46,7 +46,7 @@ const USAGE =
     \\  sketerm app -i archdev pcmanfm
     \\
     \\<domain> names from config.conf `[domain.<name>]` sections work
-    \\(udp-transport domains imply -u).
+    \\(transport defaults to auto; ssh/udp can be forced per domain).
     \\
 ;
 
@@ -92,14 +92,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // domain (or -u) picks the roaming mux transport.
     var cfg = Config.load(allocator);
     defer cfg.deinit();
-    var host: []const u8 = parsed.host;
-    var use_udp = parsed.udp;
-    const domain_spec = cfg.resolveDomain(host, allocator);
+    var host_spec: []const u8 = parsed.host;
+    const domain_spec = cfg.resolveDomain(host_spec, allocator);
     defer if (domain_spec) |s| allocator.free(s);
-    if (domain_spec) |s| host = s;
-    if (std.mem.startsWith(u8, host, "udp:")) {
-        use_udp = true;
-        host = host["udp:".len..];
+    if (domain_spec) |s| host_spec = s;
+    var forced_udp_buf: [320]u8 = undefined;
+    if (parsed.udp) {
+        const remote = mux_client.RemoteSpec.parse(host_spec);
+        host_spec = std.fmt.bufPrint(&forced_udp_buf, "udp:{s}", .{remote.host}) catch return 1;
     }
 
     const port_range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
@@ -110,7 +110,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
     // Null = no GUI to render into.
-    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
+    if (runNativeApp(allocator, host_spec, parsed.command, port_range, parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
     errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
     return 1;
 }
@@ -122,9 +122,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 /// failure returns a status with its own message.
 fn runNativeApp(
     allocator: std.mem.Allocator,
-    host: []const u8,
+    host_spec: []const u8,
     command: []const []const u8,
-    use_udp: bool,
     port_range: ?[]const u8,
     isolated: bool,
     gpu: bool,
@@ -134,11 +133,9 @@ fn runNativeApp(
     const gui_sock = ipc_client.resolveSocket(allocator, null) orelse return null;
     allocator.free(gui_sock);
 
-    var conn = (if (use_udp)
-        mux_client.Conn.connectUdp(allocator, host, port_range)
-    else
-        mux_client.Conn.connectSsh(allocator, host)) catch {
-        errMsg("could not reach {s} over {s} (key/agent auth + sketerm-mux required there)", .{ host, if (use_udp) "UDP" else "ssh" });
+    const remote = mux_client.RemoteSpec.parse(host_spec);
+    var conn = mux_client.Conn.connectRemote(allocator, host_spec, port_range) catch {
+        errMsg("could not reach {s} using {s} transport policy (key/agent auth + sketerm-mux required there)", .{ remote.host, @tagName(remote.mode) });
         return 1;
     };
     defer conn.deinit();
@@ -162,18 +159,14 @@ fn runNativeApp(
         .kb_layout = kb_layout,
     }) catch return 1;
     const ok = conn.recvExpectFor(&.{.ok}, 20_000) catch {
-        errMsg("daemon on {s} refused the app session", .{host});
+        errMsg("daemon on {s} refused the app session", .{remote.host});
         return 1;
     };
     ok.deinit(allocator);
 
     // The GUI attaches with its own connection and owns the session
     // from here — over the same transport, so UDP sessions roam.
-    var host_buf: [320]u8 = undefined;
-    const attach_host: []const u8 = if (use_udp)
-        (std.fmt.bufPrint(&host_buf, "udp:{s}", .{host}) catch return 1)
-    else
-        host;
+    const attach_host = host_spec;
     if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, attach_host, true)) {
         // guiCommand already printed the specific reason (e.g. "no
         // running sketerm window found", or "attach failed: no such
@@ -184,7 +177,7 @@ fn runNativeApp(
         );
         return 1;
     }
-    std.debug.print("sketerm: app session '{s}' on {s} — windows render via the sketerm GUI\n", .{ name, host });
+    std.debug.print("sketerm: app session '{s}' on {s} over {s} — windows render via the sketerm GUI\n", .{ name, remote.host, @tagName(conn.transport) });
     return 0;
 }
 

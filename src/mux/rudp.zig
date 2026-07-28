@@ -123,6 +123,12 @@ pub const Channel = struct {
         self.backlog.deinit(self.allocator);
     }
 
+    pub fn queuedBytes(self: *const Channel) usize {
+        var total = self.backlog.items.len;
+        for (self.inflight.items) |segment| total += segment.data.len;
+        return total;
+    }
+
     fn seal(self: *Channel, inner: []const u8, out: []u8) []const u8 {
         self.crypto_seq += 1;
         const seq = self.crypto_seq;
@@ -470,4 +476,20 @@ test "rudp: key hex round-trip" {
     const hex = keyToHex(key, &hexbuf);
     try std.testing.expectEqual(key, keyFromHex(hex).?);
     try std.testing.expectEqual(@as(?[KEY_LEN]u8, null), keyFromHex("short"));
+}
+
+test "rudp: queuedBytes includes the window and unsent backlog" {
+    const a = std.testing.allocator;
+    const key: [KEY_LEN]u8 = @splat(4);
+    var channel = Channel.init(a, key, true);
+    defer channel.deinit();
+    const bytes = try a.alloc(u8, SEG_MAX * (WINDOW + 2));
+    defer a.free(bytes);
+    @memset(bytes, 0x5a);
+    const Drop = struct {
+        fn emit(_: ?*anyopaque, _: []const u8) void {}
+    };
+    try channel.send(bytes, 0, Drop.emit, null);
+    try std.testing.expectEqual(bytes.len, channel.queuedBytes());
+    try std.testing.expect(channel.backlog.items.len > 0);
 }

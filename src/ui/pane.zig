@@ -278,6 +278,8 @@ pub const Pane = struct {
     /// it the browser is unreachable once hidden: only its own toolbar
     /// could flip the faces.
     browser_banner: ?*c.GtkWidget = null,
+    /// Persistent transport-loss status; click retries immediately.
+    connection_banner: ?*c.GtkWidget = null,
     /// The GraphicsOffload wrapping the GLArea — hidden while an app
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
@@ -457,6 +459,7 @@ pub const Pane = struct {
         terminal.on_clipboard_get = onClipboardGetEvent;
         terminal.on_render_request = onRenderRequest;
         terminal.on_crashed = onCrashEvent;
+        terminal.on_connection_state = onConnectionStateEvent;
         terminal.on_activity = onActivityEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
@@ -1889,6 +1892,44 @@ fn onActivityEvent(ctx: ?*anyopaque) void {
 fn onCrashEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_crashed) |f| f(self.win_crash_ctx, self);
+}
+
+fn onConnectionStateEvent(ctx: ?*anyopaque, state: Terminal.ConnectionState, retry_seconds: u32) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.widgets_dead) return;
+    if (state == .connected) {
+        if (self.connection_banner) |banner| c.gtk_widget_set_visible(banner, 0);
+        return;
+    }
+    if (self.connection_banner == null) {
+        const btn = c.gtk_button_new_with_label("");
+        c.gtk_widget_add_css_class(btn, "sketerm-app-banner");
+        c.gtk_widget_set_hexpand(btn, 1);
+        c.gtk_widget_set_tooltip_text(btn, "The session is still running remotely. Click to retry now.");
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onConnectionBannerClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        if (self.wrapper_box) |wrap| c.gtk_box_prepend(@ptrCast(wrap), btn);
+        self.connection_banner = btn;
+    }
+    var buf: [160:0]u8 = undefined;
+    switch (state) {
+        .lost, .reconnecting => c.gtk_button_set_label(@ptrCast(self.connection_banner.?), "Connection lost. Reconnecting..."),
+        .retry_wait => {
+            const text = std.fmt.bufPrintZ(&buf, "Reconnect failed. Retrying in {d}s. Click to retry now.", .{retry_seconds}) catch {
+                c.gtk_button_set_label(@ptrCast(self.connection_banner.?), "Reconnect failed. Click to retry now.");
+                c.gtk_widget_set_visible(self.connection_banner.?, 1);
+                return;
+            };
+            c.gtk_button_set_label(@ptrCast(self.connection_banner.?), text.ptr);
+        },
+        .unavailable => c.gtk_button_set_label(@ptrCast(self.connection_banner.?), "Session is no longer available. Click to try again."),
+        .connected => unreachable,
+    }
+    c.gtk_widget_set_visible(self.connection_banner.?, 1);
+}
+
+fn onConnectionBannerClick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    self.terminal.retryRemoteNow();
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
