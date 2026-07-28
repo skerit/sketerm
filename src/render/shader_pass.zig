@@ -60,12 +60,9 @@ pub const TextureDecl = struct {
 
 /// One `shader_param.<name> = <value>` config entry. Float params
 /// carry `value`; color params (hex `#rrggbb` in the config) carry
-/// `color` and ignore `value`.
-pub const ParamKV = struct {
-    name: []const u8,
-    value: f32 = 0,
-    color: ?[3]f32 = null,
-};
+/// `color` and ignore `value`. Lives in config.zig so the mux graph
+/// can import config without pulling in GL.
+pub const ParamKV = @import("../config.zig").ParamKV;
 
 pub const MAX_PARAMS = 24;
 

@@ -889,57 +889,16 @@ fn runTrashRestore(spec: Spec) u8 {
 
 // ── durable cross-host copy coordinator ──────────────────────────
 
-/// The daemon host's `mux_udp_port_range` from a config body.
-/// Top-level key only: the first `[section]` header ends the scan
-/// scope, and a malformed value is treated as unset (config.zig
-/// warns about it at GUI load; the job just degrades to no range).
-fn udpPortRangeFromBody(body: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, body, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
-        if (line[0] == '[') return null;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), "mux_udp_port_range")) continue;
-        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return null;
-        const lo = std.fmt.parseInt(u16, value[0..colon], 10) catch return null;
-        const hi = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch return null;
-        if (lo == 0 or hi < lo) return null;
-        return value;
-    }
-    return null;
-}
-
-/// This process cannot import config.zig (GUI graph), so the one key
-/// the transport policy needs is scanned out of the daemon host's own
-/// config.conf. Journal-resumed jobs therefore also read the CURRENT
-/// value instead of a stale copy from submission time.
-fn udpPortRangeFromConfig(allocator: std.mem.Allocator) ?[]u8 {
-    var path_buf: [4096:0]u8 = undefined;
-    const path = blk: {
-        if (c.getenv("XDG_CONFIG_HOME")) |x|
-            break :blk std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{std.mem.sliceTo(x, 0)}) catch return null;
-        if (c.getenv("HOME")) |home|
-            break :blk std.fmt.bufPrintZ(&path_buf, "{s}/.config/sketerm/config.conf", .{std.mem.sliceTo(home, 0)}) catch return null;
-        return null;
-    };
-    const f = c.fopen(path.ptr, "r") orelse return null;
-    defer _ = c.fclose(f);
-    const body = allocator.alloc(u8, 256 * 1024) catch return null;
-    defer allocator.free(body);
-    const n = c.fread(body.ptr, 1, body.len, f);
-    const range = udpPortRangeFromBody(body[0..n]) orelse return null;
-    return allocator.dupe(u8, range) catch null;
-}
-
 fn connectHostFs(allocator: std.mem.Allocator, host: []const u8) !fsdrive.Fs {
     const conn = if (host.len == 0)
         try muxclient.Conn.connectLocalAutostart(allocator)
     else blk: {
-        const range = udpPortRangeFromConfig(allocator);
-        defer if (range) |r| allocator.free(r);
-        break :blk try muxclient.Conn.connectRemote(allocator, host, range);
+        // The daemon host's own config governs its outbound UDP;
+        // journal-resumed jobs read the CURRENT value, not a stale
+        // copy journaled at submission time.
+        var cfg = @import("../config.zig").Config.load(allocator);
+        defer cfg.deinit();
+        break :blk try muxclient.Conn.connectRemote(allocator, host, cfg.udpRange());
     };
     return fsdrive.Fs.initConn(allocator, conn);
 }
@@ -2722,16 +2681,6 @@ fn applyPdfinfo(m: *mediameta.Meta, text: []const u8) void {
 }
 
 // ── tests ───────────────────────────────────────────────────────
-
-test "udpPortRangeFromBody finds only the valid top-level key" {
-    const t = std.testing;
-    try t.expectEqualStrings("60000:61000", udpPortRangeFromBody(
-        "# mux_udp_port_range = 1:2\nfont_size = 12\nmux_udp_port_range = 60000:61000\n",
-    ).?);
-    try t.expect(udpPortRangeFromBody("[profile.x]\nmux_udp_port_range = 1:2\n") == null);
-    try t.expect(udpPortRangeFromBody("mux_udp_port_range = 5:2\n") == null);
-    try t.expect(udpPortRangeFromBody("mux_udp_port_range = junk\n") == null);
-}
 
 test "nameMatches: substring default, glob with wildcards, ci" {
     const t = std.testing;

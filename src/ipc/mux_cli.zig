@@ -666,12 +666,8 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         }
         var cfg = @import("../config.zig").Config.load(allocator);
         defer cfg.deinit();
-        const range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
-            cfg.mux_udp_port_range
-        else
-            null;
         const remote = mux_client.RemoteSpec.parse(h);
-        const conn = mux_client.Conn.connectRemote(allocator, h, range) catch {
+        const conn = mux_client.Conn.connectRemote(allocator, h, cfg.udpRange()) catch {
             const mode_name = @tagName(remote.mode);
             _ = c.fprintf(
                 platform.stderr(),

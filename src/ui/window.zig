@@ -4237,13 +4237,9 @@ pub const Window = struct {
             if (std.mem.startsWith(u8, h, "sock:")) {
                 return mux_client.Conn.connectProbed(self.allocator, h[5..]);
             }
-            const range: ?[]const u8 = if (self.config.mux_udp_port_range.len > 0)
-                self.config.mux_udp_port_range
-            else
-                null;
             const remote = mux_client.RemoteSpec.parse(h);
             if (remote.mode == .auto) return mux_client.Conn.connectSsh(self.allocator, remote.host);
-            return mux_client.Conn.connectRemote(self.allocator, h, range);
+            return mux_client.Conn.connectRemote(self.allocator, h, self.config.udpRange());
         }
         return mux_client.Conn.connectLocalAutostart(self.allocator);
     }

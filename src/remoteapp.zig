@@ -102,15 +102,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         host_spec = std.fmt.bufPrint(&forced_udp_buf, "udp:{s}", .{remote.host}) catch return 1;
     }
 
-    const port_range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
-        cfg.mux_udp_port_range
-    else
-        null;
-
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
     // Null = no GUI to render into.
-    if (runNativeApp(allocator, host_spec, parsed.command, port_range, parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
+    if (runNativeApp(allocator, host_spec, parsed.command, cfg.udpRange(), parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
     errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
     return 1;
 }

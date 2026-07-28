@@ -162,6 +162,15 @@ pub const Domain = struct {
 ///   always   — ask on every close
 pub const ConfirmClose = enum { never, multiple, always };
 
+/// One `shader_param.<name>` override. Defined here (not in the
+/// render graph) so the mux side can import config.zig; the shader
+/// passes import it FROM config.
+pub const ParamKV = struct {
+    name: []const u8,
+    value: f32 = 0,
+    color: ?[3]f32 = null,
+};
+
 pub const Config = struct {
     /// The Default profile — every pane-level setting (font, colors,
     /// shell, scrollback, shader). Named profiles in `profiles` are
@@ -394,7 +403,7 @@ pub const Config = struct {
     /// uniforms custom shaders declare via `//@param` lines (glow,
     /// vignette, curvature, …). Uploaded every frame — a reload
     /// re-tunes live without recompiling.
-    shader_params: std.ArrayList(@import("render/shader_pass.zig").ParamKV) = .empty,
+    shader_params: std.ArrayList(ParamKV) = .empty,
 
     /// Named profiles. Defined via `[profile.<name>]` sections —
     /// each is a COMPLETE ProfileSettings (seeded from the Default
@@ -437,6 +446,12 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         if (self.arena) |*a| a.deinit();
         self.arena = null;
+    }
+
+    /// `mux_udp_port_range` in the optional-slice form the transport
+    /// connectors take (null = no pinned range).
+    pub fn udpRange(self: *const Config) ?[]const u8 {
+        return if (self.mux_udp_port_range.len > 0) self.mux_udp_port_range else null;
     }
 
     /// Deep-copy every heap-backed field (strings, keybinds, profiles)
