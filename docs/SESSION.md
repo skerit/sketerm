@@ -10875,3 +10875,34 @@ SSH-to-UDP upgrade; commands typed after the upgrade reached the same
 session. In a second isolated Xvfb run, the exact GUI proxy process was
 killed: the GUI logged loss, reattached over a new SSH proxy, stayed in
 the same pane, and commands before and after reconnect both completed.
+
+## 2026-07-28: code-quality pass (dedup, dead code, window.zig split)
+
+Five refactors, no behavior change, each its own commit. config.zig is
+now importable from the mux graph (ParamKV moved out of render/
+shader_pass — the only GUI dependency), so cross-host fsjobs parse the
+REAL config instead of a one-key scanner, and Config.udpRange()
+replaces the load-and-extract port-range boilerplate at every
+transport call site; the configured UDP range now also reaches mounts,
+browser hosts and cross-host jobs (sketerm-mux still links libc only —
+checked with ldd). wire.compactConsumed replaces three hand-rolled
+buffer slide-downs; reconnectDone/finishTransportUpgrade share one
+install-and-replay epilogue; Remote.bumpGeneration owns the fence
+counter. Dead worker-era code removed: EventRing/RING_CAP and
+util/ring.zig had no consumer, stale mainDrain/worker comments now
+describe the daemon-backed reality, spawnFsJob's fourteen parameters
+collapsed into FsJobArgs. Remote's connection flags stay booleans
+(the axes are genuinely orthogonal — a closed session keeps its
+transport until deinit for kill/detach), but ~20 hand-assembled guard
+clauses became named predicates (canSend/isLive/awaitingReconnect)
+documented once on the fields. window.zig shrank 8854 → 7320 lines via
+two extractions using the browser-split pattern (functions keep their
+*Window receiver, aliased back into Window so call sites are
+unchanged): ui/muxtabs.zig (durable tabs, session attach, layout-
+restore jobs, tabless app sessions) and ui/remotectl.zig (ipcDispatch,
+cross-window pane/tab lookup, notification slots).
+
+Verified per commit: build, mux-portable, suite (1056 pass / 5 skip —
+two util/ring tests removed with the module), smoke-mux, Xvfb
+smoke-e2e (which drives the moved ipcDispatch and the daemon-backed
+pane path end to end).
