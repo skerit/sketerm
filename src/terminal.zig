@@ -252,8 +252,16 @@ pub const Terminal = struct {
         pending_record: u8 = 0,
         watch_id: c_uint = 0,
         idle_kick_id: c_uint = 0,
+        /// ── Connection state axes (orthogonal, see predicates below) ──
+        /// `connected` = transport attached (`conn` valid). False while
+        /// the reconnect machinery owns the link. A CLOSED session keeps
+        /// its transport until Terminal.deinit — kill/detach ride it.
         connected: bool = true,
+        /// Terminal.deinit fence: no new callbacks or jobs may start.
         destroying: bool = false,
+        /// In-flight worker jobs. Both can be true at once — a transport
+        /// lost mid-upgrade starts a reconnect while the stale upgrade
+        /// job is still returning; generation fencing discards the loser.
         reconnect_job_active: bool = false,
         upgrade_job_active: bool = false,
         reconnect_timer: c_uint = 0,
@@ -261,7 +269,8 @@ pub const Terminal = struct {
         retry_delay_ms: u32 = 1000,
         pending_rows: u16 = 0,
         pending_cols: u16 = 0,
-        /// Set when the daemon said GONE/EXIT — no more writes.
+        /// Session ended (daemon EXIT/GONE or protocol error) — terminal
+        /// state, never cleared, no more writes.
         closed: bool = false,
         /// This session is GUI-owned (a flipped local tab, not an explicit
         /// durable/remote one): tearing the terminal down KILLS the session
@@ -302,8 +311,25 @@ pub const Terminal = struct {
         /// with a different id is stale (we navigated away) and ignored.
         list_xfer: u32 = 0,
 
+        /// Session running AND transport attached — writes may go out.
+        pub fn canSend(self: *const Remote) bool {
+            return !self.closed and self.connected;
+        }
+
+        /// canSend outside teardown — new background machinery
+        /// (transport upgrade, state-changing requests) may start.
+        fn isLive(self: *const Remote) bool {
+            return self.canSend() and !self.destroying;
+        }
+
+        /// Transport lost on a still-running session outside teardown —
+        /// the reconnect machinery may run.
+        fn awaitingReconnect(self: *const Remote) bool {
+            return !self.connected and !self.closed and !self.destroying;
+        }
+
         pub fn sendInput(self: *Remote, bytes: []const u8) bool {
-            if (self.closed or !self.connected) return false;
+            if (!self.canSend()) return false;
             self.conn.sendFrame(.input, bytes) catch return false;
             return true;
         }
@@ -510,7 +536,7 @@ pub const Terminal = struct {
             if (drain.terminal) |term| {
                 if (term.remote) |remote| {
                     remote.idle_kick_id = 0;
-                    if (remote.connected and !remote.closed)
+                    if (remote.canSend())
                         _ = remoteSocketCb(-1, c.G_IO_IN, @ptrCast(term));
                 }
             }
@@ -538,7 +564,7 @@ pub const Terminal = struct {
     /// Preserve the pane and frozen screen while reattaching its durable session.
     fn transportLost(self: *Terminal, reason: []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or remote.destroying or !remote.connected) return;
+        if (!remote.isLive()) return;
         remote.connected = false;
         if (remote.watch_id != 0) {
             _ = c.g_source_remove(remote.watch_id);
@@ -563,7 +589,7 @@ pub const Terminal = struct {
 
     fn startReconnectAttempt(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or remote.destroying or remote.connected or remote.reconnect_job_active) return;
+        if (!remote.awaitingReconnect() or remote.reconnect_job_active) return;
         if (remote.reconnect_timer != 0) {
             _ = c.g_source_remove(remote.reconnect_timer);
             remote.reconnect_timer = 0;
@@ -584,7 +610,7 @@ pub const Terminal = struct {
     /// live attachment to UDP off the main loop when the host supports it.
     fn startTransportUpgrade(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or remote.destroying or !remote.connected or remote.upgrade_job_active) return;
+        if (!remote.isLive() or remote.upgrade_job_active) return;
         if (remote.conn.transport != .ssh) return;
         if (!remote.control_known) return;
         const host = remote.host orelse return;
@@ -698,7 +724,7 @@ pub const Terminal = struct {
         }
         if (job.upgrade) remote.upgrade_job_active = false else remote.reconnect_job_active = false;
         if (job.upgrade) return self.finishTransportUpgrade(job);
-        if (remote.closed or remote.connected) return 0;
+        if (!remote.awaitingReconnect()) return 0;
         if (job.session_missing) {
             self.notifyConnectionState(.unavailable, 0);
             std.debug.print("sketerm: mux session '{s}': no longer available\n", .{remote.session});
@@ -751,7 +777,7 @@ pub const Terminal = struct {
 
     fn finishTransportUpgrade(self: *Terminal, job: *ReconnectJob) c.gboolean {
         const remote = self.remote orelse return 0;
-        if (remote.closed or remote.destroying or !remote.connected or job.session_missing) return 0;
+        if (!remote.isLive() or job.session_missing) return 0;
         if (remote.upload != null or remote.download != null or remote.pending_record != 0) return 0;
         if (job.control) {
             if (job.conn) |*candidate| {
@@ -762,7 +788,7 @@ pub const Terminal = struct {
         if (job.conn == null) return 0;
         const snapshot = job.snapshot orelse return 0;
         self.applyRemoteSnapshot(snapshot) catch return 0;
-        if (!remote.connected or remote.closed or remote.destroying) return 0;
+        if (!remote.isLive()) return 0;
         if (remote.watch_id != 0) {
             _ = c.g_source_remove(remote.watch_id);
             remote.watch_id = 0;
@@ -787,7 +813,7 @@ pub const Terminal = struct {
 
     fn scheduleReconnect(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or remote.destroying or remote.connected or remote.reconnect_timer != 0) return;
+        if (!remote.awaitingReconnect() or remote.reconnect_timer != 0) return;
         const delay = remote.retry_delay_ms;
         remote.retry_delay_ms = nextReconnectDelay(delay);
         self.notifyConnectionState(.retry_wait, @max(1, delay / 1000));
@@ -806,7 +832,7 @@ pub const Terminal = struct {
 
     pub fn retryRemoteNow(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.connected or remote.closed or remote.reconnect_job_active) return;
+        if (!remote.awaitingReconnect() or remote.reconnect_job_active) return;
         if (remote.reconnect_timer != 0) {
             _ = c.g_source_remove(remote.reconnect_timer);
             remote.reconnect_timer = 0;
@@ -1045,7 +1071,7 @@ pub const Terminal = struct {
     /// frame comes back.
     pub fn renameSession(self: *Terminal, new_name: []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         self.cancelTransportUpgrade();
         if (remote.pending_rename != null or remote.pending_record != 0) return;
         if (new_name.len == 0 or new_name.len > 64) return;
@@ -1058,7 +1084,7 @@ pub const Terminal = struct {
 
     fn sendPendingRename(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         const pending = remote.pending_rename orelse return;
         remote.conn.sendJson(.rename, .{ .name = remote.session, .new_name = pending }) catch
             self.transportLost("rename write failed");
@@ -1117,7 +1143,7 @@ pub const Terminal = struct {
 
     fn sendChanClose(self: *Terminal, id: u32) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         var hdr: [4]u8 = undefined;
         remote.conn.sendFrame(.chan_close, mux_wire.putChanHeader(&hdr, id)) catch
             self.transportLost("channel-close write failed");
@@ -1192,7 +1218,7 @@ pub const Terminal = struct {
     fn aappFlush(self: *Terminal, aa: *AApp) void {
         if (comptime builtin.os.tag != .linux) return;
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         const out = aa.sink.takeOut();
         if (out.len == 0) return;
         var payload: std.ArrayList(u8) = .empty;
@@ -1234,7 +1260,7 @@ pub const Terminal = struct {
     /// local (non-remote) or closed terminal. Paths are copied.
     pub fn startUpload(self: *Terminal, paths: []const []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         for (paths) |p| {
             if (p.len == 0) continue;
             const owned = self.allocator.dupe(u8, p) catch continue;
@@ -1308,7 +1334,7 @@ pub const Terminal = struct {
             up.idle_id = 0;
             return 0; // G_SOURCE_REMOVE
         };
-        if (remote.closed or !remote.connected or remote.upload != up) {
+        if (!remote.canSend() or remote.upload != up) {
             up.idle_id = 0;
             return 0; // G_SOURCE_REMOVE
         }
@@ -1480,7 +1506,7 @@ pub const Terminal = struct {
     /// file:// URI. One download runs at a time.
     pub fn startDownload(self: *Terminal, remote_path: []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         const path = stripFileUri(remote_path);
         const base = std.fs.path.basename(path);
         if (path.len == 0 or base.len == 0) return;
@@ -1589,7 +1615,7 @@ pub const Terminal = struct {
     /// The reply arrives via `on_listing`.
     pub fn requestList(self: *Terminal, path: []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         remote.list_xfer = remote.upload_next_id;
         remote.upload_next_id += 1;
         remote.conn.sendJson(.file_list, .{ .xfer = remote.list_xfer, .path = path }) catch
@@ -1627,7 +1653,7 @@ pub const Terminal = struct {
     /// Request the remote host's installed-app list. Reply → `on_apps`.
     pub fn requestApps(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         remote.conn.sendFrame(.app_list, "") catch self.transportLost("app-list write failed");
     }
 
@@ -1636,7 +1662,7 @@ pub const Terminal = struct {
     /// to a remote path. `recording` flips when the daemon acks.
     pub fn requestRecordStart(self: *Terminal, path: []const u8) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         self.cancelTransportUpgrade();
         if (remote.pending_rename != null or remote.pending_record != 0) return;
         remote.pending_record = 1;
@@ -1645,7 +1671,7 @@ pub const Terminal = struct {
 
     pub fn requestRecordStop(self: *Terminal) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         self.cancelTransportUpgrade();
         if (remote.pending_rename != null or remote.pending_record != 0) return;
         remote.pending_record = 2;
@@ -1722,7 +1748,7 @@ pub const Terminal = struct {
     /// the current holder; without it a held lease is left alone.
     pub fn requestControl(self: *Terminal, force: bool) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         self.cancelTransportUpgrade();
         remote.force_control = force;
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1839,7 +1865,7 @@ pub const Terminal = struct {
 
     fn wsappFlush(self: *Terminal, wa: *WsApp) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         const out = wa.host.takeOut();
         if (out.len == 0) return;
         var payload: std.ArrayList(u8) = .empty;
@@ -1935,7 +1961,7 @@ pub const Terminal = struct {
     /// Ship pending compositor events to the daemon.
     fn nappFlush(self: *Terminal, na: *NApp) void {
         const remote = self.remote orelse return;
-        if (remote.closed or !remote.connected) return;
+        if (!remote.canSend()) return;
         const out = na.host.takeOut();
         if (out.len == 0) return;
         var payload: std.ArrayList(u8) = .empty;
@@ -1981,7 +2007,7 @@ pub const Terminal = struct {
     /// input. Routed to the mux daemon (every Terminal is daemon-backed).
     pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
         const r = self.remote orelse return;
-        if (!r.sendInput(bytes) and r.connected and !r.closed)
+        if (!r.sendInput(bytes) and r.canSend())
             self.transportLost("input write failed");
     }
 
@@ -1992,13 +2018,13 @@ pub const Terminal = struct {
         const r = self.remote orelse return;
         r.pending_rows = rows;
         r.pending_cols = cols;
-        if (r.closed or !r.connected) return;
+        if (!r.canSend()) return;
         self.sendPendingResize();
     }
 
     fn sendPendingResize(self: *Terminal) void {
         const r = self.remote orelse return;
-        if (r.closed or !r.connected or r.pending_rows == 0 or r.pending_cols == 0) return;
+        if (!r.canSend() or r.pending_rows == 0 or r.pending_cols == 0) return;
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u16, payload[0..2], r.pending_rows, .little);
         std.mem.writeInt(u16, payload[2..4], r.pending_cols, .little);
@@ -2271,7 +2297,7 @@ pub const Terminal = struct {
             remote.wsapps.deinit(self.allocator);
             remote.aapps.deinit(self.allocator);
             remote.predictor.deinit();
-            if (remote.connected and !remote.closed) {
+            if (remote.canSend()) {
                 // A stalled upload can leave queued frames in conn.wbuf;
                 // the kill/detach below must not silently queue behind
                 // them and die with the fd. Bounded, best-effort drain.
