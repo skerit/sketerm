@@ -518,11 +518,7 @@ fn flushStreamPending(pending: *std.ArrayList(u8), fd: c_int) bool {
         }
         return false;
     }
-    if (off > 0) {
-        const remaining = pending.items.len - off;
-        std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[off..]);
-        pending.shrinkRetainingCapacity(remaining);
-    }
+    @import("mux/wire.zig").compactConsumed(pending, off);
     return true;
 }
 
