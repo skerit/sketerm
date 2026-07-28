@@ -321,11 +321,10 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     var chan = rudp.Channel.init(allocator, key, false);
     defer chan.deinit();
     var out = UdpOut{ .fd = udp_fd };
-    // A bootstrap whose client never shows up must not squat the
-    // port forever (abandoned `ssh host sketerm-mux --udp-listen`).
-    // Once a client HAS authenticated, we wait indefinitely — that
-    // persistence is what makes roaming + reattach work.
-    return bridgeUdp(allocator, &chan, &out, udp_fd, unix_fd, unix_fd, true, nowMs() + 60_000, null);
+    // A bootstrap whose client never shows up must not squat the port
+    // forever. An authenticated but abandoned peer gets the same roaming
+    // grace as the local bridge, then retires so stale viewers do not leak.
+    return bridgeUdp(allocator, &chan, &out, udp_fd, unix_fd, unix_fd, true, nowMs() + 60_000, null, 30_000);
 }
 
 /// `--udp-connect <ip> <port> <keyhex>`: run on the LOCAL side as a
@@ -343,7 +342,9 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     const pz = std.fmt.bufPrintZ(&port_z, "{d}", .{port}) catch return 1;
 
     var hints: cc.struct_addrinfo = std.mem.zeroes(cc.struct_addrinfo);
-    hints.ai_family = cc.AF_UNSPEC;
+    // --udp-listen currently binds IPv4, so do not select an IPv6 AAAA
+    // result first (notably localhost -> ::1) for an unreachable peer.
+    hints.ai_family = cc.AF_INET;
     hints.ai_socktype = cc.SOCK_DGRAM;
     var res: ?*cc.struct_addrinfo = null;
     if (cc.getaddrinfo(hz.ptr, pz.ptr, &hints, &res) != 0 or res == null) {
@@ -379,7 +380,7 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     return bridgeUdp(allocator, &chan, &out, udp_fd, 0, 1, false, start + 15_000, .{
         .at = start + 5_000,
         .msg = warn_msg,
-    });
+    }, 30_000);
 }
 
 /// Shared pump: encrypted UDP ↔ a local byte stream.
@@ -400,11 +401,18 @@ fn bridgeUdp(
     roam: bool,
     abandon_deadline: ?i64,
     warn: ?UdpWarn,
+    authenticated_timeout_ms: ?i64,
 ) u8 {
     const cc = @import("c.zig").c;
+    const queue_limit = 8 << 20;
     var deliver: std.ArrayList(u8) = .empty;
     defer deliver.deinit(allocator);
+    var stream_pending: std.ArrayList(u8) = .empty;
+    defer stream_pending.deinit(allocator);
+    const stream_flags = cc.fcntl(stream_out, cc.F_GETFL, @as(c_int, 0));
+    if (stream_flags >= 0) _ = cc.fcntl(stream_out, cc.F_SETFL, stream_flags | cc.O_NONBLOCK);
     var ever_authenticated = false;
+    var last_authenticated_ms: i64 = 0;
     var warned = false;
 
     while (true) {
@@ -412,6 +420,12 @@ fn bridgeUdp(
         if (abandon_deadline) |dl| {
             if (!ever_authenticated and now > dl) {
                 if (warn != null) std.debug.print("sketerm-mux: giving up on UDP transport\n", .{});
+                return 1;
+            }
+        }
+        if (authenticated_timeout_ms) |limit| {
+            if (ever_authenticated and now - last_authenticated_ms >= limit) {
+                std.debug.print("sketerm-mux: authenticated UDP peer silent for {d}s; reconnecting\n", .{@divTrunc(limit, 1000)});
                 return 1;
             }
         }
@@ -431,10 +445,22 @@ fn bridgeUdp(
 
         var fds = [_]cc.struct_pollfd{
             .{ .fd = udp_fd, .events = cc.POLLIN, .revents = 0 },
-            .{ .fd = stream_in, .events = cc.POLLIN, .revents = 0 },
+            .{ .fd = stream_in, .events = if (chan.queuedBytes() < queue_limit) cc.POLLIN else 0, .revents = 0 },
+            .{ .fd = stream_out, .events = if (stream_pending.items.len > 0) cc.POLLOUT else 0, .revents = 0 },
         };
         if (cc.poll(&fds, fds.len, timeout) < 0) continue;
         const now2 = nowMs();
+
+        if (fds[0].revents & (cc.POLLERR | cc.POLLNVAL) != 0 or
+            fds[1].revents & (cc.POLLERR | cc.POLLNVAL) != 0 or
+            fds[2].revents & (cc.POLLERR | cc.POLLNVAL) != 0)
+        {
+            return 1;
+        }
+
+        if (stream_pending.items.len > 0 and fds[2].revents & cc.POLLOUT != 0) {
+            if (!flushStreamPending(&stream_pending, stream_out)) return 0;
+        }
 
         if (fds[0].revents & cc.POLLIN != 0) {
             var dgram: [rudp.MAX_DGRAM + 64]u8 = undefined;
@@ -446,16 +472,19 @@ fn bridgeUdp(
                 const alive = chan.onDatagram(dgram[0..@intCast(n)], now2, &deliver, UdpOut.emit, @ptrCast(out)) catch true;
                 if (chan.last_rx_authenticated) {
                     ever_authenticated = true;
+                    last_authenticated_ms = now2;
                     if (roam) {
                         out.peer = from;
                         out.peer_len = from_len;
                     }
                 }
                 if (deliver.items.len > 0) {
-                    if (!writeFull(stream_out, deliver.items)) {
+                    if (stream_pending.items.len + deliver.items.len > queue_limit) {
                         chan.sendBye(now2, UdpOut.emit, @ptrCast(out));
-                        return 0;
+                        return 1;
                     }
+                    stream_pending.appendSlice(allocator, deliver.items) catch return 1;
+                    if (!flushStreamPending(&stream_pending, stream_out)) return 0;
                 }
                 if (!alive) return 0; // peer said bye
             }
@@ -471,6 +500,30 @@ fn bridgeUdp(
             chan.send(buf[0..@intCast(n)], now2, UdpOut.emit, @ptrCast(out)) catch return 1;
         }
     }
+}
+
+fn flushStreamPending(pending: *std.ArrayList(u8), fd: c_int) bool {
+    const cc = @import("c.zig").c;
+    var off: usize = 0;
+    while (off < pending.items.len) {
+        const n = cc.write(fd, pending.items.ptr + off, pending.items.len - off);
+        if (n > 0) {
+            off += @intCast(n);
+            continue;
+        }
+        if (n < 0) {
+            const err = std.posix.errno(n);
+            if (err == .INTR) continue;
+            if (err == .AGAIN) break;
+        }
+        return false;
+    }
+    if (off > 0) {
+        const remaining = pending.items.len - off;
+        std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[off..]);
+        pending.shrinkRetainingCapacity(remaining);
+    }
+    return true;
 }
 
 /// Connect to the local daemon socket, starting the daemon when

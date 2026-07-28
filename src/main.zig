@@ -72,10 +72,11 @@ const HELP_TEXT =
     \\  sketerm mux [host]     TUI picker: attach / spawn / kill
     \\                         daemon-backed sessions that survive
     \\                         GUI restarts. With a host, manages the
-    \\                         REMOTE daemon over SSH. Also: mux
+    \\                         REMOTE daemon over UDP when reachable,
+    \\                         with automatic SSH fallback. Also: mux
     \\                         [host] list / attach <name> / new /
     \\                         kill <name>.
-    \\  sketerm ssh <host>     mosh-style: durable remote shell on
+    \\  sketerm ssh <host>     durable remote shell on
     \\                         <host> as a tab in the running window.
     \\                         Needs key auth + sketerm-mux on the
     \\                         host; survives disconnects (reattach
@@ -85,8 +86,8 @@ const HELP_TEXT =
     \\                         on this desktop (this sketerm window
     \\                         renders them). Needs key auth and
     \\                         sketerm-mux on the remote.
-    \\                         -u: mosh-style encrypted UDP with
-    \\                         roaming.
+    \\                         -u: force encrypted roaming UDP instead
+    \\                         of automatic UDP/SSH selection.
     \\  sketerm files [spec]   File browser as its OWN application
     \\                         ("Sketerm Files", own icon and taskbar
     \\                         entry, id dev.sker.sketerm.files): each
@@ -281,10 +282,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return @import("doctor.zig").run(allocator, doc_args);
     }
 
-    // `sketerm ssh [-u] <host>` — mosh-style: open a durable remote
+    // `sketerm ssh [-u] <host>` — open a durable remote
     // shell on <host> as a tab in the running window. Sugar for
-    // `sketerm mux [udp:]<host> new`. -u picks the encrypted UDP
-    // transport (lower latency, roams across network changes).
+    // `sketerm mux [udp:|ssh:]<host> new`. Bare hosts automatically
+    // probe UDP then fall back to SSH; -u forces encrypted UDP.
     if (argv.len >= 3 and std.mem.eql(u8, std.mem.span(argv[1]), "ssh")) {
         const use_udp = std.mem.eql(u8, std.mem.span(argv[2]), "-u");
         if (use_udp and argv.len < 4) return 2;
@@ -297,10 +298,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer if (domain_spec) |s| allocator.free(s);
         if (domain_spec) |s| host_raw = s;
         var host_buf: [300]u8 = undefined;
-        const host: []const u8 = if (use_udp and !std.mem.startsWith(u8, host_raw, "udp:"))
-            std.fmt.bufPrint(&host_buf, "udp:{s}", .{host_raw}) catch return 2
-        else
-            host_raw;
+        const host: []const u8 = if (use_udp) blk: {
+            const remote = @import("mux/client.zig").RemoteSpec.parse(host_raw);
+            break :blk std.fmt.bufPrint(&host_buf, "udp:{s}", .{remote.host}) catch return 2;
+        } else host_raw;
         const ssh_args = [_][]const u8{ host, "new" };
         return @import("ipc/mux_cli.zig").run(allocator, &ssh_args);
     }

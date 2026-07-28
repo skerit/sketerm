@@ -786,6 +786,7 @@ pub const Window = struct {
         // Tabless app sessions: detach (apps are durable — they keep
         // running in the daemon like any other session).
         for (self.app_sessions.items) |as| {
+            if (as.reap_idle_id != 0) _ = c.g_source_remove(as.reap_idle_id);
             as.terminal.clearSinks();
             as.terminal.deinit();
             self.allocator.destroy(as);
@@ -2146,7 +2147,7 @@ pub const Window = struct {
         defer snap.deinit(self.allocator);
         // Pass the pre-allocated id so it isn't double-allocated (keeps pane
         // ids contiguous + matches the env-exported SKETERM_PANE_ID).
-        const pane = try self.makeRemotePaneFromSnap(conn, name, null, snap.payload, pane_id);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, null, snap.payload, pane_id, false, false);
         if (pane.terminal.remote) |r| {
             r.ephemeral = true; // GUI-owned → close kills the session (no leak)
             r.predictor.force = .never;
@@ -3499,7 +3500,7 @@ pub const Window = struct {
     pub fn killFocusedMuxSession(self: *Window) void {
         const pane = self.focusedPane() orelse return;
         const remote = pane.terminal.remote orelse return;
-        if (!remote.closed) {
+        if (!remote.closed and remote.connected) {
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
             if (std.json.Stringify.value(.{ .name = remote.session }, .{}, &aw.writer)) {
@@ -4221,23 +4222,14 @@ pub const Window = struct {
 
     // ── Durable tabs (sketerm-mux) ───────────────────────────────
 
-    /// Connect to the mux daemon — local (spawning it if absent) or
-    /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
+    /// Connect locally or to a remote host using its transport policy.
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
-        // The transport handshake forks (ssh/udp bridge) and blocks the main
-        // loop; name it so a death in here is attributable.
+        // The transport handshake forks and blocks the main loop; name it so
+        // a death in here is attributable. Bare hosts bootstrap over SSH and
+        // Terminal upgrades the live attachment to UDP in the background.
         crashlog.set("mux connect host={s}", .{host orelse "local"});
         if (host) |h| {
-            // "udp:host" selects the mosh-style encrypted UDP
-            // transport (ssh bootstrap, then roaming datagrams).
-            if (std.mem.startsWith(u8, h, "udp:")) {
-                const range: ?[]const u8 = if (self.config.mux_udp_port_range.len > 0)
-                    self.config.mux_udp_port_range
-                else
-                    null;
-                return mux_client.Conn.connectUdp(self.allocator, h[4..], range);
-            }
             // "sock:/path" targets a specific daemon instance's unix
             // socket (an MCP private/named daemon) — connect only,
             // NEVER autostart: a dead assistant daemon must not be
@@ -4245,14 +4237,20 @@ pub const Window = struct {
             if (std.mem.startsWith(u8, h, "sock:")) {
                 return mux_client.Conn.connectProbed(self.allocator, h[5..]);
             }
-            return mux_client.Conn.connectSsh(self.allocator, h);
+            const range: ?[]const u8 = if (self.config.mux_udp_port_range.len > 0)
+                self.config.mux_udp_port_range
+            else
+                null;
+            const remote = mux_client.RemoteSpec.parse(h);
+            if (remote.mode == .auto) return mux_client.Conn.connectSsh(self.allocator, remote.host);
+            return mux_client.Conn.connectRemote(self.allocator, h, range);
         }
         return mux_client.Conn.connectLocalAutostart(self.allocator);
     }
 
     /// Connect + attach a session as a viewer tab/app (switcher rows,
     /// `sketerm cli attach-session`). Host semantics of muxConnect
-    /// (null local, "user@box", "udp:box", "sock:/path").
+    /// (null local, bare auto, forced "udp:"/"ssh:", "sock:/path").
     pub fn attachSessionByHost(self: *Window, name: []const u8, host: ?[]const u8) bool {
         const conn = self.muxConnect(host) catch return false;
         self.attachMux(conn, name, host, null) catch return false;
@@ -4430,6 +4428,8 @@ pub const Window = struct {
         /// Exit handled — reap is deferred to an idle (the exit
         /// fires inside the terminal's own socket callback).
         doomed: bool = false,
+        unavailable: bool = false,
+        reap_idle_id: c_uint = 0,
     };
 
     /// Attach an app session with NO pane and NO tab: like a desktop
@@ -4441,17 +4441,25 @@ pub const Window = struct {
         name: []const u8,
         host: ?[]const u8,
         snap_payload: []const u8,
+        read_only: bool,
+        want_control: bool,
     ) !void {
         var conn = conn_in;
         const term = blk: {
             errdefer conn.deinit();
-            break :blk try Terminal.initRemote(self.allocator, conn, name, snap_payload);
+            break :blk try Terminal.initRemote(
+                self.allocator,
+                conn,
+                name,
+                snap_payload,
+                host,
+                self.config.mux_udp_port_range,
+                read_only,
+                want_control,
+            );
         };
         errdefer term.deinit();
         term.debug_to_stderr = self.debug_events;
-        if (host) |h| {
-            term.remote.?.host = self.allocator.dupe(u8, h) catch null;
-        }
         const as = try self.allocator.create(AppSession);
         errdefer self.allocator.destroy(as);
         as.* = .{ .window = self, .terminal = term };
@@ -4461,6 +4469,7 @@ pub const Window = struct {
         // (remoteClosed sets child_exited, then fires this).
         term.on_render_request = appSessionRender;
         term.on_crashed = appSessionCrashed;
+        term.on_connection_state = appSessionConnectionState;
         term.on_peers = appSessionPeers;
         term.on_app_view = appSessionAppView;
     }
@@ -4470,28 +4479,40 @@ pub const Window = struct {
     /// log is the user's only diagnostic (failed launch, or a
     /// single-instance handoff) — materialize a held tab around it.
     fn appSessionExited(self: *Window, as: *AppSession) void {
+        _ = self;
         if (as.doomed) return;
         as.doomed = true;
-        if (!as.terminal.remote.?.app_window_opened) {
-            const status = as.terminal.screen.child_exit_status;
-            if (self.adoptAppSessionIntoTab(as)) |pane| {
-                self.holdExitedAppPane(pane, status);
-                return; // the terminal lives on inside the pane
-            }
-            return; // adoption freed everything on failure
-        }
-        // Deferred: we are inside the terminal's own socket callback.
-        _ = c.g_idle_add(@ptrCast(&appSessionReapIdle), @ptrCast(as));
+        // Always defer: this is called from the Terminal's socket callback,
+        // so even an allocation failure while materializing a log tab must
+        // not deinit that Terminal before its callback returns.
+        as.reap_idle_id = c.g_idle_add(@ptrCast(&appSessionReapIdle), @ptrCast(as));
     }
 
     fn appSessionReapIdle(user: ?*anyopaque) callconv(.c) c_int {
         const as = cast.userData(AppSession, user);
+        as.reap_idle_id = 0;
+        if (!as.terminal.remote.?.app_window_opened) {
+            const status = as.terminal.screen.child_exit_status;
+            const win = as.window;
+            const unavailable = as.unavailable;
+            if (win.adoptAppSessionIntoTab(as)) |pane| {
+                if (unavailable)
+                    win.holdUnavailableAppPane(pane)
+                else
+                    win.holdExitedAppPane(pane, status);
+            }
+            return 0;
+        }
         as.window.unlistAppSession(as);
         return 0; // G_SOURCE_REMOVE
     }
 
     /// Drop a tabless app session: fence, deinit terminal, free.
     fn unlistAppSession(self: *Window, as: *AppSession) void {
+        if (as.reap_idle_id != 0) {
+            _ = c.g_source_remove(as.reap_idle_id);
+            as.reap_idle_id = 0;
+        }
         for (self.app_sessions.items, 0..) |it, i| {
             if (it == as) {
                 _ = self.app_sessions.swapRemove(i);
@@ -4510,6 +4531,10 @@ pub const Window = struct {
     /// failure the whole session is dropped and null returned.
     fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
         const term = as.terminal;
+        if (as.reap_idle_id != 0) {
+            _ = c.g_source_remove(as.reap_idle_id);
+            as.reap_idle_id = 0;
+        }
         for (self.app_sessions.items, 0..) |it, i| {
             if (it == as) {
                 _ = self.app_sessions.swapRemove(i);
@@ -4595,20 +4620,25 @@ pub const Window = struct {
         // env at spawn time; passing it here keeps that id (no double-alloc,
         // so pane ids stay contiguous — `split --pane 2` must find pane 2).
         pane_id: ?u32,
+        read_only: bool,
+        want_control: bool,
     ) !*Pane {
         var conn = conn_in;
         const term = blk: {
             errdefer conn.deinit();
-            break :blk try Terminal.initRemote(self.allocator, conn, name, snap_payload);
+            break :blk try Terminal.initRemote(
+                self.allocator,
+                conn,
+                name,
+                snap_payload,
+                host,
+                self.config.mux_udp_port_range,
+                read_only,
+                want_control,
+            );
         };
         errdefer term.deinit();
         term.debug_to_stderr = self.debug_events;
-        // Remember the transport host so session renames can rebuild
-        // the "⌁ name @ host" tab title (and layout save records it).
-        if (host) |h| {
-            term.remote.?.host = self.allocator.dupe(u8, h) catch null;
-        }
-
         const pane = try self.makePane(term);
         pane.id = pane_id orelse self.allocPaneId();
         errdefer pane.deinit();
@@ -4683,7 +4713,7 @@ pub const Window = struct {
             }
         }
         defer snap.deinit(self.allocator);
-        const pane = try self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
+        const pane = try self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null, false, false);
         const profile = self.findProfile(spec.profile);
         pane.active_profile = if (profile) |p| p.name else null;
         self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = spec.font_size });
@@ -4844,14 +4874,11 @@ pub const Window = struct {
 
     fn muxRestoreConnect(job: *MuxRestoreJob) !void {
         const mux_client = @import("../mux/client.zig");
-        var conn = if (std.mem.startsWith(u8, job.host, "udp:"))
-            try mux_client.Conn.connectUdp(
-                job.allocator,
-                job.host[4..],
-                if (job.port_range.len > 0) job.port_range else null,
-            )
-        else
-            try mux_client.Conn.connectSsh(job.allocator, job.host);
+        var conn = try mux_client.Conn.connectRemote(
+            job.allocator,
+            job.host,
+            if (job.port_range.len > 0) job.port_range else null,
+        );
         errdefer conn.deinit();
 
         // Bound the attach handshake: a remote that answers the hello
@@ -4936,8 +4963,10 @@ pub const Window = struct {
         }
 
         const conn = job.conn.?;
+        const remote = @import("../mux/client.zig").RemoteSpec.parse(job.host);
+        const used_ssh_fallback = remote.mode == .auto and conn.transport == .ssh;
         job.conn = null; // ownership moves to makeRemotePaneFromSnap
-        const pane = win.makeRemotePaneFromSnap(conn, job.session, job.host, job.snap.?, null) catch |err| {
+        const pane = win.makeRemotePaneFromSnap(conn, job.session, job.host, job.snap.?, null, false, false) catch |err| {
             std.debug.print(
                 "sketerm: mux restore '{s}' @ {s}: pane build failed ({s})\n",
                 .{ job.session, job.host, @errorName(err) },
@@ -4952,6 +4981,10 @@ pub const Window = struct {
             win.unlistPane(pane);
             return 0;
         };
+        if (used_ssh_fallback) {
+            var msg: [256]u8 = undefined;
+            showToast(win, std.fmt.bufPrint(&msg, "UDP unavailable for {s}; restored over SSH", .{remote.host}) catch "UDP unavailable; restored over SSH");
+        }
         return 0;
     }
 
@@ -5071,6 +5104,14 @@ pub const Window = struct {
             c.adw_tab_page_set_needs_attention(page, 1);
     }
 
+    fn holdUnavailableAppPane(self: *Window, pane: *Pane) void {
+        const page = tabPageForPane(self, pane) orelse return;
+        c.adw_tab_page_set_title(page, "app session unavailable");
+        c.adw_tab_page_set_tooltip(page, "The remote daemon no longer has this app session. Its last log remains in this tab.");
+        if (page != c.adw_tab_view_get_selected_page(self.tab_view))
+            c.adw_tab_page_set_needs_attention(page, 1);
+    }
+
     const CrashBtnCtx = struct { allocator: std.mem.Allocator, window: *Window, pane: *Pane };
 
     /// The pane's session died unexpectedly — replace the GL terminal with a
@@ -5159,11 +5200,11 @@ pub const Window = struct {
             return error.BadSnapshot;
         };
         if (takeover == null and self.config.app_view == .window and envelope.app) {
-            return self.attachMuxApp(conn, name, host, snap.payload);
+            return self.attachMuxApp(conn, name, host, snap.payload, lease == .read_only, lease == .control);
         }
 
         crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
-        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null, lease == .read_only, lease == .control);
         pane.active_profile = if (profile) |p| p.name else null;
         self.applyPaneConfig(pane, .{ .profile = profile });
 
@@ -7739,10 +7780,24 @@ fn appSessionRender(ctx: ?*anyopaque) void {
     as.window.appSessionExited(as);
 }
 
-/// Connection dropped uncleanly — same cleanup path.
+/// Protocol corruption remains fatal; ordinary transport loss reconnects.
 fn appSessionCrashed(ctx: ?*anyopaque) void {
     const as = cast.userData(Window.AppSession, ctx);
     as.window.appSessionExited(as);
+}
+
+fn appSessionConnectionState(ctx: ?*anyopaque, state: Terminal.ConnectionState, _: u32) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    switch (state) {
+        .lost => showToast(as.window, "Remote app connection lost; reconnecting"),
+        .unavailable => {
+            showToast(as.window, "Remote app session is no longer available");
+            as.unavailable = true;
+            as.window.appSessionExited(as);
+        },
+        .connected => showToast(as.window, "Remote app reconnected"),
+        else => {},
+    }
 }
 
 /// AI-driving badge on the floating windows (no pane border to tint).

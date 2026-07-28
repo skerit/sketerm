@@ -19,7 +19,7 @@ const MUX_HELP =
     \\Usage: sketerm mux [host] [command]
     \\
     \\No command: interactive session picker (TUI) — local daemon,
-    \\or <host>'s daemon over SSH (`sketerm mux user@box`).
+    \\or <host>'s daemon (UDP when reachable, SSH fallback).
     \\  Up/Down or j/k  select        Enter  attach as tab
     \\  n  new durable tab            x      kill selected session
     \\  r  rename selected session    q / Esc  quit
@@ -53,6 +53,8 @@ const MUX_HELP =
     \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
+    \\Bare hosts select transport automatically; udp:<host> and
+    \\ssh:<host> force one transport.
     \\
 ;
 
@@ -654,18 +656,6 @@ fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u
 
 pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
     if (host) |h| {
-        if (std.mem.startsWith(u8, h, "udp:")) {
-            var cfg = @import("../config.zig").Config.load(allocator);
-            defer cfg.deinit();
-            const range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
-                cfg.mux_udp_port_range
-            else
-                null;
-            return mux_client.Conn.connectUdp(allocator, h[4..], range) catch {
-                _ = c.fprintf(platform.stderr(), "sketerm mux: UDP transport failed (key auth? sketerm-mux on the host? UDP not filtered?)\n");
-                return null;
-            };
-        }
         // "sock:/path" = a specific daemon instance's unix socket (an
         // MCP private daemon). Connect only — never autostart one.
         if (std.mem.startsWith(u8, h, "sock:")) {
@@ -674,21 +664,40 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
                 return null;
             };
         }
-        return mux_client.Conn.connectSsh(allocator, h) catch {
+        var cfg = @import("../config.zig").Config.load(allocator);
+        defer cfg.deinit();
+        const range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
+            cfg.mux_udp_port_range
+        else
+            null;
+        const remote = mux_client.RemoteSpec.parse(h);
+        const conn = mux_client.Conn.connectRemote(allocator, h, range) catch {
+            const mode_name = @tagName(remote.mode);
             _ = c.fprintf(
                 platform.stderr(),
-                "sketerm mux: ssh transport to %.*s failed\n" ++
-                    "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
-                    "  common causes: sketerm-mux not installed there; binary built\n" ++
-                    "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
-                    "  key/agent auth not set up (BatchMode forbids password prompts)\n",
-                @as(c_int, @intCast(h.len)),
-                h.ptr,
-                @as(c_int, @intCast(h.len)),
-                h.ptr,
+                "sketerm mux: cannot reach %.*s using %.*s transport policy\n" ++
+                "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
+                "  common causes: sketerm-mux not installed there; binary built\n" ++
+                "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
+                "  key/agent auth not set up; or UDP filtered when forced\n",
+                @as(c_int, @intCast(remote.host.len)),
+                remote.host.ptr,
+                @as(c_int, @intCast(mode_name.len)),
+                mode_name.ptr,
+                @as(c_int, @intCast(remote.host.len)),
+                remote.host.ptr,
             );
             return null;
         };
+        if (remote.mode == .auto and conn.transport == .ssh) {
+            _ = c.fprintf(
+                platform.stderr(),
+                "sketerm mux: UDP unavailable for %.*s; connected over SSH\n",
+                @as(c_int, @intCast(remote.host.len)),
+                remote.host.ptr,
+            );
+        }
+        return conn;
     }
     const path = mux_daemon.defaultSocketPath(allocator) catch return null;
     defer allocator.free(path);

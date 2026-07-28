@@ -68,6 +68,7 @@ pub fn hostSectionTitle(host: []const u8, buf: []u8) []const u8 {
     var name = host;
     if (std.mem.lastIndexOfScalar(u8, name, '@')) |at| name = name[at + 1 ..];
     if (std.mem.startsWith(u8, name, "udp:")) name = name["udp:".len..];
+    if (std.mem.startsWith(u8, name, "ssh:")) name = name["ssh:".len..];
     if (name.len == 0) name = host;
     const text = std.fmt.bufPrint(buf, "{s} Places", .{name}) catch return "Remote Places";
     if (text.len > 0) text[0] = std.ascii.toUpper(text[0]);
