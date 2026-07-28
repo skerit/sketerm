@@ -316,6 +316,13 @@ pub const Terminal = struct {
             self.conn.sendFrame(.input, bytes) catch return false;
             return true;
         }
+
+        /// Invalidate every in-flight reconnect/upgrade job. 0 is
+        /// reserved as "never fenced", so the counter skips it.
+        fn bumpGeneration(self: *Remote) void {
+            self.reconnect_generation +%= 1;
+            if (self.reconnect_generation == 0) self.reconnect_generation = 1;
+        }
     };
 
     const ReconnectJob = struct {
@@ -570,8 +577,7 @@ pub const Terminal = struct {
             _ = c.g_source_remove(remote.reconnect_timer);
             remote.reconnect_timer = 0;
         }
-        remote.reconnect_generation +%= 1;
-        if (remote.reconnect_generation == 0) remote.reconnect_generation = 1;
+        remote.bumpGeneration();
         const job = self.makeReconnectJob(false) orelse return self.scheduleReconnect();
         remote.reconnect_job_active = true;
         self.notifyConnectionState(.reconnecting, 0);
@@ -592,8 +598,7 @@ pub const Terminal = struct {
         if (!remote.control_known) return;
         const host = remote.host orelse return;
         if (mux_client.RemoteSpec.parse(host).mode != .auto) return;
-        remote.reconnect_generation +%= 1;
-        if (remote.reconnect_generation == 0) remote.reconnect_generation = 1;
+        remote.bumpGeneration();
         const job = self.makeReconnectJob(true) orelse return;
         remote.upgrade_job_active = true;
         const thread = std.Thread.spawn(.{}, reconnectThreadMain, .{job}) catch {
@@ -708,10 +713,10 @@ pub const Terminal = struct {
             std.debug.print("sketerm: mux session '{s}': no longer available\n", .{remote.session});
             return 0;
         }
-        const conn = job.conn orelse {
+        if (job.conn == null) {
             self.scheduleReconnect();
             return 0;
-        };
+        }
         const snapshot = job.snapshot orelse {
             self.scheduleReconnect();
             return 0;
@@ -720,26 +725,37 @@ pub const Terminal = struct {
             self.scheduleReconnect();
             return 0;
         };
-        if (job.rename_applied) {
-            if (remote.pending_rename) |renamed| {
-                remote.pending_rename = null;
-                self.allocator.free(remote.session);
-                remote.session = renamed;
-                if (self.on_session_renamed) |f| f(self.user_ctx, renamed);
-            }
-        }
-        remote.conn = conn;
-        job.conn = null;
         remote.connected = true;
         remote.retry_delay_ms = 1000;
-        self.armRemoteWatch();
-        self.sendPendingResize();
-        if (!remote.connected) return 0;
-        if (!job.rename_applied) self.sendPendingRename();
-        if (!remote.connected) return 0;
+        if (!self.installReattachedConn(remote, job)) return 0;
         self.notifyConnectionState(.connected, 0);
         std.debug.print("sketerm: mux session '{s}': reattached over {s}\n", .{ remote.session, @tagName(remote.conn.transport) });
         return 0;
+    }
+
+    /// Commit a rename the reconnect attach already proved applied
+    /// daemon-side (the OLD name was gone, the pending one attached).
+    fn commitReattachRename(self: *Terminal, remote: *Remote) void {
+        const renamed = remote.pending_rename orelse return;
+        remote.pending_rename = null;
+        self.allocator.free(remote.session);
+        remote.session = renamed;
+        if (self.on_session_renamed) |f| f(self.user_ctx, renamed);
+    }
+
+    /// Shared reattach epilogue: install the job's connection, commit or
+    /// resend the pending rename, re-arm the watch and replay the latest
+    /// resize. Returns false when a replayed write already lost the NEW
+    /// transport (transportLost has then restarted the cycle).
+    fn installReattachedConn(self: *Terminal, remote: *Remote, job: *ReconnectJob) bool {
+        remote.conn = job.conn orelse return false;
+        job.conn = null;
+        if (job.rename_applied) self.commitReattachRename(remote);
+        self.armRemoteWatch();
+        self.sendPendingResize();
+        if (!remote.connected) return false;
+        if (!job.rename_applied) self.sendPendingRename();
+        return remote.connected;
     }
 
     fn finishTransportUpgrade(self: *Terminal, job: *ReconnectJob) c.gboolean {
@@ -752,18 +768,10 @@ pub const Terminal = struct {
                 candidate.queueFrame(.control_req, "{\"op\":\"takeover\"}") catch return 0;
             }
         }
-        const conn = job.conn orelse return 0;
+        if (job.conn == null) return 0;
         const snapshot = job.snapshot orelse return 0;
         self.applyRemoteSnapshot(snapshot) catch return 0;
         if (!remote.connected or remote.closed or remote.destroying) return 0;
-        if (job.rename_applied) {
-            if (remote.pending_rename) |renamed| {
-                remote.pending_rename = null;
-                self.allocator.free(remote.session);
-                remote.session = renamed;
-                if (self.on_session_renamed) |f| f(self.user_ctx, renamed);
-            }
-        }
         if (remote.watch_id != 0) {
             _ = c.g_source_remove(remote.watch_id);
             remote.watch_id = 0;
@@ -775,12 +783,7 @@ pub const Terminal = struct {
         self.destroyAllChans();
         remote.conn.queueFrame(.detach, "") catch {};
         remote.conn.deinit();
-        remote.conn = conn;
-        job.conn = null;
-        self.armRemoteWatch();
-        self.sendPendingResize();
-        if (!remote.connected) return 0;
-        if (!job.rename_applied) self.sendPendingRename();
+        if (!self.installReattachedConn(remote, job)) return 0;
         std.debug.print("sketerm: mux session '{s}': upgraded to UDP\n", .{remote.session});
         return 0;
     }
@@ -788,8 +791,7 @@ pub const Terminal = struct {
     fn cancelTransportUpgrade(self: *Terminal) void {
         const remote = self.remote orelse return;
         if (!remote.upgrade_job_active) return;
-        remote.reconnect_generation +%= 1;
-        if (remote.reconnect_generation == 0) remote.reconnect_generation = 1;
+        remote.bumpGeneration();
     }
 
     fn scheduleReconnect(self: *Terminal) void {

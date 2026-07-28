@@ -543,11 +543,7 @@ pub const Conn = struct {
             if (e == .AGAIN) break;
             return error.WriteFailed;
         }
-        if (off > 0) {
-            const rem = self.wbuf.items.len - off;
-            std.mem.copyForwards(u8, self.wbuf.items[0..rem], self.wbuf.items[off..]);
-            self.wbuf.shrinkRetainingCapacity(rem);
-        }
+        wire.compactConsumed(&self.wbuf, off);
     }
 
     /// Drain queued frames, waiting (bounded) for the fd on backpressure.
@@ -699,12 +695,10 @@ pub const Conn = struct {
     pub fn takeFrame(self: *Conn) !?OwnedFrame {
         const peeled = (try wire.peelFrame(self.rbuf.items)) orelse return null;
         const owned = try self.allocator.dupe(u8, peeled.frame.payload);
-        const remaining = self.rbuf.items.len - peeled.consumed;
-        std.mem.copyForwards(u8, self.rbuf.items[0..remaining], self.rbuf.items[peeled.consumed..]);
-        self.rbuf.shrinkRetainingCapacity(remaining);
+        wire.compactConsumed(&self.rbuf, peeled.consumed);
         // One big frame (a multi-MB window buffer) must not pin its
         // high-water capacity for the connection's lifetime.
-        if (remaining == 0 and self.rbuf.capacity > (4 << 20))
+        if (self.rbuf.items.len == 0 and self.rbuf.capacity > (4 << 20))
             self.rbuf.clearAndFree(self.allocator);
         return .{ .ftype = peeled.frame.ftype, .payload = owned };
     }

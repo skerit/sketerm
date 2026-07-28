@@ -286,6 +286,15 @@ pub fn decodeChanId(payload: []const u8) ?u32 {
 
 pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
 
+/// Drop `consumed` leading bytes from a stream buffer, sliding the
+/// unread tail down in place (capacity retained).
+pub fn compactConsumed(list: *std.ArrayList(u8), consumed: usize) void {
+    if (consumed == 0) return;
+    const rem = list.items.len - consumed;
+    std.mem.copyForwards(u8, list.items[0..rem], list.items[consumed..]);
+    list.shrinkRetainingCapacity(rem);
+}
+
 /// Frozen legacy event schema: records have no length, so adding a tag
 /// would desynchronize older readers; new optional data belongs in a mux
 /// frame until a negotiated length-delimited event schema exists.
