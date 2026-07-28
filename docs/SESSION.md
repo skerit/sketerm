@@ -10828,3 +10828,50 @@ keeps that sound). Dragging Name narrower than the leftover is still
 a no-op until columns overflow (GTK expand-column semantics, same as
 Nemo). Miller ancestor columns and the icon grid keep their old
 widgets by design.
+
+## 2026-07-28: automatic mux transport + live reattach
+
+Bare remote hosts now use an explicit auto policy: select encrypted
+roaming UDP when reachable, then fall back to the SSH pipe. `udp:` and
+`ssh:` force one transport; named domains default to auto and accept
+`transport = auto|udp|ssh`. Selection is centralized in mux/client.zig
+and used by the mux CLI, GUI attach/restore, browser hosts, FUSE mounts,
+cross-host jobs and remote apps. Conn records the selected transport.
+UDP bootstrap pipe reads, child reaping and welcome negotiation share
+one absolute deadline and every helper fd is CLOEXEC.
+
+Interactive GUI connects keep their existing SSH startup latency, then
+upgrade the live attachment to UDP from a worker so an automatic UDP
+probe never adds a multi-second GTK main-loop stall. The replacement
+snapshot, controller lease, read-only state, pending resize and session
+identity transfer in place; a takeover frame is ordered before any user
+input on the replacement stream. CLI/background callers probe UDP
+directly and CLI reports an SSH fallback. Both UDP bridge ends retire
+after 30s without authenticated traffic; byte queues are bounded and
+stream backpressure stays non-blocking, so a dead path triggers reattach
+instead of leaking a viewer or memory.
+
+GUI durable panes now distinguish transport loss from session exit.
+EOF freezes the last screen, destroys connection-scoped app/audio/
+transfer state, and reattaches the SAME session in the existing
+Terminal from a worker thread. The main loop installs the fresh
+snapshot + fd watch in place; pane/tree/profile identity never moves.
+Retries are immediate then 1/2/4/8/16/30s indefinitely, with a
+persistent clickable pane banner and tabless-app loss/recovery toasts.
+Input is dropped while disconnected; the latest resize is resent on
+reattach. Clean EXIT/GONE still follows normal exit handling, while
+only protocol corruption reaches the crash panel. Reconnect jobs ride
+DrainHandle + generation fencing, so pane close/detach safely discards
+late worker results. A daemon-confirmed missing session stops automatic
+retry and becomes a manual-retry pane state; tabless apps are reaped or
+materialized as an explicitly unavailable log tab. In-flight rename and
+controller state are reconciled without consuming another operation's
+acknowledgement.
+
+Verified: build, mux-portable, suite 1058 pass / 5 skip (1063 total),
+smoke-mux and Xvfb smoke-e2e. Fake-SSH tests proved direct UDP success,
+unsupported-bootstrap SSH fallback, and an interactive GUI's live
+SSH-to-UDP upgrade; commands typed after the upgrade reached the same
+session. In a second isolated Xvfb run, the exact GUI proxy process was
+killed: the GUI logged loss, reattached over a new SSH proxy, stayed in
+the same pane, and commands before and after reconnect both completed.
