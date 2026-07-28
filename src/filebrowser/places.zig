@@ -131,14 +131,18 @@ pub fn recordRecent(
     spec: []const u8,
     cap: usize,
 ) void {
+    var normalized_buf: [4300]u8 = undefined;
+    const normalized = normalizeRecentSpec(spec, &normalized_buf);
     var i: usize = 0;
     while (i < list.items.len) {
-        if (std.mem.eql(u8, list.items[i], spec)) {
+        var existing_buf: [4300]u8 = undefined;
+        const existing = normalizeRecentSpec(list.items[i], &existing_buf);
+        if (std.mem.eql(u8, existing, normalized)) {
             allocator.free(list.items[i]);
             _ = list.orderedRemove(i);
         } else i += 1;
     }
-    const owned = allocator.dupe(u8, spec) catch return;
+    const owned = allocator.dupe(u8, normalized) catch return;
     list.insert(allocator, 0, owned) catch {
         allocator.free(owned);
         return;
@@ -147,6 +151,12 @@ pub fn recordRecent(
         const last = list.pop() orelse break;
         allocator.free(last);
     }
+}
+
+/// Canonicalize an old host-only recent to the explicit root form.
+pub fn normalizeRecentSpec(spec: []const u8, buf: []u8) []const u8 {
+    if (spec.len < 2 or spec[spec.len - 1] != ':') return spec;
+    return std.fmt.bufPrint(buf, "{s}/", .{spec}) catch spec;
 }
 
 test "splitRecentLabel dims the lead and drops the local scheme" {
@@ -227,4 +237,18 @@ test "recordRecent dedupes, front-inserts, and trims" {
     try t.expectEqual(@as(usize, 3), list.items.len);
     try t.expectEqualStrings("/d", list.items[0]);
     try t.expectEqualStrings("/a", list.items[2]);
+}
+
+test "host-only recents normalize to a remote root" {
+    const t = std.testing;
+    var list: std.ArrayList([]u8) = .empty;
+    defer {
+        for (list.items) |s| t.allocator.free(s);
+        list.deinit(t.allocator);
+    }
+    recordRecent(t.allocator, &list, "archdev:", 3);
+    try t.expectEqualStrings("archdev:/", list.items[0]);
+    recordRecent(t.allocator, &list, "archdev:/", 3);
+    try t.expectEqual(@as(usize, 1), list.items.len);
+    try t.expectEqualStrings("archdev:/", list.items[0]);
 }

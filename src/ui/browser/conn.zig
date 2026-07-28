@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const colview = @import("colview.zig");
 const mediacols = @import("mediacols.zig");
 const muxclient = @import("../../mux/client.zig");
 
@@ -483,6 +484,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (p.dir.own(we)) |e| p.staged.append(self.allocator, e) catch {};
         }
         if (!rep.more) {
+            if (p.navigation == null) colview.invalidateBackingRefs(p.tab);
             for (p.dir.entries.items) |*e| e.deinit(self.allocator);
             p.dir.entries.deinit(self.allocator);
             p.dir.entries = p.staged;
@@ -733,6 +735,7 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             } else {
                 // Expanded subdir vanished: its own delta already
                 // removed the entry from the parent; drop the view.
+                colview.invalidateBackingRefs(tab);
                 tab.dropSubdirsUnder(dir.path);
             }
             return true;
@@ -744,6 +747,7 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.refreshDir(tab, dir);
             return false;
         }
+        if (d.changes.len > 0) colview.invalidateBackingRefs(tab);
         for (d.changes) |ch| {
             if (std.mem.eql(u8, ch.op, "upsert")) {
                 if (ch.entry) |we| dir.upsert(we);

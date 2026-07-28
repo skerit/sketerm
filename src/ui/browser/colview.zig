@@ -7,9 +7,9 @@
 //! The model is a flat GListStore of FbItem GObjects rebuilt by
 //! renderList (grouping, tree expansion and filtering resolve into
 //! the item list, same as the old row walk). Items borrow their
-//! `*Entry`/`*Dir` from the tab's directories; those pointers are
-//! valid only until the next splice, so anything that outlives a
-//! render must copy `path`/`is_dir` out (they are owned copies).
+//! `*Entry`/`*Dir` from the tab's directories; mutation paths fence
+//! them off before changing that storage, and anything that outlives
+//! a render must copy `path`/`is_dir` out (they are owned copies).
 //!
 //! Cells are recycled: factories build the widget tree once (setup)
 //! and re-point it per item (bind). Every cell root carries qdata
@@ -135,6 +135,18 @@ pub fn itemDataAt(tab: *BTab, pos: c.guint) ?*ItemData {
     const obj = c.g_list_model_get_item(@ptrCast(@alignCast(tab.store)), pos) orelse return null;
     defer c.g_object_unref(obj);
     return itemPayload(obj);
+}
+
+/// Fence recycled cells off before their borrowed Dir/Entry storage changes.
+pub fn invalidateBackingRefs(tab: *BTab) void {
+    const n = itemCount(tab);
+    var i: c.guint = 0;
+    while (i < n) : (i += 1) {
+        const d = itemDataAt(tab, i) orelse continue;
+        d.dir = null;
+        d.entry = null;
+    }
+    tab.name_cells.clearRetainingCapacity();
 }
 
 /// Position of the entry item whose path equals `path`.
