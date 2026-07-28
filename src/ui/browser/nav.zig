@@ -232,6 +232,7 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
             break;
         }
     }
+    colview.invalidateBackingRefs(tab);
     tab.deinit();
     if (self.currentTab()) |t| {
         self.syncPathEntry(t);
@@ -377,6 +378,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     // The rows the visual range was anchored in are about to go.
     self.visualForget(tab);
     self.ta_len = 0;
+    // A column-set rebuild can bind recycled cells before renderList
+    // splices the new items. Fence those items off the old directory
+    // before any of its backing storage is released.
+    colview.invalidateBackingRefs(tab);
     tab.dropSubdirsUnder(tab.root.path);
     self.cancelPendingDir(tab.root);
     self.closeViewOf(tab.hc, tab.root);
@@ -424,6 +429,7 @@ pub fn goUp(self: *BrowserView, tab: *BTab) void {
 
 pub fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
     if (tab.subdirByPath(dir_path)) |_| {
+        colview.invalidateBackingRefs(tab);
         tab.dropSubdirsUnder(dir_path);
         self.renderTab(tab);
         return;

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const model = @import("model.zig");
 const mounts = @import("../util/mounts.zig");
 
 /// A parsed location spec. Bare "/path" keeps the CURRENT host
@@ -20,6 +21,11 @@ pub const Loc = struct {
 pub fn parseSpec(spec: []const u8) Loc {
     if (spec.len == 0) return .{ .host = null, .current_host = false, .path = "/" };
     if (spec[0] == '/') return .{ .host = null, .current_host = true, .path = spec };
+    if (model.hostOnlySpec(spec)) |host| {
+        if (std.mem.eql(u8, host, "local"))
+            return .{ .host = null, .current_host = false, .path = "/" };
+        return .{ .host = host, .current_host = false, .path = "/" };
+    }
     if (std.mem.indexOf(u8, spec, ":/")) |i| {
         const host = spec[0..i];
         const path = spec[i + 1 ..];
@@ -39,8 +45,9 @@ pub const SPEC_BUF_LEN = 4300;
 /// never picks up a "current host". Falls back to the bare path when
 /// `buf` is too small, so the result is NOT always a slice of `buf`.
 pub fn formatSpec(buf: []u8, host: ?[]const u8, path: []const u8) []const u8 {
-    if (host) |h| return std.fmt.bufPrint(buf, "{s}:{s}", .{ h, path }) catch path;
-    return std.fmt.bufPrint(buf, "local:{s}", .{path}) catch path;
+    const absolute = if (path.len == 0) "/" else path;
+    if (host) |h| return std.fmt.bufPrint(buf, "{s}:{s}", .{ h, absolute }) catch absolute;
+    return std.fmt.bufPrint(buf, "local:{s}", .{absolute}) catch absolute;
 }
 
 /// Whether `name` is offered as a path-bar completion for `prefix`
@@ -289,6 +296,15 @@ test "parseSpec forms" {
     l = parseSpec("docs");
     try t.expect(l.current_host);
     try t.expectEqualStrings("docs", l.path);
+    // Old persisted host-only recents name the host root, not a
+    // relative path on whichever tab happens to be current.
+    l = parseSpec("archdev:");
+    try t.expect(!l.current_host);
+    try t.expectEqualStrings("archdev", l.host.?);
+    try t.expectEqualStrings("/", l.path);
+    l = parseSpec("local:");
+    try t.expect(l.host == null and !l.current_host);
+    try t.expectEqualStrings("/", l.path);
 }
 
 test "formatSpec round-trips through parseSpec" {
@@ -298,6 +314,7 @@ test "formatSpec round-trips through parseSpec" {
     try t.expectEqualStrings("local:/etc", formatSpec(&buf, null, "/etc"));
     try t.expectEqualStrings("nas:/srv/data", formatSpec(&buf, "nas", "/srv/data"));
     try t.expectEqualStrings("udp:box:/p", formatSpec(&buf, "udp:box", "/p"));
+    try t.expectEqualStrings("nas:/", formatSpec(&buf, "nas", ""));
 
     // The spec a browser tab hands out must parse back to the same
     // (host, path) with no dependence on a "current" host.

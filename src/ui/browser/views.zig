@@ -325,6 +325,7 @@ pub fn startFlat(self: *BrowserView, tab: *BTab) void {
         return;
     }
     // The subtree stream replaces the directory subscription.
+    @import("colview.zig").invalidateBackingRefs(tab);
     self.cancelPendingDir(tab.root);
     self.closeViewOf(tab.hc, tab.root);
     tab.root.view_id = 0;

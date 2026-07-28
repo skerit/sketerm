@@ -754,7 +754,9 @@ pub const BrowserView = struct {
                 self.bookmarks.append(allocator, owned) catch allocator.free(owned);
             }
             for (parsed.value.recent) |r| {
-                const owned = allocator.dupe(u8, r) catch continue;
+                var normalized_buf: [4300]u8 = undefined;
+                const normalized = places_mod.normalizeRecentSpec(r, &normalized_buf);
+                const owned = allocator.dupe(u8, normalized) catch continue;
                 self.recent.append(allocator, owned) catch allocator.free(owned);
             }
             for (parsed.value.collapsed) |s| {
@@ -1032,7 +1034,10 @@ pub const BrowserView = struct {
         for (self.watches.items) |wt| wt.destroy(self.allocator);
         self.watches.deinit(self.allocator);
         if (self.compare) |cmp| cmp.close();
-        for (self.tabs.items) |t| t.deinit();
+        for (self.tabs.items) |t| {
+            @import("colview.zig").invalidateBackingRefs(t);
+            t.deinit();
+        }
         self.tabs.deinit(self.allocator);
         for (self.pending.items) |p| {
             for (p.staged.items) |*e| e.deinit(self.allocator);

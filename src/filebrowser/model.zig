@@ -16,8 +16,9 @@ pub const FileRef = struct {
     }
 
     pub fn format(self: FileRef, out: []u8) ![]const u8 {
-        if (self.host.len == 0) return std.fmt.bufPrint(out, "{s}", .{self.path});
-        return std.fmt.bufPrint(out, "{s}:{s}", .{ self.host, self.path });
+        const absolute = if (self.path.len == 0) "/" else self.path;
+        if (self.host.len == 0) return std.fmt.bufPrint(out, "{s}", .{absolute});
+        return std.fmt.bufPrint(out, "{s}:{s}", .{ self.host, absolute });
     }
 };
 
@@ -26,10 +27,20 @@ pub const ParsedSpec = struct {
     inherits_host: bool = false,
 };
 
+/// Return the host from a host-only root spec such as "box:".
+pub fn hostOnlySpec(spec: []const u8) ?[]const u8 {
+    if (spec.len < 2 or spec[spec.len - 1] != ':') return null;
+    return spec[0 .. spec.len - 1];
+}
+
 /// Parse a location; a bare path inherits `current_host`.
 pub fn parseSpec(spec: []const u8, current_host: []const u8) ParsedSpec {
     if (spec.len == 0) return .{ .ref = .{ .host = current_host, .path = "/" }, .inherits_host = true };
     if (spec[0] == '/') return .{ .ref = .{ .host = current_host, .path = spec }, .inherits_host = true };
+    if (hostOnlySpec(spec)) |host| return .{ .ref = .{
+        .host = if (std.mem.eql(u8, host, "local")) "" else host,
+        .path = "/",
+    } };
     if (std.mem.indexOf(u8, spec, ":/")) |i| {
         const host = spec[0..i];
         return .{ .ref = .{
@@ -229,6 +240,13 @@ test "FileRef parses, formats, and keeps host identity explicit" {
     const remote = parseSpec("udp:box:/var", "").ref;
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("udp:box:/var", try remote.format(&buf));
+    const remote_root = parseSpec("archdev:", "").ref;
+    try std.testing.expectEqualStrings("archdev", remote_root.host);
+    try std.testing.expectEqualStrings("/", remote_root.path);
+    const local_root = parseSpec("local:", "remote").ref;
+    try std.testing.expectEqualStrings("", local_root.host);
+    try std.testing.expectEqualStrings("/", local_root.path);
+    try std.testing.expectEqualStrings("archdev:/", try (FileRef{ .host = "archdev", .path = "" }).format(&buf));
 }
 
 test "PaneState JSON round-trip preserves future browser state" {
