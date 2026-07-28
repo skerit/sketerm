@@ -240,6 +240,14 @@ pub fn main() u8 {
     // Auto asciicast recordings must land under the isolated state
     // dir, not the developer's real one.
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
+    // The headless bash must not source the developer's real rc files:
+    // a prompt manager there (oh-my-posh, starship) replaces the prompt
+    // hooks and silently breaks the injected OSC 133 marks the
+    // command-mode stages assert on. Empty HOME = stock bash.
+    var home_buf: [280]u8 = undefined;
+    const home = std.fmt.bufPrintZ(&home_buf, "{s}/home", .{rt}) catch return 1;
+    _ = c.mkdir(home.ptr, 0o700);
+    _ = c.setenv("HOME", home.ptr, 1);
     // App/GUI socket auto-discovery must not find anything; keep the
     // env clean.
     _ = c.unsetenv("SKETERM_SOCKET");
@@ -283,7 +291,11 @@ pub fn main() u8 {
         const idle_probe = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-RUN-IDLE\",\"wait_for\":\"command\"}");
         if (std.mem.indexOf(u8, idle_probe, "\\\"command_sent\\\":false") == null or
             std.mem.indexOf(u8, idle_probe, "outside command mode") == null)
+            {
+            std.debug.print("DEBUG idle_run: {s}\n", .{idle_run});
+            std.debug.print("DEBUG idle_probe: {s}\n", .{idle_probe});
             fail("term_run idle mode waited for command completion");
+        }
         const idle = m.callTool("term_wait_idle", "{\"quiet_ms\":100,\"timeout_ms\":500}");
         if (std.mem.indexOf(u8, idle, "idle") == null) fail("term_wait_idle no longer reports output quiescence");
         _ = c.usleep(1_600_000);
