@@ -1632,7 +1632,7 @@ pub const Window = struct {
     /// Last-reported cwd of the focused pane (OSC 7), or null if no
     /// pane has the focus or no cwd has been reported. Bare path, for
     /// spawning a shell -- browser faces want `paneBrowserSpec`.
-    fn focusedPaneCwd(self: *Window) ?[]const u8 {
+    pub fn focusedPaneCwd(self: *Window) ?[]const u8 {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
             if (focus == @as(*c.GtkWidget, @ptrCast(p.area))) {
@@ -1886,7 +1886,7 @@ pub const Window = struct {
         c.adw_tab_page_set_tooltip(page, title_z);
     }
 
-    fn makePane(self: *Window, term: *Terminal) !*Pane {
+    pub fn makePane(self: *Window, term: *Terminal) !*Pane {
         const pane = try Pane.init(self.allocator, term);
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
@@ -2026,7 +2026,7 @@ pub const Window = struct {
     /// The pane gets the profile's complete settings bundle (shell,
     /// font, colors, scrollback, shader, …); empty/null profile = the
     /// window default profile, falling back to the Default settings.
-    fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8, profile_name: ?[]const u8) !*Pane {
+    pub fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8, profile_name: ?[]const u8) !*Pane {
         const profile: ?*const @import("../config.zig").Profile = if (profile_name) |n|
             self.findProfile(n)
         else if (self.config.default_profile.len > 0)
@@ -2070,7 +2070,7 @@ pub const Window = struct {
     /// exists" → DaemonError), which dropped most tabs on a multi-tab load.
     /// pid + this counter is unique within and across GUI processes/restarts.
     var session_seq: u64 = 0;
-    fn nextSessionName(buf: []u8) []const u8 {
+    pub fn nextSessionName(buf: []u8) []const u8 {
         session_seq += 1;
         return std.fmt.bufPrint(buf, "s{d}-{d}", .{ c.getpid(), session_seq }) catch "s0";
     }
@@ -2166,7 +2166,7 @@ pub const Window = struct {
     /// All handlers are pane-aware and no-op when irrelevant (e.g.
     /// child-exit on a remote pane means "session ended / connection
     /// lost" and detaches to a local shell instead of exit_action).
-    fn wirePaneSinks(self: *Window, pane: *Pane) void {
+    pub fn wirePaneSinks(self: *Window, pane: *Pane) void {
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
@@ -2204,7 +2204,7 @@ pub const Window = struct {
     /// WITHOUT tearing the pane down. Shared by the close path
     /// (unlistPane) and cross-window tab adoption, where the pane
     /// lives on under another Window.
-    fn disownPane(self: *Window, pane: *Pane) void {
+    pub fn disownPane(self: *Window, pane: *Pane) void {
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
@@ -2232,7 +2232,7 @@ pub const Window = struct {
     /// the terminal's sinks, and defer the actual deinit past GTK's
     /// widget-destroy chain. Counterpart of wirePaneSinks — the
     /// single removal path.
-    fn unlistPane(self: *Window, pane: *Pane) void {
+    pub fn unlistPane(self: *Window, pane: *Pane) void {
         self.disownPane(pane);
         // Not in disownPane: adoption (cross-window tab drag) also
         // disowns, but there the pane lives on and must keep its IM.
@@ -2379,7 +2379,7 @@ pub const Window = struct {
     /// applyPaneConfig with the pane's stored profile re-resolved by
     /// name — for paths that need a config re-push outside the
     /// spawn/restore flows.
-    fn applyPaneConfigByName(self: *Window, pane: *Pane) void {
+    pub fn applyPaneConfigByName(self: *Window, pane: *Pane) void {
         var profile: ?*const @import("../config.zig").Profile = null;
         if (pane.active_profile) |name| {
             for (self.config.profiles.items) |*p| {
@@ -2499,7 +2499,7 @@ pub const Window = struct {
     /// pane-creation paths (new tab/split, layout restore,
     /// addTabInternal) — restored panes used to skip the color push
     /// entirely and kept the built-in gray background.
-    fn applyPaneConfig(self: *Window, pane: *Pane, opts: PaneConfigOpts) void {
+    pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: PaneConfigOpts) void {
         const s: *const @import("../config.zig").ProfileSettings =
             if (opts.profile) |p| &p.settings else &self.config.settings;
         const term = pane.terminal;
@@ -3867,7 +3867,7 @@ pub const Window = struct {
     /// `at_end` forces an append regardless of the `new_tab_after_current`
     /// preference — used by layout restore, which must preserve the saved
     /// tab order (insert-after-current would reverse a bulk load).
-    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget, tree_root: PaneTree.Node, at_end: bool) *c.AdwTabPage {
+    pub fn appendOrInsertTab(self: *Window, child: *c.GtkWidget, tree_root: PaneTree.Node, at_end: bool) *c.AdwTabPage {
         const page = blk: {
             if (!at_end and self.config.new_tab_after_current) {
                 const sel = c.adw_tab_view_get_selected_page(self.tab_view);
@@ -3901,7 +3901,7 @@ pub const Window = struct {
 
     /// Attach the pane-tree model to a tab page. Best-effort on OOM
     /// (queries fall back gracefully on a missing tree).
-    fn attachTabTree(self: *Window, page: *c.AdwTabPage, root: PaneTree.Node) void {
+    pub fn attachTabTree(self: *Window, page: *c.AdwTabPage, root: PaneTree.Node) void {
         const t = self.allocator.create(PaneTree) catch return;
         t.* = .{ .allocator = self.allocator, .root = root };
         c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_TREE_KEY, @ptrCast(t));
@@ -3925,7 +3925,7 @@ pub const Window = struct {
 
     // ── Remote control (sketerm cli) ─────────────────────────────
 
-    fn allocPaneId(_: *Window) u32 {
+    pub fn allocPaneId(_: *Window) u32 {
         const id = next_pane_id;
         next_pane_id += 1;
         return id;
@@ -3974,7 +3974,7 @@ pub const Window = struct {
 
     /// Resolve a pane address: explicit id, else the focused pane,
     /// else the selected tab's first pane, else the first pane.
-    fn paneById(self: *Window, id_opt: ?u32) ?*Pane {
+    pub fn paneById(self: *Window, id_opt: ?u32) ?*Pane {
         if (id_opt) |id| {
             for (self.panes.items) |p| if (p.id == id) return p;
             return null;
@@ -4068,7 +4068,7 @@ pub const Window = struct {
     /// a pane; the first non-null wins. The IPC server lives on the
     /// primary window, but panes can sit in secondary windows (tab
     /// drag-out), so pane resolution MUST span them all.
-    fn findPaneAcrossWindows(self: *Window, ctx: anytype, f: *const fn (@TypeOf(ctx), *Window) ?*Pane) ?*Pane {
+    pub fn findPaneAcrossWindows(self: *Window, ctx: anytype, f: *const fn (@TypeOf(ctx), *Window) ?*Pane) ?*Pane {
         const app = c.gtk_window_get_application(@ptrCast(self.app_window)) orelse return f(ctx, self);
         var node = c.gtk_application_get_windows(app);
         while (node != null) : (node = node.*.next) {
@@ -4082,7 +4082,7 @@ pub const Window = struct {
 
     /// The pane rendering daemon session `name` — the stable identity
     /// behind `$SKETERM_SESSION`. Searched across all windows.
-    fn paneBySession(self: *Window, name: []const u8) ?*Pane {
+    pub fn paneBySession(self: *Window, name: []const u8) ?*Pane {
         if (name.len == 0) return null;
         return self.findPaneAcrossWindows(name, struct {
             fn f(n: []const u8, w: *Window) ?*Pane {
@@ -4218,769 +4218,30 @@ pub const Window = struct {
         return null;
     }
 
-    // ── Durable tabs (sketerm-mux) ───────────────────────────────
-
-    /// Connect locally or to a remote host using its transport policy.
-    fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
-        const mux_client = @import("../mux/client.zig");
-        // The transport handshake forks and blocks the main loop; name it so
-        // a death in here is attributable. Bare hosts bootstrap over SSH and
-        // Terminal upgrades the live attachment to UDP in the background.
-        crashlog.set("mux connect host={s}", .{host orelse "local"});
-        if (host) |h| {
-            // "sock:/path" targets a specific daemon instance's unix
-            // socket (an MCP private/named daemon) — connect only,
-            // NEVER autostart: a dead assistant daemon must not be
-            // resurrected empty by a viewer.
-            if (std.mem.startsWith(u8, h, "sock:")) {
-                return mux_client.Conn.connectProbed(self.allocator, h[5..]);
-            }
-            const remote = mux_client.RemoteSpec.parse(h);
-            if (remote.mode == .auto) return mux_client.Conn.connectSsh(self.allocator, remote.host);
-            return mux_client.Conn.connectRemote(self.allocator, h, self.config.udpRange());
-        }
-        return mux_client.Conn.connectLocalAutostart(self.allocator);
-    }
-
-    /// Connect + attach a session as a viewer tab/app (switcher rows,
-    /// `sketerm cli attach-session`). Host semantics of muxConnect
-    /// (null local, bare auto, forced "udp:"/"ssh:", "sock:/path").
-    pub fn attachSessionByHost(self: *Window, name: []const u8, host: ?[]const u8) bool {
-        const conn = self.muxConnect(host) catch return false;
-        self.attachMux(conn, name, host, null) catch return false;
-        return true;
-    }
-
-    /// Select the tab containing `pane`, focus it and raise the
-    /// window (switcher activate on an embedded app / pane row).
-    pub fn focusPaneTab(self: *Window, pane: *Pane) void {
-        if (tabPageForPane(self, pane)) |page| {
-            c.adw_tab_view_set_selected_page(self.tab_view, page);
-            _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
-        }
-        c.gtk_window_present(@ptrCast(self.app_window));
-    }
-
-    /// Spawn a shell session in the daemon (local or `host`'s) and
-    /// attach it as a tab.
-    pub fn newDurableTab(self: *Window, host: ?[]const u8) !void {
-        try self.newDurableSession(host, null);
-    }
-
-    /// Durable shell tab on `host` starting in `cwd` — the browser's
-    /// "Open Terminal Here (new tab)". Unlike newDurableSession, the
-    /// cwd travels even for remote hosts (it names a REMOTE path).
-    pub fn newDurableSessionAt(self: *Window, host: ?[]const u8, cwd: []const u8) !void {
-        var name_buf: [64]u8 = undefined;
-        const name = nextSessionName(&name_buf);
-        var conn = try self.muxConnect(host);
-        {
-            errdefer conn.deinit();
-            const argv: []const []const u8 = if (host != null) &.{} else blk: {
-                const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
-                    const env = c.getenv("SHELL");
-                    break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
-                };
-                break :blk &.{sh};
-            };
-            try conn.sendJson(.spawn, .{
-                .name = name,
-                .argv = argv,
-                .cwd = cwd,
-                .rows = @as(u16, 24),
-                .cols = @as(u16, 80),
-                .kb_layout = self.config.app_keyboard_layout,
-            });
-            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-        }
-        try self.attachMux(conn, name, host, null);
-    }
-
-    /// Spawn a fresh session on the daemon and attach it — into a new
-    /// tab, or into `takeover`'s slot when the request came from a
-    /// `sketerm mux` CLI running inside that pane.
-    pub fn newDurableSession(self: *Window, host: ?[]const u8, takeover: ?*Pane) !void {
-        var name_buf: [64]u8 = undefined;
-        // Process-unique name (pid + global counter); see nextSessionName.
-        const name = nextSessionName(&name_buf);
-        const profile = if (self.config.default_profile.len > 0) self.findProfile(self.config.default_profile) else null;
-        const settings = if (profile) |p| &p.settings else &self.config.settings;
-
-        var conn = try self.muxConnect(host);
-        {
-            // This errdefer covers ONLY the spawn phase; once the
-            // block exits cleanly, attachMuxTab owns the conn (and
-            // deinits it on its own failures).
-            errdefer conn.deinit();
-            // The account-shell launcher works with older remote daemons that
-            // incorrectly use their inherited $SHELL.
-            const argv: []const []const u8 = if (host != null)
-                &@import("../mux/shell.zig").remote_login_argv
-            else blk: {
-                const sh: []const u8 = if (settings.shell) |s| s else sh2: {
-                    const env = c.getenv("SHELL");
-                    break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
-                };
-                break :blk &.{sh};
-            };
-            var remote_shell_buf: [512]u8 = undefined;
-            var remote_env_items: [2][]const u8 = undefined;
-            var remote_env_len: usize = 0;
-            if (host != null) {
-                if (settings.shell) |shell| {
-                    remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell});
-                    remote_env_len += 1;
-                }
-                remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
-                remote_env_len += 1;
-            }
-            try conn.sendJson(.spawn, .{
-                .name = name,
-                .argv = argv,
-                .env = remote_env_items[0..remote_env_len],
-                .cwd = if (host != null) null else self.focusedPaneCwd(),
-                .rows = @as(u16, 24),
-                .cols = @as(u16, 80),
-                .term = settings.term_env,
-                .color_term = settings.color_term_env,
-                .login_shell = host == null and settings.login_shell,
-                .kb_layout = self.config.app_keyboard_layout,
-            });
-            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-        }
-        try self.attachMuxProfile(conn, name, host, takeover, profile);
-    }
-
-    pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8) !void {
-        try self.attachMux(conn_in, name, host, null);
-    }
-
-    /// True when a pane or tabless app session in this window already
-    /// renders mux session `name` on `host` (null = local daemon).
-    pub fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
-        for (self.panes.items) |p| {
-            const r = p.terminal.remote orelse continue;
-            if (!hostEql(r.host, host)) continue;
-            if (std.mem.eql(u8, r.session, name)) return true;
-        }
-        for (self.app_sessions.items) |as| {
-            const r = as.terminal.remote orelse continue;
-            if (!hostEql(r.host, host)) continue;
-            if (std.mem.eql(u8, r.session, name)) return true;
-        }
-        return false;
-    }
-
-    fn hostEql(a: ?[]const u8, b: ?[]const u8) bool {
-        if (a == null and b == null) return true;
-        if (a == null or b == null) return false;
-        return std.mem.eql(u8, a.?, b.?);
-    }
-
-    /// Bulk handoff: attach every non-exited session on `host` that
-    /// this window isn't already showing. Terminal sessions become
-    /// tabs; app sessions follow app_view (tabless in window mode).
-    /// Returns the number attached.
-    pub fn attachAllSessions(self: *Window, host: ?[]const u8) u32 {
-        const mux_cli = @import("../ipc/mux_cli.zig");
-        var sessions = mux_cli.fetchSessions(self.allocator, host) orelse return 0;
-        defer sessions.deinit();
-        var n: u32 = 0;
-        for (sessions.value.sessions) |s| {
-            if (s.exited) continue;
-            if (self.sessionShown(s.name, host)) continue;
-            const conn = self.muxConnect(host) catch return n;
-            self.attachMux(conn, s.name, host, null) catch continue;
-            n += 1;
-        }
-        return n;
-    }
-
-    /// Focus the pane already rendering local mux session `name`, or
-    /// attach it as a new tab. Cross-session-search jump target.
-    pub fn focusOrAttachSession(self: *Window, name: []const u8) void {
-        for (self.panes.items) |p| {
-            const r = p.terminal.remote orelse continue;
-            if (r.host != null) continue;
-            if (!std.mem.eql(u8, r.session, name)) continue;
-            if (tabPageForPane(self, p)) |page| {
-                c.adw_tab_view_set_selected_page(self.tab_view, page);
-                _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
-                return;
-            }
-        }
-        const conn = self.muxConnect(null) catch return;
-        self.attachMux(conn, name, null, null) catch {};
-    }
-
-    /// Tabless forwarded-app session (window view mode): the mux
-    /// attach client feeding the app's floating windows. See the
-    /// `app_sessions` field docs.
-    pub const AppSession = struct {
-        window: *Window,
-        terminal: *Terminal,
-        /// Exit handled — reap is deferred to an idle (the exit
-        /// fires inside the terminal's own socket callback).
-        doomed: bool = false,
-        unavailable: bool = false,
-        reap_idle_id: c_uint = 0,
-    };
-
-    /// Attach an app session with NO pane and NO tab: like a desktop
-    /// launcher, the app's own windows are the only thing that
-    /// appears. Takes ownership of `conn`.
-    fn attachMuxApp(
-        self: *Window,
-        conn_in: @import("../mux/client.zig").Conn,
-        name: []const u8,
-        host: ?[]const u8,
-        snap_payload: []const u8,
-        read_only: bool,
-        want_control: bool,
-    ) !void {
-        var conn = conn_in;
-        const term = blk: {
-            errdefer conn.deinit();
-            break :blk try Terminal.initRemote(
-                self.allocator,
-                conn,
-                name,
-                snap_payload,
-                host,
-                self.config.mux_udp_port_range,
-                read_only,
-                want_control,
-            );
-        };
-        errdefer term.deinit();
-        term.debug_to_stderr = self.debug_events;
-        const as = try self.allocator.create(AppSession);
-        errdefer self.allocator.destroy(as);
-        as.* = .{ .window = self, .terminal = term };
-        try self.app_sessions.append(self.allocator, as);
-        term.user_ctx = @ptrCast(as);
-        // Render requests only matter as the exit signal here
-        // (remoteClosed sets child_exited, then fires this).
-        term.on_render_request = appSessionRender;
-        term.on_crashed = appSessionCrashed;
-        term.on_connection_state = appSessionConnectionState;
-        term.on_peers = appSessionPeers;
-        term.on_app_view = appSessionAppView;
-    }
-
-    /// A tabless app session ended. Normal quit (a window was shown)
-    /// drops it quietly; an exit with NO window ever shown means the
-    /// log is the user's only diagnostic (failed launch, or a
-    /// single-instance handoff) — materialize a held tab around it.
-    fn appSessionExited(self: *Window, as: *AppSession) void {
-        _ = self;
-        if (as.doomed) return;
-        as.doomed = true;
-        // Always defer: this is called from the Terminal's socket callback,
-        // so even an allocation failure while materializing a log tab must
-        // not deinit that Terminal before its callback returns.
-        as.reap_idle_id = c.g_idle_add(@ptrCast(&appSessionReapIdle), @ptrCast(as));
-    }
-
-    fn appSessionReapIdle(user: ?*anyopaque) callconv(.c) c_int {
-        const as = cast.userData(AppSession, user);
-        as.reap_idle_id = 0;
-        if (!as.terminal.remote.?.app_window_opened) {
-            const status = as.terminal.screen.child_exit_status;
-            const win = as.window;
-            const unavailable = as.unavailable;
-            if (win.adoptAppSessionIntoTab(as)) |pane| {
-                if (unavailable)
-                    win.holdUnavailableAppPane(pane)
-                else
-                    win.holdExitedAppPane(pane, status);
-            }
-            return 0;
-        }
-        as.window.unlistAppSession(as);
-        return 0; // G_SOURCE_REMOVE
-    }
-
-    /// Drop a tabless app session: fence, deinit terminal, free.
-    fn unlistAppSession(self: *Window, as: *AppSession) void {
-        if (as.reap_idle_id != 0) {
-            _ = c.g_source_remove(as.reap_idle_id);
-            as.reap_idle_id = 0;
-        }
-        for (self.app_sessions.items, 0..) |it, i| {
-            if (it == as) {
-                _ = self.app_sessions.swapRemove(i);
-                break;
-            }
-        }
-        as.terminal.clearSinks();
-        as.terminal.deinit();
-        self.allocator.destroy(as);
-    }
-
-    /// Materialize a real pane + tab around a live tabless app
-    /// terminal ("Show in Tab", or exit-without-window feedback).
-    /// Pane.init rewires user_ctx and callbacks; the AppSession is
-    /// freed (terminal ownership moves to panes/terminals). On
-    /// failure the whole session is dropped and null returned.
-    fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
-        const term = as.terminal;
-        if (as.reap_idle_id != 0) {
-            _ = c.g_source_remove(as.reap_idle_id);
-            as.reap_idle_id = 0;
-        }
-        for (self.app_sessions.items, 0..) |it, i| {
-            if (it == as) {
-                _ = self.app_sessions.swapRemove(i);
-                break;
-            }
-        }
-        self.allocator.destroy(as);
-        term.clearSinks();
-        // Clear host callbacks still pointing at the freed AppSession;
-        // the pane re-wires its own (adoptAppHost) after.
-        if (term.remote) |r| {
-            for (r.napps.items) |na| na.host.releaseEmbed();
-        }
-        const pane = self.makePane(term) catch {
-            term.deinit();
-            return null;
-        };
-        pane.id = self.allocPaneId();
-        self.wirePaneSinks(pane);
-        self.applyPaneConfig(pane, .{});
-        self.panes.append(self.allocator, pane) catch {};
-        self.terminals.append(self.allocator, term) catch {};
-        term.replayRetainedImages();
-
-        var title_buf: [160:0]u8 = undefined;
-        const title_z = if (term.remote.?.host) |h|
-            std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ term.remote.?.session, h }) catch "app"
-        else
-            std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{term.remote.?.session}) catch "app";
-        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_hexpand(wrapper, 1);
-        c.gtk_widget_set_vexpand(wrapper, 1);
-        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
-        c.adw_tab_page_set_title(page, title_z.ptr);
-        c.adw_tab_page_set_tooltip(page, title_z.ptr);
-        c.adw_tab_view_set_selected_page(self.tab_view, page);
-        return pane;
-    }
-
-    /// Spawn a forwarded GUI-app session (`app=true`) running `argv`
-    /// on `host`'s daemon and attach it; in window view mode this is
-    /// TABLESS (floating windows only), in tab mode it's an embedded
-    /// tab. Used by the app launcher. `host` null = the local
-    /// autostart daemon. `gpu` = per-session dmabuf opt-in.
-    pub fn launchRemoteAppSession(self: *Window, host: ?[]const u8, argv: []const []const u8, gpu: bool) !void {
-        var name_buf: [64]u8 = undefined;
-        const name = nextSessionName(&name_buf);
-        var conn = try self.muxConnect(host);
-        {
-            errdefer conn.deinit();
-            try conn.sendJson(.spawn, .{
-                .name = name,
-                .argv = argv,
-                .rows = @as(u16, 24),
-                .cols = @as(u16, 80),
-                .app = true,
-                .gpu = gpu,
-                .kb_layout = self.config.app_keyboard_layout,
-            });
-            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-        }
-        try self.attachMux(conn, name, host, null);
-    }
-
-    /// Attach `conn` to session `name` — wrapped in a new tab, or
-    /// replacing `takeover`'s spot in its split tree (the pane the
-    /// `sketerm mux` CLI was invoked from; its shell — including that
-    /// CLI — is torn down once the remote pane is in place).
-    /// Takes ownership of `conn` on success AND failure.
-    /// Build a remote (mux) pane from an attach snapshot: Terminal +
-    /// Pane, sinks wired, config pushed, listed, images replayed —
-    /// but NO tab page; the caller decides where the widget goes.
-    /// Takes ownership of `conn` on success and failure.
-    fn makeRemotePaneFromSnap(
-        self: *Window,
-        conn_in: @import("../mux/client.zig").Conn,
-        name: []const u8,
-        host: ?[]const u8,
-        snap_payload: []const u8,
-        // Pre-allocated pane id, or null to allocate one. Daemon-backed local
-        // panes pre-allocate so they can export SKETERM_PANE_ID into the child
-        // env at spawn time; passing it here keeps that id (no double-alloc,
-        // so pane ids stay contiguous — `split --pane 2` must find pane 2).
-        pane_id: ?u32,
-        read_only: bool,
-        want_control: bool,
-    ) !*Pane {
-        var conn = conn_in;
-        const term = blk: {
-            errdefer conn.deinit();
-            break :blk try Terminal.initRemote(
-                self.allocator,
-                conn,
-                name,
-                snap_payload,
-                host,
-                self.config.mux_udp_port_range,
-                read_only,
-                want_control,
-            );
-        };
-        errdefer term.deinit();
-        term.debug_to_stderr = self.debug_events;
-        const pane = try self.makePane(term);
-        pane.id = pane_id orelse self.allocPaneId();
-        errdefer pane.deinit();
-        self.wirePaneSinks(pane);
-        // Fonts, colors, padding, palette — same push every other
-        // pane-creation path gets. Must happen before the widget
-        // enters the tree (realize builds the atlas from pane state).
-        self.applyPaneConfig(pane, .{});
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
-        // Pane sinks are wired — push snapshot-restored image
-        // placements into the ImageStore.
-        term.replayRetainedImages();
-        return pane;
-    }
-
-    /// Layout restore for a durable mux pane: attach when the
-    /// session still exists, otherwise recreate it under the SAME
-    /// name (daemon restarted / server rebooted) and attach that —
-    /// "resume or create". Returns the placed-nowhere pane.
-    fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
-        const host: ?[]const u8 = if (spec.mux_host.len > 0) spec.mux_host else null;
-        const settings = self.config.profileSettings(spec.profile);
-        var conn = try self.muxConnect(host);
-
-        const Owned = @TypeOf(try conn.recvFrame());
-        var snap: Owned = undefined;
-        {
-            errdefer conn.deinit();
-            try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
-            const reply = try conn.recvExpect(&.{ .snapshot, .err });
-            if (reply.ftype == .snapshot) {
-                snap = reply;
-            } else {
-                reply.deinit(self.allocator);
-                // The explicit remote launcher also works with old daemons.
-                const argv: []const []const u8 = if (host != null)
-                    &@import("../mux/shell.zig").remote_login_argv
-                else blk: {
-                    const sh: []const u8 = if (settings.shell) |s| s else sh2: {
-                        const env = c.getenv("SHELL");
-                        break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
-                    };
-                    break :blk &.{sh};
-                };
-                var remote_shell_buf: [512]u8 = undefined;
-                var remote_env_items: [2][]const u8 = undefined;
-                var remote_env_len: usize = 0;
-                if (host != null) {
-                    if (settings.shell) |shell| {
-                        remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell});
-                        remote_env_len += 1;
-                    }
-                    remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
-                    remote_env_len += 1;
-                }
-                try conn.sendJson(.spawn, .{
-                    .name = spec.mux_session,
-                    .argv = argv,
-                    .env = remote_env_items[0..remote_env_len],
-                    .cwd = if (host != null or spec.cwd.len == 0) null else spec.cwd,
-                    .rows = @as(u16, 24),
-                    .cols = @as(u16, 80),
-                    .term = settings.term_env,
-                    .color_term = settings.color_term_env,
-                    .login_shell = host == null and settings.login_shell,
-                    .kb_layout = self.config.app_keyboard_layout,
-                });
-                (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-                try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
-                snap = try conn.recvExpect(&.{.snapshot});
-            }
-        }
-        defer snap.deinit(self.allocator);
-        const pane = try self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null, false, false);
-        const profile = self.findProfile(spec.profile);
-        pane.active_profile = if (profile) |p| p.name else null;
-        self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = spec.font_size });
-        return pane;
-    }
-
-    /// One in-flight async remote-mux reattach (layout restore).
-    /// The background thread touches ONLY the connect/handshake
-    /// fields; `canceled` and the result consumption are main-thread
-    /// (g_idle_add's internal lock orders the hand-off).
-    const MuxRestoreJob = struct {
-        allocator: std.mem.Allocator,
-        window: *Window,
-        /// Placeholder pane to take over; resolved by id on completion
-        /// (the pane may have been closed meanwhile).
-        pane_id: u32,
-        session: []u8,
-        host: []u8,
-        port_range: []u8,
-        kb_layout: []u8,
-        remote_shell: []u8,
-        term: []u8,
-        color_term: []u8,
-        login_shell: bool,
-        /// Thread results — set before g_idle_add, read after.
-        conn: ?@import("../mux/client.zig").Conn = null,
-        snap: ?[]u8 = null,
-        err_name: []const u8 = "unknown",
-        /// Main-thread only: window torn down; idle must not touch it.
-        canceled: bool = false,
-
-        fn destroy(job: *MuxRestoreJob) void {
-            if (job.conn) |*cn| cn.deinit();
-            if (job.snap) |s| job.allocator.free(s);
-            job.allocator.free(job.session);
-            job.allocator.free(job.host);
-            job.allocator.free(job.port_range);
-            job.allocator.free(job.kb_layout);
-            job.allocator.free(job.remote_shell);
-            job.allocator.free(job.term);
-            job.allocator.free(job.color_term);
-            job.allocator.destroy(job);
-        }
-    };
-
-    /// Kick off the background reattach for a restored remote mux
-    /// pane. Failure to start just leaves the placeholder shell.
-    fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec) void {
-        const a = self.allocator;
-        const settings = self.config.profileSettings(spec.profile);
-        const session = a.dupe(u8, spec.mux_session) catch return;
-        const host = a.dupe(u8, spec.mux_host) catch {
-            a.free(session);
-            return;
-        };
-        const port_range = a.dupe(u8, self.config.mux_udp_port_range) catch {
-            a.free(session);
-            a.free(host);
-            return;
-        };
-        const kb_layout = a.dupe(u8, self.config.app_keyboard_layout) catch {
-            a.free(session);
-            a.free(host);
-            a.free(port_range);
-            return;
-        };
-        const remote_shell = a.dupe(u8, settings.shell orelse "") catch {
-            a.free(session);
-            a.free(host);
-            a.free(port_range);
-            a.free(kb_layout);
-            return;
-        };
-        const term = a.dupe(u8, settings.term_env) catch {
-            a.free(session);
-            a.free(host);
-            a.free(port_range);
-            a.free(kb_layout);
-            a.free(remote_shell);
-            return;
-        };
-        const color_term = a.dupe(u8, settings.color_term_env) catch {
-            a.free(session);
-            a.free(host);
-            a.free(port_range);
-            a.free(kb_layout);
-            a.free(remote_shell);
-            a.free(term);
-            return;
-        };
-        const job = a.create(MuxRestoreJob) catch {
-            a.free(session);
-            a.free(host);
-            a.free(port_range);
-            a.free(kb_layout);
-            a.free(remote_shell);
-            a.free(term);
-            a.free(color_term);
-            return;
-        };
-        job.* = .{
-            .allocator = a,
-            .window = self,
-            .pane_id = pane.id,
-            .session = session,
-            .host = host,
-            .port_range = port_range,
-            .kb_layout = kb_layout,
-            .remote_shell = remote_shell,
-            .term = term,
-            .color_term = color_term,
-            .login_shell = settings.login_shell,
-        };
-        self.mux_restore_jobs.append(a, job) catch {
-            job.destroy();
-            return;
-        };
-        const th = std.Thread.spawn(.{}, muxRestoreThreadMain, .{job}) catch {
-            std.debug.print(
-                "sketerm: mux restore '{s}' @ {s}: thread spawn failed — pane stays a local shell\n",
-                .{ job.session, job.host },
-            );
-            self.removeMuxRestoreJob(job);
-            job.destroy();
-            return;
-        };
-        th.detach();
-    }
-
-    fn removeMuxRestoreJob(self: *Window, job: *MuxRestoreJob) void {
-        for (self.mux_restore_jobs.items, 0..) |it, i| {
-            if (it == job) {
-                _ = self.mux_restore_jobs.swapRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Pending reattach targeting `pane_id`, if any — lets a layout
-    /// save while the connect is still in flight keep the mux
-    /// identity instead of demoting the pane to a plain local shell.
-    fn muxRestoreJobFor(self: *Window, pane_id: u32) ?*MuxRestoreJob {
-        for (self.mux_restore_jobs.items) |job| {
-            if (job.pane_id == pane_id) return job;
-        }
-        return null;
-    }
-
-    /// Background thread: connect + attach handshake, no GTK/Window
-    /// access. Results (or err_name) land on the job, then the idle
-    /// finishes on the main thread.
-    fn muxRestoreThreadMain(job: *MuxRestoreJob) void {
-        muxRestoreConnect(job) catch |err| {
-            job.err_name = @errorName(err);
-        };
-        _ = c.g_idle_add(@ptrCast(&onMuxRestoreDone), @ptrCast(job));
-    }
-
-    fn muxRestoreConnect(job: *MuxRestoreJob) !void {
-        const mux_client = @import("../mux/client.zig");
-        var conn = try mux_client.Conn.connectRemote(
-            job.allocator,
-            job.host,
-            if (job.port_range.len > 0) job.port_range else null,
-        );
-        errdefer conn.deinit();
-
-        // Bound the attach handshake: a remote that answers the hello
-        // but then wedges would otherwise hang this thread (and leave
-        // the placeholder pending) forever. Cleared before hand-off —
-        // the GUI switches the fd to non-blocking anyway.
-        setRecvTimeout(conn.fd, 30);
-        defer setRecvTimeout(conn.fd, 0);
-
-        try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
-        const reply = try conn.recvExpect(&.{ .snapshot, .err });
-        if (reply.ftype == .snapshot) {
-            job.snap = reply.payload;
-        } else {
-            reply.deinit(job.allocator);
-            // Session gone: recreate through the old-daemon-compatible
-            // account-shell launcher under the same durable name.
-            var remote_shell_buf: [512]u8 = undefined;
-            var remote_env_items: [2][]const u8 = undefined;
-            var remote_env_len: usize = 0;
-            if (job.remote_shell.len > 0) {
-                remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{job.remote_shell});
-                remote_env_len += 1;
-            }
-            remote_env_items[remote_env_len] = if (job.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
-            remote_env_len += 1;
-            try conn.sendJson(.spawn, .{
-                .name = job.session,
-                .argv = @as([]const []const u8, &@import("../mux/shell.zig").remote_login_argv),
-                .env = remote_env_items[0..remote_env_len],
-                .cwd = @as(?[]const u8, null),
-                .rows = @as(u16, 24),
-                .cols = @as(u16, 80),
-                .term = job.term,
-                .color_term = job.color_term,
-                .kb_layout = job.kb_layout,
-            });
-            (try conn.recvExpect(&.{.ok})).deinit(job.allocator);
-            try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
-            const snap2 = try conn.recvExpect(&.{.snapshot});
-            job.snap = snap2.payload;
-        }
-        job.conn = conn;
-    }
-
-    fn setRecvTimeout(fd: c_int, seconds: c_long) void {
-        var tv: c.struct_timeval = .{ .tv_sec = seconds, .tv_usec = 0 };
-        _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
-    }
-
-    /// Main-thread completion: swap the reattached session into the
-    /// placeholder pane's slot, or surface the failure as a toast.
-    fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
-        const job = cast.userData(MuxRestoreJob, user);
-        defer job.destroy();
-        // Window gone — job.window dangles; just drop everything
-        // (destroy deinits the conn = clean detach, session persists).
-        if (job.canceled) return 0;
-        const win = job.window;
-        win.removeMuxRestoreJob(job);
-
-        if (job.conn == null or job.snap == null) {
-            std.debug.print(
-                "sketerm: mux restore '{s}' @ {s} failed ({s}) — pane stays a local shell\n",
-                .{ job.session, job.host, job.err_name },
-            );
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "Couldn't reattach '{s}' @ {s} ({s}) — pane is a local shell",
-                .{ job.session, job.host, job.err_name },
-            ) catch "Couldn't reattach remote mux session";
-            showToast(win, msg);
-            return 0;
-        }
-
-        // Placeholder closed meanwhile, or the user already put a
-        // durable session in its place — drop the attach quietly.
-        const old = win.paneById(job.pane_id) orelse return 0;
-        if (old.terminal.remote) |r| {
-            if (!r.ephemeral) return 0;
-        }
-
-        const conn = job.conn.?;
-        const remote = @import("../mux/client.zig").RemoteSpec.parse(job.host);
-        const used_ssh_fallback = remote.mode == .auto and conn.transport == .ssh;
-        job.conn = null; // ownership moves to makeRemotePaneFromSnap
-        const pane = win.makeRemotePaneFromSnap(conn, job.session, job.host, job.snap.?, null, false, false) catch |err| {
-            std.debug.print(
-                "sketerm: mux restore '{s}' @ {s}: pane build failed ({s})\n",
-                .{ job.session, job.host, @errorName(err) },
-            );
-            return 0;
-        };
-        const profile = if (old.active_profile) |name| win.findProfile(name) else null;
-        pane.active_profile = if (profile) |p| p.name else null;
-        win.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = old.font_size });
-        _ = win.swapPaneInPlace(old, pane) catch {
-            // No tab slot to land in (mid-teardown) — drop the new pane.
-            win.unlistPane(pane);
-            return 0;
-        };
-        if (used_ssh_fallback) {
-            var msg: [256]u8 = undefined;
-            showToast(win, std.fmt.bufPrint(&msg, "UDP unavailable for {s}; restored over SSH", .{remote.host}) catch "UDP unavailable; restored over SSH");
-        }
-        return 0;
-    }
+    // ── Durable tabs + app sessions: split out to ui/muxtabs.zig ──
+    // Aliased so `self.method()` call sites and Window.Type references
+    // keep working unchanged on both sides of the split.
+    const muxtabs = @import("muxtabs.zig");
+    pub const attachSessionByHost = muxtabs.attachSessionByHost;
+    pub const focusPaneTab = muxtabs.focusPaneTab;
+    pub const newDurableTab = muxtabs.newDurableTab;
+    pub const newDurableSessionAt = muxtabs.newDurableSessionAt;
+    pub const newDurableSession = muxtabs.newDurableSession;
+    pub const attachMuxTab = muxtabs.attachMuxTab;
+    pub const sessionShown = muxtabs.sessionShown;
+    pub const attachAllSessions = muxtabs.attachAllSessions;
+    pub const focusOrAttachSession = muxtabs.focusOrAttachSession;
+    pub const AppSession = muxtabs.AppSession;
+    pub const launchRemoteAppSession = muxtabs.launchRemoteAppSession;
+    pub const Lease = muxtabs.Lease;
+    pub const attachMux = muxtabs.attachMux;
+    const muxConnect = muxtabs.muxConnect;
+    const makeRemotePaneFromSnap = muxtabs.makeRemotePaneFromSnap;
+    const restoreMuxPane = muxtabs.restoreMuxPane;
+    const MuxRestoreJob = muxtabs.MuxRestoreJob;
+    const startMuxRestoreJob = muxtabs.startMuxRestoreJob;
+    const muxRestoreJobFor = muxtabs.muxRestoreJobFor;
+    const attachMuxLease = muxtabs.attachMuxLease;
 
     /// Carry a pane's per-pane shader choice onto its in-place
     /// replacement, so a mux takeover or a detach-to-shell doesn't
@@ -4988,7 +4249,7 @@ pub const Window = struct {
     /// Mirrors the layout save/restore precedence (preset, then an
     /// explicit pick, then a sticky clear); `new` already had the
     /// default applied by its config push, so this is an override.
-    fn transferPaneShader(self: *Window, old: *Pane, new: *Pane) void {
+    pub fn transferPaneShader(self: *Window, old: *Pane, new: *Pane) void {
         if (old.preset_name) |pn| {
             if (self.applyShaderPresetByName(new, pn)) return;
         }
@@ -5005,7 +4266,7 @@ pub const Window = struct {
     /// the same function — then unlist `old` (its teardown is
     /// deferred past GTK's destroy chain). Shared by the mux takeover
     /// and the detach-to-local-shell path.
-    fn swapPaneInPlace(self: *Window, old: *Pane, pane: *Pane) !*c.AdwTabPage {
+    pub fn swapPaneInPlace(self: *Window, old: *Pane, pane: *Pane) !*c.AdwTabPage {
         // Resolve BOTH failure conditions before touching anything: an
         // error after the model swap would leave the model pointing at a
         // pane the widget tree doesn't have (and the caller then frees that
@@ -5053,7 +4314,7 @@ pub const Window = struct {
     /// shell). Also the landing path when a remote session ends or
     /// the connection drops. Falls back to closing the pane only if
     /// the local shell spawn itself fails.
-    fn detachPaneToShell(self: *Window, pane: *Pane) void {
+    pub fn detachPaneToShell(self: *Window, pane: *Pane) void {
         if (pane.terminal.remote == null) return;
         const fresh = self.spawnShellPaneOpts(null, null) catch {
             std.debug.print("sketerm: detach: local shell spawn failed — closing pane\n", .{});
@@ -5084,7 +4345,7 @@ pub const Window = struct {
     /// now-frozen log on screen (the user's only diagnostic) instead of
     /// detaching to a shell, and retitle the tab to flag the exit. The
     /// user reads the log and closes the tab manually.
-    fn holdExitedAppPane(self: *Window, pane: *Pane, status: i32) void {
+    pub fn holdExitedAppPane(self: *Window, pane: *Pane, status: i32) void {
         std.debug.print("sketerm: forwarded app exited ({d}) without opening a window — holding pane so the log stays visible\n", .{status});
         const page = tabPageForPane(self, pane) orelse return;
         var buf: [96:0]u8 = undefined;
@@ -5098,7 +4359,7 @@ pub const Window = struct {
             c.adw_tab_page_set_needs_attention(page, 1);
     }
 
-    fn holdUnavailableAppPane(self: *Window, pane: *Pane) void {
+    pub fn holdUnavailableAppPane(self: *Window, pane: *Pane) void {
         const page = tabPageForPane(self, pane) orelse return;
         c.adw_tab_page_set_title(page, "app session unavailable");
         c.adw_tab_page_set_tooltip(page, "The remote daemon no longer has this app session. Its last log remains in this tab.");
@@ -5144,91 +4405,6 @@ pub const Window = struct {
         c.gtk_box_append(@ptrCast(wrap), box);
     }
 
-    /// Controller-lease intent for one attach (see mux_cli.Lease).
-    pub const Lease = enum { default, read_only, control };
-
-    pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
-        return self.attachMuxProfile(conn_in, name, host, takeover, null);
-    }
-
-    fn attachMuxProfile(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile) !void {
-        return self.attachMuxLease(conn_in, name, host, takeover, profile, .default);
-    }
-
-    fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
-        var conn = conn_in;
-        self.mux_attach_err_len = 0;
-        crashlog.set("mux attach '{s}' @ {s} takeover={} - handshake", .{ name, host orelse "local", takeover != null });
-
-        const snap = blk: {
-            errdefer conn.deinit();
-            // A GUI attach asks for the app's controller lease by
-            // default (it only lands if free); the daemon answers with
-            // a control_state frame either way, so a viewer that did
-            // not get it finds out.
-            try conn.sendJson(.attach, .{
-                .name = name,
-                .kind = "gui",
-                .read_only = lease == .read_only,
-                .control = lease == .control,
-            });
-            break :blk conn.recvExpect(&.{.snapshot}) catch |err| {
-                // Stash the daemon's reason while `conn` is still alive
-                // (the errdefer below frees it) so the caller surfaces it.
-                const m = conn.lastErr();
-                const n = @min(m.len, self.mux_attach_err.len);
-                @memcpy(self.mux_attach_err[0..n], m[0..n]);
-                self.mux_attach_err_len = n;
-                return err;
-            };
-        };
-        defer snap.deinit(self.allocator);
-
-        // App sessions in window view mode attach TABLESS (their
-        // floating windows are the only UI — a desktop launcher does
-        // not open a terminal). Snapshot header byte 8 is the app
-        // flag. Takeover keeps the tab path: the user explicitly
-        // attached from inside a pane.
-        const envelope = @import("../mux/snapshot.zig").peelEnvelope(snap.payload) catch {
-            conn.deinit();
-            return error.BadSnapshot;
-        };
-        if (takeover == null and self.config.app_view == .window and envelope.app) {
-            return self.attachMuxApp(conn, name, host, snap.payload, lease == .read_only, lease == .control);
-        }
-
-        crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
-        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null, lease == .read_only, lease == .control);
-        pane.active_profile = if (profile) |p| p.name else null;
-        self.applyPaneConfig(pane, .{ .profile = profile });
-
-        var title_buf: [160:0]u8 = undefined;
-        const title_z = if (host) |h|
-            std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch "mux"
-        else
-            std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
-
-        // From here on the pane is LISTED (panes/terminals) and owns the
-        // connection, so a failure must unlist it - leaving it listed with
-        // no parent widget keeps a live fd watch and a phantom pane in every
-        // later query (layout save, `cli list`, pane cycling).
-        const page = if (takeover) |old|
-            self.swapPaneInPlace(old, pane) catch |err| {
-                self.unlistPane(pane);
-                return err;
-            }
-        else blk: {
-            const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-            c.gtk_widget_set_hexpand(wrapper, 1);
-            c.gtk_widget_set_vexpand(wrapper, 1);
-            c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-            break :blk self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
-        };
-        c.adw_tab_page_set_title(page, title_z.ptr);
-        c.adw_tab_page_set_tooltip(page, title_z.ptr);
-        c.adw_tab_view_set_selected_page(self.tab_view, page);
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
-    }
 
     // ── Background layer (image / gradient) ─────────────────────
 
@@ -7762,68 +6938,6 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
-// ── tabless app-session callbacks (Terminal → AppSession) ────────
-
-/// Exit signal for tabless app sessions: remoteClosed sets
-/// child_exited then fires on_render_request (there is no pane tick
-/// to notice it).
-fn appSessionRender(ctx: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    if (!as.terminal.screen.child_exited) return;
-    as.terminal.screen.child_exited = false;
-    as.window.appSessionExited(as);
-}
-
-/// Protocol corruption remains fatal; ordinary transport loss reconnects.
-fn appSessionCrashed(ctx: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    as.window.appSessionExited(as);
-}
-
-fn appSessionConnectionState(ctx: ?*anyopaque, state: Terminal.ConnectionState, _: u32) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    switch (state) {
-        .lost => showToast(as.window, "Remote app connection lost; reconnecting"),
-        .unavailable => {
-            showToast(as.window, "Remote app session is no longer available");
-            as.unavailable = true;
-            as.window.appSessionExited(as);
-        },
-        .connected => showToast(as.window, "Remote app reconnected"),
-        else => {},
-    }
-}
-
-/// AI-driving badge on the floating windows (no pane border to tint).
-fn appSessionPeers(ctx: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    const t = as.terminal;
-    const remote = t.remote orelse return;
-    for (remote.napps.items) |na| na.host.setDriven(t.peer_drivers > 0);
-}
-
-/// New app host on a tabless session: offer "Show in Tab" via the
-/// host menu (materializes a tab, then embeds).
-fn appSessionAppView(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    const AppHost = @import("../wlapp.zig").AppHost;
-    const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
-    if (new) |h| {
-        h.embed_ctx = @ptrCast(as);
-        h.on_request_embed = appSessionRequestEmbed;
-        h.on_embed = null;
-    }
-}
-
-fn appSessionRequestEmbed(ctx: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    const win = as.window;
-    const term = as.terminal;
-    const pane = win.adoptAppSessionIntoTab(as) orelse return;
-    const remote = term.remote orelse return;
-    if (remote.napps.items.len > 0)
-        pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));
-}
 
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
     const self = cast.userData(Window, ctx);
@@ -8013,7 +7127,7 @@ fn setTabPageTitleFromUtf8(allocator: std.mem.Allocator, page: *c.AdwTabPage, ti
 /// Walk every tab page and return the one whose widget tree contains
 /// `pane`. O(tabs × panes-per-tab) — both small for any realistic
 /// session.
-fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
+pub fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
     const n = c.adw_tab_view_get_n_pages(self.tab_view);
     // Model first: pure data, correct even while a pane is zoomed
     // (zoom reparents widgets but never touches the model).
