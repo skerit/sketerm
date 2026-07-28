@@ -1276,11 +1276,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         if (host) |h| {
             var cfg = @import("config.zig").Config.load(allocator);
             defer cfg.deinit();
-            const range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
-                cfg.mux_udp_port_range
-            else
-                null;
-            break :blk muxclient.Conn.connectRemote(allocator, h, range) catch |err| {
+            break :blk muxclient.Conn.connectRemote(allocator, h, cfg.udpRange()) catch |err| {
                 _ = c.fprintf(platform.stderr(), "sketerm mount: cannot connect: %s\n", @errorName(err).ptr);
                 return 1;
             };

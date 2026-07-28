@@ -86,8 +86,8 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     };
     var cfg = @import("../../config.zig").Config.load(self.allocator);
     defer cfg.deinit();
-    if (cfg.mux_udp_port_range.len > 0) {
-        ctx.port_range = self.allocator.dupe(u8, cfg.mux_udp_port_range) catch &.{};
+    if (cfg.udpRange()) |range| {
+        ctx.port_range = self.allocator.dupe(u8, range) catch &.{};
     }
     const th = std.Thread.spawn(.{}, connectThreadMain, .{ctx}) catch {
         if (ctx.port_range.len > 0) self.allocator.free(ctx.port_range);
