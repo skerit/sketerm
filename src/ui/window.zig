@@ -15,6 +15,7 @@ const palette_mod = @import("palette.zig");
 const clipboard = @import("clipboard.zig");
 const remotectl_mod = @import("remotectl.zig");
 const modes_mod = @import("modes.zig");
+const winlayout_mod = @import("winlayout.zig");
 const Config = @import("../config.zig").Config;
 const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
@@ -91,24 +92,6 @@ const NotifySlot = struct {
     want_focus: bool,
 };
 
-/// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
-/// `freePanedRatio`. Carries its own allocator so the GTK destroy-notify
-/// can free without needing a Window pointer.
-/// Live ratio tracker for a GtkPaned. `ratio` is updated whenever the
-/// user drags (via notify::position) and re-applied on every map (via
-/// the map signal). Tab switches unmap+remap the paged subtree; without
-/// re-apply, GtkPaned reverts to natural sizes on remap.
-///
-/// `setting` guards against the feedback loop: our own gtk_paned_set_
-/// position triggers notify::position, which would re-read total (which
-/// may be transient during allocation) and corrupt ratio. We bracket
-/// every set_position with setting=true so the notify handler ignores
-/// our own writes.
-const PanedRatioCtx = struct {
-    allocator: std.mem.Allocator,
-    ratio: f32,
-    setting: bool = false,
-};
 
 /// Smallest M such that `scale * M` is integer (within 1e-3 tolerance).
 /// 1.0 → 1, 1.5 → 2, 1.25/1.75 → 4. Caps at 16; anything past that we
@@ -121,7 +104,7 @@ const PanedRatioCtx = struct {
 /// (which c3db441 was supposed to escape). Diagnose with
 /// `GDK_DEBUG=offload` — the "Non-integral device coordinates" line
 /// is the rejection.
-fn alignmentForScale(scale: f64) u32 {
+pub fn alignmentForScale(scale: f64) u32 {
     if (scale <= 0) return 1;
     const tol: f64 = 1e-3;
     var m: u32 = 1;
@@ -133,14 +116,14 @@ fn alignmentForScale(scale: f64) u32 {
 }
 
 /// Surface scale for `widget`'s native, or 1.0 if not realized yet.
-fn widgetSurfaceScale(widget: *c.GtkWidget) f64 {
+pub fn widgetSurfaceScale(widget: *c.GtkWidget) f64 {
     const native = c.gtk_widget_get_native(widget) orelse return 1.0;
     const surface = c.gtk_native_get_surface(native) orelse return 1.0;
     return c.gdk_surface_get_scale(surface);
 }
 
 /// Round `pos` down to the nearest multiple of M that's still > 0.
-fn snapDown(pos: c_int, m: u32) c_int {
+pub fn snapDown(pos: c_int, m: u32) c_int {
     if (m <= 1) return pos;
     if (pos <= 0) return pos;
     const im: c_int = @intCast(m);
@@ -152,7 +135,7 @@ fn snapDown(pos: c_int, m: u32) c_int {
 /// window callbacks) when a fallible op (`newShellTab`, `splitFocused`,
 /// …) fails. The previous `catch {}` swallowed errors silently — the
 /// user clicked, nothing happened, and there was no log line.
-fn logActionError(action: []const u8, err: anyerror) void {
+pub fn logActionError(action: []const u8, err: anyerror) void {
     std.debug.print("sketerm: action '{s}' failed: {s}\n", .{ action, @errorName(err) });
 }
 
@@ -821,6 +804,31 @@ pub const Window = struct {
         self.allocator.destroy(self);
     }
 
+    // ── Layout persistence: split out to ui/winlayout.zig ──
+    const winlayout = @import("winlayout.zig");
+    pub const newTabFromSpec = winlayout.newTabFromSpec;
+    pub const restoreLastClosed = winlayout.restoreLastClosed;
+    pub const loadLayoutDefault = winlayout.loadLayoutDefault;
+    pub const loadLayoutFromPath = winlayout.loadLayoutFromPath;
+    pub const collectLayout = winlayout.collectLayout;
+    pub const saveLayoutAs = winlayout.saveLayoutAs;
+    pub const loadLayoutAs = winlayout.loadLayoutAs;
+    pub const saveLayoutQuietly = winlayout.saveLayoutQuietly;
+    pub const duplicateCurrentTab = winlayout.duplicateCurrentTab;
+    pub const saveDefaultLayout = winlayout.saveDefaultLayout;
+    pub const loadDefaultLayoutIfPresent = winlayout.loadDefaultLayoutIfPresent;
+    const restorePaneShader = winlayout.restorePaneShader;
+    const buildTreeWidget = winlayout.buildTreeWidget;
+    const captureClosedTab = winlayout.captureClosedTab;
+    const loadLayoutSimple = winlayout.loadLayoutSimple;
+    const collectTree = winlayout.collectTree;
+    const paneSpec = winlayout.paneSpec;
+    const modelTreeToLayout = winlayout.modelTreeToLayout;
+    const verifyTreeModel = winlayout.verifyTreeModel;
+    const verifyAllTabs = winlayout.verifyAllTabs;
+    const widgetMatchesNode = winlayout.widgetMatchesNode;
+    const saveLayoutToDefault = winlayout.saveLayoutToDefault;
+
     // ── Hints / search / copy mode: split out to ui/modes.zig ──
     const modes = @import("modes.zig");
     pub const openHints = modes.openHints;
@@ -961,7 +969,7 @@ pub const Window = struct {
 
     /// Give a browser face its window-level abilities: durable
     /// terminal tabs on any host, and app-forwarded remote opens.
-    fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
+    pub fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
         if (self.file_transfer_service == null) {
             self.file_transfer_service = file_transfers.acquire(
                 self.allocator,
@@ -1161,217 +1169,6 @@ pub const Window = struct {
         return null;
     }
 
-    /// Spawn a new tab from a layout TabSpec (used on --restore).
-    /// Handles both v2 (tree) and v1-compat (cwd/command) fields. `at_end`
-    /// forces an append so a multi-tab restore keeps its saved order.
-    pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_end: bool) !void {
-        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_vexpand(wrapper, 1);
-        c.gtk_widget_set_hexpand(wrapper, 1);
-
-        var model_root: PaneTree.Node = undefined;
-        const root_widget = try self.buildTreeWidget(spec.tree, &model_root);
-        c.gtk_box_append(@ptrCast(wrapper), root_widget);
-
-        const title_z = try self.allocator.allocSentinel(u8, spec.title.len, 0);
-        defer self.allocator.free(title_z);
-        @memcpy(title_z, spec.title);
-
-        const page = self.appendOrInsertTab(wrapper, model_root, at_end);
-        c.adw_tab_page_set_title(page, title_z.ptr);
-        c.adw_tab_page_set_tooltip(page, title_z.ptr);
-        // Re-arm the user-rename lock so OSC titles can't stomp a
-        // deliberately named tab. Files predating the flag (null)
-        // count as renamed — restored titles never followed OSC then.
-        if (spec.title_locked orelse true) {
-            c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-title-locked", @ptrCast(page));
-        }
-        if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
-        if (spec.color) |col_str| {
-            if (parseHexRGB(col_str)) |col| self.setTabColor(page, col);
-        }
-        tab_effects.setTabSettings(page, .{
-            .show_activity = spec.show_activity,
-            .warn_inactive = spec.warn_inactive,
-        });
-        // A restored/duplicated warn-tab starts clean: the warning is edge-
-        // triggered on activity→silence, so it stays quiet until the tab
-        // actually produces output and then falls silent. Nothing to anchor.
-    }
-
-    /// Re-apply a PaneSpec's saved shader state: preset by name
-    /// first, then the explicit path pick, then a sticky clear.
-    fn restorePaneShader(self: *Window, pane: *Pane, p: @import("../layout.zig").PaneSpec) void {
-        if (p.shader_preset.len > 0) {
-            if (self.applyShaderPresetByName(pane, p.shader_preset)) return;
-        }
-        if (p.custom_shader.len > 0)
-            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
-        else if (p.shader_cleared)
-            pane.clearShader();
-    }
-
-    /// Build the widget subtree for a layout spec, producing the
-    /// matching model node in `node_out` (valid only on success).
-    fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_out: *PaneTree.Node) !*c.GtkWidget {
-        switch (tree) {
-            .pane => |p| {
-                // Durable LOCAL mux pane: reattach (or recreate under
-                // the same name) instead of spawning a local PTY. A
-                // failed daemon falls through to the plain spawn below
-                // so startup never wedges on a layout. REMOTE mux panes
-                // never connect here — ssh/udp to a dead host would
-                // freeze the whole GUI (this runs on the main loop);
-                // they spawn the local placeholder below and reattach
-                // asynchronously (startMuxRestoreJob).
-                if (p.mux_session.len > 0 and p.mux_host.len == 0) {
-                    if (self.restoreMuxPane(p)) |pane| {
-                        self.restorePaneShader(pane, p);
-                        node_out.* = .{ .leaf = pane };
-                        return pane.widget();
-                    } else |err| {
-                        std.debug.print(
-                            "sketerm: mux restore '{s}' failed ({s}) — spawning local shell\n",
-                            .{ p.mux_session, @errorName(err) },
-                        );
-                    }
-                }
-
-                if (p.command.len == 0) return error.EmptyCommand;
-
-                // Resolve profile (if any) so we can honour profile.shell
-                // override before constructing argv.
-                const profile: ?*const @import("../config.zig").Profile = if (p.profile.len > 0)
-                    self.findProfile(p.profile)
-                else
-                    null;
-
-                var argv_buf = try self.allocator.alloc([*:0]const u8, p.command.len);
-                defer self.allocator.free(argv_buf);
-                var arg_owners: std.ArrayList([:0]u8) = .empty;
-                defer {
-                    for (arg_owners.items) |s| self.allocator.free(s);
-                    arg_owners.deinit(self.allocator);
-                }
-                for (p.command, 0..) |cmd, i| {
-                    // The profile's shell overrides command[0] if
-                    // set, so duplicating an "ssh" profile keeps
-                    // using ssh even after a layout round-trip
-                    // captured the current $SHELL.
-                    const eff_cmd: []const u8 = if (i == 0 and profile != null and profile.?.settings.shell != null)
-                        profile.?.settings.shell.?
-                    else
-                        cmd;
-                    const z = try self.allocator.allocSentinel(u8, eff_cmd.len, 0);
-                    try arg_owners.append(self.allocator, z);
-                    @memcpy(z, eff_cmd);
-                    argv_buf[i] = z.ptr;
-                }
-
-                // Convert argv to slices for the wire spawn. The restored
-                // local pane becomes a daemon-backed session (the unified
-                // model) — the factory tracks it in panes/terminals.
-                var argv_slices: std.ArrayList([]const u8) = .empty;
-                defer argv_slices.deinit(self.allocator);
-                for (argv_buf) |a| try argv_slices.append(self.allocator, std.mem.span(a));
-
-                const pane = try self.daemonSpawnPane(.{
-                    .argv = argv_slices.items,
-                    .cwd = p.cwd,
-                    .si = self.shellIntegrationFor(argv_buf[0]),
-                    .profile = profile,
-                });
-                pane.setSpawnArgv(argv_buf);
-                // Restore extras the base factory doesn't cover: per-pane
-                // font-size override + explicit shader preset/clear.
-                if (p.font_size != null)
-                    self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = p.font_size });
-                self.restorePaneShader(pane, p);
-
-                // Remote durable pane: the local shell above is a live
-                // placeholder; the reattach runs off the main loop and
-                // swaps in when (if) the host answers.
-                if (p.mux_session.len > 0 and p.mux_host.len > 0)
-                    self.startMuxRestoreJob(pane, p);
-
-                // Browser face: reattach with the saved internal tabs.
-                if (p.browser != null or p.browser_tabs.len > 0) {
-                    const browser_mod = @import("browser.zig");
-                    const restored = if (p.browser) |state|
-                        browser_mod.BrowserView.attachState(self.allocator, pane, state)
-                    else
-                        browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0]);
-                    if (restored) |bv| {
-                        self.installBrowserHooks(bv);
-                        if (p.browser == null) {
-                            for (p.browser_tabs[1..]) |tp| _ = bv.newTabSpec(tp);
-                        }
-                    } else |err| {
-                        std.debug.print("sketerm: browser restore failed: {s}\n", .{@errorName(err)});
-                    }
-                }
-
-                node_out.* = .{ .leaf = pane };
-                return pane.widget();
-            },
-            .split => |s| {
-                if (s.children.len < 2) return error.InvalidLayout;
-                const orientation: c_uint = if (s.orientation == .horizontal)
-                    @intCast(c.GTK_ORIENTATION_HORIZONTAL)
-                else
-                    @intCast(c.GTK_ORIENTATION_VERTICAL);
-                const paned = c.gtk_paned_new(orientation);
-                c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
-                c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
-                c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
-                c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
-                // Wide handle so GtkPaned honours CSS min-width on
-                // the separator (gives us the gutter around the line).
-                c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
-                var first_node: PaneTree.Node = undefined;
-                var second_node: PaneTree.Node = undefined;
-                const first = try self.buildTreeWidget(s.children[0], &first_node);
-                const second = try self.buildTreeWidget(s.children[1], &second_node);
-                c.gtk_paned_set_start_child(@ptrCast(paned), first);
-                c.gtk_paned_set_end_child(@ptrCast(paned), second);
-                const split_node = try self.allocator.create(PaneTree.Split);
-                split_node.* = .{
-                    .orientation = if (s.orientation == .horizontal) .horizontal else .vertical,
-                    .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
-                    .children = .{ first_node, second_node },
-                    .view = paned,
-                };
-                node_out.* = .{ .split = split_node };
-
-                // Apply saved ratio after the widget gets its first
-                // allocation. Until then we don't know the total
-                // size in pixels.
-                const ratio_holder = try self.allocator.create(PanedRatioCtx);
-                ratio_holder.* = .{
-                    .allocator = self.allocator,
-                    .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
-                };
-                _ = c.g_signal_connect_data(
-                    paned,
-                    "notify::position",
-                    @ptrCast(&onPanedPositionChanged),
-                    @ptrCast(ratio_holder),
-                    @ptrCast(&freePanedRatio),
-                    c.G_CONNECT_DEFAULT,
-                );
-                _ = c.g_signal_connect_data(
-                    paned,
-                    "map",
-                    @ptrCast(&applyPanedRatioMap),
-                    @ptrCast(ratio_holder),
-                    null,
-                    c.G_CONNECT_DEFAULT,
-                );
-                return paned;
-            },
-        }
-    }
-
     pub fn addTabInternal(
         self: *Window,
         title_z: [*:0]const u8,
@@ -1459,78 +1256,6 @@ pub const Window = struct {
         return self.spawnShellPaneOpts(null, null);
     }
 
-    /// Snapshot a tab into the recently-closed ring before its panes
-    /// are torn down. Stores title + first-pane cwd + active profile.
-    /// Splits aren't preserved — the restore spawns a single shell.
-    fn captureClosedTab(self: *Window, page: *c.AdwTabPage, root: *c.GtkWidget) void {
-        if (self.closed_arena == null) {
-            self.closed_arena = std.heap.ArenaAllocator.init(self.allocator);
-        }
-        const arena = self.closed_arena.?.allocator();
-
-        // Title (AdwTabPage owns the string; dup into our arena).
-        const title_c = c.adw_tab_page_get_title(page);
-        const title_dup: []const u8 = if (title_c == null) "Tab" else blk: {
-            const span = std.mem.span(@as([*:0]const u8, @ptrCast(title_c)));
-            break :blk arena.dupe(u8, span) catch "Tab";
-        };
-
-        // Find the first pane in this page's tree → snapshot its cwd
-        // + profile.
-        var snap_cwd: ?[]const u8 = null;
-        var snap_profile: ?[]const u8 = null;
-        for (self.panes.items) |p| {
-            if (widgetIsAncestor(root, p.widget())) {
-                if (p.terminal.cwd) |c2| snap_cwd = arena.dupe(u8, c2) catch null;
-                if (p.active_profile) |pn| snap_profile = arena.dupe(u8, pn) catch null;
-                break;
-            }
-        }
-
-        const entry: ClosedTab = .{
-            .title = title_dup,
-            .cwd = snap_cwd,
-            .profile_name = snap_profile,
-        };
-
-        // Cap at 16; drop the oldest when full.
-        const max_closed: usize = 16;
-        if (self.closed_tabs.items.len >= max_closed) {
-            _ = self.closed_tabs.orderedRemove(0);
-        }
-        self.closed_tabs.append(self.allocator, entry) catch {};
-    }
-
-    /// Pop the most-recently-closed tab and respawn it with its
-    /// captured title / cwd / profile. No-op when the ring is empty.
-    pub fn restoreLastClosed(self: *Window) void {
-        if (self.closed_tabs.items.len == 0) return;
-        const entry = self.closed_tabs.pop().?;
-        // newShellTabWithProfile takes a NUL-terminated title.
-        var title_buf: [256:0]u8 = undefined;
-        const n = @min(entry.title.len, title_buf.len);
-        @memcpy(title_buf[0..n], entry.title[0..n]);
-        title_buf[n] = 0;
-        const title_z: ?[*:0]const u8 = if (entry.title.len > 0) @ptrCast(&title_buf) else null;
-        // The captured cwd is owned by closed_arena; the spawn path
-        // dups it into the child PTY's env briefly so it's safe.
-        const pane = self.spawnShellPaneOpts(entry.cwd, entry.profile_name) catch |err| {
-            std.debug.print("sketerm: restore-closed-tab spawn failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        // Wrap pane.widget() in a Box so layout reparenting works the
-        // same as addTabWithProfile does.
-        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_hexpand(wrapper, 1);
-        c.gtk_widget_set_vexpand(wrapper, 1);
-        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-        const adw_page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
-        const title_for_page: [*:0]const u8 = title_z orelse "Tab";
-        c.adw_tab_page_set_title(adw_page, title_for_page);
-        c.adw_tab_page_set_tooltip(adw_page, title_for_page);
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
-    }
-
     /// Look up a named profile in the active Config, or null if no
     /// such profile exists. Caller-borrowed slice (Config arena).
     pub fn findProfile(self: *const Window, name: []const u8) ?*const @import("../config.zig").Profile {
@@ -1614,7 +1339,7 @@ pub const Window = struct {
     /// shell-integration for full parity with the old in-process spawn, and
     /// disables the predictor (the local socket hop is sub-ms, so speculative
     /// echo would only add flicker).
-    fn daemonSpawnPane(self: *Window, spec: DaemonSpawnSpec) !*Pane {
+    pub fn daemonSpawnPane(self: *Window, spec: DaemonSpawnSpec) !*Pane {
         var name_buf: [64]u8 = undefined;
         const name = nextSessionName(&name_buf);
         const pane_id = self.allocPaneId();
@@ -1914,7 +1639,7 @@ pub const Window = struct {
     /// Spawn an empty secondary Window sharing this one's config.
     /// Used by tab drag-out (AdwTabView "create-window") and the
     /// detach_tab action.
-    fn spawnSecondaryWindow(self: *Window) ?*Window {
+    pub fn spawnSecondaryWindow(self: *Window) ?*Window {
         const app = c.gtk_window_get_application(@ptrCast(self.app_window));
         const cfg = self.config.clone(self.allocator) catch null;
         const win = Window.initWithConfig(self.allocator, @ptrCast(app), cfg, false) catch |err| {
@@ -1993,7 +1718,7 @@ pub const Window = struct {
 
     /// Walk a transferred page's widget tree and adopt every pane in
     /// it (split trees carry several).
-    fn adoptPanesInTree(self: *Window, w: *c.GtkWidget) void {
+    pub fn adoptPanesInTree(self: *Window, w: *c.GtkWidget) void {
         if (c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-pane")) |data| {
             const pane: *Pane = @ptrCast(@alignCast(data));
             self.adoptPane(pane);
@@ -2208,20 +1933,20 @@ pub const Window = struct {
         }
         // Safety net: also apply 0.5 ratio on map, in case the paned
         // gets a different allocation than its focused predecessor.
-        const ratio_holder = try self.allocator.create(PanedRatioCtx);
+        const ratio_holder = try self.allocator.create(winlayout_mod.PanedRatioCtx);
         ratio_holder.* = .{ .allocator = self.allocator, .ratio = 0.5 };
         _ = c.g_signal_connect_data(
             paned,
             "notify::position",
-            @ptrCast(&onPanedPositionChanged),
+            @ptrCast(&winlayout_mod.onPanedPositionChanged),
             @ptrCast(ratio_holder),
-            @ptrCast(&freePanedRatio),
+            @ptrCast(&winlayout_mod.freePanedRatio),
             c.G_CONNECT_DEFAULT,
         );
         _ = c.g_signal_connect_data(
             paned,
             "map",
-            @ptrCast(&applyPanedRatioMap),
+            @ptrCast(&winlayout_mod.applyPanedRatioMap),
             @ptrCast(ratio_holder),
             null,
             c.G_CONNECT_DEFAULT,
@@ -2288,81 +2013,6 @@ pub const Window = struct {
         c.gtk_widget_queue_resize(@ptrCast(paned));
 
         _ = c.gtk_widget_grab_focus(focused_w);
-    }
-
-    /// Load the default last.json and rebuild tabs from it.
-    pub fn loadLayoutDefault(self: *Window) !bool {
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const path = try layout_mod.defaultSavePath(arena);
-        var parsed = layout_mod.load(self.allocator, path) catch |err| {
-            std.debug.print("sketerm: cannot load layout from {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        defer parsed.deinit();
-
-        for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab, true) catch |err| {
-                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
-            };
-        }
-        return true;
-    }
-
-    pub fn loadLayoutFromPath(self: *Window, path: []const u8) !bool {
-        if (std.mem.endsWith(u8, path, ".layout")) {
-            return self.loadLayoutSimple(path);
-        }
-        var parsed = layout_mod.load(self.allocator, path) catch |err| {
-            std.debug.print("sketerm: cannot load layout from {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        defer parsed.deinit();
-        for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab, true) catch |err| {
-                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
-            };
-        }
-        return true;
-    }
-
-    fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
-        const layout_simple = @import("../layout_simple.zig");
-        // Zig 0.16's `std.fs.cwd().openFile` requires an `Io`. Use libc.
-        var path_z: [4096]u8 = undefined;
-        const p = pathZ(&path_z, path) catch {
-            std.debug.print("sketerm: path too long: {s}\n", .{path});
-            return false;
-        };
-        const fp = c.fopen(p, "rb") orelse {
-            std.debug.print("sketerm: cannot open {s}\n", .{path});
-            return false;
-        };
-        defer _ = c.fclose(fp);
-        if (c.fseek(fp, 0, c.SEEK_END) != 0) return false;
-        const size_long = c.ftell(fp);
-        if (size_long <= 0 or size_long > 1024 * 1024) return false;
-        if (c.fseek(fp, 0, c.SEEK_SET) != 0) return false;
-        const size: usize = @intCast(size_long);
-        const bytes = self.allocator.alloc(u8, size) catch return false;
-        defer self.allocator.free(bytes);
-        if (c.fread(bytes.ptr, 1, size, fp) != size) {
-            std.debug.print("sketerm: short read on {s}\n", .{path});
-            return false;
-        }
-        var parsed = layout_simple.parse(self.allocator, bytes) catch |err| {
-            std.debug.print("sketerm: parse {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        defer parsed.deinit();
-        for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab, true) catch |err| {
-                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
-            };
-        }
-        return true;
     }
 
     pub fn closeCurrentTab(self: *Window) void {
@@ -2582,7 +2232,7 @@ pub const Window = struct {
     /// for the now-selected `page`. Any previous pending acknowledge is
     /// cancelled, so flicking through tabs never acknowledges the ones merely
     /// passed over — only the tab dwelt on long enough.
-    fn scheduleTabAck(self: *Window, page: *c.AdwTabPage) void {
+    pub fn scheduleTabAck(self: *Window, page: *c.AdwTabPage) void {
         if (self.ack_timer_id != 0) {
             _ = c.g_source_remove(self.ack_timer_id);
             self.ack_timer_id = 0;
@@ -3434,7 +3084,7 @@ pub const Window = struct {
     /// Free a page's tree model — call ONLY on true tab teardown
     /// (close/shutdown), never on cross-window transfer (the qdata
     /// must travel with the page).
-    fn freeTabTree(self: *Window, page: *c.AdwTabPage) void {
+    pub fn freeTabTree(self: *Window, page: *c.AdwTabPage) void {
         if (tabTreeOf(page)) |t| {
             t.deinit();
             self.allocator.destroy(t);
@@ -3653,7 +3303,7 @@ pub const Window = struct {
     /// resolution in util/shellintegration.zig) and cache the
     /// per-shell script + shim paths. Missing dir = feature
     /// silently off.
-    fn resolveShellIntegration(self: *Window) void {
+    pub fn resolveShellIntegration(self: *Window) void {
         const ally = self.allocator;
         var base_buf: [4096]u8 = undefined;
         const base = @import("../util/shellintegration.zig").baseDir(&base_buf) orelse return;
@@ -3667,7 +3317,7 @@ pub const Window = struct {
 
     /// Pick the injection setup for the program being spawned, or
     /// null (no injection) for shells we don't auto-integrate.
-    fn shellIntegrationFor(self: *const Window, argv0: [*:0]const u8) ?@import("../pty.zig").ShellIntegration {
+    pub fn shellIntegrationFor(self: *const Window, argv0: [*:0]const u8) ?@import("../pty.zig").ShellIntegration {
         if (!self.config.shell_integration) return null;
         const prog = std.mem.span(argv0);
         const base = std.fs.path.basename(prog);
@@ -4155,7 +3805,7 @@ pub const Window = struct {
 
     /// Wire / unwire each Terminal's broadcast_sink based on the
     /// current groupsend mode. Off = no sink installed (direct writes).
-    fn refreshBroadcastSink(self: *Window) void {
+    pub fn refreshBroadcastSink(self: *Window) void {
         const sink: ?*const fn (ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void = if (self.groupsend == .off) null else broadcastSinkFn;
         for (self.terminals.items) |t| {
             t.broadcast_sink = sink;
@@ -4163,7 +3813,7 @@ pub const Window = struct {
         }
     }
 
-    fn applyBroadcastCss(self: *Window, p: *Pane) void {
+    pub fn applyBroadcastCss(self: *Window, p: *Pane) void {
         if (p.titlebar_box) |tb| {
             const w: *c.GtkWidget = @ptrCast(@alignCast(tb));
             if (self.groupsend != .off) {
@@ -4528,375 +4178,6 @@ pub const Window = struct {
         self.verifyAllTabs();
     }
 
-    /// Build a Layout snapshot of the current window state.
-    /// Caller must arena-free or otherwise track strings.
-    pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout {
-        var tabs: std.ArrayList(layout_mod.TabSpec) = .empty;
-        const n_pages = c.adw_tab_view_get_n_pages(self.tab_view);
-        var i: c_int = 0;
-        while (i < n_pages) : (i += 1) {
-            const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
-            const wrapper = c.adw_tab_page_get_child(page);
-            const root = c.gtk_widget_get_first_child(@ptrCast(wrapper));
-            if (root == null) continue;
-
-            const title_cstr = c.adw_tab_page_get_title(page);
-            const title = if (title_cstr != null) std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr))) else "";
-
-            self.verifyTreeModel(page.?, root.?);
-            // Model-based serialization (correct even while zoomed);
-            // widget walk only as fallback for a missing model.
-            const tree = if (Window.tabTreeOf(page.?)) |t|
-                self.modelTreeToLayout(arena, t.root) catch continue
-            else
-                self.collectTree(arena, root.?) catch continue;
-            try tabs.append(arena, .{
-                .title = try arena.dupe(u8, title),
-                .tree = tree,
-                .pinned = c.adw_tab_page_get_pinned(page) != 0,
-                .color = if (tabColorOf(page.?)) |col|
-                    try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
-                else
-                    null,
-                .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
-                .show_activity = tab_effects.tabSettings(page.?).show_activity,
-                .warn_inactive = tab_effects.tabSettings(page.?).warn_inactive,
-            });
-        }
-        return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
-    }
-
-    fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !layout_mod.Tree {
-        const is_paned = c.g_type_check_instance_is_a(
-            @ptrCast(@alignCast(w)),
-            c.gtk_paned_get_type(),
-        ) != 0;
-        if (is_paned) {
-            const start = c.gtk_paned_get_start_child(@ptrCast(w)) orelse return error.MissingChild;
-            const end = c.gtk_paned_get_end_child(@ptrCast(w)) orelse return error.MissingChild;
-            const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
-            const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-                c.gtk_widget_get_width(w)
-            else
-                c.gtk_widget_get_height(w);
-            const pos = c.gtk_paned_get_position(@ptrCast(w));
-            const ratio: f32 = if (total > 0)
-                @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total))
-            else
-                0.5;
-            const children = try arena.alloc(layout_mod.Tree, 2);
-            children[0] = try self.collectTree(arena, start);
-            children[1] = try self.collectTree(arena, end);
-            return .{ .split = .{
-                .orientation = if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical,
-                .ratio = ratio,
-                .children = children,
-            } };
-        }
-
-        // Leaf — find the Pane that owns this widget.
-        for (self.panes.items) |p| {
-            if (@intFromPtr(p.widget()) == @intFromPtr(w)) {
-                return .{ .pane = try self.paneSpec(arena, p) };
-            }
-        }
-        return error.PaneNotFound;
-    }
-
-    /// Serialize one pane's restore state (cwd, command, profile,
-    /// shader, mux session) — shared by the model- and widget-based
-    /// layout walkers.
-    fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.PaneSpec {
-        {
-            {
-                // OSC 7 cwd if the shell reported it, else "/". (The shell
-                // runs under the mux daemon now — there's no local pid to
-                // resolve /proc against; the daemon-side cwd rides `list`.)
-                const cwd: []const u8 = if (p.terminal.cwd) |reported|
-                    try arena.dupe(u8, reported)
-                else
-                    try arena.dupe(u8, "/");
-                // Serialize the command the pane was actually spawned
-                // with; fall back to $SHELL for panes without a record.
-                const cmd: [][]const u8 = if (p.spawn_argv) |av| blk: {
-                    const out = try arena.alloc([]const u8, av.len);
-                    for (av, 0..) |a, i| out[i] = try arena.dupe(u8, a);
-                    break :blk out;
-                } else blk: {
-                    const out = try arena.alloc([]const u8, 1);
-                    out[0] = try arena.dupe(u8, @import("../util/profile.zig").getenv("SHELL") orelse "/bin/bash");
-                    break :blk out;
-                };
-                // Save font_size only if it diverges from the pane's
-                // profile settings — keeps layout files terse.
-                const base_fs = self.config.profileSettings(p.active_profile orelse "").font_size;
-                const fs: ?u16 = if (p.font_size != base_fs) p.font_size else null;
-                // Carry profile name so split-tree restore / duplicate
-                // can reapply per-pane profile overrides.
-                const prof: []const u8 = if (p.active_profile) |pn|
-                    try arena.dupe(u8, pn)
-                else
-                    "";
-                // Explicit shader pick travels with the layout;
-                // profile/global shaders re-resolve on restore.
-                const shader: []const u8 = if (p.custom_shader_user)
-                    (if (p.custom_shader_path) |sp| try arena.dupe(u8, sp) else "")
-                else
-                    "";
-                const preset: []const u8 = if (p.preset_name) |pn|
-                    try arena.dupe(u8, pn)
-                else
-                    "";
-                // Durable mux panes: session + transport so restore can
-                // reattach (or recreate under the same name). Skip EPHEMERAL
-                // (GUI-owned local) sessions — they're killed on quit, so
-                // saving their name would make restore recreate a non-ephemeral
-                // session (leaking it + losing env parity). They restore as a
-                // plain command/cwd local pane instead, re-routed through
-                // daemonSpawnPane (which re-marks them ephemeral).
-                var mux_session: []const u8 = "";
-                var mux_host: []const u8 = "";
-                if (p.terminal.remote) |r| {
-                    if (!r.ephemeral) {
-                        mux_session = try arena.dupe(u8, r.session);
-                        if (r.host) |h| mux_host = try arena.dupe(u8, h);
-                    }
-                }
-                // Placeholder for an async remote reattach still in
-                // flight: keep the saved mux identity so quitting
-                // mid-connect doesn't demote the pane to a plain shell.
-                if (mux_session.len == 0) {
-                    if (self.muxRestoreJobFor(p.id)) |job| {
-                        mux_session = try arena.dupe(u8, job.session);
-                        mux_host = try arena.dupe(u8, job.host);
-                    }
-                }
-                // Browser face: persist the internal tab paths so a
-                // restore reopens the same locations.
-                const browser_tabs: []const []const u8 = blk: {
-                    const bv = @import("browser.zig").BrowserView.fromPane(p) orelse
-                        break :blk &[_][]const u8{};
-                    break :blk try bv.tabPaths(arena);
-                };
-                const browser_state = blk: {
-                    const bv = @import("browser.zig").BrowserView.fromPane(p) orelse break :blk null;
-                    break :blk try bv.paneState(arena);
-                };
-                return .{
-                    .cwd = cwd,
-                    .command = cmd,
-                    .font_size = fs,
-                    .profile = prof,
-                    .custom_shader = shader,
-                    .shader_preset = preset,
-                    .shader_cleared = p.shader_cleared,
-                    .mux_session = mux_session,
-                    .mux_host = mux_host,
-                    .browser_tabs = browser_tabs,
-                    .browser = browser_state,
-                };
-            }
-        }
-    }
-
-    /// Serialize a model node to a layout tree. Split ratios are
-    /// read live from the view handle (the GtkPaned) at save time.
-    fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree.Node) !layout_mod.Tree {
-        switch (node) {
-            .leaf => |p| return .{ .pane = try self.paneSpec(arena, p) },
-            .split => |sp| {
-                var ratio: f32 = if (sp.ratio > 0 and sp.ratio < 1) sp.ratio else 0.5;
-                if (sp.view) |v| {
-                    const paned: *c.GtkWidget = @ptrCast(@alignCast(v));
-                    const total: c_int = if (sp.orientation == .horizontal)
-                        c.gtk_widget_get_width(paned)
-                    else
-                        c.gtk_widget_get_height(paned);
-                    const pos = c.gtk_paned_get_position(@ptrCast(paned));
-                    if (total > 0) ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
-                }
-                const children = try arena.alloc(layout_mod.Tree, 2);
-                children[0] = try self.modelTreeToLayout(arena, sp.children[0]);
-                children[1] = try self.modelTreeToLayout(arena, sp.children[1]);
-                return .{ .split = .{
-                    .orientation = if (sp.orientation == .horizontal) .horizontal else .vertical,
-                    .ratio = ratio,
-                    .children = children,
-                } };
-            },
-        }
-    }
-
-    /// SKETERM_VERIFY_TREE=1: structural cross-check of the tree
-    /// model against the live widget tree. Skipped while a pane is
-    /// zoomed (zoom reparents widgets; the model is authoritative).
-    fn verifyTreeModel(self: *Window, page: *c.AdwTabPage, root_widget: *c.GtkWidget) void {
-        const S = struct {
-            var enabled: ?bool = null;
-        };
-        if (S.enabled == null) S.enabled = c.getenv("SKETERM_VERIFY_TREE") != null;
-        if (!S.enabled.?) return;
-        if (self.zoom_pane != null) return;
-        const t = Window.tabTreeOf(page) orelse {
-            std.debug.print("sketerm: VERIFY: page has no tree model\n", .{});
-            return;
-        };
-        if (!self.widgetMatchesNode(root_widget, t.root)) {
-            std.debug.print("sketerm: VERIFY FAILED: tree model diverges from widget tree\n", .{});
-            // Test-only env var: die loudly so the e2e harness fails.
-            c.abort();
-        }
-    }
-
-    /// Verify every tab's model (SKETERM_VERIFY_TREE only; no-op
-    /// otherwise). Called after each tree mutation.
-    fn verifyAllTabs(self: *Window) void {
-        if (c.getenv("SKETERM_VERIFY_TREE") == null) return;
-        const n = c.adw_tab_view_get_n_pages(self.tab_view);
-        var i: c_int = 0;
-        while (i < n) : (i += 1) {
-            const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
-            const wrapper = c.adw_tab_page_get_child(page) orelse continue;
-            const root = c.gtk_widget_get_first_child(@ptrCast(wrapper)) orelse continue;
-            self.verifyTreeModel(page, root);
-        }
-    }
-
-    fn widgetMatchesNode(self: *Window, w: *c.GtkWidget, node: PaneTree.Node) bool {
-        const is_paned = c.g_type_check_instance_is_a(
-            @ptrCast(@alignCast(w)),
-            c.gtk_paned_get_type(),
-        ) != 0;
-        switch (node) {
-            .leaf => |p| return !is_paned and @intFromPtr(p.widget()) == @intFromPtr(w),
-            .split => |sp| {
-                if (!is_paned) return false;
-                const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
-                const want_horiz = sp.orientation == .horizontal;
-                if ((orientation == c.GTK_ORIENTATION_HORIZONTAL) != want_horiz) return false;
-                const start = c.gtk_paned_get_start_child(@ptrCast(w)) orelse return false;
-                const end = c.gtk_paned_get_end_child(@ptrCast(w)) orelse return false;
-                return self.widgetMatchesNode(start, sp.children[0]) and
-                    self.widgetMatchesNode(end, sp.children[1]);
-            },
-        }
-    }
-
-    /// Open a GtkFileChooserNative for save-as; user picks a path,
-    /// we serialize the current layout to it. Defaults to .json (the
-    /// authoritative format) — pick `.layout` if you want the simple
-    /// DSL but only JSON is implemented for save right now.
-    pub fn saveLayoutAs(self: *Window) void {
-        const dialog = c.gtk_file_dialog_new();
-        c.gtk_file_dialog_set_title(dialog, "Save Layout");
-        c.gtk_file_dialog_set_initial_name(dialog, "layout.json");
-        c.gtk_file_dialog_save(
-            dialog,
-            @ptrCast(self.app_window),
-            null,
-            @ptrCast(&onSaveLayoutAsDone),
-            @ptrCast(self),
-        );
-    }
-
-    /// Open a GtkFileDialog to pick a saved layout (.json/.layout)
-    /// and append its tabs to the current window — same semantics as
-    /// the `--layout` CLI flag (existing tabs are kept).
-    pub fn loadLayoutAs(self: *Window) void {
-        const dialog = c.gtk_file_dialog_new();
-        c.gtk_file_dialog_set_title(dialog, "Load Layout");
-        c.gtk_file_dialog_open(
-            dialog,
-            @ptrCast(self.app_window),
-            null,
-            @ptrCast(&onLoadLayoutDone),
-            @ptrCast(self),
-        );
-    }
-
-    /// Save current state to the default path.
-    fn saveLayoutToDefault(self: *Window) !void {
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const path = try layout_mod.defaultSavePath(arena);
-        const layout = try self.collectLayout(arena);
-        try layout_mod.save(layout, path);
-    }
-
-    /// Save current state to the default path. Non-fatal: a failure is
-    /// logged, never raised. Runs at shutdown too, where a toast could
-    /// not be seen and a dialog would block teardown - so stderr (the
-    /// GUI's log channel) is the only report.
-    pub fn saveLayoutQuietly(self: *Window) void {
-        self.saveLayoutToDefault() catch |err| logActionError("save_layout", err);
-    }
-
-    /// Duplicate the focused tab — spawn a new tab inheriting the
-    /// focused pane's cwd and profile. Splits in the source tab are
-    /// NOT replicated (the new tab gets one shell pane); cloning a
-    /// full split tree would duplicate the layout snapshot/restore
-    /// path, which is a bigger feature. Most user value is "open
-    /// another shell here in this dir as this profile."
-    pub fn duplicateCurrentTab(self: *Window) void {
-        const pane = self.focusedPane() orelse return;
-
-        // Detect single-pane vs split-tree by inspecting the tab page's
-        // root widget. Single-pane case wins by preserving the profile
-        // (which TabSpec doesn't carry today). Split-tree case loses
-        // profile-per-pane but keeps the layout — picked over the
-        // alternative of flattening to one pane and dropping the
-        // splits the user spent time arranging.
-        const sel = c.adw_tab_view_get_selected_page(self.tab_view) orelse {
-            self.newShellTabWithProfile(null, pane.active_profile) catch |err| logActionError("duplicate_tab", err);
-            return;
-        };
-        const wrapper = c.adw_tab_page_get_child(sel);
-        const root = if (wrapper != null) c.gtk_widget_get_first_child(@ptrCast(wrapper)) else null;
-        const is_paned = root != null and c.g_type_check_instance_is_a(
-            @ptrCast(@alignCast(root.?)),
-            c.gtk_paned_get_type(),
-        ) != 0;
-
-        if (!is_paned) {
-            // Single pane — use the profile-aware fast path.
-            self.newShellTabWithProfile(null, pane.active_profile) catch |err| {
-                std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
-            };
-            return;
-        }
-
-        // Split tree — round-trip via the tree model → newTabFromSpec
-        // (widget walk only as fallback for a missing model).
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const tree = (if (Window.tabTreeOf(sel)) |t|
-            self.modelTreeToLayout(arena, t.root)
-        else
-            self.collectTree(arena, root.?)) catch |err| {
-            std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-
-        const title_cstr = c.adw_tab_page_get_title(sel);
-        const title = if (title_cstr != null)
-            std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr)))
-        else
-            "shell";
-
-        const spec = layout_mod.TabSpec{
-            .title = arena.dupe(u8, title) catch return,
-            .tree = tree,
-            .pinned = false, // duplicates start unpinned
-        };
-        self.newTabFromSpec(spec, false) catch |err| {
-            std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
-        };
-    }
-
     /// Copy the focused pane's visible screen to the system clipboard.
     /// Same body as input.zig::copyScreen — duplicated here because
     /// the menu sink hits the Window directly while runAction goes
@@ -5031,58 +4312,6 @@ pub const Window = struct {
         c.adw_tab_view_set_page_pinned(self.tab_view, page, if (is_pinned) 0 else 1);
     }
 
-    /// Save current state as the "default" layout that's auto-loaded
-    /// on subsequent cold starts (no --layout / --restore needed).
-    /// Best-effort; user gets stderr feedback on failure.
-    pub fn saveDefaultLayout(self: *Window) void {
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const path = layout_mod.defaultLayoutPath(arena) catch |err| {
-            std.debug.print("sketerm: default layout path failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        const layout = self.collectLayout(arena) catch |err| {
-            std.debug.print("sketerm: collect layout failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        layout_mod.save(layout, path) catch |err| {
-            std.debug.print("sketerm: save default layout to {s} failed: {s}\n", .{ path, @errorName(err) });
-            return;
-        };
-        std.debug.print("sketerm: saved default layout to {s}\n", .{path});
-    }
-
-    /// Load $XDG_STATE_HOME/sketerm/default.json if it exists. Returns
-    /// false silently when the file isn't there (the common case on a
-    /// fresh install). Distinct from loadLayoutDefault, which targets
-    /// last.json under --restore.
-    pub fn loadDefaultLayoutIfPresent(self: *Window) !bool {
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const path = try layout_mod.defaultLayoutPath(arena);
-        // Existence check via libc. F_OK = 0 in POSIX; Aro translates
-        // the F_OK macro fine but it's only accessible inside `c.`.
-        var path_z: [4096]u8 = undefined;
-        const p = pathZ(&path_z, path) catch return false;
-        if (c.access(p, c.F_OK) != 0) return false;
-
-        var parsed = layout_mod.load(self.allocator, path) catch |err| {
-            std.debug.print("sketerm: cannot load default layout {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        defer parsed.deinit();
-
-        for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab, true) catch |err| {
-                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
-            };
-        }
-        return true;
-    }
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
@@ -5425,42 +4654,6 @@ fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque
     _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
 }
 
-fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const self = cast.userData(Window, user);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
-
-    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const layout = self.collectLayout(arena) catch return;
-    layout_mod.save(layout, path) catch return;
-}
-
-fn onLoadLayoutDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const self = cast.userData(Window, user);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
-    // Load into a fresh window so the current window's tabs are left intact
-    // (and the restored tabs keep their saved order). Fall back to this
-    // window if spawning one fails.
-    const target = self.spawnSecondaryWindow() orelse self;
-    const ok = target.loadLayoutFromPath(path) catch |err| blk: {
-        std.debug.print("sketerm: load layout failed: {s}\n", .{@errorName(err)});
-        break :blk false;
-    };
-    // Nothing loaded into the brand-new window — don't leave it empty.
-    if (!ok and target != self) c.gtk_window_close(@ptrCast(target.app_window));
-}
-
 fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     if (!self.config.auto_theme) return;
@@ -5475,61 +4668,6 @@ fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.
         p.terminal.screen.notifyColorScheme(isDarkBg(fg_bg.bg));
         p.terminal.screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(p.area));
-    }
-}
-
-fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-    applyPanedRatioImpl(paned, user);
-}
-
-/// notify::position fires when the user drags the divider AND when the
-/// paned itself re-allocates on window resize. We re-snap to the
-/// device-pixel grid (see `alignmentForScale`) so GtkGraphicsOffload
-/// keeps engaging at fractional scale, and update ratio so the next
-/// remap and layout save reflect the snapped position.
-fn onPanedPositionChanged(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(PanedRatioCtx, user);
-    if (ctx.setting) return;
-    const w: *c.GtkWidget = @ptrCast(paned);
-    const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
-    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-        c.gtk_widget_get_width(w)
-    else
-        c.gtk_widget_get_height(w);
-    if (total <= 0) return;
-    const pos = c.gtk_paned_get_position(@ptrCast(w));
-    if (pos <= 0) return;
-
-    const m = alignmentForScale(widgetSurfaceScale(w));
-    const snapped = snapDown(pos, m);
-    if (snapped != pos) {
-        ctx.setting = true;
-        c.gtk_paned_set_position(@ptrCast(w), snapped);
-        ctx.setting = false;
-    }
-    ctx.ratio = @as(f32, @floatFromInt(snapped)) / @as(f32, @floatFromInt(total));
-}
-
-fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
-    const ctx = cast.userData(PanedRatioCtx, user);
-    const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
-    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-        c.gtk_widget_get_width(paned)
-    else
-        c.gtk_widget_get_height(paned);
-    if (total <= 0) return;
-    const raw_pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
-    const m = alignmentForScale(widgetSurfaceScale(paned));
-    const pos = snapDown(raw_pos, m);
-    ctx.setting = true;
-    c.gtk_paned_set_position(@ptrCast(paned), pos);
-    ctx.setting = false;
-}
-
-fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *PanedRatioCtx = @ptrCast(@alignCast(u));
-        ctx.allocator.destroy(ctx);
     }
 }
 
