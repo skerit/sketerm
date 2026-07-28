@@ -17,16 +17,12 @@ const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const NavigationIntent = @import("types.zig").NavigationIntent;
 const Pending = @import("types.zig").Pending;
-const RowCtx = @import("render.zig").RowCtx;
+const colview = @import("colview.zig");
 const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
 const completionMatches = @import("../../filebrowser/paths.zig").completionMatches;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
-const onListDrop = @import("ops.zig").onListDrop;
-const onRightClick = @import("menu.zig").onRightClick;
-const onRowActivated = @import("render.zig").onRowActivated;
-const onSelectionChanged = @import("render.zig").onSelectionChanged;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 
 pub const PathCompletion = struct {
@@ -77,24 +73,6 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_widget_set_hexpand(page, 1);
     c.gtk_widget_set_vexpand(page, 1);
 
-    // Sort header (details/compact views); contents are built by
-    // updateSortHeader once the tab exists. Its spacing and margins
-    // are the row boxes' spacing and margins -- render.zig budgets
-    // both from the same constants, and the columns only line up
-    // because these agree.
-    const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, render_mod.CELL_SPACING);
-    c.gtk_widget_add_css_class(header, "sketerm-fb-header");
-    c.gtk_widget_set_margin_start(header, render_mod.EDGE_MARGIN);
-    c.gtk_widget_set_margin_end(header, render_mod.EDGE_MARGIN);
-    // The header rides its own scrollbar-less scroller LOCKED to the
-    // listing's horizontal adjustment (set below, once the listing
-    // scroller exists): a column set wider than the pane scrolls
-    // header and rows as ONE surface instead of clipping.
-    const header_scroll = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(@ptrCast(header_scroll), c.GTK_POLICY_EXTERNAL, c.GTK_POLICY_NEVER);
-    c.gtk_scrolled_window_set_child(@ptrCast(header_scroll), header);
-    c.gtk_box_append(@ptrCast(page), header_scroll);
-
     const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_hexpand(content, 1);
     c.gtk_widget_set_vexpand(content, 1);
@@ -135,30 +113,11 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     const scroller = c.gtk_scrolled_window_new();
     c.gtk_widget_set_hexpand(scroller, 1);
     c.gtk_widget_set_vexpand(scroller, 1);
-    // The sort header sits outside this scroller (but shares its
-    // horizontal adjustment, above): a VERTICAL scrollbar that took
-    // width would push every row left of its own column title.
-    // Overlay scrolling takes none.
+    // The GtkColumnView is the scrollable child: its header stays
+    // pinned while the rows scroll, and an over-wide column set gets
+    // a REAL horizontal scrollbar moving header and rows as one
+    // widget (they are one widget).
     c.gtk_scrolled_window_set_overlay_scrolling(@ptrCast(scroller), 1);
-    const listbox = c.gtk_list_box_new();
-    c.gtk_list_box_set_selection_mode(@ptrCast(listbox), c.GTK_SELECTION_MULTIPLE);
-    c.gtk_list_box_set_activate_on_single_click(@ptrCast(listbox), 0);
-    // The listbox rides inside an overlay so the rubber-band rectangle
-    // can be drawn OVER it; the drawing area scrolls with the content,
-    // so band coordinates equal listbox coordinates.
-    const list_overlay = c.gtk_overlay_new();
-    c.gtk_overlay_set_child(@ptrCast(list_overlay), listbox);
-    const band_area = c.gtk_drawing_area_new();
-    c.gtk_widget_set_can_target(band_area, 0);
-    c.gtk_widget_set_visible(band_area, 0);
-    c.gtk_overlay_add_overlay(@ptrCast(list_overlay), band_area);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list_overlay);
-    // ONE horizontal adjustment for header and rows: scrolling an
-    // over-wide column set moves both together, always aligned.
-    c.gtk_scrolled_window_set_hadjustment(
-        @ptrCast(header_scroll),
-        c.gtk_scrolled_window_get_hadjustment(@ptrCast(scroller)),
-    );
     c.gtk_box_append(@ptrCast(content), scroller);
     c.gtk_box_append(@ptrCast(page), content);
 
@@ -181,10 +140,8 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         .hc = hc,
         .root = dir,
         .page = page,
-        .listbox = @ptrCast(listbox),
+        .colview = undefined,
         .tab_label = @ptrCast(@alignCast(label)),
-        .header_box = header,
-        .header_scroll = header_scroll,
         .scroller = scroller,
         .miller_box = miller_box,
         .empty_box = empty_box,
@@ -197,42 +154,24 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         return null;
     };
 
-    _ = c.g_signal_connect_data(listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(listbox, "selected-rows-changed", @ptrCast(&onSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    // The listing itself: model, columns, activation, selection,
+    // context-menu/sticky/key controllers and the DnD target all
+    // live in colview.zig.
+    const cv = colview.installColumnView(self, tab);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), cv);
 
-    // Capture phase: GtkListBox's own click gesture answers every
-    // button, so the context menu must see (and claim) the press
-    // before it, or a right-click inside a multi-selection collapses
-    // the selection the menu is about to act on.
-    const rclick = c.gtk_gesture_click_new();
-    c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
-    c.gtk_event_controller_set_propagation_phase(@ptrCast(rclick), c.GTK_PHASE_CAPTURE);
-    _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
+    _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
     // The content box behind the rows: the background menu for the
     // states where the rows are HIDDEN (empty folder, failed listing)
-    // and the listbox gesture therefore cannot fire. Bubble phase and
-    // gated on empty_box visibility, so it never doubles the listbox's
-    // own background menu.
+    // and the column view's gesture therefore cannot fire. Bubble
+    // phase and gated on empty_box visibility, so it never doubles
+    // the view's own background menu.
     const area_click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(area_click), 3);
     _ = c.g_signal_connect_data(area_click, "pressed", @ptrCast(&@import("menu.zig").onAreaRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(content, @ptrCast(area_click));
 
-    // Right-click the header STRIP (not just a title) opens the
-    // column picker. Installed once, on the box that survives every
-    // header rebuild -- the buttons inside it do not.
-    render_mod.installHeaderMenu(self, tab, header);
-
-    // Sticky-click toggling and the visual-mode keys, both capture
-    // phase so GtkListBox does not get there first.
-    self.installSelectionGestures(tab, listbox, false);
-    // Rubber-band drag-to-select from empty listing space.
-    tab.rubber_area = band_area;
-    c.gtk_drawing_area_set_draw_func(@ptrCast(band_area), @ptrCast(&selection.drawRubberBand), @ptrCast(tab), null);
-    selection.installRubberBand(tab, listbox);
     // Mouse side buttons navigate history anywhere in the listing;
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
@@ -241,12 +180,6 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // (an explicit TabState restore runs after newTab and wins).
     self.installViewGestures(tab, page);
     self.applyFolderMemory(tab);
-
-    // Internal DnD: dropping an entry spec here moves (same
-    // host) or copies (cross-host) into the target directory.
-    const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
-    _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onListDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(listbox, @ptrCast(dropt));
 
     const page_idx = c.gtk_notebook_append_page(self.notebook, page, label_box);
     c.gtk_notebook_set_current_page(self.notebook, page_idx);
@@ -557,12 +490,7 @@ pub fn setStatusFmt(self: *BrowserView, comptime fmt: []const u8, args: anytype)
 }
 
 pub fn countSelected(tab: *BTab) usize {
-    var n: usize = 0;
-    var rows = c.gtk_list_box_get_selected_rows(tab.listbox);
-    const head = rows;
-    while (rows != null) : (rows = rows.*.next) n += 1;
-    if (head != null) c.g_list_free(head);
-    return n;
+    return colview.countSelected(tab);
 }
 
 /// The listing entry `path` names in `tab`, or null when the tab no
@@ -691,11 +619,8 @@ fn chordUndo(self: *BrowserView) bool {
 fn chordRename(self: *BrowserView) bool {
     const tab = self.currentTab() orelse return false;
     var target: ?[]const u8 = null;
-    if (c.gtk_widget_get_focus_child(@ptrCast(@alignCast(tab.listbox)))) |child| {
-        if (c.g_object_get_data(@ptrCast(child), "sketerm-row")) |data| {
-            const rctx: *render_mod.RowCtx = @ptrCast(@alignCast(data));
-            target = rctx.path;
-        }
+    if (colview.focusedItem(tab)) |p| {
+        if (p.data.kind == .entry) target = p.data.path;
     }
     if (target == null and tab.selected.items.len == 1)
         target = tab.selected.items[0];
@@ -1191,16 +1116,15 @@ pub fn typeahead(self: *BrowserView, keyval: c_uint) bool {
 pub fn typeaheadJump(self: *BrowserView) bool {
     const tab = self.currentTab() orelse return false;
     const prefix = self.ta_buf[0..self.ta_len];
-    var idx: c_int = 0;
-    while (c.gtk_list_box_get_row_at_index(tab.listbox, idx)) |row| : (idx += 1) {
-        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
-        const ctx: *RowCtx = @ptrCast(@alignCast(data));
-        const name = std.fs.path.basename(ctx.path);
+    const n = colview.itemCount(tab);
+    var idx: c.guint = 0;
+    while (idx < n) : (idx += 1) {
+        const d = colview.itemDataAt(tab, idx) orelse continue;
+        if (d.kind != .entry) continue;
+        const name = std.fs.path.basename(d.path);
         if (name.len < prefix.len) continue;
         if (!std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) continue;
-        c.gtk_list_box_unselect_all(tab.listbox);
-        c.gtk_list_box_select_row(tab.listbox, @ptrCast(row));
-        _ = c.gtk_widget_grab_focus(@ptrCast(row));
+        colview.focusRow(tab, idx, true);
         self.setStatusFmt("jump: {s}", .{prefix});
         return true;
     }
@@ -1272,7 +1196,7 @@ test "entryForPath resolves flat rows, expanded subdirs and miller ancestors" {
         .hc = undefined,
         .root = &root,
         .page = undefined,
-        .listbox = undefined,
+        .colview = undefined,
         .tab_label = undefined,
     };
     defer {

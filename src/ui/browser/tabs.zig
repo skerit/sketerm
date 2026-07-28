@@ -201,10 +201,7 @@ pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkW
     // The tab-bar gestures below hit-test against this mark to tell
     // "on a tab" from "on the strip's empty space".
     c.g_object_set_data(@ptrCast(@alignCast(label_box)), "sketerm-tablabel", @ptrCast(label_box));
-    const rows = c.gtk_gesture_click_new();
-    c.gtk_gesture_single_set_button(@ptrCast(rows), c.GDK_BUTTON_MIDDLE);
-    _ = c.g_signal_connect_data(rows, "pressed", @ptrCast(&onRowMiddleClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(@ptrCast(@alignCast(tab.listbox)), @ptrCast(rows));
+    // Middle-click-a-row lives on the column view (colview.zig).
 
     const close = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(close), c.GDK_BUTTON_MIDDLE);
@@ -258,7 +255,7 @@ pub fn installGridMiddleClick(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox)
 
 /// Open `path` in a new tab on the tab's host, copying both strings
 /// out of storage the new tab may re-render away.
-fn openInNewTab(tab: *BTab, path: []const u8) void {
+pub fn openInNewTab(tab: *BTab, path: []const u8) void {
     var pbuf: [4096]u8 = undefined;
     if (path.len >= pbuf.len) return;
     @memcpy(pbuf[0..path.len], path);
@@ -270,15 +267,6 @@ fn openInNewTab(tab: *BTab, path: []const u8) void {
         host = hbuf[0..h.len];
     }
     _ = tab.view.newTab(host, pbuf[0..path.len]);
-}
-
-pub fn onRowMiddleClick(_: *c.GtkGestureClick, _: c_int, _: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
-    const row = c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y)) orelse return;
-    const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse return;
-    const ctx: *RowCtx = @ptrCast(@alignCast(data));
-    if (!ctx.is_dir) return;
-    openInNewTab(tab, ctx.path);
 }
 
 pub fn onTileMiddleClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {

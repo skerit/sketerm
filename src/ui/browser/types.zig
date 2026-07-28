@@ -542,26 +542,31 @@ pub const BTab = struct {
     vs: TabView = .{},
     /// Sticky-click flag and visual-mode anchor (selection.zig).
     sel: TabSel = .{},
-    /// Rubber-band drag-to-select (selection.zig): the overlay
-    /// drawing area and the live band rectangle, in listbox coords.
-    rubber_area: ?*c.GtkWidget = null,
-    rubber: struct {
-        active: bool = false,
-        x0: f64 = 0,
-        y0: f64 = 0,
-        x1: f64 = 0,
-        y1: f64 = 0,
-    } = .{},
     page: *c.GtkWidget,
-    listbox: *c.GtkListBox,
+    /// The details/compact listing: ONE GtkColumnView owns the header
+    /// and the rows (colview.zig), so their columns cannot disagree.
+    colview: *c.GtkColumnView,
+    /// Flat item model the listing renders from; rebuilt by splice on
+    /// every render (items borrow entries between renders).
+    store: *c.GListStore = undefined,
+    /// The GtkMultiSelection over `store`; `selected` mirrors it.
+    selmodel: *c.GtkSelectionModel = undefined,
+    /// Live path → bound-name-cell map (colview.zig): thumbnails land
+    /// in place and inline rename finds its label through it. Keys
+    /// borrow the bound item's owned path.
+    name_cells: std.StringHashMapUnmanaged(*c.GtkWidget) = .empty,
+    /// Signature of the column set the view currently shows;
+    /// syncColumns rebuilds the columns only when it changes.
+    col_sig: u64 = 0,
+    /// Guards the GTK sorter/width callbacks against programmatic
+    /// sync (syncColumns) re-entering as if the user acted.
+    col_syncing: bool = false,
+    /// Debounce source for persisting dragged column widths.
+    width_save_src: c.guint = 0,
+    /// Press coords of a possible click-on-empty-space (colview.zig
+    /// clears the selection when it releases without travel).
+    empty_press: ?struct { x: f64, y: f64 } = null,
     tab_label: *c.GtkLabel,
-    /// Details/compact sort header (hidden in grid/miller). Rebuilt
-    /// whenever the column set or sort changes.
-    header_box: *c.GtkWidget = undefined,
-    /// The header's scrollbar-less scroller, h-locked to `scroller`;
-    /// what show/hide toggles (hiding only the inner box would leave
-    /// an empty scroller behind).
-    header_scroll: *c.GtkWidget = undefined,
     /// Optional details columns, rendered in Column declaration order.
     columns: std.EnumSet(browser_model.Column) =
         std.EnumSet(browser_model.Column).initMany(&browser_model.default_columns),
@@ -729,6 +734,8 @@ pub const BTab = struct {
         for (self.attr_columns.items) |name| a.free(name);
         self.attr_columns.deinit(a);
         self.attr_col_widths.deinit(a);
+        self.name_cells.deinit(a);
+        if (self.width_save_src != 0) _ = c.g_source_remove(self.width_save_src);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         self.clearNavError();

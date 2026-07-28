@@ -10,7 +10,7 @@ const classicmenu = @import("classicmenu.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
-const RowCtx = @import("render.zig").RowCtx;
+const colview = @import("colview.zig");
 const copyToClip = @import("ops.zig").copyToClip;
 const countSelected = @import("nav.zig").countSelected;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
@@ -75,19 +75,26 @@ pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64,
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     const self = tab.view;
 
+    // Right-click on the column header strip: the column picker,
+    // like every file manager's header.
+    if (colview.pickIsHeader(tab, x, y)) {
+        _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+        @import("render.zig").showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)));
+        return;
+    }
+
     var path: ?[]u8 = null;
     var name: ?[]u8 = null;
     var is_dir = false;
-    if (c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y))) |row| {
-        if (c.g_object_get_data(@ptrCast(row), "sketerm-row")) |data| {
-            const rctx: *RowCtx = @ptrCast(@alignCast(data));
-            path = self.allocator.dupe(u8, rctx.path) catch null;
-            name = self.allocator.dupe(u8, std.fs.path.basename(rctx.path)) catch null;
-            is_dir = rctx.is_dir;
-            keepOrSelect(gesture, tab, row);
+    if (colview.pickItem(tab, x, y)) |p| {
+        if (p.data.kind == .entry) {
+            path = self.allocator.dupe(u8, p.data.path) catch null;
+            name = self.allocator.dupe(u8, std.fs.path.basename(p.data.path)) catch null;
+            is_dir = p.data.is_dir;
+            keepOrSelect(gesture, tab, p.pos);
         }
     }
-    self.showEntryMenu(tab, @ptrCast(@alignCast(tab.listbox)), x, y, path, name, is_dir);
+    self.showEntryMenu(tab, @ptrCast(@alignCast(tab.colview)), x, y, path, name, is_dir);
 }
 
 /// Right-click on the listing AREA while the rows are hidden (empty
@@ -109,19 +116,18 @@ pub fn onAreaRightClick(_: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, u
 /// on the whole selection, and collapsing it here made the menu
 /// silently target one row instead of all of them.
 ///
-/// GtkListBox's own click gesture answers EVERY button, not just the
-/// primary one, so simply not calling `select_row` is not enough --
-/// the sequence has to be CLAIMED (this controller runs in the
-/// capture phase) before GtkListBox can act on it. An unselected row
-/// is selected explicitly, since claiming denies GtkListBox the
-/// chance to do it.
-fn keepOrSelect(gesture: *c.GtkGestureClick, tab: *BTab, row: *c.GtkListBoxRow) void {
+/// The view's own click handling answers EVERY button, so simply not
+/// selecting is not enough -- the sequence has to be CLAIMED (this
+/// controller runs in the capture phase) before the view can act on
+/// it. An unselected row is selected exclusively, since claiming
+/// denies the view the chance to do it.
+fn keepOrSelect(gesture: *c.GtkGestureClick, tab: *BTab, pos: c.guint) void {
     _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
-    if (c.gtk_list_box_row_is_selected(row) == 0) {
+    const model: *c.GtkSelectionModel = @ptrCast(@alignCast(tab.selmodel));
+    if (c.gtk_selection_model_is_selected(model, pos) == 0) {
         // OUTSIDE the selection: the click retargets — select only
-        // the clicked row (select_row alone ADDS in multiple mode).
-        c.gtk_list_box_unselect_all(tab.listbox);
-        c.gtk_list_box_select_row(tab.listbox, row);
+        // the clicked row.
+        _ = c.gtk_selection_model_select_item(model, pos, 1);
     }
 }
 
@@ -835,7 +841,7 @@ pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const n = @min(path.len, z.len - 1);
     @memcpy(z[0..n], path[0..n]);
     z[n] = 0;
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.tab.listbox)));
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.tab.colview)));
     c.gdk_clipboard_set_text(clip, &z);
     menuDone(ctx);
 }

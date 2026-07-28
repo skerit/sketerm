@@ -10762,3 +10762,69 @@ Known limitations: dragging Name NARROWER than the leftover is a
 no-op while nothing overflows (same as Nemo's expand column); the
 classicmenu depth limit means no submenu may contain another; a
 long-running daemon needs a restart to learn the `create` op.
+
+## 2026-07-28 (later): files -- columns rebuilt on GtkColumnView, panel width pinned
+
+Fourth feedback round. The headline: the hand-rolled header/rows
+column system (two synchronized widget sets) is GONE, replaced by
+GtkColumnView -- the machinery GNOME Files runs on. Header and rows
+are ONE widget now; they cannot disagree, by construction.
+
+- New src/ui/browser/colview.zig: a GListStore of SkFbItem GObjects
+  (registered from Zig; payload freed in finalize) spliced per
+  render, GtkMultiSelection, signal factories per column with
+  recycled cells, a row factory that makes group headers
+  unselectable, native resizable columns (fixed-width persisted into
+  the same viewmem/TabState fields as before), Name as the GTK
+  expand column, native rubber-band, native horizontal scrollbar,
+  gtk_column_view_sort_by_column arrows driven by (and driving) the
+  tab's own sort state via dummy sorters -- the model is spliced
+  pre-sorted, GTK only tracks the clicked column.
+- Grouping, tree expansion, filtering, zebra parity and depth
+  indents all resolve into the flat item list (same walk as before,
+  emitting items instead of widgets). Zebra parity is computed per
+  ENTRY and stamped on the row widget, so stripes stay in phase
+  across group headers now (old nth-child bug gone).
+- Ported onto the model/positions API: sticky click, visual range
+  mode, tree Left/Right keys, type-ahead, register select-here,
+  context-menu hit tests (gtk_widget_pick + qdata climb), DnD drop
+  targeting, middle-click, batch rename (reads tab.selected), inline
+  rename (live path->cell map; also feeds thumbnails and the media
+  fetch window), scroll pinning across splices.
+- Deleted: header buttons/grips/liveResizeCells/cellRefCode/
+  nameBoxWidth, the overlay rubber band, per-row widget builders --
+  net ~500 lines of synchronization code replaced by GTK's own.
+- Click on empty space clears the selection (rubberband handles the
+  drag case; a zero-travel release is ours). Column picker points at
+  the header strip. Right-click a header title = picker, unchanged.
+- Information panel can no longer GROW past its configured width:
+  every label WORD_CHAR-wraps with a tiny natural (max_width_chars),
+  so no content can force the paned divider (which then persisted
+  the forced width -- a ratchet). Verified with a 90-char unbroken
+  name and a 100KB unbroken text head: divider pixel-identical.
+- Split view: a durable download's progress row now shows ONLY in
+  the pane that started it (Intent.origin, volatile). Records with
+  no living submitter (restart recovery, watch sync-backs) show in
+  the primary pane only. Verified: 700MB download in a split, bar in
+  one pane; after a GUI restart the recovered record surfaced once.
+- Remote folder "N items", Owner/Group names, Created: verified
+  end-to-end over a fake-SSH remote -- they are computed by the
+  daemon on the OWNING host (fsserve countChildren) and simply
+  require a current sketerm-mux on that host. No GUI-side fallback
+  exists or is wanted (no duplication).
+
+Verified: suite 1052/5 skip (same set), mux-portable, smoke-e2e
+PASS, and a manual Xvfb drive: native drag-resize (header+cells move
+as one), sort arrows both directions, expanders + nested subdir rows,
+group collapse, zebra on/off, all four view modes round-trip, F2
+rename landing on disk, rubber band, empty-click deselect, visual
+mode, context/background menus, column picker incl. adding 7 columns
+with h-scroll, remote tab over fake ssh, split + single progress row.
+
+Known notes: GtkColumnView recycles cells -- anything holding a cell
+pointer must go through tab.name_cells (bind-scoped); items borrow
+*Entry between renders (splice-on-every-change is the invariant that
+keeps that sound). Dragging Name narrower than the leftover is still
+a no-op until columns overflow (GTK expand-column semantics, same as
+Nemo). Miller ancestor columns and the icon grid keep their old
+widgets by design.
