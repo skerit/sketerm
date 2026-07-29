@@ -11057,3 +11057,55 @@ the fake Wayland app connects to the wrong session -- the mcp client
 then waits out its 30s recv timeout as "first-commit read". Now
 compares nanoseconds too. This was a latent flake on any fast machine,
 not an artifact of the test host.
+
+## UDP transport respects the ssh config
+
+`sketerm ssh vastai` reported "UDP unavailable ... connected over SSH"
+for every host whose name is an ssh_config alias. The bootstrap ran
+`ssh <spec> sketerm-mux --udp-listen` -- where ssh resolves the alias
+through the user's config -- but handed the SAME literal string, minus
+any `user@`, to the local bridge as `--udp-connect <host>`, which does a
+plain `getaddrinfo`. An alias resolves to nothing there, the bridge died
+with "cannot resolve", and since `.auto` swallowed the error the only
+visible result was a silent downgrade.
+
+`connectUdpFor` now asks ssh itself (`ssh -G <spec>`, which prints the
+resolved config and never connects) and targets the resolved `hostname`.
+Reimplementing the config parser locally would have been a second source
+of truth; ssh already owns `Host`/`HostName`/`Match`. The lookup runs
+BEFORE the bootstrap fork, so a `ProxyJump`/`ProxyCommand` host -- which
+has no directly reachable address, whatever we resolve -- returns
+`error.UdpProxiedHost` immediately instead of burning the probe timeout.
+`ssh` missing or too old for `-G` falls back to the literal host, the
+previous behaviour.
+
+Fallback reasons are no longer swallowed. `Conn.udp_error` records why
+`.auto` came up on SSH and `Conn.udpErrorText` renders it, so the CLI
+now prints the cause plus the `sketerm mux udp:<host>` command that
+reproduces it loudly. The post-bootstrap handshake failure is
+`error.UdpBridgeUnreachable`, distinct from "the remote never announced"
+(`error.SshTransportFailed`) -- that split is what separates filtered or
+NAT-mapped UDP from an old/missing remote binary.
+
+This came from reading mosh, which defaults to `--experimental-remote-ip=proxy`:
+it re-execs itself as ssh's `ProxyCommand`, so ssh expands `%h`/`%p`
+post-config and mosh learns the exact address the TCP landed on, printing
+`MOSH IP <addr>` for the UDP leg (its `remote` mode instead reads
+`$SSH_CONNECTION` off the server). `ssh -G` was chosen over the
+ProxyCommand trick because injecting a ProxyCommand overrides any
+ProxyJump the user configured, and for a NAT-mapped container
+`$SSH_CONNECTION` reports the useless container-internal address while
+the resolved `HostName` is the public endpoint.
+
+Note this fixes the ADDRESS, not NAT port-mapping: the bootstrap still
+announces the port bound inside the container. See docs/REMOTE.md for
+the identity-mapping requirement.
+
+Tests: parser cases (alias, proxyjump, proxycommand, the "none"
+spelling, missing hostname), a fake-`ssh` spawn test through
+SKETERM_SSH covering the fork/exec/read half, and the auto-fallback
+cause recording. Verified with a core-only test build (261 pass),
+smoke-mux and smoke-broker. The full `zig build test` and the two GUI
+fallback messages (`ui/browser/conn.zig`, `ui/muxtabs.zig`) could NOT be
+compiled on this host -- GTK 4.6 vs the 4.14 the GUI needs -- so those
+two messages still print without a reason.
