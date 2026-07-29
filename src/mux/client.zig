@@ -407,6 +407,19 @@ pub const Conn = struct {
     fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
         if (!validSshHost(host)) return error.BadPath;
         if (port_range) |r| if (!validPortRange(r)) return error.BadPath;
+
+        // 0. Resolve the UDP target through the user's ssh config
+        //    FIRST: a proxied host can never work over UDP, and
+        //    finding that out now costs one non-connecting `ssh -G`
+        //    instead of a portable-mux deployment round-trip plus the
+        //    full bootstrap and handshake timeout.
+        var resolved_buf: [256]u8 = undefined;
+        var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, host, '@')) |at| host[at + 1 ..] else host;
+        if (resolveSshConfig(host, &resolved_buf, monotonicMs() + timeout_ms)) |target| {
+            if (target.proxied) return error.UdpProxiedHost;
+            udp_host = target.hostname;
+        }
+
         var prepared = deploy.prepare(allocator, host);
         defer if (prepared) |*p| p.deinit();
         var command_buf: [4300:0]u8 = undefined;
@@ -416,18 +429,9 @@ pub const Conn = struct {
             }
             break :blk std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --udp-listen", .{p.path}) catch return error.BadPath;
         } else null;
+        // The bootstrap budget starts AFTER deployment: an upload on
+        // first contact must not eat the announcement deadline.
         const deadline = monotonicMs() + timeout_ms;
-
-        // 0. Resolve the UDP target through the user's ssh config
-        //    FIRST: a proxied host can never work over UDP, and
-        //    finding that out now costs one non-connecting `ssh -G`
-        //    instead of the full bootstrap plus handshake timeout.
-        var resolved_buf: [256]u8 = undefined;
-        var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, host, '@')) |at| host[at + 1 ..] else host;
-        if (resolveSshConfig(host, &resolved_buf, deadline)) |target| {
-            if (target.proxied) return error.UdpProxiedHost;
-            udp_host = target.hostname;
-        }
 
         // 0.5. Bind the transport's UDP socket EARLY, so its port can
         //      ride the punch line to the remote (below) and the very
@@ -673,11 +677,16 @@ pub const Conn = struct {
         // first pays that cost; this retry covers the master setup
         // itself stalling. Both together turn an intermittent failure
         // into a reliable connect.
-        if (prepared) |p| {
-            if (connectSshOnceUsing(allocator, host, p.path, 20_000)) |conn| return conn else |_| {}
-        }
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
+            // The deployed path is retried alongside the PATH spelling:
+            // on a host whose ONLY binary is the deployed one, a
+            // transient sshd stall on the first attempt must not
+            // demote every remaining attempt to fast "command not
+            // found" failures.
+            if (prepared) |p| {
+                if (connectSshOnceUsing(allocator, host, p.path, 20_000)) |conn| return conn else |_| {}
+            }
             if (connectSshOnceUsing(allocator, host, null, 20_000)) |conn| {
                 return conn;
             } else |err| {
