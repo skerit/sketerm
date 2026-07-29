@@ -85,6 +85,144 @@ fn socketAccepts(path: []const u8) bool {
     return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0;
 }
 
+// ── audio-flag stage ─────────────────────────────────────────────
+//
+// A hand-rolled PulseAudio-native client (same frames the pulse.zig
+// unit tests feed the Server directly, here over the REAL session
+// socket): AUTH, SET_CLIENT_NAME, CREATE_PLAYBACK_STREAM uncorked.
+// The daemon must then report `"audio":true` for the session in
+// `list` — in broker mode that means the worker's 'M' metadata push
+// carries it, exactly the hop that has silently regressed before.
+
+const PA_DESC_SIZE = 20;
+
+fn paU32(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) void {
+    out.append(a, 'L') catch fail("oom");
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .big);
+    out.appendSlice(a, &b) catch fail("oom");
+}
+
+fn paBool(out: *std.ArrayList(u8), a: std.mem.Allocator, v: bool) void {
+    out.append(a, if (v) @as(u8, '1') else '0') catch fail("oom");
+}
+
+fn paFrameSend(fd: c_int, a: std.mem.Allocator, fields: []const u8) void {
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    var desc: [PA_DESC_SIZE]u8 = [_]u8{0} ** PA_DESC_SIZE;
+    std.mem.writeInt(u32, desc[0..4], @intCast(fields.len), .big);
+    std.mem.writeInt(u32, desc[4..8], 0xffff_ffff, .big); // control channel
+    frame.appendSlice(a, &desc) catch fail("oom");
+    frame.appendSlice(a, fields) catch fail("oom");
+    var off: usize = 0;
+    while (off < frame.items.len) {
+        const n = c.write(fd, frame.items.ptr + off, frame.items.len - off);
+        if (n <= 0) fail("audio: short write to the pulse socket");
+        off += @intCast(n);
+    }
+}
+
+/// Does the daemon's raw `list` reply currently say `"audio":true`?
+fn listSaysAudio(allocator: std.mem.Allocator, sock_path: []const u8) bool {
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("audio: list connect");
+    defer conn.deinit();
+    conn.sendFrame(.list, "") catch fail("audio: list send");
+    const f = conn.recvExpect(&.{.welcome}) catch fail("audio: list recv");
+    defer f.deinit(allocator);
+    return std.mem.indexOf(u8, f.payload, "\"audio\":true") != null;
+}
+
+fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server: []const u8) void {
+    const a = allocator;
+    // "unix:<path>" — the scheme was asserted at create.
+    const pa_path = pulse_server["unix:".len..];
+    if (listSaysAudio(a, sock_path)) fail("audio: flag already true with no stream");
+
+    const fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) fail("audio: socket");
+    var addr: c.struct_sockaddr_un = undefined;
+    @import("mux/daemon.zig").fillSockaddrUn(&addr, pa_path) catch fail("audio: pulse path too long");
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0)
+        fail("audio: cannot connect to the session's PULSE_SERVER");
+
+    var fields: std.ArrayList(u8) = .empty;
+    defer fields.deinit(a);
+    { // AUTH(version 35, zero cookie)
+        paU32(&fields, a, 8); // CMD_AUTH
+        paU32(&fields, a, 1); // tag
+        paU32(&fields, a, 35 | 0x8000_0000);
+        fields.append(a, 'x') catch fail("oom"); // arbitrary blob
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, 256, .big);
+        fields.appendSlice(a, &lb) catch fail("oom");
+        fields.appendSlice(a, &([_]u8{0} ** 256)) catch fail("oom");
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+    { // SET_CLIENT_NAME with empty proplist
+        paU32(&fields, a, 9); // CMD_SET_CLIENT_NAME
+        paU32(&fields, a, 2);
+        fields.appendSlice(a, "PN") catch fail("oom"); // empty proplist
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+    { // CREATE_PLAYBACK_STREAM: s16le stereo 48k, NOT corked
+        paU32(&fields, a, 3); // CMD_CREATE_PLAYBACK_STREAM
+        paU32(&fields, a, 3); // tag
+        fields.appendSlice(a, &[_]u8{ 'a', 3, 2 }) catch fail("oom"); // sample spec s16le stereo...
+        var rb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &rb, 48000, .big);
+        fields.appendSlice(a, &rb) catch fail("oom"); // ...48 kHz
+        fields.appendSlice(a, &[_]u8{ 'm', 2, 1, 2 }) catch fail("oom"); // channel map FL,FR
+        paU32(&fields, a, 0xffff_ffff); // sink index: invalid
+        fields.append(a, 'N') catch fail("oom"); // sink name: null
+        paU32(&fields, a, 0xffff_ffff); // maxlength
+        paBool(&fields, a, false); // corked — the whole point
+        paU32(&fields, a, 48000); // tlength
+        paU32(&fields, a, 0xffff_ffff); // prebuf
+        paU32(&fields, a, 0xffff_ffff); // minreq
+        paU32(&fields, a, 0); // syncid
+        fields.append(a, 'v') catch fail("oom"); // cvolume, 2 channels
+        fields.append(a, 2) catch fail("oom");
+        var vb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &vb, 0x10000, .big);
+        fields.appendSlice(a, &vb) catch fail("oom");
+        fields.appendSlice(a, &vb) catch fail("oom");
+        var i: u8 = 0; // v12 bools
+        while (i < 7) : (i += 1) paBool(&fields, a, false);
+        paBool(&fields, a, false); // muted
+        paBool(&fields, a, true); // adjust_latency
+        fields.appendSlice(a, "PN") catch fail("oom"); // proplist
+        paBool(&fields, a, false); // v14: volume_set
+        paBool(&fields, a, false); // v14: early_requests
+        paBool(&fields, a, false); // v15: muted_set
+        paBool(&fields, a, false); // v15: dont_inhibit_auto_suspend
+        paBool(&fields, a, false); // v15: fail_on_suspend
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+
+    // The daemon's poll loop must notice the uncorked stream, and in
+    // broker mode the worker's 'M' push must carry it to the broker.
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        if (listSaysAudio(allocator, sock_path)) break;
+        if (tries == 99) fail("audio: list never reported the uncorked stream as \"audio\":true");
+        _ = c.usleep(50_000);
+    }
+
+    // Closing the client tears the stream down; the flag must clear.
+    _ = c.close(fd);
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        if (!listSaysAudio(allocator, sock_path)) break;
+        if (tries == 99) fail("audio: flag stuck true after the stream's client vanished");
+        _ = c.usleep(50_000);
+    }
+    std.debug.print("smoke-display: session audio flag ok\n", .{});
+}
+
 /// One attached viewer. `has_control` mirrors the daemon's
 /// control_state pushes — the lease is only observable through them.
 const Viewer = struct {
@@ -294,6 +432,8 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     // ── create: the JSON environment is the contract ──────────────
     var wl_path_buf: [4096]u8 = undefined;
     var wl_path_len: usize = 0;
+    var pa_buf: [4096]u8 = undefined;
+    var pa_len: usize = 0;
     {
         const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
@@ -320,8 +460,11 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
             failf("create: nothing listening on {s}", .{env.WAYLAND_DISPLAY});
         wl_path_len = env.WAYLAND_DISPLAY.len;
         @memcpy(wl_path_buf[0..wl_path_len], env.WAYLAND_DISPLAY);
+        pa_len = env.PULSE_SERVER.len;
+        @memcpy(pa_buf[0..pa_len], env.PULSE_SERVER);
     }
     const wl_path = wl_path_buf[0..wl_path_len];
+    const pulse_server = pa_buf[0..pa_len];
     std.debug.print("smoke-display: create + live wayland socket ok ({s})\n", .{wl_path});
 
     // ── duplicate names are refused, not silently reused ──────────
@@ -363,6 +506,9 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     }
     if (!hasDisplay(allocator, sock_path, "dsp1")) fail("list: dsp1 missing");
     std.debug.print("smoke-display: inspect + list ok\n", .{});
+
+    // ── an uncorked stream flips list's audio flag (and back) ─────
+    audioStage(allocator, sock_path, pulse_server);
 
     // ── the controller lease, against a real external app ─────────
     if (c.access("/usr/bin/weston-terminal", c.X_OK) == 0)

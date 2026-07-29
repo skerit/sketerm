@@ -71,6 +71,9 @@ pub const SessionInfo = struct {
     idle_ms: i64 = 0,
     /// Child cwd (daemon-resolved). Empty from an older daemon.
     cwd: []const u8 = "",
+    /// An uncorked audio stream is playing right now (false from an
+    /// older daemon) — how "what is making that sound?" gets answered.
+    audio: bool = false,
 };
 
 /// Human-readable activity for the `idle_ms` a session reports. Recent output
@@ -150,7 +153,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
                 @as(c_uint, s.rows),
                 @as(c_uint, s.clients),
                 fmtIdle(&idle_buf, s.idle_ms).ptr,
-                @as([*:0]const u8, if (s.exited) " [exited]" else ""),
+                @as([*:0]const u8, if (s.exited) " [exited]" else if (s.audio) " [audio]" else ""),
                 @as(c_int, @intCast(s.cwd.len)),
                 s.cwd.ptr,
                 @as(c_int, @intCast(s.title.len)),
@@ -186,15 +189,9 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "kill") and args.len >= 2) {
-        var conn = muxConnect(allocator, host) orelse return 1;
-        defer conn.deinit();
-        conn.sendJson(.kill, .{ .name = args[1] }) catch return 1;
-        const f = conn.recvExpect(&.{.ok}) catch {
-            _ = c.fprintf(platform.stderr(), "sketerm mux: kill failed\n");
-            return 1;
-        };
-        f.deinit(allocator);
-        return 0;
+        if (killSession(allocator, host, args[1])) return 0;
+        _ = c.fprintf(platform.stderr(), "sketerm mux: kill failed\n");
+        return 1;
     }
     if (std.mem.eql(u8, cmd, "rename") and args.len >= 3) {
         return if (renameSession(allocator, host, args[1], args[2])) 0 else 1;
@@ -710,6 +707,17 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
     };
 }
 
+/// Kill one session on `host`'s daemon (muxConnect host semantics).
+/// Shared by the CLI, the TUI picker and the GUI session overview.
+pub fn killSession(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8) bool {
+    var conn = muxConnect(allocator, host) orelse return false;
+    defer conn.deinit();
+    conn.sendJson(.kill, .{ .name = name }) catch return false;
+    const f = conn.recvExpect(&.{.ok}) catch return false;
+    f.deinit(allocator);
+    return true;
+}
+
 pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Parsed(Welcome) {
     var conn = muxConnect(allocator, host) orelse return null;
     defer conn.deinit();
@@ -932,7 +940,7 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
             @as(c_uint, s.clients),
             @as([*:0]const u8, if (active) "\x1b[32m" else "\x1b[2m"),
             fmtIdle(&idle_buf, s.idle_ms).ptr,
-            @as([*:0]const u8, if (s.exited) " [exited]" else ""),
+            @as([*:0]const u8, if (s.exited) " [exited]" else if (s.audio) " \x1b[33m[audio]\x1b[39m" else ""),
             @as(c_int, @intCast(@min(s.title.len, 30))),
             s.title.ptr,
         );

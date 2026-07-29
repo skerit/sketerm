@@ -297,6 +297,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .idle_ms = if (w.last_activity_ms == 0) 0 else now - w.last_activity_ms,
             .cwd = if (w.cwd) |cw| cw else "",
             .pid = w.child_pid,
+            .audio = w.audio,
             .display = w.display,
             .wl_display = if (w.wl_display) |p| p else "",
             .pulse_server = if (w.pulse_server) |p| p else "",
