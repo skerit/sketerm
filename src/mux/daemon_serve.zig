@@ -231,6 +231,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.display = m.display;
             w.ttl_secs = m.ttl_secs;
             w.viewers = m.viewers;
+            w.audio = m.audio;
             if (self.allocator.dupe(u8, m.title)) |t| {
                 if (w.title) |old| self.allocator.free(old);
                 w.title = t;
@@ -320,13 +321,15 @@ pub fn maybePushMeta(self: *Daemon) void {
     var ctrl_buf: [32]u8 = undefined;
     const controller = self.controllerLabel(s, &ctrl_buf);
     const ch = std.hash.Wyhash.hash(0, controller);
+    const audio = self.sessionAudioRunning(s, null);
     const structural = !self.wpush.inited or
         n_clients != self.wpush.clients or
         s.exited != self.wpush.exited or
         s.screen.rows != self.wpush.rows or
         s.screen.cols != self.wpush.cols or
         th != self.wpush.title_hash or
-        ch != self.wpush.controller_hash;
+        ch != self.wpush.controller_hash or
+        audio != self.wpush.audio;
     const activity_moved = s.last_activity_ms != self.wpush.activity;
     const now = nowMs();
     if (!structural and !(activity_moved and now - self.wpush.last_push_ms >= 200)) return;
@@ -350,6 +353,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
         .viewers = n_clients,
         .controller = controller,
+        .audio = audio,
         .wl = if (s.wl_display_path) |p| p else "",
         .pa = if (s.pa_socket_path) |p| p else "",
         .rt = if (s.runtime_dir_path) |p| p else "",
@@ -369,6 +373,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .title_hash = th,
         .controller_hash = ch,
         .activity = s.last_activity_ms,
+        .audio = audio,
         .last_push_ms = now,
     };
 }

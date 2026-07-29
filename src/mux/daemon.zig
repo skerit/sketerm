@@ -228,6 +228,9 @@ pub const SessionInfo = struct {
     /// The session child's pid ON THE DAEMON'S HOST (0 = unknown). For a
     /// string-command spawn this is the wrapping `/bin/sh`, not the app.
     pid: i32 = 0,
+    /// An uncorked audio stream is playing right now — how a viewer finds
+    /// WHICH session is making sound without attaching to each in turn.
+    audio: bool = false,
     /// External display session (`display create`) — its child is the
     /// keeper, so the "terminal" is meaningless; what matters is the
     /// environment below.
@@ -400,6 +403,8 @@ pub const Worker = struct {
     display: bool = false,
     ttl_secs: u32 = 0,
     viewers: u32 = 0,
+    /// Last-pushed audio-playing state (see SessionInfo.audio).
+    audio: bool = false,
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
@@ -469,6 +474,8 @@ pub const WorkerMeta = struct {
     ttl_secs: u32 = 0,
     viewers: u32 = 0,
     controller: []const u8 = "",
+    /// An uncorked audio stream is playing (see SessionInfo.audio).
+    audio: bool = false,
     wl: []const u8 = "",
     pa: []const u8 = "",
     rt: []const u8 = "",
@@ -487,6 +494,7 @@ pub const WorkerPush = struct {
     title_hash: u64 = 0,
     controller_hash: u64 = 0,
     activity: i64 = 0,
+    audio: bool = false,
     last_push_ms: i64 = 0,
 };
 
@@ -2270,7 +2278,7 @@ pub const Daemon = struct {
     /// Any OTHER audio connection of this session with an uncorked
     /// stream — feeds the v15 sink STATE (a pactl connection has no
     /// streams of its own but must still see the sink RUNNING).
-    fn sessionAudioRunning(self: *Daemon, s: *Session, except: *Channel) bool {
+    pub fn sessionAudioRunning(self: *Daemon, s: *Session, except: ?*Channel) bool {
         for (self.channels.items) |ch| {
             if (ch == except or ch.dead or ch.session != s) continue;
             const srv = ch.pa orelse continue;
@@ -3318,6 +3326,7 @@ pub const Daemon = struct {
                 .idle_ms = now - s.last_activity_ms,
                 .cwd = cwd,
                 .pid = s.pty.child_pid,
+                .audio = self.sessionAudioRunning(s, null),
                 .display = s.display,
                 .wl_display = if (s.wl_display_path) |p| p else "",
                 .pulse_server = if (s.pa_socket_path) |p| p else "",
