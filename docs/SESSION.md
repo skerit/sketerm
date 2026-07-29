@@ -11109,3 +11109,28 @@ smoke-mux and smoke-broker. The full `zig build test` and the two GUI
 fallback messages (`ui/browser/conn.zig`, `ui/muxtabs.zig`) could NOT be
 compiled on this host -- GTK 4.6 vs the 4.14 the GUI needs -- so those
 two messages still print without a reason.
+
+## `zig build test-core`: the GTK-free test subset
+
+`zig build test` compiles the GUI, so on a host whose GTK is older than
+what the GUI calls into, the ENTIRE suite is unrunnable -- parser, grid,
+mux, wlhost and all. That was the state on the Ubuntu 22.04 box this
+session ran on (GTK 4.6 against the 4.14 the GUI needs): the daemon
+built and its smokes passed, but not one unit test could execute.
+
+`src/tests_core.zig` is a second test root built with the same lean
+`configureCoreDeps` set as `sketerm-mux` itself, so the core is testable
+wherever the daemon builds. Its membership was not hand-picked: the
+transitive `@import` closure of `src/mux_main.zig` gives 66 modules that
+are GTK-free by construction, and a generous superset of plausible
+additions was then pruned by the compiler until it built clean. What
+dropped out was exactly what reaches the GUI -- `ipc/mcp.zig` and
+`ipc/appdrive.zig` (via wlapp/winapp), `a11y/nsax.zig`,
+`filebrowser/transfers.zig` and `util/gifrec.zig`. 120 modules remain:
+902 pass, 7 skip.
+
+It is a SUBSET, never a replacement -- `zig build test` stays the gate.
+The rule for new files is in CLAUDE.md: core-side tests go in BOTH
+roots, anything touching `ui/`/`render/` only in `tests.zig`. Adding a
+GTK-reaching module here would break the build for exactly the
+mux-portable users the step exists to serve.
