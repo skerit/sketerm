@@ -86,6 +86,11 @@ pub const Conn = struct {
     /// drain before failing (a wedged daemon must cost an error, not
     /// a hung caller).
     write_timeout_ms: c_int = 30_000,
+    /// Why an `.auto` connection came up on SSH instead of UDP. Null
+    /// on a UDP connection, on a forced transport, and on local
+    /// sockets. Callers surface it so a downgrade names its cause
+    /// instead of reading as an unexplained "UDP unavailable".
+    udp_error: ?anyerror = null,
     /// Selected core profile and the daemon's newest profile when advertised.
     proto: u32 = 1,
     server_proto: u32 = 1,
@@ -265,9 +270,120 @@ pub const Conn = struct {
         return switch (remote.mode) {
             .udp => forced_udp_connect(allocator, remote.host, port_range),
             .ssh => ssh_connect(allocator, remote.host, port_range),
-            .auto => auto_udp_connect(allocator, remote.host, port_range) catch
-                ssh_connect(allocator, remote.host, port_range),
+            .auto => auto_udp_connect(allocator, remote.host, port_range) catch |udp_err| blk: {
+                var conn = try ssh_connect(allocator, remote.host, port_range);
+                conn.udp_error = udp_err;
+                break :blk conn;
+            },
         };
+    }
+
+    /// Human-readable cause for an automatic UDP -> SSH downgrade.
+    pub fn udpErrorText(e: anyerror) []const u8 {
+        return switch (e) {
+            error.UdpProxiedHost => "ssh reaches it through a ProxyJump/ProxyCommand hop, so it has no directly reachable address",
+            error.UdpBridgeUnreachable => "the announced UDP port never answered (filtered, or NAT-mapped to a different port)",
+            error.SshTransportFailed => "no UDP announcement came back over ssh (remote sketerm-mux too old, or the bootstrap failed)",
+            else => @errorName(e),
+        };
+    }
+
+    /// What the user's ssh config actually resolves a host spec to.
+    /// `hostname` points into the caller's buffer.
+    pub const SshTarget = struct {
+        hostname: []const u8,
+        /// A ProxyJump/ProxyCommand hop means there is no address the
+        /// UDP leg can reach directly, however we resolve the name.
+        proxied: bool,
+    };
+
+    /// Parse `ssh -G` output. Split from the spawn so the parsing is
+    /// testable without a live ssh.
+    pub fn parseSshConfigOutput(text: []const u8, out: *[256]u8) ?SshTarget {
+        var hostname: ?[]const u8 = null;
+        var proxied = false;
+        var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+        while (lines.next()) |line| {
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const key = line[0..sp];
+            const val = std.mem.trim(u8, line[sp + 1 ..], " \t");
+            if (val.len == 0) continue;
+            if (std.mem.eql(u8, key, "hostname")) {
+                if (val.len <= out.len) {
+                    @memcpy(out[0..val.len], val);
+                    hostname = out[0..val.len];
+                }
+            } else if (std.mem.eql(u8, key, "proxyjump") or std.mem.eql(u8, key, "proxycommand")) {
+                // Unset reads as the literal "none" in some versions
+                // and is simply absent in others.
+                if (!std.mem.eql(u8, val, "none")) proxied = true;
+            }
+        }
+        return .{ .hostname = hostname orelse return null, .proxied = proxied };
+    }
+
+    /// Ask ssh itself what a host spec resolves to, so the UDP leg
+    /// targets the same machine the SSH leg does.
+    ///
+    /// `Host` aliases, `HostName` overrides and `Match` blocks all live
+    /// in the user's ssh config; sending UDP to the literal spec
+    /// resolves nothing when it is an alias, which silently downgraded
+    /// every aliased host to SSH. Reimplementing that config parser
+    /// here would be a second source of truth, so `ssh -G` is asked
+    /// instead -- it only prints the resolved config and never
+    /// connects, so an unreachable host costs nothing.
+    ///
+    /// Null when ssh is missing or too old for `-G`; the caller then
+    /// keeps the literal host, which is the pre-existing behaviour.
+    fn resolveSshConfig(spec: []const u8, out: *[256]u8, deadline: i64) ?SshTarget {
+        var spec_z_buf: [256:0]u8 = undefined;
+        const spec_z = std.fmt.bufPrintZ(&spec_z_buf, "{s}", .{spec}) catch return null;
+
+        var pipe_fds: [2]c_int = undefined;
+        if (c.pipe(&pipe_fds) != 0) return null;
+        for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+
+        const ssh_env = c.getenv("SKETERM_SSH");
+        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+
+        const pid = c.fork();
+        if (pid < 0) {
+            _ = c.close(pipe_fds[0]);
+            _ = c.close(pipe_fds[1]);
+            return null;
+        }
+        if (pid == 0) {
+            _ = c.dup2(pipe_fds[1], 1);
+            // Config warnings on stderr are not ours to print.
+            const devnull = c.open("/dev/null", c.O_WRONLY);
+            if (devnull >= 0) _ = c.dup2(devnull, 2);
+            _ = c.close(pipe_fds[0]);
+            _ = c.close(pipe_fds[1]);
+            var argv = [_:null]?[*:0]const u8{ ssh_bin, "-G", spec_z.ptr, null };
+            _ = c.execvp(ssh_bin, @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        _ = c.close(pipe_fds[1]);
+
+        var buf: [8192]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const remain = deadline - monotonicMs();
+            if (remain <= 0) break;
+            var pfd = c.struct_pollfd{ .fd = pipe_fds[0], .events = c.POLLIN, .revents = 0 };
+            const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
+            if (pr < 0) {
+                if (std.posix.errno(pr) == .INTR) continue;
+                break;
+            }
+            if (pr == 0) continue;
+            const n = c.read(pipe_fds[0], buf[len..].ptr, buf.len - len);
+            if (n <= 0) break;
+            len += @intCast(n);
+        }
+        _ = c.close(pipe_fds[0]);
+        reapBootstrapChild(pid);
+        return parseSshConfigOutput(buf[0..len], out);
     }
 
     /// Mosh-style UDP transport: bootstrap over SSH (run
@@ -283,6 +399,18 @@ pub const Conn = struct {
 
     fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
         const deadline = monotonicMs() + timeout_ms;
+
+        // 0. Resolve the UDP target through the user's ssh config
+        //    FIRST: a proxied host can never work over UDP, and
+        //    finding that out now costs one non-connecting `ssh -G`
+        //    instead of the full bootstrap plus handshake timeout.
+        var resolved_buf: [256]u8 = undefined;
+        var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, host, '@')) |at| host[at + 1 ..] else host;
+        if (resolveSshConfig(host, &resolved_buf, deadline)) |target| {
+            if (target.proxied) return error.UdpProxiedHost;
+            udp_host = target.hostname;
+        }
+
         // 1. Bootstrap: ssh prints the announcement on a pipe.
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
@@ -359,9 +487,8 @@ pub const Conn = struct {
         const port = it.next() orelse return error.SshTransportFailed;
         const keyhex = it.next() orelse return error.SshTransportFailed;
 
-        // 2. Local UDP bridge child over a socketpair. UDP goes to
-        // the bare hostname (strip any user@ ssh prefix).
-        const bare_host = if (std.mem.indexOfScalar(u8, host, '@')) |at| host[at + 1 ..] else host;
+        // 2. Local UDP bridge child over a socketpair, aimed at the
+        // ssh-config-resolved address from step 0.
         var mux_bin_buf: [4096:0]u8 = undefined;
         const mux_bin = findMuxBinary(&mux_bin_buf);
         var port_z_buf: [16:0]u8 = undefined;
@@ -369,7 +496,7 @@ pub const Conn = struct {
         var key_z_buf: [128:0]u8 = undefined;
         const key_z = std.fmt.bufPrintZ(&key_z_buf, "{s}", .{keyhex}) catch return error.SshTransportFailed;
         var bh_z_buf: [256:0]u8 = undefined;
-        const bh_z = std.fmt.bufPrintZ(&bh_z_buf, "{s}", .{bare_host}) catch return error.BadPath;
+        const bh_z = std.fmt.bufPrintZ(&bh_z_buf, "{s}", .{udp_host}) catch return error.BadPath;
 
         const argv2 = [_:null]?[*:0]const u8{
             mux_bin, "--udp-connect", bh_z.ptr, port_z.ptr, key_z.ptr, null,
@@ -377,10 +504,15 @@ pub const Conn = struct {
         var conn = try spawnOverSocketpair(allocator, mux_bin, &argv2);
         errdefer conn.deinit();
 
-        conn.sendHello() catch return error.SshTransportFailed;
+        // Past this point the ssh bootstrap already succeeded, so a
+        // failure is the UDP path itself not carrying traffic --
+        // distinct from "the remote never announced", and the only
+        // thing that distinguishes filtered/NAT-mapped UDP for the
+        // fallback message.
+        conn.sendHello() catch return error.UdpBridgeUnreachable;
         const remain = deadline - monotonicMs();
-        if (remain <= 0) return error.SshTransportFailed;
-        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
+        if (remain <= 0) return error.UdpBridgeUnreachable;
+        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.UdpBridgeUnreachable;
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
         conn.transport = .udp;
@@ -816,6 +948,85 @@ test "explicit remote transport never falls back" {
     );
     const ssh = try Conn.connectRemoteUsing(t.allocator, "ssh:box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
     try t.expectEqual(Transport.ssh, ssh.transport);
+}
+
+test "auto fallback records why UDP was not used" {
+    const t = std.testing;
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess);
+    try t.expectEqual(Transport.ssh, ssh.transport);
+    try t.expectEqual(@as(?anyerror, error.SshTransportFailed), ssh.udp_error);
+
+    // A UDP connection and a forced transport must not claim a cause.
+    const udp = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    try t.expectEqual(@as(?anyerror, null), udp.udp_error);
+    const forced = try Conn.connectRemoteUsing(t.allocator, "ssh:box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    try t.expectEqual(@as(?anyerror, null), forced.udp_error);
+}
+
+test "ssh -G output resolves an alias to its real hostname" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    // Trimmed but faithful `ssh -G vastai` output: the alias the user
+    // typed appears nowhere, only the resolved HostName.
+    const out = Conn.parseSshConfigOutput(
+        \\user root
+        \\hostname ssh5.vast.ai
+        \\port 41234
+        \\forwardagent no
+        \\
+    , &buf) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("ssh5.vast.ai", out.hostname);
+    try t.expect(!out.proxied);
+}
+
+test "ssh -G output flags proxied hosts as UDP-ineligible" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const jump = Conn.parseSshConfigOutput(
+        "hostname inner.example\nproxyjump bastion\n",
+        &buf,
+    ) orelse return error.TestUnexpectedResult;
+    try t.expect(jump.proxied);
+
+    const cmd = Conn.parseSshConfigOutput(
+        "hostname inner.example\nproxycommand nc %h %p\n",
+        &buf,
+    ) orelse return error.TestUnexpectedResult;
+    try t.expect(cmd.proxied);
+
+    // "none" is how some OpenSSH versions spell "unset".
+    const none = Conn.parseSshConfigOutput(
+        "hostname plain.example\nproxycommand none\n",
+        &buf,
+    ) orelse return error.TestUnexpectedResult;
+    try t.expect(!none.proxied);
+    try t.expectEqualStrings("plain.example", none.hostname);
+}
+
+test "ssh config resolution spawns ssh and reads back the hostname" {
+    // Covers the fork/exec/read half that the parser tests cannot:
+    // SKETERM_SSH swaps in a fake that answers -G like OpenSSH.
+    var path_buf: [128:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-fake-ssh-{d}", .{c.getpid()}) catch unreachable;
+    const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
+    _ = c.fputs("#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'user root\\nhostname 10.1.2.3\\nport 2222\\n'; fi\n", f);
+    _ = c.fclose(f);
+    if (c.chmod(path.ptr, 0o755) != 0) return error.SkipZigTest;
+    defer _ = c.unlink(path.ptr);
+
+    _ = c.setenv("SKETERM_SSH", path.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_SSH");
+
+    var buf: [256]u8 = undefined;
+    const target = Conn.resolveSshConfig("some-alias", &buf, monotonicMs() + 5_000) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("10.1.2.3", target.hostname);
+    try std.testing.expect(!target.proxied);
+}
+
+test "ssh -G output without a hostname yields no target" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(Conn.parseSshConfigOutput("user root\nport 22\n", &buf) == null);
 }
 
 test "welcome records older and future daemon profiles without rejecting either" {

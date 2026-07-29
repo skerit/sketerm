@@ -686,9 +686,16 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
             return null;
         };
         if (remote.mode == .auto and conn.transport == .ssh) {
+            const why = if (conn.udp_error) |e| mux_client.Conn.udpErrorText(e) else "reason unrecorded";
             _ = c.fprintf(
                 platform.stderr(),
-                "sketerm mux: UDP unavailable for %.*s; connected over SSH\n",
+                "sketerm mux: UDP unavailable for %.*s; connected over SSH\n" ++
+                    "  reason: %.*s\n" ++
+                    "  force it to see the full error:  sketerm mux udp:%.*s\n",
+                @as(c_int, @intCast(remote.host.len)),
+                remote.host.ptr,
+                @as(c_int, @intCast(why.len)),
+                why.ptr,
                 @as(c_int, @intCast(remote.host.len)),
                 remote.host.ptr,
             );
