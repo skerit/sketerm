@@ -471,14 +471,21 @@ pub fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const name = std.mem.trim(u8, raw, " ");
     if (name.len == 0) return;
+    const owned = ctx.allocator.dupe(u8, name) catch return;
+    defer ctx.allocator.free(owned);
     tab.view.closeColumnPicker();
-    _ = addAttrColumnByName(tab, name);
+    _ = addAttrColumnByName(tab, owned);
 }
 
 pub fn closeColumnPicker(self: *BrowserView) void {
     const pop = self.column_picker orelse return;
     self.column_picker = null;
     c.gtk_popover_popdown(@ptrCast(pop));
+}
+
+fn onColumnPickerClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (self.column_picker == @as(*c.GtkWidget, @ptrCast(pop))) self.column_picker = null;
 }
 
 /// Re-SUBSCRIBE the tab's directories so both the listing and the
@@ -506,8 +513,10 @@ pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
 
 pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
-    showColumnPicker(ctx.tab, @ptrCast(@alignCast(btn)));
+    showColumnPicker(ctx.tab, @ptrCast(@alignCast(btn)), null);
 }
+
+pub const PickerPoint = struct { x: f64, y: f64 };
 
 /// One dim section heading inside the column picker.
 fn pickerHeading(box: *c.GtkWidget, text: [*:0]const u8, top_gap: bool) void {
@@ -544,7 +553,7 @@ fn isKnownKey(key: []const u8) bool {
 /// Build and pop the column picker, anchored at `btn` -- whichever
 /// header widget was clicked, since a right-click anywhere in the
 /// header opens it too.
-pub fn showColumnPicker(tab: *BTab, btn: *c.GtkWidget) void {
+pub fn showColumnPicker(tab: *BTab, btn: *c.GtkWidget, point: ?PickerPoint) void {
     const self = tab.view;
     // Right-clicking a second header while one is open would otherwise
     // leave two pickers stacked, only one of them reachable.
@@ -641,17 +650,32 @@ pub fn showColumnPicker(tab: *BTab, btn: *c.GtkWidget) void {
     // view; pointing at its HEADER strip (not its full extent, whose
     // midpoint is the bottom of a tall listing) is what drops the
     // picker where the columns live.
-    var bounds: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(@ptrCast(btn), tab.page, &bounds) != 0) {
-        const rect = c.GdkRectangle{
-            .x = @intFromFloat(bounds.origin.x),
-            .y = @intFromFloat(bounds.origin.y),
-            .width = @intFromFloat(bounds.size.width),
-            .height = @min(@as(c_int, @intFromFloat(bounds.size.height)), 28),
-        };
-        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+    if (point) |p| {
+        var src = c.graphene_point_t{ .x = @floatCast(p.x), .y = @floatCast(p.y) };
+        var dst = c.graphene_point_t{ .x = 0, .y = 0 };
+        if (c.gtk_widget_compute_point(btn, tab.page, &src, &dst) != 0) {
+            const rect = c.GdkRectangle{
+                .x = @intFromFloat(dst.x),
+                .y = @intFromFloat(dst.y),
+                .width = 1,
+                .height = 1,
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        }
+    } else {
+        var bounds: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(@ptrCast(btn), tab.page, &bounds) != 0) {
+            const rect = c.GdkRectangle{
+                .x = @intFromFloat(bounds.origin.x),
+                .y = @intFromFloat(bounds.origin.y),
+                .width = @intFromFloat(bounds.size.width),
+                .height = @min(@as(c_int, @intFromFloat(bounds.size.height)), 28),
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        }
     }
     c.gtk_widget_set_parent(popover, tab.page);
+    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onColumnPickerClosed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     connectPopoverAutoUnparent(popover);
     self.column_picker = popover;
     c.gtk_popover_popup(@ptrCast(popover));
@@ -1335,4 +1359,3 @@ pub fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
     views.rememberFolder(tab.view, tab);
     tab.view.renderTab(tab);
 }
-

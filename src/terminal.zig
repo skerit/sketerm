@@ -1029,6 +1029,14 @@ pub const Terminal = struct {
             .app_listing => self.handleAppListing(frame.payload),
             .peer_info => self.handlePeerInfo(frame.payload),
             .control_state => self.handleControlState(frame.payload),
+            .session_meta => {
+                const Meta = struct { cwd: []const u8 = "" };
+                var parsed = std.json.parseFromSlice(Meta, self.allocator, frame.payload, .{
+                    .ignore_unknown_fields = true,
+                }) catch return;
+                defer parsed.deinit();
+                if (parsed.value.cwd.len > 0) self.setCwd(parsed.value.cwd);
+            },
             .file_data => self.downloadData(frame.payload),
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
@@ -2070,9 +2078,18 @@ pub const Terminal = struct {
             break :blk cwd_in;
         };
         const decoded = percent.decode(self.allocator, raw) catch return;
+        self.replaceCwd(decoded);
+    }
+
+    fn setCwd(self: *Terminal, cwd: []const u8) void {
+        const owned = self.allocator.dupe(u8, cwd) catch return;
+        self.replaceCwd(owned);
+    }
+
+    fn replaceCwd(self: *Terminal, owned: []u8) void {
         if (self.cwd) |old| self.allocator.free(old);
-        self.cwd = decoded;
-        if (self.on_cwd_changed) |f| f(self.user_ctx, decoded);
+        self.cwd = owned;
+        if (self.on_cwd_changed) |f| f(self.user_ctx, owned);
     }
 
     /// Replay snapshot-restored image placements into the image sink

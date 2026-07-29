@@ -655,6 +655,7 @@ pub const BrowserView = struct {
     pub const previewHostDied = @import("preview.zig").previewHostDied;
     pub const abandonPreviewRead = @import("preview.zig").abandonPreviewRead;
     pub const abandonPreload = @import("preview.zig").abandonPreload;
+    pub const shutdownPreviewTransfers = @import("preview.zig").shutdownTransfers;
     pub const updatePreview = @import("preview.zig").updatePreview;
     pub const feedPreview = @import("preview.zig").feedPreview;
     pub const queuePreviewDecode = @import("preview.zig").queuePreviewDecode;
@@ -1015,7 +1016,7 @@ pub const BrowserView = struct {
                 0,
                 0,
                 null,
-                @constCast(@ptrCast(&onRootDestroy)),
+                @ptrCast(@constCast(&onRootDestroy)),
                 @ptrCast(self),
             );
             self.widgets_dead = true;
@@ -1064,6 +1065,7 @@ pub const BrowserView = struct {
             self.allocator.destroy(j);
         }
         self.jobs.deinit(self.allocator);
+        self.shutdownPreviewTransfers();
         for (self.conns.items) |hc| {
             if (hc.state == .connecting) {
                 // A worker thread still owns the connect; the idle
@@ -1090,7 +1092,6 @@ pub const BrowserView = struct {
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
         self.endAttrRequest();
-        if (self.preview_read) |pr| pr.destroy(self.allocator);
         self.preview_state.deinit(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
@@ -1104,9 +1105,6 @@ pub const BrowserView = struct {
             tc.unlock();
             tc.unref(); // the view's ref; thread + idles drop theirs
         }
-        if (self.remote_thumb_watch != 0) _ = c.g_source_remove(self.remote_thumb_watch);
-        if (self.remote_thumb) |rt| rt.destroy(self.allocator);
-        for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
         self.remote_thumb_queue.deinit(self.allocator);
         for (self.undo_stack.items) |u| u.destroy(self.allocator);
         self.undo_stack.deinit(self.allocator);

@@ -234,6 +234,10 @@ pub const FrameType = enum(u8) {
     /// each recipient gets its own view, so a viewer that asked for
     /// control and did not get it learns so without polling.
     control_state = 89,
+    /// Daemon-authoritative metadata for the attached session. JSON
+    /// `{cwd}` follows every snapshot so a newly attached GUI does not
+    /// depend on having witnessed an earlier OSC 7 event.
+    session_meta = 90,
     _,
 };
 

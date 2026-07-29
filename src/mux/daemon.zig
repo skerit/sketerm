@@ -1375,7 +1375,7 @@ pub const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 pub const FsJob = struct {
-    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta };
+    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport };
     pub const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -1434,6 +1434,12 @@ pub const FsJob = struct {
     /// Short-lived client-owned helper: no journal/history and killed
     /// when its requesting client disappears.
     ephemeral: bool = false,
+    /// Host scratch path in `dst` belongs to this job.
+    owns_dst: bool = false,
+    /// Host scratch source belongs to this job after its helper exits.
+    owns_src: bool = false,
+    /// Finished temp-producing jobs stay readable until this deadline.
+    cleanup_at_ms: i64 = 0,
 
     pub fn deinit(self: *FsJob, kill_child: bool) void {
         if (kill_child and self.out_fd >= 0 and self.pid > 0) {
@@ -1442,6 +1448,10 @@ pub const FsJob = struct {
             _ = c.waitpid(self.pid, &st, 0);
         }
         if (self.out_fd >= 0) _ = c.close(self.out_fd);
+        self.releaseOwnedSource();
+        if (self.owns_dst) self.unlinkOwned(self.dst);
+        if ((self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and self.done_path_len > 0)
+            self.unlinkOwned(self.done_path[0..self.done_path_len]);
         self.lbuf.deinit(self.allocator);
         self.allocator.free(self.src);
         self.allocator.free(self.dst);
@@ -1451,6 +1461,49 @@ pub const FsJob = struct {
         self.allocator.free(self.client_token);
         self.allocator.free(self.conflict);
         self.allocator.destroy(self);
+    }
+
+    fn unlinkOwned(self: *FsJob, path: []const u8) void {
+        _ = self;
+        var z: [4096:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return;
+        _ = c.unlink(p.ptr);
+    }
+
+    pub fn releaseOwnedSource(self: *FsJob) void {
+        if (!self.owns_src) return;
+        self.unlinkOwned(self.src);
+        self.owns_src = false;
+    }
+
+    pub fn ownsTempPath(self: *const FsJob, path: []const u8) bool {
+        const owns_done = self.op == .thumbnail or self.op == .preview or self.op == .preview_transport;
+        return (self.owns_src and std.mem.eql(u8, self.src, path)) or
+            (self.owns_dst and std.mem.eql(u8, self.dst, path)) or
+            (owns_done and self.done_path_len > 0 and std.mem.eql(u8, self.done_path[0..self.done_path_len], path));
+    }
+
+    pub fn releaseTempPath(self: *FsJob, path: []const u8, now_ms: i64) bool {
+        const owns_done = self.op == .thumbnail or self.op == .preview or self.op == .preview_transport;
+        var released_src = false;
+        var released_dst = false;
+        var released_result = false;
+        if (self.owns_src and std.mem.eql(u8, self.src, path)) {
+            self.owns_src = false;
+            released_src = true;
+        }
+        if (self.owns_dst and std.mem.eql(u8, self.dst, path)) {
+            self.owns_dst = false;
+            released_dst = true;
+        }
+        if (owns_done and self.done_path_len > 0 and std.mem.eql(u8, self.done_path[0..self.done_path_len], path)) {
+            self.done_path_len = 0;
+            released_result = true;
+        }
+        if (released_result or released_dst or
+            (released_src and self.done_path_len == 0 and !self.owns_dst))
+            self.cleanup_at_ms = now_ms;
+        return released_src or released_dst or released_result;
     }
 
     pub fn setMessage(self: *FsJob, msg: []const u8) void {
@@ -1463,6 +1516,40 @@ pub const FsJob = struct {
         return self.state == .done or self.state == .failed or self.state == .canceled;
     }
 };
+
+test "preview temp source release preserves result ownership" {
+    const t = std.testing;
+    const job = try t.allocator.create(FsJob);
+    job.* = .{
+        .allocator = t.allocator,
+        .id = 1,
+        .op = .preview_transport,
+        .owner = null,
+        .pid = -1,
+        .out_fd = -1,
+        .src = try t.allocator.dupe(u8, "/tmp/nonexistent-preview-source"),
+        .dst = try t.allocator.dupe(u8, ""),
+        .pattern = try t.allocator.dupe(u8, ""),
+        .src_host = try t.allocator.dupe(u8, ""),
+        .dst_host = try t.allocator.dupe(u8, ""),
+        .client_token = try t.allocator.dupe(u8, ""),
+        .conflict = try t.allocator.dupe(u8, ""),
+        .owns_src = true,
+        .cleanup_at_ms = 500,
+    };
+    defer job.deinit(false);
+    const result = "/tmp/nonexistent-preview-result.jxl";
+    @memcpy(job.done_path[0..result.len], result);
+    job.done_path_len = result.len;
+
+    try t.expect(job.releaseTempPath(job.src, 100));
+    try t.expect(!job.owns_src);
+    try t.expectEqual(result.len, job.done_path_len);
+    try t.expectEqual(@as(i64, 500), job.cleanup_at_ms);
+    try t.expect(job.releaseTempPath(result, 200));
+    try t.expectEqual(@as(usize, 0), job.done_path_len);
+    try t.expectEqual(@as(i64, 200), job.cleanup_at_ms);
+}
 
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -2674,7 +2761,6 @@ pub const Daemon = struct {
     const takePasteFd = daemon_native.takePasteFd;
     const applyAppUnit = daemon_native.applyAppUnit;
 
-
     pub fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
         if (ch.dead) return;
         ch.dead = true;
@@ -2713,7 +2799,6 @@ pub const Daemon = struct {
     const setupAudioHub = daemon_sessions.setupAudioHub;
     const setupHubSocket = daemon_sessions.setupHubSocket;
     const winstreamGate = daemon_sessions.winstreamGate;
-
 
     // ── controller lease ────────────────────────────────────────────
     //
@@ -3166,6 +3251,10 @@ pub const Daemon = struct {
             return;
         };
         cl.queueFrame(.snapshot, buf.items);
+        var cwd_buf: [4096]u8 = undefined;
+        cl.queueJson(.session_meta, .{
+            .cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse "",
+        });
     }
 
     pub fn broadcastSnapshot(self: *Daemon, s: *Session) void {
@@ -3668,6 +3757,7 @@ pub const Daemon = struct {
                             _ = c.kill(-j.pid, c.SIGKILL);
                             j.state = .canceled;
                         }
+                        if (j.cleanup_at_ms > 0) j.cleanup_at_ms = nowMs();
                         j.owner = null;
                     }
                 }
@@ -3704,9 +3794,12 @@ pub const Daemon = struct {
                 }
             }
             var i: usize = 0;
+            const cleanup_now = nowMs();
             while (i < self.fs_jobs.items.len) {
                 const j = self.fs_jobs.items[i];
-                if (j.ephemeral and j.finished() and j.out_fd < 0) {
+                if (j.ephemeral and j.finished() and j.out_fd < 0 and
+                    (j.cleanup_at_ms == 0 or j.cleanup_at_ms <= cleanup_now))
+                {
                     _ = self.fs_jobs.orderedRemove(i);
                     j.deinit(false);
                 } else i += 1;
@@ -3714,7 +3807,10 @@ pub const Daemon = struct {
             i = 0;
             while (finished_count > MAX_FINISHED_JOBS and i < self.fs_jobs.items.len) {
                 const j = self.fs_jobs.items[i];
-                if (j.finished() and !j.terminal_pending and j.client_token.len == 0) {
+                // Ephemeral jobs were not counted above and may be
+                // TTL-held preview producers/sidecars a client is
+                // about to consume; only the TTL sweep removes them.
+                if (!j.ephemeral and j.finished() and !j.terminal_pending and j.client_token.len == 0) {
                     _ = self.fs_jobs.orderedRemove(i);
                     j.deinit(false);
                     finished_count -= 1;

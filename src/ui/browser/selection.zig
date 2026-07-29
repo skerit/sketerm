@@ -380,6 +380,10 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
     if (tab.view.inline_rename != null) return 0;
     const mods = state & (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK);
     if (tab.view.currentTab() == tab) {
+        // GtkColumnView binds plain Space to selection toggling before
+        // the browser's bubble controller can open Quick Look.
+        if (mods == 0 and (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space))
+            return @intFromBool(@import("nav.zig").quickLookKey(tab.view));
         const mark = (mods == 0 and keyval == c.GDK_KEY_Insert) or
             (mods == c.GDK_CONTROL_MASK and (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space));
         if (mark) return @intFromBool(toggleMarkFocused(tab.view));
@@ -943,15 +947,16 @@ pub fn onMarkActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const self = ctx.view;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const name = std.mem.trim(u8, raw, " ");
+    const valid = registers.validName(name);
+    var nbuf: [registers.MAX_NAME]u8 = undefined;
+    if (valid) @memcpy(nbuf[0..name.len], name);
     if (ctx.popover) |pop| {
         if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
     }
-    if (!registers.validName(name)) {
+    if (!valid) {
         self.setStatus("register names are 1-48 printable characters, no spaces");
         return;
     }
-    var nbuf: [registers.MAX_NAME]u8 = undefined;
-    @memcpy(nbuf[0..name.len], name);
     const tab = self.currentTab() orelse return;
     if (ctx.action == .mark_results) markResults(self, tab, nbuf[0..name.len]) else markPaths(self, tab, nbuf[0..name.len], tab.selected.items);
 }

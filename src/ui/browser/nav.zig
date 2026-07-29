@@ -280,9 +280,16 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
     if (tab.navigation_generation == 0) tab.navigation_generation = 1;
     // Navigation is transactional: the visible root and history do
     // not change until the candidate listing succeeds.
-    const p = self.allocator.create(Pending) catch { new_dir.deinit(); return; };
+    const p = self.allocator.create(Pending) catch {
+        new_dir.deinit();
+        return;
+    };
     p.* = .{ .req = self.nextReq(), .tab = tab, .dir = new_dir, .hc = new_hc, .op = .open_view, .navigation = intent, .navigation_generation = tab.navigation_generation };
-    self.pending.append(self.allocator, p) catch { self.allocator.destroy(p); new_dir.deinit(); return; };
+    self.pending.append(self.allocator, p) catch {
+        self.allocator.destroy(p);
+        new_dir.deinit();
+        return;
+    };
     if (new_hc.state == .ready) {
         self.sendListingOp(p);
     } else if (new_hc.state == .dead) {
@@ -368,7 +375,10 @@ pub fn applyHistoryIntent(self: *BrowserView, tab: *BTab, intent: NavigationInte
 pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
     if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
         const owned = self.allocator.dupe(u8, canonical) catch null;
-        if (owned) |path| { self.allocator.free(candidate.path); candidate.path = path; }
+        if (owned) |path| {
+            self.allocator.free(candidate.path);
+            candidate.path = path;
+        }
     }
     // A landed navigation settles the previous refusal.
     tab.clearNavError();
@@ -734,7 +744,16 @@ fn chordTypeaheadReset(self: *BrowserView) bool {
 /// overlay and its own Escape/arrow/Enter keys). Mid-word the space
 /// belongs to type-ahead instead.
 fn chordQuickLook(self: *BrowserView) bool {
-    if (self.ta_len != 0) return false;
+    return quickLookKey(self);
+}
+
+/// Capture- and bubble-phase entry point for Space. A stale type-ahead
+/// prefix must not suppress preview forever after its timeout elapsed.
+pub fn quickLookKey(self: *BrowserView) bool {
+    if (self.ta_len != 0) {
+        if (c.g_get_monotonic_time() - self.ta_last_us <= TYPEAHEAD_RESET_US) return false;
+        self.typeaheadReset();
+    }
     return self.quickLookToggle();
 }
 
@@ -803,13 +822,15 @@ pub fn onCwdSyncClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const tab = self.currentTab() orelse return;
     const cwd = self.pane.terminal.cwd orelse {
-        self.setStatus("the shell has not reported a directory yet (needs OSC 7 shell integration)");
+        self.setStatus("the terminal session has not reported a directory yet");
         return;
     };
     var buf: [4096]u8 = undefined;
     if (cwd.len >= buf.len) return;
     @memcpy(buf[0..cwd.len], cwd);
-    self.navigate(tab, null, buf[0..cwd.len]);
+    const raw: ?[]const u8 = if (self.pane.terminal.remote) |remote| remote.host else null;
+    const host = @import("../../filebrowser/paths.zig").browserHost(raw);
+    self.navigate(tab, host, buf[0..cwd.len]);
 }
 
 pub fn onHiddenToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
@@ -895,8 +916,15 @@ pub fn renderPathCompletion(self: *BrowserView) void {
     const hc = self.hostConnFor(candidate_host) orelse return;
     if (hc.state != .ready) return;
     const request = self.allocator.create(PathCompletion) catch return;
-    const display_owned = self.allocator.dupe(u8, raw[0 .. slash + 1]) catch { self.allocator.destroy(request); return; };
-    const prefix_owned = self.allocator.dupe(u8, prefix) catch { self.allocator.free(display_owned); self.allocator.destroy(request); return; };
+    const display_owned = self.allocator.dupe(u8, raw[0 .. slash + 1]) catch {
+        self.allocator.destroy(request);
+        return;
+    };
+    const prefix_owned = self.allocator.dupe(u8, prefix) catch {
+        self.allocator.free(display_owned);
+        self.allocator.destroy(request);
+        return;
+    };
     request.* = .{
         .req = self.nextReq(),
         .hc = hc,
@@ -941,7 +969,10 @@ pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefi
         var text_buf: [4600]u8 = undefined;
         const completed = std.fmt.bufPrint(&text_buf, "{s}{s}/", .{ display_prefix, name }) catch continue;
         const ctx = self.allocator.create(CompletionCtx) catch continue;
-        ctx.* = .{ .allocator = self.allocator, .view = self, .text = self.allocator.dupe(u8, completed) catch { self.allocator.destroy(ctx); continue; } };
+        ctx.* = .{ .allocator = self.allocator, .view = self, .text = self.allocator.dupe(u8, completed) catch {
+            self.allocator.destroy(ctx);
+            continue;
+        } };
         const row = c.gtk_list_box_row_new();
         c.gtk_widget_set_can_focus(row, 0);
         const label = c.gtk_label_new(null);
