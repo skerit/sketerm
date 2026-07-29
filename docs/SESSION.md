@@ -11169,3 +11169,30 @@ What this cannot do: symmetric/port-randomizing NAT (nothing without
 a relay can) -- the connection falls back to SSH and names the reason.
 The pinned-range identity mapping in docs/REMOTE.md stays the
 reliable answer for providers that drop outbound UDP entirely.
+
+## Dialect-proof portable-mux deployment (2026-07-29)
+
+The auto-deploy handshake now works regardless of the remote login
+shell. The original check/upload scripts were POSIX syntax handed to
+`ssh host <script>`, which the LOGIN shell parses -- fish or csh would
+fail every deployment (gracefully, but always). The fix is structural:
+the remote command is now always a SINGLE word, which no dialect can
+misparse. The check phase runs `sh` with the script on stdin; the
+upload phase runs the uploader script the check staged, as one bare
+word, with stdin carrying only the raw binary.
+
+The interesting failure this surfaced: the first design appended the
+payload after the script on sh's stdin, relying on POSIX byte-exact
+reads -- and the new real-sh unit test immediately caught dash
+(Debian/Ubuntu /bin/sh) BUFFERING stdin scripts and eating the payload
+(`head -c` got 0 bytes where bash got all of them). Hence the staged
+uploader: heredocs are parsed as script text so read-ahead cannot hurt
+the staging, and the payload gets a connection of its own.
+
+Tested at three levels: FakeRunner shape assertions (upload command is
+one whitespace-free word), a real-sh round trip through the actual
+runSshCommand streaming (deploy /bin/true into an isolated $HOME:
+check-miss, stage, upload, verify, republish-check, wrong-arch
+refusal), and a third smoke-udp stage that deploys the real mux
+through an emulated login shell and completes a hole-punched UDP
+connect FROM the deployed copy.

@@ -118,11 +118,50 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         \\
     );
 
+    // Fake ssh #3: emulates a real login shell — it RUNS the remote
+    // command it is given (deploy phases hand it the single word `sh`,
+    // the bootstrap hands it the exec of the deployed binary) against
+    // an isolated $HOME. With SKETERM_MUX_PORTABLE set, connectUdp
+    // deploys the real mux via the sh-on-stdin path and then boots
+    // from the DEPLOYED copy.
+    var home2_buf: [176:0]u8 = undefined;
+    const home2 = std.fmt.bufPrintZ(&home2_buf, "{s}/home", .{dir}) catch unreachable;
+    _ = c.mkdir(home2.ptr, 0o700);
+    var ssh3_buf: [176:0]u8 = undefined;
+    const ssh3 = std.fmt.bufPrintZ(&ssh3_buf, "{s}/fake-ssh-login", .{dir}) catch unreachable;
+    var ssh3_body_buf: [512]u8 = undefined;
+    const ssh3_body = std.fmt.bufPrint(&ssh3_body_buf,
+        \\#!/bin/sh
+        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+        \\HOME={s}; export HOME
+        \\export SSH_CONNECTION="127.0.0.1 12345 127.0.0.1 22"
+        \\for a in "$@"; do cmd="$a"; done
+        \\exec sh -c "$cmd"
+        \\
+    , .{home2}) catch unreachable;
+    writeScript(ssh3, ssh3_body);
+
     _ = c.setenv("SKETERM_SSH", ssh1.ptr, 1);
     connectStage(allocator, "direct UDP connect");
 
     _ = c.setenv("SKETERM_SSH", ssh2.ptr, 1);
     connectStage(allocator, "hole-punched connect (wrong announced port)");
+
+    _ = c.setenv("SKETERM_SSH", ssh3.ptr, 1);
+    _ = c.setenv("SKETERM_MUX_PORTABLE", argv[1], 1);
+    connectStage(allocator, "auto-deployed connect (emulated login shell)");
+    _ = c.unsetenv("SKETERM_MUX_PORTABLE");
+    {
+        // The bootstrap above must have run the DEPLOYED binary: the
+        // content-addressed copy exists in the isolated $HOME.
+        const hash = @import("util/filehash.zig").sha256File(std.mem.span(argv[1])) orelse fail("hash artifact");
+        var dep_buf: [320:0]u8 = undefined;
+        const dep = std.fmt.bufPrintZ(&dep_buf, "{s}/.cache/sketerm/mux/sketerm-mux-{s}", .{ home2, &hash.hex }) catch unreachable;
+        var st: c.struct_stat = undefined;
+        if (c.stat(dep.ptr, &st) != 0) fail("deployed binary missing");
+        if (@as(u64, @intCast(st.st_size)) != hash.size) fail("deployed binary size mismatch");
+        _ = c.unlink(dep.ptr);
+    }
 
     // Clean daemon shutdown so the leak check means something.
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
