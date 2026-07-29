@@ -189,7 +189,27 @@ pub fn main() u8 {
     if (std.mem.count(u8, list3, "\"id\":") != std.mem.count(u8, list2, "\"id\":"))
         return fail("close-pane wrong pane count");
 
-    // 6. A stale SKETERM_PANE_ID (the GUI restarted since the pane's
+    // 6. Closing a split that wears a browser face must synchronously
+    // stop its filesystem mux watch and fence GTK's synchronous model
+    // callbacks before their child widgets are destroyed.
+    const split_browser = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return fail("browser split roundtrip");
+    defer allocator.free(split_browser);
+    if (std.mem.indexOf(u8, split_browser, "\"ok\":true") == null) return fail("browser split not ok");
+    const browser_here = roundtrip(allocator, sock_path, "{\"cmd\":\"browser-here\",\"pane\":4,\"data\":\"/\"}\n") orelse return fail("browser-here roundtrip");
+    defer allocator.free(browser_here);
+    if (std.mem.indexOf(u8, browser_here, "\"ok\":true") == null) return fail("browser-here not ok");
+    const close_browser = roundtrip(allocator, sock_path, "{\"cmd\":\"close-pane\",\"pane\":4}\n") orelse return fail("browser close roundtrip");
+    defer allocator.free(close_browser);
+    if (std.mem.indexOf(u8, close_browser, "\"ok\":true") == null) return fail("browser close not ok");
+    _ = c.usleep(1_000_000);
+    const after_browser_close = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("GUI stopped serving after browser split close");
+    defer allocator.free(after_browser_close);
+    if (std.mem.indexOf(u8, after_browser_close, "\"ok\":true") == null)
+        return fail("GUI unhealthy after browser split close");
+    if (std.mem.count(u8, after_browser_close, "\"id\":") != std.mem.count(u8, list3, "\"id\":"))
+        return fail("browser split close did not remove its pane");
+
+    // 7. A stale SKETERM_PANE_ID (the GUI restarted since the pane's
     // shell was spawned, so its baked-in id no longer matches a live
     // pane) must NOT fail an attach with "no such pane" — the takeover
     // falls back to the current pane. Using a bogus session name keeps
@@ -200,7 +220,7 @@ pub fn main() u8 {
     defer allocator.free(stale);
     if (std.mem.indexOf(u8, stale, "no such pane") != null) return fail("stale SKETERM_PANE_ID regressed to 'no such pane'");
 
-    // 6b. An attach that cannot proceed must DEGRADE, never abort the
+    // 7b. An attach that cannot proceed must DEGRADE, never abort the
     // process: a crash here takes every attached durable session's viewer
     // with it. Sessions whose names carry a space or a colon ("Traffic
     // Giant", "ST:AFU") travel through the JSON request and the daemon's
@@ -225,7 +245,7 @@ pub fn main() u8 {
             return fail("GUI unhealthy after a failed attach");
     }
 
-    // 7. unknown command must error.
+    // 8. unknown command must error.
     const bad = roundtrip(allocator, sock_path, "{\"cmd\":\"nope\"}\n") orelse return fail("bad-cmd roundtrip");
     defer allocator.free(bad);
     if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return fail("unknown cmd not rejected");
@@ -234,7 +254,9 @@ pub fn main() u8 {
     _ = c.kill(pid, c.SIGTERM);
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
+    const gui_ok = c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0;
     child_pid = 0;
+    if (!gui_ok) return fail("GUI exited abnormally during final teardown");
     if (c.access(sock_path.ptr, c.F_OK) == 0) return fail("socket not unlinked on shutdown");
 
     _ = c.kill(daemon_pid, c.SIGTERM);

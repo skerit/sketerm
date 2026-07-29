@@ -139,6 +139,10 @@ pub fn itemDataAt(tab: *BTab, pos: c.guint) ?*ItemData {
 
 /// Fence recycled cells off before their borrowed Dir/Entry storage changes.
 pub fn invalidateBackingRefs(tab: *BTab) void {
+    if (tab.view.widgets_dead) {
+        tab.name_cells.clearRetainingCapacity();
+        return;
+    }
     const n = itemCount(tab);
     var i: c.guint = 0;
     while (i < n) : (i += 1) {

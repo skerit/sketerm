@@ -269,6 +269,7 @@ pub const Pane = struct {
     /// fd watch must never outlive the pane.
     browser_widget: ?*c.GtkWidget = null,
     browser_ctx: ?*anyopaque = null,
+    browser_prepare_destroy: ?*const fn (*anyopaque) void = null,
     browser_deinit: ?*const fn (*anyopaque) void = null,
     /// Put GTK focus inside the browser face (its listing). Called
     /// whenever that face becomes the visible one.
@@ -862,6 +863,7 @@ pub const Pane = struct {
         self: *Pane,
         face: *c.GtkWidget,
         ctx: *anyopaque,
+        prepare_destroy_cb: *const fn (*anyopaque) void,
         deinit_cb: *const fn (*anyopaque) void,
         focus_cb: *const fn (*anyopaque) void,
     ) void {
@@ -869,6 +871,7 @@ pub const Pane = struct {
         self.detachBrowser();
         self.browser_widget = face;
         self.browser_ctx = ctx;
+        self.browser_prepare_destroy = prepare_destroy_cb;
         self.browser_deinit = deinit_cb;
         self.browser_focus = focus_cb;
         c.gtk_widget_set_vexpand(face, 1);
@@ -919,14 +922,23 @@ pub const Pane = struct {
         return true;
     }
 
-    /// Tear the browser face down (idempotent). Runs its deinit
-    /// callback BEFORE removing the widget so the fd watch dies while
-    /// the widgets still exist.
+    /// Tear the browser face down without freeing its state during GTK destruction signals.
     pub fn detachBrowser(self: *Pane) void {
-        if (self.browser_ctx) |ctx| {
-            if (self.browser_deinit) |cb| cb(ctx);
+        const ctx = self.browser_ctx;
+        const prepare_destroy_cb = self.browser_prepare_destroy;
+        const deinit_cb = self.browser_deinit;
+        const face = self.browser_widget;
+        // Clear pane ownership first so widget-destruction signals cannot
+        // re-enter through the pane and try to detach the same face again.
+        self.browser_ctx = null;
+        self.browser_prepare_destroy = null;
+        self.browser_deinit = null;
+        self.browser_focus = null;
+        self.browser_widget = null;
+        if (ctx) |browser_ctx| {
+            if (prepare_destroy_cb) |cb| cb(browser_ctx);
         }
-        if (self.browser_widget) |bw| {
+        if (face) |bw| {
             // After the widget tree's destroy these pointers are no
             // longer widgets; GTK already removed everything itself.
             if (!self.widgets_dead) {
@@ -934,10 +946,12 @@ pub const Pane = struct {
                 if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
             }
         }
-        self.browser_ctx = null;
-        self.browser_deinit = null;
-        self.browser_focus = null;
-        self.browser_widget = null;
+        // Unparenting synchronously emits sorter and selection signals that
+        // still use BrowserView. Free it, and remove its mux watch, only
+        // after that GTK destruction chain has completed.
+        if (ctx) |browser_ctx| {
+            if (deinit_cb) |cb| cb(browser_ctx);
+        }
         // No face left to go back to.
         if (!self.widgets_dead) setBrowserBanner(self, false);
     }

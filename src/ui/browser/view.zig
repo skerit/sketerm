@@ -45,6 +45,7 @@ const JobRow = @import("types.zig").JobRow;
 const LabelProbe = @import("props.zig").LabelProbe;
 const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
 const OpenWithCtx = @import("open.zig").OpenWithCtx;
+const PendingOpen = @import("open.zig").PendingOpen;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const PathCompletion = @import("nav.zig").PathCompletion;
 const Pending = @import("types.zig").Pending;
@@ -76,6 +77,8 @@ pub const BrowserView = struct {
     next_view: u32 = 1,
     tabs: std.ArrayList(*BTab) = .empty,
     pending: std.ArrayList(*Pending) = .empty,
+    /// Remote opens whose host mount is still starting.
+    pending_opens: std.ArrayList(*PendingOpen) = .empty,
     pending_jobs: std.ArrayList(*PendingJob) = .empty,
     jobs: std.ArrayList(*JobRow) = .empty,
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
@@ -221,11 +224,15 @@ pub const BrowserView = struct {
     bar_collapsed: bool = false,
     /// The one-shot post-layout overflow evaluation (0 = none).
     bar_idle_src: c.guint = 0,
+    /// Delayed pane close while the toolbar popover dismisses.
+    close_pane_src: c.guint = 0,
     /// Set from the root box's ::destroy. Closing a pane destroys the
     /// browser's widgets IMMEDIATELY but defers `Pane.deinit` (and so
     /// this view's deinit) -- a deferred callback scheduled before the
     /// close would otherwise run against destroyed widgets.
     widgets_dead: bool = false,
+    /// True only after the root's destroy signal has actually fired.
+    root_destroyed: bool = false,
     /// Toolbar width the collapsed cluster gives back, so expanding
     /// cannot immediately re-trip the collapse (hysteresis).
     bar_reclaim: c_int = 0,
@@ -792,7 +799,7 @@ pub const BrowserView = struct {
         // After the menus: their two buttons belong to the collapsible
         // cluster, and the sidebar toggle below renders places.
         self.applyChromeState();
-        pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb, focusCb);
+        pane.attachBrowser(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
 
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
         if (start_spec) |sp| {
@@ -811,6 +818,11 @@ pub const BrowserView = struct {
     fn destroyCb(ctx: *anyopaque) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
         self.deinit();
+    }
+
+    fn prepareDestroyCb(ctx: *anyopaque) void {
+        const self: *BrowserView = @ptrCast(@alignCast(ctx));
+        self.widgets_dead = true;
     }
 
     fn focusCb(ctx: *anyopaque) void {
@@ -1026,9 +1038,14 @@ pub const BrowserView = struct {
             _ = c.g_source_remove(self.bar_idle_src);
             self.bar_idle_src = 0;
         }
-        // detachBrowser deinits the view BEFORE unparenting its widget,
-        // so the destroy fence would otherwise fire on freed memory.
-        if (!self.widgets_dead) {
+        if (self.close_pane_src != 0) {
+            _ = c.g_source_remove(self.close_pane_src);
+            self.close_pane_src = 0;
+        }
+        // detachBrowser unparents the root before deinit, so its destroy
+        // fence has normally fired already. Other teardown paths can still
+        // deinit a live widget tree, and must disconnect the raw self pointer.
+        if (!self.root_destroyed) {
             _ = c.g_signal_handlers_disconnect_matched(
                 @ptrCast(self.root_box),
                 c.G_SIGNAL_MATCH_FUNC | c.G_SIGNAL_MATCH_DATA,
@@ -1038,8 +1055,10 @@ pub const BrowserView = struct {
                 @ptrCast(@constCast(&onRootDestroy)),
                 @ptrCast(self),
             );
-            self.widgets_dead = true;
         }
+        self.widgets_dead = true;
+        for (self.pending_opens.items) |pending| pending.view = null;
+        self.pending_opens.deinit(self.allocator);
         self.jobs_panel.deinit(self.allocator);
         self.copy_queue.deinit(self.allocator);
         self.cancelPendingRetries();
@@ -1533,6 +1552,7 @@ pub const BrowserView = struct {
     fn onRootDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         self.widgets_dead = true;
+        self.root_destroyed = true;
         if (self.bar_idle_src != 0) {
             _ = c.g_source_remove(self.bar_idle_src);
             self.bar_idle_src = 0;
@@ -1627,11 +1647,13 @@ pub const BrowserView = struct {
     /// popover still in that state crashes the process later, during
     /// application teardown. One dismiss animation is the wait.
     pub fn closePaneDeferred(self: *BrowserView) void {
-        _ = c.g_timeout_add(250, @ptrCast(&closePaneIdle), @ptrCast(self));
+        if (self.close_pane_src != 0) return;
+        self.close_pane_src = c.g_timeout_add(250, @ptrCast(&closePaneIdle), @ptrCast(self));
     }
 
     fn closePaneIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.close_pane_src = 0;
         if (self.widgets_dead) return 0;
         const ictx = self.pane.input_ctx orelse return 0;
         // closeFocusedPane closes the WINDOW's focused pane; see

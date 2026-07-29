@@ -1527,6 +1527,10 @@ pub const Window = struct {
         // Not in disownPane: adoption (cross-window tab drag) also
         // disowns, but there the pane lives on and must keep its IM.
         pane.detachIm();
+        // Browser mux watches and delayed callbacks hold raw pointers
+        // into the face. Stop them before deferred Pane teardown leaves
+        // a destroyed GTK subtree paired with a live BrowserView.
+        pane.detachBrowser();
         // Return any embedded app view to its hidden window before the
         // widget surgery destroys the pane subtree it lives in.
         pane.detachAppHost();
@@ -2313,6 +2317,7 @@ pub const Window = struct {
         // must be severed BEFORE the destroy, or its still-connected
         // handlers fire against the dangling GLArea in the gap.
         old.detachIm();
+        old.detachBrowser();
         if (is_paned) {
             if (c.gtk_paned_get_start_child(@ptrCast(parent)) == old_w) {
                 c.gtk_paned_set_start_child(@ptrCast(parent), pane.widget());
@@ -2687,6 +2692,10 @@ pub const Window = struct {
         // first so commit/preedit-changed can't fire on the dead
         // widget in that gap.
         pane.detachIm();
+        // The browser has its own mux fd watch. Remove it while its GTK
+        // face is still valid; Pane.deinit is deferred until after this
+        // subtree has already been destroyed.
+        pane.detachBrowser();
 
         // Detach sibling from paned.
         if (start == w) {
@@ -3669,6 +3678,7 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             // detached page drops its last ref, before the deferred
             // Pane.deinit idle runs.
             pane.detachIm();
+            pane.detachBrowser();
             pane.detachAppHost();
             term.clearSinks();
             schedulePaneTeardown(pane, term);

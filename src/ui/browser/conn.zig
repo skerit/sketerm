@@ -136,6 +136,14 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         return 0;
     }
     const view = hc.view;
+    if (view.widgets_dead) {
+        if (ctx.result) |conn| {
+            var mut = conn;
+            mut.deinit();
+        }
+        hc.state = .dead;
+        return 0;
+    }
     if (ctx.result) |conn| {
         hc.conn = conn;
         view.wireReady(hc);
@@ -411,6 +419,10 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
     _ = fd;
     const hc: *HostConn = @ptrCast(@alignCast(user.?));
     const self = hc.view;
+    if (self.widgets_dead) {
+        hc.watch_id = 0;
+        return 0;
+    }
     const alive = hc.conn.fillAvailable();
     var dirty = false;
     var xfer_touched = false;
