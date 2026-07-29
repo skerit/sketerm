@@ -11010,3 +11010,50 @@ Re-verified: suite 1062 pass / 5 skip (1067), mux ldd libc/libm only,
 mux-portable, smoke-mux, smoke-broker, smoke-fs, smoke-e2e, plus a
 live Xvfb check of local Space Quick Look over the PNG transport with
 sidecar cleanup confirmed.
+
+## Debian/Ubuntu install path
+
+`dist/install.sh` grew a second packaging path. It was a three-line
+`exec makepkg -sif`; it now detects the host and either delegates to
+makepkg as before (Arch), builds and installs a real `.deb` via
+`dpkg-deb` (Debian/Ubuntu), or falls back to a plain prefix install.
+Flags: `--mux-only`, `--gui-only`, `--deps`, `--prefix`, `--no-install`.
+Both packaging paths share one `stage()` so the layout cannot drift
+from the PKGBUILD's `package()`. `.deb` Depends are derived from the
+built binary's real `NEEDED` libraries via `dpkg -S` rather than a
+hardcoded list that rots across releases (libvpx7 vs libvpx9);
+dlopen'd optionals (opus, tesseract) stay Recommends/Suggests, since
+their absence is a supported runtime state. Full and mux-only installs
+use distinct package names so they cannot claim each other's file
+lists.
+
+The script probes gtk4 >= 4.14, libadwaita >= 1.4 and glib >= 2.74 --
+the floors below which the GUI does not compile at all -- and degrades
+to a daemon-only build with a warning rather than failing, because the
+daemon is the useful half on a headless server. Verified on Ubuntu
+22.04 (gtk4 4.6.9 / libadwaita 1.1.7, so GUI-ineligible): sketerm-mux
+packaged and installed, `ldd` libc/libm only, smoke-mux, smoke-broker
+and smoke-fs pass, and the installed binary served `display
+create/list/destroy` end to end.
+
+Terminfo needs the SYSTEM `tic`, not the first one on PATH: a
+conda/homebrew ncurses writes hex-named directories (`73/sketerm-*`)
+while Debian's reader only looks in the letter directory (`s/`), so a
+foreign tic installs an entry that silently never resolves. Observed
+exactly that on the test host.
+
+`vendor/cimport_root.h` gained three version-gated GLib fallbacks so
+translate-c survives pre-2.74 hosts: the 2.74 API pin now applies only
+when the system GLib actually reaches 2.74 (glib `#error`s otherwise),
+`G_APPLICATION_DEFAULT_FLAGS`/`G_CONNECT_DEFAULT` get pre-2.74
+spellings, and `<gio/gunixsocketaddress.h>` is included explicitly
+because GLib only folded the gio-unix headers into `<gio/gio.h>` in
+2.80. Inert on 2.74+.
+
+`smoke_backlog.zig`'s `newestWlDisplay` compared `st_mtim.tv_sec` only.
+Both sessions spawn back to back, so on a fast host they share a whole
+second, the strict `>` keeps whichever `readdir` returned first, and
+the fake Wayland app connects to the wrong session -- the mcp client
+then waits out its 30s recv timeout as "first-commit read". Now
+compares nanoseconds too. This was a latent flake on any fast machine,
+not an artifact of the test host.
