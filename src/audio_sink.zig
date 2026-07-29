@@ -48,6 +48,17 @@ pub const AudioSink = struct {
         dec_failed: bool = false,
     };
 
+    /// Any uncorked voice: this sink is putting sound on the local
+    /// speakers right now (the daemon's sink-RUNNING view, seen from
+    /// the playing end).
+    pub fn playing(self: *const AudioSink) bool {
+        var it = self.voices.valueIterator();
+        while (it.next()) |v| {
+            if (!v.*.corked) return true;
+        }
+        return false;
+    }
+
     pub fn create(allocator: std.mem.Allocator) !*AudioSink {
         const self = try allocator.create(AudioSink);
         self.* = .{ .allocator = allocator };

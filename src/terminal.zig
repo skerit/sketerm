@@ -2013,6 +2013,18 @@ pub const Terminal = struct {
 
     /// Socket write for parser replies / mouse / focus reports / user
     /// input. Routed to the mux daemon (every Terminal is daemon-backed).
+    /// Is this terminal's session putting sound on the LOCAL speakers
+    /// right now (any uncorked remote-audio voice)? The session
+    /// overview uses it to answer "which one is making that sound".
+    pub fn audioPlaying(self: *Terminal) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        const remote = self.remote orelse return false;
+        for (remote.aapps.items) |aa| {
+            if (aa.sink.playing()) return true;
+        }
+        return false;
+    }
+
     pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
         const r = self.remote orelse return;
         if (!r.sendInput(bytes) and r.canSend())
