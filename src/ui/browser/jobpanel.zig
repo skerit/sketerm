@@ -307,7 +307,7 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
                 .unpause = j.state == .paused,
                 .cancel = !j.terminal(),
                 .dismiss = j.terminal(),
-                .retry = j.state == .failed and j.retry != null,
+                .retry = j.state == .failed and j.retry != null and !j.retry_scheduled,
             },
             .hc = j.hc,
         }) catch return;

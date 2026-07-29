@@ -592,6 +592,7 @@ pub const BrowserView = struct {
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
     pub const startTransfer = @import("jobs.zig").startTransfer;
     pub const retryCopyJob = @import("jobs.zig").retryCopyJob;
+    pub const dropSupersededRetryRows = @import("jobs.zig").dropSupersededRetryRows;
     pub const cancelPendingRetries = @import("jobs.zig").cancelPendingRetries;
     pub const startDaemonJob = @import("jobs.zig").startDaemonJob;
     pub const startDaemonJobResumable = @import("jobs.zig").startDaemonJobResumable;

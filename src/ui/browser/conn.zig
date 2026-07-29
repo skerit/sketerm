@@ -584,6 +584,9 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             };
             _ = self.pending_jobs.orderedRemove(i);
             self.allocator.destroy(pj);
+            // A resumed cross-host copy supersedes the failed row it
+            // came from; one transfer must read as one row.
+            if (row.retry != null) self.dropSupersededRetryRows(row);
             self.renderJobs();
         } else {
             self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
