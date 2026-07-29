@@ -11267,3 +11267,37 @@ re-applied on resize -- GTK4 has no widget resize signal, so the hook
 is the scrolled window's hadjustment page-size, which IS the viewport
 width. The stored value is never rewritten by the clamp, so widening
 restores it.
+
+## Review pass on the file-manager batch
+
+A review of the previous batch fixed four things and one build.
+
+**One row per cross-copy.** Every dropped link left a spent `.failed`
+row (with a live Retry button) stacked next to the copy that resumed
+it -- up to four rows for one transfer, and the button could submit
+the same copy twice while an automatic attempt was armed. A resumed
+attempt's row now supersedes the failed one (`dropSupersededRetryRows`
+on the daemon's job reply), and `retry_scheduled` hides the button
+while a resume is pending.
+
+**Failed mounts age out.** hostmount kept a host `.unavailable` until
+app restart, so one ssh hiccup meant downloading forever. A failure
+now retries after a 30s cooldown, a mount that dies while ready says
+"the mount ended", and `shutdownAll` fences waiter ticks so nothing
+respawns into a dying process.
+
+**The cross-copy smoke tested the wrong daemon.** Its "local
+destination" resolves `$XDG_RUNTIME_DIR/sketerm/mux.sock`; daemon B
+listened one level up, so `connectLocalAutostart` silently spawned the
+INSTALLED `sketerm-mux` and leaked a broker per run. B now sits at the
+default path and the stage exercises the code under test.
+
+**fsjob duplication.** Eight retry wrappers shared one
+classify-reconnect-or-fail pattern; `recoverOrFail` is now the single
+copy, symlinks reconnect like everything else, and the initial dial
+names the side and host in its retry notices.
+
+**aarch64 cross-build.** `zig build mux-portable
+-Dportable-target=aarch64-macos` was broken by bare `@ptrCast` on
+dlsym results (fn pointers have real alignment on aarch64); every
+dlsym site now `@alignCast`s.
