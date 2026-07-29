@@ -40,12 +40,38 @@
  * doesn't get defined. That macro expands into a `__builtin_constant_p`
  * ternary chain that translate-c lowers to invalid Zig (statement-
  * position `if (cond) _ = a else _ = b`). Pinning to 2.74 leaves the
- * plain `g_string_free()` function declaration in place. */
+ * plain `g_string_free()` function declaration in place.
+ *
+ * Only pin when the system GLib actually reaches 2.74 — glib's own
+ * gversionmacros.h `#error`s when MIN_REQUIRED exceeds CUR_STABLE
+ * (Ubuntu 22.04 ships 2.72), and on those releases the macro this
+ * guards against does not exist anyway. `glibconfig.h` is the one
+ * glib header includable without going through <glib.h> — it pulls
+ * gmacros.h, which wants the <glib.h> sentinel, but not
+ * gversionmacros.h, so the pin below still lands before any
+ * availability macro is evaluated. */
+#define __GLIB_H_INSIDE__ 1
+#include <glibconfig.h>
+#undef __GLIB_H_INSIDE__
+#if GLIB_MAJOR_VERSION > 2 || (GLIB_MAJOR_VERSION == 2 && GLIB_MINOR_VERSION >= 74)
 #define GLIB_VERSION_MIN_REQUIRED GLIB_VERSION_2_74
 #define GLIB_VERSION_MAX_ALLOWED GLIB_VERSION_2_74
+#endif
+
+#if !(GLIB_MAJOR_VERSION > 2 || (GLIB_MAJOR_VERSION == 2 && GLIB_MINOR_VERSION >= 74))
+/* GLib < 2.74 compat: both enum members arrived in 2.74 and are 0.
+ * The pre-2.74 spelling stays valid on newer GLib, so this only ever
+ * fills a gap; on 2.74+ the real enum members are used. */
+#define G_APPLICATION_DEFAULT_FLAGS G_APPLICATION_FLAGS_NONE
+#define G_CONNECT_DEFAULT 0
+#endif
 
 #include <gtk/gtk.h>
 #include <adwaita.h>
+/* GLib 2.80 folded the gio-unix-2.0 headers into <gio/gio.h>; before
+ * that they must be pulled in by hand (the include path carries them
+ * either way, so this is a no-op on new GLib). */
+#include <gio/gunixsocketaddress.h>
 #include <epoxy/gl.h>
 
 #include <ft2build.h>
