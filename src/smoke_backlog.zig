@@ -102,7 +102,12 @@ fn newestWlDisplay(sock_path: []const u8, out: *[256]u8) []const u8 {
     dbuf[dir_end] = 0;
     const dirp = c.opendir(dbuf[0..dir_end :0].ptr) orelse fail("opendir runtime dir");
     defer _ = c.closedir(dirp);
-    var best_mtime: i64 = -1;
+    // Nanoseconds matter: both sessions are spawned back to back, so on
+    // a fast host their display sockets share an st_mtim.tv_sec and a
+    // seconds-only comparison silently keeps whichever one readdir
+    // returned first -- pointing the fake app at the wrong session.
+    var best_sec: i64 = -1;
+    var best_nsec: i64 = -1;
     var best_len: usize = 0;
     while (c.readdir(dirp)) |ent| {
         const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
@@ -112,8 +117,11 @@ fn newestWlDisplay(sock_path: []const u8, out: *[256]u8) []const u8 {
         const full = std.fmt.bufPrintZ(&pbuf, "{s}/{s}", .{ sock_path[0..dir_end], name }) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(full.ptr, &st) != 0) continue;
-        if (st.st_mtim.tv_sec > best_mtime) {
-            best_mtime = st.st_mtim.tv_sec;
+        const sec: i64 = st.st_mtim.tv_sec;
+        const nsec: i64 = st.st_mtim.tv_nsec;
+        if (sec > best_sec or (sec == best_sec and nsec > best_nsec)) {
+            best_sec = sec;
+            best_nsec = nsec;
             const w = std.fmt.bufPrint(out, "{s}/{s}", .{ sock_path[0..dir_end], name }) catch continue;
             best_len = w.len;
         }
