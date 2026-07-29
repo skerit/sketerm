@@ -11376,3 +11376,30 @@ can reach it (menubar Edit, background context menu, hamburger). New
 (details|compact|icons|miller), `files_show_hidden`,
 `files_confirm_delete` (false skips the permanent-delete prompt).
 Defaults apply at newTab; per-folder view memory still wins.
+
+## Listings: stream, count async, never block the loop
+
+The "open a 307-item NFS folder = 5 seconds of Listing..." fix, in
+three parts. (1) The daemon no longer builds a listing synchronously
+inside the fs_op callback: `fsStartListing` reads and sorts the NAMES
+up front (one cheap readdir, so open errors still reply
+synchronously), then `pumpFsListings` — a tick pump beside
+pumpDownloads with the same wbuf watermark — stats entries in
+time-boxed batches (8ms) and streams them as the fs_reply `more:true`
+chunk run every consumer already accumulates; the poll timeout clamps
+to 0 while listings are pending. (2) `countChildren` (a full readdir
+of EVERY subdirectory, inline per entry) left the listing path
+entirely: after the stat stream, the same pump counts the listed
+directories in 5ms batches and ships the numbers as idempotent upsert
+deltas on the open view — the GUI's existing delta path fills the "N
+items" cells in place; single-entry stats (properties, watch deltas)
+still count inline. (3) The GUI renders each chunk as it lands:
+navigation commits on the FIRST chunk (Nemo-style, rows immediately),
+`Dir.streaming` keeps the status honest ("listing… N items so far"),
+and a refresh (`list` op) keeps the old swap-at-end so live rows never
+half-disappear. Wire format unchanged — old daemon/new GUI and new
+daemon/old GUI both degrade to the previous behavior. smoke_fs grew an
+async-child-count stage; the 1300-file chunk test now really crosses
+poll ticks. Also confirmed (not new): the browser's ssh connection
+already rides OpenSSH ControlMaster multiplexing from the terminal's
+session, so no reconnect cost was left there.
