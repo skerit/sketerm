@@ -51,7 +51,9 @@ const Ctx = struct {
     edit_name: []const u8,
     /// Needed to reopen the dialog bound to another profile.
     parent_window: *c.GtkWindow,
-    dialog: ?*c.AdwDialog = null,
+    /// The AdwPreferencesWindow (a real toplevel, not an attached
+    /// sheet).
+    dialog: ?*c.GtkWidget = null,
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
@@ -120,17 +122,22 @@ fn openForProfile(
         }
     }
 
-    const dialog = c.adw_preferences_dialog_new();
-    ctx.dialog = @ptrCast(@alignCast(dialog));
+    // A real window, deliberately NOT modal and not an AdwDialog
+    // sheet: preferences should not pin themselves over (or inside)
+    // the main window.
+    const dialog = c.adw_preferences_window_new();
+    ctx.dialog = dialog;
+    c.gtk_window_set_title(@ptrCast(dialog), "Preferences");
     if (ctx.edit_name.len > 0) {
         var title_buf: [160:0]u8 = undefined;
         const t = std.fmt.bufPrintZ(&title_buf, "Preferences — profile “{s}”", .{ctx.edit_name}) catch "Preferences";
-        c.adw_dialog_set_title(@ptrCast(@alignCast(dialog)), t.ptr);
+        c.gtk_window_set_title(@ptrCast(dialog), t.ptr);
     }
-    // Free Ctx when the dialog goes away.
+    c.gtk_window_set_transient_for(@ptrCast(dialog), parent_window);
+    // Free Ctx when the window goes away.
     _ = c.g_signal_connect_data(
         dialog,
-        "closed",
+        "destroy",
         @ptrCast(&onClosed),
         @ptrCast(ctx),
         null,
@@ -141,18 +148,19 @@ fn openForProfile(
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &appearancePage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &colorsPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &behaviorPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &filesPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &renderingPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &windowPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &keybindsPage);
 
     // Force the on-demand GL panes to repaint so the overlay composites
     // over an idle terminal (and the dimming clears on close).
-    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(parent_window), null, c.G_CONNECT_DEFAULT);
-    c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(parent_window));
+    _ = c.g_signal_connect_data(dialog, "destroy", @ptrCast(&render_kick.onDialogClosed), @ptrCast(parent_window), null, c.G_CONNECT_DEFAULT);
+    c.gtk_window_present(@ptrCast(dialog));
     render_kick.dialogPresented(@ptrCast(@alignCast(parent_window)));
 }
 
-fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
+fn onClosed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
@@ -160,10 +168,10 @@ fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
 
 const PageBuilder = *const fn (page: *c.AdwPreferencesPage, ctx: *Ctx) void;
 
-fn appendPage(dialog: *c.AdwPreferencesDialog, ctx: *Ctx, builder: PageBuilder) void {
+fn appendPage(dialog: *c.AdwPreferencesWindow, ctx: *Ctx, builder: PageBuilder) void {
     const page = c.adw_preferences_page_new();
     builder(@ptrCast(@alignCast(page)), ctx);
-    c.adw_preferences_dialog_add(dialog, @ptrCast(@alignCast(page)));
+    c.adw_preferences_window_add(dialog, @ptrCast(@alignCast(page)));
 }
 
 // ── Profiles page ───────────────────────────────────────────────
@@ -256,8 +264,9 @@ fn reopenForProfile(ctx: *Ctx, name: []const u8) void {
     @memcpy(name_buf[0..n], name[0..n]);
     var snapshot = ctx.cfg.clone(allocator) catch return;
     defer snapshot.deinit();
-    // force_close frees ctx via onClosed — no Ctx access past here.
-    if (dialog) |d| c.adw_dialog_force_close(d);
+    // Destroying the window frees ctx via onClosed — no Ctx access
+    // past here.
+    if (dialog) |d| c.gtk_window_destroy(@ptrCast(d));
     openForProfile(allocator, parent_window, win, snapshot, apply, name_buf[0..n]) catch {};
 }
 
@@ -1148,6 +1157,55 @@ fn exitActionSelected(ctx: *Ctx, idx: c_uint) void {
         1 => .restart,
         2 => .hold,
         else => .close,
+    };
+    ctx.ev();
+}
+
+// ── Files page (the `sketerm files` browser) ───────────────────
+
+fn filesPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Files");
+    c.adw_preferences_page_set_icon_name(page, "folder-symbolic");
+
+    const view_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(view_group)), "New tabs");
+    addFilesViewRow(@ptrCast(@alignCast(view_group)), ctx);
+    addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Show hidden files", "New browser tabs start with dotfiles visible.", &ctx.cfg.files_show_hidden, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(view_group)));
+
+    const danger_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(danger_group)), "Deleting");
+    addSwitchRow(@ptrCast(@alignCast(danger_group)), ctx, "Confirm permanent delete", "Ask before Shift+Delete / Delete Permanently. Moving to trash never asks (it is undoable).", &ctx.cfg.files_confirm_delete, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(danger_group)));
+}
+
+fn addFilesViewRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Details list", "Compact list", "Icon grid", "Miller columns" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Default view");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Folders you have adjusted keep their remembered view.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    const initial: c_uint = switch (ctx.cfg.files_default_view) {
+        .details => 0,
+        .compact => 1,
+        .icons => 2,
+        .miller => 3,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = filesViewSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn filesViewSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.files_default_view = switch (idx) {
+        0 => .details,
+        1 => .compact,
+        2 => .icons,
+        3 => .miller,
+        else => .details,
     };
     ctx.ev();
 }

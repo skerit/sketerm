@@ -236,6 +236,7 @@ pub fn showEntryMenu(
         pane.item("Close Pane", &onMenuClosePane, ctx);
         const tail = m.section();
         tail.itemIcon("Properties…", .{ .name = "document-properties-symbolic" }, &onMenuFolderProperties, ctx);
+        tail.itemIcon("Preferences…", .{ .name = "preferences-system-symbolic" }, &onMenuPrefs, ctx);
     }
 
     const popover = root.popupVia(parent, self.root_box, x, y);
@@ -330,6 +331,7 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
 
     const tail = m.section();
     tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));
+    tail.itemIcon("Preferences…", .{ .name = "preferences-system-symbolic" }, &onMenuPrefs, ctx);
 
     const popover = root.popup(anchor, @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)), @floatFromInt(c.gtk_widget_get_height(anchor)));
     ctx.popover = popover;
@@ -1100,6 +1102,14 @@ pub fn onMenuToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     menuDone(ctx);
     const active = c.gtk_toggle_button_get_active(view.hidden_toggle);
     c.gtk_toggle_button_set_active(view.hidden_toggle, @intFromBool(active == 0));
+}
+
+/// Open the application preferences (same dialog as terminal mode).
+pub fn onMenuPrefs(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const view = ctx.view;
+    menuDone(ctx);
+    if (view.ownerWindow()) |win| win.openPrefs();
 }
 
 /// Properties of the folder the background click landed in.

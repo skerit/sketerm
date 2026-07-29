@@ -395,6 +395,11 @@ pub const Window = struct {
         c.adw_header_bar_pack_start(@ptrCast(header_bar), new_tab_btn);
 
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), header_bar);
+        // Files mode gets a classic menubar (Nemo-style) between the
+        // header and the tab strip. `self` is only STORED by the
+        // buttons here; nothing dereferences it until a menu opens.
+        if (files_identity)
+            c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @import("browser/menubar.zig").build(allocator, self));
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_bar_w)));
         // Toast overlay wraps the tab area so transient notices (file
         // upload finished / failed) float over the terminal grid.
@@ -853,7 +858,7 @@ pub const Window = struct {
     const addApplyProfileButtons = winconfig.addApplyProfileButtons;
     const resolveDefaultColors = winconfig.resolveDefaultColors;
     const resolveColorsFor = winconfig.resolveColorsFor;
-    const openPrefs = winconfig.openPrefs;
+    pub const openPrefs = winconfig.openPrefs;
     const persistConfig = winconfig.persistConfig;
     const refreshBgSource = winconfig.refreshBgSource;
     const refreshShaderSource = winconfig.refreshShaderSource;
