@@ -11196,3 +11196,74 @@ check-miss, stage, upload, verify, republish-check, wrong-arch
 refusal), and a third smoke-udp stage that deploys the real mux
 through an emulated login shell and completes a hole-punched UDP
 connect FROM the deployed copy.
+
+## Dual-pane file-manager fixes + mounted remote opens (2026-07-29)
+
+Five reported problems, four of them one root cause each and all of
+them found by reproducing rather than guessing.
+
+**The clipboard was per PANE.** `clip_host/clip_path/clip_paths/
+clip_cut/clip_dev` were fields on `BrowserView`, and a BrowserView is
+one pane's face. Copying in one pane therefore left the other pane's
+clipboard empty: Ctrl+V answered "clipboard is empty" and the context
+menu hid Paste entirely, because both Paste rows are gated on
+`clip_path != null`. That read as "remote folders cannot be pasted
+into", but the host never mattered -- `ops.pasteOne` already routed
+same-host to a daemon `copy` job and cross-host to `cross_copy`. The
+store is now one process-wide `filebrowser/clipboard.zig` board
+reached through `BrowserView.clipboard()`; nothing else about the
+paste path changed.
+
+**A dropped link killed a cross-host copy.** `CrossCopy` returned bare
+`false` from every failure, so a three-gigabyte transfer that lost its
+ssh link at 316 MB reported the literal string "cross-host copy
+failed" and stopped. The `.skpart` staging already gave byte-level
+resume; nothing used it after a transport error. Now every remote call
+goes through a wrapper that classifies Timeout/NotConnected as
+transport, re-dials that side (6 attempts, 1-30s backoff) and retries
+at the same offset -- every read and write is offset-addressed and the
+staged partial holds what was acknowledged, so a reconnect costs a
+reconnect and not the bytes. Everything else records which operation,
+which path, which host and the daemon's own errno text. A running job
+reports why it is stalled (the daemon keeps non-terminal messages
+sticky, like the in-flight path), and the GUI resumes a failed copy
+three times before leaving the row with its reason and a Retry button.
+
+`zig build smoke-fs` grew a stage that proves it with the real
+binaries: a fake ssh bridges stdio to a source daemon and is made to
+DIE after 5 MB of a 6 MB file. The copy must still finish, hash equal,
+never let its byte counter regress, tell the client about the drop,
+and resume at a non-zero offset. Two rig lessons are baked into it: a
+bare host makes `connectRemote` spawn ssh twice (UDP probe, then ssh),
+so the test forces `ssh:` mode or it severs the wrong connection; and
+an in-job reconnect legitimately reports `resumed_from == 0`, because
+that counter only describes what a `.skpart` probe found at file
+start.
+
+**Opening a remote file downloaded the whole thing.** The FUSE client
+had existed unused since phase 6 (`src/fsmount.zig`: ranged reads,
+write-through, no libfuse). `ui/hostmount.zig` is now its lifecycle --
+one child per host under `$XDG_RUNTIME_DIR/sketerm/mnt/<pid>/<host>`,
+shared by every pane and window, unmounted at shutdown, orphans of a
+SIGKILL swept at the next start. Per-process mount points on purpose:
+no stacking when two instances browse one host, and no live mount
+pulled out from under one when the other exits. Downloading survives
+only as the fallback, and the status line names the reason.
+
+**Ctrl+L reached the wrong pane.** Not a chord problem: much of a
+browser face cannot take focus (the places sidebar's empty space, the
+toolbar, the status line), so clicking the other pane left focus in
+the pane you came from and the chord bubbled there. A capture-phase
+click on each face pulls focus over only when it is currently in
+another pane. Ctrl+L also OPENS the entry now instead of toggling it,
+and folds the peer's, so exactly one address bar is ever open.
+
+**Column widths never re-fit.** A dragged Name width was persisted per
+folder and then treated as a floor forever (a real `viewmem.json` held
+`name_width: 1762`), so splitting a pane left Name alone on screen
+with every other column behind a horizontal scrollbar. A stored width
+is now a preference clamped to the room the viewport actually has, and
+re-applied on resize -- GTK4 has no widget resize signal, so the hook
+is the scrolled window's hadjustment page-size, which IS the viewport
+width. The stored value is never rewritten by the clamp, so widening
+restores it.
