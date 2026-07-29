@@ -17,11 +17,9 @@ const hostmount = @import("../hostmount.zig");
 const mimeListContains = @import("../../filebrowser/desktop.zig").mimeListContains;
 
 /// One remote open waiting for its host's FUSE mount to come up.
-/// Owned by the pending callback; the view is reached through the
-/// DrainHandle-style `widgets_dead` fence its own field provides.
-const PendingOpen = struct {
+pub const PendingOpen = struct {
     allocator: std.mem.Allocator,
-    view: *BrowserView,
+    view: ?*BrowserView,
     hc: *HostConn,
     host: []u8,
     path: []u8,
@@ -77,6 +75,10 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
         },
         .appid = if (appid) |a| (self.allocator.dupe(u8, a) catch null) else null,
     };
+    self.pending_opens.append(self.allocator, p) catch {
+        p.destroy();
+        return downloadAndOpen(self, hc, host, path, appid);
+    };
     self.setStatusFmt("mounting {s}…", .{host});
     hostmount.whenReady(self.allocator, host, @ptrCast(p), &onMountReady);
 }
@@ -84,8 +86,13 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
 fn onMountReady(ctx: ?*anyopaque, mounted: bool) void {
     const p: *PendingOpen = @ptrCast(@alignCast(ctx.?));
     defer p.destroy();
-    const self = p.view;
-    // The pane can close while a mount is coming up.
+    const self = p.view orelse return;
+    for (self.pending_opens.items, 0..) |pending, i| {
+        if (pending == p) {
+            _ = self.pending_opens.swapRemove(i);
+            break;
+        }
+    }
     if (self.widgets_dead) return;
     if (mounted) return launchMounted(self, p.host, p.path, p.appid);
     self.setStatusFmt("could not mount {s} ({s}) -- downloading a copy instead", .{

@@ -22,6 +22,7 @@ pub fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig"
     // a death in here is attributable. Bare hosts bootstrap over SSH and
     // Terminal upgrades the live attachment to UDP in the background.
     crashlog.set("mux connect host={s}", .{host orelse "local"});
+    defer crashlog.clear();
     if (host) |h| {
         // "sock:/path" targets a specific daemon instance's unix
         // socket (an MCP private/named daemon) — connect only,

@@ -69,10 +69,12 @@ fn entryIconImage(anchor: *c.GtkWidget, e: Entry, px: i32) ?*c.GtkWidget {
 }
 
 pub fn renderCurrent(self: *BrowserView) void {
+    if (self.widgets_dead) return;
     if (self.currentTab()) |t| self.renderTab(t);
 }
 
 pub fn renderTab(self: *BrowserView, tab: *BTab) void {
+    if (self.widgets_dead) return;
     // Media values are stitched onto the entries BEFORE the sort:
     // they arrive from a batched job long after the listing, and a
     // sort by a media column reads them straight off the entries.
