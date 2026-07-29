@@ -10935,3 +10935,78 @@ under oh-my-posh/starship on real user machines.
 Verified per split commit: build, mux-portable (sketerm-mux still
 libc-only), suite 1056 pass / 5 skip, smoke-mux, smoke-broker,
 smoke-mcp, Xvfb smoke-e2e.
+
+## 2026-07-29: Files interaction fixes + compressed remote previews
+
+Finished the GtkColumnView migration's user-facing edge cases. Native
+sort indicators now sit at the right edge of their headers; assigning
+an explicit Name width transfers expansion to the last visible column;
+the column picker points at the actual header click and can be closed
+and reopened without retaining dead widgets. Space is intercepted in
+capture phase so Quick Look wins over GtkColumnView's selection toggle,
+uses the focused row, expires stale type-ahead state, and refreshes when
+the window manager closes it. Register/custom-column activation copies
+entry text before destroying its popover. Recent remote rows keep the
+hostname in a dedicated non-ellipsized label and truncate only the path.
+
+Remote previews no longer transfer a freedesktop-cache PNG. The file-
+owning host still installs the spec-required 128/512px PNG cache entry,
+then runtime-loaded libjxl encodes a distance-1 JPEG XL transport image
+with exact alpha; runtime-loaded libwebp quality 92 is the fallback.
+The receiver advertises its codecs, decodes directly into RGBA, and
+accepts at most 512x512 / 2 MiB. Neither codec is an ELF dependency of
+sketerm-mux, and no common codec is an explicit preview error rather
+than a PNG/original-file fallback. Host-command images use a separate
+preview_transport job: box resize + transcode happens on the owning
+host without polluting the freedesktop cache.
+
+Temporary ownership is daemon-enforced. A completed panelize preview
+authorizes transfer of its random /tmp scratch to the transport job;
+the source and exclusive random sidecar are independently tracked,
+released on unlink, client death, helper exit, or a five-minute TTL.
+The helper announces the sidecar before writing so cancellation can
+remove partial output. Browser teardown cancels jobs and unlinks assets
+while host connections still exist. Tests pin encoder dimension/size
+guards, JXL preference, WebP fallback, RGBA/alpha round trips, and the
+source-vs-result ownership invariant.
+
+Remote terminal-to-Files handoff now gets cwd from authoritative mux
+session metadata (`session_meta = 90`, append-only after snapshots).
+Terminal owns the copied cwd and embedded Files preserves its host;
+missing remote cwd falls back to remote `/`, never a local directory.
+
+Verified: build + diff check, suite 1061 pass / 5 skip (1066 total),
+mux-portable, smoke-mux, smoke-broker, smoke-fs, and Xvfb smoke-e2e.
+Manual isolated Xvfb checks covered right-aligned sort arrows, column
+expansion, picker positioning/lifetime, local and fake-SSH Quick Look,
+remote terminal Open in Sketerm Files, the remote Recent hostname/path
+layout, and a custom image:host preview through preview_transport. A
+9.4MB source produced a 545KB host-local cache PNG and a 29KB JXL wire
+asset; the custom scratch and new transport sidecar were gone after
+display and no custom cache entry was created. Final guardian review
+reported no findings.
+
+A follow-up review round hardened the same work. Terminal-to-Files and
+the cwd-sync button now canonicalize the pane's host through
+`paths.browserHost` (ssh:/udp: transport prefixes strip to the bare
+host so the spec reads `host:/path` and shares the connection identity
+a typed location gets; `sock:` sessions map to local). The local
+daemon's previews advertise and receive plain PNG sidecars —
+`wireImageCodecs` in preview.zig, a `PngSink` fast path in
+`transportPreview`, and a gdk-pixbuf fallback decode — so local Quick
+Look neither transcodes over a unix socket nor requires libjxl/libwebp
+(remote stays strict JXL/WebP per design). JXL encodes at effort 4
+(distance unchanged) for interactive latency. Review fixes: the
+finished-jobs trim loop no longer destroys TTL-held ephemeral preview
+jobs (it also mis-decremented a count that never included them);
+transport sidecars moved from the thumbnail-cache directory to
+/tmp/.sketerm-preview-* so a daemon killed mid-preview cannot orphan
+files in the freedesktop cache; and image previewers' transport
+authorization ignores stray stdout paths (only the registered %o temp
+is consumable). smoke-fs gained an image-preview stage (PNG and
+JXL/WebP variants, sidecar read + ownership-aware unlink) under an
+isolated XDG_CACHE_HOME, and fsdrive grew `startPreviewCodecs`.
+Re-verified: suite 1062 pass / 5 skip (1067), mux ldd libc/libm only,
+mux-portable, smoke-mux, smoke-broker, smoke-fs, smoke-e2e, plus a
+live Xvfb check of local Space Quick Look over the PNG transport with
+sidecar cleanup confirmed.
