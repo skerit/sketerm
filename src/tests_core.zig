@@ -67,6 +67,7 @@ comptime {
     _ = @import("mux/cast.zig");
     _ = @import("mux/dbus.zig");
     _ = @import("mux/desktop.zig");
+    _ = @import("mux/deploy.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/drmdev.zig");
@@ -106,6 +107,7 @@ comptime {
     _ = @import("util/clock.zig");
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
+    _ = @import("util/filehash.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/imagecodec.zig");
     _ = @import("util/marks.zig");

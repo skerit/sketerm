@@ -5,10 +5,32 @@ The remote side is one lean binary, `sketerm-mux` (libc only, no
 GTK), which owns the PTYs so sessions survive disconnects, GUI
 restarts, and suspends.
 
-## Install on the server
+## Automatic deployment
 
-Deploy the **portable** build — one static binary that runs on any
-x86_64 Linux, regardless of CPU generation or libc:
+Sketerm automatically deploys its **portable** mux when connecting to a
+supported Linux server with key or agent authentication. The local artifact is
+SHA-256 hashed, the remote architecture is checked, and the binary is uploaded
+atomically under `$HOME/.cache/sketerm/mux/`. Content-addressed names let old
+and new binaries coexist, so an upgrade never overwrites a binary that may
+still back durable sessions.
+
+The packaged artifact supports x86_64 Linux. An explicit cross-built artifact
+can be selected with `SKETERM_MUX_PORTABLE`; its ELF architecture is checked
+before deployment. If the artifact is unavailable, the server architecture is
+unsupported, `sha256sum` is absent, or deployment is prohibited, Sketerm falls
+back to `sketerm-mux` on the remote non-interactive PATH.
+
+`SKETERM_SSH` transport wrappers retain their historical argv by default. Set
+`SKETERM_MUX_PORTABLE` explicitly to opt such a wrapper into deployment.
+
+An already-running remote daemon is deliberately not replaced: its PTYs and
+forwarded-app state remain intact. The newly deployed binary is used when no
+daemon is running, such as after a reboot. There is currently no live session
+handover between daemon builds.
+
+Manual deployment remains available when automatic deployment is unsuitable.
+The portable build is one static binary that runs on any x86_64 Linux host,
+regardless of CPU generation or libc:
 
 ```
 scp /usr/lib/sketerm/sketerm-mux-portable server:/tmp/

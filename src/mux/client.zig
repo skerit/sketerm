@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
+const deploy = @import("deploy.zig");
 
 pub const Transport = enum { local, ssh, udp };
 pub const RemoteMode = enum { auto, ssh, udp };
@@ -266,7 +267,7 @@ pub const Conn = struct {
         ssh_connect: RemoteConnector,
     ) !Conn {
         const remote = RemoteSpec.parse(spec);
-        if (remote.host.len == 0) return error.BadPath;
+        if (!validSshHost(remote.host)) return error.BadPath;
         return switch (remote.mode) {
             .udp => forced_udp_connect(allocator, remote.host, port_range),
             .ssh => ssh_connect(allocator, remote.host, port_range),
@@ -398,6 +399,17 @@ pub const Conn = struct {
     }
 
     fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
+        if (!validSshHost(host)) return error.BadPath;
+        if (port_range) |r| if (!validPortRange(r)) return error.BadPath;
+        var prepared = deploy.prepare(allocator, host);
+        defer if (prepared) |*p| p.deinit();
+        var command_buf: [4300:0]u8 = undefined;
+        const prepared_command: ?[:0]const u8 = if (prepared) |p| blk: {
+            if (port_range) |r| {
+                break :blk std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --udp-listen --udp-port {s}", .{ p.path, r }) catch return error.BadPath;
+            }
+            break :blk std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --udp-listen", .{p.path}) catch return error.BadPath;
+        } else null;
         const deadline = monotonicMs() + timeout_ms;
 
         // 0. Resolve the UDP target through the user's ssh config
@@ -419,6 +431,44 @@ pub const Conn = struct {
         for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const ssh_env = c.getenv("SKETERM_SSH");
         const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+        var range_z_buf: [32:0]u8 = undefined;
+        const range_z: ?[:0]const u8 = if (port_range) |r|
+            std.fmt.bufPrintZ(&range_z_buf, "{s}", .{r}) catch return error.BadPath
+        else
+            null;
+        var argv: [20:null]?[*:0]const u8 = .{null} ** 20;
+        var argc: usize = 0;
+        const push = struct {
+            fn f(buf: *[20:null]?[*:0]const u8, i: *usize, value: ?[*:0]const u8) void {
+                buf[i.*] = value;
+                i.* += 1;
+            }
+        }.f;
+        push(&argv, &argc, ssh_bin);
+        push(&argv, &argc, "-T");
+        push(&argv, &argc, "-x");
+        push(&argv, &argc, "-o");
+        push(&argv, &argc, "BatchMode=yes");
+        if (ssh_env == null and deploy.canMultiplex()) {
+            push(&argv, &argc, "-o");
+            push(&argv, &argc, "ControlMaster=auto");
+            push(&argv, &argc, "-o");
+            push(&argv, &argc, "ControlPath=~/.ssh/sketerm-%C");
+            push(&argv, &argc, "-o");
+            push(&argv, &argc, "ControlPersist=120");
+        }
+        push(&argv, &argc, host_z.ptr);
+        if (prepared_command) |command| {
+            push(&argv, &argc, command.ptr);
+        } else {
+            push(&argv, &argc, "sketerm-mux");
+            push(&argv, &argc, "--udp-listen");
+            if (range_z) |range| {
+                push(&argv, &argc, "--udp-port");
+                push(&argv, &argc, range.ptr);
+            }
+        }
+        push(&argv, &argc, null);
 
         const pid = c.fork();
         if (pid < 0) {
@@ -430,16 +480,6 @@ pub const Conn = struct {
             _ = c.dup2(pipe_fds[1], 1);
             _ = c.close(pipe_fds[0]);
             _ = c.close(pipe_fds[1]);
-            var range_z_buf: [32:0]u8 = undefined;
-            var argv = [_:null]?[*:0]const u8{
-                ssh_bin, "-T", "-o", "BatchMode=yes", host_z.ptr, "sketerm-mux", "--udp-listen", null, null, null,
-            };
-            if (port_range) |r| {
-                if (std.fmt.bufPrintZ(&range_z_buf, "{s}", .{r})) |rz| {
-                    argv[7] = "--udp-port";
-                    argv[8] = rz.ptr;
-                } else |_| {}
-            }
             _ = c.execvp(ssh_bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
@@ -519,6 +559,14 @@ pub const Conn = struct {
         return conn;
     }
 
+    fn validPortRange(value: []const u8) bool {
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+        if (colon == 0 or colon + 1 == value.len or std.mem.indexOfScalarPos(u8, value, colon + 1, ':') != null) return false;
+        for (value[0..colon]) |byte| if (byte < '0' or byte > '9') return false;
+        for (value[colon + 1 ..]) |byte| if (byte < '0' or byte > '9') return false;
+        return true;
+    }
+
     /// Connect to a REMOTE host's daemon by running
     /// `ssh -T -o BatchMode=yes <host> sketerm-mux --proxy` over a
     /// socketpair (one fd both ways, so everything downstream is
@@ -527,6 +575,9 @@ pub const Conn = struct {
     /// (BatchMode fails instead of prompting on the protocol pipe).
     /// $SKETERM_SSH overrides the ssh binary (tests fake a remote).
     pub fn connectSsh(allocator: std.mem.Allocator, host: []const u8) !Conn {
+        if (!validSshHost(host)) return error.BadPath;
+        var prepared = deploy.prepare(allocator, host);
+        defer if (prepared) |*p| p.deinit();
         // `sketerm app` opens TWO connections moments apart (the CLI to
         // spawn the session, then the GUI to attach). When the remote
         // sshd is slow to service new connections — a loaded box stalls
@@ -536,9 +587,12 @@ pub const Conn = struct {
         // first pays that cost; this retry covers the master setup
         // itself stalling. Both together turn an intermittent failure
         // into a reliable connect.
+        if (prepared) |p| {
+            if (connectSshOnceUsing(allocator, host, p.path, 20_000)) |conn| return conn else |_| {}
+        }
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
-            if (connectSshOnce(allocator, host)) |conn| {
+            if (connectSshOnceUsing(allocator, host, null, 20_000)) |conn| {
                 return conn;
             } else |err| {
                 if (attempt + 1 >= 3) return err;
@@ -551,6 +605,16 @@ pub const Conn = struct {
     /// callers that must not pay connectSsh's 3x retry inline (e.g.
     /// termdrive's transparent reattach inside a drain path).
     pub fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !Conn {
+        if (!validSshHost(host)) return error.BadPath;
+        var prepared = deploy.localPath(allocator);
+        defer if (prepared) |*p| p.deinit();
+        if (prepared) |p| {
+            if (connectSshOnceUsing(allocator, host, p.path, 5_000)) |conn| return conn else |_| {}
+        }
+        return connectSshOnceUsing(allocator, host, null, 15_000);
+    }
+
+    fn connectSshOnceUsing(allocator: std.mem.Allocator, host: []const u8, remote_mux: ?[]const u8, timeout_ms: c_int) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
         const ssh_env = c.getenv("SKETERM_SSH");
@@ -563,7 +627,7 @@ pub const Conn = struct {
         // exits so the GUI's attach a beat later rides the same master
         // (instant — no second banner exchange). %C is a fixed-length
         // hash, so the socket path stays well under the sun_path limit.
-        const mux = ssh_env == null;
+        const mux = ssh_env == null and deploy.canMultiplex();
         var argv_buf: [16]?[*:0]const u8 = undefined;
         var n: usize = 0;
         const push = struct {
@@ -590,8 +654,14 @@ pub const Conn = struct {
             push(&argv_buf, &n, "ControlPersist=120");
         }
         push(&argv_buf, &n, host_z.ptr);
-        push(&argv_buf, &n, "sketerm-mux");
-        push(&argv_buf, &n, "--proxy");
+        var command_buf: [4300:0]u8 = undefined;
+        if (remote_mux) |path| {
+            const command = std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --proxy", .{path}) catch return error.BadPath;
+            push(&argv_buf, &n, command.ptr);
+        } else {
+            push(&argv_buf, &n, "sketerm-mux");
+            push(&argv_buf, &n, "--proxy");
+        }
         push(&argv_buf, &n, null);
 
         var conn = try spawnOverSocketpair(allocator, ssh_bin, @ptrCast(&argv_buf));
@@ -602,12 +672,19 @@ pub const Conn = struct {
         // Bound the welcome wait so a stalled banner surfaces as a
         // retryable error instead of hanging the blocking read forever.
         conn.sendHello() catch return error.SshTransportFailed;
-        try waitReadable(conn.fd, 20_000);
-        const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
+        const deadline = monotonicMs() + timeout_ms;
+        try waitReadable(conn.fd, deadline);
+        const remain = deadline - monotonicMs();
+        if (remain <= 0) return error.SshTransportFailed;
+        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
         conn.transport = .ssh;
         return conn;
+    }
+
+    fn validSshHost(host: []const u8) bool {
+        return host.len > 0 and host[0] != '-';
     }
 
     /// Switch the fd to non-blocking so NO call on this connection can
@@ -623,10 +700,12 @@ pub const Conn = struct {
 
     /// Poll `fd` for readability, bounded by `timeout_ms`. A timeout or
     /// poll error becomes a retryable SshTransportFailed.
-    fn waitReadable(fd: c_int, timeout_ms: c_int) !void {
+    fn waitReadable(fd: c_int, deadline: i64) !void {
         var pfd = [_]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
         while (true) {
-            const r = c.poll(&pfd, 1, timeout_ms);
+            const remain = deadline - monotonicMs();
+            if (remain <= 0) return error.SshTransportFailed;
+            const r = c.poll(&pfd, 1, @intCast(remain));
             if (r > 0) return;
             if (r < 0 and std.posix.errno(r) == .INTR) continue;
             return error.SshTransportFailed;
@@ -1027,6 +1106,13 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
 test "ssh -G output without a hostname yields no target" {
     var buf: [256]u8 = undefined;
     try std.testing.expect(Conn.parseSshConfigOutput("user root\nport 22\n", &buf) == null);
+}
+
+test "remote transports reject option-shaped hosts" {
+    try std.testing.expectError(
+        error.BadPath,
+        Conn.connectRemoteUsing(std.testing.allocator, "-oProxyCommand=bad", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess),
+    );
 }
 
 test "welcome records older and future daemon profiles without rejecting either" {
