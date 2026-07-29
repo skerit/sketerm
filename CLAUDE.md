@@ -22,6 +22,7 @@ Zig **0.16**. The default optimize mode is `ReleaseFast` because **`Debug` build
 - File IO via libc (`c.fopen`/`c.open`) — `std.fs.cwd()` is gone (see `config.zig`).
 - ArrayLists are unmanaged: `.empty`, `list.append(allocator, x)`.
 - `std.Io.Writer.Allocating` for JSON stringify targets. `@abs(i64)` returns `u64`.
+- `std.process.Child.run` is gone. Inside `build.zig` use `b.run` / `b.runAllowFail` (configure-time subprocesses, e.g. the git describe embed).
 - `@cImport` goes through an out-of-process TranslateC step + sed fixup (Aro can't parse GTK headers in-process). Translated bindings land at `.zig-cache/o/*/cimport_root_fixed.zig` (GUI set) and `cimport_core_fixed.zig` (mux set) — **grep there to check whether a C symbol exists before using it**. New C headers go in `vendor/cimport_root.h`; headers the mux side needs ALSO go in `vendor/cimport_core.h`, which must stay translatable against musl (no GTK/glibc-only headers — `zig build mux-portable` is the check).
 
 ## Build / run / test
@@ -82,6 +83,20 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 **Helpers worth knowing.** `cast.userData(T, user)` in `src/util/cast.zig` collapses `@ptrCast(@alignCast(user.?))` for GTK callbacks. `style.colorToVec` / `style.colorToRGBA` in `src/render/style.zig` are the shared color-resolution path used by both `cell_pass` and `grid_pass` — don't copy that logic into a third place.
 
+## File browser (`sketerm files`)
+
+UI in `src/ui/browser/` (BrowserView per pane, `BTab` tabs on a GtkNotebook), pure helpers in `src/filebrowser/`. **The GUI never touches the disk**: every file op (list/trash/delete/copy jobs) goes to the daemon via `sendOp`/`startDaemonJob` — so env-isolation in tests must isolate the DAEMON's env too (trash resolves against the daemon's `$HOME`, not the GUI's).
+
+State lives in three places: `places.json` (state dir; bookmarks+labels, recent, saved queries, section order/hidden, widget sections, sidebar px — user-global, last save wins), `viewmem.json` (per-folder view/sort/columns memory), and `config.conf` (`files_*` keys = defaults for new tabs). Don't add a fourth.
+
+Gotchas that bite:
+- `renderPlaces` destroys and rebuilds EVERY sidebar row on any change. A row/menu handler must copy its ctx string to a stack buffer BEFORE calling anything that re-renders (savePlaces/navigate/toggle) — the ctx dies mid-handler otherwise. Same pattern throughout `places.zig`.
+- Context menus are `classicmenu.zig` (hand-built popover rows, NOT GMenuModel — model menus can't do per-item icons). Submenus only off the TOP menu (depth limit); per-item heap ctxs register with `root.own(cb, ctx)`; the popover pops down BEFORE the handler runs.
+- Browser keyboard chords live in `nav.browser_chords`; an audit test cross-checks them against `input.default_bindings` — a chord shadowing a global action must declare `.shadows` or the suite fails.
+- Danger verbs (trash/delete) act on the whole selection when the clicked row is in it (`ops.menuTargets`, same rule as copy) — keep new verbs consistent.
+- Column widths: `colview.applyExpandPolicy` — auto Name expands, explicit Name = NO expander (surplus stays blank, Nemo-style); `fittedNameWidth` clamps to the viewport so splits never grow a horizontal scrollbar.
+- `BrowserView.ownerWindow()` is the route to `Window`/`Config` (browser code must not cache Window pointers).
+
 ## Remote control (IPC)
 
 Every GUI instance serves a JSON-lines protocol on `$XDG_RUNTIME_DIR/sketerm/<pid>.sock` (a `GSocketService`, so everything runs on the main loop). `sketerm cli <command>` is the client: `list`, `send-text`, `send-keys`, `get-text`, `screen-info`, `new-tab`, `split`, `focus`, `close-pane`, `set-title`, `set-tab-color`, `new-durable-tab`, `attach-session`. Child processes inherit `SKETERM_SOCKET` and `SKETERM_PANE_ID`, so `--pane self` works from inside any pane. Code in `src/ipc/` (`protocol.zig`, `server.zig`, `client.zig`, `mux_cli.zig`, `keys.zig` = pure chord→bytes encoder for send-keys). Socket discovery in `resolveSocket` must skip `mux.sock`.
@@ -136,6 +151,8 @@ User entry points: `sketerm ssh [-u] <host>`, `sketerm mux [host] [list|attach <
 - **Daemon log**: every daemon writes lifecycle + warnings to `$XDG_STATE_HOME/sketerm/mux.log` (all instances share it; `[pid]` attributes lines; rotated at 2MB to `.old`). `SKETERM_MUX_LOG=debug` adds wlhost tracing — pool mirror lifecycle (mapped/orphaned/reclaimed with incarnation serials) and commit pixel-path TRANSITIONS ("commit resolves NO mirror" is the silent-black-window failure class). `=off` disables the file, `=<path>` logs there at debug level. Warnings always also hit stderr. Module: `src/mux/log.zig` (libc-only, no allocator).
 - `zig build replay -- capture.bin [cols rows]` replays raw PTY bytes through parser→Screen and dumps the grid — invaluable for "app X renders wrong" reports. Capture with a small `pty.fork` tee script.
 - **Headless GUI testing works**: `xvfb-run -a zig build smoke-e2e`; for interactive visual checks run `Xvfb :99` + the app with `DISPLAY=:99 GDK_BACKEND=x11`, drive it with `xdotool` (clicks/keys) and screenshot with ImageMagick `import`. ALWAYS isolate `XDG_CONFIG_HOME`/`XDG_STATE_HOME` (prefs auto-saves would clobber the real config.conf) and set `SKETERM_APP_ID` so GApplication uniqueness doesn't reuse a live instance.
+- **Isolated test daemons: keep the socket path SHORT.** `sockaddr_un` caps at ~108 bytes; a daemon under a deep scratchpad path fails to bind (`BadPath`) and the GUI then silently autostarts the INSTALLED daemon instead. Use something like `/tmp/<short>/sketerm/mux.sock`.
+- A `zig build test` run can fail spuriously in the OCR (tesseract) tests with leak warnings; rerun once before diagnosing.
 - **NEVER `pkill`/`killall`/`pgrep -f` on ANY "sketerm" name, including `pkill -x sketerm-mux`.** A by-name kill destroys the USER's real daemon and durable sessions (their running work), not just isolated test instances. There is no safe `pkill` here. Clean up a test instance by exact PID only: launch it under an isolated `XDG_RUNTIME_DIR`, capture the GUI pid at launch and kill just that; for its daemon, list read-only with `pgrep -x sketerm-mux` and kill ONLY the pid whose `/proc/<pid>/environ` contains YOUR isolated `XDG_RUNTIME_DIR=`. When unsure, leave the isolated process running rather than risk a broad kill.
 
 ## Commit style
