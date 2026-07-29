@@ -328,17 +328,17 @@ fn openLibrary(names: []const [*:0]const u8) ?*anyopaque {
 }
 
 fn symbol(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
-    return @ptrCast(dlsym(handle, name) orelse return null);
+    return @ptrCast(@alignCast(dlsym(handle, name) orelse return null));
 }
 
 fn eglProc(comptime T: type, handle: *anyopaque, get_proc: GetProcAddress, name: [*:0]const u8) ?T {
     const address = dlsym(handle, name) orelse get_proc(name) orelse return null;
-    return @ptrCast(address);
+    return @ptrCast(@alignCast(address));
 }
 
 fn glProc(comptime T: type, handle: *anyopaque, get_proc: GetProcAddress, name: [*:0]const u8) ?T {
     const address = dlsym(handle, name) orelse get_proc(name) orelse return null;
-    return @ptrCast(address);
+    return @ptrCast(@alignCast(address));
 }
 
 fn loadEgl() ?EglApi {
