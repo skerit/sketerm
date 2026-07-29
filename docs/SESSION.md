@@ -11301,3 +11301,25 @@ names the side and host in its retry notices.
 -Dportable-target=aarch64-macos` was broken by bare `@ptrCast` on
 dlsym results (fn pointers have real alignment on aarch64); every
 dlsym site now `@alignCast`s.
+
+## Session overview (the "what is playing that sound?" fix)
+
+The app switcher grew into a real task overview (palette: "Session
+Overview…", action `app_windows`). One dialog lists open forwarded-app
+windows (thumbnails), every attached session — panes AND tabless app
+sessions whose window is closed, the classic invisible-sound case —
+and attachable sessions on the local daemon, on every REMOTE host the
+window has sessions on, and on assistant (MCP) instances. Daemon
+lists are fetched on worker threads (`pending_ops`/`dead` keep the
+struct alive until the last op lands); unattached rows get a kill
+button riding the same thread pattern.
+
+Audio is first-class: the daemon's `list` reply now carries
+`audio:true` for any session with an uncorked stream
+(`sessionAudioRunning`, broker via a new WorkerMeta field on the 'M'
+push), the CLI/TUI show `[audio]`, and attached rows use the LOCAL
+sink truth (`AudioSink.playing` -> `Terminal.audioPlaying`). The
+smoke-display audio stage speaks the native PA protocol against a
+real session socket and asserts the flag flips on and off in BOTH
+monolith and broker modes — the broker 'M' hop is exactly where such
+fields have silently regressed before.
