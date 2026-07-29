@@ -475,7 +475,6 @@ fn appendColumn(self: *BrowserView, tab: *BTab, title: [*:0]const u8, ref: Colum
     const col = c.gtk_column_view_column_new(title, @ptrCast(@alignCast(factory)));
     c.g_object_set_data(@ptrCast(@alignCast(col)), "sketerm-colref", @ptrFromInt(colRefCode(ref)));
     c.gtk_column_view_column_set_resizable(col, 1);
-    if (ref == .name) c.gtk_column_view_column_set_expand(col, 1);
     const sorter = c.gtk_custom_sorter_new(@ptrCast(&dummyCompare), null, null);
     c.gtk_column_view_column_set_sorter(col, @ptrCast(@alignCast(sorter)));
     c.g_object_unref(sorter);
@@ -494,6 +493,22 @@ fn appendColumn(self: *BrowserView, tab: *BTab, title: [*:0]const u8, ref: Colum
     c.g_object_unref(col);
 }
 
+/// GtkColumnViewTitle owns a horizontal box containing its label and
+/// native sort indicator. GTK leaves the label at its natural width;
+/// expanding it puts the indicator against the column's right edge.
+fn alignHeaderIndicators(w: *c.GtkWidget) void {
+    const tn = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(w))));
+    if (std.mem.eql(u8, tn, "GtkColumnViewTitle")) {
+        const box = c.gtk_widget_get_first_child(w) orelse return;
+        const label = c.gtk_widget_get_first_child(box) orelse return;
+        c.gtk_widget_set_hexpand(label, 1);
+        return;
+    }
+    var child = c.gtk_widget_get_first_child(w);
+    while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch))
+        alignHeaderIndicators(ch);
+}
+
 fn onColumnWidthChanged(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
     const tab = ctx.tab;
@@ -504,6 +519,7 @@ fn onColumnWidthChanged(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) ca
     } else {
         render_mod.setColumnWidth(tab, ctx.ref, width);
     }
+    if (ctx.ref == .name) applyExpandPolicy(tab);
     // Debounced: a drag emits one notify per frame.
     if (tab.width_save_src != 0) _ = c.g_source_remove(tab.width_save_src);
     tab.width_save_src = c.g_timeout_add(400, @ptrCast(&onWidthSaveTick), @ptrCast(tab));
@@ -546,7 +562,25 @@ pub fn syncColumns(self: *BrowserView, tab: *BTab) void {
         }
     }
     applyWidths(tab);
+    applyExpandPolicy(tab);
+    alignHeaderIndicators(@ptrCast(@alignCast(tab.colview)));
     applySortIndicator(tab);
+}
+
+/// Auto-width Name consumes spare room. Once the user gives Name an
+/// explicit width, the final visible column consumes it instead, so
+/// dragging Name narrower behaves like Nemo rather than snapping back.
+fn applyExpandPolicy(tab: *BTab) void {
+    const cols = c.gtk_column_view_get_columns(tab.colview);
+    const n = c.g_list_model_get_n_items(cols);
+    if (n == 0) return;
+    const expand_index: c.guint = if (tab.name_width > 0 and n > 1) n - 1 else 0;
+    var i: c.guint = 0;
+    while (i < n) : (i += 1) {
+        const obj = c.g_list_model_get_item(cols, i) orelse continue;
+        defer c.g_object_unref(obj);
+        c.gtk_column_view_column_set_expand(@ptrCast(@alignCast(obj)), @intFromBool(i == expand_index));
+    }
 }
 
 fn applyWidths(tab: *BTab) void {

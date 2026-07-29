@@ -1138,7 +1138,8 @@ pub const Window = struct {
     /// browser face would open a local directory that usually does not
     /// exist. Writes into `buf`; null when the pane reported no cwd.
     fn paneBrowserSpec(pane: *Pane, buf: []u8) ?[]const u8 {
-        const host: ?[]const u8 = if (pane.terminal.remote) |r| r.host else null;
+        const raw: ?[]const u8 = if (pane.terminal.remote) |r| r.host else null;
+        const host = @import("../filebrowser/paths.zig").browserHost(raw);
         return files_entry.startSpec(buf, host, pane.terminal.cwd);
     }
 

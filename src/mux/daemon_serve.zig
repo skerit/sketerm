@@ -1343,6 +1343,12 @@ pub const FsOpReq = struct {
     /// Comma-separated extended-attribute names to include with
     /// every entry (listings, stat and deltas).
     attrs: []const u8 = "",
+    /// Preferred image transport codecs supported by the receiver.
+    image_codecs: []const u8 = "",
+    /// A preview transport job owns and removes its source scratch.
+    delete_source: bool = false,
+    /// A panelize preview job owns the scratch path carried in `to`.
+    delete_destination: bool = false,
 };
 
 /// One change inside an fs_delta. upsert carries `entry`; del only
@@ -1379,7 +1385,7 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         std.mem.eql(u8, r.op, "trash_restore") or std.mem.eql(u8, r.op, "cross_copy") or
         std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
         std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract") or
-        std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview") or
+        std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview") or std.mem.eql(u8, r.op, "preview_transport") or
         std.mem.eql(u8, r.op, "dir_size") or std.mem.eql(u8, r.op, "perm_tree") or
         std.mem.eql(u8, r.op, "media_meta"))
         return self.fsStartJob(cl, r);
@@ -1468,8 +1474,20 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     } else if (std.mem.eql(u8, r.op, "unlink") or std.mem.eql(u8, r.op, "rmdir")) {
         var z: [4096]u8 = undefined;
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+        var owned_temp = false;
+        if (std.mem.eql(u8, r.op, "unlink")) {
+            for (self.fs_jobs.items) |job| {
+                if (job.ownsTempPath(r.path)) owned_temp = true;
+            }
+        }
         const rc = if (std.mem.eql(u8, r.op, "rmdir")) c.rmdir(p) else c.unlink(p);
-        if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        if (rc != 0 and !(owned_temp and std.posix.errno(rc) == .NOENT))
+            return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        if (owned_temp) {
+            for (self.fs_jobs.items) |job| {
+                _ = job.releaseTempPath(r.path, nowMs());
+            }
+        }
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "create")) {
         // Empty-file create, O_EXCL so an existing file can never
@@ -2068,4 +2086,3 @@ pub fn fsWatchReadable(self: *Daemon) void {
         }
     }
 }
-

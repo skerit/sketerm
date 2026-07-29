@@ -125,6 +125,20 @@ pub fn hostEq(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+/// The browser host identity for a terminal session's host string.
+/// Transport prefixes are stripped so the spec reads `host:/path` and
+/// shares its connection with a typed `host:` location (bare = auto
+/// transport, which reuses SSH multiplexing where available); a
+/// `sock:` session's filesystem is the local one.
+pub fn browserHost(host: ?[]const u8) ?[]const u8 {
+    const h = host orelse return null;
+    if (std.mem.startsWith(u8, h, "sock:")) return null;
+    const bare = for ([_][]const u8{ "ssh:", "udp:" }) |prefix| {
+        if (std.mem.startsWith(u8, h, prefix)) break h[prefix.len..];
+    } else h;
+    return if (bare.len == 0) null else bare;
+}
+
 /// Extensions the preview pane and row thumbnails treat as images
 /// (decodable by gdk-pixbuf).
 pub fn isImageName(name: []const u8) bool {
@@ -383,6 +397,16 @@ test "hostEq treats null as local and compares strings otherwise" {
     try t.expect(!hostEq("box", null));
     try t.expect(hostEq("user@box", "user@box"));
     try t.expect(!hostEq("user@box", "box"));
+}
+
+test "browserHost strips transport prefixes and localizes sock sessions" {
+    const t = std.testing;
+    try t.expect(browserHost(null) == null);
+    try t.expect(browserHost("sock:/run/user/1000/x/mux.sock") == null);
+    try t.expect(browserHost("ssh:") == null);
+    try t.expectEqualStrings("dalaran", browserHost("dalaran").?);
+    try t.expectEqualStrings("dalaran", browserHost("ssh:dalaran").?);
+    try t.expectEqualStrings("me@dalaran", browserHost("udp:me@dalaran").?);
 }
 
 test "unescapeMnt decodes /proc/mounts octal escapes" {

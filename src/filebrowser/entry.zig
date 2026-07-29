@@ -83,10 +83,11 @@ fn invokedAsFiles(argv0: []const u8) bool {
 /// whose shell last reported `cwd` on `host` (null host = local). A
 /// remote pane's cwd is a path on ITS host, so handing the bare path
 /// to the browser would open a local directory that usually does not
-/// exist. Returns null when the pane reported no cwd.
+/// exist. A remote pane with no reported cwd opens its own root rather
+/// than silently falling back to the local browser.
 pub fn startSpec(buf: []u8, host: ?[]const u8, cwd: ?[]const u8) ?[]const u8 {
-    const p = cwd orelse return null;
-    if (p.len == 0) return null;
+    const p = cwd orelse if (host != null) "/" else return null;
+    if (p.len == 0) return if (host != null) paths.formatSpec(buf, host, "/") else null;
     return paths.formatSpec(buf, host, p);
 }
 
@@ -240,6 +241,8 @@ test "files entry: startSpec host-qualifies a pane cwd" {
     var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
     try std.testing.expect(startSpec(&buf, null, null) == null);
     try std.testing.expect(startSpec(&buf, null, "") == null);
+    try std.testing.expectEqualStrings("dalaran:/", startSpec(&buf, "dalaran", null).?);
+    try std.testing.expectEqualStrings("dalaran:/", startSpec(&buf, "dalaran", "").?);
 
     // Local: "local:" prefix so a round trip never picks up the
     // browser tab's current host.

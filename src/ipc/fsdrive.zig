@@ -515,6 +515,7 @@ pub const Fs = struct {
             dst_host: []const u8 = "",
             client_token: []const u8 = "",
             attrs: []const u8 = "",
+            image_codecs: []const u8 = "",
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -928,6 +929,13 @@ pub const Fs = struct {
 
     pub fn startPreview(self: *Fs, path: []const u8) Error!u64 {
         return self.startJob("preview", .{ .path = path });
+    }
+
+    /// Image preview with an explicit transport-codec advertisement
+    /// ("png" | "jxl,webp" | ...); the done event's path is the
+    /// bounded sidecar the receiver reads and then unlinks.
+    pub fn startPreviewCodecs(self: *Fs, path: []const u8, image_codecs: []const u8) Error!u64 {
+        return self.startJob("preview", .{ .path = path, .image_codecs = image_codecs });
     }
 
     /// Recursive size; the done event carries bytes in `done` and the

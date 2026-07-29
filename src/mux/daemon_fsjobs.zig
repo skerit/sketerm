@@ -27,6 +27,7 @@ pub const MAX_FINISHED_JOBS = 64;
 /// Cap on one media_meta batch's separator-joined name list.
 pub const MAX_MEDIA_BATCH_BYTES = 16 * 1024;
 pub const MAX_TOKEN_JOBS = 1024;
+const PREVIEW_ASSET_TTL_MS: i64 = 300_000;
 
 pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
     const op: FsJob.Op = if (std.mem.eql(u8, r.op, "copy"))
@@ -59,6 +60,8 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .thumbnail
     else if (std.mem.eql(u8, r.op, "preview"))
         .preview
+    else if (std.mem.eql(u8, r.op, "preview_transport"))
+        .preview_transport
     else if (std.mem.eql(u8, r.op, "dir_size"))
         .dir_size
     else if (std.mem.eql(u8, r.op, "perm_tree"))
@@ -70,6 +73,12 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
     if ((op == .copy or op == .extract or op == .archive_create) and
         (r.to.len == 0 or r.to[0] != '/'))
         return fsReplyErr(cl, r.req, "to must be absolute");
+    if (r.delete_destination and (op != .panelize or r.to.len == 0 or r.to[0] != '/'))
+        return fsReplyErr(cl, r.req, "temporary destination must be an absolute panelize path");
+    if (r.delete_destination and !std.mem.startsWith(u8, r.to, "/tmp/.sketerm-preview-"))
+        return fsReplyErr(cl, r.req, "temporary destination is outside the preview scratch namespace");
+    if (r.delete_source and op != .preview_transport)
+        return fsReplyErr(cl, r.req, "delete_source is only valid for preview transport");
     if (op == .delete_tree and r.path.len <= 1)
         return fsReplyErr(cl, r.req, "refusing to delete /");
     if ((op == .find or op == .grep or op == .panelize or op == .live_find) and r.pattern.len == 0)
@@ -111,6 +120,19 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
             return;
         }
     }
+    var source_owner: ?*FsJob = null;
+    if (r.delete_source) {
+        for (self.fs_jobs.items) |existing| {
+            if (existing.owner == cl and existing.owns_dst and existing.state == .done and
+                std.mem.eql(u8, existing.dst, r.path))
+            {
+                source_owner = existing;
+                break;
+            }
+        }
+        if (source_owner == null)
+            return fsReplyErr(cl, r.req, "preview source is not a completed asset owned by this client");
+    }
     const job = spawnFsJob(self, cl, op, self.next_fs_job_id, .{
         .src = r.path,
         .dst = r.to,
@@ -123,8 +145,15 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .max_matches = r.max_matches,
         .perm = .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 },
         .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode },
+        .image_codecs = r.image_codecs,
+        .owns_dst = op == .panelize and r.delete_destination,
+        .owns_src = op == .preview_transport and r.delete_source,
     }) catch
         return fsReplyErr(cl, r.req, "cannot start job");
+    if (source_owner) |producer| {
+        producer.owns_dst = false;
+        producer.cleanup_at_ms = nowMs();
+    }
     self.next_fs_job_id = job.id + 1;
     cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
 }
@@ -133,7 +162,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
 /// with the requesting client. They report a view's decoration, not
 /// a mutation worth recovering.
 pub fn ephemeralOp(op: FsJob.Op) bool {
-    return op == .thumbnail or op == .preview or op == .dir_size or op == .media_meta;
+    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta;
 }
 
 /// Recursive-permission arguments; -1 keeps the current owner or
@@ -157,6 +186,9 @@ pub const FsJobArgs = struct {
     max_matches: u64 = 0,
     perm: PermArgs = .{},
     copy: CopyArgs = .{},
+    image_codecs: []const u8 = "",
+    owns_dst: bool = false,
+    owns_src: bool = false,
 };
 
 pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: FsJobArgs) !*FsJob {
@@ -171,6 +203,8 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
     const max_matches = args.max_matches;
     const perm = args.perm;
     const copy = args.copy;
+    const image_codecs = args.image_codecs;
+    const ephemeral = ephemeralOp(op) or args.owns_dst or args.owns_src;
     var exe_buf: [4096:0]u8 = undefined;
     const exe = @import("../util/platform.zig").selfExecPathZ(&exe_buf) orelse return error.NoExecutable;
     var spec_aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -184,7 +218,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .dst_host = dst_host,
         .@"resume" = resumable,
         .job_id = id,
-        .journal_dir = if (ephemeralOp(op)) "" else self.fs_job_dir,
+        .journal_dir = if (ephemeral) "" else self.fs_job_dir,
         .within_ms = within_ms,
         .max_matches = max_matches,
         .client_token = client_token,
@@ -193,6 +227,8 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .gid = perm.gid,
         .conflict = copy.conflict,
         .dir_mode = copy.dir_mode,
+        .image_codecs = image_codecs,
+        .delete_source = args.owns_src,
     }, .{}, &spec_aw.writer);
     try spec_aw.writer.writeByte('\n');
 
@@ -263,7 +299,9 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .client_token = client_token_owned,
         .conflict = conflict_owned,
         .resumable = resumable,
-        .ephemeral = ephemeralOp(op),
+        .ephemeral = ephemeral,
+        .owns_dst = args.owns_dst,
+        .owns_src = args.owns_src,
     };
     job_initialized = true;
     // The job owns the read end from here on; its deinit closes it,
@@ -438,12 +476,16 @@ pub fn restoreFsJobs(self: *Daemon) void {
             }) catch {
                 const job = restoredFsJob(self, rec, op, .failed) orelse continue;
                 job.setMessage("could not resume after daemon restart");
-                saveFsJob(self, job) catch { job.terminal_pending = true; };
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                };
             };
         } else {
             const job = restoredFsJob(self, rec, op, .failed) orelse continue;
             job.setMessage("operation interrupted by daemon restart");
-            saveFsJob(self, job) catch { job.terminal_pending = true; };
+            saveFsJob(self, job) catch {
+                job.terminal_pending = true;
+            };
         }
     }
 }
@@ -657,6 +699,12 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     }) catch return;
     defer parsed.deinit();
     const e = parsed.value;
+    if (std.mem.eql(u8, e.ev, "asset")) {
+        job.done_path_len = @min(e.path.len, job.done_path.len);
+        @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
+        job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
+        return;
+    }
     if (std.mem.eql(u8, e.ev, "match") or std.mem.eql(u8, e.ev, "unmatch") or
         std.mem.eql(u8, e.ev, "resync") or std.mem.eql(u8, e.ev, "ready") or
         std.mem.eql(u8, e.ev, "reject"))
@@ -716,6 +764,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
         job.done_text_len = @min(e.text.len, job.done_text.len);
         @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
+        if (job.owns_dst or job.owns_src or job.op == .thumbnail or job.op == .preview or job.op == .preview_transport)
+            job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
         saveFsJob(self, job) catch {
             job.terminal_pending = true;
             return;
@@ -741,6 +791,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
 pub fn fsJobExited(self: *Daemon, job: *FsJob) void {
     var st: c_int = 0;
     _ = c.waitpid(job.pid, &st, 0);
+    job.releaseOwnedSource();
     _ = c.close(job.out_fd);
     job.out_fd = -1;
     var emit_terminal = job.terminal_pending;

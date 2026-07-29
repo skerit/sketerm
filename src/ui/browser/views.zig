@@ -672,7 +672,7 @@ pub fn onColumnsMenu(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const tab = self.currentTab() orelse return;
     if (c.gtk_widget_get_ancestor(@ptrCast(@alignCast(btn)), c.gtk_popover_get_type())) |pop|
         c.gtk_popover_popdown(@ptrCast(pop));
-    showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)));
+    showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)), null);
 }
 
 pub fn onForgetFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

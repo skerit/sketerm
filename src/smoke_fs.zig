@@ -16,6 +16,7 @@ const fsdrive = @import("ipc/fsdrive.zig");
 const fstransfer = @import("ipc/fstransfer.zig");
 const fsserve = @import("mux/fsserve.zig");
 const fsjob = @import("mux/fsjob.zig");
+const imagecodec = @import("util/imagecodec.zig");
 const pathz = @import("util/pathz.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -697,6 +698,68 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
             waited += 5;
         }
         if (!preview_done) fail("preview never completed");
+
+        // Image preview transport: the helper answers with a bounded
+        // sidecar (plain PNG for a png-advertising receiver, JXL/WebP
+        // when the host codecs allow), which the receiver reads and
+        // then unlinks through the ownership-aware unlink op.
+        {
+            var fpi: [4096]u8 = undefined;
+            var pic_z: [4096:0]u8 = undefined;
+            const pic = std.fmt.bufPrint(&fpi, "{s}/pic.png", .{sdir}) catch unreachable;
+            _ = std.fmt.bufPrintZ(&pic_z, "{s}", .{pic}) catch unreachable;
+            var rgba: [64 * 48 * 4]u8 = undefined;
+            for (0..64 * 48) |i| {
+                rgba[i * 4] = @truncate(i * 3);
+                rgba[i * 4 + 1] = @truncate(i * 7);
+                rgba[i * 4 + 2] = @truncate(i * 11);
+                rgba[i * 4 + 3] = 255;
+            }
+            if (c.stbi_write_png(&pic_z, 64, 48, 4, &rgba, 64 * 4) == 0) fail("write pic.png");
+
+            const codec_specs = [_][]const u8{ "png", imagecodec.capabilities() };
+            for (codec_specs) |codecs| {
+                if (codecs.len == 0) continue;
+                const pj = fs.startPreviewCodecs(pic, codecs) catch failErr("start image preview", fs.lastErr());
+                var sidecar_buf: [4096]u8 = undefined;
+                var sidecar_len: usize = 0;
+                var pdone = false;
+                var pwaited: usize = 0;
+                while (!pdone and pwaited < 20_000) {
+                    while (fs.takeJobEvent()) |e0| {
+                        var e = e0;
+                        defer e.deinit();
+                        if (e.job != pj) continue;
+                        if (std.mem.eql(u8, e.ev, "done")) {
+                            if (e.path.len == 0 or std.mem.eql(u8, e.path, pic)) fail("image preview did not produce a sidecar");
+                            sidecar_len = e.path.len;
+                            @memcpy(sidecar_buf[0..sidecar_len], e.path);
+                            pdone = true;
+                        } else if (e.terminal()) fail("image preview job failed");
+                    }
+                    if (!pdone) _ = c.usleep(5_000);
+                    pwaited += 5;
+                }
+                if (!pdone) fail("image preview never completed");
+                const sidecar = sidecar_buf[0..sidecar_len];
+                const want_png = std.mem.eql(u8, codecs, "png");
+                if (want_png and !std.mem.endsWith(u8, sidecar, ".png")) fail("png receiver got a transcoded sidecar");
+                if (!want_png and std.mem.endsWith(u8, sidecar, ".png")) fail("codec receiver got a PNG sidecar");
+                var bytes: std.ArrayList(u8) = .empty;
+                defer bytes.deinit(allocator);
+                const info = fs.read(sidecar, 0, 2 << 20, &bytes) catch failErr("read sidecar", fs.lastErr());
+                if (!info.eof or bytes.items.len == 0) fail("sidecar read incomplete");
+                if (!want_png) {
+                    const dec = imagecodec.decode(allocator, bytes.items, 512 * 512) catch fail("sidecar not decodable");
+                    allocator.free(dec.rgba);
+                    if (dec.width != 64 or dec.height != 48) fail("sidecar dimensions wrong");
+                }
+                fs.unlink(sidecar) catch failErr("unlink sidecar", fs.lastErr());
+                var side_z: [4096:0]u8 = undefined;
+                _ = std.fmt.bufPrintZ(&side_z, "{s}", .{sidecar}) catch unreachable;
+                if (c.access(&side_z, c.F_OK) == 0) fail("sidecar survived its release");
+            }
+        }
 
         // dir_size walks host-side: bytes in `done`, entries in `total`.
         const size_job = fs.startDirSize(sdir) catch failErr("start dir_size", fs.lastErr());
@@ -1839,6 +1902,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var media_cache_buf: [128:0]u8 = undefined;
     const media_cache = std.fmt.bufPrintZ(&media_cache_buf, "/tmp/sketerm-smoke-fs-media-{d}", .{c.getpid()}) catch unreachable;
     _ = c.setenv("SKETERM_MEDIA_CACHE_DIR", media_cache.ptr, 1);
+    // Image previews install freedesktop thumbnail-cache entries under
+    // XDG_CACHE_HOME; keep those out of the real user cache too.
+    var thumb_cache_buf: [128:0]u8 = undefined;
+    const thumb_cache = std.fmt.bufPrintZ(&thumb_cache_buf, "/tmp/sketerm-smoke-fs-cache-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.setenv("XDG_CACHE_HOME", thumb_cache.ptr, 1);
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     defer if (gpa_state.deinit() == .leak) {
         std.debug.print("smoke-fs: FAIL — leaked memory (see GPA report above)\n", .{});

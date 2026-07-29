@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const places_mod = @import("../../filebrowser/places.zig");
+const paths = @import("../../filebrowser/paths.zig");
 const query_mod = @import("../../filebrowser/query.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
@@ -129,11 +130,57 @@ pub fn placeHeader(self: *BrowserView, text: [*:0]const u8) void {
     c.gtk_list_box_append(self.places_list, row);
 }
 
+fn makePlaceCtx(self: *BrowserView, spec: []const u8, is_bookmark: bool) ?*PlaceCtx {
+    const ctx = self.allocator.create(PlaceCtx) catch return null;
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .spec = self.allocator.dupe(u8, spec) catch {
+            self.allocator.destroy(ctx);
+            return null;
+        },
+        .is_bookmark = is_bookmark,
+    };
+    return ctx;
+}
+
+fn appendPlaceRow(self: *BrowserView, hbox: *c.GtkWidget, ctx: *PlaceCtx) void {
+    const row = c.gtk_list_box_row_new();
+    c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
+    var tip: [4300:0]u8 = undefined;
+    if (std.fmt.bufPrintZ(&tip, "{s}", .{ctx.spec})) |t| c.gtk_widget_set_tooltip_text(@ptrCast(row), t.ptr) else |_| {}
+    c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
+    c.gtk_list_box_append(self.places_list, row);
+}
+
 /// A recent-location row. The label is not the raw spec: the folder
 /// name reads plainly and the path leading to it is dimmed, so a
 /// column of recents scans as names rather than as repeated prefixes.
 /// Activation still uses the raw spec.
 fn recentRow(self: *BrowserView, spec: []const u8) void {
+    const loc = paths.parseSpec(spec);
+    if (loc.host) |host| {
+        const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_set_margin_start(hbox, 10);
+        c.gtk_widget_set_margin_end(hbox, 10);
+        c.gtk_box_append(@ptrCast(hbox), iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), "document-open-recent-symbolic", 16));
+        var hz: [260:0]u8 = undefined;
+        const host_text = std.fmt.bufPrintZ(&hz, "{s}:", .{host}) catch return;
+        const host_label = c.gtk_label_new(host_text.ptr);
+        c.gtk_widget_add_css_class(host_label, "dim-label");
+        c.gtk_box_append(@ptrCast(hbox), host_label);
+        var pz: [4096:0]u8 = undefined;
+        const n = @min(loc.path.len, pz.len - 1);
+        @memcpy(pz[0..n], loc.path[0..n]);
+        pz[n] = 0;
+        const path_label = c.gtk_label_new(&pz);
+        c.gtk_label_set_xalign(@ptrCast(path_label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(path_label), c.PANGO_ELLIPSIZE_START);
+        c.gtk_widget_set_hexpand(path_label, 1);
+        c.gtk_box_append(@ptrCast(hbox), path_label);
+        appendPlaceRow(self, hbox, makePlaceCtx(self, spec, false) orelse return);
+        return;
+    }
     const split = places_mod.splitRecentLabel(spec);
     var pz: [1024:0]u8 = undefined;
     var nz: [512:0]u8 = undefined;
@@ -160,29 +207,15 @@ fn recentRow(self: *BrowserView, spec: []const u8) void {
 fn placeRowMarkup(self: *BrowserView, icon: [*:0]const u8, markup: [*:0]const u8, spec: []const u8) void {
     const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_margin_start(hbox, 10);
+    c.gtk_widget_set_margin_end(hbox, 10);
     c.gtk_box_append(@ptrCast(hbox), iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), icon, 16));
     const lab = c.gtk_label_new(null);
     c.gtk_label_set_markup(@ptrCast(lab), markup);
     c.gtk_label_set_xalign(@ptrCast(lab), 0);
-    c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_START);
+    c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_widget_set_hexpand(lab, 1);
     c.gtk_box_append(@ptrCast(hbox), lab);
-    const ctx = self.allocator.create(PlaceCtx) catch return;
-    ctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .spec = self.allocator.dupe(u8, spec) catch {
-            self.allocator.destroy(ctx);
-            return;
-        },
-        .is_bookmark = false,
-    };
-    const row = c.gtk_list_box_row_new();
-    c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
-    var tip: [4300:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&tip, "{s}", .{spec})) |t| c.gtk_widget_set_tooltip_text(@ptrCast(row), t.ptr) else |_| {}
-    c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
-    c.gtk_list_box_append(self.places_list, row);
+    appendPlaceRow(self, hbox, makePlaceCtx(self, spec, false) orelse return);
 }
 
 pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec: []const u8, is_bookmark: bool) void {
@@ -199,16 +232,7 @@ pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec
     c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_widget_set_hexpand(lab, 1);
     c.gtk_box_append(@ptrCast(hbox), lab);
-    const ctx = self.allocator.create(PlaceCtx) catch return;
-    ctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .spec = self.allocator.dupe(u8, spec) catch {
-            self.allocator.destroy(ctx);
-            return;
-        },
-        .is_bookmark = is_bookmark,
-    };
+    const ctx = makePlaceCtx(self, spec, is_bookmark) orelse return;
     if (is_bookmark) {
         const rm = c.gtk_button_new_from_icon_name("window-close-symbolic");
         c.gtk_button_set_has_frame(@ptrCast(rm), 0);
@@ -216,10 +240,7 @@ pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec
         _ = c.g_signal_connect_data(rm, "clicked", @ptrCast(&onBookmarkRemove), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(hbox), rm);
     }
-    const row = c.gtk_list_box_row_new();
-    c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
-    c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
-    c.gtk_list_box_append(self.places_list, row);
+    appendPlaceRow(self, hbox, ctx);
 }
 
 pub fn renderPlaces(self: *BrowserView) void {

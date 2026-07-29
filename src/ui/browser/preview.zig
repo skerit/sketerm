@@ -30,6 +30,7 @@ const hexdump = @import("../../filebrowser/hexdump.zig");
 const mediacols = @import("mediacols.zig");
 const previewers = @import("../../filebrowser/previewers.zig");
 const thumbs_mod = @import("../../filebrowser/thumbs.zig");
+const imagecodec = @import("../../util/imagecodec.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -128,6 +129,9 @@ pub const ThumbResult = struct {
     /// In-memory cache key ("path\x00mtime", owned by c_allocator).
     key: []u8,
     pixbuf: ?*c.GdkPixbuf,
+    rgba: ?[]u8 = null,
+    width: u32 = 0,
+    height: u32 = 0,
     /// Original path (owned); identifies the row the result belongs to.
     path: []u8,
     mtime_ms: i64,
@@ -165,12 +169,15 @@ pub const RemoteThumb = struct {
     req: u32 = 0,
     job: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
+    /// Ephemeral JXL/WebP sidecar on the file-owning host.
+    asset: []u8 = &.{},
     /// Monotonic ms of the last frame that belonged to this fetch;
     /// what REMOTE_THUMB_SILENCE_MS is measured from.
     last_ms: i64 = 0,
 
     pub fn destroy(self: *RemoteThumb, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        if (self.asset.len > 0) allocator.free(self.asset);
         self.buf.deinit(allocator);
         allocator.destroy(self);
     }
@@ -211,6 +218,8 @@ pub const PreviewRead = struct {
     /// Metadata the generator reported alongside its image (owned).
     note: []u8 = &.{},
     buf: std.ArrayList(u8) = .empty,
+    /// A host-command image needs one second job to resize/transcode it.
+    needs_transport: bool = false,
 
     pub fn destroy(self: *PreviewRead, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -318,7 +327,9 @@ pub const State = struct {
 };
 
 /// Content caps: whole image (bounded) vs a text head.
-pub const PREVIEW_IMAGE_CAP: usize = 8 << 20;
+/// A built-in preview is at most 512x512 before JXL/WebP encoding,
+/// so 2 MiB leaves ample framing/compression headroom.
+pub const PREVIEW_IMAGE_CAP: usize = 2 << 20;
 
 pub const PREVIEW_TEXT_CAP: usize = 4096;
 
@@ -387,11 +398,43 @@ pub fn thumbWorkerMain(tc: *ThumbCtx) void {
     }
 }
 
+/// Codecs to advertise for images fetched over `hc`: the local
+/// daemon's sidecar never crosses a network, so plain PNG skips the
+/// transcode and keeps local previews independent of libjxl/libwebp.
+fn wireImageCodecs(hc: *HostConn) []const u8 {
+    return if (hc.host == null) "png" else imagecodec.capabilities();
+}
+
+/// Decode + bound non-JXL/WebP wire data (the local daemon's PNG
+/// sidecars) on the worker via gdk-pixbuf.
+fn wirePixbuf(data: []const u8, kind: ThumbKind) ?*c.GdkPixbuf {
+    const loader = c.gdk_pixbuf_loader_new();
+    defer c.g_object_unref(loader); // drops the full-size pixbuf with it
+    var loaded = false;
+    if (c.gdk_pixbuf_loader_write(loader, data.ptr, data.len, null) != 0)
+        loaded = c.gdk_pixbuf_loader_close(loader, null) != 0
+    else
+        _ = c.gdk_pixbuf_loader_close(loader, null);
+    if (!loaded) return null;
+    const full = c.gdk_pixbuf_loader_get_pixbuf(loader) orelse return null;
+    const w: f64 = @floatFromInt(c.gdk_pixbuf_get_width(full));
+    const h: f64 = @floatFromInt(c.gdk_pixbuf_get_height(full));
+    if (w < 1 or h < 1) return null;
+    const bound: f64 = if (kind == .preview) 1024.0 else 128.0;
+    const scale = @max(w / bound, h / bound);
+    const nw: c_int = if (scale > 1) @intFromFloat(@max(1.0, w / scale)) else @intFromFloat(w);
+    const nh: c_int = if (scale > 1) @intFromFloat(@max(1.0, h / scale)) else @intFromFloat(h);
+    return c.gdk_pixbuf_scale_simple(full, nw, nh, c.GDK_INTERP_BILINEAR);
+}
+
 /// Worker-side: probe the freedesktop cache, else decode +
 /// save (local) / encode for write-back (remote bytes).
 pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     const a = std.heap.c_allocator;
     var pixbuf: ?*c.GdkPixbuf = null;
+    var decoded_rgba: ?[]u8 = null;
+    var decoded_width: u32 = 0;
+    var decoded_height: u32 = 0;
 
     var ubuf: [4096 * 3 + 8]u8 = undefined;
     const uri = thumbs_mod.fileUri(req.path, &ubuf) orelse return;
@@ -419,49 +462,42 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             if (pixbuf != null) thumbSaveLocal(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
         }
     } else {
-        // Wire-delivered PNG/source bytes: all decode/scale work
-        // stays on this worker, never in the fd callback.
-        const loader = c.gdk_pixbuf_loader_new();
-        var loaded = false;
-        if (c.gdk_pixbuf_loader_write(loader, req.data.?.ptr, req.data.?.len, null) != 0)
-            loaded = c.gdk_pixbuf_loader_close(loader, null) != 0
-        else
-            _ = c.gdk_pixbuf_loader_close(loader, null);
-        if (loaded) {
-            if (c.gdk_pixbuf_loader_get_pixbuf(loader)) |full| {
-                const w: f64 = @floatFromInt(c.gdk_pixbuf_get_width(full));
-                const h: f64 = @floatFromInt(c.gdk_pixbuf_get_height(full));
-                // Previews feed the Quick Look overlay too, which is
-                // near screen-sized -- 480px looked postage-stamp
-                // there. ~1MP ceiling keeps the 12-entry cache sane.
-                const bound: f64 = if (req.kind == .preview) 1024.0 else 128.0;
-                const scale = @max(w / bound, h / bound);
-                const nw: c_int = if (scale > 1) @intFromFloat(@max(1.0, w / scale)) else @intFromFloat(w);
-                const nh: c_int = if (scale > 1) @intFromFloat(@max(1.0, h / scale)) else @intFromFloat(h);
-                pixbuf = c.gdk_pixbuf_scale_simple(full, nw, nh, c.GDK_INTERP_BILINEAR);
-            }
+        // Wire images are bounded JXL/WebP transport data from remote
+        // hosts, or plain PNG when the daemon is the local one.
+        const max_pixels: usize = if (req.kind == .preview) 512 * 512 else 128 * 128;
+        if (imagecodec.decode(a, req.data.?, max_pixels)) |decoded| {
+            decoded_rgba = decoded.rgba;
+            decoded_width = decoded.width;
+            decoded_height = decoded.height;
+        } else |_| {
+            pixbuf = wirePixbuf(req.data.?, req.kind);
         }
-        c.g_object_unref(loader); // drops `full` with it
     }
 
     // Hand the result to the main thread.
     const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.cache_key, req.mtime_ms }) catch {
         if (pixbuf) |pb| c.g_object_unref(pb);
+        if (decoded_rgba) |rgba| a.free(rgba);
         return;
     };
     const res = a.create(ThumbResult) catch {
         a.free(key);
         if (pixbuf) |pb| c.g_object_unref(pb);
+        if (decoded_rgba) |rgba| a.free(rgba);
         return;
     };
     res.* = .{
         .ctx = tc,
         .key = key,
         .pixbuf = pixbuf,
+        .rgba = decoded_rgba,
+        .width = decoded_width,
+        .height = decoded_height,
         .path = a.dupe(u8, req.path) catch {
             a.free(key);
             a.destroy(res);
             if (pixbuf) |pb| c.g_object_unref(pb);
+            if (decoded_rgba) |rgba| a.free(rgba);
             return;
         },
         .mtime_ms = req.mtime_ms,
@@ -502,6 +538,7 @@ pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     defer {
         a.free(res.key);
         a.free(res.path);
+        if (res.rgba) |rgba| a.free(rgba);
         a.destroy(res);
         tc.unref();
     }
@@ -517,6 +554,21 @@ pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
+fn resultTexture(res: *const ThumbResult) ?*c.GdkTexture {
+    if (res.pixbuf) |pb| return c.gdk_texture_new_for_pixbuf(pb);
+    const rgba = res.rgba orelse return null;
+    if (res.width == 0 or res.height == 0) return null;
+    const bytes = c.g_bytes_new(rgba.ptr, rgba.len) orelse return null;
+    defer c.g_bytes_unref(bytes);
+    return @ptrCast(@alignCast(c.gdk_memory_texture_new(
+        @intCast(res.width),
+        @intCast(res.height),
+        c.GDK_MEMORY_R8G8B8A8,
+        bytes,
+        @intCast(res.width * 4),
+    )));
+}
+
 pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
     if (res.kind == .preview) {
         defer if (res.pixbuf) |pb| c.g_object_unref(pb);
@@ -526,9 +578,8 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
         self.pumpPreload();
         return;
     }
-    if (res.pixbuf) |pb| {
-        defer c.g_object_unref(pb);
-        const tex = c.gdk_texture_new_for_pixbuf(pb) orelse return;
+    if (resultTexture(res)) |tex| {
+        defer if (res.pixbuf) |pb| c.g_object_unref(pb);
         if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
         const owned = self.allocator.dupe(u8, res.key) catch {
             c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
@@ -593,7 +644,10 @@ pub fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry
         }
         if (tc.queue.items.len > 512) return null; // bounded
         const owned = a.dupe(u8, full) catch return null;
-        const cache_key = a.dupe(u8, full) catch { a.free(owned); return null; };
+        const cache_key = a.dupe(u8, full) catch {
+            a.free(owned);
+            return null;
+        };
         tc.queue.append(a, .{ .path = owned, .cache_key = cache_key, .mtime_ms = e.mtime_ms }) catch {
             a.free(owned);
             a.free(cache_key);
@@ -648,8 +702,8 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
         self.remote_thumb = rt;
         armRemoteThumbWatch(self);
         // Generation happens on the file-owning host. Only the
-        // bounded cached PNG returns over the wire.
-        self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path });
+        // bounded JXL/WebP sidecar returns over the wire.
+        self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path, .image_codecs = wireImageCodecs(rt.hc) });
         return;
     }
 }
@@ -682,6 +736,8 @@ pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
     // which arms a FRESH source, and clearing afterwards would drop
     // that id and leak a source nothing can remove.
     self.remote_thumb_watch = 0;
+    if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
+        self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
     self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
     self.finishRemoteThumb();
     return 0;
@@ -689,6 +745,8 @@ pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
 
 pub fn finishRemoteThumb(self: *BrowserView) void {
     if (self.remote_thumb) |rt| {
+        if (rt.asset.len > 0 and rt.hc.state == .ready)
+            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
         self.remote_thumb = null;
     }
@@ -729,7 +787,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                     return true;
                 },
                 .read_thumb => {
-                    if (!rep.ok or rt.buf.items.len == 0) {
+                    if (!rep.ok or !rep.eof or rep.size > PREVIEW_IMAGE_CAP or rt.buf.items.len == 0) {
                         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
                         self.finishRemoteThumb();
                         return true;
@@ -758,6 +816,11 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
             if (ev.job != rt.job) return false;
             rt.touch();
             if (std.mem.eql(u8, ev.ev, "done") and ev.path.len > 0) {
+                rt.asset = self.allocator.dupe(u8, ev.path) catch {
+                    self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+                    self.finishRemoteThumb();
+                    return true;
+                };
                 rt.req = self.nextReq();
                 rt.phase = .read_thumb;
                 rt.buf.clearRetainingCapacity();
@@ -772,9 +835,8 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
     }
 }
 
-/// The host's thumbnail PNG arrived: hand it to the worker to decode
-/// off the loop. Nothing is written back -- the daemon installed the
-/// spec entry in its own host's cache before serving it.
+/// The host's bounded JXL/WebP transport image arrived: hand it to the
+/// worker to decode off the loop. The daemon keeps its spec PNG local.
 /// @return false when the job was NOT handed off, in which case no
 /// handback will ever arrive and the caller owns `rt`'s release.
 pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) bool {
@@ -782,9 +844,15 @@ pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) bool {
     const a = std.heap.c_allocator;
     const path = a.dupe(u8, rt.path) catch return false;
     const key = if (rt.hc.host) |host|
-        std.fmt.allocPrint(a, "{s}:{s}", .{ host, rt.path }) catch { a.free(path); return false; }
+        std.fmt.allocPrint(a, "{s}:{s}", .{ host, rt.path }) catch {
+            a.free(path);
+            return false;
+        }
     else
-        a.dupe(u8, rt.path) catch { a.free(path); return false; };
+        a.dupe(u8, rt.path) catch {
+            a.free(path);
+            return false;
+        };
     const data = a.dupe(u8, rt.buf.items) catch {
         a.free(path);
         a.free(key);
@@ -806,9 +874,7 @@ pub fn releaseRemoteThumbFor(self: *BrowserView, remote_id: u64) void {
     if (remote_id == 0) return;
     if (self.remote_thumb) |rt| {
         if (rt.id == remote_id) {
-            rt.destroy(self.allocator);
-            self.remote_thumb = null;
-            self.pumpRemoteThumbs();
+            self.finishRemoteThumb();
         }
     }
 }
@@ -880,6 +946,26 @@ fn endRead(self: *BrowserView, slot: *?*PreviewRead) void {
     if (pr.temp.len > 0 and pr.hc.state == .ready)
         self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
     pr.destroy(self.allocator);
+}
+
+/// Cancel and release host-side preview assets while connections still live.
+pub fn shutdownTransfers(self: *BrowserView) void {
+    endRead(self, &self.preview_read);
+    endRead(self, &self.preview_state.preload_read);
+    if (self.remote_thumb_watch != 0) {
+        _ = c.g_source_remove(self.remote_thumb_watch);
+        self.remote_thumb_watch = 0;
+    }
+    if (self.remote_thumb) |rt| {
+        if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
+            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
+        if (rt.asset.len > 0 and rt.hc.state == .ready)
+            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
+        rt.destroy(self.allocator);
+        self.remote_thumb = null;
+    }
+    for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
+    self.remote_thumb_queue.clearRetainingCapacity();
 }
 
 /// The entry the preview is about: the Quick Look cursor when the
@@ -1251,9 +1337,9 @@ fn fillEntryPanel(self: *BrowserView, tab: *BTab, path: []const u8, entry: ?*Ent
     if (e.tags.len > 0) addInfoRow(self, "Tags", e.tags);
 
     const interesting = [_][]const u8{
-        "media.format",           "media.width",  "media.height", "media.duration_ms",
-        "media.bitrate_kbps",     "tag.title",    "tag.artist",   "tag.album",
-        "exif.datetime_original", "exif.model",   "doc.pages",    "doc.author",
+        "media.format",           "media.width", "media.height", "media.duration_ms",
+        "media.bitrate_kbps",     "tag.title",   "tag.artist",   "tag.album",
+        "exif.datetime_original", "exif.model",  "doc.pages",    "doc.author",
     };
     const estimated = if (mediacols.lookup(self, tab.hc, path, e.mtime_ms, "media.duration_estimated")) |v|
         std.mem.eql(u8, v, "1")
@@ -1363,9 +1449,9 @@ fn appendMediaLines(
     described: []const u8,
 ) []const u8 {
     const interesting = [_][]const u8{
-        "media.format",    "media.width",       "media.height", "media.duration_ms",
-        "media.bitrate_kbps", "tag.title",      "tag.artist",   "tag.album",
-        "exif.datetime_original", "exif.model", "doc.pages",
+        "media.format",           "media.width", "media.height", "media.duration_ms",
+        "media.bitrate_kbps",     "tag.title",   "tag.artist",   "tag.album",
+        "exif.datetime_original", "exif.model",  "doc.pages",
     };
     const estimated = if (mediacols.lookup(self, tab.hc, path, mtime_ms, "media.duration_estimated")) |v|
         std.mem.eql(u8, v, "1")
@@ -1469,6 +1555,7 @@ fn startPreview(
         .force_hex = handler.producer == .builtin and handler.producer.builtin == .hex,
         .preload = preload,
         .generation = if (preload) 0 else self.preview_generation,
+        .needs_transport = handler.producer == .host_command and handler.output == .image,
     };
     const slot = if (preload) &self.preview_state.preload_read else &self.preview_read;
     endRead(self, slot);
@@ -1478,7 +1565,7 @@ fn startPreview(
 
     switch (handler.producer) {
         .builtin => |b| switch (b) {
-            .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path }),
+            .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc) }),
             .head, .hex => {
                 pr.phase = .read_file;
                 self.sendOp(hc, .{
@@ -1594,7 +1681,14 @@ fn startHostPreviewer(self: *BrowserView, pr: *PreviewRead, cmd: []const u8, out
         return failRead(self, pr, "previewer command is unusable");
     defer self.allocator.free(script);
     const dir = std.fs.path.dirname(pr.path) orelse "/";
-    self.sendOp(pr.hc, .{ .req = pr.req, .op = "panelize", .path = dir, .pattern = script });
+    self.sendOp(pr.hc, .{
+        .req = pr.req,
+        .op = "panelize",
+        .path = dir,
+        .to = pr.temp,
+        .pattern = script,
+        .delete_destination = true,
+    });
 }
 
 /// Feed preview-fetch frames; true when consumed.
@@ -1641,6 +1735,8 @@ fn feedReadSlot(
                 .read_file => {
                     if (!rep.ok or pr.buf.items.len == 0) {
                         failRead(self, pr, if (rep.@"error".len > 0) rep.@"error" else "the preview is empty");
+                    } else if (pr.output == .image and (!rep.eof or rep.size > PREVIEW_IMAGE_CAP)) {
+                        failRead(self, pr, "preview output exceeds the 2 MiB transfer limit");
                     } else {
                         deliverRead(self, pr);
                     }
@@ -1660,10 +1756,18 @@ fn feedReadSlot(
             if (ev.job != pr.job) return false;
             if (std.mem.eql(u8, ev.ev, "match")) {
                 // A host previewer names its scratch file; the wrapper
-                // prints exactly one path.
-                if (pr.temp.len > 0 and ev.path.len > 0 and !std.mem.eql(u8, pr.temp, ev.path)) {
+                // prints exactly one path. Image previewers are exempt:
+                // transport authorization is keyed to the registered
+                // %o temp, and a multi-statement command's stray
+                // stdout must not repoint the read at an unowned path.
+                if (!pr.needs_transport and pr.temp.len > 0 and ev.path.len > 0 and !std.mem.eql(u8, pr.temp, ev.path)) {
+                    const replacement = self.allocator.dupe(u8, ev.path) catch {
+                        failRead(self, pr, "out of memory while receiving the preview path");
+                        endSlot(self, slot);
+                        return true;
+                    };
                     self.allocator.free(pr.temp);
-                    pr.temp = self.allocator.dupe(u8, ev.path) catch &.{};
+                    pr.temp = replacement;
                 }
                 return true;
             }
@@ -1674,10 +1778,39 @@ fn feedReadSlot(
                 if (ev.text.len > 0 and pr.note.len == 0)
                     pr.note = prettifyGeneratorNote(self.allocator, ev.text) orelse
                         (self.allocator.dupe(u8, ev.text) catch &.{});
-                const asset = if (ev.path.len > 0) ev.path else pr.temp;
+                // Transport-authorized image previews may only consume
+                // the registered %o temp (see the match arm).
+                const asset = if (ev.path.len > 0 and !pr.needs_transport) ev.path else pr.temp;
                 if (asset.len == 0) {
                     if (pr.note.len > 0) deliverRead(self, pr) else failRead(self, pr, "the previewer produced no output");
                     endSlot(self, slot);
+                    return true;
+                }
+                if (!pr.needs_transport and ev.path.len > 0 and !std.mem.eql(u8, pr.temp, ev.path)) {
+                    const replacement = self.allocator.dupe(u8, ev.path) catch {
+                        failRead(self, pr, "out of memory while receiving the preview path");
+                        endSlot(self, slot);
+                        return true;
+                    };
+                    if (pr.temp.len > 0) {
+                        self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
+                        self.allocator.free(pr.temp);
+                    }
+                    pr.temp = replacement;
+                }
+                if (pr.needs_transport) {
+                    pr.needs_transport = false;
+                    pr.phase = .job_start;
+                    pr.req = self.nextReq();
+                    self.sendOp(pr.hc, .{
+                        .req = pr.req,
+                        .op = "preview_transport",
+                        .path = asset,
+                        .image_codecs = wireImageCodecs(pr.hc),
+                        .delete_source = true,
+                    });
+                    self.allocator.free(pr.temp);
+                    pr.temp = &.{};
                     return true;
                 }
                 pr.phase = .read_file;
@@ -1688,7 +1821,7 @@ fn feedReadSlot(
                     .op = "read",
                     .path = asset,
                     .off = @as(u64, 0),
-                    .len = @as(u64, 2 << 20),
+                    .len = @as(u64, if (pr.output == .image) PREVIEW_IMAGE_CAP else PREVIEW_TEXT_CAP),
                 });
                 return true;
             }
@@ -1819,7 +1952,7 @@ fn storePreviewImage(self: *BrowserView, res: *ThumbResult) void {
     // previews; strip that suffix back to the read's cache key.
     const key_end = std.mem.lastIndexOfScalar(u8, res.key, 0) orelse res.key.len;
     const key = res.key[0..key_end];
-    const texture: ?*c.GdkTexture = if (res.pixbuf) |pb| c.gdk_texture_new_for_pixbuf(pb) else null;
+    const texture = resultTexture(res);
     // deliverRead already parked the generator's metadata under this
     // key; merge the image into it rather than replacing the note.
     const stored = if (self.preview_state.cacheFind(key)) |existing| blk: {
@@ -2082,8 +2215,12 @@ pub fn quickLookToggle(self: *BrowserView) bool {
         return true;
     }
     const tab = self.currentTab() orelse return false;
-    if (tab.selected.items.len == 0) return false;
-    const path = tab.selected.items[tab.selected.items.len - 1];
+    const path = if (@import("colview.zig").focusedItem(tab)) |focused|
+        if (focused.data.kind == .entry) focused.data.path else return false
+    else if (tab.selected.items.len > 0)
+        tab.selected.items[tab.selected.items.len - 1]
+    else
+        return false;
     return self.quickLookOpen(path);
 }
 
@@ -2263,6 +2400,7 @@ pub fn onQuickLookCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) 
         self.abandonPreviewRead();
         self.clearPreloadQueue();
     }
+    self.updatePreview();
     return 0; // let the default handler destroy the window
 }
 

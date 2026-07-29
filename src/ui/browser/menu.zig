@@ -69,7 +69,6 @@ pub fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *an
     c.gtk_box_append(@ptrCast(box), btn);
 }
 
-
 pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n_press;
     const tab: *BTab = @ptrCast(@alignCast(user.?));
@@ -79,7 +78,7 @@ pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64,
     // like every file manager's header.
     if (colview.pickIsHeader(tab, x, y)) {
         _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
-        @import("render.zig").showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)));
+        @import("render.zig").showColumnPicker(tab, @ptrCast(@alignCast(tab.colview)), .{ .x = x, .y = y });
         return;
     }
 

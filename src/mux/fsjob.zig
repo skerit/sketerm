@@ -16,6 +16,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
+const png = @import("../util/png.zig");
+const imagecodec = @import("../util/imagecodec.zig");
 const pathz = @import("../util/pathz.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
@@ -75,6 +77,10 @@ pub const Spec = struct {
     /// perm_tree: -1 leaves the current owner/group untouched.
     uid: i64 = -1,
     gid: i64 = -1,
+    /// Receiver-supported preview transport codecs, preference order.
+    image_codecs: []const u8 = "",
+    /// The preview transport helper owns and removes its source scratch.
+    delete_source: bool = false,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -275,6 +281,8 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runPreview(allocator, spec, true)
     else if (std.mem.eql(u8, spec.op, "preview"))
         runPreview(allocator, spec, false)
+    else if (std.mem.eql(u8, spec.op, "preview_transport"))
+        runPreviewTransport(allocator, spec)
     else if (std.mem.eql(u8, spec.op, "media_meta"))
         runMediaMeta(allocator, spec)
     else
@@ -385,7 +393,11 @@ fn captureArgv(argv: []const ?[*:0]const u8, out: []u8) usize {
     var pipefd: [2]c_int = undefined;
     if (c.pipe(&pipefd) != 0) return 0;
     const pid = c.fork();
-    if (pid < 0) { _ = c.close(pipefd[0]); _ = c.close(pipefd[1]); return 0; }
+    if (pid < 0) {
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        return 0;
+    }
     if (pid == 0) {
         _ = c.dup2(pipefd[1], 1);
         _ = c.dup2(pipefd[1], 2);
@@ -458,20 +470,155 @@ fn rasterThumbnail(allocator: std.mem.Allocator, source: [:0]const u8, output: [
     const scale = @max(@as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(bound)), @as(f64, @floatFromInt(height)) / @as(f64, @floatFromInt(bound)));
     const out_w: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(width)) / scale)) else width;
     const out_h: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(height)) / scale)) else height;
-    const count = @as(usize, @intCast(out_w)) * @as(usize, @intCast(out_h)) * 4;
-    const scaled = allocator.alloc(u8, count) catch return false;
-    defer allocator.free(scaled);
     const src: [*]const u8 = @ptrCast(pixels);
-    var y: usize = 0;
-    while (y < @as(usize, @intCast(out_h))) : (y += 1) {
-        const sy: usize = @min(@as(usize, @intCast(height - 1)), y * @as(usize, @intCast(height)) / @as(usize, @intCast(out_h)));
-        var x: usize = 0;
-        while (x < @as(usize, @intCast(out_w))) : (x += 1) {
-            const sx: usize = @min(@as(usize, @intCast(width - 1)), x * @as(usize, @intCast(width)) / @as(usize, @intCast(out_w)));
-            @memcpy(scaled[(y * @as(usize, @intCast(out_w)) + x) * 4 ..][0..4], src[(sy * @as(usize, @intCast(width)) + sx) * 4 ..][0..4]);
+    const rgba = src[0 .. @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4];
+    if (out_w == width and out_h == height)
+        return c.stbi_write_png(output.ptr, out_w, out_h, 4, rgba.ptr, out_w * 4) != 0;
+    const scaled = png.downscaleRgba(
+        allocator,
+        rgba,
+        @intCast(width),
+        @intCast(height),
+        @intCast(out_w),
+        @intCast(out_h),
+    ) catch return false;
+    defer allocator.free(scaled);
+    return c.stbi_write_png(output.ptr, out_w, out_h, 4, scaled.ptr, out_w * 4) != 0;
+}
+
+/// Must match the GUI's PREVIEW_IMAGE_CAP: reads refuse larger assets.
+const TRANSPORT_BYTE_CAP: usize = 2 << 20;
+
+const PngSink = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    failed: bool = false,
+};
+
+fn pngSinkWrite(ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) void {
+    const sink: *PngSink = @ptrCast(@alignCast(ctx.?));
+    if (sink.failed or size <= 0) return;
+    const chunk = @as([*]const u8, @ptrCast(data.?))[0..@intCast(size)];
+    sink.buf.appendSlice(sink.allocator, chunk) catch {
+        sink.failed = true;
+    };
+}
+
+/// Transcode a host-local image into the receiver's best transport codec.
+fn transportPreview(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    codecs: []const u8,
+    bound: u32,
+    out_path: *[4096:0]u8,
+) ?[]const u8 {
+    if (codecs.len == 0) return null;
+    var pz: [4096:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pz, "{s}", .{source_path}) catch return null;
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const pixels = c.stbi_load(path.ptr, &width, &height, &channels, 4) orelse return null;
+    defer c.stbi_image_free(pixels);
+    if (width <= 0 or height <= 0) return null;
+    const max_dim = @max(width, height);
+    const out_w: u32 = if (max_dim > bound)
+        @intFromFloat(@max(1.0, @as(f64, @floatFromInt(width)) * @as(f64, @floatFromInt(bound)) / @as(f64, @floatFromInt(max_dim))))
+    else
+        @intCast(width);
+    const out_h: u32 = if (max_dim > bound)
+        @intFromFloat(@max(1.0, @as(f64, @floatFromInt(height)) * @as(f64, @floatFromInt(bound)) / @as(f64, @floatFromInt(max_dim))))
+    else
+        @intCast(height);
+    const pixels_len = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
+    const src_len = std.math.mul(usize, pixels_len, 4) catch return null;
+    const src = @as([*]const u8, @ptrCast(pixels))[0..src_len];
+    const scaled: ?[]u8 = if (out_w != width or out_h != height)
+        png.downscaleRgba(allocator, src, @intCast(width), @intCast(height), out_w, out_h) catch return null
+    else
+        null;
+    defer {
+        if (scaled) |rgba| allocator.free(rgba);
+    }
+    const rgba = scaled orelse src;
+    // A receiver listing "png" is the daemon's own host (local unix
+    // socket): serve plain PNG so local previews neither pay a
+    // transcode nor depend on libjxl/libwebp being installed.
+    var png_sink = PngSink{ .allocator = allocator };
+    defer png_sink.buf.deinit(allocator);
+    var jx_bytes: ?[]u8 = null;
+    defer if (jx_bytes) |b| allocator.free(b);
+    var bytes: []const u8 = undefined;
+    var ext: []const u8 = undefined;
+    if (imagecodec.wanted(codecs, "png") and
+        c.stbi_write_png_to_func(&pngSinkWrite, @ptrCast(&png_sink), @intCast(out_w), @intCast(out_h), 4, rgba.ptr, @intCast(out_w * 4)) != 0 and
+        !png_sink.failed and png_sink.buf.items.len <= TRANSPORT_BYTE_CAP)
+    {
+        bytes = png_sink.buf.items;
+        ext = "png";
+    } else {
+        const encoded = imagecodec.encodePreferred(
+            allocator,
+            rgba,
+            out_w,
+            out_h,
+            codecs,
+            TRANSPORT_BYTE_CAP,
+        ) catch return null;
+        jx_bytes = encoded.bytes;
+        bytes = encoded.bytes;
+        ext = switch (encoded.codec) {
+            .jxl => "jxl",
+            .webp => "webp",
+        };
+    }
+    var random: [8]u8 = undefined;
+    if (c.getentropy(&random, random.len) != 0) {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        std.mem.writeInt(u64, &random, (@as(u64, @intCast(c.getpid())) << 32) ^ @as(u32, @intCast(ts.tv_nsec)), .little);
+    }
+    const nonce = std.mem.readInt(u64, &random, .little);
+    // Under /tmp (not next to the source): a daemon killed between
+    // asset and cleanup would otherwise orphan sidecars permanently
+    // inside the freedesktop thumbnail cache; /tmp dies at boot.
+    const out = std.fmt.bufPrintZ(out_path, "/tmp/.sketerm-preview-{x}.{s}", .{ nonce, ext }) catch return null;
+    const fd = c.open(out.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return null;
+    var open = true;
+    defer {
+        if (open) {
+            _ = c.close(fd);
+            _ = c.unlink(out.ptr);
         }
     }
-    return c.stbi_write_png(output.ptr, out_w, out_h, 4, scaled.ptr, out_w * 4) != 0;
+    // Register the exclusive pathname before writing so cancellation
+    // cannot leave a partial sidecar once the daemon has seen it.
+    emit(.{ .ev = "asset", .path = out });
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) return null;
+        off += @intCast(n);
+    }
+    if (c.fsync(fd) != 0 or c.close(fd) != 0) return null;
+    open = false;
+    return out;
+}
+
+/// Resize/transcode a previewer-owned image without installing a cache entry.
+fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
+    var source_z: [4096:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
+    defer {
+        if (spec.delete_source) _ = c.unlink(source.ptr);
+    }
+    var transport_buf: [4096:0]u8 = undefined;
+    const transport = transportPreview(allocator, spec.src, spec.image_codecs, 512, &transport_buf) orelse
+        return emitError("JPEG XL/WebP preview codec unavailable or output too large");
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport });
+    return 0;
 }
 
 fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8 {
@@ -517,10 +664,6 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     var uri_buf: [4096 * 3 + 8]u8 = undefined;
     const uri = thumbs.fileUri(spec.src, &uri_buf) orelse return emitError("thumbnail URI too long");
     const cached = thumbs.validatePng(final, uri, mtime_sec);
-    if (cached and thumbnail_only) {
-        emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = final });
-        return 0;
-    }
     if (!cached) {
         pathz.makeParentDirs(final) catch return emitError("cannot create thumbnail cache");
         var mode_buf: [4096]u8 = undefined;
@@ -544,7 +687,7 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
                 generated = rasterThumbnail(allocator, source, raw, bound);
                 if (!generated) {
                     var vf_buf: [64:0]u8 = undefined;
-                    const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:-1", .{bound}) catch return emitError("scale");
+                    const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return emitError("scale");
                     const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
                     generated = runArgv(&argv);
                 }
@@ -564,9 +707,9 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
         } else {
             var vf_buf: [64:0]u8 = undefined;
             const vf = if (extIs(spec.src, &video_exts))
-                std.fmt.bufPrintZ(&vf_buf, "scale={d}:-1", .{bound}) catch return emitError("scale")
+                std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return emitError("scale")
             else
-                std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x240", .{bound}) catch return emitError("scale");
+                std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }) catch return emitError("scale");
             if (extIs(spec.src, &video_exts)) {
                 const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
                 generated = runArgv(&argv);
@@ -586,7 +729,10 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     } else if (!thumbnail_only and extIs(spec.src, &pdf_exts)) {
         metadata_len = pdfinfoText(source.ptr, &metadata);
     }
-    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = final, .text = metadata[0..metadata_len] });
+    var transport_buf: [4096:0]u8 = undefined;
+    const transport = transportPreview(allocator, final, spec.image_codecs, 512, &transport_buf) orelse
+        return emitError("JPEG XL/WebP preview codec unavailable or output too large");
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport, .text = metadata[0..metadata_len] });
     return 0;
 }
 
@@ -836,9 +982,7 @@ fn trashInto(src: []const u8, root: []const u8) TrashResult {
     }
     var sz: [4096]u8 = undefined;
     var tz: [4096]u8 = undefined;
-    if (c.rename(pathz.pathZ(&sz, src) catch return .fail,
-        pathz.pathZ(&tz, trashed) catch return .fail) != 0)
-    {
+    if (c.rename(pathz.pathZ(&sz, src) catch return .fail, pathz.pathZ(&tz, trashed) catch return .fail) != 0) {
         const failed_errno = std.posix.errno(@as(c_int, -1));
         _ = c.unlink(ip);
         return if (failed_errno == .XDEV) .xdev else .fail;
@@ -876,8 +1020,7 @@ fn runTrashRestore(spec: Spec) u8 {
     pathz.makeParentDirs(spec.dst) catch return emitError("cannot create restore parent");
     var sz: [4096]u8 = undefined;
     var dz: [4096]u8 = undefined;
-    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"),
-        pathz.pathZ(&dz, spec.dst) catch return emitError("path too long")) != 0)
+    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"), pathz.pathZ(&dz, spec.dst) catch return emitError("path too long")) != 0)
         return emitErrno("restore from trash");
     if (spec.pattern.len > 0) {
         var iz: [4096]u8 = undefined;
@@ -1290,7 +1433,6 @@ fn panelizeOne(root: []const u8, value: []const u8) bool {
     });
     return true;
 }
-
 
 // ── live queries ────────────────────────────────────────────────
 
@@ -2824,7 +2966,6 @@ test "copyOneFile resumes only on matching prefix hash" {
     const out_h2 = hashPrefix(dst, data.len, null).?;
     try t.expectEqualSlices(u8, &expect_h, &out_h2);
 }
-
 
 test "media cache: newest record for a key wins" {
     const t = std.testing;
