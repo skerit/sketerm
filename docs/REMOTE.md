@@ -20,6 +20,14 @@ before deployment. If the artifact is unavailable, the server architecture is
 unsupported, `sha256sum` is absent, or deployment is prohibited, Sketerm falls
 back to `sketerm-mux` on the remote non-interactive PATH.
 
+Deployment is independent of the remote login shell (fish, csh, anything):
+the ssh command is always a single word — `sh` with the script on stdin for
+the check, or the staged uploader's bare path for the upload — so no shell
+dialect ever parses script text. The binary payload never shares a stream
+with script text either (dash buffers stdin scripts), riding a dedicated
+connection into an exact-count `head -c`. Remote requirements are just a
+POSIX `sh`, coreutils, and `sha256sum`.
+
 `SKETERM_SSH` transport wrappers retain their historical argv by default. Set
 `SKETERM_MUX_PORTABLE` explicitly to opt such a wrapper into deployment.
 

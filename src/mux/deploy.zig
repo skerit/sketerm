@@ -1,4 +1,18 @@
 //! Automatic content-addressed deployment of the portable remote mux.
+//!
+//! Dialect-proof by construction: the remote ssh command is either the
+//! single word `sh` (script rides stdin) or a single bare word the
+//! check phase staged — the user's login shell, fish/csh/anything,
+//! has nothing to parse either way.
+//!
+//! The payload deliberately never shares a stream with script text:
+//! dash (Debian/Ubuntu /bin/sh) BUFFERS stdin scripts, so the classic
+//! append-the-binary-after-the-script trick silently loses the
+//! payload prefix there (caught by the real-sh test below). Instead
+//! the check phase stages a content-addressed uploader script via a
+//! quoted heredoc — heredocs are parsed as script text, read-ahead
+//! safe — and the upload phase runs that uploader as a bare word
+//! whose stdin is purely the raw binary, `head -c <size>` exact.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -138,13 +152,39 @@ fn ensureUsing(
     var keep_remote_path = false;
     defer if (!keep_remote_path) allocator.free(remote_path);
 
+    // Check-and-stage, riding stdin into `sh` (no payload follows, so
+    // shell read-ahead is harmless). Exit 0 = current binary present.
+    // Exit CHECK_MISSING = absent/stale AND the uploader script for
+    // this exact artifact is now staged at a content-addressed path.
+    // The quoted heredoc keeps $HOME/$$ literal in the uploader so
+    // they expand at ITS runtime; the staging mv is atomic, so
+    // concurrent connects write identical bytes and cannot corrupt.
     const check = std.fmt.allocPrintSentinel(
         allocator,
-        "case \"$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" in {s}) ;; *) exit {d};; esac; " ++
-            "p=\"{s}\"; [ -x \"$p\" ] || exit {d}; " ++
-            "h=$(sha256sum \"$p\" 2>/dev/null) || exit {d}; [ \"${{h%% *}}\" = \"{s}\" ] || exit {d}; " ++
-            "\"$p\" --help >/dev/null 2>&1 || exit {d}",
-        .{ arch_case, CHECK_UNSUPPORTED, remote_path, CHECK_MISSING, CHECK_MISSING, hash, CHECK_MISSING, CHECK_MISSING },
+        "case \"$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" in {s}) ;; *) exit {d};; esac\n" ++
+            "command -v sha256sum >/dev/null 2>&1 || exit 67\n" ++
+            "p=\"{s}\"\n" ++
+            "if [ -x \"$p\" ]; then h=$(sha256sum \"$p\" 2>/dev/null) && [ \"${{h%% *}}\" = \"{s}\" ] && \"$p\" --help >/dev/null 2>&1 && exit 0; fi\n" ++
+            "umask 077; d=\"$HOME/.cache/sketerm/mux\"; mkdir -p \"$d\" || exit 68\n" ++
+            "chmod 700 \"$HOME/.cache/sketerm\" \"$d\" 2>/dev/null || true\n" ++
+            "u=\"$d/.upload-{s}\"; ut=\"$u.$$\"\n" ++
+            "cat >\"$ut\" <<'SKETERM_UPLOADER'\n" ++
+            "#!/bin/sh\n" ++
+            "umask 077\n" ++
+            "p=\"$HOME/.cache/sketerm/mux/sketerm-mux-{s}\"; t=\"$p.part.$$\"\n" ++
+            "trap 'rm -f \"$t\"' EXIT HUP INT TERM\n" ++
+            "head -c {d} >\"$t\" || exit 69\n" ++
+            "[ \"$(wc -c <\"$t\")\" = \"{d}\" ] || exit 70\n" ++
+            "h=$(sha256sum \"$t\") || exit 71\n" ++
+            "[ \"${{h%% *}}\" = \"{s}\" ] || exit 72\n" ++
+            "chmod 700 \"$t\" || exit 73\n" ++
+            "mv -f \"$t\" \"$p\" || exit 74\n" ++
+            "\"$p\" --help >/dev/null 2>&1 || exit 75\n" ++
+            "trap - EXIT\n" ++
+            "SKETERM_UPLOADER\n" ++
+            "chmod 700 \"$ut\" || exit 76; mv -f \"$ut\" \"$u\" || exit 77\n" ++
+            "exit {d}\n",
+        .{ arch_case, CHECK_UNSUPPORTED, remote_path, hash, hash, hash, artifact.hash.size, artifact.hash.size, hash, CHECK_MISSING },
         0,
     ) catch return null;
     defer allocator.free(check);
@@ -156,20 +196,21 @@ fn ensureUsing(
     }
     if (checked != CHECK_MISSING) return null;
 
-    const upload = std.fmt.allocPrintSentinel(
+    // Upload: the remote command is the staged uploader as one bare
+    // word (no shell has anything to parse; bare-word $HOME expands
+    // in every login shell), and stdin carries ONLY the raw binary —
+    // `head -c` reads the exact byte count, wc cross-checks it (head
+    // exits 0 on a truncated stream), sha256sum proves integrity
+    // before the atomic publish, and the --help probe proves the
+    // published file actually executes.
+    const upload_word = std.fmt.allocPrintSentinel(
         allocator,
-        "umask 077; case \"$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" in {s}) ;; *) exit {d};; esac; " ++
-            "command -v sha256sum >/dev/null 2>&1 || exit 67; " ++
-            "d=\"$HOME/.cache/sketerm/mux\"; p=\"{s}\"; mkdir -p \"$d\" || exit 68; chmod 700 \"$HOME/.cache/sketerm\" \"$d\" 2>/dev/null || true; " ++
-            "t=\"$p.part.$$\"; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat >\"$t\" || exit 69; " ++
-            "[ \"$(wc -c <\"$t\")\" = \"{d}\" ] || exit 70; h=$(sha256sum \"$t\") || exit 71; " ++
-            "[ \"${{h%% *}}\" = \"{s}\" ] || exit 72; chmod 700 \"$t\" || exit 73; mv -f \"$t\" \"$p\" || exit 74; " ++
-            "\"$p\" --help >/dev/null 2>&1 || exit 75; trap - EXIT",
-        .{ arch_case, CHECK_UNSUPPORTED, remote_path, artifact.hash.size, hash },
+        "$HOME/.cache/sketerm/mux/.upload-{s}",
+        .{hash},
         0,
     ) catch return null;
-    defer allocator.free(upload);
-    if (runner.run(runner.ctx, ssh_bin, host, upload, artifact.path) != 0) return null;
+    defer allocator.free(upload_word);
+    if (runner.run(runner.ctx, ssh_bin, host, upload_word, artifact.path) != 0) return null;
     keep_remote_path = true;
     return .{ .allocator = allocator, .path = remote_path };
 }
@@ -198,6 +239,31 @@ fn reapChild(pid: c.pid_t, deadline: i64) ?u8 {
         }
     }
     return null;
+}
+
+/// Bounded non-blocking write of the whole buffer; false on timeout,
+/// EPIPE (remote script exited early — its exit code is the story),
+/// or any other write failure.
+fn sendBytes(fd: c_int, bytes: []const u8, deadline: i64) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        if (monotonicMs() >= deadline) return false;
+        const wrote = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+            c.send(fd, bytes.ptr + off, bytes.len - off, c.MSG_NOSIGNAL)
+        else
+            c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (wrote > 0) {
+            off += @intCast(wrote);
+        } else if (wrote < 0 and std.posix.errno(wrote) == .INTR) {
+            continue;
+        } else if (wrote < 0 and std.posix.errno(wrote) == .AGAIN) {
+            var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+            _ = c.poll(&pfd, 1, 100);
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, command: [:0]const u8, input_path: ?[]const u8) u8 {
@@ -234,8 +300,13 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
         argv[n + 5] = "ControlPersist=120";
         n += 6;
     }
+    // Either way the remote command is a SINGLE word — nothing for any
+    // login shell dialect to misparse. Without a payload it is `sh`
+    // and `command` is the script ridden in on stdin; with a payload
+    // it is `command` itself (the staged uploader's bare-word path)
+    // and stdin carries only the raw bytes.
     argv[n] = host_z.ptr;
-    argv[n + 1] = command.ptr;
+    argv[n + 1] = if (input_path == null) "sh" else command.ptr;
 
     const pid = c.fork();
     if (pid < 0) {
@@ -262,8 +333,12 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
     }
     const flags = c.fcntl(pair[0], c.F_GETFL);
     if (flags >= 0) _ = c.fcntl(pair[0], c.F_SETFL, flags | c.O_NONBLOCK);
-    var sent_ok = true;
-    if (input_path) |path| {
+    // Script mode: the script IS the stdin. Payload mode: stdin is
+    // exclusively the raw bytes — script text and payload must never
+    // share a stream (dash buffers stdin scripts and would eat the
+    // payload prefix).
+    var sent_ok = if (input_path == null) sendBytes(pair[0], command, deadline) else true;
+    if (sent_ok) if (input_path) |path| {
         var path_buf: [4096]u8 = undefined;
         const path_z: ?[*:0]const u8 = pathZ(&path_buf, path) catch blk: {
             sent_ok = false;
@@ -278,41 +353,22 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
             _ = c.close(fd);
         } else {
             var buf: [64 * 1024]u8 = undefined;
-            outer: while (true) {
+            while (true) {
                 const read_n = c.read(fd, &buf, buf.len);
                 if (read_n < 0) {
                     if (std.posix.errno(read_n) == .INTR) continue;
                     sent_ok = false;
                     break;
                 }
-                const got: usize = @intCast(read_n);
-                var off: usize = 0;
-                while (off < got) {
-                    if (monotonicMs() >= deadline) {
-                        sent_ok = false;
-                        break :outer;
-                    }
-                    const wrote = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
-                        c.send(pair[0], &buf[off], got - off, c.MSG_NOSIGNAL)
-                    else
-                        c.write(pair[0], &buf[off], got - off);
-                    if (wrote > 0) {
-                        off += @intCast(wrote);
-                    } else if (wrote < 0 and std.posix.errno(wrote) == .INTR) {
-                        continue;
-                    } else if (wrote < 0 and std.posix.errno(wrote) == .AGAIN) {
-                        var pfd = c.struct_pollfd{ .fd = pair[0], .events = c.POLLOUT, .revents = 0 };
-                        _ = c.poll(&pfd, 1, 100);
-                    } else {
-                        sent_ok = false;
-                        break :outer;
-                    }
+                if (read_n == 0) break;
+                if (!sendBytes(pair[0], buf[0..@intCast(read_n)], deadline)) {
+                    sent_ok = false;
+                    break;
                 }
-                if (got == 0) break;
             }
             _ = c.close(fd);
         }
-    }
+    };
     _ = c.shutdown(pair[0], c.SHUT_WR);
     _ = c.close(pair[0]);
     const status = reapChild(pid, deadline) orelse return 255;
@@ -323,10 +379,24 @@ const FakeRunner = struct {
     statuses: [2]u8,
     calls: usize = 0,
     uploads: usize = 0,
+    upload_script_ok: bool = false,
+    check_script_ok: bool = false,
 
-    fn run(raw: ?*anyopaque, _: [*:0]const u8, _: []const u8, _: [:0]const u8, input: ?[]const u8) u8 {
+    fn run(raw: ?*anyopaque, _: [*:0]const u8, _: []const u8, command: [:0]const u8, input: ?[]const u8) u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(raw.?));
-        if (input != null) self.uploads += 1;
+        if (input != null) {
+            self.uploads += 1;
+            // The upload command must be ONE bare word (dialect-proof)
+            // naming the staged uploader — never script text, which
+            // would put the payload behind a shell's stdin buffering.
+            self.upload_script_ok = std.mem.indexOf(u8, command, ".upload-") != null and
+                std.mem.indexOfAny(u8, command, " \t\n") == null;
+        } else {
+            // The check script stages an uploader with an exact-count
+            // payload read, and ends in a newline.
+            self.check_script_ok = std.mem.indexOf(u8, command, "head -c 1234 ") != null and
+                command.len > 0 and command[command.len - 1] == '\n';
+        }
         const status = self.statuses[@min(self.calls, self.statuses.len - 1)];
         self.calls += 1;
         return status;
@@ -356,6 +426,76 @@ test "deployment uploads an absent or stale mux" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
+    try std.testing.expect(fake.upload_script_ok);
+    try std.testing.expect(fake.check_script_ok);
+}
+
+test "check and upload run through a real sh with the payload on stdin" {
+    // Full-fidelity dialect proof: the REAL runSshCommand streams the
+    // REAL scripts + payload into a real `sh` (the fake ssh ignores
+    // every argument — a login shell has nothing to parse when the
+    // remote command is one word), against an isolated $HOME.
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const arch: Arch = switch (builtin.cpu.arch) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        else => return error.SkipZigTest,
+    };
+
+    var home_buf: [128:0]u8 = undefined;
+    const home = std.fmt.bufPrintZ(&home_buf, "/tmp/sketerm-deploy-home-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.mkdir(home.ptr, 0o700);
+    var ssh_buf: [160:0]u8 = undefined;
+    const ssh = std.fmt.bufPrintZ(&ssh_buf, "{s}/fake-ssh", .{home}) catch unreachable;
+    var script_buf: [320:0]u8 = undefined;
+    const script = std.fmt.bufPrintZ(
+        &script_buf,
+        "#!/bin/sh\nHOME={s}; export HOME\nfor a in \"$@\"; do cmd=\"$a\"; done\nexec sh -c \"$cmd\"\n",
+        .{home},
+    ) catch unreachable;
+    {
+        const f = c.fopen(ssh.ptr, "w") orelse return error.SkipZigTest;
+        _ = c.fputs(script.ptr, f);
+        _ = c.fclose(f);
+        if (c.chmod(ssh.ptr, 0o755) != 0) return error.SkipZigTest;
+    }
+
+    // /bin/true is a real executable whose `--help` probe exits 0, so
+    // the deployed file passes the post-publish validation.
+    const hash = filehash.sha256File("/bin/true") orelse return error.SkipZigTest;
+    const artifact = Artifact{ .path = "/bin/true", .arch = arch, .hash = hash };
+
+    // Round 1: check misses and stages the uploader, upload streams
+    // the raw payload into it and publishes.
+    var first = ensureUsing(std.testing.allocator, "box", ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+        return error.TestUnexpectedResult;
+    first.deinit();
+    var deployed_buf: [256:0]u8 = undefined;
+    const deployed = std.fmt.bufPrintZ(
+        &deployed_buf,
+        "{s}/.cache/sketerm/mux/sketerm-mux-{s}",
+        .{ home, &hash.hex },
+    ) catch unreachable;
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.stat(deployed.ptr, &st) == 0);
+    try std.testing.expectEqual(@as(u64, hash.size), @as(u64, @intCast(st.st_size)));
+    try std.testing.expect(st.st_mode & 0o777 == 0o700);
+
+    // Round 2: the check recognizes the deployed copy — no re-upload
+    // (proven by mtime staying put would race; size+success suffices).
+    var second = ensureUsing(std.testing.allocator, "box", ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+        return error.TestUnexpectedResult;
+    second.deinit();
+
+    // Wrong-architecture artifact is refused by the remote case guard
+    // before any payload flows.
+    const other: Arch = if (arch == .x86_64) .aarch64 else .x86_64;
+    const mismatched = Artifact{ .path = "/bin/true", .arch = other, .hash = hash };
+    try std.testing.expect(ensureUsing(std.testing.allocator, "box", ssh.ptr, mismatched, .{ .run = runSshCommand }) == null);
+
+    _ = c.unlink(deployed.ptr);
+    _ = c.unlink(ssh.ptr);
 }
 
 test "deployment leaves unsupported hosts and failed checks untouched" {
