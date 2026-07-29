@@ -97,8 +97,26 @@ mux_udp_port_range = 60000:61000
 The remote bootstrap then binds the first free port in that range
 (`sketerm-mux --udp-listen --udp-port 60000:61000`). If the UDP
 path is blocked, automatic mode continues over SSH (CLI commands also
-report the fallback). Forced UDP prints a warning after 5 s and gives up
-after 15 s.
+report the fallback, with the reason). Forced UDP prints a warning
+after 5 s and gives up after 15 s.
+
+### Where UDP goes
+
+The UDP leg targets whatever `ssh -G <host>` resolves the spec to, not
+the string you typed, so `Host` aliases, `HostName` overrides and
+`Match` blocks in `~/.ssh/config` are honoured — `sketerm ssh vastai`
+sends its datagrams to the alias's real `HostName`. A host reached
+through `ProxyJump`/`ProxyCommand` has no directly reachable address,
+so UDP is skipped immediately and the connection goes over SSH rather
+than burning the probe timeout.
+
+Containers behind NAT port-mapping (Vast.ai, Docker `-p`, most cloud
+sandboxes) need the pinned range above **and** an identity mapping:
+the bootstrap announces the port it bound *inside* the container, and
+nothing tells the client that the outside world reaches it on a
+different number. Map the range straight through (`-p 60000-61000:60000-61000/udp`)
+or UDP will announce a port that is not reachable and quietly fall
+back to SSH.
 
 Typing feel on high-latency links: printable keystrokes are echoed
 predictively (underlined until the server confirms), mosh-style.
