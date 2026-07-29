@@ -25,6 +25,10 @@ const platform = @import("../util/platform.zig");
 pub const READY_TIMEOUT_MS: i64 = 20_000;
 /// Readiness poll interval.
 pub const POLL_MS: c.guint = 150;
+/// How long a failed mount stays failed before an open may try it
+/// again. A host that was rebooting or unreachable comes back; without
+/// this, one failure meant "download forever" until app restart.
+pub const RETRY_COOLDOWN_MS: i64 = 30_000;
 
 pub const State = enum {
     /// Mounted and usable now.
@@ -46,6 +50,8 @@ const Mount = struct {
     state: State = .starting,
     /// Monotonic ms when the child was spawned, for the ready timeout.
     started_ms: i64 = 0,
+    /// Monotonic ms when it became unavailable, for the retry cooldown.
+    failed_ms: i64 = 0,
     /// Why it is unavailable, for the status line (static text).
     reason: []const u8 = "",
 };
@@ -53,6 +59,9 @@ const Mount = struct {
 var g_allocator: ?std.mem.Allocator = null;
 var g_mounts: std.ArrayList(*Mount) = .empty;
 var g_swept: bool = false;
+/// Set by `shutdownAll`: a waiter tick that fires during application
+/// teardown must not spawn a fresh mount into a dying process.
+var g_shutdown: bool = false;
 
 fn nowMs() i64 {
     var ts: c.struct_timespec = undefined;
@@ -218,8 +227,12 @@ fn onMountExited(pid: c.GPid, status: c_int, user: ?*anyopaque) callconv(.c) voi
     m.pid = 0;
     // One-shot: it has fired, so teardown must not remove it again.
     m.watch = 0;
-    if (m.state != .ready) m.reason = "the mount helper exited (is fuse3 installed?)";
+    m.reason = if (m.state != .ready)
+        "the mount helper exited (is fuse3 installed?)"
+    else
+        "the mount ended";
     m.state = .unavailable;
+    m.failed_ms = nowMs();
 }
 
 /// Where `host` is mounted, mounting it if necessary.
@@ -228,6 +241,7 @@ fn onMountExited(pid: c.GPid, status: c_int, user: ?*anyopaque) callconv(.c) voi
 /// and the caller either waits with `whenReady` or falls back.
 pub fn ensure(allocator: std.mem.Allocator, host: []const u8) State {
     if (comptime !platform.is_linux) return .unavailable;
+    if (g_shutdown) return .unavailable;
     g_allocator = allocator;
     if (!g_swept) {
         g_swept = true;
@@ -240,10 +254,26 @@ pub fn ensure(allocator: std.mem.Allocator, host: []const u8) State {
         if (m.state == .ready and m.pid == 0) {
             unmount(m.point);
             m.state = .unavailable;
+            m.failed_ms = nowMs();
+            if (m.reason.len == 0) m.reason = "the mount ended";
         }
         if (m.state == .starting and nowMs() - m.started_ms > READY_TIMEOUT_MS) {
             m.reason = "the mount did not come up in time";
             m.state = .unavailable;
+            m.failed_ms = nowMs();
+        }
+        // A failure is a state, not a verdict: after a cooldown the
+        // next open tries the mount again -- a host that was down comes
+        // back, and one bad moment must not mean downloading forever.
+        if (m.state == .unavailable and m.pid == 0 and nowMs() - m.failed_ms > RETRY_COOLDOWN_MS) {
+            if (mkdirp(m.point) and spawn(m)) {
+                m.state = .starting;
+                m.started_ms = nowMs();
+                m.reason = "";
+                if (isMounted(m.point)) m.state = .ready;
+            } else {
+                m.failed_ms = nowMs();
+            }
         }
         return m.state;
     }
@@ -277,6 +307,7 @@ pub fn ensure(allocator: std.mem.Allocator, host: []const u8) State {
     };
     if (!spawn(m)) {
         m.state = .unavailable;
+        m.failed_ms = nowMs();
         return .unavailable;
     }
     // A local daemon can be up before the first poll tick.
@@ -353,6 +384,7 @@ pub fn whenReady(
 /// application's shutdown handler; a crash instead leaves the sweep
 /// above to clean up on the next start.
 pub fn shutdownAll() void {
+    g_shutdown = true;
     const allocator = g_allocator orelse return;
     for (g_mounts.items) |m| {
         if (m.watch != 0) {
