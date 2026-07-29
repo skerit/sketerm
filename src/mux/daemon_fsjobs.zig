@@ -780,6 +780,11 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         };
         fsJobEmit(self, job, "error");
     } else {
+        // A running job may report WHY it is not moving (a cross-host
+        // copy reconnecting to a host that dropped). Sticky like the
+        // in-flight path, so the panel shows the reason for the stall
+        // instead of a row that silently stops advancing.
+        if (e.message.len > 0) job.setMessage(e.message);
         fsJobEmit(self, job, "progress");
         journalFsJob(self, job);
     }
