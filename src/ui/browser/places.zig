@@ -17,6 +17,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
 const classicmenu = @import("classicmenu.zig");
 const iconload = @import("iconload.zig");
+const sidewidgets = @import("sidewidgets.zig");
 
 /// Heap ctx on each places row (freed with the row).
 pub const PlaceCtx = struct {
@@ -26,7 +27,7 @@ pub const PlaceCtx = struct {
     spec: []u8,
     is_bookmark: bool,
 
-    fn free(user: ?*anyopaque) callconv(.c) void {
+    pub fn free(user: ?*anyopaque) callconv(.c) void {
         const p: *PlaceCtx = @ptrCast(@alignCast(user.?));
         p.allocator.free(p.spec);
         p.allocator.destroy(p);
@@ -74,6 +75,106 @@ pub fn hostSectionTitle(host: []const u8, buf: []u8) []const u8 {
     const text = std.fmt.bufPrint(buf, "{s} Places", .{name}) catch return "Remote Places";
     if (text.len > 0) text[0] = std.ascii.toUpper(text[0]);
     return text;
+}
+
+/// True when the user hid section `key` from the sidebar entirely
+/// (distinct from folding: a hidden section has no header at all).
+pub fn sectionHidden(self: *BrowserView, key: []const u8) bool {
+    for (self.hidden_sections.items) |k| {
+        if (std.mem.eql(u8, k, key)) return true;
+    }
+    return false;
+}
+
+/// Flip section `key` between hidden and shown, persist, re-render.
+pub fn toggleSectionHidden(self: *BrowserView, key: []const u8) void {
+    for (self.hidden_sections.items, 0..) |k, i| {
+        if (!std.mem.eql(u8, k, key)) continue;
+        self.allocator.free(k);
+        _ = self.hidden_sections.orderedRemove(i);
+        self.savePlaces();
+        self.renderPlaces();
+        return;
+    }
+    const owned = self.allocator.dupe(u8, key) catch return;
+    self.hidden_sections.append(self.allocator, owned) catch {
+        self.allocator.free(owned);
+        return;
+    };
+    self.savePlaces();
+    self.renderPlaces();
+}
+
+/// Every section key that currently exists, in DEFAULT order: the
+/// built-ins, then the user widget sections. Arena-allocated widget
+/// keys ("widgets:<name>").
+fn allSectionKeys(self: *BrowserView, arena: std.mem.Allocator) [][]const u8 {
+    const n = places_mod.builtin_sections.len + self.widgets.sections.items.len;
+    const keys = arena.alloc([]const u8, n) catch return &.{};
+    for (places_mod.builtin_sections, 0..) |def, i| keys[i] = def.key;
+    for (self.widgets.sections.items, 0..) |sec, i| {
+        keys[places_mod.builtin_sections.len + i] =
+            std.fmt.allocPrint(arena, "{s}{s}", .{ places_mod.WIDGET_KEY_PREFIX, sec.name }) catch "";
+    }
+    return keys;
+}
+
+/// Display title for a section key (widget sections show their name).
+pub fn sectionTitleForKey(key: []const u8) []const u8 {
+    for (places_mod.builtin_sections) |def| {
+        if (std.mem.eql(u8, def.key, key)) return def.title;
+    }
+    if (std.mem.startsWith(u8, key, places_mod.WIDGET_KEY_PREFIX))
+        return key[places_mod.WIDGET_KEY_PREFIX.len..];
+    return key;
+}
+
+/// The section KEY a header row's title belongs to. Built-ins win over
+/// a widget section that shadows their title.
+fn sectionKeyForTitle(self: *BrowserView, title: []const u8, buf: []u8) ?[]const u8 {
+    for (places_mod.builtin_sections) |def| {
+        if (std.mem.eql(u8, def.title, title)) return def.key;
+    }
+    // Host sections ("Archdev Places") all belong to the one
+    // "remote" slot.
+    if (std.mem.endsWith(u8, title, " Places")) return "remote";
+    if (self.widgets.sectionByName(title) != null)
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ places_mod.WIDGET_KEY_PREFIX, title }) catch null;
+    return null;
+}
+
+/// Move section `key` one slot up or down in the persisted order.
+/// The stored order is first normalized to the full current key list
+/// so a partial saved order moves predictably.
+pub fn moveSection(self: *BrowserView, key: []const u8, up: bool) void {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const all = allSectionKeys(self, a);
+    const saved = a.alloc([]const u8, self.section_order.items.len) catch return;
+    for (self.section_order.items, 0..) |s, i| saved[i] = s;
+    const ordered = places_mod.orderSections(a, saved, all) catch return;
+    const mut = a.dupe([]const u8, ordered) catch return;
+    var idx: ?usize = null;
+    for (mut, 0..) |k, i| {
+        if (std.mem.eql(u8, k, key)) idx = i;
+    }
+    const i = idx orelse return;
+    if (up) {
+        if (i == 0) return;
+        std.mem.swap([]const u8, &mut[i], &mut[i - 1]);
+    } else {
+        if (i + 1 >= mut.len) return;
+        std.mem.swap([]const u8, &mut[i], &mut[i + 1]);
+    }
+    for (self.section_order.items) |s| self.allocator.free(s);
+    self.section_order.clearRetainingCapacity();
+    for (mut) |k| {
+        const owned = self.allocator.dupe(u8, k) catch continue;
+        self.section_order.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+    self.savePlaces();
+    self.renderPlaces();
 }
 
 /// Fold a section open or shut and persist it. The caller re-renders:
@@ -247,101 +348,143 @@ pub fn renderPlaces(self: *BrowserView) void {
     while (c.gtk_list_box_get_row_at_index(self.places_list, 0)) |row| {
         c.gtk_list_box_remove(self.places_list, @ptrCast(row));
     }
-    // Always the LOCAL machine, whatever host the current tab shows:
-    // specs are "local:"-qualified so a click can never resolve
-    // against the remote tab's host.
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const all = allSectionKeys(self, a);
+    const saved = a.alloc([]const u8, self.section_order.items.len) catch return;
+    for (self.section_order.items, 0..) |s, i| saved[i] = s;
+    const ordered = places_mod.orderSections(a, saved, all) catch all;
+    for (ordered) |key| {
+        if (sectionHidden(self, key)) continue;
+        if (std.mem.eql(u8, key, "local")) {
+            renderLocalSection(self);
+        } else if (std.mem.eql(u8, key, "remote")) {
+            renderRemoteSection(self);
+        } else if (std.mem.eql(u8, key, "registers")) {
+            renderRegistersSection(self);
+        } else if (std.mem.eql(u8, key, "bookmarks")) {
+            renderBookmarksSection(self);
+        } else if (std.mem.eql(u8, key, "searches")) {
+            renderSearchesSection(self);
+        } else if (std.mem.eql(u8, key, "recent")) {
+            renderRecentSection(self);
+        } else if (std.mem.eql(u8, key, "devices")) {
+            renderDevicesSection(self);
+        } else if (std.mem.startsWith(u8, key, places_mod.WIDGET_KEY_PREFIX)) {
+            const name = key[places_mod.WIDGET_KEY_PREFIX.len..];
+            if (self.widgets.sectionByName(name)) |sec|
+                sidewidgets.renderSection(self, sec);
+        }
+    }
+}
+
+/// Always the LOCAL machine, whatever host the current tab shows:
+/// specs are "local:"-qualified so a click can never resolve against
+/// the remote tab's host.
+fn renderLocalSection(self: *BrowserView) void {
     self.placeHeader("Local Places");
-    if (!sectionCollapsed(self, "Local Places")) {
-        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
-        var home_spec_buf: [4200]u8 = undefined;
-        if (std.fmt.bufPrint(&home_spec_buf, "local:{s}", .{home})) |hs|
+    if (sectionCollapsed(self, "Local Places")) return;
+    const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
+    var home_spec_buf: [4200]u8 = undefined;
+    if (std.fmt.bufPrint(&home_spec_buf, "local:{s}", .{home})) |hs|
+        self.placeRow("user-home-symbolic", "Home", hs, false)
+    else |_|
+        self.placeRow("user-home-symbolic", "Home", home, false);
+    self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
+    var trash_buf: [4200]u8 = undefined;
+    if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+}
+
+/// Browsing another machine adds ITS places under its own name — the
+/// two systems are never conflated in one section.
+fn renderRemoteSection(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    const host = tab.hc.host orelse return;
+    var title_buf: [160]u8 = undefined;
+    var title_z: [160:0]u8 = undefined;
+    const title = hostSectionTitle(host, &title_buf);
+    const tn = @min(title.len, title_z.len - 1);
+    @memcpy(title_z[0..tn], title[0..tn]);
+    title_z[tn] = 0;
+    self.placeHeader(&title_z);
+    if (sectionCollapsed(self, title_z[0..tn])) return;
+    var spec_buf: [4600]u8 = undefined;
+    if (tab.hc.home_dir) |hd| {
+        if (std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ host, hd })) |hs|
             self.placeRow("user-home-symbolic", "Home", hs, false)
-        else |_|
-            self.placeRow("user-home-symbolic", "Home", home, false);
-        self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
-        var trash_buf: [4200]u8 = undefined;
-        if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+        else |_| {}
     }
-    // Browsing another machine adds ITS places right below, under its
-    // own name — the two systems are never conflated in one section.
-    if (self.currentTab()) |tab| {
-        if (tab.hc.host) |host| {
-            var title_buf: [160]u8 = undefined;
-            var title_z: [160:0]u8 = undefined;
-            const title = hostSectionTitle(host, &title_buf);
-            const tn = @min(title.len, title_z.len - 1);
-            @memcpy(title_z[0..tn], title[0..tn]);
-            title_z[tn] = 0;
-            self.placeHeader(&title_z);
-            if (!sectionCollapsed(self, title_z[0..tn])) {
-                var spec_buf: [4600]u8 = undefined;
-                if (tab.hc.home_dir) |hd| {
-                    if (std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ host, hd })) |hs|
-                        self.placeRow("user-home-symbolic", "Home", hs, false)
-                    else |_| {}
-                }
-                if (std.fmt.bufPrint(&spec_buf, "{s}:/", .{host})) |rs|
-                    self.placeRow("drive-harddisk-symbolic", "File System", rs, false)
-                else |_| {}
-            }
-        }
-    }
+    if (std.fmt.bufPrint(&spec_buf, "{s}:/", .{host})) |rs|
+        self.placeRow("drive-harddisk-symbolic", "File System", rs, false)
+    else |_| {}
+}
+
+fn renderRegistersSection(self: *BrowserView) void {
     const store = self.regStore();
-    if (store.count() > 0) {
-        self.placeHeader("Registers");
-        var ri: usize = if (sectionCollapsed(self, "Registers")) store.count() else 0;
-        while (ri < store.count()) : (ri += 1) {
-            const name = store.nameAt(ri);
-            var lbl: [160]u8 = undefined;
-            const ltxt = std.fmt.bufPrint(&lbl, "{s} ({d})", .{ name, store.sizeOf(name) }) catch name;
-            var spec_buf: [80]u8 = undefined;
-            const rspec = std.fmt.bufPrint(&spec_buf, "register:{s}", .{name}) catch continue;
-            self.placeRow("folder-saved-search-symbolic", ltxt, rspec, false);
-        }
+    if (store.count() == 0) return;
+    self.placeHeader("Registers");
+    var ri: usize = if (sectionCollapsed(self, "Registers")) store.count() else 0;
+    while (ri < store.count()) : (ri += 1) {
+        const name = store.nameAt(ri);
+        var lbl: [160]u8 = undefined;
+        const ltxt = std.fmt.bufPrint(&lbl, "{s} ({d})", .{ name, store.sizeOf(name) }) catch name;
+        var spec_buf: [80]u8 = undefined;
+        const rspec = std.fmt.bufPrint(&spec_buf, "register:{s}", .{name}) catch continue;
+        self.placeRow("folder-saved-search-symbolic", ltxt, rspec, false);
     }
-    if (self.bookmarks.items.len > 0) {
-        self.placeHeader("Bookmarks");
-        if (!sectionCollapsed(self, "Bookmarks")) for (self.bookmarks.items) |b| {
-            self.placeRow("starred-symbolic", std.fs.path.basename(b), b, true);
-        };
+}
+
+fn renderBookmarksSection(self: *BrowserView) void {
+    if (self.bookmarks.items.len == 0) return;
+    self.placeHeader("Bookmarks");
+    if (sectionCollapsed(self, "Bookmarks")) return;
+    for (self.bookmarks.items, 0..) |b, i| {
+        const label = bookmarkLabelAt(self, i) orelse std.fs.path.basename(b);
+        self.placeRow("starred-symbolic", label, b, true);
     }
-    if (self.saved_searches.items.len > 0) {
-        self.placeHeader("Saved Queries");
-        if (!sectionCollapsed(self, "Saved Queries")) for (self.saved_searches.items, 0..) |sq, i| {
-            // A saved query is durable, not a stored mode: what it is
-            // follows from its own text, resolved here so the label
-            // and the run can never disagree.
-            const q = query_mod.parse(sq.pattern, sq.content);
-            // Kind first: the row ellipsizes in the MIDDLE, so what a
-            // query is has to sit where the ellipsis cannot eat it.
-            var lbl: [300]u8 = undefined;
-            const ltxt = std.fmt.bufPrint(&lbl, "[{s}] {s} in {s}", .{
-                if (q) |v| v.kindLabel() else "empty",
-                sq.pattern,
-                sq.spec,
-            }) catch sq.pattern;
-            // Encode the index as "search:<i>" — rows resolve it
-            // at click time so edits do not dangle.
-            var spec_buf: [32]u8 = undefined;
-            const sspec = std.fmt.bufPrint(&spec_buf, "search:{d}", .{i}) catch continue;
-            const icon: [*:0]const u8 = if (q != null and q.?.live())
-                "folder-saved-search-symbolic"
-            else
-                "system-search-symbolic";
-            self.placeRow(icon, ltxt, sspec, true);
-        };
+}
+
+fn renderSearchesSection(self: *BrowserView) void {
+    if (self.saved_searches.items.len == 0) return;
+    self.placeHeader("Saved Queries");
+    if (sectionCollapsed(self, "Saved Queries")) return;
+    for (self.saved_searches.items, 0..) |sq, i| {
+        // A saved query is durable, not a stored mode: what it is
+        // follows from its own text, resolved here so the label
+        // and the run can never disagree.
+        const q = query_mod.parse(sq.pattern, sq.content);
+        // Kind first: the row ellipsizes in the MIDDLE, so what a
+        // query is has to sit where the ellipsis cannot eat it.
+        var lbl: [300]u8 = undefined;
+        const ltxt = std.fmt.bufPrint(&lbl, "[{s}] {s} in {s}", .{
+            if (q) |v| v.kindLabel() else "empty",
+            sq.pattern,
+            sq.spec,
+        }) catch sq.pattern;
+        // Encode the index as "search:<i>" — rows resolve it
+        // at click time so edits do not dangle.
+        var spec_buf: [32]u8 = undefined;
+        const sspec = std.fmt.bufPrint(&spec_buf, "search:{d}", .{i}) catch continue;
+        const icon: [*:0]const u8 = if (q != null and q.?.live())
+            "folder-saved-search-symbolic"
+        else
+            "system-search-symbolic";
+        self.placeRow(icon, ltxt, sspec, true);
     }
-    if (self.recent.items.len > 0) {
-        self.placeHeader("Recent");
-        if (!sectionCollapsed(self, "Recent")) for (self.recent.items) |r| {
-            recentRow(self, r);
-        };
-    }
+}
+
+fn renderRecentSection(self: *BrowserView) void {
+    if (self.recent.items.len == 0) return;
+    self.placeHeader("Recent");
+    if (sectionCollapsed(self, "Recent")) return;
+    for (self.recent.items) |r| recentRow(self, r);
+}
+
+/// Devices: real block-device and network mounts, from /proc/mounts.
+fn renderDevicesSection(self: *BrowserView) void {
     const devices_folded = sectionCollapsed(self, "Devices");
-    // Devices: real block-device and network mounts.
-    const f = c.fopen("/proc/mounts", "rb") orelse {
-        return;
-    };
+    const f = c.fopen("/proc/mounts", "rb") orelse return;
     var buf: [32 * 1024]u8 = undefined;
     const nread = c.fread(&buf, 1, buf.len, f);
     _ = c.fclose(f);
@@ -401,13 +544,31 @@ fn isRecentSpec(self: *BrowserView, spec: []const u8) bool {
 
 pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    const row = c.gtk_list_box_get_row_at_y(self.places_list, @intFromFloat(y)) orelse return;
-    const data = c.g_object_get_data(@ptrCast(row), "sketerm-place") orelse return;
-    const pctx: *PlaceCtx = @ptrCast(@alignCast(data));
-    if (pctx.spec.len == 0 or std.mem.startsWith(u8, pctx.spec, "section:")) return;
+    var spec: []const u8 = "";
+    var is_bookmark = false;
+    if (c.gtk_list_box_get_row_at_y(self.places_list, @intFromFloat(y))) |row| {
+        if (c.g_object_get_data(@ptrCast(row), "sketerm-place")) |data| {
+            const pctx: *PlaceCtx = @ptrCast(@alignCast(data));
+            spec = pctx.spec;
+            is_bookmark = pctx.is_bookmark;
+        }
+    }
+    if (std.mem.startsWith(u8, spec, "section:")) {
+        showSectionMenu(self, spec["section:".len..], x, y);
+        return;
+    }
+    if (std.mem.startsWith(u8, spec, "widget:")) {
+        showWidgetRowMenu(self, spec, x, y);
+        return;
+    }
+    if (spec.len == 0) {
+        // Empty sidebar space: the sidebar's own configuration menu.
+        showSidebarConfigMenu(self, x, y);
+        return;
+    }
 
     const ctx = self.allocator.create(PlacesMenuCtx) catch return;
-    const spec_owned = self.allocator.dupe(u8, pctx.spec) catch {
+    const spec_owned = self.allocator.dupe(u8, spec) catch {
         self.allocator.destroy(ctx);
         return;
     };
@@ -435,16 +596,342 @@ pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user:
         m.item("Open Here", &onPlacesMenuOpen, @ptrCast(ctx));
         m.item("Copy Location", &onPlacesMenuCopy, @ptrCast(ctx));
         const extra = m.section();
-        if (pctx.is_bookmark)
-            extra.item("Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx))
-        else if (isRecentSpec(self, ctx.spec))
+        if (is_bookmark) {
+            extra.item("Rename Bookmark…", &onBookmarkRenameItem, @ptrCast(ctx));
+            extra.item("Move Up", &onBookmarkMoveUp, @ptrCast(ctx));
+            extra.item("Move Down", &onBookmarkMoveDown, @ptrCast(ctx));
+            extra.item("Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx));
+        } else if (isRecentSpec(self, ctx.spec))
             extra.item("Remove from Recent", &onPlacesMenuRemove, @ptrCast(ctx))
         else
             extra.item("Add Bookmark", &onPlacesMenuBookmark, @ptrCast(ctx));
     }
+    appendSidebarConfigItems(self, root, m.section());
     const popover = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
     ctx.popover = popover;
     c.g_object_set_data_full(@ptrCast(popover), "sketerm-placesmenu", @ptrCast(ctx), @ptrCast(&PlacesMenuCtx.free));
+}
+
+// ── sidebar configuration menu (sections, widgets, bookmarks) ────
+
+/// Per-item ctx for section-level menu rows; owned by the menu Root.
+const SectionCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    key: []u8,
+
+    fn make(self: *BrowserView, root: *classicmenu.Root, key: []const u8) ?*SectionCtx {
+        const ctx = self.allocator.create(SectionCtx) catch return null;
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .key = self.allocator.dupe(u8, key) catch {
+                self.allocator.destroy(ctx);
+                return null;
+            },
+        };
+        root.own(&SectionCtx.free, @ptrCast(ctx));
+        return ctx;
+    }
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.free(ctx.key);
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+/// The "which sections are visible" checks + section/widget/bookmark
+/// housekeeping, appended to whatever menu is opening.
+fn appendSidebarConfigItems(self: *BrowserView, root: *classicmenu.Root, m: classicmenu.Menu) void {
+    const sub = m.submenu("Sidebar Sections");
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const all = allSectionKeys(self, a);
+    const saved = a.alloc([]const u8, self.section_order.items.len) catch return;
+    for (self.section_order.items, 0..) |s, i| saved[i] = s;
+    const ordered = places_mod.orderSections(a, saved, all) catch all;
+    for (ordered) |key| {
+        if (key.len == 0) continue;
+        const ctx = SectionCtx.make(self, root, key) orelse continue;
+        var tz: [160:0]u8 = undefined;
+        const title = sectionTitleForKey(key);
+        const tn = @min(title.len, tz.len - 1);
+        @memcpy(tz[0..tn], title[0..tn]);
+        tz[tn] = 0;
+        sub.check(&tz, !sectionHidden(self, key), &onSectionToggleHidden, @ptrCast(ctx));
+    }
+    const tail = m.section();
+    if (SectionCtx.make(self, root, "")) |ctx| {
+        tail.item("New Widget Section…", &onNewWidgetSection, @ptrCast(ctx));
+        tail.itemIcon("Bookmark Current Folder", .{ .name = "starred-symbolic" }, &onBookmarkHere, @ptrCast(ctx));
+    }
+}
+
+/// Right-click on a section HEADER: reorder + per-section verbs, plus
+/// the shared config items.
+fn showSectionMenu(self: *BrowserView, title: []const u8, x: f64, y: f64) void {
+    var kbuf: [180]u8 = undefined;
+    const key = sectionKeyForTitle(self, title, &kbuf);
+    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const m = root.top();
+    if (key) |k| {
+        if (SectionCtx.make(self, root, k)) |ctx| {
+            m.item("Move Section Up", &onSectionMoveUp, @ptrCast(ctx));
+            m.item("Move Section Down", &onSectionMoveDown, @ptrCast(ctx));
+            if (std.mem.startsWith(u8, k, places_mod.WIDGET_KEY_PREFIX)) {
+                const wsec = m.section();
+                wsec.item("Add Widget…", &onSectionAddWidget, @ptrCast(ctx));
+                wsec.item("Remove Section", &onSectionRemove, @ptrCast(ctx));
+            }
+        }
+    }
+    appendSidebarConfigItems(self, root, m.section());
+    _ = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
+}
+
+/// Right-click on empty sidebar space.
+fn showSidebarConfigMenu(self: *BrowserView, x: f64, y: f64) void {
+    const root = classicmenu.Root.create(self.allocator) orelse return;
+    appendSidebarConfigItems(self, root, root.top());
+    _ = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
+}
+
+fn onSectionToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    var kbuf: [180]u8 = undefined;
+    if (ctx.key.len > kbuf.len) return;
+    @memcpy(kbuf[0..ctx.key.len], ctx.key);
+    toggleSectionHidden(ctx.view, kbuf[0..ctx.key.len]);
+}
+
+fn onSectionMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    var kbuf: [180]u8 = undefined;
+    if (ctx.key.len > kbuf.len) return;
+    @memcpy(kbuf[0..ctx.key.len], ctx.key);
+    moveSection(ctx.view, kbuf[0..ctx.key.len], true);
+}
+
+fn onSectionMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    var kbuf: [180]u8 = undefined;
+    if (ctx.key.len > kbuf.len) return;
+    @memcpy(kbuf[0..ctx.key.len], ctx.key);
+    moveSection(ctx.view, kbuf[0..ctx.key.len], false);
+}
+
+fn widgetSectionIndex(self: *BrowserView, key: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, key, places_mod.WIDGET_KEY_PREFIX)) return null;
+    const name = key[places_mod.WIDGET_KEY_PREFIX.len..];
+    for (self.widgets.sections.items, 0..) |sec, i| {
+        if (std.mem.eql(u8, sec.name, name)) return i;
+    }
+    return null;
+}
+
+fn onSectionAddWidget(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const si = widgetSectionIndex(ctx.view, ctx.key) orelse return;
+    sidewidgets.openWidgetForm(ctx.view, si, null);
+}
+
+fn onSectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const si = widgetSectionIndex(ctx.view, ctx.key) orelse return;
+    sidewidgets.removeSection(ctx.view, si);
+}
+
+fn onNewWidgetSection(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    openNamePrompt(ctx.view, .new_section, 0, "New Widget Section", "section name", "");
+}
+
+fn onBookmarkHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    bookmarkCurrent(ctx.view);
+}
+
+// ── widget row menu ──────────────────────────────────────────────
+
+/// Parse "widget:<si>:<wi>".
+fn parseWidgetSpec(spec: []const u8) ?struct { si: usize, wi: usize } {
+    const rest = spec["widget:".len..];
+    const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const si = std.fmt.parseInt(usize, rest[0..colon], 10) catch return null;
+    const wi = std.fmt.parseInt(usize, rest[colon + 1 ..], 10) catch return null;
+    return .{ .si = si, .wi = wi };
+}
+
+fn showWidgetRowMenu(self: *BrowserView, spec: []const u8, x: f64, y: f64) void {
+    const ids = parseWidgetSpec(spec) orelse return;
+    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const m = root.top();
+    var sbuf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&sbuf, "{d}:{d}", .{ ids.si, ids.wi }) catch return;
+    if (SectionCtx.make(self, root, key)) |ctx| {
+        m.item("Edit Widget…", &onWidgetEdit, @ptrCast(ctx));
+        m.item("Move Up", &onWidgetMoveUp, @ptrCast(ctx));
+        m.item("Move Down", &onWidgetMoveDown, @ptrCast(ctx));
+        m.item("Remove Widget", &onWidgetRemove, @ptrCast(ctx));
+    }
+    appendSidebarConfigItems(self, root, m.section());
+    _ = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
+}
+
+fn widgetCtxIds(ctx: *SectionCtx) ?struct { si: usize, wi: usize } {
+    const colon = std.mem.indexOfScalar(u8, ctx.key, ':') orelse return null;
+    const si = std.fmt.parseInt(usize, ctx.key[0..colon], 10) catch return null;
+    const wi = std.fmt.parseInt(usize, ctx.key[colon + 1 ..], 10) catch return null;
+    return .{ .si = si, .wi = wi };
+}
+
+fn onWidgetEdit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ids = widgetCtxIds(ctx) orelse return;
+    sidewidgets.openWidgetForm(ctx.view, ids.si, ids.wi);
+}
+
+fn onWidgetRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ids = widgetCtxIds(ctx) orelse return;
+    sidewidgets.removeWidget(ctx.view, ids.si, ids.wi);
+}
+
+fn onWidgetMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ids = widgetCtxIds(ctx) orelse return;
+    sidewidgets.moveWidget(ctx.view, ids.si, ids.wi, true);
+}
+
+fn onWidgetMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ids = widgetCtxIds(ctx) orelse return;
+    sidewidgets.moveWidget(ctx.view, ids.si, ids.wi, false);
+}
+
+// ── bookmark row verbs ───────────────────────────────────────────
+
+fn onBookmarkRenameItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const i = bookmarkIndexOf(self, ctx.spec) orelse return;
+    const current = bookmarkLabelAt(self, i) orelse std.fs.path.basename(self.bookmarks.items[i]);
+    openNamePrompt(self, .rename_bookmark, i, "Rename Bookmark", "bookmark label", current);
+}
+
+fn onBookmarkMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const i = bookmarkIndexOf(ctx.view, ctx.spec) orelse return;
+    moveBookmark(ctx.view, i, true);
+}
+
+fn onBookmarkMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const i = bookmarkIndexOf(ctx.view, ctx.spec) orelse return;
+    moveBookmark(ctx.view, i, false);
+}
+
+// ── one-line name prompt (new section, bookmark label) ──────────
+
+const NamePromptCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    purpose: enum { new_section, rename_bookmark },
+    aux: usize,
+    window: *c.GtkWidget,
+    entry: *c.GtkWidget,
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+fn openNamePrompt(
+    self: *BrowserView,
+    purpose: @FieldType(NamePromptCtx, "purpose"),
+    aux: usize,
+    title: [*:0]const u8,
+    placeholder: [*:0]const u8,
+    initial: []const u8,
+) void {
+    const win = c.gtk_window_new();
+    c.gtk_window_set_title(@ptrCast(win), title);
+    c.gtk_window_set_modal(@ptrCast(win), 1);
+    c.gtk_window_set_default_size(@ptrCast(win), 360, -1);
+    if (c.gtk_widget_get_root(self.root_box)) |root|
+        c.gtk_window_set_transient_for(@ptrCast(win), @ptrCast(@alignCast(root)));
+    const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10);
+    c.gtk_widget_set_margin_start(vbox, 14);
+    c.gtk_widget_set_margin_end(vbox, 14);
+    c.gtk_widget_set_margin_top(vbox, 14);
+    c.gtk_widget_set_margin_bottom(vbox, 14);
+    const entry = c.gtk_entry_new();
+    c.gtk_entry_set_placeholder_text(@ptrCast(entry), placeholder);
+    if (initial.len > 0) {
+        var z: [512:0]u8 = undefined;
+        const n = @min(initial.len, z.len - 1);
+        @memcpy(z[0..n], initial[0..n]);
+        z[n] = 0;
+        c.gtk_editable_set_text(@ptrCast(entry), &z);
+        c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+    }
+    c.gtk_box_append(@ptrCast(vbox), entry);
+    const btnbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+    c.gtk_widget_set_halign(btnbox, c.GTK_ALIGN_END);
+    const cancel = c.gtk_button_new_with_label("Cancel");
+    const ok = c.gtk_button_new_with_label("OK");
+    c.gtk_widget_add_css_class(ok, "suggested-action");
+    c.gtk_box_append(@ptrCast(btnbox), cancel);
+    c.gtk_box_append(@ptrCast(btnbox), ok);
+    c.gtk_box_append(@ptrCast(vbox), btnbox);
+    const ctx = self.allocator.create(NamePromptCtx) catch {
+        c.gtk_window_destroy(@ptrCast(win));
+        return;
+    };
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .purpose = purpose,
+        .aux = aux,
+        .window = win,
+        .entry = entry,
+    };
+    c.g_object_set_data_full(@ptrCast(win), "sketerm-nameprompt", @ptrCast(ctx), @ptrCast(&NamePromptCtx.free));
+    _ = c.g_signal_connect_data(cancel, "clicked", @ptrCast(&onNamePromptCancel), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(ok, "clicked", @ptrCast(&onNamePromptOk), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onNamePromptActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_window_set_child(@ptrCast(win), vbox);
+    c.gtk_window_present(@ptrCast(win));
+    _ = c.gtk_widget_grab_focus(entry);
+}
+
+fn onNamePromptCancel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+    c.gtk_window_destroy(@ptrCast(ctx.window));
+}
+
+fn onNamePromptActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    onNamePromptOk(undefined, user);
+}
+
+fn onNamePromptOk(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const text = std.mem.span(c.gtk_editable_get_text(@ptrCast(ctx.entry)));
+    var nbuf: [512]u8 = undefined;
+    const n = @min(text.len, nbuf.len);
+    @memcpy(nbuf[0..n], text[0..n]);
+    const name = nbuf[0..n];
+    const purpose = ctx.purpose;
+    const aux = ctx.aux;
+    c.gtk_window_destroy(@ptrCast(ctx.window));
+    switch (purpose) {
+        .new_section => sidewidgets.addSection(self, name),
+        .rename_bookmark => setBookmarkLabel(self, aux, name),
+    }
 }
 
 /// Activate the row exactly as a click would (navigate here, run the
@@ -518,14 +1005,8 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             _ = self.saved_searches.orderedRemove(idx);
         }
     } else {
+        while (bookmarkIndexOf(self, ctx.spec)) |i| removeBookmarkAt(self, i);
         var i: usize = 0;
-        while (i < self.bookmarks.items.len) {
-            if (std.mem.eql(u8, self.bookmarks.items[i], ctx.spec)) {
-                self.allocator.free(self.bookmarks.items[i]);
-                _ = self.bookmarks.orderedRemove(i);
-            } else i += 1;
-        }
-        i = 0;
         while (i < self.recent.items.len) {
             if (std.mem.eql(u8, self.recent.items[i], ctx.spec)) {
                 self.allocator.free(self.recent.items[i]);
@@ -643,13 +1124,7 @@ pub fn onBookmarkRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             _ = self.saved_searches.orderedRemove(idx);
         }
     } else {
-        var i: usize = 0;
-        while (i < self.bookmarks.items.len) {
-            if (std.mem.eql(u8, self.bookmarks.items[i], ctx.spec)) {
-                self.allocator.free(self.bookmarks.items[i]);
-                _ = self.bookmarks.orderedRemove(i);
-            } else i += 1;
-        }
+        while (bookmarkIndexOf(self, ctx.spec)) |i| removeBookmarkAt(self, i);
     }
     self.savePlaces();
     self.renderPlaces();
@@ -661,6 +1136,16 @@ pub fn savePlaces(self: *BrowserView) void {
     const a = arena.allocator();
     const bm = a.alloc([]const u8, self.bookmarks.items.len) catch return;
     for (self.bookmarks.items, 0..) |b, i| bm[i] = b;
+    // Labels stay strictly parallel to the bookmarks; a short list
+    // pads out with "".
+    const bl = a.alloc([]const u8, self.bookmarks.items.len) catch return;
+    for (bm, 0..) |_, i| {
+        bl[i] = if (i < self.bookmark_labels.items.len) self.bookmark_labels.items[i] else "";
+    }
+    const hs = a.alloc([]const u8, self.hidden_sections.items.len) catch return;
+    for (self.hidden_sections.items, 0..) |k, i| hs[i] = k;
+    const so = a.alloc([]const u8, self.section_order.items.len) catch return;
+    for (self.section_order.items, 0..) |k, i| so[i] = k;
     const rc = a.alloc([]const u8, self.recent.items.len) catch return;
     for (self.recent.items, 0..) |r, i| rc[i] = r;
     const sq = a.alloc(places_mod.SavedSearch, self.saved_searches.items.len) catch return;
@@ -674,16 +1159,82 @@ pub fn savePlaces(self: *BrowserView) void {
     for (self.collapsed.items, 0..) |s, i| cl[i] = s;
     places_mod.save(self.allocator, .{
         .bookmarks = bm,
+        .bookmark_labels = bl,
         .recent = rc,
         .searches = sq,
         .collection = &.{},
         .collapsed = cl,
+        .hidden_sections = hs,
+        .section_order = so,
+        .widget_sections = self.widgets.toPlaces(a),
         .sidebar_px = self.sidebar_px,
         .sidebar_open = self.sidebar_open,
         .zebra = self.zebra,
         .preview_px = self.preview_px,
         .side_info = self.side_info,
     });
+}
+
+/// The custom label for bookmark `i`, or null when it should derive
+/// from the spec. The labels list is kept parallel to `bookmarks`;
+/// a short list (older places.json) reads as no-label.
+pub fn bookmarkLabelAt(self: *BrowserView, i: usize) ?[]const u8 {
+    if (i >= self.bookmark_labels.items.len) return null;
+    const l = self.bookmark_labels.items[i];
+    return if (l.len == 0) null else l;
+}
+
+fn bookmarkIndexOf(self: *BrowserView, spec: []const u8) ?usize {
+    for (self.bookmarks.items, 0..) |b, i| {
+        if (std.mem.eql(u8, b, spec)) return i;
+    }
+    return null;
+}
+
+/// Remove bookmark `i` together with its label slot.
+fn removeBookmarkAt(self: *BrowserView, i: usize) void {
+    if (i >= self.bookmarks.items.len) return;
+    self.allocator.free(self.bookmarks.items[i]);
+    _ = self.bookmarks.orderedRemove(i);
+    if (i < self.bookmark_labels.items.len) {
+        self.allocator.free(self.bookmark_labels.items[i]);
+        _ = self.bookmark_labels.orderedRemove(i);
+    }
+}
+
+/// Move bookmark `i` (and its label) one slot up or down.
+pub fn moveBookmark(self: *BrowserView, i: usize, up: bool) void {
+    const items = self.bookmarks.items;
+    const j = if (up) (if (i == 0) return else i - 1) else (if (i + 1 >= items.len) return else i + 1);
+    std.mem.swap([]u8, &items[i], &items[j]);
+    // Keep the labels list long enough to swap in step.
+    while (self.bookmark_labels.items.len <= @max(i, j)) {
+        const empty = self.allocator.dupe(u8, "") catch return;
+        self.bookmark_labels.append(self.allocator, empty) catch {
+            self.allocator.free(empty);
+            return;
+        };
+    }
+    std.mem.swap([]u8, &self.bookmark_labels.items[i], &self.bookmark_labels.items[j]);
+    self.savePlaces();
+    self.renderPlaces();
+}
+
+/// Set (or with "" clear) the custom label of bookmark `i`.
+pub fn setBookmarkLabel(self: *BrowserView, i: usize, label: []const u8) void {
+    if (i >= self.bookmarks.items.len) return;
+    while (self.bookmark_labels.items.len <= i) {
+        const empty = self.allocator.dupe(u8, "") catch return;
+        self.bookmark_labels.append(self.allocator, empty) catch {
+            self.allocator.free(empty);
+            return;
+        };
+    }
+    const owned = self.allocator.dupe(u8, label) catch return;
+    self.allocator.free(self.bookmark_labels.items[i]);
+    self.bookmark_labels.items[i] = owned;
+    self.savePlaces();
+    self.renderPlaces();
 }
 
 pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
@@ -695,9 +1246,22 @@ pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
         self.allocator.free(owned);
         return;
     };
+    const empty = self.allocator.dupe(u8, "") catch null;
+    if (empty) |e| self.bookmark_labels.append(self.allocator, e) catch self.allocator.free(e);
     self.savePlaces();
     if (self.places_on) self.renderPlaces();
     self.setStatusFmt("bookmarked: {s}", .{spec});
+}
+
+/// Bookmark the CURRENT tab's directory (menu + Ctrl+D).
+pub fn bookmarkCurrent(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    var buf: [4600]u8 = undefined;
+    const spec = if (tab.hc.host) |host|
+        std.fmt.bufPrint(&buf, "{s}:{s}", .{ host, tab.root.path }) catch return
+    else
+        std.fmt.bufPrint(&buf, "local:{s}", .{tab.root.path}) catch return;
+    addBookmark(self, spec);
 }
 
 pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {

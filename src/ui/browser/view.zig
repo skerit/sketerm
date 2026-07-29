@@ -237,10 +237,22 @@ pub const BrowserView = struct {
     /// cannot immediately re-trip the collapse (hysteresis).
     bar_reclaim: c_int = 0,
     bookmarks: std.ArrayList([]u8) = .empty,
+    /// Custom bookmark labels, parallel to `bookmarks` ("" = derive
+    /// from the spec).
+    bookmark_labels: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
     /// Sidebar sections the user folded shut, by header text (owned,
     /// persisted with places).
     collapsed: std.ArrayList([]u8) = .empty,
+    /// Sidebar sections hidden entirely, by section key (owned,
+    /// persisted with places).
+    hidden_sections: std.ArrayList([]u8) = .empty,
+    /// Preferred sidebar section order, by key (owned, persisted).
+    section_order: std.ArrayList([]u8) = .empty,
+    /// User sidebar widget sections (persisted with places) and their
+    /// live command/graph state.
+    widgets: @import("sidewidgets.zig").Store = .{},
+    widget_runs: std.ArrayList(*@import("sidewidgets.zig").Run) = .empty,
     /// Saved queries (persisted with places): the root spec plus the
     /// query text exactly as typed. A live query and a one-shot search
     /// are ONE concept here -- what a query text means is decided by
@@ -754,10 +766,25 @@ pub const BrowserView = struct {
         self.git_map = std.StringHashMap(u8).init(allocator);
         if (places_mod.load(allocator)) |parsed| {
             defer parsed.deinit();
-            for (parsed.value.bookmarks) |b| {
+            for (parsed.value.bookmarks, 0..) |b, i| {
                 const owned = allocator.dupe(u8, b) catch continue;
-                self.bookmarks.append(allocator, owned) catch allocator.free(owned);
+                self.bookmarks.append(allocator, owned) catch {
+                    allocator.free(owned);
+                    continue;
+                };
+                const lbl: []const u8 = if (i < parsed.value.bookmark_labels.len) parsed.value.bookmark_labels[i] else "";
+                const lowned = allocator.dupe(u8, lbl) catch continue;
+                self.bookmark_labels.append(allocator, lowned) catch allocator.free(lowned);
             }
+            for (parsed.value.hidden_sections) |k| {
+                const owned = allocator.dupe(u8, k) catch continue;
+                self.hidden_sections.append(allocator, owned) catch allocator.free(owned);
+            }
+            for (parsed.value.section_order) |k| {
+                const owned = allocator.dupe(u8, k) catch continue;
+                self.section_order.append(allocator, owned) catch allocator.free(owned);
+            }
+            self.widgets.loadFrom(allocator, parsed.value.widget_sections);
             for (parsed.value.recent) |r| {
                 var normalized_buf: [4300]u8 = undefined;
                 const normalized = places_mod.normalizeRecentSpec(r, &normalized_buf);
@@ -813,6 +840,13 @@ pub const BrowserView = struct {
         // no tab to focus at the time.
         self.focusListing();
         return self;
+    }
+
+    /// The Window whose widget tree hosts this browser face (null
+    /// before attach or after teardown).
+    pub fn ownerWindow(self: *BrowserView) ?*@import("../window.zig").Window {
+        const root = c.gtk_widget_get_root(self.root_box) orelse return null;
+        return @import("../remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
     }
 
     fn destroyCb(ctx: *anyopaque) void {
@@ -1155,10 +1189,19 @@ pub const BrowserView = struct {
         self.pending_history.deinit(self.allocator);
         for (self.bookmarks.items) |b| self.allocator.free(b);
         self.bookmarks.deinit(self.allocator);
+        for (self.bookmark_labels.items) |b| self.allocator.free(b);
+        self.bookmark_labels.deinit(self.allocator);
         for (self.recent.items) |r| self.allocator.free(r);
         self.recent.deinit(self.allocator);
         for (self.collapsed.items) |s| self.allocator.free(s);
         self.collapsed.deinit(self.allocator);
+        for (self.hidden_sections.items) |s| self.allocator.free(s);
+        self.hidden_sections.deinit(self.allocator);
+        for (self.section_order.items) |s| self.allocator.free(s);
+        self.section_order.deinit(self.allocator);
+        @import("sidewidgets.zig").resetRuns(self);
+        self.widget_runs.deinit(self.allocator);
+        self.widgets.deinit(self.allocator);
         for (self.saved_searches.items) |sq| sq.deinitOwned(self.allocator);
         self.saved_searches.deinit(self.allocator);
         if (self.last_search) |ls| ls.deinitOwned(self.allocator);
