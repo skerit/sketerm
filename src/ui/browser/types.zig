@@ -254,6 +254,10 @@ pub const Dir = struct {
     view_id: u32,
     entries: std.ArrayList(Entry) = .empty,
     loaded: bool = false,
+    /// A chunked listing is still arriving: rows are already visible
+    /// and grow per chunk, so the status line says "listing…" rather
+    /// than presenting the running count as final.
+    streaming: bool = false,
     gone: bool = false,
     /// Why the last listing of this directory was refused (owned), or
     /// null. It rides the DIR so it dies with it, and so every render

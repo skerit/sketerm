@@ -124,6 +124,9 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         }) catch ""
     else if (tab.vs.total == 0)
         std.fmt.bufPrint(&count_buf, "{s}{s}{s}", .{ format.listingStatus(state), note, qnote }) catch ""
+    else if (tab.root.streaming)
+        // Rows are landing chunk by chunk; the count is a floor.
+        std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}", .{ tab.vs.total, note, qnote }) catch ""
     else
         std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{ tab.vs.total, note, qnote }) catch "";
     var status_buf: [700]u8 = undefined;

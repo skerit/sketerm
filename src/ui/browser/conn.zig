@@ -509,37 +509,59 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         }
         p.dir.clearLoadError();
         if (rep.dev != 0) p.dir.dev = rep.dev;
-        for (rep.entries) |we| {
-            if (p.dir.own(we)) |e| p.staged.append(self.allocator, e) catch {};
+
+        if (p.op == .list) {
+            // Refresh of a live directory: the rows on screen stay
+            // valid, so chunks accumulate aside and swap in whole at
+            // the end — a half-swapped refresh would read as loss.
+            for (rep.entries) |we| {
+                if (p.dir.own(we)) |e| p.staged.append(self.allocator, e) catch {};
+            }
+            if (!rep.more) {
+                colview.invalidateBackingRefs(p.tab);
+                for (p.dir.entries.items) |*e| e.deinit(self.allocator);
+                p.dir.entries.deinit(self.allocator);
+                p.dir.entries = p.staged;
+                p.staged = .empty;
+                p.dir.loaded = true;
+                p.dir.sort();
+                if (rep.truncated) self.setStatus("listing truncated (very large directory)");
+                self.dropPending(i);
+                return true;
+            }
+            return false;
         }
-        if (!rep.more) {
-            if (p.navigation == null) colview.invalidateBackingRefs(p.tab);
-            for (p.dir.entries.items) |*e| e.deinit(self.allocator);
-            p.dir.entries.deinit(self.allocator);
-            p.dir.entries = p.staged;
-            p.staged = .empty;
-            p.dir.loaded = true;
-            p.dir.sort();
-            if (rep.truncated) self.setStatus("listing truncated (very large directory)");
-            if (p.navigation) |intent| {
-                if (p.navigation_generation != p.tab.navigation_generation) {
-                    self.dropPending(i);
-                    return false;
-                }
-                p.navigation = null;
-                _ = self.pending.swapRemove(i);
-                p.staged.deinit(self.allocator);
-                self.commitNavigation(p.tab, p.hc, p.dir, intent, rep.path);
-                self.allocator.destroy(p);
-                // commitNavigation just rendered the tab; reporting
-                // dirty here would rebuild the same listing a second
-                // time in the same drain.
+
+        // open_view (navigation, new tab, subdir expansion): STREAM.
+        // Rows land on screen as each chunk arrives instead of the
+        // tab sitting at "Listing..." until the run ends.
+        for (rep.entries) |we| {
+            if (p.dir.own(we)) |e| p.dir.entries.append(self.allocator, e) catch {};
+        }
+        p.dir.streaming = rep.more;
+        if (!rep.more) p.dir.loaded = true;
+        colview.invalidateBackingRefs(p.tab);
+        p.dir.sort();
+        if (rep.truncated and !rep.more) self.setStatus("listing truncated (very large directory)");
+        var rendered = false;
+        if (p.navigation) |intent| {
+            if (p.navigation_generation != p.tab.navigation_generation) {
+                self.dropPending(i);
                 return false;
             }
-            self.dropPending(i);
-            return true;
+            // The navigation lands on the FIRST chunk, Nemo-style:
+            // the user is in the folder immediately and the rest of
+            // the rows stream in. Ownership of the candidate dir
+            // moves to the tab here, so the eventual dropPending
+            // must not (and will not: navigation is nulled) free it.
+            p.navigation = null;
+            self.commitNavigation(p.tab, p.hc, p.dir, intent, rep.path);
+            rendered = true;
         }
-        return false;
+        if (!rep.more) self.dropPending(i);
+        // commitNavigation already rendered this tab; reporting dirty
+        // too would rebuild the same listing again in the same drain.
+        return !rendered;
     }
     // Job start reply?
     for (self.pending_jobs.items, 0..) |pj, i| {
