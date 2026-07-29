@@ -570,11 +570,13 @@ pub fn syncColumns(self: *BrowserView, tab: *BTab) void {
 /// Auto-width Name consumes spare room. Once the user gives Name an
 /// explicit width, the final visible column consumes it instead, so
 /// dragging Name narrower behaves like Nemo rather than snapping back.
+/// A Name width the viewport cannot honour counts as auto here too, or
+/// the leftover would go to a column that is already off-screen.
 fn applyExpandPolicy(tab: *BTab) void {
     const cols = c.gtk_column_view_get_columns(tab.colview);
     const n = c.g_list_model_get_n_items(cols);
     if (n == 0) return;
-    const expand_index: c.guint = if (tab.name_width > 0 and n > 1) n - 1 else 0;
+    const expand_index: c.guint = if (fittedNameWidth(tab) > 0 and n > 1) n - 1 else 0;
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
         const obj = c.g_list_model_get_item(cols, i) orelse continue;
@@ -583,9 +585,48 @@ fn applyExpandPolicy(tab: *BTab) void {
     }
 }
 
+/// Room the OTHER columns claim, in pixels. Their widths are all
+/// explicit (a dragged one or the type's default), so this is exact
+/// rather than a measurement.
+fn otherColumnsWidth(tab: *BTab) c_int {
+    const cols = c.gtk_column_view_get_columns(tab.colview);
+    const n = c.g_list_model_get_n_items(cols);
+    var total: c_int = 0;
+    var i: c.guint = 0;
+    while (i < n) : (i += 1) {
+        const obj = c.g_list_model_get_item(cols, i) orelse continue;
+        defer c.g_object_unref(obj);
+        const code = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(obj)), "sketerm-colref"));
+        const ref = colRefFromCode(code) orelse continue;
+        if (ref == .name) continue;
+        total += render_mod.columnWidthOf(tab, ref);
+    }
+    return total;
+}
+
+/// The Name width to actually apply: -1 means "auto, take what is
+/// left".
+///
+/// A dragged width is a PREFERENCE, never a floor. Splitting a pane
+/// halves the listing, and honouring a width measured in the old,
+/// wider pane left Name alone on screen with every other column behind
+/// a horizontal scrollbar. So the stored width is clamped to the room
+/// this viewport actually has; widening the pane again restores it,
+/// because the stored value is never rewritten from here.
+fn fittedNameWidth(tab: *BTab) c_int {
+    if (tab.name_width <= 0) return -1;
+    const avail = c.gtk_widget_get_width(tab.scroller);
+    // Before the first allocation there is nothing to fit against.
+    if (avail <= 0) return tab.name_width;
+    const room = avail - otherColumnsWidth(tab);
+    if (room < render_mod.MIN_NAME_WIDTH) return -1;
+    return @min(tab.name_width, room);
+}
+
 fn applyWidths(tab: *BTab) void {
     const cols = c.gtk_column_view_get_columns(tab.colview);
     const n = c.g_list_model_get_n_items(cols);
+    const name_want = fittedNameWidth(tab);
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
         const obj = c.g_list_model_get_item(cols, i) orelse continue;
@@ -595,12 +636,42 @@ fn applyWidths(tab: *BTab) void {
         const ref = colRefFromCode(code) orelse continue;
         const want: c_int = switch (ref) {
             // Auto: the expand column takes the leftover.
-            .name => if (tab.name_width > 0) tab.name_width else -1,
+            .name => name_want,
             else => render_mod.columnWidthOf(tab, ref),
         };
         if (c.gtk_column_view_column_get_fixed_width(col) != want)
             c.gtk_column_view_column_set_fixed_width(col, want);
     }
+}
+
+/// Re-fit after the listing viewport changed size. The scrolled
+/// window's horizontal adjustment is the resize signal GtkWidget does
+/// not offer: its page size IS the viewport width.
+pub fn installWidthFit(tab: *BTab) void {
+    const adj = c.gtk_scrolled_window_get_hadjustment(@ptrCast(@alignCast(tab.scroller))) orelse return;
+    _ = c.g_signal_connect_data(adj, "notify::page-size", @ptrCast(&onViewportWidthChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+}
+
+fn onViewportWidthChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    // Only an explicit Name width can ever need re-fitting; an auto
+    // one is GTK's own leftover and already correct.
+    if (tab.name_width <= 0 or tab.width_fit_src != 0) return;
+    tab.width_fit_src = c.g_idle_add(@ptrCast(&onWidthFitTick), @ptrCast(tab));
+}
+
+/// Deferred so the widths are read AFTER allocation settled. Applying
+/// a width feeds back into the adjustment, so the idle is one-shot and
+/// re-arms only when the target actually moved.
+fn onWidthFitTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    tab.width_fit_src = 0;
+    if (tab.view.widgets_dead) return 0;
+    tab.col_syncing = true;
+    defer tab.col_syncing = false;
+    applyWidths(tab);
+    applyExpandPolicy(tab);
+    return 0;
 }
 
 /// Point GTK's header arrows at the tab's current sort.

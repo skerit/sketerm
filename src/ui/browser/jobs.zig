@@ -8,6 +8,7 @@
 //! panel that displays all of this lives in jobpanel.zig.
 
 const std = @import("std");
+const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
 const file_transfers = @import("../file_transfers.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
@@ -16,6 +17,7 @@ const xferqueue = @import("../../filebrowser/xferqueue.zig");
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
+const CopyRetry = @import("types.zig").CopyRetry;
 const EditWatch = @import("types.zig").EditWatch;
 const HistoryDirection = @import("types.zig").HistoryDirection;
 const HostConn = @import("types.zig").HostConn;
@@ -283,32 +285,138 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
         item.destroy(self.allocator);
         return;
     }
+    // The queue item's owned strings move into the retry record, which
+    // outlives the job: a copy that dies with a staged partial must be
+    // resumable without asking the user to find the paths again.
+    const retry = self.allocator.create(CopyRetry) catch {
+        item.destroy(self.allocator);
+        return;
+    };
+    retry.* = .{
+        .coordinator = item.coordinator,
+        .src_hc = item.src_hc,
+        .dst_hc = item.dst_hc,
+        .src_path = item.src_path,
+        .dst_path = item.dst_path,
+        .label = item.label,
+        .dest_key = item.dest_key,
+    };
+    self.allocator.destroy(item);
+    submitRetry(self, retry);
+}
+
+/// Hand one cross-host copy to the coordinating daemon. Shared by the
+/// first submission and every resume, so a retry is the same request
+/// with the same idempotent `resume` flag -- never a second code path.
+fn submitRetry(self: *BrowserView, retry: *CopyRetry) void {
+    if (retry.coordinator.state != .ready) {
+        self.setStatusFmt("transfer dropped, coordinator offline: {s}", .{retry.label});
+        retry.destroy(self.allocator);
+        return;
+    }
     const req = self.nextReq();
     const pj = self.allocator.create(PendingJob) catch {
-        item.destroy(self.allocator);
+        retry.destroy(self.allocator);
         return;
     };
-    // The label moves into the job record; the paths do not outlive it.
-    pj.* = .{ .req = req, .hc = item.coordinator, .label = item.label, .dest_key = item.dest_key };
-    pj.paths.set(item.src_path, item.dst_path);
+    pj.* = .{
+        .req = req,
+        .hc = retry.coordinator,
+        .label = self.allocator.dupe(u8, retry.label) catch {
+            self.allocator.destroy(pj);
+            retry.destroy(self.allocator);
+            return;
+        },
+        .dest_key = retry.dest_key,
+        .retry = retry,
+    };
+    pj.paths.set(retry.src_path, retry.dst_path);
     self.pending_jobs.append(self.allocator, pj) catch {
+        self.allocator.free(pj.label);
         self.allocator.destroy(pj);
-        item.destroy(self.allocator);
+        retry.destroy(self.allocator);
         return;
     };
-    self.sendOp(item.coordinator, .{
+    self.sendOp(retry.coordinator, .{
         .req = req,
         .op = "cross_copy",
-        .path = item.src_path,
-        .to = item.dst_path,
-        .src_host = item.src_hc.host orelse "",
-        .dst_host = item.dst_hc.host orelse "",
+        .path = retry.src_path,
+        .to = retry.dst_path,
+        .src_host = retry.src_hc.host orelse "",
+        .dst_host = retry.dst_hc.host orelse "",
         .@"resume" = true,
     });
-    self.setStatusFmt("durable transfer started: {s}", .{item.label});
-    self.allocator.free(item.src_path);
-    self.allocator.free(item.dst_path);
-    self.allocator.destroy(item);
+    if (retry.attempts == 0) {
+        self.setStatusFmt("durable transfer started: {s}", .{retry.label});
+    } else {
+        self.setStatusFmt("resuming transfer (attempt {d}): {s}", .{ retry.attempts + 1, retry.label });
+    }
+}
+
+/// Automatic attempts a failed cross-host copy makes before the row
+/// settles as failed and waits for the user's Retry button. Each one
+/// resumes from the staged partial, so a retry costs a reconnect, not
+/// the bytes already moved.
+const COPY_AUTO_RETRIES: u8 = 3;
+/// Delay before an automatic resume: the daemon-side job already spent
+/// its own reconnect budget, so a host that answers again needs a
+/// moment, not another immediate hammering.
+const COPY_RETRY_DELAY_MS: c.guint = 5_000;
+
+/// Submit everything whose delay has elapsed. The records live on the
+/// view, so a pane torn down while a retry is pending drops them in
+/// `deinit` and the timer with them -- nothing outlives the face.
+fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.retry_timer = 0;
+    var pending = self.retry_pending;
+    self.retry_pending = .empty;
+    defer pending.deinit(self.allocator);
+    for (pending.items) |retry| submitRetry(self, retry);
+    self.renderJobs();
+    return 0;
+}
+
+/// Take over a failed copy's retry record and arm the next attempt.
+/// Returns false when the attempts are spent, which is what leaves the
+/// row failed with its reason and a Retry button.
+fn scheduleCopyRetry(self: *BrowserView, row: *JobRow) bool {
+    const retry = row.retry orelse return false;
+    if (retry.attempts >= COPY_AUTO_RETRIES) return false;
+    retry.attempts += 1;
+    // The row keeps a clone: the user can still press Retry after the
+    // automatic attempts are done, and the failed row is what carries
+    // that button.
+    row.retry = retry.clone(self.allocator);
+    self.retry_pending.append(self.allocator, retry) catch {
+        retry.destroy(self.allocator);
+        return false;
+    };
+    if (self.retry_timer == 0)
+        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    return true;
+}
+
+/// Drop everything waiting on the retry timer (view teardown).
+pub fn cancelPendingRetries(self: *BrowserView) void {
+    if (self.retry_timer != 0) {
+        _ = c.g_source_remove(self.retry_timer);
+        self.retry_timer = 0;
+    }
+    for (self.retry_pending.items) |retry| retry.destroy(self.allocator);
+    self.retry_pending.deinit(self.allocator);
+    self.retry_pending = .empty;
+}
+
+/// The jobs panel's Retry button: resume a copy the automatic attempts
+/// gave up on. The record is cloned so the failed row keeps its own
+/// (the user may press Retry again after a second failure).
+pub fn retryCopyJob(self: *BrowserView, row: *JobRow) void {
+    const retry = row.retry orelse return;
+    const fresh = retry.clone(self.allocator) orelse return;
+    fresh.attempts = 0;
+    submitRetry(self, fresh);
+    self.renderJobs();
 }
 
 /// Drop a queued cross-host copy that was never submitted.
@@ -684,6 +792,9 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
     if (e.files_done > row.files_done) row.files_done = e.files_done;
     if (e.files_total > row.files_total) row.files_total = e.files_total;
+    // The daemon repeats the last message on every event, and a
+    // RUNNING job uses it to say why it is not advancing.
+    if (e.message.len > 0) row.setMessage(e.message);
     if (std.mem.eql(u8, e.ev, "progress")) {
         row.done = e.done;
         row.total = e.total;
@@ -724,7 +835,16 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         }
     } else if (std.mem.eql(u8, e.ev, "error")) {
         row.state = .failed;
-        self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
+        // A cross-host copy resumes itself: the destination still holds
+        // the verified `.skpart`, so the next attempt continues from
+        // where the link died instead of restarting the transfer. Only
+        // once the automatic attempts are spent does the row settle as
+        // failed, with the reason and a Retry button.
+        if (scheduleCopyRetry(self, row)) {
+            self.setStatusFmt("transfer interrupted, resuming shortly: {s} ({s})", .{ row.label, e.message });
+        } else {
+            self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
+        }
         if (row.undo_op) |u| {
             row.undo_op = null;
             u.destroy(self.allocator);

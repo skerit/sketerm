@@ -563,6 +563,10 @@ pub const BTab = struct {
     col_syncing: bool = false,
     /// Debounce source for persisting dragged column widths.
     width_save_src: c.guint = 0,
+    /// Coalescing idle that re-fits the Name column after the listing
+    /// viewport changed size (colview.zig). Sizes are only valid after
+    /// allocation, so the work cannot run from the size signal itself.
+    width_fit_src: c.guint = 0,
     /// Press coords of a possible click-on-empty-space (colview.zig
     /// clears the selection when it releases without travel).
     empty_press: ?struct { x: f64, y: f64 } = null,
@@ -736,6 +740,7 @@ pub const BTab = struct {
         self.attr_col_widths.deinit(a);
         self.name_cells.deinit(a);
         if (self.width_save_src != 0) _ = c.g_source_remove(self.width_save_src);
+        if (self.width_fit_src != 0) _ = c.g_source_remove(self.width_fit_src);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         self.clearNavError();
@@ -769,6 +774,63 @@ pub const Pending = struct {
     navigation_generation: u64 = 0,
     sent: bool = false,
     staged: std.ArrayList(Entry) = .empty,
+};
+
+/// Everything needed to resubmit a cross-host copy. The panel's
+/// `JobPaths` cannot serve: it keeps only a 512-byte TAIL of each
+/// path, which identifies a file but cannot address one.
+///
+/// A resubmission always carries `resume`, so it continues from the
+/// staged `.skpart` the failed attempt left on the destination rather
+/// than starting a multi-gigabyte transfer over.
+pub const CopyRetry = struct {
+    coordinator: *HostConn,
+    src_hc: *HostConn,
+    dst_hc: *HostConn,
+    src_path: []u8,
+    dst_path: []u8,
+    label: []u8,
+    dest_key: u64,
+    /// Automatic attempts already spent, so a host that is simply gone
+    /// stops costing retries and the row settles as failed.
+    attempts: u8 = 0,
+
+    pub fn destroy(self: *CopyRetry, allocator: std.mem.Allocator) void {
+        allocator.free(self.src_path);
+        allocator.free(self.dst_path);
+        allocator.free(self.label);
+        allocator.destroy(self);
+    }
+
+    pub fn clone(self: *const CopyRetry, allocator: std.mem.Allocator) ?*CopyRetry {
+        const out = allocator.create(CopyRetry) catch return null;
+        const src = allocator.dupe(u8, self.src_path) catch {
+            allocator.destroy(out);
+            return null;
+        };
+        const dst = allocator.dupe(u8, self.dst_path) catch {
+            allocator.free(src);
+            allocator.destroy(out);
+            return null;
+        };
+        const label = allocator.dupe(u8, self.label) catch {
+            allocator.free(src);
+            allocator.free(dst);
+            allocator.destroy(out);
+            return null;
+        };
+        out.* = .{
+            .coordinator = self.coordinator,
+            .src_hc = self.src_hc,
+            .dst_hc = self.dst_hc,
+            .src_path = src,
+            .dst_path = dst,
+            .label = label,
+            .dest_key = self.dest_key,
+            .attempts = self.attempts,
+        };
+        return out;
+    }
 };
 
 /// What a job operates on, for the jobs-panel detail view. Fixed
@@ -836,9 +898,28 @@ pub const JobRow = struct {
     /// Destination identity for cross-host copies started by the
     /// transfer queue (0 = this job does not hold a destination slot).
     dest_key: u64 = 0,
+    /// Last thing the daemon said about this job: the failure reason on
+    /// a terminal event, and on a running one the reason it is not
+    /// advancing (a cross-host copy waiting on a reconnect).
+    message: [256]u8 = undefined,
+    message_len: u16 = 0,
+    /// Everything needed to run this job AGAIN. Only cross-host copies
+    /// carry it: they are the ones that can die from a dropped link
+    /// with a verified partial already staged, so "Retry" is a resume.
+    retry: ?*CopyRetry = null,
 
     pub fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
+    }
+
+    pub fn messageText(self: *const JobRow) []const u8 {
+        return self.message[0..self.message_len];
+    }
+
+    pub fn setMessage(self: *JobRow, text: []const u8) void {
+        const n = @min(text.len, self.message.len);
+        @memcpy(self.message[0..n], text[0..n]);
+        self.message_len = @intCast(n);
     }
 
     pub fn currentFile(self: *const JobRow) []const u8 {
@@ -870,6 +951,8 @@ pub const PendingJob = struct {
     /// Carried onto the JobRow when the daemon answers with the id.
     paths: JobPaths = .{},
     dest_key: u64 = 0,
+    /// Cross-host copies only; moves onto the JobRow with the id.
+    retry: ?*CopyRetry = null,
 };
 
 /// One client-mediated cross-host transfer, running or queued.

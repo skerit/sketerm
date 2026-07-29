@@ -72,6 +72,10 @@ const Controls = struct {
     cancel: bool = false,
     reorder: bool = false,
     dismiss: bool = false,
+    /// Only a cross-host copy offers it: the staged partial on the
+    /// destination is what makes a retry a RESUME rather than a
+    /// three-gigabyte transfer starting over.
+    retry: bool = false,
 };
 
 /// One row as collected from its source; arena-lived, rebuilt per
@@ -297,11 +301,13 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .current_file = if (j.currentFile().len > 0) j.currentFile() else null,
             .files_done = @intCast(j.files_done),
             .files_total = @intCast(j.files_total),
+            .message = j.messageText(),
             .controls = .{
                 .pause = !j.terminal() and j.state != .paused,
                 .unpause = j.state == .paused,
                 .cancel = !j.terminal(),
                 .dismiss = j.terminal(),
+                .retry = j.state == .failed and j.retry != null,
             },
             .hc = j.hc,
         }) catch return;
@@ -436,7 +442,10 @@ fn headText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
     if (meter.status.eta_s) |eta| {
         w.print(" - {s} left", .{progress.formatEta(&eta_buf, eta)}) catch {};
     }
-    if (row.message.len > 0 and (row.state == .failed or row.state == .queued))
+    // A running job's message is why it is NOT moving (a cross-host
+    // copy waiting out a reconnect), which is exactly the moment the
+    // head line needs to explain itself.
+    if (row.message.len > 0 and row.state != .finished)
         w.print(" - {s}", .{row.message}) catch {};
     return w.buffered();
 }
@@ -529,7 +538,7 @@ pub const JobBtnCtx = struct {
     copy: ?*jobs.CopyItem = null,
     /// Durable ledger token (owned).
     service_token: ?[]u8 = null,
-    kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand },
+    kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand, retry },
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
@@ -610,6 +619,14 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             self.markJob(hc, ctx.job, .running);
         },
         .cancel => self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = ctx.job }),
+        .retry => {
+            for (self.jobs.items) |j| {
+                if (j.hc == hc and j.job == ctx.job) {
+                    self.retryCopyJob(j);
+                    break;
+                }
+            }
+        },
         .dismiss => {
             var i: usize = 0;
             while (i < self.jobs.items.len) : (i += 1) {
@@ -617,6 +634,7 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
                 if (j.hc == hc and j.job == ctx.job) {
                     if (j.undo_op) |u| u.destroy(self.allocator);
                     if (j.undo_trash_orig) |o| self.allocator.free(o);
+                    if (j.retry) |r| r.destroy(self.allocator);
                     self.allocator.free(j.label);
                     self.allocator.destroy(j);
                     _ = self.jobs.orderedRemove(i);
@@ -707,6 +725,8 @@ fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) v
         jobsButton(self, head, "media-playback-start-symbolic", identityCtx(self, row, .resume_));
     if (row.controls.pause)
         jobsButton(self, head, "media-playback-pause-symbolic", identityCtx(self, row, .pause));
+    if (row.controls.retry)
+        jobsButton(self, head, "view-refresh-symbolic", identityCtx(self, row, .retry));
     if (row.controls.cancel)
         jobsButton(self, head, "process-stop-symbolic", identityCtx(self, row, .cancel));
     if (row.controls.dismiss)

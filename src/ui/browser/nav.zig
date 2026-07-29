@@ -159,6 +159,9 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // live in colview.zig.
     const cv = colview.installColumnView(self, tab);
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), cv);
+    // A narrower viewport must shrink the Name column, not push the
+    // rest of the columns behind a horizontal scrollbar.
+    colview.installWidthFit(tab);
 
     _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
@@ -668,8 +671,14 @@ fn chordRedo(self: *BrowserView) bool {
     return true;
 }
 
+/// Ctrl+L OPENS this pane's location entry and selects it, the way
+/// every browser and file manager does -- it does not toggle. Toggling
+/// meant the second press in a dual-pane window closed an entry the
+/// user was trying to reach, and left the other pane's entry standing
+/// open next to it. Escape is the way back to the breadcrumb.
 fn chordLocation(self: *BrowserView) bool {
-    self.toggleLocationFace();
+    if (self.peerView()) |peer| _ = peer.foldLocationFace();
+    self.showEntryFace();
     return true;
 }
 

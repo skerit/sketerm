@@ -1,6 +1,6 @@
 //! Opening files: the default handler, the Open With chooser (local
-//! GAppInfo plus the host's own .desktop apps), remote
-//! download-then-open, and the local-edit sync-back watches that
+//! GAppInfo plus the host's own .desktop apps), remote opens through an
+//! automatic FUSE mount, and the local-edit sync-back watches that
 //! upload a remotely-sourced file again after an editor writes it.
 
 const std = @import("std");
@@ -13,17 +13,102 @@ const HostConn = @import("types.zig").HostConn;
 const WireApp = @import("types.zig").WireApp;
 const buildHostExecCmd = @import("../../filebrowser/desktop.zig").buildHostExecCmd;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const hostmount = @import("../hostmount.zig");
 const mimeListContains = @import("../../filebrowser/desktop.zig").mimeListContains;
 
-/// Download a remote file into the local open-cache, launch an
-/// app on it when done (null appid = default handler), and watch
-/// the cache copy so local edits sync back to the host.
+/// One remote open waiting for its host's FUSE mount to come up.
+/// Owned by the pending callback; the view is reached through the
+/// DrainHandle-style `widgets_dead` fence its own field provides.
+const PendingOpen = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    hc: *HostConn,
+    host: []u8,
+    path: []u8,
+    appid: ?[]u8,
+
+    fn destroy(self: *PendingOpen) void {
+        self.allocator.free(self.host);
+        self.allocator.free(self.path);
+        if (self.appid) |a| self.allocator.free(a);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Open a remote file through the host's FUSE mount: the application
+/// gets a real path and reads only the bytes it asks for.
+///
+/// This used to download the whole file into a cache first, which made
+/// "open" mean "wait for three gigabytes" and left a copy behind. The
+/// mount is the same mux file service, so a video seeks instead of
+/// transferring, and edits write straight back with no sync-back watch
+/// to reconcile. Downloading survives only as the fallback for hosts
+/// where no mount can be made (no fuse3, a mount that will not start).
 pub fn openRemoteFile(self: *BrowserView, tab: *BTab, path: []const u8, appid: ?[]const u8) void {
     self.openRemoteFileHc(tab.hc, path, appid);
 }
 
 pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, appid: ?[]const u8) void {
     const host = hc.host orelse return;
+    switch (hostmount.ensure(self.allocator, host)) {
+        .ready => return launchMounted(self, host, path, appid),
+        .unavailable => {
+            self.setStatusFmt("no FUSE mount for {s} ({s}) -- downloading a copy instead", .{
+                host, hostmount.reasonFor(host),
+            });
+            return downloadAndOpen(self, hc, host, path, appid);
+        },
+        .starting => {},
+    }
+    const p = self.allocator.create(PendingOpen) catch
+        return downloadAndOpen(self, hc, host, path, appid);
+    p.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .hc = hc,
+        .host = self.allocator.dupe(u8, host) catch {
+            self.allocator.destroy(p);
+            return downloadAndOpen(self, hc, host, path, appid);
+        },
+        .path = self.allocator.dupe(u8, path) catch {
+            self.allocator.free(p.host);
+            self.allocator.destroy(p);
+            return downloadAndOpen(self, hc, host, path, appid);
+        },
+        .appid = if (appid) |a| (self.allocator.dupe(u8, a) catch null) else null,
+    };
+    self.setStatusFmt("mounting {s}…", .{host});
+    hostmount.whenReady(self.allocator, host, @ptrCast(p), &onMountReady);
+}
+
+fn onMountReady(ctx: ?*anyopaque, mounted: bool) void {
+    const p: *PendingOpen = @ptrCast(@alignCast(ctx.?));
+    defer p.destroy();
+    const self = p.view;
+    // The pane can close while a mount is coming up.
+    if (self.widgets_dead) return;
+    if (mounted) return launchMounted(self, p.host, p.path, p.appid);
+    self.setStatusFmt("could not mount {s} ({s}) -- downloading a copy instead", .{
+        p.host, hostmount.reasonFor(p.host),
+    });
+    downloadAndOpen(self, p.hc, p.host, p.path, p.appid);
+}
+
+fn launchMounted(self: *BrowserView, host: []const u8, path: []const u8, appid: ?[]const u8) void {
+    var buf: [8192]u8 = undefined;
+    const local = hostmount.localPath(&buf, host, path) orelse {
+        self.setStatusFmt("mount of {s} vanished -- downloading a copy instead", .{host});
+        const hc = self.hostConnFor(host) orelse return;
+        return downloadAndOpen(self, hc, host, path, appid);
+    };
+    if (appid) |id| launchLocalWithApp(id, local) else launchLocal(local);
+    self.setStatusFmt("opening {s} from the {s} mount", .{ std.fs.path.basename(path), host });
+}
+
+/// The pre-mount behaviour, kept as the fallback: copy the file into
+/// the local open-cache, launch on the copy, and watch it so local
+/// edits are uploaded again.
+fn downloadAndOpen(self: *BrowserView, hc: *HostConn, host: []const u8, path: []const u8, appid: ?[]const u8) void {
     const cache_root = c.g_get_user_cache_dir();
     var dirbuf: [4096:0]u8 = undefined;
     const dir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/fsopen", .{cache_root}) catch return;
@@ -60,8 +145,8 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
     self.renderJobs();
 }
 
-/// Open a path that lives on `hc`'s host: directly for local,
-/// download-and-open for remote.
+/// Open a path that lives on `hc`'s host: directly for local, through
+/// the host's mount for remote.
 pub fn openPathOnHost(self: *BrowserView, hc: *HostConn, path: []const u8) void {
     if (hc.host == null) {
         launchLocal(path);
@@ -136,7 +221,7 @@ pub fn openWithDialog(self: *BrowserView, tab: *BTab, path: []const u8) void {
     c.g_object_set_data_full(@ptrCast(popover), "sketerm-openwith", @ptrCast(ctx), @ptrCast(&OpenWithCtx.free));
 
     // Local applications for the file's guessed content type.
-    const sec = c.gtk_label_new(if (is_local) "Open with:" else "Open locally (downloads a copy):");
+    const sec = c.gtk_label_new(if (is_local) "Open with:" else "Open locally (through the host mount):");
     c.gtk_widget_add_css_class(sec, "dim-label");
     c.gtk_label_set_xalign(@ptrCast(sec), 0);
     c.gtk_box_append(@ptrCast(box), sec);

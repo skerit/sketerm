@@ -499,13 +499,22 @@ pub fn showEntryFace(self: *BrowserView) void {
 /// and the arrow keys work again.
 /// @return false when the entry face was not showing.
 pub fn showCrumbFace(self: *BrowserView) bool {
+    if (!foldLocationFace(self)) return false;
+    if (self.currentTab()) |tab| _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview)));
+    return true;
+}
+
+/// Back to the breadcrumb WITHOUT taking focus, for folding a pane
+/// the user just left. `showCrumbFace` pulls focus back into the
+/// listing, which is right for the pane being abandoned by its own
+/// Escape and wrong for one being abandoned for another pane.
+pub fn foldLocationFace(self: *BrowserView) bool {
     const sw = self.locbar.scroller orelse return false;
     if (!self.locbar.editing) return false;
     self.locbar.editing = false;
     self.cancelPathCompletion();
     c.gtk_widget_set_visible(@ptrCast(@alignCast(self.path_entry)), 0);
     c.gtk_widget_set_visible(sw, 1);
-    if (self.currentTab()) |tab| _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview)));
     return true;
 }
 

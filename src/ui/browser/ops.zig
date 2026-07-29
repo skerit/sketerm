@@ -18,6 +18,7 @@ const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
+const clipboard = @import("../../filebrowser/clipboard.zig");
 const conflict = @import("conflict.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
@@ -72,29 +73,16 @@ pub fn clipSelection(self: *BrowserView, cut: bool) void {
 }
 
 fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void {
-    self.clip_cut = cut;
-    if (self.clip_host) |s| self.allocator.free(s);
-    self.clip_host = null;
-    if (tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
-    // The source directory's filesystem: what decides later whether a
-    // hard link into another directory could work at all.
-    self.clip_dev = tab.root.dev;
-    if (self.clip_path) |s| self.allocator.free(s);
-    self.clip_path = null;
-    for (self.clip_paths.items) |p| self.allocator.free(p);
-    self.clip_paths.clearRetainingCapacity();
-    for (srcs) |sp| {
-        const owned = self.allocator.dupe(u8, sp) catch continue;
-        self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
-    }
-    if (self.clip_paths.items.len > 0)
-        self.clip_path = self.allocator.dupe(u8, self.clip_paths.items[0]) catch null;
+    // The source directory's filesystem rides along: it decides later
+    // whether a hard link into another directory could work at all.
+    const board = self.clipboard();
+    board.set(tab.hc.host, srcs, cut, tab.root.dev);
     exportClipToGdk(self, tab, cut);
     const verb: []const u8 = if (cut) "cut" else "copied";
-    if (self.clip_paths.items.len > 1) {
-        self.setStatusFmt("{s} {d} items", .{ verb, self.clip_paths.items.len });
-    } else if (self.clip_paths.items.len == 1) {
-        self.setStatusFmt("{s}: {s}", .{ verb, self.clip_paths.items[0] });
+    if (board.items().len > 1) {
+        self.setStatusFmt("{s} {d} items", .{ verb, board.items().len });
+    } else if (board.first()) |only| {
+        self.setStatusFmt("{s}: {s}", .{ verb, only });
     }
 }
 
@@ -108,15 +96,16 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
 /// so this is purely an export. Remote entries are skipped: their
 /// paths mean nothing to other local applications.
 fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
-    if (self.clip_host != null) return;
-    if (self.clip_paths.items.len == 0) return;
+    const board = self.clipboard();
+    if (board.host != null) return;
+    if (board.isEmpty()) return;
     const a = self.allocator;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
     var gnome: std.ArrayList(u8) = .empty;
     defer gnome.deinit(a);
     gnome.appendSlice(a, if (cut) "cut" else "copy") catch return;
-    for (self.clip_paths.items, 0..) |p, i| {
+    for (board.items(), 0..) |p, i| {
         if (i > 0) text.append(a, '\n') catch return;
         text.appendSlice(a, p) catch return;
         const pz = a.dupeZ(u8, p) catch return;
@@ -142,17 +131,16 @@ fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
 }
 
 /// Chord-driven paste (Ctrl+V): the clipboard into the current tab.
+/// The board is process-wide, so the copy may well have been made in
+/// another pane, on another host.
 pub fn pasteIntoCurrent(self: *BrowserView) void {
     const tab = self.currentTab() orelse return;
-    if (self.clip_paths.items.len == 0 and self.clip_path == null) {
+    const board = self.clipboard();
+    if (board.isEmpty()) {
         self.setStatus("clipboard is empty");
         return;
     }
-    const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
-        self.clip_paths.items
-    else
-        (&[_][]u8{self.clip_path.?})[0..];
-    self.beginPaste(tab, self.clip_host, srcs, self.clip_cut, true);
+    self.beginPaste(tab, board.hostOpt(), board.items(), board.cut, true);
 }
 
 /// Is `tab` still one of this view's tabs? Anything that parks work
@@ -228,11 +216,7 @@ pub fn beginPaste(
     if (cut and clear_clipboard) {
         // Cut is one-shot: the sources are moving away. Parked
         // conflicts own their own copy of the paths.
-        if (self.clip_path) |s| self.allocator.free(s);
-        self.clip_path = null;
-        for (self.clip_paths.items) |p| self.allocator.free(p);
-        self.clip_paths.clearRetainingCapacity();
-        self.clip_cut = false;
+        self.clipboard().clear();
     }
 }
 
@@ -331,9 +315,10 @@ pub fn linkHere(self: *BrowserView, tab: *BTab, target: []const u8, hard: bool) 
 /// device id the daemon ships with each listing -- the verb is only
 /// offered where it can succeed, never offered and then failed.
 pub fn hardlinkPossible(self: *BrowserView, tab: *BTab) bool {
-    if (self.clip_path == null) return false;
-    if (!hostEq(if (self.clip_host) |h| @as(?[]const u8, h) else null, tab.hc.host)) return false;
-    return self.clip_dev != 0 and self.clip_dev == tab.root.dev;
+    const board = self.clipboard();
+    if (board.isEmpty()) return false;
+    if (!hostEq(board.hostOpt(), tab.hc.host)) return false;
+    return board.dev != 0 and board.dev == tab.root.dev;
 }
 
 pub fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {

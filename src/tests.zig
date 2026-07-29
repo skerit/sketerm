@@ -55,6 +55,7 @@ comptime {
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
     _ = @import("ui/tab_effects.zig");
+    _ = @import("ui/hostmount.zig");
     // The browser facade only re-exports a few decls, which is NOT
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced
@@ -111,6 +112,7 @@ comptime {
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/cache.zig");
+    _ = @import("filebrowser/clipboard.zig");
     _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/thumbs.zig");
