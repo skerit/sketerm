@@ -144,6 +144,8 @@ comptime {
     _ = @import("mux/dbus.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
+    _ = @import("mux/client.zig");
+    _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/keep.zig");

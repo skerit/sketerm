@@ -45,7 +45,9 @@ const HELP =
     \\--udp-listen is the mosh-style bootstrap (run via ssh): binds a
     \\UDP port, announces "SKETERM-UDP <port> <key>" on stdout, then
     \\detaches and serves encrypted datagrams. --udp-port pins the
-    \\port to a firewall-open range (e.g. 60000:61000).
+    \\port to a firewall-open range (e.g. 60000:61000). A client that
+    \\sends "SKETERM-PUNCH <port>" on stdin gets NAT hole-punch
+    \\probes aimed at its $SSH_CONNECTION address.
     \\
 ;
 
@@ -101,11 +103,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             return runUdpListen(allocator, range);
         } else if (std.mem.eql(u8, a, "--udp-connect") and i + 3 < argv.len) {
+            // Optional 4th arg: an inherited pre-bound socket fd — the
+            // port the client announced in its punch line. Old binaries
+            // ignore trailing args here, so version skew degrades to a
+            // punchless (= previous) connect instead of an error.
             return runUdpConnect(
                 allocator,
                 std.mem.span(argv[i + 1]),
                 std.mem.span(argv[i + 2]),
                 std.mem.span(argv[i + 3]),
+                if (i + 4 < argv.len) std.mem.span(argv[i + 4]) else null,
             );
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP});
@@ -229,6 +236,7 @@ fn writeFull(fd: c_int, bytes: []const u8) bool {
 // ── UDP transport (mosh-style) ──────────────────────────────────
 
 const rudp = @import("mux/rudp.zig");
+const punch = @import("mux/punch.zig");
 
 fn parsePortRange(s: []const u8) ?[2]u16 {
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
@@ -305,6 +313,26 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     // libcs where `stdout` is a macro/inline fn translate-c mangles.
     _ = cc.fflush(null);
 
+    // Hole punch: a new client announces its own UDP port on stdin
+    // and $SSH_CONNECTION names the address it connected from.
+    // Pre-aiming the channel there turns the first keepalive tick
+    // into the probe that opens THIS side's NAT, so the client's
+    // retransmitted hello can get in even when the announced port is
+    // not reachable from outside; roaming latches the true source
+    // once a packet authenticates. See punch.zig for the timing —
+    // this wait is normally instant, never longer than 2s.
+    var punch_target: ?punch.Endpoint = null;
+    {
+        var lbuf: [64]u8 = undefined;
+        if (punch.readLine(0, 2_000, &lbuf)) |line| {
+            if (punch.parseLine(line)) |client_port| {
+                if (cc.getenv("SSH_CONNECTION")) |sc| {
+                    punch_target = punch.clientEndpoint(std.mem.span(sc), client_port);
+                }
+            }
+        }
+    }
+
     // Detach from the ssh session: the bootstrap is done, the
     // connection now lives on UDP. Parent exits → ssh returns.
     const pid = cc.fork();
@@ -321,15 +349,26 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     var chan = rudp.Channel.init(allocator, key, false);
     defer chan.deinit();
     var out = UdpOut{ .fd = udp_fd };
+    if (punch_target) |ep| {
+        var pa: cc.struct_sockaddr_in = std.mem.zeroes(cc.struct_sockaddr_in);
+        pa.sin_family = cc.AF_INET;
+        pa.sin_port = std.mem.nativeToBig(u16, ep.port);
+        pa.sin_addr.s_addr = std.mem.bytesToValue(u32, &ep.ip);
+        @memcpy(@as([*]u8, @ptrCast(&out.peer))[0..@sizeOf(cc.struct_sockaddr_in)], @as([*]const u8, @ptrCast(&pa))[0..@sizeOf(cc.struct_sockaddr_in)]);
+        out.peer_len = @sizeOf(cc.struct_sockaddr_in);
+    }
     // A bootstrap whose client never shows up must not squat the port
     // forever. An authenticated but abandoned peer gets the same roaming
     // grace as the local bridge, then retires so stale viewers do not leak.
     return bridgeUdp(allocator, &chan, &out, udp_fd, unix_fd, unix_fd, true, nowMs() + 60_000, null, 30_000);
 }
 
-/// `--udp-connect <ip> <port> <keyhex>`: run on the LOCAL side as a
-/// transport child (socketpair on stdin/stdout, like --proxy).
-fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const u8, keyhex: []const u8) u8 {
+/// `--udp-connect <ip> <port> <keyhex> [fd]`: run on the LOCAL side
+/// as a transport child (socketpair on stdin/stdout, like --proxy).
+/// `fd` is an inherited pre-bound UDP socket — its port is what the
+/// client's punch line announced, so using it (instead of a fresh
+/// socket) is what makes the remote's punch target real.
+fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const u8, keyhex: []const u8, fd_s: ?[]const u8) u8 {
     const cc = @import("c.zig").c;
     _ = cc.signal(cc.SIGPIPE, sig_ign);
 
@@ -354,7 +393,14 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     defer cc.freeaddrinfo(res);
 
     const ai = res.?;
-    const udp_fd = platform.socketCloexec(ai.ai_family, cc.SOCK_DGRAM, 0);
+    const udp_fd = blk: {
+        if (fd_s) |s| {
+            if (std.fmt.parseInt(c_int, s, 10)) |fd| {
+                if (cc.fcntl(fd, cc.F_GETFD) >= 0) break :blk fd;
+            } else |_| {}
+        }
+        break :blk platform.socketCloexec(ai.ai_family, cc.SOCK_DGRAM, 0);
+    };
     if (udp_fd < 0) return 1;
 
     var chan = rudp.Channel.init(allocator, key, true);
@@ -377,7 +423,11 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
         .{ host, port, host },
     ) catch "sketerm-mux: no UDP reply after 5s — port blocked?\n";
     const start = nowMs();
-    return bridgeUdp(allocator, &chan, &out, udp_fd, 0, 1, false, start + 15_000, .{
+    // roam=true on the CLIENT side too: a hole-punch probe from a
+    // NATed server arrives from its SNAT source, which need not be
+    // the announced port. Only authenticated packets may re-aim us,
+    // same rule as the server side.
+    return bridgeUdp(allocator, &chan, &out, udp_fd, 0, 1, true, start + 15_000, .{
         .at = start + 5_000,
         .msg = warn_msg,
     }, 30_000);
