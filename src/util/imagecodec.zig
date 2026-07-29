@@ -125,7 +125,9 @@ var jxl_api: ?JxlApi = null;
 var webp_api: ?WebpApi = null;
 
 fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
-    return @ptrCast(dlsym(handle, name) orelse return null);
+    // dlsym returns *anyopaque (align 1); function pointers have a
+    // real alignment on aarch64, so the cast needs @alignCast.
+    return @ptrCast(@alignCast(dlsym(handle, name) orelse return null));
 }
 
 fn loadOne(names: []const [*:0]const u8) ?*anyopaque {

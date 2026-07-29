@@ -59,7 +59,7 @@ var load_attempted = false;
 var loaded_api: ?Api = null;
 
 fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
-    return @ptrCast(dlsym(handle, name) orelse return null);
+    return @ptrCast(@alignCast(dlsym(handle, name) orelse return null));
 }
 
 fn loadApi() ?Api {
