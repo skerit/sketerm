@@ -635,6 +635,30 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // GTK-free subset — `zig build test-core`. The full `test` step
+    // above compiles the GUI, so on a host whose GTK is older than the
+    // GUI requires (Ubuntu 22.04 ships 4.6 against the 4.14 the GUI
+    // calls into) NOTHING is runnable, daemon logic included. This step
+    // uses the same lean dependency set as `sketerm-mux` so the core is
+    // always testable wherever the daemon itself builds.
+    const coretests_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests_core.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, coretests_mod, core_cbindings_mod);
+    coretests_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, coretests_mod);
+    if (have_x264) addVideo(b, coretests_mod);
+    if (have_vtenc) addVtEnc(b, coretests_mod);
+    const coretests = b.addTest(.{
+        .root_module = coretests_mod,
+        .use_lld = use_lld,
+    });
+    const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
+    core_test_step.dependOn(&b.addRunArtifact(coretests).step);
 }
 
 /// Set up the out-of-process TranslateC step that turns
