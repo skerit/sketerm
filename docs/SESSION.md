@@ -11134,3 +11134,38 @@ The rule for new files is in CLAUDE.md: core-side tests go in BOTH
 roots, anything touching `ui/`/`render/` only in `tests.zig`. Adding a
 GTK-reaching module here would break the build for exactly the
 mux-portable users the step exists to serve.
+
+## NAT hole punching for the UDP transport (2026-07-29)
+
+The UDP bootstrap now carries a best-effort, infrastructure-free NAT
+hole punch. The insight that keeps it small: everything hard about
+traversal was already built. The ssh bootstrap is an authenticated
+bidirectional signaling channel (what other systems run a rendezvous
+server for), and rudp's roaming rule -- peer address moves only on
+AUTHENTICATED packets -- is exactly the latch a punch phase needs.
+
+Mechanics (`src/mux/punch.zig` + both ends of the bootstrap): the
+client binds its UDP socket BEFORE ssh starts and writes
+"SKETERM-PUNCH <port>" to ssh stdin, so by the time the remote reads
+stdin the line is already buffered (zero added latency). The remote
+combines it with the client address in $SSH_CONNECTION and pre-aims
+its rudp channel there; the channel's own sealed keepalives double as
+punch probes, opening the server-side NAT for the client's
+retransmitted hello. The client inherits its pre-bound socket into
+the bridge child (4th `--udp-connect` arg) and now roams too, so SNAT
+port rewrites on either side converge. Old binaries on either end
+ignore every piece of this and connect exactly as before.
+
+`zig build smoke-udp` proves the traversal end to end with the REAL
+binaries: a fake ssh execs the freshly built `sketerm-mux
+--udp-listen` against an isolated daemon, and a second stage rewrites
+the announced port so client hellos go into a void -- only the punch
+can complete that connect. Run against the OLD daemon binary the same
+stage fails with UdpBridgeUnreachable while the straight stage still
+passes, which is both the discrimination proof and the version-skew
+proof in one.
+
+What this cannot do: symmetric/port-randomizing NAT (nothing without
+a relay can) -- the connection falls back to SSH and names the reason.
+The pinned-range identity mapping in docs/REMOTE.md stays the
+reliable answer for providers that drop outbound UDP entirely.

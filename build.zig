@@ -237,6 +237,31 @@ pub fn build(b: *std.Build) void {
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
+    // UDP transport + NAT hole-punch smoke — `zig build smoke-udp`
+    // (headless). Drives the REAL bootstrap: fake ssh execs the built
+    // sketerm-mux --udp-listen against an isolated in-process daemon,
+    // including a wrong-announced-port stage only the punch survives.
+    const smoke_udp_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_udp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_udp_mod, core_cbindings_mod);
+    smoke_udp_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_udp_mod);
+    if (have_x264) addVideo(b, smoke_udp_mod);
+    if (have_vtenc) addVtEnc(b, smoke_udp_mod);
+    const smoke_udp = b.addExecutable(.{
+        .name = "sketerm-smoke-udp",
+        .root_module = smoke_udp_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_udp_run = b.addRunArtifact(smoke_udp);
+    smoke_udp_run.addArtifactArg(mux_exe);
+    const smoke_udp_step = b.step("smoke-udp", "UDP transport + hole-punch smoke (headless)");
+    smoke_udp_step.dependOn(&smoke_udp_run.step);
+
     // File-service smoke — `zig build smoke-fs` (headless). Daemon
     // thread + fsdrive client: listings, live view deltas, verbs,
     // ranged read/write, monolith AND broker mode.

@@ -55,6 +55,9 @@ fn reapBootstrapChild(pid: c.pid_t) void {
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     const platform = @import("../util/platform.zig");
+    // $SKETERM_MUX_BIN pins the binary outright — test rigs run from
+    // zig-cache where neither the sibling nor $PATH is the fresh build.
+    if (c.getenv("SKETERM_MUX_BIN")) |p| return p;
     if (platform.exePathZ(buf)) |exe_path| {
         if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
             const dir_len = slash + 1;
@@ -283,7 +286,7 @@ pub const Conn = struct {
     pub fn udpErrorText(e: anyerror) []const u8 {
         return switch (e) {
             error.UdpProxiedHost => "ssh reaches it through a ProxyJump/ProxyCommand hop, so it has no directly reachable address",
-            error.UdpBridgeUnreachable => "the announced UDP port never answered (filtered, or NAT-mapped to a different port)",
+            error.UdpBridgeUnreachable => "the announced UDP port never answered and the NAT hole punch did not connect (filtered UDP, or symmetric NAT)",
             error.SshTransportFailed => "no UDP announcement came back over ssh (remote sketerm-mux too old, or the bootstrap failed)",
             else => @errorName(e),
         };
@@ -394,6 +397,9 @@ pub const Conn = struct {
     /// socketpair. Everything downstream is fd-agnostic, same as
     /// the plain SSH transport — but the live connection is
     /// encrypted UDP with roaming + retransmission (rudp.zig).
+    /// The bootstrap also carries a best-effort NAT hole punch
+    /// (punch.zig): we announce our pre-bound UDP port over ssh
+    /// stdin so a NATed remote can probe back at us.
     pub fn connectUdp(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
         return connectUdpFor(allocator, host, port_range, 20_000);
     }
@@ -423,12 +429,54 @@ pub const Conn = struct {
             udp_host = target.hostname;
         }
 
-        // 1. Bootstrap: ssh prints the announcement on a pipe.
+        // 0.5. Bind the transport's UDP socket EARLY, so its port can
+        //      ride the punch line to the remote (below) and the very
+        //      same socket can then be inherited by the bridge child —
+        //      the remote's punch probes only help if they hit the
+        //      port the bridge actually sends from. CLOEXEC stays set
+        //      until just before the bridge spawn so the ssh child
+        //      never inherits it. Failure = no punch, not no connect.
+        const platform = @import("../util/platform.zig");
+        var punch_fd: c_int = platform.socketCloexec(c.AF_INET, c.SOCK_DGRAM, 0);
+        var punch_port: u16 = 0;
+        if (punch_fd >= 0 and punch_fd < 3) {
+            // A GUI daemonized with closed stdio can land this on fd
+            // 0/1, where the bridge child's dup2-of-the-socketpair
+            // would clobber it. Park it above the stdio range.
+            const moved = c.fcntl(punch_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+            _ = c.close(punch_fd);
+            punch_fd = if (moved >= 0) moved else -1;
+        }
+        if (punch_fd >= 0) {
+            var ba: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+            ba.sin_family = c.AF_INET;
+            var ga: c.struct_sockaddr_in = undefined;
+            var gl: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+            if (c.bind(punch_fd, @ptrCast(&ba), @sizeOf(c.struct_sockaddr_in)) == 0 and
+                c.getsockname(punch_fd, @ptrCast(&ga), &gl) == 0)
+            {
+                punch_port = std.mem.bigToNative(u16, ga.sin_port);
+            } else {
+                _ = c.close(punch_fd);
+                punch_fd = -1;
+            }
+        }
+        defer if (punch_fd >= 0) {
+            _ = c.close(punch_fd);
+        };
+
+        // 1. Bootstrap: ssh prints the announcement on a pipe; our
+        //    punch line goes out on its stdin.
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.SocketFailed;
         for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        var in_fds: [2]c_int = .{ -1, -1 };
+        if (c.pipe(&in_fds) != 0) in_fds = .{ -1, -1 };
+        for (in_fds) |fd| {
+            if (fd >= 0) _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        }
         const ssh_env = c.getenv("SKETERM_SSH");
         const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
         var range_z_buf: [32:0]u8 = undefined;
@@ -474,16 +522,42 @@ pub const Conn = struct {
         if (pid < 0) {
             _ = c.close(pipe_fds[0]);
             _ = c.close(pipe_fds[1]);
+            for (in_fds) |fd| {
+                if (fd >= 0) _ = c.close(fd);
+            }
             return error.ForkFailed;
         }
         if (pid == 0) {
             _ = c.dup2(pipe_fds[1], 1);
             _ = c.close(pipe_fds[0]);
             _ = c.close(pipe_fds[1]);
+            if (in_fds[0] >= 0) {
+                _ = c.dup2(in_fds[0], 0);
+                _ = c.close(in_fds[0]);
+                _ = c.close(in_fds[1]);
+            }
             _ = c.execvp(ssh_bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
         _ = c.close(pipe_fds[1]);
+        if (in_fds[0] >= 0) _ = c.close(in_fds[0]);
+
+        // Send the punch line NOW, before the announcement round-trip:
+        // by the time the remote reads its stdin the line is already
+        // buffered, so a new server pays no wait and an old server
+        // simply never reads it. Closing the write end gives the
+        // remote a fast EOF (and old-server stdin stays untouched).
+        // SIGPIPE is neutered process-wide in every entry point that
+        // reaches here, so a dead ssh costs an EPIPE, not the process.
+        if (in_fds[1] >= 0) {
+            if (punch_port != 0) {
+                var pl_buf: [32]u8 = undefined;
+                if (@import("punch.zig").formatLine(punch_port, &pl_buf)) |pl| {
+                    _ = c.write(in_fds[1], pl.ptr, pl.len);
+                }
+            }
+            _ = c.close(in_fds[1]);
+        }
 
         // Read the announcement line with one absolute deadline; an
         // old remote binary or wedged SSH must reach the SSH fallback.
@@ -538,9 +612,21 @@ pub const Conn = struct {
         var bh_z_buf: [256:0]u8 = undefined;
         const bh_z = std.fmt.bufPrintZ(&bh_z_buf, "{s}", .{udp_host}) catch return error.BadPath;
 
-        const argv2 = [_:null]?[*:0]const u8{
-            mux_bin, "--udp-connect", bh_z.ptr, port_z.ptr, key_z.ptr, null,
+        // Hand the pre-bound punch socket to the bridge (fd number as
+        // a 4th positional arg; the fd survives spawnOverSocketpair's
+        // dup2-of-0/1 untouched once CLOEXEC is dropped). An OLDER
+        // bridge binary ignores trailing --udp-connect args, binds its
+        // own socket, and merely loses the punch — never the connect.
+        var fd_z_buf: [16:0]u8 = undefined;
+        var argv2 = [_:null]?[*:0]const u8{
+            mux_bin, "--udp-connect", bh_z.ptr, port_z.ptr, key_z.ptr, null, null,
         };
+        if (punch_fd >= 0) {
+            if (std.fmt.bufPrintZ(&fd_z_buf, "{d}", .{punch_fd})) |fz| {
+                _ = c.fcntl(punch_fd, c.F_SETFD, @as(c_int, 0));
+                argv2[5] = fz.ptr;
+            } else |_| {}
+        }
         var conn = try spawnOverSocketpair(allocator, mux_bin, &argv2);
         errdefer conn.deinit();
 
@@ -1101,6 +1187,45 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("10.1.2.3", target.hostname);
     try std.testing.expect(!target.proxied);
+}
+
+test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
+    // Fake ssh: answers -G, then captures stdin to a file and prints
+    // no announcement — connectUdpFor must fail SshTransportFailed
+    // AFTER having already written "SKETERM-PUNCH <port>".
+    var cap_buf: [128:0]u8 = undefined;
+    const cap = std.fmt.bufPrintZ(&cap_buf, "/tmp/sketerm-punch-cap-{d}", .{c.getpid()}) catch unreachable;
+    var path_buf: [128:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-fake-ssh-punch-{d}", .{c.getpid()}) catch unreachable;
+    const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
+    var script_buf: [512:0]u8 = undefined;
+    const script = std.fmt.bufPrintZ(
+        &script_buf,
+        "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'hostname 127.0.0.1\\n'; exit 0; fi\ncat > {s}\n",
+        .{cap},
+    ) catch unreachable;
+    _ = c.fputs(script.ptr, f);
+    _ = c.fclose(f);
+    if (c.chmod(path.ptr, 0o755) != 0) return error.SkipZigTest;
+    defer _ = c.unlink(path.ptr);
+    defer _ = c.unlink(cap.ptr);
+
+    _ = c.setenv("SKETERM_SSH", path.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_SSH");
+
+    try std.testing.expectError(
+        error.SshTransportFailed,
+        Conn.connectUdpFor(std.testing.allocator, "punch-test-host", null, 1_500),
+    );
+
+    const cf = c.fopen(cap.ptr, "r") orelse return error.TestUnexpectedResult;
+    defer _ = c.fclose(cf);
+    var line: [64]u8 = undefined;
+    const n = c.fread(&line, 1, line.len, cf);
+    const punch = @import("punch.zig");
+    const nl = std.mem.indexOfScalar(u8, line[0..n], '\n') orelse return error.TestUnexpectedResult;
+    const port = punch.parseLine(line[0 .. nl + 1]) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(port != 0);
 }
 
 test "ssh -G output without a hostname yields no target" {

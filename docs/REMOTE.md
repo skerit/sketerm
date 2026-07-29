@@ -132,13 +132,34 @@ through `ProxyJump`/`ProxyCommand` has no directly reachable address,
 so UDP is skipped immediately and the connection goes over SSH rather
 than burning the probe timeout.
 
+### NAT hole punching
+
+The bootstrap carries a best-effort, infrastructure-free hole punch.
+The client binds its UDP socket before ssh even starts and announces
+that port over the ssh channel (`SKETERM-PUNCH <port>` on stdin); the
+remote combines it with the client address in `$SSH_CONNECTION` and
+starts sending sealed keepalives at that endpoint immediately. That
+outbound probe opens the server-side NAT (the conntrack entry the
+client's retransmitted hello then rides in on), and since only
+AUTHENTICATED packets may move a peer address — the same rule roaming
+already enforces — both sides safely latch onto whatever endpoints
+the punch actually established, even when SNAT rewrote the ports.
+
+This traverses full/restricted-cone NAT and Docker-style masquerade
+with no STUN server, no relay, and no configuration. It cannot beat
+symmetric or port-randomizing NAT (nothing without a relay can); the
+connection then falls back to SSH and names that reason. Both sides
+must be current: an old binary on either end simply ignores the punch
+and behaves as before.
+
 Containers behind NAT port-mapping (Vast.ai, Docker `-p`, most cloud
-sandboxes) need the pinned range above **and** an identity mapping:
-the bootstrap announces the port it bound *inside* the container, and
-nothing tells the client that the outside world reaches it on a
-different number. Map the range straight through (`-p 60000-61000:60000-61000/udp`)
-or UDP will announce a port that is not reachable and quietly fall
-back to SSH.
+sandboxes) where the punch cannot help — provider drops outbound UDP,
+or symmetric NAT — need the pinned range above **and** an identity
+mapping: the bootstrap announces the port it bound *inside* the
+container, and nothing tells the client that the outside world
+reaches it on a different number. Map the range straight through
+(`-p 60000-61000:60000-61000/udp`) or UDP will announce a port that
+is not reachable and quietly fall back to SSH.
 
 Typing feel on high-latency links: printable keystrokes are echoed
 predictively (underlined until the server confirms), mosh-style.
