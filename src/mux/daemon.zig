@@ -1354,6 +1354,44 @@ pub const Download = struct {
 /// namespace, no allocation round trip). `wd` is the kernel watch
 /// descriptor; equal paths share one wd, so teardown only removes the
 /// kernel watch when the last view on it goes (see dropFsView).
+/// One in-flight incremental directory listing. Names are read (and
+/// sorted) up front — one cheap readdir pass — then pumpFsListings
+/// stats and streams entries in bounded, time-boxed batches as the
+/// same fs_reply chunk run clients already accumulate. Afterwards the
+/// directories among them get their child counts, delivered as
+/// idempotent upsert deltas on the open view.
+pub const FsListing = struct {
+    allocator: std.mem.Allocator,
+    /// Owns names, statted entries and per-batch scratch.
+    arena: std.heap.ArenaAllocator,
+    client: *Client,
+    req: u32,
+    /// Owned directory path (gpa).
+    path: []u8,
+    /// Owned attr spec (gpa).
+    attrs: []u8,
+    /// Sorted entry names (arena).
+    names: [][]u8,
+    idx: usize = 0,
+    dev: u64 = 0,
+    truncated: bool = false,
+    /// View id for child-count deltas; null = no live view (plain
+    /// list from a non-view client), counts are skipped.
+    view: ?u32,
+    /// Directory entries seen while statting (arena); the count phase
+    /// re-sends each as an upsert with `children` filled in.
+    dirs: std.ArrayList(fsserve.Entry) = .empty,
+    count_idx: usize = 0,
+    stage: enum { stat, count } = .stat,
+
+    pub fn deinit(self: *FsListing) void {
+        self.arena.deinit();
+        self.allocator.free(self.path);
+        self.allocator.free(self.attrs);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const FsView = struct {
     allocator: std.mem.Allocator,
     client: *Client,
@@ -1578,6 +1616,10 @@ pub const Daemon = struct {
     /// Open fs directory views (fs_op open_view), keyed by (client,
     /// client-chosen view id). Views die with their client.
     fs_views: std.ArrayList(*FsView) = .empty,
+    /// In-flight incremental listings, advanced by pumpFsListings —
+    /// bounded work per tick so one slow directory (NFS, huge) can
+    /// never stall the poll loop or the other sessions.
+    fs_listings: std.ArrayList(*FsListing) = .empty,
     /// Shared inotify fd backing every view (lazy; -1 until the first
     /// open_view, and permanently -1 where inotify doesn't exist).
     fs_watch: fsserve.Watcher = .{},
@@ -1723,6 +1765,8 @@ pub const Daemon = struct {
         self.fs_jobs.deinit(self.allocator);
         for (self.fs_views.items) |v| v.deinit();
         self.fs_views.deinit(self.allocator);
+        for (self.fs_listings.items) |l| l.deinit();
+        self.fs_listings.deinit(self.allocator);
         self.fs_watch.deinit();
         for (self.uploads.items) |u| u.deinit();
         self.uploads.deinit(self.allocator);
@@ -1850,7 +1894,12 @@ pub const Daemon = struct {
 
     /// One poll iteration. Exposed for tests.
     pub fn tick(self: *Daemon, timeout_ms: i32) !void {
-        const poll_timeout = self.pulseTick(timeout_ms);
+        var poll_timeout = self.pulseTick(timeout_ms);
+        // Listing work pending: don't sleep on poll. The pump makes
+        // bounded progress per tick, so this converges rather than
+        // spins; usually POLLOUT re-wakes the loop anyway, but the
+        // count phase can have ticks that emit nothing.
+        if (self.fs_listings.items.len > 0) poll_timeout = 0;
         var fds: std.ArrayList(c.struct_pollfd) = .empty;
         defer fds.deinit(self.allocator);
 
@@ -2071,6 +2120,7 @@ pub const Daemon = struct {
 
         self.pumpWinstreams();
         self.pumpDownloads();
+        self.pumpFsListings();
         // Worker: tell the broker our latest metadata (throttled).
         if (self.control_fd >= 0 and !self.is_broker) self.maybePushMeta();
         self.refreshDetachedFsJobs();
@@ -2112,6 +2162,7 @@ pub const Daemon = struct {
     const controlRecv = daemon_serve.controlRecv;
     const controlSend = daemon_serve.controlSend;
     const clientReadable = daemon_serve.clientReadable;
+    const pumpFsListings = daemon_serve.pumpFsListings;
     const clientWritable = daemon_serve.clientWritable;
     const handleFrame = daemon_serve.handleFrame;
     const findChannel = daemon_serve.findChannel;
@@ -2140,7 +2191,7 @@ pub const Daemon = struct {
     const fsCloseView = daemon_serve.fsCloseView;
     const dropFsViewAt = daemon_serve.dropFsViewAt;
     const splitAttrs = daemon_serve.splitAttrs;
-    const fsSendListing = daemon_serve.fsSendListing;
+    const fsStartListing = daemon_serve.fsStartListing;
     const fsStat = daemon_serve.fsStat;
     const fsRead = daemon_serve.fsRead;
     const AppEntry = daemon_serve.AppEntry;
