@@ -72,8 +72,16 @@ pub fn build(b: *std.Build) void {
     // without adding either library to the daemon's ELF dependencies.
     const have_dmabuf_import = target.result.os.tag == .linux and
         (b.option(bool, "dmabuf-import", "Runtime EGL/GLES import for modifier-backed dma-bufs (default on on Linux)") orelse true);
+    // Commit id + commit date for Help > About. Stable per commit so a
+    // rebuild without new commits stays fully cached; tarball builds
+    // without git degrade to "unknown".
+    const git_commit = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--always", "--dirty" }) orelse "unknown";
+    const git_date = runCapture(b, &.{ "git", "-C", b.build_root.path orelse ".", "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M" }) orelse "unknown";
+
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
+    glib_opts.addOption([]const u8, "commit", git_commit);
+    glib_opts.addOption([]const u8, "commit_date", git_date);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
     glib_opts.addOption(bool, "video", have_x264);
     glib_opts.addOption(bool, "vtenc", have_vtenc);
@@ -968,6 +976,16 @@ fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
             mod.linkSystemLibrary(tok[2..], .{ .use_pkg_config = .no });
         }
     }
+}
+
+/// Capture a command's trimmed stdout, or null when the command is
+/// unavailable or fails (tarball builds without git).
+fn runCapture(b: *std.Build, argv: []const []const u8) ?[]const u8 {
+    var code: u8 = undefined;
+    const out = b.runAllowFail(argv, &code, .ignore) catch return null;
+    const trimmed = std.mem.trim(u8, out, " \r\n\t");
+    if (trimmed.len == 0) return null;
+    return trimmed;
 }
 
 /// Include paths only — for modules that compile against a package's

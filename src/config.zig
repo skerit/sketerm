@@ -162,6 +162,10 @@ pub const Domain = struct {
 ///   always   — ask on every close
 pub const ConfirmClose = enum { never, multiple, always };
 
+/// File-browser listing view modes (mirrors filebrowser/model.zig's
+/// ViewMode; config keeps its own enum so the parser has no UI dep).
+pub const FilesView = enum { details, compact, icons, miller };
+
 /// One `shader_param.<name>` override. Defined here (not in the
 /// render graph) so the mux side can import config.zig; the shader
 /// passes import it FROM config.
@@ -290,6 +294,15 @@ pub const Config = struct {
     /// Confirm-on-close policy. Default: ask only if there's more
     /// than one pane being lost (matches Terminator's default).
     confirm_close: ConfirmClose = .multiple,
+
+    // File browser
+    /// Default view mode for new browser tabs (per-folder view memory
+    /// still wins for folders the user has adjusted).
+    files_default_view: FilesView = .details,
+    /// New browser tabs start with hidden files shown.
+    files_show_hidden: bool = false,
+    /// Ask before a permanent delete (Shift+Delete / the menu verb).
+    files_confirm_delete: bool = true,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -738,6 +751,12 @@ pub const Config = struct {
         if (self.gpu_apps.len > 0) try w.print("gpu_apps = {s}\n", .{self.gpu_apps});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
+
+        // File browser.
+        if (self.files_default_view != .details)
+            try w.print("files_default_view = {s}\n", .{@tagName(self.files_default_view)});
+        if (self.files_show_hidden) try w.writeAll("files_show_hidden = true\n");
+        if (!self.files_confirm_delete) try w.writeAll("files_confirm_delete = false\n");
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -1247,6 +1266,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         else if (std.mem.eql(u8, value, "multiple")) cfg.confirm_close = .multiple
         else if (std.mem.eql(u8, value, "always")) cfg.confirm_close = .always
         else return error.BadConfirmClose;
+    } else if (std.mem.eql(u8, key, "files_default_view")) {
+        cfg.files_default_view = std.meta.stringToEnum(FilesView, value) orelse return error.BadFilesView;
+    } else if (std.mem.eql(u8, key, "files_show_hidden")) {
+        cfg.files_show_hidden = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "files_confirm_delete")) {
+        cfg.files_confirm_delete = try parseBool(value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {
