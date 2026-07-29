@@ -709,6 +709,7 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     c.gtk_widget_set_hexpand(fs, 1);
     c.gtk_widget_set_vexpand(fs, 1);
     const fb = c.gtk_flow_box_new();
+    c.gtk_widget_add_css_class(fb, "sketerm-fb-flow");
     c.gtk_flow_box_set_selection_mode(@ptrCast(fb), c.GTK_SELECTION_MULTIPLE);
     c.gtk_flow_box_set_activate_on_single_click(@ptrCast(fb), 0);
     c.gtk_flow_box_set_homogeneous(@ptrCast(fb), 1);

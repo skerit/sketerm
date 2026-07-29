@@ -498,14 +498,18 @@ fn appendColumn(self: *BrowserView, tab: *BTab, title: [*:0]const u8, ref: Colum
 }
 
 /// GtkColumnViewTitle owns a horizontal box containing its label and
-/// native sort indicator. GTK leaves the label at its natural width;
-/// expanding it puts the indicator against the column's right edge.
+/// native sort indicator. GTK leaves the label at its natural width
+/// (which reads as centered once it expands); expanding it puts the
+/// indicator against the column's right edge, and xalign 0 keeps the
+/// title itself left-aligned like every other file manager.
 fn alignHeaderIndicators(w: *c.GtkWidget) void {
     const tn = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(w))));
     if (std.mem.eql(u8, tn, "GtkColumnViewTitle")) {
         const box = c.gtk_widget_get_first_child(w) orelse return;
         const label = c.gtk_widget_get_first_child(box) orelse return;
         c.gtk_widget_set_hexpand(label, 1);
+        if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(label)), c.gtk_label_get_type()) != 0)
+            c.gtk_label_set_xalign(@ptrCast(@alignCast(label)), 0);
         return;
     }
     var child = c.gtk_widget_get_first_child(w);
@@ -572,20 +576,23 @@ pub fn syncColumns(self: *BrowserView, tab: *BTab) void {
 }
 
 /// Auto-width Name consumes spare room. Once the user gives Name an
-/// explicit width, the final visible column consumes it instead, so
-/// dragging Name narrower behaves like Nemo rather than snapping back.
-/// A Name width the viewport cannot honour counts as auto here too, or
-/// the leftover would go to a column that is already off-screen.
+/// explicit width, NO column expands: surplus room stays blank at the
+/// right, like Nemo. Handing the surplus to the last visible column
+/// grew Modified/Created to absurd widths whenever a split closed, and
+/// handing it back to Name would snap a just-narrowed Name straight
+/// back. A Name width the viewport cannot honour counts as auto here
+/// too, so a shrunken pane never hides every other column behind a
+/// horizontal scrollbar.
 fn applyExpandPolicy(tab: *BTab) void {
     const cols = c.gtk_column_view_get_columns(tab.colview);
     const n = c.g_list_model_get_n_items(cols);
     if (n == 0) return;
-    const expand_index: c.guint = if (fittedNameWidth(tab) > 0 and n > 1) n - 1 else 0;
+    const name_expands = fittedNameWidth(tab) <= 0;
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
         const obj = c.g_list_model_get_item(cols, i) orelse continue;
         defer c.g_object_unref(obj);
-        c.gtk_column_view_column_set_expand(@ptrCast(@alignCast(obj)), @intFromBool(i == expand_index));
+        c.gtk_column_view_column_set_expand(@ptrCast(@alignCast(obj)), @intFromBool(i == 0 and name_expands));
     }
 }
 
@@ -1174,6 +1181,11 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\}
         \\columnview.sketerm-fb-cv > listview > row:hover:not(:selected) {
         \\  background: alpha(currentColor, 0.1);
+        \\}
+        \\columnview.sketerm-fb-cv > listview > row:selected,
+        \\flowbox.sketerm-fb-flow > flowboxchild:selected {
+        \\  background: alpha(@accent_bg_color, 0.85);
+        \\  color: @accent_fg_color;
         \\}
         \\text.sketerm-fb-rename {
         \\  padding: 0 2px;
