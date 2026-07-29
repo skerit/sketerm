@@ -33,6 +33,7 @@ zig build mux                   # sketerm-mux session daemon (libc-only)
 zig build mux-portable          # static-musl baseline-CPU daemon for scp-to-server
 zig build test                  # full test suite (currently ~1060 tests)
 zig build test --summary all    # show test count + timings
+zig build test-core             # GTK-free subset (~900 tests, no GUI toolchain)
 zig build smoke-mux             # mux daemon end-to-end smoke (headless)
 zig build smoke-mcp             # `sketerm mcp` isolation + headless-terminal smoke (headless)
 zig build smoke-e2e             # drives the real GUI via the IPC socket (needs display)
@@ -47,6 +48,8 @@ zig build smoke-transparency    # headless GL bg-alpha render
 ```
 
 Tests are discovered via `src/tests.zig`, which `_ = @import(...)`s every module containing `test` blocks. **When adding a new test file, add it to `src/tests.zig`** or `zig build test` won't pick it up.
+
+`src/tests_core.zig` is the GTK-free subset behind `zig build test-core`, built with the same lean `configureCoreDeps` set as `sketerm-mux`. It exists because `zig build test` compiles the GUI, so on a host whose GTK predates what the GUI calls into (Ubuntu 22.04 ships 4.6 vs the 4.14 required) the whole suite — daemon logic included — is unrunnable. **A new core-side test file belongs in BOTH roots**; anything reaching `ui/`/`render/` belongs only in `tests.zig`, and putting it in `tests_core.zig` breaks the build for `mux-portable` users.
 
 There's no `--test-filter` wired through `build.zig`; to run a single test, either invoke `zig test src/path/to/file.zig` directly with the same `linkSystemLibrary` flags, or add a temporary `b.option(...)` filter to the `tests` step.
 
