@@ -9,6 +9,7 @@ comptime {
     _ = @import("util/utf8.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/filehash.zig");
     _ = @import("util/shellquote.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
@@ -26,6 +27,7 @@ comptime {
     _ = @import("util/yuv.zig");
     _ = @import("shim_drift_test.zig");
     _ = @import("mux/predict.zig");
+    _ = @import("mux/deploy.zig");
     _ = @import("mux/kitty_inline.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
