@@ -391,9 +391,23 @@ const JobOutcome = struct {
     files_total: u64 = 0,
     /// Was `resumed_from` ever non-zero on a RUNNING (progress) line?
     resumed_while_running: bool = false,
+    /// The terminal event's message: for a failed job this IS the
+    /// reason, and a generic one is a bug worth failing on.
+    message: [320]u8 = undefined,
+    message_len: usize = 0,
+    /// Did a RUNNING line ever explain a stall? A cross-host copy
+    /// riding out a dropped link must say so rather than look frozen.
+    said_reconnecting: bool = false,
+    /// Bytes already transferred when the link came back. Non-zero is
+    /// the whole point: a resume continues, it does not restart.
+    resumed_at: u64 = 0,
 
     fn is(self: *const JobOutcome, ev: []const u8) bool {
         return std.mem.eql(u8, self.ev[0..self.ev_len], ev);
+    }
+
+    fn messageText(self: *const JobOutcome) []const u8 {
+        return self.message[0..self.message_len];
     }
 
     fn namedFile(self: *const JobOutcome) []const u8 {
@@ -413,6 +427,9 @@ fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
             if (e.files_total > out.files_total) out.files_total = e.files_total;
             if (std.mem.eql(u8, e.ev, "progress")) {
                 out.progress_events += 1;
+                if (std.mem.indexOf(u8, e.message, "reconnect") != null) out.said_reconnecting = true;
+                if (std.mem.indexOf(u8, e.message, "reconnected") != null and e.done > out.resumed_at)
+                    out.resumed_at = e.done;
                 if (e.done < out.max_done) out.regressed = true;
                 if (e.done > out.max_done) out.max_done = e.done;
                 if (e.resumed_from > 0) out.resumed_while_running = true;
@@ -429,6 +446,8 @@ fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
                 out.ev_len = n;
                 out.done = e.done;
                 out.resumed_from = e.resumed_from;
+                out.message_len = @min(e.message.len, out.message.len);
+                @memcpy(out.message[0..out.message_len], e.message[0..out.message_len]);
                 if (e.hash.len == 64) {
                     @memcpy(&out.hash, e.hash[0..64]);
                     out.has_hash = true;
@@ -1880,6 +1899,226 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
     std.debug.print("smoke-fs: xfer stage ok\n", .{});
 }
 
+// ── cross-host copy: reconnect and resume ────────────────────────
+//
+// A `cross_copy` job talks to two daemons through fsdrive. The source
+// side is reached the way a real remote is -- `connectRemote` spawns
+// $SKETERM_SSH and speaks the protocol over its stdio -- so a fake ssh
+// that DIES mid-transfer is exactly the failure a user hits when their
+// link drops on a multi-gigabyte copy. The job must reconnect and
+// continue from the staged partial rather than report a bare failure.
+
+/// Exit status of a bridge that severed a live transfer, so the fake
+/// ssh can tell a real drop apart from an ordinary close (the UDP
+/// bootstrap probe also runs the script and closes immediately).
+const BRIDGE_SEVERED: u8 = 42;
+
+/// `--bridge <sock> [die_after_bytes]`: pump stdin<->unix socket, the
+/// job of the real `sketerm-mux --proxy`. A non-zero byte budget makes
+/// the bridge exit once that many bytes have travelled toward the
+/// client, which is a dropped link in the middle of a transfer.
+fn bridgeMain(sock_path: []const u8, die_after: u64) u8 {
+    const fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return 1;
+    defer _ = c.close(fd);
+    var addr: c.struct_sockaddr_un = undefined;
+    daemon_mod.fillSockaddrUn(&addr, sock_path) catch return 1;
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return 1;
+    var forwarded: u64 = 0;
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        var pfds = [_]c.struct_pollfd{
+            .{ .fd = 0, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = fd, .events = c.POLLIN, .revents = 0 },
+        };
+        if (c.poll(&pfds, 2, 5000) < 0) return 0;
+        if (pfds[0].revents != 0) {
+            const n = c.read(0, &buf, buf.len);
+            if (n <= 0) return 0;
+            if (!writeAll(fd, buf[0..@intCast(n)])) return 0;
+        }
+        if (pfds[1].revents != 0) {
+            const n = c.read(fd, &buf, buf.len);
+            if (n <= 0) return 0;
+            if (!writeAll(1, buf[0..@intCast(n)])) return 0;
+            forwarded += @intCast(n);
+            if (die_after > 0 and forwarded >= die_after) return BRIDGE_SEVERED;
+        }
+    }
+}
+
+fn writeAll(fd: c_int, data: []const u8) bool {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = c.write(fd, data.ptr + off, data.len - off);
+        if (n <= 0) {
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            return false;
+        }
+        off += @intCast(n);
+    }
+    return true;
+}
+
+fn writeScript(path: [:0]const u8, body: []const u8) void {
+    const f = c.fopen(path.ptr, "wb") orelse fail("write fake-ssh");
+    if (c.fwrite(body.ptr, 1, body.len, f) != body.len) fail("write fake-ssh body");
+    _ = c.fclose(f);
+    if (c.chmod(path.ptr, 0o755) != 0) fail("chmod fake-ssh");
+}
+
+/// Both stages of the cross-host copy: a clean one, then one whose
+/// source link dies partway. `sock_src` is the source host's daemon;
+/// `dst_runtime` is the runtime dir whose mux.sock is the destination
+/// (a cross_copy with an empty dst_host resolves it there).
+fn crossStage(
+    allocator: std.mem.Allocator,
+    exe: []const u8,
+    sock_src: []const u8,
+    dst_runtime: []const u8,
+    sock_dst: []const u8,
+) void {
+    var dir_buf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dir_buf, "cross");
+    var src_dir_buf: [128]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_dir_buf, "{s}/from", .{dir}) catch unreachable;
+    var dst_dir_buf: [128]u8 = undefined;
+    const dst_dir = std.fmt.bufPrint(&dst_dir_buf, "{s}/to", .{dir}) catch unreachable;
+    mkdirAt(src_dir);
+    mkdirAt(dst_dir);
+
+    // Big enough that the failing bridge dies with the transfer well
+    // under way, so the resume has something staged to continue from.
+    var big_buf: [256]u8 = undefined;
+    const big = std.fmt.bufPrint(&big_buf, "{s}/payload.bin", .{src_dir}) catch unreachable;
+    writePattern(big, 6 << 20, 0x5a);
+    const want = fileSha(big) orelse fail("cross: source hash");
+
+    // Fake ssh #1: a clean bridge to the source daemon.
+    var ssh_ok_buf: [160:0]u8 = undefined;
+    const ssh_ok = std.fmt.bufPrintZ(&ssh_ok_buf, "{s}/fake-ssh", .{dir}) catch unreachable;
+    var body_buf: [1024]u8 = undefined;
+    writeScript(ssh_ok, std.fmt.bufPrint(&body_buf,
+        \\#!/bin/sh
+        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+        \\exec "{s}" --bridge "{s}"
+        \\
+    , .{ exe, sock_src }) catch unreachable);
+
+    // Fake ssh #2: the FIRST connection dies after 2 MB; every later
+    // one is clean. The counter is bumped only when the bridge really
+    // severed a transfer (exit 42), so the count IS the number of
+    // dropped links.
+    var count_buf: [160]u8 = undefined;
+    const count = std.fmt.bufPrint(&count_buf, "{s}/attempts", .{dir}) catch unreachable;
+    var ssh_flaky_buf: [160:0]u8 = undefined;
+    const ssh_flaky = std.fmt.bufPrintZ(&ssh_flaky_buf, "{s}/fake-ssh-flaky", .{dir}) catch unreachable;
+    var body2_buf: [1024]u8 = undefined;
+    writeScript(ssh_flaky, std.fmt.bufPrint(&body2_buf,
+        \\#!/bin/sh
+        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+        \\n=$(cat "{s}" 2>/dev/null || echo 0)
+        \\if [ "$n" = "0" ]; then
+        \\  "{s}" --bridge "{s}" 5000000
+        \\  rc=$?
+        \\  if [ "$rc" = "42" ]; then echo 1 > "{s}"; fi
+        \\  exit $rc
+        \\fi
+        \\exec "{s}" --bridge "{s}"
+        \\
+    , .{ count, exe, sock_src, count, exe, sock_src }) catch unreachable);
+
+    // The destination side of a cross_copy with an empty dst_host is
+    // "the local daemon", which resolves under $XDG_RUNTIME_DIR. The
+    // job helper inherits it from the daemon that spawns it.
+    var rt_buf: [160:0]u8 = undefined;
+    const rt = std.fmt.bufPrintZ(&rt_buf, "{s}", .{dst_runtime}) catch unreachable;
+    const prev_rt = c.getenv("XDG_RUNTIME_DIR");
+    var prev_rt_buf: [256:0]u8 = undefined;
+    const had_rt = prev_rt != null;
+    if (had_rt) _ = std.fmt.bufPrintZ(&prev_rt_buf, "{s}", .{std.mem.span(prev_rt.?)}) catch unreachable;
+    _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    defer if (had_rt) {
+        _ = c.setenv("XDG_RUNTIME_DIR", &prev_rt_buf, 1);
+    } else {
+        _ = c.unsetenv("XDG_RUNTIME_DIR");
+    };
+
+    var fs = fsdrive.Fs.connect(allocator, sock_dst) catch fail("cross: connect coordinator");
+    defer fs.deinit();
+
+    // ── clean cross-host copy ──────────────────────────────────
+    _ = c.setenv("SKETERM_SSH", ssh_ok.ptr, 1);
+    var out_buf: [256]u8 = undefined;
+    const out_clean = std.fmt.bufPrint(&out_buf, "{s}/clean.bin", .{dst_dir}) catch unreachable;
+    {
+        const job = fs.startCrossCopy("ssh:127.0.0.1", big, "", out_clean, true) catch
+            failErr("cross: start clean", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("done")) failErr("cross: clean copy did not finish", res.messageText());
+        const got = fileSha(out_clean) orelse fail("cross: clean hash");
+        if (!std.mem.eql(u8, &got, &want)) fail("cross: clean copy content mismatch");
+    }
+
+    // ── link dies mid-transfer: reconnect, resume, same bytes ──
+    _ = c.setenv("SKETERM_SSH", ssh_flaky.ptr, 1);
+    const out_flaky = std.fmt.bufPrint(&out_buf, "{s}/flaky.bin", .{dst_dir}) catch unreachable;
+    {
+        const job = fs.startCrossCopy("ssh:127.0.0.1", big, "", out_flaky, true) catch
+            failErr("cross: start flaky", fs.lastErr());
+        const res = collectJob(&fs, job, 180_000);
+        if (!res.is("done"))
+            failErr("cross: a dropped source link killed the copy instead of resuming it", res.messageText());
+        const got = fileSha(out_flaky) orelse fail("cross: flaky hash");
+        if (!std.mem.eql(u8, &got, &want)) fail("cross: resumed copy content mismatch");
+        // The bridge really did die and get re-dialled.
+        var cbuf: [32]u8 = undefined;
+        const severed = readSmall(count, &cbuf);
+        if (severed.len == 0 or severed[0] != '1')
+            fail("cross: the source link never actually dropped mid-transfer");
+        // Continuing, not restarting: the byte counter only ever moved
+        // forward across the drop, so the megabytes already staged were
+        // not thrown away.
+        if (res.regressed)
+            fail("cross: the reconnect restarted the file from zero instead of continuing");
+        // ...and the stall explained itself while it happened, instead
+        // of the row simply freezing.
+        if (!res.said_reconnecting)
+            fail("cross: the dropped link was never reported to the client");
+        // The megabytes moved before the drop survived it. This is the
+        // property that makes a dead link cost a reconnect rather than
+        // the whole transfer.
+        if (res.resumed_at == 0)
+            fail("cross: the copy resumed from byte zero, losing everything already transferred");
+    }
+    _ = c.unsetenv("SKETERM_SSH");
+
+    // ── an unreachable source names itself in the failure ──────
+    var ssh_dead_buf: [160:0]u8 = undefined;
+    const ssh_dead = std.fmt.bufPrintZ(&ssh_dead_buf, "{s}/fake-ssh-dead", .{dir}) catch unreachable;
+    writeScript(ssh_dead,
+        \\#!/bin/sh
+        \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+        \\exit 1
+        \\
+    );
+    _ = c.setenv("SKETERM_SSH", ssh_dead.ptr, 1);
+    {
+        const out_dead = std.fmt.bufPrint(&out_buf, "{s}/dead.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopy("ssh:127.0.0.1", big, "", out_dead, true) catch
+            failErr("cross: start dead", fs.lastErr());
+        const res = collectJob(&fs, job, 180_000);
+        if (!res.is("error")) fail("cross: an unreachable source reported success");
+        // "cross-host copy failed" told a user nothing; the reason has
+        // to say which side and which host.
+        if (std.mem.indexOf(u8, res.messageText(), "source") == null or
+            std.mem.indexOf(u8, res.messageText(), "127.0.0.1") == null)
+            failErr("cross: failure reason names neither the side nor the host", res.messageText());
+    }
+    _ = c.unsetenv("SKETERM_SSH");
+    std.debug.print("smoke-fs: cross-host copy reconnect/resume OK\n", .{});
+}
+
 fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -1890,6 +2129,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var helper_gpa: std.heap.DebugAllocator(.{}) = .{};
         defer _ = helper_gpa.deinit();
         return fsjob.serve(helper_gpa.allocator());
+    }
+    // The cross-host stage's fake ssh: stdio <-> a daemon socket, the
+    // job `sketerm-mux --proxy` does on a real remote.
+    if (argv.len > 2 and std.mem.eql(u8, std.mem.span(argv[1]), "--bridge")) {
+        const die_after: u64 = if (argv.len > 3)
+            std.fmt.parseInt(u64, std.mem.span(argv[3]), 10) catch 0
+        else
+            0;
+        return bridgeMain(std.mem.span(argv[2]), die_after);
     }
 
     // A daemon-thread write racing a closed client socket (the abrupt-
@@ -1943,6 +2191,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const db = daemon_mod.Daemon.init(allocator, sock_xb) catch fail("daemon B init");
     const thb = std.Thread.spawn(.{}, daemonMain, .{db}) catch fail("thread B spawn");
     xferStage(allocator, sock_xa, sock_xb);
+    // Daemon-coordinated cross-host copy: B coordinates and is the
+    // destination ("local"), A is the source reached through a fake
+    // ssh bridge that can be made to die mid-transfer.
+    {
+        var exe_buf: [4096]u8 = undefined;
+        const exe = @import("util/platform.zig").exePath(&exe_buf) orelse fail("own exe path");
+        const dst_runtime = std.fs.path.dirname(sock_xb) orelse fail("dst runtime dir");
+        crossStage(allocator, exe, sock_xa, dst_runtime, sock_xb);
+    }
     inline for (.{ sock_xa, sock_xb }) |sp| {
         var conn = client_mod.Conn.connect(allocator, sp) catch fail("xfer shutdown connect");
         defer conn.deinit();

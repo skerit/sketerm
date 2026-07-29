@@ -1046,18 +1046,245 @@ fn connectHostFs(allocator: std.mem.Allocator, host: []const u8) !fsdrive.Fs {
     return fsdrive.Fs.initConn(allocator, conn);
 }
 
+/// Is this failure the LINK dying rather than the filesystem refusing?
+/// Only that class is worth reconnecting for; a permission error or a
+/// full disk will answer the same way forever.
+fn isTransportError(err: fsdrive.Error) bool {
+    return err == fsdrive.Error.Timeout or err == fsdrive.Error.NotConnected;
+}
+
+/// Reconnect budget for ONE cross-host copy. A multi-GB transfer over
+/// a home link legitimately outlives several drops, so the ceiling is
+/// generous; it exists only so a permanently dead host ends the job
+/// instead of spinning on it forever.
+const RECONNECT_ATTEMPTS: u32 = 6;
+const RECONNECT_BUDGET: u32 = 200;
+const RECONNECT_BACKOFF_MS = [_]u32{ 1_000, 2_000, 4_000, 8_000, 15_000, 30_000 };
+
+const Side = enum {
+    src,
+    dst,
+
+    fn label(self: Side) []const u8 {
+        return switch (self) {
+            .src => "source",
+            .dst => "destination",
+        };
+    }
+};
+
 const CrossCopy = struct {
     allocator: std.mem.Allocator,
     src: *fsdrive.Fs,
     dst: *fsdrive.Fs,
+    /// Host strings the two sides were opened with, so a dropped link
+    /// can be dialled again.
+    src_host: []const u8,
+    dst_host: []const u8,
     progress: Progress = .{},
+    /// Why the copy stopped. Empty until something fails; the error
+    /// line reports it verbatim, because "cross-host copy failed" told
+    /// a user with a half-transferred 3 GB file exactly nothing.
+    fail_buf: [320]u8 = undefined,
+    fail_len: usize = 0,
+    /// Reconnects spent so far, across every file in the job.
+    reconnects: u32 = 0,
+    /// Set while a reconnect is being reported, so the notice reaches
+    /// the panel on the next progress line.
+    notice_buf: [160]u8 = undefined,
+    notice_len: usize = 0,
 
-    fn hash(self: *CrossCopy, fs: *fsdrive.Fs, path: []const u8) ?[64]u8 {
-        _ = self;
-        const job = fs.startHash(path) catch return null;
-        const end = fs.waitJobEnd(job, 120_000) catch return null;
-        if (!end.ok or !end.has_hash) return null;
-        return end.hash;
+    fn fsOf(self: *CrossCopy, side: Side) *fsdrive.Fs {
+        return switch (side) {
+            .src => self.src,
+            .dst => self.dst,
+        };
+    }
+
+    fn hostOf(self: *CrossCopy, side: Side) []const u8 {
+        return switch (side) {
+            .src => self.src_host,
+            .dst => self.dst_host,
+        };
+    }
+
+    fn hostLabel(self: *CrossCopy, side: Side) []const u8 {
+        const h = self.hostOf(side);
+        return if (h.len == 0) "local" else h;
+    }
+
+    /// Record the first failure; later ones are consequences of it.
+    fn fail(self: *CrossCopy, comptime fmt: []const u8, args: anytype) void {
+        if (self.fail_len > 0) return;
+        var w = std.Io.Writer.fixed(&self.fail_buf);
+        w.print(fmt, args) catch {};
+        self.fail_len = w.buffered().len;
+    }
+
+    fn failOp(self: *CrossCopy, side: Side, what: []const u8, path: []const u8, err: fsdrive.Error) void {
+        const detail = self.fsOf(side).lastErr();
+        if (err == fsdrive.Error.FsOpFailed and detail.len > 0) {
+            self.fail("{s} {s} on {s}: {s}", .{ what, tailOf(path), self.hostLabel(side), detail });
+        } else {
+            self.fail("{s} {s} on {s}: {s}", .{ what, tailOf(path), self.hostLabel(side), @errorName(err) });
+        }
+    }
+
+    fn failedReason(self: *const CrossCopy) []const u8 {
+        if (self.fail_len == 0) return "cross-host copy failed";
+        return self.fail_buf[0..self.fail_len];
+    }
+
+    /// Emit a progress line carrying a human note. The daemon keeps the
+    /// last message on the job, so the panel shows "reconnecting…"
+    /// while it happens instead of a row that silently stalls.
+    fn notice(self: *CrossCopy, comptime fmt: []const u8, args: anytype) void {
+        var w = std.Io.Writer.fixed(&self.notice_buf);
+        w.print(fmt, args) catch {};
+        self.notice_len = w.buffered().len;
+        emit(.{
+            .ev = "progress",
+            .done = self.progress.done,
+            .total = self.progress.total,
+            .resumed_from = self.progress.resumed,
+            .message = self.notice_buf[0..self.notice_len],
+            .files_done = self.progress.entries_done,
+            .files_total = self.progress.entries_total,
+        });
+    }
+
+    /// Re-establish ONE side's connection. The transfer itself needs no
+    /// other repair: every read and write names an explicit offset, and
+    /// the staged `.skpart` on the destination already holds everything
+    /// acknowledged so far.
+    fn reconnect(self: *CrossCopy, side: Side) bool {
+        if (self.reconnects >= RECONNECT_BUDGET) {
+            self.fail("{s} host {s} kept dropping ({d} reconnects)", .{
+                side.label(), self.hostLabel(side), self.reconnects,
+            });
+            return false;
+        }
+        var attempt: u32 = 0;
+        while (attempt < RECONNECT_ATTEMPTS) : (attempt += 1) {
+            self.reconnects += 1;
+            const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
+            self.notice("{s} {s} unreachable -- reconnecting in {d}s (attempt {d}/{d})", .{
+                side.label(), self.hostLabel(side), wait_ms / 1000, attempt + 1, RECONNECT_ATTEMPTS,
+            });
+            sleepMs(wait_ms);
+            const fresh = connectHostFs(self.allocator, self.hostOf(side)) catch continue;
+            const fs = self.fsOf(side);
+            fs.deinit();
+            fs.* = fresh;
+            self.notice("reconnected to {s}; resuming at {d} MB", .{
+                self.hostLabel(side), self.progress.done >> 20,
+            });
+            return true;
+        }
+        self.fail("cannot reconnect to {s} host {s}", .{ side.label(), self.hostLabel(side) });
+        return false;
+    }
+
+    /// Ranged read that survives a dropped link.
+    fn readChunk(self: *CrossCopy, path: []const u8, off: u64, want: u32, out: *std.ArrayList(u8)) bool {
+        while (true) {
+            out.clearRetainingCapacity();
+            _ = self.src.read(path, off, want, out) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(.src, "read", path, err);
+                    return false;
+                }
+                if (!self.reconnect(.src)) return false;
+                continue;
+            };
+            if (out.items.len == 0) {
+                self.fail("read {s} on {s}: short read at offset {d}", .{
+                    tailOf(path), self.hostLabel(.src), off,
+                });
+                return false;
+            }
+            return true;
+        }
+    }
+
+    /// Offset-addressed write that survives a dropped link. Replaying
+    /// the same offset after a reconnect is idempotent, so a write that
+    /// half-landed before the drop costs nothing.
+    fn writeChunk(self: *CrossCopy, path: []const u8, off: u64, data: []const u8, flags: fsdrive.WriteFlags) bool {
+        while (true) {
+            const written = self.dst.write(path, off, data, flags) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(.dst, "write", path, err);
+                    return false;
+                }
+                if (!self.reconnect(.dst)) return false;
+                continue;
+            };
+            if (written != data.len) {
+                self.fail("write {s} on {s}: {d} of {d} bytes accepted", .{
+                    tailOf(path), self.hostLabel(.dst), written, data.len,
+                });
+                return false;
+            }
+            return true;
+        }
+    }
+
+    /// stat whose "not there" is an ordinary answer (the resume probes
+    /// and the metadata copy), so it records no failure reason. A dead
+    /// link still reconnects rather than reading as absence.
+    fn statProbe(self: *CrossCopy, side: Side, arena: std.mem.Allocator, path: []const u8) ?fsdrive.Entry {
+        while (true) {
+            return self.fsOf(side).statPath(arena, path) catch |err| {
+                if (!isTransportError(err)) return null;
+                if (!self.reconnect(side)) return null;
+                continue;
+            };
+        }
+    }
+
+    /// stat the job cannot continue without: its failure IS the job's.
+    fn statRequired(self: *CrossCopy, side: Side, arena: std.mem.Allocator, path: []const u8) ?fsdrive.Entry {
+        while (true) {
+            return self.fsOf(side).statPath(arena, path) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(side, "stat", path, err);
+                    return null;
+                }
+                if (!self.reconnect(side)) return null;
+                continue;
+            };
+        }
+    }
+
+    fn hash(self: *CrossCopy, side: Side, path: []const u8) ?[64]u8 {
+        while (true) {
+            const fs = self.fsOf(side);
+            const job = fs.startHash(path) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(side, "hash", path, err);
+                    return null;
+                }
+                if (!self.reconnect(side)) return null;
+                continue;
+            };
+            const end = fs.waitJobEnd(job, 120_000) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(side, "hash", path, err);
+                    return null;
+                }
+                if (!self.reconnect(side)) return null;
+                continue;
+            };
+            if (!end.ok or !end.has_hash) {
+                self.fail("hash {s} on {s}: {s}", .{
+                    tailOf(path), self.hostLabel(side),
+                    if (end.messageText().len > 0) end.messageText() else "no digest returned",
+                });
+                return null;
+            }
+            return end.hash;
+        }
     }
 
     fn copyFile(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, size: u64, allow_resume: bool) bool {
@@ -1065,28 +1292,37 @@ const CrossCopy = struct {
         if (allow_resume) {
             var arena_final = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_final.deinit();
-            if (self.dst.statPath(arena_final.allocator(), dst_path)) |e| {
+            if (self.statProbe(.dst, arena_final.allocator(), dst_path)) |e| {
                 if (std.mem.eql(u8, e.kind, "file") and e.size == size) {
-                    const sh = self.hash(self.src, src_path);
-                    const dh = self.hash(self.dst, dst_path);
+                    // A destination that already matches is the whole
+                    // point of resume; a digest that cannot be taken
+                    // just means "copy it again", never a job failure.
+                    const before = self.fail_len;
+                    const sh = self.hash(.src, src_path);
+                    const dh = self.hash(.dst, dst_path);
                     if (sh != null and dh != null and std.mem.eql(u8, &sh.?, &dh.?)) {
+                        self.fail_len = before;
                         self.progress.resumed += size;
                         self.progress.add(size);
                         self.progress.entryDone();
                         return true;
                     }
+                    self.fail_len = before;
                 }
-            } else |_| {}
+            }
         }
         var part_buf: [4096]u8 = undefined;
-        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{dst_path}) catch return false;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{dst_path}) catch {
+            self.fail("destination path too long: {s}", .{tailOf(dst_path)});
+            return false;
+        };
         var off: u64 = 0;
         if (allow_resume) {
             var arena_part = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_part.deinit();
-            if (self.dst.statPath(arena_part.allocator(), part)) |e| {
+            if (self.statProbe(.dst, arena_part.allocator(), part)) |e| {
                 if (std.mem.eql(u8, e.kind, "file") and e.size <= size) off = e.size;
-            } else |_| {}
+            }
         }
         const resumed_from = off;
         self.progress.done += off;
@@ -1095,59 +1331,132 @@ const CrossCopy = struct {
         var chunk: std.ArrayList(u8) = .empty;
         defer chunk.deinit(self.allocator);
         while (off < size) {
-            chunk.clearRetainingCapacity();
             const want: u32 = @intCast(@min(@as(u64, fsserve.MAX_READ), size - off));
-            _ = self.src.read(src_path, off, want, &chunk) catch return false;
-            if (chunk.items.len == 0) return false;
-            const written = self.dst.write(part, off, chunk.items, .{
+            if (!self.readChunk(src_path, off, want, &chunk)) return false;
+            if (!self.writeChunk(part, off, chunk.items, .{
                 .create = true,
                 .truncate = off == 0 and resumed_from == 0,
-            }) catch return false;
-            if (written != chunk.items.len) return false;
-            off += written;
-            self.progress.add(written);
+            })) return false;
+            off += chunk.items.len;
+            self.progress.add(chunk.items.len);
         }
         if (size == 0) {
-            _ = self.dst.write(part, 0, &.{}, .{ .create = true, .truncate = true }) catch return false;
+            if (!self.writeChunk(part, 0, &.{}, .{ .create = true, .truncate = true })) return false;
         }
-        self.dst.fsync(part) catch return false;
-        const sh = self.hash(self.src, src_path) orelse return false;
-        const dh = self.hash(self.dst, part) orelse return false;
+        if (!self.simpleDst("fsync", part, fsdrive.Fs.fsync)) return false;
+        const sh = self.hash(.src, src_path) orelse return false;
+        const dh = self.hash(.dst, part) orelse return false;
         if (!std.mem.eql(u8, &sh, &dh)) {
             self.dst.deletePath(part) catch {};
             if (resumed_from > 0) {
+                // The staged prefix did not belong to this source after
+                // all. Start it over from zero rather than fail.
                 self.progress.done -|= off;
                 self.progress.resumed -|= resumed_from;
+                self.notice("staged partial for {s} did not verify -- restarting the file", .{tailOf(dst_path)});
                 return self.copyFile(src_path, dst_path, size, false);
             }
+            self.fail("{s}: checksum mismatch after transfer", .{tailOf(dst_path)});
             return false;
         }
         // Verification precedes replacement: a corrupt transfer can
         // never destroy the destination that existed before this job.
-        self.dst.rename(part, dst_path) catch return false;
+        if (!self.renameDst(part, dst_path)) return false;
         var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_meta.deinit();
-        if (self.src.statPath(arena_meta.allocator(), src_path)) |e| {
+        if (self.statProbe(.src, arena_meta.allocator(), src_path)) |e| {
             self.dst.chmod(dst_path, e.mode) catch {};
             self.dst.utimens(dst_path, e.atime_ms, e.mtime_ms) catch {};
-        } else |_| {}
+        }
         self.progress.entryDone();
         return true;
     }
 
+    /// A no-argument destination verb (fsync) with the same
+    /// reconnect-and-retry treatment as the byte path.
+    fn simpleDst(
+        self: *CrossCopy,
+        what: []const u8,
+        path: []const u8,
+        comptime call: fn (*fsdrive.Fs, []const u8) fsdrive.Error!void,
+    ) bool {
+        while (true) {
+            call(self.dst, path) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(.dst, what, path, err);
+                    return false;
+                }
+                if (!self.reconnect(.dst)) return false;
+                continue;
+            };
+            return true;
+        }
+    }
+
+    fn renameDst(self: *CrossCopy, from: []const u8, to: []const u8) bool {
+        while (true) {
+            self.dst.rename(from, to) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(.dst, "rename", to, err);
+                    return false;
+                }
+                if (!self.reconnect(.dst)) return false;
+                continue;
+            };
+            return true;
+        }
+    }
+
+    fn mkdirDst(self: *CrossCopy, path: []const u8) bool {
+        while (true) {
+            self.dst.mkdir(path) catch |err| {
+                if (err == fsdrive.Error.FsOpFailed and
+                    std.mem.indexOf(u8, self.dst.lastErr(), "EXIST") != null) return true;
+                if (!isTransportError(err)) {
+                    self.failOp(.dst, "mkdir", path, err);
+                    return false;
+                }
+                if (!self.reconnect(.dst)) return false;
+                continue;
+            };
+            return true;
+        }
+    }
+
+    fn listSrc(self: *CrossCopy, path: []const u8) ?fsdrive.Listing {
+        while (true) {
+            return self.src.list(path) catch |err| {
+                if (!isTransportError(err)) {
+                    self.failOp(.src, "list", path, err);
+                    return null;
+                }
+                if (!self.reconnect(.src)) return null;
+                continue;
+            };
+        }
+    }
+
     fn copyTree(self: *CrossCopy, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool) bool {
-        self.dst.mkdir(dst_dir) catch |err| {
-            if (err != fsdrive.Error.FsOpFailed or std.mem.indexOf(u8, self.dst.lastErr(), "EXIST") == null)
-                return false;
-        };
-        var listing = self.src.list(src_dir) catch return false;
+        if (!self.mkdirDst(dst_dir)) return false;
+        var listing = self.listSrc(src_dir) orelse return false;
         defer listing.deinit();
-        if (listing.truncated) return false;
+        if (listing.truncated) {
+            self.fail("{s} on {s}: directory too large to enumerate", .{
+                tailOf(src_dir), self.hostLabel(.src),
+            });
+            return false;
+        }
         for (listing.entries) |e| {
             var sbuf: [4096]u8 = undefined;
             var dbuf: [4096]u8 = undefined;
-            const sp = std.fmt.bufPrint(&sbuf, "{s}/{s}", .{ if (src_dir.len == 1) "" else src_dir, e.name }) catch return false;
-            const dp = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ if (dst_dir.len == 1) "" else dst_dir, e.name }) catch return false;
+            const sp = std.fmt.bufPrint(&sbuf, "{s}/{s}", .{ if (src_dir.len == 1) "" else src_dir, e.name }) catch {
+                self.fail("source path too long under {s}", .{tailOf(src_dir)});
+                return false;
+            };
+            const dp = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ if (dst_dir.len == 1) "" else dst_dir, e.name }) catch {
+                self.fail("destination path too long under {s}", .{tailOf(dst_dir)});
+                return false;
+            };
             if (std.mem.eql(u8, e.kind, "dir")) {
                 if (!self.copyTree(sp, dp, allow_resume)) return false;
             } else if (std.mem.eql(u8, e.kind, "file")) {
@@ -1159,44 +1468,114 @@ const CrossCopy = struct {
                 if (!self.copyFile(sp, dp, e.size, allow_resume)) return false;
             } else if (std.mem.eql(u8, e.kind, "link")) {
                 var temp_buf: [4096]u8 = undefined;
-                const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dp, c.getpid() }) catch return false;
-                self.dst.deletePath(temp) catch {};
-                self.dst.symlink(e.target orelse return false, temp) catch return false;
-                self.dst.rename(temp, dp) catch {
-                    self.dst.deletePath(temp) catch {};
+                const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dp, c.getpid() }) catch {
+                    self.fail("destination path too long under {s}", .{tailOf(dst_dir)});
                     return false;
                 };
+                self.dst.deletePath(temp) catch {};
+                const target = e.target orelse {
+                    self.fail("{s}: symlink with no target", .{tailOf(sp)});
+                    return false;
+                };
+                self.dst.symlink(target, temp) catch |err| {
+                    self.failOp(.dst, "symlink", dp, err);
+                    return false;
+                };
+                if (!self.renameDst(temp, dp)) {
+                    self.dst.deletePath(temp) catch {};
+                    return false;
+                }
             }
         }
         var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_meta.deinit();
-        if (self.src.statPath(arena_meta.allocator(), src_dir)) |e| {
+        if (self.statProbe(.src, arena_meta.allocator(), src_dir)) |e| {
             self.dst.chmod(dst_dir, e.mode) catch {};
             self.dst.utimens(dst_dir, e.atime_ms, e.mtime_ms) catch {};
-        } else |_| {}
+        }
         return true;
     }
 };
 
+/// Last path component plus enough parent to identify it, for error
+/// text that has to fit on one line.
+fn tailOf(path: []const u8) []const u8 {
+    if (path.len <= 72) return path;
+    return path[path.len - 72 ..];
+}
+
+/// Interruptible sleep: SIGSTOP/SIGCONT (the daemon's pause control)
+/// lands as EINTR here, and the remaining time is what the loop waits.
+fn sleepMs(ms: u32) void {
+    var ts = c.struct_timespec{
+        .tv_sec = @intCast(ms / 1000),
+        .tv_nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    while (true) {
+        const r = c.nanosleep(&ts, &ts);
+        if (r == 0) return;
+        if (std.posix.errno(r) != .INTR) return;
+    }
+}
+
+/// Open one side, retrying the dial itself: the destination daemon may
+/// still be starting, or the route may be flapping at exactly the wrong
+/// moment. Only after the retries are spent is the job refused.
+fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side) ?fsdrive.Fs {
+    var attempt: u32 = 0;
+    while (attempt < RECONNECT_ATTEMPTS) : (attempt += 1) {
+        if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
+        const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
+        emit(.{
+            .ev = "progress",
+            .message = if (host.len == 0) "local daemon unreachable -- retrying" else "host unreachable -- retrying",
+        });
+        _ = side;
+        sleepMs(wait_ms);
+    }
+    return null;
+}
+
 fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.dst.len == 0) return emitError("cross_copy needs destination");
-    var src = connectHostFs(allocator, spec.src_host) catch return emitError("cannot connect source host");
+    const src_label = if (spec.src_host.len == 0) "local" else spec.src_host;
+    const dst_label = if (spec.dst_host.len == 0) "local" else spec.dst_host;
+    var src = connectHostFsRetrying(allocator, spec.src_host, .src) orelse {
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("cannot reach source host {s}", .{src_label}) catch return emitError("cannot connect source host");
+        return emitError(w.buffered());
+    };
     defer src.deinit();
-    var dst = connectHostFs(allocator, spec.dst_host) catch return emitError("cannot connect destination host");
+    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst) orelse {
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("cannot reach destination host {s}", .{dst_label}) catch return emitError("cannot connect destination host");
+        return emitError(w.buffered());
+    };
     defer dst.deinit();
+    var cc = CrossCopy{
+        .allocator = allocator,
+        .src = &src,
+        .dst = &dst,
+        .src_host = spec.src_host,
+        .dst_host = spec.dst_host,
+    };
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = src.statPath(arena.allocator(), spec.src) catch return emitError("cannot stat source");
-    var cc = CrossCopy{ .allocator = allocator, .src = &src, .dst = &dst };
+    const root = cc.statRequired(.src, arena.allocator(), spec.src) orelse
+        return emitError(cc.failedReason());
     const ok = if (std.mem.eql(u8, root.kind, "file")) blk: {
         cc.progress.total = root.size;
         cc.progress.entries_total = 1;
         break :blk cc.copyFile(spec.src, spec.dst, root.size, spec.@"resume");
     } else if (root.tdir)
         cc.copyTree(spec.src, spec.dst, spec.@"resume")
-    else
-        false;
-    if (!ok) return emitError("cross-host copy failed");
+    else blk: {
+        cc.fail("{s} is neither a file nor a directory", .{tailOf(spec.src)});
+        break :blk false;
+    };
+    if (!ok) return emitError(cc.failedReason());
     emitCopyDone(&cc.progress);
     return 0;
 }
