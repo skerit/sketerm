@@ -179,9 +179,19 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
     self.installTabConveniences(tab, label_box);
-    // Ctrl+wheel zoom, then the folder's remembered view settings
-    // (an explicit TabState restore runs after newTab and wins).
+    // Ctrl+wheel zoom, then the config defaults, then the folder's
+    // remembered view settings (an explicit TabState restore runs
+    // after newTab and wins over everything).
     self.installViewGestures(tab, page);
+    if (self.ownerWindow()) |win| {
+        tab.view_mode = switch (win.config.files_default_view) {
+            .details => .details,
+            .compact => .compact,
+            .icons => .icons,
+            .miller => .miller,
+        };
+        tab.show_hidden = win.config.files_show_hidden;
+    }
     self.applyFolderMemory(tab);
 
     const page_idx = c.gtk_notebook_append_page(self.notebook, page, label_box);
@@ -595,6 +605,7 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK, .what = "filter listing", .run = &chordFilter },
     .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK, .what = "flat view", .run = &chordFlat },
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK, .what = "mark selection in a register", .run = &selection.chordMark },
+    .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_CONTROL_MASK, .what = "bookmark current folder", .run = &chordBookmark },
     .{
         .keyval = c.GDK_KEY_x,
         .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
@@ -614,6 +625,10 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_ALT_MASK, .what = "forward", .run = &chordForward },
     .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_ALT_MASK, .what = "up one directory", .run = &chordUp },
     .{ .keyval = c.GDK_KEY_F2, .mods = 0, .what = "rename", .run = &chordRename },
+    .{ .keyval = c.GDK_KEY_Delete, .mods = 0, .what = "move selection to trash", .run = &chordTrash },
+    .{ .keyval = c.GDK_KEY_KP_Delete, .mods = 0, .what = "move selection to trash", .run = &chordTrash },
+    .{ .keyval = c.GDK_KEY_Delete, .mods = c.GDK_SHIFT_MASK, .what = "permanently delete selection (confirmed)", .run = &chordDelete },
+    .{ .keyval = c.GDK_KEY_KP_Delete, .mods = c.GDK_SHIFT_MASK, .what = "permanently delete selection (confirmed)", .run = &chordDelete },
     .{ .keyval = c.GDK_KEY_F5, .mods = 0, .what = "copy to the other pane", .run = &chordCopyPeer },
     .{ .keyval = c.GDK_KEY_F6, .mods = 0, .what = "move to the other pane", .run = &chordMovePeer },
     .{ .keyval = c.GDK_KEY_BackSpace, .mods = 0, .what = "type-ahead backspace", .run = &chordTypeaheadBackspace },
@@ -648,6 +663,29 @@ fn chordRename(self: *BrowserView) bool {
     if (path.len >= buf.len) return false;
     @memcpy(buf[0..path.len], path);
     self.startInlineRename(tab, buf[0..path.len]);
+    return true;
+}
+
+/// Ctrl+D, Nemo's add-bookmark chord.
+fn chordBookmark(self: *BrowserView) bool {
+    @import("places.zig").bookmarkCurrent(self);
+    return true;
+}
+
+/// Delete: the selection goes to the trash, no confirmation (it is
+/// undoable). Nothing selected = the key is not ours.
+fn chordTrash(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    if (tab.selected.items.len == 0) return false;
+    @import("ops.zig").trashSelection(self);
+    return true;
+}
+
+/// Shift+Delete: permanent delete, behind the modal confirmation.
+fn chordDelete(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    if (tab.selected.items.len == 0) return false;
+    @import("ops.zig").deleteSelection(self);
     return true;
 }
 

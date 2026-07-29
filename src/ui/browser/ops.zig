@@ -665,23 +665,43 @@ pub fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg:
     menuDone(ctx);
 }
 
-pub fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    const hc = ctx.tab.hc;
-    if (hc.state != .ready) {
-        self.setStatusFmt("not connected to {s}", .{hc.label()});
-        return menuDone(ctx);
-    }
+/// The paths a danger verb applies to: the whole selection when the
+/// clicked row is part of a multi-selection, else just the clicked
+/// row (same rule as copyToClip). `one` is the caller's storage for
+/// the single-target case.
+fn menuTargets(ctx: *MenuCtx, one: *[1][]u8) []const []u8 {
+    const path = ctx.path orelse return &.{};
+    const in_selection = for (ctx.tab.selected.items) |sp| {
+        if (std.mem.eql(u8, sp, path)) break true;
+    } else false;
+    if (in_selection and ctx.tab.selected.items.len > 1)
+        return ctx.tab.selected.items;
+    one[0] = path;
+    return one;
+}
+
+/// Whether the listing knows `path` as a directory (symlink targets
+/// count, matching activation). Unknown paths read as files.
+fn pathIsDir(tab: *BTab, path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    const parent = std.fs.path.dirname(path) orelse return false;
+    const dir: *Dir = if (std.mem.eql(u8, tab.root.path, parent))
+        tab.root
+    else
+        tab.subdirByPath(parent) orelse return false;
+    const i = dir.find(base) orelse return false;
+    return dir.entries.items[i].tdir;
+}
+
+fn trashOne(self: *BrowserView, hc: *HostConn, path: []const u8) void {
     const req = self.nextReq();
-    const pj = self.allocator.create(PendingJob) catch return menuDone(ctx);
+    const pj = self.allocator.create(PendingJob) catch return;
     pj.* = .{
         .req = req,
         .hc = hc,
         .label = self.allocator.dupe(u8, "move to trash") catch {
             self.allocator.destroy(pj);
-            return menuDone(ctx);
+            return;
         },
         .undo_trash_orig = self.allocator.dupe(u8, path) catch null,
     };
@@ -689,54 +709,161 @@ pub fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         if (pj.undo_trash_orig) |o| self.allocator.free(o);
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
-        return menuDone(ctx);
+        return;
     };
     self.sendOp(hc, .{ .req = req, .op = "trash", .path = path });
+}
+
+pub fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    var one: [1][]u8 = undefined;
+    const targets = menuTargets(ctx, &one);
+    if (targets.len == 0) return menuDone(ctx);
+    const hc = ctx.tab.hc;
+    if (hc.state != .ready) {
+        self.setStatusFmt("not connected to {s}", .{hc.label()});
+        return menuDone(ctx);
+    }
+    trashPaths(self, hc, targets);
     menuDone(ctx);
 }
+
+/// Chord-driven trash (Delete): the tab's selection.
+pub fn trashSelection(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    if (tab.selected.items.len == 0) {
+        self.setStatus("nothing selected");
+        return;
+    }
+    if (tab.hc.state != .ready) {
+        self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+        return;
+    }
+    trashPaths(self, tab.hc, tab.selected.items);
+}
+
+fn trashPaths(self: *BrowserView, hc: *HostConn, targets: []const []u8) void {
+    for (targets) |p| trashOne(self, hc, p);
+    if (targets.len > 1) self.setStatusFmt("moving {d} items to trash", .{targets.len});
+}
+
+/// Pending permanent-delete confirmation: paths are owned copies —
+/// the selection and the listing can change while the dialog is up.
+const DeleteReq = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    tab: *BTab,
+    paths: [][]u8,
+    dirs: []bool,
+    dialog: *c.GtkAlertDialog,
+
+    fn destroy(self: *DeleteReq) void {
+        for (self.paths) |p| self.allocator.free(p);
+        self.allocator.free(self.paths);
+        self.allocator.free(self.dirs);
+        c.g_object_unref(self.dialog);
+        self.allocator.destroy(self);
+    }
+};
 
 pub fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    // Confirm popover with one destructive button.
-    const popover = c.gtk_popover_new();
-    const cctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
-    cctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = ctx.tab,
-        .path = self.allocator.dupe(u8, path) catch null,
-        .name = null,
-        .is_dir = ctx.is_dir,
-        .popover = popover,
-    };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(cctx), @ptrCast(&MenuCtx.free));
-    var lbl: [300:0]u8 = undefined;
-    const base = std.fs.path.basename(path);
-    const txt = std.fmt.bufPrintZ(&lbl, "Delete {s}{s}", .{ base, if (ctx.is_dir) " (recursively)" else "" }) catch "Delete";
-    const btn = c.gtk_button_new_with_label(txt.ptr);
-    c.gtk_widget_add_css_class(btn, "destructive-action");
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onDeleteConfirmed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_popover_set_child(@ptrCast(popover), btn);
-    c.gtk_widget_set_parent(popover, ctx.tab.page);
-    connectPopoverAutoUnparent(popover);
-    c.gtk_popover_popup(@ptrCast(popover));
+    var one: [1][]u8 = undefined;
+    const targets = menuTargets(ctx, &one);
+    confirmDeletePaths(ctx.view, ctx.tab, targets);
     menuDone(ctx);
 }
 
-pub fn onDeleteConfirmed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    if (ctx.is_dir) {
+/// Chord-driven permanent delete (Shift+Delete): the tab's selection.
+pub fn deleteSelection(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    if (tab.selected.items.len == 0) {
+        self.setStatus("nothing selected");
+        return;
+    }
+    confirmDeletePaths(self, tab, tab.selected.items);
+}
+
+/// Modal confirmation, Nemo's shape: names one item, counts many.
+/// The dialog is window-modal, so the tab cannot be closed under it.
+/// `files_confirm_delete = false` skips straight to the delete.
+pub fn confirmDeletePaths(self: *BrowserView, tab: *BTab, targets: []const []u8) void {
+    if (targets.len == 0) return;
+    if (self.ownerWindow()) |win| {
+        if (!win.config.files_confirm_delete) {
+            for (targets) |path| deleteOne(self, tab, path, pathIsDir(tab, path));
+            if (targets.len > 1) self.setStatusFmt("deleting {d} items", .{targets.len});
+            return;
+        }
+    }
+    const a = self.allocator;
+    const req = a.create(DeleteReq) catch return;
+    const paths = a.alloc([]u8, targets.len) catch {
+        a.destroy(req);
+        return;
+    };
+    const dirs = a.alloc(bool, targets.len) catch {
+        a.free(paths);
+        a.destroy(req);
+        return;
+    };
+    var n: usize = 0;
+    for (targets) |p| {
+        paths[n] = a.dupe(u8, p) catch continue;
+        dirs[n] = pathIsDir(tab, p);
+        n += 1;
+    }
+    var msg: [340:0]u8 = undefined;
+    const txt = if (n == 1)
+        std.fmt.bufPrintZ(&msg, "Are you sure you want to permanently delete \"{s}\"?", .{std.fs.path.basename(paths[0])}) catch "Permanently delete this item?"
+    else
+        std.fmt.bufPrintZ(&msg, "Are you sure you want to permanently delete the {d} selected items?", .{n}) catch "Permanently delete the selected items?";
+    const dlg = c.gtk_alert_dialog_new("%s", txt.ptr) orelse {
+        for (paths[0..n]) |p| a.free(p);
+        a.free(paths);
+        a.free(dirs);
+        a.destroy(req);
+        return;
+    };
+    req.* = .{
+        .allocator = a,
+        .view = self,
+        .tab = tab,
+        .paths = paths[0..n],
+        .dirs = dirs[0..n],
+        .dialog = dlg,
+    };
+    c.gtk_alert_dialog_set_detail(dlg, "If you delete an item, it will be permanently lost.");
+    const buttons = [_:null]?[*:0]const u8{ "Cancel", "Delete" };
+    c.gtk_alert_dialog_set_buttons(dlg, @ptrCast(@constCast(&buttons)));
+    c.gtk_alert_dialog_set_cancel_button(dlg, 0);
+    c.gtk_alert_dialog_set_default_button(dlg, 0);
+    c.gtk_alert_dialog_set_modal(dlg, 1);
+    const root = c.gtk_widget_get_root(self.root_box);
+    c.gtk_alert_dialog_choose(dlg, @ptrCast(@alignCast(root)), null, @ptrCast(&onDeleteChosen), @ptrCast(req));
+}
+
+fn deleteOne(self: *BrowserView, tab: *BTab, path: []const u8, is_dir: bool) void {
+    if (is_dir) {
         var lbl: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&lbl, "delete {s}", .{std.fs.path.basename(path)}) catch "delete";
-        self.startDaemonJob(ctx.tab.hc, "delete_tree", path, "", label);
+        self.startDaemonJob(tab.hc, "delete_tree", path, "", label);
     } else {
-        self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "delete", .path = path });
+        self.sendOp(tab.hc, .{ .req = self.nextReq(), .op = "delete", .path = path });
     }
-    menuDone(ctx);
+}
+
+fn onDeleteChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    _ = source;
+    const req: *DeleteReq = @ptrCast(@alignCast(user.?));
+    defer req.destroy();
+    const choice = c.gtk_alert_dialog_choose_finish(req.dialog, res, null);
+    if (choice != 1) return;
+    const self = req.view;
+    if (self.widgets_dead) return;
+    for (req.paths, req.dirs) |path, is_dir| deleteOne(self, req.tab, path, is_dir);
+    if (req.paths.len > 1) self.setStatusFmt("deleting {d} items", .{req.paths.len});
 }
 
 /// One-entry popover shared by Rename (target = old full path)
