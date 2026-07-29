@@ -661,6 +661,10 @@ fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
         if (g_app.primary) |w| shutdownWindow(w);
     }
     g_app.primary = null;
+    // After the windows: a FUSE mount can still be serving a file an
+    // application opened from a pane, and the panes are what own those
+    // opens. A crash instead leaves the next start's sweep to clean up.
+    @import("ui/hostmount.zig").shutdownAll();
 }
 
 fn shutdownWindow(w: *Window) void {

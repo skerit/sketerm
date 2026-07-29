@@ -17,6 +17,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
+    _ = @import("filebrowser/clipboard.zig");
     _ = @import("filebrowser/crumbs.zig");
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/emblems.zig");

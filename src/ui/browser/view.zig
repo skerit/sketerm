@@ -19,6 +19,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
+const clipboard_mod = @import("../../filebrowser/clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const emblems_mod = @import("../../filebrowser/emblems.zig");
 const iconload = @import("iconload.zig");
@@ -30,6 +31,7 @@ const AttrRequest = @import("props.zig").AttrRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
 const CopyQueue = @import("jobs.zig").CopyQueue;
+const CopyRetry = @import("types.zig").CopyRetry;
 const conflict_mod = @import("conflict.zig");
 const DupState = @import("search.zig").DupState;
 const EditWatch = @import("types.zig").EditWatch;
@@ -79,6 +81,10 @@ pub const BrowserView = struct {
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
     /// Cross-host copies waiting for their destination (jobs.zig).
     copy_queue: CopyQueue = .{},
+    /// Failed cross-host copies waiting out their automatic-resume
+    /// delay, and the one timer that submits them (jobs.zig).
+    retry_pending: std.ArrayList(*CopyRetry) = .empty,
+    retry_timer: c.guint = 0,
 
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
@@ -103,19 +109,6 @@ pub const BrowserView = struct {
     /// Rate meters, expansion state and the sampling tick of the jobs
     /// panel -- all owned by jobpanel.zig.
     jobs_panel: JobPanel = .{},
-    /// Copy-source for the context menu's Copy/Paste (owned).
-    /// clip_paths holds the full multi-selection; clip_path mirrors
-    /// its first item (single-source verbs: Sync Here, Compare).
-    clip_host: ?[]u8 = null,
-    clip_path: ?[]u8 = null,
-    clip_paths: std.ArrayList([]u8) = .empty,
-    /// Cut mode: paste MOVES (rename same-host, transfer+delete
-    /// cross-host) and then clears the clipboard.
-    clip_cut: bool = false,
-    /// Filesystem the clipboard's sources live on (0 = unknown). A
-    /// hard link is only OFFERED where it can work, and this is what
-    /// decides that without a round trip per menu.
-    clip_dev: u64 = 0,
     /// Parked paste collisions and their decision dialog. A collision
     /// never stalls the rest of the batch (conflict.zig).
     conflicts: conflict_mod.State = .{},
@@ -401,6 +394,7 @@ pub const BrowserView = struct {
     pub const toggleLocationFace = @import("locbar.zig").toggleLocationFace;
     pub const showEntryFace = @import("locbar.zig").showEntryFace;
     pub const showCrumbFace = @import("locbar.zig").showCrumbFace;
+    pub const foldLocationFace = @import("locbar.zig").foldLocationFace;
     pub const showHistoryMenu = @import("locbar.zig").showHistoryMenu;
     pub const historyJump = @import("locbar.zig").historyJump;
     pub const installNavGestures = @import("locbar.zig").installNavGestures;
@@ -597,6 +591,8 @@ pub const BrowserView = struct {
     pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
     pub const startTransfer = @import("jobs.zig").startTransfer;
+    pub const retryCopyJob = @import("jobs.zig").retryCopyJob;
+    pub const cancelPendingRetries = @import("jobs.zig").cancelPendingRetries;
     pub const startDaemonJob = @import("jobs.zig").startDaemonJob;
     pub const startDaemonJobResumable = @import("jobs.zig").startDaemonJobResumable;
     pub const startDaemonJobKind = @import("jobs.zig").startDaemonJobKind;
@@ -854,6 +850,22 @@ pub const BrowserView = struct {
         self.focusListing();
     }
 
+    /// Capture-phase press anywhere in the face. Focus already inside
+    /// is left alone -- the clicked widget claims it in the target
+    /// phase, which is the normal path. Only focus sitting in ANOTHER
+    /// pane is pulled over, and the location face that pane was
+    /// editing folds back so exactly one address bar is ever open.
+    fn onFaceClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        if (self.widgets_dead) return;
+        const root = c.gtk_widget_get_root(self.root_box) orelse return;
+        if (c.gtk_root_get_focus(root)) |focused| {
+            if (focused == self.root_box or c.gtk_widget_is_ancestor(focused, self.root_box) != 0) return;
+        }
+        if (self.peerView()) |peer| _ = peer.foldLocationFace();
+        self.focusListing();
+    }
+
     /// Put GTK focus on the current tab's rows, so the browser's chords
     /// (Ctrl+L, Ctrl+Shift+B, type-ahead) reach its key controller.
     /// Falls back to the first focusable widget in the face -- what
@@ -873,6 +885,12 @@ pub const BrowserView = struct {
             if (c.gtk_widget_grab_focus(target) != 0) return;
         }
         _ = c.gtk_widget_child_focus(self.root_box, c.GTK_DIR_TAB_FORWARD);
+    }
+
+    /// The file-manager clipboard. Process-wide on purpose: a copy in
+    /// one pane must paste in every other one, local or remote.
+    pub fn clipboard(self: *BrowserView) *clipboard_mod.Board {
+        return clipboard_mod.shared(self.allocator);
     }
 
     /// The BrowserView riding `pane`, if any. Safe cast: browser_ctx
@@ -1023,6 +1041,7 @@ pub const BrowserView = struct {
         }
         self.jobs_panel.deinit(self.allocator);
         self.copy_queue.deinit(self.allocator);
+        self.cancelPendingRetries();
         self.conflicts.deinit(self.allocator);
         self.templates.deinit(self.allocator);
         for (self.transfers.items) |t| {
@@ -1053,6 +1072,7 @@ pub const BrowserView = struct {
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);
             if (pj.history_op) |op| op.destroy(self.allocator);
+            if (pj.retry) |r| r.destroy(self.allocator);
             self.allocator.free(pj.label);
             self.allocator.destroy(pj);
         }
@@ -1061,6 +1081,7 @@ pub const BrowserView = struct {
             if (j.undo_op) |u| u.destroy(self.allocator);
             if (j.undo_trash_orig) |o| self.allocator.free(o);
             if (j.history_op) |op| op.destroy(self.allocator);
+            if (j.retry) |r| r.destroy(self.allocator);
             self.allocator.free(j.label);
             self.allocator.destroy(j);
         }
@@ -1076,10 +1097,8 @@ pub const BrowserView = struct {
             }
         }
         self.conns.deinit(self.allocator);
-        if (self.clip_host) |s| self.allocator.free(s);
-        if (self.clip_path) |s| self.allocator.free(s);
-        for (self.clip_paths.items) |p| self.allocator.free(p);
-        self.clip_paths.deinit(self.allocator);
+        // The clipboard is process-wide: closing one pane must not
+        // empty it for the others.
         self.closePathCompletion();
         if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
         if (self.completion_request) |request| request.destroy(self.allocator);
@@ -1470,6 +1489,17 @@ pub const BrowserView = struct {
         const keys = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onBrowserKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(vbox, @ptrCast(keys));
+
+        // Clicking anywhere in this face makes it the pane the chords
+        // act on. Lots of it cannot take focus (the places sidebar's
+        // empty space, the toolbar, the status line, a column header),
+        // so "click the other pane, press Ctrl+L" used to reach the
+        // pane the user had just left.
+        const claim = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(claim), 0);
+        c.gtk_event_controller_set_propagation_phase(@ptrCast(claim), c.GTK_PHASE_CAPTURE);
+        _ = c.g_signal_connect_data(claim, "pressed", @ptrCast(&onFaceClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(vbox, @ptrCast(claim));
 
         // The fence for every deferred callback below: see
         // `widgets_dead`.

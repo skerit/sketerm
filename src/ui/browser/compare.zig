@@ -450,21 +450,22 @@ pub const CompareCtx = struct {
 pub fn onMenuSyncHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
-    const src = self.clip_path orelse return menuDone(ctx);
+    const board = self.clipboard();
+    const src = board.first() orelse return menuDone(ctx);
     const tab = ctx.tab;
     const base = std.fs.path.basename(src);
     var dst_buf: [4096]u8 = undefined;
     const dir = tab.root.path;
     const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ if (dir.len == 1) "" else dir, base }) catch
         return menuDone(ctx);
-    if (hostEq(self.clip_host, tab.hc.host)) {
+    if (hostEq(board.hostOpt(), tab.hc.host)) {
         // Same host: daemon copy with resume — completed files
         // skip, partials continue (incremental mirror, no deletes).
         var lbl: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&lbl, "sync {s}", .{base}) catch base;
         self.startDaemonJobResumable(tab.hc, "copy", src, dst, label);
     } else {
-        const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse
+        const src_hc = self.hostConnFor(board.hostOpt()) orelse
             return menuDone(ctx);
         self.startTransfer(src_hc, src, tab.hc, dst, .{});
     }
@@ -474,12 +475,13 @@ pub fn onMenuSyncHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// Open the compare/sync window: source = the copied directory,
 /// target = `right_path` on this tab's host. Host-side scans.
 pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void {
-    const src_path = self.clip_path orelse return;
+    const board = self.clipboard();
+    const src_path = board.first() orelse return;
     if (self.compare != null) {
         self.setStatus("a compare window is already open");
         return;
     }
-    const left_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse return;
+    const left_hc = self.hostConnFor(board.hostOpt()) orelse return;
     const right_hc = tab.hc;
     if (left_hc.state != .ready or right_hc.state != .ready) {
         self.setStatus("both hosts must be connected — retry in a moment");

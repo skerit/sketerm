@@ -189,7 +189,10 @@ pub fn showEntryMenu(
         const edit = m.section();
         edit.itemIcon("Cut", .{ .name = "edit-cut-symbolic" }, &onMenuCut, ctx);
         edit.itemIcon("Copy", .{ .name = "edit-copy-symbolic" }, &onMenuCopy, ctx);
-        if (self.clip_path != null)
+        // The clipboard is process-wide, so this offers Paste for a
+        // copy made in ANY pane -- which is what made a remote folder
+        // look like it had no Paste at all.
+        if (!self.clipboard().isEmpty())
             buildPaste(self, tab, ctx, edit.submenuIcon("Paste", .{ .name = "edit-paste-symbolic" }));
         const org = m.section();
         org.item("Rename…", &onMenuRename, ctx);
@@ -217,7 +220,7 @@ pub fn showEntryMenu(
         // click is the pane, not a file.
         buildCreateNew(self, ctx, m, false);
         const paste = m.section();
-        if (self.clip_path != null) {
+        if (!self.clipboard().isEmpty()) {
             paste.itemIcon("Paste", .{ .name = "edit-paste-symbolic" }, &onMenuPaste, ctx);
             buildPasteSpecial(self, tab, ctx, paste.submenu("Paste Special"));
         }
@@ -848,12 +851,9 @@ pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
-    if (self.clip_paths.items.len == 0 and self.clip_path == null) return menuDone(ctx);
-    const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
-        self.clip_paths.items
-    else
-        (&[_][]u8{self.clip_path.?})[0..];
-    self.beginPaste(ctx.tab, self.clip_host, srcs, self.clip_cut, true);
+    const board = self.clipboard();
+    if (board.isEmpty()) return menuDone(ctx);
+    self.beginPaste(ctx.tab, board.hostOpt(), board.items(), board.cut, true);
     menuDone(ctx);
 }
 
@@ -1025,17 +1025,12 @@ fn pasteAsLink(ctx: *MenuCtx, hard: bool) void {
     const self = ctx.view;
     const tab = ctx.tab;
     menuDone(ctx);
-    if (!hostEq(if (self.clip_host) |h| @as(?[]const u8, h) else null, tab.hc.host)) {
+    const board = self.clipboard();
+    if (!hostEq(board.hostOpt(), tab.hc.host)) {
         self.setStatus("a link can only point at a path on the same host");
         return;
     }
-    const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
-        self.clip_paths.items
-    else if (self.clip_path) |p|
-        (&[_][]u8{p})[0..]
-    else
-        return;
-    for (srcs) |src| self.linkHere(tab, src, hard);
+    for (board.items()) |src| self.linkHere(tab, src, hard);
 }
 
 pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

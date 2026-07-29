@@ -571,9 +571,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .history_direction = pj.history_direction,
                 .paths = pj.paths,
                 .dest_key = pj.dest_key,
+                .retry = pj.retry,
             };
             self.jobs.append(self.allocator, row) catch {
                 if (row.history_op) |op| self.restoreHistory(op, row.history_direction.?);
+                if (row.retry) |r| r.destroy(self.allocator);
                 self.allocator.destroy(row);
                 self.allocator.free(pj.label);
                 _ = self.pending_jobs.orderedRemove(i);
@@ -598,6 +600,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);
             if (pj.history_op) |op| self.restoreHistory(op, pj.history_direction.?);
+            if (pj.retry) |r| r.destroy(self.allocator);
             self.allocator.free(pj.label);
             _ = self.pending_jobs.orderedRemove(i);
             self.allocator.destroy(pj);
