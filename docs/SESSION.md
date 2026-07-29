@@ -11323,3 +11323,56 @@ smoke-display audio stage speaks the native PA protocol against a
 real session socket and asserts the flag flips on and off in BOTH
 monolith and broker modes — the broker 'M' hop is exactly where such
 fields have silently regressed before.
+
+## Files-browser usability pass (Nemo-alignment round)
+
+**Columns.** Header titles are left-aligned (the hexpanded
+GtkColumnViewTitle label kept GTK's centered xalign; now pinned to 0).
+The expand policy no longer hands surplus width to the LAST column
+when Name has an explicit width — closing a split grew Modified to
+half the window. Now: auto Name expands; an explicit Name width means
+NO column expands and the surplus stays blank at the right, Nemo-style
+(the shrink-clamp in `fittedNameWidth` is unchanged, so narrow panes
+still never scroll horizontally).
+
+**Selection + delete.** Selected rows have explicit accent CSS (list
+and icon grid), so an open context-menu grab no longer greys them into
+looking dropped. Move to Trash and Delete Permanently now act on the
+WHOLE selection when the clicked row is inside it (`menuTargets`, same
+rule as copy). Delete Permanently confirms via a real window-modal
+GtkAlertDialog with Nemo's wording (names one item, counts many)
+instead of the unanchored top-of-page balloon. New chords: Delete =
+trash (undoable, no prompt), Shift+Delete = confirmed permanent
+delete, Ctrl+D = bookmark the current folder.
+
+**Sidebar.** Sections are now identity-keyed ("local", "remote",
+"registers", "bookmarks", "searches", "recent", "devices",
+"widgets:<name>"): right-click anywhere in the sidebar gets a config
+menu with per-section show/hide checks, headers get Move Section
+Up/Down, and the order/hidden sets persist in places.json
+(`section_order`/`hidden_sections`, merged by
+`places.orderSections`). Bookmarks got labels (`bookmark_labels`,
+parallel array — old files load unchanged), rename via a prompt,
+move up/down, and a menubar Bookmarks menu. NEW: user widget
+sections (`src/ui/browser/sidewidgets.zig`) — title/text labels,
+local command output (optional refresh interval), images, and
+command-fed sparkline graphs; model in places.json
+(`widget_sections`), runtime (GSubprocess fetches, timers, history)
+lives per view and resets on edit. The model is deliberately
+sidebar-independent for reuse elsewhere later.
+
+**Menubar + About.** Files-mode windows get a classic File / Edit /
+View / Go / Bookmarks / Help menubar (`src/ui/browser/menubar.zig`),
+built per click from live state on the classicmenu machinery. Help >
+About is an AdwAboutDialog whose version badge carries the git
+describe + commit date embedded at build time (`runCapture` in
+build.zig -> `build_options.commit`/`commit_date`; tarball builds
+degrade to "unknown").
+
+**Preferences.** Now an AdwPreferencesWindow — a real toplevel,
+transient but NOT modal and no longer an attached sheet. Files mode
+can reach it (menubar Edit, background context menu, hamburger). New
+"Files" page backed by three config.conf keys: `files_default_view`
+(details|compact|icons|miller), `files_show_hidden`,
+`files_confirm_delete` (false skips the permanent-delete prompt).
+Defaults apply at newTab; per-folder view memory still wins.
