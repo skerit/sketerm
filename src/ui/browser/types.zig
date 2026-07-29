@@ -907,6 +907,10 @@ pub const JobRow = struct {
     /// carry it: they are the ones that can die from a dropped link
     /// with a verified partial already staged, so "Retry" is a resume.
     retry: ?*CopyRetry = null,
+    /// A resume for this failed copy is armed or already running, so
+    /// the row offers no Retry button (pressing it would double the
+    /// copy) and disappears once the new attempt's row lands.
+    retry_scheduled: bool = false,
 
     pub fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;

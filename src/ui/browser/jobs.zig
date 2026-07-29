@@ -302,22 +302,23 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
         .dest_key = item.dest_key,
     };
     self.allocator.destroy(item);
-    submitRetry(self, retry);
+    _ = submitRetry(self, retry);
 }
 
 /// Hand one cross-host copy to the coordinating daemon. Shared by the
 /// first submission and every resume, so a retry is the same request
 /// with the same idempotent `resume` flag -- never a second code path.
-fn submitRetry(self: *BrowserView, retry: *CopyRetry) void {
+/// @return false when nothing was sent (the record is destroyed then).
+fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
     if (retry.coordinator.state != .ready) {
         self.setStatusFmt("transfer dropped, coordinator offline: {s}", .{retry.label});
         retry.destroy(self.allocator);
-        return;
+        return false;
     }
     const req = self.nextReq();
     const pj = self.allocator.create(PendingJob) catch {
         retry.destroy(self.allocator);
-        return;
+        return false;
     };
     pj.* = .{
         .req = req,
@@ -325,7 +326,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) void {
         .label = self.allocator.dupe(u8, retry.label) catch {
             self.allocator.destroy(pj);
             retry.destroy(self.allocator);
-            return;
+            return false;
         },
         .dest_key = retry.dest_key,
         .retry = retry,
@@ -335,7 +336,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) void {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
         retry.destroy(self.allocator);
-        return;
+        return false;
     };
     self.sendOp(retry.coordinator, .{
         .req = req,
@@ -350,6 +351,33 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) void {
         self.setStatusFmt("durable transfer started: {s}", .{retry.label});
     } else {
         self.setStatusFmt("resuming transfer (attempt {d}): {s}", .{ retry.attempts + 1, retry.label });
+    }
+    return true;
+}
+
+/// The resumed attempt's row replaces the failed one it came from:
+/// without this, every dropped link left a spent `.failed` row (with a
+/// live Retry button) stacked next to the copy that superseded it.
+pub fn dropSupersededRetryRows(self: *BrowserView, fresh: *JobRow) void {
+    const fr = fresh.retry orelse return;
+    var i: usize = 0;
+    while (i < self.jobs.items.len) {
+        const j = self.jobs.items[i];
+        const jr = j.retry;
+        if (j != fresh and j.terminal() and jr != null and
+            std.mem.eql(u8, jr.?.src_path, fr.src_path) and
+            std.mem.eql(u8, jr.?.dst_path, fr.dst_path))
+        {
+            if (j.undo_op) |u| u.destroy(self.allocator);
+            if (j.undo_trash_orig) |o| self.allocator.free(o);
+            if (j.history_op) |op| op.destroy(self.allocator);
+            jr.?.destroy(self.allocator);
+            self.allocator.free(j.label);
+            self.allocator.destroy(j);
+            _ = self.jobs.orderedRemove(i);
+            continue;
+        }
+        i += 1;
     }
 }
 
@@ -372,7 +400,7 @@ fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     var pending = self.retry_pending;
     self.retry_pending = .empty;
     defer pending.deinit(self.allocator);
-    for (pending.items) |retry| submitRetry(self, retry);
+    for (pending.items) |retry| _ = submitRetry(self, retry);
     self.renderJobs();
     return 0;
 }
@@ -392,6 +420,9 @@ fn scheduleCopyRetry(self: *BrowserView, row: *JobRow) bool {
         retry.destroy(self.allocator);
         return false;
     };
+    // No Retry button while an automatic attempt is armed: pressing it
+    // then would run the same copy twice.
+    row.retry_scheduled = true;
     if (self.retry_timer == 0)
         self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
     return true;
@@ -412,10 +443,13 @@ pub fn cancelPendingRetries(self: *BrowserView) void {
 /// gave up on. The record is cloned so the failed row keeps its own
 /// (the user may press Retry again after a second failure).
 pub fn retryCopyJob(self: *BrowserView, row: *JobRow) void {
+    if (row.retry_scheduled) return;
     const retry = row.retry orelse return;
     const fresh = retry.clone(self.allocator) orelse return;
     fresh.attempts = 0;
-    submitRetry(self, fresh);
+    // The new attempt's row replaces this one once the daemon answers
+    // (dropSupersededRetryRows); until then the button stays hidden.
+    if (submitRetry(self, fresh)) row.retry_scheduled = true;
     self.renderJobs();
 }
 
@@ -842,6 +876,7 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         // failed, with the reason and a Retry button.
         if (scheduleCopyRetry(self, row)) {
             self.setStatusFmt("transfer interrupted, resuming shortly: {s} ({s})", .{ row.label, e.message });
+            row.setMessage("interrupted -- resuming automatically");
         } else {
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
         }

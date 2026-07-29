@@ -92,7 +92,7 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
 /// x-special/gnome-copied-files carries file:// URIs so GNOME-family
 /// file managers paste the files themselves.
 ///
-/// Paste-into-self never reads GDK — it uses the internal clip_paths —
+/// Paste-into-self never reads GDK — it uses the internal board —
 /// so this is purely an export. Remote entries are skipped: their
 /// paths mean nothing to other local applications.
 fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
