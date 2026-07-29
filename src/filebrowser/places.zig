@@ -26,14 +26,45 @@ pub const CollItem = struct {
     dir: bool = false,
 };
 
+/// One user sidebar widget. `kind` decides which of the other fields
+/// matter: title/text use `text`; command/graph run `command` (graph
+/// plots its numeric first line); image shows the file at `path`.
+pub const Widget = struct {
+    kind: []const u8 = "title",
+    text: []const u8 = "",
+    command: []const u8 = "",
+    path: []const u8 = "",
+    /// Re-run seconds for command/graph output; 0 = once per session.
+    interval_secs: u32 = 0,
+};
+
+/// A user-named sidebar section housing widgets.
+pub const WidgetSection = struct {
+    name: []const u8 = "",
+    widgets: []const Widget = &.{},
+};
+
 pub const Places = struct {
     bookmarks: []const []const u8 = &.{},
+    /// Display labels parallel to `bookmarks`; "" (or a missing tail,
+    /// for files written before labels existed) = derive from spec.
+    bookmark_labels: []const []const u8 = &.{},
     recent: []const []const u8 = &.{},
     searches: []const SavedSearch = &.{},
     collection: []const CollItem = &.{},
     /// Sidebar section headers the user folded shut, by header text.
     /// Missing (an older file) = everything expanded.
     collapsed: []const []const u8 = &.{},
+    /// Sidebar sections hidden entirely, by section KEY (see
+    /// `builtin_sections`; "remote" covers every host section,
+    /// "widgets:<name>" a user widget section).
+    hidden_sections: []const []const u8 = &.{},
+    /// Preferred section order, by key. Keys absent here keep the
+    /// default order after the listed ones.
+    section_order: []const []const u8 = &.{},
+    /// User widget sections (rendered between the built-in sections
+    /// per `section_order`).
+    widget_sections: []const WidgetSection = &.{},
     /// Width of the places sidebar, in pixels (the GtkPaned position).
     sidebar_px: i32 = DEFAULT_SIDEBAR_PX,
     /// Whether the sidebar is shown. `null` = never toggled, so the
@@ -46,6 +77,61 @@ pub const Places = struct {
     /// Compact info card at the bottom of the places sidebar.
     side_info: bool = false,
 };
+
+/// Stable identity + display title for each built-in sidebar section.
+/// The KEY is what hidden_sections/section_order store; the title is
+/// what the header shows (and what fold state keys on, historically).
+pub const SectionDef = struct { key: []const u8, title: []const u8 };
+
+pub const builtin_sections = [_]SectionDef{
+    .{ .key = "local", .title = "Local Places" },
+    .{ .key = "remote", .title = "Remote Places" },
+    .{ .key = "registers", .title = "Registers" },
+    .{ .key = "bookmarks", .title = "Bookmarks" },
+    .{ .key = "searches", .title = "Saved Queries" },
+    .{ .key = "recent", .title = "Recent" },
+    .{ .key = "devices", .title = "Devices" },
+};
+
+pub const WIDGET_KEY_PREFIX = "widgets:";
+
+/// Merge a saved order with the full current key set: saved keys that
+/// still exist come first (in saved order), then every remaining key
+/// in `all` order. Caller frees the returned slice (the strings are
+/// borrowed from `all`).
+pub fn orderSections(
+    allocator: std.mem.Allocator,
+    saved: []const []const u8,
+    all: []const []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (saved) |k| {
+        const exists = for (all) |a| {
+            if (std.mem.eql(u8, a, k)) break true;
+        } else false;
+        if (!exists) continue;
+        const dup = for (out.items) |o| {
+            if (std.mem.eql(u8, o, k)) break true;
+        } else false;
+        if (dup) continue;
+        // Borrow the canonical string, not the saved one: `saved`
+        // may be freed before the result.
+        for (all) |a| {
+            if (std.mem.eql(u8, a, k)) {
+                try out.append(allocator, a);
+                break;
+            }
+        }
+    }
+    for (all) |a| {
+        const seen = for (out.items) |o| {
+            if (std.mem.eql(u8, o, a)) break true;
+        } else false;
+        if (!seen) try out.append(allocator, a);
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 pub const DEFAULT_SIDEBAR_PX: i32 = 190;
 pub const MIN_SIDEBAR_PX: i32 = 120;
@@ -218,6 +304,54 @@ test "clampSidebarPx rejects widths that would break the layout" {
     try t.expectEqual(MIN_SIDEBAR_PX, clampSidebarPx(MIN_SIDEBAR_PX));
     try t.expectEqual(@as(i32, 245), clampSidebarPx(245));
     try t.expectEqual(MAX_SIDEBAR_PX, clampSidebarPx(10_000));
+}
+
+test "orderSections: saved-first, leftovers in default order, stale keys dropped" {
+    const t = std.testing;
+    const all = [_][]const u8{ "local", "remote", "bookmarks", "widgets:Mine" };
+    const saved = [_][]const u8{ "bookmarks", "gone", "local", "bookmarks" };
+    const out = try orderSections(t.allocator, &saved, &all);
+    defer t.allocator.free(out);
+    try t.expectEqual(@as(usize, 4), out.len);
+    try t.expectEqualStrings("bookmarks", out[0]);
+    try t.expectEqualStrings("local", out[1]);
+    try t.expectEqualStrings("remote", out[2]);
+    try t.expectEqualStrings("widgets:Mine", out[3]);
+}
+
+test "widget sections and hidden sections round-trip; old files default empty" {
+    const t = std.testing;
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    const w = [_]Widget{.{ .kind = "command", .text = "Load", .command = "uptime", .interval_secs = 30 }};
+    const ws = [_]WidgetSection{.{ .name = "Mine", .widgets = &w }};
+    try std.json.Stringify.value(Places{
+        .hidden_sections = &.{"recent"},
+        .section_order = &.{ "bookmarks", "local" },
+        .widget_sections = &ws,
+        .bookmark_labels = &.{"Projects"},
+    }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(Places, t.allocator, out.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try t.expectEqualStrings("recent", parsed.value.hidden_sections[0]);
+    try t.expectEqualStrings("bookmarks", parsed.value.section_order[0]);
+    try t.expectEqualStrings("Mine", parsed.value.widget_sections[0].name);
+    try t.expectEqualStrings("uptime", parsed.value.widget_sections[0].widgets[0].command);
+    try t.expectEqual(@as(u32, 30), parsed.value.widget_sections[0].widgets[0].interval_secs);
+    try t.expectEqualStrings("Projects", parsed.value.bookmark_labels[0]);
+
+    const old = "{\"bookmarks\":[\"/x\"]}";
+    const p2 = try std.json.parseFromSlice(Places, t.allocator, old, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer p2.deinit();
+    try t.expectEqual(@as(usize, 0), p2.value.widget_sections.len);
+    try t.expectEqual(@as(usize, 0), p2.value.hidden_sections.len);
+    try t.expectEqual(@as(usize, 0), p2.value.bookmark_labels.len);
 }
 
 test "recordRecent dedupes, front-inserts, and trims" {
