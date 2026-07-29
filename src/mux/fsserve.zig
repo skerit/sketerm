@@ -203,8 +203,11 @@ pub fn joinZ(buf: *[4096]u8, dir: []const u8, name: []const u8) pathz.Error![*:0
 pub const CHILD_COUNT_CAP: i64 = 100_000;
 
 /// Count of a directory's entries excluding "." / "..", or -1 when it
-/// cannot be opened or exceeds CHILD_COUNT_CAP.
-fn countChildren(path: [*:0]const u8) i64 {
+/// cannot be opened or exceeds CHILD_COUNT_CAP. Deliberately NOT part
+/// of listings (a full readdir per subdirectory made big/networked
+/// folders take seconds) — the daemon counts asynchronously after the
+/// listing and ships the numbers as view deltas.
+pub fn countChildren(path: [*:0]const u8) i64 {
     const d = c.opendir(path) orelse return -1;
     defer _ = c.closedir(d);
     var n: i64 = 0;
@@ -220,14 +223,15 @@ fn countChildren(path: [*:0]const u8) i64 {
 /// Stat one entry (lstat semantics; links resolved just enough for
 /// `target`/`tdir`). Strings are duped into `arena`. Null when the
 /// entry vanished between readdir and stat — a live filesystem race,
-/// not an error.
+/// not an error. Single-entry stats count children (one readdir);
+/// listings must not (see countChildren).
 pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?Entry {
-    return statEntryAttrs(arena, dir, name, &.{});
+    return statEntryAttrs(arena, dir, name, &.{}, true);
 }
 
 /// statEntry plus the values of `attrs` (client-requested extended
 /// attribute names), in request order.
-pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u8, attrs: []const []const u8) ?Entry {
+pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u8, attrs: []const []const u8, count_children: bool) ?Entry {
     var z_buf: [4096]u8 = undefined;
     const full = joinZ(&z_buf, dir, name) catch return null;
     var st: c.struct_stat = undefined;
@@ -261,7 +265,7 @@ pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u
         var fst: c.struct_stat = undefined;
         if (c.stat(full, &fst) == 0) e.tdir = (fst.st_mode & c.S_IFMT) == c.S_IFDIR;
     }
-    if (e.tdir) e.children = countChildren(full);
+    if (count_children and e.tdir) e.children = countChildren(full);
     if (attrs.len > 0) {
         const values = arena.alloc([]const u8, attrs.len) catch return null;
         for (attrs, 0..) |attr, i| {
@@ -406,11 +410,57 @@ pub fn listDirAttrsWhy(
             truncated = true;
             break;
         }
-        const e = statEntryAttrs(arena, dir_path, name, attrs) orelse continue;
+        const e = statEntryAttrs(arena, dir_path, name, attrs, false) orelse continue;
         entries.append(arena, e) catch break;
     }
     sortEntries(entries.items);
     return .{ .entries = entries.items, .truncated = truncated };
+}
+
+pub const Names = struct {
+    names: [][]u8,
+    truncated: bool,
+};
+
+/// Just the entry NAMES of a directory, sorted case-insensitively —
+/// the cheap first phase of an incremental listing: one readdir pass,
+/// no stats. Same filters as listDir (".", "..", non-UTF-8 skipped).
+pub fn readNames(
+    arena: std.mem.Allocator,
+    dir_path: []const u8,
+    max: usize,
+    why: *[]const u8,
+) error{OpenFailed}!Names {
+    var z_buf: [4096]u8 = undefined;
+    const dz = pathz.pathZ(&z_buf, dir_path) catch {
+        why.* = "NAMETOOLONG";
+        return error.OpenFailed;
+    };
+    const dir = c.opendir(dz) orelse {
+        why.* = errnoName(@as(c_int, -1));
+        return error.OpenFailed;
+    };
+    defer _ = c.closedir(dir);
+    var names: std.ArrayList([]u8) = .empty;
+    var truncated = false;
+    while (c.readdir(dir)) |de| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+        if (name.len == 0) continue;
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (!std.unicode.utf8ValidateSlice(name)) continue;
+        if (names.items.len >= max) {
+            truncated = true;
+            break;
+        }
+        const owned = arena.dupe(u8, name) catch break;
+        names.append(arena, owned) catch break;
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.lt);
+    return .{ .names = names.items, .truncated = truncated };
 }
 
 pub fn sortEntries(entries: []Entry) void {
@@ -654,10 +704,36 @@ test "listDir: rich entries, dirs-first ci sort, symlink target" {
     try std.testing.expect(l.entries[3].mtime_ms > 0);
     try std.testing.expect(!l.entries[3].tdir);
 
-    // Dirs (and links to dirs) carry their child count; files stay -1.
-    try std.testing.expectEqual(@as(i64, 1), l.entries[1].children);
-    try std.testing.expectEqual(@as(i64, 1), l.entries[0].children);
+    // Listings never count children (that is the async follow-up);
+    // a single-entry stat does, links-to-dirs included.
+    try std.testing.expectEqual(@as(i64, -1), l.entries[1].children);
     try std.testing.expectEqual(@as(i64, -1), l.entries[3].children);
+    const sub = statEntry(arena, dir, "sub") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), sub.children);
+    const lnk = statEntry(arena, dir, "lnk") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 1), lnk.children);
+}
+
+test "readNames: sorted cheap phase with the same filters" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    try touch(dir, "Beta.txt", "");
+    try touch(dir, "alpha.txt", "");
+    var z: [4096]u8 = undefined;
+    _ = c.mkdir(try joinZ(&z, dir, "sub"), 0o755);
+    var why: []const u8 = "";
+    const n = try readNames(arena, dir, MAX_ENTRIES, &why);
+    try std.testing.expectEqual(@as(usize, 3), n.names.len);
+    try std.testing.expect(!n.truncated);
+    try std.testing.expectEqualStrings("alpha.txt", n.names[0]);
+    try std.testing.expectEqualStrings("Beta.txt", n.names[1]);
+    try std.testing.expectEqualStrings("sub", n.names[2]);
+    const capped = try readNames(arena, dir, 2, &why);
+    try std.testing.expect(capped.truncated);
+    try std.testing.expectEqual(@as(usize, 2), capped.names.len);
 }
 
 test "listDir: entry cap sets truncated" {

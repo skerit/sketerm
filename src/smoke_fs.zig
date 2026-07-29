@@ -74,6 +74,7 @@ const DeltaLog = struct {
         name: []u8 = &.{},
         size: u64 = 0,
         tdir: bool = false,
+        children: i64 = -1,
     };
 
     allocator: std.mem.Allocator,
@@ -106,6 +107,7 @@ const DeltaLog = struct {
                     .name = self.allocator.dupe(u8, ch.name) catch fail("log oom"),
                     .size = if (ch.entry) |e| e.size else 0,
                     .tdir = if (ch.entry) |e| e.tdir else false,
+                    .children = if (ch.entry) |e| e.children else -1,
                 }) catch fail("log oom");
             }
         }
@@ -146,6 +148,20 @@ const DeltaLog = struct {
         return false;
     }
 
+    /// Await the async child-count upsert for a directory entry.
+    fn expectChildren(self: *DeltaLog, fs: *fsdrive.Fs, view: u32, name: []const u8, children: i64) bool {
+        var rounds: usize = 0;
+        while (rounds < 100) : (rounds += 1) {
+            self.pump(fs);
+            for (self.recs.items) |r| {
+                if (r.view == view and std.mem.eql(u8, r.op, "upsert") and
+                    std.mem.eql(u8, r.name, name) and r.children == children) return true;
+            }
+            _ = fs.waitDelta(100);
+        }
+        return false;
+    }
+
     fn expectGone(self: *DeltaLog, fs: *fsdrive.Fs, view: u32) bool {
         var rounds: usize = 0;
         while (rounds < 100) : (rounds += 1) {
@@ -165,6 +181,7 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     touch(dir, "a.txt", "hello fs");
     var z: [4096]u8 = undefined;
     _ = c.mkdir(fsserve.joinZ(&z, dir, "sub") catch fail("mk sub"), 0o755);
+    touch(dir, "sub/inner.txt", "y");
 
     var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("fs connect");
     defer fs.deinit();
@@ -181,7 +198,12 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     if (!std.mem.eql(u8, atxt.kind, "file")) fail("a.txt kind");
     if (atxt.size != 8) fail("a.txt size");
     if (atxt.mtime_ms <= 0) fail("a.txt mtime");
+    // Child counts never ride the listing (they cost a readdir per
+    // subdirectory); they follow asynchronously as an upsert delta
+    // on the view, with the count filled in.
+    if (sub.children != -1) fail("listing carried a child count");
     l.deinit();
+    if (!dlog.expectChildren(&fs, 1, "sub", 1)) fail("async child-count delta never arrived");
 
     // ── live deltas: external create / write / delete ──────────
     touch(dir, "c.txt", "x");

@@ -1398,7 +1398,12 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     if (std.mem.eql(u8, r.op, "open_view")) {
         fsOpenView(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "list")) {
-        _ = fsSendListing(self, cl, r.req, r.path, r.attrs);
+        // A refresh of a directory this client also watches gets its
+        // child counts refreshed too (deltas ride the view).
+        const view: ?u32 = for (self.fs_views.items) |v| {
+            if (v.client == cl and !v.gone and std.mem.eql(u8, v.path, r.path)) break v.id;
+        } else null;
+        _ = fsStartListing(self, cl, r.req, r.path, r.attrs, view);
     } else if (std.mem.eql(u8, r.op, "stat")) {
         fsStat(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "read")) {
@@ -1710,7 +1715,7 @@ pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
     };
     // Listing failure (dir vanished between checks) → the open as
     // a whole failed; the view must not linger daemon-side.
-    if (!fsSendListing(self, cl, r.req, canon, r.attrs))
+    if (!fsStartListing(self, cl, r.req, canon, r.attrs, r.view))
         dropFsViewAt(self, self.fs_views.items.len - 1);
 }
 
@@ -1731,6 +1736,11 @@ pub fn fsCloseView(self: *Daemon, cl: *Client, r: FsOpReq) void {
 /// view shares its wd (inotify hands equal paths the same wd).
 pub fn dropFsViewAt(self: *Daemon, i: usize) void {
     const v = self.fs_views.swapRemove(i);
+    // A dying view takes its pending child-count work with it (the
+    // stat stream keeps going — the chunk run was promised to `req`).
+    for (self.fs_listings.items) |l| {
+        if (l.client == v.client and l.view != null and l.view.? == v.id) l.view = null;
+    }
     if (v.wd >= 0) {
         var shared = false;
         for (self.fs_views.items) |o| {
@@ -1765,19 +1775,31 @@ pub fn splitAttrs(spec: []const u8, buf: *[MAX_ATTR_NAMES][]const u8) []const []
     return buf[0..n];
 }
 
-/// Rich listing as a chunk run of fs_reply frames (`more:true`
-/// until the last) — one request, one round trip, every entry
-/// fully stat'ed. This is the anti-GVFS listing shape.
-pub fn fsSendListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8, attr_spec: []const u8) bool {
+/// Per-batch bounds for pumpFsListings: a chunk frame never carries
+/// more than CHUNK_ENTRIES entries, and a batch stops early once its
+/// time box elapses — one slow filesystem (NFS, cold disk) then costs
+/// small chunks, never a stalled poll loop.
+const LISTING_BATCH_MS: i64 = 8;
+const COUNT_BATCH_MS: i64 = 5;
+/// Skip a listing while its client's write buffer is over this mark;
+/// POLLOUT drains it and the pump resumes (pumpDownloads' rule).
+const LISTING_WATERMARK: usize = 8 << 20;
+
+/// Begin an incremental listing. The names are read and sorted NOW —
+/// one cheap readdir pass, so open failures still reply synchronously
+/// and fsOpenView's drop-the-view-on-failure contract holds — then
+/// the per-entry stats stream from pumpFsListings as the fs_reply
+/// chunk run (`more:true` until the last) every client already
+/// accumulates. `view` non-null schedules async child counts after
+/// the listing, delivered as upsert deltas on that view.
+pub fn fsStartListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8, attr_spec: []const u8, view: ?u32) bool {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena_state.deinit();
-    var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
-    const attrs = splitAttrs(attr_spec, &attr_buf);
     // The REASON travels: "cannot open directory" made a permission
     // denial and a vanished directory indistinguishable, and a
     // client cannot report what it was never told.
     var why: []const u8 = "";
-    const l = fsserve.listDirAttrsWhy(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES, attrs, &why) catch {
+    const names = fsserve.readNames(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES, &why) catch {
+        arena_state.deinit();
         fsReplyErr(cl, req, if (why.len > 0) why else "cannot open directory");
         return false;
     };
@@ -1792,23 +1814,131 @@ pub fn fsSendListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8,
     else |_|
         0;
 
-    var off: usize = 0;
-    while (true) {
-        const n = @min(fsserve.CHUNK_ENTRIES, l.entries.len - off);
-        const last = off + n == l.entries.len;
-        cl.queueJson(.fs_reply, .{
-            .req = req,
-            .ok = true,
-            .path = dir_path,
-            .dev = dev,
-            .entries = l.entries[off .. off + n],
-            .more = !last,
-            .truncated = l.truncated,
-        });
-        off += n;
-        if (last) break;
+    const listing = self.allocator.create(dmod.FsListing) catch {
+        arena_state.deinit();
+        fsReplyErr(cl, req, "out of memory");
+        return false;
+    };
+    const path_owned = self.allocator.dupe(u8, dir_path) catch {
+        self.allocator.destroy(listing);
+        arena_state.deinit();
+        fsReplyErr(cl, req, "out of memory");
+        return false;
+    };
+    const attrs_owned = self.allocator.dupe(u8, attr_spec) catch {
+        self.allocator.free(path_owned);
+        self.allocator.destroy(listing);
+        arena_state.deinit();
+        fsReplyErr(cl, req, "out of memory");
+        return false;
+    };
+    listing.* = .{
+        .allocator = self.allocator,
+        .arena = arena_state,
+        .client = cl,
+        .req = req,
+        .path = path_owned,
+        .attrs = attrs_owned,
+        .names = names.names,
+        .truncated = names.truncated,
+        .dev = dev,
+        .view = view,
+    };
+    self.fs_listings.append(self.allocator, listing) catch {
+        listing.deinit();
+        fsReplyErr(cl, req, "out of memory");
+        return false;
+    };
+    // First batch immediately: a small local directory completes in
+    // this very call, keeping the old one-round-trip latency.
+    if (pumpListing(self, listing)) {
+        _ = self.fs_listings.pop();
+        listing.deinit();
     }
     return true;
+}
+
+/// Advance every in-flight listing by one bounded batch (tick).
+pub fn pumpFsListings(self: *Daemon) void {
+    var i: usize = 0;
+    while (i < self.fs_listings.items.len) {
+        const listing = self.fs_listings.items[i];
+        if (pumpListing(self, listing)) {
+            _ = self.fs_listings.swapRemove(i);
+            listing.deinit();
+        } else i += 1;
+    }
+}
+
+/// One batch of one listing. True = finished (caller removes it).
+fn pumpListing(self: *Daemon, listing: *dmod.FsListing) bool {
+    if (listing.client.dead) return true;
+    if (listing.client.queuedBytes() >= LISTING_WATERMARK) return false;
+    const a = listing.arena.allocator();
+    switch (listing.stage) {
+        .stat => {
+            var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
+            const attrs = splitAttrs(listing.attrs, &attr_buf);
+            var chunk: std.ArrayList(fsserve.Entry) = .empty;
+            const deadline = nowMs() + LISTING_BATCH_MS;
+            while (listing.idx < listing.names.len and chunk.items.len < fsserve.CHUNK_ENTRIES) {
+                const name = listing.names[listing.idx];
+                listing.idx += 1;
+                if (fsserve.statEntryAttrs(a, listing.path, name, attrs, false)) |e| {
+                    chunk.append(a, e) catch break;
+                    if (listing.view != null and e.tdir) listing.dirs.append(a, e) catch {};
+                }
+                if (nowMs() >= deadline) break;
+            }
+            const last = listing.idx == listing.names.len;
+            // An empty non-final batch (every stat in the box was a
+            // vanished entry, or one stat ate the whole box) sends
+            // nothing — the run is still open, the next tick continues.
+            if (chunk.items.len > 0 or last) {
+                listing.client.queueJson(.fs_reply, .{
+                    .req = listing.req,
+                    .ok = true,
+                    .path = listing.path,
+                    .dev = listing.dev,
+                    .entries = chunk.items,
+                    .more = !last,
+                    .truncated = listing.truncated,
+                });
+            }
+            if (!last) return false;
+            if (listing.view == null or listing.dirs.items.len == 0) return true;
+            listing.stage = .count;
+            return false;
+        },
+        .count => {
+            const view_id = listing.view orelse return true;
+            // The view may have died since (tab closed, navigation).
+            const alive = for (self.fs_views.items) |v| {
+                if (v.client == listing.client and v.id == view_id and !v.gone) break true;
+            } else false;
+            if (!alive) return true;
+            var changes: std.ArrayList(FsChange) = .empty;
+            const deadline = nowMs() + COUNT_BATCH_MS;
+            while (listing.count_idx < listing.dirs.items.len) {
+                const e = &listing.dirs.items[listing.count_idx];
+                listing.count_idx += 1;
+                var z: [4096]u8 = undefined;
+                if (fsserve.joinZ(&z, listing.path, e.name)) |full| {
+                    const cnt = fsserve.countChildren(full);
+                    // Vanished or over the cap: leave it unknown
+                    // rather than upsert a stale entry back to life.
+                    if (cnt >= 0) {
+                        e.children = cnt;
+                        changes.append(a, .{ .op = "upsert", .name = e.name, .entry = e.* }) catch break;
+                    }
+                } else |_| {}
+                if (nowMs() >= deadline) break;
+            }
+            if (changes.items.len > 0)
+                listing.client.queueJson(.fs_delta, .{ .view = view_id, .changes = changes.items });
+            return listing.count_idx == listing.dirs.items.len;
+        },
+    }
 }
 
 pub fn fsStat(self: *Daemon, cl: *Client, r: FsOpReq) void {
@@ -2049,7 +2179,7 @@ pub fn fsWatchReadable(self: *Daemon) void {
                 // MOVED_FROM (rapid re-create) — trust a fresh stat
                 // over the event kind.
                 var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
-                if (fsserve.statEntryAttrs(arena, v.path, ev.name, splitAttrs(v.attrs, &attr_buf))) |e| {
+                if (fsserve.statEntryAttrs(arena, v.path, ev.name, splitAttrs(v.attrs, &attr_buf), true)) |e| {
                     pv.changes.append(arena, .{ .op = "upsert", .name = e.name, .entry = e }) catch {};
                 } else {
                     // Stat failed → the entry is gone now, whatever
