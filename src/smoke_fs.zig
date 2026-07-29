@@ -2185,7 +2185,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var xa_buf: [128]u8 = undefined;
     var xb_buf: [128]u8 = undefined;
     const sock_xa = std.fmt.bufPrint(&xa_buf, "/tmp/sketerm-smoke-fs-xa{d}/mux.sock", .{c.getpid()}) catch unreachable;
-    const sock_xb = std.fmt.bufPrint(&xb_buf, "/tmp/sketerm-smoke-fs-xb{d}/mux.sock", .{c.getpid()}) catch unreachable;
+    // B sits at the DEFAULT local-daemon path under its runtime dir:
+    // the cross stage's "local destination" resolves it exactly the way
+    // a real client does ($XDG_RUNTIME_DIR/sketerm/mux.sock). Anywhere
+    // else and connectLocalAutostart silently spawns whatever
+    // `sketerm-mux` is INSTALLED, and the stage tests the wrong binary.
+    const sock_xb = std.fmt.bufPrint(&xb_buf, "/tmp/sketerm-smoke-fs-xb{d}/sketerm/mux.sock", .{c.getpid()}) catch unreachable;
+    // Daemon.init mkdirs only the socket's immediate parent.
+    var xb_base_buf: [128]u8 = undefined;
+    mkdirAt(std.fmt.bufPrint(&xb_base_buf, "/tmp/sketerm-smoke-fs-xb{d}", .{c.getpid()}) catch unreachable);
     const da = daemon_mod.Daemon.init(allocator, sock_xa) catch fail("daemon A init");
     const tha = std.Thread.spawn(.{}, daemonMain, .{da}) catch fail("thread A spawn");
     const db = daemon_mod.Daemon.init(allocator, sock_xb) catch fail("daemon B init");
@@ -2197,7 +2205,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     {
         var exe_buf: [4096]u8 = undefined;
         const exe = @import("util/platform.zig").exePath(&exe_buf) orelse fail("own exe path");
-        const dst_runtime = std.fs.path.dirname(sock_xb) orelse fail("dst runtime dir");
+        const sk_dir = std.fs.path.dirname(sock_xb) orelse fail("dst sketerm dir");
+        const dst_runtime = std.fs.path.dirname(sk_dir) orelse fail("dst runtime dir");
         crossStage(allocator, exe, sock_xa, dst_runtime, sock_xb);
     }
     inline for (.{ sock_xa, sock_xb }) |sp| {
