@@ -34,6 +34,8 @@ pub const Cleanup = *const fn (?*anyopaque) callconv(.c) void;
 /// Pixel size of the icon slot every row reserves (labels align
 /// whether or not the row has an icon, like Nemo's menus).
 const ICON_PX = 16;
+const SHORT_MENU_MAX_PX = 96;
+const CONTENT_KEY = "sketerm-cm-content";
 
 /// One row's icon: nothing (blank slot), a themed name, or a GIcon
 /// (application icons).
@@ -185,7 +187,7 @@ pub const Root = struct {
         stabilizeScroll(scroll, self.box, cap);
         for (self.subpops.items) |sp| {
             const sw = c.gtk_popover_get_child(@ptrCast(sp)) orelse continue;
-            const box = c.gtk_scrolled_window_get_child(@ptrCast(sw)) orelse continue;
+            const box = scrollContent(sw) orelse continue;
             stabilizeScroll(sw, box, cap);
         }
         const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
@@ -203,13 +205,30 @@ fn wrapScroll(box: *c.GtkWidget, cap: c_int) *c.GtkWidget {
     c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(sw), 1);
     c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), cap);
     c.gtk_scrolled_window_set_child(@ptrCast(sw), box);
+    c.g_object_set_data(@ptrCast(@alignCast(sw)), CONTENT_KEY, @ptrCast(box));
     return sw;
+}
+
+pub fn scrollContent(scroll: *c.GtkWidget) ?*c.GtkWidget {
+    const data = c.g_object_get_data(@ptrCast(@alignCast(scroll)), CONTENT_KEY) orelse return null;
+    return @ptrCast(@alignCast(data));
+}
+
+fn needsVerticalScroll(natural: c_int, cap: c_int) bool {
+    return natural > @min(cap, SHORT_MENU_MAX_PX);
 }
 
 fn stabilizeScroll(scroll: *c.GtkWidget, box: *c.GtkWidget, cap: c_int) void {
     var natural: c_int = 0;
     c.gtk_widget_measure(box, c.GTK_ORIENTATION_VERTICAL, -1, null, &natural, null, null);
-    c.gtk_scrolled_window_set_min_content_height(@ptrCast(scroll), @min(natural, cap));
+    const height = @min(natural, cap);
+    c.gtk_scrolled_window_set_min_content_height(@ptrCast(scroll), height);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(scroll), height);
+    c.gtk_scrolled_window_set_policy(
+        @ptrCast(scroll),
+        c.GTK_POLICY_NEVER,
+        if (needsVerticalScroll(natural, cap)) c.GTK_POLICY_AUTOMATIC else c.GTK_POLICY_NEVER,
+    );
 }
 
 /// GMenu-style separator semantics for the eager separators
@@ -459,4 +478,11 @@ test "escapeLabel copies text verbatim" {
     var buf: [64]u8 = undefined;
     try t.expectEqualStrings("my_file.txt", std.mem.span(escapeLabel("my_file.txt", &buf)));
     try t.expectEqualStrings("plain", std.mem.span(escapeLabel("plain", &buf)));
+}
+
+test "only short fitting menus suppress vertical scrollbar negotiation" {
+    const t = std.testing;
+    try t.expect(!needsVerticalScroll(30, 700));
+    try t.expect(needsVerticalScroll(120, 700));
+    try t.expect(needsVerticalScroll(80, 60));
 }

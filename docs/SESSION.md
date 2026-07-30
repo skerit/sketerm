@@ -11469,3 +11469,15 @@ Help > About now creates a separate transient, non-modal
 blue row selection, File -> Edit hover switching, 192x58 one-row Help
 menu, separate 388x340 About window. Full suite 1090/5/0 and
 smoke-e2e PASS.
+
+Follow-up field test: the Help menu still visibly resized because the
+settled screenshot missed its opening commits. The populated row box
+was stable; GTK's always-automatic vertical scrollbar contributed its
+theme minimum during realization, then disappeared after adjustment
+visibility resolved. `stabilizeScroll` now pins measured min/max
+content height and uses `GTK_POLICY_NEVER` for genuinely short menus
+(<=96px), retaining automatic scrolling for longer or cap-constrained
+menus. MCP frame trace changed from two popup commits settling at
+192x56 to one first-and-final 192x34 commit; File likewise opens in one
+192x148 commit. Scrollers retain the real row box as qdata so submenu
+measurement and F10 focus do not stop at GTK's intermediary viewport.
