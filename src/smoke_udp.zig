@@ -163,6 +163,37 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.unlink(dep.ptr);
     }
 
+    // Connection-ticket brokering: a live UDP connection mints a
+    // sibling listener over its own sealed channel, and the second
+    // connect dials it while ssh REFUSES to run anything but -G
+    // (config resolution never connects) — proof the ticket path
+    // needs no bootstrap.
+    {
+        _ = c.setenv("SKETERM_SSH", ssh1.ptr, 1);
+        var conn = client_mod.Conn.connectUdp(allocator, "smoke-udp-host", null) catch fail("ticket stage connect");
+        defer conn.deinit();
+        if (!conn.udp_tickets) fail("welcome does not advertise udp_ticket");
+        const ticket = conn.requestUdpTicket(null, 15_000) catch fail("ticket mint over live UDP conn");
+
+        var ssh4_buf: [176:0]u8 = undefined;
+        const ssh4 = std.fmt.bufPrintZ(&ssh4_buf, "{s}/fake-ssh-refuse", .{dir}) catch unreachable;
+        writeScript(ssh4,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\echo "smoke-udp: ssh ran during a ticket connect" >&2
+            \\exit 1
+            \\
+        );
+        _ = c.setenv("SKETERM_SSH", ssh4.ptr, 1);
+        var conn2 = client_mod.Conn.connectUdpTicket(allocator, "smoke-udp-host", ticket) catch fail("ticket connect");
+        defer conn2.deinit();
+        if (conn2.transport != .udp) fail("ticket transport is not udp");
+        conn2.sendFrame(.list, "") catch fail("ticket list send");
+        (conn2.recvExpectFor(&.{.welcome}, 10_000) catch fail("ticket list reply")).deinit(allocator);
+        _ = c.unlink(ssh4.ptr);
+        std.debug.print("smoke-udp: brokered ticket connect (no ssh bootstrap) ok\n", .{});
+    }
+
     // Clean daemon shutdown so the leak check means something.
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
     conn.sendFrame(.shutdown, "") catch fail("shutdown send");

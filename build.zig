@@ -242,6 +242,8 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const smoke_mux_run = b.addRunArtifact(smoke_mux);
+    // The ticket stage spawns real --udp-listen/--udp-connect children.
+    smoke_mux_run.addArtifactArg(mux_exe);
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
@@ -359,6 +361,8 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const smoke_broker_run = b.addRunArtifact(smoke_broker);
+    // The ticket stage spawns real --udp-listen/--udp-connect children.
+    smoke_broker_run.addArtifactArg(mux_exe);
     const smoke_broker_step = b.step("smoke-broker", "Broker process-isolation end-to-end smoke (headless)");
     smoke_broker_step.dependOn(&smoke_broker_run.step);
 

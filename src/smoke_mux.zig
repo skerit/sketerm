@@ -2231,6 +2231,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // keeper is spawned as /proc/self/exe --keep = us. Answer it, or
     // the keeper would re-run the whole smoke.
     if (@import("mux/keep.zig").wanted(init.args.vector)) return @import("mux/keep.zig").serve();
+    // The built sketerm-mux binary (argv[1], from build.zig): the
+    // ticket stage spawns real --udp-listen / --udp-connect children,
+    // which this smoke binary cannot answer itself.
+    if (init.args.vector.len > 1)
+        _ = c.setenv("SKETERM_MUX_BIN", init.args.vector[1], 1);
     // safety=true forces allocation tracking even in ReleaseFast (the
     // repo's default optimize mode), where it is off by default — so
     // the leak check below actually runs.
@@ -2440,6 +2445,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // External display sessions + the controller lease (shared stage,
     // also run against a real broker by smoke-broker).
     @import("smoke_display.zig").run(allocator, sock_path);
+
+    // UDP connection-ticket brokering (shared stage, also run against
+    // a real broker by smoke-broker — the worker-served mint differs).
+    @import("smoke_ticket.zig").run(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
