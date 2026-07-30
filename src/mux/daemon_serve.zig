@@ -430,7 +430,7 @@ pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) void {
 /// `control_fd`). `base_dir` is the runtime dir for the session's Wayland /
 /// isolated-rt sockets (the broker's socket dir). The caller spawns the one
 /// session and runs the loop.
-pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []const u8) !*Daemon {
+pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []const u8, broker_sock: []const u8) !*Daemon {
     const self = try allocator.create(Daemon);
     self.* = .{
         .allocator = allocator,
@@ -438,14 +438,15 @@ pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []c
         .sock_path = try allocator.dupe(u8, ""),
         .control_fd = control_fd,
         .base_dir = if (base_dir.len > 0) try allocator.dupe(u8, base_dir) else null,
+        .broker_sock = if (broker_sock.len > 0) try allocator.dupe(u8, broker_sock) else null,
     };
     return self;
 }
 
 /// Worker process entry: own one session (from `req`), serve clients the
 /// broker hands over `control_fd`, until killed or the broker goes away.
-pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq, base_dir: []const u8) !void {
-    const self = try initWorker(allocator, control_fd, base_dir);
+pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq, base_dir: []const u8, broker_sock: []const u8) !void {
+    const self = try initWorker(allocator, control_fd, base_dir, broker_sock);
     defer self.deinit();
     // If spawnSession fails, report WHY over the control channel ('E' +
     // error name) before dying — the broker folds it into the deferred
@@ -629,6 +630,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 .version = version.string,
                 .audio_opus = opuscodec.available(),
                 .video = build_options.video,
+                // Capability, not a proto bump: clients must not send
+                // udp_ticket_req to daemons that would answer `.err`
+                // (misattributable on a multiplexed GUI connection).
+                .udp_ticket = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -687,6 +692,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             cl.queueJson(.ok, .{ .ok = true });
             self.running = false;
         },
+        .udp_ticket_req => handleUdpTicketReq(self, cl, frame.payload),
         .fs_op => handleFsOp(self, cl, frame.payload),
         .fs_write => handleFsWrite(self, cl, frame.payload),
         .file_open => handleFileOpen(self, cl, frame.payload),
@@ -768,6 +774,155 @@ pub fn findChannel(self: *Daemon, id: u32) ?*Channel {
         if (ch.id == id) return ch;
     }
     return null;
+}
+
+// === UDP connection tickets ================================
+
+/// "lo:hi", digits only — same shape --udp-port accepts.
+fn validTicketRange(value: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    if (colon == 0 or colon + 1 == value.len) return false;
+    if (std.mem.indexOfScalarPos(u8, value, colon + 1, ':') != null) return false;
+    for (value[0..colon]) |byte| if (byte < '0' or byte > '9') return false;
+    for (value[colon + 1 ..]) |byte| if (byte < '0' or byte > '9') return false;
+    return true;
+}
+
+fn udpTicketErr(cl: *Client, msg: []const u8) void {
+    cl.queueJson(.udp_ticket, .{ .ok = false, .@"error" = msg });
+}
+
+/// Answer `udp_ticket_req`: spawn a single-use sibling UDP listener on
+/// THIS host and hand its port+key back, so a new client that already
+/// reaches this daemon over an authenticated channel can connect over
+/// UDP with no ssh bootstrap of its own (connection-ticket brokering).
+///
+/// The listener is the unchanged `--udp-listen` path (mosh-server
+/// model, one instance per connection), aimed back at THIS instance
+/// via `--socket`; it retires itself when nobody authenticates within
+/// its 60s grace, so an unclaimed ticket is never a leak. No NAT hole
+/// punch rides this path — a host whose announced port is unreachable
+/// costs the requester a bounded timeout and the ssh-bootstrap
+/// fallback, exactly the status quo.
+///
+/// The announce read is synchronous but bounded: the child only
+/// binds INADDR_ANY and prints (no network, no disk), so the line
+/// normally lands in single-digit milliseconds — same class of
+/// bounded fork work as handleSpawn. A wedged child costs one
+/// deadline'd error, never a stalled poll loop.
+pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void {
+    const rudp = @import("rudp.zig");
+    const punch = @import("punch.zig");
+
+    var range_buf: [32:0]u8 = undefined;
+    var range: ?[:0]const u8 = null;
+    if (payload.len > 0) {
+        const Req = struct { range: ?[]const u8 = null };
+        if (std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true })) |p| {
+            defer p.deinit();
+            if (p.value.range) |r| {
+                if (!validTicketRange(r)) return udpTicketErr(cl, "bad port range");
+                range = std.fmt.bufPrintZ(&range_buf, "{s}", .{r}) catch return udpTicketErr(cl, "bad port range");
+            }
+        } else |_| return udpTicketErr(cl, "bad request");
+    }
+
+    // Workers keep `sock_path` empty (deinit must not unlink the
+    // broker's socket); the broker's full path travels separately.
+    const sock = if (self.sock_path.len > 0) self.sock_path else self.broker_sock orelse
+        return udpTicketErr(cl, "daemon socket path unknown");
+    var sock_z_buf: [4096:0]u8 = undefined;
+    const sock_z = std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{sock}) catch
+        return udpTicketErr(cl, "socket path too long");
+
+    // The listener must be a binary that answers --udp-listen: the
+    // test rigs host a Daemon in a smoke binary, so SKETERM_MUX_BIN
+    // wins over /proc/self/exe, same rule as findMuxBinary.
+    var bin_buf: [4096:0]u8 = undefined;
+    const bin: [*:0]const u8 = if (c.getenv("SKETERM_MUX_BIN")) |b|
+        b
+    else if (platform.selfExecPathZ(&bin_buf)) |_|
+        @ptrCast(&bin_buf)
+    else
+        return udpTicketErr(cl, "cannot locate sketerm-mux binary");
+
+    var pipe_fds: [2]c_int = undefined;
+    if (c.pipe(&pipe_fds) != 0) return udpTicketErr(cl, "pipe failed");
+    // Park the pipe above the stdio range: a daemonized parent can
+    // have fds 0-2 closed, and the child's stdio rewiring below must
+    // not clobber its own pipe end.
+    for (&pipe_fds) |*fd| {
+        _ = c.fcntl(fd.*, c.F_SETFD, c.FD_CLOEXEC);
+        if (fd.* < 3) {
+            const moved = c.fcntl(fd.*, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+            _ = c.close(fd.*);
+            if (moved < 0) {
+                fd.* = -1;
+            } else fd.* = moved;
+        }
+    }
+    if (pipe_fds[0] < 0 or pipe_fds[1] < 0) {
+        for (pipe_fds) |fd| if (fd >= 0) {
+            _ = c.close(fd);
+        };
+        return udpTicketErr(cl, "pipe failed");
+    }
+
+    // Double fork so init reaps the listener; we waitpid only the
+    // short-lived middle child.
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.close(pipe_fds[0]);
+        _ = c.close(pipe_fds[1]);
+        return udpTicketErr(cl, "fork failed");
+    }
+    if (pid == 0) {
+        if (c.fork() == 0) {
+            _ = c.setsid();
+            _ = c.dup2(pipe_fds[1], 1);
+            // Full stdio for the exec'd listener: /dev/null stdin (no
+            // punch line will ever arrive — instant EOF) AND stderr
+            // (a detached daemon has no fd 2; leaving it unoccupied
+            // would seat the listener's own sockets in the stdio
+            // range its detach path closes).
+            const devnull = c.open("/dev/null", c.O_RDWR);
+            if (devnull >= 0) {
+                if (devnull != 0) _ = c.dup2(devnull, 0);
+                if (devnull != 2) _ = c.dup2(devnull, 2);
+                if (devnull > 2) _ = c.close(devnull);
+            }
+            _ = c.close(pipe_fds[0]);
+            _ = c.close(pipe_fds[1]);
+            var argv: [8:null]?[*:0]const u8 = .{null} ** 8;
+            var n: usize = 0;
+            argv[n] = bin;
+            argv[n + 1] = "--udp-listen";
+            n += 2;
+            if (range) |r| {
+                argv[n] = "--udp-port";
+                argv[n + 1] = r.ptr;
+                n += 2;
+            }
+            argv[n] = "--socket";
+            argv[n + 1] = sock_z.ptr;
+            _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        c._exit(0);
+    }
+    _ = c.close(pipe_fds[1]);
+    var st: c_int = 0;
+    _ = c.waitpid(pid, &st, 0);
+
+    var line_buf: [256]u8 = undefined;
+    const line = punch.readLine(pipe_fds[0], 3_000, &line_buf);
+    _ = c.close(pipe_fds[0]);
+    const ann = rudp.parseAnnounce(line orelse "") orelse {
+        log.warn("udp ticket: listener failed to announce", .{});
+        return udpTicketErr(cl, "udp listener failed to announce");
+    };
+    log.info("udp ticket minted: port {d}", .{ann.port});
+    cl.queueJson(.udp_ticket, .{ .ok = true, .port = ann.port, .key = ann.keyhex });
 }
 
 // === File upload (file_* frames) ===========================

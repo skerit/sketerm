@@ -148,6 +148,15 @@ pub const FrameType = enum(u8) {
     /// `control_state` broadcast (never an ok/err — the state IS the
     /// answer, and every viewer needs it anyway).
     control_req = 25,
+    /// Mint a sibling UDP listener on the daemon's host, so a NEW
+    /// client can reach this daemon over UDP without its own ssh
+    /// bootstrap (connection-ticket brokering). JSON { range? }
+    /// (optional "lo:hi" port pin, like --udp-port). Answered with
+    /// `udp_ticket`. Only sent to daemons whose welcome advertises
+    /// `udp_ticket:true` — older daemons would answer `.err`, which
+    /// a multiplexed GUI connection could misattribute to another
+    /// pending request.
+    udp_ticket_req = 26,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -238,6 +247,11 @@ pub const FrameType = enum(u8) {
     /// `{cwd}` follows every snapshot so a newly attached GUI does not
     /// depend on having witnessed an earlier OSC 7 event.
     session_meta = 90,
+    /// Answer to `udp_ticket_req`: JSON { ok, port?, key?, error? }.
+    /// `key` is the rudp key as hex; the listener is single-use (the
+    /// mosh-server model: one instance per connection) and retires
+    /// itself when no client authenticates within its grace window.
+    udp_ticket = 91,
     _,
 };
 

@@ -185,7 +185,7 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         // isolated-rt sockets land in the right runtime dir (the worker has
         // no listen socket of its own to derive it from). COW-valid here.
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse self.sock_path.len;
-        runWorker(self.allocator, sp[1], req, self.sock_path[0..dir_end]) catch {};
+        runWorker(self.allocator, sp[1], req, self.sock_path[0..dir_end], self.sock_path) catch {};
         c._exit(0);
     }
     // Broker parent.
