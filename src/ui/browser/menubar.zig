@@ -298,7 +298,7 @@ fn switchAdjacent(state: *BarState, forward: bool) void {
 
 fn focusFirstItem(pop: *c.GtkWidget) void {
     const scroll = c.gtk_popover_get_child(@ptrCast(pop)) orelse return;
-    const box = c.gtk_scrolled_window_get_child(@ptrCast(scroll)) orelse return;
+    const box = classicmenu.scrollContent(scroll) orelse return;
     var child = c.gtk_widget_get_first_child(box);
     while (child) |row| : (child = c.gtk_widget_get_next_sibling(row)) {
         if (c.gtk_widget_get_visible(row) != 0 and c.gtk_widget_grab_focus(row) != 0) return;

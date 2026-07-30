@@ -94,6 +94,7 @@ State lives in three places: `places.json` (state dir; bookmarks+labels, recent,
 Gotchas that bite:
 - `renderPlaces` destroys and rebuilds EVERY sidebar row on any change. A row/menu handler must copy its ctx string to a stack buffer BEFORE calling anything that re-renders (savePlaces/navigate/toggle) — the ctx dies mid-handler otherwise. Same pattern throughout `places.zig`.
 - Context menus are `classicmenu.zig` (hand-built popover rows, NOT GMenuModel — model menus can't do per-item icons). Submenus only off the TOP menu (depth limit); per-item heap ctxs register with `root.own(cb, ctx)`; the popover pops down BEFORE the handler runs.
+- `classicmenu` short menus disable vertical scrollbar negotiation after measuring; an unused `GTK_POLICY_AUTOMATIC` scrollbar changes height during popup realization under desktop themes. Longer menus keep automatic scrolling.
 - Browser keyboard chords live in `nav.browser_chords`; an audit test cross-checks them against `input.default_bindings` — a chord shadowing a global action must declare `.shadows` or the suite fails.
 - Danger verbs (trash/delete) act on the whole selection when the clicked row is in it (`ops.menuTargets`, same rule as copy) — keep new verbs consistent.
 - Column widths: `colview.applyExpandPolicy` — auto Name expands, explicit Name = NO expander (surplus stays blank, Nemo-style); `fittedNameWidth` clamps to the viewport so splits never grow a horizontal scrollbar.
