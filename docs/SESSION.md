@@ -11403,3 +11403,44 @@ async-child-count stage; the 1300-file chunk test now really crosses
 poll ticks. Also confirmed (not new): the browser's ssh connection
 already rides OpenSSH ControlMaster multiplexing from the terminal's
 session, so no reconnect cost was left there.
+
+## UDP connection tickets: reuse the session's transport (2026-07-30)
+
+"Open in sketerm files" from a UDP session used to pay a full ssh
+handshake + `--udp-listen` bootstrap for the browser's own connection
+(the ControlMaster from the original bootstrap dies after 120s — a
+long-lived UDP session holds no ssh at all). Now any client holding a
+live authenticated channel can ask the daemon to mint a **connection
+ticket**: the daemon spawns one unchanged `--udp-listen` sibling
+(`--socket` aims it back at the minting instance) and returns
+`{port, key}` over the existing sealed channel (wire frames
+`udp_ticket_req` 26 / `udp_ticket` 91, gated on a `udp_ticket:true`
+welcome capability so old daemons are never asked). A new client dials
+it with `Conn.connectUdpTicket` — no ssh, ~1 RTT on an already-proven
+path; every failure falls back to the normal transports.
+
+Consumers: `openInFilesApp` pre-mints over the pane's UDP terminal
+conn (async, 3s bound) and hands the ticket to the spawned files
+process via `$SKETERM_UDP_TICKET` (single-use, host-matched); a
+browser pane inside the terminal GUI mints in-process
+(`remotectl.mintUdpTicket` — pending slot on `Remote`, resolved
+exactly once via frame/loss/teardown/timeout, DrainHandle-fenced).
+No hole punch rides the ticket path: a filtered port costs one
+bounded timeout, then the ssh bootstrap — the status quo.
+
+The live-rig bug worth remembering: a detached daemon has fds 0-2
+closed, so the ticket listener's UDP socket landed on **fd 2** and
+`runUdpListen`'s post-announce `close(0..2)` detach destroyed it —
+announced port, nobody listening. Fixed by parking the socket above
+the stdio range (and giving the spawned listener a full /dev/null
+stdio set). The smokes never caught it because smoke rigs have real
+stderr; the fix was found by driving the real GUI over the MCP rig.
+
+Proof: `smoke-ticket.zig` shared stage runs in BOTH smoke-mux and
+smoke-broker (unattached = broker-served, attached = WORKER-served via
+the new `Daemon.broker_sock`), smoke-udp gained a stage that mints
+over a live UDP conn and reconnects with ssh refusing to run anything
+but `-G`, plus a live end-to-end pass through the real GUI (context
+menu -> files app over ticket; Browse Here in New Tab -> in-process
+mint) with `mux.log` showing the mints and `ssh.log` showing zero
+bootstraps.
