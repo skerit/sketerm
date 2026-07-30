@@ -37,6 +37,10 @@ pub const ConnectCtx = struct {
     /// worker cannot touch the config arena, which may be swapped
     /// by a reload while the connect is in flight.
     port_range: []u8 = &.{},
+    /// Brokered UDP connection ticket (env from the spawning GUI, or
+    /// minted in-process over a live terminal connection). The worker
+    /// tries it first and falls back to the normal transports.
+    ticket: ?muxclient.UdpTicket = null,
     result: ?muxclient.Conn = null,
 };
 
@@ -89,21 +93,86 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     if (cfg.udpRange()) |range| {
         ctx.port_range = self.allocator.dupe(u8, range) catch &.{};
     }
-    const th = std.Thread.spawn(.{}, connectThreadMain, .{ctx}) catch {
-        if (ctx.port_range.len > 0) self.allocator.free(ctx.port_range);
-        self.allocator.free(ctx.host);
-        self.allocator.destroy(ctx);
-        hc.state = .dead;
-        self.setStatusFmt("cannot start connection to {s}", .{host.?});
-        return hc;
-    };
-    th.detach();
+    // Connection-ticket brokering: reach a UDP host's daemon over a
+    // pre-minted single-use listener instead of a fresh ssh bootstrap.
+    // A spawned files process gets its ticket from the GUI via env; a
+    // browser pane inside the terminal GUI mints one over a live UDP
+    // terminal connection to the same host (async — the worker thread
+    // starts when the mint resolves, ticket or not).
+    if (muxclient.takeTicketFromEnv(ctx.host)) |ticket| {
+        ctx.ticket = ticket;
+    } else if (self.ownerWindow()) |win| {
+        const remotectl = @import("../remotectl.zig");
+        const bare = muxclient.RemoteSpec.parse(ctx.host).host;
+        if (remotectl.mintUdpTicket(win, bare, @ptrCast(ctx), onMintForConnect)) {
+            self.setStatusFmt("connecting to {s}…", .{host.?});
+            return hc;
+        }
+    }
+    startConnectThread(ctx);
     self.setStatusFmt("connecting to {s}…", .{host.?});
     return hc;
 }
 
+/// Ticket mint resolved (ticket or null) — start the connect worker.
+/// The view may have moved on during the wait: mirror onConnectIdle's
+/// orphan/dead handling, because with no thread spawned yet nobody
+/// else will free this HostConn.
+fn onMintForConnect(user: ?*anyopaque, ticket: ?muxclient.UdpTicket) void {
+    const ctx: *ConnectCtx = @ptrCast(@alignCast(user.?));
+    const hc = ctx.hc;
+    const allocator = ctx.allocator;
+    if (hc.orphaned) {
+        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        allocator.free(ctx.host);
+        allocator.destroy(ctx);
+        if (hc.host) |h| allocator.free(h);
+        allocator.destroy(hc);
+        return;
+    }
+    if (hc.view.widgets_dead) {
+        hc.state = .dead;
+        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        allocator.free(ctx.host);
+        allocator.destroy(ctx);
+        return;
+    }
+    ctx.ticket = ticket;
+    startConnectThread(ctx);
+}
+
+/// Spawn the connect worker, taking ownership of `ctx`. On spawn
+/// failure the HostConn dies and every listing queued on it is
+/// refused (they would otherwise sit at "Listing…" forever).
+fn startConnectThread(ctx: *ConnectCtx) void {
+    const hc = ctx.hc;
+    const view = hc.view;
+    const allocator = ctx.allocator;
+    const th = std.Thread.spawn(.{}, connectThreadMain, .{ctx}) catch {
+        hc.state = .dead;
+        view.setStatusFmt("cannot start connection to {s}", .{hc.label()});
+        var buf: [256]u8 = undefined;
+        const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
+        view.failPendingListings(hc, why);
+        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        allocator.free(ctx.host);
+        allocator.destroy(ctx);
+        return;
+    };
+    th.detach();
+}
+
 pub fn connectThreadMain(ctx: *ConnectCtx) void {
     const alloc = std.heap.c_allocator;
+    if (ctx.ticket) |ticket| {
+        if (muxclient.Conn.connectUdpTicket(alloc, ctx.host, ticket)) |conn| {
+            ctx.result = conn;
+            _ = c.g_idle_add(@ptrCast(&onConnectIdle), @ptrCast(ctx));
+            return;
+        } else |_| {}
+        // Ticket didn't carry (listener expired, filtered UDP): the
+        // normal transports below are the unchanged fallback.
+    }
     const result = muxclient.Conn.connectRemote(
         alloc,
         ctx.host,

@@ -200,6 +200,108 @@ pub fn paneByIdGlobal(self: *Window, id: u32) ?*Pane {
     }.f);
 }
 
+// ── UDP connection-ticket brokering ──────────────────────────
+//
+// A live UDP terminal connection can ask its daemon to mint a
+// single-use sibling listener (wire `udp_ticket_req`/`udp_ticket`),
+// so a NEW process — the spawned files app, a browser pane's host
+// connection — reaches the same daemon over UDP with no ssh
+// bootstrap of its own. This is the GUI-side broker: find an
+// eligible connection, request asynchronously, resolve the caller
+// exactly once (ticket, refusal, transport loss, or timeout).
+
+const mux_client = @import("../mux/client.zig");
+const term_mod = @import("../terminal.zig");
+
+pub const UdpTicketFn = *const fn (ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void;
+
+const TicketWait = struct {
+    allocator: std.mem.Allocator,
+    ctx: ?*anyopaque,
+    cb: UdpTicketFn,
+    /// Liveness fence for the terminal holding our pending slot: the
+    /// timeout must clear that slot through it, never through a
+    /// possibly-freed Terminal pointer.
+    drain: *term_mod.DrainHandle,
+    timeout_id: c_uint = 0,
+};
+
+/// A live, ticket-capable UDP connection to `bare_host` (no
+/// udp:/ssh: prefix), across every window.
+fn findUdpTicketTerminal(self: *Window, bare_host: []const u8) ?*term_mod.Terminal {
+    const pane = self.findPaneAcrossWindows(bare_host, struct {
+        fn f(host: []const u8, w: *Window) ?*Pane {
+            for (w.panes.items) |p| {
+                const r = p.terminal.remote orelse continue;
+                if (!r.canSend() or r.destroying) continue;
+                if (r.conn.transport != .udp or !r.conn.udp_tickets) continue;
+                if (r.pending_ticket_cb != null) continue;
+                const h = r.host orelse continue;
+                if (std.mem.eql(u8, mux_client.RemoteSpec.parse(h).host, host)) return p;
+            }
+            return null;
+        }
+    }.f) orelse return null;
+    return pane.terminal;
+}
+
+/// Whether `mintUdpTicket` for `bare_host` could find a connection to
+/// broker over right now. Lets callers skip heap setup entirely.
+pub fn canMintUdpTicket(self: *Window, bare_host: []const u8) bool {
+    if (bare_host.len == 0) return false;
+    return findUdpTicketTerminal(self, bare_host) != null;
+}
+
+/// Mint a UDP connection ticket for `bare_host` over any live UDP
+/// terminal connection in this application. Returns false — the
+/// callback never fires — when no eligible connection exists; on true
+/// the callback fires exactly once on the main loop: the ticket, or
+/// null on refusal, transport loss, or the 3s timeout.
+pub fn mintUdpTicket(self: *Window, bare_host: []const u8, ctx: ?*anyopaque, cb: UdpTicketFn) bool {
+    if (bare_host.len == 0) return false;
+    const term = findUdpTicketTerminal(self, bare_host) orelse return false;
+    const wait = self.allocator.create(TicketWait) catch return false;
+    wait.* = .{ .allocator = self.allocator, .ctx = ctx, .cb = cb, .drain = term.drain };
+    // Timeout armed BEFORE the request: a write failure inside
+    // requestUdpTicket resolves the slot synchronously (transportLost
+    // → callback → wait freed), so `wait` must already be complete.
+    wait.timeout_id = c.g_timeout_add(3_000, @ptrCast(&onTicketTimeout), @ptrCast(wait));
+    if (!term.requestUdpTicket(@ptrCast(wait), onTicketResolved)) {
+        _ = c.g_source_remove(wait.timeout_id);
+        self.allocator.destroy(wait);
+        return false;
+    }
+    return true;
+}
+
+/// Exactly-once resolution from the Terminal's pending slot (frame,
+/// refusal, transport loss, teardown fence).
+fn onTicketResolved(ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void {
+    const wait: *TicketWait = @ptrCast(@alignCast(ctx.?));
+    if (wait.timeout_id != 0) _ = c.g_source_remove(wait.timeout_id);
+    const cb = wait.cb;
+    const uctx = wait.ctx;
+    const allocator = wait.allocator;
+    allocator.destroy(wait);
+    cb(uctx, ticket);
+}
+
+fn onTicketTimeout(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const wait: *TicketWait = @ptrCast(@alignCast(user.?));
+    wait.timeout_id = 0;
+    // Empty the pending slot so a late frame cannot fire into the
+    // memory freed below; the DrainHandle fences terminal teardown.
+    if (wait.drain.alive.load(.acquire)) {
+        if (wait.drain.terminal) |t| t.cancelUdpTicket(@ptrCast(wait));
+    }
+    const cb = wait.cb;
+    const uctx = wait.ctx;
+    const allocator = wait.allocator;
+    allocator.destroy(wait);
+    cb(uctx, null);
+    return 0; // G_SOURCE_REMOVE
+}
+
 /// The pane that currently has keyboard focus anywhere — the active
 /// window's focused pane, else any focused pane, else the first pane
 /// in any window. The guaranteed floor for "the pane I'm in": as long
