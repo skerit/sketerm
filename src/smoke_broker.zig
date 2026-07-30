@@ -207,6 +207,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // display session's keeper is /proc/self/exe --keep = us. Answer it,
     // or the keeper would re-run the whole smoke.
     if (@import("mux/keep.zig").wanted(init.args.vector)) return @import("mux/keep.zig").serve();
+    // The built sketerm-mux binary (argv[1], from build.zig) — the
+    // ticket stage's listener/bridge children need a real mux binary.
+    if (init.args.vector.len > 1)
+        _ = c.setenv("SKETERM_MUX_BIN", init.args.vector[1], 1);
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -347,6 +351,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // silently broken while the monolith stage passes. ──
     @import("smoke_display.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: display sessions + controller lease via worker ok\n", .{});
+
+    // ── UDP connection tickets THROUGH THE BROKER: an attached
+    // client's mint is served by the WORKER, whose Daemon has an
+    // empty sock_path and must aim the listener via `broker_sock` —
+    // omitted, and the monolith stage stays green while the real GUI
+    // path fails. ──
+    @import("smoke_ticket.zig").run(allocator, sock_path);
+    std.debug.print("smoke-broker: udp connection tickets via worker ok\n", .{});
 
     // ── post-mortem delivery: a worker whose session died must NOT exit
     //    before a backlogged, non-reading MCP client has been sent the
