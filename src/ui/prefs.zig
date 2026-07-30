@@ -1,4 +1,4 @@
-//! Preferences dialog — AdwPreferencesDialog with one page per
+//! Preferences window with one page per
 //! configuration category. Built programmatically (no XML / Blueprint)
 //! to match sketerm's "own the stack" philosophy.
 //!
@@ -64,10 +64,10 @@ const Ctx = struct {
     }
 };
 
-/// Open a modal preferences dialog rooted at `parent_window`. Caller
+/// Open a non-modal preferences window associated with `parent_window`. Caller
 /// (Window) provides the apply callback that lives-updates state and
 /// persists to disk. Memory: Ctx is heap-allocated; freed when the
-/// dialog emits "closed".
+/// window emits "destroy".
 pub fn open(
     allocator: std.mem.Allocator,
     parent_window: *c.GtkWindow,

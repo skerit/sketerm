@@ -11364,7 +11364,7 @@ sidebar-independent for reuse elsewhere later.
 **Menubar + About.** Files-mode windows get a classic File / Edit /
 View / Go / Bookmarks / Help menubar (`src/ui/browser/menubar.zig`),
 built per click from live state on the classicmenu machinery. Help >
-About is an AdwAboutDialog whose version badge carries the git
+About is a non-modal AdwAboutWindow whose version badge carries the git
 describe + commit date embedded at build time (`runCapture` in
 build.zig -> `build_options.commit`/`commit_date`; tarball builds
 degrade to "unknown").
@@ -11444,3 +11444,28 @@ but `-G`, plus a live end-to-end pass through the real GUI (context
 menu -> files app over ticket; Browse Here in New Tab -> in-process
 mint) with `mux.log` showing the mints and `ssh.log` showing zero
 bootstraps.
+
+## Files: selection, real menubar behavior, non-modal About
+
+Selected rows now use the GTK theme's selected background/foreground
+colors instead of libadwaita-only accent aliases (Breeze did not
+define those aliases, so the override erased its blue selection).
+
+The custom menubar now owns an open-menu state: its heading keeps the
+theme accent tint + underline, pointer hover switches headings while a
+menu is open (motion is captured on the grabbed popover and translated
+back to bar coordinates), and F10/Left/Right/Escape provide the
+classic keyboard path while GTK handles row traversal. The target
+browser pane is pinned while the menu chain is open so focus moving
+into menu chrome cannot redirect an action to another split. Menubar
+dropdowns have compact, scoped
+padding/radii; ordinary context menus are unchanged. `classicmenu`
+again measures each populated row box after parenting and pins the
+scroller's bounded minimum height, removing the one-item opening jump.
+
+Help > About now creates a separate transient, non-modal
+`AdwAboutWindow`, matching Preferences, rather than an attached
+`AdwAboutDialog`. Verified through the isolated Sketerm MCP compositor:
+blue row selection, File -> Edit hover switching, 192x58 one-row Help
+menu, separate 388x340 About window. Full suite 1090/5/0 and
+smoke-e2e PASS.

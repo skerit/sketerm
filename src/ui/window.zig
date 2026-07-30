@@ -399,7 +399,7 @@ pub const Window = struct {
         // header and the tab strip. `self` is only STORED by the
         // buttons here; nothing dereferences it until a menu opens.
         if (files_identity)
-            c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @import("browser/menubar.zig").build(allocator, self));
+            c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @import("browser/menubar.zig").build(allocator, self, @ptrCast(app_window)));
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_bar_w)));
         // Toast overlay wraps the tab area so transient notices (file
         // upload finished / failed) float over the terminal grid.
@@ -3773,4 +3773,3 @@ pub fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
     }
     return false;
 }
-

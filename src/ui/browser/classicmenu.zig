@@ -65,6 +65,14 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\popover.sketerm-cm > contents {
         \\  padding: 4px;
         \\}
+        \\popover.sketerm-cm-menubar > contents {
+        \\  padding: 2px;
+        \\  border-radius: 3px;
+        \\}
+        \\popover.sketerm-cm-menubar button.sketerm-cm-row {
+        \\  padding: 2px 6px;
+        \\  border-radius: 3px;
+        \\}
     ;
     const provider = c.gtk_css_provider_new();
     c.gtk_css_provider_load_from_string(provider, css);
@@ -139,19 +147,26 @@ pub const Root = struct {
     /// Build the popover and pop it up at (x, y) in `parent`.
     /// Ownership of the Root moves to the popover.
     pub fn popup(self: *Root, parent: *c.GtkWidget, x: f64, y: f64) *c.GtkWidget {
+        return self.popupStyled(parent, x, y, null);
+    }
+
+    /// Build a popover with an optional caller-specific CSS class.
+    pub fn popupStyled(self: *Root, parent: *c.GtkWidget, x: f64, y: f64, css_class: ?[*:0]const u8) *c.GtkWidget {
         installCss(parent);
         var cap: c_int = 700;
         if (c.gtk_widget_get_root(parent)) |root| {
             const rh = c.gtk_widget_get_height(@ptrCast(@alignCast(root)));
             if (rh > 260) cap = rh - 80;
         }
+        tidySeparators(self.box);
         const pop = c.gtk_popover_new().?;
         c.gtk_widget_add_css_class(pop, "sketerm-cm");
         c.gtk_widget_add_css_class(pop, "menu");
+        if (css_class) |class| c.gtk_widget_add_css_class(pop, class);
         c.gtk_popover_set_has_arrow(@ptrCast(pop), 0);
         c.gtk_widget_set_halign(pop, c.GTK_ALIGN_START);
-        c.gtk_popover_set_child(@ptrCast(pop), wrapScroll(self.box, cap));
-        tidySeparators(self.box);
+        const scroll = wrapScroll(self.box, cap);
+        c.gtk_popover_set_child(@ptrCast(pop), scroll);
         for (self.subpops.items) |sp| {
             if (c.gtk_popover_get_child(@ptrCast(sp))) |sw|
                 c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), cap);
@@ -164,6 +179,15 @@ pub const Root = struct {
         // still reads this Root, so tearing down inline would be a
         // use-after-free on every item click.
         _ = c.g_signal_connect_data(pop, "closed", @ptrCast(&onClosed), null, null, c.G_CONNECT_DEFAULT);
+        // GTK's scroller under-reports its natural height before the
+        // first frame. Measure after parenting, while the final CSS is
+        // active, so short menus do not visibly resize while opening.
+        stabilizeScroll(scroll, self.box, cap);
+        for (self.subpops.items) |sp| {
+            const sw = c.gtk_popover_get_child(@ptrCast(sp)) orelse continue;
+            const box = c.gtk_scrolled_window_get_child(@ptrCast(sw)) orelse continue;
+            stabilizeScroll(sw, box, cap);
+        }
         const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
         c.gtk_popover_set_pointing_to(@ptrCast(pop), &rect);
         c.gtk_popover_popup(@ptrCast(pop));
@@ -180,6 +204,12 @@ fn wrapScroll(box: *c.GtkWidget, cap: c_int) *c.GtkWidget {
     c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), cap);
     c.gtk_scrolled_window_set_child(@ptrCast(sw), box);
     return sw;
+}
+
+fn stabilizeScroll(scroll: *c.GtkWidget, box: *c.GtkWidget, cap: c_int) void {
+    var natural: c_int = 0;
+    c.gtk_widget_measure(box, c.GTK_ORIENTATION_VERTICAL, -1, null, &natural, null, null);
+    c.gtk_scrolled_window_set_min_content_height(@ptrCast(scroll), @min(natural, cap));
 }
 
 /// GMenu-style separator semantics for the eager separators
