@@ -1664,6 +1664,11 @@ pub const Daemon = struct {
     /// the dir from `sock_path` ("") the way the monolith/broker does — the
     /// broker hands it the dir at fork time. null in monolith/broker.
     base_dir: ?[]u8 = null,
+    /// Worker only: the broker's full listen-socket path (owned). Kept
+    /// separately from `sock_path` (empty in workers so deinit never
+    /// unlinks the broker's socket); the udp-ticket listener uses it to
+    /// aim its bridge back at this daemon instance. null in monolith/broker.
+    broker_sock: ?[]u8 = null,
     /// One EGL display/context owner per process. EGL displays are commonly
     /// shared handles, so terminating a per-channel importer could invalidate
     /// every other live app channel.
@@ -1800,6 +1805,7 @@ pub const Daemon = struct {
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         if (self.base_dir) |d| self.allocator.free(d);
+        if (self.broker_sock) |s| self.allocator.free(s);
         // Only unlink the exact inode this daemon bound. A replaced pathname
         // belongs to another instance and must survive our teardown.
         if (lock_fd >= 0) {

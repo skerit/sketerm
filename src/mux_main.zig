@@ -92,16 +92,30 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--proxy")) {
             return runProxy(allocator);
         } else if (std.mem.eql(u8, a, "--udp-listen")) {
-            // Optional: --udp-listen --udp-port 60000:61000 (firewalls
-            // usually need a pinned range, like mosh's 60000-61000).
+            // Optional: --udp-port 60000:61000 (firewalls usually need a
+            // pinned range, like mosh's 60000-61000) and --socket PATH
+            // (bridge to a specific daemon instance — the udp-ticket
+            // broker passes its own socket; the ssh bootstrap never does).
             var range: ?[2]u16 = null;
-            if (i + 2 < argv.len and std.mem.eql(u8, std.mem.span(argv[i + 1]), "--udp-port")) {
-                range = parsePortRange(std.mem.span(argv[i + 2])) orelse {
-                    std.debug.print("sketerm-mux: bad --udp-port (want lo:hi)\n", .{});
+            var listen_sock: ?[]const u8 = null;
+            var j = i + 1;
+            while (j < argv.len) : (j += 1) {
+                const arg = std.mem.span(argv[j]);
+                if (std.mem.eql(u8, arg, "--udp-port") and j + 1 < argv.len) {
+                    j += 1;
+                    range = parsePortRange(std.mem.span(argv[j])) orelse {
+                        std.debug.print("sketerm-mux: bad --udp-port (want lo:hi)\n", .{});
+                        return 2;
+                    };
+                } else if (std.mem.eql(u8, arg, "--socket") and j + 1 < argv.len) {
+                    j += 1;
+                    listen_sock = std.mem.span(argv[j]);
+                } else {
+                    std.debug.print("sketerm-mux: unknown --udp-listen argument: {s}\n", .{arg});
                     return 2;
-                };
+                }
             }
-            return runUdpListen(allocator, range);
+            return runUdpListen(allocator, range, listen_sock);
         } else if (std.mem.eql(u8, a, "--udp-connect") and i + 3 < argv.len) {
             // Optional 4th arg: an inherited pre-bound socket fd — the
             // port the client announced in its punch line. Old binaries
@@ -271,11 +285,20 @@ const cc_sockaddr_storage = @import("c.zig").c.struct_sockaddr_storage;
 /// and bridges encrypted UDP ↔ the local daemon socket. One
 /// instance per connection (the mosh-server model); exits on BYE or
 /// daemon loss, NOT on network silence — that's the durability.
-fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
+fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16, sock_path: ?[]const u8) u8 {
     const cc = @import("c.zig").c;
     _ = cc.signal(cc.SIGPIPE, sig_ign);
 
-    const udp_fd = platform.socketCloexec(cc.AF_INET, cc.SOCK_DGRAM, 0);
+    var udp_fd = platform.socketCloexec(cc.AF_INET, cc.SOCK_DGRAM, 0);
+    // Park the socket above the stdio range: when the spawner has fds
+    // 0-2 closed (a detached daemon minting a udp ticket), the socket
+    // lands there and the post-announce `close(0..2)` detach below
+    // would destroy it — announced port, nobody listening.
+    if (udp_fd >= 0 and udp_fd < 3) {
+        const moved = cc.fcntl(udp_fd, cc.F_DUPFD_CLOEXEC, @as(c_int, 3));
+        _ = cc.close(udp_fd);
+        udp_fd = if (moved >= 0) moved else -1;
+    }
     if (udp_fd < 0) return 1;
     var bind_addr: cc.struct_sockaddr_in = std.mem.zeroes(cc.struct_sockaddr_in);
     bind_addr.sin_family = cc.AF_INET;
@@ -344,7 +367,7 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     _ = cc.close(2);
 
     // Daemon connection (start it if needed — same as --proxy).
-    const unix_fd = connectDaemonRetry(allocator) orelse return 1;
+    const unix_fd = connectDaemonRetry(allocator, sock_path) orelse return 1;
 
     var chan = rudp.Channel.init(allocator, key, false);
     defer chan.deinit();
@@ -574,11 +597,17 @@ fn flushStreamPending(pending: *std.ArrayList(u8), fd: c_int) bool {
 
 /// Connect to the local daemon socket, starting the daemon when
 /// absent (detached re-exec of /proc/self/exe). Shared by --proxy
-/// and --udp-listen.
-fn connectDaemonRetry(allocator: std.mem.Allocator) ?c_int {
+/// and --udp-listen. A non-null `sock_path` targets a SPECIFIC
+/// instance (the udp-ticket broker's own socket) and never
+/// autostarts: replacing a private daemon with a fresh default one
+/// would silently connect the ticket holder to the wrong daemon.
+fn connectDaemonRetry(allocator: std.mem.Allocator, sock_path: ?[]const u8) ?c_int {
     const cc = @import("c.zig").c;
     const client = @import("mux/client.zig");
-    const path = daemon.defaultSocketPath(allocator) catch return null;
+    const path = if (sock_path) |p|
+        allocator.dupe(u8, p) catch return null
+    else
+        daemon.defaultSocketPath(allocator) catch return null;
     defer allocator.free(path);
 
     if (client.Conn.connect(allocator, path)) |conn_v| {
@@ -587,6 +616,7 @@ fn connectDaemonRetry(allocator: std.mem.Allocator) ?c_int {
         conn.rbuf.deinit(conn.allocator); // keep fd, drop the wrapper
         return fd;
     } else |_| {}
+    if (sock_path != null) return null;
 
     const pid = cc.fork();
     if (pid == 0) {

@@ -315,6 +315,24 @@ pub fn keyFromHex(s: []const u8) ?[KEY_LEN]u8 {
     return key;
 }
 
+/// A parsed "SKETERM-UDP <port> <keyhex>" bootstrap announcement.
+/// `keyhex` points into the caller's line.
+pub const Announce = struct { port: u16, keyhex: []const u8 };
+
+/// Parse the --udp-listen announcement line (shared by the ssh
+/// bootstrap client and the daemon's ticket broker).
+pub fn parseAnnounce(line: []const u8) ?Announce {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const tag = it.next() orelse return null;
+    if (!std.mem.eql(u8, tag, "SKETERM-UDP")) return null;
+    const port_s = it.next() orelse return null;
+    const keyhex = it.next() orelse return null;
+    if (it.next() != null) return null;
+    const port = std.fmt.parseInt(u16, port_s, 10) catch return null;
+    if (port == 0 or keyFromHex(keyhex) == null) return null;
+    return .{ .port = port, .keyhex = keyhex };
+}
+
 // ── tests ───────────────────────────────────────────────────────
 
 const TestNet = struct {
@@ -492,4 +510,21 @@ test "rudp: queuedBytes includes the window and unsent backlog" {
     try channel.send(bytes, 0, Drop.emit, null);
     try std.testing.expectEqual(bytes.len, channel.queuedBytes());
     try std.testing.expect(channel.backlog.items.len > 0);
+}
+
+test "rudp: announce line parses and rejects malformed variants" {
+    var key: [KEY_LEN]u8 = @splat(7);
+    var hexbuf: [KEY_LEN * 2]u8 = undefined;
+    const hex = keyToHex(key, &hexbuf);
+    var line_buf: [128]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "SKETERM-UDP 61234 {s}", .{hex});
+    const a = parseAnnounce(line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 61234), a.port);
+    try std.testing.expectEqualStrings(hex, a.keyhex);
+    try std.testing.expectEqual(@as(?Announce, null), parseAnnounce("SKETERM-PUNCH 1234"));
+    try std.testing.expectEqual(@as(?Announce, null), parseAnnounce("SKETERM-UDP 0 deadbeef"));
+    try std.testing.expectEqual(@as(?Announce, null), parseAnnounce("SKETERM-UDP 99999 deadbeef"));
+    const bad = try std.fmt.bufPrint(&line_buf, "SKETERM-UDP 1 {s} extra", .{hex});
+    try std.testing.expectEqual(@as(?Announce, null), parseAnnounce(bad));
+    key[0] = 0;
 }

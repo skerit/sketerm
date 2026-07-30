@@ -7,6 +7,34 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
 const deploy = @import("deploy.zig");
+const rudp = @import("rudp.zig");
+
+/// A brokered UDP connection ticket: a single-use listener the remote
+/// daemon bound for us, reachable with no ssh bootstrap of our own.
+pub const UdpTicket = struct {
+    port: u16,
+    /// rudp key as hex (fixed length — validated at parse).
+    key: [rudp.KEY_LEN * 2]u8,
+
+    pub fn keyhex(self: *const UdpTicket) []const u8 {
+        return &self.key;
+    }
+};
+
+/// Parse an `udp_ticket` frame payload; null = refused or malformed.
+pub fn parseUdpTicketReply(allocator: std.mem.Allocator, payload: []const u8) ?UdpTicket {
+    const Reply = struct { ok: bool = false, port: u16 = 0, key: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Reply, allocator, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    if (!parsed.value.ok or parsed.value.port == 0) return null;
+    if (parsed.value.key.len != rudp.KEY_LEN * 2) return null;
+    if (rudp.keyFromHex(parsed.value.key) == null) return null;
+    var ticket = UdpTicket{ .port = parsed.value.port, .key = undefined };
+    @memcpy(&ticket.key, parsed.value.key);
+    return ticket;
+}
 
 pub const Transport = enum { local, ssh, udp };
 pub const RemoteMode = enum { auto, ssh, udp };
@@ -72,6 +100,29 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     return "sketerm-mux";
 }
 
+/// Consume a spawn-time brokered ticket from $SKETERM_UDP_TICKET
+/// ("<host> <port> <keyhex>") when it names `host`. Single-use: the
+/// variable is cleared on a match — the remote listener serves
+/// exactly one connection, so a second consumer would only burn a
+/// timeout on it. Main-thread only (getenv/unsetenv are not
+/// thread-safe against each other).
+pub fn takeTicketFromEnv(host: []const u8) ?UdpTicket {
+    const raw = c.getenv("SKETERM_UDP_TICKET") orelse return null;
+    const s = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+    var it = std.mem.tokenizeScalar(u8, s, ' ');
+    const h = it.next() orelse return null;
+    const port_s = it.next() orelse return null;
+    const key = it.next() orelse return null;
+    if (it.next() != null) return null;
+    if (!std.mem.eql(u8, h, RemoteSpec.parse(host).host)) return null;
+    const port = std.fmt.parseInt(u16, port_s, 10) catch return null;
+    if (port == 0 or key.len != rudp.KEY_LEN * 2 or rudp.keyFromHex(key) == null) return null;
+    var ticket = UdpTicket{ .port = port, .key = undefined };
+    @memcpy(&ticket.key, key);
+    _ = c.unsetenv("SKETERM_UDP_TICKET");
+    return ticket;
+}
+
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
@@ -99,6 +150,10 @@ pub const Conn = struct {
     proto: u32 = 1,
     server_proto: u32 = 1,
     snapshot_version: u8 = @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION,
+    /// Daemon answers `udp_ticket_req` (welcome capability). Gates the
+    /// request — an older daemon would answer `.err`, which a
+    /// multiplexed GUI connection could misattribute.
+    udp_tickets: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -213,11 +268,13 @@ pub const Conn = struct {
         self.proto = 0;
         self.server_proto = 0;
         self.snapshot_version = 0;
+        self.udp_tickets = false;
         const Probe = struct {
             proto: u32 = 1,
             server_proto: ?u32 = null,
             negotiation: u8 = 0,
             snapshot: u8 = 0,
+            udp_ticket: bool = false,
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
@@ -229,6 +286,7 @@ pub const Conn = struct {
             else
                 0;
             self.server_proto = parsed.value.server_proto orelse reported;
+            self.udp_tickets = parsed.value.udp_ticket;
             self.snapshot_version = if (parsed.value.snapshot > 0)
                 @min(parsed.value.snapshot, @import("snapshot.zig").SNAPSHOT_VERSION)
             else if (self.proto >= 6)
@@ -598,15 +656,27 @@ pub const Conn = struct {
         _ = c.close(pipe_fds[0]);
         reapBootstrapChild(pid);
         const ann = announce orelse return error.SshTransportFailed;
-
-        // "SKETERM-UDP <port> <keyhex>"
-        var it = std.mem.tokenizeScalar(u8, ann, ' ');
-        _ = it.next(); // tag
-        const port = it.next() orelse return error.SshTransportFailed;
-        const keyhex = it.next() orelse return error.SshTransportFailed;
+        const parsed_ann = rudp.parseAnnounce(ann) orelse return error.SshTransportFailed;
+        var port_buf: [8]u8 = undefined;
+        const port = std.fmt.bufPrint(&port_buf, "{d}", .{parsed_ann.port}) catch unreachable;
 
         // 2. Local UDP bridge child over a socketpair, aimed at the
         // ssh-config-resolved address from step 0.
+        return connectUdpBridge(allocator, udp_host, port, parsed_ann.keyhex, punch_fd, deadline);
+    }
+
+    /// Spawn the local `--udp-connect` bridge child at
+    /// `udp_host:port` and complete the hello/welcome probe.
+    /// `punch_fd >= 0` hands the pre-bound punch socket to the
+    /// bridge (ssh-bootstrap path only; the ticket path has no punch).
+    fn connectUdpBridge(
+        allocator: std.mem.Allocator,
+        udp_host: []const u8,
+        port: []const u8,
+        keyhex: []const u8,
+        punch_fd: c_int,
+        deadline: i64,
+    ) !Conn {
         var mux_bin_buf: [4096:0]u8 = undefined;
         const mux_bin = findMuxBinary(&mux_bin_buf);
         var port_z_buf: [16:0]u8 = undefined;
@@ -634,7 +704,7 @@ pub const Conn = struct {
         var conn = try spawnOverSocketpair(allocator, mux_bin, &argv2);
         errdefer conn.deinit();
 
-        // Past this point the ssh bootstrap already succeeded, so a
+        // Past this point the bootstrap/ticket already succeeded, so a
         // failure is the UDP path itself not carrying traffic --
         // distinct from "the remote never announced", and the only
         // thing that distinguishes filtered/NAT-mapped UDP for the
@@ -647,6 +717,39 @@ pub const Conn = struct {
         conn.applyWelcome(allocator, w.payload);
         conn.transport = .udp;
         return conn;
+    }
+
+    /// Ask the daemon at the other end of THIS connection to mint a
+    /// single-use UDP listener (connection-ticket brokering). Blocking
+    /// helper for DEDICATED connections only: unrelated frames arriving
+    /// during the wait are discarded (recvExpectFor) — a GUI terminal
+    /// connection must use its async frame dispatch instead.
+    pub fn requestUdpTicket(self: *Conn, port_range: ?[]const u8, timeout_ms: i64) !UdpTicket {
+        if (!self.udp_tickets) return error.TicketsUnsupported;
+        try self.sendJson(.udp_ticket_req, .{ .range = port_range });
+        const f = try self.recvExpectFor(&.{.udp_ticket}, timeout_ms);
+        defer f.deinit(self.allocator);
+        return parseUdpTicketReply(self.allocator, f.payload) orelse error.TicketRefused;
+    }
+
+    /// Connect to `host`'s daemon over UDP with a brokered ticket — NO
+    /// ssh bootstrap: the listener already exists on the remote and the
+    /// key already traveled over an authenticated channel. `ssh -G`
+    /// still resolves host aliases (it never connects). No hole punch
+    /// rides this path, so a NATed remote costs one bounded failure;
+    /// callers fall back to the normal transports.
+    pub fn connectUdpTicket(allocator: std.mem.Allocator, host: []const u8, ticket: UdpTicket) !Conn {
+        const bare = RemoteSpec.parse(host).host;
+        if (!validSshHost(bare)) return error.BadPath;
+        const deadline = monotonicMs() + 10_000;
+        var resolved_buf: [256]u8 = undefined;
+        var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, bare, '@')) |at| bare[at + 1 ..] else bare;
+        if (resolveSshConfig(bare, &resolved_buf, monotonicMs() + 3_000)) |target| {
+            if (!target.proxied) udp_host = target.hostname;
+        }
+        var port_buf: [8]u8 = undefined;
+        const port = std.fmt.bufPrint(&port_buf, "{d}", .{ticket.port}) catch unreachable;
+        return connectUdpBridge(allocator, udp_host, port, ticket.keyhex(), -1, deadline);
     }
 
     fn validPortRange(value: []const u8) bool {
@@ -1277,4 +1380,42 @@ fn errFieldOf(payload: []const u8) []const u8 {
     const rest = payload[i + key.len ..];
     const end = std.mem.indexOfScalar(u8, rest, '"') orelse return payload;
     return rest[0..end];
+}
+
+test "udp ticket reply parses and rejects refusals and bad keys" {
+    const a = std.testing.allocator;
+    var key: [rudp.KEY_LEN]u8 = @splat(9);
+    var hexbuf: [rudp.KEY_LEN * 2]u8 = undefined;
+    const hex = rudp.keyToHex(key, &hexbuf);
+    var payload_buf: [256]u8 = undefined;
+    const payload = try std.fmt.bufPrint(&payload_buf, "{{\"ok\":true,\"port\":61000,\"key\":\"{s}\"}}", .{hex});
+    const ticket = parseUdpTicketReply(a, payload) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 61000), ticket.port);
+    try std.testing.expectEqualStrings(hex, ticket.keyhex());
+    try std.testing.expect(parseUdpTicketReply(a, "{\"ok\":false,\"error\":\"nope\"}") == null);
+    try std.testing.expect(parseUdpTicketReply(a, "{\"ok\":true,\"port\":0,\"key\":\"beef\"}") == null);
+    try std.testing.expect(parseUdpTicketReply(a, "{\"ok\":true,\"port\":1,\"key\":\"zz\"}") == null);
+    try std.testing.expect(parseUdpTicketReply(a, "not json") == null);
+    key[0] = 0;
+}
+
+test "env ticket is host-matched and single-use" {
+    var key: [rudp.KEY_LEN]u8 = @splat(3);
+    var hexbuf: [rudp.KEY_LEN * 2]u8 = undefined;
+    const hex = rudp.keyToHex(key, &hexbuf);
+    var val_buf: [128:0]u8 = undefined;
+    const val = try std.fmt.bufPrintZ(&val_buf, "boxy 61111 {s}", .{hex});
+    _ = c.setenv("SKETERM_UDP_TICKET", val.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_UDP_TICKET");
+    // A mismatched host must neither match nor consume.
+    try std.testing.expect(takeTicketFromEnv("otherbox") == null);
+    try std.testing.expect(c.getenv("SKETERM_UDP_TICKET") != null);
+    // Prefixed spellings normalize to the same bare host; a match
+    // clears the variable (the listener serves exactly one connection).
+    const ticket = takeTicketFromEnv("udp:boxy") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 61111), ticket.port);
+    try std.testing.expectEqualStrings(hex, ticket.keyhex());
+    try std.testing.expect(c.getenv("SKETERM_UDP_TICKET") == null);
+    try std.testing.expect(takeTicketFromEnv("boxy") == null);
+    key[0] = 0;
 }
