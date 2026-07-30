@@ -2573,6 +2573,10 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     remote.aapps = .empty;
     remote.app_window_opened = false;
     remote.closed = true; // sendChanClose must not touch conn
+    // clearSinks resolves a pending udp-ticket request; the slot must
+    // be EMPTY, not `undefined` garbage, or it calls through it.
+    remote.pending_ticket_cb = null;
+    remote.pending_ticket_ctx = null;
 
     var term: Terminal = undefined;
     term.allocator = alloc;
