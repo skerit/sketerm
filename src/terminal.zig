@@ -250,6 +250,12 @@ pub const Terminal = struct {
         /// Interactive actions are one-at-a-time, so a single slot
         /// suffices (like pending_rename).
         pending_record: u8 = 0,
+        /// In-flight `udp_ticket_req` (one at a time, like the slots
+        /// above). The callback fires EXACTLY once — with the ticket,
+        /// or with null on refusal/transport loss/teardown — so the
+        /// requester can free its context unconditionally.
+        pending_ticket_cb: ?*const fn (ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void = null,
+        pending_ticket_ctx: ?*anyopaque = null,
         watch_id: c_uint = 0,
         idle_kick_id: c_uint = 0,
         /// ── Connection state axes (orthogonal, see predicates below) ──
@@ -576,6 +582,7 @@ pub const Terminal = struct {
         }
         remote.conn.deinit();
         remote.pending_record = 0;
+        self.failPendingTicket();
         self.cancelUploads();
         self.cancelDownload();
         self.destroyAllChans();
@@ -1038,6 +1045,14 @@ pub const Terminal = struct {
                 if (parsed.value.cwd.len > 0) self.setCwd(parsed.value.cwd);
             },
             .file_data => self.downloadData(frame.payload),
+            .udp_ticket => {
+                const remote = self.remote orelse return;
+                const cb = remote.pending_ticket_cb orelse return;
+                const ctx = remote.pending_ticket_ctx;
+                remote.pending_ticket_cb = null;
+                remote.pending_ticket_ctx = null;
+                cb(ctx, mux_client.parseUdpTicketReply(self.allocator, frame.payload));
+            },
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
             .chan_close => {
@@ -1103,6 +1118,7 @@ pub const Terminal = struct {
         const remote = self.remote orelse return;
         if (remote.closed) return;
         remote.closed = true;
+        self.failPendingTicket();
         self.cancelUploads();
         self.cancelDownload();
         self.destroyAllChans();
@@ -1686,6 +1702,54 @@ pub const Terminal = struct {
         remote.conn.sendFrame(.rec_stop, "") catch self.transportLost("record request write failed");
     }
 
+    /// Ask this terminal's daemon for a UDP connection ticket (a
+    /// single-use sibling listener a NEW client can dial with no ssh
+    /// bootstrap). Returns false — callback never fired — when this
+    /// connection can't broker one: not UDP transport, daemon too old,
+    /// teardown, or a mint already in flight. On true the callback
+    /// fires exactly once (frame, transport loss, or teardown).
+    pub fn requestUdpTicket(
+        self: *Terminal,
+        ctx: ?*anyopaque,
+        cb: *const fn (ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void,
+    ) bool {
+        const remote = self.remote orelse return false;
+        if (!remote.canSend() or remote.destroying) return false;
+        if (remote.conn.transport != .udp or !remote.conn.udp_tickets) return false;
+        if (remote.pending_ticket_cb != null) return false;
+        const range: ?[]const u8 = if (remote.port_range.len > 0) remote.port_range else null;
+        remote.pending_ticket_cb = cb;
+        remote.pending_ticket_ctx = ctx;
+        remote.conn.sendJson(.udp_ticket_req, .{ .range = range }) catch {
+            // transportLost fails the slot (fires cb with null), so
+            // the contract holds even on an immediate write failure.
+            self.transportLost("udp ticket request write failed");
+        };
+        return true;
+    }
+
+    /// Abandon an in-flight ticket request WITHOUT firing its callback
+    /// (the requester timed out and freed its context; a late frame
+    /// must find the slot empty). No-op unless `ctx` still owns it.
+    pub fn cancelUdpTicket(self: *Terminal, ctx: ?*anyopaque) void {
+        const remote = self.remote orelse return;
+        if (remote.pending_ticket_cb == null) return;
+        if (remote.pending_ticket_ctx != ctx) return;
+        remote.pending_ticket_cb = null;
+        remote.pending_ticket_ctx = null;
+    }
+
+    /// Resolve an in-flight ticket request with null (transport loss,
+    /// session end, teardown). Idempotent — the slot empties first.
+    fn failPendingTicket(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        const cb = remote.pending_ticket_cb orelse return;
+        const ctx = remote.pending_ticket_ctx;
+        remote.pending_ticket_cb = null;
+        remote.pending_ticket_ctx = null;
+        cb(ctx, null);
+    }
+
     fn handleAppListing(self: *Terminal, payload: []const u8) void {
         const f = self.on_apps orelse return;
         const Msg = struct {
@@ -2207,6 +2271,10 @@ pub const Terminal = struct {
         self.on_apps = null;
         self.apps_ctx = null;
         self.on_peers = null;
+        // A pending udp-ticket callback's ctx is requester-owned heap
+        // memory (never pane memory); resolving it here lets the
+        // requester free it instead of leaking past the fence.
+        self.failPendingTicket();
         // Deferred Terminal.deinit runs destroyAllChans AFTER this
         // fence; a still-set on_app_view would fire into the freed
         // Pane with a nulled user_ctx (was a crash on app-tab close).
@@ -2312,6 +2380,7 @@ pub const Terminal = struct {
             // Detach, don't kill: the session keeps running in the
             // daemon — that's the entire point.
             remote.destroying = true;
+            self.failPendingTicket();
             self.drain.terminal = null;
             self.drain.alive.store(false, .release);
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);

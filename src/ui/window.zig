@@ -1164,11 +1164,70 @@ pub const Window = struct {
         else
             null;
 
+        // Connection-ticket brokering: when the focused pane's session
+        // runs on a host we reach over UDP, pre-mint a ticket over
+        // that live connection and hand it to the files process via
+        // env — it then dials the daemon directly, no ssh bootstrap.
+        // The spawn is deferred by one daemon round trip (bounded 3s);
+        // any failure degrades to the plain spawn.
+        if (spec != null) blk: {
+            const pane = self.focusedPane() orelse break :blk;
+            const remote = pane.terminal.remote orelse break :blk;
+            const bare = @import("../filebrowser/paths.zig").browserHost(remote.host) orelse break :blk;
+            const launch = self.allocator.create(FilesLaunch) catch break :blk;
+            launch.* = .{
+                .allocator = self.allocator,
+                .spec = self.allocator.dupe(u8, spec.?) catch {
+                    self.allocator.destroy(launch);
+                    break :blk;
+                },
+                .host = self.allocator.dupe(u8, bare) catch {
+                    self.allocator.free(launch.spec);
+                    self.allocator.destroy(launch);
+                    break :blk;
+                },
+            };
+            if (self.mintUdpTicket(bare, @ptrCast(launch), onFilesLaunchTicket)) return;
+            self.allocator.free(launch.spec);
+            self.allocator.free(launch.host);
+            self.allocator.destroy(launch);
+        }
+
+        if (!spawnFilesProcess(spec, null, null)) {
+            showToast(self, "Sketerm Files: launch failed");
+        }
+    }
+
+    /// Deferred `openInFilesApp` spawn: self-contained (the Window may
+    /// have closed during the mint round trip, so nothing here may
+    /// touch it — a launch failure logs instead of toasting).
+    const FilesLaunch = struct {
+        allocator: std.mem.Allocator,
+        spec: []u8,
+        host: []u8,
+    };
+
+    fn onFilesLaunchTicket(ctx: ?*anyopaque, ticket: ?@import("../mux/client.zig").UdpTicket) void {
+        const l: *FilesLaunch = @ptrCast(@alignCast(ctx.?));
+        const host: ?[]const u8 = if (ticket != null) l.host else null;
+        if (!spawnFilesProcess(l.spec, host, ticket)) {
+            std.debug.print("sketerm: files launch failed (deferred spawn)\n", .{});
+        }
+        l.allocator.free(l.spec);
+        l.allocator.free(l.host);
+        l.allocator.destroy(l);
+    }
+
+    /// Spawn the files application. Window-independent (callable from
+    /// a deferred callback after the spawning Window closed). A
+    /// non-null ticket rides $SKETERM_UDP_TICKET in the child's env.
+    fn spawnFilesProcess(
+        spec: ?[]const u8,
+        ticket_host: ?[]const u8,
+        ticket: ?@import("../mux/client.zig").UdpTicket,
+    ) bool {
         var exe_buf: [4096:0]u8 = undefined;
-        const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse {
-            showToast(self, "Sketerm Files: own executable path unknown");
-            return;
-        };
+        const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse return false;
 
         // Prefer the sibling `sketerm-files` binary: taskbars that
         // match windows by process/cmdline see a distinct executable
@@ -1200,11 +1259,22 @@ pub const Window = struct {
             } else |_| {}
         }
 
+        // A ticket rides the child's env; envp == null keeps plain
+        // inheritance (isolated test rigs keep their XDG dirs / app id).
+        var envp: [*c][*c]c.gchar = null;
+        var ticket_buf: [512:0]u8 = undefined;
+        if (ticket) |t| if (ticket_host) |h| {
+            if (std.fmt.bufPrintZ(&ticket_buf, "{s} {d} {s}", .{ h, t.port, t.keyhex() })) |v| {
+                envp = c.g_environ_setenv(c.g_get_environ(), "SKETERM_UDP_TICKET", v.ptr, 1);
+            } else |_| {}
+        };
+        defer if (envp != null) c.g_strfreev(envp);
+
         var gerr: [*c]c.GError = null;
         const ok = c.g_spawn_async(
             null,
             &argv,
-            null,
+            envp,
             @intCast(c.G_SPAWN_DEFAULT),
             null,
             null,
@@ -1213,8 +1283,9 @@ pub const Window = struct {
         );
         if (ok == 0) {
             if (gerr != null) c.g_error_free(gerr);
-            showToast(self, "Sketerm Files: launch failed");
+            return false;
         }
+        return true;
     }
 
     /// Last-reported cwd of the focused pane (OSC 7), or null if no
@@ -2241,6 +2312,8 @@ pub const Window = struct {
     pub const detachWindowSignals = remotectl.detachWindowSignals;
     pub const findPaneAcrossWindows = remotectl.findPaneAcrossWindows;
     pub const paneBySession = remotectl.paneBySession;
+    pub const mintUdpTicket = remotectl.mintUdpTicket;
+    pub const canMintUdpTicket = remotectl.canMintUdpTicket;
     pub const TabRef = remotectl.TabRef;
     const registerNotifySlot = remotectl.registerNotifySlot;
     const dropNotifySlotsForPane = remotectl.dropNotifySlotsForPane;
