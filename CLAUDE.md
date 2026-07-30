@@ -98,6 +98,7 @@ Gotchas that bite:
 - Danger verbs (trash/delete) act on the whole selection when the clicked row is in it (`ops.menuTargets`, same rule as copy) — keep new verbs consistent.
 - Column widths: `colview.applyExpandPolicy` — auto Name expands, explicit Name = NO expander (surplus stays blank, Nemo-style); `fittedNameWidth` clamps to the viewport so splits never grow a horizontal scrollbar.
 - `BrowserView.ownerWindow()` is the route to `Window`/`Config` (browser code must not cache Window pointers).
+- Informational windows such as Preferences and About are separate, transient, non-modal toplevels (`AdwPreferencesWindow` / `AdwAboutWindow`), never attached `AdwDialog` sheets.
 
 ## Remote control (IPC)
 

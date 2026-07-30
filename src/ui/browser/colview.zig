@@ -1184,8 +1184,8 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\}
         \\columnview.sketerm-fb-cv > listview > row:selected,
         \\flowbox.sketerm-fb-flow > flowboxchild:selected {
-        \\  background: alpha(@accent_bg_color, 0.85);
-        \\  color: @accent_fg_color;
+        \\  background-color: @theme_selected_bg_color;
+        \\  color: @theme_selected_fg_color;
         \\}
         \\text.sketerm-fb-rename {
         \\  padding: 0 2px;
