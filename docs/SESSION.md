@@ -11754,3 +11754,40 @@ Verified: 1098/930 tests green (frecency model test added), smoke-fs
 new daemon verb exercised end-to-end through `sketerm-mux --job`
 (split→combine byte-identical, secure delete unlinks, diff streams,
 git_status M/? records, verified copy).
+
+## 2026-07-31 — remote transport honesty sweep
+
+Root-caused the "copying is an atrocity" report: three compounding
+defects, all fixed.
+
+1. rudp reorder buffer + fast retransmit: a lost datagram no longer
+discards up to 127 delivered segments behind it (receiver holds them;
+one head retransmit releases the run), duplicate cumulative acks
+resend the head before the RTO, and the send backlog drains by offset
+instead of an O(n^2) memmove per segment.
+
+2. Inactivity timeouts: fsdrive's flat 10s completion deadline
+classified any chunk slower than ~210 KB/s as a DEAD LINK, tearing
+down and re-bootstrapping a healthy connection per chunk (the
+"unreachable / reconnected; resuming" flap). Waits now die only after
+10s with no bytes arriving (recvFrameProgressive, 120s hard cap under
+the MCP watchdog); bulk write waits budget for the upload itself.
+
+3. Paste-while-connecting: startTransfer dropped the job outright
+when a host was still dialing. Deferred transfers now queue on the
+view and fire from wireReady (dropped with a message if the host
+dies). Covers paste, drag, dual-pane send, cross-host moves.
+
+Also: hostmount's dead-end (a mount finishing after the 20s ready
+timeout was never used again — every open silently downloaded) now
+promotes to ready whenever the live child's mountpoint appears, and
+wireReady warms the host mount eagerly so the first double-click open
+does not pay the whole dial. connectRemote keeps a per-host UDP-down
+stamp (10 min) so mount/copy helper processes stop re-paying a failed
+6s UDP probe, plus a deploy-verified stamp that skips the ssh check
+leg; both under $XDG_CACHE_HOME/sketerm/mux. Transfer panel buttons
+got tooltips.
+
+Verified: 1100 tests green (2 new rudp tests), test-core, smoke-mux,
+smoke-udp, smoke-mcp, xvfb smoke-e2e all PASS; mux-portable +
+aarch64-macos cross build; sketerm-mux still links libc only.
