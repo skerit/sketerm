@@ -402,6 +402,39 @@ pub const Dir = struct {
         };
     }
 
+    /// Index of an existing entry for which `we` differs ONLY by
+    /// `children` — the daemon's async child-count delta re-sends the
+    /// stat it already shipped with the count filled in. Such an
+    /// update is written in place by the caller: `children` is never
+    /// a sort input, nothing reallocates, so bound rows stay valid
+    /// and no listing rebuild is owed. Anything else returns null and
+    /// takes the full upsert path.
+    pub fn countOnlyIndex(self: *Dir, we: WireEntry) ?usize {
+        if (we.children < 0) return null;
+        const i = self.find(we.name) orelse return null;
+        const e = &self.entries.items[i];
+        if (e.children == we.children) return i;
+        if (!std.mem.eql(u8, e.kind, we.kind)) return null;
+        if (e.size != we.size or e.mode != we.mode) return null;
+        if (e.mtime_ms != we.mtime_ms or e.ctime_ms != we.ctime_ms) return null;
+        if (e.atime_ms != we.atime_ms or e.btime_ms != we.btime_ms) return null;
+        if (e.uid != we.uid or e.gid != we.gid) return null;
+        if (e.nlink != we.nlink or e.blocks != we.blocks) return null;
+        if (e.tdir != we.tdir) return null;
+        if (!std.mem.eql(u8, e.owner, we.owner)) return null;
+        if (!std.mem.eql(u8, e.group, we.group)) return null;
+        if (!std.mem.eql(u8, e.tags, we.tags)) return null;
+        if ((e.target == null) != (we.target == null)) return null;
+        if (e.target) |t| {
+            if (!std.mem.eql(u8, t, we.target.?)) return null;
+        }
+        if (e.attrs.len != we.attrs.len) return null;
+        for (e.attrs, we.attrs) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return null;
+        }
+        return i;
+    }
+
     pub fn upsert(self: *Dir, we: WireEntry) void {
         if (self.find(we.name)) |i| {
             var old = self.entries.items[i];
@@ -1205,6 +1238,36 @@ test "an ordinary dir never resolves a path through a symlink's target" {
     try dir.entries.append(a, try testEntry(a, "link", "/etc/passwd"));
     try t.expect(dir.findPath("/etc/passwd") == null);
     try t.expectEqualStrings("link", (dir.findPath("/data/link") orelse return error.NotFound).name);
+}
+
+test "countOnlyIndex accepts the daemon's count re-send and nothing else" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/d"), .view_id = 1 };
+    defer freeTestDir(&dir);
+    var sub = try testEntry(a, "sub", null);
+    a.free(sub.kind);
+    sub.kind = try a.dupe(u8, "dir");
+    sub.tdir = true;
+    sub.mtime_ms = 111;
+    try dir.entries.append(a, sub);
+    try dir.entries.append(a, try testEntry(a, "plain.txt", null));
+
+    // The daemon's async count delta: the SAME stat it already
+    // shipped, with children filled in. Fast path.
+    const count_resend = WireEntry{ .name = "sub", .kind = "dir", .tdir = true, .mtime_ms = 111, .children = 7 };
+    try t.expectEqual(@as(?usize, 0), dir.countOnlyIndex(count_resend));
+
+    // A count for an entry we never saw is structural.
+    try t.expectEqual(@as(?usize, null), dir.countOnlyIndex(.{ .name = "ghost", .kind = "dir", .tdir = true, .children = 3 }));
+    // No count at all is never the fast path (a watch delta).
+    try t.expectEqual(@as(?usize, null), dir.countOnlyIndex(.{ .name = "sub", .kind = "dir", .tdir = true, .mtime_ms = 111 }));
+    // A count riding a REAL change (mtime moved) is structural: the
+    // in-place write would hide the change from the sort.
+    try t.expectEqual(@as(?usize, null), dir.countOnlyIndex(.{ .name = "sub", .kind = "dir", .tdir = true, .mtime_ms = 222, .children = 7 }));
+    // Same count again is still the fast (no-op) path.
+    dir.entries.items[0].children = 7;
+    try t.expectEqual(@as(?usize, 0), dir.countOnlyIndex(count_resend));
 }
 
 test "upsert defers the sort for a media column and performs it otherwise" {

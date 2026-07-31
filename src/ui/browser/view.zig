@@ -161,15 +161,21 @@ pub const BrowserView = struct {
     thumb_failed: std.StringHashMap(void) = undefined,
     /// Async thumbnail worker (freedesktop cache; lazily started).
     thumb_ctx: ?*ThumbCtx = null,
-    /// Serial remote-thumbnail pipeline.
-    remote_thumb: ?*RemoteThumb = null,
+    /// Remote-thumbnail pipeline: the fetches in flight (bounded by
+    /// REMOTE_THUMB_CONCURRENCY) plus the waiting queue.
+    remote_thumbs: std.ArrayList(*RemoteThumb) = .empty,
     remote_thumb_queue: std.ArrayList(*RemoteThumb) = .empty,
-    /// Silence deadline for the fetch in flight; runs only while the
-    /// pipeline is busy (preview.zig), so an unanswered reply frees
-    /// the one slot instead of wedging it forever.
+    /// Silence deadline for the fetches in flight; runs only while
+    /// the pipeline is busy (preview.zig), so an unanswered reply
+    /// frees its slot instead of wedging it forever.
     remote_thumb_watch: c.guint = 0,
     /// Coalesced re-render after thumbnails land.
     thumb_render_src: c.guint = 0,
+    /// Leading-edge throttle for socket-driven listing renders
+    /// (streaming chunks, watch deltas): pending one-shot source and
+    /// the stamp of the last listing render (render.zig).
+    listing_render_src: c.guint = 0,
+    last_listing_render_ms: i64 = 0,
     /// Live local-edit sync-back watches (remote files opened here).
     watches: std.ArrayList(*EditWatch) = .empty,
     /// The one open Open With chooser (its popover owns the ctx).
@@ -429,6 +435,7 @@ pub const BrowserView = struct {
 
     // render.zig -- listing rendering, columns, rows, emblems
     pub const renderCurrent = @import("render.zig").renderCurrent;
+    pub const scheduleListingRender = @import("render.zig").scheduleListingRender;
     pub const renderTab = @import("render.zig").renderTab;
     pub const applyViewChrome = @import("render.zig").applyViewChrome;
     pub const headerButton = @import("render.zig").headerButton;
@@ -661,6 +668,7 @@ pub const BrowserView = struct {
     pub const thumbLookup = @import("preview.zig").thumbLookup;
     pub const enqueueRemoteThumb = @import("preview.zig").enqueueRemoteThumb;
     pub const pumpRemoteThumbs = @import("preview.zig").pumpRemoteThumbs;
+    pub const dropQueuedThumbs = @import("preview.zig").dropQueuedThumbs;
     pub const finishRemoteThumb = @import("preview.zig").finishRemoteThumb;
     pub const feedRemoteThumb = @import("preview.zig").feedRemoteThumb;
     pub const queueRemoteDecode = @import("preview.zig").queueRemoteDecode;
@@ -1170,6 +1178,7 @@ pub const BrowserView = struct {
         if (self.dup) |d| d.destroy(self.allocator);
         if (self.editor_rename) |er| er.destroy(self.allocator);
         if (self.thumb_render_src != 0) _ = c.g_source_remove(self.thumb_render_src);
+        if (self.listing_render_src != 0) _ = c.g_source_remove(self.listing_render_src);
         if (self.thumb_ctx) |tc| {
             tc.lock();
             tc.orphaned = true;
@@ -1178,6 +1187,7 @@ pub const BrowserView = struct {
             tc.unlock();
             tc.unref(); // the view's ref; thread + idles drop theirs
         }
+        self.remote_thumbs.deinit(self.allocator);
         self.remote_thumb_queue.deinit(self.allocator);
         for (self.undo_stack.items) |u| u.destroy(self.allocator);
         self.undo_stack.deinit(self.allocator);
