@@ -304,10 +304,14 @@ fn verdictText(buf: []u8, item: *const Item) []const u8 {
 }
 
 fn choiceButton(self: *BrowserView, box: *c.GtkWidget, label: [*:0]const u8, choice: Choice, destructive: bool) void {
+    choiceButtonStyled(self, box, label, choice, if (destructive) "destructive-action" else null);
+}
+
+fn choiceButtonStyled(self: *BrowserView, box: *c.GtkWidget, label: [*:0]const u8, choice: Choice, class: ?[*:0]const u8) void {
     const ctx = self.allocator.create(BtnCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .view = self, .choice = choice };
     const btn = c.gtk_button_new_with_label(label);
-    if (destructive) c.gtk_widget_add_css_class(btn, "destructive-action");
+    if (class) |cl| c.gtk_widget_add_css_class(btn, cl);
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onChoice), @ptrCast(ctx), @ptrCast(&BtnCtx.free), c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(box), btn);
 }
@@ -397,6 +401,20 @@ fn refreshButtons(self: *BrowserView, item: *Item) void {
     const buttons = self.conflicts.buttons_box orelse return;
     while (c.gtk_widget_get_first_child(buttons)) |child| {
         c.gtk_box_remove(@ptrCast(buttons), child);
+    }
+    // A destination this same source already failed to copy onto is
+    // most likely an interrupted transfer: offer to pick it up where
+    // it stopped (the daemon's resume skips verified-complete files
+    // and continues staged partials) rather than making the user
+    // reason it out from Replace/Merge.
+    if (item.mergeable() and @import("../../filebrowser/incomplete.zig").match(
+        self.allocator,
+        item.src_host orelse "",
+        item.src,
+        item.dst_hc.host orelse "",
+        item.dst,
+    )) {
+        choiceButtonStyled(self, buttons, "Continue Copy (this transfer was interrupted)", .merge, "suggested-action");
     }
     if (item.mergeable()) {
         choiceButton(self, buttons, "Merge (files only in the destination stay)", .merge, false);
