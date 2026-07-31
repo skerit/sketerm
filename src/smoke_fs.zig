@@ -350,6 +350,45 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     w7.print("{s}/post-death", .{dir}) catch fail("fmt7");
     fs.mkdir(w7.buffered()) catch failErr("post-death mkdir", fs.lastErr());
 
+    // ── close_view aborts an in-flight listing ─────────────────
+    // open_view + close_view sent back to back: the daemon must cut
+    // the chunk run short with an `aborted` terminator instead of
+    // statting all 1300 entries for a view nobody watches (that
+    // backlog is what delayed the NEXT navigation on slow links).
+    {
+        fs.conn.sendJson(.fs_op, .{ .req = @as(u32, 9001), .op = "open_view", .path = chunk_dir, .view = @as(u32, 7) }) catch fail("abort open send");
+        fs.conn.sendJson(.fs_op, .{ .req = @as(u32, 9002), .op = "close_view", .view = @as(u32, 7) }) catch fail("abort close send");
+        const AbortReply = struct {
+            req: u32 = 0,
+            ok: bool = false,
+            more: bool = false,
+            aborted: bool = false,
+            entries: []struct { name: []const u8 = "" } = &.{},
+        };
+        var total: usize = 0;
+        var aborted = false;
+        var close_ok = false;
+        var rounds: usize = 0;
+        while (rounds < 200 and !(aborted and close_ok)) : (rounds += 1) {
+            const f = fs.conn.recvFrameFor(3000) catch fail("abort recv");
+            defer f.deinit(allocator);
+            if (f.ftype != .fs_reply) continue;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const rep = std.json.parseFromSliceLeaky(AbortReply, arena.allocator(), f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("abort parse");
+            if (rep.req == 9001) {
+                total += rep.entries.len;
+                if (rep.aborted) aborted = true;
+                if (!rep.more and !rep.aborted) fail("listing ran to completion instead of aborting");
+            } else if (rep.req == 9002 and rep.ok) close_ok = true;
+        }
+        if (!aborted) fail("no aborted listing terminator");
+        if (!close_ok) fail("close_view reply missing");
+        if (total >= 1300) fail("abort did not stop the stat stream");
+    }
+
     std.debug.print("smoke-fs: {s} stage ok\n", .{tag});
 }
 
