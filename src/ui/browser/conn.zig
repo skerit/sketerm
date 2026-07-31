@@ -346,11 +346,13 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     if (self.attr_request) |request| {
         if (request.hc == hc) self.endAttrRequest();
     }
-    if (self.remote_thumb) |rt| {
+    i = 0;
+    while (i < self.remote_thumbs.items.len) {
+        const rt = self.remote_thumbs.items[i];
         if (rt.hc == hc) {
+            _ = self.remote_thumbs.orderedRemove(i);
             rt.destroy(self.allocator);
-            self.remote_thumb = null;
-        }
+        } else i += 1;
     }
     i = 0;
     while (i < self.remote_thumb_queue.items.len) {
@@ -522,7 +524,10 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
     }
     if (xfer_touched) self.reapTransfers();
     if (xfer_touched) self.renderJobs();
-    if (dirty) self.renderCurrent();
+    // Socket-driven renders are throttled: chunk runs and delta
+    // storms otherwise rebuild the listing model per drain, which
+    // eats clicks and flickers hover for as long as the data trickles.
+    if (dirty) self.scheduleListingRender();
     if (!alive or cond & (c.G_IO_HUP | c.G_IO_ERR) != 0) {
         self.hostDied(hc);
         return 0;
@@ -873,15 +878,37 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.refreshDir(tab, dir);
             return false;
         }
-        if (d.changes.len > 0) colview.invalidateBackingRefs(tab);
+        // Count-only upserts (the daemon's async child counts) are
+        // written in place and rebind ONE row: `children` is never a
+        // sort input and nothing reallocates, so the listing model
+        // stays put — no rebuild, no flicker, no eaten clicks while
+        // counts trickle in. Anything structural falls through to
+        // the full upsert path and reports dirty. Once one structural
+        // change ran, entry pointers may have moved, so the fast path
+        // is off for the rest of the batch.
+        var structural = false;
         for (d.changes) |ch| {
             if (std.mem.eql(u8, ch.op, "upsert")) {
-                if (ch.entry) |we| dir.upsert(we);
+                const we = ch.entry orelse continue;
+                if (!structural) {
+                    if (dir.countOnlyIndex(we)) |idx| {
+                        dir.entries.items[idx].children = we.children;
+                        colview.refreshEntryRow(self, tab, dir, &dir.entries.items[idx]);
+                        continue;
+                    }
+                    structural = true;
+                    colview.invalidateBackingRefs(tab);
+                }
+                dir.upsert(we);
             } else if (std.mem.eql(u8, ch.op, "del")) {
+                if (!structural) {
+                    structural = true;
+                    colview.invalidateBackingRefs(tab);
+                }
                 dir.del(ch.name);
             }
         }
-        return true;
+        return structural;
     }
     return false;
 }

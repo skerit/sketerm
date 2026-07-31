@@ -159,7 +159,13 @@ pub const REMOTE_THUMB_SILENCE_MS: i64 = 60_000;
 /// pipeline is idle.
 const REMOTE_THUMB_TICK_MS: c.guint = 1000;
 
-/// One remote thumbnail fetch in flight (serial per view).
+/// How many remote thumbnail fetches run at once. Each one costs a
+/// host-side generator job plus a bounded sidecar read; serial was
+/// the whole reason a folder of photos took minutes to fill in over
+/// a far link (one job-spawn round trip per file, back to back).
+pub const REMOTE_THUMB_CONCURRENCY = 4;
+
+/// One remote thumbnail fetch in flight.
 pub const RemoteThumb = struct {
     id: u64,
     hc: *HostConn,
@@ -661,7 +667,7 @@ pub fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry
 }
 
 pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {
-    if (self.remote_thumb) |rt| {
+    for (self.remote_thumbs.items) |rt| {
         if (rt.hc == hc and std.mem.eql(u8, rt.path, path)) return;
     }
     for (self.remote_thumb_queue.items) |rt| {
@@ -689,8 +695,9 @@ pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, m
 }
 
 pub fn pumpRemoteThumbs(self: *BrowserView) void {
-    if (self.remote_thumb != null) return;
-    while (self.remote_thumb_queue.items.len > 0) {
+    while (self.remote_thumbs.items.len < REMOTE_THUMB_CONCURRENCY and
+        self.remote_thumb_queue.items.len > 0)
+    {
         const rt = self.remote_thumb_queue.orderedRemove(0);
         if (rt.hc.state != .ready) {
             rt.destroy(self.allocator);
@@ -699,13 +706,25 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
         rt.req = self.nextReq();
         rt.phase = .start_job;
         rt.touch();
-        self.remote_thumb = rt;
+        self.remote_thumbs.append(self.allocator, rt) catch {
+            rt.destroy(self.allocator);
+            return;
+        };
         armRemoteThumbWatch(self);
         // Generation happens on the file-owning host. Only the
         // bounded JXL/WebP sidecar returns over the wire.
         self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path, .image_codecs = wireImageCodecs(rt.hc) });
-        return;
     }
+}
+
+/// A landed navigation obsoletes every QUEUED thumbnail fetch: the
+/// rows that wanted them are gone, and the new folder's visible rows
+/// re-queue theirs at first render (thumbLookup). Fetches already in
+/// flight finish — there are at most REMOTE_THUMB_CONCURRENCY and
+/// their results cache for a return visit.
+pub fn dropQueuedThumbs(self: *BrowserView) void {
+    for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
+    self.remote_thumb_queue.clearRetainingCapacity();
 }
 
 /// Start the silence watch, if it is not already running.
@@ -726,41 +745,56 @@ fn armRemoteThumbWatch(self: *BrowserView) void {
 /// row is not re-queued in a loop.
 pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    const rt = self.remote_thumb orelse {
-        // Idle: the next pump re-arms.
-        self.remote_thumb_watch = 0;
-        return 0;
-    };
-    if (!rt.silent(clock.nowMs())) return 1;
-    // Cleared BEFORE finishing: finishRemoteThumb pumps the queue,
-    // which arms a FRESH source, and clearing afterwards would drop
-    // that id and leak a source nothing can remove.
-    self.remote_thumb_watch = 0;
-    if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
-        self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
-    self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-    self.finishRemoteThumb();
-    return 0;
-}
-
-pub fn finishRemoteThumb(self: *BrowserView) void {
-    if (self.remote_thumb) |rt| {
+    const now = clock.nowMs();
+    var i: usize = 0;
+    while (i < self.remote_thumbs.items.len) {
+        const rt = self.remote_thumbs.items[i];
+        if (!rt.silent(now)) {
+            i += 1;
+            continue;
+        }
+        if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
+            self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
+        self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+        // Removed WITHOUT pumping: the pump below runs once, after
+        // every timed-out slot is gone.
+        _ = self.remote_thumbs.orderedRemove(i);
         if (rt.asset.len > 0 and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
-        self.remote_thumb = null;
     }
+    self.pumpRemoteThumbs();
+    if (self.remote_thumbs.items.len > 0) return 1;
+    // Idle: the next pump re-arms.
+    self.remote_thumb_watch = 0;
+    return 0;
+}
+
+/// Release one finished (or failed) fetch: its slot frees, its
+/// host-side sidecar is unlinked, and the queue advances.
+pub fn finishRemoteThumb(self: *BrowserView, rt: *RemoteThumb) void {
+    for (self.remote_thumbs.items, 0..) |x, i| {
+        if (x == rt) {
+            _ = self.remote_thumbs.orderedRemove(i);
+            break;
+        }
+    }
+    if (rt.asset.len > 0 and rt.hc.state == .ready)
+        self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
+    rt.destroy(self.allocator);
     self.pumpRemoteThumbs();
 }
 
-/// Feed frames into the remote-thumbnail pipeline.
+/// Feed frames into the remote-thumbnail pipeline. Frames are keyed
+/// to a specific in-flight fetch by req (fs_data/fs_reply) or job id
+/// (fs_job); anything that matches none of them is not ours.
 pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
-    const rt = self.remote_thumb orelse return false;
-    if (rt.hc != hc) return false;
+    if (self.remote_thumbs.items.len == 0) return false;
     switch (ftype) {
         .fs_data => {
             if (payload.len < 12) return false;
-            if (std.mem.readInt(u32, payload[0..4], .little) != rt.req) return false;
+            const req = std.mem.readInt(u32, payload[0..4], .little);
+            const rt = thumbByReq(self, hc, req) orelse return false;
             // The fetch is alive: restart its silence deadline before
             // anything below can free it.
             rt.touch();
@@ -773,13 +807,13 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
             const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
                 .ignore_unknown_fields = true,
             }) catch return false;
-            if (rep.req != rt.req) return false;
+            const rt = thumbByReq(self, hc, rep.req) orelse return false;
             rt.touch();
             switch (rt.phase) {
                 .start_job => {
                     if (!rep.ok or rep.job == 0) {
                         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                        self.finishRemoteThumb();
+                        self.finishRemoteThumb(rt);
                         return true;
                     }
                     rt.job = rep.job;
@@ -789,19 +823,19 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 .read_thumb => {
                     if (!rep.ok or !rep.eof or rep.size > PREVIEW_IMAGE_CAP or rt.buf.items.len == 0) {
                         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                        self.finishRemoteThumb();
+                        self.finishRemoteThumb(rt);
                         return true;
                     }
                     // Deliberately NOT finishRemoteThumb: the worker
                     // handback needs rt's host + path, so
                     // releaseRemoteThumbFor owns the release and
                     // pumps the next queue entry. If the handoff
-                    // failed there is no handback, and leaving
-                    // self.remote_thumb set would wedge the pipeline
-                    // for the life of the view.
+                    // failed there is no handback, and leaving the
+                    // slot occupied would wedge it for the life of
+                    // the view.
                     if (!self.queueRemoteDecode(rt)) {
                         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                        self.finishRemoteThumb();
+                        self.finishRemoteThumb(rt);
                     }
                     return true;
                 },
@@ -809,16 +843,15 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
             }
         },
         .fs_job => {
-            if (rt.phase != .wait_job) return false;
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
-            if (ev.job != rt.job) return false;
+            const rt = thumbByJob(self, hc, ev.job) orelse return false;
             rt.touch();
             if (std.mem.eql(u8, ev.ev, "done") and ev.path.len > 0) {
                 rt.asset = self.allocator.dupe(u8, ev.path) catch {
                     self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                    self.finishRemoteThumb();
+                    self.finishRemoteThumb(rt);
                     return true;
                 };
                 rt.req = self.nextReq();
@@ -827,12 +860,27 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = ev.path, .off = @as(u64, 0), .len = @as(u64, 2 << 20) });
             } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
                 self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
-                self.finishRemoteThumb();
+                self.finishRemoteThumb(rt);
             }
             return true;
         },
         else => return false,
     }
+}
+
+fn thumbByReq(self: *BrowserView, hc: *HostConn, req: u32) ?*RemoteThumb {
+    for (self.remote_thumbs.items) |rt| {
+        if (rt.hc == hc and rt.req == req) return rt;
+    }
+    return null;
+}
+
+fn thumbByJob(self: *BrowserView, hc: *HostConn, job: u64) ?*RemoteThumb {
+    if (job == 0) return null;
+    for (self.remote_thumbs.items) |rt| {
+        if (rt.hc == hc and rt.phase == .wait_job and rt.job == job) return rt;
+    }
+    return null;
 }
 
 /// The host's bounded JXL/WebP transport image arrived: hand it to the
@@ -872,9 +920,10 @@ pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) bool {
 
 pub fn releaseRemoteThumbFor(self: *BrowserView, remote_id: u64) void {
     if (remote_id == 0) return;
-    if (self.remote_thumb) |rt| {
+    for (self.remote_thumbs.items) |rt| {
         if (rt.id == remote_id) {
-            self.finishRemoteThumb();
+            self.finishRemoteThumb(rt);
+            return;
         }
     }
 }
@@ -956,14 +1005,14 @@ pub fn shutdownTransfers(self: *BrowserView) void {
         _ = c.g_source_remove(self.remote_thumb_watch);
         self.remote_thumb_watch = 0;
     }
-    if (self.remote_thumb) |rt| {
+    for (self.remote_thumbs.items) |rt| {
         if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
         if (rt.asset.len > 0 and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
-        self.remote_thumb = null;
     }
+    self.remote_thumbs.clearRetainingCapacity();
     for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
     self.remote_thumb_queue.clearRetainingCapacity();
 }
@@ -2491,7 +2540,7 @@ test "a silent remote thumbnail is abandoned and the queue moves on" {
     defer a.destroy(self);
     self.allocator = a;
     self.thumb_failed = std.StringHashMap(void).init(a);
-    self.remote_thumb = null;
+    self.remote_thumbs = .empty;
     self.remote_thumb_queue = .empty;
     self.remote_thumb_watch = 0;
     self.next_req = 1;
@@ -2499,6 +2548,7 @@ test "a silent remote thumbnail is abandoned and the queue moves on" {
         var it = self.thumb_failed.iterator();
         while (it.next()) |kv| a.free(kv.key_ptr.*);
         self.thumb_failed.deinit();
+        self.remote_thumbs.deinit(a);
         self.remote_thumb_queue.deinit(a);
     }
 
@@ -2506,7 +2556,7 @@ test "a silent remote thumbnail is abandoned and the queue moves on" {
 
     const stuck = try a.create(RemoteThumb);
     stuck.* = .{ .id = 7, .hc = &hc, .path = try a.dupe(u8, "/pics/wedged.png"), .mtime_ms = 42, .last_ms = 0 };
-    self.remote_thumb = stuck;
+    try self.remote_thumbs.append(a, stuck);
     // A second request queued behind it: before the deadline existed,
     // this could never start, because the one slot was never freed.
     const waiting = try a.create(RemoteThumb);
@@ -2516,14 +2566,15 @@ test "a silent remote thumbnail is abandoned and the queue moves on" {
     // Not yet silent: nothing moves and the watch keeps running.
     stuck.last_ms = clock.nowMs();
     try t.expectEqual(@as(c.gboolean, 1), onRemoteThumbWatch(@ptrCast(self)));
-    try t.expect(self.remote_thumb == stuck);
+    try t.expectEqual(@as(usize, 1), self.remote_thumbs.items.len);
+    try t.expect(self.remote_thumbs.items[0] == stuck);
 
     // Past the deadline: the slot is released and the queue drains
     // (this host is dead, so the next entry is dropped rather than
     // sent -- what matters is that the pipeline is no longer wedged).
     stuck.last_ms = clock.nowMs() - REMOTE_THUMB_SILENCE_MS;
     try t.expectEqual(@as(c.gboolean, 0), onRemoteThumbWatch(@ptrCast(self)));
-    try t.expect(self.remote_thumb == null);
+    try t.expectEqual(@as(usize, 0), self.remote_thumbs.items.len);
     try t.expectEqual(@as(usize, 0), self.remote_thumb_queue.items.len);
     // The abandoned entry is remembered as failed, so the row is not
     // re-queued on every render.

@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
+const clock = @import("../../util/clock.zig");
 const fsjob = @import("../../mux/fsjob.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
 const profile = @import("../../util/profile.zig");
@@ -73,8 +74,37 @@ pub fn renderCurrent(self: *BrowserView) void {
     if (self.currentTab()) |t| self.renderTab(t);
 }
 
+/// Leading-edge throttle for SOCKET-driven renders (streaming listing
+/// chunks, watch-delta storms): render immediately when the last one
+/// is old enough, otherwise coalesce into ONE deferred render when
+/// the window reopens. Interaction-driven renders stay direct — a
+/// click's feedback must never wait on this.
+const LISTING_RENDER_THROTTLE_MS: i64 = 120;
+
+pub fn scheduleListingRender(self: *BrowserView) void {
+    if (self.widgets_dead or self.listing_render_src != 0) return;
+    const elapsed = clock.nowMs() - self.last_listing_render_ms;
+    if (elapsed >= LISTING_RENDER_THROTTLE_MS) {
+        self.renderCurrent();
+        return;
+    }
+    const delay: c.guint = @intCast(LISTING_RENDER_THROTTLE_MS - elapsed);
+    self.listing_render_src = c.g_timeout_add(delay, @ptrCast(&onListingRenderTick), @ptrCast(self));
+}
+
+fn onListingRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.listing_render_src = 0;
+    self.renderCurrent();
+    return 0; // one-shot
+}
+
 pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     if (self.widgets_dead) return;
+    // Every full render restamps the throttle window, whoever asked
+    // for it — a socket render right after a click render is still a
+    // back-to-back rebuild.
+    self.last_listing_render_ms = clock.nowMs();
     // Media values are stitched onto the entries BEFORE the sort:
     // they arrive from a batched job long after the listing, and a
     // sort by a media column reads them straight off the entries.

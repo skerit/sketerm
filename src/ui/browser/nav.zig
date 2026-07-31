@@ -418,6 +418,9 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     // A media batch in flight was asked for rows that no longer
     // exist; its answers would be paid for and thrown away.
     self.mediaResetForNavigation();
+    // Queued thumbnail fetches belonged to the rows just left behind;
+    // the new folder's rows re-queue theirs at first render.
+    self.dropQueuedThumbs();
     self.applyFolderMemory(tab);
     self.updateTabLabel(tab);
     self.syncPathEntry(tab);

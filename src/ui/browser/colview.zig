@@ -165,6 +165,52 @@ pub fn positionForPath(tab: *BTab, path: []const u8) ?c.guint {
     return null;
 }
 
+/// Rebind ONE live row after an in-place entry update (the async
+/// child count): a fresh item is spliced over the old position, so
+/// only that row's cells rebind — the rest of the view keeps its
+/// hover, selection and scroll untouched, which a full renderList
+/// cannot promise. No-op when the row is not in the model (filtered
+/// out, icons view, or a render already pending).
+pub fn refreshEntryRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: *Entry) void {
+    if (self.widgets_dead or tab.view_mode == .icons) return;
+    if (self.listing_render_src != 0) return; // a full rebuild is coming anyway
+    const n = itemCount(tab);
+    var pos: c.guint = 0;
+    const old: *ItemData = blk: while (pos < n) : (pos += 1) {
+        const d = itemDataAt(tab, pos) orelse continue;
+        if (d.kind == .entry and d.entry == e) break :blk d;
+    } else return;
+    const d = self.allocator.create(ItemData) catch return;
+    d.* = .{
+        .allocator = self.allocator,
+        .tab = tab,
+        .kind = .entry,
+        .path = self.allocator.dupe(u8, old.path) catch {
+            self.allocator.destroy(d);
+            return;
+        },
+        .dir = dir,
+        .entry = e,
+        .depth = old.depth,
+        .is_dir = e.tdir,
+        .alt = old.alt,
+    };
+    const obj = newItem(d) orelse {
+        self.allocator.free(d.path);
+        self.allocator.destroy(d);
+        return;
+    };
+    const was_selected = c.gtk_selection_model_is_selected(selModel(tab), pos) != 0;
+    // `rendering` fences the selection-changed handler exactly like
+    // renderList's splice: the swap must not rewrite tab.selected.
+    tab.rendering = true;
+    defer tab.rendering = false;
+    var items = [_]?*anyopaque{@ptrCast(obj)};
+    c.g_list_store_splice(tab.store, pos, 1, &items, 1);
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
+    if (was_selected) _ = c.gtk_selection_model_select_item(selModel(tab), pos, 0);
+}
+
 fn selModel(tab: *BTab) *c.GtkSelectionModel {
     return @ptrCast(@alignCast(tab.selmodel));
 }
