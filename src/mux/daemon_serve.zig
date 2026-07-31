@@ -1891,10 +1891,29 @@ pub fn fsCloseView(self: *Daemon, cl: *Client, r: FsOpReq) void {
 /// view shares its wd (inotify hands equal paths the same wd).
 pub fn dropFsViewAt(self: *Daemon, i: usize) void {
     const v = self.fs_views.swapRemove(i);
-    // A dying view takes its pending child-count work with it (the
-    // stat stream keeps going — the chunk run was promised to `req`).
-    for (self.fs_listings.items) |l| {
-        if (l.client == v.client and l.view != null and l.view.? == v.id) l.view = null;
+    // A dying view aborts its in-flight listing outright. Statting on
+    // for a view nobody watches would queue chunks AHEAD of whatever
+    // the client asks for next — on a slow link that backlog is why
+    // a navigation away from a huge folder went dead. Every
+    // close_view is preceded by cancelPendingDir client-side, so the
+    // terminator frame can never land on a live accumulator.
+    var j: usize = 0;
+    while (j < self.fs_listings.items.len) {
+        const l = self.fs_listings.items[j];
+        if (l.client == v.client and l.view != null and l.view.? == v.id) {
+            if (l.stage == .stat) {
+                l.client.queueJson(.fs_reply, .{
+                    .req = l.req,
+                    .ok = true,
+                    .path = l.path,
+                    .entries = &[_]fsserve.Entry{},
+                    .more = false,
+                    .aborted = true,
+                });
+            }
+            _ = self.fs_listings.swapRemove(j);
+            l.deinit();
+        } else j += 1;
     }
     if (v.wd >= 0) {
         var shared = false;
@@ -1938,7 +1957,10 @@ const LISTING_BATCH_MS: i64 = 8;
 const COUNT_BATCH_MS: i64 = 5;
 /// Skip a listing while its client's write buffer is over this mark;
 /// POLLOUT drains it and the pump resumes (pumpDownloads' rule).
-const LISTING_WATERMARK: usize = 8 << 20;
+/// Deliberately far below the download watermark: everything the
+/// client asks for NEXT queues behind these bytes, and on a slow
+/// remote link a megabyte of backlog is already seconds of dead UI.
+const LISTING_WATERMARK: usize = 1 << 20;
 
 /// Begin an incremental listing. The names are read and sorted NOW —
 /// one cheap readdir pass, so open failures still reply synchronously
