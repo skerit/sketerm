@@ -8,8 +8,11 @@
 //! the `thumbnail` op installs the spec 128px PNG into its own host's
 //! freedesktop cache and serves that path, so the entry is shared with
 //! that machine's own file managers and survives our restarts. This
-//! side only decodes what comes back; it must never write a second
-//! copy of the same entry.
+//! side never writes a second copy of a LOCAL entry — but thumbnails
+//! fetched from a REMOTE host persist their transport sidecar bytes in
+//! a private local cache (see "local persistent cache" below), because
+//! the daemon's cache lives on the wrong machine to save a revisit the
+//! round trip.
 //!
 //! The side panel and the Quick Look overlay are two views of ONE
 //! pipeline: `previewers.resolve` picks a handler for the entry, one
@@ -661,9 +664,213 @@ pub fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry
         };
         _ = c.pthread_cond_signal(&tc.cond);
     } else {
+        // A remote entry may already be on the local disk cache from
+        // an earlier visit: decode that instead of paying the wire.
+        if (hc.host != null and remoteThumbFromDisk(self, full, identity, e.mtime_ms)) return null;
         self.enqueueRemoteThumb(hc, full, e.mtime_ms);
     }
     return null;
+}
+
+// ── local persistent cache of remote thumbnails ──────────────────
+//
+// The daemon's freedesktop cache lives on the file-owning host, so a
+// fresh browser process used to re-fetch every remote thumbnail over
+// the wire: one generator-job round trip plus a transfer per file,
+// per visit. The bounded transport sidecar that comes back (JXL/WebP,
+// 3-6x smaller than the spec PNG) is therefore persisted locally,
+// keyed by md5 of the "host:path" identity and validated against the
+// entry's mtime; a render-time hit hands the bytes straight to the
+// decode worker with zero remote traffic. LOCAL hosts never land
+// here — their daemon cache is already on this disk. Stale entries
+// overwrite in place (same identity, same filename); growth from
+// distinct files is bounded by a lazy oldest-first sweep.
+
+pub const REMOTE_THUMB_HDR: usize = 12;
+const REMOTE_THUMB_MAGIC = "SKT1";
+/// Sweep threshold: at the typical 5-20KB per sidecar this caps the
+/// cache around 20-80MB.
+const REMOTE_THUMB_CACHE_MAX_FILES: usize = 4096;
+/// How many the sweep removes once over the cap: enough slack that
+/// one sweep per process start is plenty.
+const REMOTE_THUMB_CACHE_SWEEP: usize = 1024;
+
+pub fn packRemoteThumbHeader(out: *[REMOTE_THUMB_HDR]u8, mtime_ms: i64) void {
+    out[0..4].* = REMOTE_THUMB_MAGIC.*;
+    std.mem.writeInt(i64, out[4..12], mtime_ms, .little);
+}
+
+pub fn remoteThumbHeaderMtime(bytes: []const u8) ?i64 {
+    if (bytes.len < REMOTE_THUMB_HDR) return null;
+    if (!std.mem.eql(u8, bytes[0..4], REMOTE_THUMB_MAGIC)) return null;
+    return std.mem.readInt(i64, bytes[4..12], .little);
+}
+
+/// Cache basename for one host-qualified identity: 32 hex chars of
+/// md5 plus ".thumb". Pure (unit-tested); md5 is key derivation
+/// here, not integrity.
+pub fn remoteThumbCacheName(identity: []const u8) [38]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(identity, &digest, .{});
+    var out: [38]u8 = undefined;
+    const hexd = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hexd[b >> 4];
+        out[i * 2 + 1] = hexd[b & 15];
+    }
+    out[32..38].* = ".thumb".*;
+    return out;
+}
+
+fn remoteThumbCacheDir(buf: []u8) ?[]const u8 {
+    const base = c.g_get_user_cache_dir() orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/sketerm/remote-thumbs", .{
+        std.mem.span(@as([*:0]const u8, @ptrCast(base))),
+    }) catch null;
+}
+
+fn remoteThumbCachePath(z: *[4096:0]u8, identity: []const u8) ?[*:0]const u8 {
+    var dbuf: [4096]u8 = undefined;
+    const dir = remoteThumbCacheDir(&dbuf) orelse return null;
+    const name = remoteThumbCacheName(identity);
+    const s = std.fmt.bufPrintZ(z, "{s}/{s}", .{ dir, name }) catch return null;
+    return s.ptr;
+}
+
+/// Queue a worker decode from the local disk cache. True = the row's
+/// thumbnail is on its way (or already queued) — no wire fetch owed.
+fn remoteThumbFromDisk(self: *BrowserView, full: []const u8, identity: []const u8, mtime_ms: i64) bool {
+    var z: [4096:0]u8 = undefined;
+    const p = remoteThumbCachePath(&z, identity) orelse return false;
+    const f = c.fopen(p, "rb") orelse return false;
+    defer _ = c.fclose(f);
+    var hdr: [REMOTE_THUMB_HDR]u8 = undefined;
+    if (c.fread(&hdr, 1, hdr.len, f) != hdr.len) return false;
+    const mt = remoteThumbHeaderMtime(&hdr) orelse return false;
+    // Stale: the file changed since this was cached. Fall through to
+    // the wire fetch, whose success overwrites this same filename.
+    if (mt != mtime_ms) return false;
+    const a = std.heap.c_allocator;
+    const buf = a.alloc(u8, PREVIEW_IMAGE_CAP + 1) catch return false;
+    const n = c.fread(buf.ptr, 1, buf.len, f);
+    if (n == 0 or n > PREVIEW_IMAGE_CAP) {
+        a.free(buf);
+        return false;
+    }
+    const tc = self.ensureThumbWorker() orelse {
+        a.free(buf);
+        return false;
+    };
+    tc.lock();
+    defer tc.unlock();
+    for (tc.queue.items) |q| {
+        if (std.mem.eql(u8, q.cache_key, identity)) {
+            a.free(buf);
+            return true; // already on its way
+        }
+    }
+    if (tc.queue.items.len > 512) {
+        a.free(buf);
+        return false;
+    }
+    const path_owned = a.dupe(u8, full) catch {
+        a.free(buf);
+        return false;
+    };
+    const key_owned = a.dupe(u8, identity) catch {
+        a.free(buf);
+        a.free(path_owned);
+        return false;
+    };
+    const data = a.realloc(buf, n) catch buf[0..n];
+    tc.queue.append(a, .{
+        .path = path_owned,
+        .cache_key = key_owned,
+        .mtime_ms = mtime_ms,
+        .data = data,
+    }) catch {
+        a.free(data);
+        a.free(path_owned);
+        a.free(key_owned);
+        return false;
+    };
+    _ = c.pthread_cond_signal(&tc.cond);
+    return true;
+}
+
+/// One sweep per process: only counts (and prunes) when over the cap.
+var remote_thumb_cache_swept = false;
+
+fn writeRemoteThumbCache(host: []const u8, path: []const u8, mtime_ms: i64, bytes: []const u8) void {
+    if (bytes.len == 0 or bytes.len > PREVIEW_IMAGE_CAP) return;
+    var ibuf: [4600]u8 = undefined;
+    const identity = std.fmt.bufPrint(&ibuf, "{s}:{s}", .{ host, path }) catch return;
+    var dbuf: [4096]u8 = undefined;
+    const dir = remoteThumbCacheDir(&dbuf) orelse return;
+    var dz: [4096:0]u8 = undefined;
+    const dirz = std.fmt.bufPrintZ(&dz, "{s}", .{dir}) catch return;
+    if (c.g_mkdir_with_parents(dirz.ptr, 0o700) != 0) return;
+    if (!remote_thumb_cache_swept) {
+        remote_thumb_cache_swept = true;
+        sweepRemoteThumbCache(dirz.ptr);
+    }
+    var z: [4096:0]u8 = undefined;
+    const final = remoteThumbCachePath(&z, identity) orelse return;
+    // Atomic install: a crash mid-write must never leave a torn file
+    // that a later run would trust (the header would not parse, but
+    // torn payload bytes after a valid header still decode-fail into
+    // thumb_failed for a session).
+    var tmpz: [4200:0]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmpz, "{s}.tmp{d}", .{ std.mem.span(final), c.getpid() }) catch return;
+    const f = c.fopen(tmp.ptr, "wb") orelse return;
+    var ok = false;
+    defer {
+        if (!ok) _ = c.unlink(tmp.ptr);
+    }
+    var hdr: [REMOTE_THUMB_HDR]u8 = undefined;
+    packRemoteThumbHeader(&hdr, mtime_ms);
+    const whdr = c.fwrite(&hdr, 1, hdr.len, f);
+    const wbytes = c.fwrite(bytes.ptr, 1, bytes.len, f);
+    if (c.fclose(f) != 0 or whdr != hdr.len or wbytes != bytes.len) return;
+    ok = c.rename(tmp.ptr, final) == 0;
+}
+
+/// Oldest-first prune, run at most once per process and only when
+/// the cache exceeds its file cap. Bounded collection: entries past
+/// twice the cap are ignored this round; the next process sweeps
+/// again.
+fn sweepRemoteThumbCache(dirz: [*:0]const u8) void {
+    const Item = struct { mtime: i64, name: [38]u8 };
+    const a = std.heap.c_allocator;
+    var items: std.ArrayList(Item) = .empty;
+    defer items.deinit(a);
+    const d = c.opendir(dirz) orelse return;
+    defer _ = c.closedir(d);
+    while (true) {
+        const ent = c.readdir(d) orelse break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len != 38 or !std.mem.endsWith(u8, name, ".thumb")) continue;
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dirz), name }) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(p.ptr, &st) != 0) continue;
+        var it = Item{ .mtime = @intCast(st.st_mtim.tv_sec), .name = undefined };
+        @memcpy(&it.name, name);
+        items.append(a, it) catch break;
+        if (items.items.len >= REMOTE_THUMB_CACHE_MAX_FILES * 2) break;
+    }
+    if (items.items.len <= REMOTE_THUMB_CACHE_MAX_FILES) return;
+    std.mem.sort(Item, items.items, {}, struct {
+        fn lt(_: void, x: Item, y: Item) bool {
+            return x.mtime < y.mtime;
+        }
+    }.lt);
+    const doomed = @min(items.items.len - REMOTE_THUMB_CACHE_MAX_FILES + REMOTE_THUMB_CACHE_SWEEP, items.items.len);
+    for (items.items[0..doomed]) |it| {
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dirz), it.name }) catch continue;
+        _ = c.unlink(p.ptr);
+    }
 }
 
 pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {
@@ -826,6 +1033,12 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                         self.finishRemoteThumb(rt);
                         return true;
                     }
+                    // Persist the sidecar bytes so the next visit (or
+                    // process) decodes from local disk instead of
+                    // re-fetching. Local-daemon fetches skip this:
+                    // their freedesktop cache is already on this disk.
+                    if (rt.hc.host) |host|
+                        writeRemoteThumbCache(host, rt.path, rt.mtime_ms, rt.buf.items);
                     // Deliberately NOT finishRemoteThumb: the worker
                     // handback needs rt's host + path, so
                     // releaseRemoteThumbFor owns the release and
@@ -2510,6 +2723,30 @@ pub fn quickLookActivate(self: *BrowserView) void {
     const hc = tab.hc;
     self.quickLookClose();
     self.openPathOnHost(hc, path);
+}
+
+test "remote-thumb cache header round-trips and rejects foreign bytes" {
+    const t = std.testing;
+    var hdr: [REMOTE_THUMB_HDR]u8 = undefined;
+    packRemoteThumbHeader(&hdr, 1721990000123);
+    try t.expectEqual(@as(?i64, 1721990000123), remoteThumbHeaderMtime(&hdr));
+    packRemoteThumbHeader(&hdr, -1);
+    try t.expectEqual(@as(?i64, -1), remoteThumbHeaderMtime(&hdr));
+    // Too short, and a valid-length file that is not ours.
+    try t.expectEqual(@as(?i64, null), remoteThumbHeaderMtime(hdr[0..11]));
+    var png = [_]u8{ 0x89, 'P', 'N', 'G', 0, 0, 0, 0, 0, 0, 0, 0 };
+    try t.expectEqual(@as(?i64, null), remoteThumbHeaderMtime(&png));
+}
+
+test "remote-thumb cache names are stable, hex, and identity-distinct" {
+    const t = std.testing;
+    const a1 = remoteThumbCacheName("box:/pics/cat.jpg");
+    const a2 = remoteThumbCacheName("box:/pics/cat.jpg");
+    const b = remoteThumbCacheName("otherbox:/pics/cat.jpg");
+    try t.expect(std.mem.eql(u8, &a1, &a2));
+    try t.expect(!std.mem.eql(u8, &a1, &b));
+    try t.expect(std.mem.endsWith(u8, &a1, ".thumb"));
+    for (a1[0..32]) |ch| try t.expect(std.ascii.isHex(ch));
 }
 
 test "the silence deadline is measured from the last frame, not the start" {
