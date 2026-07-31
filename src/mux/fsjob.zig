@@ -594,36 +594,30 @@ fn transportPreview(
     const rgba = img.rgba;
     const out_w = img.w;
     const out_h = img.h;
-    // A receiver listing "png" is the daemon's own host (local unix
-    // socket): serve plain PNG so local previews neither pay a
-    // transcode nor depend on libjxl/libwebp being installed.
+    // Prefer the compact codecs; PNG is the always-available last
+    // resort (stb encoder is compiled in — a host without
+    // libjxl/libwebp, or a static mux-portable whose dlopen can never
+    // load them, still previews). A local receiver lists only "png",
+    // so local previews keep skipping the transcode entirely.
     var png_sink = PngSink{ .allocator = allocator };
     defer png_sink.buf.deinit(allocator);
     var jx_bytes: ?[]u8 = null;
     defer if (jx_bytes) |b| allocator.free(b);
     var bytes: []const u8 = undefined;
     var ext: []const u8 = undefined;
-    if (imagecodec.wanted(codecs, "png") and
-        c.stbi_write_png_to_func(&pngSinkWrite, @ptrCast(&png_sink), @intCast(out_w), @intCast(out_h), 4, rgba.ptr, @intCast(out_w * 4)) != 0 and
-        !png_sink.failed and png_sink.buf.items.len <= TRANSPORT_BYTE_CAP)
-    {
-        bytes = png_sink.buf.items;
-        ext = "png";
-    } else {
-        const encoded = imagecodec.encodePreferred(
-            allocator,
-            rgba,
-            out_w,
-            out_h,
-            codecs,
-            TRANSPORT_BYTE_CAP,
-        ) catch return null;
+    if (imagecodec.encodePreferred(allocator, rgba, out_w, out_h, codecs, TRANSPORT_BYTE_CAP)) |encoded| {
         jx_bytes = encoded.bytes;
         bytes = encoded.bytes;
         ext = switch (encoded.codec) {
             .jxl => "jxl",
             .webp => "webp",
         };
+    } else |_| {
+        if (!imagecodec.wanted(codecs, "png")) return null;
+        if (c.stbi_write_png_to_func(&pngSinkWrite, @ptrCast(&png_sink), @intCast(out_w), @intCast(out_h), 4, rgba.ptr, @intCast(out_w * 4)) == 0 or
+            png_sink.failed or png_sink.buf.items.len > TRANSPORT_BYTE_CAP) return null;
+        bytes = png_sink.buf.items;
+        ext = "png";
     }
     var random: [8]u8 = undefined;
     if (c.getentropy(&random, random.len) != 0) {
@@ -669,7 +663,7 @@ fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
     }
     var transport_buf: [4096:0]u8 = undefined;
     const transport = transportPreview(allocator, spec.src, spec.image_codecs, 512, &transport_buf) orelse
-        return emitError("JPEG XL/WebP preview codec unavailable or output too large");
+        return emitError("no accepted preview codec (jxl/webp/png) or output over the 2 MiB cap");
     emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport });
     return 0;
 }
@@ -960,7 +954,7 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     }
     var transport_buf: [4096:0]u8 = undefined;
     const transport = transportPreview(allocator, final, spec.image_codecs, 512, &transport_buf) orelse
-        return emitError("JPEG XL/WebP preview codec unavailable or output too large");
+        return emitError("no accepted preview codec (jxl/webp/png) or output over the 2 MiB cap");
     emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport, .text = metadata[0..metadata_len] });
     return 0;
 }
@@ -3476,6 +3470,24 @@ test "preview event carries a fully escaped 4 KiB text head" {
     const line = encodeEvent(&encoded, .{ .ev = "done", .text = &text }) orelse return error.TestUnexpectedResult;
     try std.testing.expect(line.len > text.len);
     try std.testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
+}
+
+test "transportPreview serves PNG when jxl/webp cannot, refuses without any accepted codec" {
+    const t = std.testing;
+    var src_z: [128:0]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-tp-{d}.png", .{c.getpid()}) catch unreachable;
+    var rgba: [8 * 8 * 4]u8 = undefined;
+    @memset(&rgba, 0x80);
+    try t.expect(c.stbi_write_png(src.ptr, 8, 8, 4, &rgba, 8 * 4) != 0);
+    defer _ = c.unlink(src.ptr);
+    var out_buf: [4096:0]u8 = undefined;
+    // "png" as last resort: a host without libjxl/libwebp still serves.
+    const out = transportPreview(t.allocator, src, "png", 512, &out_buf) orelse return error.TestUnexpectedResult;
+    defer _ = c.unlink(out_buf[0..out.len :0].ptr);
+    try t.expect(std.mem.endsWith(u8, out, ".png"));
+    // A receiver accepting nothing usable gets a refusal, not a PNG.
+    var out2: [4096:0]u8 = undefined;
+    try t.expect(transportPreview(t.allocator, src, "", 512, &out2) == null);
 }
 
 test "archive member validation rejects traversal and absolute paths" {
