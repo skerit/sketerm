@@ -427,11 +427,11 @@ const WireThumbRes = struct {
     }
 };
 
-/// Run one wire-cache thumbnail job to completion over the raw conn.
-fn wireThumbRequest(allocator: std.mem.Allocator, fs: *fsdrive.Fs, src: []const u8, req: u32) WireThumbRes {
+/// Run one wire-cache thumbnail/preview job to completion over the raw conn.
+fn wireThumbRequest(allocator: std.mem.Allocator, fs: *fsdrive.Fs, op: []const u8, src: []const u8, req: u32) WireThumbRes {
     fs.conn.sendJson(.fs_op, .{
         .req = req,
-        .op = "thumbnail",
+        .op = op,
         .path = src,
         .image_codecs = "jxl,webp",
         .wire_cache = true,
@@ -491,7 +491,7 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
     w.print("{s}/wire-photo.png", .{dir}) catch fail("wire fmt");
     const src = w.buffered();
 
-    const first = wireThumbRequest(allocator, fs, src, 9100);
+    const first = wireThumbRequest(allocator, fs, "thumbnail", src, 9100);
     if (!first.ok) {
         // No libjxl/libwebp on this host: the fallback (spec PNG +
         // per-fetch transcode) also cannot encode, so there is
@@ -521,7 +521,7 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
         fail("wire mode installed a freedesktop PNG");
 
     // Second request: served from the cache file, not rebuilt.
-    const second = wireThumbRequest(allocator, fs, src, 9101);
+    const second = wireThumbRequest(allocator, fs, "thumbnail", src, 9101);
     if (!second.ok or !second.keep) fail("wire thumb re-request failed");
     if (!std.mem.eql(u8, first.assetPath(), second.assetPath())) fail("wire thumb hit path differs");
     if (c.stat(pathz.pathZ(&z, second.assetPath()) catch fail("wire path"), &st) != 0)
@@ -537,12 +537,34 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
         if (c.utimensat(c.AT_FDCWD, pathz.pathZ(&z, src) catch fail("wire src path"), &ts, 0) != 0)
             fail("wire src touch");
     }
-    const third = wireThumbRequest(allocator, fs, src, 9102);
+    const third = wireThumbRequest(allocator, fs, "thumbnail", src, 9102);
     if (!third.ok or !third.keep) fail("wire thumb refresh failed");
     if (c.stat(pathz.pathZ(&z, third.assetPath()) catch fail("wire path"), &st) != 0)
         fail("wire thumb refresh missing");
     if (st.st_ino == first_ino) fail("stale wire thumb served after source change");
     if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec + 5) fail("wire thumb refresh stamp wrong");
+
+    // The 512px preview tier: same regime, its own xl/ cache dir, no
+    // x-large freedesktop PNG, and it never collides with the 128px
+    // entry of the same source.
+    const pv = wireThumbRequest(allocator, fs, "preview", src, 9103);
+    if (!pv.ok or !pv.keep) fail("wire preview failed");
+    if (std.mem.indexOf(u8, pv.assetPath(), "/sketerm/thumbs/xl/") == null)
+        fail("wire preview asset outside the xl wire cache");
+    if (std.mem.eql(u8, pv.assetPath(), third.assetPath())) fail("preview collided with thumbnail entry");
+    if (c.stat(pathz.pathZ(&z, pv.assetPath()) catch fail("wire path"), &st) != 0)
+        fail("wire preview cache file missing");
+    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec + 5) fail("wire preview freshness stamp wrong");
+    const pv_ino = st.st_ino;
+    var xl_buf: [4096]u8 = undefined;
+    const fd_xl = thumbs_mod.thumbPathTier(cache_root, src, .x_large, &xl_buf) orelse fail("fd xl path");
+    if (c.stat(pathz.pathZ(&z, fd_xl) catch fail("fd xl pathz"), &st) == 0)
+        fail("wire preview installed an x-large freedesktop PNG");
+    const pv2 = wireThumbRequest(allocator, fs, "preview", src, 9104);
+    if (!pv2.ok or !pv2.keep) fail("wire preview re-request failed");
+    if (c.stat(pathz.pathZ(&z, pv2.assetPath()) catch fail("wire path"), &st) != 0)
+        fail("wire preview cache vanished");
+    if (st.st_ino != pv_ino) fail("wire preview hit rebuilt the cache file");
 
     std.debug.print("smoke-fs: {s} wire-thumb stage ok\n", .{tag});
 }

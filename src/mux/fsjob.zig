@@ -735,35 +735,48 @@ fn encodeWire(allocator: std.mem.Allocator, source_path: []const u8, codecs: []c
 const WIRE_THUMB_CACHE_MAX = 4096;
 const WIRE_THUMB_CACHE_SWEEP = 1024;
 
-/// Serve (or build) the wire-cache thumbnail for `spec.src`.
-/// Freshness = the cache file's mtime equals the source's, stamped at
-/// install. Null = no codec library — caller falls back to the
-/// legacy spec-PNG path.
-fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, mtime_sec: i64, cache_root: []const u8) ?u8 {
+/// Serve (or build) the wire-cache thumbnail (128px) or preview
+/// (512px, its own xl/ cache dir) for `spec.src`. Freshness = the
+/// cache file's mtime equals the source's, stamped at install. Null
+/// = no codec library — caller falls back to the legacy spec-PNG
+/// path. Media metadata (ffprobe/pdfinfo) is computed per fetch,
+/// exactly as the spec-PNG path always did on its cache hits.
+fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool, mtime_sec: i64, cache_root: []const u8) ?u8 {
+    const tier: thumbs.Tier = if (thumbnail_only) .normal else .x_large;
+    var source_z: [4096:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
+    var metadata: [2048]u8 = undefined;
+    var metadata_len: usize = 0;
+    if (!thumbnail_only) {
+        if (extIs(spec.src, &video_exts) or extIs(spec.src, &audio_exts)) {
+            metadata_len = ffprobeEntries(source.ptr, FFPROBE_PREVIEW_ENTRIES, &metadata);
+        } else if (extIs(spec.src, &pdf_exts)) {
+            metadata_len = pdfinfoText(source.ptr, &metadata);
+        }
+    }
+
     // Already cached in a codec the receiver decodes?
     var it = std.mem.splitScalar(u8, spec.image_codecs, ',');
     while (it.next()) |raw_codec| {
         const codec = std.mem.trim(u8, raw_codec, " ");
         if (codec.len == 0 or std.mem.eql(u8, codec, "png")) continue;
         var pbuf: [4096]u8 = undefined;
-        const p = thumbs.wireThumbPath(cache_root, spec.src, codec, &pbuf) orelse continue;
+        const p = thumbs.wireThumbPath(cache_root, spec.src, tier, codec, &pbuf) orelse continue;
         var pz: [4096:0]u8 = undefined;
         const path = pathz.pathZ(&pz, p) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(path, &st) != 0 or st.st_size <= 0) continue;
         const fts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
         if (@as(i64, fts.tv_sec) != mtime_sec) continue;
-        emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = p, .keep = true });
+        emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = p, .keep = true, .text = metadata[0..metadata_len] });
         return 0;
     }
 
     // Encode source: a valid freedesktop PNG (this host's own cache,
     // or another file manager's) is read through; otherwise generate
     // a raw thumb that never gets installed as PNG.
-    var source_z: [4096:0]u8 = undefined;
-    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
     var final_buf: [4096]u8 = undefined;
-    const final = thumbs.thumbPathTier(cache_root, spec.src, .normal, &final_buf) orelse return emitError("thumbnail path too long");
+    const final = thumbs.thumbPathTier(cache_root, spec.src, tier, &final_buf) orelse return emitError("thumbnail path too long");
     var uri_buf: [4096 * 3 + 8]u8 = undefined;
     const uri = thumbs.fileUri(spec.src, &uri_buf) orelse return emitError("thumbnail URI too long");
     var raw_buf: [4096:0]u8 = undefined;
@@ -773,7 +786,7 @@ fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, mtime_sec: i64, cache_
     };
     const enc_src: []const u8 = if (thumbs.validatePng(final, uri, mtime_sec)) final else blk: {
         const r = std.fmt.bufPrintZ(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}) catch return emitError("thumbnail path too long");
-        if (!generateThumbPng(allocator, spec.src, source, r, 128))
+        if (!generateThumbPng(allocator, spec.src, source, r, if (thumbnail_only) 128 else 512))
             return emitError("preview generator unavailable or failed");
         raw = r;
         break :blk r;
@@ -784,7 +797,7 @@ fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, mtime_sec: i64, cache_
     // Install: atomic rename, then stamp the file's mtime with the
     // SOURCE's so the hit check above is a plain stat compare.
     var dbuf: [4096]u8 = undefined;
-    const dest = thumbs.wireThumbPath(cache_root, spec.src, enc.ext, &dbuf) orelse return emitError("thumbnail path too long");
+    const dest = thumbs.wireThumbPath(cache_root, spec.src, tier, enc.ext, &dbuf) orelse return emitError("thumbnail path too long");
     pathz.makeParentDirs(dest) catch return emitError("cannot create wire thumb cache");
     if (std.fs.path.dirname(dest)) |dir| sweepWireThumbs(dir);
     var tz: [4200:0]u8 = undefined;
@@ -815,7 +828,7 @@ fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, mtime_sec: i64, cache_
         .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
     };
     _ = c.utimes(destz, &tv);
-    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = dest, .keep = true });
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = dest, .keep = true, .text = metadata[0..metadata_len] });
     return 0;
 }
 
@@ -884,12 +897,13 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     var cache_buf: [4096]u8 = undefined;
     const cache_root = cacheRootDir(&cache_buf);
 
-    // Remote-serving wire cache: the codec bytes themselves are the
-    // cache, no freedesktop PNG is installed and no per-fetch
-    // re-encode happens. Null = no codec library on this host —
-    // degrade to the legacy spec-PNG path below.
-    if (thumbnail_only and spec.wire_cache and spec.image_codecs.len > 0) {
-        if (runWireThumb(allocator, spec, mtime_sec, cache_root)) |rc| return rc;
+    // Remote-serving wire cache (both tiers: 128px thumbnails and
+    // 512px previews): the codec bytes themselves are the cache, no
+    // freedesktop PNG is installed and no per-fetch re-encode
+    // happens. Null = no codec library on this host — degrade to the
+    // legacy spec-PNG path below.
+    if (spec.wire_cache and spec.image_codecs.len > 0) {
+        if (runWireThumb(allocator, spec, thumbnail_only, mtime_sec, cache_root)) |rc| return rc;
     }
     // Tier directories are size contracts other applications rely on:
     // normal is 128px, x-large is 512px. Writing a 512px image into

@@ -11561,3 +11561,23 @@ serves the same inodes and the cache survives the client's cleanup.
 Rig lesson recorded in CLAUDE.md: a re-exec'd daemon has comm "exe",
 so pgrep -x sketerm-mux misses stale test daemons — one served a
 deleted pre-feature binary and mimicked a broken feature for an hour.
+
+## 2026-07-31: 512px previews join the wire cache (no remote PNG at all)
+
+The preview op (Quick Look / side panel, x-large tier) was the last
+path installing spec PNGs on remote hosts. runWireThumb now serves
+both tiers: 128px thumbnails at sketerm/thumbs/<md5>.<ext>, 512px
+previews at sketerm/thumbs/xl/<md5>.<ext> (own directory so the two
+tiers of one source never collide), same mtime-stamp freshness, same
+keep:true / read-through / no-codec-lib fallback semantics. Media
+metadata (ffprobe/pdfinfo) is computed per fetch on hit and miss,
+exactly as the spec-PNG path always did. GUI: the preview op sends
+wire_cache to remote hosts and PreviewRead.keep guards both unlink
+sites (endRead + temp replacement in the done arm).
+
+smoke-fs wire-thumb stage extended (mono + broker): preview keep +
+xl/ path + tier non-collision + no x-large freedesktop PNG + hit
+same-inode. Live rig: Quick Look on a fake-remote photo landed xl/
+jxl entries (plus neighbor preloads), zero freedesktop PNGs, close +
+reopen left inodes untouched; a standalone --job wav preview carried
+duration metadata on both miss and hit.
