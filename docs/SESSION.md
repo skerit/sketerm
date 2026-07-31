@@ -11608,3 +11608,47 @@ the GUI-local daemon journal stayed empty), A-to-B cut-paste moved
 with delete_src:true, and A-to-C (C's outbound ssh dead) failed one
 direct attempt then relayed via the local daemon 33ms later with a
 matching hash.
+
+## 2026-07-31: hover-stable listings, instant navigation, daemon self-upgrade
+
+The vastai flicker report came back "not fixed" — and the root cause
+was double. First, the daemon on that host had been RUNNING for two
+days: every daemon-side fix shipped this week was invisible there
+(deploy is content-addressed but never restarts a live daemon).
+Second, the GUI still full-rebuilt the listing model on STRUCTURAL
+watch deltas (only count deltas were surgical) — an actively-written
+directory rebuilds forever, old daemon or new.
+
+Three fixes, all verified against the REAL vastai host with its OLD
+busy daemon still serving:
+
+1. renderList now splices a WINDOW: build the desired items as
+before, match common prefix/suffix by identity (path/depth/zebra
+parity; rows named in BTab.changed_paths are forced into the
+window), re-aim reused rows' nulled dir/entry pointers, splice only
+the middle. Unchanged rows keep their GObjects — GTK never rebinds
+them, so hover, selection and clicks survive delta storms.
+mediacols.applyToDir change-detects stitched meta into
+noteChangedFull. Local churn rig (3 writes/sec): hovered and
+selected rows pixel-stable (single-frame bursts), clicks land in
+~100-170ms. Real artifact_hunt: same, with thumbnails streaming.
+
+2. Navigation commits INSTANTLY: navigateMode adopts the empty
+streaming candidate at click time (location bar, tab, history move
+NOW; rows fill in as chunks land; failures land as a load error on
+the visible dir). Real vastai: 280ms from double-click to committed
+location + "Listing..." page, against the old synchronous daemon
+that used to freeze the click for seconds.
+
+3. Daemons self-upgrade when idle: the welcome announces the build
+id (git describe, now in every binary's build_options);
+Conn.upgradeStaleIdle probes sessions + running jobs over
+LONG-STANDING verbs and uses the ancient .shutdown frame, so even
+pre-announce daemons are replaceable. Wired into GUI startup (before
+the window spawns its own pane session — learned live: from inside a
+running GUI the local daemon is never idle) and the browser's remote
+connect worker. Busy daemons are never bounced; the status line says
+they serve an older build. Verified: an installed-binary daemon on
+an isolated socket was replaced by the dev binary at GUI start;
+vastai's daemon (2 live sessions) was correctly left alone and its
+sessions confirmed intact after the whole test round.
