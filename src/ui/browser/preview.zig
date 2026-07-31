@@ -217,6 +217,9 @@ pub const PreviewRead = struct {
     /// Host-side scratch file to unlink once read (owned; empty for
     /// producers that read the source or the thumbnail cache).
     temp: []u8 = &.{},
+    /// `temp` is a wire-cache daemon's persistent cache file — never
+    /// unlink it after reading.
+    keep: bool = false,
     output: previewers.Output,
     /// Always render as hex, whatever the bytes look like.
     force_hex: bool = false,
@@ -1219,7 +1222,7 @@ fn endRead(self: *BrowserView, slot: *?*PreviewRead) void {
     slot.* = null;
     if (pr.phase == .job_wait and pr.job != 0 and pr.hc.state == .ready)
         self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = pr.job });
-    if (pr.temp.len > 0 and pr.hc.state == .ready)
+    if (pr.temp.len > 0 and !pr.keep and pr.hc.state == .ready)
         self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
     pr.destroy(self.allocator);
 }
@@ -1841,7 +1844,7 @@ fn startPreview(
 
     switch (handler.producer) {
         .builtin => |b| switch (b) {
-            .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc) }),
+            .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
             .head, .hex => {
                 pr.phase = .read_file;
                 self.sendOp(hc, .{
@@ -2069,10 +2072,11 @@ fn feedReadSlot(
                         return true;
                     };
                     if (pr.temp.len > 0) {
-                        self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
+                        if (!pr.keep) self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = pr.temp });
                         self.allocator.free(pr.temp);
                     }
                     pr.temp = replacement;
+                    pr.keep = ev.keep;
                 }
                 if (pr.needs_transport) {
                     pr.needs_transport = false;
