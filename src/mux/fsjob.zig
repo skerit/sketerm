@@ -97,6 +97,9 @@ pub const Spec = struct {
     /// a small cap so an unreachable peer fails in seconds and the
     /// caller falls back to relaying, instead of a minute of backoff.
     dial_tries: u32 = 0,
+    /// copy: hash-compare every staged file against its source before
+    /// the rename installs it (files_verify_copy).
+    verify: bool = false,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -310,6 +313,16 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runPreviewTransport(allocator, spec)
     else if (std.mem.eql(u8, spec.op, "media_meta"))
         runMediaMeta(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "git_status"))
+        runGitStatus(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "diff"))
+        runDiff(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "split"))
+        runSplit(spec)
+    else if (std.mem.eql(u8, spec.op, "combine"))
+        runCombine(spec)
+    else if (std.mem.eql(u8, spec.op, "secure_delete"))
+        runSecureDelete(spec)
     else
         emitError("unknown job op");
     if (spec.job_id != 0 and spec.journal_dir.len > 0) {
@@ -956,6 +969,278 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     const transport = transportPreview(allocator, final, spec.image_codecs, 512, &transport_buf) orelse
         return emitError("no accepted preview codec (jxl/webp/png) or output over the 2 MiB cap");
     emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = transport, .text = metadata[0..metadata_len] });
+    return 0;
+}
+
+/// `git status --porcelain -z` for the browsed directory, run on the
+/// host that owns the repo. Emits one `match` per record — `path`
+/// already relative to the BROWSED dir (the repo prefix is stripped
+/// here), `text` the 1-char aggregate status — so the client only
+/// maps first path segments to badges.
+fn runGitStatus(allocator: std.mem.Allocator, spec: Spec) u8 {
+    var cmd: [4400:0]u8 = undefined;
+    var w = std.Io.Writer.fixed(cmd[0 .. cmd.len - 1]);
+    w.writeAll("cd '") catch return emitError("path too long");
+    for (spec.src) |ch| {
+        if (ch == '\'') w.writeAll("'\\''") catch return emitError("path too long") else w.writeByte(ch) catch return emitError("path too long");
+    }
+    w.writeAll("' 2>/dev/null && git status --porcelain --no-renames -z 2>/dev/null | head -c 65536 && printf '\\x01' && git rev-parse --show-prefix 2>/dev/null") catch return emitError("path too long");
+    cmd[w.buffered().len] = 0;
+    const fp = c.popen(&cmd, "r") orelse return emitError("cannot run git");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, fp);
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch break;
+        if (out.items.len > 128 * 1024) break;
+    }
+    _ = c.pclose(fp);
+    const sep = std.mem.indexOfScalar(u8, out.items, 1) orelse {
+        // Not a repo (or git missing): an empty done, not an error —
+        // "no overlay" is a normal answer.
+        emit(.{ .ev = "done", .done = @as(u64, 0), .total = @as(u64, 0) });
+        return 0;
+    };
+    const status = out.items[0..sep];
+    const prefix = std.mem.trim(u8, out.items[sep + 1 ..], "\n ");
+    var emitted: u64 = 0;
+    var it = std.mem.tokenizeScalar(u8, status, 0);
+    while (it.next()) |rec| {
+        if (rec.len < 4) continue;
+        const st: u8 = if (rec[0] != ' ' and rec[0] != '?') rec[0] else rec[1];
+        var path = rec[3..];
+        if (prefix.len > 0) {
+            if (!std.mem.startsWith(u8, path, prefix)) continue;
+            path = path[prefix.len..];
+        }
+        if (path.len == 0) continue;
+        emit(.{ .ev = "match", .path = path, .text = &[1]u8{st} });
+        emitted += 1;
+        if (emitted >= 4096) break;
+    }
+    emit(.{ .ev = "done", .done = emitted, .total = emitted });
+    return 0;
+}
+
+/// `diff -u src dst` on this host, streamed as one `line` event per
+/// diff line (bounded). Identical files complete with zero lines;
+/// binary files get diff's own one-line verdict.
+fn runDiff(allocator: std.mem.Allocator, spec: Spec) u8 {
+    if (spec.dst.len == 0) return emitError("diff needs two paths");
+    var cmd: [8600:0]u8 = undefined;
+    var w = std.Io.Writer.fixed(cmd[0 .. cmd.len - 1]);
+    w.writeAll("diff -u -- '") catch return emitError("path too long");
+    for (spec.src) |ch| {
+        if (ch == '\'') w.writeAll("'\\''") catch return emitError("path too long") else w.writeByte(ch) catch return emitError("path too long");
+    }
+    w.writeAll("' '") catch return emitError("path too long");
+    for (spec.dst) |ch| {
+        if (ch == '\'') w.writeAll("'\\''") catch return emitError("path too long") else w.writeByte(ch) catch return emitError("path too long");
+    }
+    w.writeAll("' 2>&1 | head -c 262144") catch return emitError("path too long");
+    cmd[w.buffered().len] = 0;
+    const fp = c.popen(&cmd, "r") orelse return emitError("cannot run diff");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, fp);
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch break;
+        if (out.items.len > 300 * 1024) break;
+    }
+    _ = c.pclose(fp);
+    var emitted: u64 = 0;
+    var it = std.mem.splitScalar(u8, out.items, '\n');
+    while (it.next()) |line| {
+        if (emitted >= 4000) {
+            emit(.{ .ev = "line", .line = emitted, .text = "[diff truncated]" });
+            emitted += 1;
+            break;
+        }
+        if (line.len == 0 and it.peek() == null) break;
+        emit(.{ .ev = "line", .line = emitted, .text = line[0..@min(line.len, 2048)] });
+        emitted += 1;
+    }
+    emit(.{ .ev = "done", .done = emitted, .total = emitted });
+    return 0;
+}
+
+/// "10M"/"1G"/plain bytes → bytes; null on junk or zero.
+fn parsePartSize(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var digits = s;
+    var mult: u64 = 1;
+    switch (s[s.len - 1]) {
+        'k', 'K' => {
+            mult = 1 << 10;
+            digits = s[0 .. s.len - 1];
+        },
+        'm', 'M' => {
+            mult = 1 << 20;
+            digits = s[0 .. s.len - 1];
+        },
+        'g', 'G' => {
+            mult = 1 << 30;
+            digits = s[0 .. s.len - 1];
+        },
+        else => {},
+    }
+    const n = std.fmt.parseInt(u64, digits, 10) catch return null;
+    if (n == 0) return null;
+    return std.math.mul(u64, n, mult) catch null;
+}
+
+/// Split `src` into `<src>.001`, `.002`, … of `pattern` bytes each
+/// (TC convention). Existing part files refuse the whole job rather
+/// than silently overwriting a previous split.
+fn runSplit(spec: Spec) u8 {
+    const part_size = parsePartSize(spec.pattern) orelse return emitError("bad part size");
+    var sz: [4096:0]u8 = undefined;
+    const src = pathz.pathZ(&sz, spec.src) catch return emitError("path too long");
+    var st: c.struct_stat = undefined;
+    if (c.lstat(src, &st) != 0) return emitErrno("split stat");
+    if (st.st_mode & c.S_IFMT != c.S_IFREG) return emitError("split needs a regular file");
+    const total: u64 = @intCast(st.st_size);
+    const parts = if (total == 0) 1 else (total + part_size - 1) / part_size;
+    if (parts > 999) return emitError("more than 999 parts; pick a larger part size");
+    const in = c.open(src, c.O_RDONLY | c.O_CLOEXEC);
+    if (in < 0) return emitErrno("split open");
+    defer _ = c.close(in);
+    var done: u64 = 0;
+    var part: u32 = 1;
+    while (part <= parts) : (part += 1) {
+        var pz: [4200:0]u8 = undefined;
+        const pp = std.fmt.bufPrintZ(&pz, "{s}.{d:0>3}", .{ spec.src, part }) catch return emitError("path too long");
+        const out = c.open(pp.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, st.st_mode & 0o777);
+        if (out < 0) return emitErrno("split part exists or unwritable");
+        defer _ = c.close(out);
+        var remain: u64 = @min(part_size, total - done);
+        var buf: [1 << 16]u8 = undefined;
+        while (remain > 0) {
+            const want: usize = @intCast(@min(remain, buf.len));
+            const n = c.read(in, &buf, want);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n <= 0) return emitError("split read failed");
+            var off: usize = 0;
+            while (off < @as(usize, @intCast(n))) {
+                const w = c.write(out, buf[off..].ptr, @as(usize, @intCast(n)) - off);
+                if (w < 0 and std.posix.errno(w) == .INTR) continue;
+                if (w <= 0) return emitError("split write failed");
+                off += @intCast(w);
+            }
+            remain -= @intCast(n);
+            done += @intCast(n);
+            emit(.{ .ev = "progress", .done = done, .total = total });
+        }
+        if (c.fsync(out) != 0) return emitErrno("split fsync");
+    }
+    emit(.{ .ev = "done", .done = total, .total = total });
+    return 0;
+}
+
+/// Rebuild `<base>` from `<base>.001`… (any first-part path may be
+/// given). The destination must not exist yet.
+fn runCombine(spec: Spec) u8 {
+    // Strip a trailing ".NNN" to find the base name.
+    const dot = std.mem.lastIndexOfScalar(u8, spec.src, '.') orelse return emitError("not a split part");
+    const ext = spec.src[dot + 1 ..];
+    if (ext.len != 3) return emitError("not a .NNN split part");
+    _ = std.fmt.parseInt(u16, ext, 10) catch return emitError("not a .NNN split part");
+    const base = spec.src[0..dot];
+    var dz: [4096:0]u8 = undefined;
+    const dst = pathz.pathZ(&dz, base) catch return emitError("path too long");
+    const out = c.open(dst, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o644));
+    if (out < 0) return emitErrno("combine destination exists or unwritable");
+    var ok = false;
+    defer {
+        _ = c.close(out);
+        if (!ok) _ = c.unlink(dst);
+    }
+    var part: u32 = 1;
+    var done: u64 = 0;
+    while (part <= 999) : (part += 1) {
+        var pz: [4200:0]u8 = undefined;
+        const pp = std.fmt.bufPrintZ(&pz, "{s}.{d:0>3}", .{ base, part }) catch return emitError("path too long");
+        const in = c.open(pp.ptr, c.O_RDONLY | c.O_CLOEXEC);
+        if (in < 0) {
+            if (part == 1) return emitError("no .001 part beside the file");
+            break;
+        }
+        defer _ = c.close(in);
+        var buf: [1 << 16]u8 = undefined;
+        while (true) {
+            const n = c.read(in, &buf, buf.len);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n < 0) return emitError("combine read failed");
+            if (n == 0) break;
+            var off: usize = 0;
+            while (off < @as(usize, @intCast(n))) {
+                const w = c.write(out, buf[off..].ptr, @as(usize, @intCast(n)) - off);
+                if (w < 0 and std.posix.errno(w) == .INTR) continue;
+                if (w <= 0) return emitError("combine write failed");
+                off += @intCast(w);
+            }
+            done += @intCast(n);
+        }
+        emit(.{ .ev = "progress", .done = done, .total = @as(u64, 0) });
+    }
+    if (c.fsync(out) != 0) return emitErrno("combine fsync");
+    ok = true;
+    emit(.{ .ev = "done", .done = done, .total = done, .path = base });
+    return 0;
+}
+
+/// One random overwrite pass + fsync + unlink. Regular files only —
+/// and honesty demands saying so: on CoW/journaled filesystems the
+/// old extents may survive; this is best-effort, like every GUI
+/// shredder.
+fn runSecureDelete(spec: Spec) u8 {
+    var sz: [4096:0]u8 = undefined;
+    const src = pathz.pathZ(&sz, spec.src) catch return emitError("path too long");
+    var st: c.struct_stat = undefined;
+    if (c.lstat(src, &st) != 0) return emitErrno("stat");
+    if (st.st_mode & c.S_IFMT != c.S_IFREG) return emitError("secure delete works on regular files only");
+    const total: u64 = @intCast(st.st_size);
+    const fd = c.open(src, c.O_WRONLY | c.O_CLOEXEC);
+    if (fd < 0) return emitErrno("open");
+    var closed = false;
+    defer if (!closed) {
+        _ = c.close(fd);
+    };
+    // Cheap PRNG stream seeded from real entropy: getentropy per
+    // block would cap throughput far below the disk.
+    var seed: [8]u8 = undefined;
+    if (c.getentropy(&seed, seed.len) != 0) std.mem.writeInt(u64, &seed, @as(u64, @intCast(c.getpid())) ^ total, .little);
+    var state = std.mem.readInt(u64, &seed, .little) | 1;
+    var buf: [1 << 16]u8 = undefined;
+    var done: u64 = 0;
+    while (done < total) {
+        var i: usize = 0;
+        while (i + 8 <= buf.len) : (i += 8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            std.mem.writeInt(u64, buf[i..][0..8], state, .little);
+        }
+        const want: usize = @intCast(@min(total - done, buf.len));
+        var off: usize = 0;
+        while (off < want) {
+            const w = c.write(fd, buf[off..].ptr, want - off);
+            if (w < 0 and std.posix.errno(w) == .INTR) continue;
+            if (w <= 0) return emitError("overwrite failed");
+            off += @intCast(w);
+        }
+        done += want;
+        emit(.{ .ev = "progress", .done = done, .total = total });
+    }
+    if (c.fsync(fd) != 0) return emitErrno("fsync");
+    _ = c.close(fd);
+    closed = true;
+    if (c.unlink(src) != 0) return emitErrno("unlink");
+    emit(.{ .ev = "done", .done = total, .total = total });
     return 0;
 }
 
@@ -2498,7 +2783,7 @@ fn runCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         .total = if (st.st_size > 0) @intCast(st.st_size) else 0,
         .entries_total = 1,
     };
-    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", &progress)) {
+    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", spec.verify, &progress)) {
         .ok => progress.entryDone(),
         .err => |m| return emitError(m),
         .errno => |what| return emitErrno(what),
@@ -2529,10 +2814,12 @@ const CopyOpts = struct {
     allow_resume: bool = false,
     conflict: enum { overwrite, skip, keep_both } = .overwrite,
     replace: bool = false,
+    verify: bool = false,
 
     fn fromSpec(spec: Spec) CopyOpts {
         return .{
             .allow_resume = spec.@"resume",
+            .verify = spec.verify,
             .conflict = if (std.mem.eql(u8, spec.conflict, "skip"))
                 .skip
             else if (std.mem.eql(u8, spec.conflict, "keep_both"))
@@ -2546,7 +2833,7 @@ const CopyOpts = struct {
 
 /// Single-file copy via a staged `.skpart` with hash-verified resume,
 /// fsync, mode preservation, and atomic rename.
-fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, progress: *Progress) CopyResult {
+fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, verify: bool, progress: *Progress) CopyResult {
     var part_buf: [4096]u8 = undefined;
     var wpart = std.Io.Writer.fixed(&part_buf);
     wpart.print("{s}.skpart", .{dst}) catch return .{ .err = "path too long" };
@@ -2609,6 +2896,17 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
 
     if (c.fsync(dfd) != 0) return .{ .errno = "fsync" };
     _ = c.fchmod(dfd, src_st.st_mode & 0o7777);
+    // Verify-after-copy: the staged bytes must hash like the source
+    // BEFORE the rename installs them; a mismatch leaves the
+    // destination untouched and discards the stage.
+    if (verify) {
+        const part_h = hashPrefix(part, src_size, null);
+        const src_h = hashPrefix(src, src_size, null);
+        if (part_h == null or src_h == null or !std.mem.eql(u8, &part_h.?, &src_h.?)) {
+            _ = c.unlink(pp);
+            return .{ .err = "copy verification failed (checksum mismatch)" };
+        }
+    }
     var zr: [4096]u8 = undefined;
     const dp = pathz.pathZ(&zr, dst) catch return .{ .err = "path too long" };
     if (c.rename(pp, dp) != 0) return .{ .errno = "rename" };
@@ -2791,7 +3089,7 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
             if (!statOf(spath, &fst, true)) return .{ .errno = "stat source file" };
             // Only regular files are counted: `entries_total` comes
             // from sizeTree, which counts exactly those.
-            switch (copyOneFile(spath, dpath, fst, opts.allow_resume, progress)) {
+            switch (copyOneFile(spath, dpath, fst, opts.allow_resume, opts.verify, progress)) {
                 .ok => progress.entryDone(),
                 else => |r| return r,
             }
@@ -3581,7 +3879,7 @@ test "copyOneFile resumes only on matching prefix hash" {
     // pipe. Emitting into it corrupts the protocol and wedges the
     // run -- the "test runner hangs" this file caused for a while.
     var progress = Progress{ .total = data.len, .quiet = true };
-    switch (copyOneFile(src, dst, st, true, &progress)) {
+    switch (copyOneFile(src, dst, st, true, false, &progress)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
@@ -3600,7 +3898,7 @@ test "copyOneFile resumes only on matching prefix hash" {
         try t.expect(c.fwrite(&junk, 1, junk.len, f) == junk.len);
     }
     var progress2 = Progress{ .total = data.len, .quiet = true };
-    switch (copyOneFile(src, dst, st, true, &progress2)) {
+    switch (copyOneFile(src, dst, st, true, false, &progress2)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
