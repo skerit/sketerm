@@ -141,18 +141,26 @@ const Meter = struct {
     seen: bool = false,
     /// Sticky: the daemon reports it only on the terminal event.
     resumed_from: u64 = 0,
-    head_label: ?*c.GtkLabel = null,
-    detail_label: ?*c.GtkLabel = null,
+    state_icon: ?*c.GtkWidget = null,
+    name_label: ?*c.GtkLabel = null,
+    badge_label: ?*c.GtkLabel = null,
+    rate_label: ?*c.GtkLabel = null,
     detail_box: ?*c.GtkWidget = null,
+    detail_keys: [DETAIL_N]?*c.GtkWidget = @splat(null),
+    detail_vals: [DETAIL_N]?*c.GtkLabel = @splat(null),
     spark: ?*c.GtkWidget = null,
     /// Borrowed: owned by the drawing area above.
     spark_data: ?*Spark = null,
     bar: ?*c.GtkProgressBar = null,
 
     fn forgetWidgets(self: *Meter) void {
-        self.head_label = null;
-        self.detail_label = null;
+        self.state_icon = null;
+        self.name_label = null;
+        self.badge_label = null;
+        self.rate_label = null;
         self.detail_box = null;
+        self.detail_keys = @splat(null);
+        self.detail_vals = @splat(null);
         self.spark = null;
         self.spark_data = null;
         self.bar = null;
@@ -408,97 +416,101 @@ fn dropUnseenMeters(self: *BrowserView) void {
     }
 }
 
-// ── text ────────────────────────────────────────────────────────
+// ── row content ─────────────────────────────────────────────────
 
-fn stateWord(state: RowState, stalled: bool) []const u8 {
+/// Detail-grid fields, one key/value row each; an empty value hides
+/// its row.
+const DETAIL_N = 8;
+const DetailField = enum(usize) { src, dst, file, files, bytes, rate, eta, msg };
+const detail_titles = [DETAIL_N][*:0]const u8{
+    "Source", "Destination", "Current file", "Files", "Bytes", "Rate", "ETA", "Status",
+};
+
+/// State icon + Adwaita color class for the head of a row.
+const StateLook = struct { icon: [*:0]const u8, class: [*:0]const u8 };
+
+fn stateLook(state: RowState, stalled: bool) StateLook {
     return switch (state) {
-        .queued => "queued",
-        .running => if (stalled) "stalled" else "",
-        .paused => "paused",
-        .finished => "done",
-        .failed => "failed",
-        .canceled => "canceled",
+        .queued => .{ .icon = "hourglass-symbolic", .class = "dim-label" },
+        .running => if (stalled)
+            .{ .icon = "network-offline-symbolic", .class = "warning" }
+        else
+            .{ .icon = "network-transmit-receive-symbolic", .class = "accent" },
+        .paused => .{ .icon = "media-playback-pause-symbolic", .class = "dim-label" },
+        .finished => .{ .icon = "emblem-ok-symbolic", .class = "success" },
+        .failed => .{ .icon = "dialog-error-symbolic", .class = "error" },
+        .canceled => .{ .icon = "process-stop-symbolic", .class = "dim-label" },
     };
 }
 
-fn headText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
-    var done_buf: [48:0]u8 = undefined;
-    var total_buf: [48:0]u8 = undefined;
-    var rate_buf: [32]u8 = undefined;
-    var eta_buf: [32]u8 = undefined;
-    var w = std.Io.Writer.fixed(buf);
-    w.print("{s}", .{row.label}) catch return w.buffered();
-    const word = stateWord(row.state, meter.status.stalled);
-    if (word.len > 0) w.print(" [{s}]", .{word}) catch {};
-    if (row.total > 0) {
-        const pct: u64 = @min(@as(u64, 100), row.done * 100 / row.total);
-        w.print(" {d}% ({s} of {s})", .{ pct, fmtSize(&done_buf, row.done), fmtSize(&total_buf, row.total) }) catch {};
-    } else if (row.done > 0) {
-        w.print(" {s}", .{fmtSize(&done_buf, row.done)}) catch {};
-    }
-    if (meter.status.rate_bps) |bps| {
-        w.print(" - {s}", .{progress.formatRate(&rate_buf, bps)}) catch {};
-    }
-    if (meter.status.eta_s) |eta| {
-        w.print(" - {s} left", .{progress.formatEta(&eta_buf, eta)}) catch {};
-    }
-    // A running job's message is why it is NOT moving (a cross-host
-    // copy waiting out a reconnect), which is exactly the moment the
-    // head line needs to explain itself.
-    if (row.message.len > 0 and row.state != .finished)
-        w.print(" - {s}", .{row.message}) catch {};
-    return w.buffered();
+/// Link-state pill derived from the job's live message: the free-text
+/// "reconnected to gobelijn; resuming…" prose becomes a small colored
+/// badge instead of a sentence glued onto the head line.
+const Badge = struct { text: [*:0]const u8, class: [*:0]const u8 };
+
+fn linkBadge(row: Row) ?Badge {
+    if (!row.active()) return null;
+    const m = row.message;
+    if (m.len == 0) return null;
+    if (std.mem.indexOf(u8, m, "waiting for") != null or
+        std.mem.indexOf(u8, m, "connecting") != null)
+        return .{ .text = "connecting", .class = "warning" };
+    if (std.mem.indexOf(u8, m, "unreachable") != null or
+        std.mem.indexOf(u8, m, "reconnecting") != null)
+        return .{ .text = "reconnecting", .class = "warning" };
+    if (std.mem.indexOf(u8, m, "reconnected") != null or
+        std.mem.indexOf(u8, m, "resuming") != null)
+        return .{ .text = "reconnected", .class = "success" };
+    return null;
 }
 
-fn detailText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
+fn detailValue(field: DetailField, buf: []u8, row: Row, meter: *const Meter) []const u8 {
     var a: [48:0]u8 = undefined;
     var b: [48:0]u8 = undefined;
     var rate_buf: [32]u8 = undefined;
-    // Second scratch for a line that formats two rates (or a rate and
-    // an ETA) at once.
     var alt_buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(buf);
-    if (row.src.len > 0) w.print("source: {s}\n", .{row.src}) catch {};
-    if (row.dst.len > 0) w.print("destination: {s}\n", .{row.dst}) catch {};
-    if (row.total > 0) {
-        w.print("bytes: {s} of {s}", .{ fmtSize(&a, row.done), fmtSize(&b, row.total) }) catch {};
-    } else {
-        w.print("bytes: {s} (total unknown)", .{fmtSize(&a, row.done)}) catch {};
+    switch (field) {
+        .src => if (row.src.len > 0) w.print("{s}", .{row.src}) catch {},
+        .dst => if (row.dst.len > 0) w.print("{s}", .{row.dst}) catch {},
+        .file => if (row.current_file) |file| w.print("{s}", .{file}) catch {},
+        .files => if (row.files_total > 0)
+            w.print("{d} of {d}", .{ row.files_done, row.files_total }) catch {},
+        .bytes => {
+            if (row.total > 0) {
+                w.print("{s} of {s}", .{ fmtSize(&a, row.done), fmtSize(&b, row.total) }) catch {};
+            } else if (row.done > 0) {
+                w.print("{s} (total unknown)", .{fmtSize(&a, row.done)}) catch {};
+            }
+            if (meter.resumed_from > 0)
+                w.print(", resumed from {s}", .{fmtSize(&b, meter.resumed_from)}) catch {};
+        },
+        .rate => {
+            if (meter.status.stalled) {
+                w.print("stalled (no progress for {d}s)", .{@divTrunc(progress.STALL_MS, 1000)}) catch {};
+            } else if (meter.status.rate_bps) |bps| {
+                w.print("{s}", .{progress.formatRate(&rate_buf, bps)}) catch {};
+                if (meter.sampler.peak() > 0)
+                    w.print(" (peak {s})", .{progress.formatRate(&alt_buf, meter.sampler.peak())}) catch {};
+            } else if (row.state == .running) {
+                w.print("measuring", .{}) catch {};
+            } else if (meter.sampler.average(row.done)) |avg| {
+                // Not running: the live rate would be a fiction, but
+                // what this run actually achieved is a fact.
+                w.print("averaged {s}", .{progress.formatRate(&rate_buf, avg)}) catch {};
+            }
+        },
+        .eta => {
+            if (meter.status.eta_s) |eta| {
+                w.print("{s}", .{progress.formatEta(&alt_buf, eta)}) catch {};
+            } else if (row.total == 0 and row.state == .running) {
+                // Honest: no total means no estimate, not a made-up one.
+                w.print("unknown (the job reports no total)", .{}) catch {};
+            }
+        },
+        .msg => if (row.message.len > 0) w.print("{s}", .{row.message}) catch {},
     }
-    if (meter.resumed_from > 0) w.print(", resumed from {s}", .{fmtSize(&b, meter.resumed_from)}) catch {};
-    w.writeByte('\n') catch {};
-    if (row.files_total > 0)
-        w.print("files: {d} of {d}\n", .{ row.files_done, row.files_total }) catch {};
-    if (meter.status.stalled) {
-        w.print("rate: stalled (no progress for {d}s)\n", .{@divTrunc(progress.STALL_MS, 1000)}) catch {};
-    } else if (meter.status.rate_bps) |bps| {
-        w.print("rate: {s}", .{progress.formatRate(&rate_buf, bps)}) catch {};
-        if (meter.sampler.peak() > 0)
-            w.print(" (peak {s})", .{progress.formatRate(&alt_buf, meter.sampler.peak())}) catch {};
-        w.writeByte('\n') catch {};
-    } else if (row.state == .running) {
-        w.print("rate: measuring\n", .{}) catch {};
-    } else if (meter.sampler.average(row.done)) |avg| {
-        // Not running: the live rate would be a fiction, but what this
-        // run actually achieved is a fact worth keeping.
-        w.print("rate: averaged {s}\n", .{progress.formatRate(&rate_buf, avg)}) catch {};
-    }
-    if (meter.status.eta_s) |eta| {
-        w.print("ETA: {s}\n", .{progress.formatEta(&alt_buf, eta)}) catch {};
-    } else if (row.total == 0 and row.state == .running) {
-        // Honest: no total means no estimate, not a made-up one.
-        w.print("ETA: unknown (the job reports no total)\n", .{}) catch {};
-    }
-    if (row.current_file) |file| {
-        w.print("current file: {s}\n", .{file}) catch {};
-    } else if (row.state == .running) {
-        // Single-step jobs (rename, trash, hash) have no "current
-        // file" distinct from the source they already show.
-        w.print("current file: this job works on one item\n", .{}) catch {};
-    }
-    if (row.message.len > 0) w.print("message: {s}\n", .{row.message}) catch {};
-    const text = w.buffered();
-    return if (text.len > 0 and text[text.len - 1] == '\n') text[0 .. text.len - 1] else text;
+    return w.buffered();
 }
 
 fn summaryText(buf: []u8, rows: []const Row, panel: *Panel) []const u8 {
@@ -705,7 +717,84 @@ fn drawSpark(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int
     c.cairo_stroke(cr);
 }
 
+/// One-time CSS for the panel's badge pill.
+var g_panel_css = false;
+
+fn ensurePanelCss() void {
+    if (g_panel_css) return;
+    g_panel_css = true;
+    const css =
+        ".job-badge { padding: 1px 8px; border-radius: 10px; font-size: 0.85em; " ++
+        "background: alpha(currentColor, 0.12); }";
+    const provider = c.gtk_css_provider_new();
+    c.gtk_css_provider_load_from_string(provider, css);
+    c.gtk_style_context_add_provider_for_display(
+        c.gdk_display_get_default(),
+        @ptrCast(provider),
+        c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    c.g_object_unref(provider);
+}
+
+/// Swap the Adwaita color class on a widget (the classes are mutually
+/// exclusive, so all candidates are cleared first).
+fn setColorClass(widget: *c.GtkWidget, class: [*:0]const u8) void {
+    const candidates = [_][*:0]const u8{ "success", "warning", "error", "accent", "dim-label" };
+    for (candidates) |cl| c.gtk_widget_remove_css_class(widget, cl);
+    c.gtk_widget_add_css_class(widget, class);
+}
+
+/// Write every dynamic part of a row into its widgets. Shared by the
+/// initial build and every refresh, so the two can never drift.
+fn applyRow(row: Row, meter: *Meter) void {
+    const look = stateLook(row.state, meter.status.stalled);
+    if (meter.state_icon) |icon| {
+        c.gtk_image_set_from_icon_name(@ptrCast(icon), look.icon);
+        setColorClass(icon, look.class);
+    }
+    if (meter.badge_label) |badge| {
+        if (linkBadge(row)) |bd| {
+            c.gtk_label_set_text(badge, bd.text);
+            setColorClass(@ptrCast(@alignCast(badge)), bd.class);
+            c.gtk_widget_add_css_class(@ptrCast(@alignCast(badge)), "job-badge");
+            c.gtk_widget_set_visible(@ptrCast(@alignCast(badge)), 1);
+        } else {
+            c.gtk_widget_set_visible(@ptrCast(@alignCast(badge)), 0);
+        }
+    }
+    if (meter.bar) |bar| c.gtk_progress_bar_set_fraction(bar, fraction(row));
+    if (meter.rate_label) |rate| {
+        var rate_buf: [32]u8 = undefined;
+        var rz: [48:0]u8 = undefined;
+        if (meter.status.stalled) {
+            c.gtk_label_set_text(rate, "stalled");
+            setColorClass(@ptrCast(@alignCast(rate)), "warning");
+        } else if (meter.status.rate_bps) |bps| {
+            c.gtk_label_set_text(rate, copyZ(&rz, progress.formatRate(&rate_buf, bps)));
+            setColorClass(@ptrCast(@alignCast(rate)), "dim-label");
+        } else {
+            c.gtk_label_set_text(rate, "");
+        }
+    }
+    if (meter.expanded) {
+        var buf: [1024]u8 = undefined;
+        var z: [1024:0]u8 = undefined;
+        for (0..DETAIL_N) |i| {
+            const value = detailValue(@enumFromInt(i), &buf, row, meter);
+            const shown: c_int = if (value.len > 0) 1 else 0;
+            if (meter.detail_keys[i]) |key| c.gtk_widget_set_visible(key, shown);
+            if (meter.detail_vals[i]) |val| {
+                c.gtk_label_set_text(val, copyZ(&z, value));
+                c.gtk_widget_set_visible(@ptrCast(@alignCast(val)), shown);
+            }
+        }
+        if (meter.spark_data) |data| data.take(&meter.sampler);
+        if (meter.spark) |spark| c.gtk_widget_queue_draw(spark);
+    }
+}
+
 fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) void {
+    ensurePanelCss();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
     c.gtk_widget_set_margin_start(box, 6);
     c.gtk_widget_set_margin_end(box, 6);
@@ -713,20 +802,35 @@ fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) v
     const head = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     jobsButton(self, head, if (meter.expanded) "pan-down-symbolic" else "pan-end-symbolic", identityCtx(self, row, .expand));
 
-    var text_buf: [512]u8 = undefined;
+    const icon = c.gtk_image_new_from_icon_name("hourglass-symbolic");
+    c.gtk_box_append(@ptrCast(head), icon);
+
     var zbuf: [512:0]u8 = undefined;
-    const head_text = headText(&text_buf, row, meter);
-    const label = c.gtk_label_new(copyZ(&zbuf, head_text));
+    const label = c.gtk_label_new(copyZ(&zbuf, row.label));
     c.gtk_label_set_xalign(@ptrCast(label), 0);
     c.gtk_widget_set_hexpand(label, 1);
     c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_widget_add_css_class(label, "heading");
     c.gtk_box_append(@ptrCast(head), label);
 
+    const badge = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(badge, "job-badge");
+    c.gtk_widget_set_valign(badge, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(badge, 0);
+    c.gtk_box_append(@ptrCast(head), badge);
+
     const bar = c.gtk_progress_bar_new();
-    c.gtk_widget_set_size_request(bar, 90, -1);
+    c.gtk_widget_set_size_request(bar, 110, -1);
     c.gtk_widget_set_valign(bar, c.GTK_ALIGN_CENTER);
-    c.gtk_progress_bar_set_fraction(@ptrCast(bar), fraction(row));
+    c.gtk_progress_bar_set_show_text(@ptrCast(bar), 1);
     c.gtk_box_append(@ptrCast(head), bar);
+
+    const rate = c.gtk_label_new("");
+    c.gtk_label_set_width_chars(@ptrCast(rate), 10);
+    c.gtk_label_set_xalign(@ptrCast(rate), 1);
+    c.gtk_widget_add_css_class(rate, "numeric");
+    c.gtk_widget_add_css_class(rate, "dim-label");
+    c.gtk_box_append(@ptrCast(head), rate);
 
     if (row.controls.reorder) {
         jobsButton(self, head, "go-up-symbolic", identityCtx(self, row, .move_up));
@@ -744,19 +848,33 @@ fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) v
         jobsButton(self, head, "window-close-symbolic", identityCtx(self, row, .dismiss));
     c.gtk_box_append(@ptrCast(box), head);
 
-    const detail = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_widget_set_margin_start(detail, 24);
+    const detail = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12);
+    c.gtk_widget_set_margin_start(detail, 30);
+    c.gtk_widget_set_margin_top(detail, 2);
     c.gtk_widget_set_margin_bottom(detail, 4);
-    var detail_buf: [2048]u8 = undefined;
-    var detail_z: [2048:0]u8 = undefined;
-    const dlabel = c.gtk_label_new(copyZ(&detail_z, detailText(&detail_buf, row, meter)));
-    c.gtk_label_set_xalign(@ptrCast(dlabel), 0);
-    c.gtk_label_set_yalign(@ptrCast(dlabel), 0);
-    c.gtk_widget_set_hexpand(dlabel, 1);
-    c.gtk_label_set_wrap(@ptrCast(dlabel), 1);
-    c.gtk_label_set_selectable(@ptrCast(dlabel), 1);
-    c.gtk_widget_add_css_class(dlabel, "dim-label");
-    c.gtk_box_append(@ptrCast(detail), dlabel);
+
+    const grid = c.gtk_grid_new();
+    c.gtk_grid_set_row_spacing(@ptrCast(grid), 2);
+    c.gtk_grid_set_column_spacing(@ptrCast(grid), 12);
+    c.gtk_widget_set_hexpand(grid, 1);
+    for (0..DETAIL_N) |i| {
+        const key = c.gtk_label_new(detail_titles[i]);
+        c.gtk_label_set_xalign(@ptrCast(key), 1);
+        c.gtk_widget_set_valign(key, c.GTK_ALIGN_START);
+        c.gtk_widget_add_css_class(key, "dim-label");
+        c.gtk_widget_add_css_class(key, "caption");
+        const val = c.gtk_label_new("");
+        c.gtk_label_set_xalign(@ptrCast(val), 0);
+        c.gtk_widget_set_hexpand(val, 1);
+        c.gtk_label_set_ellipsize(@ptrCast(val), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_label_set_selectable(@ptrCast(val), 1);
+        c.gtk_widget_add_css_class(val, "caption");
+        c.gtk_grid_attach(@ptrCast(grid), key, 0, @intCast(i), 1, 1);
+        c.gtk_grid_attach(@ptrCast(grid), val, 1, @intCast(i), 1, 1);
+        meter.detail_keys[i] = key;
+        meter.detail_vals[i] = @ptrCast(@alignCast(val));
+    }
+    c.gtk_box_append(@ptrCast(detail), grid);
 
     const spark = c.gtk_drawing_area_new();
     c.gtk_widget_set_size_request(spark, SPARK_W, SPARK_H);
@@ -774,12 +892,15 @@ fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) v
     c.gtk_box_append(@ptrCast(box), detail);
     c.gtk_box_append(@ptrCast(parent), box);
 
-    meter.head_label = @ptrCast(@alignCast(label));
-    meter.detail_label = @ptrCast(@alignCast(dlabel));
+    meter.state_icon = icon;
+    meter.name_label = @ptrCast(@alignCast(label));
+    meter.badge_label = @ptrCast(@alignCast(badge));
+    meter.rate_label = @ptrCast(@alignCast(rate));
     meter.detail_box = detail;
     meter.spark = spark;
     meter.spark_data = spark_data;
     meter.bar = @ptrCast(@alignCast(bar));
+    applyRow(row, meter);
 }
 
 fn fraction(row: Row) f64 {
@@ -836,19 +957,7 @@ fn refresh(self: *BrowserView, rows: []const Row) void {
     const panel = &self.jobs_panel;
     for (rows) |r| {
         const meter = panel.find(r.key) orelse continue;
-        var text_buf: [512]u8 = undefined;
-        var zbuf: [512:0]u8 = undefined;
-        if (meter.head_label) |label|
-            c.gtk_label_set_text(label, copyZ(&zbuf, headText(&text_buf, r, meter)));
-        if (meter.bar) |bar| c.gtk_progress_bar_set_fraction(bar, fraction(r));
-        if (meter.expanded) {
-            var detail_buf: [2048]u8 = undefined;
-            var detail_z: [2048:0]u8 = undefined;
-            if (meter.detail_label) |label|
-                c.gtk_label_set_text(label, copyZ(&detail_z, detailText(&detail_buf, r, meter)));
-            if (meter.spark_data) |data| data.take(&meter.sampler);
-            if (meter.spark) |spark| c.gtk_widget_queue_draw(spark);
-        }
+        applyRow(r, meter);
     }
     if (panel.summary) |summary| {
         var sbuf: [128]u8 = undefined;
