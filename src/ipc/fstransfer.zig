@@ -17,7 +17,10 @@
 //! Pure state machine over two caller-owned Conns: the caller pumps
 //! both sockets and offers every frame via feed(); no thread, no GTK,
 //! no blocking wait lives here (the no-hang invariant is the
-//! caller's poll loop).
+//! caller's poll loop). Every send QUEUES (queueFrame/queueJson) —
+//! the caller must also flush each Conn's wbuf when its fd turns
+//! writable (POLLOUT watch or pump tick), or a chunk that outgrew
+//! the socket buffer stalls the transfer.
 
 const std = @import("std");
 const client = @import("../mux/client.zig");
@@ -196,7 +199,7 @@ pub const Transfer = struct {
     }
 
     fn sendSrcOp(self: *Transfer, args: anytype) bool {
-        self.src.sendJson(.fs_op, args) catch {
+        self.src.queueJson(.fs_op, args) catch {
             self.fail("source connection lost");
             return false;
         };
@@ -204,7 +207,7 @@ pub const Transfer = struct {
     }
 
     fn sendDstOp(self: *Transfer, args: anytype) bool {
-        self.dst.sendJson(.fs_op, args) catch {
+        self.dst.queueJson(.fs_op, args) catch {
             self.fail("destination connection lost");
             return false;
         };
@@ -495,7 +498,7 @@ pub const Transfer = struct {
         try payload.appendSlice(self.allocator, &hdr);
         try payload.appendSlice(self.allocator, self.staged);
         try payload.appendSlice(self.allocator, data);
-        try self.dst.sendFrame(.fs_write, payload.items);
+        try self.dst.queueFrame(.fs_write, payload.items);
     }
 };
 
@@ -649,7 +652,7 @@ pub const Xfer = struct {
     pub fn start(self: *Xfer) void {
         self.list_req = self.nr();
         self.state = .stat_root;
-        self.src.sendJson(.fs_op, .{ .req = self.list_req, .op = "stat", .path = self.src_root }) catch
+        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "stat", .path = self.src_root }) catch
             self.fail("source connection lost");
     }
 
@@ -801,7 +804,7 @@ pub const Xfer = struct {
         var buf: [4096]u8 = undefined;
         const abs = self.srcAbs(&buf, rel) orelse return self.fail("path too long");
         self.list_req = self.nr();
-        self.src.sendJson(.fs_op, .{ .req = self.list_req, .op = "list", .path = abs }) catch
+        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "list", .path = abs }) catch
             self.fail("source connection lost");
     }
 
@@ -817,7 +820,7 @@ pub const Xfer = struct {
                 const abs = self.dstAbs(&buf, self.dirs.items[self.setup_idx]) orelse
                     return self.fail("path too long");
                 self.setup_req = self.nr();
-                self.dst.sendJson(.fs_op, .{ .req = self.setup_req, .op = "mkdir", .path = abs }) catch
+                self.dst.queueJson(.fs_op, .{ .req = self.setup_req, .op = "mkdir", .path = abs }) catch
                     self.fail("destination connection lost");
             },
             .symlinks => {
@@ -830,7 +833,7 @@ pub const Xfer = struct {
                 var buf: [4096]u8 = undefined;
                 const abs = self.dstAbs(&buf, l.rel) orelse return self.fail("path too long");
                 self.setup_req = self.nr();
-                self.dst.sendJson(.fs_op, .{
+                self.dst.queueJson(.fs_op, .{
                     .req = self.setup_req,
                     .op = "symlink",
                     .path = abs,
