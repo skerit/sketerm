@@ -1885,11 +1885,14 @@ fn pumpXfer(allocator: std.mem.Allocator, x: *fstransfer.Xfer, conns: *XferConns
         waited += 20;
         inline for (.{ .src, .dst }) |side| {
             const conn = if (side == .src) &conns.src else &conns.dst;
+            // fstransfer sends only queue; the pump owns the flush.
+            conn.flushQueued() catch fail("xfer conn write failed");
             if (!conn.fillAvailable()) fail("xfer conn hangup");
             while (conn.takeFrame() catch null) |f| {
                 defer f.deinit(allocator);
                 _ = x.feed(side, f.ftype, f.payload);
             }
+            conn.flushQueued() catch fail("xfer conn write failed");
         }
         if (x.isTerminal()) return true;
         if (stop_after > 0 and x.progress().done >= stop_after) return false;
@@ -1910,11 +1913,14 @@ fn pumpFor(allocator: std.mem.Allocator, x: *fstransfer.Xfer, conns: *XferConns,
         waited += 20;
         inline for (.{ .src, .dst }) |side| {
             const conn = if (side == .src) &conns.src else &conns.dst;
+            // fstransfer sends only queue; the pump owns the flush.
+            conn.flushQueued() catch fail("xfer conn write failed");
             if (!conn.fillAvailable()) fail("xfer conn hangup");
             while (conn.takeFrame() catch null) |f| {
                 defer f.deinit(allocator);
                 _ = x.feed(side, f.ftype, f.payload);
             }
+            conn.flushQueued() catch fail("xfer conn write failed");
         }
     }
 }

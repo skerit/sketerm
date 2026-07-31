@@ -1057,6 +1057,15 @@ pub const Conn = struct {
         try self.sendFrame(ftype, aw.written());
     }
 
+    /// queueFrame's JSON twin: never waits on the fd. The caller owns
+    /// flushing any wbuf remainder (a POLLOUT watch or pump loop).
+    pub fn queueJson(self: *Conn, ftype: wire.FrameType, value: anytype) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try std.json.Stringify.value(value, .{}, &aw.writer);
+        try self.queueFrame(ftype, aw.written());
+    }
+
     /// Spawn `argv` with both stdio ends on one socketpair fd,
     /// double-forked so init reaps it (no zombies, child outlives
     /// nothing it shouldn't). Returns a Conn over our end.
