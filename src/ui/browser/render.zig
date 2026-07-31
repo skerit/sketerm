@@ -142,6 +142,13 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // erased by whatever status message comes next.
     var query_buf: [200]u8 = undefined;
     const qnote = searchmod.queryNote(tab, &query_buf);
+    // Free space of the filesystem behind the tab root, when known.
+    var free_buf: [64]u8 = undefined;
+    var free_size_buf: [48:0]u8 = undefined;
+    const fnote: []const u8 = if (tab.free_bytes) |free|
+        std.fmt.bufPrint(&free_buf, ", {s} free", .{format.fmtSize(&free_size_buf, free)}) catch ""
+    else
+        "";
     // The count phrase, or -- when there is nothing to count -- what the
     // emptiness means. Both are then prefixed by a refused navigation,
     // which stays visible until the next one lands.
@@ -149,16 +156,16 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         std.fmt.bufPrint(&count_buf, "cannot open {s}: {s}", .{ tab.root.path, why }) catch
             "cannot open this folder"
     else if (tab.filter.len > 0)
-        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}{s}", .{
-            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note, qnote,
+        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}{s}{s}", .{
+            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note, qnote, fnote,
         }) catch ""
     else if (tab.vs.total == 0)
         std.fmt.bufPrint(&count_buf, "{s}{s}{s}", .{ format.listingStatus(state), note, qnote }) catch ""
     else if (tab.root.streaming)
         // Rows are landing chunk by chunk; the count is a floor.
-        std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}", .{ tab.vs.total, note, qnote }) catch ""
+        std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch ""
     else
-        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{ tab.vs.total, note, qnote }) catch "";
+        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch "";
     var status_buf: [700]u8 = undefined;
     const cmsg: []const u8 = if (tab.nav_error) |refused|
         std.fmt.bufPrint(&status_buf, "{s} -- still showing {s} ({s})", .{

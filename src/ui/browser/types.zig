@@ -117,6 +117,9 @@ pub const WireReply = struct {
     /// The HOST's freedesktop template directory (XDG_TEMPLATES_DIR),
     /// resolved by the daemon that owns the files.
     templates: []const u8 = "",
+    /// statfs: free space = bavail * frsize.
+    bavail: u64 = 0,
+    frsize: u64 = 0,
 };
 
 /// One host-side application (daemon `apps` op reply).
@@ -196,6 +199,9 @@ pub const HostConn = struct {
     /// POLLOUT watch draining a queued-send backlog (0 = none). Sends
     /// on the GUI thread only queue; this finishes the delivery.
     write_watch_id: c.guint = 0,
+    /// Idle continuing a budget-cut frame drain (0 = none): one main-
+    /// loop dispatch parses at most a few ms of buffered frames.
+    drain_idle: c.guint = 0,
     /// Owning view died while the connect thread was in flight; the
     /// idle handback frees this struct.
     orphaned: bool = false,
@@ -223,6 +229,7 @@ pub const HostConn = struct {
     pub fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.write_watch_id != 0) _ = c.g_source_remove(self.write_watch_id);
+        if (self.drain_idle != 0) _ = c.g_source_remove(self.drain_idle);
         if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
@@ -577,6 +584,12 @@ pub const BTab = struct {
     dirs_first: bool = true,
     /// Live view narrowing (filter-as-you-type); persisted per tab.
     filter: []u8 = &.{},
+    /// Free space of the filesystem behind `root` (statfs bavail *
+    /// frsize), null until the host answered. Refreshed with every
+    /// root listing; the status line shows it.
+    free_bytes: ?u64 = null,
+    /// The in-flight statfs request (0 = none).
+    free_req: u32 = 0,
     virtual_spec: []u8 = &.{},
     /// The live/one-shot query filling this tab's flat rows, if any
     /// (search.zig). Per TAB, not per view: several live queries stay

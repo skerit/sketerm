@@ -6,9 +6,13 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const wire = @import("../../mux/wire.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
+const HostConn = @import("types.zig").HostConn;
+const WireJobEv = @import("types.zig").WireJobEv;
+const WireReply = @import("types.zig").WireReply;
 
 /// Git-status worker context. The thread runs `git status` via
 /// popen (never on the GLib loop); the idle handback applies the
@@ -35,10 +39,12 @@ pub fn clearGitMap(self: *BrowserView) void {
     self.git_map.clearRetainingCapacity();
 }
 
-/// Kick a background `git status` for a LOCAL root. Results land
-/// via idle handback; a stale generation is discarded.
+/// Kick a background `git status` for the tab root. Local roots run
+/// it on a worker thread; remote roots as a daemon-side job on the
+/// host that owns the repo (feedGit consumes its events). Stale
+/// generations are discarded either way.
 pub fn refreshGitOverlay(self: *BrowserView, tab: *BTab) void {
-    if (tab.hc.host != null) return;
+    if (tab.hc.host != null) return refreshGitRemote(self, tab);
     self.git_gen +%= 1;
     self.clearGitMap();
     if (self.git_root.len > 0) self.allocator.free(self.git_root);
@@ -61,6 +67,91 @@ pub fn refreshGitOverlay(self: *BrowserView, tab: *BTab) void {
         return;
     };
     th.detach();
+}
+
+/// Remote root: submit a `git_status` job on the tab's host. Any
+/// previous overlay job is cancelled — its events would carry a
+/// stale root's records.
+fn refreshGitRemote(self: *BrowserView, tab: *BTab) void {
+    self.git_gen +%= 1;
+    clearGitMap(self);
+    if (self.git_root.len > 0) self.allocator.free(self.git_root);
+    self.git_root = self.allocator.dupe(u8, tab.root.path) catch &.{};
+    if (self.git_rjob != 0) {
+        if (self.git_rhc) |old| {
+            if (old.state == .ready)
+                self.sendOp(old, .{ .req = @as(u32, 0), .op = "job_cancel", .job = self.git_rjob });
+        }
+    }
+    self.git_rjob = 0;
+    if (tab.hc.state != .ready) {
+        self.git_rhc = null;
+        self.git_rreq = 0;
+        return;
+    }
+    self.git_rhc = tab.hc;
+    self.git_rreq = self.nextReq();
+    self.sendOp(tab.hc, .{ .req = self.git_rreq, .op = "git_status", .path = tab.root.path });
+}
+
+/// One porcelain record lands in the aggregate child map (a real
+/// change outranks "untracked").
+fn applyRecord(self: *BrowserView, path: []const u8, st: u8) void {
+    const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
+    const child = path[0..end];
+    if (child.len == 0) return;
+    const gop = self.git_map.getOrPut(child) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = self.allocator.dupe(u8, child) catch {
+            _ = self.git_map.remove(child);
+            return;
+        };
+        gop.value_ptr.* = st;
+    } else if (gop.value_ptr.* == '?' and st != '?') {
+        gop.value_ptr.* = st;
+    }
+}
+
+/// Consume frames of the in-flight remote git_status job.
+/// @return true when the frame was ours (the dispatcher stops).
+pub fn feedGit(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+    if (self.git_rhc != hc) return false;
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    switch (ftype) {
+        .fs_reply => {
+            if (self.git_rreq == 0) return false;
+            const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
+                .ignore_unknown_fields = true,
+            }) catch return false;
+            if (rep.req != self.git_rreq) return false;
+            self.git_rreq = 0;
+            if (rep.ok and rep.job != 0) {
+                self.git_rjob = rep.job;
+            } else {
+                self.git_rhc = null;
+            }
+            return true;
+        },
+        .fs_job => {
+            if (self.git_rjob == 0) return false;
+            const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{
+                .ignore_unknown_fields = true,
+            }) catch return false;
+            if (ev.job != self.git_rjob) return false;
+            if (std.mem.eql(u8, ev.ev, "match")) {
+                if (ev.path.len > 0 and ev.text.len > 0) applyRecord(self, ev.path, ev.text[0]);
+                return true;
+            }
+            if (ev.terminalEv()) {
+                self.git_rjob = 0;
+                self.git_rhc = null;
+                if (self.git_map.count() > 0) self.renderCurrent();
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 pub fn gitThreadMain(ctx: *GitCtx) void {
@@ -117,20 +208,7 @@ pub fn onGitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             path = path[prefix.len..];
         }
         if (path.len == 0) continue;
-        const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
-        const child = path[0..end];
-        if (child.len == 0) continue;
-        const gop = self.git_map.getOrPut(child) catch continue;
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.allocator.dupe(u8, child) catch {
-                _ = self.git_map.remove(child);
-                continue;
-            };
-            gop.value_ptr.* = st;
-        } else if (gop.value_ptr.* == '?' and st != '?') {
-            // A real change outranks "untracked" for aggregation.
-            gop.value_ptr.* = st;
-        }
+        applyRecord(self, path, st);
     }
     if (self.git_map.count() > 0) self.renderCurrent();
     return 0;

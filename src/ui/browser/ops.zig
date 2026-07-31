@@ -757,6 +757,8 @@ const DeleteReq = struct {
     paths: [][]u8,
     dirs: []bool,
     dialog: *c.GtkAlertDialog,
+    /// Overwrite-then-unlink instead of a plain delete (files only).
+    secure: bool = false,
 
     fn destroy(self: *DeleteReq) void {
         for (self.paths) |p| self.allocator.free(p);
@@ -775,6 +777,14 @@ pub fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     menuDone(ctx);
 }
 
+pub fn onMenuSecureDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    var one: [1][]u8 = undefined;
+    const targets = menuTargets(ctx, &one);
+    confirmDeletePathsMode(ctx.view, ctx.tab, targets, true);
+    menuDone(ctx);
+}
+
 /// Chord-driven permanent delete (Shift+Delete): the tab's selection.
 pub fn deleteSelection(self: *BrowserView) void {
     const tab = self.currentTab() orelse return;
@@ -789,14 +799,19 @@ pub fn deleteSelection(self: *BrowserView) void {
 /// The dialog is window-modal, so the tab cannot be closed under it.
 /// `files_confirm_delete = false` skips straight to the delete.
 pub fn confirmDeletePaths(self: *BrowserView, tab: *BTab, targets: []const []u8) void {
+    confirmDeletePathsMode(self, tab, targets, false);
+}
+
+pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const []u8, secure: bool) void {
     if (targets.len == 0) return;
-    if (self.ownerWindow()) |win| {
+    // Secure delete always confirms: it is unrecoverable by design.
+    if (!secure) if (self.ownerWindow()) |win| {
         if (!win.config.files_confirm_delete) {
             for (targets) |path| deleteOne(self, tab, path, pathIsDir(tab, path));
             if (targets.len > 1) self.setStatusFmt("deleting {d} items", .{targets.len});
             return;
         }
-    }
+    };
     const a = self.allocator;
     const req = a.create(DeleteReq) catch return;
     const paths = a.alloc([]u8, targets.len) catch {
@@ -815,10 +830,11 @@ pub fn confirmDeletePaths(self: *BrowserView, tab: *BTab, targets: []const []u8)
         n += 1;
     }
     var msg: [340:0]u8 = undefined;
+    const verb: []const u8 = if (secure) "securely delete" else "permanently delete";
     const txt = if (n == 1)
-        std.fmt.bufPrintZ(&msg, "Are you sure you want to permanently delete \"{s}\"?", .{std.fs.path.basename(paths[0])}) catch "Permanently delete this item?"
+        std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} \"{s}\"?", .{ verb, std.fs.path.basename(paths[0]) }) catch "Permanently delete this item?"
     else
-        std.fmt.bufPrintZ(&msg, "Are you sure you want to permanently delete the {d} selected items?", .{n}) catch "Permanently delete the selected items?";
+        std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} the {d} selected items?", .{ verb, n }) catch "Permanently delete the selected items?";
     const dlg = c.gtk_alert_dialog_new("%s", txt.ptr) orelse {
         for (paths[0..n]) |p| a.free(p);
         a.free(paths);
@@ -833,8 +849,12 @@ pub fn confirmDeletePaths(self: *BrowserView, tab: *BTab, targets: []const []u8)
         .paths = paths[0..n],
         .dirs = dirs[0..n],
         .dialog = dlg,
+        .secure = secure,
     };
-    c.gtk_alert_dialog_set_detail(dlg, "If you delete an item, it will be permanently lost.");
+    c.gtk_alert_dialog_set_detail(dlg, if (secure)
+        "Contents are overwritten before deletion; recovery tools will not get them back. Folders are skipped."
+    else
+        "If you delete an item, it will be permanently lost.");
     const buttons = [_:null]?[*:0]const u8{ "Cancel", "Delete" };
     c.gtk_alert_dialog_set_buttons(dlg, @ptrCast(@constCast(&buttons)));
     c.gtk_alert_dialog_set_cancel_button(dlg, 0);
@@ -842,6 +862,16 @@ pub fn confirmDeletePaths(self: *BrowserView, tab: *BTab, targets: []const []u8)
     c.gtk_alert_dialog_set_modal(dlg, 1);
     const root = c.gtk_widget_get_root(self.root_box);
     c.gtk_alert_dialog_choose(dlg, @ptrCast(@alignCast(root)), null, @ptrCast(&onDeleteChosen), @ptrCast(req));
+}
+
+fn secureDeleteOne(self: *BrowserView, tab: *BTab, path: []const u8, is_dir: bool) void {
+    if (is_dir) {
+        self.setStatusFmt("skipped folder {s} (secure delete is per-file)", .{std.fs.path.basename(path)});
+        return;
+    }
+    var lbl: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&lbl, "secure delete {s}", .{std.fs.path.basename(path)}) catch "secure delete";
+    self.startDaemonJob(tab.hc, "secure_delete", path, "", label);
 }
 
 fn deleteOne(self: *BrowserView, tab: *BTab, path: []const u8, is_dir: bool) void {
@@ -862,7 +892,11 @@ fn onDeleteChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque)
     if (choice != 1) return;
     const self = req.view;
     if (self.widgets_dead) return;
-    for (req.paths, req.dirs) |path, is_dir| deleteOne(self, req.tab, path, is_dir);
+    if (req.secure) {
+        for (req.paths, req.dirs) |path, is_dir| secureDeleteOne(self, req.tab, path, is_dir);
+    } else {
+        for (req.paths, req.dirs) |path, is_dir| deleteOne(self, req.tab, path, is_dir);
+    }
     if (req.paths.len > 1) self.setStatusFmt("deleting {d} items", .{req.paths.len});
 }
 
@@ -1430,7 +1464,6 @@ pub fn onListDrop(
     y: f64,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
-    _ = target;
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     const self = tab.view;
     const cstr = c.g_value_get_string(value) orelse return 0;
@@ -1444,14 +1477,30 @@ pub fn onListDrop(
             dst_dir = dbuf[0..p.data.path.len];
         }
     }
-    return @intFromBool(dropSpecInto(self, tab, spec, dst_dir));
+    // Explorer/Nemo convention: Ctrl forces copy, Shift forces move,
+    // no modifier keeps the topology default.
+    const mods = c.gtk_event_controller_get_current_event_state(@ptrCast(target));
+    const action: DropAction = if (mods & c.GDK_CONTROL_MASK != 0)
+        .copy
+    else if (mods & c.GDK_SHIFT_MASK != 0)
+        .move
+    else
+        .auto;
+    return @intFromBool(dropSpecIntoAction(self, tab, spec, dst_dir, action));
 }
 
-/// Land a dragged entry spec in `dst_dir` on `tab`'s host: same host
-/// = MOVE (rename, undoable), cross-host = copy. Shared by the
-/// listing, the breadcrumb segments and the tab labels.
+pub const DropAction = enum { auto, copy, move };
+
+/// Land a dragged entry spec in `dst_dir` on `tab`'s host. `.auto`
+/// keeps the topology default (same host = MOVE via undoable rename,
+/// cross-host = copy); modifiers override it. Shared by the listing,
+/// the breadcrumb segments and the tab labels.
 /// @return false when the spec is unusable or the drop is a no-op.
 pub fn dropSpecInto(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8) bool {
+    return dropSpecIntoAction(self, tab, spec, dst_dir, .auto);
+}
+
+pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction) bool {
     if (spec.len == 0) return false;
     const loc = parseSpec(spec);
     const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
@@ -1465,14 +1514,22 @@ pub fn dropSpecInto(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: [
 
     if (hostEq(src_host, tab.hc.host)) {
         if (std.mem.eql(u8, src, dst)) return false; // dropped in place
+        if (action == .copy) {
+            var lbl: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
+            self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, src, ""), .{});
+            self.setStatusFmt("copying {s} -> {s}", .{ base, dst_dir });
+            return true;
+        }
         const req = self.nextReq();
         self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
         self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
         self.setStatusFmt("moved {s} -> {s}", .{ base, dst_dir });
     } else {
         const src_hc = self.hostConnFor(src_host) orelse return false;
-        self.startTransfer(src_hc, src, tab.hc, dst, .{});
-        self.setStatusFmt("copying {s} -> {s}", .{ base, dst_dir });
+        const move = action == .move;
+        self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = move });
+        self.setStatusFmt("{s} {s} -> {s}", .{ if (move) "moving" else "copying", base, dst_dir });
     }
     return true;
 }

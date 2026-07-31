@@ -21,6 +21,7 @@ const launchLocal = @import("open.zig").launchLocal;
 const launchLocalWithApp = @import("open.zig").launchLocalWithApp;
 const onMenuBatchRename = @import("ops.zig").onMenuBatchRename;
 const onMenuDelete = @import("ops.zig").onMenuDelete;
+const onMenuSecureDelete = @import("ops.zig").onMenuSecureDelete;
 const onMenuEditorRename = @import("ops.zig").onMenuEditorRename;
 const onMenuExportSel = @import("ops.zig").onMenuExportSel;
 const onMenuProperties = @import("props.zig").onMenuProperties;
@@ -203,6 +204,10 @@ pub fn showEntryMenu(
         // too deep to receive clicks (classicmenu's depth limit).
         buildCompress(self, ctx, org.submenuIcon("Compress", .{ .name = "package-x-generic" }));
         if (tools) buildTools(ctx, org.submenu("Tools"), is_dir, is_local);
+        // Exactly two selected files diff host-side (Dolphin's
+        // compare verb, without shelling out to kompare).
+        if (tab.selected.items.len == 2 and !is_dir)
+            org.item("Compare Files", &onMenuDiffFiles, ctx);
         const create = m.section();
         buildCreateNew(self, ctx, create.submenuIcon("Create New", .{ .name = "list-add-symbolic" }), true);
         const acts = m.section();
@@ -210,6 +215,7 @@ pub fn showEntryMenu(
         const danger = m.section();
         danger.itemIcon("Move to Trash", .{ .name = "user-trash-symbolic" }, &onMenuTrash, ctx);
         danger.item("Delete Permanently…", &onMenuDelete, ctx);
+        if (!is_dir) danger.item("Secure Delete…", &onMenuSecureDelete, ctx);
         const tail = m.section();
         appendUndoItem(self, tail, ctx);
         tail.itemIcon("Properties…", .{ .name = "document-properties-symbolic" }, &onMenuProperties, ctx);
@@ -621,6 +627,57 @@ fn buildTools(ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool, is_local: bool) 
         p.item("Pin (keep hydrated)", &onMenuPin, ctx);
         p.item("Evict Cached Data", &onMenuEvict, ctx);
     }
+    if (!is_dir) {
+        // TC-style split/combine; the parts land beside the file.
+        if (isSplitPartName(ctx.path.?)) {
+            p.item("Combine Parts", &onMenuCombine, ctx);
+        } else {
+            const sizes = p.section();
+            sizes.item("Split into 10 MB Parts", &onMenuSplit10M, ctx);
+            sizes.item("Split into 100 MB Parts", &onMenuSplit100M, ctx);
+            sizes.item("Split into 1 GB Parts", &onMenuSplit1G, ctx);
+        }
+    }
+}
+
+/// "<name>.NNN" — a combine candidate.
+fn isSplitPartName(path: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return false;
+    const ext = path[dot + 1 ..];
+    if (ext.len != 3) return false;
+    _ = std.fmt.parseInt(u16, ext, 10) catch return false;
+    return true;
+}
+
+fn startSplit(ctx: *MenuCtx, comptime size: []const u8) void {
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    var lbl: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&lbl, "split {s}", .{std.fs.path.basename(path)}) catch "split";
+    self.startDaemonJobKind(ctx.tab.hc, "split", path, "", size, label, .{});
+    self.setStatusFmt("splitting {s} into {s} parts…", .{ std.fs.path.basename(path), size });
+    menuDone(ctx);
+}
+
+pub fn onMenuSplit10M(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    startSplit(@ptrCast(@alignCast(user.?)), "10M");
+}
+pub fn onMenuSplit100M(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    startSplit(@ptrCast(@alignCast(user.?)), "100M");
+}
+pub fn onMenuSplit1G(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    startSplit(@ptrCast(@alignCast(user.?)), "1G");
+}
+
+pub fn onMenuCombine(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    var lbl: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&lbl, "combine {s}", .{std.fs.path.basename(path)}) catch "combine";
+    self.startDaemonJob(ctx.tab.hc, "combine", path, "", label);
+    self.setStatusFmt("combining parts of {s}…", .{std.fs.path.basename(path)});
+    menuDone(ctx);
 }
 
 /// Dolphin's "Create New" block / Nemo's background head: New Folder
@@ -1033,6 +1090,23 @@ fn pasteAsLink(ctx: *MenuCtx, hard: bool) void {
         return;
     }
     for (board.items()) |src| self.linkHere(tab, src, hard);
+}
+
+pub fn onMenuDiffFiles(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const tab = ctx.tab;
+    if (tab.selected.items.len != 2) return;
+    // Stack copies: compareSelected can re-render, which reorders
+    // the selection storage under us.
+    var a_buf: [4096]u8 = undefined;
+    var b_buf: [4096]u8 = undefined;
+    const a = tab.selected.items[0];
+    const b = tab.selected.items[1];
+    if (a.len > a_buf.len or b.len > b_buf.len) return;
+    @memcpy(a_buf[0..a.len], a);
+    @memcpy(b_buf[0..b.len], b);
+    self.compareSelected(a_buf[0..a.len], b_buf[0..b.len]);
 }
 
 pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

@@ -72,6 +72,9 @@ pub const BrowserView = struct {
     allocator: std.mem.Allocator,
     pane: *Pane,
     conns: std.ArrayList(*HostConn) = .empty,
+    /// Backoff timers re-dialing hosts whose connection dropped while
+    /// tabs were still on them (conn.zig scheduleReconnect).
+    reconnects: std.ArrayList(*@import("conn.zig").Reconnect) = .empty,
     next_req: u32 = 1,
     next_remote_thumb_id: u64 = 1,
     next_view: u32 = 1,
@@ -247,6 +250,8 @@ pub const BrowserView = struct {
     /// from the spec).
     bookmark_labels: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
+    /// Visit statistics behind the frecency jump (Ctrl+J).
+    frecency: std.ArrayList(places_mod.FrecOwned) = .empty,
     /// Sidebar sections the user folded shut, by header text (owned,
     /// persisted with places).
     collapsed: std.ArrayList([]u8) = .empty,
@@ -278,6 +283,13 @@ pub const BrowserView = struct {
     git_root: []u8 = &.{},
     git_gen: u64 = 0,
     git_inflight: ?*GitCtx = null,
+    /// Remote-root overlay: the in-flight `git_status` daemon job
+    /// (gitstat.zig feedGit). req 0 + job 0 = idle.
+    git_rhc: ?*HostConn = null,
+    git_rreq: u32 = 0,
+    git_rjob: u64 = 0,
+    /// The one in-flight compare-two-files job (diffview.zig).
+    diff: @import("diffview.zig").DiffState = .{},
     /// Running "Calculate Size" scan (0 = none).
     calc_job: u64 = 0,
     calc_hc: ?*HostConn = null,
@@ -344,6 +356,8 @@ pub const BrowserView = struct {
     pub const sendOp = @import("conn.zig").sendOp;
     pub const closeViewOf = @import("conn.zig").closeViewOf;
     pub const ensureWriteFlush = @import("conn.zig").ensureWriteFlush;
+    pub const scheduleReconnect = @import("conn.zig").scheduleReconnect;
+    pub const clearReconnect = @import("conn.zig").clearReconnect;
     pub const requestHostDirs = @import("conn.zig").requestHostDirs;
     pub const attrSpec = @import("conn.zig").attrSpec;
     pub const sendListingOp = @import("conn.zig").sendListingOp;
@@ -399,6 +413,7 @@ pub const BrowserView = struct {
     pub const onCompletionActivated = @import("nav.zig").onCompletionActivated;
     pub const onPathKey = @import("nav.zig").onPathKey;
     pub const showSelectPattern = @import("nav.zig").showSelectPattern;
+    pub const showFrecencyJump = @import("nav.zig").showFrecencyJump;
     pub const onPatternActivate = @import("nav.zig").onPatternActivate;
     pub const selectPattern = @import("nav.zig").selectPattern;
     pub const selectPatternDirs = @import("nav.zig").selectPatternDirs;
@@ -610,6 +625,7 @@ pub const BrowserView = struct {
 
     // jobs.zig -- daemon jobs and client-mediated transfers
     pub const feedTransfers = @import("jobs.zig").feedTransfers;
+    pub const verifyCopies = @import("jobs.zig").verifyCopies;
     pub const pumpTransferQueue = @import("jobs.zig").pumpTransferQueue;
     pub const moveTransfer = @import("jobs.zig").moveTransfer;
     pub const setTransferPaused = @import("jobs.zig").setTransferPaused;
@@ -757,6 +773,9 @@ pub const BrowserView = struct {
     // gitstat.zig -- the git status overlay
     pub const clearGitMap = @import("gitstat.zig").clearGitMap;
     pub const refreshGitOverlay = @import("gitstat.zig").refreshGitOverlay;
+    pub const feedGit = @import("gitstat.zig").feedGit;
+    pub const feedDiff = @import("diffview.zig").feedDiff;
+    pub const compareSelected = @import("diffview.zig").compareSelected;
     pub const gitThreadMain = @import("gitstat.zig").gitThreadMain;
     pub const finishGit = @import("gitstat.zig").finishGit;
     pub const onGitIdle = @import("gitstat.zig").onGitIdle;
@@ -804,6 +823,11 @@ pub const BrowserView = struct {
             for (parsed.value.collapsed) |s| {
                 const owned = allocator.dupe(u8, s) catch continue;
                 self.collapsed.append(allocator, owned) catch allocator.free(owned);
+            }
+            for (parsed.value.frecency) |fe| {
+                if (fe.spec.len == 0) continue;
+                const owned = allocator.dupe(u8, fe.spec) catch continue;
+                self.frecency.append(allocator, .{ .spec = owned, .count = fe.count, .last_ms = fe.last_ms }) catch allocator.free(owned);
             }
             self.sidebar_px = places_mod.clampSidebarPx(parsed.value.sidebar_px);
             self.sidebar_open = parsed.value.sidebar_open;
@@ -1101,6 +1125,8 @@ pub const BrowserView = struct {
             );
         }
         self.widgets_dead = true;
+        for (self.reconnects.items) |r| r.destroy(self.allocator);
+        self.reconnects.deinit(self.allocator);
         for (self.pending_opens.items) |pending| pending.view = null;
         self.pending_opens.deinit(self.allocator);
         self.jobs_panel.deinit(self.allocator);
@@ -1205,6 +1231,9 @@ pub const BrowserView = struct {
         self.bookmark_labels.deinit(self.allocator);
         for (self.recent.items) |r| self.allocator.free(r);
         self.recent.deinit(self.allocator);
+        for (self.frecency.items) |fe| self.allocator.free(fe.spec);
+        self.frecency.deinit(self.allocator);
+        self.diff.deinit(self.allocator);
         for (self.collapsed.items) |s| self.allocator.free(s);
         self.collapsed.deinit(self.allocator);
         for (self.hidden_sections.items) |s| self.allocator.free(s);

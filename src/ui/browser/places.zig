@@ -1148,6 +1148,8 @@ pub fn savePlaces(self: *BrowserView) void {
     for (self.section_order.items, 0..) |k, i| so[i] = k;
     const rc = a.alloc([]const u8, self.recent.items.len) catch return;
     for (self.recent.items, 0..) |r, i| rc[i] = r;
+    const fr = a.alloc(places_mod.FrecEntry, self.frecency.items.len) catch return;
+    for (self.frecency.items, 0..) |fe, i| fr[i] = .{ .spec = fe.spec, .count = fe.count, .last_ms = fe.last_ms };
     const sq = a.alloc(places_mod.SavedSearch, self.saved_searches.items.len) catch return;
     for (self.saved_searches.items, 0..) |sv, i| {
         sq[i] = .{ .spec = sv.spec, .pattern = sv.pattern, .content = sv.content };
@@ -1161,6 +1163,7 @@ pub fn savePlaces(self: *BrowserView) void {
         .bookmarks = bm,
         .bookmark_labels = bl,
         .recent = rc,
+        .frecency = fr,
         .searches = sq,
         .collection = &.{},
         .collapsed = cl,
@@ -1266,6 +1269,10 @@ pub fn bookmarkCurrent(self: *BrowserView) void {
 
 pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
     places_mod.recordRecent(self.allocator, &self.recent, spec, places_mod.RECENT_CAP);
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    const now_ms = @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+    places_mod.recordVisit(self.allocator, &self.frecency, spec, now_ms, places_mod.FRECENCY_CAP);
     self.savePlaces();
     if (self.places_on) self.renderPlaces();
 }

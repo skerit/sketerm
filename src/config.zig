@@ -303,6 +303,9 @@ pub const Config = struct {
     files_show_hidden: bool = false,
     /// Ask before a permanent delete (Shift+Delete / the menu verb).
     files_confirm_delete: bool = true,
+    /// Hash-compare every copied file against its source before the
+    /// copy installs (same-host daemon copy jobs).
+    files_verify_copy: bool = false,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -757,6 +760,7 @@ pub const Config = struct {
             try w.print("files_default_view = {s}\n", .{@tagName(self.files_default_view)});
         if (self.files_show_hidden) try w.writeAll("files_show_hidden = true\n");
         if (!self.files_confirm_delete) try w.writeAll("files_confirm_delete = false\n");
+        if (self.files_verify_copy) try w.writeAll("files_verify_copy = true\n");
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -1272,6 +1276,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.files_show_hidden = try parseBool(value);
     } else if (std.mem.eql(u8, key, "files_confirm_delete")) {
         cfg.files_confirm_delete = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "files_verify_copy")) {
+        cfg.files_verify_copy = try parseBool(value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {
