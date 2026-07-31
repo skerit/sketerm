@@ -16,6 +16,7 @@ const TabQuery = @import("search.zig").TabQuery;
 const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
+const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
 
 /// One owned directory entry (strings owned by the Dir's allocator).
 pub const Entry = struct {
@@ -192,6 +193,9 @@ pub const HostConn = struct {
     conn: muxclient.Conn = undefined,
     state: enum { connecting, ready, dead } = .connecting,
     watch_id: c.guint = 0,
+    /// POLLOUT watch draining a queued-send backlog (0 = none). Sends
+    /// on the GUI thread only queue; this finishes the delivery.
+    write_watch_id: c.guint = 0,
     /// Owning view died while the connect thread was in flight; the
     /// idle handback frees this struct.
     orphaned: bool = false,
@@ -218,6 +222,7 @@ pub const HostConn = struct {
 
     pub fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
+        if (self.write_watch_id != 0) _ = c.g_source_remove(self.write_watch_id);
         if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
@@ -507,38 +512,38 @@ pub const Dir = struct {
                     // exactly that reason.
                     const o = colkeys.order(col.kind, col.valueOf(a_in), col.valueOf(b_in), ctx.desc);
                     if (o != .eq) return o == .lt;
-                    return std.ascii.lessThanIgnoreCase(a.name, b.name);
+                    return naturalLess(a.name, b.name);
                 }
                 return switch (ctx.key) {
-                    .size => if (a.size != b.size) a.size < b.size else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .allocated => if (a.blocks != b.blocks) a.blocks < b.blocks else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .mtime => if (a.mtime_ms != b.mtime_ms) a.mtime_ms < b.mtime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .ctime => if (a.ctime_ms != b.ctime_ms) a.ctime_ms < b.ctime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .atime => if (a.atime_ms != b.atime_ms) a.atime_ms < b.atime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .btime => if (a.btime_ms != b.btime_ms) a.btime_ms < b.btime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .kind => if (!std.mem.eql(u8, a.kind, b.kind)) std.mem.lessThan(u8, a.kind, b.kind) else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .size => if (a.size != b.size) a.size < b.size else naturalLess(a.name, b.name),
+                    .allocated => if (a.blocks != b.blocks) a.blocks < b.blocks else naturalLess(a.name, b.name),
+                    .mtime => if (a.mtime_ms != b.mtime_ms) a.mtime_ms < b.mtime_ms else naturalLess(a.name, b.name),
+                    .ctime => if (a.ctime_ms != b.ctime_ms) a.ctime_ms < b.ctime_ms else naturalLess(a.name, b.name),
+                    .atime => if (a.atime_ms != b.atime_ms) a.atime_ms < b.atime_ms else naturalLess(a.name, b.name),
+                    .btime => if (a.btime_ms != b.btime_ms) a.btime_ms < b.btime_ms else naturalLess(a.name, b.name),
+                    .kind => if (!std.mem.eql(u8, a.kind, b.kind)) std.mem.lessThan(u8, a.kind, b.kind) else naturalLess(a.name, b.name),
                     .extension => blk: {
                         const ea = extensionOf(a.name);
                         const eb = extensionOf(b.name);
                         if (!std.ascii.eqlIgnoreCase(ea, eb)) break :blk std.ascii.lessThanIgnoreCase(ea, eb);
-                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                        break :blk naturalLess(a.name, b.name);
                     },
                     .owner => blk: {
                         // Names when the host resolved both; ids otherwise.
                         if (a.owner.len > 0 and b.owner.len > 0 and !std.ascii.eqlIgnoreCase(a.owner, b.owner))
                             break :blk std.ascii.lessThanIgnoreCase(a.owner, b.owner);
                         if (a.uid != b.uid) break :blk a.uid < b.uid;
-                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                        break :blk naturalLess(a.name, b.name);
                     },
                     .group => blk: {
                         if (a.group.len > 0 and b.group.len > 0 and !std.ascii.eqlIgnoreCase(a.group, b.group))
                             break :blk std.ascii.lessThanIgnoreCase(a.group, b.group);
                         if (a.gid != b.gid) break :blk a.gid < b.gid;
-                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                        break :blk naturalLess(a.name, b.name);
                     },
-                    .nlink => if (a.nlink != b.nlink) a.nlink < b.nlink else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .permissions => if (a.mode != b.mode) a.mode < b.mode else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .name => std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .nlink => if (a.nlink != b.nlink) a.nlink < b.nlink else naturalLess(a.name, b.name),
+                    .permissions => if (a.mode != b.mode) a.mode < b.mode else naturalLess(a.name, b.name),
+                    .name => naturalLess(a.name, b.name),
                 };
             }
         }.lt);

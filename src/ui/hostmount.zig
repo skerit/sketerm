@@ -83,20 +83,43 @@ fn ownDir(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/sketerm/mnt/{d}", .{ platform.runtimeDir(), c.getpid() }) catch null;
 }
 
-/// Is `path` a mount point? Its device differs from its parent's the
-/// moment something is mounted there, and matches again once it is
-/// gone -- which is also how a mount that died is detected.
+/// Is `path` a mount point? Answered from /proc/self/mounts, never by
+/// stat'ing the path: a stat ENTERS the FUSE filesystem, so a wedged
+/// (not dead) helper would hang the GUI thread on its own mountpoint.
+/// Kernel escapes (\040 etc.) in the table are decoded before compare.
 fn isMounted(path: []const u8) bool {
-    var pz: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return false;
-    var st: c.struct_stat = undefined;
-    if (c.stat(p.ptr, &st) != 0) return false;
-    const parent = std.fs.path.dirname(path) orelse return false;
-    var qz: [4096:0]u8 = undefined;
-    const q = std.fmt.bufPrintZ(&qz, "{s}", .{parent}) catch return false;
-    var pst: c.struct_stat = undefined;
-    if (c.stat(q.ptr, &pst) != 0) return false;
-    return st.st_dev != pst.st_dev;
+    const fp = c.fopen("/proc/self/mounts", "re") orelse return false;
+    defer _ = c.fclose(fp);
+    var line: [4400]u8 = undefined;
+    while (c.fgets(&line, line.len, fp) != null) {
+        const row = std.mem.span(@as([*:0]const u8, @ptrCast(&line)));
+        // "<spec> <point> <fstype> ..." — the mountpoint is field 2.
+        var it = std.mem.splitScalar(u8, row, ' ');
+        _ = it.next() orelse continue;
+        const raw = it.next() orelse continue;
+        var dec: [4096]u8 = undefined;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len and n < dec.len) {
+            if (raw[i] == '\\' and i + 3 < raw.len) {
+                const v = std.fmt.parseInt(u8, raw[i + 1 .. i + 4], 8) catch {
+                    dec[n] = raw[i];
+                    n += 1;
+                    i += 1;
+                    continue;
+                };
+                dec[n] = v;
+                n += 1;
+                i += 4;
+            } else {
+                dec[n] = raw[i];
+                n += 1;
+                i += 1;
+            }
+        }
+        if (std.mem.eql(u8, dec[0..n], path)) return true;
+    }
+    return false;
 }
 
 fn mkdirp(path: []const u8) bool {

@@ -330,26 +330,26 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
     const target_pane = ctx.state.target_pane;
     switch (ctx.which) {
         .file => {
-            addItem(root, m, a, win, target_pane, "New Tab", .new_tab);
-            addItem(root, m, a, win, target_pane, "New Window", .new_window);
+            addItem(root, m, a, win, target_pane, "New Tab", .{ .name = "tab-new-symbolic" }, .new_tab);
+            addItem(root, m, a, win, target_pane, "New Window", .{ .name = "window-new-symbolic" }, .new_window);
             const pane = m.section();
-            addItem(root, pane, a, win, target_pane, "Split Pane", .split_pane);
-            addItem(root, pane, a, win, target_pane, "Close Pane", .close_pane);
+            addItem(root, pane, a, win, target_pane, "Split Pane", .none, .split_pane);
+            addItem(root, pane, a, win, target_pane, "Close Pane", .none, .close_pane);
             const tail = m.section();
-            addItem(root, tail, a, win, target_pane, "Close Window", .close_window);
+            addItem(root, tail, a, win, target_pane, "Close Window", .{ .name = "window-close-symbolic" }, .close_window);
         },
         .edit => {
-            addItem(root, m, a, win, target_pane, "Cut", .cut);
-            addItem(root, m, a, win, target_pane, "Copy", .copy);
-            addItem(root, m, a, win, target_pane, "Paste", .paste);
+            addItem(root, m, a, win, target_pane, "Cut", .{ .name = "edit-cut-symbolic" }, .cut);
+            addItem(root, m, a, win, target_pane, "Copy", .{ .name = "edit-copy-symbolic" }, .copy);
+            addItem(root, m, a, win, target_pane, "Paste", .{ .name = "edit-paste-symbolic" }, .paste);
             const sel = m.section();
-            addItem(root, sel, a, win, target_pane, "Select All", .select_all);
-            addItem(root, sel, a, win, target_pane, "Invert Selection", .invert_selection);
+            addItem(root, sel, a, win, target_pane, "Select All", .{ .name = "edit-select-all-symbolic" }, .select_all);
+            addItem(root, sel, a, win, target_pane, "Invert Selection", .none, .invert_selection);
             const tail = m.section();
-            addItem(root, tail, a, win, target_pane, "Preferences…", .prefs);
+            addItem(root, tail, a, win, target_pane, "Preferences…", .{ .name = "preferences-system-symbolic" }, .prefs);
         },
         .view => {
-            addItem(root, m, a, win, target_pane, "Reload", .reload);
+            addItem(root, m, a, win, target_pane, "Reload", .{ .name = "view-refresh-symbolic" }, .reload);
             const toggles = m.section();
             const tab = if (bv) |v| v.currentTab() else null;
             addCheck(root, toggles, a, win, target_pane, "Show Hidden Files", if (tab) |t| t.show_hidden else false, .toggle_hidden);
@@ -362,15 +362,15 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             addCheck(root, modes, a, win, target_pane, "Miller Columns", mode == .miller, .mode_miller);
         },
         .go => {
-            addItem(root, m, a, win, target_pane, "Back", .back);
-            addItem(root, m, a, win, target_pane, "Forward", .forward);
-            addItem(root, m, a, win, target_pane, "Up", .up);
+            addItem(root, m, a, win, target_pane, "Back", .{ .name = "go-previous-symbolic" }, .back);
+            addItem(root, m, a, win, target_pane, "Forward", .{ .name = "go-next-symbolic" }, .forward);
+            addItem(root, m, a, win, target_pane, "Up", .{ .name = "go-up-symbolic" }, .up);
             const placesec = m.section();
-            addItem(root, placesec, a, win, target_pane, "Home", .home);
-            addItem(root, placesec, a, win, target_pane, "Trash", .trash);
+            addItem(root, placesec, a, win, target_pane, "Home", .{ .name = "user-home-symbolic" }, .home);
+            addItem(root, placesec, a, win, target_pane, "Trash", .{ .name = "user-trash-symbolic" }, .trash);
         },
         .bookmarks => {
-            addItem(root, m, a, win, target_pane, "Add Bookmark", .add_bookmark);
+            addItem(root, m, a, win, target_pane, "Add Bookmark", .{ .name = "bookmark-new-symbolic" }, .add_bookmark);
             if (bv) |v| {
                 if (v.bookmarks.items.len > 0) {
                     const list = m.section();
@@ -387,7 +387,7 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             }
         },
         .help => {
-            addItem(root, m, a, win, target_pane, "About Sketerm Files", .about);
+            addItem(root, m, a, win, target_pane, "About Sketerm Files", .{ .name = "help-about-symbolic" }, .about);
         },
     }
     // Anchor under the button, classic menubar drop.
@@ -395,9 +395,9 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
     return root.popupStyled(w, 0, @floatFromInt(c.gtk_widget_get_height(w)), "sketerm-cm-menubar");
 }
 
-fn addItem(root: *classicmenu.Root, m: classicmenu.Menu, a: std.mem.Allocator, win: *Window, target_pane: ?*Pane, label: [*:0]const u8, verb: ItemCtx.Verb) void {
+fn addItem(root: *classicmenu.Root, m: classicmenu.Menu, a: std.mem.Allocator, win: *Window, target_pane: ?*Pane, label: [*:0]const u8, icon: classicmenu.Icon, verb: ItemCtx.Verb) void {
     const ctx = ItemCtx.make(root, a, win, target_pane, verb, "") orelse return;
-    m.item(label, &onItem, @ptrCast(ctx));
+    m.itemIcon(label, icon, &onItem, @ptrCast(ctx));
 }
 
 fn addCheck(root: *classicmenu.Root, m: classicmenu.Menu, a: std.mem.Allocator, win: *Window, target_pane: ?*Pane, label: [*:0]const u8, checked: bool, verb: ItemCtx.Verb) void {
@@ -427,6 +427,7 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .prefs => win.openPrefs(),
         .reload => if (bv) |v| {
             if (v.currentTab()) |tab| {
+                v.clearFailureCaches();
                 v.refreshDir(tab, tab.root);
                 for (tab.subdirs.items) |d| v.refreshDir(tab, d);
             }

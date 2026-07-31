@@ -65,6 +65,8 @@ pub fn pumpTransferQueue(self: *BrowserView) void {
         const t = self.transfers.items[map[k]];
         t.started = true;
         t.x.start();
+        self.ensureWriteFlush(t.src_hc);
+        self.ensureWriteFlush(t.dst_hc);
         self.setStatusFmt("transfer started: {s}", .{t.label});
     }
 }
@@ -81,6 +83,8 @@ pub fn setTransferPaused(self: *BrowserView, t: *ActiveTransfer, paused: bool) v
         if (t.started) t.x.pause();
     } else if (t.started) {
         t.x.unpause();
+        self.ensureWriteFlush(t.src_hc);
+        self.ensureWriteFlush(t.dst_hc);
     }
     if (t.token) |token| {
         if (self.transfer_service) |service| service.setMediatedPaused(token, paused);
