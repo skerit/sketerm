@@ -62,6 +62,7 @@ int login_tty(int fd);
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/time.h> /* fsjob: utimes stamps the wire-thumb cache freshness */
 #ifndef __linux__
 #include <sys/mount.h>
 #endif

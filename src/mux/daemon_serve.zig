@@ -1505,6 +1505,9 @@ pub const FsOpReq = struct {
     attrs: []const u8 = "",
     /// Preferred image transport codecs supported by the receiver.
     image_codecs: []const u8 = "",
+    /// thumbnail: cache the codec bytes host-side and serve that
+    /// persistent file (remote-serving mode; see fsjob.Spec).
+    wire_cache: bool = false,
     /// A preview transport job owns and removes its source scratch.
     delete_source: bool = false,
     /// A panelize preview job owns the scratch path carried in `to`.

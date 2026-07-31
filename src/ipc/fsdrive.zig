@@ -225,6 +225,8 @@ pub const JobEvent = struct {
     /// daemon served them from its cache.
     meta: []const MediaField = &.{},
     cached: bool = false,
+    /// done: `path` is a persistent host-side cache file.
+    keep: bool = false,
 
     pub fn deinit(self: *JobEvent) void {
         self.arena.deinit();
@@ -363,6 +365,7 @@ pub const Fs = struct {
             files_total: u64 = 0,
             meta: []const MediaField = &.{},
             cached: bool = false,
+            keep: bool = false,
         };
         const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
@@ -398,6 +401,7 @@ pub const Fs = struct {
             .files_total = parsed.files_total,
             .meta = parsed.meta,
             .cached = parsed.cached,
+            .keep = parsed.keep,
         }) catch arena.deinit();
     }
 

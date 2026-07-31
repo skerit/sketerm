@@ -11536,3 +11536,28 @@ sidecars; run 2 (fresh process) rendered every thumbnail with zero
 cache rewrites (= zero wire fetches); touching a photo on the remote
 re-fetched exactly that one entry once. Suite 1094/5/0; new unit
 tests for the header round-trip and cache-name derivation.
+
+## 2026-07-31: remote hosts cache thumbnails as JXL, not PNG
+
+Decision: local daemons keep installing spec freedesktop PNGs (shared
+with the desktop's other file managers and pickers); remote hosts
+stop generating PNGs entirely. The browser sends wire_cache:true on
+thumbnail ops to remote hosts; the remote daemon then caches the
+transport codec bytes themselves (~/.cache/sketerm/thumbs/<md5>.jxl
+or .webp, 3-6x smaller than the PNG tier, freshness = file mtime
+stamped to the source's) and serves that file directly — no spec PNG,
+no per-fetch re-encode. Miss path reads through a valid freedesktop
+PNG when one exists (interop hits still count); no codec libs on the
+remote falls back to the legacy PNG path. The done event carries
+keep:true: the GUI skips its asset unlink and FsJob.done_kept keeps
+daemon job reaping from unlinking the cache. Old daemons ignore the
+field (unchanged); old GUIs never send it.
+
+smoke-fs gained a wire-thumb stage (mono + broker): keep flag, cache
+path, no freedesktop PNG installed, stat-validated hit (same inode),
+mtime-change refresh. Live rig verified: 60 photos -> 60 .jxl on the
+"remote", zero PNGs, thumbnails render, client-cache-cleared revisit
+serves the same inodes and the cache survives the client's cleanup.
+Rig lesson recorded in CLAUDE.md: a re-exec'd daemon has comm "exe",
+so pgrep -x sketerm-mux misses stale test daemons — one served a
+deleted pre-feature binary and mimicked a broken feature for an hour.

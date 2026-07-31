@@ -1484,6 +1484,9 @@ pub const FsJob = struct {
     owns_dst: bool = false,
     /// Host scratch source belongs to this job after its helper exits.
     owns_src: bool = false,
+    /// The done path is a PERSISTENT cache file (wire-cache
+    /// thumbnails): reaping this job must never unlink it.
+    done_kept: bool = false,
     /// Finished temp-producing jobs stay readable until this deadline.
     cleanup_at_ms: i64 = 0,
 
@@ -1496,7 +1499,8 @@ pub const FsJob = struct {
         if (self.out_fd >= 0) _ = c.close(self.out_fd);
         self.releaseOwnedSource();
         if (self.owns_dst) self.unlinkOwned(self.dst);
-        if ((self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and self.done_path_len > 0)
+        if ((self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and
+            self.done_path_len > 0 and !self.done_kept)
             self.unlinkOwned(self.done_path[0..self.done_path_len]);
         self.lbuf.deinit(self.allocator);
         self.allocator.free(self.src);
@@ -1523,14 +1527,14 @@ pub const FsJob = struct {
     }
 
     pub fn ownsTempPath(self: *const FsJob, path: []const u8) bool {
-        const owns_done = self.op == .thumbnail or self.op == .preview or self.op == .preview_transport;
+        const owns_done = (self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and !self.done_kept;
         return (self.owns_src and std.mem.eql(u8, self.src, path)) or
             (self.owns_dst and std.mem.eql(u8, self.dst, path)) or
             (owns_done and self.done_path_len > 0 and std.mem.eql(u8, self.done_path[0..self.done_path_len], path));
     }
 
     pub fn releaseTempPath(self: *FsJob, path: []const u8, now_ms: i64) bool {
-        const owns_done = self.op == .thumbnail or self.op == .preview or self.op == .preview_transport;
+        const owns_done = (self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and !self.done_kept;
         var released_src = false;
         var released_dst = false;
         var released_result = false;

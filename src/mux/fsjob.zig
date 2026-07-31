@@ -81,6 +81,12 @@ pub const Spec = struct {
     image_codecs: []const u8 = "",
     /// The preview transport helper owns and removes its source scratch.
     delete_source: bool = false,
+    /// thumbnail: cache the transport codec bytes themselves (JXL/
+    /// WebP) in this host's private wire cache and serve that file,
+    /// instead of installing a freedesktop PNG and re-encoding per
+    /// fetch. Remote-serving hosts only — a desktop host's PNG cache
+    /// is shared with its other file managers.
+    wire_cache: bool = false,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -504,22 +510,30 @@ fn pngSinkWrite(ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) v
     };
 }
 
-/// Transcode a host-local image into the receiver's best transport codec.
-fn transportPreview(
-    allocator: std.mem.Allocator,
-    source_path: []const u8,
-    codecs: []const u8,
-    bound: u32,
-    out_path: *[4096:0]u8,
-) ?[]const u8 {
-    if (codecs.len == 0) return null;
+/// A decoded, bound-scaled RGBA image with its backing storage.
+const ScaledRgba = struct {
+    rgba: []const u8,
+    w: u32,
+    h: u32,
+    pixels: ?*anyopaque,
+    scaled: ?[]u8,
+
+    fn deinit(self: *const ScaledRgba, allocator: std.mem.Allocator) void {
+        if (self.scaled) |b| allocator.free(b);
+        if (self.pixels) |p| c.stbi_image_free(p);
+    }
+};
+
+/// Decode `source_path` and scale it down to fit `bound` px.
+fn loadScaledRgba(allocator: std.mem.Allocator, source_path: []const u8, bound: u32) ?ScaledRgba {
     var pz: [4096:0]u8 = undefined;
     const path = std.fmt.bufPrintZ(&pz, "{s}", .{source_path}) catch return null;
     var width: c_int = 0;
     var height: c_int = 0;
     var channels: c_int = 0;
     const pixels = c.stbi_load(path.ptr, &width, &height, &channels, 4) orelse return null;
-    defer c.stbi_image_free(pixels);
+    var owned = true;
+    defer if (owned) c.stbi_image_free(pixels);
     if (width <= 0 or height <= 0) return null;
     const max_dim = @max(width, height);
     const out_w: u32 = if (max_dim > bound)
@@ -537,10 +551,30 @@ fn transportPreview(
         png.downscaleRgba(allocator, src, @intCast(width), @intCast(height), out_w, out_h) catch return null
     else
         null;
-    defer {
-        if (scaled) |rgba| allocator.free(rgba);
-    }
-    const rgba = scaled orelse src;
+    owned = false;
+    return .{
+        .rgba = scaled orelse src,
+        .w = out_w,
+        .h = out_h,
+        .pixels = pixels,
+        .scaled = scaled,
+    };
+}
+
+/// Transcode a host-local image into the receiver's best transport codec.
+fn transportPreview(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    codecs: []const u8,
+    bound: u32,
+    out_path: *[4096:0]u8,
+) ?[]const u8 {
+    if (codecs.len == 0) return null;
+    const img = loadScaledRgba(allocator, source_path, bound) orelse return null;
+    defer img.deinit(allocator);
+    const rgba = img.rgba;
+    const out_w = img.w;
+    const out_h = img.h;
     // A receiver listing "png" is the daemon's own host (local unix
     // socket): serve plain PNG so local previews neither pay a
     // transcode nor depend on libjxl/libwebp being installed.
@@ -621,6 +655,210 @@ fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
     return 0;
 }
 
+const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
+const pdf_exts = [_][]const u8{".pdf"};
+const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
+const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };
+
+/// This host's XDG cache root ("/tmp" as the last resort).
+fn cacheRootDir(buf: []u8) []const u8 {
+    if (c.getenv("XDG_CACHE_HOME")) |p|
+        return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+    if (c.getenv("HOME")) |p|
+        return std.fmt.bufPrint(buf, "{s}/.cache", .{std.mem.span(@as([*:0]const u8, @ptrCast(p)))}) catch "/tmp";
+    return "/tmp";
+}
+
+/// Generate a raw (uninstalled) thumbnail PNG for `src_path` at
+/// `raw`, bounded to `bound` px. @return false when no generator on
+/// this host could produce it.
+fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: [:0]const u8, raw: [:0]const u8, bound: c_int) bool {
+    var generated = false;
+    if (extIs(src_path, &image_exts)) {
+        if (extIs(src_path, &[_][]const u8{".svg"})) {
+            var size_buf: [16:0]u8 = undefined;
+            const size = std.fmt.bufPrintZ(&size_buf, "{d}", .{bound}) catch unreachable;
+            const argv = [_:null]?[*:0]const u8{ "rsvg-convert", "--keep-aspect-ratio", "-w", size.ptr, "-h", size.ptr, "-o", raw.ptr, source.ptr, null };
+            generated = runArgv(&argv);
+        } else {
+            generated = rasterThumbnail(allocator, source, raw, bound);
+            if (!generated) {
+                var vf_buf: [64:0]u8 = undefined;
+                const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return false;
+                const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+                generated = runArgv(&argv);
+            }
+        }
+    } else if (extIs(src_path, &pdf_exts)) {
+        var prefix_buf: [4096:0]u8 = undefined;
+        const prefix = std.fmt.bufPrintZ(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}) catch return false;
+        var scale_buf: [16:0]u8 = undefined;
+        const scale = std.fmt.bufPrintZ(&scale_buf, "{d}", .{bound}) catch unreachable;
+        const argv = [_:null]?[*:0]const u8{ "pdftoppm", "-f", "1", "-singlefile", "-scale-to", scale.ptr, "-png", source.ptr, prefix.ptr, null };
+        generated = runArgv(&argv);
+        if (generated) {
+            var made: [4096:0]u8 = undefined;
+            const mp = std.fmt.bufPrintZ(&made, "{s}.png", .{prefix}) catch return false;
+            generated = c.rename(mp.ptr, raw.ptr) == 0;
+        }
+    } else {
+        var vf_buf: [64:0]u8 = undefined;
+        const vf = if (extIs(src_path, &video_exts))
+            std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return false
+        else
+            std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }) catch return false;
+        if (extIs(src_path, &video_exts)) {
+            const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+            generated = runArgv(&argv);
+        } else {
+            const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-filter_complex", vf.ptr, "-frames:v", "1", raw.ptr, null };
+            generated = runArgv(&argv);
+        }
+    }
+    return generated;
+}
+
+/// Encode a host-local image into the receiver's best NON-PNG codec.
+/// Null = no codec library available (or unreadable source).
+fn encodeWire(allocator: std.mem.Allocator, source_path: []const u8, codecs: []const u8, bound: u32) ?struct { bytes: []u8, ext: []const u8 } {
+    const img = loadScaledRgba(allocator, source_path, bound) orelse return null;
+    defer img.deinit(allocator);
+    const encoded = imagecodec.encodePreferred(allocator, img.rgba, img.w, img.h, codecs, TRANSPORT_BYTE_CAP) catch return null;
+    return .{ .bytes = encoded.bytes, .ext = switch (encoded.codec) {
+        .jxl => "jxl",
+        .webp => "webp",
+    } };
+}
+
+/// Wire-cache file cap; at the typical 2-20KB per sidecar this is
+/// tens of MB. Pruned oldest-install-first (ctime), only when over.
+const WIRE_THUMB_CACHE_MAX = 4096;
+const WIRE_THUMB_CACHE_SWEEP = 1024;
+
+/// Serve (or build) the wire-cache thumbnail for `spec.src`.
+/// Freshness = the cache file's mtime equals the source's, stamped at
+/// install. Null = no codec library — caller falls back to the
+/// legacy spec-PNG path.
+fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, mtime_sec: i64, cache_root: []const u8) ?u8 {
+    // Already cached in a codec the receiver decodes?
+    var it = std.mem.splitScalar(u8, spec.image_codecs, ',');
+    while (it.next()) |raw_codec| {
+        const codec = std.mem.trim(u8, raw_codec, " ");
+        if (codec.len == 0 or std.mem.eql(u8, codec, "png")) continue;
+        var pbuf: [4096]u8 = undefined;
+        const p = thumbs.wireThumbPath(cache_root, spec.src, codec, &pbuf) orelse continue;
+        var pz: [4096:0]u8 = undefined;
+        const path = pathz.pathZ(&pz, p) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(path, &st) != 0 or st.st_size <= 0) continue;
+        const fts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        if (@as(i64, fts.tv_sec) != mtime_sec) continue;
+        emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = p, .keep = true });
+        return 0;
+    }
+
+    // Encode source: a valid freedesktop PNG (this host's own cache,
+    // or another file manager's) is read through; otherwise generate
+    // a raw thumb that never gets installed as PNG.
+    var source_z: [4096:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
+    var final_buf: [4096]u8 = undefined;
+    const final = thumbs.thumbPathTier(cache_root, spec.src, .normal, &final_buf) orelse return emitError("thumbnail path too long");
+    var uri_buf: [4096 * 3 + 8]u8 = undefined;
+    const uri = thumbs.fileUri(spec.src, &uri_buf) orelse return emitError("thumbnail URI too long");
+    var raw_buf: [4096:0]u8 = undefined;
+    var raw: ?[:0]const u8 = null;
+    defer if (raw) |r| {
+        _ = c.unlink(r.ptr);
+    };
+    const enc_src: []const u8 = if (thumbs.validatePng(final, uri, mtime_sec)) final else blk: {
+        const r = std.fmt.bufPrintZ(&raw_buf, "/tmp/.sketerm-thumbgen-{d}.png", .{c.getpid()}) catch return emitError("thumbnail path too long");
+        if (!generateThumbPng(allocator, spec.src, source, r, 128))
+            return emitError("preview generator unavailable or failed");
+        raw = r;
+        break :blk r;
+    };
+    const enc = encodeWire(allocator, enc_src, spec.image_codecs, 512) orelse return null;
+    defer allocator.free(enc.bytes);
+
+    // Install: atomic rename, then stamp the file's mtime with the
+    // SOURCE's so the hit check above is a plain stat compare.
+    var dbuf: [4096]u8 = undefined;
+    const dest = thumbs.wireThumbPath(cache_root, spec.src, enc.ext, &dbuf) orelse return emitError("thumbnail path too long");
+    pathz.makeParentDirs(dest) catch return emitError("cannot create wire thumb cache");
+    if (std.fs.path.dirname(dest)) |dir| sweepWireThumbs(dir);
+    var tz: [4200:0]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tz, "{s}.tmp{d}", .{ dest, c.getpid() }) catch return emitError("thumbnail path too long");
+    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return emitErrno("wire thumb open");
+    var ok = false;
+    defer if (!ok) {
+        _ = c.unlink(tmp.ptr);
+    };
+    var off: usize = 0;
+    while (off < enc.bytes.len) {
+        const n = c.write(fd, enc.bytes.ptr + off, enc.bytes.len - off);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) {
+            _ = c.close(fd);
+            return emitError("wire thumb write failed");
+        }
+        off += @intCast(n);
+    }
+    if (c.close(fd) != 0) return emitError("wire thumb write failed");
+    var dz: [4096:0]u8 = undefined;
+    const destz = pathz.pathZ(&dz, dest) catch return emitError("thumbnail path too long");
+    if (c.rename(tmp.ptr, destz) != 0) return emitErrno("wire thumb install");
+    ok = true;
+    const tv = [2]c.struct_timeval{
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
+    };
+    _ = c.utimes(destz, &tv);
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = dest, .keep = true });
+    return 0;
+}
+
+/// Prune the wire cache oldest-install-first (ctime — mtime carries
+/// the SOURCE's stamp). Only counts when called, only prunes when
+/// over the cap; generation is already the expensive path.
+fn sweepWireThumbs(dir: []const u8) void {
+    var dz: [4096:0]u8 = undefined;
+    const dirz = pathz.pathZ(&dz, dir) catch return;
+    const Item = struct { ctime: i64, name: [44]u8, name_len: usize };
+    const a = std.heap.c_allocator;
+    var items: std.ArrayList(Item) = .empty;
+    defer items.deinit(a);
+    const d = c.opendir(dirz) orelse return;
+    defer _ = c.closedir(d);
+    while (true) {
+        const ent = c.readdir(d) orelse break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len < 5 or name.len > 44 or name[0] == '.') continue;
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, name }) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(p.ptr, &st) != 0) continue;
+        const cts = if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec;
+        var item = Item{ .ctime = cts.tv_sec, .name = undefined, .name_len = name.len };
+        @memcpy(item.name[0..name.len], name);
+        items.append(a, item) catch break;
+        if (items.items.len >= WIRE_THUMB_CACHE_MAX * 2) break;
+    }
+    if (items.items.len <= WIRE_THUMB_CACHE_MAX) return;
+    std.mem.sort(Item, items.items, {}, struct {
+        fn lt(_: void, x: Item, y: Item) bool {
+            return x.ctime < y.ctime;
+        }
+    }.lt);
+    const doomed = @min(items.items.len - WIRE_THUMB_CACHE_MAX + WIRE_THUMB_CACHE_SWEEP, items.items.len);
+    for (items.items[0..doomed]) |item| {
+        var pz: [4200:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ dir, item.name[0..item.name_len] }) catch continue;
+        _ = c.unlink(p.ptr);
+    }
+}
+
 fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8 {
     var source_z: [4096:0]u8 = undefined;
     const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
@@ -628,10 +866,6 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     if (c.stat(source.ptr, &st) != 0) return emitErrno("preview stat");
     const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
     const mtime_sec: i64 = ts.tv_sec;
-    const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
-    const pdf_exts = [_][]const u8{".pdf"};
-    const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
-    const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };
     const media = extIs(spec.src, &image_exts) or extIs(spec.src, &pdf_exts) or extIs(spec.src, &video_exts) or extIs(spec.src, &audio_exts);
 
     if (!media and !thumbnail_only) {
@@ -648,12 +882,15 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     if (!media) return emitError("no thumbnailer for this file type");
 
     var cache_buf: [4096]u8 = undefined;
-    const cache_root: []const u8 = if (c.getenv("XDG_CACHE_HOME")) |p|
-        std.mem.span(@as([*:0]const u8, @ptrCast(p)))
-    else if (c.getenv("HOME")) |p|
-        std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{std.mem.span(@as([*:0]const u8, @ptrCast(p)))}) catch return emitError("cache path too long")
-    else
-        "/tmp";
+    const cache_root = cacheRootDir(&cache_buf);
+
+    // Remote-serving wire cache: the codec bytes themselves are the
+    // cache, no freedesktop PNG is installed and no per-fetch
+    // re-encode happens. Null = no codec library on this host —
+    // degrade to the legacy spec-PNG path below.
+    if (thumbnail_only and spec.wire_cache and spec.image_codecs.len > 0) {
+        if (runWireThumb(allocator, spec, mtime_sec, cache_root)) |rc| return rc;
+    }
     // Tier directories are size contracts other applications rely on:
     // normal is 128px, x-large is 512px. Writing a 512px image into
     // `large` (256px) would hand every other file manager an
@@ -676,49 +913,8 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
         const raw = std.fmt.bufPrintZ(&raw_buf, "{s}.generated-{d}.png", .{ final, c.getpid() }) catch return emitError("thumbnail path too long");
         defer _ = c.unlink(raw.ptr);
         const bound: c_int = if (thumbnail_only) 128 else 512;
-        var generated = false;
-        if (extIs(spec.src, &image_exts)) {
-            if (extIs(spec.src, &[_][]const u8{".svg"})) {
-                var size_buf: [16:0]u8 = undefined;
-                const size = std.fmt.bufPrintZ(&size_buf, "{d}", .{bound}) catch unreachable;
-                const argv = [_:null]?[*:0]const u8{ "rsvg-convert", "--keep-aspect-ratio", "-w", size.ptr, "-h", size.ptr, "-o", raw.ptr, source.ptr, null };
-                generated = runArgv(&argv);
-            } else {
-                generated = rasterThumbnail(allocator, source, raw, bound);
-                if (!generated) {
-                    var vf_buf: [64:0]u8 = undefined;
-                    const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return emitError("scale");
-                    const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-                    generated = runArgv(&argv);
-                }
-            }
-        } else if (extIs(spec.src, &pdf_exts)) {
-            var prefix_buf: [4096:0]u8 = undefined;
-            const prefix = std.fmt.bufPrintZ(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}) catch return emitError("thumbnail path too long");
-            var scale_buf: [16:0]u8 = undefined;
-            const scale = std.fmt.bufPrintZ(&scale_buf, "{d}", .{bound}) catch unreachable;
-            const argv = [_:null]?[*:0]const u8{ "pdftoppm", "-f", "1", "-singlefile", "-scale-to", scale.ptr, "-png", source.ptr, prefix.ptr, null };
-            generated = runArgv(&argv);
-            if (generated) {
-                var made: [4096:0]u8 = undefined;
-                const mp = std.fmt.bufPrintZ(&made, "{s}.png", .{prefix}) catch return emitError("thumbnail path too long");
-                generated = c.rename(mp.ptr, raw.ptr) == 0;
-            }
-        } else {
-            var vf_buf: [64:0]u8 = undefined;
-            const vf = if (extIs(spec.src, &video_exts))
-                std.fmt.bufPrintZ(&vf_buf, "scale={d}:{d}:force_original_aspect_ratio=decrease", .{ bound, bound }) catch return emitError("scale")
-            else
-                std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }) catch return emitError("scale");
-            if (extIs(spec.src, &video_exts)) {
-                const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-                generated = runArgv(&argv);
-            } else {
-                const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-filter_complex", vf.ptr, "-frames:v", "1", raw.ptr, null };
-                generated = runArgv(&argv);
-            }
-        }
-        if (!generated) return emitError("preview generator unavailable or failed");
+        if (!generateThumbPng(allocator, spec.src, source, raw, bound))
+            return emitError("preview generator unavailable or failed");
         thumbs.installPng(allocator, raw, final, uri, mtime_sec) catch return emitError("cannot install thumbnail cache entry");
     }
 
