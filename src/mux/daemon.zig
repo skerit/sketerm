@@ -1463,6 +1463,11 @@ pub const FsJob = struct {
     done_path_len: usize = 0,
     done_text: [4096]u8 = undefined,
     done_text_len: usize = 0,
+    /// Structural cause of a terminal error ("unreachable" = a
+    /// cross_copy dial failed) — drives the client's coordinator
+    /// fallback, so it must survive the forward.
+    err_kind: [32]u8 = undefined,
+    err_kind_len: usize = 0,
     src: []u8,
     dst: []u8,
     pattern: []u8,
@@ -1480,6 +1485,9 @@ pub const FsJob = struct {
     /// Short-lived client-owned helper: no journal/history and killed
     /// when its requesting client disappears.
     ephemeral: bool = false,
+    /// cross_copy move: the helper deletes the verified source.
+    /// Journaled — a respawned move must stay a move.
+    delete_src: bool = false,
     /// Host scratch path in `dst` belongs to this job.
     owns_dst: bool = false,
     /// Host scratch source belongs to this job after its helper exits.

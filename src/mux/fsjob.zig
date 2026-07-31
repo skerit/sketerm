@@ -87,6 +87,16 @@ pub const Spec = struct {
     /// fetch. Remote-serving hosts only — a desktop host's PNG cache
     /// is shared with its other file managers.
     wire_cache: bool = false,
+    /// cross_copy: delete the source after the verified rename — a
+    /// cross-host MOVE as one daemon-owned job. A failed deletion
+    /// fails the job with the copy intact; the retry re-verifies by
+    /// hash (cheap) and redoes only the delete.
+    delete_src: bool = false,
+    /// cross_copy: cap the initial dial attempts per side (0 = the
+    /// full reconnect budget). A DIRECT remote-to-remote attempt sets
+    /// a small cap so an unreachable peer fails in seconds and the
+    /// caller falls back to relaying, instead of a minute of backoff.
+    dial_tries: u32 = 0,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -146,6 +156,15 @@ fn emit(value: anytype) void {
 
 fn emitError(msg: []const u8) u8 {
     emit(.{ .ev = "error", .message = msg });
+    return 1;
+}
+
+/// Error whose CAUSE the caller may act on structurally.
+/// "unreachable" = a cross_copy side never answered the dial — the
+/// browser retries the same job through a different coordinator
+/// instead of burning resume attempts.
+fn emitErrorKind(kind: []const u8, msg: []const u8) u8 {
+    emit(.{ .ev = "error", .message = msg, .kind = kind });
     return 1;
 }
 
@@ -1633,6 +1652,39 @@ const CrossCopy = struct {
         }
     }
 
+    /// Move tail: drop the source once the copy is verified in place.
+    /// Runs AFTER the rename, so a failure here can never cost data —
+    /// the retry's hash probe skips the copy and lands back here.
+    fn deleteSrc(self: *CrossCopy, path: []const u8, is_dir: bool) bool {
+        if (!is_dir) {
+            while (true) {
+                self.src.deletePath(path) catch |err| {
+                    if (!self.recoverOrFail(.src, "delete", path, err)) return false;
+                    continue;
+                };
+                return true;
+            }
+        }
+        while (true) {
+            const job = self.src.startDeleteTree(path) catch |err| {
+                if (!self.recoverOrFail(.src, "delete", path, err)) return false;
+                continue;
+            };
+            const end = self.src.waitJobEnd(job, 600_000) catch |err| {
+                if (!self.recoverOrFail(.src, "delete", path, err)) return false;
+                continue;
+            };
+            if (!end.ok) {
+                self.fail("delete {s} on {s}: {s}", .{
+                    tailOf(path), self.hostLabel(.src),
+                    if (end.messageText().len > 0) end.messageText() else "source deletion failed",
+                });
+                return false;
+            }
+            return true;
+        }
+    }
+
     fn copyTree(self: *CrossCopy, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool) bool {
         if (!self.mkdirDst(dst_dir)) return false;
         var listing = self.listSrc(src_dir) orelse return false;
@@ -1715,9 +1767,10 @@ fn sleepMs(ms: u32) void {
 /// Open one side, retrying the dial itself: the destination daemon may
 /// still be starting, or the route may be flapping at exactly the wrong
 /// moment. Only after the retries are spent is the job refused.
-fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side) ?fsdrive.Fs {
+fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side, max_tries: u32) ?fsdrive.Fs {
+    const tries = if (max_tries == 0) RECONNECT_ATTEMPTS else @min(max_tries, RECONNECT_ATTEMPTS);
     var attempt: u32 = 0;
-    while (attempt < RECONNECT_ATTEMPTS) : (attempt += 1) {
+    while (attempt < tries) : (attempt += 1) {
         if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
         const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
         var buf: [160]u8 = undefined;
@@ -1735,18 +1788,18 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.dst.len == 0) return emitError("cross_copy needs destination");
     const src_label = if (spec.src_host.len == 0) "local" else spec.src_host;
     const dst_label = if (spec.dst_host.len == 0) "local" else spec.dst_host;
-    var src = connectHostFsRetrying(allocator, spec.src_host, .src) orelse {
+    var src = connectHostFsRetrying(allocator, spec.src_host, .src, spec.dial_tries) orelse {
         var buf: [160]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        w.print("cannot reach source host {s}", .{src_label}) catch return emitError("cannot connect source host");
-        return emitError(w.buffered());
+        w.print("cannot reach source host {s}", .{src_label}) catch return emitErrorKind("unreachable", "cannot connect source host");
+        return emitErrorKind("unreachable", w.buffered());
     };
     defer src.deinit();
-    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst) orelse {
+    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst, spec.dial_tries) orelse {
         var buf: [160]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        w.print("cannot reach destination host {s}", .{dst_label}) catch return emitError("cannot connect destination host");
-        return emitError(w.buffered());
+        w.print("cannot reach destination host {s}", .{dst_label}) catch return emitErrorKind("unreachable", "cannot connect destination host");
+        return emitErrorKind("unreachable", w.buffered());
     };
     defer dst.deinit();
     var cc = CrossCopy{
@@ -1771,6 +1824,9 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         break :blk false;
     };
     if (!ok) return emitError(cc.failedReason());
+    if (spec.delete_src) {
+        if (!cc.deleteSrc(spec.src, root.tdir)) return emitError(cc.failedReason());
+    }
     emitCopyDone(&cc.progress);
     return 0;
 }

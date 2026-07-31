@@ -639,6 +639,14 @@ const JobOutcome = struct {
     /// Bytes already transferred when the link came back. Non-zero is
     /// the whole point: a resume continues, it does not restart.
     resumed_at: u64 = 0,
+    /// The terminal event's structural cause ("unreachable" on a
+    /// failed dial), which drives the browser's coordinator fallback.
+    kind: [32]u8 = undefined,
+    kind_len: usize = 0,
+
+    fn kindText(self: *const JobOutcome) []const u8 {
+        return self.kind[0..self.kind_len];
+    }
 
     fn is(self: *const JobOutcome, ev: []const u8) bool {
         return std.mem.eql(u8, self.ev[0..self.ev_len], ev);
@@ -686,6 +694,8 @@ fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
                 out.resumed_from = e.resumed_from;
                 out.message_len = @min(e.message.len, out.message.len);
                 @memcpy(out.message[0..out.message_len], e.message[0..out.message_len]);
+                out.kind_len = @min(e.kind.len, out.kind.len);
+                @memcpy(out.kind[0..out.kind_len], e.kind[0..out.kind_len]);
                 if (e.hash.len == 64) {
                     @memcpy(&out.hash, e.hash[0..64]);
                     out.has_hash = true;
@@ -2331,6 +2341,55 @@ fn crossStage(
     }
     _ = c.unsetenv("SKETERM_SSH");
 
+    // ── cross-host MOVE: verified copy, then the source is gone ──
+    // delete_src runs strictly after the rename, on the SOURCE
+    // daemon, so the move is one daemon-owned job end to end.
+    _ = c.setenv("SKETERM_SSH", ssh_ok.ptr, 1);
+    {
+        var mv_buf: [256]u8 = undefined;
+        const mv_src = std.fmt.bufPrint(&mv_buf, "{s}/move-me.bin", .{src_dir}) catch unreachable;
+        writePattern(mv_src, 1 << 20, 0x77);
+        const mv_want = fileSha(mv_src) orelse fail("cross: move source hash");
+        var mvd_buf: [256]u8 = undefined;
+        const mv_dst = std.fmt.bufPrint(&mvd_buf, "{s}/moved.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", mv_src, "", mv_dst, true, .{ .delete_src = true }) catch
+            failErr("cross: start move", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("done")) failErr("cross: move did not finish", res.messageText());
+        const got = fileSha(mv_dst) orelse fail("cross: move dst hash");
+        if (!std.mem.eql(u8, &got, &mv_want)) fail("cross: moved content mismatch");
+        var z2: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(pathz.pathZ(&z2, mv_src) catch unreachable, &st) == 0)
+            fail("cross: move left the source file behind");
+    }
+    {
+        // A directory move: the source side needs a delete_tree job.
+        var td_buf: [256]u8 = undefined;
+        const tree_src = std.fmt.bufPrint(&td_buf, "{s}/movetree", .{src_dir}) catch unreachable;
+        mkdirAt(tree_src);
+        touch(tree_src, "a.txt", "alpha");
+        var sub_buf: [256]u8 = undefined;
+        const sub = std.fmt.bufPrint(&sub_buf, "{s}/sub", .{tree_src}) catch unreachable;
+        mkdirAt(sub);
+        touch(sub, "b.txt", "beta");
+        var tdd_buf: [256]u8 = undefined;
+        const tree_dst = std.fmt.bufPrint(&tdd_buf, "{s}/movetree", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", tree_src, "", tree_dst, true, .{ .delete_src = true }) catch
+            failErr("cross: start tree move", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("done")) failErr("cross: tree move did not finish", res.messageText());
+        var chk_buf: [256]u8 = undefined;
+        var z2: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        const moved_b = std.fmt.bufPrint(&chk_buf, "{s}/sub/b.txt", .{tree_dst}) catch unreachable;
+        if (c.lstat(pathz.pathZ(&z2, moved_b) catch unreachable, &st) != 0)
+            fail("cross: tree move lost a nested file");
+        if (c.lstat(pathz.pathZ(&z2, tree_src) catch unreachable, &st) == 0)
+            fail("cross: tree move left the source tree behind");
+    }
+    _ = c.unsetenv("SKETERM_SSH");
+
     // ── an unreachable source names itself in the failure ──────
     var ssh_dead_buf: [160:0]u8 = undefined;
     const ssh_dead = std.fmt.bufPrintZ(&ssh_dead_buf, "{s}/fake-ssh-dead", .{dir}) catch unreachable;
@@ -2343,7 +2402,9 @@ fn crossStage(
     _ = c.setenv("SKETERM_SSH", ssh_dead.ptr, 1);
     {
         const out_dead = std.fmt.bufPrint(&out_buf, "{s}/dead.bin", .{dst_dir}) catch unreachable;
-        const job = fs.startCrossCopy("ssh:127.0.0.1", big, "", out_dead, true) catch
+        // dial_tries caps the dial backoff (the browser's DIRECT
+        // remote-to-remote attempt), so the failure lands in seconds.
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", big, "", out_dead, true, .{ .dial_tries = 2 }) catch
             failErr("cross: start dead", fs.lastErr());
         const res = collectJob(&fs, job, 180_000);
         if (!res.is("error")) fail("cross: an unreachable source reported success");
@@ -2352,6 +2413,10 @@ fn crossStage(
         if (std.mem.indexOf(u8, res.messageText(), "source") == null or
             std.mem.indexOf(u8, res.messageText(), "127.0.0.1") == null)
             failErr("cross: failure reason names neither the side nor the host", res.messageText());
+        // The structural cause that drives the browser's fallback to
+        // relaying: a failed dial must be told apart from a failed copy.
+        if (!std.mem.eql(u8, res.kindText(), "unreachable"))
+            failErr("cross: dial failure not stamped kind=unreachable", res.kindText());
     }
     _ = c.unsetenv("SKETERM_SSH");
     std.debug.print("smoke-fs: cross-host copy reconnect/resume OK\n", .{});
