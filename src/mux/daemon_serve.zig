@@ -628,6 +628,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 .audio = cl.audio_channels,
                 .winstream = cl.winstream_channels,
                 .version = version.string,
+                // Build identity (git describe): a client whose own
+                // build differs may upgrade-restart this daemon when
+                // it is provably idle (Conn.upgradeStaleIdle).
+                .build = build_options.commit,
                 .audio_opus = opuscodec.available(),
                 .video = build_options.video,
                 // Capability, not a proto bump: clients must not send

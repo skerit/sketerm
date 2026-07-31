@@ -90,6 +90,8 @@ pub fn build(b: *std.Build) void {
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
+    noglib_opts.addOption([]const u8, "commit", git_commit);
+    noglib_opts.addOption([]const u8, "commit_date", git_date);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
     noglib_opts.addOption(bool, "video", have_x264);
     noglib_opts.addOption(bool, "vtenc", have_vtenc);
@@ -204,6 +206,8 @@ pub fn build(b: *std.Build) void {
     // mux`; portable stays the lowest-common-denominator artifact.
     const portable_opts = b.addOptions();
     portable_opts.addOption(bool, "glib", false);
+    portable_opts.addOption([]const u8, "commit", git_commit);
+    portable_opts.addOption([]const u8, "commit_date", git_date);
     portable_opts.addOption(bool, "winstream_sck", false);
     portable_opts.addOption(bool, "video", false);
     portable_opts.addOption(bool, "vtenc", false);
