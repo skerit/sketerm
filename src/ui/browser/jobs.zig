@@ -1053,6 +1053,15 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             row.setMessage("interrupted -- resuming automatically");
         } else {
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
+            // Out of automatic attempts: remember the interrupted copy
+            // so a later paste of the same source offers Continue.
+            if (row.retry) |r| @import("../../filebrowser/incomplete.zig").record(
+                self.allocator,
+                r.src_hc.host orelse "",
+                r.src_path,
+                r.dst_hc.host orelse "",
+                r.dst_path,
+            );
         }
         if (row.undo_op) |u| {
             row.undo_op = null;
@@ -1071,6 +1080,13 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     } else if (std.mem.eql(u8, e.ev, "canceled")) {
         row.state = .canceled;
         self.setStatusFmt("canceled: {s}", .{row.label});
+        if (row.retry) |r| @import("../../filebrowser/incomplete.zig").record(
+            self.allocator,
+            r.src_hc.host orelse "",
+            r.src_path,
+            r.dst_hc.host orelse "",
+            r.dst_path,
+        );
         if (row.undo_op) |u| {
             row.undo_op = null;
             u.destroy(self.allocator);
@@ -1085,6 +1101,14 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             row.history_direction = null;
             self.restoreHistory(op, direction);
         }
+    }
+    // A completed copy is no longer "interrupted".
+    if (row.state == .finished) {
+        if (row.retry) |r| @import("../../filebrowser/incomplete.zig").clear(
+            self.allocator,
+            r.dst_hc.host orelse "",
+            r.dst_path,
+        );
     }
     // A finished cross-host copy releases its destination.
     if (row.dest_key != 0 and row.terminal()) self.pumpCopyQueue();
