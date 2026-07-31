@@ -11481,3 +11481,39 @@ menus. MCP frame trace changed from two popup commits settling at
 192x56 to one first-and-final 192x34 commit; File likewise opens in one
 192x148 commit. Scrollers retain the real row box as qdata so submenu
 measurement and F10 focus do not stop at GTK's intermediary viewport.
+
+## 2026-07-31: big remote folders stop freezing the browser
+
+Opening a large remote folder (vastai, 1500+ entries) left the UI
+dead for minutes: hover flickered, clicks were eaten, Up did nothing.
+Four compounding causes, all fixed:
+
+1. Every child-count fs_delta batch full-rebuilt the listing model
+   (all row items destroyed + respliced, plus one full sort per
+   upserted entry via Dir.upsert). Count deltas now take
+   Dir.countOnlyIndex: the count is written in place ("children" is
+   never a sort input) and colview.refreshEntryRow resplices ONE row,
+   so hover/selection/scroll stay untouched. Structural deltas still
+   rebuild, but through the throttle below.
+2. Socket-driven renders (streaming chunks, watch deltas) now go
+   through scheduleListingRender, a 120ms leading-edge throttle;
+   interaction renders stay direct.
+3. Navigating away did not stop the daemon: dropFsViewAt only ended
+   the count phase while the stat stream kept queueing chunks for the
+   dead view ahead of the next request (the dead Up button). A
+   close_view now aborts the listing with an `aborted:true`
+   terminator; LISTING_WATERMARK dropped 8MB -> 1MB. smoke-fs gained
+   an abort stage (mono + broker).
+4. Remote thumbnails ran strictly one-at-a-time, each paying a
+   host-side job round trip (minutes for a folder of photos). The
+   pipeline is now a 4-wide pool (BrowserView.remote_thumbs), and the
+   queue is purged on navigation.
+
+Verified live by driving the real files GUI through a scripted
+`sketerm mcp` instance against a fake-ssh remote rate-limited to
+150KB/s with 1540 entries + 80 dirs + 60 photos: rows stream in,
+counts fill without a rebuild, selection stays accent-blue through
+clicks (~100-200ms repaints), Up supersedes a pending slow navigation
+instantly, thumbnails trickle in. Suite 1092/5/0, test-core 926/5/0,
+smoke-fs, smoke-mux, smoke-e2e all pass; new unit test for
+countOnlyIndex.
