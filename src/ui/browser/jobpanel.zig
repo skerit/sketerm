@@ -553,6 +553,17 @@ pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ct
     ctx.* = ctx_in;
     const btn = c.gtk_button_new_from_icon_name(icon);
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    const tip: [*:0]const u8 = switch (ctx_in.kind) {
+        .pause => "Pause",
+        .resume_ => "Resume",
+        .cancel => "Cancel",
+        .dismiss => "Dismiss",
+        .move_up => "Move up in the queue",
+        .move_down => "Move down in the queue",
+        .expand => "Show details",
+        .retry => "Retry",
+    };
+    c.gtk_widget_set_tooltip_text(btn, tip);
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onJobBtn), @ptrCast(ctx), @ptrCast(&JobBtnCtx.free), c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(row), btn);
 }

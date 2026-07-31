@@ -31,6 +31,7 @@ const AttrRequest = @import("props.zig").AttrRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
 const CopyQueue = @import("jobs.zig").CopyQueue;
+const DeferredTransfer = @import("jobs.zig").DeferredTransfer;
 const CopyRetry = @import("types.zig").CopyRetry;
 const conflict_mod = @import("conflict.zig");
 const DupState = @import("search.zig").DupState;
@@ -91,6 +92,9 @@ pub const BrowserView = struct {
     /// delay, and the one timer that submits them (jobs.zig).
     retry_pending: std.ArrayList(*CopyRetry) = .empty,
     retry_timer: c.guint = 0,
+    /// Pastes/sends held while a source or destination host is still
+    /// connecting; released by wireReady, dropped on host death.
+    deferred_transfers: std.ArrayList(*DeferredTransfer) = .empty,
 
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
@@ -631,6 +635,7 @@ pub const BrowserView = struct {
     pub const setTransferPaused = @import("jobs.zig").setTransferPaused;
     pub const unclaimMediated = @import("jobs.zig").unclaimMediated;
     pub const pumpCopyQueue = @import("jobs.zig").pumpCopyQueue;
+    pub const pumpDeferredTransfers = @import("jobs.zig").pumpDeferredTransfers;
     pub const cancelQueuedCopy = @import("jobs.zig").cancelQueuedCopy;
     pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
@@ -1131,6 +1136,8 @@ pub const BrowserView = struct {
         self.pending_opens.deinit(self.allocator);
         self.jobs_panel.deinit(self.allocator);
         self.copy_queue.deinit(self.allocator);
+        for (self.deferred_transfers.items) |d| d.destroy(self.allocator);
+        self.deferred_transfers.deinit(self.allocator);
         self.cancelPendingRetries();
         self.conflicts.deinit(self.allocator);
         self.templates.deinit(self.allocator);

@@ -263,6 +263,7 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     } else {
         hc.state = .dead;
         view.setStatusFmt("cannot connect to {s}", .{hc.label()});
+        view.pumpDeferredTransfers();
         // The listings queued while connecting will never be answered.
         // Without this the tabs that asked for them sit at "Listing..."
         // for good, which reads like a slow host rather than a dead one.
@@ -327,6 +328,11 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     self.requestHostDirs(hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
+    self.pumpDeferredTransfers();
+    // Warm the host's FUSE mount NOW, while the user is still
+    // browsing: the mount helper's own connect (ssh auth, deploy
+    // check) is the whole latency of the first double-click open.
+    if (hc.host) |host| _ = @import("../hostmount.zig").ensure(self.allocator, host);
 }
 
 /// One host being re-dialed after a drop, with backoff. Owned by
@@ -526,6 +532,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     }
     hc.conn.deinit();
     hc.state = .dead;
+    self.pumpDeferredTransfers();
     self.renderJobs();
     // A remote host with tabs still on it gets re-dialed by timer; a
     // local daemon reconnects on the next op anyway.

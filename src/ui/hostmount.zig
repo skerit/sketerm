@@ -272,6 +272,15 @@ pub fn ensure(allocator: std.mem.Allocator, host: []const u8) State {
     }
     if (find(host)) |m| {
         if (m.state == .starting and isMounted(m.point)) m.state = .ready;
+        // A helper that outlived the ready timeout may still finish
+        // coming up (slow ssh auth, UDP probe fallback). The moment
+        // its mountpoint appears, use it — this state used to be a
+        // dead end that silently downloaded every open forever while
+        // a perfectly good mount sat idle.
+        if (m.state == .unavailable and m.pid != 0 and isMounted(m.point)) {
+            m.state = .ready;
+            m.reason = "";
+        }
         // A helper that died leaves a stale mount the kernel answers
         // with ENOTCONN; clear it so the next open can try again.
         if (m.state == .ready and m.pid == 0) {
