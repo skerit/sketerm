@@ -22,6 +22,10 @@ pub const Record = struct {
     /// destination already happened before any copying, and doing it
     /// again on restart would only destroy the partial result.
     conflict: []const u8 = "",
+    /// cross_copy: this job is a MOVE (source deleted after verify).
+    /// Persisted for the same reason as `conflict`: a respawn that
+    /// dropped it would silently turn the move into a copy.
+    delete_src: bool = false,
     pid: i64 = -1,
     done: u64 = 0,
     total: u64 = 0,

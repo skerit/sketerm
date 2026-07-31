@@ -149,6 +149,8 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .wire_cache = r.wire_cache,
         .owns_dst = op == .panelize and r.delete_destination,
         .owns_src = op == .preview_transport and r.delete_source,
+        .delete_src = op == .cross_copy and r.delete_src,
+        .dial_tries = r.dial_tries,
     }) catch
         return fsReplyErr(cl, r.req, "cannot start job");
     if (source_owner) |producer| {
@@ -191,6 +193,11 @@ pub const FsJobArgs = struct {
     wire_cache: bool = false,
     owns_dst: bool = false,
     owns_src: bool = false,
+    /// cross_copy move semantics: journaled, so a daemon-restart
+    /// respawn still deletes the source instead of degrading to a copy.
+    delete_src: bool = false,
+    /// NOT journaled: a respawn dials with the full budget.
+    dial_tries: u32 = 0,
 };
 
 pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: FsJobArgs) !*FsJob {
@@ -232,6 +239,8 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .image_codecs = image_codecs,
         .wire_cache = args.wire_cache,
         .delete_source = args.owns_src,
+        .delete_src = args.delete_src,
+        .dial_tries = args.dial_tries,
     }, .{}, &spec_aw.writer);
     try spec_aw.writer.writeByte('\n');
 
@@ -305,6 +314,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .ephemeral = ephemeral,
         .owns_dst = args.owns_dst,
         .owns_src = args.owns_src,
+        .delete_src = args.delete_src,
     };
     job_initialized = true;
     // The job owns the read end from here on; its deinit closes it,
@@ -361,6 +371,7 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
         .dst_host = job.dst_host,
         .@"resume" = job.resumable,
         .conflict = job.conflict,
+        .delete_src = job.delete_src,
         .pid = job.pid,
         .done = job.done,
         .total = job.total,
@@ -413,6 +424,7 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .conflict = conflict,
         .acknowledged = rec.acknowledged,
         .resumable = rec.@"resume",
+        .delete_src = rec.delete_src,
     };
     job.setMessage(rec.message);
     self.fs_jobs.append(self.allocator, job) catch {
@@ -476,6 +488,7 @@ pub fn restoreFsJobs(self: *Daemon) void {
                 .client_token = rec.client_token,
                 .resumable = true,
                 .copy = .{ .conflict = rec.conflict },
+                .delete_src = rec.delete_src,
             }) catch {
                 const job = restoredFsJob(self, rec, op, .failed) orelse continue;
                 job.setMessage("could not resume after daemon restart");
@@ -637,6 +650,7 @@ pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
         .exit_status = job.exit_status,
         .path = job.done_path[0..job.done_path_len],
         .keep = job.done_kept,
+        .kind = job.err_kind[0..job.err_kind_len],
         .text = job.done_text[0..job.done_text_len],
         .file = job.cur_file[0..job.cur_file_len],
         .files_done = job.files_done,
@@ -782,6 +796,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     } else if (std.mem.eql(u8, e.ev, "error")) {
         job.state = .failed;
         job.setMessage(e.message);
+        job.err_kind_len = @min(e.kind.len, job.err_kind.len);
+        @memcpy(job.err_kind[0..job.err_kind_len], e.kind[0..job.err_kind_len]);
         saveFsJob(self, job) catch {
             job.terminal_pending = true;
             return;

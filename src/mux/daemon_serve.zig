@@ -634,6 +634,12 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // udp_ticket_req to daemons that would answer `.err`
                 // (misattributable on a multiplexed GUI connection).
                 .udp_ticket = true,
+                // cross_copy honors delete_src (move) + dial_tries and
+                // stamps dial failures kind:"unreachable". Gates both
+                // daemon-owned moves and DIRECT remote-to-remote
+                // coordination: an old daemon ignoring delete_src
+                // would silently turn a move into a copy.
+                .cross_move = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -1512,6 +1518,11 @@ pub const FsOpReq = struct {
     delete_source: bool = false,
     /// A panelize preview job owns the scratch path carried in `to`.
     delete_destination: bool = false,
+    /// cross_copy: delete the verified source afterwards (a move).
+    delete_src: bool = false,
+    /// cross_copy: cap the initial per-side dial attempts (0 = full
+    /// budget); direct remote-to-remote attempts fail fast with it.
+    dial_tries: u32 = 0,
 };
 
 /// One change inside an fs_delta. upsert carries `entry`; del only

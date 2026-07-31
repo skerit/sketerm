@@ -150,6 +150,10 @@ pub const Conn = struct {
     proto: u32 = 1,
     server_proto: u32 = 1,
     snapshot_version: u8 = @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION,
+    /// Daemon's cross_copy honors delete_src/dial_tries and stamps
+    /// dial failures kind:"unreachable" (welcome capability). Gates
+    /// daemon-owned moves and direct remote-to-remote coordination.
+    cross_move: bool = false,
     /// Daemon answers `udp_ticket_req` (welcome capability). Gates the
     /// request — an older daemon would answer `.err`, which a
     /// multiplexed GUI connection could misattribute.
@@ -269,12 +273,14 @@ pub const Conn = struct {
         self.server_proto = 0;
         self.snapshot_version = 0;
         self.udp_tickets = false;
+        self.cross_move = false;
         const Probe = struct {
             proto: u32 = 1,
             server_proto: ?u32 = null,
             negotiation: u8 = 0,
             snapshot: u8 = 0,
             udp_ticket: bool = false,
+            cross_move: bool = false,
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
@@ -287,6 +293,7 @@ pub const Conn = struct {
                 0;
             self.server_proto = parsed.value.server_proto orelse reported;
             self.udp_tickets = parsed.value.udp_ticket;
+            self.cross_move = parsed.value.cross_move;
             self.snapshot_version = if (parsed.value.snapshot > 0)
                 @min(parsed.value.snapshot, @import("snapshot.zig").SNAPSHOT_VERSION)
             else if (self.proto >= 6)

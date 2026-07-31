@@ -518,6 +518,9 @@ pub const Fs = struct {
             src_host: []const u8 = "",
             dst_host: []const u8 = "",
             client_token: []const u8 = "",
+            /// cross_copy move + dial cap (see CrossOpts).
+            delete_src: bool = false,
+            dial_tries: u32 = 0,
             attrs: []const u8 = "",
             image_codecs: []const u8 = "",
         };
@@ -982,12 +985,33 @@ pub const Fs = struct {
         dst: []const u8,
         resumable: bool,
     ) Error!u64 {
+        return self.startCrossCopyOpts(src_host, src, dst_host, dst, resumable, .{});
+    }
+
+    pub const CrossOpts = struct {
+        /// Delete the verified source afterwards — a move.
+        delete_src: bool = false,
+        /// Cap the initial dial attempts per side (0 = full budget).
+        dial_tries: u32 = 0,
+    };
+
+    pub fn startCrossCopyOpts(
+        self: *Fs,
+        src_host: []const u8,
+        src: []const u8,
+        dst_host: []const u8,
+        dst: []const u8,
+        resumable: bool,
+        opts: CrossOpts,
+    ) Error!u64 {
         return self.startJob("cross_copy", .{
             .path = src,
             .to = dst,
             .src_host = src_host,
             .dst_host = dst_host,
             .@"resume" = resumable,
+            .delete_src = opts.delete_src,
+            .dial_tries = opts.dial_tries,
         });
     }
 
