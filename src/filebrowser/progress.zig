@@ -12,10 +12,15 @@ const fmtSize = @import("format.zig").fmtSize;
 
 /// Rate-history depth; one entry per HISTORY_INTERVAL_MS at most.
 pub const HISTORY_LEN = 48;
-/// Gap at which a new observation weighs half of the average.
-pub const SMOOTHING_MS: f64 = 2000;
-/// No byte moved for this long = stalled.
-pub const STALL_MS: i64 = 5000;
+/// Gap at which a new observation weighs half of the average. 5s
+/// damps the chunked-transfer sawtooth (progress lands in bursts per
+/// chunk) into a readable figure instead of 3 MiB/s -> 300 KiB/s
+/// whiplash.
+pub const SMOOTHING_MS: f64 = 5000;
+/// No byte moved for this long = stalled. Sits above one full chunk
+/// round trip on a slow link so a working transfer never flickers
+/// through "stalled" between chunks.
+pub const STALL_MS: i64 = 10_000;
 /// Rate-history resolution.
 pub const HISTORY_INTERVAL_MS: i64 = 500;
 /// ETA ceiling; beyond this the estimate says nothing useful.
