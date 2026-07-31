@@ -199,23 +199,23 @@ fn applyToDir(self: *BrowserView, tab: *BTab, dir: *Dir, cols: []const []const u
     const a = self.allocator;
     for (dir.entries.items) |*e| {
         if (cols.len == 0) {
-            freeMeta(a, e);
+            dropMeta(a, tab, dir, e);
             continue;
         }
         var path_buf: [4096]u8 = undefined;
         const full = dir.fullPath(e.*, &path_buf) orelse {
-            freeMeta(a, e);
+            dropMeta(a, tab, dir, e);
             continue;
         };
         var key_buf: [4300]u8 = undefined;
         const key = cacheKey(&key_buf, tab.hc, full, e.mtime_ms) orelse {
-            freeMeta(a, e);
+            dropMeta(a, tab, dir, e);
             continue;
         };
         const row = self.media.rows.get(key) orelse {
             // No answer yet: leave the row value-less rather than
             // allocating an empty array per entry.
-            freeMeta(a, e);
+            dropMeta(a, tab, dir, e);
             continue;
         };
         const values = a.alloc([]u8, cols.len) catch continue;
@@ -230,9 +230,29 @@ fn applyToDir(self: *BrowserView, tab: *BTab, dir: *Dir, cols: []const []const u
             filled += 1;
         }
         if (filled != cols.len) continue;
+        // Value change detection feeds the windowed splice: a row
+        // whose meta just arrived (or changed) must rebind, and
+        // identity alone cannot see it.
+        const changed = blk: {
+            if (e.meta.len != values.len) break :blk true;
+            for (e.meta, values) |old_v, new_v| {
+                if (!std.mem.eql(u8, old_v, new_v)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (changed) tab.noteChangedFull(full);
         freeMeta(a, e);
         e.meta = values;
     }
+}
+
+/// Clear a row's meta; a row that HAD values must rebind (its cells
+/// still show them).
+fn dropMeta(a: std.mem.Allocator, tab: *BTab, dir: *Dir, e: *Entry) void {
+    if (e.meta.len == 0) return;
+    var path_buf: [4096]u8 = undefined;
+    if (dir.fullPath(e.*, &path_buf)) |full| tab.noteChangedFull(full);
+    freeMeta(a, e);
 }
 
 fn freeMeta(allocator: std.mem.Allocator, e: *Entry) void {
