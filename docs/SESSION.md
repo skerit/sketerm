@@ -11581,3 +11581,30 @@ same-inode. Live rig: Quick Look on a fake-remote photo landed xl/
 jxl entries (plus neighbor preloads), zero freedesktop PNGs, close +
 reopen left inodes untouched; a standalone --job wav preview carried
 duration metadata on both miss and hit.
+
+## 2026-07-31: direct remote-to-remote transfers + daemon-owned moves
+
+Two transfer fixes. (1) Cross-host MOVES left the client-mediated
+path (GUI relaying bytes, dying with the window) and became
+cross_copy jobs with a new delete_src flag: the helper deletes the
+verified source strictly after the rename, a failed delete fails the
+job with the copy intact (retry = cheap hash-skip re-verify + redo
+the delete), and the flag is journaled so a daemon-restart respawn
+stays a move. (2) Remote-to-remote copies no longer relay through
+this machine: pickCoordinator submits the job to the DESTINATION
+host's daemon, whose helper dials the source directly. Gated on a
+new cross_move welcome capability; host strings on the wire are
+coordinator-relative. An unreachable peer (e.g. two hosts with no
+keys for each other) fails one capped dial (dial_tries) with the
+error stamped kind:"unreachable", and fallbackDirectCopy resubmits
+the same job through the local daemon — same staged partial, no
+auto-resume attempt spent.
+
+smoke-fs crossStage grew: file move + tree move (source gone only
+after verify), and the dead-host stage now asserts the unreachable
+kind and rides dial_tries. Live rig (three fake hosts, per-host
+daemons): A-to-B copy coordinated by B (its journal owns the job,
+the GUI-local daemon journal stayed empty), A-to-B cut-paste moved
+with delete_src:true, and A-to-C (C's outbound ssh dead) failed one
+direct attempt then relayed via the local daemon 33ms later with a
+matching hash.
