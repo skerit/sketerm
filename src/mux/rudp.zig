@@ -7,8 +7,10 @@
 //! address is learned from the latest *authenticated* datagram,
 //! which is what makes roaming (Wi-Fi → LTE, suspend/resume) free.
 //!
-//! On top of the sealed datagrams runs a small go-back-N stream:
-//! 1200-byte segments, cumulative acks (piggybacked on data),
+//! On top of the sealed datagrams runs a small reliable stream:
+//! 1200-byte segments, cumulative acks (piggybacked on data), a
+//! receiver-side reorder buffer (a lost datagram holds back only
+//! itself, not the window behind it), duplicate-ack fast retransmit,
 //! timer-driven retransmission with exponential backoff, periodic
 //! keepalives. Both mux peers speak the same byte-stream protocol
 //! as over SSH — this layer only replaces the pipe.
@@ -39,6 +41,16 @@ const RTO_MAX_MS: i64 = 1000;
 const KEEPALIVE_MS: i64 = 3000;
 /// In-flight segment cap; beyond it send() queues unsent.
 const WINDOW: usize = 128;
+/// Receiver-side out-of-order hold: segments up to this far ahead of
+/// recv_expected are buffered instead of dropped, so one lost
+/// datagram costs one retransmit, not the whole window behind it.
+const REORDER_MAX: u32 = WINDOW;
+/// Duplicate cumulative acks before the head segment is resent
+/// without waiting for the RTO (TCP-style fast retransmit).
+const DUP_ACK_FAST: u8 = 3;
+/// Compact the backlog buffer once this many consumed bytes sit in
+/// front of it (amortized O(1) drain instead of a memmove per seg).
+const BACKLOG_COMPACT: usize = 1 << 20;
 
 pub const EmitFn = *const fn (ctx: ?*anyopaque, datagram: []const u8) void;
 
@@ -92,13 +104,22 @@ pub const Channel = struct {
     /// Bytes accepted by send() but not yet segmented into the
     /// window (window full). Drained by poll().
     backlog: std.ArrayList(u8) = .empty,
+    /// Consumed prefix of `backlog`; compacted lazily.
+    backlog_off: usize = 0,
     rto_ms: i64 = RTO_MIN_MS,
     retransmit_at: i64 = 0,
     last_emit_at: i64 = 0,
+    /// Fast-retransmit state: last cumulative ack seen + how many
+    /// times it repeated without progress.
+    last_ack: u32 = 0,
+    dup_acks: u8 = 0,
 
     // Receiver side.
     recv_expected: u32 = 0,
     ack_pending: bool = false,
+    /// Out-of-order segments held until the gap fills, sorted by
+    /// distance from recv_expected. Bounded by REORDER_MAX.
+    reorder: std.ArrayList(Segment) = .empty,
 
     /// Peer said bye / fatal — no further traffic.
     closed: bool = false,
@@ -121,10 +142,12 @@ pub const Channel = struct {
         for (self.inflight.items) |s| self.allocator.free(s.data);
         self.inflight.deinit(self.allocator);
         self.backlog.deinit(self.allocator);
+        for (self.reorder.items) |s| self.allocator.free(s.data);
+        self.reorder.deinit(self.allocator);
     }
 
     pub fn queuedBytes(self: *const Channel) usize {
-        var total = self.backlog.items.len;
+        var total = self.backlog.items.len - self.backlog_off;
         for (self.inflight.items) |segment| total += segment.data.len;
         return total;
     }
@@ -172,17 +195,25 @@ pub const Channel = struct {
     }
 
     fn pump(self: *Channel, now_ms: i64, emit: EmitFn, ctx: ?*anyopaque) !void {
-        while (self.backlog.items.len > 0 and self.inflight.items.len < WINDOW) {
-            const take = @min(self.backlog.items.len, SEG_MAX);
-            const data = try self.allocator.dupe(u8, self.backlog.items[0..take]);
+        while (self.backlog.items.len > self.backlog_off and self.inflight.items.len < WINDOW) {
+            const avail = self.backlog.items.len - self.backlog_off;
+            const take = @min(avail, SEG_MAX);
+            const data = try self.allocator.dupe(u8, self.backlog.items[self.backlog_off..][0..take]);
             errdefer self.allocator.free(data);
-            const remaining = self.backlog.items.len - take;
-            std.mem.copyForwards(u8, self.backlog.items[0..remaining], self.backlog.items[take..]);
-            self.backlog.shrinkRetainingCapacity(remaining);
+            self.backlog_off += take;
             const seg = Segment{ .seq = self.next_seq, .data = data };
             self.next_seq +%= 1;
             try self.inflight.append(self.allocator, seg);
             self.emitSegment(seg, now_ms, emit, ctx);
+        }
+        if (self.backlog_off == self.backlog.items.len) {
+            self.backlog.clearRetainingCapacity();
+            self.backlog_off = 0;
+        } else if (self.backlog_off >= BACKLOG_COMPACT) {
+            const remaining = self.backlog.items.len - self.backlog_off;
+            std.mem.copyForwards(u8, self.backlog.items[0..remaining], self.backlog.items[self.backlog_off..]);
+            self.backlog.shrinkRetainingCapacity(remaining);
+            self.backlog_off = 0;
         }
         if (self.inflight.items.len > 0 and self.retransmit_at == 0) {
             self.retransmit_at = now_ms + self.rto_ms;
@@ -252,7 +283,23 @@ pub const Channel = struct {
         if (progressed) {
             self.rto_ms = RTO_MIN_MS;
             self.retransmit_at = if (self.inflight.items.len > 0) now_ms + self.rto_ms else 0;
+            self.last_ack = ack;
+            self.dup_acks = 0;
             try self.pump(now_ms, emit, ctx);
+        } else if (self.inflight.items.len > 0 and ack == self.last_ack) {
+            // The peer keeps acking below our head: it is alive and
+            // missing exactly the head segment. Resend it now rather
+            // than after a full RTO (the receiver's reorder buffer
+            // turns this one datagram into a whole-window ack jump).
+            self.dup_acks +|= 1;
+            if (self.dup_acks >= DUP_ACK_FAST) {
+                self.dup_acks = 0;
+                self.emitSegment(self.inflight.items[0], now_ms, emit, ctx);
+                self.retransmit_at = now_ms + self.rto_ms;
+            }
+        } else {
+            self.last_ack = ack;
+            self.dup_acks = 0;
         }
 
         switch (t) {
@@ -261,6 +308,9 @@ pub const Channel = struct {
                 if (seq == self.recv_expected) {
                     try deliver.appendSlice(self.allocator, payload);
                     self.recv_expected +%= 1;
+                    try self.drainReorder(deliver);
+                } else {
+                    try self.holdReorder(seq, payload);
                 }
                 // Dup or gap: (re-)ack so the sender converges.
                 self.ack_pending = true;
@@ -272,6 +322,38 @@ pub const Channel = struct {
             else => {},
         }
         return true;
+    }
+
+    /// Buffer an out-of-order segment (ahead of recv_expected) so a
+    /// single head retransmit later releases the whole run. Old
+    /// duplicates and segments past the hold window are dropped.
+    fn holdReorder(self: *Channel, seq: u32, payload: []const u8) !void {
+        const dist = seq -% self.recv_expected;
+        if (dist == 0 or dist >= REORDER_MAX) return;
+        var insert_at: usize = self.reorder.items.len;
+        for (self.reorder.items, 0..) |held, i| {
+            const held_dist = held.seq -% self.recv_expected;
+            if (held_dist == dist) return; // duplicate
+            if (held_dist > dist) {
+                insert_at = i;
+                break;
+            }
+        }
+        const copy = try self.allocator.dupe(u8, payload);
+        errdefer self.allocator.free(copy);
+        try self.reorder.insert(self.allocator, insert_at, .{ .seq = seq, .data = copy });
+    }
+
+    /// Deliver every buffered segment that is now in order.
+    fn drainReorder(self: *Channel, deliver: *std.ArrayList(u8)) !void {
+        while (self.reorder.items.len > 0) {
+            const head = self.reorder.items[0];
+            if (head.seq != self.recv_expected) break;
+            try deliver.appendSlice(self.allocator, head.data);
+            self.allocator.free(head.data);
+            _ = self.reorder.orderedRemove(0);
+            self.recv_expected +%= 1;
+        }
     }
 
     /// Timer driver: retransmit on RTO, flush pending acks, emit
@@ -485,6 +567,102 @@ test "rudp: retransmission recovers a fully-dropped window" {
         }
     }
     try std.testing.expectEqualStrings("important", received.items);
+}
+
+test "rudp: reorder buffer releases the run behind one lost segment" {
+    const a = std.testing.allocator;
+    const key: [KEY_LEN]u8 = @splat(5);
+    var net = TestNet{ .allocator = a, .prng = std.Random.DefaultPrng.init(3) };
+    defer net.deinit();
+    var ca = Channel.init(a, key, true);
+    defer ca.deinit();
+    var cb = Channel.init(a, key, false);
+    defer cb.deinit();
+
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(a);
+
+    // Ten full segments in one send.
+    const payload = try a.alloc(u8, SEG_MAX * 10);
+    defer a.free(payload);
+    var prng = std.Random.DefaultPrng.init(11);
+    prng.random().bytes(payload);
+    try ca.send(payload, 0, TestNet.emitToB, @ptrCast(&net));
+    try std.testing.expectEqual(@as(usize, 10), net.to_b.items.len);
+
+    // Drop segment 0; deliver 1..9 out of order — nothing reaches the
+    // stream yet, but everything is buffered.
+    a.free(net.to_b.orderedRemove(0));
+    while (net.to_b.items.len > 0) {
+        const d = net.to_b.orderedRemove(0);
+        defer a.free(d);
+        _ = try cb.onDatagram(d, 0, &received, TestNet.emitToA, @ptrCast(&net));
+    }
+    try std.testing.expectEqual(@as(usize, 0), received.items.len);
+    try std.testing.expectEqual(@as(usize, 9), cb.reorder.items.len);
+
+    // The receiver's duplicate acks trigger a fast retransmit of the
+    // head — one datagram releases the whole run.
+    while (net.to_a.items.len > 0) {
+        const d = net.to_a.orderedRemove(0);
+        defer a.free(d);
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(a);
+        _ = try ca.onDatagram(d, 0, &sink, TestNet.emitToB, @ptrCast(&net));
+    }
+    _ = ca.tick(1000, TestNet.emitToB, @ptrCast(&net)); // RTO backstop if dup-acks were < 3
+    try std.testing.expect(net.to_b.items.len >= 1);
+    while (net.to_b.items.len > 0) {
+        const d = net.to_b.orderedRemove(0);
+        defer a.free(d);
+        _ = try cb.onDatagram(d, 1000, &received, TestNet.emitToA, @ptrCast(&net));
+    }
+    try std.testing.expectEqualSlices(u8, payload, received.items);
+    try std.testing.expectEqual(@as(usize, 0), cb.reorder.items.len);
+}
+
+test "rudp: duplicate acks fast-retransmit the head before the RTO" {
+    const a = std.testing.allocator;
+    const key: [KEY_LEN]u8 = @splat(6);
+    var net = TestNet{ .allocator = a, .prng = std.Random.DefaultPrng.init(4) };
+    defer net.deinit();
+    var ca = Channel.init(a, key, true);
+    defer ca.deinit();
+    var cb = Channel.init(a, key, false);
+    defer cb.deinit();
+
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(a);
+
+    const payload = try a.alloc(u8, SEG_MAX * 5);
+    defer a.free(payload);
+    @memset(payload, 0xab);
+    try ca.send(payload, 0, TestNet.emitToB, @ptrCast(&net));
+    a.free(net.to_b.orderedRemove(0)); // lose the head
+
+    // Receiver acks each stray segment at the same cumulative value.
+    while (net.to_b.items.len > 0) {
+        const d = net.to_b.orderedRemove(0);
+        defer a.free(d);
+        _ = try cb.onDatagram(d, 0, &received, TestNet.emitToA, @ptrCast(&net));
+        _ = cb.tick(0, TestNet.emitToA, @ptrCast(&net));
+    }
+    // Feed those duplicate acks to the sender WITHOUT advancing time:
+    // the head must be resent by dup-ack logic alone.
+    while (net.to_a.items.len > 0) {
+        const d = net.to_a.orderedRemove(0);
+        defer a.free(d);
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(a);
+        _ = try ca.onDatagram(d, 0, &sink, TestNet.emitToB, @ptrCast(&net));
+    }
+    try std.testing.expect(net.to_b.items.len >= 1); // fast retransmit fired at t=0
+    while (net.to_b.items.len > 0) {
+        const d = net.to_b.orderedRemove(0);
+        defer a.free(d);
+        _ = try cb.onDatagram(d, 0, &received, TestNet.emitToA, @ptrCast(&net));
+    }
+    try std.testing.expectEqualSlices(u8, payload, received.items);
 }
 
 test "rudp: key hex round-trip" {
