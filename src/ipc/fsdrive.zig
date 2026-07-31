@@ -22,8 +22,19 @@ const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const Entry = fsserve.Entry;
 
-/// Bound on any single fs round trip. Well under the MCP watchdog.
+/// Inactivity bound on any single fs round trip: the wait dies only
+/// after this long with NO bytes arriving. A slow link that is still
+/// moving data is alive, not timed out (the old flat completion
+/// deadline tore down healthy connections mid-chunk).
 pub const OP_TIMEOUT_MS: i64 = 10_000;
+/// Hard cap on one op wait however slowly bytes trickle in — keeps
+/// the no-hang invariant under the 150s MCP watchdog.
+pub const OP_CAP_MS: i64 = 120_000;
+/// Assumed worst-case honest uplink for sizing write waits: a bulk
+/// fs_write's ack cannot arrive before the payload has left, so the
+/// wait budget grows with the payload (flat 10s misread a working
+/// slow uplink as a dead link).
+const WRITE_MIN_RATE: u64 = 32 * 1024; // bytes/sec
 
 pub const Error = error{
     NotConnected,
@@ -456,11 +467,11 @@ pub const Fs = struct {
     /// stale replies meanwhile. On success the parsed Reply is arena-
     /// allocated into `arena`.
     fn awaitReply(self: *Fs, arena: std.mem.Allocator, req: u32, timeout_ms: i64) Error!Reply {
-        const deadline = nowMs() + timeout_ms;
+        const cap_deadline = nowMs() + @max(timeout_ms, OP_CAP_MS);
         while (true) {
-            const remain = deadline - nowMs();
-            if (remain <= 0) return Error.Timeout;
-            const f = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+            const cap_remain = cap_deadline - nowMs();
+            if (cap_remain <= 0) return Error.Timeout;
+            const f = self.conn.recvFrameProgressive(timeout_ms, cap_remain) catch |err| switch (err) {
                 error.Timeout => return Error.Timeout,
                 else => return Error.NotConnected,
             };
@@ -731,11 +742,11 @@ pub const Fs = struct {
     pub fn read(self: *Fs, path: []const u8, off: u64, len: u32, out: *std.ArrayList(u8)) Error!ReadInfo {
         const req = self.nextReq();
         try self.sendOp("read", req, .{ .path = path, .off = off, .len = len });
-        const deadline = nowMs() + OP_TIMEOUT_MS;
+        const cap_deadline = nowMs() + OP_CAP_MS;
         while (true) {
-            const remain = deadline - nowMs();
-            if (remain <= 0) return Error.Timeout;
-            const f = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+            const cap_remain = cap_deadline - nowMs();
+            if (cap_remain <= 0) return Error.Timeout;
+            const f = self.conn.recvFrameProgressive(OP_TIMEOUT_MS, cap_remain) catch |err| switch (err) {
                 error.Timeout => return Error.Timeout,
                 else => return Error.NotConnected,
             };
@@ -789,7 +800,10 @@ pub const Fs = struct {
 
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
+        // The ack cannot beat the payload up a slow link: budget the
+        // wait for the upload itself, not just the round trip.
+        const upload_ms: i64 = @intCast(@min(@as(u64, @intCast(OP_CAP_MS - OP_TIMEOUT_MS)), data.len / (WRITE_MIN_RATE / 1000)));
+        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS + upload_ms);
         return rep.written;
     }
 

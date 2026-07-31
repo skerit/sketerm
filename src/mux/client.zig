@@ -123,6 +123,63 @@ pub fn takeTicketFromEnv(host: []const u8) ?UdpTicket {
     return ticket;
 }
 
+/// How long a "UDP is down for this host" verdict is trusted before
+/// the probe is retried. Long enough that a burst of helper processes
+/// (mount, per-file copy jobs) rides one verdict; short enough that a
+/// fixed firewall or network change is picked up soon.
+const UDP_MEMO_TTL_S: i64 = 600;
+
+/// Stamp path for the per-host UDP memo, under the user cache dir.
+fn udpMemoPath(buf: []u8, host: []const u8) ?[:0]const u8 {
+    const h = std.hash.Wyhash.hash(0, host);
+    if (c.getenv("XDG_CACHE_HOME")) |raw| {
+        const base = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        return std.fmt.bufPrintZ(buf, "{s}/sketerm/mux/udp-down-{x:0>16}", .{ base, h }) catch null;
+    }
+    const home_raw = c.getenv("HOME") orelse return null;
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
+    return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/udp-down-{x:0>16}", .{ home, h }) catch null;
+}
+
+fn udpMemoDown(host: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const path = udpMemoPath(&buf, host) orelse return false;
+    var st: c.struct_stat = undefined;
+    if (c.stat(path.ptr, &st) != 0) return false;
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+    return @as(i64, ts.tv_sec) - @as(i64, mtime) <= UDP_MEMO_TTL_S;
+}
+
+fn udpMemoMark(host: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const path = udpMemoPath(&buf, host) orelse return;
+    // Parent dirs may not exist yet (fresh cache); build them plainly.
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+        var dir_buf: [4096:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{path[0..slash]})) |dir| {
+            var i: usize = 1;
+            while (i <= dir.len) : (i += 1) {
+                if (i == dir.len or dir[i] == '/') {
+                    const save = dir[i];
+                    dir_buf[i] = 0;
+                    _ = c.mkdir(dir.ptr, 0o700);
+                    dir_buf[i] = save;
+                }
+            }
+        } else |_| {}
+    }
+    const fp = c.fopen(path.ptr, "we") orelse return;
+    _ = c.fclose(fp);
+}
+
+fn udpMemoClear(host: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const path = udpMemoPath(&buf, host) orelse return;
+    _ = c.unlink(path.ptr);
+}
+
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
@@ -384,9 +441,27 @@ pub const Conn = struct {
     }
 
     /// Connect to a remote daemon using the requested transport policy.
+    ///
+    /// Auto mode consults the per-host UDP memo: a host whose UDP probe
+    /// failed recently is dialed over ssh IMMEDIATELY instead of every
+    /// helper process (mount, cross-copy job) re-burning the probe
+    /// budget the GUI already spent. The memo expires, so UDP gets
+    /// retried once the network may have changed.
     pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, port_range: ?[]const u8) !Conn {
         if (std.mem.startsWith(u8, spec, "sock:")) return connectProbed(allocator, spec[5..]);
-        return connectRemoteUsing(allocator, spec, port_range, connectUdpAuto, connectUdp, connectSshWithRange);
+        const remote = RemoteSpec.parse(spec);
+        if (remote.mode == .auto and udpMemoDown(remote.host)) {
+            var conn = try connectSsh(allocator, remote.host);
+            conn.udp_error = error.UdpRecentlyUnavailable;
+            return conn;
+        }
+        const conn = try connectRemoteUsing(allocator, spec, port_range, connectUdpAuto, connectUdp, connectSshWithRange);
+        if (conn.transport == .udp) {
+            udpMemoClear(remote.host);
+        } else if (remote.mode == .auto and conn.udp_error != null) {
+            udpMemoMark(remote.host);
+        }
+        return conn;
     }
 
     const RemoteConnector = *const fn (std.mem.Allocator, []const u8, ?[]const u8) anyerror!Conn;
@@ -426,6 +501,7 @@ pub const Conn = struct {
             error.UdpProxiedHost => "ssh reaches it through a ProxyJump/ProxyCommand hop, so it has no directly reachable address",
             error.UdpBridgeUnreachable => "the announced UDP port never answered and the NAT hole punch did not connect (filtered UDP, or symmetric NAT)",
             error.SshTransportFailed => "no UDP announcement came back over ssh (remote sketerm-mux too old, or the bootstrap failed)",
+            error.UdpRecentlyUnavailable => "UDP failed for this host moments ago; the probe was skipped and will be retried in a few minutes",
             else => @errorName(e),
         };
     }
@@ -1151,6 +1227,40 @@ pub const Conn = struct {
                 return error.Disconnected;
             }
             try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
+        }
+    }
+
+    /// `recvFrame` with an INACTIVITY deadline: error.Timeout means no
+    /// bytes arrived for `idle_ms` — a multi-MB frame crawling in over
+    /// a slow link keeps the wait alive as long as it keeps moving.
+    /// `cap_ms` hard-bounds the whole wait (no-hang invariant).
+    pub fn recvFrameProgressive(self: *Conn, idle_ms: i64, cap_ms: i64) !OwnedFrame {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        var now = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+        const cap_deadline = now + cap_ms;
+        var idle_deadline = now + idle_ms;
+        while (true) {
+            if (try self.takeFrame()) |owned| return owned;
+            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+            now = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+            const remain = @min(idle_deadline, cap_deadline) - now;
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            const pr = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (pr < 0 and std.posix.errno(pr) != .INTR) return error.Disconnected;
+            if (pr <= 0) continue;
+            var tmp: [16384]u8 = undefined;
+            const n = c.read(self.fd, &tmp, tmp.len);
+            if (n == 0) return error.Disconnected;
+            if (n < 0) {
+                const e = std.posix.errno(n);
+                if (e == .AGAIN or e == .INTR) continue;
+                return error.Disconnected;
+            }
+            try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
+            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+            idle_deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + idle_ms;
         }
     }
 
