@@ -967,7 +967,6 @@ pub const AppHost = struct {
         }
         win.buf_w = lw;
         win.buf_h = lh;
-        self.updateShadowLayout(win);
         // Geometry size changed (app self-resize or first frame): match
         // the host window to it. Same-size calls no-op in GTK.
         if (builtin.os.tag == .macos and (dw != win.crop_w or dh != win.crop_h)) {
@@ -977,6 +976,9 @@ pub const AppHost = struct {
         win.crop_y = dy;
         win.crop_w = dw;
         win.crop_h = dh;
+        // After the crop is current: shadow layout re-resolves child
+        // placements against crop_x/crop_y.
+        self.updateShadowLayout(win);
         const cropped = (dx != 0 or dy != 0 or dw != lw or dh != lh);
         // Crop coords are logical; pixel coords scale by the REAL
         // physical/logical ratio (fractional under a viewport, where
@@ -1056,15 +1058,24 @@ pub const AppHost = struct {
     }
 
     const Placement = struct { win: *Win, x: i32, y: i32 };
+    const ChildRole = enum { popup, subsurface };
 
     /// Resolve a child surface's parent to an absolute GtkOverlay
     /// position. The extra shadow inset is the space reserved around
     /// the main picture for below-parent decoration subsurfaces.
-    fn parentPlacement(self: *AppHost, parent: u32) ?Placement {
+    /// Popups position relative to the parent's WINDOW GEOMETRY;
+    /// wl_subsurface positions are relative to the parent SURFACE
+    /// (buffer) origin — adding the geometry inset to subsurfaces
+    /// shifts CSD apps' content (Firefox) off their own border.
+    fn parentPlacement(self: *AppHost, parent: u32, role: ChildRole) ?Placement {
         if (self.windows.get(parent)) |win| {
             var x: i32 = if (builtin.os.tag == .macos) 0 else win.sub_shadow[0];
             var y: i32 = if (builtin.os.tag == .macos) 0 else win.sub_shadow[2];
-            if (builtin.os.tag != .macos) {
+            // The picture's top-left shows buffer coord (crop_x, crop_y)
+            // when cropped (macOS / embedded views).
+            x -= win.crop_x;
+            y -= win.crop_y;
+            if (role == .popup) {
                 if (self.geos.get(parent)) |g| {
                     x += g[0];
                     y += g[1];
@@ -1147,7 +1158,7 @@ pub const AppHost = struct {
             if (sub.win != win) continue;
             const visible = !(win.embedded and sub.parent == win.surface and sub.below);
             c.gtk_widget_set_visible(sub.area, @intFromBool(visible));
-            const base = self.parentPlacement(sub.parent) orelse continue;
+            const base = self.parentPlacement(sub.parent, .subsurface) orelse continue;
             sub.cox = base.x;
             sub.coy = base.y;
             c.gtk_widget_set_margin_start(sub.area, @max(0, base.x + sub.x));
@@ -1161,7 +1172,7 @@ pub const AppHost = struct {
 
     fn materializePopup(self: *AppHost, surface: u32) bool {
         const p = self.pending_popups.get(surface) orelse return false;
-        const base = self.parentPlacement(p.parent) orelse return false;
+        const base = self.parentPlacement(p.parent, .popup) orelse return false;
         const popup = self.allocator.create(Popup) catch return false;
         const area = c.gtk_drawing_area_new() orelse {
             self.allocator.destroy(popup);
@@ -1189,7 +1200,7 @@ pub const AppHost = struct {
 
     fn materializeSubsurface(self: *AppHost, surface: u32) bool {
         const p = self.pending_subsurfaces.get(surface) orelse return false;
-        const base = self.parentPlacement(p.parent) orelse return false;
+        const base = self.parentPlacement(p.parent, .subsurface) orelse return false;
         const sub = self.allocator.create(Subsurface) catch return false;
         const area = c.gtk_drawing_area_new() orelse {
             self.allocator.destroy(sub);
@@ -1278,7 +1289,7 @@ pub const AppHost = struct {
         sub.x = x;
         sub.y = y;
         self.updateShadowLayout(sub.win);
-        const base = self.parentPlacement(sub.parent) orelse return;
+        const base = self.parentPlacement(sub.parent, .subsurface) orelse return;
         sub.cox = base.x;
         sub.coy = base.y;
         c.gtk_widget_set_margin_start(sub.area, @max(0, base.x + x));
@@ -2273,7 +2284,7 @@ pub const AppHost = struct {
             return;
         }
         const popup = self.popups.get(surface) orelse return;
-        const base = self.parentPlacement(parent) orelse return;
+        const base = self.parentPlacement(parent, .popup) orelse return;
         c.gtk_widget_set_margin_start(popup.area, @max(0, base.x + x));
         c.gtk_widget_set_margin_top(popup.area, @max(0, base.y + y));
     }
