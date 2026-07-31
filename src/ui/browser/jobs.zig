@@ -167,6 +167,8 @@ pub const CopyItem = struct {
     dst_path: []u8,
     label: []u8,
     dest_key: u64,
+    move: bool = false,
+    direct: bool = false,
 
     pub fn destroy(self: *CopyItem, allocator: std.mem.Allocator) void {
         allocator.free(self.src_path);
@@ -193,6 +195,7 @@ fn enqueueCrossCopy(
     src_path: []const u8,
     dst_hc: *HostConn,
     dst_path: []const u8,
+    move: bool,
 ) void {
     const item = self.allocator.create(CopyItem) catch return;
     const src = self.allocator.dupe(u8, src_path) catch {
@@ -220,6 +223,8 @@ fn enqueueCrossCopy(
         .dst_path = dst,
         .label = label,
         .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
+        .move = move,
+        .direct = coordinator.host != null,
     };
     self.copy_queue.items.append(self.allocator, item) catch {
         item.destroy(self.allocator);
@@ -300,6 +305,8 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
         .dst_path = item.dst_path,
         .label = item.label,
         .dest_key = item.dest_key,
+        .move = item.move,
+        .direct = item.direct,
     };
     self.allocator.destroy(item);
     _ = submitRetry(self, retry);
@@ -338,14 +345,20 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         retry.destroy(self.allocator);
         return false;
     };
+    // Host strings are relative to the COORDINATOR: the side the
+    // coordinator itself owns is "" (its own disk), and a remote
+    // coordinator resolves the other side through ITS OWN ssh/UDP
+    // config — which is exactly what direct transfer means.
     self.sendOp(retry.coordinator, .{
         .req = req,
         .op = "cross_copy",
         .path = retry.src_path,
         .to = retry.dst_path,
-        .src_host = retry.src_hc.host orelse "",
-        .dst_host = retry.dst_hc.host orelse "",
+        .src_host = if (retry.src_hc == retry.coordinator) "" else retry.src_hc.host orelse "",
+        .dst_host = if (retry.dst_hc == retry.coordinator) "" else retry.dst_hc.host orelse "",
         .@"resume" = true,
+        .delete_src = retry.move,
+        .dial_tries = @as(u32, if (retry.direct) 2 else 0),
     });
     if (retry.attempts == 0) {
         self.setStatusFmt("durable transfer started: {s}", .{retry.label});
@@ -403,6 +416,34 @@ fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     for (pending.items) |retry| _ = submitRetry(self, retry);
     self.renderJobs();
     return 0;
+}
+
+/// A DIRECT remote-to-remote copy whose coordinator could not reach
+/// its peer: resubmit the SAME job through the local daemon (the
+/// relay), which resumes from any staged partial. Spends no automatic
+/// resume attempt — the direct try moved no bytes.
+fn fallbackDirectCopy(self: *BrowserView, row: *JobRow, kind: []const u8) bool {
+    const retry = row.retry orelse return false;
+    if (!retry.direct or !std.mem.eql(u8, kind, "unreachable")) return false;
+    // hostConnFor STARTS a local connection when the view has none yet
+    // (a view browsing two remotes never needed one before) — so a
+    // still-connecting coordinator goes through the retry timer, by
+    // which point the unix-socket autostart has long finished.
+    const local = self.hostConnFor(null) orelse return false;
+    if (local.state == .dead) return false;
+    if (retry.move and local.state == .ready and !local.conn.cross_move) return false;
+    retry.coordinator = local;
+    retry.direct = false;
+    row.retry = retry.clone(self.allocator);
+    if (local.state == .ready) return submitRetry(self, retry);
+    self.retry_pending.append(self.allocator, retry) catch {
+        retry.destroy(self.allocator);
+        return false;
+    };
+    row.retry_scheduled = true;
+    if (self.retry_timer == 0)
+        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    return true;
 }
 
 /// Take over a failed copy's retry record and arm the next attempt.
@@ -490,6 +531,21 @@ pub const TransferOpts = struct {
     delete_src_after: bool = false,
 };
 
+/// The daemon that should coordinate a cross-host copy/move, or null
+/// when none qualifies (a move then degrades to client-mediated).
+/// Remote-to-remote picks the destination daemon when it advertises
+/// cross_move; everything else (and the fallback) is the local daemon,
+/// which for a MOVE must itself advertise cross_move.
+fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, move: bool) ?*HostConn {
+    if (src_hc.host != null and dst_hc.host != null and src_hc != dst_hc and
+        dst_hc.state == .ready and dst_hc.conn.cross_move)
+        return dst_hc;
+    const local = self.hostConnFor(null) orelse return null;
+    if (local.state != .ready) return null;
+    if (move and !local.conn.cross_move) return null;
+    return local;
+}
+
 pub fn startTransfer(
     self: *BrowserView,
     src_hc: *HostConn,
@@ -503,19 +559,30 @@ pub fn startTransfer(
         self.setStatus("both hosts must be connected — retry in a moment");
         return;
     }
-    if (!open_when_done and opts.upload_watch == null and !opts.delete_src_after) {
-        // User copies are coordinated by the local daemon, not this
+    if (!open_when_done and opts.upload_watch == null) {
+        // User copies and moves are coordinated by a DAEMON, not this
         // BrowserView. They therefore survive pane/window teardown and
         // reconnect through the stable job journal. They still queue
         // here first, so a paste of ten files does not put ten helpers
         // on one destination disk at once.
-        const coordinator = self.hostConnFor(null) orelse return;
-        if (coordinator.state != .ready) {
+        //
+        // Coordinator choice: remote-to-remote prefers the DESTINATION
+        // host's own daemon, whose helper dials the source directly —
+        // the bytes never route through this machine. That needs the
+        // cross_move capability (fast dial-failure reporting; for a
+        // move, delete_src honored rather than silently dropped). An
+        // "unreachable" failure falls back to the local relay, which
+        // resumes from the same staged partial.
+        if (pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after)) |coordinator| {
+            enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after);
+            return;
+        }
+        if (!opts.delete_src_after) {
             self.setStatus("local transfer coordinator is not connected");
             return;
         }
-        enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path);
-        return;
+        // A move with no capable daemon anywhere degrades to the old
+        // client-mediated transfer below rather than refusing.
     }
     const x = fstransfer.Xfer.init(
         self.allocator,
@@ -874,7 +941,10 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         // where the link died instead of restarting the transfer. Only
         // once the automatic attempts are spent does the row settle as
         // failed, with the reason and a Retry button.
-        if (scheduleCopyRetry(self, row)) {
+        if (fallbackDirectCopy(self, row, e.kind)) {
+            self.setStatusFmt("direct host-to-host failed, relaying via this machine: {s}", .{row.label});
+            row.setMessage("hosts cannot reach each other -- relaying via this machine");
+        } else if (scheduleCopyRetry(self, row)) {
             self.setStatusFmt("transfer interrupted, resuming shortly: {s} ({s})", .{ row.label, e.message });
             row.setMessage("interrupted -- resuming automatically");
         } else {

@@ -834,6 +834,12 @@ pub const CopyRetry = struct {
     /// Automatic attempts already spent, so a host that is simply gone
     /// stops costing retries and the row settles as failed.
     attempts: u8 = 0,
+    /// A MOVE: the helper deletes the verified source (delete_src).
+    move: bool = false,
+    /// The coordinator is a REMOTE daemon dialing its peer directly.
+    /// An "unreachable" failure re-coordinates through the local
+    /// daemon instead of burning resume attempts.
+    direct: bool = false,
 
     pub fn destroy(self: *CopyRetry, allocator: std.mem.Allocator) void {
         allocator.free(self.src_path);
@@ -868,6 +874,8 @@ pub const CopyRetry = struct {
             .label = label,
             .dest_key = self.dest_key,
             .attempts = self.attempts,
+            .move = self.move,
+            .direct = self.direct,
         };
         return out;
     }
