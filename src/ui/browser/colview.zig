@@ -1279,15 +1279,56 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         buildDirItems(self, tab, tab.root, 0, &items, &alt);
     }
 
-    // Rebinding drops stale path→cell entries as it goes, but cells
-    // that stay unbound would keep pointers to freed items.
-    tab.name_cells.clearRetainingCapacity();
-
     const old_n = itemCount(tab);
-    c.g_list_store_splice(tab.store, 0, old_n, items.items.ptr, @intCast(items.items.len));
+    const new_n: c.guint = @intCast(items.items.len);
+
+    // Windowed splice: rows whose identity AND content are unchanged
+    // keep their exact GObjects, so GTK never rebinds them — a
+    // watch-delta storm on a busy directory repaints only the rows
+    // that changed instead of flickering the whole listing and eating
+    // the click under the cursor. Rows named by `changed_paths`
+    // (structural deltas, fresh media values) are forced into the
+    // window; `changed_all` widens it to everything.
+    var prefix: c.guint = 0;
+    var suffix: c.guint = 0;
+    if (!tab.changed_all) {
+        const lim = @min(old_n, new_n);
+        while (prefix < lim) : (prefix += 1) {
+            const od = itemDataAt(tab, prefix) orelse break;
+            const nd = itemPayload(items.items[prefix]) orelse break;
+            if (!reusableItem(self, tab, od, nd)) break;
+        }
+        while (suffix < lim - prefix) : (suffix += 1) {
+            const od = itemDataAt(tab, old_n - 1 - suffix) orelse break;
+            const nd = itemPayload(items.items[new_n - 1 - suffix]) orelse break;
+            if (!reusableItem(self, tab, od, nd)) break;
+        }
+    }
+    // Reused rows keep their item, but the item's borrowed pointers
+    // must be re-aimed at the fresh (possibly reallocated) entry
+    // storage — delta application nulled them via
+    // invalidateBackingRefs, and leaving them null breaks every later
+    // interaction with those rows.
+    rebindReused(tab, items.items, prefix, suffix, old_n, new_n);
+
+    if (prefix == 0 and suffix == 0) {
+        // Full replacement: rebinding drops stale path→cell entries as
+        // it goes, but cells that stay unbound would keep pointers to
+        // freed items. Partial splices keep out-of-window cells bound
+        // and valid, so their map entries must survive.
+        tab.name_cells.clearRetainingCapacity();
+    }
+    c.g_list_store_splice(
+        tab.store,
+        prefix,
+        old_n - prefix - suffix,
+        items.items.ptr + prefix,
+        new_n - prefix - suffix,
+    );
     for (items.items) |it| {
         if (it) |o| c.g_object_unref(@as(?*anyopaque, o));
     }
+    tab.clearChanged();
 
     // Restore the path selection onto the new items.
     const want = c.gtk_bitset_new_empty() orelse return;
@@ -1307,6 +1348,47 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     setSelection(tab, want);
 
     if (keep_scroll) |value| restoreScroll(tab, value);
+}
+
+/// May the row at this store position keep its GObject for this new
+/// item? Identity must match (path, depth, zebra parity when it
+/// shows, header fields) and the row must not be named as changed.
+fn reusableItem(self: *BrowserView, tab: *BTab, od: *ItemData, nd: *ItemData) bool {
+    if (od.kind != nd.kind) return false;
+    if (od.kind == .group) {
+        return od.group_id == nd.group_id and od.group_count == nd.group_count and
+            std.mem.eql(
+                u8,
+                std.mem.sliceTo(&od.group_label, 0),
+                std.mem.sliceTo(&nd.group_label, 0),
+            );
+    }
+    if (od.depth != nd.depth or od.is_dir != nd.is_dir) return false;
+    if (self.zebra and od.alt != nd.alt) return false;
+    if (!std.mem.eql(u8, od.path, nd.path)) return false;
+    for (tab.changed_paths.items) |chp| {
+        if (std.mem.eql(u8, chp, od.path)) return false;
+    }
+    return true;
+}
+
+/// Re-aim reused rows' borrowed Dir/Entry pointers at the fresh
+/// storage the matching new items carry.
+fn rebindReused(tab: *BTab, new_items: []?*anyopaque, prefix: c.guint, suffix: c.guint, old_n: c.guint, new_n: c.guint) void {
+    var i: c.guint = 0;
+    while (i < prefix) : (i += 1) {
+        const od = itemDataAt(tab, i) orelse continue;
+        const nd = itemPayload(new_items[i]) orelse continue;
+        od.dir = nd.dir;
+        od.entry = nd.entry;
+    }
+    var s: c.guint = 0;
+    while (s < suffix) : (s += 1) {
+        const od = itemDataAt(tab, old_n - 1 - s) orelse continue;
+        const nd = itemPayload(new_items[new_n - 1 - s]) orelse continue;
+        od.dir = nd.dir;
+        od.entry = nd.entry;
+    }
 }
 
 fn appendEntryItem(

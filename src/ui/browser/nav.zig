@@ -303,12 +303,22 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
         new_dir.deinit();
         return;
     };
-    if (new_hc.state == .ready) {
-        self.sendListingOp(p);
-    } else if (new_hc.state == .dead) {
+    if (new_hc.state == .dead) {
         self.setStatus("destination host is unavailable");
         self.dropPending(self.pending.items.len - 1);
+        return;
     }
+    // The location changes NOW: the click's feedback is immediate —
+    // an empty streaming page whose rows fill in as chunks land, not
+    // a frozen click while a slow host computes the first reply.
+    // Ownership of the candidate moves to the tab here (navigation
+    // nulled, so no later dropPending frees it); a refused listing
+    // lands as a load error on the visible dir, and Back works
+    // because the history move already happened.
+    new_dir.streaming = true;
+    p.navigation = null;
+    self.commitNavigation(tab, new_hc, new_dir, intent, "");
+    if (new_hc.state == .ready) self.sendListingOp(p);
 }
 
 pub fn navigateSpec(self: *BrowserView, tab: *BTab, spec: []const u8) void {

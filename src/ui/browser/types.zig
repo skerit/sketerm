@@ -657,6 +657,12 @@ pub const BTab = struct {
     /// replaced -- but the refusal still has to be said, on every
     /// render, until the next navigation lands.
     nav_error: ?[]u8 = null,
+    /// Full paths (owned) whose entries changed content since the last
+    /// render: renderList's windowed splice forces these rows to
+    /// rebind even though their identity (path/depth/parity) matches.
+    /// Overflow trades precision for correctness via `changed_all`.
+    changed_paths: std.ArrayList([]u8) = .empty,
+    changed_all: bool = false,
 
     pub fn subdirByPath(self: *BTab, path: []const u8) ?*Dir {
         for (self.subdirs.items) |d| {
@@ -753,6 +759,47 @@ pub const BTab = struct {
         self.view.allocator.free(msg);
     }
 
+    /// Record one full path as content-changed for the next render's
+    /// windowed splice. Any failure widens the window to everything —
+    /// imprecision may cost a repaint, never a stale row.
+    pub fn noteChangedFull(self: *BTab, full: []const u8) void {
+        if (self.changed_all) return;
+        const a = self.view.allocator;
+        if (self.changed_paths.items.len >= 256) {
+            self.changed_all = true;
+            return;
+        }
+        for (self.changed_paths.items) |existing| {
+            if (std.mem.eql(u8, existing, full)) return;
+        }
+        const owned = a.dupe(u8, full) catch {
+            self.changed_all = true;
+            return;
+        };
+        self.changed_paths.append(a, owned) catch {
+            a.free(owned);
+            self.changed_all = true;
+        };
+    }
+
+    pub fn noteChanged(self: *BTab, dir: *const Dir, name: []const u8) void {
+        var buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{
+            if (dir.path.len == 1) "" else dir.path, name,
+        }) catch {
+            self.changed_all = true;
+            return;
+        };
+        self.noteChangedFull(full);
+    }
+
+    pub fn clearChanged(self: *BTab) void {
+        const a = self.view.allocator;
+        for (self.changed_paths.items) |p| a.free(p);
+        self.changed_paths.clearRetainingCapacity();
+        self.changed_all = false;
+    }
+
     pub fn deinit(self: *BTab) void {
         const a = self.view.allocator;
         // Before anything else: a running query holds a host-side
@@ -783,6 +830,8 @@ pub const BTab = struct {
         if (self.width_fit_src != 0) _ = c.g_source_remove(self.width_fit_src);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
+        self.clearChanged();
+        self.changed_paths.deinit(a);
         self.clearNavError();
         self.vs.deinit(a);
         self.sel.deinit(a);

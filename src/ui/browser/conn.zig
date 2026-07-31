@@ -73,6 +73,16 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
             self.setStatus("local daemon unreachable");
             return hc;
         };
+        // A leftover daemon from before an upgrade keeps serving old
+        // code forever; when it is idle, replace it now.
+        if (hc.conn.upgradeStaleIdle(self.allocator)) {
+            hc.conn.deinit();
+            hc.conn = muxclient.Conn.connectLocalAutostart(self.allocator) catch {
+                hc.state = .dead;
+                self.setStatus("local daemon unreachable");
+                return hc;
+            };
+        }
         self.wireReady(hc);
         return hc;
     }
@@ -166,7 +176,7 @@ pub fn connectThreadMain(ctx: *ConnectCtx) void {
     const alloc = std.heap.c_allocator;
     if (ctx.ticket) |ticket| {
         if (muxclient.Conn.connectUdpTicket(alloc, ctx.host, ticket)) |conn| {
-            ctx.result = conn;
+            ctx.result = upgradeReconnect(alloc, ctx, conn);
             _ = c.g_idle_add(@ptrCast(&onConnectIdle), @ptrCast(ctx));
             return;
         } else |_| {}
@@ -179,11 +189,31 @@ pub fn connectThreadMain(ctx: *ConnectCtx) void {
         if (ctx.port_range.len > 0) ctx.port_range else null,
     );
     if (result) |conn| {
-        ctx.result = conn;
+        ctx.result = upgradeReconnect(alloc, ctx, conn);
     } else |_| {
         ctx.result = null;
     }
     _ = c.g_idle_add(@ptrCast(&onConnectIdle), @ptrCast(ctx));
+}
+
+/// Stale-daemon upgrade, on the worker thread where blocking is
+/// cheap: an idle daemon of a different build is asked to exit and
+/// the reconnect autostarts the freshly deployed binary. One attempt;
+/// any failure keeps or replaces the connection best-effort — a
+/// still-stale daemon is served as-is (and the status line says so).
+fn upgradeReconnect(alloc: std.mem.Allocator, ctx: *ConnectCtx, conn: muxclient.Conn) ?muxclient.Conn {
+    var live = conn;
+    if (!live.upgradeStaleIdle(alloc)) return live;
+    live.deinit();
+    if (muxclient.Conn.connectRemote(
+        alloc,
+        ctx.host,
+        if (ctx.port_range.len > 0) ctx.port_range else null,
+    )) |fresh| {
+        return fresh;
+    } else |_| {
+        return null;
+    }
 }
 
 pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -217,7 +247,15 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         hc.conn = conn;
         view.wireReady(hc);
         const remote = muxclient.RemoteSpec.parse(ctx.host);
-        if (remote.mode == .auto and conn.transport == .ssh) {
+        if (conn.buildStale()) {
+            // Busy daemons cannot be bounced (their sessions are the
+            // user's running work) — but serving old code silently is
+            // how "the fix didn't work" happens. Say it.
+            view.setStatusFmt(
+                "{s}: daemon runs an older sketerm build (busy; upgrades when its sessions end)",
+                .{remote.host},
+            );
+        } else if (remote.mode == .auto and conn.transport == .ssh) {
             view.setStatusFmt("UDP unavailable; connected to {s} over SSH", .{remote.host});
         } else {
             view.setStatusFmt("connected to {s} over {s}", .{ remote.host, @tagName(conn.transport) });
@@ -899,12 +937,14 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                     structural = true;
                     colview.invalidateBackingRefs(tab);
                 }
+                tab.noteChanged(dir, we.name);
                 dir.upsert(we);
             } else if (std.mem.eql(u8, ch.op, "del")) {
                 if (!structural) {
                     structural = true;
                     colview.invalidateBackingRefs(tab);
                 }
+                tab.noteChanged(dir, ch.name);
                 dir.del(ch.name);
             }
         }
