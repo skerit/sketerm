@@ -47,6 +47,55 @@ const Runner = struct {
     run: *const fn (?*anyopaque, [*:0]const u8, []const u8, [:0]const u8, ?[]const u8) u8,
 };
 
+/// How long a verified remote deployment is trusted before it is
+/// re-checked over ssh. Every helper process (mount, cross-copy job)
+/// used to pay the check round trip on every single dial.
+const DEPLOY_MEMO_TTL_S: i64 = 600;
+
+fn deployMemoPath(buf: []u8, host: []const u8, hash: []const u8) ?[:0]const u8 {
+    const h = std.hash.Wyhash.hash(0, host);
+    const tail = hash[0..@min(hash.len, 16)];
+    if (c.getenv("XDG_CACHE_HOME")) |raw| {
+        const base = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        return std.fmt.bufPrintZ(buf, "{s}/sketerm/mux/deployed-{x:0>16}-{s}", .{ base, h, tail }) catch null;
+    }
+    const home_raw = c.getenv("HOME") orelse return null;
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
+    return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/deployed-{x:0>16}-{s}", .{ home, h, tail }) catch null;
+}
+
+fn deployMemoFresh(host: []const u8, hash: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const path = deployMemoPath(&buf, host, hash) orelse return false;
+    var st: c.struct_stat = undefined;
+    if (c.stat(path.ptr, &st) != 0) return false;
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+    return @as(i64, ts.tv_sec) - @as(i64, mtime) <= DEPLOY_MEMO_TTL_S;
+}
+
+fn deployMemoStamp(host: []const u8, hash: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const path = deployMemoPath(&buf, host, hash) orelse return;
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+        var dir_buf: [4096:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{path[0..slash]})) |dir| {
+            var i: usize = 1;
+            while (i <= dir.len) : (i += 1) {
+                if (i == dir.len or dir[i] == '/') {
+                    const save = dir[i];
+                    dir_buf[i] = 0;
+                    _ = c.mkdir(dir.ptr, 0o700);
+                    dir_buf[i] = save;
+                }
+            }
+        } else |_| {}
+    }
+    const fp = c.fopen(path.ptr, "we") orelse return;
+    _ = c.fclose(fp);
+}
+
 /// Ensure the matching portable mux exists remotely; null preserves PATH fallback.
 pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
     // Existing test/transport wrappers expect only the historical proxy argv.
@@ -56,9 +105,23 @@ pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
     var artifact_path_buf: [4096:0]u8 = undefined;
     const artifact_path = findPortable(&artifact_path_buf) orelse return null;
     const artifact = inspectArtifact(artifact_path) orelse return null;
+    // A recent verified deploy of this exact artifact skips the ssh
+    // check leg entirely (content-addressed path, so a stale memo can
+    // only name a binary that once passed its own --help probe).
+    if (deployMemoFresh(host, &artifact.hash.hex)) {
+        const remote_path = std.fmt.allocPrintSentinel(
+            allocator,
+            "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
+            .{&artifact.hash.hex},
+            0,
+        ) catch return null;
+        return .{ .allocator = allocator, .path = remote_path };
+    }
     const ssh_env = c.getenv("SKETERM_SSH");
     const ssh_bin: [*:0]const u8 = if (ssh_env) |p| p else "ssh";
-    return ensureUsing(allocator, host, ssh_bin, artifact, .{ .run = runSshCommand });
+    const prepared = ensureUsing(allocator, host, ssh_bin, artifact, .{ .run = runSshCommand });
+    if (prepared != null) deployMemoStamp(host, &artifact.hash.hex);
+    return prepared;
 }
 
 /// Resolve the expected content-addressed path without touching the network.
