@@ -11517,3 +11517,22 @@ clicks (~100-200ms repaints), Up supersedes a pending slow navigation
 instantly, thumbnails trickle in. Suite 1092/5/0, test-core 926/5/0,
 smoke-fs, smoke-mux, smoke-e2e all pass; new unit test for
 countOnlyIndex.
+
+## 2026-07-31: local persistent cache for remote thumbnails
+
+Remote thumbnails only lived in a 256-entry in-memory map, so every
+new browser process re-fetched them (job round trip + transfer per
+file). The transport sidecar bytes (JXL/WebP, 3-6x smaller than the
+spec PNG the remote's freedesktop cache stores) now persist under
+$XDG_CACHE_HOME/sketerm/remote-thumbs/: filename md5("host:path"),
+12-byte header (magic + mtime_ms) validates freshness, stale entries
+overwrite in place, a lazy oldest-first sweep (once per process, cap
+4096 files) bounds growth. thumbLookup checks the disk before the
+wire; a hit decodes on the existing worker thread. Local-daemon
+fetches never land there (their freedesktop cache is already local).
+
+Proven on the 150KB/s fake-remote rig by timeline: run 1 wrote all 59
+sidecars; run 2 (fresh process) rendered every thumbnail with zero
+cache rewrites (= zero wire fetches); touching a photo on the remote
+re-fetched exactly that one entry once. Suite 1094/5/0; new unit
+tests for the header round-trip and cache-name derivation.
