@@ -320,10 +320,16 @@ fn placeRowMarkup(self: *BrowserView, icon: [*:0]const u8, markup: [*:0]const u8
 }
 
 pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec: []const u8, is_bookmark: bool) void {
+    const img = iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), icon, 16);
+    placeRowWithIcon(self, img, label, spec, is_bookmark);
+}
+
+/// A places row whose icon widget the caller already built (custom
+/// bookmark icons: image files and emoji are not themed icon names).
+fn placeRowWithIcon(self: *BrowserView, icon_widget: *c.GtkWidget, label: []const u8, spec: []const u8, is_bookmark: bool) void {
     const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_margin_start(hbox, 10);
-    const img = iconload.newImageIcon(@ptrCast(@alignCast(self.places_list)), icon, 16);
-    c.gtk_box_append(@ptrCast(hbox), img);
+    c.gtk_box_append(@ptrCast(hbox), icon_widget);
     var lz: [256:0]u8 = undefined;
     const n = @min(label.len, lz.len - 1);
     @memcpy(lz[0..n], label[0..n]);
@@ -334,14 +340,50 @@ pub fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec
     c.gtk_widget_set_hexpand(lab, 1);
     c.gtk_box_append(@ptrCast(hbox), lab);
     const ctx = makePlaceCtx(self, spec, is_bookmark) orelse return;
-    if (is_bookmark) {
-        const rm = c.gtk_button_new_from_icon_name("window-close-symbolic");
-        c.gtk_button_set_has_frame(@ptrCast(rm), 0);
-        c.gtk_widget_set_tooltip_text(rm, "Remove bookmark");
-        _ = c.g_signal_connect_data(rm, "clicked", @ptrCast(&onBookmarkRemove), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(hbox), rm);
-    }
     appendPlaceRow(self, hbox, ctx);
+}
+
+const DEFAULT_BOOKMARK_ICON = "starred-symbolic";
+
+/// Resolve a bookmark's icon value into a 16px widget: "" = the
+/// default star, "/..." = an image file (broken file falls back),
+/// a leading non-ASCII codepoint = emoji rendered as a label, and
+/// anything else a themed icon name.
+fn bookmarkIconWidget(self: *BrowserView, icon: []const u8) *c.GtkWidget {
+    const anchor: *c.GtkWidget = @ptrCast(@alignCast(self.places_list));
+    if (icon.len == 0) return iconload.newImageIcon(anchor, DEFAULT_BOOKMARK_ICON, 16);
+    if (icon[0] == '/') {
+        var pz: [4096:0]u8 = undefined;
+        if (icon.len < pz.len) {
+            @memcpy(pz[0..icon.len], icon);
+            pz[icon.len] = 0;
+            if (c.gdk_pixbuf_new_from_file_at_size(&pz, 16, 16, null)) |pb| {
+                defer c.g_object_unref(@as(?*anyopaque, @ptrCast(pb)));
+                if (c.gdk_texture_new_for_pixbuf(pb)) |tex| {
+                    defer c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+                    const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+                    c.gtk_image_set_pixel_size(@ptrCast(@alignCast(img)), 16);
+                    return img;
+                }
+            }
+        }
+        return iconload.newImageIcon(anchor, DEFAULT_BOOKMARK_ICON, 16);
+    }
+    if (icon[0] >= 0x80) {
+        // Emoji (or any non-ASCII text): a plain label, no markup.
+        var z: [64:0]u8 = undefined;
+        const n = @min(icon.len, z.len - 1);
+        @memcpy(z[0..n], icon[0..n]);
+        z[n] = 0;
+        const lab = c.gtk_label_new(&z);
+        c.gtk_widget_set_size_request(lab, 16, -1);
+        return lab;
+    }
+    var z: [128:0]u8 = undefined;
+    const n = @min(icon.len, z.len - 1);
+    @memcpy(z[0..n], icon[0..n]);
+    z[n] = 0;
+    return iconload.newImageIcon(anchor, &z, 16);
 }
 
 pub fn renderPlaces(self: *BrowserView) void {
@@ -441,7 +483,8 @@ fn renderBookmarksSection(self: *BrowserView) void {
     if (sectionCollapsed(self, "Bookmarks")) return;
     for (self.bookmarks.items, 0..) |b, i| {
         const label = bookmarkLabelAt(self, i) orelse std.fs.path.basename(b);
-        self.placeRow("starred-symbolic", label, b, true);
+        const img = bookmarkIconWidget(self, bookmarkIconAt(self, i));
+        placeRowWithIcon(self, img, label, b, true);
     }
 }
 
@@ -598,6 +641,7 @@ pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user:
         const extra = m.section();
         if (is_bookmark) {
             extra.item("Rename Bookmark…", &onBookmarkRenameItem, @ptrCast(ctx));
+            extra.item("Change Icon…", &onBookmarkIconItem, @ptrCast(ctx));
             extra.item("Move Up", &onBookmarkMoveUp, @ptrCast(ctx));
             extra.item("Move Down", &onBookmarkMoveDown, @ptrCast(ctx));
             extra.item("Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx));
@@ -745,7 +789,7 @@ fn onSectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 fn onNewWidgetSection(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
-    openNamePrompt(ctx.view, .new_section, 0, "New Widget Section", "section name", "");
+    openNamePrompt(ctx.view, .new_section, 0, "New Widget Section", "section name", "", null);
 }
 
 fn onBookmarkHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -818,7 +862,22 @@ fn onBookmarkRenameItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = ctx.view;
     const i = bookmarkIndexOf(self, ctx.spec) orelse return;
     const current = bookmarkLabelAt(self, i) orelse std.fs.path.basename(self.bookmarks.items[i]);
-    openNamePrompt(self, .rename_bookmark, i, "Rename Bookmark", "bookmark label", current);
+    openNamePrompt(self, .rename_bookmark, i, "Rename Bookmark", "bookmark label", current, null);
+}
+
+fn onBookmarkIconItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const i = bookmarkIndexOf(self, ctx.spec) orelse return;
+    openNamePrompt(
+        self,
+        .set_bookmark_icon,
+        i,
+        "Bookmark Icon",
+        "icon name, emoji, or image path",
+        bookmarkIconAt(self, i),
+        "Icon name (e.g. folder-music-symbolic), an emoji, or an absolute image path. Empty resets to the default.",
+    );
 }
 
 fn onBookmarkMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -838,7 +897,7 @@ fn onBookmarkMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 const NamePromptCtx = struct {
     allocator: std.mem.Allocator,
     view: *BrowserView,
-    purpose: enum { new_section, rename_bookmark },
+    purpose: enum { new_section, rename_bookmark, set_bookmark_icon },
     aux: usize,
     window: *c.GtkWidget,
     entry: *c.GtkWidget,
@@ -856,6 +915,7 @@ fn openNamePrompt(
     title: [*:0]const u8,
     placeholder: [*:0]const u8,
     initial: []const u8,
+    hint: ?[*:0]const u8,
 ) void {
     const win = c.gtk_window_new();
     c.gtk_window_set_title(@ptrCast(win), title);
@@ -879,6 +939,14 @@ fn openNamePrompt(
         c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
     }
     c.gtk_box_append(@ptrCast(vbox), entry);
+    if (hint) |h| {
+        const hl = c.gtk_label_new(h);
+        c.gtk_label_set_xalign(@ptrCast(hl), 0);
+        c.gtk_label_set_wrap(@ptrCast(hl), 1);
+        c.gtk_widget_add_css_class(hl, "dim-label");
+        c.gtk_widget_add_css_class(hl, "caption");
+        c.gtk_box_append(@ptrCast(vbox), hl);
+    }
     const btnbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
     c.gtk_widget_set_halign(btnbox, c.GTK_ALIGN_END);
     const cancel = c.gtk_button_new_with_label("Cancel");
@@ -931,6 +999,7 @@ fn onNamePromptOk(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     switch (purpose) {
         .new_section => sidewidgets.addSection(self, name),
         .rename_bookmark => setBookmarkLabel(self, aux, name),
+        .set_bookmark_icon => setBookmarkIcon(self, aux, name),
     }
 }
 
@@ -1114,22 +1183,6 @@ pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     self.setStatusFmt("saved query: {s}", .{ls.pattern});
 }
 
-pub fn onBookmarkRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlaceCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    if (std.mem.startsWith(u8, ctx.spec, "search:")) {
-        const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
-        if (idx < self.saved_searches.items.len) {
-            self.saved_searches.items[idx].deinitOwned(self.allocator);
-            _ = self.saved_searches.orderedRemove(idx);
-        }
-    } else {
-        while (bookmarkIndexOf(self, ctx.spec)) |i| removeBookmarkAt(self, i);
-    }
-    self.savePlaces();
-    self.renderPlaces();
-}
-
 pub fn savePlaces(self: *BrowserView) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
@@ -1141,6 +1194,11 @@ pub fn savePlaces(self: *BrowserView) void {
     const bl = a.alloc([]const u8, self.bookmarks.items.len) catch return;
     for (bm, 0..) |_, i| {
         bl[i] = if (i < self.bookmark_labels.items.len) self.bookmark_labels.items[i] else "";
+    }
+    // Icons follow the same strict-parallel rule as the labels.
+    const bi = a.alloc([]const u8, self.bookmarks.items.len) catch return;
+    for (bm, 0..) |_, i| {
+        bi[i] = if (i < self.bookmark_icons.items.len) self.bookmark_icons.items[i] else "";
     }
     const hs = a.alloc([]const u8, self.hidden_sections.items.len) catch return;
     for (self.hidden_sections.items, 0..) |k, i| hs[i] = k;
@@ -1162,6 +1220,7 @@ pub fn savePlaces(self: *BrowserView) void {
     places_mod.save(self.allocator, .{
         .bookmarks = bm,
         .bookmark_labels = bl,
+        .bookmark_icons = bi,
         .recent = rc,
         .frecency = fr,
         .searches = sq,
@@ -1187,6 +1246,13 @@ pub fn bookmarkLabelAt(self: *BrowserView, i: usize) ?[]const u8 {
     return if (l.len == 0) null else l;
 }
 
+/// The custom icon value for bookmark `i`; "" (also for a short list,
+/// an older places.json) = the default icon.
+pub fn bookmarkIconAt(self: *BrowserView, i: usize) []const u8 {
+    if (i >= self.bookmark_icons.items.len) return "";
+    return self.bookmark_icons.items[i];
+}
+
 fn bookmarkIndexOf(self: *BrowserView, spec: []const u8) ?usize {
     for (self.bookmarks.items, 0..) |b, i| {
         if (std.mem.eql(u8, b, spec)) return i;
@@ -1194,7 +1260,19 @@ fn bookmarkIndexOf(self: *BrowserView, spec: []const u8) ?usize {
     return null;
 }
 
-/// Remove bookmark `i` together with its label slot.
+/// Pad an owned-string parallel list with "" up to index `i`.
+fn padParallel(self: *BrowserView, list: *std.ArrayList([]u8), i: usize) bool {
+    while (list.items.len <= i) {
+        const empty = self.allocator.dupe(u8, "") catch return false;
+        list.append(self.allocator, empty) catch {
+            self.allocator.free(empty);
+            return false;
+        };
+    }
+    return true;
+}
+
+/// Remove bookmark `i` together with its label and icon slots.
 fn removeBookmarkAt(self: *BrowserView, i: usize) void {
     if (i >= self.bookmarks.items.len) return;
     self.allocator.free(self.bookmarks.items[i]);
@@ -1203,22 +1281,22 @@ fn removeBookmarkAt(self: *BrowserView, i: usize) void {
         self.allocator.free(self.bookmark_labels.items[i]);
         _ = self.bookmark_labels.orderedRemove(i);
     }
+    if (i < self.bookmark_icons.items.len) {
+        self.allocator.free(self.bookmark_icons.items[i]);
+        _ = self.bookmark_icons.orderedRemove(i);
+    }
 }
 
-/// Move bookmark `i` (and its label) one slot up or down.
+/// Move bookmark `i` (with its label and icon) one slot up or down.
 pub fn moveBookmark(self: *BrowserView, i: usize, up: bool) void {
     const items = self.bookmarks.items;
     const j = if (up) (if (i == 0) return else i - 1) else (if (i + 1 >= items.len) return else i + 1);
     std.mem.swap([]u8, &items[i], &items[j]);
-    // Keep the labels list long enough to swap in step.
-    while (self.bookmark_labels.items.len <= @max(i, j)) {
-        const empty = self.allocator.dupe(u8, "") catch return;
-        self.bookmark_labels.append(self.allocator, empty) catch {
-            self.allocator.free(empty);
-            return;
-        };
-    }
+    // Keep the parallel lists long enough to swap in step.
+    if (!padParallel(self, &self.bookmark_labels, @max(i, j))) return;
     std.mem.swap([]u8, &self.bookmark_labels.items[i], &self.bookmark_labels.items[j]);
+    if (!padParallel(self, &self.bookmark_icons, @max(i, j))) return;
+    std.mem.swap([]u8, &self.bookmark_icons.items[i], &self.bookmark_icons.items[j]);
     self.savePlaces();
     self.renderPlaces();
 }
@@ -1226,16 +1304,21 @@ pub fn moveBookmark(self: *BrowserView, i: usize, up: bool) void {
 /// Set (or with "" clear) the custom label of bookmark `i`.
 pub fn setBookmarkLabel(self: *BrowserView, i: usize, label: []const u8) void {
     if (i >= self.bookmarks.items.len) return;
-    while (self.bookmark_labels.items.len <= i) {
-        const empty = self.allocator.dupe(u8, "") catch return;
-        self.bookmark_labels.append(self.allocator, empty) catch {
-            self.allocator.free(empty);
-            return;
-        };
-    }
+    if (!padParallel(self, &self.bookmark_labels, i)) return;
     const owned = self.allocator.dupe(u8, label) catch return;
     self.allocator.free(self.bookmark_labels.items[i]);
     self.bookmark_labels.items[i] = owned;
+    self.savePlaces();
+    self.renderPlaces();
+}
+
+/// Set (or with "" reset) the custom icon of bookmark `i`.
+pub fn setBookmarkIcon(self: *BrowserView, i: usize, icon: []const u8) void {
+    if (i >= self.bookmarks.items.len) return;
+    if (!padParallel(self, &self.bookmark_icons, i)) return;
+    const owned = self.allocator.dupe(u8, icon) catch return;
+    self.allocator.free(self.bookmark_icons.items[i]);
+    self.bookmark_icons.items[i] = owned;
     self.savePlaces();
     self.renderPlaces();
 }
@@ -1251,6 +1334,8 @@ pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
     };
     const empty = self.allocator.dupe(u8, "") catch null;
     if (empty) |e| self.bookmark_labels.append(self.allocator, e) catch self.allocator.free(e);
+    const empty_icon = self.allocator.dupe(u8, "") catch null;
+    if (empty_icon) |e| self.bookmark_icons.append(self.allocator, e) catch self.allocator.free(e);
     self.savePlaces();
     if (self.places_on) self.renderPlaces();
     self.setStatusFmt("bookmarked: {s}", .{spec});

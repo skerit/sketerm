@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const snapshots = @import("../../filebrowser/snapshots.zig");
 const fsserve = @import("../../mux/fsserve.zig");
 
 const BTab = @import("types.zig").BTab;
@@ -585,6 +586,22 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
 
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
+    // Previous versions from btrfs snapshots (Timeshift/snapper),
+    // discovered with plain list+stat ops so it works for any host.
+    const snap_head = c.gtk_label_new("Previous Versions");
+    c.gtk_widget_add_css_class(snap_head, "heading");
+    c.gtk_label_set_xalign(@ptrCast(snap_head), 0);
+    c.gtk_box_append(@ptrCast(box), snap_head);
+    const snap_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+    const snap_wait = c.gtk_label_new("Searching snapshots…");
+    c.gtk_label_set_xalign(@ptrCast(snap_wait), 0);
+    c.gtk_widget_add_css_class(snap_wait, "dim-label");
+    c.gtk_box_append(@ptrCast(snap_box), snap_wait);
+    c.gtk_box_append(@ptrCast(box), snap_box);
+    self.requestSnapshots(ctx, snap_box);
+
+    c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
     const grid = c.gtk_grid_new();
     c.gtk_grid_set_row_spacing(@ptrCast(grid), 2);
     c.gtk_grid_set_column_spacing(@ptrCast(grid), 8);
@@ -913,6 +930,341 @@ pub fn parseId(entry: *c.GtkWidget) ?u32 {
     const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     if (txt.len == 0) return null;
     return std.fmt.parseInt(u32, txt, 10) catch null;
+}
+
+// ── Previous Versions (btrfs snapshots) ──────────────────────────
+
+/// The dim one-liner every failure path degrades to.
+const SNAP_NONE = "No snapshots found (Timeshift/snapper btrfs snapshots are detected)";
+
+/// The in-flight snapshot discovery for an open Properties dialog:
+/// a small client-driven state machine over plain `list`/`stat` ops,
+/// so it needs no daemon verb and works for remote hosts unchanged.
+/// The box is g_object_ref'd, so a closed dialog cannot dangle; one
+/// per view (a newer dialog supersedes an older search), mirroring
+/// `AttrRequest`.
+pub const SnapRequest = struct {
+    allocator: std.mem.Allocator,
+    hc: *HostConn,
+    box: *c.GtkWidget,
+    /// The original file's absolute path (owned).
+    path: []u8,
+    /// The ONE outstanding fs request (list chunks share it).
+    req: u32,
+    phase: enum { list_timeshift, probe_localhost, probe_at, list_snapper, stat_versions },
+    layout: snapshots.Layout = .timeshift_localhost,
+    /// Snapshot names (owned), newest first once sorted.
+    names: std.ArrayList([]u8) = .empty,
+    /// The candidate currently being stat'ed.
+    idx: usize = 0,
+    /// Stat hits, in newest-first candidate order.
+    hits: std.ArrayList(snapshots.Version) = .empty,
+
+    fn clearNames(self: *SnapRequest) void {
+        for (self.names.items) |n| self.allocator.free(n);
+        self.names.clearRetainingCapacity();
+    }
+
+    fn destroy(self: *SnapRequest) void {
+        c.g_object_unref(@ptrCast(self.box));
+        self.clearNames();
+        self.names.deinit(self.allocator);
+        self.hits.deinit(self.allocator);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
+fn setSnapLine(box: *c.GtkWidget, message: [*:0]const u8) void {
+    clearBox(box);
+    const lbl = c.gtk_label_new(message);
+    c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+    c.gtk_widget_add_css_class(lbl, "dim-label");
+    c.gtk_box_append(@ptrCast(box), lbl);
+}
+
+pub fn endSnapRequest(self: *BrowserView) void {
+    const sr = self.snap_request orelse return;
+    self.snap_request = null;
+    sr.destroy();
+}
+
+/// Show the none-line and end the search: every error path lands
+/// here (host death included), deliberately silent about the reason.
+pub fn snapDegrade(self: *BrowserView) void {
+    const sr = self.snap_request orelse return;
+    setSnapLine(sr.box, SNAP_NONE);
+    self.endSnapRequest();
+}
+
+pub fn requestSnapshots(self: *BrowserView, ctx: *PropsCtx, box: *c.GtkWidget) void {
+    const hc = ctx.tab.hc;
+    if (self.snap_request != null) {
+        // A newer dialog supersedes the older search (one in flight
+        // per view, like AttrRequest); its section settles as "none".
+        setSnapLine(self.snap_request.?.box, SNAP_NONE);
+        self.endSnapRequest();
+    }
+    if (hc.state != .ready) return setSnapLine(box, SNAP_NONE);
+    const sr = self.allocator.create(SnapRequest) catch return setSnapLine(box, SNAP_NONE);
+    const path = self.allocator.dupe(u8, ctx.path) catch {
+        self.allocator.destroy(sr);
+        return setSnapLine(box, SNAP_NONE);
+    };
+    _ = c.g_object_ref(@ptrCast(box));
+    sr.* = .{
+        .allocator = self.allocator,
+        .hc = hc,
+        .box = box,
+        .path = path,
+        .req = self.nextReq(),
+        .phase = .list_timeshift,
+    };
+    self.snap_request = sr;
+    self.sendOp(hc, .{ .req = sr.req, .op = "list", .path = snapshots.TIMESHIFT_ROOT });
+}
+
+/// Advance to the snapper layout after Timeshift yielded nothing.
+fn snapTrySnapper(self: *BrowserView, sr: *SnapRequest) void {
+    sr.clearNames();
+    sr.phase = .list_snapper;
+    sr.req = self.nextReq();
+    self.sendOp(sr.hc, .{ .req = sr.req, .op = "list", .path = snapshots.SNAPPER_ROOT });
+}
+
+/// Sort newest first, cap the stat work, and begin statting versions.
+fn snapStartStats(self: *BrowserView, sr: *SnapRequest) void {
+    if (sr.names.items.len == 0) return snapDegrade(self);
+    snapshots.sortNewestFirst(sr.names.items, sr.layout == .snapper);
+    while (sr.names.items.len > snapshots.MAX_SNAPSHOTS) {
+        const n = sr.names.pop() orelse break;
+        sr.allocator.free(n);
+    }
+    sr.idx = 0;
+    sr.phase = .stat_versions;
+    snapSendNextStat(self, sr);
+}
+
+/// Stat the next candidate, skipping ones whose path cannot be
+/// built; past the last, finish.
+fn snapSendNextStat(self: *BrowserView, sr: *SnapRequest) void {
+    var buf: [4600]u8 = undefined;
+    while (sr.idx < sr.names.items.len) {
+        const vpath = snapshots.versionPath(&buf, sr.layout, sr.names.items[sr.idx], sr.path) orelse {
+            sr.idx += 1;
+            continue;
+        };
+        sr.req = self.nextReq();
+        self.sendOp(sr.hc, .{ .req = sr.req, .op = "stat", .path = vpath });
+        return;
+    }
+    snapFinish(self, sr);
+}
+
+/// Dedupe the hits and render one row per surviving version.
+fn snapFinish(self: *BrowserView, sr: *SnapRequest) void {
+    const kept = snapshots.dedupeNewestFirst(sr.hits.items);
+    if (kept == 0) return snapDegrade(self);
+    clearBox(sr.box);
+    var buf: [4600]u8 = undefined;
+    for (sr.hits.items[0..kept]) |v| {
+        const vpath = snapshots.versionPath(&buf, sr.layout, sr.names.items[v.snap], sr.path) orelse continue;
+        appendSnapRow(self, sr, vpath, v);
+    }
+    if (c.gtk_widget_get_first_child(sr.box) == null) setSnapLine(sr.box, SNAP_NONE);
+    self.endSnapRequest();
+}
+
+fn appendSnapRow(self: *BrowserView, sr: *SnapRequest, vpath: []const u8, v: snapshots.Version) void {
+    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    var tbuf: [40:0]u8 = undefined;
+    var human: [48:0]u8 = undefined;
+    var text: [96:0]u8 = undefined;
+    const label_txt = std.fmt.bufPrintZ(&text, "{s}  {s}", .{
+        std.mem.span(fmtTimeZ(&tbuf, v.mtime_ms)), fmtSize(&human, v.size),
+    }) catch return;
+    const lbl = c.gtk_label_new(label_txt.ptr);
+    c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+    c.gtk_widget_set_hexpand(lbl, 1);
+    var tipz: [4700:0]u8 = undefined;
+    c.gtk_widget_set_tooltip_text(lbl, copyZ(@ptrCast(&tipz), vpath));
+    c.gtk_box_append(@ptrCast(row), lbl);
+
+    // One heap ctx per button: each connection frees its own via
+    // GDestroyNotify (the AttrRowCtx pattern).
+    if (makeSnapRowCtx(self, sr, vpath, v.mtime_ms)) |octx| {
+        const open = c.gtk_button_new_with_label("Open");
+        _ = c.g_signal_connect_data(open, "clicked", @ptrCast(&onSnapOpen), @ptrCast(octx), @ptrCast(&SnapRowCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), open);
+    }
+    if (makeSnapRowCtx(self, sr, vpath, v.mtime_ms)) |rctx| {
+        const restore = c.gtk_button_new_with_label("Restore a Copy…");
+        _ = c.g_signal_connect_data(restore, "clicked", @ptrCast(&onSnapRestore), @ptrCast(rctx), @ptrCast(&SnapRowCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), restore);
+    }
+    c.gtk_box_append(@ptrCast(sr.box), row);
+}
+
+/// Heap context for one version row button.
+pub const SnapRowCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    hc: *HostConn,
+    /// The versioned file inside the snapshot (owned).
+    vpath: []u8,
+    /// The original file the dialog describes (owned).
+    orig: []u8,
+    mtime_ms: i64,
+
+    fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.free(ctx.vpath);
+        ctx.allocator.free(ctx.orig);
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+fn makeSnapRowCtx(self: *BrowserView, sr: *SnapRequest, vpath: []const u8, mtime_ms: i64) ?*SnapRowCtx {
+    const ctx = self.allocator.create(SnapRowCtx) catch return null;
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .hc = sr.hc,
+        .vpath = self.allocator.dupe(u8, vpath) catch {
+            self.allocator.destroy(ctx);
+            return null;
+        },
+        .orig = self.allocator.dupe(u8, sr.path) catch {
+            self.allocator.free(ctx.vpath);
+            self.allocator.destroy(ctx);
+            return null;
+        },
+        .mtime_ms = mtime_ms,
+    };
+    return ctx;
+}
+
+/// Open the snapshot's copy read-only-in-effect: the snapshot subvol
+/// is mounted read-only, so opening the path directly is safe.
+pub fn onSnapOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    if (ctx.hc.host != null and ctx.hc.state != .ready)
+        return self.setStatusFmt("not connected to {s}", .{ctx.hc.label()});
+    self.openPathOnHost(ctx.hc, ctx.vpath);
+}
+
+/// Copy the version NEXT TO the original as "<name> (from
+/// YYYY-MM-DD)" through the normal daemon copy job -- the original
+/// is never overwritten.
+pub fn onSnapRestore(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    if (ctx.hc.state != .ready)
+        return self.setStatusFmt("not connected to {s}", .{ctx.hc.label()});
+    var t: c.time_t = @intCast(@divTrunc(ctx.mtime_ms, 1000));
+    var tm: c.struct_tm = undefined;
+    if (c.localtime_r(&t, &tm) == null) return;
+    var datez: [16:0]u8 = undefined;
+    const n = c.strftime(&datez, datez.len - 1, "%Y-%m-%d", &tm);
+    var dst_buf: [4700]u8 = undefined;
+    const dst = snapshots.restoreCopyPath(&dst_buf, ctx.orig, datez[0..n]) orelse return;
+    var lblbuf: [128]u8 = undefined;
+    const label = std.fmt.bufPrint(&lblbuf, "restore {s}", .{std.fs.path.basename(ctx.orig)}) catch "restore";
+    self.startDaemonJob(ctx.hc, "copy", ctx.vpath, dst, label);
+    self.setStatusFmt("restoring a copy of {s}", .{std.fs.path.basename(ctx.orig)});
+}
+
+/// Route fs replies belonging to the snapshot search.
+/// @return true when the frame was consumed.
+pub fn feedSnapRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+    if (ftype != .fs_reply) return false;
+    const sr = self.snap_request orelse return false;
+    if (sr.hc != hc) return false;
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    if (rep.req == 0 or rep.req != sr.req) return false;
+
+    switch (sr.phase) {
+        .list_timeshift, .list_snapper => {
+            const snapper = sr.phase == .list_snapper;
+            if (!rep.ok) {
+                if (snapper) snapDegrade(self) else snapTrySnapper(self, sr);
+                return true;
+            }
+            for (rep.entries) |we| {
+                if (!we.tdir) continue;
+                if (snapper and !snapshots.isSnapperName(we.name)) continue;
+                const name = sr.allocator.dupe(u8, we.name) catch continue;
+                sr.names.append(sr.allocator, name) catch sr.allocator.free(name);
+            }
+            if (rep.more) return true;
+            if (sr.names.items.len == 0) {
+                if (snapper) snapDegrade(self) else snapTrySnapper(self, sr);
+                return true;
+            }
+            if (snapper) {
+                sr.layout = .snapper;
+                snapStartStats(self, sr);
+                return true;
+            }
+            // Which Timeshift sub-layout? Probe the newest snapshot.
+            snapshots.sortNewestFirst(sr.names.items, false);
+            var buf: [4600]u8 = undefined;
+            const probe = snapshots.timeshiftProbe(&buf, sr.names.items[0], false) orelse {
+                snapTrySnapper(self, sr);
+                return true;
+            };
+            sr.phase = .probe_localhost;
+            sr.req = self.nextReq();
+            self.sendOp(sr.hc, .{ .req = sr.req, .op = "stat", .path = probe });
+            return true;
+        },
+        .probe_localhost => {
+            if (rep.ok and rep.entry != null and rep.entry.?.tdir) {
+                sr.layout = .timeshift_localhost;
+                snapStartStats(self, sr);
+                return true;
+            }
+            var buf: [4600]u8 = undefined;
+            const probe = snapshots.timeshiftProbe(&buf, sr.names.items[0], true) orelse {
+                snapTrySnapper(self, sr);
+                return true;
+            };
+            sr.phase = .probe_at;
+            sr.req = self.nextReq();
+            self.sendOp(sr.hc, .{ .req = sr.req, .op = "stat", .path = probe });
+            return true;
+        },
+        .probe_at => {
+            if (rep.ok and rep.entry != null and rep.entry.?.tdir) {
+                sr.layout = .timeshift_at;
+                snapStartStats(self, sr);
+            } else {
+                // The Timeshift root exists but maps nothing we
+                // recognize; snapper may still cover this path.
+                snapTrySnapper(self, sr);
+            }
+            return true;
+        },
+        .stat_versions => {
+            if (rep.ok) {
+                if (rep.entry) |we| {
+                    sr.hits.append(sr.allocator, .{
+                        .snap = sr.idx,
+                        .size = we.size,
+                        .mtime_ms = we.mtime_ms,
+                    }) catch {};
+                }
+            }
+            sr.idx += 1;
+            snapSendNextStat(self, sr);
+            return true;
+        },
+    }
 }
 
 // ── background-click (folder) properties ─────────────────────────

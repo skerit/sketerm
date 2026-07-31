@@ -119,6 +119,7 @@ comptime {
     _ = @import("filebrowser/transfers.zig");
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/entry.zig");
+    _ = @import("filebrowser/incomplete.zig");
     _ = @import("filebrowser/crumbs.zig");
     _ = @import("filebrowser/fileicon.zig");
     _ = @import("filebrowser/format.zig");
@@ -131,6 +132,7 @@ comptime {
     _ = @import("filebrowser/viewmem.zig");
     _ = @import("filebrowser/registers.zig");
     _ = @import("filebrowser/query.zig");
+    _ = @import("filebrowser/snapshots.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
