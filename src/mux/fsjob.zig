@@ -35,7 +35,10 @@ const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const CHUNK: usize = 256 * 1024;
 /// Emit a progress line at least every this many bytes.
-const PROGRESS_BYTES: u64 = 4 << 20;
+// 1 MiB: at typical WAN rates the panel gets a sample every second
+// or two — 4 MiB made sub-4-MB/s transfers read as stalled between
+// samples and turned the rate display into a sawtooth.
+const PROGRESS_BYTES: u64 = 1 << 20;
 /// ...and, when the entry in flight changes, no more often than this.
 /// A tree of small files never crosses the byte threshold, so without
 /// a second trigger the reported file would sit on the first one

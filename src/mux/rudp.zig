@@ -51,6 +51,13 @@ const DUP_ACK_FAST: u8 = 3;
 /// Compact the backlog buffer once this many consumed bytes sit in
 /// front of it (amortized O(1) drain instead of a memmove per seg).
 const BACKLOG_COMPACT: usize = 1 << 20;
+/// AIMD congestion window bounds (segments). Blasting the full
+/// WINDOW back-to-back induced loss on tunneled paths, which
+/// collapsed into RTO stalls — the visible 3 MiB/s -> 300 KiB/s
+/// sawtooth. Additive increase per ack, halve on fast retransmit,
+/// floor on RTO.
+const CWND_MIN: usize = 4;
+const CWND_START: usize = 16;
 
 pub const EmitFn = *const fn (ctx: ?*anyopaque, datagram: []const u8) void;
 
@@ -113,6 +120,9 @@ pub const Channel = struct {
     /// times it repeated without progress.
     last_ack: u32 = 0,
     dup_acks: u8 = 0,
+    /// Congestion window: how much of WINDOW may actually be in
+    /// flight right now.
+    cwnd: usize = CWND_START,
 
     // Receiver side.
     recv_expected: u32 = 0,
@@ -195,7 +205,8 @@ pub const Channel = struct {
     }
 
     fn pump(self: *Channel, now_ms: i64, emit: EmitFn, ctx: ?*anyopaque) !void {
-        while (self.backlog.items.len > self.backlog_off and self.inflight.items.len < WINDOW) {
+        const limit = @min(self.cwnd, WINDOW);
+        while (self.backlog.items.len > self.backlog_off and self.inflight.items.len < limit) {
             const avail = self.backlog.items.len - self.backlog_off;
             const take = @min(avail, SEG_MAX);
             const data = try self.allocator.dupe(u8, self.backlog.items[self.backlog_off..][0..take]);
@@ -285,6 +296,7 @@ pub const Channel = struct {
             self.retransmit_at = if (self.inflight.items.len > 0) now_ms + self.rto_ms else 0;
             self.last_ack = ack;
             self.dup_acks = 0;
+            if (self.cwnd < WINDOW) self.cwnd += 1;
             try self.pump(now_ms, emit, ctx);
         } else if (self.inflight.items.len > 0 and ack == self.last_ack) {
             // The peer keeps acking below our head: it is alive and
@@ -294,6 +306,7 @@ pub const Channel = struct {
             self.dup_acks +|= 1;
             if (self.dup_acks >= DUP_ACK_FAST) {
                 self.dup_acks = 0;
+                self.cwnd = @max(self.cwnd / 2, CWND_MIN);
                 self.emitSegment(self.inflight.items[0], now_ms, emit, ctx);
                 self.retransmit_at = now_ms + self.rto_ms;
             }
@@ -362,11 +375,14 @@ pub const Channel = struct {
     pub fn tick(self: *Channel, now_ms: i64, emit: EmitFn, ctx: ?*anyopaque) ?i64 {
         if (self.closed) return null;
         if (self.inflight.items.len > 0 and self.retransmit_at != 0 and now_ms >= self.retransmit_at) {
-            // Go-back-N: resend the whole window (bounded burst).
+            // RTO: real loss (dup-acks would have recovered a single
+            // gap). Resend the head run and restart probing from a
+            // small window.
             const burst = @min(self.inflight.items.len, 8);
             for (self.inflight.items[0..burst]) |seg| self.emitSegment(seg, now_ms, emit, ctx);
             self.rto_ms = @min(self.rto_ms * 2, RTO_MAX_MS);
             self.retransmit_at = now_ms + self.rto_ms;
+            self.cwnd = CWND_MIN;
         }
         if (self.ack_pending) self.emitControl(TYPE_ACK, now_ms, emit, ctx);
         if (now_ms - self.last_emit_at >= KEEPALIVE_MS) self.emitControl(TYPE_ACK, now_ms, emit, ctx);
