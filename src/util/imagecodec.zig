@@ -123,6 +123,9 @@ const RTLD_LAZY: c_int = 1;
 var load_attempted = false;
 var jxl_api: ?JxlApi = null;
 var webp_api: ?WebpApi = null;
+/// Spinlock (Zig 0.16 std.Thread has no Mutex; this module keeps no
+/// libc module dependency). Contention is a first-probe race only.
+var load_lock = std.atomic.Value(u8).init(0);
 
 fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
     // dlsym returns *anyopaque (align 1); function pointers have a
@@ -196,18 +199,30 @@ fn loadWebp() ?WebpApi {
     return api;
 }
 
-fn ensureLoaded() void {
-    if (load_attempted) return;
-    load_attempted = true;
-    jxl_api = loadJxl();
-    webp_api = loadWebp();
+const Apis = struct { jxl: ?JxlApi, webp: ?WebpApi };
+
+/// Re-probes while NOTHING loaded: installing libjxl/libwebp and
+/// retrying then works without restarting the process. Once a
+/// library is in, the result is final (a lib in use is never
+/// reloaded). Returns COPIES taken under the mutex so concurrent
+/// callers (GUI main thread + thumb worker) never read a mid-store
+/// global. A failed dlopen re-probe costs microseconds per call.
+fn ensureLoaded() Apis {
+    while (load_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
+    defer load_lock.store(0, .release);
+    if (!load_attempted or (jxl_api == null and webp_api == null)) {
+        jxl_api = loadJxl();
+        webp_api = loadWebp();
+        load_attempted = true;
+    }
+    return .{ .jxl = jxl_api, .webp = webp_api };
 }
 
 pub fn capabilities() []const u8 {
-    ensureLoaded();
-    if (jxl_api != null and webp_api != null) return "jxl,webp";
-    if (jxl_api != null) return "jxl";
-    if (webp_api != null) return "webp";
+    const apis = ensureLoaded();
+    if (apis.jxl != null and apis.webp != null) return "jxl,webp";
+    if (apis.jxl != null) return "jxl";
+    if (apis.webp != null) return "webp";
     return "";
 }
 
@@ -221,12 +236,12 @@ pub fn encodePreferred(allocator: std.mem.Allocator, rgba: []const u8, width: u3
     const expected = try checkedEncodeSize(width, height);
     if (rgba.len < expected) return Error.EncodeFailed;
     if (max_bytes == 0) return Error.TooLarge;
-    ensureLoaded();
-    if (wanted(receiver, "jxl")) if (jxl_api) |*api|
+    const apis = ensureLoaded();
+    if (wanted(receiver, "jxl")) if (apis.jxl) |*api|
         if (encodeJxl(allocator, api, rgba, width, height, max_bytes)) |bytes|
             return .{ .codec = .jxl, .bytes = bytes }
         else |_| {};
-    if (wanted(receiver, "webp")) if (webp_api) |*api|
+    if (wanted(receiver, "webp")) if (apis.webp) |*api|
         if (encodeWebp(allocator, api, rgba, width, height, max_bytes)) |bytes|
             return .{ .codec = .webp, .bytes = bytes }
         else |_| {};
@@ -300,13 +315,13 @@ fn encodeWebp(allocator: std.mem.Allocator, api: *const WebpApi, rgba: []const u
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, max_pixels: usize) Error!Decoded {
-    ensureLoaded();
+    const apis = ensureLoaded();
     if (isJxl(bytes)) {
-        const api = if (jxl_api) |*a| a else return Error.NoCodec;
+        const api = if (apis.jxl) |*a| a else return Error.NoCodec;
         return decodeJxl(allocator, api, bytes, max_pixels);
     }
     if (isWebp(bytes)) {
-        const api = if (webp_api) |*a| a else return Error.NoCodec;
+        const api = if (apis.webp) |*a| a else return Error.NoCodec;
         return decodeWebp(allocator, api, bytes, max_pixels);
     }
     return Error.DecodeFailed;
@@ -412,8 +427,8 @@ test "available preview codecs round-trip RGBA with exact alpha" {
 }
 
 test "WebP fallback round-trips dimensions and alpha" {
-    ensureLoaded();
-    const api = if (webp_api) |*loaded| loaded else return error.SkipZigTest;
+    const apis = ensureLoaded();
+    const api = if (apis.webp) |*loaded| loaded else return error.SkipZigTest;
     const a = std.testing.allocator;
     var rgba: [12 * 9 * 4]u8 = undefined;
     for (0..12 * 9) |i| {
