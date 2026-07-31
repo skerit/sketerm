@@ -416,8 +416,16 @@ pub fn thumbWorkerMain(tc: *ThumbCtx) void {
 /// Codecs to advertise for images fetched over `hc`: the local
 /// daemon's sidecar never crosses a network, so plain PNG skips the
 /// transcode and keeps local previews independent of libjxl/libwebp.
+/// Remote hosts get PNG as the last resort — a host without
+/// libjxl/libwebp (or a static mux-portable, whose dlopen can never
+/// load them) still previews, just with fatter transfers.
 fn wireImageCodecs(hc: *HostConn) []const u8 {
-    return if (hc.host == null) "png" else imagecodec.capabilities();
+    if (hc.host == null) return "png";
+    const caps = imagecodec.capabilities();
+    if (caps.len == 0) return "png";
+    if (std.mem.eql(u8, caps, "jxl,webp")) return "jxl,webp,png";
+    if (std.mem.eql(u8, caps, "jxl")) return "jxl,png";
+    return "webp,png";
 }
 
 /// Decode + bound non-JXL/WebP wire data (the local daemon's PNG
@@ -620,6 +628,23 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
     }
     // A remote decode holds the pipeline slot until now.
     self.releaseRemoteThumbFor(res.remote_id);
+}
+
+/// Forget remembered preview/thumbnail FAILURES so an explicit
+/// reload re-asks the host — fixing "installed the codec/previewer
+/// on the remote, retried, still refused" without restarting
+/// anything. Successful entries stay cached.
+pub fn clearFailureCaches(self: *BrowserView) void {
+    var i: usize = 0;
+    while (i < self.preview_state.cache.items.len) {
+        if (self.preview_state.cache.items[i].failed) {
+            var dead = self.preview_state.cache.orderedRemove(i);
+            dead.deinit(self.allocator);
+        } else i += 1;
+    }
+    var it = self.thumb_failed.iterator();
+    while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
+    self.thumb_failed.clearRetainingCapacity();
 }
 
 /// Coalesced re-render ~8x/s while thumbnails trickle in.

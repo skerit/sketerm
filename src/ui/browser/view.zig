@@ -343,11 +343,13 @@ pub const BrowserView = struct {
     pub const hostDied = @import("conn.zig").hostDied;
     pub const sendOp = @import("conn.zig").sendOp;
     pub const closeViewOf = @import("conn.zig").closeViewOf;
+    pub const ensureWriteFlush = @import("conn.zig").ensureWriteFlush;
     pub const requestHostDirs = @import("conn.zig").requestHostDirs;
     pub const attrSpec = @import("conn.zig").attrSpec;
     pub const sendListingOp = @import("conn.zig").sendListingOp;
     pub const openDir = @import("conn.zig").openDir;
     pub const refreshDir = @import("conn.zig").refreshDir;
+    pub const clearFailureCaches = @import("preview.zig").clearFailureCaches;
     pub const queueListing = @import("conn.zig").queueListing;
     pub const nextReq = @import("conn.zig").nextReq;
     pub const onFdReadable = @import("conn.zig").onFdReadable;
@@ -1338,6 +1340,7 @@ pub const BrowserView = struct {
     fn onRefreshClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const tab = self.currentTab() orelse return;
+        self.clearFailureCaches();
         self.refreshDir(tab, tab.root);
         for (tab.subdirs.items) |d| self.refreshDir(tab, d);
     }

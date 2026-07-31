@@ -402,6 +402,10 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     }
     self.pumpRemoteThumbs();
     hc.watch_id = 0;
+    if (hc.write_watch_id != 0) {
+        _ = c.g_source_remove(hc.write_watch_id);
+        hc.write_watch_id = 0;
+    }
     hc.conn.deinit();
     hc.state = .dead;
     self.setStatusFmt("connection to {s} lost — navigate to reconnect", .{hc.label()});
@@ -413,17 +417,71 @@ pub fn sendOp(self: *BrowserView, hc: *HostConn, args: anytype) void {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return;
     }
-    hc.conn.sendJson(.fs_op, args) catch self.setStatus("daemon connection lost");
+    hc.conn.queueJson(.fs_op, args) catch self.setStatus("daemon connection lost");
+    self.ensureWriteFlush(hc);
 }
 
 pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
-    _ = self;
     if (dir.view_id == 0 or hc.state != .ready) return;
-    hc.conn.sendJson(.fs_op, .{
+    hc.conn.queueJson(.fs_op, .{
         .req = @as(u32, 0),
         .op = "close_view",
         .view = dir.view_id,
     }) catch {};
+    self.ensureWriteFlush(hc);
+}
+
+/// Sends on the GUI thread only queue (a stalled host must degrade
+/// its own pane, never wedge the GLib loop on POLLOUT): whenever a
+/// send leaves a wbuf remainder, a writable-fd watch finishes the
+/// delivery.
+pub fn ensureWriteFlush(self: *BrowserView, hc: *HostConn) void {
+    _ = self;
+    if (hc.state != .ready or hc.write_watch_id != 0) return;
+    if (hc.conn.wbuf.items.len == 0) return;
+    hc.write_watch_id = c.g_unix_fd_add(
+        hc.conn.fd,
+        c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
+        @ptrCast(&onFdWritable),
+        @ptrCast(hc),
+    );
+}
+
+/// The read watch normally removes itself by returning 0 from
+/// onFdReadable; a death discovered on the WRITE side must remove it
+/// explicitly or it keeps firing on a dead fd.
+fn dropReadWatch(hc: *HostConn) void {
+    if (hc.watch_id != 0) {
+        _ = c.g_source_remove(hc.watch_id);
+        hc.watch_id = 0;
+    }
+}
+
+fn onFdWritable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+    _ = fd;
+    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const self = hc.view;
+    if (self.widgets_dead) {
+        hc.write_watch_id = 0;
+        return 0;
+    }
+    if (cond & (c.G_IO_HUP | c.G_IO_ERR) != 0) {
+        hc.write_watch_id = 0;
+        dropReadWatch(hc);
+        self.hostDied(hc);
+        return 0;
+    }
+    hc.conn.flushQueued() catch {
+        hc.write_watch_id = 0;
+        dropReadWatch(hc);
+        self.hostDied(hc);
+        return 0;
+    };
+    if (hc.conn.wbuf.items.len == 0) {
+        hc.write_watch_id = 0;
+        return 0;
+    }
+    return 1;
 }
 
 /// The tab's EXTENDED-ATTRIBUTE columns as the wire's
@@ -562,6 +620,14 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
     }
     if (xfer_touched) self.reapTransfers();
     if (xfer_touched) self.renderJobs();
+    if (xfer_touched) {
+        // fstransfer sends only QUEUE; a chunk that outgrew the
+        // socket buffer needs the writable watch to finish delivery.
+        for (self.transfers.items) |t| {
+            self.ensureWriteFlush(t.src_hc);
+            self.ensureWriteFlush(t.dst_hc);
+        }
+    }
     // Socket-driven renders are throttled: chunk runs and delta
     // storms otherwise rebuild the listing model per drain, which
     // eats clicks and flickers hover for as long as the data trickles.

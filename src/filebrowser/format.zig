@@ -251,3 +251,59 @@ test "copyZ truncates instead of overflowing" {
     var wide: [512:0]u8 = undefined;
     try t.expectEqual(@as(usize, 300), std.mem.span(copyZN(&wide, long)).len);
 }
+
+/// Natural (version-aware) case-insensitive name order: digit runs
+/// compare as numbers, so "file2" < "file10". Equal-value runs with
+/// different zero-padding, and case-insensitively equal names, break
+/// the tie bytewise for a strict deterministic order.
+pub fn naturalLess(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        const da = std.ascii.isDigit(a[i]);
+        const db = std.ascii.isDigit(b[j]);
+        if (da and db) {
+            var zi = i;
+            while (zi < a.len and a[zi] == '0') zi += 1;
+            var zj = j;
+            while (zj < b.len and b[zj] == '0') zj += 1;
+            var ei = zi;
+            while (ei < a.len and std.ascii.isDigit(a[ei])) ei += 1;
+            var ej = zj;
+            while (ej < b.len and std.ascii.isDigit(b[ej])) ej += 1;
+            if (ei - zi != ej - zj) return ei - zi < ej - zj;
+            const ord = std.mem.order(u8, a[zi..ei], b[zj..ej]);
+            if (ord != .eq) return ord == .lt;
+            if (ei - i != ej - j) return ei - i < ej - j;
+            i = ei;
+            j = ej;
+            continue;
+        }
+        const ca = std.ascii.toLower(a[i]);
+        const cb = std.ascii.toLower(b[j]);
+        if (ca != cb) return ca < cb;
+        i += 1;
+        j += 1;
+    }
+    if (a.len - i != b.len - j) return a.len - i < b.len - j;
+    return std.mem.lessThan(u8, a, b);
+}
+
+test "naturalLess orders digit runs numerically" {
+    const t = std.testing;
+    try t.expect(naturalLess("file2.txt", "file10.txt"));
+    try t.expect(!naturalLess("file10.txt", "file2.txt"));
+    try t.expect(naturalLess("file9", "file10"));
+    try t.expect(naturalLess("2", "10"));
+    try t.expect(naturalLess("img001", "img2") == naturalLess("img1", "img2"));
+    // Case-insensitive on the text parts.
+    try t.expect(naturalLess("Alpha", "beta"));
+    try t.expect(naturalLess("alpha", "Beta"));
+    // Equal numeric value, different padding: deterministic, not equal-both-ways.
+    try t.expect(naturalLess("a01", "a1") != naturalLess("a1", "a01"));
+    // Prefix orders before its extension.
+    try t.expect(naturalLess("file", "file2"));
+    // Plain text still ordinary.
+    try t.expect(naturalLess("apple", "banana"));
+    try t.expect(!naturalLess("banana", "apple"));
+}
