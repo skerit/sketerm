@@ -157,6 +157,13 @@ pub const FrameType = enum(u8) {
     /// a multiplexed GUI connection could misattribute to another
     /// pending request.
     udp_ticket_req = 26,
+    /// Ask an IDLE daemon (no sessions, no running jobs or transfers)
+    /// to exit so the next connect autostarts the freshly deployed
+    /// binary. JSON {}; answered `.ok` { ok, error? } — ok:false =
+    /// busy, nothing happens. Only sent to daemons whose welcome
+    /// advertises `quit_idle:true` AND a `build` differing from the
+    /// client's own; older daemons never see the frame.
+    quit_idle = 27,
     // daemon → client
     welcome = 64,
     snapshot = 65,

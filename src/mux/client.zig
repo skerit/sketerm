@@ -154,6 +154,10 @@ pub const Conn = struct {
     /// dial failures kind:"unreachable" (welcome capability). Gates
     /// daemon-owned moves and direct remote-to-remote coordination.
     cross_move: bool = false,
+    /// The daemon's announced build id (git describe). Empty = a
+    /// daemon that predates the announce — stale by definition.
+    server_build: [72]u8 = undefined,
+    server_build_len: usize = 0,
     /// Daemon answers `udp_ticket_req` (welcome capability). Gates the
     /// request — an older daemon would answer `.err`, which a
     /// multiplexed GUI connection could misattribute.
@@ -274,6 +278,7 @@ pub const Conn = struct {
         self.snapshot_version = 0;
         self.udp_tickets = false;
         self.cross_move = false;
+        self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
             server_proto: ?u32 = null,
@@ -281,6 +286,7 @@ pub const Conn = struct {
             snapshot: u8 = 0,
             udp_ticket: bool = false,
             cross_move: bool = false,
+            build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
@@ -294,6 +300,8 @@ pub const Conn = struct {
             self.server_proto = parsed.value.server_proto orelse reported;
             self.udp_tickets = parsed.value.udp_ticket;
             self.cross_move = parsed.value.cross_move;
+            self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
+            @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
                 @min(parsed.value.snapshot, @import("snapshot.zig").SNAPSHOT_VERSION)
             else if (self.proto >= 6)
@@ -301,6 +309,71 @@ pub const Conn = struct {
             else
                 @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION;
         } else |_| {}
+    }
+
+    pub fn serverBuild(self: *const Conn) []const u8 {
+        return self.server_build[0..self.server_build_len];
+    }
+
+    /// The daemon runs an older (or just different) build than this
+    /// client. "unknown" local builds (tarball, no git) never claim
+    /// staleness; a daemon announcing NO build predates the announce
+    /// and is stale by definition.
+    pub fn buildStale(self: *const Conn) bool {
+        const mine = @import("build_options").commit;
+        if (std.mem.eql(u8, mine, "unknown")) return false;
+        return !std.mem.eql(u8, self.serverBuild(), mine);
+    }
+
+    /// Ask a STALE and provably IDLE daemon (no sessions, no live fs
+    /// jobs — both probed over verbs old daemons answer) to shut down
+    /// so the caller's reconnect autostarts the freshly deployed
+    /// binary. True = the daemon agreed and this connection is spent;
+    /// reconnect. Any refusal or uncertainty leaves the connection
+    /// usable and returns false. Interrupted fs jobs would not even
+    /// be lost (journal respawn), but a running one is a reason not
+    /// to bounce the daemon under someone.
+    pub fn upgradeStaleIdle(self: *Conn, allocator: std.mem.Allocator) bool {
+        if (!self.buildStale()) return false;
+        // Sessions? `.list` answers with a welcome-shaped frame
+        // carrying `sessions` (the mux CLI's own list path).
+        self.sendFrame(.list, "") catch return false;
+        {
+            const f = self.recvExpectFor(&.{.welcome}, 5_000) catch return false;
+            defer f.deinit(allocator);
+            const Probe = struct { sessions: []const struct {
+                name: []const u8 = "",
+            } = &.{} };
+            const parsed = std.json.parseFromSlice(Probe, allocator, f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch return false;
+            defer parsed.deinit();
+            if (parsed.value.sessions.len != 0) return false;
+        }
+        // Live jobs? job_list is req-matched on fs_reply.
+        const req: u32 = 0x5f757067; // arbitrary fixed nonce ("_upg")
+        self.sendJson(.fs_op, .{ .req = req, .op = "job_list" }) catch return false;
+        {
+            const f = self.recvExpectFor(&.{.fs_reply}, 5_000) catch return false;
+            defer f.deinit(allocator);
+            const Probe = struct { req: u32 = 0, ok: bool = false, jobs: []const struct {
+                state: []const u8 = "",
+            } = &.{} };
+            const parsed = std.json.parseFromSlice(Probe, allocator, f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch return false;
+            defer parsed.deinit();
+            if (parsed.value.req != req or !parsed.value.ok) return false;
+            for (parsed.value.jobs) |j| {
+                if (std.mem.eql(u8, j.state, "running") or std.mem.eql(u8, j.state, "paused"))
+                    return false;
+            }
+        }
+        // Idle and stale: the long-standing shutdown verb, so even a
+        // daemon from before this mechanism can be replaced.
+        self.sendJson(.shutdown, .{}) catch return false;
+        if (self.recvExpectFor(&.{.ok}, 5_000)) |f| f.deinit(allocator) else |_| {}
+        return true;
     }
 
     pub fn deinit(self: *Conn) void {

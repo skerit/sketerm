@@ -205,6 +205,27 @@ const HELP_TEXT =
 
 var g_app: App = undefined;
 
+/// Replace a stale idle local daemon at startup, then wait (bounded)
+/// until a fresh one answers so the window's first session spawn
+/// cannot race the old daemon's exit.
+fn upgradeLocalDaemon(allocator: std.mem.Allocator) void {
+    const muxclient = @import("mux/client.zig");
+    var conn = muxclient.Conn.connectLocalAutostart(allocator) catch return;
+    const upgraded = conn.upgradeStaleIdle(allocator);
+    conn.deinit();
+    if (!upgraded) return;
+    var tries: u32 = 0;
+    while (tries < 20) : (tries += 1) {
+        _ = c.usleep(50_000);
+        if (muxclient.Conn.connectLocalAutostart(allocator)) |fresh_conn| {
+            var m = fresh_conn;
+            const fresh = !m.buildStale();
+            m.deinit();
+            if (fresh) return;
+        } else |_| {}
+    }
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
@@ -344,6 +365,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             },
         }
     }
+
+    // A leftover local daemon from before a binary upgrade keeps
+    // serving old code to every client forever. At process start —
+    // before this GUI spawns any session of its own — a stale AND
+    // idle daemon is asked to exit and the fresh binary takes over.
+    // Busy daemons (real sessions = the user's running work) are
+    // never touched; the browser status line reports them instead.
+    upgradeLocalDaemon(allocator);
 
     // GApplication parses argv inside the "command-line" signal
     // handler (our `onCommandLine`). With HANDLES_COMMAND_LINE the
