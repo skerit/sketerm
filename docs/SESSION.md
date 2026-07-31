@@ -11791,3 +11791,44 @@ got tooltips.
 Verified: 1100 tests green (2 new rudp tests), test-core, smoke-mux,
 smoke-udp, smoke-mcp, xvfb smoke-e2e all PASS; mux-portable +
 aarch64-macos cross build; sketerm-mux still links libc only.
+
+## 2026-07-31 (later) — transfer polish + sidebar/props features
+
+1. rudp AIMD congestion window (start 16, +1/ack, halve on fast
+retransmit, floor 4 on RTO): full-window blasts were inducing the
+loss behind the 3 MiB/s -> 300 KiB/s throughput sawtooth. Display
+side smoothed too: PROGRESS_BYTES 4->1 MiB, SMOOTHING_MS 2->5s,
+STALL_MS 5->10s.
+
+2. Transfer panel redesign (jobpanel.zig): per-row state icon with
+Adwaita color classes, bold name, link-state pill badge (connecting/
+reconnecting/reconnected parsed out of the job message instead of
+prose on the head line), percent-labelled bar, right-aligned rate
+label; detail area is now an aligned key/value grid (Source/
+Destination/Current file/Files/Bytes/Rate/ETA/Status) beside the
+sparkline. applyRow shared by build+refresh.
+
+3. Continue Copy: interrupted cross-host copies (retry budget spent,
+or canceled) are journaled in $XDG_STATE_HOME/sketerm/
+incomplete-copies.json (filebrowser/incomplete.zig, capped 64); a
+re-paste of the same src->dst shows a suggested "Continue Copy"
+button in the conflict dialog riding the daemon's resume semantics.
+Completion clears the entry.
+
+4. Per-bookmark icons (theme-icon name, emoji, or absolute image
+path scaled to 16px; "Change Icon…" context-menu prompt; places.json
+gains a parallel bookmark_icons list, old files pad defaults) and the
+redundant per-row X remove button is gone (context menu has Remove).
+
+5. Properties "Previous Versions": the file across Timeshift
+(/run/timeshift/backup/timeshift-btrfs/snapshots/*/localhost|@) and
+snapper (/.snapshots/N/snapshot) btrfs snapshots, discovered with
+existing daemon list/stat ops (works on remote hosts), newest-first,
+capped 64, identical runs deduped keeping the oldest; rows offer
+Open and Restore-a-Copy (never overwrites). Pure logic in
+filebrowser/snapshots.zig (in both test roots).
+
+Verified: zig build clean, full test suite + test-core exit 0 (1108/
+941 incl. new rudp fast-retransmit/reorder, incomplete round-trip,
+places icon round-trip, 6 snapshots tests), smoke-mux + smoke-udp +
+xvfb smoke-e2e PASS, mux-portable builds.
