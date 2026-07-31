@@ -18,6 +18,7 @@ const fsserve = @import("mux/fsserve.zig");
 const fsjob = @import("mux/fsjob.zig");
 const imagecodec = @import("util/imagecodec.zig");
 const pathz = @import("util/pathz.zig");
+const thumbs_mod = @import("filebrowser/thumbs.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -389,7 +390,161 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         if (total >= 1300) fail("abort did not stop the stat stream");
     }
 
+    // ── wire-cache thumbnails (remote-serving mode) ────────────
+    wireThumbStage(allocator, &fs, dir, tag);
+
     std.debug.print("smoke-fs: {s} stage ok\n", .{tag});
+}
+
+/// An 8x8 RGB gradient PNG (stb-decodable) for the thumbnail stages.
+const TINY_PNG = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0x6c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x0d, 0xc9, 0x41, 0x01, 0x00,
+    0x30, 0x08, 0x03, 0x31, 0x94, 0xa0, 0xa4, 0x4a, 0xaa, 0x84, 0xe7, 0xa9, 0x40, 0x09, 0x4a, 0xaa,
+    0x68, 0xcb, 0x37, 0x55, 0x45, 0x17, 0x2a, 0x5c, 0x4c, 0xb1, 0xc5, 0x15, 0x29, 0xaa, 0x9a, 0x6e,
+    0xd4, 0xb8, 0x99, 0x66, 0x9b, 0x6b, 0xd2, 0x3f, 0x44, 0x0b, 0x09, 0x8b, 0x11, 0x2b, 0x4e, 0x44,
+    0x3f, 0x4c, 0x1b, 0x19, 0x9b, 0x31, 0x6b, 0xce, 0xc4, 0x3f, 0x86, 0x1e, 0x34, 0x78, 0x98, 0x61,
+    0x87, 0x1b, 0x32, 0x3f, 0x96, 0x5e, 0xb4, 0x78, 0x99, 0x65, 0x97, 0x5b, 0xb2, 0x3f, 0x8e, 0x3e,
+    0x74, 0xf8, 0x98, 0x63, 0x8f, 0x3b, 0x72, 0x3f, 0x42, 0x07, 0x05, 0x87, 0x09, 0x1b, 0x2e, 0x24,
+    0x3c, 0xb0, 0x2c, 0x54, 0x81, 0x31, 0xc8, 0xe3, 0xff, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+    0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
+const WireThumbRes = struct {
+    ok: bool = false,
+    keep: bool = false,
+    path: [4096]u8 = undefined,
+    path_len: usize = 0,
+    err: [256]u8 = undefined,
+    err_len: usize = 0,
+
+    fn assetPath(self: *const WireThumbRes) []const u8 {
+        return self.path[0..self.path_len];
+    }
+    fn errMsg(self: *const WireThumbRes) []const u8 {
+        return self.err[0..self.err_len];
+    }
+};
+
+/// Run one wire-cache thumbnail job to completion over the raw conn.
+fn wireThumbRequest(allocator: std.mem.Allocator, fs: *fsdrive.Fs, src: []const u8, req: u32) WireThumbRes {
+    fs.conn.sendJson(.fs_op, .{
+        .req = req,
+        .op = "thumbnail",
+        .path = src,
+        .image_codecs = "jxl,webp",
+        .wire_cache = true,
+    }) catch fail("wire thumb send");
+    var res = WireThumbRes{};
+    var job: u64 = 0;
+    const Ev = struct {
+        job: u64 = 0,
+        ev: []const u8 = "",
+        path: []const u8 = "",
+        message: []const u8 = "",
+        keep: bool = false,
+    };
+    const Rep = struct { req: u32 = 0, ok: bool = false, job: u64 = 0, @"error": []const u8 = "" };
+    var rounds: usize = 0;
+    while (rounds < 300) : (rounds += 1) {
+        const f = fs.conn.recvFrameFor(3000) catch fail("wire thumb recv");
+        defer f.deinit(allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        if (f.ftype == .fs_reply) {
+            const rep = std.json.parseFromSliceLeaky(Rep, arena.allocator(), f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("wire thumb reply parse");
+            if (rep.req != req) continue;
+            if (!rep.ok or rep.job == 0) fail("wire thumb job start refused");
+            job = rep.job;
+        } else if (f.ftype == .fs_job) {
+            const ev = std.json.parseFromSliceLeaky(Ev, arena.allocator(), f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("wire thumb event parse");
+            if (job == 0 or ev.job != job) continue;
+            if (std.mem.eql(u8, ev.ev, "done")) {
+                res.ok = true;
+                res.keep = ev.keep;
+                res.path_len = @min(ev.path.len, res.path.len);
+                @memcpy(res.path[0..res.path_len], ev.path[0..res.path_len]);
+                return res;
+            }
+            if (std.mem.eql(u8, ev.ev, "error")) {
+                res.err_len = @min(ev.message.len, res.err.len);
+                @memcpy(res.err[0..res.err_len], ev.message[0..res.err_len]);
+                return res;
+            }
+        }
+    }
+    fail("wire thumb never finished");
+}
+
+/// The remote-serving thumbnail cache: codec bytes cached host-side,
+/// served in place (keep), no freedesktop PNG installed, hits are
+/// stat-validated, and a changed source misses.
+fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8, comptime tag: []const u8) void {
+    touch(dir, "wire-photo.png", &TINY_PNG);
+    var src_buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&src_buf);
+    w.print("{s}/wire-photo.png", .{dir}) catch fail("wire fmt");
+    const src = w.buffered();
+
+    const first = wireThumbRequest(allocator, fs, src, 9100);
+    if (!first.ok) {
+        // No libjxl/libwebp on this host: the fallback (spec PNG +
+        // per-fetch transcode) also cannot encode, so there is
+        // nothing more to prove here.
+        std.debug.print("smoke-fs: {s} wire-thumb stage skipped ({s})\n", .{ tag, first.errMsg() });
+        return;
+    }
+    if (!first.keep) fail("wire thumb asset not marked keep");
+    if (std.mem.indexOf(u8, first.assetPath(), "/sketerm/thumbs/") == null)
+        fail("wire thumb asset outside the wire cache");
+
+    var z: [4096:0]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.stat(pathz.pathZ(&z, first.assetPath()) catch fail("wire path"), &st) != 0)
+        fail("wire thumb cache file missing");
+    if (st.st_size <= 0) fail("wire thumb cache file empty");
+    const first_ino = st.st_ino;
+    var src_st: c.struct_stat = undefined;
+    if (c.stat(pathz.pathZ(&z, src) catch fail("wire src path"), &src_st) != 0) fail("wire src stat");
+    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec) fail("wire thumb freshness stamp wrong");
+
+    // No freedesktop PNG may have been installed for this source.
+    const cache_root = std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("XDG_CACHE_HOME") orelse fail("no cache home"))));
+    var fd_buf: [4096]u8 = undefined;
+    const fd_png = thumbs_mod.thumbPath(cache_root, src, &fd_buf) orelse fail("fd path");
+    if (c.stat(pathz.pathZ(&z, fd_png) catch fail("fd pathz"), &st) == 0)
+        fail("wire mode installed a freedesktop PNG");
+
+    // Second request: served from the cache file, not rebuilt.
+    const second = wireThumbRequest(allocator, fs, src, 9101);
+    if (!second.ok or !second.keep) fail("wire thumb re-request failed");
+    if (!std.mem.eql(u8, first.assetPath(), second.assetPath())) fail("wire thumb hit path differs");
+    if (c.stat(pathz.pathZ(&z, second.assetPath()) catch fail("wire path"), &st) != 0)
+        fail("wire thumb cache vanished");
+    if (st.st_ino != first_ino) fail("wire thumb hit rebuilt the cache file");
+
+    // A changed source misses and reinstalls (new inode, new stamp).
+    {
+        var ts = [2]c.struct_timespec{
+            .{ .tv_sec = src_st.st_mtim.tv_sec + 5, .tv_nsec = 0 },
+            .{ .tv_sec = src_st.st_mtim.tv_sec + 5, .tv_nsec = 0 },
+        };
+        if (c.utimensat(c.AT_FDCWD, pathz.pathZ(&z, src) catch fail("wire src path"), &ts, 0) != 0)
+            fail("wire src touch");
+    }
+    const third = wireThumbRequest(allocator, fs, src, 9102);
+    if (!third.ok or !third.keep) fail("wire thumb refresh failed");
+    if (c.stat(pathz.pathZ(&z, third.assetPath()) catch fail("wire path"), &st) != 0)
+        fail("wire thumb refresh missing");
+    if (st.st_ino == first_ino) fail("stale wire thumb served after source change");
+    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec + 5) fail("wire thumb refresh stamp wrong");
+
+    std.debug.print("smoke-fs: {s} wire-thumb stage ok\n", .{tag});
 }
 
 /// Stream-hash a local file (verification oracle for copy jobs).

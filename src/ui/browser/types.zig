@@ -151,6 +151,9 @@ pub const WireJobEv = struct {
     mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    /// done: `path` is a persistent host-side cache file — the
+    /// consumer must NOT unlink it after reading.
+    keep: bool = false,
     /// Live-query status detail (ev == "ready").
     watches: u64 = 0,
     watch_limit: bool = false,

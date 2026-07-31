@@ -66,6 +66,30 @@ pub fn thumbPathTier(cache_dir: []const u8, path: []const u8, tier: Tier, buf: [
     return std.fmt.bufPrint(buf, "{s}/thumbnails/{s}/{s}.png", .{ cache_dir, tierName(tier), &key }) catch null;
 }
 
+/// The daemon's private remote-serving thumbnail cache
+/// (…/sketerm/thumbs/<md5>.<ext>): transport codec bytes stored
+/// as-is, freshness = the file's mtime equals the SOURCE's (stamped
+/// by the installer). Not freedesktop: entries here are JXL/WebP no
+/// other file manager could read anyway.
+pub fn wireThumbPath(cache_dir: []const u8, path: []const u8, ext: []const u8, buf: []u8) ?[]const u8 {
+    const key = thumbKey(path) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/sketerm/thumbs/{s}.{s}", .{ cache_dir, &key, ext }) catch null;
+}
+
+test "wireThumbPath shares the freedesktop key but its own directory" {
+    const t = std.testing;
+    var buf: [4096]u8 = undefined;
+    var fd_buf: [4096]u8 = undefined;
+    const wire = wireThumbPath("/home/u/.cache", "/data/cat.jpg", "jxl", &buf) orelse return error.TestUnexpectedResult;
+    const fdp = thumbPath("/home/u/.cache", "/data/cat.jpg", &fd_buf) orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.startsWith(u8, wire, "/home/u/.cache/sketerm/thumbs/"));
+    try t.expect(std.mem.endsWith(u8, wire, ".jxl"));
+    // Same md5 key as the spec path: one identity per source file.
+    const wire_key = wire["/home/u/.cache/sketerm/thumbs/".len .. wire.len - ".jxl".len];
+    const fd_key = fdp["/home/u/.cache/thumbnails/normal/".len .. fdp.len - ".png".len];
+    try t.expectEqualStrings(fd_key, wire_key);
+}
+
 fn appendChunk(out: *std.ArrayList(u8), allocator: std.mem.Allocator, kind: *const [4]u8, data: []const u8) !void {
     var len: [4]u8 = undefined;
     std.mem.writeInt(u32, &len, @intCast(data.len), .big);

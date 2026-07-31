@@ -146,6 +146,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .perm = .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 },
         .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode },
         .image_codecs = r.image_codecs,
+        .wire_cache = r.wire_cache,
         .owns_dst = op == .panelize and r.delete_destination,
         .owns_src = op == .preview_transport and r.delete_source,
     }) catch
@@ -187,6 +188,7 @@ pub const FsJobArgs = struct {
     perm: PermArgs = .{},
     copy: CopyArgs = .{},
     image_codecs: []const u8 = "",
+    wire_cache: bool = false,
     owns_dst: bool = false,
     owns_src: bool = false,
 };
@@ -228,6 +230,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .conflict = copy.conflict,
         .dir_mode = copy.dir_mode,
         .image_codecs = image_codecs,
+        .wire_cache = args.wire_cache,
         .delete_source = args.owns_src,
     }, .{}, &spec_aw.writer);
     try spec_aw.writer.writeByte('\n');
@@ -633,6 +636,7 @@ pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
         .rejected = job.rejected,
         .exit_status = job.exit_status,
         .path = job.done_path[0..job.done_path_len],
+        .keep = job.done_kept,
         .text = job.done_text[0..job.done_text_len],
         .file = job.cur_file[0..job.cur_file_len],
         .files_done = job.files_done,
@@ -693,6 +697,9 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         /// whether the helper served them from its cache.
         meta: []const MetaKV = &.{},
         cached: bool = false,
+        /// done: the result path is a PERSISTENT host-side cache
+        /// file, not a temp asset — nobody may unlink it.
+        keep: bool = false,
     };
     const parsed = std.json.parseFromSlice(Ev, self.allocator, line, .{
         .ignore_unknown_fields = true,
@@ -762,6 +769,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         }
         job.done_path_len = @min(e.path.len, job.done_path.len);
         @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
+        job.done_kept = e.keep;
         job.done_text_len = @min(e.text.len, job.done_text.len);
         @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
         if (job.owns_dst or job.owns_src or job.op == .thumbnail or job.op == .preview or job.op == .preview_transport)

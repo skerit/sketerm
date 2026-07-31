@@ -178,8 +178,11 @@ pub const RemoteThumb = struct {
     req: u32 = 0,
     job: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
-    /// Ephemeral JXL/WebP sidecar on the file-owning host.
+    /// JXL/WebP sidecar on the file-owning host. Ephemeral unless
+    /// `keep` (a wire-cache daemon answered with its persistent
+    /// cache file, which must survive us).
     asset: []u8 = &.{},
+    keep: bool = false,
     /// Monotonic ms of the last frame that belonged to this fetch;
     /// what REMOTE_THUMB_SILENCE_MS is measured from.
     last_ms: i64 = 0,
@@ -919,8 +922,18 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
         };
         armRemoteThumbWatch(self);
         // Generation happens on the file-owning host. Only the
-        // bounded JXL/WebP sidecar returns over the wire.
-        self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path, .image_codecs = wireImageCodecs(rt.hc) });
+        // bounded JXL/WebP sidecar returns over the wire. Remote
+        // hosts cache the codec bytes themselves (wire_cache) —
+        // their freedesktop PNG serves nobody we care about there;
+        // the LOCAL daemon keeps the spec PNG cache, which this
+        // desktop's other file managers and pickers share.
+        self.sendOp(rt.hc, .{
+            .req = rt.req,
+            .op = "thumbnail",
+            .path = rt.path,
+            .image_codecs = wireImageCodecs(rt.hc),
+            .wire_cache = rt.hc.host != null,
+        });
     }
 }
 
@@ -966,7 +979,7 @@ pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
         // Removed WITHOUT pumping: the pump below runs once, after
         // every timed-out slot is gone.
         _ = self.remote_thumbs.orderedRemove(i);
-        if (rt.asset.len > 0 and rt.hc.state == .ready)
+        if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
     }
@@ -986,7 +999,7 @@ pub fn finishRemoteThumb(self: *BrowserView, rt: *RemoteThumb) void {
             break;
         }
     }
-    if (rt.asset.len > 0 and rt.hc.state == .ready)
+    if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
         self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
     rt.destroy(self.allocator);
     self.pumpRemoteThumbs();
@@ -1062,6 +1075,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
             const rt = thumbByJob(self, hc, ev.job) orelse return false;
             rt.touch();
             if (std.mem.eql(u8, ev.ev, "done") and ev.path.len > 0) {
+                rt.keep = ev.keep;
                 rt.asset = self.allocator.dupe(u8, ev.path) catch {
                     self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
                     self.finishRemoteThumb(rt);
@@ -1221,7 +1235,7 @@ pub fn shutdownTransfers(self: *BrowserView) void {
     for (self.remote_thumbs.items) |rt| {
         if (rt.phase == .wait_job and rt.job != 0 and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = rt.job });
-        if (rt.asset.len > 0 and rt.hc.state == .ready)
+        if (rt.asset.len > 0 and !rt.keep and rt.hc.state == .ready)
             self.sendOp(rt.hc, .{ .req = @as(u32, 0), .op = "unlink", .path = rt.asset });
         rt.destroy(self.allocator);
     }
