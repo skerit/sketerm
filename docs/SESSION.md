@@ -11700,3 +11700,57 @@ Verified: zig build test 1097 pass / test-core 929 pass (new
 transportPreview-PNG + naturalLess tests), smoke-fs OK (transfer
 pause/resume/disconnect stages over the queued-send path),
 smoke-mux PASS, xvfb smoke-e2e PASS, mux-portable builds.
+
+## 2026-07-31: file browser gap sweep (audit follow-up)
+
+The feature-audit gaps, all closed in one pass:
+
+1. DnD modifier overrides: Ctrl forces copy, Shift forces move at
+drop time (listing drops read the controller's modifier state);
+no modifier keeps the topology default. Cross-host Shift-drop is a
+delete-after-verify move via the existing transfer machinery.
+
+2. Free space in the status line: a statfs rides every ROOT listing
+(navigation/reload/resync) and the count phrase appends ", N free".
+
+3. Auto-reconnect: a dropped remote host with tabs still on it is
+re-dialed on a backoff timer (3s/8s/20s/45s, then give up —
+every attempt may spawn a real ssh). wireReady adopts stranded tabs
+onto the fresh connection and re-subscribes their views.
+
+4. Remote git overlays: refreshGitOverlay submits a `git_status`
+daemon job on remote roots — porcelain runs on the repo's host,
+prefix-stripped records stream back as match events (gitstat.zig
+feedGit), same aggregation as the local worker-thread path.
+
+5. Frecency jump (Ctrl+J): visits recorded per location spec
+(count + last-visit, capped 200, lowest-score eviction) in
+places.json; the popover ranks by zoxide-style recency buckets and
+filters as you type. Enter = top match, click = that row.
+
+6. Compare Files (two selected files, same host): a `diff -u`
+daemon job streamed as line events into a transient monospace
+window. Cross-host pairs refuse honestly.
+
+7. Split/Combine (TC convention): Tools submenu splits into
+10M/100M/1G `.NNN` parts beside the file (refuses existing parts);
+a `.NNN` file offers Combine Parts (999 max, refuses an existing
+destination). Both daemon jobs with progress.
+
+8. Secure Delete… (files only): one PRNG overwrite pass + fsync +
+unlink, daemon-side; always confirms (config cannot skip it), the
+dialog says CoW filesystems make it best-effort.
+
+9. files_verify_copy (prefs toggle, default off): copy jobs hash the
+staged .skpart against the source BEFORE the rename installs it; a
+mismatch discards the stage and fails the file.
+
+10. Frame-parse budget: the browser socket drain parses at most 8ms
+per main-loop dispatch and continues on an idle (per-HostConn
+drain_idle), so a 4MB fillAvailable burst can no longer stall input.
+
+Verified: 1098/930 tests green (frecency model test added), smoke-fs
++ smoke-mux + xvfb smoke-e2e PASS, mux-portable builds, and every
+new daemon verb exercised end-to-end through `sketerm-mux --job`
+(split→combine byte-identical, secure delete unlinks, diff streams,
+git_status M/? records, verified copy).
