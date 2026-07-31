@@ -50,6 +50,9 @@ pub const Places = struct {
     /// for files written before labels existed) = derive from spec.
     bookmark_labels: []const []const u8 = &.{},
     recent: []const []const u8 = &.{},
+    /// Visit statistics behind the frecency jump (Ctrl+J): parallel
+    /// to nothing, its own capped list.
+    frecency: []const FrecEntry = &.{},
     searches: []const SavedSearch = &.{},
     collection: []const CollItem = &.{},
     /// Sidebar section headers the user folded shut, by header text.
@@ -385,4 +388,111 @@ test "host-only recents normalize to a remote root" {
     recordRecent(t.allocator, &list, "archdev:/", 3);
     try t.expectEqual(@as(usize, 1), list.items.len);
     try t.expectEqualStrings("archdev:/", list.items[0]);
+}
+
+/// One frecency record: how often and how recently a location spec
+/// was visited.
+pub const FrecEntry = struct {
+    spec: []const u8 = "",
+    count: u32 = 0,
+    last_ms: i64 = 0,
+};
+
+/// Owned mirror of FrecEntry the view keeps.
+pub const FrecOwned = struct { spec: []u8, count: u32, last_ms: i64 };
+
+pub const FRECENCY_CAP = 200;
+
+/// zoxide-style recency buckets: frequency weighted by how recently
+/// the location was last visited.
+pub fn frecencyScore(count: u32, last_ms: i64, now_ms: i64) u64 {
+    const age: i64 = @max(0, now_ms -| last_ms);
+    const n: u64 = count;
+    if (age < 3_600_000) return n * 4000;
+    if (age < 86_400_000) return n * 2000;
+    if (age < 7 * 86_400_000) return n * 500;
+    return n * 250;
+}
+
+/// Count a visit; over `cap` the lowest-scoring record makes room.
+pub fn recordVisit(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(FrecOwned),
+    spec: []const u8,
+    now_ms: i64,
+    cap: usize,
+) void {
+    if (spec.len == 0) return;
+    for (list.items) |*e| {
+        if (std.mem.eql(u8, e.spec, spec)) {
+            e.count +|= 1;
+            e.last_ms = now_ms;
+            return;
+        }
+    }
+    const owned = allocator.dupe(u8, spec) catch return;
+    list.append(allocator, .{ .spec = owned, .count = 1, .last_ms = now_ms }) catch {
+        allocator.free(owned);
+        return;
+    };
+    if (list.items.len > cap) {
+        var worst: usize = 0;
+        var worst_score: u64 = std.math.maxInt(u64);
+        for (list.items, 0..) |e, i| {
+            const sc = frecencyScore(e.count, e.last_ms, now_ms);
+            if (sc < worst_score) {
+                worst_score = sc;
+                worst = i;
+            }
+        }
+        allocator.free(list.items[worst].spec);
+        _ = list.orderedRemove(worst);
+    }
+}
+
+/// Indices of entries whose spec contains `filter` (case-insensitive,
+/// "" matches all), best score first. Returns the used prefix of
+/// `out`.
+pub fn frecencyRank(list: []const FrecOwned, filter: []const u8, now_ms: i64, out: []usize) []usize {
+    var n: usize = 0;
+    for (list, 0..) |e, i| {
+        if (n >= out.len) break;
+        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(e.spec, filter) == null) continue;
+        out[n] = i;
+        n += 1;
+    }
+    const ranked = out[0..n];
+    const Ctx = struct { list: []const FrecOwned, now: i64 };
+    std.mem.sort(usize, ranked, Ctx{ .list = list, .now = now_ms }, struct {
+        fn lt(ctx: Ctx, a: usize, b: usize) bool {
+            return frecencyScore(ctx.list[a].count, ctx.list[a].last_ms, ctx.now) >
+                frecencyScore(ctx.list[b].count, ctx.list[b].last_ms, ctx.now);
+        }
+    }.lt);
+    return ranked;
+}
+
+test "recordVisit counts, caps by score, and frecencyRank orders" {
+    const t = std.testing;
+    var list: std.ArrayList(FrecOwned) = .empty;
+    defer {
+        for (list.items) |e| t.allocator.free(e.spec);
+        list.deinit(t.allocator);
+    }
+    const now: i64 = 1_000_000_000_000;
+    recordVisit(t.allocator, &list, "local:/rare", now - 8 * 86_400_000, 3);
+    recordVisit(t.allocator, &list, "local:/often", now, 3);
+    recordVisit(t.allocator, &list, "local:/often", now, 3);
+    recordVisit(t.allocator, &list, "host:/mid", now - 2 * 3_600_000, 3);
+    try t.expectEqual(@as(usize, 3), list.items.len);
+    // Cap eviction drops the lowest score (the stale rare one).
+    recordVisit(t.allocator, &list, "local:/new", now, 3);
+    try t.expectEqual(@as(usize, 3), list.items.len);
+    for (list.items) |e| try t.expect(!std.mem.eql(u8, e.spec, "local:/rare"));
+    var idx: [8]usize = undefined;
+    const ranked = frecencyRank(list.items, "", now, &idx);
+    try t.expectEqualStrings("local:/often", list.items[ranked[0]].spec);
+    // Substring filter, case-insensitive.
+    const only = frecencyRank(list.items, "OFT", now, &idx);
+    try t.expectEqual(@as(usize, 1), only.len);
 }

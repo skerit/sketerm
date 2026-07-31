@@ -1176,6 +1176,7 @@ fn filesPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const danger_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(danger_group)), "Deleting");
     addSwitchRow(@ptrCast(@alignCast(danger_group)), ctx, "Confirm permanent delete", "Ask before Shift+Delete / Delete Permanently. Moving to trash never asks (it is undoable).", &ctx.cfg.files_confirm_delete, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(danger_group)), ctx, "Verify copies", "Hash-compare every copied file against its source before it is installed. Slower (each file is read twice), but a bad disk or interrupted write can never install silently.", &ctx.cfg.files_verify_copy, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(danger_group)));
 }
 

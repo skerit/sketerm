@@ -8,6 +8,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const fsjob = @import("../../mux/fsjob.zig");
 const input = @import("../input.zig");
+const places_mod = @import("../../filebrowser/places.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -619,6 +620,7 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK, .what = "flat view", .run = &chordFlat },
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK, .what = "mark selection in a register", .run = &selection.chordMark },
     .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_CONTROL_MASK, .what = "bookmark current folder", .run = &chordBookmark },
+    .{ .keyval = c.GDK_KEY_j, .mods = c.GDK_CONTROL_MASK, .what = "frecency jump", .run = &chordJump },
     .{
         .keyval = c.GDK_KEY_x,
         .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
@@ -1101,6 +1103,111 @@ pub fn onPathKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.Gd
         return 1;
     }
     return 0;
+}
+
+pub const JumpCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    popover: *c.GtkWidget,
+    entry: *c.GtkWidget,
+    list: *c.GtkWidget,
+    fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const ctx: *JumpCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+/// Frecency jump (Ctrl+J): type a substring, land in the directory
+/// you visit most, weighted by recency (zoxide model).
+pub fn showFrecencyJump(self: *BrowserView) void {
+    if (self.frecency.items.len == 0) {
+        self.setStatus("no visited folders recorded yet");
+        return;
+    }
+    const pop = c.gtk_popover_new();
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+    const entry = c.gtk_entry_new();
+    c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Jump to folder (frecency)");
+    const list = c.gtk_list_box_new();
+    c.gtk_list_box_set_selection_mode(@ptrCast(@alignCast(list)), c.GTK_SELECTION_NONE);
+    c.gtk_widget_set_size_request(list, 380, -1);
+    c.gtk_box_append(@ptrCast(box), entry);
+    c.gtk_box_append(@ptrCast(box), list);
+    const ctx = self.allocator.create(JumpCtx) catch {
+        unrefFloating(pop);
+        unrefFloating(box);
+        return;
+    };
+    ctx.* = .{ .allocator = self.allocator, .view = self, .popover = pop, .entry = entry, .list = list };
+    _ = c.g_signal_connect_data(entry, "changed", @ptrCast(&onJumpChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onJumpActivate), @ptrCast(ctx), @ptrCast(&JumpCtx.free), c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onJumpRow), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_popover_set_child(@ptrCast(pop), box);
+    c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
+    fillJumpList(ctx, "");
+    c.gtk_popover_popup(@ptrCast(pop));
+    _ = c.gtk_widget_grab_focus(entry);
+}
+
+const JUMP_ROWS = 10;
+
+fn fillJumpList(ctx: *JumpCtx, filter: []const u8) void {
+    const lb: *c.GtkListBox = @ptrCast(@alignCast(ctx.list));
+    while (c.gtk_list_box_get_row_at_index(lb, 0)) |row|
+        c.gtk_list_box_remove(lb, @ptrCast(@alignCast(row)));
+    var idx: [JUMP_ROWS]usize = undefined;
+    const ranked = places_mod.frecencyRank(ctx.view.frecency.items, filter, nowMsWall(), &idx);
+    for (ranked) |i| {
+        const spec = ctx.view.frecency.items[i].spec;
+        var z: [4300:0]u8 = undefined;
+        const n = @min(spec.len, z.len - 1);
+        @memcpy(z[0..n], spec[0..n]);
+        z[n] = 0;
+        const label = c.gtk_label_new(&z);
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_START);
+        c.gtk_list_box_append(lb, label);
+    }
+}
+
+fn nowMsWall() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+}
+
+fn onJumpChanged(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *JumpCtx = @ptrCast(@alignCast(user.?));
+    const text = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
+    fillJumpList(ctx, text);
+}
+
+fn jumpTo(ctx: *JumpCtx, row_index: c_int) void {
+    const lb: *c.GtkListBox = @ptrCast(@alignCast(ctx.list));
+    const row = c.gtk_list_box_get_row_at_index(lb, row_index) orelse return;
+    const label = c.gtk_list_box_row_get_child(@ptrCast(@alignCast(row))) orelse return;
+    const text = c.gtk_label_get_text(@ptrCast(@alignCast(label))) orelse return;
+    var spec_buf: [4300]u8 = undefined;
+    const spec = std.mem.span(@as([*:0]const u8, @ptrCast(text)));
+    const n = @min(spec.len, spec_buf.len);
+    @memcpy(spec_buf[0..n], spec[0..n]);
+    const self = ctx.view;
+    if (c.gtk_widget_get_parent(ctx.popover) != null) c.gtk_widget_unparent(ctx.popover);
+    const tab = self.currentTab() orelse return;
+    self.navigateSpec(tab, spec_buf[0..n]);
+}
+
+fn onJumpActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    jumpTo(@ptrCast(@alignCast(user.?)), 0);
+}
+
+fn onJumpRow(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+    jumpTo(@ptrCast(@alignCast(user.?)), c.gtk_list_box_row_get_index(row));
+}
+
+fn chordJump(self: *BrowserView) bool {
+    self.showFrecencyJump();
+    return true;
 }
 
 pub const PatternCtx = struct {

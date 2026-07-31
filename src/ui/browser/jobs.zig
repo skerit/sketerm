@@ -770,7 +770,7 @@ pub fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: [
         self.allocator.destroy(pj);
         return;
     };
-    self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = true });
+    self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = true, .verify = self.verifyCopies() });
 }
 
 pub fn startDaemonJobKind(
@@ -815,7 +815,7 @@ pub fn startDaemonJobKind(
         self.search_max_matches = 0;
         self.sendOp(hc, .{ .req = req, .op = op, .path = path, .pattern = pattern, .within_ms = within, .max_matches = maxm });
     } else if (to.len > 0) {
-        self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false });
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false, .verify = self.verifyCopies() });
     } else {
         self.sendOp(hc, .{ .req = req, .op = op, .path = path });
     }
@@ -1036,7 +1036,14 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         .@"resume" = false,
         .conflict = mode.conflict,
         .dir_mode = mode.dir_mode,
+        .verify = self.verifyCopies(),
     });
+}
+
+/// files_verify_copy: hash-compare every copied file before install.
+pub fn verifyCopies(self: *BrowserView) bool {
+    if (self.ownerWindow()) |win| return win.config.files_verify_copy;
+    return false;
 }
 
 pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection) void {

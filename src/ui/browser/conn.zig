@@ -309,9 +309,113 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         if (p.sent or p.hc != hc) continue;
         self.sendListingOp(p);
     }
+    // Tabs stranded on a DEAD HostConn to this same host adopt the
+    // fresh connection and re-subscribe their views (the old view
+    // subscriptions died with the old socket).
+    for (self.tabs.items) |tab| {
+        if (tab.hc == hc or tab.hc.state != .dead or !hostEq(tab.hc.host, hc.host)) continue;
+        tab.hc = hc;
+        tab.free_req = 0;
+        tab.root.view_id = 0;
+        self.openDir(tab, tab.root);
+        for (tab.subdirs.items) |d| {
+            d.view_id = 0;
+            self.openDir(tab, d);
+        }
+    }
+    self.clearReconnect(hc.host);
     self.requestHostDirs(hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
+}
+
+/// One host being re-dialed after a drop, with backoff. Owned by
+/// BrowserView.reconnects; the timer holds the pointer.
+pub const Reconnect = struct {
+    view: *BrowserView,
+    host: []u8,
+    attempts: u32 = 0,
+    source: c.guint = 0,
+
+    pub fn destroy(self: *Reconnect, allocator: std.mem.Allocator) void {
+        if (self.source != 0) _ = c.g_source_remove(self.source);
+        allocator.free(self.host);
+        allocator.destroy(self);
+    }
+};
+
+/// Re-dial delays; after the last one the host stays dead until the
+/// user navigates (every attempt may spawn a real ssh).
+const RECONNECT_DELAYS_MS = [_]c.guint{ 3_000, 8_000, 20_000, 45_000 };
+
+/// A connection dropped while tabs were on it: retry by timer so a
+/// rebooted host comes back without the user re-navigating.
+pub fn scheduleReconnect(self: *BrowserView, host: []const u8) void {
+    for (self.reconnects.items) |r| {
+        if (std.mem.eql(u8, r.host, host)) return;
+    }
+    const r = self.allocator.create(Reconnect) catch return;
+    r.* = .{
+        .view = self,
+        .host = self.allocator.dupe(u8, host) catch {
+            self.allocator.destroy(r);
+            return;
+        },
+    };
+    self.reconnects.append(self.allocator, r) catch {
+        self.allocator.free(r.host);
+        self.allocator.destroy(r);
+        return;
+    };
+    r.source = c.g_timeout_add(RECONNECT_DELAYS_MS[0], @ptrCast(&onReconnectTick), @ptrCast(r));
+}
+
+pub fn clearReconnect(self: *BrowserView, host: ?[]const u8) void {
+    const h = host orelse return;
+    for (self.reconnects.items, 0..) |r, i| {
+        if (!std.mem.eql(u8, r.host, h)) continue;
+        _ = self.reconnects.orderedRemove(i);
+        r.destroy(self.allocator);
+        return;
+    }
+}
+
+fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const r: *Reconnect = @ptrCast(@alignCast(user.?));
+    const self = r.view;
+    r.source = 0;
+    if (self.widgets_dead) return 0;
+    // Anything already live (or dialing) for this host? Then this
+    // timer's job is done — wireReady adopts the stranded tabs.
+    for (self.conns.items) |hc| {
+        if (hc.state != .dead and hostEq(hc.host, r.host)) {
+            self.clearReconnect(r.host);
+            return 0;
+        }
+    }
+    // Still worth dialing? Only while a tab is stranded on this host.
+    var stranded = false;
+    for (self.tabs.items) |tab| {
+        if (tab.hc.state == .dead and hostEq(tab.hc.host, r.host)) stranded = true;
+    }
+    if (!stranded) {
+        self.clearReconnect(r.host);
+        return 0;
+    }
+    r.attempts += 1;
+    if (r.attempts > RECONNECT_DELAYS_MS.len) {
+        self.setStatusFmt("gave up reconnecting to {s} -- navigate to retry", .{r.host});
+        self.clearReconnect(r.host);
+        return 0;
+    }
+    self.setStatusFmt("reconnecting to {s} (attempt {d})…", .{ r.host, r.attempts });
+    var host_buf: [512]u8 = undefined;
+    const n = @min(r.host.len, host_buf.len);
+    @memcpy(host_buf[0..n], r.host[0..n]);
+    _ = self.hostConnFor(host_buf[0..n]);
+    const next = RECONNECT_DELAYS_MS[@min(r.attempts, RECONNECT_DELAYS_MS.len - 1)];
+    r.source = c.g_timeout_add(next, @ptrCast(&onReconnectTick), @ptrCast(r));
+    return 0;
 }
 
 /// Ask the host to identify its own directories -- once per
@@ -381,6 +485,16 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     }
     self.previewHostDied(hc);
     self.endProbesFor(hc, "host connection lost");
+    if (self.git_rhc == hc) {
+        self.git_rhc = null;
+        self.git_rreq = 0;
+        self.git_rjob = 0;
+    }
+    if (self.diff.hc == hc) {
+        self.diff.hc = null;
+        self.diff.req = 0;
+        self.diff.job = 0;
+    }
     if (self.attr_request) |request| {
         if (request.hc == hc) self.endAttrRequest();
     }
@@ -406,10 +520,27 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         _ = c.g_source_remove(hc.write_watch_id);
         hc.write_watch_id = 0;
     }
+    if (hc.drain_idle != 0) {
+        _ = c.g_source_remove(hc.drain_idle);
+        hc.drain_idle = 0;
+    }
     hc.conn.deinit();
     hc.state = .dead;
-    self.setStatusFmt("connection to {s} lost — navigate to reconnect", .{hc.label()});
     self.renderJobs();
+    // A remote host with tabs still on it gets re-dialed by timer; a
+    // local daemon reconnects on the next op anyway.
+    if (hc.host) |host| {
+        var stranded = false;
+        for (self.tabs.items) |tab| {
+            if (tab.hc == hc) stranded = true;
+        }
+        if (stranded) {
+            self.setStatusFmt("connection to {s} lost — reconnecting…", .{hc.label()});
+            self.scheduleReconnect(host);
+            return;
+        }
+    }
+    self.setStatusFmt("connection to {s} lost — navigate to reconnect", .{hc.label()});
 }
 
 pub fn sendOp(self: *BrowserView, hc: *HostConn, args: anytype) void {
@@ -540,6 +671,12 @@ pub fn sendListingOp(self: *BrowserView, p: *Pending) void {
             .attrs = attrs,
         }),
     }
+    // Free space rides every root listing: navigation, reload and
+    // resync all keep the status line's figure current for cheap.
+    if (p.dir == p.tab.root) {
+        p.tab.free_req = self.nextReq();
+        self.sendOp(p.hc, .{ .req = p.tab.free_req, .op = "statfs", .path = p.dir.path });
+    }
 }
 
 /// Subscribe a directory and start collecting its listing. When
@@ -582,18 +719,26 @@ pub fn nextReq(self: *BrowserView) u32 {
     return r;
 }
 
-pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-    _ = fd;
-    const hc: *HostConn = @ptrCast(@alignCast(user.?));
-    const self = hc.view;
-    if (self.widgets_dead) {
-        hc.watch_id = 0;
-        return 0;
-    }
-    const alive = hc.conn.fillAvailable();
+/// Frame-parse budget per main-loop dispatch. fillAvailable buffers
+/// up to 4 MB per call; parsing it all in one dispatch stalls input
+/// for as long as a fast host keeps the pipe full. Leftovers continue
+/// on an idle so clicks interleave with the parse.
+const DRAIN_BUDGET_US: i64 = 8_000;
+
+/// Parse buffered frames for at most the budget.
+/// @return true when the budget ran out with frames still buffered.
+fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
+    const deadline = c.g_get_monotonic_time() + DRAIN_BUDGET_US;
     var dirty = false;
     var xfer_touched = false;
-    while (hc.conn.takeFrame() catch null) |f| {
+    var over_budget = false;
+    while (true) {
+        if (c.g_get_monotonic_time() > deadline) {
+            // Possibly nothing left; the idle drains once for free.
+            over_budget = true;
+            break;
+        }
+        const f = (hc.conn.takeFrame() catch null) orelse break;
         // The frame payload belongs to the CONN's allocator (the
         // C allocator for thread-connected remotes), not ours.
         defer f.deinit(hc.conn.allocator);
@@ -606,6 +751,8 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
         if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
         if (self.feedProbes(hc, f.ftype, f.payload)) continue;
         if (self.feedAttrRequest(hc, f.ftype, f.payload)) continue;
+        if (self.feedGit(hc, f.ftype, f.payload)) continue;
+        if (self.feedDiff(hc, f.ftype, f.payload)) continue;
         if (mediacols.feed(self, hc, f.ftype, f.payload)) continue;
         switch (f.ftype) {
             .fs_reply => {
@@ -632,6 +779,45 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
     // storms otherwise rebuild the listing model per drain, which
     // eats clicks and flickers hover for as long as the data trickles.
     if (dirty) self.scheduleListingRender();
+    return over_budget;
+}
+
+fn ensureDrainIdle(hc: *HostConn) void {
+    if (hc.drain_idle != 0) return;
+    hc.drain_idle = c.g_idle_add(@ptrCast(&onDrainIdle), @ptrCast(hc));
+}
+
+fn onDrainIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const self = hc.view;
+    if (self.widgets_dead or hc.state != .ready) {
+        hc.drain_idle = 0;
+        return 0;
+    }
+    const alive = hc.conn.fillAvailable();
+    const more = drainFrames(self, hc);
+    if (!alive) {
+        hc.drain_idle = 0;
+        dropReadWatch(hc);
+        self.hostDied(hc);
+        return 0;
+    }
+    if (more) return 1;
+    hc.drain_idle = 0;
+    return 0;
+}
+
+pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+    _ = fd;
+    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const self = hc.view;
+    if (self.widgets_dead) {
+        hc.watch_id = 0;
+        return 0;
+    }
+    const alive = hc.conn.fillAvailable();
+    const more = drainFrames(self, hc);
+    if (more) ensureDrainIdle(hc);
     if (!alive or cond & (c.G_IO_HUP | c.G_IO_ERR) != 0) {
         self.hostDied(hc);
         return 0;
@@ -646,6 +832,14 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         .ignore_unknown_fields = true,
     }) catch return false;
     if (rep.req == 0) return false;
+
+    for (self.tabs.items) |tab| {
+        if (tab.hc == hc and tab.free_req != 0 and tab.free_req == rep.req) {
+            tab.free_req = 0;
+            if (rep.ok and rep.frsize > 0) tab.free_bytes = rep.bavail * rep.frsize;
+            return if (self.currentTab()) |cur| cur == tab else false;
+        }
+    }
 
     if (self.completion_request) |completion| {
         if (completion.hc == hc and completion.req == rep.req) {
