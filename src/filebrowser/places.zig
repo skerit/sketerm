@@ -49,6 +49,11 @@ pub const Places = struct {
     /// Display labels parallel to `bookmarks`; "" (or a missing tail,
     /// for files written before labels existed) = derive from spec.
     bookmark_labels: []const []const u8 = &.{},
+    /// Custom icons parallel to `bookmarks`; "" (or a missing tail,
+    /// for files written before icons existed) = the default star.
+    /// A value is a themed icon name, an emoji, or an absolute
+    /// image-file path — resolved at render time, not here.
+    bookmark_icons: []const []const u8 = &.{},
     recent: []const []const u8 = &.{},
     /// Visit statistics behind the frecency jump (Ctrl+J): parallel
     /// to nothing, its own capped list.
@@ -355,6 +360,34 @@ test "widget sections and hidden sections round-trip; old files default empty" {
     try t.expectEqual(@as(usize, 0), p2.value.widget_sections.len);
     try t.expectEqual(@as(usize, 0), p2.value.hidden_sections.len);
     try t.expectEqual(@as(usize, 0), p2.value.bookmark_labels.len);
+}
+
+test "bookmark icons round-trip; old files default to no icons" {
+    const t = std.testing;
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(Places{
+        .bookmarks = &.{ "/music", "/pics" },
+        .bookmark_icons = &.{ "folder-music-symbolic", "🎨" },
+    }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(Places, t.allocator, out.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try t.expectEqual(@as(usize, 2), parsed.value.bookmark_icons.len);
+    try t.expectEqualStrings("folder-music-symbolic", parsed.value.bookmark_icons[0]);
+    try t.expectEqualStrings("🎨", parsed.value.bookmark_icons[1]);
+
+    // A file written before icons existed: the list defaults empty and
+    // the loader pads per-bookmark with "" (= default icon).
+    const old = "{\"bookmarks\":[\"/x\",\"/y\"],\"bookmark_labels\":[\"X\"]}";
+    const p2 = try std.json.parseFromSlice(Places, t.allocator, old, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer p2.deinit();
+    try t.expectEqual(@as(usize, 0), p2.value.bookmark_icons.len);
 }
 
 test "recordRecent dedupes, front-inserts, and trims" {

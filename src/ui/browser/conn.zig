@@ -504,6 +504,9 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     if (self.attr_request) |request| {
         if (request.hc == hc) self.endAttrRequest();
     }
+    if (self.snap_request) |sr| {
+        if (sr.hc == hc) @import("props.zig").snapDegrade(self);
+    }
     i = 0;
     while (i < self.remote_thumbs.items.len) {
         const rt = self.remote_thumbs.items[i];
@@ -758,6 +761,7 @@ fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
         if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
         if (self.feedProbes(hc, f.ftype, f.payload)) continue;
         if (self.feedAttrRequest(hc, f.ftype, f.payload)) continue;
+        if (self.feedSnapRequest(hc, f.ftype, f.payload)) continue;
         if (self.feedGit(hc, f.ftype, f.payload)) continue;
         if (self.feedDiff(hc, f.ftype, f.payload)) continue;
         if (mediacols.feed(self, hc, f.ftype, f.payload)) continue;

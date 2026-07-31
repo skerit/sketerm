@@ -22,6 +22,7 @@ comptime {
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/entry.zig");
+    _ = @import("filebrowser/incomplete.zig");
     _ = @import("filebrowser/fileicon.zig");
     _ = @import("filebrowser/format.zig");
     _ = @import("filebrowser/grouping.zig");
@@ -34,6 +35,7 @@ comptime {
     _ = @import("filebrowser/query.zig");
     _ = @import("filebrowser/registers.zig");
     _ = @import("filebrowser/thumbs.zig");
+    _ = @import("filebrowser/snapshots.zig");
     _ = @import("filebrowser/viewmem.zig");
     _ = @import("filebrowser/xferqueue.zig");
     _ = @import("fsmount.zig");

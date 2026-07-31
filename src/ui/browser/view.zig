@@ -28,6 +28,7 @@ const file_transfers = @import("../file_transfers.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const AttrRequest = @import("props.zig").AttrRequest;
+const SnapRequest = @import("props.zig").SnapRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
 const CopyQueue = @import("jobs.zig").CopyQueue;
@@ -253,6 +254,9 @@ pub const BrowserView = struct {
     /// Custom bookmark labels, parallel to `bookmarks` ("" = derive
     /// from the spec).
     bookmark_labels: std.ArrayList([]u8) = .empty,
+    /// Custom bookmark icons, parallel to `bookmarks` ("" = default;
+    /// otherwise an icon name, emoji, or absolute image path).
+    bookmark_icons: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
     /// Visit statistics behind the frecency jump (Ctrl+J).
     frecency: std.ArrayList(places_mod.FrecOwned) = .empty,
@@ -320,6 +324,9 @@ pub const BrowserView = struct {
     on_host_exec: ?HostAction = null,
     /// In-flight attr_list for an open Properties dialog.
     attr_request: ?AttrRequest = null,
+    /// In-flight snapshot ("Previous Versions") discovery for an open
+    /// Properties dialog.
+    snap_request: ?*SnapRequest = null,
     /// The open column picker, so editing a column can close it.
     column_picker: ?*c.GtkWidget = null,
     /// Emblem rules (name globs / attribute predicates -> badge icon).
@@ -726,6 +733,9 @@ pub const BrowserView = struct {
     pub const endAttrRequest = @import("props.zig").endAttrRequest;
     pub const requestAttrs = @import("props.zig").requestAttrs;
     pub const feedAttrRequest = @import("props.zig").feedAttrRequest;
+    pub const endSnapRequest = @import("props.zig").endSnapRequest;
+    pub const requestSnapshots = @import("props.zig").requestSnapshots;
+    pub const feedSnapRequest = @import("props.zig").feedSnapRequest;
     pub const attrLabel = @import("props.zig").attrLabel;
     pub const onAttrRowSet = @import("props.zig").onAttrRowSet;
     pub const onAttrRowActivate = @import("props.zig").onAttrRowActivate;
@@ -748,7 +758,6 @@ pub const BrowserView = struct {
     pub const onPlacesRightClick = @import("places.zig").onPlacesRightClick;
     pub const runSavedSearch = @import("places.zig").runSavedSearch;
     pub const onSaveSearchClicked = @import("places.zig").onSaveSearchClicked;
-    pub const onBookmarkRemove = @import("places.zig").onBookmarkRemove;
     pub const savePlaces = @import("places.zig").savePlaces;
     pub const addBookmark = @import("places.zig").addBookmark;
     pub const recordRecentSpec = @import("places.zig").recordRecentSpec;
@@ -809,6 +818,11 @@ pub const BrowserView = struct {
                 const lbl: []const u8 = if (i < parsed.value.bookmark_labels.len) parsed.value.bookmark_labels[i] else "";
                 const lowned = allocator.dupe(u8, lbl) catch continue;
                 self.bookmark_labels.append(allocator, lowned) catch allocator.free(lowned);
+                // Older files have no icons list; pad with "" so the
+                // three lists stay strictly parallel.
+                const ico: []const u8 = if (i < parsed.value.bookmark_icons.len) parsed.value.bookmark_icons[i] else "";
+                const iowned = allocator.dupe(u8, ico) catch continue;
+                self.bookmark_icons.append(allocator, iowned) catch allocator.free(iowned);
             }
             for (parsed.value.hidden_sections) |k| {
                 const owned = allocator.dupe(u8, k) catch continue;
@@ -1208,6 +1222,7 @@ pub const BrowserView = struct {
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
         self.endAttrRequest();
+        self.endSnapRequest();
         self.preview_state.deinit(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
@@ -1236,6 +1251,8 @@ pub const BrowserView = struct {
         self.bookmarks.deinit(self.allocator);
         for (self.bookmark_labels.items) |b| self.allocator.free(b);
         self.bookmark_labels.deinit(self.allocator);
+        for (self.bookmark_icons.items) |b| self.allocator.free(b);
+        self.bookmark_icons.deinit(self.allocator);
         for (self.recent.items) |r| self.allocator.free(r);
         self.recent.deinit(self.allocator);
         for (self.frecency.items) |fe| self.allocator.free(fe.spec);
