@@ -1524,6 +1524,8 @@ pub const FsOpReq = struct {
     delete_destination: bool = false,
     /// cross_copy: delete the verified source afterwards (a move).
     delete_src: bool = false,
+    /// copy: hash-verify each file after copy (files_verify_copy).
+    verify: bool = false,
     /// cross_copy: cap the initial per-side dial attempts (0 = full
     /// budget); direct remote-to-remote attempts fail fast with it.
     dial_tries: u32 = 0,

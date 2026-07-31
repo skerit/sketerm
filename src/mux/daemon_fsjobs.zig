@@ -68,6 +68,16 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .perm_tree
     else if (std.mem.eql(u8, r.op, "media_meta"))
         .media_meta
+    else if (std.mem.eql(u8, r.op, "git_status"))
+        .git_status
+    else if (std.mem.eql(u8, r.op, "diff"))
+        .diff
+    else if (std.mem.eql(u8, r.op, "split"))
+        .split
+    else if (std.mem.eql(u8, r.op, "combine"))
+        .combine
+    else if (std.mem.eql(u8, r.op, "secure_delete"))
+        .secure_delete
     else
         .hash;
     if ((op == .copy or op == .extract or op == .archive_create) and
@@ -85,6 +95,8 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         return fsReplyErr(cl, r.req, "empty pattern");
     // media_meta carries its batch in `pattern`; the cap keeps one
     // spec line inside the job helper's stdin buffer.
+    if (op == .split and r.pattern.len == 0)
+        return fsReplyErr(cl, r.req, "split needs a part size");
     if (op == .media_meta) {
         if (r.pattern.len == 0) return fsReplyErr(cl, r.req, "media_meta needs at least one name");
         if (r.pattern.len > MAX_MEDIA_BATCH_BYTES) return fsReplyErr(cl, r.req, "media_meta batch too large");
@@ -151,6 +163,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .owns_src = op == .preview_transport and r.delete_source,
         .delete_src = op == .cross_copy and r.delete_src,
         .dial_tries = r.dial_tries,
+        .verify = r.verify,
     }) catch
         return fsReplyErr(cl, r.req, "cannot start job");
     if (source_owner) |producer| {
@@ -165,7 +178,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
 /// with the requesting client. They report a view's decoration, not
 /// a mutation worth recovering.
 pub fn ephemeralOp(op: FsJob.Op) bool {
-    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta;
+    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff;
 }
 
 /// Recursive-permission arguments; -1 keeps the current owner or
@@ -196,6 +209,7 @@ pub const FsJobArgs = struct {
     /// cross_copy move semantics: journaled, so a daemon-restart
     /// respawn still deletes the source instead of degrading to a copy.
     delete_src: bool = false,
+    verify: bool = false,
     /// NOT journaled: a respawn dials with the full budget.
     dial_tries: u32 = 0,
 };
@@ -241,6 +255,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .delete_source = args.owns_src,
         .delete_src = args.delete_src,
         .dial_tries = args.dial_tries,
+        .verify = args.verify,
     }, .{}, &spec_aw.writer);
     try spec_aw.writer.writeByte('\n');
 
