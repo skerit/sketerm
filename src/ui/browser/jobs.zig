@@ -550,6 +550,100 @@ fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, mov
     return local;
 }
 
+/// A paste/send that arrived while its source or destination host was
+/// still CONNECTING. Held here and released by wireReady — the first
+/// paste onto a cold host used to be silently dropped with "retry in
+/// a moment" as the only recovery.
+pub const DeferredTransfer = struct {
+    src_hc: *HostConn,
+    dst_hc: *HostConn,
+    src_path: []u8,
+    dst_path: []u8,
+    open_when_done: bool,
+    open_with_appid: ?[]u8,
+    watch_host: ?[]u8,
+    watch_remote: ?[]u8,
+    delete_src_after: bool,
+
+    pub fn destroy(self: *DeferredTransfer, allocator: std.mem.Allocator) void {
+        allocator.free(self.src_path);
+        allocator.free(self.dst_path);
+        if (self.open_with_appid) |s| allocator.free(s);
+        if (self.watch_host) |s| allocator.free(s);
+        if (self.watch_remote) |s| allocator.free(s);
+        allocator.destroy(self);
+    }
+};
+
+fn deferTransfer(
+    self: *BrowserView,
+    src_hc: *HostConn,
+    src_path: []const u8,
+    dst_hc: *HostConn,
+    dst_path: []const u8,
+    opts: TransferOpts,
+) void {
+    const d = self.allocator.create(DeferredTransfer) catch return;
+    const src = self.allocator.dupe(u8, src_path) catch {
+        self.allocator.destroy(d);
+        return;
+    };
+    const dst = self.allocator.dupe(u8, dst_path) catch {
+        self.allocator.free(src);
+        self.allocator.destroy(d);
+        return;
+    };
+    d.* = .{
+        .src_hc = src_hc,
+        .dst_hc = dst_hc,
+        .src_path = src,
+        .dst_path = dst,
+        .open_when_done = opts.open_when_done,
+        .open_with_appid = if (opts.open_with_appid) |s| (self.allocator.dupe(u8, s) catch null) else null,
+        .watch_host = if (opts.watch_host) |s| (self.allocator.dupe(u8, s) catch null) else null,
+        .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
+        .delete_src_after = opts.delete_src_after,
+    };
+    self.deferred_transfers.append(self.allocator, d) catch {
+        d.destroy(self.allocator);
+        return;
+    };
+    const waiting = if (src_hc.state != .ready) src_hc else dst_hc;
+    self.setStatusFmt("transfer queued — waiting for {s} to connect", .{waiting.label()});
+}
+
+/// Release every deferred transfer whose hosts are now both ready;
+/// drop (with a message) those whose host died. Called from wireReady
+/// and hostDied.
+pub fn pumpDeferredTransfers(self: *BrowserView) void {
+    var i: usize = 0;
+    while (i < self.deferred_transfers.items.len) {
+        const d = self.deferred_transfers.items[i];
+        if (d.src_hc.state == .dead or d.dst_hc.state == .dead) {
+            const gone = if (d.src_hc.state == .dead) d.src_hc else d.dst_hc;
+            self.setStatusFmt("transfer dropped — {s} is unreachable: {s}", .{
+                gone.label(), std.fs.path.basename(d.src_path),
+            });
+            _ = self.deferred_transfers.orderedRemove(i);
+            d.destroy(self.allocator);
+            continue;
+        }
+        if (d.src_hc.state != .ready or d.dst_hc.state != .ready) {
+            i += 1;
+            continue;
+        }
+        _ = self.deferred_transfers.orderedRemove(i);
+        startTransfer(self, d.src_hc, d.src_path, d.dst_hc, d.dst_path, .{
+            .open_when_done = d.open_when_done,
+            .open_with_appid = d.open_with_appid,
+            .watch_host = d.watch_host,
+            .watch_remote = d.watch_remote,
+            .delete_src_after = d.delete_src_after,
+        });
+        d.destroy(self.allocator);
+    }
+}
+
 pub fn startTransfer(
     self: *BrowserView,
     src_hc: *HostConn,
@@ -560,7 +654,13 @@ pub fn startTransfer(
 ) void {
     const open_when_done = opts.open_when_done;
     if (src_hc.state != .ready or dst_hc.state != .ready) {
-        self.setStatus("both hosts must be connected — retry in a moment");
+        // A sync-back upload carries a raw EditWatch pointer that must
+        // not outlive this call — that one path keeps the old refusal.
+        if (src_hc.state == .dead or dst_hc.state == .dead or opts.upload_watch != null) {
+            self.setStatus("both hosts must be connected — retry in a moment");
+            return;
+        }
+        deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts);
         return;
     }
     if (!open_when_done and opts.upload_watch == null) {
