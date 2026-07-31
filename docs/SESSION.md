@@ -11652,3 +11652,51 @@ they serve an older build. Verified: an installed-binary daemon on
 an isolated socket was replaced by the dev binary at GUI start;
 vastai's daemon (2 live sessions) was correctly left alone and its
 sessions confirmed intact after the whole test round.
+
+## 2026-07-31: PNG preview fallback, forwarded-app subsurface offset, menubar icons, queued GUI sends
+
+1. Remote previews/thumbnails no longer die on hosts without
+libjxl/libwebp: the GUI's advertised codec list now always ends in
+"png" for remote hosts, and the daemon's transportPreview tries
+jxl/webp first with an stb-PNG last resort (compiled in — works on a
+static mux-portable where dlopen can never load a codec). The wire
+cache stays jxl/webp-only; PNG rides the legacy freedesktop path.
+imagecodec's dlopen probe re-probes while nothing loaded (installing
+a codec mid-session upgrades transfers without a restart; APIs are
+returned as copies under a spinlock). Explicit Reload clears the
+preview/thumbnail negative caches so a fixed host is observable in
+the same session. Error message now names the real condition.
+
+2. Forwarded CSD apps (Firefox) drew their content subsurface offset
+~20px from the window border: wlapp's parentPlacement added the
+parent's xdg window-geometry origin (the CSD shadow inset) to BOTH
+popups and subsurfaces. Per spec (and per our own daemon-side
+compositor model) wl_subsurface positions are parent-BUFFER
+relative; only xdg_popup anchors are geometry-relative. Placement
+now takes a role, and cropped views (macOS/embedded) subtract the
+crop origin for both roles. updateShadowLayout moved after the crop
+store so re-resolves see current crops.
+
+3. Files menubar dropdowns carry icons (tab-new, window-new/close,
+edit-cut/copy/paste/select-all, prefs, view-refresh, go-prev/next/up,
+user-home, user-trash, bookmark-new, help-about — Nemo's mapping);
+check rows keep the checkmark slot like Nemo's iconless toggles.
+
+4. No-block-UI hardening: fstransfer sends now QUEUE
+(queueFrame/queueJson) — the browser flushes wbuf remainders via a
+per-HostConn G_IO_OUT watch (ensureWriteFlush/onFdWritable), so a
+1 MiB chunk into a slow host's full socket buffer can no longer hold
+the GTK loop in sendFrame's 30s poll; smoke_fs pumps flush queued
+writes itself. hostmount.isMounted answers from /proc/self/mounts
+instead of stat'ing the mountpoint (a wedged FUSE helper hung the
+old device-compare). sendOp/closeViewOf queue too.
+
+5. Natural filename sort: naturalLess in filebrowser/format.zig
+(digit runs compare numerically, case-insensitive text, deterministic
+padding/case tiebreaks) replaces lessThanIgnoreCase for every name
+comparison in applySort — "file2" before "file10" in all views.
+
+Verified: zig build test 1097 pass / test-core 929 pass (new
+transportPreview-PNG + naturalLess tests), smoke-fs OK (transfer
+pause/resume/disconnect stages over the queued-send path),
+smoke-mux PASS, xvfb smoke-e2e PASS, mux-portable builds.
