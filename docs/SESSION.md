@@ -11832,3 +11832,35 @@ Verified: zig build clean, full test suite + test-core exit 0 (1108/
 941 incl. new rudp fast-retransmit/reorder, incomplete round-trip,
 places icon round-trip, 6 snapshots tests), smoke-mux + smoke-udp +
 xvfb smoke-e2e PASS, mux-portable builds.
+
+## 2026-08-02: durable transfer batches and aggregate selection facts
+
+Large multi-item paste/drop commands now render as one collapsed row
+with aggregate byte/file progress and optional per-item details. The
+cross-host admission path persists one bounded v5 batch manifest first,
+then materializes deterministic child tokens from GTK idle callbacks;
+expanded children stay hidden until admission ends, avoiding quadratic
+widget rebuilds. Retry predecessor/successor rows deduplicate by the
+durable item token, and panel rebuilds preserve the user's scroll
+position.
+
+The manifest owns the complete command, including conflicts and drop
+probes. Child records carry their parent token, terminal tombstones live
+until the parent is durably retired, Skip is one terminal write, and
+owner identity prevents two panes from submitting one child. Recovery
+routes an ownerless batch through registered panes until one can accept
+its destination. Record creation/deletion fsyncs the ledger directory;
+an ambiguous failed rename is poisoned to an unreadable version rather
+than becoming runnable after a crash.
+
+Multi-selection information now totals sizes from already-loaded file
+metadata without synchronous filesystem work, naming excluded folders
+and unavailable sizes honestly. Inline rename selection has an explicit
+theme-safe foreground/background rule.
+
+Verified: zig build; 1134/1139 full tests and 945/950 core tests (five
+skipped in each); smoke-fs, smoke-mux, smoke-broker, smoke-mcp,
+smoke-udp and xvfb smoke-e2e PASS; Linux-musl and aarch64-macos
+mux-portable builds; sketerm-mux still links libc/libm only. Live GUI
+checks covered a responsive 400-file batch, final-build grouped copy,
+34-byte aggregate selection total, expansion and rename selection.
