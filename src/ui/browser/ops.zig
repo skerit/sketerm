@@ -57,14 +57,75 @@ pub const DropProbe = struct {
     src: []u8,
     dst: []u8,
     cut: bool,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
+    manifest_token: ?[]u8 = null,
+    manifest_index: ?usize = null,
 
     pub fn destroy(self: *DropProbe, allocator: std.mem.Allocator) void {
         if (self.src_host) |host| allocator.free(host);
         allocator.free(self.src);
         allocator.free(self.dst);
+        if (self.manifest_token) |token| allocator.free(token);
         allocator.destroy(self);
     }
 };
+
+const PasteItem = struct {
+    src: []u8,
+    dst: []u8,
+    collision_is_dir: ?bool = null,
+    manifest_index: ?usize = null,
+
+    fn deinit(self: PasteItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.src);
+        allocator.free(self.dst);
+    }
+};
+
+/// One paste command being admitted incrementally from GTK's idle
+/// queue. The expensive durable fsync remains per item, but no command
+/// callback performs hundreds of them before returning to the UI.
+pub const PasteRun = struct {
+    tab: ?*BTab,
+    src_hc: *HostConn,
+    dst_hc: *HostConn,
+    src_host: ?[]u8,
+    dst_dir: []u8,
+    items: std.ArrayList(PasteItem) = .empty,
+    next: usize = 0,
+    admitted: usize = 0,
+    conflicts: usize = 0,
+    rejected: usize = 0,
+    cut: bool,
+    no_replace: bool = true,
+    batch_id: u64,
+    total: usize,
+    manifest_token: ?[]u8 = null,
+    failure: [256]u8 = undefined,
+    failure_len: usize = 0,
+
+    pub fn destroy(self: *PasteRun, allocator: std.mem.Allocator) void {
+        for (self.items.items) |item| item.deinit(allocator);
+        self.items.deinit(allocator);
+        if (self.src_host) |host| allocator.free(host);
+        if (self.manifest_token) |token| allocator.free(token);
+        allocator.free(self.dst_dir);
+        allocator.destroy(self);
+    }
+};
+
+fn newBatchId() u64 {
+    var raw: [8]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) == 0) {
+        const id = std.mem.readInt(u64, &raw, .little);
+        if (id != 0) return id;
+    }
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    const fallback = (@as(u64, @intCast(c.getpid())) << 32) ^ @as(u64, @intCast(ts.tv_nsec));
+    return if (fallback == 0) 1 else fallback;
+}
 
 pub fn copyToClip(ctx: *MenuCtx, cut: bool) void {
     const self = ctx.view;
@@ -184,7 +245,15 @@ pub fn cancelDropStateForTab(self: *BrowserView, tab: *BTab) void {
             continue;
         }
         _ = self.drop_probes.orderedRemove(i);
+        if (probe.manifest_token) |token| if (self.transfer_service) |service|
+            service.unclaimUserBatch(token);
         probe.destroy(self.allocator);
+    }
+    // Non-conflicting items already carry their exact destination and
+    // can continue without the tab. A later conflict needs a live page
+    // for its decision UI, so null the pointer before the tab dies.
+    for (self.paste_runs.items) |run| {
+        if (run.tab == tab) run.tab = null;
     }
     conflict.cancelTab(self, tab);
 }
@@ -214,6 +283,8 @@ pub const PasteOpts = struct {
     dir_mode: []const u8 = "",
     undoable: bool = true,
     no_replace: bool = false,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
 };
 
 const PasteBatchAction = enum { preserve_failure, rejected, conflicts, nothing, queued };
@@ -257,51 +328,405 @@ pub fn beginPaste(
         self.setStatus("paste not started: cannot allocate a host connection");
         return;
     };
-    const dir = tab.root.path;
-    var admitted: usize = 0;
-    var conflicts: usize = 0;
-    var rejected: usize = 0;
-    var failure_buf: [256]u8 = undefined;
-    var failure_len: usize = 0;
+    if (tab.hc.state == .ready and !tab.hc.conn.copy_no_replace) {
+        self.setStatusFmt("paste not queued: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return;
+    }
+    const run = self.allocator.create(PasteRun) catch {
+        self.setStatus("paste not started: out of memory");
+        return;
+    };
+    const dst_dir = self.allocator.dupe(u8, tab.root.path) catch {
+        self.allocator.destroy(run);
+        self.setStatus("paste not started: out of memory");
+        return;
+    };
+    const src_host_owned = if (src_host) |host| self.allocator.dupe(u8, host) catch {
+        self.allocator.free(dst_dir);
+        self.allocator.destroy(run);
+        self.setStatus("paste not started: out of memory");
+        return;
+    } else null;
+    run.* = .{
+        .tab = tab,
+        .src_hc = src_hc,
+        .dst_hc = tab.hc,
+        .src_host = src_host_owned,
+        .dst_dir = dst_dir,
+        .cut = cut,
+        .batch_id = 0,
+        .total = 0,
+    };
+    var existing: std.StringHashMapUnmanaged(bool) = .empty;
+    defer existing.deinit(self.allocator);
+    for (tab.root.entries.items) |entry|
+        existing.put(self.allocator, entry.name, entry.tdir) catch {};
     for (srcs) |src| {
         const base = std.fs.path.basename(src);
         var dst_buf: [4096]u8 = undefined;
         const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
-            if (dir.len == 1) "" else dir, base,
+            if (dst_dir.len == 1) "" else dst_dir, base,
         }) catch continue;
         // Pasting onto itself is a no-op, not a copy/move.
         if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) continue;
-        if (tab.root.find(base)) |i| {
-            const queued_before = self.conflicts.queue.items.len;
-            conflict.enqueue(self, tab, src_hc, src_host, src, dst, tab.root.entries.items[i].tdir, cut);
-            if (self.conflicts.queue.items.len > queued_before) {
-                conflicts += 1;
-            } else {
-                rejected += 1;
-                self.setStatusFmt("paste not queued: {s}", .{base});
-                rememberFailureStatus(self, &failure_buf, &failure_len);
-            }
+        const src_owned = self.allocator.dupe(u8, src) catch continue;
+        const dst_owned = self.allocator.dupe(u8, dst) catch {
+            self.allocator.free(src_owned);
             continue;
+        };
+        run.items.append(self.allocator, .{
+            .src = src_owned,
+            .dst = dst_owned,
+            .collision_is_dir = existing.get(base),
+        }) catch {
+            self.allocator.free(src_owned);
+            self.allocator.free(dst_owned);
+        };
+    }
+    if (run.items.items.len == 0) {
+        run.destroy(self.allocator);
+        self.setStatus("nothing to paste here");
+        return;
+    }
+    run.total = run.items.items.len;
+    if (run.total > 1) run.batch_id = newBatchId();
+
+    if (hostEq(src_host, tab.hc.host)) {
+        // Same-host admission does not need the client-side manifest.
+        // Park conflicts first and submit every free name directly.
+        var item_index: usize = 0;
+        while (item_index < run.items.items.len) {
+            const item = run.items.items[item_index];
+            if (item.collision_is_dir == null) {
+                item_index += 1;
+                continue;
+            }
+            queuePasteConflict(self, run, item, item.collision_is_dir.?);
+            _ = run.items.orderedRemove(item_index);
+            item.deinit(self.allocator);
         }
-        if (pasteOneAdmitted(self, tab, src_host, src, dst, cut, .{ .no_replace = true })) {
-            admitted += 1;
-        } else {
-            rejected += 1;
-            rememberFailureStatus(self, &failure_buf, &failure_len);
+        // Same-host admission has no client-side fsync and completed in
+        // one short callback even for hundreds of files. Keep it
+        // synchronous so every daemon request exists before return.
+        while (run.next < run.items.items.len) {
+            admitPasteItem(self, run, run.items.items[run.next]);
+            run.next += 1;
+        }
+        if (cut and clear_clipboard) self.clipboard().clear();
+        finishPasteRun(self, run);
+        run.destroy(self.allocator);
+        self.renderJobs();
+        return;
+    }
+
+    const service = self.transfer_service orelse {
+        conflict.cancelBatch(self, run.batch_id);
+        run.destroy(self.allocator);
+        self.setStatus("paste not started because durable recovery is unavailable");
+        return;
+    };
+    if (run.batch_id == 0) run.batch_id = newBatchId();
+    const specs = self.allocator.alloc(@import("../file_transfers.zig").BatchSpec, run.items.items.len) catch {
+        conflict.cancelBatch(self, run.batch_id);
+        run.destroy(self.allocator);
+        self.setStatus("paste not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(specs);
+    for (run.items.items, 0..) |item, i| specs[i] = .{
+        .src_path = item.src,
+        .dst_path = item.dst,
+        .conflict_is_dir = item.collision_is_dir,
+    };
+    const manifest = service.newUserBatch(
+        src_host orelse "",
+        tab.hc.host orelse "",
+        cut,
+        run.batch_id,
+        run.total,
+        specs,
+        @ptrCast(self),
+    ) orelse {
+        conflict.cancelBatch(self, run.batch_id);
+        run.destroy(self.allocator);
+        self.setStatus("paste not started because its batch recovery record could not be saved");
+        return;
+    };
+    run.manifest_token = self.allocator.dupe(u8, manifest) catch {
+        service.redispatchUserBatch(manifest);
+        run.destroy(self.allocator);
+        self.setStatus("paste recovery was saved but could not be attached to this pane");
+        return;
+    };
+    for (run.items.items, 0..) |*item, i| item.manifest_index = i;
+    if (cut and clear_clipboard) self.clipboard().clear();
+    self.paste_runs.append(self.allocator, run) catch {
+        service.redispatchUserBatch(manifest);
+        run.destroy(self.allocator);
+        self.setStatus("paste not started: out of memory");
+        return;
+    };
+    self.setStatusFmt("queuing 0 of {d} transfer(s)", .{run.total});
+    self.renderJobs();
+    if (self.paste_idle == 0)
+        self.paste_idle = c.g_idle_add(@ptrCast(&onPasteIdle), @ptrCast(self));
+}
+
+fn queuePasteConflict(self: *BrowserView, run: *PasteRun, item: PasteItem, is_dir: bool) void {
+    if (run.tab) |tab| {
+        const queued_before = self.conflicts.queue.items.len;
+        conflict.enqueue(self, tab, run.src_hc, run.src_host, item.src, item.dst, is_dir, run.cut, run.batch_id, run.total, if (run.manifest_token) |token| .{
+            .token = token,
+            .index = item.manifest_index.?,
+        } else null);
+        if (self.conflicts.queue.items.len > queued_before) {
+            run.conflicts += 1;
+            return;
         }
     }
-    switch (pasteBatchAction(admitted, conflicts, rejected, failure_len > 0)) {
-        .preserve_failure => self.setStatus(failure_buf[0..failure_len]),
-        .rejected => self.setStatusFmt("{d} item(s) could not be queued", .{rejected}),
-        .conflicts => self.setStatusFmt("{d} item(s) queued; {d} name conflict(s) waiting for a decision", .{ admitted, conflicts }),
+    run.rejected += 1;
+    self.setStatusFmt("paste conflict could not be queued: {s}", .{std.fs.path.basename(item.src)});
+    rememberFailureStatus(self, &run.failure, &run.failure_len);
+}
+
+fn admitPasteItem(self: *BrowserView, run: *PasteRun, item: PasteItem) void {
+    const opts = @import("jobs.zig").TransferOpts{
+        .delete_src_after = run.cut,
+        .no_replace = run.no_replace,
+        .batch_id = run.batch_id,
+        .batch_total = run.total,
+    };
+    const admitted = if (run.manifest_token) |manifest|
+        self.startBatchTransfer(run.src_hc, item.src, run.dst_hc, item.dst, opts, manifest, item.manifest_index.?)
+    else
+        pasteOneAdmittedOn(self, run.dst_hc, run.src_host, item.src, item.dst, run.cut, .{
+            .no_replace = run.no_replace,
+            .batch_id = run.batch_id,
+            .batch_total = run.total,
+        });
+    if (admitted) {
+        run.admitted += 1;
+    } else {
+        run.rejected += 1;
+        rememberFailureStatus(self, &run.failure, &run.failure_len);
+    }
+}
+
+fn finishPasteRun(self: *BrowserView, run: *PasteRun) void {
+    switch (pasteBatchAction(run.admitted, run.conflicts, run.rejected, run.failure_len > 0)) {
+        .preserve_failure => self.setStatus(run.failure[0..run.failure_len]),
+        .rejected => self.setStatusFmt("{d} item(s) could not be queued", .{run.rejected}),
+        .conflicts => self.setStatusFmt("{d} item(s) queued; {d} name conflict(s) waiting for a decision", .{ run.admitted, run.conflicts }),
         .nothing => self.setStatus("nothing to paste here"),
-        .queued => self.setStatusFmt("{d} transfer(s) queued", .{admitted}),
+        .queued => self.setStatusFmt("{d} transfer(s) queued", .{run.admitted}),
     }
-    if (cut and clear_clipboard) {
-        // Cut is one-shot: the sources are moving away. Parked
-        // conflicts own their own copy of the paths.
-        self.clipboard().clear();
+}
+
+fn onPasteIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (self.widgets_dead or self.paste_runs.items.len == 0) {
+        self.paste_idle = 0;
+        return 0;
     }
+    const run = self.paste_runs.items[0];
+    if (run.next < run.items.items.len) {
+        const item = run.items.items[run.next];
+        run.next += 1;
+        if (item.collision_is_dir) |is_dir| {
+            queuePasteConflict(self, run, item, is_dir);
+        } else {
+            admitPasteItem(self, run, item);
+        }
+        if (run.next < run.items.items.len)
+            self.setStatusFmt("queuing {d} of {d} transfer(s)", .{ run.next, run.total });
+        self.renderJobs();
+    }
+    if (run.next < run.items.items.len) return 1;
+    finishPasteRun(self, run);
+    const manifest = run.manifest_token;
+    run.manifest_token = null;
+    _ = self.paste_runs.orderedRemove(0);
+    run.destroy(self.allocator);
+    if (manifest) |token| {
+        self.settleUserBatch(token);
+        self.allocator.free(token);
+    }
+    self.renderJobs();
+    if (self.paste_runs.items.len > 0) return 1;
+    self.paste_idle = 0;
+    return 0;
+}
+
+/// Rebuild an interrupted admission run from its durable manifest.
+pub fn adoptPasteBatch(ctx: *anyopaque, rec: @import("../file_transfers.zig").BatchRec) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx));
+    for (self.paste_runs.items) |run| {
+        if (run.manifest_token) |token| {
+            if (std.mem.eql(u8, token, rec.token)) return;
+        }
+    }
+    const service = self.transfer_service orelse return;
+    const src_hc = self.hostConnFor(if (rec.src_host.len == 0) null else rec.src_host) orelse {
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    const dst_hc = self.hostConnFor(if (rec.dst_host.len == 0) null else rec.dst_host) orelse {
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    if (rec.items.len == 0) {
+        _ = service.finishUserBatch(rec.token);
+        return;
+    }
+    var target_tab: ?*BTab = null;
+    for (rec.items, 0..) |item, i| {
+        if (item.conflict_is_dir == null or service.userBatchItemMaterialized(rec.token, i)) continue;
+        const dir = std.fs.path.dirname(item.dst_path) orelse "/";
+        for (self.tabs.items) |tab| {
+            if (tab.hc != dst_hc) continue;
+            if (std.mem.eql(u8, tab.root.path, dir) or tab.subdirByPath(dir) != null) {
+                target_tab = tab;
+                break;
+            }
+        }
+        if (target_tab == null) {
+            service.unclaimUserBatch(rec.token);
+            return;
+        }
+        break;
+    }
+    const run = self.allocator.create(PasteRun) catch {
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    const first_dir = std.fs.path.dirname(rec.items[0].dst_path) orelse "/";
+    const dst_dir = self.allocator.dupe(u8, first_dir) catch {
+        self.allocator.destroy(run);
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    const src_host = if (rec.src_host.len > 0) self.allocator.dupe(u8, rec.src_host) catch {
+        self.allocator.free(dst_dir);
+        self.allocator.destroy(run);
+        service.unclaimUserBatch(rec.token);
+        return;
+    } else null;
+    const manifest = self.allocator.dupe(u8, rec.token) catch {
+        if (src_host) |host| self.allocator.free(host);
+        self.allocator.free(dst_dir);
+        self.allocator.destroy(run);
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    run.* = .{
+        .tab = target_tab,
+        .src_hc = src_hc,
+        .dst_hc = dst_hc,
+        .src_host = src_host,
+        .dst_dir = dst_dir,
+        .cut = rec.move,
+        .no_replace = rec.no_replace,
+        .batch_id = rec.batch_id,
+        .total = @intCast(rec.batch_total),
+        .manifest_token = manifest,
+    };
+    for (rec.items, 0..) |item, i| {
+        if (service.userBatchItemMaterialized(rec.token, i)) continue;
+        const src = self.allocator.dupe(u8, item.src_path) catch break;
+        const dst = self.allocator.dupe(u8, item.dst_path) catch {
+            self.allocator.free(src);
+            break;
+        };
+        run.items.append(self.allocator, .{
+            .src = src,
+            .dst = dst,
+            .collision_is_dir = item.conflict_is_dir,
+            .manifest_index = i,
+        }) catch {
+            self.allocator.free(src);
+            self.allocator.free(dst);
+            break;
+        };
+    }
+    const remaining = for (rec.items, 0..) |_, i| {
+        if (!service.userBatchItemMaterialized(rec.token, i)) break false;
+    } else true;
+    if (remaining) {
+        run.destroy(self.allocator);
+        _ = service.finishUserBatch(rec.token);
+        return;
+    }
+    var expected_remaining: usize = 0;
+    for (rec.items, 0..) |_, i| if (!service.userBatchItemMaterialized(rec.token, i)) {
+        expected_remaining += 1;
+    };
+    if (run.items.items.len != expected_remaining) {
+        run.destroy(self.allocator);
+        service.unclaimUserBatch(rec.token);
+        return;
+    }
+    self.paste_runs.append(self.allocator, run) catch {
+        run.destroy(self.allocator);
+        service.unclaimUserBatch(rec.token);
+        return;
+    };
+    self.setStatusFmt("recovering transfer batch: {d} item(s)", .{run.total});
+    self.renderJobs();
+    if (self.paste_idle == 0)
+        self.paste_idle = c.g_idle_add(@ptrCast(&onPasteIdle), @ptrCast(self));
+}
+
+/// Resolve an interactive conflict through its deterministic manifest
+/// child when this command was persisted as a cross-host batch.
+pub fn resolvePasteConflict(
+    self: *BrowserView,
+    tab: *BTab,
+    src_host: ?[]const u8,
+    src: []const u8,
+    dst: []const u8,
+    cut: bool,
+    opts: PasteOpts,
+    manifest_token: ?[]const u8,
+    manifest_index: ?usize,
+    skip: bool,
+) bool {
+    const manifest = manifest_token orelse {
+        if (skip) return true;
+        return pasteOneAdmitted(self, tab, src_host, src, dst, cut, opts);
+    };
+    const index = manifest_index orelse return false;
+    const service = self.transfer_service orelse return false;
+    const admitted = if (skip)
+        service.skipUserBatchItem(manifest, index, @ptrCast(self))
+    else blk: {
+        const src_hc = self.hostConnFor(src_host) orelse break :blk false;
+        break :blk self.startBatchTransfer(src_hc, src, tab.hc, dst, .{
+            .delete_src_after = cut,
+            .no_replace = opts.no_replace,
+            .batch_id = opts.batch_id,
+            .batch_total = opts.batch_total,
+        }, manifest, index);
+    };
+    if (!admitted) return false;
+    self.settleUserBatch(manifest);
+    return true;
+}
+
+/// Retire a fully materialized manifest, or release an incomplete one
+/// only when no live probe/conflict still owns its missing children.
+pub fn settleUserBatch(self: *BrowserView, token: []const u8) void {
+    const service = self.transfer_service orelse return;
+    if (service.finishUserBatch(token)) return;
+    for (self.paste_runs.items) |run| if (run.manifest_token) |active| {
+        if (std.mem.eql(u8, active, token)) return;
+    };
+    for (self.drop_probes.items) |probe| if (probe.manifest_token) |active| {
+        if (std.mem.eql(u8, active, token)) return;
+    };
+    for (self.conflicts.queue.items) |item| if (item.manifest_token) |active| {
+        if (std.mem.eql(u8, active, token)) return;
+    };
+    service.unclaimUserBatch(token);
 }
 
 /// Start ONE source's copy (or move) to an exact destination path.
@@ -336,21 +761,33 @@ fn pasteOneAdmitted(
     cut: bool,
     opts: PasteOpts,
 ) bool {
+    return pasteOneAdmittedOn(self, tab.hc, src_host, src, dst, cut, opts);
+}
+
+fn pasteOneAdmittedOn(
+    self: *BrowserView,
+    dst_hc: *HostConn,
+    src_host: ?[]const u8,
+    src: []const u8,
+    dst: []const u8,
+    cut: bool,
+    opts: PasteOpts,
+) bool {
     const base = std.fs.path.basename(src);
-    if (opts.no_replace and tab.hc.state == .ready and !tab.hc.conn.copy_no_replace) {
-        self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{tab.hc.label()});
+    if (opts.no_replace and dst_hc.state == .ready and !dst_hc.conn.copy_no_replace) {
+        self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{dst_hc.label()});
         return false;
     }
-    if (hostEq(src_host, tab.hc.host)) {
-        if (tab.hc.state != .ready) {
-            self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+    if (hostEq(src_host, dst_hc.host)) {
+        if (dst_hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{dst_hc.label()});
             return false;
         }
         if (cut) {
             // Same-host move = one rename, undoable.
             const req = self.nextReq();
-            const undo = self.makeUndo(tab.hc.host, .rename_back, dst, src, "");
-            if (!self.sendOpOk(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst, .no_replace = opts.no_replace })) {
+            const undo = self.makeUndo(dst_hc.host, .rename_back, dst, src, "");
+            if (!self.sendOpOk(dst_hc, .{ .req = req, .op = "rename", .path = src, .to = dst, .no_replace = opts.no_replace })) {
                 if (undo) |op| op.destroy(self.allocator);
                 return false;
             }
@@ -360,10 +797,15 @@ fn pasteOneAdmitted(
         var lbl: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
         const undo = if (opts.undoable)
-            self.makeUndo(tab.hc.host, .delete_created, dst, src, "")
+            self.makeUndo(dst_hc.host, .delete_created, dst, src, "")
         else
             null;
-        const admitted = self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, undo, .{ .dir_mode = opts.dir_mode, .no_replace = opts.no_replace });
+        const admitted = self.startDaemonJobUndo(dst_hc, "copy", src, dst, label, undo, .{
+            .dir_mode = opts.dir_mode,
+            .no_replace = opts.no_replace,
+            .batch_id = opts.batch_id,
+            .batch_total = opts.batch_total,
+        });
         if (!admitted) self.setStatusFmt("copy not queued: {s}", .{base});
         return admitted;
     }
@@ -374,7 +816,12 @@ fn pasteOneAdmitted(
     const before = transferAdmissionCount(self);
     var status_before_buf: [256]u8 = undefined;
     const status_before = statusSnapshot(self, &status_before_buf);
-    self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut, .no_replace = opts.no_replace });
+    self.startTransfer(src_hc, src, dst_hc, dst, .{
+        .delete_src_after = cut,
+        .no_replace = opts.no_replace,
+        .batch_id = opts.batch_id,
+        .batch_total = opts.batch_total,
+    });
     const admitted = transferAdmissionCount(self) > before;
     if (!admitted) {
         var status_after_buf: [256]u8 = undefined;
@@ -1687,11 +2134,76 @@ pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst
             return false;
         };
     }
-    var admitted = false;
-    for (owned.items) |spec| {
-        if (dropSpecIntoAction(self, tab, spec, dst_dir, fromGdkAction(action))) admitted = true;
+    if (owned.items.len == 0) return false;
+    const drop_action = fromGdkAction(action);
+    var manifest_specs: std.ArrayList(@import("../file_transfers.zig").BatchSpec) = .empty;
+    var planned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (manifest_specs.items) |item| self.allocator.free(item.dst_path);
+        manifest_specs.deinit(self.allocator);
+        planned.deinit(self.allocator);
     }
-    if (admitted) self.setStatusFmt("checking {d} dropped item(s) for conflicts", .{owned.items.len});
+    var common_host: ?[]const u8 = null;
+    var common_host_set = false;
+    var cross_host = false;
+    var move = false;
+    for (owned.items) |spec| {
+        const loc = parseSpec(spec);
+        const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
+        if (loc.path.len == 0 or loc.path[0] != '/') return false;
+        if (!common_host_set) {
+            common_host = src_host;
+            common_host_set = true;
+            cross_host = !hostEq(src_host, tab.hc.host);
+            move = drop_action == .move or (drop_action == .auto and !cross_host);
+        } else if (!hostEq(common_host, src_host)) {
+            self.setStatus("drop refused: all items must come from one host");
+            return false;
+        }
+        var dst_buf: [4200]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
+            if (dst_dir.len == 1) "" else dst_dir,
+            std.fs.path.basename(loc.path),
+        }) catch return false;
+        if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, loc.path, dst)) continue;
+        const dst_owned = self.allocator.dupe(u8, dst) catch return false;
+        manifest_specs.append(self.allocator, .{
+            .src_path = loc.path,
+            .dst_path = dst_owned,
+        }) catch {
+            self.allocator.free(dst_owned);
+            return false;
+        };
+        planned.append(self.allocator, spec) catch return false;
+    }
+    if (manifest_specs.items.len == 0) return false;
+    var batch_id = if (planned.items.len > 1) newBatchId() else 0;
+    if (cross_host and batch_id == 0) batch_id = newBatchId();
+    var manifest: ?[]const u8 = null;
+    if (cross_host) {
+        const service = self.transfer_service orelse {
+            self.setStatus("drop not started because durable recovery is unavailable");
+            return false;
+        };
+        manifest = service.newUserBatch(
+            common_host orelse "",
+            tab.hc.host orelse "",
+            move,
+            batch_id,
+            manifest_specs.items.len,
+            manifest_specs.items,
+            @ptrCast(self),
+        ) orelse {
+            self.setStatus("drop not started because its recovery record could not be saved");
+            return false;
+        };
+    }
+    var admitted = false;
+    for (planned.items, 0..) |spec, item_index| {
+        if (dropSpecIntoActionBatch(self, tab, spec, dst_dir, drop_action, batch_id, planned.items.len, manifest, if (manifest != null) item_index else null)) admitted = true;
+    }
+    if (!admitted) if (manifest) |token| if (self.transfer_service) |service| service.unclaimUserBatch(token);
+    if (admitted) self.setStatusFmt("checking {d} dropped item(s) for conflicts", .{planned.items.len});
     return admitted;
 }
 
@@ -1705,6 +2217,10 @@ pub fn dropSpecInto(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: [
 }
 
 pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction) bool {
+    return dropSpecIntoActionBatch(self, tab, spec, dst_dir, action, 0, 0, null, null);
+}
+
+fn dropSpecIntoActionBatch(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction, batch_id: u64, batch_total: usize, manifest_token: ?[]const u8, manifest_index: ?usize) bool {
     if (spec.len == 0) return false;
     const loc = parseSpec(spec);
     const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
@@ -1739,6 +2255,13 @@ pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_
         self.allocator.destroy(probe);
         return false;
     } else null;
+    const manifest_owned = if (manifest_token) |token| self.allocator.dupe(u8, token) catch {
+        if (host_owned) |host| self.allocator.free(host);
+        self.allocator.free(src_owned);
+        self.allocator.free(dst_owned);
+        self.allocator.destroy(probe);
+        return false;
+    } else null;
     const move = action == .move or (action == .auto and same_host);
     probe.* = .{
         .req = self.nextReq(),
@@ -1749,6 +2272,10 @@ pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_
         .src = src_owned,
         .dst = dst_owned,
         .cut = move,
+        .batch_id = batch_id,
+        .batch_total = batch_total,
+        .manifest_token = manifest_owned,
+        .manifest_index = manifest_index,
     };
     self.drop_probes.append(self.allocator, probe) catch {
         probe.destroy(self.allocator);
@@ -1767,14 +2294,25 @@ pub fn feedDropProbe(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
         if (probe.req != rep.req or probe.dst_hc != hc) continue;
         _ = self.drop_probes.orderedRemove(i);
         defer probe.destroy(self.allocator);
+        defer if (probe.manifest_token) |token| self.settleUserBatch(token);
         if (!self.tabAlive(probe.tab)) return true;
         if (probe.tab.hc != probe.dst_hc) {
             self.setStatus("drop canceled because the target tab moved to another host");
             return true;
         }
         if (rep.ok and rep.entry != null) {
+            if (probe.manifest_token) |token| {
+                const service = self.transfer_service orelse return true;
+                if (!service.markUserBatchConflict(token, probe.manifest_index.?, rep.entry.?.tdir)) {
+                    self.setStatusFmt("drop conflict recovery could not be updated: {s}", .{std.fs.path.basename(probe.src)});
+                    return true;
+                }
+            }
             const before = self.conflicts.queue.items.len;
-            conflict.enqueue(self, probe.tab, probe.src_hc, probe.src_host, probe.src, probe.dst, rep.entry.?.tdir, probe.cut);
+            conflict.enqueue(self, probe.tab, probe.src_hc, probe.src_host, probe.src, probe.dst, rep.entry.?.tdir, probe.cut, probe.batch_id, probe.batch_total, if (probe.manifest_token) |token| .{
+                .token = token,
+                .index = probe.manifest_index.?,
+            } else null);
             if (self.conflicts.queue.items.len == before)
                 self.setStatusFmt("drop conflict could not be queued: {s}", .{std.fs.path.basename(probe.src)});
             return true;
@@ -1784,9 +2322,23 @@ pub fn feedDropProbe(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
                 self.setStatusFmt("drop not queued: {s} runs an older daemon without safe no-replace support", .{probe.dst_hc.label()});
                 return true;
             }
-            _ = pasteOneAdmitted(self, probe.tab, probe.src_host, probe.src, probe.dst, probe.cut, .{ .no_replace = true });
+            const opts = PasteOpts{ .no_replace = true, .batch_id = probe.batch_id, .batch_total = probe.batch_total };
+            if (probe.manifest_token) |token| {
+                const admitted = self.startBatchTransfer(probe.src_hc, probe.src, probe.dst_hc, probe.dst, .{
+                    .delete_src_after = probe.cut,
+                    .no_replace = true,
+                    .batch_id = probe.batch_id,
+                    .batch_total = probe.batch_total,
+                }, token, probe.manifest_index.?);
+                if (admitted) {
+                    self.settleUserBatch(token);
+                }
+            } else {
+                _ = pasteOneAdmitted(self, probe.tab, probe.src_host, probe.src, probe.dst, probe.cut, opts);
+            }
             return true;
         }
+        if (probe.manifest_token) |token| self.settleUserBatch(token);
         self.setStatusFmt("drop not started: cannot inspect {s} ({s})", .{ probe.dst, rep.@"error" });
         return true;
     }

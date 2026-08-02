@@ -1219,6 +1219,13 @@ fn zebraClass(w: *c.GtkWidget, d: *ItemData) void {
 
 var css_installed = false;
 
+const rename_selection_css =
+    \\text.sketerm-fb-rename > selection {
+    \\  background-color: @theme_selected_bg_color;
+    \\  color: @theme_selected_fg_color;
+    \\}
+;
+
 /// Density + zebra + rename-editor styling for the column view.
 /// Installed once per process at APPLICATION priority, scoped to
 /// the sketerm-fb-cv class.
@@ -1262,11 +1269,17 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\  color: @theme_text_color;
         \\  caret-color: @theme_text_color;
         \\}
-    ;
+    ++ rename_selection_css;
     const provider = c.gtk_css_provider_new();
     c.gtk_css_provider_load_from_string(provider, css);
     const display = c.gtk_widget_get_display(any_widget);
     c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
+test "inline rename styles the text selection node" {
+    try std.testing.expect(std.mem.indexOf(u8, rename_selection_css, "text.sketerm-fb-rename > selection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rename_selection_css, "@theme_selected_bg_color") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rename_selection_css, "@theme_selected_fg_color") != null);
 }
 
 // ── rendering (model splice) ─────────────────────────────────────

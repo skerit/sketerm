@@ -32,7 +32,7 @@ const MAX_PANEL_HEIGHT = 168;
 const SPARK_W = 96;
 const SPARK_H = 18;
 
-const Kind = enum { daemon, xfer, durable, copy, deferred };
+const Kind = enum { batch, pending, conflict, probe, daemon, xfer, durable, copy, deferred };
 
 /// Stable identity of a panel row across rebuilds.
 const Key = struct {
@@ -47,12 +47,13 @@ const Key = struct {
     fn eql(a: Key, b: Key) bool {
         if (a.kind != b.kind) return false;
         return switch (a.kind) {
+            .batch => a.job == b.job,
             .durable => std.mem.eql(u8, a.token, b.token),
             .daemon => if (a.token.len > 0 or b.token.len > 0)
                 a.token.len > 0 and b.token.len > 0 and std.mem.eql(u8, a.token, b.token)
             else
                 a.ptr == b.ptr and a.job == b.job,
-            .xfer, .copy, .deferred => a.ptr == b.ptr,
+            .pending, .conflict, .probe, .xfer, .copy, .deferred => a.ptr == b.ptr,
         };
     }
 
@@ -101,6 +102,15 @@ const Row = struct {
     files_total: usize = 0,
     message: []const u8 = "",
     controls: Controls = .{},
+    /// Shared presentation identity of one paste/drop command.
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
+    /// Durable item identity used to collapse predecessor/successor
+    /// rows while an automatic retry changes queue representation.
+    batch_item: []const u8 = "",
+    move: bool = false,
+    /// Expanded batch members are indented under their synthetic row.
+    batch_child: bool = false,
     /// Daemon-job rows carry their HostConn, transfer rows their
     /// transfer, queued cross-host copies their queue item: the button
     /// handlers act on these.
@@ -191,12 +201,20 @@ pub const Panel = struct {
     in_tick: bool = false,
     rows_box: ?*c.GtkWidget = null,
     summary: ?*c.GtkLabel = null,
+    scroller: ?*c.GtkWidget = null,
+    scroll_restore: c.guint = 0,
+    scroll_state: ?ScrollState = null,
 
     pub fn deinit(self: *Panel, allocator: std.mem.Allocator) void {
         if (self.tick != 0) {
             _ = c.g_source_remove(self.tick);
             self.tick = 0;
         }
+        if (self.scroll_restore != 0) {
+            _ = c.g_source_remove(self.scroll_restore);
+            self.scroll_restore = 0;
+        }
+        self.scroll_state = null;
         for (self.meters.items) |m| m.destroy(allocator);
         self.meters.deinit(allocator);
     }
@@ -241,6 +259,10 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
             .src = hostQualified(arena, d.src_host, d.src_path),
             .dst = hostQualified(arena, d.dst_host, d.dst_path),
             .message = d.message,
+            .batch_id = d.batch_id,
+            .batch_total = @intCast(d.batch_total),
+            .batch_item = d.token,
+            .move = d.delete_src_after,
             .controls = .{
                 .pause = !terminal and !d.paused,
                 .unpause = !terminal and d.paused,
@@ -282,6 +304,10 @@ fn transferRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
             .files_done = counts.done,
             .files_total = counts.total,
             .message = if (state == .failed) t.x.errMsg() else "",
+            .batch_id = t.batch_id,
+            .batch_total = t.batch_total,
+            .batch_item = t.token orelse "",
+            .move = t.delete_src_after,
             // A terminal one is reaped rather than dismissed by hand.
             // Pause stops the pumping at the next chunk boundary; the
             // staged partial is the checkpoint it resumes from.
@@ -324,6 +350,10 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .files_done = @intCast(j.files_done),
             .files_total = @intCast(j.files_total),
             .message = j.messageText(),
+            .batch_id = j.batch_id,
+            .batch_total = j.batch_total,
+            .batch_item = if (j.retry) |retry| retry.token else "",
+            .move = if (j.retry) |retry| retry.move else false,
             .controls = .{
                 .pause = !j.terminal() and j.state != .paused,
                 .unpause = j.state == .paused,
@@ -332,6 +362,61 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
                 .retry = j.state == .failed and j.retry != null and !j.retry_scheduled and !successor_active,
             },
             .hc = j.hc,
+        }) catch return;
+    }
+}
+
+/// Batched start requests waiting for the daemon's job id. They are
+/// hidden under the collapsed batch row, but keep its full count and
+/// waiting state visible before the first reply arrives.
+fn pendingBatchRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
+    for (self.pending_jobs.items) |pending| {
+        if (pending.batch_id == 0) continue;
+        out.append(arena, .{
+            .key = .{ .kind = .pending, .ptr = @intFromPtr(pending) },
+            .label = pending.label,
+            .state = .queued,
+            .src = pending.paths.srcPath(),
+            .dst = pending.paths.dstPath(),
+            .batch_id = pending.batch_id,
+            .batch_total = pending.batch_total,
+            .batch_item = if (pending.retry) |retry| retry.token else "",
+            .move = if (pending.retry) |retry| retry.move else false,
+            .message = "waiting for the daemon to start the job",
+        }) catch return;
+    }
+}
+
+fn conflictRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
+    for (self.conflicts.queue.items) |item| {
+        if (item.batch_id == 0) continue;
+        out.append(arena, .{
+            .key = .{ .kind = .conflict, .ptr = @intFromPtr(item) },
+            .label = std.fs.path.basename(item.src),
+            .state = .queued,
+            .src = hostQualified(arena, item.src_hc.host orelse "", item.src),
+            .dst = hostQualified(arena, item.dst_hc.host orelse "", item.dst),
+            .message = "waiting for a name-conflict decision",
+            .batch_id = item.batch_id,
+            .batch_total = item.batch_total,
+            .move = item.cut,
+        }) catch return;
+    }
+}
+
+fn dropProbeRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
+    for (self.drop_probes.items) |probe| {
+        if (probe.batch_id == 0) continue;
+        out.append(arena, .{
+            .key = .{ .kind = .probe, .ptr = @intFromPtr(probe) },
+            .label = std.fs.path.basename(probe.src),
+            .state = .queued,
+            .src = hostQualified(arena, probe.src_hc.host orelse "", probe.src),
+            .dst = hostQualified(arena, probe.dst_hc.host orelse "", probe.dst),
+            .message = "checking for a name conflict",
+            .batch_id = probe.batch_id,
+            .batch_total = probe.batch_total,
+            .move = probe.cut,
         }) catch return;
     }
 }
@@ -347,6 +432,10 @@ fn copyQueueRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLi
             .src = hostQualified(arena, item.src_hc.host orelse "", item.src_path),
             .dst = hostQualified(arena, item.dst_hc.host orelse "", item.dst_path),
             .message = "waiting for the destination to be free",
+            .batch_id = item.batch_id,
+            .batch_total = item.batch_total,
+            .batch_item = item.token,
+            .move = item.move,
             .controls = .{ .cancel = true, .reorder = true },
             .copy = item,
         }) catch return;
@@ -368,6 +457,10 @@ fn deferredRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
             .src = hostQualified(arena, item.src_hc.host orelse "", item.src_path),
             .dst = hostQualified(arena, item.dst_hc.host orelse "", item.dst_path),
             .message = waiting,
+            .batch_id = item.batch_id,
+            .batch_total = item.batch_total,
+            .batch_item = item.token orelse "",
+            .move = item.delete_src_after,
             .controls = .{ .cancel = true },
             .deferred = item,
         }) catch return;
@@ -378,10 +471,183 @@ fn collectRows(self: *BrowserView, arena: std.mem.Allocator) []Row {
     var rows: std.ArrayList(Row) = .empty;
     durableRows(self, arena, &rows);
     transferRows(self, arena, &rows);
-    daemonRows(self, arena, &rows);
+    pendingBatchRows(self, arena, &rows);
+    conflictRows(self, arena, &rows);
+    dropProbeRows(self, arena, &rows);
     copyQueueRows(self, arena, &rows);
     deferredRows(self, arena, &rows);
+    daemonRows(self, arena, &rows);
     return rows.items;
+}
+
+const BatchAgg = struct {
+    id: u64,
+    expected: usize = 0,
+    admitting: bool = false,
+    admission_done: usize = 0,
+    children: usize = 0,
+    running: usize = 0,
+    queued: usize = 0,
+    paused: usize = 0,
+    finished: usize = 0,
+    failed: usize = 0,
+    canceled: usize = 0,
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    totals_known: bool = true,
+    move: bool = false,
+    dst: []const u8 = "",
+    current_file: ?[]const u8 = null,
+};
+
+fn satAdd(a: u64, b: u64) u64 {
+    return a +| b;
+}
+
+fn batchState(batch: BatchAgg) RowState {
+    if (batch.running > 0) return .running;
+    if (batch.admitting or batch.queued > 0) return .queued;
+    if (batch.paused > 0) return .paused;
+    if (batch.failed > 0) return .failed;
+    if (batch.finished > 0) return .finished;
+    if (batch.canceled > 0) return .canceled;
+    return .queued;
+}
+
+fn batchMessage(arena: std.mem.Allocator, batch: BatchAgg) []const u8 {
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var has_text = false;
+    if (batch.admitting) {
+        w.writer.print("queuing {d} of {d}", .{ batch.admission_done, batch.expected }) catch {};
+        has_text = true;
+    }
+    const absent = if (!batch.admitting and batch.expected > batch.children)
+        batch.expected - batch.children
+    else
+        0;
+    const counts = [_]struct { n: usize, label: []const u8 }{
+        .{ .n = batch.running, .label = "running" },
+        .{ .n = batch.queued, .label = "waiting" },
+        .{ .n = batch.paused, .label = "paused" },
+        .{ .n = batch.finished, .label = "finished" },
+        .{ .n = batch.failed, .label = "failed" },
+        .{ .n = batch.canceled, .label = "canceled" },
+        .{ .n = absent, .label = "not active" },
+    };
+    for (counts) |part| {
+        if (part.n == 0) continue;
+        if (has_text) w.writer.writeAll(", ") catch {};
+        w.writer.print("{d} {s}", .{ part.n, part.label }) catch {};
+        has_text = true;
+    }
+    return w.written();
+}
+
+/// Replace every nonzero batch id with one synthetic collapsed row.
+/// The existing item rows remain the expansion contents and retain all
+/// of their individual controls.
+fn groupedRows(self: *BrowserView, arena: std.mem.Allocator, raw: []const Row) []Row {
+    var batches: std.ArrayList(BatchAgg) = .empty;
+    var by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    var seen_items: std.StringHashMapUnmanaged(void) = .empty;
+    var members: std.ArrayList(Row) = .empty;
+
+    for (self.paste_runs.items) |run| {
+        if (run.batch_id == 0) continue;
+        const gop = by_id.getOrPut(arena, run.batch_id) catch continue;
+        if (!gop.found_existing) {
+            const index = batches.items.len;
+            batches.append(arena, .{ .id = run.batch_id }) catch {
+                _ = by_id.remove(run.batch_id);
+                continue;
+            };
+            gop.value_ptr.* = index;
+        }
+        const batch = &batches.items[gop.value_ptr.*];
+        batch.expected = run.total;
+        batch.admitting = true;
+        batch.admission_done = @min(run.total, run.next);
+        batch.move = run.cut;
+        batch.dst = hostQualified(arena, run.dst_hc.host orelse "", run.dst_dir);
+    }
+
+    for (raw) |row| {
+        if (row.batch_id == 0) continue;
+        if (row.batch_item.len > 0) {
+            const seen = seen_items.getOrPut(arena, row.batch_item) catch continue;
+            if (seen.found_existing) continue;
+        }
+        members.append(arena, row) catch continue;
+        const gop = by_id.getOrPut(arena, row.batch_id) catch continue;
+        if (!gop.found_existing) {
+            const index = batches.items.len;
+            batches.append(arena, .{ .id = row.batch_id }) catch {
+                _ = by_id.remove(row.batch_id);
+                continue;
+            };
+            gop.value_ptr.* = index;
+        }
+        const batch = &batches.items[gop.value_ptr.*];
+        batch.children += 1;
+        batch.expected = @max(batch.expected, row.batch_total);
+        batch.move = batch.move or row.move;
+        if (batch.dst.len == 0)
+            batch.dst = std.fs.path.dirname(row.dst) orelse row.dst;
+        if (batch.current_file == null and row.current_file != null)
+            batch.current_file = row.current_file;
+        batch.done = satAdd(batch.done, row.done);
+        batch.resumed_from = satAdd(batch.resumed_from, row.resumed_from);
+        if (row.total == 0 and row.active()) {
+            batch.totals_known = false;
+        } else {
+            batch.total = satAdd(batch.total, row.total);
+        }
+        switch (row.state) {
+            .running => batch.running += 1,
+            .queued => batch.queued += 1,
+            .paused => batch.paused += 1,
+            .finished => batch.finished += 1,
+            .failed => batch.failed += 1,
+            .canceled => batch.canceled += 1,
+        }
+    }
+
+    var out: std.ArrayList(Row) = .empty;
+    for (batches.items) |stored| {
+        const batch = stored;
+        const count = if (batch.expected > 0) batch.expected else batch.children;
+        const label = std.fmt.allocPrint(arena, "{s} {d} items to {s}", .{
+            if (batch.move) "Move" else "Copy", count, if (batch.dst.len > 0) batch.dst else "destination",
+        }) catch "File operation batch";
+        const key = Key{ .kind = .batch, .job = batch.id };
+        out.append(arena, .{
+            .key = key,
+            .label = label,
+            .state = batchState(batch),
+            .done = batch.done,
+            .total = if (batch.totals_known) batch.total else 0,
+            .resumed_from = batch.resumed_from,
+            .dst = batch.dst,
+            .current_file = batch.current_file,
+            .files_done = batch.finished + batch.failed + batch.canceled,
+            .files_total = count,
+            .message = batchMessage(arena, batch),
+            .move = batch.move,
+        }) catch return out.items;
+        const expanded = if (self.jobs_panel.find(key)) |meter| meter.expanded else false;
+        if (!expanded or batch.admitting) continue;
+        for (members.items) |row| {
+            if (row.batch_id != batch.id) continue;
+            var child = row;
+            child.batch_child = true;
+            out.append(arena, child) catch return out.items;
+        }
+    }
+    for (raw) |row| {
+        if (row.batch_id == 0) out.append(arena, row) catch return out.items;
+    }
+    return out.items;
 }
 
 /// Everything a rebuild depends on: which rows exist, in what order,
@@ -393,7 +659,6 @@ fn signature(rows: []const Row, panel: *Panel) u64 {
         r.key.hash(&h);
         h.update(std.mem.asBytes(&@intFromEnum(r.state)));
         h.update(std.mem.asBytes(&r.controls));
-        h.update(r.label);
         const expanded = if (panel.find(r.key)) |m| m.expanded else false;
         h.update(std.mem.asBytes(&expanded));
     }
@@ -556,6 +821,9 @@ fn summaryText(buf: []u8, rows: []const Row, panel: *Panel) []const u8 {
     var files_done: usize = 0;
     var files_total: usize = 0;
     for (rows) |r| {
+        // Expanded batch children are detail rows, not additional copy
+        // commands; the synthetic batch already contributes progress.
+        if (r.batch_child) continue;
         switch (r.state) {
             .running => running += 1,
             .queued, .paused => queued += 1,
@@ -594,18 +862,26 @@ pub const JobBtnCtx = struct {
     deferred: ?*jobs.DeferredTransfer = null,
     /// Durable ledger token (owned).
     service_token: ?[]u8 = null,
+    meter_key: Key,
+    /// Owned storage when meter_key carries a durable token.
+    meter_token: ?[]u8 = null,
     kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand, retry },
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
         const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
         if (ctx.service_token) |token| ctx.allocator.free(token);
+        if (ctx.meter_token) |token| ctx.allocator.free(token);
         ctx.allocator.destroy(ctx);
     }
 };
 
 pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ctx_in: JobBtnCtx) void {
-    const ctx = self.allocator.create(JobBtnCtx) catch return;
+    const ctx = self.allocator.create(JobBtnCtx) catch {
+        if (ctx_in.service_token) |token| ctx_in.allocator.free(token);
+        if (ctx_in.meter_token) |token| ctx_in.allocator.free(token);
+        return;
+    };
     ctx.* = ctx_in;
     const btn = c.gtk_button_new_from_icon_name(icon);
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
@@ -762,20 +1038,11 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 /// The meter a button belongs to, from the identity it carries.
 fn meterOf(ctx: *JobBtnCtx, self: *BrowserView) ?*Meter {
-    if (ctx.service_token) |token|
-        return self.jobs_panel.find(.{ .kind = .durable, .token = token });
-    if (ctx.transfer) |t|
-        return self.jobs_panel.find(.{ .kind = .xfer, .ptr = @intFromPtr(t) });
-    if (ctx.copy) |item|
-        return self.jobs_panel.find(.{ .kind = .copy, .ptr = @intFromPtr(item) });
-    if (ctx.deferred) |item|
-        return self.jobs_panel.find(.{ .kind = .deferred, .ptr = @intFromPtr(item) });
-    const hc = ctx.hc orelse return null;
-    return self.jobs_panel.find(.{ .kind = .daemon, .ptr = @intFromPtr(hc), .job = ctx.job });
+    return self.jobs_panel.find(ctx.meter_key);
 }
 
 fn identityCtx(self: *BrowserView, row: Row, kind: @FieldType(JobBtnCtx, "kind")) JobBtnCtx {
-    return .{
+    var ctx: JobBtnCtx = .{
         .allocator = self.allocator,
         .view = self,
         .hc = row.hc,
@@ -784,8 +1051,14 @@ fn identityCtx(self: *BrowserView, row: Row, kind: @FieldType(JobBtnCtx, "kind")
         .copy = row.copy,
         .deferred = row.deferred,
         .service_token = if (row.key.kind == .durable) (self.allocator.dupe(u8, row.key.token) catch null) else null,
+        .meter_key = row.key,
         .kind = kind,
     };
+    if (row.key.token.len > 0) {
+        ctx.meter_token = self.allocator.dupe(u8, row.key.token) catch null;
+        if (ctx.meter_token) |token| ctx.meter_key.token = token;
+    }
+    return ctx;
 }
 
 fn drawSpark(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int, user: c.gpointer) callconv(.c) void {
@@ -841,6 +1114,10 @@ fn setColorClass(widget: *c.GtkWidget, class: [*:0]const u8) void {
 /// initial build and every refresh, so the two can never drift.
 fn applyRow(row: Row, meter: *Meter) void {
     const look = stateLook(row.state, meter.status.stalled);
+    if (meter.name_label) |label| {
+        var z: [512:0]u8 = undefined;
+        c.gtk_label_set_text(label, copyZ(&z, row.label));
+    }
     if (meter.state_icon) |icon| {
         c.gtk_image_set_from_icon_name(@ptrCast(icon), look.icon);
         setColorClass(icon, look.class);
@@ -899,7 +1176,7 @@ fn applyRow(row: Row, meter: *Meter) void {
 fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) void {
     ensurePanelCss();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    c.gtk_widget_set_margin_start(box, 6);
+    c.gtk_widget_set_margin_start(box, if (row.batch_child) 30 else 6);
     c.gtk_widget_set_margin_end(box, 6);
 
     const head = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
@@ -1008,13 +1285,86 @@ fn buildRow(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) v
 
 fn fraction(row: Row) f64 {
     if (row.state == .finished) return 1.0;
-    if (row.total == 0) return 0.0;
+    if (row.total == 0) {
+        if (row.files_total == 0) return 0.0;
+        return @min(1.0, @as(f64, @floatFromInt(row.files_done)) / @as(f64, @floatFromInt(row.files_total)));
+    }
     const f = @as(f64, @floatFromInt(row.done)) / @as(f64, @floatFromInt(row.total));
     return @min(1.0, @max(0.0, f));
 }
 
+const ScrollState = struct {
+    value: f64,
+    at_bottom: bool,
+};
+
+const ScrollRestore = struct {
+    allocator: std.mem.Allocator,
+    adjustment: *c.GtkAdjustment,
+    panel: *Panel,
+
+    fn destroy(user: ?*anyopaque) callconv(.c) void {
+        const self: *ScrollRestore = @ptrCast(@alignCast(user.?));
+        c.g_object_unref(@as(?*anyopaque, @ptrCast(self.adjustment)));
+        self.allocator.destroy(self);
+    }
+};
+
+fn captureScroll(panel: *Panel) ?ScrollState {
+    const scroller = panel.scroller orelse return null;
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(scroller))) orelse return null;
+    const value = c.gtk_adjustment_get_value(adjustment);
+    const lower = c.gtk_adjustment_get_lower(adjustment);
+    const bottom = c.gtk_adjustment_get_upper(adjustment) - c.gtk_adjustment_get_page_size(adjustment);
+    return .{ .value = value, .at_bottom = bottom > lower + 1.0 and bottom - value <= 1.0 };
+}
+
+fn scrollTarget(state: ScrollState, lower: f64, upper: f64, page_size: f64) f64 {
+    const bottom = @max(lower, upper - page_size);
+    return if (state.at_bottom) bottom else std.math.clamp(state.value, lower, bottom);
+}
+
+fn restoreScroll(self: *BrowserView, scroller: *c.GtkWidget, state: ScrollState) void {
+    const panel = &self.jobs_panel;
+    if (panel.scroll_restore != 0) {
+        _ = c.g_source_remove(panel.scroll_restore);
+        panel.scroll_restore = 0;
+    }
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(@alignCast(scroller))) orelse return;
+    const ctx = self.allocator.create(ScrollRestore) catch return;
+    _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(adjustment)));
+    panel.scroll_state = state;
+    ctx.* = .{ .allocator = self.allocator, .adjustment = adjustment, .panel = panel };
+    panel.scroll_restore = c.g_idle_add_full(
+        c.G_PRIORITY_DEFAULT_IDLE,
+        @ptrCast(&restoreScrollIdle),
+        @ptrCast(ctx),
+        @ptrCast(&ScrollRestore.destroy),
+    );
+}
+
+fn restoreScrollIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const ctx: *ScrollRestore = @ptrCast(@alignCast(user.?));
+    const adjustment = ctx.adjustment;
+    const state = ctx.panel.scroll_state orelse return 0;
+    c.gtk_adjustment_set_value(adjustment, scrollTarget(
+        state,
+        c.gtk_adjustment_get_lower(adjustment),
+        c.gtk_adjustment_get_upper(adjustment),
+        c.gtk_adjustment_get_page_size(adjustment),
+    ));
+    ctx.panel.scroll_state = null;
+    ctx.panel.scroll_restore = 0;
+    return 0;
+}
+
 fn rebuild(self: *BrowserView, rows: []const Row) void {
     const panel = &self.jobs_panel;
+    const old_scroll = panel.scroll_state orelse captureScroll(panel);
+    if (panel.scroll_restore != 0) {
+        _ = c.g_source_remove(panel.scroll_restore);
+        panel.scroll_restore = 0;
+    }
     while (c.gtk_widget_get_first_child(self.jobs_box)) |child| {
         c.gtk_box_remove(@ptrCast(self.jobs_box), child);
     }
@@ -1023,8 +1373,10 @@ fn rebuild(self: *BrowserView, rows: []const Row) void {
     for (panel.meters.items) |m| m.forgetWidgets();
     panel.rows_box = null;
     panel.summary = null;
+    panel.scroller = null;
     dropUnseenMeters(self);
     if (rows.len == 0) {
+        panel.scroll_state = null;
         panel.built = false;
         return;
     }
@@ -1053,7 +1405,9 @@ fn rebuild(self: *BrowserView, rows: []const Row) void {
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), rows_box);
     c.gtk_box_append(@ptrCast(self.jobs_box), scroller);
     panel.rows_box = rows_box;
+    panel.scroller = scroller;
     panel.built = true;
+    if (old_scroll) |state| restoreScroll(self, scroller, state);
 }
 
 fn refresh(self: *BrowserView, rows: []const Row) void {
@@ -1101,7 +1455,8 @@ fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
 pub fn renderJobs(self: *BrowserView) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
-    const rows = collectRows(self, arena.allocator());
+    const raw = collectRows(self, arena.allocator());
+    const rows = groupedRows(self, arena.allocator(), raw);
     c.gtk_widget_set_visible(self.jobs_box, if (rows.len > 0) 1 else 0);
     syncMeters(self, rows);
     const sig = signature(rows, &self.jobs_panel);
@@ -1132,4 +1487,23 @@ test "summary reports queued commands and aggregate file progress" {
         "1 running, 2 waiting - 37 of 120 files",
         summaryText(&buf, &rows, &panel),
     );
+}
+
+test "batch state and progress stay aggregate" {
+    try std.testing.expectEqual(RowState.running, batchState(.{ .id = 1, .running = 1, .queued = 399 }));
+    try std.testing.expectEqual(RowState.failed, batchState(.{ .id = 1, .finished = 399, .failed = 1 }));
+    try std.testing.expectEqual(RowState.finished, batchState(.{ .id = 1, .expected = 10, .children = 8, .finished = 8 }));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), fraction(.{
+        .key = .{ .kind = .batch, .job = 1 },
+        .label = "batch",
+        .state = .running,
+        .files_done = 100,
+        .files_total = 400,
+    }), 0.0001);
+}
+
+test "panel scroll restoration preserves position and bottom following" {
+    try std.testing.expectEqual(@as(f64, 75), scrollTarget(.{ .value = 75, .at_bottom = false }, 0, 500, 100));
+    try std.testing.expectEqual(@as(f64, 400), scrollTarget(.{ .value = 300, .at_bottom = true }, 0, 500, 100));
+    try std.testing.expectEqual(@as(f64, 40), scrollTarget(.{ .value = 75, .at_bottom = false }, 0, 100, 60));
 }

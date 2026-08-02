@@ -9,12 +9,14 @@
 //! processes any more; the only single-process rule left is the
 //! `shared` service below, so one process has one owner per record.
 //!
-//! Two record kinds live here:
+//! Three record kinds live here:
 //!   * daemon-coordinated downloads/uploads, submitted as `cross_copy`
 //!     jobs and driven by this service directly;
 //!   * client-mediated transfers (fstransfer), which need a browser
 //!     face with both host connections to run. Those are adopted only
 //!     while a DRIVER is registered, and handed to it.
+//!   * batch admission manifests, one fsynced command whose fixed child
+//!     tokens are materialized incrementally by that same driver.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -72,6 +74,9 @@ const Intent = struct {
     /// service. `claimed` means the driver currently holds it.
     mediated: bool = false,
     user_copy: bool = false,
+    batch_id: u64 = 0,
+    batch_total: u64 = 0,
+    batch_token: []u8,
     coordinator_host: []u8,
     coordinator_set: bool = false,
     ack_host: []u8,
@@ -120,6 +125,9 @@ const Intent = struct {
                 .retired = self.retired,
                 .mediated = self.mediated,
                 .user_copy = self.user_copy,
+                .batch_id = self.batch_id,
+                .batch_total = self.batch_total,
+                .batch_token = self.batch_token,
                 .coordinator_host = self.coordinator_host,
                 .coordinator_set = self.coordinator_set,
                 .ack_host = self.ack_host,
@@ -132,7 +140,7 @@ const Intent = struct {
     }
 
     fn destroy(self: *Intent, a: std.mem.Allocator) void {
-        inline for (.{ self.token, self.client_token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message, self.coordinator_host, self.ack_host }) |s|
+        inline for (.{ self.token, self.client_token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message, self.coordinator_host, self.ack_host, self.batch_token }) |s|
             a.free(s);
         a.destroy(self);
     }
@@ -180,6 +188,78 @@ const Watch = struct {
     }
 };
 
+pub const BatchItemRec = struct {
+    token: []u8,
+    src_path: []u8,
+    dst_path: []u8,
+    conflict_is_dir: ?bool = null,
+
+    fn destroy(self: BatchItemRec, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+        allocator.free(self.src_path);
+        allocator.free(self.dst_path);
+    }
+};
+
+fn dupBatchItem(allocator: std.mem.Allocator, item: store.BatchItem) !BatchItemRec {
+    const token = try allocator.dupe(u8, item.token);
+    errdefer allocator.free(token);
+    const src_path = try allocator.dupe(u8, item.src_path);
+    errdefer allocator.free(src_path);
+    const dst_path = try allocator.dupe(u8, item.dst_path);
+    return .{
+        .token = token,
+        .src_path = src_path,
+        .dst_path = dst_path,
+        .conflict_is_dir = item.conflict_is_dir,
+    };
+}
+
+const UserBatch = struct {
+    handle: store.Handle,
+    token: []u8,
+    batch_id: u64,
+    batch_total: u64,
+    src_host: []u8,
+    dst_host: []u8,
+    move: bool,
+    no_replace: bool,
+    items: []BatchItemRec,
+    /// Volatile driver identity. The durable lock belongs to the
+    /// service; this only prevents two panes in one process from
+    /// materializing the same manifest concurrently.
+    owner: ?*anyopaque = null,
+
+    fn record(self: *const UserBatch, allocator: std.mem.Allocator) !store.Record {
+        const items = try allocator.alloc(store.BatchItem, self.items.len);
+        for (self.items, 0..) |item, i| items[i] = .{
+            .token = item.token,
+            .src_path = item.src_path,
+            .dst_path = item.dst_path,
+            .conflict_is_dir = item.conflict_is_dir,
+        };
+        return .{ .rtype = .batch, .batch = .{
+            .token = self.token,
+            .batch_id = self.batch_id,
+            .batch_total = self.batch_total,
+            .src_host = self.src_host,
+            .dst_host = self.dst_host,
+            .move = self.move,
+            .no_replace = self.no_replace,
+            .items = items,
+        } };
+    }
+
+    fn destroy(self: *UserBatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+        allocator.free(self.src_host);
+        allocator.free(self.dst_host);
+        for (self.items) |item| item.destroy(allocator);
+        allocator.free(self.items);
+        allocator.destroy(self);
+    }
+};
+
 const Pending = struct { req: u32, intent: *Intent };
 
 pub const QueueRow = struct {
@@ -197,6 +277,9 @@ pub const QueueRow = struct {
     resumed_from: u64 = 0,
     message: []const u8 = "",
     mediated: bool = false,
+    batch_id: u64 = 0,
+    batch_total: u64 = 0,
+    delete_src_after: bool = false,
 };
 
 /// One client-mediated transfer as handed to a driver.
@@ -215,6 +298,8 @@ pub const MediatedRec = struct {
     no_replace: bool,
     watch_after: bool,
     user_copy: bool,
+    batch_id: u64,
+    batch_total: u64,
     coordinator_host: []const u8,
     coordinator_set: bool,
     ack_host: []const u8,
@@ -224,12 +309,29 @@ pub const MediatedRec = struct {
     state: store.State,
 };
 
+pub const BatchSpec = struct {
+    src_path: []const u8,
+    dst_path: []const u8,
+    conflict_is_dir: ?bool = null,
+};
+pub const BatchRec = struct {
+    token: []const u8,
+    batch_id: u64,
+    batch_total: u64,
+    src_host: []const u8,
+    dst_host: []const u8,
+    move: bool,
+    no_replace: bool,
+    items: []const BatchItemRec,
+};
+
 pub const MediatedFn = *const fn (ctx: *anyopaque, rec: MediatedRec) void;
+pub const BatchFn = *const fn (ctx: *anyopaque, rec: BatchRec) void;
 /// Repaint the jobs/transfers panel: rows can appear without any user
 /// action here (an adopted orphan, a sync-back queued by a watch), and
 /// the panel's own sampling tick only runs while rows already exist.
 pub const RefreshFn = *const fn (ctx: *anyopaque) void;
-const Driver = struct { ctx: *anyopaque, callback: MediatedFn, refresh: RefreshFn };
+const Driver = struct { ctx: *anyopaque, callback: MediatedFn, batch_callback: BatchFn, refresh: RefreshFn };
 
 pub const Service = struct {
     allocator: std.mem.Allocator,
@@ -241,6 +343,7 @@ pub const Service = struct {
     order_seq: u64 = 0,
     intents: std.ArrayList(*Intent) = .empty,
     watches: std.ArrayList(*Watch) = .empty,
+    batches: std.ArrayList(*UserBatch) = .empty,
     pending: std.ArrayList(Pending) = .empty,
     subscribers: std.ArrayList(Subscriber) = .empty,
     drivers: std.ArrayList(Driver) = .empty,
@@ -287,6 +390,11 @@ pub const Service = struct {
             w.destroy(self.allocator);
         }
         self.watches.deinit(self.allocator);
+        for (self.batches.items) |batch| {
+            batch.handle.release();
+            batch.destroy(self.allocator);
+        }
+        self.batches.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.subscribers.deinit(self.allocator);
         self.drivers.deinit(self.allocator);
@@ -324,79 +432,125 @@ pub const Service = struct {
         return false;
     }
 
+    fn ownsBatch(self: *Service, token: []const u8) bool {
+        for (self.batches.items) |batch| if (std.mem.eql(u8, batch.token, token)) return true;
+        return false;
+    }
+
     /// Take over every record no live process owns. Called at startup
     /// and on a timer: a peer GUI can die at any moment, and its
     /// transfers must not wait for a restart of THIS one.
     fn adoptOrphans(self: *Service) void {
         const entries = store.list(self.allocator) catch return;
         defer store.freeList(self.allocator, entries);
-        var handed: std.ArrayList(*Intent) = .empty;
-        defer handed.deinit(self.allocator);
-        for (entries) |e| {
-            switch (e.rtype) {
-                .intent => if (self.ownsIntent(e.token)) continue,
-                .watch => if (self.ownsWatch(e.token)) continue,
-            }
-            var handle = (store.open(self.allocator, e.rtype, e.token) catch continue) orelse continue;
-            const parsed = store.readFile(self.allocator, handle.json_path) catch null;
-            const rec = parsed orelse {
-                // A lock with no record: debris of an owner that died
-                // between creating the lock and writing the record.
-                _ = handle.destroyRecord();
-                continue;
-            };
-            defer rec.deinit();
-            if (!store.readableVersion(rec.value.version)) {
-                handle.release();
-                continue;
-            }
-            switch (e.rtype) {
-                .intent => {
-                    const value = rec.value.intent;
-                    if ((value.retired or value.state == .done or value.state == .canceled) and value.ack_job == 0) {
-                        _ = handle.destroyRecord();
-                        continue;
-                    }
-                    if (value.mediated and self.drivers.items.len == 0) {
-                        // Nothing here can run it; leave it adoptable.
-                        handle.release();
-                        continue;
-                    }
-                    const it = self.dupIntent(handle, value) catch {
-                        handle.release();
-                        continue;
-                    };
-                    it.record_version = rec.value.version;
-                    if (it.record_version < store.VERSION and it.mediated and it.job != 0) {
-                        it.state = .failed;
-                        it.claimed = false;
-                        self.replaceMessage(it, "legacy transfer held because its running job identity is not durable");
-                    }
-                    self.intents.append(self.allocator, it) catch {
-                        it.handle.release();
-                        it.destroy(self.allocator);
-                        continue;
-                    };
-                    if (it.mediated and it.state != .failed) handed.append(self.allocator, it) catch {};
-                },
-                .watch => {
-                    const w = self.dupWatch(handle, rec.value.watch) catch {
-                        handle.release();
-                        continue;
-                    };
-                    self.watches.append(self.allocator, w) catch {
-                        w.handle.release();
-                        w.destroy(self.allocator);
-                        continue;
-                    };
-                    self.armWatch(w);
-                    self.detectOfflineEdit(w);
-                },
+        // Parents are loaded before children regardless of readdir
+        // order. The child also carries its parent token for the case
+        // where another process still owns that parent lock.
+        for ([_]store.RType{ .batch, .intent, .watch }) |rtype| {
+            for (entries) |e| {
+                if (e.rtype != rtype) continue;
+                switch (e.rtype) {
+                    .intent => if (self.ownsIntent(e.token)) continue,
+                    .watch => if (self.ownsWatch(e.token)) continue,
+                    .batch => if (self.ownsBatch(e.token)) continue,
+                }
+                var handle = (store.open(self.allocator, e.rtype, e.token) catch continue) orelse continue;
+                const parsed = store.readFile(self.allocator, handle.json_path) catch {
+                    // An unreadable record may be transient I/O failure or
+                    // memory pressure. Keep it for a later sweep rather
+                    // than converting a read failure into data loss.
+                    handle.release();
+                    self.notify("cannot read transfer recovery state; retrying", .{});
+                    continue;
+                };
+                const rec = parsed orelse {
+                    // A lock with no record: debris of an owner that died
+                    // between creating the lock and writing the record.
+                    _ = handle.destroyRecord();
+                    continue;
+                };
+                defer rec.deinit();
+                if (!store.readableVersion(rec.value.version)) {
+                    handle.release();
+                    continue;
+                }
+                switch (e.rtype) {
+                    .intent => {
+                        const value = rec.value.intent;
+                        if (value.batch_token.len > 0 and self.batchByToken(value.batch_token) == null and self.childManifestExists(value.token, value.batch_token)) {
+                            // Another process owns the parent. Do not split
+                            // the lock set by retaining one of its children;
+                            // the parent owner will acquire it on a later
+                            // sweep, or this process will acquire both after
+                            // that owner exits.
+                            handle.release();
+                            continue;
+                        }
+                        if ((value.retired or value.state == .done or value.state == .canceled) and value.ack_job == 0 and !self.childManifestExists(value.token, value.batch_token)) {
+                            _ = handle.destroyRecord();
+                            continue;
+                        }
+                        if (value.mediated and self.drivers.items.len == 0) {
+                            // Nothing here can run it; leave it adoptable.
+                            handle.release();
+                            continue;
+                        }
+                        const it = self.dupIntent(handle, value) catch {
+                            handle.release();
+                            continue;
+                        };
+                        it.record_version = rec.value.version;
+                        if (it.record_version < store.VERSION and it.mediated and it.job != 0) {
+                            it.state = .failed;
+                            it.claimed = false;
+                            self.replaceMessage(it, "legacy transfer held because its running job identity is not durable");
+                        }
+                        self.intents.append(self.allocator, it) catch {
+                            it.handle.release();
+                            it.destroy(self.allocator);
+                            continue;
+                        };
+                    },
+                    .watch => {
+                        const w = self.dupWatch(handle, rec.value.watch) catch {
+                            handle.release();
+                            continue;
+                        };
+                        self.watches.append(self.allocator, w) catch {
+                            w.handle.release();
+                            w.destroy(self.allocator);
+                            continue;
+                        };
+                        self.armWatch(w);
+                        self.detectOfflineEdit(w);
+                    },
+                    .batch => {
+                        if (self.drivers.items.len == 0) {
+                            handle.release();
+                            continue;
+                        }
+                        const batch = self.dupBatch(handle, rec.value.batch) catch {
+                            handle.release();
+                            continue;
+                        };
+                        if (batch.items.len == 0) {
+                            _ = batch.handle.destroyRecord();
+                            batch.destroy(self.allocator);
+                            continue;
+                        }
+                        self.batches.append(self.allocator, batch) catch {
+                            batch.handle.release();
+                            batch.destroy(self.allocator);
+                            continue;
+                        };
+                    },
+                }
             }
         }
         // Dispatch AFTER the scan: a driver may call back into the
         // service, and the lists must be settled first.
-        for (handed.items) |it| self.handToDriver(it);
+        self.handLooseIntents();
+        self.handAllBatches();
         self.queueDirtyWatches();
         self.refreshViews();
     }
@@ -565,6 +719,8 @@ pub const Service = struct {
         const coordinator_host = try a.dupe(u8, value.coordinator_host);
         errdefer a.free(coordinator_host);
         const ack_host = try a.dupe(u8, value.ack_host);
+        errdefer a.free(ack_host);
+        const batch_token = try a.dupe(u8, value.batch_token);
         it.* = .{
             .handle = handle,
             .token = token,
@@ -591,6 +747,9 @@ pub const Service = struct {
             .retired = value.retired,
             .mediated = value.mediated,
             .user_copy = value.user_copy,
+            .batch_id = value.batch_id,
+            .batch_total = value.batch_total,
+            .batch_token = batch_token,
             .coordinator_host = coordinator_host,
             .coordinator_set = value.coordinator_set,
             .ack_host = ack_host,
@@ -629,6 +788,40 @@ pub const Service = struct {
         return w;
     }
 
+    fn dupBatch(self: *Service, handle: store.Handle, value: store.Batch) !*UserBatch {
+        const a = self.allocator;
+        const batch = try a.create(UserBatch);
+        errdefer a.destroy(batch);
+        const token = try a.dupe(u8, value.token);
+        errdefer a.free(token);
+        const src_host = try a.dupe(u8, value.src_host);
+        errdefer a.free(src_host);
+        const dst_host = try a.dupe(u8, value.dst_host);
+        errdefer a.free(dst_host);
+        const items = try a.alloc(BatchItemRec, value.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| item.destroy(a);
+            a.free(items);
+        }
+        for (value.items, 0..) |item, i| {
+            items[i] = try dupBatchItem(a, item);
+            initialized += 1;
+        }
+        batch.* = .{
+            .handle = handle,
+            .token = token,
+            .batch_id = value.batch_id,
+            .batch_total = value.batch_total,
+            .src_host = src_host,
+            .dst_host = dst_host,
+            .move = value.move,
+            .no_replace = value.no_replace,
+            .items = items,
+        };
+        return batch;
+    }
+
     // ── persistence ─────────────────────────────────────────────
 
     fn writeIntentOk(self: *Service, it: *Intent) bool {
@@ -660,10 +853,28 @@ pub const Service = struct {
         self.durability_error = false;
     }
 
+    fn writeBatchOk(self: *Service, batch: *UserBatch) bool {
+        const record = batch.record(self.allocator) catch return false;
+        defer self.allocator.free(record.batch.items);
+        batch.handle.write(record) catch {
+            self.durability_error = true;
+            self.notify("cannot persist transfer batch recovery state", .{});
+            return false;
+        };
+        self.durability_error = false;
+        return true;
+    }
+
     /// Write every owned record whose content changed.
     fn persist(self: *Service) void {
-        for (self.intents.items) |it| self.writeIntent(it);
+        var i: usize = 0;
+        while (i < self.intents.items.len) {
+            const it = self.intents.items[i];
+            self.writeIntent(it);
+            if (i < self.intents.items.len and self.intents.items[i] == it) i += 1;
+        }
         for (self.watches.items) |w| self.writeWatch(w);
+        for (self.batches.items) |batch| _ = self.writeBatchOk(batch);
     }
 
     fn nextOrder(self: *Service) u64 {
@@ -972,6 +1183,10 @@ pub const Service = struct {
     /// between cannot strand the job on the daemon.
     fn retire(self: *Service, it: *Intent) bool {
         if (it.ack_job == 0) {
+            if (self.childManifestExists(it.token, it.batch_token)) {
+                it.retired = true;
+                return self.writeIntentOk(it);
+            }
             self.removeIntent(it);
             return true;
         }
@@ -982,10 +1197,18 @@ pub const Service = struct {
     }
 
     fn removeIntent(self: *Service, needle: *Intent) void {
+        self.removeIntentMode(needle, true);
+    }
+
+    fn removeIntentMode(self: *Service, needle: *Intent, sync_parent: bool) void {
         for (self.intents.items, 0..) |it, i| {
             if (it != needle) continue;
             _ = self.intents.orderedRemove(i);
-            if (!it.handle.destroyRecord()) {
+            const removed = if (sync_parent)
+                it.handle.destroyRecord()
+            else
+                it.handle.destroyRecordUnsynced();
+            if (!removed) {
                 self.durability_error = true;
                 self.notify("cannot remove transfer recovery state", .{});
             }
@@ -1361,6 +1584,9 @@ pub const Service = struct {
                 .resumed_from = it.resumed_from,
                 .message = it.message,
                 .mediated = it.mediated and it.record_version >= store.VERSION,
+                .batch_id = it.batch_id,
+                .batch_total = it.batch_total,
+                .delete_src_after = it.delete_src_after,
             });
         }
         return out.toOwnedSlice(allocator);
@@ -1389,6 +1615,8 @@ pub const Service = struct {
             .no_replace = it.no_replace,
             .watch_after = it.watch_after,
             .user_copy = it.user_copy,
+            .batch_id = it.batch_id,
+            .batch_total = it.batch_total,
             .coordinator_host = it.coordinator_host,
             .coordinator_set = it.coordinator_set,
             .ack_host = it.ack_host,
@@ -1396,6 +1624,19 @@ pub const Service = struct {
             .retired = it.retired,
             .attempts = it.attempts,
             .state = it.state,
+        };
+    }
+
+    fn batchRec(batch: *const UserBatch) BatchRec {
+        return .{
+            .token = batch.token,
+            .batch_id = batch.batch_id,
+            .batch_total = batch.batch_total,
+            .src_host = batch.src_host,
+            .dst_host = batch.dst_host,
+            .move = batch.move,
+            .no_replace = batch.no_replace,
+            .items = batch.items,
         };
     }
 
@@ -1409,20 +1650,78 @@ pub const Service = struct {
         if (it.ack_job == 0 and (it.retired or it.state == .done or it.state == .canceled)) return;
         if (it.state == .failed and it.ack_job == 0) return;
         const driver = if (self.drivers.items.len > 0) self.drivers.items[0] else return;
+        self.handIntentTo(driver, it);
+    }
+
+    fn handIntentTo(_: *Service, driver: Driver, it: *Intent) void {
+        if (it.claimed) return;
+        if (it.ack_job == 0 and (it.retired or it.state == .done or it.state == .canceled)) return;
+        if (it.state == .failed and it.ack_job == 0) return;
         it.claimed = true;
         driver.callback(driver.ctx, mediatedRec(it));
     }
 
+    fn handBatchToDriver(self: *Service, batch: *UserBatch) void {
+        if (batch.owner != null) return;
+        for (self.drivers.items) |driver| {
+            batch.owner = driver.ctx;
+            driver.batch_callback(driver.ctx, batchRec(batch));
+            var retained = false;
+            for (self.batches.items) |owned| {
+                if (owned == batch) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) return;
+            if (batch.owner != driver.ctx) continue;
+            for (batch.items) |item| {
+                if (self.intentByToken(item.token)) |it| self.handIntentTo(driver, it);
+            }
+            return;
+        }
+    }
+
+    fn handAllBatches(self: *Service) void {
+        var i: usize = 0;
+        while (i < self.batches.items.len) {
+            const batch = self.batches.items[i];
+            self.handBatchToDriver(batch);
+            if (i < self.batches.items.len and self.batches.items[i] == batch) i += 1;
+        }
+    }
+
+    fn handLooseIntents(self: *Service) void {
+        var i: usize = 0;
+        while (i < self.intents.items.len) {
+            const it = self.intents.items[i];
+            if (it.mediated and !self.childManifestExists(it.token, it.batch_token)) self.handToDriver(it);
+            if (i < self.intents.items.len and self.intents.items[i] == it) i += 1;
+        }
+    }
+
+    fn reassignBatches(self: *Service, owner: *anyopaque) void {
+        var i: usize = 0;
+        while (i < self.batches.items.len) {
+            const batch = self.batches.items[i];
+            if (batch.owner == owner) {
+                batch.owner = null;
+                self.handBatchToDriver(batch);
+            }
+            if (i < self.batches.items.len and self.batches.items[i] == batch) i += 1;
+        }
+    }
+
     /// Register a runner for client-mediated records. The FIRST driver
     /// registered runs them; the rest only matter when it goes away.
-    pub fn addMediatedDriver(self: *Service, ctx: *anyopaque, callback: MediatedFn, refresh: RefreshFn) void {
+    pub fn addMediatedDriver(self: *Service, ctx: *anyopaque, callback: MediatedFn, batch_callback: BatchFn, refresh: RefreshFn) void {
         for (self.drivers.items) |d| if (d.ctx == ctx) return;
-        self.drivers.append(self.allocator, .{ .ctx = ctx, .callback = callback, .refresh = refresh }) catch return;
-        if (self.drivers.items.len != 1) return;
-        self.adoptOrphans();
-        for (self.intents.items) |it| {
-            if (it.mediated) self.handToDriver(it);
+        self.drivers.append(self.allocator, .{ .ctx = ctx, .callback = callback, .batch_callback = batch_callback, .refresh = refresh }) catch return;
+        if (self.drivers.items.len == 1) {
+            self.adoptOrphans();
+            self.handLooseIntents();
         }
+        self.handAllBatches();
     }
 
     pub fn removeMediatedDriver(self: *Service, ctx: *anyopaque) void {
@@ -1434,9 +1733,8 @@ pub const Service = struct {
             break;
         }
         if (self.drivers.items.len > 0) {
-            for (self.intents.items) |it| {
-                if (it.mediated) self.handToDriver(it);
-            }
+            self.handLooseIntents();
+            self.reassignBatches(ctx);
             return;
         }
         if (!was_head) return;
@@ -1453,6 +1751,13 @@ pub const Service = struct {
             _ = self.intents.orderedRemove(i);
             it.handle.release();
             it.destroy(self.allocator);
+        }
+        i = 0;
+        while (i < self.batches.items.len) {
+            const batch = self.batches.items[i];
+            _ = self.batches.orderedRemove(i);
+            batch.handle.release();
+            batch.destroy(self.allocator);
         }
     }
 
@@ -1472,6 +1777,17 @@ pub const Service = struct {
         self.handToDriver(it);
     }
 
+    pub fn redispatchUserBatch(self: *Service, token: []const u8) void {
+        const batch = self.batchByToken(token) orelse return;
+        batch.owner = null;
+        self.handBatchToDriver(batch);
+    }
+
+    pub fn unclaimUserBatch(self: *Service, token: []const u8) void {
+        const batch = self.batchByToken(token) orelse return;
+        batch.owner = null;
+    }
+
     /// Give up this process's lock without deleting the durable record.
     /// Used when view-side setup cannot even construct a runnable item.
     pub fn abandonMediated(self: *Service, token: []const u8) void {
@@ -1484,6 +1800,312 @@ pub const Service = struct {
             self.refreshViews();
             return;
         }
+    }
+
+    fn batchByToken(self: *Service, token: []const u8) ?*UserBatch {
+        for (self.batches.items) |batch| if (std.mem.eql(u8, batch.token, token)) return batch;
+        return null;
+    }
+
+    fn batchForChild(self: *Service, token: []const u8) ?*UserBatch {
+        for (self.batches.items) |batch| for (batch.items) |item| {
+            if (std.mem.eql(u8, item.token, token)) return batch;
+        };
+        return null;
+    }
+
+    fn childManifestExists(self: *Service, child_token: []const u8, batch_token: []const u8) bool {
+        if (self.batchForChild(child_token) != null) return true;
+        if (batch_token.len == 0) return false;
+        if (self.batchByToken(batch_token) != null) return true;
+        const parsed = store.readToken(self.allocator, .batch, batch_token) catch return true;
+        const record = parsed orelse return false;
+        record.deinit();
+        return true;
+    }
+
+    fn removeBatch(self: *Service, needle: *UserBatch) bool {
+        for (self.batches.items, 0..) |batch, i| {
+            if (batch != needle) continue;
+            _ = self.batches.orderedRemove(i);
+            const removed = batch.handle.destroyRecord();
+            if (!removed) {
+                self.durability_error = true;
+                self.notify("cannot remove completed transfer batch recovery state", .{});
+            }
+            batch.destroy(self.allocator);
+            return removed;
+        }
+        return false;
+    }
+
+    /// Persist one whole cross-host paste command before any child is
+    /// admitted. Child tokens are fixed in this single fsynced record.
+    pub fn newUserBatch(
+        self: *Service,
+        src_host: []const u8,
+        dst_host: []const u8,
+        move: bool,
+        batch_id: u64,
+        batch_total: usize,
+        specs: []const BatchSpec,
+        owner: *anyopaque,
+    ) ?[]const u8 {
+        if (specs.len == 0) return null;
+        var estimated_bytes: usize = 512;
+        for (specs) |spec| {
+            // JSON can expand a path byte to a six-byte \u00xx escape.
+            // Reject before allocating/serializing a manifest that the
+            // ledger's bounded reader could never recover.
+            estimated_bytes +|= 128 +| (spec.src_path.len +| spec.dst_path.len) *| 6;
+            if (estimated_bytes > store.MAX_RECORD_BYTES) return null;
+        }
+        const token = self.newToken() catch return null;
+        var handle = (store.open(self.allocator, .batch, token) catch {
+            self.allocator.free(token);
+            return null;
+        }) orelse {
+            self.allocator.free(token);
+            return null;
+        };
+        const batch = self.allocator.create(UserBatch) catch {
+            handle.release();
+            self.allocator.free(token);
+            return null;
+        };
+        const src_host_owned = self.allocator.dupe(u8, src_host) catch {
+            handle.release();
+            self.allocator.destroy(batch);
+            self.allocator.free(token);
+            return null;
+        };
+        const dst_host_owned = self.allocator.dupe(u8, dst_host) catch {
+            handle.release();
+            self.allocator.free(src_host_owned);
+            self.allocator.destroy(batch);
+            self.allocator.free(token);
+            return null;
+        };
+        const items = self.allocator.alloc(BatchItemRec, specs.len) catch {
+            handle.release();
+            self.allocator.free(src_host_owned);
+            self.allocator.free(dst_host_owned);
+            self.allocator.destroy(batch);
+            self.allocator.free(token);
+            return null;
+        };
+        var initialized: usize = 0;
+        while (initialized < specs.len) : (initialized += 1) {
+            const item_token = self.newToken() catch break;
+            const src_path = self.allocator.dupe(u8, specs[initialized].src_path) catch {
+                self.allocator.free(item_token);
+                break;
+            };
+            const dst_path = self.allocator.dupe(u8, specs[initialized].dst_path) catch {
+                self.allocator.free(item_token);
+                self.allocator.free(src_path);
+                break;
+            };
+            items[initialized] = .{
+                .token = item_token,
+                .src_path = src_path,
+                .dst_path = dst_path,
+                .conflict_is_dir = specs[initialized].conflict_is_dir,
+            };
+        }
+        if (initialized != specs.len) {
+            for (items[0..initialized]) |item| item.destroy(self.allocator);
+            self.allocator.free(items);
+            handle.release();
+            self.allocator.free(src_host_owned);
+            self.allocator.free(dst_host_owned);
+            self.allocator.destroy(batch);
+            self.allocator.free(token);
+            return null;
+        }
+        batch.* = .{
+            .handle = handle,
+            .token = token,
+            .batch_id = batch_id,
+            .batch_total = @intCast(batch_total),
+            .src_host = src_host_owned,
+            .dst_host = dst_host_owned,
+            .move = move,
+            .no_replace = true,
+            .items = items,
+            .owner = owner,
+        };
+        self.batches.append(self.allocator, batch) catch {
+            _ = batch.handle.destroyRecord();
+            batch.destroy(self.allocator);
+            return null;
+        };
+        if (!self.writeBatchOk(batch)) {
+            _ = self.removeBatch(batch);
+            return null;
+        }
+        return batch.token;
+    }
+
+    /// Materialize one deterministic child record from its manifest.
+    /// Existing children are returned unchanged after restart.
+    pub fn materializeUserBatchItem(
+        self: *Service,
+        batch_token: []const u8,
+        index: usize,
+        coordinator_host: ?[]const u8,
+        dst_override: ?[]const u8,
+        no_replace: ?bool,
+        owner: *anyopaque,
+    ) ?[]const u8 {
+        return self.materializeUserBatchItemState(batch_token, index, coordinator_host, dst_override, no_replace, owner, false);
+    }
+
+    fn materializeUserBatchItemState(
+        self: *Service,
+        batch_token: []const u8,
+        index: usize,
+        coordinator_host: ?[]const u8,
+        dst_override: ?[]const u8,
+        no_replace: ?bool,
+        owner: *anyopaque,
+        skipped: bool,
+    ) ?[]const u8 {
+        const batch = self.batchByToken(batch_token) orelse return null;
+        if (batch.owner != owner) return null;
+        if (index >= batch.items.len) return null;
+        const item = batch.items[index];
+        if (self.intentByToken(item.token)) |existing| {
+            if (skipped and !existing.retired) {
+                existing.cancel_requested = true;
+                existing.state = .canceled;
+                existing.retired = true;
+                existing.claimed = false;
+                if (!self.writeIntentOk(existing)) return null;
+            } else if (!skipped) {
+                existing.claimed = true;
+            }
+            return existing.token;
+        }
+        var handle = (store.open(self.allocator, .intent, item.token) catch return null) orelse return null;
+        const persisted = store.readFile(self.allocator, handle.json_path) catch {
+            handle.release();
+            return null;
+        };
+        if (persisted) |rec| {
+            defer rec.deinit();
+            if (rec.value.rtype != .intent or !store.readableVersion(rec.value.version) or !std.mem.eql(u8, rec.value.intent.token, item.token)) {
+                handle.release();
+                return null;
+            }
+            const existing = self.dupIntent(handle, rec.value.intent) catch {
+                handle.release();
+                return null;
+            };
+            existing.record_version = rec.value.version;
+            if (skipped and !existing.retired) {
+                existing.cancel_requested = true;
+                existing.state = .canceled;
+                existing.retired = true;
+            }
+            existing.claimed = !skipped;
+            self.intents.append(self.allocator, existing) catch {
+                existing.handle.release();
+                existing.destroy(self.allocator);
+                return null;
+            };
+            if (skipped and !self.writeIntentOk(existing)) return null;
+            return existing.token;
+        }
+        const it = self.dupIntent(handle, .{
+            .token = item.token,
+            .kind = .download,
+            .src = .{ .host = batch.src_host, .path = item.src_path },
+            .dst = .{ .host = batch.dst_host, .path = dst_override orelse item.dst_path },
+            .state = if (skipped) .canceled else .running,
+            .order = self.nextOrder(),
+            .mediated = true,
+            .user_copy = true,
+            .batch_id = batch.batch_id,
+            .batch_total = batch.batch_total,
+            .batch_token = batch.token,
+            .coordinator_host = coordinator_host orelse "",
+            .coordinator_set = coordinator_host != null,
+            .delete_src_after = batch.move,
+            .no_replace = no_replace orelse batch.no_replace,
+            .cancel_requested = skipped,
+            .retired = skipped,
+        }) catch {
+            handle.release();
+            return null;
+        };
+        it.claimed = !skipped;
+        self.intents.append(self.allocator, it) catch {
+            _ = it.handle.destroyRecord();
+            it.destroy(self.allocator);
+            return null;
+        };
+        if (!self.writeIntentOk(it)) {
+            self.removeIntent(it);
+            return null;
+        }
+        return it.token;
+    }
+
+    pub fn userBatchItemMaterialized(self: *Service, batch_token: []const u8, index: usize) bool {
+        const batch = self.batchByToken(batch_token) orelse return false;
+        if (index >= batch.items.len) return false;
+        return self.intentByToken(batch.items[index].token) != null;
+    }
+
+    pub fn markUserBatchConflict(self: *Service, batch_token: []const u8, index: usize, is_dir: bool) bool {
+        const batch = self.batchByToken(batch_token) orelse return false;
+        if (index >= batch.items.len) return false;
+        batch.items[index].conflict_is_dir = is_dir;
+        return self.writeBatchOk(batch);
+    }
+
+    pub fn skipUserBatchItem(self: *Service, batch_token: []const u8, index: usize, owner: *anyopaque) bool {
+        return self.materializeUserBatchItemState(batch_token, index, null, null, null, owner, true) != null;
+    }
+
+    /// Remove a manifest only after every deterministic child exists.
+    pub fn finishUserBatch(self: *Service, batch_token: []const u8) bool {
+        const batch = self.batchByToken(batch_token) orelse return true;
+        for (batch.items) |item| {
+            if (self.intentByToken(item.token) == null) return false;
+        }
+        var batch_index: ?usize = null;
+        for (self.batches.items, 0..) |candidate, i| {
+            if (candidate == batch) {
+                batch_index = i;
+                break;
+            }
+        }
+        const index = batch_index orelse return false;
+        if (!batch.handle.destroyRecord()) {
+            self.durability_error = true;
+            self.notify("cannot remove completed transfer batch recovery state", .{});
+            batch.destroy(self.allocator);
+            _ = self.batches.orderedRemove(index);
+            return false;
+        }
+        _ = self.batches.orderedRemove(index);
+        var i: usize = 0;
+        while (i < self.intents.items.len) {
+            const it = self.intents.items[i];
+            const is_child = for (batch.items) |item| {
+                if (std.mem.eql(u8, item.token, it.token)) break true;
+            } else false;
+            if (is_child and it.retired and it.ack_job == 0) {
+                self.removeIntentMode(it, false);
+                continue;
+            }
+            i += 1;
+        }
+        batch.destroy(self.allocator);
+        self.refreshViews();
+        return true;
     }
 
     /// Record a client-mediated transfer so it survives a restart.
@@ -1547,6 +2169,9 @@ pub const Service = struct {
         dst_path: []const u8,
         move: bool,
         no_replace: bool,
+        batch_id: u64,
+        batch_total: usize,
+        coordinator_host: ?[]const u8,
     ) ?[]const u8 {
         const token = self.newToken() catch return null;
         defer self.allocator.free(token);
@@ -1560,6 +2185,10 @@ pub const Service = struct {
             .order = self.nextOrder(),
             .mediated = true,
             .user_copy = true,
+            .batch_id = batch_id,
+            .batch_total = @intCast(batch_total),
+            .coordinator_host = coordinator_host orelse "",
+            .coordinator_set = coordinator_host != null,
             .delete_src_after = move,
             .no_replace = no_replace,
         }) catch {
@@ -1604,7 +2233,7 @@ pub const Service = struct {
         it.state = .canceled;
         it.retired = true;
         if (!self.writeIntentOk(it)) return false;
-        self.removeIntent(it);
+        if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
         self.refreshViews();
         return true;
     }
@@ -1685,7 +2314,11 @@ pub const Service = struct {
         it.ack_durable = false;
         if (!self.replaceIntentString(&it.ack_host, "")) return false;
         if (it.retired) {
-            self.removeIntent(it);
+            if (self.childManifestExists(it.token, it.batch_token)) {
+                self.writeIntent(it);
+            } else {
+                self.removeIntent(it);
+            }
         } else {
             if (resume_after_ack) it.state = .queued;
             self.writeIntent(it);
@@ -1761,7 +2394,7 @@ pub const Service = struct {
             it.retired = true;
             it.state = .canceled;
             if (!self.writeIntentOk(it)) return false;
-            self.removeIntent(it);
+            if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
             return true;
         }
         it.retired = true;
@@ -1933,12 +2566,22 @@ test "closing a non-primary driver hands its transfer to a live pane" {
     const t = std.testing;
     const Capture = struct {
         calls: usize = 0,
+        batch_calls: usize = 0,
         token: []const u8 = "",
+        service: ?*Service = null,
+        accept_batch: bool = true,
 
         fn adopt(ctx: *anyopaque, rec: MediatedRec) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             self.token = rec.token;
+        }
+
+        fn adoptBatch(ctx: *anyopaque, rec: BatchRec) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.batch_calls += 1;
+            self.token = rec.token;
+            if (!self.accept_batch) self.service.?.unclaimUserBatch(rec.token);
         }
 
         fn refresh(_: *anyopaque) void {}
@@ -1947,10 +2590,13 @@ test "closing a non-primary driver hands its transfer to a live pane" {
     var service = Service{ .allocator = t.allocator };
     defer service.drivers.deinit(t.allocator);
     defer service.intents.deinit(t.allocator);
-    var primary = Capture{};
+    defer service.batches.deinit(t.allocator);
+    var primary = Capture{ .service = &service, .accept_batch = false };
+    var fallback = Capture{ .service = &service };
     var origin = Capture{};
-    try service.drivers.append(t.allocator, .{ .ctx = @ptrCast(&primary), .callback = &Capture.adopt, .refresh = &Capture.refresh });
-    try service.drivers.append(t.allocator, .{ .ctx = @ptrCast(&origin), .callback = &Capture.adopt, .refresh = &Capture.refresh });
+    try service.drivers.append(t.allocator, .{ .ctx = @ptrCast(&primary), .callback = &Capture.adopt, .batch_callback = &Capture.adoptBatch, .refresh = &Capture.refresh });
+    try service.drivers.append(t.allocator, .{ .ctx = @ptrCast(&fallback), .callback = &Capture.adopt, .batch_callback = &Capture.adoptBatch, .refresh = &Capture.refresh });
+    try service.drivers.append(t.allocator, .{ .ctx = @ptrCast(&origin), .callback = &Capture.adopt, .batch_callback = &Capture.adoptBatch, .refresh = &Capture.refresh });
     var intent = Intent{
         .handle = .{
             .allocator = t.allocator,
@@ -1976,15 +2622,164 @@ test "closing a non-primary driver hands its transfer to a live pane" {
         .message = @constCast(""),
         .coordinator_host = @constCast(""),
         .ack_host = @constCast(""),
+        .batch_token = @constCast(""),
         .mediated = true,
         .user_copy = true,
         .claimed = false, // origin unclaimed it before teardown
     };
     try service.intents.append(t.allocator, &intent);
+    var no_items: [0]BatchItemRec = .{};
+    var batch = UserBatch{
+        .handle = .{
+            .allocator = t.allocator,
+            .rtype = .batch,
+            .token = @constCast(""),
+            .json_path = @constCast(""),
+            .lock_path = @constCast(""),
+            .lock_fd = -1,
+        },
+        .token = @constCast("batch-record"),
+        .batch_id = 9,
+        .batch_total = 2,
+        .src_host = @constCast(""),
+        .dst_host = @constCast("box"),
+        .move = false,
+        .no_replace = true,
+        .items = &no_items,
+        .owner = @ptrCast(&origin),
+    };
+    try service.batches.append(t.allocator, &batch);
 
     service.removeMediatedDriver(@ptrCast(&origin));
     try t.expectEqual(@as(usize, 1), primary.calls);
-    try t.expectEqualStrings("copy-record", primary.token);
+    try t.expectEqual(@as(usize, 1), primary.batch_calls);
+    try t.expectEqual(@as(usize, 1), fallback.batch_calls);
+    try t.expectEqual(@as(?*anyopaque, @ptrCast(&fallback)), batch.owner);
+    try t.expectEqualStrings("batch-record", fallback.token);
+}
+
+test "a durable batch materializes deterministic child records" {
+    const t = std.testing;
+    const Cleanup = struct {
+        fn destroy(service: *Service, allocator: std.mem.Allocator) void {
+            for (service.intents.items) |it| {
+                _ = it.handle.destroyRecord();
+                it.destroy(allocator);
+            }
+            service.intents.deinit(allocator);
+            for (service.batches.items) |batch| {
+                _ = batch.handle.destroyRecord();
+                batch.destroy(allocator);
+            }
+            service.batches.deinit(allocator);
+            service.drivers.deinit(allocator);
+        }
+
+        fn release(service: *Service, allocator: std.mem.Allocator) void {
+            for (service.intents.items) |it| {
+                it.handle.release();
+                it.destroy(allocator);
+            }
+            service.intents.deinit(allocator);
+            for (service.batches.items) |batch| {
+                batch.handle.release();
+                batch.destroy(allocator);
+            }
+            service.batches.deinit(allocator);
+            service.drivers.deinit(allocator);
+        }
+    };
+    const Capture = struct {
+        mediated: usize = 0,
+        batches: usize = 0,
+
+        fn adopt(ctx: *anyopaque, _: MediatedRec) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mediated += 1;
+        }
+
+        fn adoptBatch(ctx: *anyopaque, _: BatchRec) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.batches += 1;
+        }
+
+        fn refresh(_: *anyopaque) void {}
+    };
+    const old_state = if (@import("../util/profile.zig").getenv("XDG_STATE_HOME")) |value|
+        try t.allocator.dupe(u8, value)
+    else
+        null;
+    defer {
+        if (old_state) |value| {
+            var z: [4096:0]u8 = undefined;
+            if (std.fmt.bufPrintZ(&z, "{s}", .{value})) |state| _ = c.setenv("XDG_STATE_HOME", state.ptr, 1) else |_| {}
+            t.allocator.free(value);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+
+    var service = Service{ .allocator = t.allocator };
+    var service_owned = true;
+    defer if (service_owned) Cleanup.destroy(&service, t.allocator);
+    const specs = [_]BatchSpec{
+        .{ .src_path = "/source/a", .dst_path = "/dest/a" },
+        .{ .src_path = "/source/b", .dst_path = "/dest/b" },
+    };
+    var owner: u8 = 0;
+    const batch_token = service.newUserBatch("", "box", true, 77, 2, &specs, @ptrCast(&owner)) orelse return error.BatchCreateFailed;
+    const child_token = service.materializeUserBatchItem(batch_token, 1, "relay", null, null, @ptrCast(&owner)) orelse return error.ChildCreateFailed;
+    const child = service.intentByToken(child_token) orelse return error.ChildMissing;
+    try t.expectEqual(@as(u64, 77), child.batch_id);
+    try t.expectEqual(@as(u64, 2), child.batch_total);
+    try t.expectEqualStrings(batch_token, child.batch_token);
+    try t.expect(child.delete_src_after and child.coordinator_set);
+    try t.expectEqualStrings("/source/b", child.src_path);
+    try t.expectEqualStrings("relay", child.coordinator_host);
+    try t.expect(service.finishMediated(child_token));
+    try t.expectEqual(@as(usize, 1), service.intents.items.len);
+
+    const batch_token_copy = try t.allocator.dupe(u8, batch_token);
+    defer t.allocator.free(batch_token_copy);
+    const child_token_copy = try t.allocator.dupe(u8, child_token);
+    defer t.allocator.free(child_token_copy);
+    Cleanup.release(&service, t.allocator);
+    service_owned = false;
+
+    var recovered = Service{ .allocator = t.allocator };
+    defer Cleanup.destroy(&recovered, t.allocator);
+    var capture = Capture{};
+    try recovered.drivers.append(t.allocator, .{
+        .ctx = @ptrCast(&capture),
+        .callback = &Capture.adopt,
+        .batch_callback = &Capture.adoptBatch,
+        .refresh = &Capture.refresh,
+    });
+    recovered.adoptOrphans();
+    try t.expectEqual(@as(usize, 1), capture.batches);
+    try t.expectEqual(@as(usize, 0), capture.mediated);
+    try t.expectEqual(@as(usize, 1), recovered.batches.items.len);
+    try t.expectEqual(@as(usize, 1), recovered.intents.items.len);
+    try t.expect(!recovered.mediatedRunnable(child_token_copy));
+    try t.expectEqualStrings(child_token_copy, recovered.materializeUserBatchItem(batch_token_copy, 1, "relay", null, null, @ptrCast(&capture)) orelse return error.ChildMissing);
+
+    var intruder: u8 = 0;
+    try t.expectEqual(@as(?[]const u8, null), recovered.materializeUserBatchItem(batch_token_copy, 0, "relay", null, null, @ptrCast(&intruder)));
+    try t.expect(recovered.skipUserBatchItem(batch_token_copy, 0, @ptrCast(&capture)));
+    const skipped = recovered.intentByToken(recovered.batches.items[0].items[0].token) orelse return error.ChildMissing;
+    try t.expect(skipped.retired and skipped.cancel_requested and skipped.state == .canceled);
+    const skipped_record = (try store.readToken(t.allocator, .intent, skipped.token)) orelse return error.ChildMissing;
+    defer skipped_record.deinit();
+    try t.expect(skipped_record.value.intent.retired and skipped_record.value.intent.cancel_requested);
+    try t.expectEqual(store.State.canceled, skipped_record.value.intent.state);
+    try t.expect(recovered.finishUserBatch(batch_token_copy));
+    try t.expectEqual(@as(usize, 0), recovered.batches.items.len);
+    try t.expectEqual(@as(usize, 0), recovered.intents.items.len);
 }
 
 pub fn acquire(allocator: std.mem.Allocator, notify_ctx: ?*anyopaque, notify_fn: ?NotifyFn) !*Service {
