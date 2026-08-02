@@ -644,6 +644,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // coordination: an old daemon ignoring delete_src
                 // would silently turn a move into a copy.
                 .cross_move = true,
+                // cross_copy is idempotent by client_token and its
+                // terminal job survives until an explicit job_ack.
+                .durable_copy = true,
+                .copy_no_replace = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -1487,6 +1491,8 @@ pub const FsOpReq = struct {
     len: u32 = 0,
     /// Job verbs: allow hash-verified resume of a staged partial.
     @"resume": bool = false,
+    /// The top-level destination must still be absent when installed.
+    no_replace: bool = false,
     /// copy: per-entry collision policy INSIDE a tree
     /// ("" = overwrite, "skip", "keep_both").
     conflict: []const u8 = "",
@@ -1633,8 +1639,26 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         var z2: [4096]u8 = undefined;
         const from = pathZ(&z1, r.path) catch return fsReplyErr(cl, r.req, "path too long");
         const to = pathZ(&z2, r.to) catch return fsReplyErr(cl, r.req, "path too long");
-        const rc = c.rename(from, to);
-        if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        if (r.no_replace) {
+            switch (@import("../util/platform.zig").renameNoReplace(from, to)) {
+                .ok => {},
+                .exists => return fsReplyErr(cl, r.req, "EXIST"),
+                .cross_device => return fsReplyErr(cl, r.req, "XDEV"),
+                .failed => return fsReplyErr(cl, r.req, "rename failed"),
+            }
+        } else {
+            const rc = c.rename(from, to);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        }
+        if (std.fs.path.dirname(r.path)) |parent| {
+            var dz: [4096]u8 = undefined;
+            if (pathZ(&dz, parent)) |dir_z| {
+                const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
+                if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open source parent");
+                defer _ = c.close(dfd);
+                if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync source parent");
+            } else |_| return fsReplyErr(cl, r.req, "source parent path too long");
+        } else return fsReplyErr(cl, r.req, "source has no parent");
         if (std.fs.path.dirname(r.to)) |parent| {
             var dz: [4096]u8 = undefined;
             if (pathZ(&dz, parent)) |dir_z| {
@@ -1655,6 +1679,12 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         if (c.lstat(p, &st) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
         const rc = if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) c.rmdir(p) else c.unlink(p);
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        const parent = std.fs.path.dirname(r.path) orelse return fsReplyErr(cl, r.req, "path has no parent");
+        var dz: [4096]u8 = undefined;
+        const dfd = c.open(pathZ(&dz, parent) catch return fsReplyErr(cl, r.req, "parent path too long"), c.O_RDONLY | c.O_DIRECTORY);
+        if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open directory parent");
+        defer _ = c.close(dfd);
+        if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync directory parent");
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "unlink") or std.mem.eql(u8, r.op, "rmdir")) {
         var z: [4096]u8 = undefined;

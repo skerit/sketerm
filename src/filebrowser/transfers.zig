@@ -26,7 +26,12 @@ const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
+pub const MIN_READ_VERSION: u32 = 2;
+
+pub fn readableVersion(version: u32) bool {
+    return version >= MIN_READ_VERSION and version <= VERSION;
+}
 
 pub const Kind = enum { download, upload };
 pub const State = enum { queued, submitting, running, waiting_retry, done, failed, canceled };
@@ -76,9 +81,21 @@ pub const Intent = struct {
     /// only a process with a browser face and both host connections
     /// can run it, so it is adopted only while a driver is registered.
     mediated: bool = false,
+    /// A normal browser copy/move whose daemon submission is driven by
+    /// a browser face. Its intent is still ledger-owned, so queued and
+    /// running work can be adopted after that face or process exits.
+    user_copy: bool = false,
+    /// Daemon that owns the current idempotent attempt. Empty is local;
+    /// coordinator_set distinguishes that from an unsubmitted record.
+    coordinator_host: []const u8 = "",
+    coordinator_set: bool = false,
+    /// Daemon that still needs ack_job acknowledged. It is separate
+    /// from coordinator_host because a retry may use another daemon.
+    ack_host: []const u8 = "",
     /// Mediated extras, meaningless for daemon transfers.
     open_when_done: bool = false,
     delete_src_after: bool = false,
+    no_replace: bool = false,
     watch_after: bool = false,
 };
 
@@ -149,15 +166,17 @@ pub const Handle = struct {
     }
 
     /// Delete the record, then drop ownership.
-    pub fn destroyRecord(self: *Handle) void {
+    pub fn destroyRecord(self: *Handle) bool {
+        var removed = true;
         var z: [4096]u8 = undefined;
         if (pathz.pathZ(&z, self.json_path)) |p| {
-            _ = c.unlink(p);
-        } else |_| {}
+            if (c.unlink(p) != 0 and std.posix.errno(-1) != .NOENT) removed = false;
+        } else |_| removed = false;
         if (pathz.pathZ(&z, self.lock_path)) |p| {
-            _ = c.unlink(p);
-        } else |_| {}
+            if (c.unlink(p) != 0 and std.posix.errno(-1) != .NOENT) removed = false;
+        } else |_| removed = false;
         self.release();
+        return removed;
     }
 
     /// Atomically replace the record. A byte-identical record is a
@@ -350,12 +369,11 @@ pub fn lockLegacy(allocator: std.mem.Allocator) !?LegacyLock {
     var z: [4096]u8 = undefined;
     const fd = c.open(try pathz.pathZ(&z, lock_path), c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
     if (fd < 0) return error.LedgerLockFailed;
-    // The old build takes this lock with fcntl, the new one with
-    // flock. On Linux the two lock kinds do NOT see each other, so the
-    // legacy owner is detected by BOTH: fcntl (what it holds) first,
-    // then flock (what another new process holds).
+    // Hold both lock kinds for the whole migration. Merely probing the
+    // old fcntl lock leaves a race in which an old binary can acquire
+    // it before this process takes its independent flock.
     var probe = c.struct_flock{ .l_type = c.F_WRLCK, .l_whence = c.SEEK_SET, .l_start = 0, .l_len = 0, .l_pid = 0 };
-    if (c.fcntl(fd, c.F_GETLK, &probe) == 0 and probe.l_type != c.F_UNLCK) {
+    if (c.fcntl(fd, c.F_SETLK, &probe) != 0) {
         _ = c.close(fd);
         return null;
     }
@@ -368,16 +386,16 @@ pub fn lockLegacy(allocator: std.mem.Allocator) !?LegacyLock {
 
 /// Move the migrated document aside. Kept (not deleted) so a failed
 /// upgrade can still be inspected by hand.
-pub fn retireLegacy(allocator: std.mem.Allocator) void {
-    const path = legacyPath(allocator) catch return;
+pub fn retireLegacy(allocator: std.mem.Allocator) bool {
+    const path = legacyPath(allocator) catch return false;
     defer allocator.free(path);
-    const dest = std.fmt.allocPrint(allocator, "{s}.migrated", .{path}) catch return;
+    const dest = std.fmt.allocPrint(allocator, "{s}.migrated", .{path}) catch return false;
     defer allocator.free(dest);
     var az: [4096]u8 = undefined;
     var bz: [4096]u8 = undefined;
-    const from = pathz.pathZ(&az, path) catch return;
-    const to = pathz.pathZ(&bz, dest) catch return;
-    _ = c.rename(from, to);
+    const from = pathz.pathZ(&az, path) catch return false;
+    const to = pathz.pathZ(&bz, dest) catch return false;
+    return c.rename(from, to) == 0;
 }
 
 // ── tests ───────────────────────────────────────────────────────
@@ -415,7 +433,7 @@ test "a record round trips through its own file" {
     defer tmp.deinit(t.allocator);
 
     var h = (try open(t.allocator, .intent, "abc")) orelse return error.LockBusy;
-    defer h.destroyRecord();
+    defer _ = h.destroyRecord();
     try h.write(.{ .rtype = .intent, .intent = .{
         .token = "abc",
         .src = .{ .host = "box", .path = "/remote/a" },
@@ -449,7 +467,7 @@ test "an owned record cannot be taken by a second owner" {
     h.release();
     // Released: adoptable again, record intact.
     var again = (try open(t.allocator, .intent, "held")) orelse return error.LockBusy;
-    defer again.destroyRecord();
+    defer _ = again.destroyRecord();
     const parsed = (try readToken(t.allocator, .intent, "held")) orelse return error.Missing;
     defer parsed.deinit();
     try t.expectEqualStrings("held", parsed.value.intent.token);
@@ -461,7 +479,7 @@ test "a client-mediated record carries what its driver needs to resume" {
     defer tmp.deinit(t.allocator);
 
     var h = (try open(t.allocator, .intent, "med")) orelse return error.LockBusy;
-    defer h.destroyRecord();
+    defer _ = h.destroyRecord();
     try h.write(.{ .intent = .{
         .token = "med",
         .src = .{ .host = "box", .path = "/r/f" },
@@ -469,6 +487,7 @@ test "a client-mediated record carries what its driver needs to resume" {
         .mediated = true,
         .paused = true,
         .delete_src_after = true,
+        .no_replace = true,
         .open_when_done = true,
         .watch_after = true,
         .app_id = "org.x.Editor",
@@ -476,10 +495,51 @@ test "a client-mediated record carries what its driver needs to resume" {
     const parsed = (try readToken(t.allocator, .intent, "med")) orelse return error.Missing;
     defer parsed.deinit();
     const v = parsed.value.intent;
-    try t.expect(v.mediated and v.paused and v.delete_src_after and v.open_when_done and v.watch_after);
+    try t.expect(v.mediated and v.paused and v.delete_src_after and v.no_replace and v.open_when_done and v.watch_after);
+    try t.expect(!v.user_copy);
     try t.expectEqualStrings("org.x.Editor", v.app_id);
     try t.expectEqualStrings("box", v.src.host);
     try t.expectEqualStrings("/local/f", v.dst.path);
+}
+
+test "a queued browser move persists its recovery identity" {
+    const t = std.testing;
+    var tmp = try TmpState.init(t.allocator);
+    defer tmp.deinit(t.allocator);
+
+    var h = (try open(t.allocator, .intent, "move-record")) orelse return error.LockBusy;
+    defer _ = h.destroyRecord();
+    try h.write(.{ .intent = .{
+        .token = "move-record",
+        .client_token = "attempt-1",
+        .src = .{ .host = "", .path = "/mnt/source/movie.mkv" },
+        .dst = .{ .host = "box", .path = "/srv/video/movie.mkv" },
+        .mediated = true,
+        .user_copy = true,
+        .delete_src_after = true,
+        .no_replace = true,
+        .coordinator_host = "relay",
+        .coordinator_set = true,
+        .ack_host = "relay",
+    } });
+    const parsed = (try readToken(t.allocator, .intent, "move-record")) orelse return error.Missing;
+    defer parsed.deinit();
+    const v = parsed.value.intent;
+    try t.expect(v.mediated and v.user_copy and v.delete_src_after and v.no_replace);
+    try t.expectEqualStrings("attempt-1", v.client_token);
+    try t.expectEqualStrings("/mnt/source/movie.mkv", v.src.path);
+    try t.expectEqualStrings("box", v.dst.host);
+    try t.expect(v.coordinator_set);
+    try t.expectEqualStrings("relay", v.coordinator_host);
+    try t.expectEqualStrings("relay", v.ack_host);
+}
+
+test "ledger v4 excludes older writers while retaining v2 recovery" {
+    try std.testing.expect(!readableVersion(1));
+    try std.testing.expect(readableVersion(2));
+    try std.testing.expect(readableVersion(3));
+    try std.testing.expect(readableVersion(4));
+    try std.testing.expect(!readableVersion(5));
 }
 
 test "list reports every record identity in the ledger directory" {
@@ -488,10 +548,10 @@ test "list reports every record identity in the ledger directory" {
     defer tmp.deinit(t.allocator);
 
     var a = (try open(t.allocator, .intent, "one")) orelse return error.LockBusy;
-    defer a.destroyRecord();
+    defer _ = a.destroyRecord();
     try a.write(.{ .intent = .{ .token = "one" } });
     var b = (try open(t.allocator, .watch, "two")) orelse return error.LockBusy;
-    defer b.destroyRecord();
+    defer _ = b.destroyRecord();
     try b.write(.{ .rtype = .watch, .watch = .{ .token = "two" } });
 
     const entries = try list(t.allocator);
@@ -512,7 +572,7 @@ test "a record write is skipped when nothing changed" {
     defer tmp.deinit(t.allocator);
 
     var h = (try open(t.allocator, .intent, "same")) orelse return error.LockBusy;
-    defer h.destroyRecord();
+    defer _ = h.destroyRecord();
     try h.write(.{ .intent = .{ .token = "same" } });
     const first = h.written_hash;
     try h.write(.{ .intent = .{ .token = "same" } });
@@ -547,6 +607,6 @@ test "the legacy ledger is readable and retirable" {
     try t.expectEqualStrings("w1", parsed.value.watches[0].token);
     try t.expectEqualSlices(u64, &.{7}, parsed.value.acknowledgments);
 
-    retireLegacy(t.allocator);
+    try t.expect(retireLegacy(t.allocator));
     try t.expectEqual(@as(?std.json.Parsed(LegacyLedger), null), try loadLegacy(t.allocator));
 }

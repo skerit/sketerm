@@ -39,7 +39,9 @@ fn writeScript(path: [:0]const u8, body: []const u8) void {
 }
 
 fn connectStage(allocator: std.mem.Allocator, label: []const u8) void {
-    var conn = client_mod.Conn.connectUdp(allocator, "smoke-udp-host", null) catch |err| {
+    var host_buf: [64]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "smoke-udp-host-{d}", .{c.getpid()}) catch fail("host label");
+    var conn = client_mod.Conn.connectUdp(allocator, host, null) catch |err| {
         std.debug.print("smoke-udp: {s}: connectUdp failed: {s}\n", .{ label, @errorName(err) });
         std.process.exit(1);
     };

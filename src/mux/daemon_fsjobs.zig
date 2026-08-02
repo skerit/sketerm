@@ -80,6 +80,8 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .secure_delete
     else
         .hash;
+    if (r.no_replace and std.mem.eql(u8, r.dir_mode, "replace"))
+        return fsReplyErr(cl, r.req, "no_replace conflicts with dir_mode=replace");
     if ((op == .copy or op == .extract or op == .archive_create) and
         (r.to.len == 0 or r.to[0] != '/'))
         return fsReplyErr(cl, r.req, "to must be absolute");
@@ -120,6 +122,10 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
                 .state = @tagName(existing.state),
                 .done = existing.done,
                 .total = existing.total,
+                .resumed_from = existing.resumed_from,
+                .file = existing.cur_file[0..existing.cur_file_len],
+                .files_done = existing.files_done,
+                .files_total = existing.files_total,
                 .message = existing.message[0..existing.message_len],
             });
             if (existing.finished()) {
@@ -156,7 +162,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .within_ms = r.within_ms,
         .max_matches = r.max_matches,
         .perm = .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 },
-        .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode },
+        .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode, .no_replace = r.no_replace },
         .image_codecs = r.image_codecs,
         .wire_cache = r.wire_cache,
         .owns_dst = op == .panelize and r.delete_destination,
@@ -186,7 +192,7 @@ pub fn ephemeralOp(op: FsJob.Op) bool {
 pub const PermArgs = struct { mode: u32 = 0, uid: i64 = -1, gid: i64 = -1 };
 
 /// Copy-collision arguments, forwarded verbatim to the helper.
-pub const CopyArgs = struct { conflict: []const u8 = "", dir_mode: []const u8 = "" };
+pub const CopyArgs = struct { conflict: []const u8 = "", dir_mode: []const u8 = "", no_replace: bool = false };
 
 /// Everything a job run needs beyond its op and id. One struct so
 /// call sites name what they set and default the rest.
@@ -210,8 +216,24 @@ pub const FsJobArgs = struct {
     /// respawn still deletes the source instead of degrading to a copy.
     delete_src: bool = false,
     verify: bool = false,
+    phase: []const u8 = "",
+    source_quarantine: []const u8 = "",
+    destination_stage: []const u8 = "",
+    source_fingerprint: []const u8 = "",
+    source_kind: []const u8 = "",
+    source_dev: u64 = 0,
+    source_ino: u64 = 0,
+    recovery_attempts: u32 = 0,
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     /// NOT journaled: a respawn dials with the full budget.
     dial_tries: u32 = 0,
+    /// Recovery reuses an existing job ID whose record may be the only
+    /// path to quarantined source data; spawn failure must retain it.
+    preserve_journal_on_failure: bool = false,
 };
 
 pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: FsJobArgs) !*FsJob {
@@ -250,12 +272,26 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .gid = perm.gid,
         .conflict = copy.conflict,
         .dir_mode = copy.dir_mode,
+        .no_replace = copy.no_replace,
         .image_codecs = image_codecs,
         .wire_cache = args.wire_cache,
         .delete_source = args.owns_src,
         .delete_src = args.delete_src,
-        .dial_tries = args.dial_tries,
         .verify = args.verify,
+        .phase = args.phase,
+        .source_quarantine = args.source_quarantine,
+        .destination_stage = args.destination_stage,
+        .source_fingerprint = args.source_fingerprint,
+        .source_kind = args.source_kind,
+        .source_dev = args.source_dev,
+        .source_ino = args.source_ino,
+        .recovery_attempts = args.recovery_attempts,
+        .done = args.done,
+        .total = args.total,
+        .resumed_from = args.resumed_from,
+        .files_done = args.files_done,
+        .files_total = args.files_total,
+        .dial_tries = args.dial_tries,
     }, .{}, &spec_aw.writer);
     try spec_aw.writer.writeByte('\n');
 
@@ -325,12 +361,21 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .dst_host = dst_host_owned,
         .client_token = client_token_owned,
         .conflict = conflict_owned,
+        .no_replace = copy.no_replace,
         .resumable = resumable,
         .ephemeral = ephemeral,
         .owns_dst = args.owns_dst,
         .owns_src = args.owns_src,
         .delete_src = args.delete_src,
+        .verify = args.verify,
+        .done = args.done,
+        .total = args.total,
+        .resumed_from = args.resumed_from,
+        .files_done = args.files_done,
+        .files_total = args.files_total,
+        .recovery_attempts = args.recovery_attempts,
     };
+    job.setPhase(args.phase);
     job_initialized = true;
     // The job owns the read end from here on; its deinit closes it,
     // so the pipe errdefer must not close it a second time.
@@ -340,7 +385,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
     self.fs_jobs.append(self.allocator, job) catch return error.OutOfMemory;
     saveFsJob(self, job) catch {
         _ = self.fs_jobs.pop();
-        deleteFsJobJournal(self, id);
+        if (!args.preserve_journal_on_failure) deleteFsJobJournal(self, id);
         return error.JournalFailed;
     };
     const sw = spec_aw.written();
@@ -355,7 +400,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
     spec_pipe[1] = -1;
     if (off != sw.len) {
         _ = self.fs_jobs.pop();
-        deleteFsJobJournal(self, id);
+        if (!args.preserve_journal_on_failure) deleteFsJobJournal(self, id);
         return error.SpecWriteFailed;
     }
     job_owned = false;
@@ -369,12 +414,61 @@ pub fn fsOpFromName(name: []const u8) ?FsJob.Op {
     return null;
 }
 
+fn moveHelperOwnsJournal(job: *const FsJob) bool {
+    if (job.op != .cross_copy or !job.delete_src or job.pid <= 0) return false;
+    if (job.out_fd >= 0) return true;
+    return !job.finished() and c.kill(job.pid, 0) == 0;
+}
+
 pub fn journalFsJob(self: *Daemon, job: *FsJob) void {
+    // A cross-move helper owns its journal after the initial record is
+    // installed and until stdout closes. Two independent load/merge/save
+    // writers can each be atomic yet still overwrite the stronger phase.
+    if (moveHelperOwnsJournal(job)) return;
     saveFsJob(self, job) catch {};
 }
 
 pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
     if (self.fs_job_dir.len == 0 or job.ephemeral) return;
+    // The helper writes copy/delete phase boundaries directly so they
+    // survive a daemon crash. A progress event already queued in its
+    // pipe must not race afterwards and overwrite that stronger proof.
+    var quarantine_buf: [4096]u8 = undefined;
+    var quarantine_len: usize = 0;
+    var destination_stage_buf: [4096]u8 = undefined;
+    var destination_stage_len: usize = 0;
+    var fingerprint_buf: [64]u8 = undefined;
+    var fingerprint_len: usize = 0;
+    var source_kind_buf: [16]u8 = undefined;
+    var source_kind_len: usize = 0;
+    var source_dev: u64 = 0;
+    var source_ino: u64 = 0;
+    var path_buf: [4096]u8 = undefined;
+    if (std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, job.id })) |path| {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), path)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            job.done = @max(job.done, parsed.value.done);
+            job.total = @max(job.total, parsed.value.total);
+            job.resumed_from = @max(job.resumed_from, parsed.value.resumed_from);
+            job.files_done = @max(job.files_done, parsed.value.files_done);
+            job.files_total = @max(job.files_total, parsed.value.files_total);
+            if (fsjournal.phaseRank(parsed.value.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len]))
+                job.setPhase(parsed.value.phase);
+            quarantine_len = @min(parsed.value.source_quarantine.len, quarantine_buf.len);
+            @memcpy(quarantine_buf[0..quarantine_len], parsed.value.source_quarantine[0..quarantine_len]);
+            destination_stage_len = @min(parsed.value.destination_stage.len, destination_stage_buf.len);
+            @memcpy(destination_stage_buf[0..destination_stage_len], parsed.value.destination_stage[0..destination_stage_len]);
+            fingerprint_len = @min(parsed.value.source_fingerprint.len, fingerprint_buf.len);
+            @memcpy(fingerprint_buf[0..fingerprint_len], parsed.value.source_fingerprint[0..fingerprint_len]);
+            source_kind_len = @min(parsed.value.source_kind.len, source_kind_buf.len);
+            @memcpy(source_kind_buf[0..source_kind_len], parsed.value.source_kind[0..source_kind_len]);
+            source_dev = parsed.value.source_dev;
+            source_ino = parsed.value.source_ino;
+        } else |_| {}
+    } else |_| {}
     try fsjournal.save(self.fs_job_dir, .{
         .id = job.id,
         .op = @tagName(job.op),
@@ -386,11 +480,23 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
         .dst_host = job.dst_host,
         .@"resume" = job.resumable,
         .conflict = job.conflict,
+        .no_replace = job.no_replace,
         .delete_src = job.delete_src,
+        .verify = job.verify,
+        .phase = job.phase[0..job.phase_len],
+        .source_quarantine = quarantine_buf[0..quarantine_len],
+        .destination_stage = destination_stage_buf[0..destination_stage_len],
+        .source_fingerprint = fingerprint_buf[0..fingerprint_len],
+        .source_kind = source_kind_buf[0..source_kind_len],
+        .source_dev = source_dev,
+        .source_ino = source_ino,
+        .recovery_attempts = job.recovery_attempts,
         .pid = job.pid,
         .done = job.done,
         .total = job.total,
         .resumed_from = job.resumed_from,
+        .files_done = job.files_done,
+        .files_total = job.files_total,
         .message = job.message[0..job.message_len],
         .client_token = job.client_token,
         .acknowledged = job.acknowledged,
@@ -430,6 +536,8 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .done = rec.done,
         .total = rec.total,
         .resumed_from = rec.resumed_from,
+        .files_done = rec.files_done,
+        .files_total = rec.files_total,
         .src = src,
         .dst = dst,
         .pattern = pattern,
@@ -437,11 +545,15 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .dst_host = dst_host,
         .client_token = client_token,
         .conflict = conflict,
+        .no_replace = rec.no_replace,
         .acknowledged = rec.acknowledged,
         .resumable = rec.@"resume",
         .delete_src = rec.delete_src,
+        .verify = rec.verify,
+        .recovery_attempts = rec.recovery_attempts,
     };
     job.setMessage(rec.message);
+    job.setPhase(rec.phase);
     self.fs_jobs.append(self.allocator, job) catch {
         job.deinit(false);
         return null;
@@ -490,6 +602,17 @@ pub fn restoreFsJobs(self: *Daemon) void {
             continue;
         }
         if (op == .copy or op == .cross_copy or op == .live_find) {
+            const cleanup_recovery = op == .cross_copy and rec.delete_src and
+                fsjournal.phaseRank(rec.phase) >= fsjournal.phaseRank("rename_planned") and
+                fsjournal.phaseRank(rec.phase) < fsjournal.phaseRank("source_deleted");
+            if (cleanup_recovery and rec.recovery_attempts >= 3) {
+                const job = restoredFsJob(self, rec, op, .failed) orelse continue;
+                job.setMessage("source cleanup repeatedly crashed; quarantine retained");
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                };
+                continue;
+            }
             // dir_mode is deliberately absent: the destination was
             // already replaced before any bytes moved, so a
             // restart merges into the partial result instead of
@@ -502,8 +625,23 @@ pub fn restoreFsJobs(self: *Daemon) void {
                 .dst_host = rec.dst_host,
                 .client_token = rec.client_token,
                 .resumable = true,
-                .copy = .{ .conflict = rec.conflict },
+                .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
                 .delete_src = rec.delete_src,
+                .verify = rec.verify,
+                .phase = rec.phase,
+                .source_quarantine = rec.source_quarantine,
+                .destination_stage = rec.destination_stage,
+                .source_fingerprint = rec.source_fingerprint,
+                .source_kind = rec.source_kind,
+                .source_dev = rec.source_dev,
+                .source_ino = rec.source_ino,
+                .recovery_attempts = rec.recovery_attempts + @intFromBool(cleanup_recovery),
+                .done = rec.done,
+                .total = rec.total,
+                .resumed_from = rec.resumed_from,
+                .files_done = rec.files_done,
+                .files_total = rec.files_total,
+                .preserve_journal_on_failure = true,
             }) catch {
                 const job = restoredFsJob(self, rec, op, .failed) orelse continue;
                 job.setMessage("could not resume after daemon restart");
@@ -523,7 +661,16 @@ pub fn restoreFsJobs(self: *Daemon) void {
 
 pub fn refreshDetachedFsJobs(self: *Daemon) void {
     for (self.fs_jobs.items) |job| {
-        if (job.out_fd >= 0 or job.finished() or job.pid <= 0) continue;
+        if (job.restart_pending or job.out_fd >= 0 or job.pid <= 0) continue;
+        if (job.finished()) {
+            if (job.state == .canceled and c.kill(job.pid, 0) != 0) {
+                job.pid = -1;
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                };
+            }
+            continue;
+        }
         if (c.kill(job.pid, 0) == 0) continue;
         var pbuf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&pbuf, "{s}/{d}.json", .{ self.fs_job_dir, job.id }) catch continue;
@@ -541,14 +688,101 @@ pub fn refreshDetachedFsJobs(self: *Daemon) void {
         };
         defer parsed.deinit();
         const state = parsed.value.state;
+        job.done = @max(job.done, parsed.value.done);
+        job.total = @max(job.total, parsed.value.total);
+        job.resumed_from = @max(job.resumed_from, parsed.value.resumed_from);
+        job.files_done = @max(job.files_done, parsed.value.files_done);
+        job.files_total = @max(job.files_total, parsed.value.files_total);
+        if (fsjournal.phaseRank(parsed.value.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len]))
+            job.setPhase(parsed.value.phase);
         if (std.mem.eql(u8, state, "done")) {
             job.state = .done;
             fsJobEmit(self, job, "done");
+        } else if (job.op == .cross_copy and parsed.value.delete_src and
+            !std.mem.eql(u8, state, "failed") and !std.mem.eql(u8, state, "canceled") and
+            fsjournal.phaseRank(parsed.value.phase) >= fsjournal.phaseRank("rename_planned") and
+            fsjournal.phaseRank(parsed.value.phase) < fsjournal.phaseRank("source_deleted"))
+        {
+            job.pid = -1;
+            job.restart_pending = true;
         } else {
             job.state = .failed;
             job.setMessage(parsed.value.message);
             fsJobEmit(self, job, "error");
         }
+    }
+}
+
+/// Replace helpers that died after the durable copy boundary. The
+/// quarantine journal makes this safe: recovery never deletes `src`.
+pub fn restartCrashedFsJobs(self: *Daemon) void {
+    var i: usize = 0;
+    while (i < self.fs_jobs.items.len) : (i += 1) {
+        const old = self.fs_jobs.items[i];
+        if (!old.restart_pending) continue;
+        var path_buf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, old.id }) catch {
+            old.restart_pending = false;
+            old.state = .failed;
+            old.setMessage("cannot locate durable move recovery record");
+            old.terminal_pending = true;
+            continue;
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = fsjournal.load(arena.allocator(), path) catch {
+            old.restart_pending = false;
+            old.state = .failed;
+            old.setMessage("cannot load durable move recovery record");
+            old.terminal_pending = true;
+            continue;
+        };
+        defer parsed.deinit();
+        const rec = parsed.value;
+        if (rec.recovery_attempts >= 3) {
+            old.restart_pending = false;
+            old.state = .failed;
+            old.setMessage("source cleanup repeatedly crashed; quarantine retained");
+            old.terminal_pending = true;
+            continue;
+        }
+        const replacement = spawnFsJob(self, old.owner, .cross_copy, rec.id, .{
+            .src = rec.src,
+            .dst = rec.dst,
+            .pattern = rec.pattern,
+            .src_host = rec.src_host,
+            .dst_host = rec.dst_host,
+            .client_token = rec.client_token,
+            .resumable = true,
+            .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
+            .delete_src = true,
+            .verify = rec.verify,
+            .phase = rec.phase,
+            .source_quarantine = rec.source_quarantine,
+            .destination_stage = rec.destination_stage,
+            .source_fingerprint = rec.source_fingerprint,
+            .source_kind = rec.source_kind,
+            .source_dev = rec.source_dev,
+            .source_ino = rec.source_ino,
+            .recovery_attempts = rec.recovery_attempts + 1,
+            .done = rec.done,
+            .total = rec.total,
+            .resumed_from = rec.resumed_from,
+            .files_done = rec.files_done,
+            .files_total = rec.files_total,
+            .preserve_journal_on_failure = true,
+        }) catch {
+            old.restart_pending = false;
+            old.state = .failed;
+            old.setMessage("could not resume source cleanup after helper crash");
+            old.terminal_pending = true;
+            continue;
+        };
+        // spawnFsJob appends. Replace the old slot so job IDs and
+        // client ownership remain singular and poll sees the new fd.
+        self.fs_jobs.items[i] = replacement;
+        _ = self.fs_jobs.pop();
+        old.deinit(false);
     }
 }
 
@@ -613,16 +847,19 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "job_cancel")) {
         if (!job.finished()) {
+            const helper_owns_journal = moveHelperOwnsJournal(job);
             // SIGCONT first: a SIGSTOPped child never dispatches
             // SIGKILL... actually SIGKILL cannot be blocked even
             // stopped, but the CONT keeps wait semantics simple.
             _ = c.kill(-job.pid, c.SIGCONT);
             _ = c.kill(-job.pid, c.SIGKILL);
             job.state = .canceled;
-            saveFsJob(self, job) catch {
-                job.terminal_pending = true;
-                return fsReplyErr(cl, r.req, "cannot persist canceled job state");
-            };
+            if (!helper_owns_journal) {
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                    return fsReplyErr(cl, r.req, "cannot persist canceled job state");
+                };
+            }
             fsJobEmit(self, job, "canceled");
         }
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
@@ -722,6 +959,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         file: []const u8 = "",
         files_done: u64 = 0,
         files_total: u64 = 0,
+        phase: []const u8 = "",
         /// media_meta: extracted key/value pairs for one file, plus
         /// whether the helper served them from its cache.
         meta: []const MetaKV = &.{},
@@ -771,7 +1009,9 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         }
         return;
     }
-    job.done = e.done;
+    // Error/phase events may omit counters. Never let their JSON
+    // defaults erase progress that is already durable in the daemon.
+    if (e.done > job.done) job.done = e.done;
     if (e.total > job.total) job.total = e.total;
     // Sticky, on EVERY event kind: the helper repeats neither the
     // in-flight path nor a zero resume offset, so a running row
@@ -784,6 +1024,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     if (e.resumed_from > 0) job.resumed_from = e.resumed_from;
     if (e.files_done > job.files_done) job.files_done = e.files_done;
     if (e.files_total > job.files_total) job.files_total = e.files_total;
+    if (fsjournal.phaseRank(e.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len])) job.setPhase(e.phase);
     if (std.mem.eql(u8, e.ev, "done")) {
         job.matches = if (e.matches > 0) e.matches else job.matches;
         job.truncated = e.truncated;
@@ -803,20 +1044,34 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
         if (job.owns_dst or job.owns_src or job.op == .thumbnail or job.op == .preview or job.op == .preview_transport)
             job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
-        saveFsJob(self, job) catch {
-            job.terminal_pending = true;
-            return;
-        };
+        if (!moveHelperOwnsJournal(job)) {
+            saveFsJob(self, job) catch {
+                job.terminal_pending = true;
+                return;
+            };
+        }
         fsJobEmit(self, job, "done");
     } else if (std.mem.eql(u8, e.ev, "error")) {
-        job.state = .failed;
         job.setMessage(e.message);
         job.err_kind_len = @min(e.kind.len, job.err_kind.len);
         @memcpy(job.err_kind[0..job.err_kind_len], e.kind[0..job.err_kind_len]);
-        saveFsJob(self, job) catch {
-            job.terminal_pending = true;
+        if (job.op == .cross_copy and job.delete_src and
+            std.mem.eql(u8, e.kind, "retryable_cleanup"))
+        {
+            // The helper's final journal record remains running. EOF
+            // replaces it with a bounded recovery helper; no terminal
+            // failure is visible unless that recovery budget expires.
+            job.state = .running;
+            fsJobEmit(self, job, "progress");
             return;
-        };
+        }
+        job.state = .failed;
+        if (!moveHelperOwnsJournal(job)) {
+            saveFsJob(self, job) catch {
+                job.terminal_pending = true;
+                return;
+            };
+        }
         fsJobEmit(self, job, "error");
     } else {
         // A running job may report WHY it is not moving (a cross-host
@@ -840,6 +1095,25 @@ pub fn fsJobExited(self: *Daemon, job: *FsJob) void {
     job.out_fd = -1;
     var emit_terminal = job.terminal_pending;
     if (!job.finished()) {
+        if (job.op == .cross_copy and job.delete_src) {
+            var path_buf: [4096]u8 = undefined;
+            if (std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, job.id })) |path| {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                if (fsjournal.load(arena.allocator(), path)) |parsed_value| {
+                    var parsed = parsed_value;
+                    defer parsed.deinit();
+                    if (fsjournal.phaseRank(parsed.value.phase) >= fsjournal.phaseRank("rename_planned") and
+                        fsjournal.phaseRank(parsed.value.phase) < fsjournal.phaseRank("source_deleted"))
+                    {
+                        job.setPhase(parsed.value.phase);
+                        job.pid = -1;
+                        job.restart_pending = true;
+                        return;
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
         job.state = .failed;
         job.setMessage("job helper died");
         emit_terminal = true;

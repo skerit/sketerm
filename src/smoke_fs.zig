@@ -16,6 +16,7 @@ const fsdrive = @import("ipc/fsdrive.zig");
 const fstransfer = @import("ipc/fstransfer.zig");
 const fsserve = @import("mux/fsserve.zig");
 const fsjob = @import("mux/fsjob.zig");
+const fsjournal = @import("mux/fsjournal.zig");
 const imagecodec = @import("util/imagecodec.zig");
 const pathz = @import("util/pathz.zig");
 const thumbs_mod = @import("filebrowser/thumbs.zig");
@@ -606,6 +607,113 @@ fn writePattern(path: []const u8, len: usize, seed: u8) void {
     }
 }
 
+const MoveMutation = struct {
+    part: []const u8,
+    source_dir: []const u8,
+    mutated: bool = false,
+};
+
+fn mutateMoveAfterCopyStarts(ctx: *MoveMutation) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 2) {
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (c.stat(pathz.pathZ(&z, ctx.part) catch return, &st) == 0 and st.st_size >= (1 << 20)) {
+            touch(ctx.source_dir, "a-copied.txt", "changed after copy");
+            touch(ctx.source_dir, "unexpected.txt", "late arrival");
+            ctx.mutated = true;
+            return;
+        }
+        _ = c.usleep(2_000);
+    }
+}
+
+const MoveReplacement = struct {
+    source: []const u8,
+    replaced: bool = false,
+};
+
+fn replaceMoveSourceAfterQuarantine(ctx: *MoveReplacement) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        if (!exists(ctx.source)) {
+            writePattern(ctx.source, 4096, 0xa7);
+            ctx.replaced = true;
+            return;
+        }
+        _ = c.usleep(1_000);
+    }
+}
+
+const MoveHelperKill = struct {
+    journal: []const u8,
+    remove_after_kill: []const u8 = "",
+    stage_child: []const u8 = "",
+    killed: bool = false,
+};
+
+fn killMoveHelperAfterCopy(ctx: *MoveHelperKill) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.phase, "copied") and
+                parsed.value.source_quarantine.len > 0 and exists(parsed.value.source_quarantine) and
+                parsed.value.pid > 0)
+            {
+                if (c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0) {
+                    ctx.killed = true;
+                    if (ctx.remove_after_kill.len > 0) {
+                        var z: [4096]u8 = undefined;
+                        _ = c.unlink(pathz.pathZ(&z, ctx.remove_after_kill) catch return);
+                    }
+                }
+                return;
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
+fn killMoveHelperInDestinationStage(ctx: *MoveHelperKill) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            var child_ready = true;
+            if (ctx.stage_child.len > 0 and parsed.value.destination_stage.len > 0) {
+                var child_buf: [4096]u8 = undefined;
+                const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{
+                    parsed.value.destination_stage,
+                    ctx.stage_child,
+                }) catch return;
+                child_ready = exists(child);
+            }
+            if (std.mem.eql(u8, parsed.value.phase, "rename_planned") and
+                parsed.value.destination_stage.len > 0 and exists(parsed.value.destination_stage) and
+                child_ready and
+                parsed.value.pid > 0)
+            {
+                if (c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0) {
+                    ctx.killed = true;
+                    if (ctx.remove_after_kill.len > 0) {
+                        var z: [4096]u8 = undefined;
+                        _ = c.unlink(pathz.pathZ(&z, ctx.remove_after_kill) catch return);
+                    }
+                }
+                return;
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
 /// Consume this job's event stream until terminal, counting progress
 /// frames. Fails the smoke on timeout.
 const JobOutcome = struct {
@@ -627,6 +735,8 @@ const JobOutcome = struct {
     /// Highest entry counters any event carried.
     files_done: u64 = 0,
     files_total: u64 = 0,
+    first_files_total: u64 = 0,
+    files_total_changed: bool = false,
     /// Was `resumed_from` ever non-zero on a RUNNING (progress) line?
     resumed_while_running: bool = false,
     /// The terminal event's message: for a failed job this IS the
@@ -670,6 +780,12 @@ fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
             defer e.deinit();
             if (e.job != job) continue;
             if (e.files_done > out.files_done) out.files_done = e.files_done;
+            if (e.files_total > 0) {
+                if (out.first_files_total == 0)
+                    out.first_files_total = e.files_total
+                else if (e.files_total != out.first_files_total)
+                    out.files_total_changed = true;
+            }
             if (e.files_total > out.files_total) out.files_total = e.files_total;
             if (std.mem.eql(u8, e.ev, "progress")) {
                 out.progress_events += 1;
@@ -849,6 +965,32 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
         const lnst = fs.statPath(arena.allocator(), lnp) catch failErr("tree link stat", fs.lastErr());
         if (!std.mem.eql(u8, lnst.kind, "link")) fail("tree link kind");
         if (!std.mem.eql(u8, lnst.target orelse "", "top.dat")) fail("tree link target");
+    }
+
+    // A root symlink is the object being copied, even when its target
+    // is a regular file or directory. It must never turn into a copy of
+    // the target tree/content.
+    {
+        var root_paths: [4][4096]u8 = undefined;
+        const file_link = std.fmt.bufPrint(&root_paths[0], "{s}/root-file-link", .{dir}) catch unreachable;
+        const dir_link = std.fmt.bufPrint(&root_paths[1], "{s}/root-dir-link", .{dir}) catch unreachable;
+        const file_copy = std.fmt.bufPrint(&root_paths[2], "{s}/root-file-link.copy", .{dir}) catch unreachable;
+        const dir_copy = std.fmt.bufPrint(&root_paths[3], "{s}/root-dir-link.copy", .{dir}) catch unreachable;
+        var z: [4096]u8 = undefined;
+        if (c.symlink("tree/top.dat", pathz.pathZ(&z, file_link) catch unreachable) != 0) fail("root file symlink");
+        if (c.symlink("tree", pathz.pathZ(&z, dir_link) catch unreachable) != 0) fail("root dir symlink");
+        const file_job = fs.startCopy(file_link, file_copy, false) catch failErr("copy root file symlink", fs.lastErr());
+        if (!collectJob(&fs, file_job, 20_000).is("done")) fail("root file symlink copy failed");
+        const dir_job = fs.startCopy(dir_link, dir_copy, false) catch failErr("copy root dir symlink", fs.lastErr());
+        if (!collectJob(&fs, dir_job, 20_000).is("done")) fail("root dir symlink copy failed");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const file_st = fs.statPath(arena.allocator(), file_copy) catch failErr("stat root file symlink copy", fs.lastErr());
+        const dir_st = fs.statPath(arena.allocator(), dir_copy) catch failErr("stat root dir symlink copy", fs.lastErr());
+        if (!std.mem.eql(u8, file_st.kind, "link") or !std.mem.eql(u8, file_st.target orelse "", "tree/top.dat"))
+            fail("root file symlink was dereferenced");
+        if (!std.mem.eql(u8, dir_st.kind, "link") or !dir_st.tdir or !std.mem.eql(u8, dir_st.target orelse "", "tree"))
+            fail("root directory symlink was dereferenced");
     }
     const djob = fs.startDeleteTree(tdst) catch failErr("start delete_tree", fs.lastErr());
     const dout = collectJob(&fs, djob, 20_000);
@@ -1236,6 +1378,42 @@ fn policyStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag
     const dst_only = std.fmt.bufPrint(&scratch[1], "{s}/only-here.txt", .{dst}) catch unreachable;
     const dst_leaf = std.fmt.bufPrint(&scratch[2], "{s}/sub/leaf.txt", .{dst}) catch unreachable;
     const dst_kept = std.fmt.bufPrint(&scratch[3], "{s}/shared.txt-copy", .{dst}) catch unreachable;
+
+    // A destination observed absent must still be absent at the actual
+    // install. Files, links, and directory roots all fail closed.
+    {
+        var nr: [6][4096]u8 = undefined;
+        const file_src = std.fmt.bufPrint(&nr[0], "{s}/nr-file-src", .{dir}) catch unreachable;
+        const file_dst = std.fmt.bufPrint(&nr[1], "{s}/nr-file-dst", .{dir}) catch unreachable;
+        touch(dir, "nr-file-src", "NEW");
+        touch(dir, "nr-file-dst", "OLD");
+        const file_job = fs.startCopyMode(file_src, file_dst, .{ .no_replace = true }) catch failErr("no-replace file start", fs.lastErr());
+        if (!collectJob(&fs, file_job, 20_000).is("error")) fail("no-replace file collision succeeded");
+        expectText(file_dst, "OLD", "no-replace file collision overwrote destination");
+
+        const link_src = std.fmt.bufPrint(&nr[2], "{s}/nr-link-src", .{dir}) catch unreachable;
+        const link_dst = std.fmt.bufPrint(&nr[3], "{s}/nr-link-dst", .{dir}) catch unreachable;
+        var z: [4096]u8 = undefined;
+        if (c.symlink("nr-file-src", pathz.pathZ(&z, link_src) catch unreachable) != 0) fail("no-replace link source");
+        touch(dir, "nr-link-dst", "OLD-LINK-DST");
+        const link_job = fs.startCopyMode(link_src, link_dst, .{ .no_replace = true }) catch failErr("no-replace link start", fs.lastErr());
+        if (!collectJob(&fs, link_job, 20_000).is("error")) fail("no-replace link collision succeeded");
+        expectText(link_dst, "OLD-LINK-DST", "no-replace link collision overwrote destination");
+
+        const dir_src = std.fmt.bufPrint(&nr[4], "{s}/nr-dir-src", .{dir}) catch unreachable;
+        const dir_dst = std.fmt.bufPrint(&nr[5], "{s}/nr-dir-dst", .{dir}) catch unreachable;
+        mkdirAt(dir_src);
+        mkdirAt(dir_dst);
+        touch(dir_src, "new.txt", "NEW-DIR");
+        touch(dir_dst, "old.txt", "OLD-DIR");
+        const dir_job = fs.startCopyMode(dir_src, dir_dst, .{ .no_replace = true }) catch failErr("no-replace dir start", fs.lastErr());
+        if (!collectJob(&fs, dir_job, 20_000).is("error")) fail("no-replace directory collision succeeded");
+        var old_buf: [4096]u8 = undefined;
+        expectText(std.fmt.bufPrint(&old_buf, "{s}/old.txt", .{dir_dst}) catch unreachable, "OLD-DIR", "no-replace directory damaged destination");
+        if (fs.startCopyMode(dir_src, dir_dst, .{ .dir_mode = "replace", .no_replace = true })) |_| {
+            fail("no-replace accepted replace mode");
+        } else |_| {}
+    }
 
     // ── merge (default): recurse, overwrite collisions, keep the
     // destination's own entries ────────────────────────────────
@@ -1970,6 +2148,62 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
         if (statExists(&fsb, allocator, staged)) fail("single xfer left staged partial");
     }
 
+    // The client-mediated fallback applies the same atomic root fence
+    // as daemon jobs; a late file or directory must survive unchanged.
+    {
+        var paths: [5][4096]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/nr-file", .{dir_a}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/nr-file", .{dir_b}) catch unreachable;
+        touch(dir_a, "nr-file", "NEW");
+        touch(dir_b, "nr-file", "OLD");
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src, dst, true) catch fail("no-replace xfer init");
+        defer x.deinit();
+        x.no_replace = true;
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 30_000, 0)) fail("no-replace xfer never finished");
+        if (x.ok()) fail("no-replace xfer overwrote a late destination");
+        expectText(dst, "OLD", "no-replace xfer damaged destination");
+
+        const tree_src = std.fmt.bufPrint(&paths[2], "{s}/nr-tree", .{dir_a}) catch unreachable;
+        const tree_dst = std.fmt.bufPrint(&paths[3], "{s}/nr-tree", .{dir_b}) catch unreachable;
+        mkdirAt(tree_src);
+        mkdirAt(tree_dst);
+        touch(tree_src, "new.txt", "NEW-TREE");
+        touch(tree_dst, "old.txt", "OLD-TREE");
+        const y = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, tree_src, tree_dst, true) catch fail("no-replace tree xfer init");
+        defer y.deinit();
+        y.no_replace = true;
+        y.start();
+        if (!pumpXfer(allocator, y, &conns, 30_000, 0)) fail("no-replace tree xfer never finished");
+        if (y.ok()) fail("no-replace tree xfer merged a late destination");
+        const old = std.fmt.bufPrint(&paths[4], "{s}/old.txt", .{tree_dst}) catch unreachable;
+        expectText(old, "OLD-TREE", "no-replace tree xfer damaged destination");
+    }
+
+    // A root symlink stays a symlink in the mediated path, including
+    // when its target happens to be a directory or file on the source.
+    {
+        var paths: [2][4096]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/root-link", .{dir_a}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/root-link", .{dir_b}) catch unreachable;
+        var z: [4096]u8 = undefined;
+        if (c.symlink("one.bin", pathz.pathZ(&z, src) catch unreachable) != 0) fail("root-link xfer source");
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src, dst, false) catch fail("root-link xfer init");
+        defer x.deinit();
+        x.no_replace = true;
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 30_000, 0) or !x.ok()) failErr("root-link xfer failed", x.errMsg());
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const st = fsb.statPath(arena.allocator(), dst) catch failErr("root-link xfer stat", fsb.lastErr());
+        if (!std.mem.eql(u8, st.kind, "link") or !std.mem.eql(u8, st.target orelse "", "one.bin"))
+            fail("root-link xfer dereferenced source link");
+    }
+
     // ── induced disconnect mid-transfer, then resume ───────────
     const src2 = std.fmt.bufPrint(&pb[2], "{s}/big.bin", .{dir_a}) catch unreachable;
     const dst2 = std.fmt.bufPrint(&pb[3], "{s}/big.copy", .{dir_b}) catch unreachable;
@@ -2301,17 +2535,201 @@ fn crossStage(
     var fs = fsdrive.Fs.connect(allocator, sock_dst) catch fail("cross: connect coordinator");
     defer fs.deinit();
 
+    // Same-filesystem MOVE keeps rename's fast path, but journals the
+    // source inode first so a lost reply can be resolved without a
+    // blind retry against a replacement source.
+    {
+        var paths: [2][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/rename-source.bin", .{src_dir}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/rename-destination.bin", .{dst_dir}) catch unreachable;
+        writePattern(src, 1 << 20, 0x2a);
+        const want_rename = fileSha(src) orelse fail("cross: rename source hash");
+        const job = fs.startCrossCopyOpts("", src, "", dst, true, .{ .delete_src = true, .no_replace = true }) catch
+            failErr("cross: start same-filesystem move", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("done")) failErr("cross: same-filesystem move failed", res.messageText());
+        if (exists(src)) fail("cross: same-filesystem move left its source");
+        const got = fileSha(dst) orelse fail("cross: same-filesystem move destination hash");
+        if (!std.mem.eql(u8, &got, &want_rename)) fail("cross: same-filesystem move content mismatch");
+    }
+
+    // Same-host move across mount points: rename returns XDEV, but the
+    // one durable job must fall back to verified copy/delete rather
+    // than expose that implementation detail to the file manager.
+    {
+        var tmp_st: c.struct_stat = undefined;
+        var shm_st: c.struct_stat = undefined;
+        var tz: [4096]u8 = undefined;
+        if (c.stat(pathz.pathZ(&tz, dir) catch unreachable, &tmp_st) == 0 and
+            c.stat("/dev/shm", &shm_st) == 0 and tmp_st.st_dev != shm_st.st_dev)
+        {
+            var xs_buf: [256]u8 = undefined;
+            const xsrc = std.fmt.bufPrint(&xs_buf, "{s}/xdev-source.bin", .{src_dir}) catch unreachable;
+            writePattern(xsrc, 16 << 20, 0x3c);
+            const xwant = fileSha(xsrc) orelse fail("cross: xdev source hash");
+            var xd_buf: [256]u8 = undefined;
+            const xdst = std.fmt.bufPrint(&xd_buf, "/dev/shm/sketerm-smoke-fs-xdev-{d}.bin", .{c.getpid()}) catch unreachable;
+            var xz: [4096]u8 = undefined;
+            _ = c.unlink(pathz.pathZ(&xz, xdst) catch unreachable);
+            defer _ = c.unlink(pathz.pathZ(&xz, xdst) catch unreachable);
+            const job = fs.startCrossCopyOpts("", xsrc, "", xdst, true, .{ .delete_src = true, .no_replace = true }) catch
+                failErr("cross: start xdev move", fs.lastErr());
+            const xjob_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
+            var xjournal_buf: [4096]u8 = undefined;
+            const xjournal = std.fmt.bufPrint(&xjournal_buf, "{s}/fsjobs/{d}.json", .{ xjob_parent, job }) catch
+                fail("cross: XDEV file journal path");
+            var xkiller_ctx = MoveHelperKill{ .journal = xjournal };
+            const xkiller = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&xkiller_ctx}) catch
+                fail("cross: XDEV file helper killer");
+            const res = collectJob(&fs, job, 120_000);
+            xkiller.join();
+            if (!xkiller_ctx.killed) fail("cross: XDEV file helper was not killed after staging");
+            if (!res.is("done")) failErr("cross: XDEV move did not fall back to copy/delete", res.messageText());
+            const xgot = fileSha(xdst) orelse fail("cross: xdev destination hash");
+            if (!std.mem.eql(u8, &xgot, &xwant)) fail("cross: xdev move content mismatch");
+            var gone: c.struct_stat = undefined;
+            if (c.lstat(pathz.pathZ(&xz, xsrc) catch unreachable, &gone) == 0)
+                fail("cross: xdev move left its source behind");
+
+            var tree_paths: [3][256]u8 = undefined;
+            const tree_src = std.fmt.bufPrint(&tree_paths[0], "{s}/xdev-tree", .{src_dir}) catch unreachable;
+            mkdirAt(tree_src);
+            const tree_file = std.fmt.bufPrint(&tree_paths[1], "{s}/payload.bin", .{tree_src}) catch unreachable;
+            writePattern(tree_file, 16 << 20, 0x6e);
+            const tree_dst = std.fmt.bufPrint(&tree_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-tree-{d}", .{c.getpid()}) catch unreachable;
+            daemon_mod.removeTreeBestEffort(tree_dst);
+            defer daemon_mod.removeTreeBestEffort(tree_dst);
+            const tree_job = fs.startCrossCopyOpts("", tree_src, "", tree_dst, true, .{
+                .delete_src = true,
+                .no_replace = true,
+            }) catch failErr("cross: start resumable XDEV tree move", fs.lastErr());
+            var journal_buf: [4096]u8 = undefined;
+            const job_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
+            const journal = std.fmt.bufPrint(&journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, tree_job }) catch
+                fail("cross: XDEV tree journal path");
+            var killer_ctx = MoveHelperKill{ .journal = journal, .stage_child = "payload.bin" };
+            const killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&killer_ctx}) catch
+                fail("cross: XDEV tree helper killer");
+            const tree_res = collectJob(&fs, tree_job, 180_000);
+            killer.join();
+            if (!killer_ctx.killed) fail("cross: XDEV tree helper was not killed in its destination stage");
+            if (!tree_res.is("done")) failErr("cross: XDEV tree move did not recover", tree_res.messageText());
+            if (exists(tree_src)) fail("cross: recovered XDEV tree left its source");
+            var moved_file_buf: [256]u8 = undefined;
+            const moved_file = std.fmt.bufPrint(&moved_file_buf, "{s}/payload.bin", .{tree_dst}) catch unreachable;
+            if (!exists(moved_file)) fail("cross: recovered XDEV tree lost its payload");
+
+            var stale_paths: [3][256]u8 = undefined;
+            const stale_src = std.fmt.bufPrint(&stale_paths[0], "{s}/xdev-stale-tree", .{src_dir}) catch unreachable;
+            mkdirAt(stale_src);
+            const stale_file = std.fmt.bufPrint(&stale_paths[1], "{s}/removed.bin", .{stale_src}) catch unreachable;
+            writePattern(stale_file, 8 << 20, 0x71);
+            const stale_dst = std.fmt.bufPrint(&stale_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-stale-{d}", .{c.getpid()}) catch unreachable;
+            daemon_mod.removeTreeBestEffort(stale_dst);
+            defer daemon_mod.removeTreeBestEffort(stale_dst);
+            const stale_job = fs.startCrossCopyOpts("", stale_src, "", stale_dst, true, .{
+                .delete_src = true,
+                .no_replace = true,
+            }) catch failErr("cross: start stale-stage XDEV move", fs.lastErr());
+            var stale_journal_buf: [4096]u8 = undefined;
+            const stale_journal = std.fmt.bufPrint(&stale_journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, stale_job }) catch
+                fail("cross: stale-stage journal path");
+            var stale_killer_ctx = MoveHelperKill{
+                .journal = stale_journal,
+                .remove_after_kill = stale_file,
+                .stage_child = "removed.bin",
+            };
+            const stale_killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&stale_killer_ctx}) catch
+                fail("cross: stale-stage helper killer");
+            const stale_res = collectJob(&fs, stale_job, 180_000);
+            stale_killer.join();
+            if (!stale_killer_ctx.killed) fail("cross: stale-stage helper was not killed after copying its entry");
+            if (!stale_res.is("error")) fail("cross: stale staged entry was silently installed");
+            if (!exists(stale_src)) fail("cross: stale-stage refusal deleted the current source root");
+            if (exists(stale_dst)) fail("cross: stale-stage refusal installed the destination root");
+            var stale_arena = std.heap.ArenaAllocator.init(allocator);
+            defer stale_arena.deinit();
+            if (fsjournal.load(stale_arena.allocator(), stale_journal)) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                if (parsed.value.destination_stage.len > 0)
+                    daemon_mod.removeTreeBestEffort(parsed.value.destination_stage);
+            } else |_| {}
+        }
+    }
+
     // ── clean cross-host copy ──────────────────────────────────
     _ = c.setenv("SKETERM_SSH", ssh_ok.ptr, 1);
     var out_buf: [256]u8 = undefined;
     const out_clean = std.fmt.bufPrint(&out_buf, "{s}/clean.bin", .{dst_dir}) catch unreachable;
     {
-        const job = fs.startCrossCopy("ssh:127.0.0.1", big, "", out_clean, true) catch
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", big, "", out_clean, true, .{ .no_replace = true }) catch
             failErr("cross: start clean", fs.lastErr());
         const res = collectJob(&fs, job, 120_000);
         if (!res.is("done")) failErr("cross: clean copy did not finish", res.messageText());
         const got = fileSha(out_clean) orelse fail("cross: clean hash");
         if (!std.mem.eql(u8, &got, &want)) fail("cross: clean copy content mismatch");
+    }
+
+    // A matching final file is not proof that this no-replace job
+    // installed it. Even identical bytes must leave a move source alone.
+    {
+        var paths: [3][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/collision-source.bin", .{src_dir}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/collision-destination.bin", .{dst_dir}) catch unreachable;
+        writePattern(src, 1 << 20, 0x4d);
+        writePattern(dst, 1 << 20, 0x4d);
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .delete_src = true,
+            .no_replace = true,
+        }) catch failErr("cross: start no-replace collision", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("error")) fail("cross: no-replace collision reported success");
+        if (!exists(src)) fail("cross: no-replace collision deleted its source");
+        const got = fileSha(dst) orelse fail("cross: collision destination hash");
+        const expected = fileSha(src) orelse fail("cross: collision source hash");
+        if (!std.mem.eql(u8, &got, &expected)) fail("cross: collision damaged destination");
+    }
+
+    // Root links keep link identity across hosts, including a link
+    // whose target happens to be a directory.
+    {
+        var link_paths: [7][256]u8 = undefined;
+        const target_dir = std.fmt.bufPrint(&link_paths[0], "{s}/link-target", .{src_dir}) catch unreachable;
+        mkdirAt(target_dir);
+        const file_link = std.fmt.bufPrint(&link_paths[1], "{s}/file-link", .{src_dir}) catch unreachable;
+        const dir_link = std.fmt.bufPrint(&link_paths[2], "{s}/dir-link", .{src_dir}) catch unreachable;
+        const file_dst = std.fmt.bufPrint(&link_paths[3], "{s}/file-link", .{dst_dir}) catch unreachable;
+        const dir_dst = std.fmt.bufPrint(&link_paths[4], "{s}/dir-link", .{dst_dir}) catch unreachable;
+        const move_link = std.fmt.bufPrint(&link_paths[5], "{s}/move-link", .{src_dir}) catch unreachable;
+        const move_dst = std.fmt.bufPrint(&link_paths[6], "{s}/move-link", .{dst_dir}) catch unreachable;
+        var z: [4096]u8 = undefined;
+        if (c.symlink("payload.bin", pathz.pathZ(&z, file_link) catch unreachable) != 0) fail("cross: make file link");
+        if (c.symlink("link-target", pathz.pathZ(&z, dir_link) catch unreachable) != 0) fail("cross: make dir link");
+        if (c.symlink("payload.bin", pathz.pathZ(&z, move_link) catch unreachable) != 0) fail("cross: make move link");
+        const fj = fs.startCrossCopy("ssh:127.0.0.1", file_link, "", file_dst, true) catch
+            failErr("cross: copy root file link", fs.lastErr());
+        if (!collectJob(&fs, fj, 120_000).is("done")) fail("cross: root file link failed");
+        const dj = fs.startCrossCopy("ssh:127.0.0.1", dir_link, "", dir_dst, true) catch
+            failErr("cross: copy root dir link", fs.lastErr());
+        if (!collectJob(&fs, dj, 120_000).is("done")) fail("cross: root dir link failed");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const fst = fs.statPath(arena.allocator(), file_dst) catch failErr("cross: stat file link", fs.lastErr());
+        const dst = fs.statPath(arena.allocator(), dir_dst) catch failErr("cross: stat dir link", fs.lastErr());
+        if (!std.mem.eql(u8, fst.kind, "link") or !std.mem.eql(u8, fst.target orelse "", "payload.bin"))
+            fail("cross: root file link was dereferenced");
+        if (!std.mem.eql(u8, dst.kind, "link") or !std.mem.eql(u8, dst.target orelse "", "link-target"))
+            fail("cross: root directory link was dereferenced");
+        const mj = fs.startCrossCopyOpts("ssh:127.0.0.1", move_link, "", move_dst, true, .{ .delete_src = true }) catch
+            failErr("cross: move root link", fs.lastErr());
+        if (!collectJob(&fs, mj, 120_000).is("done")) fail("cross: root link move failed");
+        arena.deinit();
+        arena = std.heap.ArenaAllocator.init(allocator);
+        const moved = fs.statPath(arena.allocator(), move_dst) catch failErr("cross: stat moved link", fs.lastErr());
+        if (!std.mem.eql(u8, moved.kind, "link") or !std.mem.eql(u8, moved.target orelse "", "payload.bin"))
+            fail("cross: moved root link was dereferenced");
+        if (exists(move_link)) fail("cross: moved root link source survived");
     }
 
     // ── link dies mid-transfer: reconnect, resume, same bytes ──
@@ -2370,6 +2788,62 @@ fn crossStage(
             fail("cross: move left the source file behind");
     }
     {
+        // Once the copied source is atomically quarantined, the original
+        // pathname belongs to the outside world again. A replacement
+        // created there must survive the remainder of source cleanup.
+        var src_buf: [256]u8 = undefined;
+        const src = std.fmt.bufPrint(&src_buf, "{s}/replace-after-quarantine.bin", .{src_dir}) catch unreachable;
+        writePattern(src, 8 << 20, 0x61);
+        var dst_buf: [256]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/replace-after-quarantine.bin", .{dst_dir}) catch unreachable;
+        var replacement = MoveReplacement{ .source = src };
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{ .delete_src = true }) catch
+            failErr("cross: start replacement-safe move", fs.lastErr());
+        const replacer = std.Thread.spawn(.{}, replaceMoveSourceAfterQuarantine, .{&replacement}) catch
+            fail("cross: replacement thread");
+        const res = collectJob(&fs, job, 120_000);
+        replacer.join();
+        if (!res.is("done")) failErr("cross: replacement-safe move did not finish", res.messageText());
+        if (!replacement.replaced) fail("cross: source replacement did not overlap quarantine cleanup");
+        const got = fileSha(src) orelse fail("cross: replacement source was deleted");
+        var expected_path_buf: [256]u8 = undefined;
+        const expected_path = std.fmt.bufPrint(&expected_path_buf, "{s}/replacement-expected.bin", .{src_dir}) catch unreachable;
+        writePattern(expected_path, 4096, 0xa7);
+        defer {
+            var z: [4096]u8 = undefined;
+            _ = c.unlink(pathz.pathZ(&z, expected_path) catch unreachable);
+        }
+        const expected = fileSha(expected_path) orelse fail("cross: replacement oracle hash");
+        if (!std.mem.eql(u8, &got, &expected)) fail("cross: move cleanup altered replacement source");
+    }
+    {
+        // The copy boundary and quarantine identity are helper-owned
+        // journal state. Killing that exact helper must respawn cleanup
+        // without falling back to deleting the original pathname.
+        var src_buf: [256]u8 = undefined;
+        const src = std.fmt.bufPrint(&src_buf, "{s}/crash-recovery.bin", .{src_dir}) catch unreachable;
+        writePattern(src, 32 << 20, 0x39);
+        const want_crash = fileSha(src) orelse fail("cross: crash recovery source hash");
+        var dst_buf: [256]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/crash-recovery.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{ .delete_src = true }) catch
+            failErr("cross: start crash-recovery move", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const job_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
+        const journal = std.fmt.bufPrint(&journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, job }) catch
+            fail("cross: crash recovery journal path");
+        var killer_ctx = MoveHelperKill{ .journal = journal };
+        const killer = std.Thread.spawn(.{}, killMoveHelperAfterCopy, .{&killer_ctx}) catch
+            fail("cross: helper killer thread");
+        const res = collectJob(&fs, job, 180_000);
+        killer.join();
+        if (!killer_ctx.killed) fail("cross: move helper was not killed after its copy boundary");
+        if (!res.is("done")) failErr("cross: killed move helper did not recover", res.messageText());
+        if (exists(src)) fail("cross: recovered move left its source behind");
+        const got = fileSha(dst) orelse fail("cross: recovered move destination hash");
+        if (!std.mem.eql(u8, &got, &want_crash)) fail("cross: recovered move content mismatch");
+    }
+    {
         // A directory move: the source side needs a delete_tree job.
         var td_buf: [256]u8 = undefined;
         const tree_src = std.fmt.bufPrint(&td_buf, "{s}/movetree", .{src_dir}) catch unreachable;
@@ -2381,10 +2855,14 @@ fn crossStage(
         touch(sub, "b.txt", "beta");
         var tdd_buf: [256]u8 = undefined;
         const tree_dst = std.fmt.bufPrint(&tdd_buf, "{s}/movetree", .{dst_dir}) catch unreachable;
-        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", tree_src, "", tree_dst, true, .{ .delete_src = true }) catch
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", tree_src, "", tree_dst, true, .{ .delete_src = true, .no_replace = true }) catch
             failErr("cross: start tree move", fs.lastErr());
         const res = collectJob(&fs, job, 120_000);
         if (!res.is("done")) failErr("cross: tree move did not finish", res.messageText());
+        if (res.files_done != 2 or res.files_total != 2)
+            fail("cross: tree move did not report a stable full-file total");
+        if (res.files_total_changed)
+            fail("cross: tree move file total grew while the copy was already running");
         var chk_buf: [256]u8 = undefined;
         var z2: [4096]u8 = undefined;
         var st: c.struct_stat = undefined;
@@ -2393,6 +2871,62 @@ fn crossStage(
             fail("cross: tree move lost a nested file");
         if (c.lstat(pathz.pathZ(&z2, tree_src) catch unreachable, &st) == 0)
             fail("cross: tree move left the source tree behind");
+    }
+
+    {
+        // A destination directory alone is not recovery proof. This is
+        // the exact dangerous shape left by an interrupted tree copy.
+        var missing_buf: [256]u8 = undefined;
+        const missing = std.fmt.bufPrint(&missing_buf, "{s}/never-existed", .{src_dir}) catch unreachable;
+        var partial_buf: [256]u8 = undefined;
+        const partial = std.fmt.bufPrint(&partial_buf, "{s}/partial-tree", .{dst_dir}) catch unreachable;
+        mkdirAt(partial);
+        touch(partial, "one.partial", "not a completed tree");
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", missing, "", partial, true, .{ .delete_src = true }) catch
+            failErr("cross: start missing-source recovery", fs.lastErr());
+        const res = collectJob(&fs, job, 120_000);
+        if (!res.is("error")) fail("cross: partial directory was accepted as completed recovery");
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(fsserve.joinZ(&z, partial, "one.partial") catch unreachable, &st) != 0)
+            fail("cross: failed recovery damaged the partial destination");
+    }
+    {
+        // Mutate a file that has already been copied and add a new
+        // source entry while a later large file is still transferring.
+        // The move must fail before deleting ANY source manifest entry.
+        var mut_src_buf: [256]u8 = undefined;
+        const mut_src = std.fmt.bufPrint(&mut_src_buf, "{s}/mutating-tree", .{src_dir}) catch unreachable;
+        mkdirAt(mut_src);
+        touch(mut_src, "a-copied.txt", "original");
+        var large_buf: [256]u8 = undefined;
+        const large = std.fmt.bufPrint(&large_buf, "{s}/b-large.bin", .{mut_src}) catch unreachable;
+        writePattern(large, 64 << 20, 0x2d);
+        var mut_dst_buf: [256]u8 = undefined;
+        const mut_dst = std.fmt.bufPrint(&mut_dst_buf, "{s}/mutating-tree", .{dst_dir}) catch unreachable;
+        var part_buf: [256]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}/b-large.bin.skpart", .{mut_dst}) catch unreachable;
+        var mutation = MoveMutation{ .part = part, .source_dir = mut_src };
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", mut_src, "", mut_dst, true, .{ .delete_src = true }) catch
+            failErr("cross: start concurrently-mutated move", fs.lastErr());
+        const mutator = std.Thread.spawn(.{}, mutateMoveAfterCopyStarts, .{&mutation}) catch fail("cross: mutation thread");
+        const res = collectJob(&fs, job, 180_000);
+        mutator.join();
+        if (!mutation.mutated) fail("cross: mutation did not overlap the copy");
+        if (!res.is("error")) fail("cross: concurrently-mutated move reported success");
+        if (std.mem.indexOf(u8, res.messageText(), "changed") == null)
+            failErr("cross: mutation failure did not explain source drift", res.messageText());
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        inline for (.{ "a-copied.txt", "b-large.bin", "unexpected.txt" }) |name| {
+            if (c.lstat(fsserve.joinZ(&z, mut_src, name) catch unreachable, &st) != 0)
+                fail("cross: mutated move deleted source content");
+        }
+        var copied_a_buf: [256]u8 = undefined;
+        const copied_a = std.fmt.bufPrint(&copied_a_buf, "{s}/a-copied.txt", .{mut_dst}) catch unreachable;
+        var bytes: [32]u8 = undefined;
+        const copied = readSmall(copied_a, &bytes);
+        if (!std.mem.eql(u8, copied, "original")) fail("cross: changed source overwrote its proven destination copy");
     }
     _ = c.unsetenv("SKETERM_SSH");
 

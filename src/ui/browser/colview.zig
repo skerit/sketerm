@@ -24,6 +24,7 @@ const colkeys = @import("../../filebrowser/colkeys.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
 const iconload = @import("iconload.zig");
+const dnd = @import("dnd.zig");
 const profile = @import("../../util/profile.zig");
 const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
@@ -256,6 +257,14 @@ fn findItemWidget(w0: ?*c.GtkWidget) ?*c.GtkWidget {
     return null;
 }
 
+/// GtkColumnView wraps each application cell child in a cell widget
+/// and then a row widget. Tagging that row makes its padding hit-test
+/// as the same item instead of false empty space.
+fn rowWidget(cell_child: *c.GtkWidget) ?*c.GtkWidget {
+    const cell = c.gtk_widget_get_parent(cell_child) orelse return null;
+    return c.gtk_widget_get_parent(cell);
+}
+
 pub const Picked = struct { data: *ItemData, pos: c.guint };
 
 /// The item under (x, y) in columnview coords, with its CURRENT
@@ -358,7 +367,9 @@ pub fn installColumnView(self: *BrowserView, tab: *BTab) *c.GtkWidget {
     // pre-sorted; GTK only tracks the clicked column and draws the
     // arrows).
     const sorter = c.gtk_column_view_get_sorter(tab.colview);
-    _ = c.g_signal_connect_data(sorter, "changed", @ptrCast(&onSorterChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    tab.sorter = sorter;
+    _ = c.g_object_ref(sorter);
+    tab.sorter_handler = c.g_signal_connect_data(sorter, "changed", @ptrCast(&onSorterChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
     // Capture phase: the context menu must claim the press before
     // the view's own gestures, or a right-click inside a
@@ -390,7 +401,7 @@ pub fn installColumnView(self: *BrowserView, tab: *BTab) *c.GtkWidget {
 
     // Internal DnD target: dropping an entry spec moves/copies into
     // the row's directory (or the tab's).
-    const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
+    const dropt = dnd.newTarget(tab);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&@import("ops.zig").onListDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(cv, @ptrCast(dropt));
 
@@ -408,6 +419,10 @@ fn onRowBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque)
 
 fn onEmptyPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const tab: *BTab = @ptrCast(@alignCast(user.?));
+    if (pickItem(tab, x, y) != null or pickIsHeader(tab, x, y)) {
+        tab.empty_press = null;
+        return;
+    }
     tab.empty_press = .{ .x = x, .y = y };
 }
 
@@ -876,6 +891,7 @@ fn onNameSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaqu
     // Any part of the row drags the file (spec string; terminals
     // paste it, browser tabs move/copy).
     const dsrc = c.gtk_drag_source_new();
+    dnd.configureSource(dsrc.?);
     _ = c.g_signal_connect_data(dsrc, "prepare", @ptrCast(&onDragPrepare), @ptrCast(root), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(root, @ptrCast(dsrc));
 
@@ -927,13 +943,7 @@ fn onDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callcon
     const root: *c.GtkWidget = @ptrCast(@alignCast(user.?));
     const d: *ItemData = @ptrCast(@alignCast(c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item") orelse return null));
     if (d.kind != .entry) return null;
-    var pz: [4500:0]u8 = undefined;
-    const spec_res = if (d.tab.hc.host) |h|
-        std.fmt.bufPrintZ(&pz, "{s}:{s}", .{ h, d.path })
-    else
-        std.fmt.bufPrintZ(&pz, "{s}", .{d.path});
-    const pzs = spec_res catch return null;
-    return c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
+    return dnd.provider(d.tab, d.path);
 }
 
 fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
@@ -945,6 +955,10 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
     const tab = ctx.tab;
     const self = tab.view;
     c.g_object_set_data(@ptrCast(@alignCast(root)), "sketerm-item", @ptrCast(d));
+    if (rowWidget(root)) |row| {
+        c.g_object_set_data(@ptrCast(@alignCast(row)), "sketerm-item", @ptrCast(d));
+        c.g_object_set_data(@ptrCast(@alignCast(row)), "sketerm-cellobj", @ptrCast(cell));
+    }
     zebraClass(root, d);
 
     if (d.kind == .group) {
@@ -1073,6 +1087,12 @@ fn onNameUnbind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaq
     const root = c.gtk_column_view_cell_get_child(cell) orelse return;
     if (c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item")) |dp| {
         const d: *ItemData = @ptrCast(@alignCast(dp));
+        if (rowWidget(root)) |row| {
+            if (c.g_object_get_data(@ptrCast(@alignCast(row)), "sketerm-item") == dp) {
+                c.g_object_set_data(@ptrCast(@alignCast(row)), "sketerm-item", null);
+                c.g_object_set_data(@ptrCast(@alignCast(row)), "sketerm-cellobj", null);
+            }
+        }
         if (d.kind == .entry) {
             if (ctx.tab.name_cells.get(d.path)) |w| {
                 if (w == root) _ = ctx.tab.name_cells.remove(d.path);
@@ -1130,6 +1150,7 @@ fn onCellSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaqu
     // The drag source rides every cell, so a row drags from any
     // column, not just the name.
     const dsrc = c.gtk_drag_source_new();
+    dnd.configureSource(dsrc.?);
     _ = c.g_signal_connect_data(dsrc, "prepare", @ptrCast(&onDragPrepare), @ptrCast(label), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(label, @ptrCast(dsrc));
     c.g_object_set_data(@ptrCast(@alignCast(label)), "sketerm-cellobj", @ptrCast(cell));

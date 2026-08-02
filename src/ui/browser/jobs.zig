@@ -29,6 +29,14 @@ const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const launchLocal = @import("open.zig").launchLocal;
 const launchLocalWithApp = @import("open.zig").launchLocalWithApp;
 
+pub const CopyAck = struct {
+    req: u32 = 0,
+    job: u64,
+    token: []u8,
+    hc: *HostConn,
+    attempts: u8 = 0,
+};
+
 pub fn feedTransfers(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
     for (self.transfers.items) |t| {
         if (t.src_hc == hc and t.x.feed(.src, ftype, payload)) return true;
@@ -78,6 +86,14 @@ pub fn pumpTransferQueue(self: *BrowserView) void {
 /// durable ledger record, so it survives a GUI restart.
 pub fn setTransferPaused(self: *BrowserView, t: *ActiveTransfer, paused: bool) void {
     if (t.paused == paused) return;
+    if (t.token) |token| {
+        if (self.transfer_service) |service| {
+            if (!service.setMediatedPaused(token, paused)) {
+                self.setStatus("could not persist transfer pause state");
+                return;
+            }
+        }
+    }
     t.paused = paused;
     if (paused) {
         if (t.started) t.x.pause();
@@ -85,9 +101,6 @@ pub fn setTransferPaused(self: *BrowserView, t: *ActiveTransfer, paused: bool) v
         t.x.unpause();
         self.ensureWriteFlush(t.src_hc);
         self.ensureWriteFlush(t.dst_hc);
-    }
-    if (t.token) |token| {
-        if (self.transfer_service) |service| service.setMediatedPaused(token, paused);
     }
     if (!paused) self.pumpTransferQueue();
     self.setStatusFmt("transfer {s}: {s}", .{ if (paused) "paused" else "resumed", t.label });
@@ -118,6 +131,20 @@ pub fn reapTransfers(self: *BrowserView) void {
             i += 1;
             continue;
         }
+        const ok = t.x.ok();
+        const canceled = t.x.state == .canceled;
+        if ((ok or canceled) and t.token != null) {
+            const service = self.transfer_service orelse {
+                i += 1;
+                continue;
+            };
+            // Completion must be crash-durable before launch/watch
+            // side effects can make it externally observable.
+            if (!service.finishMediated(t.token.?)) {
+                i += 1;
+                continue;
+            }
+        }
         if (t.upload_watch) |wt| {
             wt.uploading = false;
             if (t.x.ok()) {
@@ -125,15 +152,8 @@ pub fn reapTransfers(self: *BrowserView) void {
             } else if (t.x.state != .canceled) {
                 self.setStatusFmt("sync-back failed: {s} ({s})", .{ t.label, t.x.errMsg() });
             }
-        } else if (t.x.ok()) {
+        } else if (ok) {
             self.setStatusFmt("transfer done: {s}", .{t.label});
-            if (t.delete_src_after) {
-                // The copy hash-verified; complete the MOVE by
-                // removing the source (recursive when a tree).
-                var lbl: [128]u8 = undefined;
-                const dlabel = std.fmt.bufPrint(&lbl, "move cleanup {s}", .{std.fs.path.basename(t.x.src_root)}) catch "move cleanup";
-                self.startDaemonJob(t.src_hc, "delete_tree", t.x.src_root, "", dlabel);
-            }
             if (t.open_when_done) {
                 if (t.open_with_appid) |appid| {
                     launchLocalWithApp(appid, t.x.dst_root);
@@ -143,26 +163,44 @@ pub fn reapTransfers(self: *BrowserView) void {
                 if (t.watch_host != null and t.watch_remote != null)
                     self.registerEditWatch(t.watch_host.?, t.watch_remote.?, t.x.dst_root);
             }
-        } else if (t.x.state == .canceled) {
+        } else if (canceled) {
             self.setStatusFmt("transfer canceled: {s}", .{t.label});
         } else {
             self.setStatusFmt("transfer failed: {s} ({s})", .{ t.label, t.x.errMsg() });
         }
-        if (t.token) |token| {
-            if (self.transfer_service) |service| service.finishMediated(token);
+        const token_copy = if (t.token) |token|
+            (self.allocator.dupe(u8, token) catch null)
+        else
+            null;
+        if (t.token != null and token_copy == null) {
+            if (self.transfer_service) |service| service.abandonMediated(t.token.?);
+        }
+        _ = self.transfers.orderedRemove(i);
+        var retry_mediated = false;
+        if (token_copy) |token| {
+            if (self.transfer_service) |service| {
+                if (!ok and !canceled) {
+                    retry_mediated = service.recordMediatedFailure(token, t.x.errMsg(), COPY_AUTO_RETRIES);
+                }
+            }
         }
         t.x.deinit();
         self.allocator.free(t.label);
         t.freeExtras(self.allocator);
         self.allocator.destroy(t);
-        _ = self.transfers.orderedRemove(i);
+        if (token_copy) |token| {
+            if (retry_mediated and !scheduleMediatedRetry(self, token)) {
+                if (self.transfer_service) |service| service.setMediatedFailed(token, "could not schedule transfer retry", true);
+            }
+            self.allocator.free(token);
+        }
     }
     self.pumpTransferQueue();
 }
 
 /// One cross-host copy waiting for its destination to be free. The
-/// daemon owns a copy once it is submitted; until then it is view
-/// state, so a queued copy can still be reordered or dropped.
+/// view owns the live queue object; its token points at the persistent
+/// intent another view/process adopts if this one closes.
 pub const CopyItem = struct {
     coordinator: *HostConn,
     src_hc: *HostConn,
@@ -170,14 +208,17 @@ pub const CopyItem = struct {
     src_path: []u8,
     dst_path: []u8,
     label: []u8,
+    token: []u8,
     dest_key: u64,
     move: bool = false,
+    no_replace: bool = false,
     direct: bool = false,
 
     pub fn destroy(self: *CopyItem, allocator: std.mem.Allocator) void {
         allocator.free(self.src_path);
         allocator.free(self.dst_path);
         allocator.free(self.label);
+        allocator.free(self.token);
         allocator.destroy(self);
     }
 };
@@ -200,15 +241,22 @@ fn enqueueCrossCopy(
     dst_hc: *HostConn,
     dst_path: []const u8,
     move: bool,
+    no_replace: bool,
+    recovery_token: ?[]const u8,
 ) void {
-    const item = self.allocator.create(CopyItem) catch return;
+    const item = self.allocator.create(CopyItem) catch {
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
+        return;
+    };
     const src = self.allocator.dupe(u8, src_path) catch {
         self.allocator.destroy(item);
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     const dst = self.allocator.dupe(u8, dst_path) catch {
         self.allocator.free(src);
         self.allocator.destroy(item);
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     const label = std.fmt.allocPrint(self.allocator, "{s}:{s} -> {s}", .{
@@ -217,8 +265,49 @@ fn enqueueCrossCopy(
         self.allocator.free(src);
         self.allocator.free(dst);
         self.allocator.destroy(item);
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
+    const service = self.transfer_service orelse {
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.free(label);
+        self.allocator.destroy(item);
+        self.setStatus("transfer not started because durable recovery is unavailable");
+        return;
+    };
+    const record_token = recovery_token orelse service.newUserCopy(
+        src_hc.host orelse "",
+        src_path,
+        dst_hc.host orelse "",
+        dst_path,
+        move,
+        no_replace,
+    ) orelse {
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.free(label);
+        self.allocator.destroy(item);
+        self.setStatus("transfer not started because its recovery record could not be saved");
+        return;
+    };
+    const token = self.allocator.dupe(u8, record_token) catch {
+        service.abandonMediated(record_token);
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.free(label);
+        self.allocator.destroy(item);
+        return;
+    };
+    if (!service.setMediatedCoordinator(record_token, coordinator.host orelse "")) {
+        service.abandonMediated(record_token);
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.free(label);
+        self.allocator.free(token);
+        self.allocator.destroy(item);
+        return;
+    }
     item.* = .{
         .coordinator = coordinator,
         .src_hc = src_hc,
@@ -226,11 +315,14 @@ fn enqueueCrossCopy(
         .src_path = src,
         .dst_path = dst,
         .label = label,
+        .token = token,
         .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
         .move = move,
+        .no_replace = no_replace,
         .direct = coordinator.host != null,
     };
     self.copy_queue.items.append(self.allocator, item) catch {
+        service.abandonMediated(item.token);
         item.destroy(self.allocator);
         return;
     };
@@ -283,21 +375,33 @@ pub fn pumpCopyQueue(self: *BrowserView) void {
 }
 
 fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
+    if (!coordinatorSupports(item.coordinator, item.move, item.no_replace)) {
+        const replacement = if (item.direct)
+            self.hostConnFor(null)
+        else
+            self.hostConnFor(item.coordinator.host);
+        if (replacement) |hc| {
+            if (coordinatorSupports(hc, item.move, item.no_replace)) {
+                item.coordinator = hc;
+                item.direct = false;
+            }
+        }
+        if (!coordinatorSupports(item.coordinator, item.move, item.no_replace)) {
+            self.setStatusFmt("transfer waiting for its coordinator: {s}", .{item.label});
+            return;
+        }
+    }
     for (self.copy_queue.items.items, 0..) |queued, i| {
         if (queued == item) {
             _ = self.copy_queue.items.orderedRemove(i);
             break;
         }
     }
-    if (item.coordinator.state != .ready) {
-        self.setStatusFmt("transfer dropped, coordinator offline: {s}", .{item.label});
-        item.destroy(self.allocator);
-        return;
-    }
     // The queue item's owned strings move into the retry record, which
     // outlives the job: a copy that dies with a staged partial must be
     // resumable without asking the user to find the paths again.
     const retry = self.allocator.create(CopyRetry) catch {
+        if (self.transfer_service) |service| service.abandonMediated(item.token);
         item.destroy(self.allocator);
         return;
     };
@@ -308,8 +412,11 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
         .src_path = item.src_path,
         .dst_path = item.dst_path,
         .label = item.label,
+        .token = item.token,
         .dest_key = item.dest_key,
+        .attempts = if (self.transfer_service) |service| service.mediatedAttempts(item.token) else 0,
         .move = item.move,
+        .no_replace = item.no_replace,
         .direct = item.direct,
     };
     self.allocator.destroy(item);
@@ -321,13 +428,39 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
 /// with the same idempotent `resume` flag -- never a second code path.
 /// @return false when nothing was sent (the record is destroyed then).
 fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
+    const service = self.transfer_service orelse {
+        retry.destroy(self.allocator);
+        return false;
+    };
+    if (!service.mediatedRunnable(retry.token)) {
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (service.mediatedAckPending(retry.token)) {
+        self.retry_pending.append(self.allocator, retry) catch {
+            service.setMediatedFailed(retry.token, "could not wait for transfer acknowledgment", true);
+            retry.destroy(self.allocator);
+            return false;
+        };
+        if (self.retry_timer == 0)
+            self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+        return true;
+    }
     if (retry.coordinator.state != .ready) {
-        self.setStatusFmt("transfer dropped, coordinator offline: {s}", .{retry.label});
+        service.redispatchMediated(retry.token);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (!coordinatorSupports(retry.coordinator, retry.move, retry.no_replace) or
+        !service.setMediatedCoordinator(retry.token, retry.coordinator.host orelse ""))
+    {
+        service.abandonMediated(retry.token);
         retry.destroy(self.allocator);
         return false;
     }
     const req = self.nextReq();
     const pj = self.allocator.create(PendingJob) catch {
+        service.abandonMediated(retry.token);
         retry.destroy(self.allocator);
         return false;
     };
@@ -336,6 +469,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         .hc = retry.coordinator,
         .label = self.allocator.dupe(u8, retry.label) catch {
             self.allocator.destroy(pj);
+            service.abandonMediated(retry.token);
             retry.destroy(self.allocator);
             return false;
         },
@@ -346,6 +480,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
+        service.abandonMediated(retry.token);
         retry.destroy(self.allocator);
         return false;
     };
@@ -353,6 +488,18 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
     // coordinator itself owns is "" (its own disk), and a remote
     // coordinator resolves the other side through ITS OWN ssh/UDP
     // config — which is exactly what direct transfer means.
+    const client_token = service.mediatedClientToken(retry.token) orelse {
+            for (self.pending_jobs.items, 0..) |pending, i| {
+                if (pending == pj) {
+                    _ = self.pending_jobs.orderedRemove(i);
+                    break;
+                }
+            }
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            retry.destroy(self.allocator);
+            return false;
+        };
     self.sendOp(retry.coordinator, .{
         .req = req,
         .op = "cross_copy",
@@ -362,7 +509,9 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         .dst_host = if (retry.dst_hc == retry.coordinator) "" else retry.dst_hc.host orelse "",
         .@"resume" = true,
         .delete_src = retry.move,
+        .no_replace = retry.no_replace,
         .dial_tries = @as(u32, if (retry.direct) 2 else 0),
+        .client_token = client_token,
     });
     if (retry.attempts == 0) {
         self.setStatusFmt("durable transfer started: {s}", .{retry.label});
@@ -382,8 +531,7 @@ pub fn dropSupersededRetryRows(self: *BrowserView, fresh: *JobRow) void {
         const j = self.jobs.items[i];
         const jr = j.retry;
         if (j != fresh and j.terminal() and jr != null and
-            std.mem.eql(u8, jr.?.src_path, fr.src_path) and
-            std.mem.eql(u8, jr.?.dst_path, fr.dst_path))
+            std.mem.eql(u8, jr.?.token, fr.token))
         {
             if (j.undo_op) |u| u.destroy(self.allocator);
             if (j.undo_trash_orig) |o| self.allocator.free(o);
@@ -408,16 +556,27 @@ const COPY_AUTO_RETRIES: u8 = 3;
 /// moment, not another immediate hammering.
 const COPY_RETRY_DELAY_MS: c.guint = 5_000;
 
-/// Submit everything whose delay has elapsed. The records live on the
-/// view, so a pane torn down while a retry is pending drops them in
-/// `deinit` and the timer with them -- nothing outlives the face.
-fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+/// Submit everything whose delay has elapsed. The timer is view-owned,
+/// but every retry also has a ledger record another face can adopt.
+pub fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     self.retry_timer = 0;
     var pending = self.retry_pending;
     self.retry_pending = .empty;
     defer pending.deinit(self.allocator);
     for (pending.items) |retry| _ = submitRetry(self, retry);
+    var mediated = self.mediated_retry_tokens;
+    self.mediated_retry_tokens = .empty;
+    defer mediated.deinit(self.allocator);
+    for (mediated.items) |token| {
+        if (self.transfer_service) |service| service.redispatchMediated(token);
+        self.allocator.free(token);
+    }
+    for (self.copy_acks.items) |*ack| {
+        if (ack.hc.state == .dead)
+            ack.hc = self.hostConnFor(ack.hc.host) orelse ack.hc;
+    }
+    pumpCopyAcks(self);
     self.renderJobs();
     return 0;
 }
@@ -435,11 +594,19 @@ fn fallbackDirectCopy(self: *BrowserView, row: *JobRow, kind: []const u8) bool {
     // which point the unix-socket autostart has long finished.
     const local = self.hostConnFor(null) orelse return false;
     if (local.state == .dead) return false;
-    if (retry.move and local.state == .ready and !local.conn.cross_move) return false;
+    if (local.state == .ready and !coordinatorSupports(local, retry.move, retry.no_replace)) return false;
     retry.coordinator = local;
     retry.direct = false;
+    if (self.transfer_service) |service| {
+        if (!service.renewMediatedAttempt(retry.token, local.host orelse "", false)) return false;
+        retry.attempts = service.mediatedAttempts(retry.token);
+    } else return false;
     row.retry = retry.clone(self.allocator);
-    if (local.state == .ready) return submitRetry(self, retry);
+    if (local.state == .ready) {
+        const submitted = submitRetry(self, retry);
+        if (submitted) row.retry_scheduled = true;
+        return submitted;
+    }
     self.retry_pending.append(self.allocator, retry) catch {
         retry.destroy(self.allocator);
         return false;
@@ -455,8 +622,14 @@ fn fallbackDirectCopy(self: *BrowserView, row: *JobRow, kind: []const u8) bool {
 /// row failed with its reason and a Retry button.
 fn scheduleCopyRetry(self: *BrowserView, row: *JobRow) bool {
     const retry = row.retry orelse return false;
-    if (retry.attempts >= COPY_AUTO_RETRIES) return false;
-    retry.attempts += 1;
+    if (retry.attempts >= COPY_AUTO_RETRIES) {
+        if (self.transfer_service) |service| service.setMediatedFailed(retry.token, row.messageText(), false);
+        return false;
+    }
+    if (self.transfer_service) |service| {
+        if (!service.renewMediatedAttempt(retry.token, retry.coordinator.host orelse "", true)) return false;
+        retry.attempts = service.mediatedAttempts(retry.token);
+    } else return false;
     // The row keeps a clone: the user can still press Retry after the
     // automatic attempts are done, and the failed row is what carries
     // that button.
@@ -482,6 +655,80 @@ pub fn cancelPendingRetries(self: *BrowserView) void {
     for (self.retry_pending.items) |retry| retry.destroy(self.allocator);
     self.retry_pending.deinit(self.allocator);
     self.retry_pending = .empty;
+    for (self.mediated_retry_tokens.items) |token| self.allocator.free(token);
+    self.mediated_retry_tokens.deinit(self.allocator);
+    self.mediated_retry_tokens = .empty;
+}
+
+pub fn cancelScheduledRetry(self: *BrowserView, token: []const u8) void {
+    var i: usize = 0;
+    while (i < self.retry_pending.items.len) {
+        const retry = self.retry_pending.items[i];
+        if (!std.mem.eql(u8, retry.token, token)) {
+            i += 1;
+            continue;
+        }
+        _ = self.retry_pending.orderedRemove(i);
+        retry.destroy(self.allocator);
+    }
+    i = 0;
+    while (i < self.mediated_retry_tokens.items.len) {
+        const pending = self.mediated_retry_tokens.items[i];
+        if (!std.mem.eql(u8, pending, token)) {
+            i += 1;
+            continue;
+        }
+        _ = self.mediated_retry_tokens.orderedRemove(i);
+        self.allocator.free(pending);
+    }
+}
+
+fn scheduleMediatedRetry(self: *BrowserView, token: []const u8) bool {
+    const owned = self.allocator.dupe(u8, token) catch return false;
+    self.mediated_retry_tokens.append(self.allocator, owned) catch {
+        self.allocator.free(owned);
+        return false;
+    };
+    if (self.retry_timer == 0)
+        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    return true;
+}
+
+/// A daemon refused the start request before a JobRow existed. Keep
+/// the durable record and retry it through the same bounded resume
+/// path instead of letting an invisible claimed record strand it.
+pub fn retryRejectedCopy(self: *BrowserView, retry: *CopyRetry, reason: []const u8) bool {
+    if (retry.no_replace and (std.mem.indexOf(u8, reason, "destination exists") != null or
+        std.mem.indexOf(u8, reason, "EXIST") != null))
+    {
+        if (self.transfer_service) |service|
+            _ = service.recordMediatedFailure(retry.token, "destination appeared before the transfer could be installed", 1);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (retry.attempts >= COPY_AUTO_RETRIES) {
+        if (self.transfer_service) |service| _ = service.recordMediatedFailure(retry.token, "daemon refused the transfer start", 1);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    const service = self.transfer_service orelse {
+        retry.destroy(self.allocator);
+        return false;
+    };
+    if (!service.renewMediatedAttempt(retry.token, retry.coordinator.host orelse "", true)) {
+        service.abandonMediated(retry.token);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    retry.attempts = service.mediatedAttempts(retry.token);
+    self.retry_pending.append(self.allocator, retry) catch {
+        _ = service.recordMediatedFailure(retry.token, "could not schedule transfer retry", 1);
+        retry.destroy(self.allocator);
+        return false;
+    };
+    if (self.retry_timer == 0)
+        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    return true;
 }
 
 /// The jobs panel's Retry button: resume a copy the automatic attempts
@@ -490,6 +737,9 @@ pub fn cancelPendingRetries(self: *BrowserView) void {
 pub fn retryCopyJob(self: *BrowserView, row: *JobRow) void {
     if (row.retry_scheduled) return;
     const retry = row.retry orelse return;
+    if (self.transfer_service) |service| {
+        if (!service.restartMediatedAttempt(retry.token)) return;
+    } else return;
     const fresh = retry.clone(self.allocator) orelse return;
     fresh.attempts = 0;
     // The new attempt's row replaces this one once the daemon answers
@@ -498,13 +748,90 @@ pub fn retryCopyJob(self: *BrowserView, row: *JobRow) void {
     self.renderJobs();
 }
 
+fn queueUserCopyAck(self: *BrowserView, token_in: []const u8, job: u64, host: []const u8) bool {
+    if (job == 0) return true;
+    for (self.copy_acks.items) |ack| {
+        if (ack.job == job and std.mem.eql(u8, ack.token, token_in)) return true;
+    }
+    const hc = self.hostConnFor(if (host.len == 0) null else host) orelse return false;
+    const token = self.allocator.dupe(u8, token_in) catch return false;
+    self.copy_acks.append(self.allocator, .{
+        .job = job,
+        .token = token,
+        .hc = hc,
+    }) catch {
+        self.allocator.free(token);
+        return false;
+    };
+    pumpCopyAcks(self);
+    return true;
+}
+
+pub fn pumpCopyAcks(self: *BrowserView) void {
+    for (self.copy_acks.items) |*ack| {
+        if (ack.hc.state == .dead) {
+            if (self.retry_timer == 0)
+                self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+            continue;
+        }
+        if (ack.req != 0 or ack.hc.state != .ready) continue;
+        ack.req = self.nextReq();
+        self.sendOp(ack.hc, .{ .req = ack.req, .op = "job_ack", .job = ack.job });
+    }
+}
+
+fn acknowledgeUserCopy(self: *BrowserView, row: *JobRow, finish: bool) bool {
+    const retry = row.retry orelse return true;
+    const service = self.transfer_service orelse return false;
+    const host = row.hc.host orelse "";
+    if (!service.noteMediatedTerminal(retry.token, host, row.job, finish)) return false;
+    if (!queueUserCopyAck(self, retry.token, row.job, host)) service.unclaimMediated(retry.token);
+    return true;
+}
+
+fn refreshJobFreeSpace(self: *BrowserView, row: *JobRow) void {
+    for (self.tabs.items) |tab| {
+        var affected = tab.hc == row.hc;
+        if (row.retry) |retry| {
+            affected = affected or
+                @import("../../filebrowser/paths.zig").hostEq(tab.hc.host, retry.src_hc.host) or
+                @import("../../filebrowser/paths.zig").hostEq(tab.hc.host, retry.dst_hc.host);
+        }
+        if (affected) self.requestFreeSpace(tab);
+    }
+}
+
 /// Drop a queued cross-host copy that was never submitted.
 pub fn cancelQueuedCopy(self: *BrowserView, item: *CopyItem) void {
     for (self.copy_queue.items.items, 0..) |queued, i| {
         if (queued != item) continue;
+        if (self.transfer_service) |service| {
+            if (!service.cancelMediatedQueued(item.token)) {
+                self.setStatus("could not persist transfer cancellation");
+                return;
+            }
+        } else return;
         _ = self.copy_queue.items.orderedRemove(i);
         self.setStatusFmt("transfer canceled: {s}", .{item.label});
         item.destroy(self.allocator);
+        return;
+    }
+}
+
+/// Drop a host/coordinator wait before any copy job was submitted.
+pub fn cancelDeferredTransfer(self: *BrowserView, item: *DeferredTransfer) void {
+    for (self.deferred_transfers.items, 0..) |deferred, i| {
+        if (deferred != item) continue;
+        if (deferred.token) |token| {
+            const service = self.transfer_service orelse return;
+            if (!service.cancelMediatedQueued(token)) {
+                self.setStatus("could not persist transfer cancellation");
+                return;
+            }
+        }
+        _ = self.deferred_transfers.orderedRemove(i);
+        self.setStatusFmt("transfer canceled: {s}", .{std.fs.path.basename(deferred.src_path)});
+        deferred.destroy(self.allocator);
         return;
     }
 }
@@ -533,6 +860,7 @@ pub const TransferOpts = struct {
     upload_watch: ?*EditWatch = null,
     /// Cross-host MOVE: delete the source once the copy landed.
     delete_src_after: bool = false,
+    no_replace: bool = false,
 };
 
 /// The daemon that should coordinate a cross-host copy/move, or null
@@ -540,14 +868,18 @@ pub const TransferOpts = struct {
 /// Remote-to-remote picks the destination daemon when it advertises
 /// cross_move; everything else (and the fallback) is the local daemon,
 /// which for a MOVE must itself advertise cross_move.
-fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, move: bool) ?*HostConn {
+fn coordinatorSupports(hc: *const HostConn, move: bool, no_replace: bool) bool {
+    return hc.state == .ready and hc.conn.durable_copy and
+        (!move or hc.conn.cross_move) and
+        (!no_replace or hc.conn.copy_no_replace);
+}
+
+fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, move: bool, no_replace: bool) ?*HostConn {
     if (src_hc.host != null and dst_hc.host != null and src_hc != dst_hc and
-        dst_hc.state == .ready and dst_hc.conn.cross_move)
+        coordinatorSupports(dst_hc, move, no_replace))
         return dst_hc;
     const local = self.hostConnFor(null) orelse return null;
-    if (local.state != .ready) return null;
-    if (move and !local.conn.cross_move) return null;
-    return local;
+    return if (coordinatorSupports(local, move, no_replace)) local else null;
 }
 
 /// A paste/send that arrived while its source or destination host was
@@ -557,6 +889,8 @@ fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, mov
 pub const DeferredTransfer = struct {
     src_hc: *HostConn,
     dst_hc: *HostConn,
+    coordinator: ?*HostConn = null,
+    wait_for_coordinator: bool = false,
     src_path: []u8,
     dst_path: []u8,
     open_when_done: bool,
@@ -564,6 +898,9 @@ pub const DeferredTransfer = struct {
     watch_host: ?[]u8,
     watch_remote: ?[]u8,
     delete_src_after: bool,
+    no_replace: bool,
+    /// Existing user-copy recovery record when admission had to wait.
+    token: ?[]u8 = null,
 
     pub fn destroy(self: *DeferredTransfer, allocator: std.mem.Allocator) void {
         allocator.free(self.src_path);
@@ -571,6 +908,7 @@ pub const DeferredTransfer = struct {
         if (self.open_with_appid) |s| allocator.free(s);
         if (self.watch_host) |s| allocator.free(s);
         if (self.watch_remote) |s| allocator.free(s);
+        if (self.token) |s| allocator.free(s);
         allocator.destroy(self);
     }
 };
@@ -582,20 +920,37 @@ fn deferTransfer(
     dst_hc: *HostConn,
     dst_path: []const u8,
     opts: TransferOpts,
+    recovery_token: ?[]const u8,
+    coordinator: ?*HostConn,
+    wait_for_coordinator: bool,
 ) void {
-    const d = self.allocator.create(DeferredTransfer) catch return;
+    const d = self.allocator.create(DeferredTransfer) catch {
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
+        return;
+    };
     const src = self.allocator.dupe(u8, src_path) catch {
         self.allocator.destroy(d);
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     const dst = self.allocator.dupe(u8, dst_path) catch {
         self.allocator.free(src);
         self.allocator.destroy(d);
+        if (recovery_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
+    const token_owned = if (recovery_token) |s| self.allocator.dupe(u8, s) catch {
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.destroy(d);
+        if (self.transfer_service) |service| service.abandonMediated(s);
+        return;
+    } else null;
     d.* = .{
         .src_hc = src_hc,
         .dst_hc = dst_hc,
+        .coordinator = coordinator,
+        .wait_for_coordinator = wait_for_coordinator,
         .src_path = src,
         .dst_path = dst,
         .open_when_done = opts.open_when_done,
@@ -603,8 +958,13 @@ fn deferTransfer(
         .watch_host = if (opts.watch_host) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .delete_src_after = opts.delete_src_after,
+        .no_replace = opts.no_replace,
+        .token = token_owned,
     };
     self.deferred_transfers.append(self.allocator, d) catch {
+        if (d.token) |token| {
+            if (self.transfer_service) |service| service.abandonMediated(token);
+        }
         d.destroy(self.allocator);
         return;
     };
@@ -612,18 +972,37 @@ fn deferTransfer(
     self.setStatusFmt("transfer queued — waiting for {s} to connect", .{waiting.label()});
 }
 
-/// Release every deferred transfer whose hosts are now both ready;
-/// drop (with a message) those whose host died. Called from wireReady
-/// and hostDied.
+/// Release every deferred transfer whose hosts are now both ready.
+/// User copies remain ledger-backed while a host reconnects.
 pub fn pumpDeferredTransfers(self: *BrowserView) void {
     var i: usize = 0;
     while (i < self.deferred_transfers.items.len) {
         const d = self.deferred_transfers.items[i];
+        if (d.src_hc.state == .dead) d.src_hc = self.hostConnFor(d.src_hc.host) orelse d.src_hc;
+        if (d.dst_hc.state == .dead) d.dst_hc = self.hostConnFor(d.dst_hc.host) orelse d.dst_hc;
+        if (d.wait_for_coordinator) {
+            const coordinator = pickCoordinator(self, d.src_hc, d.dst_hc, d.delete_src_after, d.no_replace) orelse {
+                i += 1;
+                continue;
+            };
+            d.coordinator = coordinator;
+            d.wait_for_coordinator = false;
+        }
+        if (d.coordinator) |coordinator| {
+            if (coordinator.state == .dead)
+                d.coordinator = self.hostConnFor(coordinator.host);
+            if (d.coordinator == null or d.coordinator.?.state != .ready) {
+                i += 1;
+                continue;
+            }
+        }
         if (d.src_hc.state == .dead or d.dst_hc.state == .dead) {
+            if (d.token != null) {
+                i += 1;
+                continue;
+            }
             const gone = if (d.src_hc.state == .dead) d.src_hc else d.dst_hc;
-            self.setStatusFmt("transfer dropped — {s} is unreachable: {s}", .{
-                gone.label(), std.fs.path.basename(d.src_path),
-            });
+            self.setStatusFmt("transfer dropped — {s} is unreachable: {s}", .{ gone.label(), std.fs.path.basename(d.src_path) });
             _ = self.deferred_transfers.orderedRemove(i);
             d.destroy(self.allocator);
             continue;
@@ -633,13 +1012,14 @@ pub fn pumpDeferredTransfers(self: *BrowserView) void {
             continue;
         }
         _ = self.deferred_transfers.orderedRemove(i);
-        startTransfer(self, d.src_hc, d.src_path, d.dst_hc, d.dst_path, .{
+        startTransferImpl(self, d.src_hc, d.src_path, d.dst_hc, d.dst_path, .{
             .open_when_done = d.open_when_done,
             .open_with_appid = d.open_with_appid,
             .watch_host = d.watch_host,
             .watch_remote = d.watch_remote,
             .delete_src_after = d.delete_src_after,
-        });
+            .no_replace = d.no_replace,
+        }, if (d.token) |token| token else null, d.coordinator);
         d.destroy(self.allocator);
     }
 }
@@ -652,41 +1032,87 @@ pub fn startTransfer(
     dst_path: []const u8,
     opts: TransferOpts,
 ) void {
+    startTransferImpl(self, src_hc, src_path, dst_hc, dst_path, opts, null, null);
+}
+
+fn startTransferImpl(
+    self: *BrowserView,
+    src_hc: *HostConn,
+    src_path: []const u8,
+    dst_hc: *HostConn,
+    dst_path: []const u8,
+    opts: TransferOpts,
+    recovery_token: ?[]const u8,
+    forced_coordinator: ?*HostConn,
+) void {
     const open_when_done = opts.open_when_done;
+    const user_copy = !open_when_done and opts.upload_watch == null;
+    var user_token = recovery_token;
+    if (user_copy and user_token == null) {
+        const service = self.transfer_service orelse {
+            self.setStatus("transfer not started because durable recovery is unavailable");
+            return;
+        };
+        user_token = service.newUserCopy(
+            src_hc.host orelse "",
+            src_path,
+            dst_hc.host orelse "",
+            dst_path,
+            opts.delete_src_after,
+            opts.no_replace,
+        ) orelse {
+            self.setStatus("transfer not started because its recovery record could not be saved");
+            return;
+        };
+    }
+    // User copies are daemon-coordinated and ledger-backed before
+    // queue admission. A local coordinator can dial a still-connecting
+    // endpoint itself, while remote-to-remote still prefers the
+    // destination daemon's direct path.
+    if (user_copy) {
+        if (forced_coordinator) |coordinator| {
+            if (coordinator.state != .ready) {
+                deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, coordinator, false);
+                return;
+            }
+            if (coordinator.conn.durable_copy and (!opts.no_replace or coordinator.conn.copy_no_replace) and (!opts.delete_src_after or coordinator.conn.cross_move)) {
+                enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, user_token);
+                return;
+            }
+        } else if (pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after, opts.no_replace)) |coordinator| {
+            enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, user_token);
+            return;
+        }
+        if (opts.delete_src_after) {
+            deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, null, true);
+            self.setStatus("move queued until a daemon with durable move support is available");
+            return;
+        }
+        if (src_hc.state != .ready or dst_hc.state != .ready) {
+            deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, forced_coordinator, false);
+            return;
+        }
+        const service = self.transfer_service orelse return;
+        if (!service.useMediatedFallback(user_token.?)) {
+            self.setStatus("transfer not started because its recovery record could not be updated");
+            service.abandonMediated(user_token.?);
+            return;
+        }
+    }
     if (src_hc.state != .ready or dst_hc.state != .ready) {
         // A sync-back upload carries a raw EditWatch pointer that must
         // not outlive this call — that one path keeps the old refusal.
-        if (src_hc.state == .dead or dst_hc.state == .dead or opts.upload_watch != null) {
+        if (!user_copy and (src_hc.state == .dead or dst_hc.state == .dead or opts.upload_watch != null)) {
             self.setStatus("both hosts must be connected — retry in a moment");
             return;
         }
-        deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts);
+        deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, forced_coordinator, false);
         return;
     }
-    if (!open_when_done and opts.upload_watch == null) {
-        // User copies and moves are coordinated by a DAEMON, not this
-        // BrowserView. They therefore survive pane/window teardown and
-        // reconnect through the stable job journal. They still queue
-        // here first, so a paste of ten files does not put ten helpers
-        // on one destination disk at once.
-        //
-        // Coordinator choice: remote-to-remote prefers the DESTINATION
-        // host's own daemon, whose helper dials the source directly —
-        // the bytes never route through this machine. That needs the
-        // cross_move capability (fast dial-failure reporting; for a
-        // move, delete_src honored rather than silently dropped). An
-        // "unreachable" failure falls back to the local relay, which
-        // resumes from the same staged partial.
-        if (pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after)) |coordinator| {
-            enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after);
-            return;
-        }
-        if (!opts.delete_src_after) {
-            self.setStatus("local transfer coordinator is not connected");
-            return;
-        }
-        // A move with no capable daemon anywhere degrades to the old
-        // client-mediated transfer below rather than refusing.
+    if (opts.no_replace and !dst_hc.conn.copy_no_replace) {
+        self.setStatusFmt("transfer not queued: {s} lacks safe no-replace support", .{dst_hc.label()});
+        if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
+        return;
     }
     const x = fstransfer.Xfer.init(
         self.allocator,
@@ -696,16 +1122,22 @@ pub fn startTransfer(
         src_path,
         dst_path,
         true,
-    ) catch return;
+    ) catch {
+        if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
+        return;
+    };
+    x.no_replace = opts.no_replace;
     const label = std.fmt.allocPrint(self.allocator, "{s}:{s} → {s}", .{
         src_hc.label(), std.fs.path.basename(src_path), dst_hc.label(),
     }) catch {
         x.deinit();
+        if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     const t = self.allocator.create(ActiveTransfer) catch {
         x.deinit();
         self.allocator.free(label);
+        if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     t.* = .{
@@ -719,6 +1151,7 @@ pub fn startTransfer(
         .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .upload_watch = opts.upload_watch,
         .delete_src_after = opts.delete_src_after,
+        .user_copy = user_copy,
         .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
     };
     self.transfers.append(self.allocator, t) catch {
@@ -726,6 +1159,7 @@ pub fn startTransfer(
         self.allocator.free(label);
         t.freeExtras(self.allocator);
         self.allocator.destroy(t);
+        if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     };
     // Record it so a pause -- or a crash -- can be picked up again,
@@ -733,7 +1167,20 @@ pub fn startTransfer(
     // deliberately not recorded: it belongs to an in-view EditWatch
     // that no other process can reconstruct.
     if (opts.upload_watch == null) {
-        if (self.transfer_service) |service| {
+        if (user_token) |token| {
+            t.token = self.allocator.dupe(u8, token) catch {
+                for (self.transfers.items, 0..) |active, i| if (active == t) {
+                    _ = self.transfers.orderedRemove(i);
+                    break;
+                };
+                t.x.deinit();
+                self.allocator.free(t.label);
+                t.freeExtras(self.allocator);
+                self.allocator.destroy(t);
+                if (self.transfer_service) |service| service.abandonMediated(token);
+                return;
+            };
+        } else if (self.transfer_service) |service| {
             const token = service.newMediated(
                 src_hc.host orelse "",
                 src_path,
@@ -743,10 +1190,24 @@ pub fn startTransfer(
                     .app_id = opts.open_with_appid orelse "",
                     .open_when_done = open_when_done,
                     .delete_src_after = opts.delete_src_after,
+                    .no_replace = opts.no_replace,
                     .watch_after = opts.watch_host != null,
                 },
             );
-            if (token) |tok| t.token = self.allocator.dupe(u8, tok) catch null;
+            if (token) |tok| {
+                t.token = self.allocator.dupe(u8, tok) catch {
+                    for (self.transfers.items, 0..) |active, i| if (active == t) {
+                        _ = self.transfers.orderedRemove(i);
+                        break;
+                    };
+                    t.x.deinit();
+                    self.allocator.free(t.label);
+                    t.freeExtras(self.allocator);
+                    self.allocator.destroy(t);
+                    service.abandonMediated(tok);
+                    return;
+                };
+            }
         }
     }
     self.setStatusFmt("transfer queued: {s}", .{label});
@@ -760,6 +1221,45 @@ pub fn startTransfer(
 /// ordinary hash-verified resume carry it on from where it stopped.
 pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").MediatedRec) void {
     const self: *BrowserView = @ptrCast(@alignCast(ctx));
+    if (rec.record_version < @import("../../filebrowser/transfers.zig").VERSION and rec.delete_src_after) {
+        if (self.transfer_service) |service|
+            _ = service.recordMediatedFailure(rec.token, "legacy move held because its copy/delete phase is unknown", 1);
+        self.setStatus("legacy move held safely; retry it with the current daemon");
+        return;
+    }
+    if (rec.user_copy) {
+        if (rec.ack_job != 0) {
+            const service = self.transfer_service orelse return;
+            if (!queueUserCopyAck(self, rec.token, rec.ack_job, rec.ack_host)) {
+                service.unclaimMediated(rec.token);
+                return;
+            }
+            if (!rec.retired) service.unclaimMediated(rec.token);
+            return;
+        }
+        if (rec.state == .failed) {
+            if (self.transfer_service) |service| service.unclaimMediated(rec.token);
+            return;
+        }
+        if (rec.retired) return;
+        if (copyTokenActive(self, rec.token)) return;
+        const src_hc = self.hostConnFor(if (rec.src_host.len == 0) null else rec.src_host) orelse return;
+        const dst_hc = self.hostConnFor(if (rec.dst_host.len == 0) null else rec.dst_host) orelse return;
+        const coordinator = if (rec.coordinator_set)
+            self.hostConnFor(if (rec.coordinator_host.len == 0) null else rec.coordinator_host)
+        else
+            null;
+        const recovered_name = self.allocator.dupe(u8, std.fs.path.basename(rec.src_path)) catch null;
+        defer if (recovered_name) |name| self.allocator.free(name);
+        startTransferImpl(self, src_hc, rec.src_path, dst_hc, rec.dst_path, .{
+            .delete_src_after = rec.delete_src_after,
+            .no_replace = rec.no_replace,
+        }, rec.token, coordinator);
+        self.renderJobs();
+        self.setStatusFmt("transfer recovered: {s}", .{recovered_name orelse "transfer"});
+        return;
+    }
+    if (rec.state == .failed) return;
     for (self.transfers.items) |t| {
         if (t.token) |tok| {
             if (std.mem.eql(u8, tok, rec.token)) return;
@@ -776,6 +1276,7 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
         rec.dst_path,
         true,
     ) catch return;
+    x.no_replace = rec.no_replace;
     const label = std.fmt.allocPrint(self.allocator, "{s}:{s} → {s}", .{
         src_hc.label(), std.fs.path.basename(rec.src_path), dst_hc.label(),
     }) catch {
@@ -797,6 +1298,7 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
         .watch_host = if (rec.watch_after and rec.src_host.len > 0) (self.allocator.dupe(u8, rec.src_host) catch null) else null,
         .watch_remote = if (rec.watch_after and rec.src_host.len > 0) (self.allocator.dupe(u8, rec.src_path) catch null) else null,
         .delete_src_after = rec.delete_src_after,
+        .user_copy = rec.user_copy,
         .paused = rec.paused,
         .token = self.allocator.dupe(u8, rec.token) catch null,
         .dest_key = file_transfers.destinationKey(rec.dst_host, rec.dst_path),
@@ -811,6 +1313,47 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
     self.setStatusFmt("transfer recovered{s}: {s}", .{ if (rec.paused) " (paused)" else "", t.label });
     self.pumpTransferQueue();
     self.renderJobs();
+}
+
+fn copyTokenActive(self: *BrowserView, token: []const u8) bool {
+    for (self.copy_queue.items.items) |item| if (std.mem.eql(u8, item.token, token)) return true;
+    for (self.deferred_transfers.items) |item| if (item.token) |t| {
+        if (std.mem.eql(u8, t, token)) return true;
+    };
+    for (self.pending_jobs.items) |item| if (item.retry) |retry| {
+        if (std.mem.eql(u8, retry.token, token)) return true;
+    };
+    for (self.jobs.items) |item| if (item.retry) |retry| {
+        if (std.mem.eql(u8, retry.token, token) and (!item.terminal() or item.retry_scheduled)) return true;
+    };
+    for (self.retry_pending.items) |retry| {
+        if (std.mem.eql(u8, retry.token, token)) return true;
+    }
+    for (self.mediated_retry_tokens.items) |pending| {
+        if (std.mem.eql(u8, pending, token)) return true;
+    }
+    return false;
+}
+
+/// True when a terminal daemon row already handed its token onward.
+pub fn copySuccessorActive(self: *BrowserView, predecessor: *JobRow) bool {
+    const token = if (predecessor.retry) |retry| retry.token else return false;
+    for (self.transfers.items) |item| if (item.token) |active| {
+        if (std.mem.eql(u8, active, token)) return true;
+    };
+    for (self.copy_queue.items.items) |item| if (std.mem.eql(u8, item.token, token)) return true;
+    for (self.deferred_transfers.items) |item| if (item.token) |active| {
+        if (std.mem.eql(u8, active, token)) return true;
+    };
+    for (self.pending_jobs.items) |item| if (item.retry) |retry| {
+        if (std.mem.eql(u8, retry.token, token)) return true;
+    };
+    for (self.jobs.items) |item| if (item != predecessor) if (item.retry) |retry| {
+        if (std.mem.eql(u8, retry.token, token)) return true;
+    };
+    for (self.retry_pending.items) |retry| if (std.mem.eql(u8, retry.token, token)) return true;
+    for (self.mediated_retry_tokens.items) |active| if (std.mem.eql(u8, active, token)) return true;
+    return false;
 }
 
 /// Repaint the panel for a change the service made on its own (an
@@ -830,6 +1373,13 @@ pub fn unclaimMediated(self: *BrowserView) void {
     for (self.transfers.items) |t| {
         if (t.token) |token| service.unclaimMediated(token);
     }
+    for (self.copy_queue.items.items) |item| service.unclaimMediated(item.token);
+    for (self.deferred_transfers.items) |item| if (item.token) |token| service.unclaimMediated(token);
+    for (self.retry_pending.items) |retry| service.unclaimMediated(retry.token);
+    for (self.mediated_retry_tokens.items) |token| service.unclaimMediated(token);
+    for (self.pending_jobs.items) |item| if (item.retry) |retry| service.unclaimMediated(retry.token);
+    for (self.jobs.items) |item| if (item.retry) |retry| service.unclaimMediated(retry.token);
+    for (self.copy_acks.items) |ack| service.unclaimMediated(ack.token);
 }
 
 pub fn startDaemonJob(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {
@@ -1014,6 +1564,9 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         row.state = .finished;
         row.done = e.done;
         row.total = e.total;
+        if (!acknowledgeUserCopy(self, row, true))
+            self.setStatus("copy completed, but its durable acknowledgment could not be saved");
+        refreshJobFreeSpace(self, row);
         self.setStatusFmt("done: {s}", .{row.label});
         if (row.undo_op) |u| {
             row.undo_op = null;
@@ -1040,12 +1593,25 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         }
     } else if (std.mem.eql(u8, e.ev, "error")) {
         row.state = .failed;
+        const ack_saved = acknowledgeUserCopy(self, row, false);
         // A cross-host copy resumes itself: the destination still holds
         // the verified `.skpart`, so the next attempt continues from
         // where the link died instead of restarting the transfer. Only
         // once the automatic attempts are spent does the row settle as
         // failed, with the reason and a Retry button.
-        if (fallbackDirectCopy(self, row, e.kind)) {
+        const destination_collision = if (row.retry) |retry|
+            retry.no_replace and (std.mem.indexOf(u8, e.message, "destination exists") != null or
+                std.mem.indexOf(u8, e.message, "EXIST") != null)
+        else
+            false;
+        if (row.retry != null and !ack_saved) {
+            self.setStatus("transfer failed, but its durable acknowledgment could not be saved");
+        } else if (destination_collision) {
+            if (row.retry) |retry| if (self.transfer_service) |service|
+                service.setMediatedFailed(retry.token, "destination appeared before the transfer could be installed", false);
+            self.setStatusFmt("transfer stopped because the destination now exists: {s}", .{row.label});
+            row.setMessage("destination appeared before install");
+        } else if (fallbackDirectCopy(self, row, e.kind)) {
             self.setStatusFmt("direct host-to-host failed, relaying via this machine: {s}", .{row.label});
             row.setMessage("hosts cannot reach each other -- relaying via this machine");
         } else if (scheduleCopyRetry(self, row)) {
@@ -1079,6 +1645,7 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         }
     } else if (std.mem.eql(u8, e.ev, "canceled")) {
         row.state = .canceled;
+        _ = acknowledgeUserCopy(self, row, true);
         self.setStatusFmt("canceled: {s}", .{row.label});
         if (row.retry) |r| @import("../../filebrowser/incomplete.zig").record(
             self.allocator,
@@ -1121,19 +1688,25 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
 pub const CopyMode = struct {
     conflict: []const u8 = "",
     dir_mode: []const u8 = "",
+    no_replace: bool = false,
 };
 
 /// startDaemonJob variant that records an undo op on completion.
-pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8, undo: ?*UndoOp, mode: CopyMode) void {
+pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8, undo: ?*UndoOp, mode: CopyMode) bool {
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         if (undo) |u| u.destroy(self.allocator);
-        return;
+        return false;
+    }
+    if (mode.no_replace and !hc.conn.copy_no_replace) {
+        self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{hc.label()});
+        if (undo) |u| u.destroy(self.allocator);
+        return false;
     }
     const req = self.nextReq();
     const pj = self.allocator.create(PendingJob) catch {
         if (undo) |u| u.destroy(self.allocator);
-        return;
+        return false;
     };
     pj.* = .{
         .req = req,
@@ -1141,7 +1714,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         .label = self.allocator.dupe(u8, label) catch {
             self.allocator.destroy(pj);
             if (undo) |u| u.destroy(self.allocator);
-            return;
+            return false;
         },
         .undo_op = undo,
     };
@@ -1150,9 +1723,9 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
         if (undo) |u| u.destroy(self.allocator);
-        return;
+        return false;
     };
-    self.sendOp(hc, .{
+    if (!self.sendOpOk(hc, .{
         .req = req,
         .op = op,
         .path = path,
@@ -1160,8 +1733,16 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         .@"resume" = false,
         .conflict = mode.conflict,
         .dir_mode = mode.dir_mode,
+        .no_replace = mode.no_replace,
         .verify = self.verifyCopies(),
-    });
+    })) {
+        const dropped = self.pending_jobs.pop().?;
+        self.allocator.free(dropped.label);
+        if (dropped.undo_op) |u| u.destroy(self.allocator);
+        self.allocator.destroy(dropped);
+        return false;
+    }
+    return true;
 }
 
 /// files_verify_copy: hash-compare every copied file before install.
@@ -1170,13 +1751,20 @@ pub fn verifyCopies(self: *BrowserView) bool {
     return false;
 }
 
-pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection) void {
+pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection, no_replace: bool) void {
+    if (no_replace and !hc.conn.copy_no_replace) {
+        self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
+        return self.restoreHistory(op, direction);
+    }
     const req = self.nextReq();
     const pj = self.allocator.create(PendingJob) catch return self.restoreHistory(op, direction);
     pj.* = .{
         .req = req,
         .hc = hc,
-        .label = self.allocator.dupe(u8, label) catch { self.allocator.destroy(pj); return self.restoreHistory(op, direction); },
+        .label = self.allocator.dupe(u8, label) catch {
+            self.allocator.destroy(pj);
+            return self.restoreHistory(op, direction);
+        },
         .history_op = op,
         .history_direction = direction,
     };
@@ -1186,7 +1774,7 @@ pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, p
         self.allocator.destroy(pj);
         return self.restoreHistory(op, direction);
     };
-    self.sendOp(hc, .{ .req = req, .op = op_name, .path = path, .to = to, .pattern = pattern });
+    self.sendOp(hc, .{ .req = req, .op = op_name, .path = path, .to = to, .pattern = pattern, .no_replace = no_replace });
 }
 
 /// Job start with path+to+pattern (trash_restore shape).

@@ -7,6 +7,6 @@ Exec=sketerm %F
 Icon=dev.sker.sketerm
 Categories=System;TerminalEmulator;Utility;
 StartupNotify=true
-StartupWMClass=sketerm
+StartupWMClass=dev.sker.sketerm
 Terminal=false
 Keywords=shell;prompt;command;commandline;cmd;

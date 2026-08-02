@@ -20,6 +20,7 @@ const WireReply = @import("types.zig").WireReply;
 const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
 const clipboard = @import("../../filebrowser/clipboard.zig");
 const conflict = @import("conflict.zig");
+const dnd = @import("dnd.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
@@ -41,6 +42,26 @@ pub const RestoreRead = struct {
         allocator.free(self.trashed);
         allocator.free(self.info);
         self.buf.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+/// One destination-existence check fencing a drag from overwrite-capable
+/// copy/rename verbs.
+pub const DropProbe = struct {
+    req: u32,
+    tab: *BTab,
+    dst_hc: *HostConn,
+    src_hc: *HostConn,
+    src_host: ?[]u8,
+    src: []u8,
+    dst: []u8,
+    cut: bool,
+
+    pub fn destroy(self: *DropProbe, allocator: std.mem.Allocator) void {
+        if (self.src_host) |host| allocator.free(host);
+        allocator.free(self.src);
+        allocator.free(self.dst);
         allocator.destroy(self);
     }
 };
@@ -154,16 +175,35 @@ pub fn tabAlive(self: *BrowserView, tab: *BTab) bool {
     return false;
 }
 
+pub fn cancelDropStateForTab(self: *BrowserView, tab: *BTab) void {
+    var i: usize = 0;
+    while (i < self.drop_probes.items.len) {
+        const probe = self.drop_probes.items[i];
+        if (probe.tab != tab) {
+            i += 1;
+            continue;
+        }
+        _ = self.drop_probes.orderedRemove(i);
+        probe.destroy(self.allocator);
+    }
+    conflict.cancelTab(self, tab);
+}
+
 /// Pick a destination name that does not collide with the live
 /// target listing: "name-copy", then "name-copy2"…
 pub fn uniqueDstName(tab: *BTab, base: []const u8, buf: []u8) ?[]const u8 {
+    return uniqueDstNameIn(tab, tab.root.path, base, buf);
+}
+
+pub fn uniqueDstNameIn(tab: *BTab, dir_path: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
+    const dir = if (std.mem.eql(u8, dir_path, tab.root.path)) tab.root else tab.subdirByPath(dir_path) orelse return null;
     const Listing = struct {
-        tab: *BTab,
+        dir: *Dir,
         pub fn contains(self: @This(), name: []const u8) bool {
-            return self.tab.root.find(name) != null;
+            return self.dir.find(name) != null;
         }
     };
-    return uniqueName(base, buf, Listing{ .tab = tab });
+    return uniqueName(base, buf, Listing{ .dir = dir });
 }
 
 /// Per-item paste modifiers. `dir_mode` reaches the daemon copy verb
@@ -173,7 +213,32 @@ pub fn uniqueDstName(tab: *BTab, base: []const u8, buf: []u8) ?[]const u8 {
 pub const PasteOpts = struct {
     dir_mode: []const u8 = "",
     undoable: bool = true,
+    no_replace: bool = false,
 };
+
+const PasteBatchAction = enum { preserve_failure, rejected, conflicts, nothing, queued };
+
+fn pasteBatchAction(admitted: usize, conflicts: usize, rejected: usize, concrete_failure: bool) PasteBatchAction {
+    if (rejected > 0) return if (concrete_failure) .preserve_failure else .rejected;
+    if (conflicts > 0) return .conflicts;
+    if (admitted == 0) return .nothing;
+    return .queued;
+}
+
+fn statusSnapshot(self: *BrowserView, buf: *[256]u8) []const u8 {
+    const raw = c.gtk_label_get_text(self.status_label) orelse return buf[0..0];
+    const text = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+    const n = @min(text.len, buf.len);
+    @memcpy(buf[0..n], text[0..n]);
+    return buf[0..n];
+}
+
+fn rememberFailureStatus(self: *BrowserView, saved: *[256]u8, saved_len: *usize) void {
+    var status_buf: [256]u8 = undefined;
+    const status = statusSnapshot(self, &status_buf);
+    @memcpy(saved[0..status.len], status);
+    saved_len.* = status.len;
+}
 
 /// Copy/move `sources` (living on `src_host`) into `tab`'s directory.
 /// Names that are free start IMMEDIATELY; names that collide are
@@ -188,10 +253,16 @@ pub fn beginPaste(
     cut: bool,
     clear_clipboard: bool,
 ) void {
-    const src_hc = self.hostConnFor(src_host) orelse return;
+    const src_hc = self.hostConnFor(src_host) orelse {
+        self.setStatus("paste not started: cannot allocate a host connection");
+        return;
+    };
     const dir = tab.root.path;
-    var started: usize = 0;
+    var admitted: usize = 0;
     var conflicts: usize = 0;
+    var rejected: usize = 0;
+    var failure_buf: [256]u8 = undefined;
+    var failure_len: usize = 0;
     for (srcs) |src| {
         const base = std.fs.path.basename(src);
         var dst_buf: [4096]u8 = undefined;
@@ -201,17 +272,30 @@ pub fn beginPaste(
         // Pasting onto itself is a no-op, not a copy/move.
         if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) continue;
         if (tab.root.find(base)) |i| {
+            const queued_before = self.conflicts.queue.items.len;
             conflict.enqueue(self, tab, src_hc, src_host, src, dst, tab.root.entries.items[i].tdir, cut);
-            conflicts += 1;
+            if (self.conflicts.queue.items.len > queued_before) {
+                conflicts += 1;
+            } else {
+                rejected += 1;
+                self.setStatusFmt("paste not queued: {s}", .{base});
+                rememberFailureStatus(self, &failure_buf, &failure_len);
+            }
             continue;
         }
-        pasteOne(self, tab, src_host, src, dst, cut, .{});
-        started += 1;
+        if (pasteOneAdmitted(self, tab, src_host, src, dst, cut, .{ .no_replace = true })) {
+            admitted += 1;
+        } else {
+            rejected += 1;
+            rememberFailureStatus(self, &failure_buf, &failure_len);
+        }
     }
-    if (conflicts > 0) {
-        self.setStatusFmt("{d} item(s) started; {d} name conflict(s) waiting for a decision", .{ started, conflicts });
-    } else if (started == 0) {
-        self.setStatus("nothing to paste here");
+    switch (pasteBatchAction(admitted, conflicts, rejected, failure_len > 0)) {
+        .preserve_failure => self.setStatus(failure_buf[0..failure_len]),
+        .rejected => self.setStatusFmt("{d} item(s) could not be queued", .{rejected}),
+        .conflicts => self.setStatusFmt("{d} item(s) queued; {d} name conflict(s) waiting for a decision", .{ admitted, conflicts }),
+        .nothing => self.setStatus("nothing to paste here"),
+        .queued => self.setStatusFmt("{d} transfer(s) queued", .{admitted}),
     }
     if (cut and clear_clipboard) {
         // Cut is one-shot: the sources are moving away. Parked
@@ -232,14 +316,46 @@ pub fn pasteOne(
     cut: bool,
     opts: PasteOpts,
 ) void {
+    _ = pasteOneAdmitted(self, tab, src_host, src, dst, cut, opts);
+}
+
+fn transferAdmissionCount(self: *BrowserView) usize {
+    return self.pending_jobs.items.len +
+        self.copy_queue.items.items.len +
+        self.deferred_transfers.items.len +
+        self.transfers.items.len;
+}
+
+/// Start one paste and report whether it reached an owned queue.
+fn pasteOneAdmitted(
+    self: *BrowserView,
+    tab: *BTab,
+    src_host: ?[]const u8,
+    src: []const u8,
+    dst: []const u8,
+    cut: bool,
+    opts: PasteOpts,
+) bool {
     const base = std.fs.path.basename(src);
+    if (opts.no_replace and tab.hc.state == .ready and !tab.hc.conn.copy_no_replace) {
+        self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return false;
+    }
     if (hostEq(src_host, tab.hc.host)) {
+        if (tab.hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+            return false;
+        }
         if (cut) {
             // Same-host move = one rename, undoable.
             const req = self.nextReq();
-            self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
-            self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
-            return;
+            const undo = self.makeUndo(tab.hc.host, .rename_back, dst, src, "");
+            if (!self.sendOpOk(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst, .no_replace = opts.no_replace })) {
+                if (undo) |op| op.destroy(self.allocator);
+                return false;
+            }
+            self.deferUndoMode(req, undo, opts.no_replace);
+            return true;
         }
         var lbl: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
@@ -247,11 +363,26 @@ pub fn pasteOne(
             self.makeUndo(tab.hc.host, .delete_created, dst, src, "")
         else
             null;
-        self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, undo, .{ .dir_mode = opts.dir_mode });
-        return;
+        const admitted = self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, undo, .{ .dir_mode = opts.dir_mode, .no_replace = opts.no_replace });
+        if (!admitted) self.setStatusFmt("copy not queued: {s}", .{base});
+        return admitted;
     }
-    const src_hc = self.hostConnFor(src_host) orelse return;
-    self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut });
+    const src_hc = self.hostConnFor(src_host) orelse {
+        self.setStatus("transfer not queued: cannot allocate a host connection");
+        return false;
+    };
+    const before = transferAdmissionCount(self);
+    var status_before_buf: [256]u8 = undefined;
+    const status_before = statusSnapshot(self, &status_before_buf);
+    self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut, .no_replace = opts.no_replace });
+    const admitted = transferAdmissionCount(self) > before;
+    if (!admitted) {
+        var status_after_buf: [256]u8 = undefined;
+        const status_after = statusSnapshot(self, &status_after_buf);
+        if (std.mem.eql(u8, status_before, status_after))
+            self.setStatusFmt("transfer not queued: {s}", .{base});
+    }
+    return admitted;
 }
 
 /// Copy an entry beside itself under a free name ("x" -> "x-copy").
@@ -270,7 +401,7 @@ pub fn duplicateEntry(self: *BrowserView, tab: *BTab, path: []const u8) void {
     }) catch return;
     var lbl: [128]u8 = undefined;
     const label = std.fmt.bufPrint(&lbl, "duplicate {s}", .{base}) catch "duplicate";
-    self.startDaemonJobUndo(tab.hc, "copy", path, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, path, ""), .{});
+    _ = self.startDaemonJobUndo(tab.hc, "copy", path, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, path, ""), .{ .no_replace = true });
     self.setStatusFmt("duplicating {s} -> {s}", .{ base, unique });
 }
 
@@ -561,6 +692,10 @@ pub fn onEditorRenameDone(
         return;
     }
     const hc = self.hostConnFor(if (er.host) |h| @as(?[]const u8, h) else null) orelse return;
+    if (!hc.conn.copy_no_replace) {
+        self.setStatusFmt("rename not started: {s} lacks safe no-replace support", .{hc.label()});
+        return;
+    }
     var renamed: usize = 0;
     for (er.paths.items, names.items) |old, new_name| {
         const base = std.fs.path.basename(old);
@@ -570,8 +705,12 @@ pub fn onEditorRenameDone(
         var nb: [4300]u8 = undefined;
         const np = std.fmt.bufPrint(&nb, "{s}/{s}", .{ if (dir.len == 1) "" else dir, new_name }) catch continue;
         const req = self.nextReq();
-        self.deferUndo(req, self.makeUndo(hc.host, .rename_back, np, old, ""));
-        self.sendOp(hc, .{ .req = req, .op = "rename", .path = old, .to = np });
+        const undo = self.makeUndo(hc.host, .rename_back, np, old, "");
+        if (!self.sendOpOk(hc, .{ .req = req, .op = "rename", .path = old, .to = np, .no_replace = true })) {
+            if (undo) |op| op.destroy(self.allocator);
+            continue;
+        }
+        self.deferUndoMode(req, undo, true);
         renamed += 1;
     }
     self.setStatusFmt("editor rename: {d} file(s) renamed", .{renamed});
@@ -616,6 +755,10 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
     const tab = ctx.tab;
+    if (!tab.hc.conn.copy_no_replace) {
+        self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return menuDone(ctx);
+    }
     const find_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry.?)))));
     const repl_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry2.?)))));
     if (find_txt.len == 0 or std.mem.indexOfScalar(u8, repl_txt, '/') != null) {
@@ -645,8 +788,8 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
         const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
             if (parent.len == 1) "" else parent, w.buffered(),
         }) catch continue;
-        self.sendOp(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to });
-        renamed += 1;
+        if (self.sendOpOk(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to, .no_replace = true }))
+            renamed += 1;
     }
     self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
     menuDone(ctx);
@@ -980,13 +1123,21 @@ pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c)
 /// Send the rename wire op for `old` → same directory, `name`; with
 /// the undo record. Shared by the popover dialog and inline rename.
 pub fn commitRename(self: *BrowserView, tab: *BTab, old: []const u8, name: []const u8) void {
+    if (!tab.hc.conn.copy_no_replace) {
+        self.setStatusFmt("rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return;
+    }
     const dir = std.fs.path.dirname(old) orelse return;
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return;
     const req = self.nextReq();
-    self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, w.buffered(), old, ""));
-    self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
+    const undo = self.makeUndo(tab.hc.host, .rename_back, w.buffered(), old, "");
+    if (!self.sendOpOk(tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered(), .no_replace = true })) {
+        if (undo) |op| op.destroy(self.allocator);
+        return;
+    }
+    self.deferUndoMode(req, undo, true);
 }
 
 /// The live inline-rename editor; at most one per view.
@@ -1243,18 +1394,39 @@ pub fn makeUndo(
     p: []const u8,
 ) ?*UndoOp {
     const op = self.allocator.create(UndoOp) catch return null;
-    const host_owned = if (host) |h| self.allocator.dupe(u8, h) catch { self.allocator.destroy(op); return null; } else null;
-    const a_owned = self.allocator.dupe(u8, a) catch { self.allocator.destroy(op); return null; };
-    const b_owned: []u8 = if (b.len > 0) self.allocator.dupe(u8, b) catch { self.allocator.free(a_owned); if (host_owned) |h| self.allocator.free(h); self.allocator.destroy(op); return null; } else @constCast(&[_]u8{});
-    const p_owned: []u8 = if (p.len > 0) self.allocator.dupe(u8, p) catch { if (b_owned.len > 0) self.allocator.free(b_owned); self.allocator.free(a_owned); if (host_owned) |h| self.allocator.free(h); self.allocator.destroy(op); return null; } else @constCast(&[_]u8{});
+    const host_owned = if (host) |h| self.allocator.dupe(u8, h) catch {
+        self.allocator.destroy(op);
+        return null;
+    } else null;
+    const a_owned = self.allocator.dupe(u8, a) catch {
+        self.allocator.destroy(op);
+        return null;
+    };
+    const b_owned: []u8 = if (b.len > 0) self.allocator.dupe(u8, b) catch {
+        self.allocator.free(a_owned);
+        if (host_owned) |h| self.allocator.free(h);
+        self.allocator.destroy(op);
+        return null;
+    } else @constCast(&[_]u8{});
+    const p_owned: []u8 = if (p.len > 0) self.allocator.dupe(u8, p) catch {
+        if (b_owned.len > 0) self.allocator.free(b_owned);
+        self.allocator.free(a_owned);
+        if (host_owned) |h| self.allocator.free(h);
+        self.allocator.destroy(op);
+        return null;
+    } else @constCast(&[_]u8{});
     op.* = .{ .host = host_owned, .kind = kind, .a = a_owned, .b = b_owned, .p = p_owned };
     return op;
 }
 
 /// Register an undo that becomes real when req's reply is ok.
 pub fn deferUndo(self: *BrowserView, req: u32, op: ?*UndoOp) void {
+    self.deferUndoMode(req, op, false);
+}
+
+pub fn deferUndoMode(self: *BrowserView, req: u32, op: ?*UndoOp, no_replace: bool) void {
     const u = op orelse return;
-    self.pending_undo.append(self.allocator, .{ .req = req, .op = u }) catch u.destroy(self.allocator);
+    self.pending_undo.append(self.allocator, .{ .req = req, .op = u, .no_replace = no_replace }) catch u.destroy(self.allocator);
 }
 
 pub fn recordTrashUndo(self: *BrowserView, hc: *HostConn, orig: []const u8, trashed: []const u8, info: []const u8) void {
@@ -1291,17 +1463,21 @@ pub fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
     self.history_busy = true;
     switch (op.kind) {
         .rename_back => {
+            if (!hc.conn.copy_no_replace) {
+                self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
+                return self.restoreHistory(op, direction);
+            }
             const req = self.nextReq();
             if (!self.deferHistory(req, hc, op, direction)) return;
-            self.sendOp(hc, .{ .req = req, .op = "rename", .path = if (direction == .undo) op.a else op.b, .to = if (direction == .undo) op.b else op.a });
+            self.sendOp(hc, .{ .req = req, .op = "rename", .path = if (direction == .undo) op.a else op.b, .to = if (direction == .undo) op.b else op.a, .no_replace = true });
         },
         .delete_created => {
             var lbl: [128]u8 = undefined;
             const label = std.fmt.bufPrint(&lbl, "{s} copy {s}", .{ @tagName(direction), std.fs.path.basename(op.a) }) catch "copy history";
             if (direction == .undo)
-                self.startHistoryJob(hc, "delete_tree", op.a, "", "", label, op, direction)
+                self.startHistoryJob(hc, "delete_tree", op.a, "", "", label, op, direction, false)
             else if (op.b.len > 0)
-                self.startHistoryJob(hc, "copy", op.b, op.a, "", label, op, direction)
+                self.startHistoryJob(hc, "copy", op.b, op.a, "", label, op, direction, true)
             else
                 self.restoreHistory(op, direction);
         },
@@ -1309,9 +1485,9 @@ pub fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
             var lbl: [128]u8 = undefined;
             const label = std.fmt.bufPrint(&lbl, "{s} trash {s}", .{ @tagName(direction), std.fs.path.basename(op.b) }) catch "trash history";
             if (direction == .undo)
-                self.startHistoryJob(hc, "trash_restore", op.a, op.b, op.p, label, op, direction)
+                self.startHistoryJob(hc, "trash_restore", op.a, op.b, op.p, label, op, direction, false)
             else
-                self.startHistoryJob(hc, "trash", op.b, "", "", label, op, direction);
+                self.startHistoryJob(hc, "trash", op.b, "", "", label, op, direction, false);
         },
         .rmdir_created => {
             const req = self.nextReq();
@@ -1353,7 +1529,10 @@ pub fn restoreHistory(self: *BrowserView, op: *UndoOp, direction: HistoryDirecti
 
 pub fn updateTrashResult(self: *BrowserView, op: *UndoOp, trashed: []const u8, info: []const u8) void {
     const a = self.allocator.dupe(u8, trashed) catch return;
-    const p = self.allocator.dupe(u8, info) catch { self.allocator.free(a); return; };
+    const p = self.allocator.dupe(u8, info) catch {
+        self.allocator.free(a);
+        return;
+    };
     self.allocator.free(op.a);
     if (op.p.len > 0) self.allocator.free(op.p);
     op.a = a;
@@ -1466,9 +1645,6 @@ pub fn onListDrop(
 ) callconv(.c) c.gboolean {
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     const self = tab.view;
-    const cstr = c.g_value_get_string(value) orelse return 0;
-    const spec = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
-
     var dst_dir: []const u8 = tab.root.path;
     var dbuf: [4096]u8 = undefined;
     if (colview.pickItem(tab, x, y)) |p| {
@@ -1477,19 +1653,47 @@ pub fn onListDrop(
             dst_dir = dbuf[0..p.data.path.len];
         }
     }
-    // Explorer/Nemo convention: Ctrl forces copy, Shift forces move,
-    // no modifier keeps the topology default.
-    const mods = c.gtk_event_controller_get_current_event_state(@ptrCast(target));
-    const action: DropAction = if (mods & c.GDK_CONTROL_MASK != 0)
-        .copy
-    else if (mods & c.GDK_SHIFT_MASK != 0)
-        .move
-    else
-        .auto;
-    return @intFromBool(dropSpecIntoAction(self, tab, spec, dst_dir, action));
+    return @intFromBool(dropValueIntoAction(self, tab, value, dst_dir, dnd.dropAction(target, tab)));
 }
 
 pub const DropAction = enum { auto, copy, move };
+
+fn fromGdkAction(action: c.GdkDragAction) DropAction {
+    if (action & c.GDK_ACTION_MOVE != 0) return .move;
+    if (action & c.GDK_ACTION_COPY != 0) return .copy;
+    return .auto;
+}
+
+/// Apply every internal drag spec in one payload to the same target.
+pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst_dir: []const u8, action: c.GdkDragAction) bool {
+    var specs = dnd.ValueIter.init(self.allocator, value);
+    defer specs.deinit();
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |spec| self.allocator.free(spec);
+        owned.deinit(self.allocator);
+    }
+    while (specs.next()) |spec| {
+        const copy = self.allocator.dupe(u8, spec) catch return false;
+        for (owned.items) |previous| {
+            if (std.mem.eql(u8, std.fs.path.basename(previous), std.fs.path.basename(copy))) {
+                self.allocator.free(copy);
+                self.setStatusFmt("drop refused: more than one item is named {s}", .{std.fs.path.basename(spec)});
+                return false;
+            }
+        }
+        owned.append(self.allocator, copy) catch {
+            self.allocator.free(copy);
+            return false;
+        };
+    }
+    var admitted = false;
+    for (owned.items) |spec| {
+        if (dropSpecIntoAction(self, tab, spec, dst_dir, fromGdkAction(action))) admitted = true;
+    }
+    if (admitted) self.setStatusFmt("checking {d} dropped item(s) for conflicts", .{owned.items.len});
+    return admitted;
+}
 
 /// Land a dragged entry spec in `dst_dir` on `tab`'s host. `.auto`
 /// keeps the topology default (same host = MOVE via undoable rename,
@@ -1512,26 +1716,81 @@ pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_
         if (dst_dir.len == 1) "" else dst_dir, base,
     }) catch return false;
 
-    if (hostEq(src_host, tab.hc.host)) {
-        if (std.mem.eql(u8, src, dst)) return false; // dropped in place
-        if (action == .copy) {
-            var lbl: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
-            self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, src, ""), .{});
-            self.setStatusFmt("copying {s} -> {s}", .{ base, dst_dir });
-            return true;
-        }
-        const req = self.nextReq();
-        self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
-        self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
-        self.setStatusFmt("moved {s} -> {s}", .{ base, dst_dir });
-    } else {
-        const src_hc = self.hostConnFor(src_host) orelse return false;
-        const move = action == .move;
-        self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = move });
-        self.setStatusFmt("{s} {s} -> {s}", .{ if (move) "moving" else "copying", base, dst_dir });
+    const same_host = hostEq(src_host, tab.hc.host);
+    if (same_host and std.mem.eql(u8, src, dst)) return false;
+    if (tab.hc.state != .ready) {
+        self.setStatusFmt("drop not queued: not connected to {s}", .{tab.hc.label()});
+        return false;
+    }
+    const src_hc = self.hostConnFor(src_host) orelse return false;
+    const probe = self.allocator.create(DropProbe) catch return false;
+    const src_owned = self.allocator.dupe(u8, src) catch {
+        self.allocator.destroy(probe);
+        return false;
+    };
+    const dst_owned = self.allocator.dupe(u8, dst) catch {
+        self.allocator.free(src_owned);
+        self.allocator.destroy(probe);
+        return false;
+    };
+    const host_owned = if (src_host) |host| self.allocator.dupe(u8, host) catch {
+        self.allocator.free(src_owned);
+        self.allocator.free(dst_owned);
+        self.allocator.destroy(probe);
+        return false;
+    } else null;
+    const move = action == .move or (action == .auto and same_host);
+    probe.* = .{
+        .req = self.nextReq(),
+        .tab = tab,
+        .dst_hc = tab.hc,
+        .src_hc = src_hc,
+        .src_host = host_owned,
+        .src = src_owned,
+        .dst = dst_owned,
+        .cut = move,
+    };
+    self.drop_probes.append(self.allocator, probe) catch {
+        probe.destroy(self.allocator);
+        return false;
+    };
+    if (!self.sendOpOk(tab.hc, .{ .req = probe.req, .op = "stat", .path = probe.dst })) {
+        _ = self.drop_probes.pop();
+        probe.destroy(self.allocator);
+        return false;
     }
     return true;
+}
+
+pub fn feedDropProbe(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
+    for (self.drop_probes.items, 0..) |probe, i| {
+        if (probe.req != rep.req or probe.dst_hc != hc) continue;
+        _ = self.drop_probes.orderedRemove(i);
+        defer probe.destroy(self.allocator);
+        if (!self.tabAlive(probe.tab)) return true;
+        if (probe.tab.hc != probe.dst_hc) {
+            self.setStatus("drop canceled because the target tab moved to another host");
+            return true;
+        }
+        if (rep.ok and rep.entry != null) {
+            const before = self.conflicts.queue.items.len;
+            conflict.enqueue(self, probe.tab, probe.src_hc, probe.src_host, probe.src, probe.dst, rep.entry.?.tdir, probe.cut);
+            if (self.conflicts.queue.items.len == before)
+                self.setStatusFmt("drop conflict could not be queued: {s}", .{std.fs.path.basename(probe.src)});
+            return true;
+        }
+        if (std.mem.eql(u8, rep.@"error", "NOENT")) {
+            if (!probe.dst_hc.conn.copy_no_replace) {
+                self.setStatusFmt("drop not queued: {s} runs an older daemon without safe no-replace support", .{probe.dst_hc.label()});
+                return true;
+            }
+            _ = pasteOneAdmitted(self, probe.tab, probe.src_host, probe.src, probe.dst, probe.cut, .{ .no_replace = true });
+            return true;
+        }
+        self.setStatusFmt("drop not started: cannot inspect {s} ({s})", .{ probe.dst, rep.@"error" });
+        return true;
+    }
+    return false;
 }
 
 /// The other browser face in this sketerm tab, if any: the
@@ -1580,4 +1839,13 @@ pub fn sendToPeer(self: *BrowserView, move: bool, clicked: ?[]const u8) void {
         sources.len,
         peer_tab.spec(&buf),
     });
+}
+
+test "paste batch status preserves failures and counts only admissions" {
+    const t = std.testing;
+    try t.expectEqual(PasteBatchAction.preserve_failure, pasteBatchAction(2, 0, 1, true));
+    try t.expectEqual(PasteBatchAction.rejected, pasteBatchAction(0, 0, 1, false));
+    try t.expectEqual(PasteBatchAction.conflicts, pasteBatchAction(1, 2, 0, false));
+    try t.expectEqual(PasteBatchAction.nothing, pasteBatchAction(0, 0, 0, false));
+    try t.expectEqual(PasteBatchAction.queued, pasteBatchAction(3, 0, 0, false));
 }

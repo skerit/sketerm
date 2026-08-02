@@ -400,11 +400,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         break :blk id.ptr;
     };
 
-    // GTK takes the Wayland app_id and the X11 WM_CLASS from the
-    // program name, NOT from the GApplication id. Without this the file
-    // manager's windows would still group under the terminal's taskbar
-    // entry with the terminal's icon.
-    if (g_app.files_mode) c.g_set_prgname(app_id);
+    // Keep every fallback identity channel aligned with GApplication.
+    // GTK normally gets the Wayland app_id from GApplication, while
+    // AT-SPI Name and X11 WM_CLASS still follow the program name.
+    c.g_set_prgname(app_id);
+    c.g_set_application_name(if (g_app.files_mode) "Sketerm Files" else "sketerm");
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
     defer c.g_object_unref(app);

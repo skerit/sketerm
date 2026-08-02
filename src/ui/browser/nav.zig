@@ -228,6 +228,7 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     // Snapshot first: undo-close-tab needs the location AND the
     // history this is about to free.
     self.stashClosedTab(tab);
+    @import("ops.zig").cancelDropStateForTab(self, tab);
     self.visualForget(tab);
     if (self.register_tab == tab) self.register_tab = null;
     if (self.arch_tab == tab) {
@@ -396,6 +397,13 @@ pub fn applyHistoryIntent(self: *BrowserView, tab: *BTab, intent: NavigationInte
     while (tab.fwd.items.len > 100) self.allocator.free(tab.fwd.orderedRemove(0));
 }
 
+const FreeNavigationState = struct { req: u32, dirty: bool };
+
+fn freeNavigationState(req: u32, previous_host_ready: bool) FreeNavigationState {
+    if (req != 0 and previous_host_ready) return .{ .req = req, .dirty = true };
+    return .{ .req = 0, .dirty = false };
+}
+
 pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
     if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
         const owned = self.allocator.dupe(u8, canonical) catch null;
@@ -421,7 +429,15 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     self.closeViewOf(tab.hc, tab.root);
     tab.root.deinit();
     tab.root = candidate;
+    const free_state = freeNavigationState(tab.free_req, tab.hc.state == .ready);
     tab.hc = hc;
+    // The old root may have lived on another filesystem. Never show
+    // its capacity while the new root's statfs is in flight. Preserve
+    // a request that can still answer: its late reply triggers exactly
+    // one refresh for this new root instead of becoming unrecognized.
+    tab.free_bytes = null;
+    tab.free_req = free_state.req;
+    tab.free_dirty = free_state.dirty;
     // A running query (flat view, search results) belonged to the OLD
     // root; the new folder brings its own remembered view settings,
     // and the host job has nothing left to fill.
@@ -1429,6 +1445,13 @@ test "entryForPath resolves flat rows, expanded subdirs and miller ancestors" {
     tab.root = &flat;
     const hit = entryForPath(&tab, "/elsewhere/hit.txt") orelse return error.NotFound;
     try t.expectEqualStrings("hit.txt", hit.name);
+}
+
+test "navigation preserves a live statfs request for one late refresh" {
+    const t = std.testing;
+    try t.expectEqual(FreeNavigationState{ .req = 41, .dirty = true }, freeNavigationState(41, true));
+    try t.expectEqual(FreeNavigationState{ .req = 0, .dirty = false }, freeNavigationState(41, false));
+    try t.expectEqual(FreeNavigationState{ .req = 0, .dirty = false }, freeNavigationState(0, true));
 }
 
 test "no browser-face chord shadows a global binding undeclared" {

@@ -24,7 +24,7 @@ const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparen
 const copyZ = @import("../../filebrowser/format.zig").copyZN;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
-const uniqueDstName = @import("ops.zig").uniqueDstName;
+const uniqueDstNameIn = @import("ops.zig").uniqueDstNameIn;
 
 /// What the user decided for one collision. `merge` and `replace` are
 /// directory-only; `overwrite` is the file spelling of `replace`.
@@ -85,6 +85,11 @@ pub const Item = struct {
     fn mergeable(self: *const Item) bool {
         return self.is_dir and self.src_known and self.src_is_dir;
     }
+
+    fn canKeepBoth(self: *const Item) bool {
+        const dir = std.fs.path.dirname(self.dst) orelse return false;
+        return std.mem.eql(u8, dir, self.tab.root.path) or self.tab.subdirByPath(dir) != null;
+    }
 };
 
 /// The parked collisions plus the one open dialog. Owned by the
@@ -118,6 +123,22 @@ pub const State = struct {
         self.queue.deinit(allocator);
     }
 };
+
+/// Remove every decision that references a tab before that tab is freed.
+pub fn cancelTab(self: *BrowserView, tab: *BTab) void {
+    closeDialog(self);
+    var i: usize = 0;
+    while (i < self.conflicts.queue.items.len) {
+        const item = self.conflicts.queue.items[i];
+        if (item.tab != tab) {
+            i += 1;
+            continue;
+        }
+        _ = self.conflicts.queue.orderedRemove(i);
+        item.destroy(self.allocator);
+    }
+    if (self.conflicts.queue.items.len > 0) showDialog(self);
+}
 
 /// Heap context for one decision button, freed with the button.
 const BtnCtx = struct {
@@ -156,13 +177,19 @@ pub fn enqueue(
         self.allocator.destroy(item);
         return;
     };
+    const src_host_owned = if (src_host) |h| self.allocator.dupe(u8, h) catch {
+        self.allocator.free(src_owned);
+        self.allocator.free(dst_owned);
+        self.allocator.destroy(item);
+        return;
+    } else null;
     item.* = .{
         .tab = tab,
         .dst_hc = tab.hc,
         .src_hc = src_hc,
         .src = src_owned,
         .dst = dst_owned,
-        .src_host = if (src_host) |h| (self.allocator.dupe(u8, h) catch null) else null,
+        .src_host = src_host_owned,
         .is_dir = is_dir,
         .cut = cut,
     };
@@ -426,7 +453,7 @@ fn refreshButtons(self: *BrowserView, item: *Item) void {
     } else {
         choiceButton(self, buttons, "Replace", .overwrite, true);
     }
-    choiceButton(self, buttons, "Keep Both (rename the pasted copy)", .keep_both, false);
+    if (item.canKeepBoth()) choiceButton(self, buttons, "Keep Both (rename the pasted copy)", .keep_both, false);
     choiceButton(self, buttons, "Skip", .skip, false);
 }
 
@@ -505,6 +532,10 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
         self.setStatus("the target tab closed; conflict dropped");
         return;
     }
+    if (item.tab.hc != item.dst_hc) {
+        self.setStatus("the target tab moved to another host; conflict dropped");
+        return;
+    }
     // A directory cannot be "overwritten" in place and a file cannot be
     // merged: map an apply-to-all decision onto what this item is.
     const choice: Choice = switch (choice_in) {
@@ -519,16 +550,16 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
         .skip => self.setStatusFmt("skipped {s}", .{item.name()}),
         .keep_both => {
             var name_buf: [512]u8 = undefined;
-            const unique = uniqueDstName(item.tab, item.name(), &name_buf) orelse {
+            const dir = std.fs.path.dirname(item.dst) orelse return;
+            const unique = uniqueDstNameIn(item.tab, dir, item.name(), &name_buf) orelse {
                 self.setStatusFmt("no free name for {s}", .{item.name()});
                 return;
             };
             var dst_buf: [4096]u8 = undefined;
-            const dir = item.tab.root.path;
             const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
                 if (dir.len == 1) "" else dir, unique,
             }) catch return;
-            self.pasteOne(item.tab, item.src_host, item.src, dst, item.cut, .{});
+            self.pasteOne(item.tab, item.src_host, item.src, dst, item.cut, .{ .no_replace = true });
         },
         .overwrite => self.pasteOne(item.tab, item.src_host, item.src, item.dst, item.cut, .{}),
         .merge => {

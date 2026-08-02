@@ -22,7 +22,8 @@ const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
 const WireReply = @import("types.zig").WireReply;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
-const dropSpecInto = @import("ops.zig").dropSpecInto;
+const dnd = @import("dnd.zig");
+const dropValueIntoAction = @import("ops.zig").dropValueIntoAction;
 const millerNextSegment = @import("../../filebrowser/paths.zig").millerNextSegment;
 
 /// Segment budget for one bar. Deeper paths keep the root plus the
@@ -286,7 +287,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     // A segment is a drop target for the same internal DnD the
     // listing accepts: dropping here targets that directory.
     if (PathCtx.create(self, seg.path)) |dctx| {
-        const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
+        const dropt = dnd.newTarget(tab);
         _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onCrumbDrop), @ptrCast(dctx), @ptrCast(&PathCtx.freeClosure), c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(btn, @ptrCast(dropt));
     }
@@ -323,12 +324,10 @@ pub fn onCrumbClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.navigate(tab, host, pbuf[0..ctx.path.len]);
 }
 
-pub fn onCrumbDrop(_: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+pub fn onCrumbDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx: *PathCtx = @ptrCast(@alignCast(user.?));
     const tab = ctx.view.currentTab() orelse return 0;
-    const cstr = c.g_value_get_string(value) orelse return 0;
-    const spec = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
-    return @intFromBool(dropSpecInto(ctx.view, tab, spec, ctx.path));
+    return @intFromBool(dropValueIntoAction(ctx.view, tab, value, ctx.path, dnd.dropAction(target, tab)));
 }
 
 /// Ask the host for the dropdown's directory listing. The popover is

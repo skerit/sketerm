@@ -13,6 +13,28 @@ const c = @import("../c.zig").c;
 pub const is_linux = builtin.os.tag == .linux;
 pub const is_macos = builtin.os.tag == .macos;
 
+pub const RenameNoReplaceResult = enum { ok, exists, cross_device, failed };
+
+/// Atomically install `old_path` at a destination that must not exist.
+pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameNoReplaceResult {
+    if (is_linux) {
+        const linux = std.os.linux;
+        return switch (linux.errno(linux.renameat2(c.AT_FDCWD, old_path, c.AT_FDCWD, new_path, .{ .NOREPLACE = true }))) {
+            .SUCCESS => .ok,
+            .EXIST => .exists,
+            .XDEV => .cross_device,
+            else => .failed,
+        };
+    }
+    const rc = c.renamex_np(old_path, new_path, @intCast(c.RENAME_EXCL));
+    if (rc == 0) return .ok;
+    return switch (std.posix.errno(rc)) {
+        .EXIST => .exists,
+        .XDEV => .cross_device,
+        else => .failed,
+    };
+}
+
 /// macOS: dyld's path-of-this-binary call (libc, always present).
 extern fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 

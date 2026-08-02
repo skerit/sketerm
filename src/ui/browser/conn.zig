@@ -264,6 +264,7 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         hc.state = .dead;
         view.setStatusFmt("cannot connect to {s}", .{hc.label()});
         view.pumpDeferredTransfers();
+        view.pumpCopyAcks();
         // The listings queued while connecting will never be answered.
         // Without this the tabs that asked for them sit at "Listing..."
         // for good, which reads like a slow host rather than a dead one.
@@ -317,6 +318,8 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         if (tab.hc == hc or tab.hc.state != .dead or !hostEq(tab.hc.host, hc.host)) continue;
         tab.hc = hc;
         tab.free_req = 0;
+        tab.free_dirty = false;
+        tab.free_bytes = null;
         tab.root.view_id = 0;
         self.openDir(tab, tab.root);
         for (tab.subdirs.items) |d| {
@@ -329,6 +332,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     self.pumpTransferQueue();
     self.pumpCopyQueue();
     self.pumpDeferredTransfers();
+    @import("jobs.zig").pumpCopyAcks(self);
     // Warm the host's FUSE mount NOW, while the user is still
     // browsing: the mount helper's own connect (ssh auth, deploy
     // check) is the whole latency of the first double-click open.
@@ -441,7 +445,18 @@ pub fn requestHostDirs(self: *BrowserView, hc: *HostConn) void {
 /// Connection died: fail its transfers FIRST (they hold *Conn),
 /// then release the socket. Tabs keep referencing the dead
 /// HostConn; navigating again reconnects.
+fn rememberRedispatch(self: *BrowserView, list: *std.ArrayList([]u8), token: []const u8) void {
+    for (list.items) |existing| if (std.mem.eql(u8, existing, token)) return;
+    const owned = self.allocator.dupe(u8, token) catch return;
+    list.append(self.allocator, owned) catch self.allocator.free(owned);
+}
+
 pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
+    var redispatch: std.ArrayList([]u8) = .empty;
+    defer {
+        for (redispatch.items) |token| self.allocator.free(token);
+        redispatch.deinit(self.allocator);
+    }
     mediacols.hostDied(self, hc);
     // In-flight listings can never be answered. A navigation
     // request also OWNS its candidate directory until it commits,
@@ -456,12 +471,65 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         if (t.src_hc == hc or t.dst_hc == hc) {
             self.setStatusFmt("transfer failed: connection to {s} lost", .{hc.label()});
             if (t.upload_watch) |wt| wt.uploading = false;
+            if (t.token) |token| rememberRedispatch(self, &redispatch, token);
             t.x.deinit();
             self.allocator.free(t.label);
             t.freeExtras(self.allocator);
             self.allocator.destroy(t);
             _ = self.transfers.orderedRemove(i);
         } else i += 1;
+    }
+    i = 0;
+    while (i < self.pending_jobs.items.len) {
+        const pj = self.pending_jobs.items[i];
+        if (pj.hc != hc or pj.retry == null) {
+            i += 1;
+            continue;
+        }
+        if (pj.retry) |retry| {
+            rememberRedispatch(self, &redispatch, retry.token);
+            retry.destroy(self.allocator);
+        }
+        self.allocator.free(pj.label);
+        self.allocator.destroy(pj);
+        _ = self.pending_jobs.orderedRemove(i);
+    }
+    i = 0;
+    while (i < self.drop_probes.items.len) {
+        const probe = self.drop_probes.items[i];
+        if (probe.dst_hc != hc and probe.src_hc != hc) {
+            i += 1;
+            continue;
+        }
+        _ = self.drop_probes.orderedRemove(i);
+        probe.destroy(self.allocator);
+        self.setStatus("drop canceled because a host disconnected");
+    }
+    i = 0;
+    while (i < self.jobs.items.len) {
+        const row = self.jobs.items[i];
+        if (row.hc != hc or row.retry == null) {
+            i += 1;
+            continue;
+        }
+        if (row.retry) |retry| {
+            rememberRedispatch(self, &redispatch, retry.token);
+            retry.destroy(self.allocator);
+        }
+        self.allocator.free(row.label);
+        self.allocator.destroy(row);
+        _ = self.jobs.orderedRemove(i);
+    }
+    i = 0;
+    while (i < self.copy_acks.items.len) {
+        const ack = self.copy_acks.items[i];
+        if (ack.hc != hc) {
+            i += 1;
+            continue;
+        }
+        rememberRedispatch(self, &redispatch, ack.token);
+        self.allocator.free(ack.token);
+        _ = self.copy_acks.orderedRemove(i);
     }
     i = 0;
     while (i < self.pending_history.items.len) {
@@ -535,7 +603,11 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     }
     hc.conn.deinit();
     hc.state = .dead;
+    self.pumpCopyQueue();
     self.pumpDeferredTransfers();
+    if (self.transfer_service) |service| {
+        for (redispatch.items) |token| service.redispatchMediated(token);
+    }
     self.renderJobs();
     // A remote host with tabs still on it gets re-dialed by timer; a
     // local daemon reconnects on the next op anyway.
@@ -554,12 +626,20 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
 }
 
 pub fn sendOp(self: *BrowserView, hc: *HostConn, args: anytype) void {
+    _ = self.sendOpOk(hc, args);
+}
+
+pub fn sendOpOk(self: *BrowserView, hc: *HostConn, args: anytype) bool {
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
-        return;
+        return false;
     }
-    hc.conn.queueJson(.fs_op, args) catch self.setStatus("daemon connection lost");
+    hc.conn.queueJson(.fs_op, args) catch {
+        self.setStatus("daemon connection lost");
+        return false;
+    };
     self.ensureWriteFlush(hc);
+    return true;
 }
 
 pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
@@ -683,10 +763,33 @@ pub fn sendListingOp(self: *BrowserView, p: *Pending) void {
     }
     // Free space rides every root listing: navigation, reload and
     // resync all keep the status line's figure current for cheap.
-    if (p.dir == p.tab.root) {
-        p.tab.free_req = self.nextReq();
-        self.sendOp(p.hc, .{ .req = p.tab.free_req, .op = "statfs", .path = p.dir.path });
+    if (p.dir == p.tab.root) self.requestFreeSpace(p.tab);
+}
+
+/// Coalesced statfs refresh for one tab's current root.
+pub fn requestFreeSpace(self: *BrowserView, tab: *BTab) void {
+    if (tab.free_req != 0) {
+        tab.free_dirty = true;
+        return;
     }
+    if (tab.hc.state != .ready) return;
+    tab.free_dirty = false;
+    tab.free_req = self.nextReq();
+    self.sendOp(tab.hc, .{ .req = tab.free_req, .op = "statfs", .path = tab.root.path });
+}
+
+const FreeSpaceReply = struct {
+    bytes: ?u64,
+    refresh: bool,
+};
+
+fn freeSpaceReply(ok: bool, bavail: u64, frsize: u64, dirty: bool) FreeSpaceReply {
+    if (dirty) return .{ .bytes = null, .refresh = true };
+    const bytes = if (ok and frsize > 0 and bavail <= std.math.maxInt(u64) / frsize)
+        bavail * frsize
+    else
+        null;
+    return .{ .bytes = bytes, .refresh = false };
 }
 
 /// Subscribe a directory and start collecting its listing. When
@@ -844,10 +947,28 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     }) catch return false;
     if (rep.req == 0) return false;
 
+    for (self.copy_acks.items, 0..) |ack, i| {
+        if (ack.req != rep.req) continue;
+        if (!rep.ok and !std.mem.eql(u8, rep.@"error", "no such job")) {
+            self.copy_acks.items[i].req = 0;
+            self.copy_acks.items[i].attempts +|= 1;
+            if (self.retry_timer == 0)
+                self.retry_timer = c.g_timeout_add(1000, @ptrCast(&@import("jobs.zig").onRetryTimer), @ptrCast(self));
+            return false;
+        }
+        const completed = self.copy_acks.orderedRemove(i);
+        if (self.transfer_service) |service| _ = service.mediatedAcked(completed.token, completed.job);
+        self.allocator.free(completed.token);
+        return false;
+    }
+
     for (self.tabs.items) |tab| {
-        if (tab.hc == hc and tab.free_req != 0 and tab.free_req == rep.req) {
+        if (tab.free_req != 0 and tab.free_req == rep.req) {
+            const result = freeSpaceReply(rep.ok, rep.bavail, rep.frsize, tab.free_dirty);
             tab.free_req = 0;
-            if (rep.ok and rep.frsize > 0) tab.free_bytes = rep.bavail * rep.frsize;
+            tab.free_bytes = result.bytes;
+            tab.free_dirty = false;
+            if (result.refresh) self.requestFreeSpace(tab);
             return if (self.currentTab()) |cur| cur == tab else false;
         }
     }
@@ -877,6 +998,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     if (self.feedSiblings(hc, rep)) return false;
     // A parked paste collision waiting on its two stat replies?
     if (self.feedConflicts(hc, rep)) return false;
+    // A drag waiting for a destination collision check?
+    if (@import("ops.zig").feedDropProbe(self, hc, rep)) return false;
     // A "New from Template" listing?
     if (self.feedTemplates(hc, rep)) return false;
     // A background-click folder Properties stat?
@@ -950,6 +1073,9 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.pending_jobs.items, 0..) |pj, i| {
         if (pj.req != rep.req) continue;
         if (rep.ok and rep.job != 0) {
+            if (pj.retry) |retry| {
+                if (self.transfer_service) |service| _ = service.mediatedJobStarted(retry.token, rep.job);
+            }
             if (pj.kind == .query) {
                 // The tab may have closed since the request went out;
                 // its query was forgotten and pj.tab nulled with it.
@@ -976,11 +1102,28 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 self.arch_job = rep.job;
                 self.arch_hc = hc;
             }
-            const row = self.allocator.create(JobRow) catch break;
+            const row = self.allocator.create(JobRow) catch {
+                if (pj.retry) |retry| {
+                    if (self.transfer_service) |service| service.abandonMediated(retry.token);
+                    retry.destroy(self.allocator);
+                }
+                if (pj.undo_op) |u| u.destroy(self.allocator);
+                if (pj.undo_trash_orig) |o| self.allocator.free(o);
+                if (pj.history_op) |op| self.restoreHistory(op, pj.history_direction.?);
+                self.allocator.free(pj.label);
+                _ = self.pending_jobs.orderedRemove(i);
+                self.allocator.destroy(pj);
+                return false;
+            };
             row.* = .{
                 .hc = hc,
                 .job = rep.job,
                 .label = pj.label,
+                .done = rep.done,
+                .total = rep.total,
+                .resumed_from = rep.resumed_from,
+                .files_done = rep.files_done,
+                .files_total = rep.files_total,
                 .undo_op = pj.undo_op,
                 .undo_trash_orig = pj.undo_trash_orig,
                 .open_on_done = pj.open_on_done,
@@ -990,9 +1133,13 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .dest_key = pj.dest_key,
                 .retry = pj.retry,
             };
+            if (rep.file.len > 0) row.setCurrentFile(rep.file);
             self.jobs.append(self.allocator, row) catch {
                 if (row.history_op) |op| self.restoreHistory(op, row.history_direction.?);
-                if (row.retry) |r| r.destroy(self.allocator);
+                if (row.retry) |r| {
+                    if (self.transfer_service) |service| service.abandonMediated(r.token);
+                    r.destroy(self.allocator);
+                }
                 self.allocator.destroy(row);
                 self.allocator.free(pj.label);
                 _ = self.pending_jobs.orderedRemove(i);
@@ -1001,12 +1148,21 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             };
             _ = self.pending_jobs.orderedRemove(i);
             self.allocator.destroy(pj);
+            if (row.retry) |retry| {
+                if (self.transfer_service) |service| {
+                    if (service.mediatedCancelRequested(retry.token)) {
+                        self.sendOp(row.hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = row.job });
+                    } else if (service.mediatedPaused(retry.token)) {
+                        self.sendOp(row.hc, .{ .req = self.nextReq(), .op = "job_pause", .job = row.job });
+                    }
+                }
+            }
             // A resumed cross-host copy supersedes the failed row it
             // came from; one transfer must read as one row.
             if (row.retry != null) self.dropSupersededRetryRows(row);
             self.renderJobs();
         } else {
-            self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
+            self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
             if (pj.kind == .compare_left or pj.kind == .compare_right) {
                 if (self.compare) |cmp| cmp.sideFailed(pj.kind == .compare_left);
             }
@@ -1020,7 +1176,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);
             if (pj.history_op) |op| self.restoreHistory(op, pj.history_direction.?);
-            if (pj.retry) |r| r.destroy(self.allocator);
+            if (pj.retry) |r| {
+                pj.retry = null;
+                if (@import("jobs.zig").retryRejectedCopy(self, r, rep.@"error"))
+                    self.setStatusFmt("transfer start failed, retrying shortly: {s} ({s})", .{ pj.label, errorPhrase(rep.@"error") });
+            }
             self.allocator.free(pj.label);
             _ = self.pending_jobs.orderedRemove(i);
             self.allocator.destroy(pj);
@@ -1032,9 +1192,21 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         if (pu.req != rep.req) continue;
         if (rep.ok) {
             self.pushUndo(pu.op);
+        } else if (std.mem.eql(u8, rep.@"error", "XDEV") and pu.op.kind == .rename_back) {
+            const move_hc = self.hostConnFor(if (pu.op.host) |host| @as(?[]const u8, host) else null);
+            if (move_hc) |host_conn| {
+                self.startTransfer(host_conn, pu.op.b, host_conn, pu.op.a, .{
+                    .delete_src_after = true,
+                    .no_replace = pu.no_replace,
+                });
+                self.setStatusFmt("moving across filesystems: {s}", .{std.fs.path.basename(pu.op.b)});
+            } else {
+                self.setStatus("move could not be resumed because the host is unavailable");
+            }
+            pu.op.destroy(self.allocator);
         } else {
             pu.op.destroy(self.allocator);
-            self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
+            self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
         }
         _ = self.pending_undo.orderedRemove(i);
         return false;
@@ -1047,7 +1219,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.finishHistory(ph.op, ph.direction);
         } else {
             self.restoreHistory(ph.op, ph.direction);
-            self.setStatusFmt("history operation failed: {s}", .{rep.@"error"});
+            self.setStatusFmt("history operation failed: {s}", .{errorPhrase(rep.@"error")});
         }
         return false;
     }
@@ -1096,7 +1268,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     }
     // Plain op reply (mkdir/rename/delete fired from the UI).
     if (!rep.ok) {
-        self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
+        self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
         return false;
     }
     return false;
@@ -1219,6 +1391,7 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 dir.del(ch.name);
             }
         }
+        if (structural) self.requestFreeSpace(tab);
         return structural;
     }
     return false;
@@ -1233,4 +1406,19 @@ pub fn makeDir(self: *BrowserView, path: []const u8) ?*Dir {
     d.* = .{ .allocator = self.allocator, .path = owned, .view_id = self.next_view };
     self.next_view += 1;
     return d;
+}
+
+test "statfs coalescing discards stale and overflowing replies" {
+    const t = std.testing;
+    const stale = freeSpaceReply(true, 10, 4096, true);
+    try t.expectEqual(@as(?u64, null), stale.bytes);
+    try t.expect(stale.refresh);
+
+    const current = freeSpaceReply(true, 10, 4096, false);
+    try t.expectEqual(@as(?u64, 40_960), current.bytes);
+    try t.expect(!current.refresh);
+
+    const overflow = freeSpaceReply(true, std.math.maxInt(u64), 2, false);
+    try t.expectEqual(@as(?u64, null), overflow.bytes);
+    try t.expect(!overflow.refresh);
 }

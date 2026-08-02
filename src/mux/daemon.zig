@@ -1478,9 +1478,14 @@ pub const FsJob = struct {
     /// kept so a restart after a daemon crash resumes with the SAME
     /// semantics rather than silently overwriting.
     conflict: []u8,
+    no_replace: bool = false,
     acknowledged: bool = false,
     ack_req: u32 = 0,
     terminal_pending: bool = false,
+    /// Helper died after a durable cross-move boundary; reap replaces
+    /// it with a recovery helper before exposing a terminal failure.
+    restart_pending: bool = false,
+    recovery_attempts: u32 = 0,
     resumable: bool = false,
     /// Short-lived client-owned helper: no journal/history and killed
     /// when its requesting client disappears.
@@ -1488,6 +1493,10 @@ pub const FsJob = struct {
     /// cross_copy move: the helper deletes the verified source.
     /// Journaled — a respawned move must stay a move.
     delete_src: bool = false,
+    verify: bool = false,
+    /// Durable cross_copy move phase; see fsjournal.Record.phase.
+    phase: [24]u8 = undefined,
+    phase_len: usize = 0,
     /// Host scratch path in `dst` belongs to this job.
     owns_dst: bool = false,
     /// Host scratch source belongs to this job after its helper exits.
@@ -1570,8 +1579,18 @@ pub const FsJob = struct {
         self.message_len = n;
     }
 
+    pub fn setPhase(self: *FsJob, phase: []const u8) void {
+        const n = @min(phase.len, self.phase.len);
+        @memcpy(self.phase[0..n], phase[0..n]);
+        self.phase_len = n;
+    }
+
     pub fn finished(self: *const FsJob) bool {
         return self.state == .done or self.state == .failed or self.state == .canceled;
+    }
+
+    pub fn retentionReady(self: *const FsJob) bool {
+        return self.finished() and !self.terminal_pending and self.out_fd < 0;
     }
 };
 
@@ -1607,6 +1626,31 @@ test "preview temp source release preserves result ownership" {
     try t.expect(job.releaseTempPath(result, 200));
     try t.expectEqual(@as(usize, 0), job.done_path_len);
     try t.expectEqual(@as(i64, 200), job.cleanup_at_ms);
+}
+
+test "terminal filesystem jobs are retained until helper EOF" {
+    const empty: []u8 = @constCast(&[_]u8{});
+    var job = FsJob{
+        .allocator = std.testing.allocator,
+        .id = 1,
+        .op = .copy,
+        .owner = null,
+        .pid = 42,
+        .out_fd = 9,
+        .state = .done,
+        .src = empty,
+        .dst = empty,
+        .pattern = empty,
+        .src_host = empty,
+        .dst_host = empty,
+        .client_token = empty,
+        .conflict = empty,
+    };
+    try std.testing.expect(!job.retentionReady());
+    job.out_fd = -1;
+    try std.testing.expect(job.retentionReady());
+    job.terminal_pending = true;
+    try std.testing.expect(!job.retentionReady());
 }
 
 pub const Daemon = struct {
@@ -2236,6 +2280,7 @@ pub const Daemon = struct {
     const restoredFsJob = daemon_fsjobs.restoredFsJob;
     const restoreFsJobs = daemon_fsjobs.restoreFsJobs;
     const refreshDetachedFsJobs = daemon_fsjobs.refreshDetachedFsJobs;
+    const restartCrashedFsJobs = daemon_fsjobs.restartCrashedFsJobs;
     const fsJobEmit = daemon_fsjobs.fsJobEmit;
     const fsJobReadable = daemon_fsjobs.fsJobReadable;
     const MetaKV = daemon_fsjobs.MetaKV;
@@ -3826,6 +3871,7 @@ pub const Daemon = struct {
         // event route dies with it. Finished jobs are retained for
         // job_list, bounded, oldest dropped first.
         {
+            self.restartCrashedFsJobs();
             for (self.fs_jobs.items) |j| {
                 if (j.owner) |o| {
                     if (o.dead) {
@@ -3865,7 +3911,7 @@ pub const Daemon = struct {
             var finished_count: usize = 0;
             var token_count: usize = 0;
             for (self.fs_jobs.items) |j| {
-                if (!j.ephemeral and j.finished() and !j.terminal_pending) {
+                if (!j.ephemeral and j.retentionReady()) {
                     if (j.client_token.len > 0) {
                         if (j.acknowledged) token_count += 1;
                     } else finished_count += 1;
@@ -3888,7 +3934,8 @@ pub const Daemon = struct {
                 // Ephemeral jobs were not counted above and may be
                 // TTL-held preview producers/sidecars a client is
                 // about to consume; only the TTL sweep removes them.
-                if (!j.ephemeral and j.finished() and !j.terminal_pending and j.client_token.len == 0) {
+                if (!j.ephemeral and j.retentionReady() and j.client_token.len == 0) {
+                    self.deleteFsJobJournal(j.id);
                     _ = self.fs_jobs.orderedRemove(i);
                     j.deinit(false);
                     finished_count -= 1;
@@ -3897,7 +3944,7 @@ pub const Daemon = struct {
             i = 0;
             while (token_count > MAX_TOKEN_JOBS and i < self.fs_jobs.items.len) {
                 const j = self.fs_jobs.items[i];
-                if (j.finished() and j.client_token.len > 0 and j.acknowledged) {
+                if (j.retentionReady() and j.client_token.len > 0 and j.acknowledged) {
                     var record_buf: [4096]u8 = undefined;
                     if (std.fmt.bufPrintZ(&record_buf, "{s}/{d}.json", .{ self.fs_job_dir, j.id })) |record| {
                         _ = c.unlink(record.ptr);

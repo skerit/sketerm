@@ -8,10 +8,9 @@
 //! is redundant with the final done/error line (the daemon trusts
 //! the line, and maps a lineless death to "helper died").
 //!
-//! Resume needs no journal: the staged partial (`<dst>.skpart`) IS
-//! the journal — resume hashes it against the same-length source
-//! prefix and continues only on a match, else restarts. Content
-//! verification, never size trust.
+//! Byte resume needs no journal: the staged partial (`<dst>.skpart`)
+//! is verified against the same-length source prefix. Move recovery
+//! additionally journals copy-complete/source-deleted phase boundaries.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +20,7 @@ const imagecodec = @import("../util/imagecodec.zig");
 const pathz = @import("../util/pathz.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
+const platform = @import("../util/platform.zig");
 const muxclient = @import("client.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const thumbs = @import("../filebrowser/thumbs.zig");
@@ -58,6 +58,7 @@ pub const Spec = struct {
     src_host: []const u8 = "",
     dst_host: []const u8 = "",
     @"resume": bool = false,
+    no_replace: bool = false,
     /// copy: what to do about an entry INSIDE the tree whose name
     /// already exists at the destination ("" = overwrite, the
     /// historical behavior; also "skip" and "keep_both"). The
@@ -90,7 +91,7 @@ pub const Spec = struct {
     /// fetch. Remote-serving hosts only — a desktop host's PNG cache
     /// is shared with its other file managers.
     wire_cache: bool = false,
-    /// cross_copy: delete the source after the verified rename — a
+    /// cross_copy: delete the source after verified installation — a
     /// cross-host MOVE as one daemon-owned job. A failed deletion
     /// fails the job with the copy intact; the retry re-verifies by
     /// hash (cheap) and redoes only the delete.
@@ -103,6 +104,21 @@ pub const Spec = struct {
     /// copy: hash-compare every staged file against its source before
     /// the rename installs it (files_verify_copy).
     verify: bool = false,
+    /// Durable cross_copy move boundary restored from the daemon's
+    /// journal ("copied", "quarantined", or "source_deleted").
+    phase: []const u8 = "",
+    source_quarantine: []const u8 = "",
+    destination_stage: []const u8 = "",
+    source_fingerprint: []const u8 = "",
+    source_kind: []const u8 = "",
+    source_dev: u64 = 0,
+    source_ino: u64 = 0,
+    recovery_attempts: u32 = 0,
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -154,7 +170,46 @@ fn encodeEvent(buf: []u8, value: anytype) ?[]const u8 {
     return w.buffered();
 }
 
+const DurableProgress = struct {
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
+    phase: [24]u8 = undefined,
+    phase_len: usize = 0,
+
+    fn setPhase(self: *DurableProgress, phase: []const u8) void {
+        const n = @min(phase.len, self.phase.len);
+        @memcpy(self.phase[0..n], phase[0..n]);
+        self.phase_len = n;
+    }
+};
+
+const CrossDurable = struct {
+    quarantine: []const u8 = "",
+    destination_stage: []const u8 = "",
+    fingerprint: []const u8 = "",
+    source_kind: []const u8 = "",
+    source_dev: u64 = 0,
+    source_ino: u64 = 0,
+};
+
+threadlocal var durable_progress: DurableProgress = .{};
+threadlocal var durable_retryable_cleanup = false;
+
+fn captureDurableProgress(value: anytype) void {
+    const T = @TypeOf(value);
+    if (@hasField(T, "done")) durable_progress.done = @intCast(value.done);
+    if (@hasField(T, "total")) durable_progress.total = @intCast(value.total);
+    if (@hasField(T, "resumed_from")) durable_progress.resumed_from = @intCast(value.resumed_from);
+    if (@hasField(T, "files_done")) durable_progress.files_done = @intCast(value.files_done);
+    if (@hasField(T, "files_total")) durable_progress.files_total = @intCast(value.files_total);
+    if (@hasField(T, "phase")) durable_progress.setPhase(value.phase);
+}
+
 fn emit(value: anytype) void {
+    captureDurableProgress(value);
     // A 4 KiB text preview can expand sixfold under JSON escaping.
     var buf: [32 * 1024]u8 = undefined;
     emitRaw(encodeEvent(&buf, value) orelse return);
@@ -221,14 +276,16 @@ const Progress = struct {
         if (!self.emitted or nowMs() - self.last_emit_ms >= PROGRESS_FILE_MS) self.emitNow();
     }
 
-    fn entryDone(self: *Progress) void {
-        self.entries_done += 1;
+    fn entryDone(self: *Progress) bool {
+        self.entries_done = std.math.add(u64, self.entries_done, 1) catch return false;
+        return true;
     }
 
-    fn add(self: *Progress, n: u64) void {
-        self.done += n;
-        self.since_emit += n;
+    fn add(self: *Progress, n: u64) bool {
+        self.done = std.math.add(u64, self.done, n) catch return false;
+        self.since_emit +|= n;
         if (self.since_emit >= PROGRESS_BYTES) self.emitNow();
+        return true;
     }
 
     fn emitNow(self: *Progress) void {
@@ -254,6 +311,8 @@ const Progress = struct {
 /// Read the one-line JSON spec from stdin and run the job. The
 /// process exists for exactly this operation.
 pub fn serve(allocator: std.mem.Allocator) u8 {
+    durable_progress = .{};
+    durable_retryable_cleanup = false;
     // A daemon restart closes the progress pipe. The operation must
     // continue rather than dying from SIGPIPE while reporting progress.
     _ = c.signal(c.SIGPIPE, &sigNoop);
@@ -275,6 +334,12 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
     }) catch return emitError("bad job spec");
     defer parsed.deinit();
     const spec = parsed.value;
+    durable_progress.done = spec.done;
+    durable_progress.total = spec.total;
+    durable_progress.resumed_from = spec.resumed_from;
+    durable_progress.files_done = spec.files_done;
+    durable_progress.files_total = spec.files_total;
+    durable_progress.setPhase(spec.phase);
 
     const rc: u8 = if (std.mem.eql(u8, spec.op, "copy"))
         runCopy(allocator, spec)
@@ -328,22 +393,129 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runSecureDelete(spec)
     else
         emitError("unknown job op");
-    if (spec.job_id != 0 and spec.journal_dir.len > 0) {
-        fsjournal.save(spec.journal_dir, .{
-            .id = spec.job_id,
-            .op = spec.op,
-            .state = if (rc == 0) "done" else "failed",
-            .src = spec.src,
-            .dst = spec.dst,
-            .pattern = spec.pattern,
-            .src_host = spec.src_host,
-            .dst_host = spec.dst_host,
-            .@"resume" = spec.@"resume",
-            .pid = c.getpid(),
-            .client_token = spec.client_token,
-        }) catch {};
-    }
+    saveHelperJournal(allocator, spec, if (rc == 0) "done" else if (durable_retryable_cleanup) "running" else "failed") catch {};
     return rc;
+}
+
+fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8) !void {
+    if (spec.job_id == 0 or spec.journal_dir.len == 0) return;
+    var acknowledged = false;
+    var old_done = spec.done;
+    var old_total = spec.total;
+    var old_resumed = spec.resumed_from;
+    var old_files_done = spec.files_done;
+    var old_files_total = spec.files_total;
+    var old_phase = spec.phase;
+    var old_quarantine = spec.source_quarantine;
+    var old_destination_stage = spec.destination_stage;
+    var old_fingerprint = spec.source_fingerprint;
+    var old_source_kind = spec.source_kind;
+    var old_source_dev = spec.source_dev;
+    var old_source_ino = spec.source_ino;
+    var parsed_old: ?std.json.Parsed(fsjournal.Record) = null;
+    defer if (parsed_old) |*p| p.deinit();
+    var path_buf: [4096]u8 = undefined;
+    if (std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ spec.journal_dir, spec.job_id })) |path| {
+        parsed_old = fsjournal.load(allocator, path) catch null;
+        if (parsed_old) |*p| {
+            acknowledged = p.value.acknowledged;
+            old_done = p.value.done;
+            old_total = p.value.total;
+            old_resumed = p.value.resumed_from;
+            old_files_done = p.value.files_done;
+            old_files_total = p.value.files_total;
+            if (fsjournal.phaseRank(p.value.phase) > fsjournal.phaseRank(old_phase)) old_phase = p.value.phase;
+            if (old_quarantine.len == 0) old_quarantine = p.value.source_quarantine;
+            if (old_destination_stage.len == 0) old_destination_stage = p.value.destination_stage;
+            if (old_fingerprint.len == 0) old_fingerprint = p.value.source_fingerprint;
+            if (old_source_kind.len == 0) old_source_kind = p.value.source_kind;
+            if (old_source_dev == 0) old_source_dev = p.value.source_dev;
+            if (old_source_ino == 0) old_source_ino = p.value.source_ino;
+        }
+    } else |_| {}
+    const reported_phase = durable_progress.phase[0..durable_progress.phase_len];
+    const phase = if (fsjournal.phaseRank(reported_phase) > fsjournal.phaseRank(old_phase)) reported_phase else old_phase;
+    try fsjournal.save(spec.journal_dir, .{
+        .id = spec.job_id,
+        .op = spec.op,
+        .state = state,
+        .src = spec.src,
+        .dst = spec.dst,
+        .pattern = spec.pattern,
+        .src_host = spec.src_host,
+        .dst_host = spec.dst_host,
+        .@"resume" = spec.@"resume",
+        .conflict = spec.conflict,
+        .no_replace = spec.no_replace,
+        .delete_src = spec.delete_src,
+        .verify = spec.verify,
+        .phase = phase,
+        .source_quarantine = old_quarantine,
+        .destination_stage = old_destination_stage,
+        .source_fingerprint = old_fingerprint,
+        .source_kind = old_source_kind,
+        .source_dev = old_source_dev,
+        .source_ino = old_source_ino,
+        .recovery_attempts = spec.recovery_attempts,
+        .pid = c.getpid(),
+        .done = @max(old_done, durable_progress.done),
+        .total = @max(old_total, durable_progress.total),
+        .resumed_from = @max(old_resumed, durable_progress.resumed_from),
+        .files_done = @max(old_files_done, durable_progress.files_done),
+        .files_total = @max(old_files_total, durable_progress.files_total),
+        .client_token = spec.client_token,
+        .acknowledged = acknowledged,
+    });
+}
+
+fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, durable: CrossDurable) bool {
+    durable_progress.done = progress.done;
+    durable_progress.total = progress.total;
+    durable_progress.resumed_from = progress.resumed;
+    durable_progress.files_done = progress.entries_done;
+    durable_progress.files_total = progress.entries_total;
+    durable_progress.setPhase(phase);
+    if (spec.job_id == 0 or spec.journal_dir.len == 0) return true;
+    fsjournal.save(spec.journal_dir, .{
+        .id = spec.job_id,
+        .op = spec.op,
+        .state = "running",
+        .src = spec.src,
+        .dst = spec.dst,
+        .pattern = spec.pattern,
+        .src_host = spec.src_host,
+        .dst_host = spec.dst_host,
+        .@"resume" = spec.@"resume",
+        .conflict = spec.conflict,
+        .no_replace = spec.no_replace,
+        .delete_src = spec.delete_src,
+        .verify = spec.verify,
+        .phase = phase,
+        .source_quarantine = durable.quarantine,
+        .destination_stage = durable.destination_stage,
+        .source_fingerprint = durable.fingerprint,
+        .source_kind = durable.source_kind,
+        .source_dev = durable.source_dev,
+        .source_ino = durable.source_ino,
+        .recovery_attempts = spec.recovery_attempts,
+        .pid = c.getpid(),
+        .done = progress.done,
+        .total = progress.total,
+        .resumed_from = progress.resumed,
+        .files_done = progress.entries_done,
+        .files_total = progress.entries_total,
+        .client_token = spec.client_token,
+    }) catch return false;
+    emit(.{
+        .ev = "progress",
+        .done = progress.done,
+        .total = progress.total,
+        .resumed_from = progress.resumed,
+        .files_done = progress.entries_done,
+        .files_total = progress.entries_total,
+        .phase = phase,
+    });
+    return true;
 }
 
 // ── archives ─────────────────────────────────────────────────────
@@ -1592,6 +1764,7 @@ const CrossCopy = struct {
     /// can be dialled again.
     src_host: []const u8,
     dst_host: []const u8,
+    no_replace: bool = false,
     progress: Progress = .{},
     /// Why the copy stopped. Empty until something fails; the error
     /// line reports it verbatim, because "cross-host copy failed" told
@@ -1600,6 +1773,7 @@ const CrossCopy = struct {
     fail_len: usize = 0,
     /// Reconnects spent so far, across every file in the job.
     reconnects: u32 = 0,
+    retryable_transport: bool = false,
     /// Set while a reconnect is being reported, so the notice reaches
     /// the panel on the next progress line.
     notice_buf: [160]u8 = undefined,
@@ -1646,6 +1820,15 @@ const CrossCopy = struct {
         return self.fail_buf[0..self.fail_len];
     }
 
+    fn emitFailure(self: *const CrossCopy) u8 {
+        const phase = durable_progress.phase[0..durable_progress.phase_len];
+        if (self.retryable_transport and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("rename_planned")) {
+            durable_retryable_cleanup = true;
+            return emitErrorKind("retryable_cleanup", self.failedReason());
+        }
+        return emitError(self.failedReason());
+    }
+
     /// Emit a progress line carrying a human note. The daemon keeps the
     /// last message on the job, so the panel shows "reconnecting…"
     /// while it happens instead of a row that silently stalls.
@@ -1683,6 +1866,7 @@ const CrossCopy = struct {
     /// acknowledged so far.
     fn reconnect(self: *CrossCopy, side: Side) bool {
         if (self.reconnects >= RECONNECT_BUDGET) {
+            self.retryable_transport = true;
             self.fail("{s} host {s} kept dropping ({d} reconnects)", .{
                 side.label(), self.hostLabel(side), self.reconnects,
             });
@@ -1705,6 +1889,7 @@ const CrossCopy = struct {
             });
             return true;
         }
+        self.retryable_transport = true;
         self.fail("cannot reconnect to {s} host {s}", .{ side.label(), self.hostLabel(side) });
         return false;
     }
@@ -1782,7 +1967,7 @@ const CrossCopy = struct {
             };
             if (!end.ok or !end.has_hash) {
                 self.fail("hash {s} on {s}: {s}", .{
-                    tailOf(path), self.hostLabel(side),
+                    tailOf(path),                                                               self.hostLabel(side),
                     if (end.messageText().len > 0) end.messageText() else "no digest returned",
                 });
                 return null;
@@ -1791,9 +1976,9 @@ const CrossCopy = struct {
         }
     }
 
-    fn copyFile(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, size: u64, allow_resume: bool) bool {
+    fn copyFile(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, size: u64, allow_resume: bool, no_replace: bool) bool {
         self.progress.setFile(src_path);
-        if (allow_resume) {
+        if (allow_resume and !no_replace) {
             var arena_final = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_final.deinit();
             if (self.statProbe(.dst, arena_final.allocator(), dst_path)) |e| {
@@ -1806,9 +1991,14 @@ const CrossCopy = struct {
                     const dh = self.hash(.dst, dst_path);
                     if (sh != null and dh != null and std.mem.eql(u8, &sh.?, &dh.?)) {
                         self.fail_len = before;
-                        self.progress.resumed += size;
-                        self.progress.add(size);
-                        self.progress.entryDone();
+                        self.progress.resumed = std.math.add(u64, self.progress.resumed, size) catch {
+                            self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
+                            return false;
+                        };
+                        if (!self.progress.add(size) or !self.progress.entryDone()) {
+                            self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
+                            return false;
+                        }
                         return true;
                     }
                     self.fail_len = before;
@@ -1829,8 +2019,14 @@ const CrossCopy = struct {
             }
         }
         const resumed_from = off;
-        self.progress.done += off;
-        self.progress.resumed += off;
+        self.progress.done = std.math.add(u64, self.progress.done, off) catch {
+            self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
+            return false;
+        };
+        self.progress.resumed = std.math.add(u64, self.progress.resumed, off) catch {
+            self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
+            return false;
+        };
         self.progress.emitNow();
         var chunk: std.ArrayList(u8) = .empty;
         defer chunk.deinit(self.allocator);
@@ -1842,7 +2038,10 @@ const CrossCopy = struct {
                 .truncate = off == 0 and resumed_from == 0,
             })) return false;
             off += chunk.items.len;
-            self.progress.add(chunk.items.len);
+            if (!self.progress.add(chunk.items.len)) {
+                self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
+                return false;
+            }
         }
         if (size == 0) {
             if (!self.writeChunk(part, 0, &.{}, .{ .create = true, .truncate = true })) return false;
@@ -1858,21 +2057,27 @@ const CrossCopy = struct {
                 self.progress.done -|= off;
                 self.progress.resumed -|= resumed_from;
                 self.notice("staged partial for {s} did not verify -- restarting the file", .{tailOf(dst_path)});
-                return self.copyFile(src_path, dst_path, size, false);
+                return self.copyFile(src_path, dst_path, size, false, no_replace);
             }
             self.fail("{s}: checksum mismatch after transfer", .{tailOf(dst_path)});
             return false;
         }
         // Verification precedes replacement: a corrupt transfer can
         // never destroy the destination that existed before this job.
-        if (!self.renameDst(part, dst_path)) return false;
+        if (!self.renameDst(part, dst_path, no_replace)) {
+            if (no_replace) self.dst.deletePath(part) catch {};
+            return false;
+        }
         var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_meta.deinit();
         if (self.statProbe(.src, arena_meta.allocator(), src_path)) |e| {
             self.dst.chmod(dst_path, e.mode) catch {};
             self.dst.utimens(dst_path, e.atime_ms, e.mtime_ms) catch {};
         }
-        self.progress.entryDone();
+        if (!self.progress.entryDone()) {
+            self.fail("file-count overflow while copying {s}", .{tailOf(dst_path)});
+            return false;
+        }
         return true;
     }
 
@@ -1893,9 +2098,10 @@ const CrossCopy = struct {
         }
     }
 
-    fn renameDst(self: *CrossCopy, from: []const u8, to: []const u8) bool {
+    fn renameDst(self: *CrossCopy, from: []const u8, to: []const u8, no_replace: bool) bool {
         while (true) {
-            self.dst.rename(from, to) catch |err| {
+            const result = if (no_replace) self.dst.renameNoReplace(from, to) else self.dst.rename(from, to);
+            result catch |err| {
                 if (!self.recoverOrFail(.dst, "rename", to, err)) return false;
                 continue;
             };
@@ -1907,7 +2113,18 @@ const CrossCopy = struct {
         while (true) {
             self.dst.mkdir(path) catch |err| {
                 if (err == fsdrive.Error.FsOpFailed and
-                    std.mem.indexOf(u8, self.dst.lastErr(), "EXIST") != null) return true;
+                    std.mem.indexOf(u8, self.dst.lastErr(), "EXIST") != null)
+                {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const existing = self.statProbe(.dst, arena.allocator(), path) orelse {
+                        self.fail("cannot inspect existing destination directory {s}", .{tailOf(path)});
+                        return false;
+                    };
+                    if (std.mem.eql(u8, existing.kind, "dir")) return true;
+                    self.fail("destination path is not a directory: {s}", .{tailOf(path)});
+                    return false;
+                }
                 if (!self.recoverOrFail(.dst, "mkdir", path, err)) return false;
                 continue;
             };
@@ -1915,10 +2132,10 @@ const CrossCopy = struct {
         }
     }
 
-    fn listSrc(self: *CrossCopy, path: []const u8) ?fsdrive.Listing {
+    fn listSide(self: *CrossCopy, side: Side, path: []const u8) ?fsdrive.Listing {
         while (true) {
-            return self.src.list(path) catch |err| {
-                if (!self.recoverOrFail(.src, "list", path, err)) return null;
+            return self.fsOf(side).list(path) catch |err| {
+                if (!self.recoverOrFail(side, "list", path, err)) return null;
                 continue;
             };
         }
@@ -1934,42 +2151,138 @@ const CrossCopy = struct {
         }
     }
 
-    /// Move tail: drop the source once the copy is verified in place.
-    /// Runs AFTER the rename, so a failure here can never cost data —
-    /// the retry's hash probe skips the copy and lands back here.
-    fn deleteSrc(self: *CrossCopy, path: []const u8, is_dir: bool) bool {
-        if (!is_dir) {
-            while (true) {
-                self.src.deletePath(path) catch |err| {
-                    if (!self.recoverOrFail(.src, "delete", path, err)) return false;
-                    continue;
-                };
-                return true;
-            }
-        }
+    const RenameMove = enum { moved, copy_fallback, failed };
+
+    /// Same-host moves keep rename's atomic fast path. XDEV and
+    /// destination collisions fall through to verified copy/delete;
+    /// every other refusal remains an error rather than being hidden.
+    fn tryRenameMove(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, durable: CrossDurable) RenameMove {
         while (true) {
-            const job = self.src.startDeleteTree(path) catch |err| {
-                if (!self.recoverOrFail(.src, "delete", path, err)) return false;
-                continue;
-            };
-            const end = self.src.waitJobEnd(job, 600_000) catch |err| {
-                if (!self.recoverOrFail(.src, "delete", path, err)) return false;
-                continue;
-            };
-            if (!end.ok) {
-                self.fail("delete {s} on {s}: {s}", .{
-                    tailOf(path), self.hostLabel(.src),
-                    if (end.messageText().len > 0) end.messageText() else "source deletion failed",
-                });
-                return false;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const dst_current = self.statProbe(.src, arena.allocator(), dst_path);
+            const src_current = self.statProbe(.src, arena.allocator(), src_path);
+            if (src_current) |current| {
+                if (!durableMatchesRoot(durable, current)) {
+                    if (dst_current) |dest| {
+                        if (durableMatchesRoot(durable, dest)) return .moved;
+                    }
+                    self.fail("same-host move source was replaced; retained it: {s}", .{tailOf(src_path)});
+                    return .failed;
+                }
+            } else {
+                if (dst_current) |dest| {
+                    if (durableMatchesRoot(durable, dest)) return .moved;
+                }
+                self.fail("cannot resolve same-host move source identity: {s}", .{tailOf(src_path)});
+                return .failed;
             }
-            return true;
+            const result = if (self.no_replace) self.src.renameNoReplace(src_path, dst_path) else self.src.rename(src_path, dst_path);
+            result catch |err| {
+                if (isTransportError(err)) {
+                    if (!self.reconnect(.src)) return .failed;
+                    continue;
+                }
+                const detail = self.src.lastErr();
+                if (err == fsdrive.Error.FsOpFailed and
+                    (std.mem.indexOf(u8, detail, "XDEV") != null or
+                        std.mem.indexOf(u8, detail, "EXIST") != null or
+                        std.mem.indexOf(u8, detail, "NOTEMPTY") != null or
+                        std.mem.indexOf(u8, detail, "ISDIR") != null))
+                    return .copy_fallback;
+                self.failOp(.src, "rename", src_path, err);
+                return .failed;
+            };
+            return .moved;
         }
     }
 
-    fn copyTree(self: *CrossCopy, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool) bool {
-        if (!self.mkdirDst(dst_dir)) return false;
-        var listing = self.listSrc(src_dir) orelse return false;
+    const ManifestKind = enum { file, dir, link, other };
+
+    const ManifestItem = struct {
+        rel: []u8,
+        kind: ManifestKind,
+        size: u64,
+        mode: u32,
+        mtime_ns: i64,
+        ctime_ns: i64,
+        dev: u64,
+        ino: u64,
+        atime_ms: i64,
+        mtime_ms: i64,
+        target: []u8,
+
+        fn deinit(self: *ManifestItem, allocator: std.mem.Allocator) void {
+            allocator.free(self.rel);
+            allocator.free(self.target);
+        }
+
+        fn matches(self: *const ManifestItem, e: fsdrive.Entry) bool {
+            if (self.kind != manifestKind(e.kind) or self.mode != e.mode or self.dev != e.dev or
+                self.ino != e.ino or self.mtime_ns != e.mtime_ns or
+                (self.rel.len != 0 and self.ctime_ns != e.ctime_ns))
+                return false;
+            if (self.kind == .file and self.size != e.size) return false;
+            if (self.kind == .link)
+                return std.mem.eql(u8, self.target, e.target orelse "");
+            return true;
+        }
+    };
+
+    const Manifest = struct {
+        allocator: std.mem.Allocator,
+        items: std.ArrayList(ManifestItem) = .empty,
+        total: u64 = 0,
+        files: u64 = 0,
+
+        fn deinit(self: *Manifest) void {
+            for (self.items.items) |*item| item.deinit(self.allocator);
+            self.items.deinit(self.allocator);
+        }
+
+        fn sort(self: *Manifest) void {
+            std.mem.sort(ManifestItem, self.items.items, {}, struct {
+                fn lessThan(_: void, a: ManifestItem, b: ManifestItem) bool {
+                    return std.mem.lessThan(u8, a.rel, b.rel);
+                }
+            }.lessThan);
+        }
+
+        fn append(self: *Manifest, rel: []const u8, e: fsdrive.Entry) !void {
+            const rel_owned = try self.allocator.dupe(u8, rel);
+            errdefer self.allocator.free(rel_owned);
+            const target_owned = try self.allocator.dupe(u8, e.target orelse "");
+            errdefer self.allocator.free(target_owned);
+            const kind = manifestKind(e.kind);
+            if (kind == .file) {
+                self.total = try std.math.add(u64, self.total, e.size);
+                self.files = try std.math.add(u64, self.files, 1);
+            }
+            try self.items.append(self.allocator, .{
+                .rel = rel_owned,
+                .kind = kind,
+                .size = e.size,
+                .mode = e.mode,
+                .mtime_ns = e.mtime_ns,
+                .ctime_ns = e.ctime_ns,
+                .dev = e.dev,
+                .ino = e.ino,
+                .atime_ms = e.atime_ms,
+                .mtime_ms = e.mtime_ms,
+                .target = target_owned,
+            });
+        }
+    };
+
+    fn manifestKind(kind: []const u8) ManifestKind {
+        if (std.mem.eql(u8, kind, "file")) return .file;
+        if (std.mem.eql(u8, kind, "dir")) return .dir;
+        if (std.mem.eql(u8, kind, "link")) return .link;
+        return .other;
+    }
+
+    fn buildManifestSide(self: *CrossCopy, side: Side, manifest: *Manifest, src_dir: []const u8, rel_dir: []const u8) bool {
+        var listing = self.listSide(side, src_dir) orelse return false;
         defer listing.deinit();
         if (listing.truncated) {
             self.fail("{s} on {s}: directory too large to enumerate", .{
@@ -1978,50 +2291,452 @@ const CrossCopy = struct {
             return false;
         }
         for (listing.entries) |e| {
-            var sbuf: [4096]u8 = undefined;
-            var dbuf: [4096]u8 = undefined;
-            const sp = std.fmt.bufPrint(&sbuf, "{s}/{s}", .{ if (src_dir.len == 1) "" else src_dir, e.name }) catch {
+            var rel_buf: [4096]u8 = undefined;
+            const rel = std.fmt.bufPrint(&rel_buf, "{s}{s}{s}", .{
+                rel_dir,
+                if (rel_dir.len == 0) "" else "/",
+                e.name,
+            }) catch {
                 self.fail("source path too long under {s}", .{tailOf(src_dir)});
                 return false;
             };
-            const dp = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ if (dst_dir.len == 1) "" else dst_dir, e.name }) catch {
-                self.fail("destination path too long under {s}", .{tailOf(dst_dir)});
+            manifest.append(rel, e) catch {
+                self.fail("source tree is too large to manifest", .{});
                 return false;
             };
-            if (std.mem.eql(u8, e.kind, "dir")) {
-                if (!self.copyTree(sp, dp, allow_resume)) return false;
-            } else if (std.mem.eql(u8, e.kind, "file")) {
-                // Discovered as the walk goes: a cross-host tree is
-                // never pre-sized (that would be a second full remote
-                // listing pass), so both totals grow with it.
-                self.progress.total += e.size;
-                self.progress.entries_total += 1;
-                if (!self.copyFile(sp, dp, e.size, allow_resume)) return false;
-            } else if (std.mem.eql(u8, e.kind, "link")) {
-                var temp_buf: [4096]u8 = undefined;
-                const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dp, c.getpid() }) catch {
-                    self.fail("destination path too long under {s}", .{tailOf(dst_dir)});
+            if (manifestKind(e.kind) == .dir) {
+                var child_buf: [4096]u8 = undefined;
+                const child = treePath(&child_buf, src_dir, e.name) orelse {
+                    self.fail("source path too long under {s}", .{tailOf(src_dir)});
                     return false;
                 };
-                self.dst.deletePath(temp) catch {};
-                const target = e.target orelse {
-                    self.fail("{s}: symlink with no target", .{tailOf(sp)});
-                    return false;
-                };
-                if (!self.symlinkDst(target, temp)) return false;
-                if (!self.renameDst(temp, dp)) {
-                    self.dst.deletePath(temp) catch {};
-                    return false;
-                }
+                if (!self.buildManifestSide(side, manifest, child, rel)) return false;
             }
         }
-        var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_meta.deinit();
-        if (self.statProbe(.src, arena_meta.allocator(), src_dir)) |e| {
-            self.dst.chmod(dst_dir, e.mode) catch {};
-            self.dst.utimens(dst_dir, e.atime_ms, e.mtime_ms) catch {};
+        return true;
+    }
+
+    fn buildManifest(self: *CrossCopy, manifest: *Manifest, src_dir: []const u8, rel_dir: []const u8) bool {
+        return self.buildManifestSide(.src, manifest, src_dir, rel_dir);
+    }
+
+    fn treePath(buf: []u8, root: []const u8, rel: []const u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ if (root.len == 1) "" else root, rel }) catch null;
+    }
+
+    fn copyLink(self: *CrossCopy, target: []const u8, dst_path: []const u8, no_replace: bool) bool {
+        var temp_buf: [4096]u8 = undefined;
+        const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dst_path, c.getpid() }) catch {
+            self.fail("destination path too long: {s}", .{tailOf(dst_path)});
+            return false;
+        };
+        self.dst.deletePath(temp) catch {};
+        if (!self.symlinkDst(target, temp)) return false;
+        if (!self.renameDst(temp, dst_path, no_replace)) {
+            self.dst.deletePath(temp) catch {};
+            return false;
         }
         return true;
+    }
+
+    fn copyManifest(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, dst_root: []const u8, root: fsdrive.Entry, allow_resume: bool, claim_root: bool) bool {
+        if (claim_root) {
+            self.dst.mkdir(dst_root) catch |err| {
+                self.fail("create destination {s}: {s}", .{ tailOf(dst_root), if (err == fsdrive.Error.FsOpFailed) self.dst.lastErr() else @errorName(err) });
+                return false;
+            };
+        } else if (!self.mkdirDst(dst_root)) return false;
+        for (manifest.items.items) |*item| {
+            var sbuf: [4096]u8 = undefined;
+            var dbuf: [4096]u8 = undefined;
+            const sp = treePath(&sbuf, src_root, item.rel) orelse {
+                self.fail("source path too long under {s}", .{tailOf(src_root)});
+                return false;
+            };
+            const dp = treePath(&dbuf, dst_root, item.rel) orelse {
+                self.fail("destination path too long under {s}", .{tailOf(dst_root)});
+                return false;
+            };
+            var stat_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer stat_arena.deinit();
+            const current = self.statRequired(.src, stat_arena.allocator(), sp) orelse return false;
+            if (!item.matches(current)) {
+                self.fail("source changed while copying: {s}", .{tailOf(sp)});
+                return false;
+            }
+            switch (item.kind) {
+                .dir => if (!self.mkdirDst(dp)) return false,
+                .file => {
+                    if (!self.copyFile(sp, dp, item.size, allow_resume, false)) return false;
+                    stat_arena.deinit();
+                    stat_arena = std.heap.ArenaAllocator.init(self.allocator);
+                    const after = self.statRequired(.src, stat_arena.allocator(), sp) orelse return false;
+                    if (!item.matches(after)) {
+                        self.fail("source changed while copying: {s}", .{tailOf(sp)});
+                        return false;
+                    }
+                },
+                .link => if (!self.copyLink(item.target, dp, false)) return false,
+                .other => {
+                    self.fail("unsupported source entry was not copied: {s}", .{tailOf(sp)});
+                    return false;
+                },
+            }
+        }
+        var i = manifest.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            const item = &manifest.items.items[i];
+            if (item.kind != .dir) continue;
+            var dbuf: [4096]u8 = undefined;
+            const dp = treePath(&dbuf, dst_root, item.rel) orelse continue;
+            self.dst.chmod(dp, item.mode) catch {};
+            self.dst.utimens(dp, item.atime_ms, item.mtime_ms) catch {};
+        }
+        self.dst.chmod(dst_root, root.mode) catch {};
+        self.dst.utimens(dst_root, root.atime_ms, root.mtime_ms) catch {};
+        return true;
+    }
+
+    fn rootMatches(expected: fsdrive.Entry, current: fsdrive.Entry) bool {
+        if (manifestKind(expected.kind) != manifestKind(current.kind) or expected.mode != current.mode or
+            expected.dev != current.dev or expected.ino != current.ino or
+            expected.mtime_ns != current.mtime_ns or expected.ctime_ns != current.ctime_ns)
+            return false;
+        if (std.mem.eql(u8, expected.kind, "file") and expected.size != current.size) return false;
+        if (std.mem.eql(u8, expected.kind, "link"))
+            return std.mem.eql(u8, expected.target orelse "", current.target orelse "");
+        return true;
+    }
+
+    fn validateManifest(self: *CrossCopy, expected: *const Manifest, src_root: []const u8, root: fsdrive.Entry) bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const current_root = self.statRequired(.src, arena.allocator(), src_root) orelse return false;
+        if (!rootMatches(root, current_root)) {
+            self.fail("source root changed while it was copied: {s}", .{tailOf(src_root)});
+            return false;
+        }
+        var current = Manifest{ .allocator = self.allocator };
+        defer current.deinit();
+        if (!self.buildManifest(&current, src_root, "")) return false;
+        current.sort();
+        if (current.items.items.len != expected.items.items.len) {
+            self.fail("source tree changed while it was copied: entry count differs", .{});
+            return false;
+        }
+        for (expected.items.items, current.items.items) |*want, *got| {
+            if (!std.mem.eql(u8, want.rel, got.rel) or want.kind != got.kind or want.size != got.size or
+                want.mode != got.mode or want.mtime_ns != got.mtime_ns or want.ctime_ns != got.ctime_ns or
+                want.dev != got.dev or want.ino != got.ino or !std.mem.eql(u8, want.target, got.target))
+            {
+                self.fail("source tree changed while it was copied near {s}", .{tailOf(want.rel)});
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn fingerprint(root: fsdrive.Entry, manifest: *const Manifest) [Sha256.digest_length * 2]u8 {
+        var hasher = Sha256.init(.{});
+        // Renaming the root itself updates ctime on Linux. Identity,
+        // content/target, mode, and mtime remain stable across the
+        // quarantine rename and still detect a captured replacement.
+        stampEntry(&hasher, "", root.kind, root.size, root.mode, root.mtime_ns, 0, root.dev, root.ino, root.target orelse "");
+        for (manifest.items.items) |*item| {
+            if (item.rel.len == 0) continue;
+            stampEntry(&hasher, item.rel, @tagName(item.kind), item.size, item.mode, item.mtime_ns, item.ctime_ns, item.dev, item.ino, item.target);
+        }
+        var digest: [Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        var hex: [Sha256.digest_length * 2]u8 = undefined;
+        for (digest, 0..) |b, i|
+            _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+        return hex;
+    }
+
+    fn durableMatchesRoot(durable: CrossDurable, root: fsdrive.Entry) bool {
+        return durable.source_kind.len > 0 and
+            std.mem.eql(u8, durable.source_kind, root.kind) and
+            durable.source_dev == root.dev and durable.source_ino == root.ino;
+    }
+
+    fn snapshotMatches(self: *CrossCopy, path: []const u8, durable: CrossDurable) bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const root = self.statProbe(.src, arena.allocator(), path) orelse return false;
+        if (!durableMatchesRoot(durable, root)) return false;
+        var manifest = Manifest{ .allocator = self.allocator };
+        defer manifest.deinit();
+        if (std.mem.eql(u8, root.kind, "dir")) {
+            if (!self.buildManifest(&manifest, path, "")) return false;
+            manifest.sort();
+        } else manifest.append("", root) catch return false;
+        const got = fingerprint(root, &manifest);
+        return durable.fingerprint.len == got.len and std.mem.eql(u8, durable.fingerprint, &got);
+    }
+
+    fn verifyDestination(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
+        if (std.mem.eql(u8, root.kind, "file")) {
+            const sh = self.hash(.src, src_root) orelse return false;
+            const dh = self.hash(.dst, dst_root) orelse return false;
+            if (!std.mem.eql(u8, &sh, &dh)) {
+                self.fail("destination no longer proves copied file {s}", .{tailOf(dst_root)});
+                return false;
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, root.kind, "link")) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const dest = self.statRequired(.dst, arena.allocator(), dst_root) orelse return false;
+            if (!std.mem.eql(u8, dest.kind, "link") or
+                !std.mem.eql(u8, dest.target orelse "", root.target orelse ""))
+            {
+                self.fail("destination no longer proves copied link {s}", .{tailOf(dst_root)});
+                return false;
+            }
+            return true;
+        }
+        var root_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer root_arena.deinit();
+        const dst_root_stat = self.statRequired(.dst, root_arena.allocator(), dst_root) orelse return false;
+        if (!std.mem.eql(u8, dst_root_stat.kind, "dir")) {
+            self.fail("destination no longer proves copied directory {s}", .{tailOf(dst_root)});
+            return false;
+        }
+        for (manifest.items.items) |*item| {
+            var sbuf: [4096]u8 = undefined;
+            var dbuf: [4096]u8 = undefined;
+            const sp = treePath(&sbuf, src_root, item.rel) orelse return false;
+            const dp = treePath(&dbuf, dst_root, item.rel) orelse return false;
+            switch (item.kind) {
+                .file => {
+                    const sh = self.hash(.src, sp) orelse return false;
+                    const dh = self.hash(.dst, dp) orelse return false;
+                    if (!std.mem.eql(u8, &sh, &dh)) {
+                        self.fail("destination no longer proves copied file {s}", .{tailOf(dp)});
+                        return false;
+                    }
+                },
+                .link => {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const dest = self.statRequired(.dst, arena.allocator(), dp) orelse return false;
+                    if (!std.mem.eql(u8, dest.kind, "link") or
+                        !std.mem.eql(u8, dest.target orelse "", item.target))
+                    {
+                        self.fail("destination no longer proves copied link {s}", .{tailOf(dp)});
+                        return false;
+                    }
+                },
+                .dir => {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const dest = self.statRequired(.dst, arena.allocator(), dp) orelse return false;
+                    if (!std.mem.eql(u8, dest.kind, "dir")) {
+                        self.fail("destination no longer proves copied directory {s}", .{tailOf(dp)});
+                        return false;
+                    }
+                },
+                .other => return false,
+            }
+        }
+        return true;
+    }
+
+    fn destinationShapeMatches(self: *CrossCopy, expected: *const Manifest, dst_root: []const u8) bool {
+        var actual = Manifest{ .allocator = self.allocator };
+        defer actual.deinit();
+        if (!self.buildManifestSide(.dst, &actual, dst_root, "")) return false;
+        actual.sort();
+        if (actual.items.items.len != expected.items.items.len) return false;
+        for (expected.items.items, actual.items.items) |*want, *got| {
+            if (!std.mem.eql(u8, want.rel, got.rel) or want.kind != got.kind) return false;
+            if (want.kind == .file and want.size != got.size) return false;
+            if (want.kind == .link and !std.mem.eql(u8, want.target, got.target)) return false;
+        }
+        return true;
+    }
+
+    fn quarantineSource(self: *CrossCopy, src_path: []const u8, durable: CrossDurable) bool {
+        while (true) {
+            self.src.renameNoReplace(src_path, durable.quarantine) catch |err| {
+                if (isTransportError(err)) {
+                    if (!self.reconnect(.src)) return false;
+                } else if (err == fsdrive.Error.BadRequest) {
+                    self.fail("source host cannot atomically quarantine a move source", .{});
+                    return false;
+                } else {
+                    const detail = self.src.lastErr();
+                    if (std.mem.indexOf(u8, detail, "EXIST") == null and
+                        std.mem.indexOf(u8, detail, "NOENT") == null)
+                    {
+                        self.failOp(.src, "quarantine", src_path, err);
+                        return false;
+                    }
+                }
+                // Rename may have committed before its reply was lost.
+                // Only the persisted source snapshot can claim the
+                // quarantine; an unrelated collision is never removed.
+                if (self.snapshotMatches(durable.quarantine, durable)) return true;
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                if (self.statProbe(.src, arena.allocator(), durable.quarantine) != null) {
+                    self.fail("source quarantine collision; retained both paths", .{});
+                    return false;
+                }
+                arena.deinit();
+                arena = std.heap.ArenaAllocator.init(self.allocator);
+                if (self.statProbe(.src, arena.allocator(), src_path) == null) {
+                    self.fail("source disappeared before it could be quarantined", .{});
+                    return false;
+                }
+                continue;
+            };
+            return true;
+        }
+    }
+
+    fn restoreQuarantine(self: *CrossCopy, src_path: []const u8, quarantine: []const u8) void {
+        self.src.renameNoReplace(quarantine, src_path) catch {
+            self.fail("could not restore unverified source; retained it at {s}", .{tailOf(quarantine)});
+        };
+    }
+
+    fn installStagedRoot(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, stage: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const staged = self.statProbe(.dst, arena.allocator(), stage);
+            const final = self.statProbe(.dst, arena.allocator(), dst_root);
+            if (staged) |staged_root| {
+                if (!std.mem.eql(u8, staged_root.kind, root.kind) or
+                    (std.mem.eql(u8, root.kind, "dir") and !self.destinationShapeMatches(manifest, stage)) or
+                    !self.verifyDestination(manifest, src_root, stage, root))
+                {
+                    self.fail("staged destination changed before install: {s}", .{tailOf(stage)});
+                    return false;
+                }
+                if (final != null) {
+                    self.fail("destination appeared before staged directory install: {s}", .{tailOf(dst_root)});
+                    return false;
+                }
+                self.dst.renameNoReplace(stage, dst_root) catch |err| {
+                    if (isTransportError(err)) {
+                        if (!self.reconnect(.dst)) return false;
+                        continue;
+                    }
+                    self.failOp(.dst, "install", dst_root, err);
+                    return false;
+                };
+                return true;
+            }
+            if (final != null and
+                (!std.mem.eql(u8, root.kind, "dir") or self.destinationShapeMatches(manifest, dst_root)) and
+                self.verifyDestination(manifest, src_root, dst_root, root)) return true;
+            self.fail("staged destination vanished before install: {s}", .{tailOf(stage)});
+            return false;
+        }
+    }
+
+    fn isNoEnt(fs: *const fsdrive.Fs) bool {
+        return noEntDetail(fs.lastErr());
+    }
+
+    fn noEntDetail(detail: []const u8) bool {
+        return std.mem.indexOf(u8, detail, "NOENT") != null;
+    }
+
+    /// A transport can die after the source daemon applied deletion but
+    /// before its reply arrived. Retrying then returns NOENT, which is
+    /// the successful idempotent outcome rather than data loss.
+    fn deleteSourcePath(self: *CrossCopy, path: []const u8, kind: ManifestKind, dev: u64, ino: u64) bool {
+        while (true) {
+            self.src.deletePath(path) catch |err| {
+                if (err == fsdrive.Error.FsOpFailed and isNoEnt(self.src)) return true;
+                if (!isTransportError(err)) {
+                    self.failOp(.src, "delete", path, err);
+                    return false;
+                }
+                if (!self.reconnect(.src)) return false;
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const current = self.statProbe(.src, arena.allocator(), path) orelse {
+                    if (isNoEnt(self.src)) return true;
+                    self.fail("cannot resolve ambiguous source deletion: {s}", .{tailOf(path)});
+                    return false;
+                };
+                if (manifestKind(current.kind) != kind or current.dev != dev or current.ino != ino) {
+                    self.fail("source deletion encountered replacement content; retained it: {s}", .{tailOf(path)});
+                    return false;
+                }
+                continue;
+            };
+            return true;
+        }
+    }
+
+    fn deleteCopiedFile(self: *CrossCopy, item: *const ManifestItem, src_path: []const u8, dst_path: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const current = self.statProbe(.src, arena.allocator(), src_path) orelse {
+            if (isNoEnt(self.src)) return true;
+            self.fail("cannot prove source before deletion: {s}", .{tailOf(src_path)});
+            return false;
+        };
+        if (!item.matches(current)) {
+            self.fail("source changed after it was copied; left in place: {s}", .{tailOf(src_path)});
+            return false;
+        }
+        if (item.kind == .file) {
+            const sh = self.hash(.src, src_path) orelse return false;
+            const dh = self.hash(.dst, dst_path) orelse return false;
+            if (!std.mem.eql(u8, &sh, &dh)) {
+                self.fail("source changed after it was copied; left in place: {s}", .{tailOf(src_path)});
+                return false;
+            }
+        } else if (item.kind == .link) {
+            var dst_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer dst_arena.deinit();
+            const dest = self.statRequired(.dst, dst_arena.allocator(), dst_path) orelse return false;
+            if (!std.mem.eql(u8, dest.kind, "link") or
+                !std.mem.eql(u8, dest.target orelse "", item.target))
+            {
+                self.fail("destination does not prove copied link {s}", .{tailOf(dst_path)});
+                return false;
+            }
+        }
+        arena.deinit();
+        arena = std.heap.ArenaAllocator.init(self.allocator);
+        const final_source = self.statProbe(.src, arena.allocator(), src_path) orelse {
+            if (isNoEnt(self.src)) return true;
+            self.fail("cannot re-check source before deletion: {s}", .{tailOf(src_path)});
+            return false;
+        };
+        if (!item.matches(final_source)) {
+            self.fail("source changed after it was copied; left in place: {s}", .{tailOf(src_path)});
+            return false;
+        }
+        return self.deleteSourcePath(src_path, item.kind, item.dev, item.ino);
+    }
+
+    fn deleteManifest(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
+        var i = manifest.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            const item = &manifest.items.items[i];
+            var sbuf: [4096]u8 = undefined;
+            var dbuf: [4096]u8 = undefined;
+            const sp = treePath(&sbuf, src_root, item.rel) orelse return false;
+            const dp = treePath(&dbuf, dst_root, item.rel) orelse return false;
+            if (item.kind == .dir) {
+                // rmdir refuses unexpected content created after the
+                // manifest validation, preserving it and failing the job.
+                if (!self.deleteSourcePath(sp, item.kind, item.dev, item.ino)) return false;
+            } else if (!self.deleteCopiedFile(item, sp, dp)) return false;
+        }
+        return self.deleteSourcePath(src_root, manifestKind(root.kind), root.dev, root.ino);
     }
 };
 
@@ -2066,49 +2781,324 @@ fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: S
     return null;
 }
 
+fn makeSourceQuarantine(src: []const u8, job_id: u64, out: []u8) ?[]const u8 {
+    const parent = std.fs.path.dirname(src) orelse return null;
+    var random: [16]u8 = undefined;
+    if (c.getentropy(&random, random.len) != 0) return null;
+    var nonce: [32]u8 = undefined;
+    for (random, 0..) |b, i|
+        _ = std.fmt.bufPrint(nonce[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    return std.fmt.bufPrint(out, "{s}/.sketerm-move-{d}-{s}", .{
+        if (parent.len == 1) "" else parent,
+        job_id,
+        nonce,
+    }) catch null;
+}
+
+fn makeDestinationStage(dst: []const u8, job_id: u64, out: []u8) ?[]const u8 {
+    const parent = std.fs.path.dirname(dst) orelse return null;
+    var random: [16]u8 = undefined;
+    if (c.getentropy(&random, random.len) != 0) return null;
+    var nonce: [32]u8 = undefined;
+    for (random, 0..) |b, i|
+        _ = std.fmt.bufPrint(nonce[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    return std.fmt.bufPrint(out, "{s}/.sketerm-copy-{d}-{s}", .{
+        if (parent.len == 1) "" else parent,
+        job_id,
+        nonce,
+    }) catch null;
+}
+
+fn durableFromSpec(spec: Spec) CrossDurable {
+    return .{
+        .quarantine = spec.source_quarantine,
+        .destination_stage = spec.destination_stage,
+        .fingerprint = spec.source_fingerprint,
+        .source_kind = spec.source_kind,
+        .source_dev = spec.source_dev,
+        .source_ino = spec.source_ino,
+    };
+}
+
+fn emitCrossDialFailure(spec: Spec, side: Side, host: []const u8) u8 {
+    var buf: [160]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print("cannot reach {s} host {s}", .{ side.label(), host }) catch
+        return emitErrorKind("unreachable", "cannot connect host");
+    if (spec.delete_src and
+        fsjournal.phaseRank(spec.phase) >= fsjournal.phaseRank("rename_planned") and
+        fsjournal.phaseRank(spec.phase) < fsjournal.phaseRank("source_deleted"))
+    {
+        durable_retryable_cleanup = true;
+        return emitErrorKind("retryable_cleanup", w.buffered());
+    }
+    return emitErrorKind("unreachable", w.buffered());
+}
+
 fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.dst.len == 0) return emitError("cross_copy needs destination");
+    if (spec.delete_src and spec.@"resume" and std.mem.eql(u8, spec.phase, "source_deleted")) {
+        emit(.{
+            .ev = "done",
+            .done = spec.done,
+            .total = spec.total,
+            .resumed_from = spec.resumed_from,
+            .files_done = spec.files_done,
+            .files_total = spec.files_total,
+            .phase = "source_deleted",
+        });
+        return 0;
+    }
     const src_label = if (spec.src_host.len == 0) "local" else spec.src_host;
     const dst_label = if (spec.dst_host.len == 0) "local" else spec.dst_host;
-    var src = connectHostFsRetrying(allocator, spec.src_host, .src, spec.dial_tries) orelse {
-        var buf: [160]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        w.print("cannot reach source host {s}", .{src_label}) catch return emitErrorKind("unreachable", "cannot connect source host");
-        return emitErrorKind("unreachable", w.buffered());
-    };
+    var src = connectHostFsRetrying(allocator, spec.src_host, .src, spec.dial_tries) orelse
+        return emitCrossDialFailure(spec, .src, src_label);
     defer src.deinit();
-    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst, spec.dial_tries) orelse {
-        var buf: [160]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        w.print("cannot reach destination host {s}", .{dst_label}) catch return emitErrorKind("unreachable", "cannot connect destination host");
-        return emitErrorKind("unreachable", w.buffered());
-    };
+    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst, spec.dial_tries) orelse
+        return emitCrossDialFailure(spec, .dst, dst_label);
     defer dst.deinit();
+    const journal_phase = fsjournal.phaseRank(spec.phase);
+    const resume_phase = if (std.mem.eql(u8, spec.phase, "rename_planned")) 0 else journal_phase;
     var cc = CrossCopy{
         .allocator = allocator,
         .src = &src,
         .dst = &dst,
         .src_host = spec.src_host,
         .dst_host = spec.dst_host,
+        .no_replace = spec.no_replace,
+        .progress = .{
+            .done = if (journal_phase > 0) spec.done else 0,
+            .total = if (journal_phase > 0) spec.total else 0,
+            .resumed = if (journal_phase > 0) spec.resumed_from else 0,
+            .entries_done = if (journal_phase > 0) spec.files_done else 0,
+            .entries_total = if (journal_phase > 0) spec.files_total else 0,
+        },
     };
+    var move_kind_buf: [16]u8 = undefined;
+    var move_durable = durableFromSpec(spec);
+    if (spec.delete_src and journal_phase == 0) {
+        var move_arena = std.heap.ArenaAllocator.init(allocator);
+        defer move_arena.deinit();
+        const move_root = cc.statRequired(.src, move_arena.allocator(), spec.src) orelse return cc.emitFailure();
+        const kind_len = @min(move_root.kind.len, move_kind_buf.len);
+        @memcpy(move_kind_buf[0..kind_len], move_root.kind[0..kind_len]);
+        move_durable.source_kind = move_kind_buf[0..kind_len];
+        move_durable.source_dev = move_root.dev;
+        move_durable.source_ino = move_root.ino;
+        if (!persistCrossPhase(spec, "rename_planned", &cc.progress, move_durable))
+            return emitError("move could not persist its source identity");
+    } else if (spec.delete_src and std.mem.eql(u8, spec.phase, "rename_planned") and
+        (move_durable.source_kind.len == 0 or move_durable.source_ino == 0))
+    {
+        return emitError("move recovery record has no source identity");
+    }
+    if (spec.delete_src and std.mem.eql(u8, spec.src_host, spec.dst_host) and
+        (journal_phase == 0 or std.mem.eql(u8, spec.phase, "rename_planned")))
+    {
+        switch (cc.tryRenameMove(spec.src, spec.dst, move_durable)) {
+            .moved => {
+                cc.progress.done = 1;
+                cc.progress.total = 1;
+                cc.progress.entries_done = 1;
+                cc.progress.entries_total = 1;
+                if (!persistCrossPhase(spec, "source_deleted", &cc.progress, move_durable))
+                    return emitError("move completed but its durable phase could not be saved");
+                emitCopyDone(&cc.progress);
+                return 0;
+            },
+            .copy_fallback => {},
+            .failed => return cc.emitFailure(),
+        }
+    }
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = cc.statRequired(.src, arena.allocator(), spec.src) orelse
-        return emitError(cc.failedReason());
-    const ok = if (std.mem.eql(u8, root.kind, "file")) blk: {
-        cc.progress.total = root.size;
-        cc.progress.entries_total = 1;
-        break :blk cc.copyFile(spec.src, spec.dst, root.size, spec.@"resume");
-    } else if (root.tdir)
-        cc.copyTree(spec.src, spec.dst, spec.@"resume")
-    else blk: {
-        cc.fail("{s} is neither a file nor a directory", .{tailOf(spec.src)});
-        break :blk false;
-    };
-    if (!ok) return emitError(cc.failedReason());
-    if (spec.delete_src) {
-        if (!cc.deleteSrc(spec.src, root.tdir)) return emitError(cc.failedReason());
+    var durable = move_durable;
+    var active_src = spec.src;
+    var captured = false;
+    if (spec.delete_src and resume_phase >= fsjournal.phaseRank("copied") and durable.quarantine.len > 0) {
+        if (cc.statProbe(.src, arena.allocator(), durable.quarantine) != null) {
+            active_src = durable.quarantine;
+            captured = true;
+            arena.deinit();
+            arena = std.heap.ArenaAllocator.init(allocator);
+        } else if (resume_phase >= fsjournal.phaseRank("quarantined") and CrossCopy.isNoEnt(cc.src)) {
+            // Cleanup completed before its final phase write. The
+            // original path is unrelated once quarantine was durable.
+            if (!persistCrossPhase(spec, "source_deleted", &cc.progress, durable))
+                return emitError("move completed but its durable phase could not be saved");
+            emitCopyDone(&cc.progress);
+            return 0;
+        } else if (resume_phase >= fsjournal.phaseRank("quarantined")) {
+            cc.fail("cannot confirm quarantined source cleanup: {s}", .{tailOf(durable.quarantine)});
+            return cc.emitFailure();
+        }
     }
+    const root = cc.statProbe(.src, arena.allocator(), active_src) orelse {
+        // Version-3 journals had no quarantine identity. Preserve their
+        // established recovery rule, but new records never infer from
+        // the destination while a quarantine path is known.
+        if (spec.delete_src and spec.@"resume" and resume_phase >= fsjournal.phaseRank("copied") and
+            durable.quarantine.len == 0 and CrossCopy.isNoEnt(cc.src) and
+            cc.statProbe(.dst, arena.allocator(), spec.dst) != null)
+        {
+            if (!persistCrossPhase(spec, "source_deleted", &cc.progress, durable))
+                return emitError("move completed but its durable phase could not be saved");
+            emitCopyDone(&cc.progress);
+            return 0;
+        }
+        const detail = cc.src.lastErr();
+        cc.fail("stat {s} on {s}: {s}", .{ tailOf(active_src), cc.hostLabel(.src), if (detail.len > 0) detail else "source is unavailable" });
+        return cc.emitFailure();
+    };
+    if (spec.delete_src and resume_phase == 0 and !CrossCopy.durableMatchesRoot(durable, root)) {
+        cc.fail("move source was replaced before copy fallback; retained it: {s}", .{tailOf(active_src)});
+        return cc.emitFailure();
+    }
+    var manifest = CrossCopy.Manifest{ .allocator = allocator };
+    defer manifest.deinit();
+    if (std.mem.eql(u8, root.kind, "file") or std.mem.eql(u8, root.kind, "link")) {
+        manifest.append("", root) catch {
+            cc.fail("cannot manifest source root", .{});
+            return cc.emitFailure();
+        };
+    } else if (std.mem.eql(u8, root.kind, "dir")) {
+        cc.notice("counting files in {s}", .{tailOf(active_src)});
+        if (!cc.buildManifest(&manifest, active_src, "")) return cc.emitFailure();
+        manifest.sort();
+    } else {
+        cc.fail("unsupported source entry: {s}", .{tailOf(active_src)});
+        return cc.emitFailure();
+    }
+
+    var destination_stage_buf: [4096]u8 = undefined;
+    var stage_fingerprint_buf: [Sha256.digest_length * 2]u8 = undefined;
+    const staged_root = spec.delete_src and spec.no_replace and
+        resume_phase < fsjournal.phaseRank("copied");
+    var copy_dst = spec.dst;
+    if (staged_root) {
+        if (durable.destination_stage.len == 0) {
+            durable.destination_stage = makeDestinationStage(spec.dst, spec.job_id, &destination_stage_buf) orelse
+                return emitError("cannot create destination staging path");
+            if (!persistCrossPhase(spec, "rename_planned", &cc.progress, durable))
+                return emitError("move could not persist its destination staging path");
+        }
+        copy_dst = durable.destination_stage;
+        if (resume_phase == 0) {
+            var final_arena = std.heap.ArenaAllocator.init(allocator);
+            defer final_arena.deinit();
+            if (cc.statProbe(.dst, final_arena.allocator(), spec.dst) != null) {
+                cc.fail("destination exists: {s}", .{tailOf(spec.dst)});
+                return cc.emitFailure();
+            }
+        }
+    }
+
+    if (resume_phase == 0) {
+        cc.progress.total = if (std.mem.eql(u8, root.kind, "file")) root.size else manifest.total;
+        cc.progress.entries_total = if (std.mem.eql(u8, root.kind, "dir")) manifest.files else 1;
+        cc.progress.emitNow();
+        const copied = if (std.mem.eql(u8, root.kind, "file"))
+            cc.copyFile(active_src, copy_dst, root.size, spec.@"resume", spec.no_replace and !staged_root)
+        else if (std.mem.eql(u8, root.kind, "link")) blk: {
+            const target = root.target orelse {
+                cc.fail("source symlink has no readable target: {s}", .{tailOf(active_src)});
+                break :blk false;
+            };
+            if (!cc.copyLink(target, copy_dst, spec.no_replace and !staged_root)) break :blk false;
+            break :blk cc.progress.entryDone();
+        } else cc.copyManifest(&manifest, active_src, copy_dst, root, spec.@"resume", spec.no_replace and !staged_root);
+        if (!copied) return cc.emitFailure();
+        if (std.mem.eql(u8, root.kind, "dir")) {
+            if (!cc.validateManifest(&manifest, active_src, root)) return cc.emitFailure();
+        } else {
+            var verify_arena = std.heap.ArenaAllocator.init(allocator);
+            defer verify_arena.deinit();
+            const current = cc.statRequired(.src, verify_arena.allocator(), active_src) orelse
+                return cc.emitFailure();
+            if (!CrossCopy.rootMatches(root, current)) {
+                cc.fail("source changed while it was copied: {s}", .{tailOf(active_src)});
+                return cc.emitFailure();
+            }
+        }
+    }
+    if (staged_root) {
+        if (resume_phase < fsjournal.phaseRank("destination_staged")) {
+            stage_fingerprint_buf = CrossCopy.fingerprint(root, &manifest);
+            durable.fingerprint = &stage_fingerprint_buf;
+            durable.source_kind = root.kind;
+            durable.source_dev = root.dev;
+            durable.source_ino = root.ino;
+            if (!cc.verifyDestination(&manifest, active_src, durable.destination_stage, root)) return cc.emitFailure();
+            if (!persistCrossPhase(spec, "destination_staged", &cc.progress, durable))
+                return emitError("staged copy could not persist its install boundary");
+        } else {
+            stage_fingerprint_buf = CrossCopy.fingerprint(root, &manifest);
+            if (!CrossCopy.durableMatchesRoot(durable, root) or
+                !std.mem.eql(u8, durable.fingerprint, &stage_fingerprint_buf))
+            {
+                cc.fail("source changed after destination staging; retained it: {s}", .{tailOf(active_src)});
+                return cc.emitFailure();
+            }
+        }
+        if (!cc.installStagedRoot(&manifest, active_src, durable.destination_stage, spec.dst, root))
+            return cc.emitFailure();
+    }
+    if (!spec.delete_src) {
+        emitCopyDone(&cc.progress);
+        return 0;
+    }
+
+    var fingerprint_buf: [Sha256.digest_length * 2]u8 = undefined;
+    if (resume_phase < fsjournal.phaseRank("quarantined")) {
+        fingerprint_buf = CrossCopy.fingerprint(root, &manifest);
+        if (durable.fingerprint.len > 0 and
+            (!CrossCopy.durableMatchesRoot(durable, root) or
+                !std.mem.eql(u8, durable.fingerprint, &fingerprint_buf)))
+        {
+            cc.fail("source changed after its copy completed; left in place: {s}", .{tailOf(active_src)});
+            return cc.emitFailure();
+        }
+        durable.fingerprint = &fingerprint_buf;
+        durable.source_kind = root.kind;
+        durable.source_dev = root.dev;
+        durable.source_ino = root.ino;
+    } else if (!CrossCopy.durableMatchesRoot(durable, root)) {
+        cc.fail("quarantined source identity changed; retained it at {s}", .{tailOf(active_src)});
+        return cc.emitFailure();
+    }
+
+    var quarantine_buf: [4096]u8 = undefined;
+    if (!captured) {
+        if (durable.quarantine.len == 0) {
+            durable.quarantine = makeSourceQuarantine(spec.src, spec.job_id, &quarantine_buf) orelse
+                return emitError("cannot create source quarantine path");
+        }
+        if (!cc.verifyDestination(&manifest, active_src, spec.dst, root)) return cc.emitFailure();
+        if (!persistCrossPhase(spec, "copied", &cc.progress, durable))
+            return emitError("copy completed but its durable move phase could not be saved");
+        if (!cc.quarantineSource(spec.src, durable)) return cc.emitFailure();
+        if (!cc.snapshotMatches(durable.quarantine, durable)) {
+            cc.restoreQuarantine(spec.src, durable.quarantine);
+            if (cc.fail_len == 0)
+                cc.fail("source changed during quarantine; restored it", .{});
+            return cc.emitFailure();
+        }
+        active_src = durable.quarantine;
+        captured = true;
+    }
+    if (!cc.verifyDestination(&manifest, active_src, spec.dst, root)) return cc.emitFailure();
+    if (resume_phase < fsjournal.phaseRank("quarantined")) {
+        if (!persistCrossPhase(spec, "quarantined", &cc.progress, durable)) {
+            if (captured) cc.restoreQuarantine(spec.src, durable.quarantine);
+            return emitError("source quarantined but its durable phase could not be saved");
+        }
+    }
+    if (std.mem.eql(u8, root.kind, "dir")) {
+        if (!cc.deleteManifest(&manifest, active_src, spec.dst, root)) return cc.emitFailure();
+    } else if (!cc.deleteCopiedFile(&manifest.items.items[0], active_src, spec.dst))
+        return cc.emitFailure();
+    if (!persistCrossPhase(spec, "source_deleted", &cc.progress, durable))
+        return emitError("source was deleted but the durable move phase could not be saved");
     emitCopyDone(&cc.progress);
     return 0;
 }
@@ -2729,7 +3719,7 @@ fn hashPrefix(path: []const u8, limit: u64, progress: ?*Progress) ?[Sha256.diges
         if (n <= 0) break;
         h.update(buf[0..@intCast(n)]);
         left -= @intCast(n);
-        if (progress) |pr| pr.add(@intCast(n));
+        if (progress) |pr| if (!pr.add(@intCast(n))) return null;
     }
     if (left != 0) return null; // short file
     var out: [Sha256.digest_length]u8 = undefined;
@@ -2781,16 +3771,59 @@ fn runCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (!statOf(spec.src, &st, false)) return emitErrno("stat src");
 
     if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) return runCopyTree(allocator, spec);
+    if ((st.st_mode & c.S_IFMT) == c.S_IFLNK) return runCopyRootLink(spec);
 
     var progress = Progress{
         .total = if (st.st_size > 0) @intCast(st.st_size) else 0,
         .entries_total = 1,
     };
-    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", spec.verify, &progress)) {
-        .ok => progress.entryDone(),
+    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", spec.verify, spec.no_replace, &progress)) {
+        .ok => if (!progress.entryDone()) return emitError("file-count overflow"),
         .err => |m| return emitError(m),
         .errno => |what| return emitErrno(what),
     }
+    emitCopyDone(&progress);
+    return 0;
+}
+
+fn runCopyRootLink(spec: Spec) u8 {
+    var src_z: [4096]u8 = undefined;
+    const src = pathz.pathZ(&src_z, spec.src) catch return emitError("path too long");
+    var target_buf: [4096]u8 = undefined;
+    const n = c.readlink(src, &target_buf, target_buf.len);
+    if (n < 0) return emitErrno("readlink");
+    var temp_buf: [4096]u8 = undefined;
+    const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ spec.dst, c.getpid() }) catch
+        return emitError("path too long");
+    var temp_z_buf: [4096]u8 = undefined;
+    const temp_z = pathz.pathZ(&temp_z_buf, temp) catch return emitError("path too long");
+    _ = c.unlink(temp_z);
+    if (c.symlink(pathz.pathZ(&src_z, target_buf[0..@intCast(n)]) catch return emitError("symlink target too long"), temp_z) != 0)
+        return emitErrno("create symlink");
+    var dst_z_buf: [4096]u8 = undefined;
+    const dst_z = pathz.pathZ(&dst_z_buf, spec.dst) catch return emitError("path too long");
+    if (spec.no_replace) {
+        switch (platform.renameNoReplace(temp_z, dst_z)) {
+            .ok => {},
+            .exists => {
+                _ = c.unlink(temp_z);
+                return emitError("destination exists");
+            },
+            .cross_device => {
+                _ = c.unlink(temp_z);
+                return emitError("install symlink crossed filesystems");
+            },
+            .failed => {
+                _ = c.unlink(temp_z);
+                return emitError("install symlink failed");
+            },
+        }
+    } else if (c.rename(temp_z, dst_z) != 0) {
+        _ = c.unlink(temp_z);
+        return emitErrno("replace symlink");
+    }
+    if (!fsyncParent(spec.dst)) return emitErrno("fsync symlink parent");
+    const progress = Progress{ .entries_done = 1, .entries_total = 1 };
     emitCopyDone(&progress);
     return 0;
 }
@@ -2818,6 +3851,7 @@ const CopyOpts = struct {
     conflict: enum { overwrite, skip, keep_both } = .overwrite,
     replace: bool = false,
     verify: bool = false,
+    no_replace: bool = false,
 
     fn fromSpec(spec: Spec) CopyOpts {
         return .{
@@ -2830,13 +3864,14 @@ const CopyOpts = struct {
             else
                 .overwrite,
             .replace = std.mem.eql(u8, spec.dir_mode, "replace"),
+            .no_replace = spec.no_replace,
         };
     }
 };
 
 /// Single-file copy via a staged `.skpart` with hash-verified resume,
 /// fsync, mode preservation, and atomic rename.
-fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, verify: bool, progress: *Progress) CopyResult {
+fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, verify: bool, no_replace: bool, progress: *Progress) CopyResult {
     var part_buf: [4096]u8 = undefined;
     var wpart = std.Io.Writer.fixed(&part_buf);
     wpart.print("{s}.skpart", .{dst}) catch return .{ .err = "path too long" };
@@ -2860,8 +3895,10 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
     // Cumulative, not assigned: inside a tree copy `done` already
     // carries every earlier file (assigning here made the panel's
     // percentage restart from zero on every file of a tree).
-    progress.resumed += start;
-    progress.done += start;
+    progress.resumed = std.math.add(u64, progress.resumed, start) catch
+        return .{ .err = "copy progress overflow" };
+    progress.done = std.math.add(u64, progress.done, start) catch
+        return .{ .err = "copy progress overflow" };
     progress.setFile(src);
 
     var zs: [4096]u8 = undefined;
@@ -2894,7 +3931,7 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
             if (w <= 0) return .{ .errno = "write dst" };
             off += @intCast(w);
         }
-        progress.add(@intCast(n));
+        if (!progress.add(@intCast(n))) return .{ .err = "copy progress overflow" };
     }
 
     if (c.fsync(dfd) != 0) return .{ .errno = "fsync" };
@@ -2912,7 +3949,23 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
     }
     var zr: [4096]u8 = undefined;
     const dp = pathz.pathZ(&zr, dst) catch return .{ .err = "path too long" };
-    if (c.rename(pp, dp) != 0) return .{ .errno = "rename" };
+    if (no_replace) {
+        switch (platform.renameNoReplace(pp, dp)) {
+            .ok => {},
+            .exists => {
+                _ = c.unlink(pp);
+                return .{ .err = "destination exists" };
+            },
+            .cross_device => {
+                _ = c.unlink(pp);
+                return .{ .err = "install destination crossed filesystems" };
+            },
+            .failed => {
+                _ = c.unlink(pp);
+                return .{ .err = "install destination failed" };
+            },
+        }
+    } else if (c.rename(pp, dp) != 0) return .{ .errno = "rename" };
     if (!fsyncParent(dst)) return .{ .errno = "fsync destination parent" };
     return .ok;
 }
@@ -2920,9 +3973,8 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
 /// Recursive tree copy. Pass 1 sizes the job (progress totals);
 /// pass 2 copies: dirs mkdir'ed, symlinks recreated as symlinks,
 /// regular files staged like the single-file path. On resume,
-/// completed files (equal size at dst) are skipped WITHOUT hashing —
-/// only the in-flight partial gets the hash check; a paranoid full
-/// verify is what the hash verb is for.
+/// completed files are reused only after source/destination hashing;
+/// the in-flight partial is likewise prefix-verified before resume.
 ///
 /// A destination directory that already exists is MERGED by default:
 /// the walk recurses into it and entries that exist only there are
@@ -2930,10 +3982,15 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
 /// first, so those entries are gone.
 fn runCopyTree(allocator: std.mem.Allocator, spec: Spec) u8 {
     var progress = Progress{};
-    if (!sizeTree(allocator, spec.src, &progress.total, &progress.entries_total))
+    var before_hash = Sha256.init(.{});
+    if (!sizeTree(allocator, spec.src, &progress.total, &progress.entries_total, &before_hash))
         return emitError("cannot size source tree (listing failed or truncated)");
+    var before: [Sha256.digest_length]u8 = undefined;
+    before_hash.final(&before);
 
     const opts = CopyOpts.fromSpec(spec);
+    if (opts.no_replace and opts.replace)
+        return emitError("no_replace conflicts with dir_mode=replace");
     if (opts.replace) {
         var dst_st: c.struct_stat = undefined;
         if (statOf(spec.dst, &dst_st, false)) {
@@ -2948,29 +4005,69 @@ fn runCopyTree(allocator: std.mem.Allocator, spec: Spec) u8 {
             if (!removed) return emitErrno("replace destination");
         }
     }
-    switch (copyTreeDir(allocator, spec.src, spec.dst, opts, &progress)) {
+    switch (copyTreeDir(allocator, spec.src, spec.dst, opts, &progress, true)) {
         .ok => {},
         .err => |m| return emitError(m),
         .errno => |what| return emitErrno(what),
     }
+    if (progress.done != progress.total or progress.entries_done != progress.entries_total)
+        return emitError("source tree changed while it was copied; progress manifest drifted");
+    var after_total: u64 = 0;
+    var after_files: u64 = 0;
+    var after_hash = Sha256.init(.{});
+    if (!sizeTree(allocator, spec.src, &after_total, &after_files, &after_hash))
+        return emitError("source tree changed while it was copied; final listing failed");
+    var after: [Sha256.digest_length]u8 = undefined;
+    after_hash.final(&after);
+    if (after_total != progress.total or after_files != progress.entries_total or
+        !std.mem.eql(u8, &before, &after))
+        return emitError("source tree changed while it was copied; source fingerprint drifted");
     emitCopyDone(&progress);
     return 0;
 }
 
-fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64, files: *u64) bool {
+fn stampU64(hash: *Sha256, value: u64) void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, value, .little);
+    hash.update(&buf);
+}
+
+fn stampEntry(hash: *Sha256, path: []const u8, kind: []const u8, size: u64, mode: u32, mtime_ns: i64, ctime_ns: i64, dev: u64, ino: u64, target: []const u8) void {
+    stampU64(hash, path.len);
+    hash.update(path);
+    stampU64(hash, kind.len);
+    hash.update(kind);
+    stampU64(hash, size);
+    stampU64(hash, mode);
+    stampU64(hash, @bitCast(mtime_ns));
+    stampU64(hash, @bitCast(ctime_ns));
+    stampU64(hash, dev);
+    stampU64(hash, ino);
+    stampU64(hash, target.len);
+    hash.update(target);
+}
+
+fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64, files: *u64, hash: *Sha256) bool {
+    var dir_st: c.struct_stat = undefined;
+    if (!statOf(dir_path, &dir_st, false)) return false;
+    const dir_mtime = if (@hasField(c.struct_stat, "st_mtim")) dir_st.st_mtim else dir_st.st_mtimespec;
+    const dir_ctime = if (@hasField(c.struct_stat, "st_ctim")) dir_st.st_ctim else dir_st.st_ctimespec;
+    stampEntry(hash, dir_path, "dir", 0, @intCast(dir_st.st_mode & 0o7777), @as(i64, @intCast(dir_mtime.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(dir_mtime.tv_nsec)), @as(i64, @intCast(dir_ctime.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(dir_ctime.tv_nsec)), @intCast(dir_st.st_dev), @intCast(dir_st.st_ino), "");
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return false;
     if (l.truncated) return false;
     for (l.entries) |e| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("{s}/{s}", .{ dir_path, e.name }) catch return false;
+        const child = w.buffered();
+        stampEntry(hash, child, e.kind, e.size, e.mode, e.mtime_ns, e.ctime_ns, e.dev, e.ino, e.target orelse "");
         if (std.mem.eql(u8, e.kind, "dir")) {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.Writer.fixed(&buf);
-            w.print("{s}/{s}", .{ dir_path, e.name }) catch return false;
-            if (!sizeTree(allocator, w.buffered(), total, files)) return false;
+            if (!sizeTree(allocator, child, total, files, hash)) return false;
         } else if (std.mem.eql(u8, e.kind, "file")) {
-            total.* += e.size;
-            files.* += 1;
+            total.* = std.math.add(u64, total.*, e.size) catch return false;
+            files.* = std.math.add(u64, files.*, 1) catch return false;
         }
     }
     return true;
@@ -2992,7 +4089,7 @@ fn uniqueInDir(dir: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
     return uniqueName(base, buf, OnDisk{ .dir = dir });
 }
 
-fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, opts: CopyOpts, progress: *Progress) CopyResult {
+fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, opts: CopyOpts, progress: *Progress, root: bool) CopyResult {
     var src_st: c.struct_stat = undefined;
     if (!statOf(src_dir, &src_st, true)) return .{ .errno = "stat dir" };
     {
@@ -3002,6 +4099,7 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
         if (rc == 0) {
             if (!fsyncParent(dst_dir)) return .{ .errno = "fsync directory parent" };
         } else if (std.posix.errno(@as(c_int, -1)) == .EXIST) {
+            if (root and opts.no_replace) return .{ .err = "destination exists" };
             var st2: c.struct_stat = undefined;
             if (c.stat(dp, &st2) != 0 or (st2.st_mode & c.S_IFMT) != c.S_IFDIR) return .{ .errno = "mkdir" };
         } else return .{ .errno = "mkdir" };
@@ -3032,8 +4130,9 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
                 if (opts.conflict == .skip) {
                     // Counted as handled: `total` already includes it,
                     // so not counting it would strand the bar short.
-                    if (std.mem.eql(u8, e.kind, "file")) progress.add(e.size);
-                    progress.entryDone();
+                    if (std.mem.eql(u8, e.kind, "file") and !progress.add(e.size))
+                        return .{ .err = "copy progress overflow" };
+                    if (!progress.entryDone()) return .{ .err = "file-count overflow" };
                     continue;
                 }
                 const name = uniqueInDir(dst_dir, e.name, &unique_buf) orelse
@@ -3045,7 +4144,7 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
         }
 
         if (std.mem.eql(u8, e.kind, "dir")) {
-            switch (copyTreeDir(allocator, spath, dpath, opts, progress)) {
+            switch (copyTreeDir(allocator, spath, dpath, opts, progress, false)) {
                 .ok => {},
                 else => |r| return r,
             }
@@ -3081,9 +4180,10 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
                     const src_h = hashPrefix(spath, e.size, null);
                     const dst_h = hashPrefix(dpath, e.size, null);
                     if (src_h != null and dst_h != null and std.mem.eql(u8, &src_h.?, &dst_h.?)) {
-                        progress.resumed += e.size;
-                        progress.add(e.size);
-                        progress.entryDone();
+                        progress.resumed = std.math.add(u64, progress.resumed, e.size) catch
+                            return .{ .err = "copy progress overflow" };
+                        if (!progress.add(e.size) or !progress.entryDone())
+                            return .{ .err = "copy progress overflow" };
                         continue;
                     }
                 }
@@ -3092,8 +4192,8 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
             if (!statOf(spath, &fst, true)) return .{ .errno = "stat source file" };
             // Only regular files are counted: `entries_total` comes
             // from sizeTree, which counts exactly those.
-            switch (copyOneFile(spath, dpath, fst, opts.allow_resume, opts.verify, progress)) {
-                .ok => progress.entryDone(),
+            switch (copyOneFile(spath, dpath, fst, opts.allow_resume, opts.verify, false, progress)) {
+                .ok => if (!progress.entryDone()) return .{ .err = "file-count overflow" },
                 else => |r| return r,
             }
         }
@@ -3126,7 +4226,7 @@ fn runDeleteTree(spec: Spec) u8 {
         const p = pathz.pathZ(&z, spec.src) catch return emitError("path too long");
         if (c.unlink(p) != 0) return emitErrno("unlink");
         progress.done += 1;
-        progress.entryDone();
+        if (!progress.entryDone()) return emitError("file-count overflow");
     }
     emit(.{
         .ev = "done",
@@ -3180,7 +4280,7 @@ fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
             progress.setFile(full);
             if (c.unlink(fz) != 0) return false;
             progress.done += 1;
-            progress.entryDone();
+            if (!progress.entryDone()) return false;
         }
     }
     // A directory too wide for the name buffer: re-run this level
@@ -3189,7 +4289,7 @@ fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
     progress.setFile(dir_path);
     if (c.rmdir(dz) != 0) return false;
     progress.done += 1;
-    progress.entryDone();
+    if (!progress.entryDone()) return false;
     return true;
 }
 
@@ -3882,7 +4982,7 @@ test "copyOneFile resumes only on matching prefix hash" {
     // pipe. Emitting into it corrupts the protocol and wedges the
     // run -- the "test runner hangs" this file caused for a while.
     var progress = Progress{ .total = data.len, .quiet = true };
-    switch (copyOneFile(src, dst, st, true, false, &progress)) {
+    switch (copyOneFile(src, dst, st, true, false, false, &progress)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
@@ -3901,7 +5001,7 @@ test "copyOneFile resumes only on matching prefix hash" {
         try t.expect(c.fwrite(&junk, 1, junk.len, f) == junk.len);
     }
     var progress2 = Progress{ .total = data.len, .quiet = true };
-    switch (copyOneFile(src, dst, st, true, false, &progress2)) {
+    switch (copyOneFile(src, dst, st, true, false, false, &progress2)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
@@ -3998,4 +5098,83 @@ test "pdfinfo fallback maps the document keys" {
     try t.expectEqualStrings("A. Writer", m.get("doc.author").?);
     try t.expectEqualStrings("pdfTeX", m.get("doc.producer").?);
     try t.expectEqualStrings("595 x 842 pts (A4)", m.get("doc.page_size").?);
+}
+
+test "cross-copy manifest totals reject overflow" {
+    const t = std.testing;
+    var manifest = CrossCopy.Manifest{ .allocator = t.allocator };
+    defer manifest.deinit();
+    try manifest.append("first", .{ .name = "first", .kind = "file", .size = std.math.maxInt(u64) });
+    try t.expectError(error.Overflow, manifest.append("second", .{ .name = "second", .kind = "file", .size = 1 }));
+    try t.expectEqual(std.math.maxInt(u64), manifest.total);
+    try t.expectEqual(@as(u64, 1), manifest.files);
+}
+
+test "cross-copy source deletion recognizes idempotent NOENT" {
+    try std.testing.expect(CrossCopy.noEntDetail("NOENT"));
+    try std.testing.expect(CrossCopy.noEntDetail("delete failed: NOENT"));
+    try std.testing.expect(!CrossCopy.noEntDetail("NOTEMPTY"));
+}
+
+test "helper journals retain progress and explicit move phase" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const dir = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    const spec = Spec{
+        .op = "cross_copy",
+        .src = "/source",
+        .dst = "/destination",
+        .src_host = "src",
+        .dst_host = "dst",
+        .@"resume" = true,
+        .delete_src = true,
+        .no_replace = true,
+        .job_id = 73,
+        .journal_dir = dir,
+        .client_token = "move-73",
+    };
+    const progress = Progress{
+        .done = 99,
+        .total = 123,
+        .resumed = 11,
+        .entries_done = 7,
+        .entries_total = 9,
+        .quiet = true,
+    };
+    durable_progress = .{};
+    try t.expect(persistCrossPhase(spec, "copied", &progress, .{
+        .quarantine = "/.sketerm-move-73-deadbeef",
+        .fingerprint = "0123456789abcdef",
+        .source_kind = "file",
+        .source_dev = 4,
+        .source_ino = 5,
+    }));
+    // A terminal error carries no counters. Its final helper write must
+    // preserve the durable copy boundary and progress rather than zero it.
+    durable_progress.done = 0;
+    durable_progress.total = 0;
+    durable_progress.resumed_from = 0;
+    durable_progress.files_done = 0;
+    durable_progress.files_total = 0;
+    durable_progress.phase_len = 0;
+    try saveHelperJournal(t.allocator, spec, "failed");
+    const path = try std.fmt.allocPrint(arena.allocator(), "{s}/73.json", .{dir});
+    const parsed = try fsjournal.load(arena.allocator(), path);
+    defer parsed.deinit();
+    try t.expectEqualStrings("failed", parsed.value.state);
+    try t.expectEqualStrings("copied", parsed.value.phase);
+    try t.expectEqual(@as(u64, 99), parsed.value.done);
+    try t.expectEqual(@as(u64, 123), parsed.value.total);
+    try t.expectEqual(@as(u64, 11), parsed.value.resumed_from);
+    try t.expectEqual(@as(u64, 7), parsed.value.files_done);
+    try t.expectEqual(@as(u64, 9), parsed.value.files_total);
+    try t.expect(parsed.value.no_replace);
+    try t.expectEqualStrings("/.sketerm-move-73-deadbeef", parsed.value.source_quarantine);
+    try t.expectEqualStrings("0123456789abcdef", parsed.value.source_fingerprint);
+    try t.expectEqualStrings("file", parsed.value.source_kind);
+    try t.expectEqual(@as(u64, 4), parsed.value.source_dev);
+    try t.expectEqual(@as(u64, 5), parsed.value.source_ino);
 }
