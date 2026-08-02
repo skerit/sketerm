@@ -927,6 +927,8 @@ pub const CopyRetry = struct {
     /// Persistent record identity. The record outlives this pane;
     /// each daemon attempt uses the record's separately-rotated token.
     token: []u8,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
     dest_key: u64,
     /// Automatic attempts already spent, so a host that is simply gone
     /// stops costing retries and the row settles as failed.
@@ -979,6 +981,8 @@ pub const CopyRetry = struct {
             .dst_path = dst,
             .label = label,
             .token = token,
+            .batch_id = self.batch_id,
+            .batch_total = self.batch_total,
             .dest_key = self.dest_key,
             .attempts = self.attempts,
             .move = self.move,
@@ -1030,6 +1034,9 @@ pub const JobRow = struct {
     hc: *HostConn,
     job: u64,
     label: []u8,
+    /// Nonzero when this job is one item in a user paste/drop batch.
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
     done: u64 = 0,
     total: u64 = 0,
     /// Bytes a staged partial contributed (sticky).
@@ -1096,6 +1103,8 @@ pub const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
     kind: enum { normal, query, compare_left, compare_right, calc_size, dup_scan, archive_list } = .normal,
     /// The tab whose query this job feeds (`.query` only). Validated
     /// with `tabAlive` before use: a tab can close between the start
@@ -1121,6 +1130,8 @@ pub const ActiveTransfer = struct {
     src_hc: *HostConn,
     dst_hc: *HostConn,
     label: []u8,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
     /// Launch the local destination file when the transfer lands
     /// (remote-file open-with-default path).
     open_when_done: bool = false,

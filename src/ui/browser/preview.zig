@@ -37,6 +37,7 @@ const imagecodec = @import("../../util/imagecodec.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
+const Dir = @import("types.zig").Dir;
 const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const WireJobEv = @import("types.zig").WireJobEv;
@@ -1468,19 +1469,124 @@ fn setCardLabel(label: *c.GtkLabel, text: []const u8) void {
     c.gtk_label_set_text(label, &z);
 }
 
+const SelectionSummary = struct {
+    files: usize = 0,
+    dirs: usize = 0,
+    missing: usize = 0,
+    bytes: u64 = 0,
+    overflowed: bool = false,
+};
+
+fn addSelectionEntry(summary: *SelectionSummary, entry: ?*const Entry) void {
+    const e = entry orelse {
+        summary.missing += 1;
+        return;
+    };
+    if (e.tdir) {
+        summary.dirs += 1;
+        return;
+    }
+    summary.files += 1;
+    if (std.math.maxInt(u64) - summary.bytes < e.size) summary.overflowed = true;
+    summary.bytes +|= e.size;
+}
+
+fn selectionSummarySlow(tab: *BTab) SelectionSummary {
+    var summary = SelectionSummary{};
+    for (tab.selected.items) |path| addSelectionEntry(&summary, entryForPath(tab, path));
+    return summary;
+}
+
+fn collectSelectedDir(summary: *SelectionSummary, wanted: *std.StringHashMapUnmanaged(void), dir: *Dir) void {
+    var path_buf: [4096]u8 = undefined;
+    for (dir.entries.items) |*entry| {
+        const path = dir.fullPath(entry.*, &path_buf) orelse continue;
+        if (!wanted.remove(path)) continue;
+        addSelectionEntry(summary, entry);
+    }
+}
+
+fn selectionSummary(tab: *BTab) SelectionSummary {
+    var wanted: std.StringHashMapUnmanaged(void) = .empty;
+    defer wanted.deinit(tab.view.allocator);
+    for (tab.selected.items) |path|
+        wanted.put(tab.view.allocator, path, {}) catch return selectionSummarySlow(tab);
+
+    var summary = SelectionSummary{};
+    collectSelectedDir(&summary, &wanted, tab.root);
+    for (tab.subdirs.items) |dir| collectSelectedDir(&summary, &wanted, dir);
+    for (tab.ancestors.items) |dir| collectSelectedDir(&summary, &wanted, dir);
+    summary.missing = wanted.count();
+    return summary;
+}
+
+test "selection summary totals files without pretending folders are sized" {
+    var summary = SelectionSummary{};
+    const file = Entry{
+        .name = @constCast("a"),
+        .kind = @constCast("file"),
+        .size = 42,
+        .mode = 0,
+        .mtime_ms = 0,
+        .target = null,
+        .tdir = false,
+    };
+    const folder = Entry{
+        .name = @constCast("dir"),
+        .kind = @constCast("directory"),
+        .size = 4096,
+        .mode = 0,
+        .mtime_ms = 0,
+        .target = null,
+        .tdir = true,
+    };
+    addSelectionEntry(&summary, &file);
+    addSelectionEntry(&summary, &folder);
+    addSelectionEntry(&summary, null);
+    try std.testing.expectEqual(@as(usize, 1), summary.files);
+    try std.testing.expectEqual(@as(usize, 1), summary.dirs);
+    try std.testing.expectEqual(@as(usize, 1), summary.missing);
+    try std.testing.expectEqual(@as(u64, 42), summary.bytes);
+}
+
 /// Refresh the sidebar card from the current selection. Cheap and
 /// fetch-free: cached row thumbnail or themed icon, stat facts only.
 pub fn updateSideCard(self: *BrowserView) void {
     if (!self.side_info) return;
     const tab = self.currentTab() orelse return;
+    const summary = if (tab.selected.items.len > 1) selectionSummary(tab) else null;
+    updateSideCardSummary(self, tab, summary);
+}
+
+fn updateSideCardSummary(self: *BrowserView, tab: *BTab, multi_summary: ?SelectionSummary) void {
+    if (!self.side_info) return;
     var type_buf: [256:0]u8 = undefined;
     var sz: [48:0]u8 = undefined;
     var tz: [40:0]u8 = undefined;
     var line: [128]u8 = undefined;
     if (tab.selected.items.len > 1) {
+        const summary = multi_summary orelse selectionSummary(tab);
         setCardLabel(self.side_card_title, std.fmt.bufPrint(&line, "{d} items selected", .{tab.selected.items.len}) catch "");
-        setCardLabel(self.side_card_sub, "");
-        setCardLabel(self.side_card_sub2, "");
+        if (summary.files > 0) {
+            setCardLabel(self.side_card_sub, std.fmt.bufPrint(&line, "{s} in {d} file(s)", .{
+                fmtSize(&sz, summary.bytes), summary.files,
+            }) catch "");
+        } else {
+            setCardLabel(self.side_card_sub, "");
+        }
+        if (summary.overflowed) {
+            setCardLabel(self.side_card_sub2, "size exceeds the supported range; displayed total is a lower bound");
+        } else if (summary.dirs > 0 and summary.missing > 0) {
+            setCardLabel(self.side_card_sub2, std.fmt.bufPrint(&line, "{d} folder(s) not included; {d} size(s) unavailable", .{
+                summary.dirs, summary.missing,
+            }) catch "some sizes unavailable");
+        } else if (summary.dirs > 0) {
+            setCardLabel(self.side_card_sub2, std.fmt.bufPrint(&line, "{d} folder(s) - contents not included", .{summary.dirs}) catch "folder contents not included");
+        } else if (summary.missing > 0) {
+            setCardLabel(self.side_card_sub2, std.fmt.bufPrint(&line, "{d} item size(s) unavailable", .{summary.missing}) catch "some sizes unavailable");
+        } else {
+            setCardLabel(self.side_card_sub2, "");
+        }
         c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(self.side_card_img)), "dialog-information-symbolic");
         return;
     }
@@ -1673,28 +1779,19 @@ fn showFolderSummary(self: *BrowserView, tab: *BTab) void {
 }
 
 /// N entries selected: an aggregate, like Dolphin's "N items".
-fn showMultiSummary(self: *BrowserView, tab: *BTab) void {
-    var total: u64 = 0;
-    var files: usize = 0;
-    var dirs: usize = 0;
-    for (tab.selected.items) |p| {
-        const e = entryForPath(tab, p) orelse continue;
-        if (e.tdir) {
-            dirs += 1;
-        } else {
-            files += 1;
-            total += e.size;
-        }
-    }
+fn showMultiSummary(self: *BrowserView, tab: *BTab, summary: SelectionSummary) void {
     var nb: [64]u8 = undefined;
     setPanelName(self, std.fmt.bufPrint(&nb, "{d} items selected", .{tab.selected.items.len}) catch "");
     setPanelIconName(self, "dialog-information-symbolic");
     var b: [48]u8 = undefined;
-    if (files > 0) addInfoRow(self, "Files", std.fmt.bufPrint(&b, "{d}", .{files}) catch "");
+    if (summary.files > 0) addInfoRow(self, "Files", std.fmt.bufPrint(&b, "{d}", .{summary.files}) catch "");
     var b2: [48]u8 = undefined;
-    if (dirs > 0) addInfoRow(self, "Folders", std.fmt.bufPrint(&b2, "{d}", .{dirs}) catch "");
+    if (summary.dirs > 0) addInfoRow(self, "Folders", std.fmt.bufPrint(&b2, "{d}", .{summary.dirs}) catch "");
     var sz: [48:0]u8 = undefined;
-    if (total > 0) addInfoRow(self, "Total size", fmtSize(&sz, total));
+    if (summary.files > 0) addInfoRow(self, if (summary.dirs == 0 and summary.missing == 0 and !summary.overflowed) "Total size" else "Known file size", fmtSize(&sz, summary.bytes));
+    if (summary.dirs > 0) addInfoRow(self, "Size note", "folder contents are not included");
+    if (summary.overflowed) addInfoRow(self, "Size limit", "the displayed value is a lower bound");
+    if (summary.missing > 0) addInfoRow(self, "Unavailable", std.fmt.bufPrint(&b, "{d} item(s)", .{summary.missing}) catch "some items");
 }
 
 /// Refresh the Information panel and the overlay from the current
@@ -1703,8 +1800,14 @@ fn showMultiSummary(self: *BrowserView, tab: *BTab) void {
 pub fn updatePreview(self: *BrowserView) void {
     // The sidebar card follows every selection change, even with the
     // full panel off; it is deliberately fetch-free.
-    updateSideCard(self);
-    if (!self.preview_on and self.preview_state.ql == null) return;
+    const selected_tab = self.currentTab();
+    const panel_visible = self.preview_on or self.preview_state.ql != null;
+    const multi_summary: ?SelectionSummary = if (selected_tab) |tab|
+        (if (tab.selected.items.len > 1 and (self.side_info or (panel_visible and self.preview_state.ql == null))) selectionSummary(tab) else null)
+    else
+        null;
+    if (self.side_info) if (selected_tab) |tab| updateSideCardSummary(self, tab, multi_summary);
+    if (!panel_visible) return;
     self.preview_generation +%= 1;
     if (self.preview_generation == 0) self.preview_generation = 1;
     self.abandonPreviewRead();
@@ -1719,7 +1822,7 @@ pub fn updatePreview(self: *BrowserView) void {
     // A multi-selection gets an aggregate panel; the overlay is
     // excluded because its cursor is always exactly one entry.
     if (self.preview_state.ql == null and tab.selected.items.len > 1) {
-        showMultiSummary(self, tab);
+        showMultiSummary(self, tab, multi_summary orelse selectionSummary(tab));
         return;
     }
     const path = previewTargetPath(self, tab) orelse {

@@ -26,8 +26,9 @@ const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const MIN_READ_VERSION: u32 = 2;
+pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn readableVersion(version: u32) bool {
     return version >= MIN_READ_VERSION and version <= VERSION;
@@ -35,7 +36,7 @@ pub fn readableVersion(version: u32) bool {
 
 pub const Kind = enum { download, upload };
 pub const State = enum { queued, submitting, running, waiting_retry, done, failed, canceled };
-pub const RType = enum { intent, watch };
+pub const RType = enum { intent, watch, batch };
 
 pub const FileRef = struct {
     host: []const u8 = "",
@@ -85,6 +86,14 @@ pub const Intent = struct {
     /// a browser face. Its intent is still ledger-owned, so queued and
     /// running work can be adopted after that face or process exits.
     user_copy: bool = false,
+    /// Presentation identity shared by every item admitted by one
+    /// paste/drop command. Zero is an ungrouped transfer.
+    batch_id: u64 = 0,
+    batch_total: u64 = 0,
+    /// Durable parent identity for a manifest child. Unlike batch_id,
+    /// this is nonzero/nonempty even for a one-item command and lets an
+    /// adopter retain tombstones while another process owns the parent.
+    batch_token: []const u8 = "",
     /// Daemon that owns the current idempotent attempt. Empty is local;
     /// coordinator_set distinguishes that from an unsubmitted record.
     coordinator_host: []const u8 = "",
@@ -110,6 +119,31 @@ pub const Watch = struct {
     synced_mtime_ns: i64 = 0,
 };
 
+pub const BatchItem = struct {
+    token: []const u8 = "",
+    src_path: []const u8 = "",
+    dst_path: []const u8 = "",
+    /// A known collision waits for the interactive conflict flow.
+    /// Null is safe to admit with no-replace, including a drop whose
+    /// destination probe had not answered before recovery.
+    conflict_is_dir: ?bool = null,
+};
+
+/// Durable admission plan for one multi-item browser command. Every
+/// child token is fixed before the manifest lands, so recovery can
+/// materialize missing per-item records without duplicating any that
+/// were already created before a crash.
+pub const Batch = struct {
+    token: []const u8 = "",
+    batch_id: u64 = 0,
+    batch_total: u64 = 0,
+    src_host: []const u8 = "",
+    dst_host: []const u8 = "",
+    move: bool = false,
+    no_replace: bool = true,
+    items: []const BatchItem = &.{},
+};
+
 /// One ledger file. The unused arm keeps its defaults, so the record
 /// is one flat, forward-compatible JSON object.
 pub const Record = struct {
@@ -117,6 +151,7 @@ pub const Record = struct {
     rtype: RType = .intent,
     intent: Intent = .{},
     watch: Watch = .{},
+    batch: Batch = .{},
 };
 
 /// `$XDG_STATE_HOME/sketerm/file-transfers.d`.
@@ -141,6 +176,7 @@ fn prefixOf(rtype: RType) []const u8 {
     return switch (rtype) {
         .intent => "i",
         .watch => "w",
+        .batch => "b",
     };
 }
 
@@ -167,6 +203,16 @@ pub const Handle = struct {
 
     /// Delete the record, then drop ownership.
     pub fn destroyRecord(self: *Handle) bool {
+        return self.destroyRecordImpl(true);
+    }
+
+    /// Delete without a directory fsync after a parent manifest's
+    /// durable deletion already made resurrection harmless.
+    pub fn destroyRecordUnsynced(self: *Handle) bool {
+        return self.destroyRecordImpl(false);
+    }
+
+    fn destroyRecordImpl(self: *Handle, sync_parent: bool) bool {
         var removed = true;
         var z: [4096]u8 = undefined;
         if (pathz.pathZ(&z, self.json_path)) |p| {
@@ -175,6 +221,7 @@ pub const Handle = struct {
         if (pathz.pathZ(&z, self.lock_path)) |p| {
             if (c.unlink(p) != 0 and std.posix.errno(-1) != .NOENT) removed = false;
         } else |_| removed = false;
+        if (sync_parent and !syncParentDir(self.json_path)) removed = false;
         self.release();
         return removed;
     }
@@ -186,12 +233,22 @@ pub const Handle = struct {
         defer out.deinit();
         try std.json.Stringify.value(record, .{}, &out.writer);
         const bytes = out.written();
+        if (bytes.len > MAX_RECORD_BYTES) return error.RecordTooLarge;
         const h = std.hash.Wyhash.hash(0x51ed, bytes);
         if (h == self.written_hash) return;
         try writeFileAtomic(self.allocator, self.json_path, bytes);
         self.written_hash = h;
     }
 };
+
+fn syncParentDir(path: []const u8) bool {
+    const parent = std.fs.path.dirname(path) orelse return true;
+    var z: [4096]u8 = undefined;
+    const fd = c.open(pathz.pathZ(&z, parent) catch return false, c.O_RDONLY | c.O_DIRECTORY);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    return c.fsync(fd) == 0;
+}
 
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     const temp = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, c.getpid() });
@@ -218,9 +275,30 @@ fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []cons
     const parent = std.fs.path.dirname(path) orelse return;
     var dz: [4096]u8 = undefined;
     const dfd = c.open(try pathz.pathZ(&dz, parent), c.O_RDONLY | c.O_DIRECTORY);
-    if (dfd < 0) return;
+    if (dfd < 0) {
+        poisonRecord(path);
+        return error.WriteFailed;
+    }
     defer _ = c.close(dfd);
-    _ = c.fsync(dfd);
+    if (c.fsync(dfd) != 0) {
+        // The rename may or may not survive a crash. Make the renamed
+        // inode unreadable to every ledger version, so either outcome
+        // is safe rather than an uncertain command becoming runnable.
+        poisonRecord(path);
+        return error.WriteFailed;
+    }
+}
+
+fn poisonRecord(path: []const u8) void {
+    var z: [4096]u8 = undefined;
+    const fp = c.fopen(pathz.pathZ(&z, path) catch return, "wb") orelse return;
+    const bytes = "{\"version\":0}";
+    const written = c.fwrite(bytes.ptr, 1, bytes.len, fp);
+    if (written == bytes.len and c.fflush(fp) == 0) {
+        const fd = c.fileno(fp);
+        if (fd >= 0) _ = c.fsync(fd);
+    }
+    _ = c.fclose(fp);
 }
 
 /// Take ownership of `token`'s record, creating the lock when it does
@@ -265,12 +343,20 @@ pub fn open(allocator: std.mem.Allocator, rtype: RType, token: []const u8) !?Han
 /// Read one record file. `null` = no such file.
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) !?std.json.Parsed(Record) {
     var z: [4096]u8 = undefined;
-    const fp = c.fopen(try pathz.pathZ(&z, path), "rb") orelse return null;
+    const fp = c.fopen(try pathz.pathZ(&z, path), "rb") orelse {
+        if (std.posix.errno(-1) == .NOENT) return null;
+        return error.ReadFailed;
+    };
     defer _ = c.fclose(fp);
-    var bytes: [256 * 1024]u8 = undefined;
-    const n = c.fread(&bytes, 1, bytes.len, fp);
-    if (n == 0 or n == bytes.len) return error.BadRecord;
-    return std.json.parseFromSlice(Record, allocator, bytes[0..n], .{
+    if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.BadRecord;
+    const raw_len = c.ftell(fp);
+    if (raw_len <= 0 or raw_len > MAX_RECORD_BYTES) return error.BadRecord;
+    if (c.fseek(fp, 0, c.SEEK_SET) != 0) return error.BadRecord;
+    const bytes = try allocator.alloc(u8, @intCast(raw_len));
+    defer allocator.free(bytes);
+    const n = c.fread(bytes.ptr, 1, bytes.len, fp);
+    if (n != bytes.len) return error.BadRecord;
+    return std.json.parseFromSlice(Record, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch error.BadRecord;
@@ -309,6 +395,7 @@ pub fn list(allocator: std.mem.Allocator) ![]Entry {
         const rtype: RType = switch (name[0]) {
             'i' => .intent,
             'w' => .watch,
+            'b' => .batch,
             else => continue,
         };
         const token = name[2 .. name.len - ".json".len];
@@ -502,6 +589,37 @@ test "a client-mediated record carries what its driver needs to resume" {
     try t.expectEqualStrings("/local/f", v.dst.path);
 }
 
+test "a batch manifest round trips deterministic child identities" {
+    const t = std.testing;
+    var tmp = try TmpState.init(t.allocator);
+    defer tmp.deinit(t.allocator);
+
+    var h = (try open(t.allocator, .batch, "batch-one")) orelse return error.LockBusy;
+    defer _ = h.destroyRecord();
+    const items = [_]BatchItem{
+        .{ .token = "child-a", .src_path = "/src/a", .dst_path = "/dst/a" },
+        .{ .token = "child-b", .src_path = "/src/b", .dst_path = "/dst/b", .conflict_is_dir = true },
+    };
+    try h.write(.{ .rtype = .batch, .batch = .{
+        .token = "batch-one",
+        .batch_id = 99,
+        .batch_total = 2,
+        .src_host = "",
+        .dst_host = "box",
+        .move = true,
+        .items = &items,
+    } });
+    const parsed = (try readToken(t.allocator, .batch, "batch-one")) orelse return error.Missing;
+    defer parsed.deinit();
+    try t.expectEqual(RType.batch, parsed.value.rtype);
+    try t.expectEqual(@as(u64, 99), parsed.value.batch.batch_id);
+    try t.expect(parsed.value.batch.move);
+    try t.expectEqual(@as(usize, 2), parsed.value.batch.items.len);
+    try t.expectEqualStrings("child-b", parsed.value.batch.items[1].token);
+    try t.expectEqualStrings("/dst/b", parsed.value.batch.items[1].dst_path);
+    try t.expectEqual(@as(?bool, true), parsed.value.batch.items[1].conflict_is_dir);
+}
+
 test "a queued browser move persists its recovery identity" {
     const t = std.testing;
     var tmp = try TmpState.init(t.allocator);
@@ -521,6 +639,9 @@ test "a queued browser move persists its recovery identity" {
         .coordinator_host = "relay",
         .coordinator_set = true,
         .ack_host = "relay",
+        .batch_id = 0x1234,
+        .batch_total = 400,
+        .batch_token = "batch-1",
     } });
     const parsed = (try readToken(t.allocator, .intent, "move-record")) orelse return error.Missing;
     defer parsed.deinit();
@@ -532,14 +653,18 @@ test "a queued browser move persists its recovery identity" {
     try t.expect(v.coordinator_set);
     try t.expectEqualStrings("relay", v.coordinator_host);
     try t.expectEqualStrings("relay", v.ack_host);
+    try t.expectEqual(@as(u64, 0x1234), v.batch_id);
+    try t.expectEqual(@as(u64, 400), v.batch_total);
+    try t.expectEqualStrings("batch-1", v.batch_token);
 }
 
-test "ledger v4 excludes older writers while retaining v2 recovery" {
+test "ledger v5 excludes older writers while retaining v2 recovery" {
     try std.testing.expect(!readableVersion(1));
     try std.testing.expect(readableVersion(2));
     try std.testing.expect(readableVersion(3));
     try std.testing.expect(readableVersion(4));
-    try std.testing.expect(!readableVersion(5));
+    try std.testing.expect(readableVersion(5));
+    try std.testing.expect(!readableVersion(6));
 }
 
 test "list reports every record identity in the ledger directory" {

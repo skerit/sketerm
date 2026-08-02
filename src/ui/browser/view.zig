@@ -60,6 +60,7 @@ const PreviewState = @import("preview.zig").State;
 const RemoteThumb = @import("preview.zig").RemoteThumb;
 const RestoreRead = @import("ops.zig").RestoreRead;
 const DropProbe = @import("ops.zig").DropProbe;
+const PasteRun = @import("ops.zig").PasteRun;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
 const colkeys = @import("../../filebrowser/colkeys.zig");
@@ -88,6 +89,10 @@ pub const BrowserView = struct {
     pending_opens: std.ArrayList(*PendingOpen) = .empty,
     pending_jobs: std.ArrayList(*PendingJob) = .empty,
     drop_probes: std.ArrayList(*DropProbe) = .empty,
+    /// Paste commands are admitted one durable item per idle dispatch,
+    /// keeping large selections responsive while fsync runs.
+    paste_runs: std.ArrayList(*PasteRun) = .empty,
+    paste_idle: c.guint = 0,
     jobs: std.ArrayList(*JobRow) = .empty,
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
     /// Cross-host copies waiting for their destination (jobs.zig).
@@ -599,6 +604,8 @@ pub const BrowserView = struct {
     pub const copyToClip = @import("ops.zig").copyToClip;
     pub const beginPaste = @import("ops.zig").beginPaste;
     pub const pasteOne = @import("ops.zig").pasteOne;
+    pub const resolvePasteConflict = @import("ops.zig").resolvePasteConflict;
+    pub const settleUserBatch = @import("ops.zig").settleUserBatch;
     pub const tabAlive = @import("ops.zig").tabAlive;
     pub const uniqueDstName = @import("ops.zig").uniqueDstName;
     pub const duplicateEntry = @import("ops.zig").duplicateEntry;
@@ -658,6 +665,7 @@ pub const BrowserView = struct {
     pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
     pub const startTransfer = @import("jobs.zig").startTransfer;
+    pub const startBatchTransfer = @import("jobs.zig").startBatchTransfer;
     pub const retryCopyJob = @import("jobs.zig").retryCopyJob;
     pub const dropSupersededRetryRows = @import("jobs.zig").dropSupersededRetryRows;
     pub const cancelPendingRetries = @import("jobs.zig").cancelPendingRetries;
@@ -1206,6 +1214,9 @@ pub const BrowserView = struct {
         self.pending_jobs.deinit(self.allocator);
         for (self.drop_probes.items) |probe| probe.destroy(self.allocator);
         self.drop_probes.deinit(self.allocator);
+        if (self.paste_idle != 0) _ = c.g_source_remove(self.paste_idle);
+        for (self.paste_runs.items) |run| run.destroy(self.allocator);
+        self.paste_runs.deinit(self.allocator);
         for (self.jobs.items) |j| {
             if (j.undo_op) |u| u.destroy(self.allocator);
             if (j.undo_trash_orig) |o| self.allocator.free(o);

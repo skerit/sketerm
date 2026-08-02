@@ -1045,6 +1045,7 @@ pub const Window = struct {
             service.addMediatedDriver(
                 @ptrCast(bv),
                 &@import("browser/jobs.zig").adoptMediated,
+                &@import("browser/ops.zig").adoptPasteBatch,
                 &@import("browser/jobs.zig").refreshJobsPanel,
             );
         bv.hooks_ctx = @ptrCast(self);

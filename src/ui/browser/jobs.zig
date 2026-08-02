@@ -209,6 +209,8 @@ pub const CopyItem = struct {
     dst_path: []u8,
     label: []u8,
     token: []u8,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
     dest_key: u64,
     move: bool = false,
     no_replace: bool = false,
@@ -242,6 +244,8 @@ fn enqueueCrossCopy(
     dst_path: []const u8,
     move: bool,
     no_replace: bool,
+    batch_id: u64,
+    batch_total: usize,
     recovery_token: ?[]const u8,
 ) void {
     const item = self.allocator.create(CopyItem) catch {
@@ -283,6 +287,9 @@ fn enqueueCrossCopy(
         dst_path,
         move,
         no_replace,
+        batch_id,
+        batch_total,
+        coordinator.host,
     ) orelse {
         self.allocator.free(src);
         self.allocator.free(dst);
@@ -316,6 +323,8 @@ fn enqueueCrossCopy(
         .dst_path = dst,
         .label = label,
         .token = token,
+        .batch_id = batch_id,
+        .batch_total = batch_total,
         .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
         .move = move,
         .no_replace = no_replace,
@@ -413,6 +422,8 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
         .dst_path = item.dst_path,
         .label = item.label,
         .token = item.token,
+        .batch_id = item.batch_id,
+        .batch_total = item.batch_total,
         .dest_key = item.dest_key,
         .attempts = if (self.transfer_service) |service| service.mediatedAttempts(item.token) else 0,
         .move = item.move,
@@ -473,6 +484,8 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
             retry.destroy(self.allocator);
             return false;
         },
+        .batch_id = retry.batch_id,
+        .batch_total = retry.batch_total,
         .dest_key = retry.dest_key,
         .retry = retry,
     };
@@ -489,17 +502,17 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
     // coordinator resolves the other side through ITS OWN ssh/UDP
     // config — which is exactly what direct transfer means.
     const client_token = service.mediatedClientToken(retry.token) orelse {
-            for (self.pending_jobs.items, 0..) |pending, i| {
-                if (pending == pj) {
-                    _ = self.pending_jobs.orderedRemove(i);
-                    break;
-                }
+        for (self.pending_jobs.items, 0..) |pending, i| {
+            if (pending == pj) {
+                _ = self.pending_jobs.orderedRemove(i);
+                break;
             }
-            self.allocator.free(pj.label);
-            self.allocator.destroy(pj);
-            retry.destroy(self.allocator);
-            return false;
-        };
+        }
+        self.allocator.free(pj.label);
+        self.allocator.destroy(pj);
+        retry.destroy(self.allocator);
+        return false;
+    };
     self.sendOp(retry.coordinator, .{
         .req = req,
         .op = "cross_copy",
@@ -861,6 +874,8 @@ pub const TransferOpts = struct {
     /// Cross-host MOVE: delete the source once the copy landed.
     delete_src_after: bool = false,
     no_replace: bool = false,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
 };
 
 /// The daemon that should coordinate a cross-host copy/move, or null
@@ -899,6 +914,8 @@ pub const DeferredTransfer = struct {
     watch_remote: ?[]u8,
     delete_src_after: bool,
     no_replace: bool,
+    batch_id: u64,
+    batch_total: usize,
     /// Existing user-copy recovery record when admission had to wait.
     token: ?[]u8 = null,
 
@@ -959,6 +976,8 @@ fn deferTransfer(
         .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .delete_src_after = opts.delete_src_after,
         .no_replace = opts.no_replace,
+        .batch_id = opts.batch_id,
+        .batch_total = opts.batch_total,
         .token = token_owned,
     };
     self.deferred_transfers.append(self.allocator, d) catch {
@@ -1019,6 +1038,8 @@ pub fn pumpDeferredTransfers(self: *BrowserView) void {
             .watch_remote = d.watch_remote,
             .delete_src_after = d.delete_src_after,
             .no_replace = d.no_replace,
+            .batch_id = d.batch_id,
+            .batch_total = d.batch_total,
         }, if (d.token) |token| token else null, d.coordinator);
         d.destroy(self.allocator);
     }
@@ -1035,6 +1056,41 @@ pub fn startTransfer(
     startTransferImpl(self, src_hc, src_path, dst_hc, dst_path, opts, null, null);
 }
 
+/// Admit one child whose durable identity already lives in a batch
+/// manifest. The per-item record is materialized before queue ownership
+/// moves into the ordinary transfer path.
+pub fn startBatchTransfer(
+    self: *BrowserView,
+    src_hc: *HostConn,
+    src_path: []const u8,
+    dst_hc: *HostConn,
+    dst_path: []const u8,
+    opts: TransferOpts,
+    batch_token: []const u8,
+    item_index: usize,
+) bool {
+    const service = self.transfer_service orelse return false;
+    const coordinator = pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after, opts.no_replace);
+    const token = service.materializeUserBatchItem(
+        batch_token,
+        item_index,
+        if (coordinator) |hc| hc.host else null,
+        dst_path,
+        opts.no_replace,
+        @ptrCast(self),
+    ) orelse return false;
+    if (copyTokenActive(self, token)) return true;
+    // Recovery can encounter a child that completed before the
+    // manifest itself was retired. Its retained tombstone proves this
+    // item needs no second submission.
+    if (!service.mediatedRunnable(token)) return true;
+    const before = self.pending_jobs.items.len + self.copy_queue.items.items.len +
+        self.deferred_transfers.items.len + self.transfers.items.len;
+    startTransferImpl(self, src_hc, src_path, dst_hc, dst_path, opts, token, coordinator);
+    return self.pending_jobs.items.len + self.copy_queue.items.items.len +
+        self.deferred_transfers.items.len + self.transfers.items.len > before;
+}
+
 fn startTransferImpl(
     self: *BrowserView,
     src_hc: *HostConn,
@@ -1047,6 +1103,8 @@ fn startTransferImpl(
 ) void {
     const open_when_done = opts.open_when_done;
     const user_copy = !open_when_done and opts.upload_watch == null;
+    const initial_coordinator = forced_coordinator orelse
+        (if (user_copy) pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after, opts.no_replace) else null);
     var user_token = recovery_token;
     if (user_copy and user_token == null) {
         const service = self.transfer_service orelse {
@@ -1060,6 +1118,9 @@ fn startTransferImpl(
             dst_path,
             opts.delete_src_after,
             opts.no_replace,
+            opts.batch_id,
+            opts.batch_total,
+            if (initial_coordinator) |coordinator| coordinator.host else null,
         ) orelse {
             self.setStatus("transfer not started because its recovery record could not be saved");
             return;
@@ -1070,18 +1131,15 @@ fn startTransferImpl(
     // endpoint itself, while remote-to-remote still prefers the
     // destination daemon's direct path.
     if (user_copy) {
-        if (forced_coordinator) |coordinator| {
+        if (initial_coordinator) |coordinator| {
             if (coordinator.state != .ready) {
                 deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, coordinator, false);
                 return;
             }
             if (coordinator.conn.durable_copy and (!opts.no_replace or coordinator.conn.copy_no_replace) and (!opts.delete_src_after or coordinator.conn.cross_move)) {
-                enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, user_token);
+                enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, opts.batch_id, opts.batch_total, user_token);
                 return;
             }
-        } else if (pickCoordinator(self, src_hc, dst_hc, opts.delete_src_after, opts.no_replace)) |coordinator| {
-            enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, user_token);
-            return;
         }
         if (opts.delete_src_after) {
             deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, null, true);
@@ -1089,7 +1147,7 @@ fn startTransferImpl(
             return;
         }
         if (src_hc.state != .ready or dst_hc.state != .ready) {
-            deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, forced_coordinator, false);
+            deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, initial_coordinator, false);
             return;
         }
         const service = self.transfer_service orelse return;
@@ -1106,7 +1164,7 @@ fn startTransferImpl(
             self.setStatus("both hosts must be connected — retry in a moment");
             return;
         }
-        deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, forced_coordinator, false);
+        deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, initial_coordinator, false);
         return;
     }
     if (opts.no_replace and !dst_hc.conn.copy_no_replace) {
@@ -1145,6 +1203,8 @@ fn startTransferImpl(
         .src_hc = src_hc,
         .dst_hc = dst_hc,
         .label = label,
+        .batch_id = opts.batch_id,
+        .batch_total = opts.batch_total,
         .open_when_done = open_when_done,
         .open_with_appid = if (opts.open_with_appid) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .watch_host = if (opts.watch_host) |s| (self.allocator.dupe(u8, s) catch null) else null,
@@ -1254,6 +1314,8 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
         startTransferImpl(self, src_hc, rec.src_path, dst_hc, rec.dst_path, .{
             .delete_src_after = rec.delete_src_after,
             .no_replace = rec.no_replace,
+            .batch_id = rec.batch_id,
+            .batch_total = @intCast(rec.batch_total),
         }, rec.token, coordinator);
         self.renderJobs();
         self.setStatusFmt("transfer recovered: {s}", .{recovered_name orelse "transfer"});
@@ -1293,6 +1355,8 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
         .src_hc = src_hc,
         .dst_hc = dst_hc,
         .label = label,
+        .batch_id = rec.batch_id,
+        .batch_total = @intCast(rec.batch_total),
         .open_when_done = rec.open_when_done,
         .open_with_appid = if (rec.app_id.len > 0) (self.allocator.dupe(u8, rec.app_id) catch null) else null,
         .watch_host = if (rec.watch_after and rec.src_host.len > 0) (self.allocator.dupe(u8, rec.src_host) catch null) else null,
@@ -1689,6 +1753,8 @@ pub const CopyMode = struct {
     conflict: []const u8 = "",
     dir_mode: []const u8 = "",
     no_replace: bool = false,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
 };
 
 /// startDaemonJob variant that records an undo op on completion.
@@ -1716,6 +1782,8 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
             if (undo) |u| u.destroy(self.allocator);
             return false;
         },
+        .batch_id = mode.batch_id,
+        .batch_total = mode.batch_total,
         .undo_op = undo,
     };
     pj.paths.set(path, to);

@@ -29,6 +29,7 @@ const uniqueDstNameIn = @import("ops.zig").uniqueDstNameIn;
 /// What the user decided for one collision. `merge` and `replace` are
 /// directory-only; `overwrite` is the file spelling of `replace`.
 pub const Choice = enum { overwrite, keep_both, skip, merge, replace };
+pub const ManifestRef = struct { token: []const u8, index: usize };
 
 /// How often the dialog re-reads the thumbnail cache while a
 /// generation it triggered is still in flight.
@@ -50,6 +51,10 @@ pub const Item = struct {
     src_host: ?[]u8,
     is_dir: bool,
     cut: bool,
+    batch_id: u64 = 0,
+    batch_total: usize = 0,
+    manifest_token: ?[]u8 = null,
+    manifest_index: ?usize = null,
     /// In-flight stat requests (0 = answered or never asked).
     src_req: u32 = 0,
     dst_req: u32 = 0,
@@ -65,6 +70,7 @@ pub const Item = struct {
         allocator.free(self.src);
         allocator.free(self.dst);
         if (self.src_host) |h| allocator.free(h);
+        if (self.manifest_token) |token| allocator.free(token);
         allocator.destroy(self);
     }
 
@@ -134,6 +140,29 @@ pub fn cancelTab(self: *BrowserView, tab: *BTab) void {
             i += 1;
             continue;
         }
+        var manifest_buf: [128]u8 = undefined;
+        const manifest = if (item.manifest_token) |token| blk: {
+            if (token.len > manifest_buf.len) break :blk manifest_buf[0..0];
+            @memcpy(manifest_buf[0..token.len], token);
+            break :blk manifest_buf[0..token.len];
+        } else manifest_buf[0..0];
+        _ = self.conflicts.queue.orderedRemove(i);
+        item.destroy(self.allocator);
+        if (manifest.len > 0) self.settleUserBatch(manifest);
+    }
+    if (self.conflicts.queue.items.len > 0) showDialog(self);
+}
+
+pub fn cancelBatch(self: *BrowserView, batch_id: u64) void {
+    if (batch_id == 0) return;
+    closeDialog(self);
+    var i: usize = 0;
+    while (i < self.conflicts.queue.items.len) {
+        const item = self.conflicts.queue.items[i];
+        if (item.batch_id != batch_id) {
+            i += 1;
+            continue;
+        }
         _ = self.conflicts.queue.orderedRemove(i);
         item.destroy(self.allocator);
     }
@@ -166,6 +195,9 @@ pub fn enqueue(
     dst: []const u8,
     is_dir: bool,
     cut: bool,
+    batch_id: u64,
+    batch_total: usize,
+    manifest: ?ManifestRef,
 ) void {
     const item = self.allocator.create(Item) catch return;
     const src_owned = self.allocator.dupe(u8, src) catch {
@@ -183,6 +215,13 @@ pub fn enqueue(
         self.allocator.destroy(item);
         return;
     } else null;
+    const manifest_token = if (manifest) |ref| self.allocator.dupe(u8, ref.token) catch {
+        if (src_host_owned) |host| self.allocator.free(host);
+        self.allocator.free(src_owned);
+        self.allocator.free(dst_owned);
+        self.allocator.destroy(item);
+        return;
+    } else null;
     item.* = .{
         .tab = tab,
         .dst_hc = tab.hc,
@@ -192,6 +231,10 @@ pub fn enqueue(
         .src_host = src_host_owned,
         .is_dir = is_dir,
         .cut = cut,
+        .batch_id = batch_id,
+        .batch_total = batch_total,
+        .manifest_token = manifest_token,
+        .manifest_index = if (manifest) |ref| ref.index else null,
     };
     self.conflicts.queue.append(self.allocator, item) catch {
         item.destroy(self.allocator);
@@ -518,8 +561,15 @@ fn onChoice(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     var applied: usize = 0;
     while (self.conflicts.queue.items.len > 0) {
         const item = self.conflicts.queue.items[0];
+        var manifest_buf: [128]u8 = undefined;
+        const manifest = if (item.manifest_token) |token| blk: {
+            if (token.len > manifest_buf.len) break :blk manifest_buf[0..0];
+            @memcpy(manifest_buf[0..token.len], token);
+            break :blk manifest_buf[0..token.len];
+        } else manifest_buf[0..0];
         applyOne(self, item, choice);
         dropHead(self);
+        if (manifest.len > 0) self.settleUserBatch(manifest);
         applied += 1;
         if (!all) break;
     }
@@ -547,7 +597,15 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
         else => choice_in,
     };
     switch (choice) {
-        .skip => self.setStatusFmt("skipped {s}", .{item.name()}),
+        .skip => {
+            if (self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{
+                .batch_id = item.batch_id,
+                .batch_total = item.batch_total,
+            }, item.manifest_token, item.manifest_index, true))
+                self.setStatusFmt("skipped {s}", .{item.name()})
+            else
+                self.setStatusFmt("could not save the skip decision for {s}", .{item.name()});
+        },
         .keep_both => {
             var name_buf: [512]u8 = undefined;
             const dir = std.fs.path.dirname(item.dst) orelse return;
@@ -559,15 +617,15 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
             const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
                 if (dir.len == 1) "" else dir, unique,
             }) catch return;
-            self.pasteOne(item.tab, item.src_host, item.src, dst, item.cut, .{ .no_replace = true });
+            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, dst, item.cut, .{ .no_replace = true, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
         },
-        .overwrite => self.pasteOne(item.tab, item.src_host, item.src, item.dst, item.cut, .{}),
+        .overwrite => _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false),
         .merge => {
-            self.pasteOne(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "merge", .undoable = false });
+            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "merge", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
             self.setStatusFmt("merging into {s} (a merge cannot be undone)", .{item.name()});
         },
         .replace => {
-            self.pasteOne(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "replace", .undoable = false });
+            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "replace", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
             self.setStatusFmt("replacing {s} (a replace cannot be undone)", .{item.name()});
         },
     }

@@ -502,6 +502,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
             continue;
         }
         _ = self.drop_probes.orderedRemove(i);
+        if (probe.manifest_token) |token| self.settleUserBatch(token);
         probe.destroy(self.allocator);
         self.setStatus("drop canceled because a host disconnected");
     }
@@ -1119,6 +1120,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .hc = hc,
                 .job = rep.job,
                 .label = pj.label,
+                .batch_id = pj.batch_id,
+                .batch_total = pj.batch_total,
                 .done = rep.done,
                 .total = rep.total,
                 .resumed_from = rep.resumed_from,
