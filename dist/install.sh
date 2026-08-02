@@ -171,14 +171,17 @@ stage() {
         # package does not ship the binary twice.
         install -Dm755 zig-out/bin/sketerm "$dest/usr/bin/sketerm"
         ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-files"
+        ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-viewer"
 
         install -Dm644 data/dev.sker.sketerm.desktop \
             "$dest/usr/share/applications/dev.sker.sketerm.desktop"
         install -Dm644 data/dev.sker.sketerm.files.desktop \
             "$dest/usr/share/applications/dev.sker.sketerm.files.desktop"
+        install -Dm644 data/dev.sker.sketerm.viewer.desktop \
+            "$dest/usr/share/applications/dev.sker.sketerm.viewer.desktop"
 
         local i
-        for i in dev.sker.sketerm dev.sker.sketerm.files; do
+        for i in dev.sker.sketerm dev.sker.sketerm.files dev.sker.sketerm.viewer; do
             install -Dm644 "data/icons/hicolor/scalable/apps/$i.svg" \
                 "$dest/usr/share/icons/hicolor/scalable/apps/$i.svg"
         done
@@ -291,7 +294,11 @@ do_debian() {
         echo "Depends: $deps"
         # Runtime-dlopen'd, all optional by design: absent means the
         # feature degrades, never that the binary fails to start.
-        echo "Recommends: libopus0"
+        if [ "$kind" = gui ]; then
+            echo "Recommends: libopus0, libglycin-2-0, glycin-loaders"
+        else
+            echo "Recommends: libopus0"
+        fi
         echo "Suggests: libtesseract-dev"
         echo "Homepage: https://github.com/skerit/sketerm"
         if [ "$kind" = gui ]; then
