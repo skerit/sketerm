@@ -252,6 +252,6 @@ pub fn instantiate(self: *BrowserView, tab: *BTab, source: []const u8) void {
     }) catch return;
     var lbl: [160]u8 = undefined;
     const label = std.fmt.bufPrint(&lbl, "new from template {s}", .{base}) catch "new from template";
-    self.startDaemonJobUndo(tab.hc, "copy", source, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, source, ""), .{});
+    _ = self.startDaemonJobUndo(tab.hc, "copy", source, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, source, ""), .{ .no_replace = true });
     self.setStatusFmt("creating {s} from template on {s}", .{ name, tab.hc.label() });
 }

@@ -31,6 +31,7 @@ const AttrRequest = @import("props.zig").AttrRequest;
 const SnapRequest = @import("props.zig").SnapRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
+const CopyAck = @import("jobs.zig").CopyAck;
 const CopyQueue = @import("jobs.zig").CopyQueue;
 const DeferredTransfer = @import("jobs.zig").DeferredTransfer;
 const CopyRetry = @import("types.zig").CopyRetry;
@@ -58,6 +59,7 @@ const PreviewRead = @import("preview.zig").PreviewRead;
 const PreviewState = @import("preview.zig").State;
 const RemoteThumb = @import("preview.zig").RemoteThumb;
 const RestoreRead = @import("ops.zig").RestoreRead;
+const DropProbe = @import("ops.zig").DropProbe;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
 const colkeys = @import("../../filebrowser/colkeys.zig");
@@ -85,6 +87,7 @@ pub const BrowserView = struct {
     /// Remote opens whose host mount is still starting.
     pending_opens: std.ArrayList(*PendingOpen) = .empty,
     pending_jobs: std.ArrayList(*PendingJob) = .empty,
+    drop_probes: std.ArrayList(*DropProbe) = .empty,
     jobs: std.ArrayList(*JobRow) = .empty,
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
     /// Cross-host copies waiting for their destination (jobs.zig).
@@ -92,7 +95,10 @@ pub const BrowserView = struct {
     /// Failed cross-host copies waiting out their automatic-resume
     /// delay, and the one timer that submits them (jobs.zig).
     retry_pending: std.ArrayList(*CopyRetry) = .empty,
+    mediated_retry_tokens: std.ArrayList([]u8) = .empty,
     retry_timer: c.guint = 0,
+    /// Terminal user-copy jobs awaiting daemon acknowledgment.
+    copy_acks: std.ArrayList(CopyAck) = .empty,
     /// Pastes/sends held while a source or destination host is still
     /// connecting; released by wireReady, dropped on host death.
     deferred_transfers: std.ArrayList(*DeferredTransfer) = .empty,
@@ -365,6 +371,7 @@ pub const BrowserView = struct {
     pub const wireReady = @import("conn.zig").wireReady;
     pub const hostDied = @import("conn.zig").hostDied;
     pub const sendOp = @import("conn.zig").sendOp;
+    pub const sendOpOk = @import("conn.zig").sendOpOk;
     pub const closeViewOf = @import("conn.zig").closeViewOf;
     pub const ensureWriteFlush = @import("conn.zig").ensureWriteFlush;
     pub const scheduleReconnect = @import("conn.zig").scheduleReconnect;
@@ -372,6 +379,7 @@ pub const BrowserView = struct {
     pub const requestHostDirs = @import("conn.zig").requestHostDirs;
     pub const attrSpec = @import("conn.zig").attrSpec;
     pub const sendListingOp = @import("conn.zig").sendListingOp;
+    pub const requestFreeSpace = @import("conn.zig").requestFreeSpace;
     pub const openDir = @import("conn.zig").openDir;
     pub const refreshDir = @import("conn.zig").refreshDir;
     pub const clearFailureCaches = @import("preview.zig").clearFailureCaches;
@@ -618,6 +626,7 @@ pub const BrowserView = struct {
     pub const pushHistoryStack = @import("ops.zig").pushHistoryStack;
     pub const makeUndo = @import("ops.zig").makeUndo;
     pub const deferUndo = @import("ops.zig").deferUndo;
+    pub const deferUndoMode = @import("ops.zig").deferUndoMode;
     pub const recordTrashUndo = @import("ops.zig").recordTrashUndo;
     pub const performUndo = @import("ops.zig").performUndo;
     pub const performRedo = @import("ops.zig").performRedo;
@@ -642,14 +651,17 @@ pub const BrowserView = struct {
     pub const setTransferPaused = @import("jobs.zig").setTransferPaused;
     pub const unclaimMediated = @import("jobs.zig").unclaimMediated;
     pub const pumpCopyQueue = @import("jobs.zig").pumpCopyQueue;
+    pub const pumpCopyAcks = @import("jobs.zig").pumpCopyAcks;
     pub const pumpDeferredTransfers = @import("jobs.zig").pumpDeferredTransfers;
     pub const cancelQueuedCopy = @import("jobs.zig").cancelQueuedCopy;
+    pub const cancelDeferredTransfer = @import("jobs.zig").cancelDeferredTransfer;
     pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
     pub const startTransfer = @import("jobs.zig").startTransfer;
     pub const retryCopyJob = @import("jobs.zig").retryCopyJob;
     pub const dropSupersededRetryRows = @import("jobs.zig").dropSupersededRetryRows;
     pub const cancelPendingRetries = @import("jobs.zig").cancelPendingRetries;
+    pub const cancelScheduledRetry = @import("jobs.zig").cancelScheduledRetry;
     pub const startDaemonJob = @import("jobs.zig").startDaemonJob;
     pub const startDaemonJobResumable = @import("jobs.zig").startDaemonJobResumable;
     pub const startDaemonJobKind = @import("jobs.zig").startDaemonJobKind;
@@ -872,6 +884,7 @@ pub const BrowserView = struct {
         self.loadFileColors();
 
         self.buildUi();
+        @import("places.zig").registerView(self);
         // The view and selection menus ride the toolbar buildUi just
         // built.
         self.installViewMenu();
@@ -1106,6 +1119,7 @@ pub const BrowserView = struct {
     }
 
     pub fn deinit(self: *BrowserView) void {
+        @import("places.zig").unregisterView(self);
         // The client-mediated transfers this view runs are recorded in
         // the durable ledger; hand them back before their Xfers die so
         // the next browser face -- or another process -- resumes them.
@@ -1153,6 +1167,8 @@ pub const BrowserView = struct {
         for (self.deferred_transfers.items) |d| d.destroy(self.allocator);
         self.deferred_transfers.deinit(self.allocator);
         self.cancelPendingRetries();
+        for (self.copy_acks.items) |ack| self.allocator.free(ack.token);
+        self.copy_acks.deinit(self.allocator);
         self.conflicts.deinit(self.allocator);
         self.templates.deinit(self.allocator);
         for (self.transfers.items) |t| {
@@ -1188,6 +1204,8 @@ pub const BrowserView = struct {
             self.allocator.destroy(pj);
         }
         self.pending_jobs.deinit(self.allocator);
+        for (self.drop_probes.items) |probe| probe.destroy(self.allocator);
+        self.drop_probes.deinit(self.allocator);
         for (self.jobs.items) |j| {
             if (j.undo_op) |u| u.destroy(self.allocator);
             if (j.undo_trash_orig) |o| self.allocator.free(o);

@@ -1171,7 +1171,7 @@ pub fn onSnapRestore(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const dst = snapshots.restoreCopyPath(&dst_buf, ctx.orig, datez[0..n]) orelse return;
     var lblbuf: [128]u8 = undefined;
     const label = std.fmt.bufPrint(&lblbuf, "restore {s}", .{std.fs.path.basename(ctx.orig)}) catch "restore";
-    self.startDaemonJob(ctx.hc, "copy", ctx.vpath, dst, label);
+    _ = self.startDaemonJobUndo(ctx.hc, "copy", ctx.vpath, dst, label, null, .{ .no_replace = true });
     self.setStatusFmt("restoring a copy of {s}", .{std.fs.path.basename(ctx.orig)});
 }
 

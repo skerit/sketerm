@@ -26,6 +26,7 @@ const RowCtx = @import("render.zig").RowCtx;
 const activateEntry = @import("render.zig").activateEntry;
 const colview = @import("colview.zig");
 const render_mod = @import("render.zig");
+const dnd = @import("dnd.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const entryForPath = @import("nav.zig").entryForPath;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
@@ -157,11 +158,17 @@ pub fn installSelectionGestures(self: *BrowserView, tab: *BTab, widget: *c.GtkWi
         null,
         c.G_CONNECT_DEFAULT,
     );
+    _ = c.g_signal_connect_data(click, "released", @ptrCast(&onSelectionReleased), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(widget, @ptrCast(click));
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
     _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onSelectionKey), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(widget, @ptrCast(keys));
+}
+
+fn onSelectionReleased(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    dnd.clearDragSelection(tab);
 }
 
 /// True when the click carries a modifier the list widget itself
@@ -176,6 +183,7 @@ pub fn onListStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, 
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     // Group headers collapse on a plain click regardless of modes.
     if (colview.pickItem(tab, x, y)) |p| {
+        if (p.data.kind == .entry) dnd.armSelection(tab, p.data.path);
         if (p.data.kind == .group) {
             _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
             @import("views.zig").toggleGroup(tab.view, tab, p.data.group_id);
@@ -207,11 +215,13 @@ pub fn onListStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, 
 
 pub fn onGridStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const tab: *BTab = @ptrCast(@alignCast(user.?));
-    if (!tab.sel.sticky) return;
-    if (!plainClick(gesture)) return;
     const fb = tab.flowbox orelse return;
     const child = c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y)) orelse return;
     const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return;
+    const row: *RowCtx = @ptrCast(@alignCast(data));
+    dnd.armSelection(tab, row.path);
+    if (!tab.sel.sticky) return;
+    if (!plainClick(gesture)) return;
     _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
     if (n_press >= 2) {
         activateEntry(tab, @ptrCast(@alignCast(data)));

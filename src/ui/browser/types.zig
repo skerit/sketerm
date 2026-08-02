@@ -109,6 +109,13 @@ pub const WireReply = struct {
     more: bool = false,
     truncated: bool = false,
     job: u64 = 0,
+    state: []const u8 = "",
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    file: []const u8 = "",
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     size: u64 = 0,
     eof: bool = false,
     apps: []WireApp = &.{},
@@ -572,6 +579,9 @@ pub const BTab = struct {
     fwd: std.ArrayList([]u8) = .empty,
     navigation_generation: u64 = 0,
     selected: std.ArrayList([]u8) = .empty,
+    /// Selection captured on button-down before GTK collapses it while
+    /// deciding whether the gesture becomes a click or a drag.
+    drag_selected: std.ArrayList([]u8) = .empty,
     rendering: bool = false,
     /// Hash of the listing the last render showed; a re-render of the
     /// SAME listing keeps its scroll position (render.zig
@@ -590,6 +600,10 @@ pub const BTab = struct {
     free_bytes: ?u64 = null,
     /// The in-flight statfs request (0 = none).
     free_req: u32 = 0,
+    /// A filesystem mutation landed while statfs was in flight; issue
+    /// one coalesced refresh after that reply instead of flooding one
+    /// request per watcher delta.
+    free_dirty: bool = false,
     virtual_spec: []u8 = &.{},
     /// The live/one-shot query filling this tab's flat rows, if any
     /// (search.zig). Per TAB, not per view: several live queries stay
@@ -604,6 +618,10 @@ pub const BTab = struct {
     /// The details/compact listing: ONE GtkColumnView owns the header
     /// and the rows (colview.zig), so their columns cannot disagree.
     colview: *c.GtkColumnView,
+    /// Held so its raw-BTab signal can be disconnected before GTK's
+    /// deferred column teardown outlives this tab.
+    sorter: ?*c.GtkSorter = null,
+    sorter_handler: c.gulong = 0,
     /// Flat item model the listing renders from; rebuilt by splice on
     /// every render (items borrow entries between renders).
     store: *c.GListStore = undefined,
@@ -820,6 +838,13 @@ pub const BTab = struct {
 
     pub fn deinit(self: *BTab) void {
         const a = self.view.allocator;
+        if (self.sorter) |sorter| {
+            if (self.sorter_handler != 0)
+                c.g_signal_handler_disconnect(@ptrCast(sorter), self.sorter_handler);
+            c.g_object_unref(sorter);
+            self.sorter = null;
+            self.sorter_handler = 0;
+        }
         // Before anything else: a running query holds a host-side
         // recursive watcher, which must not outlive this tab.
         self.view.queryForget(self);
@@ -840,6 +865,8 @@ pub const BTab = struct {
         self.fwd.deinit(a);
         for (self.selected.items) |p| a.free(p);
         self.selected.deinit(a);
+        for (self.drag_selected.items) |p| a.free(p);
+        self.drag_selected.deinit(a);
         for (self.attr_columns.items) |name| a.free(name);
         self.attr_columns.deinit(a);
         self.attr_col_widths.deinit(a);
@@ -897,12 +924,16 @@ pub const CopyRetry = struct {
     src_path: []u8,
     dst_path: []u8,
     label: []u8,
+    /// Persistent record identity. The record outlives this pane;
+    /// each daemon attempt uses the record's separately-rotated token.
+    token: []u8,
     dest_key: u64,
     /// Automatic attempts already spent, so a host that is simply gone
     /// stops costing retries and the row settles as failed.
     attempts: u8 = 0,
     /// A MOVE: the helper deletes the verified source (delete_src).
     move: bool = false,
+    no_replace: bool = false,
     /// The coordinator is a REMOTE daemon dialing its peer directly.
     /// An "unreachable" failure re-coordinates through the local
     /// daemon instead of burning resume attempts.
@@ -912,6 +943,7 @@ pub const CopyRetry = struct {
         allocator.free(self.src_path);
         allocator.free(self.dst_path);
         allocator.free(self.label);
+        allocator.free(self.token);
         allocator.destroy(self);
     }
 
@@ -932,6 +964,13 @@ pub const CopyRetry = struct {
             allocator.destroy(out);
             return null;
         };
+        const token = allocator.dupe(u8, self.token) catch {
+            allocator.free(src);
+            allocator.free(dst);
+            allocator.free(label);
+            allocator.destroy(out);
+            return null;
+        };
         out.* = .{
             .coordinator = self.coordinator,
             .src_hc = self.src_hc,
@@ -939,9 +978,11 @@ pub const CopyRetry = struct {
             .src_path = src,
             .dst_path = dst,
             .label = label,
+            .token = token,
             .dest_key = self.dest_key,
             .attempts = self.attempts,
             .move = self.move,
+            .no_replace = self.no_replace,
             .direct = self.direct,
         };
         return out;
@@ -1095,6 +1136,8 @@ pub const ActiveTransfer = struct {
     upload_watch: ?*EditWatch = null,
     /// Cross-host move: delete the source after a verified copy.
     delete_src_after: bool = false,
+    /// Ordinary durable copy/move using the mediated fallback.
+    user_copy: bool = false,
     /// Queue state: transfers to one destination run one at a time,
     /// the rest wait here in order (see filebrowser/xferqueue.zig).
     started: bool = false,
@@ -1194,6 +1237,7 @@ pub const UndoOp = struct {
 pub const PendingUndo = struct {
     req: u32,
     op: *UndoOp,
+    no_replace: bool = false,
 };
 
 pub const HistoryDirection = enum { undo, redo };

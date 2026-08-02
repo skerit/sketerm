@@ -512,6 +512,7 @@ pub const Fs = struct {
             off: u64 = 0,
             len: u32 = 0,
             @"resume": bool = false,
+            no_replace: bool = false,
             conflict: []const u8 = "",
             dir_mode: []const u8 = "",
             job: u64 = 0,
@@ -645,6 +646,11 @@ pub const Fs = struct {
 
     pub fn rename(self: *Fs, from: []const u8, to: []const u8) Error!void {
         try self.simpleOp("rename", .{ .path = from, .to = to });
+    }
+
+    pub fn renameNoReplace(self: *Fs, from: []const u8, to: []const u8) Error!void {
+        if (!self.conn.copy_no_replace) return Error.BadRequest;
+        try self.simpleOp("rename", .{ .path = from, .to = to, .no_replace = true });
     }
 
     /// Delete ONE entry (file/link/empty dir) — recursive delete is a
@@ -829,16 +835,31 @@ pub const Fs = struct {
         return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable, .client_token = client_token });
     }
 
+    pub fn startCopyTokenMode(self: *Fs, src: []const u8, dst: []const u8, resumable: bool, client_token: []const u8, mode: CopyMode) Error!u64 {
+        if (mode.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        return self.startJob("copy", .{
+            .path = src,
+            .to = dst,
+            .@"resume" = resumable,
+            .client_token = client_token,
+            .conflict = mode.conflict,
+            .dir_mode = mode.dir_mode,
+            .no_replace = mode.no_replace,
+        });
+    }
+
     /// How a copy resolves names that already exist at the
     /// destination. `dir_mode` applies to the top-level directory
     /// only; `conflict` governs every entry inside the tree.
     pub const CopyMode = struct {
         conflict: []const u8 = "",
         dir_mode: []const u8 = "",
+        no_replace: bool = false,
     };
 
     pub fn startCopyMode(self: *Fs, src: []const u8, dst: []const u8, mode: CopyMode) Error!u64 {
-        return self.startJob("copy", .{ .path = src, .to = dst, .conflict = mode.conflict, .dir_mode = mode.dir_mode });
+        if (mode.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        return self.startJob("copy", .{ .path = src, .to = dst, .conflict = mode.conflict, .dir_mode = mode.dir_mode, .no_replace = mode.no_replace });
     }
 
     pub fn startDeleteTree(self: *Fs, path: []const u8) Error!u64 {
@@ -1005,6 +1026,7 @@ pub const Fs = struct {
     pub const CrossOpts = struct {
         /// Delete the verified source afterwards — a move.
         delete_src: bool = false,
+        no_replace: bool = false,
         /// Cap the initial dial attempts per side (0 = full budget).
         dial_tries: u32 = 0,
     };
@@ -1018,6 +1040,7 @@ pub const Fs = struct {
         resumable: bool,
         opts: CrossOpts,
     ) Error!u64 {
+        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
         return self.startJob("cross_copy", .{
             .path = src,
             .to = dst,
@@ -1025,6 +1048,7 @@ pub const Fs = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .delete_src = opts.delete_src,
+            .no_replace = opts.no_replace,
             .dial_tries = opts.dial_tries,
         });
     }
@@ -1047,6 +1071,30 @@ pub const Fs = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .client_token = client_token,
+        });
+    }
+
+    pub fn startCrossCopyTokenOpts(
+        self: *Fs,
+        src_host: []const u8,
+        src: []const u8,
+        dst_host: []const u8,
+        dst: []const u8,
+        resumable: bool,
+        client_token: []const u8,
+        opts: CrossOpts,
+    ) Error!u64 {
+        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        return self.startJob("cross_copy", .{
+            .path = src,
+            .to = dst,
+            .src_host = src_host,
+            .dst_host = dst_host,
+            .@"resume" = resumable,
+            .client_token = client_token,
+            .delete_src = opts.delete_src,
+            .no_replace = opts.no_replace,
+            .dial_tries = opts.dial_tries,
         });
     }
 

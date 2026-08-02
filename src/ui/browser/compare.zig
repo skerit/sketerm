@@ -307,9 +307,13 @@ pub const CompareCtx = struct {
             if (same_host) {
                 var lbl: [128]u8 = undefined;
                 const label = std.fmt.bufPrint(&lbl, "sync {s}", .{std.fs.path.basename(row.rel)}) catch "sync";
-                view.startDaemonJob(dst_side.hc, "copy", src, dst, label);
+                if (!view.startDaemonJobUndo(dst_side.hc, "copy", src, dst, label, null, .{
+                    .no_replace = row.status != .differs,
+                })) continue;
             } else {
-                view.startTransfer(src_side.hc, src, dst_side.hc, dst, .{});
+                view.startTransfer(src_side.hc, src, dst_side.hc, dst, .{
+                    .no_replace = row.status != .differs,
+                });
             }
             started += 1;
         }

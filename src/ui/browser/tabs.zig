@@ -18,7 +18,8 @@ const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
 const applyColumnWidths = @import("render.zig").applyColumnWidths;
 const classicmenu = @import("classicmenu.zig");
-const dropSpecInto = @import("ops.zig").dropSpecInto;
+const dnd = @import("dnd.zig");
+const dropValueIntoAction = @import("ops.zig").dropValueIntoAction;
 
 /// Closed tabs remembered for undo-close-tab. Session state on
 /// purpose: a reopened tab is a within-session correction, while
@@ -215,7 +216,7 @@ pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkW
 
     // Dropping onto a tab targets THAT tab's directory, whichever
     // tab is currently shown.
-    const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
+    const dropt = dnd.newTarget(tab);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onTabDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(label_box, @ptrCast(dropt));
 
@@ -284,16 +285,14 @@ pub fn onTabMiddleClick(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?
     tab.view.closeTab(tab);
 }
 
-pub fn onTabDrop(_: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+pub fn onTabDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const tab: *BTab = @ptrCast(@alignCast(user.?));
-    const cstr = c.g_value_get_string(value) orelse return 0;
-    const spec = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
     // The destination is the tab's own root, even when another tab
     // is the visible one.
     var dbuf: [4096]u8 = undefined;
     if (tab.root.path.len >= dbuf.len) return 0;
     @memcpy(dbuf[0..tab.root.path.len], tab.root.path);
-    return @intFromBool(dropSpecInto(tab.view, tab, spec, dbuf[0..tab.root.path.len]));
+    return @intFromBool(dropValueIntoAction(tab.view, tab, value, dbuf[0..tab.root.path.len], dnd.dropAction(target, tab)));
 }
 
 /// Heap context for the tab menu; owned by its popover.

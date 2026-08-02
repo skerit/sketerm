@@ -19,6 +19,571 @@ const classicmenu = @import("classicmenu.zig");
 const iconload = @import("iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
 
+/// Browser faces in this process. `authoritative` owns the one
+/// process-wide places snapshot; registered views are synchronized to
+/// it after every save so any later writer starts from current state.
+const LiveView = struct {
+    view: *BrowserView,
+    /// False only when an allocation failure prevented synchronization.
+    synced: bool = true,
+};
+
+var live_views: std.ArrayList(LiveView) = .empty;
+var live_allocator: ?std.mem.Allocator = null;
+
+const Authority = struct {
+    arena: std.heap.ArenaAllocator,
+    value: places_mod.Places,
+
+    fn capture(self: *BrowserView) ?Authority {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        const value = capturePlaces(self, arena.allocator()) catch {
+            arena.deinit();
+            return null;
+        };
+        return .{ .arena = arena, .value = value };
+    }
+
+    fn captureMerged(allocator: std.mem.Allocator, base: places_mod.Places, sources: MergeSources) ?Authority {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        const value = captureMergedPlaces(base, sources, arena.allocator()) catch {
+            arena.deinit();
+            return null;
+        };
+        return .{ .arena = arena, .value = value };
+    }
+
+    fn deinit(self: *Authority) void {
+        self.arena.deinit();
+    }
+};
+
+var authoritative: ?Authority = null;
+
+fn freeStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
+    list.* = .empty;
+}
+
+fn cloneStrings(allocator: std.mem.Allocator, source: anytype) ?std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    for (source) |item| {
+        const owned = allocator.dupe(u8, item) catch {
+            freeStrings(allocator, &out);
+            return null;
+        };
+        out.append(allocator, owned) catch {
+            allocator.free(owned);
+            freeStrings(allocator, &out);
+            return null;
+        };
+    }
+    return out;
+}
+
+fn cloneConstStrings(allocator: std.mem.Allocator, source: anytype) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, source.len);
+    for (source, 0..) |item, i| out[i] = try allocator.dupe(u8, item);
+    return out;
+}
+
+/// Build an arena-owned snapshot of every field written to places.json.
+fn capturePlaces(self: *BrowserView, allocator: std.mem.Allocator) !places_mod.Places {
+    const bookmarks = try cloneConstStrings(allocator, self.bookmarks.items);
+    const labels = try allocator.alloc([]const u8, bookmarks.len);
+    const icons = try allocator.alloc([]const u8, bookmarks.len);
+    for (bookmarks, 0..) |_, i| {
+        labels[i] = try allocator.dupe(u8, if (i < self.bookmark_labels.items.len) self.bookmark_labels.items[i] else "");
+        icons[i] = try allocator.dupe(u8, if (i < self.bookmark_icons.items.len) self.bookmark_icons.items[i] else "");
+    }
+    const recent = try cloneConstStrings(allocator, self.recent.items);
+    const collapsed = try cloneConstStrings(allocator, self.collapsed.items);
+    const hidden = try cloneConstStrings(allocator, self.hidden_sections.items);
+    const order = try cloneConstStrings(allocator, self.section_order.items);
+
+    const frecency = try allocator.alloc(places_mod.FrecEntry, self.frecency.items.len);
+    for (self.frecency.items, 0..) |entry, i| {
+        frecency[i] = .{
+            .spec = try allocator.dupe(u8, entry.spec),
+            .count = entry.count,
+            .last_ms = entry.last_ms,
+        };
+    }
+    const searches = try allocator.alloc(places_mod.SavedSearch, self.saved_searches.items.len);
+    for (self.saved_searches.items, 0..) |search, i| {
+        searches[i] = .{
+            .spec = try allocator.dupe(u8, search.spec),
+            .pattern = try allocator.dupe(u8, search.pattern),
+            .content = search.content,
+        };
+    }
+    const widget_sections = try allocator.alloc(places_mod.WidgetSection, self.widgets.sections.items.len);
+    for (self.widgets.sections.items, 0..) |section, i| {
+        const widgets = try allocator.alloc(places_mod.Widget, section.widgets.items.len);
+        for (section.widgets.items, 0..) |widget, j| {
+            widgets[j] = .{
+                .kind = try allocator.dupe(u8, widget.kind.name()),
+                .text = try allocator.dupe(u8, widget.text),
+                .command = try allocator.dupe(u8, widget.command),
+                .path = try allocator.dupe(u8, widget.path),
+                .interval_secs = widget.interval_secs,
+            };
+        }
+        widget_sections[i] = .{
+            .name = try allocator.dupe(u8, section.name),
+            .widgets = widgets,
+        };
+    }
+    return .{
+        .bookmarks = bookmarks,
+        .bookmark_labels = labels,
+        .bookmark_icons = icons,
+        .recent = recent,
+        .frecency = frecency,
+        .searches = searches,
+        .collection = &.{},
+        .collapsed = collapsed,
+        .hidden_sections = hidden,
+        .section_order = order,
+        .widget_sections = widget_sections,
+        .sidebar_px = self.sidebar_px,
+        .sidebar_open = self.sidebar_open,
+        .zebra = self.zebra,
+        .preview_px = self.preview_px,
+        .side_info = self.side_info,
+    };
+}
+
+fn stringsMatch(view_items: anytype, saved: []const []const u8) bool {
+    if (view_items.len != saved.len) return false;
+    for (view_items, saved) |view_item, saved_item| {
+        if (!std.mem.eql(u8, view_item, saved_item)) return false;
+    }
+    return true;
+}
+
+fn bookmarksMatch(self: *BrowserView, saved: places_mod.Places) bool {
+    if (!stringsMatch(self.bookmarks.items, saved.bookmarks)) return false;
+    for (self.bookmarks.items, 0..) |_, i| {
+        const view_label = if (i < self.bookmark_labels.items.len) self.bookmark_labels.items[i] else "";
+        const saved_label = if (i < saved.bookmark_labels.len) saved.bookmark_labels[i] else "";
+        if (!std.mem.eql(u8, view_label, saved_label)) return false;
+        const view_icon = if (i < self.bookmark_icons.items.len) self.bookmark_icons.items[i] else "";
+        const saved_icon = if (i < saved.bookmark_icons.len) saved.bookmark_icons[i] else "";
+        if (!std.mem.eql(u8, view_icon, saved_icon)) return false;
+    }
+    return true;
+}
+
+fn frecencyMatches(self: *BrowserView, saved: places_mod.Places) bool {
+    if (self.frecency.items.len != saved.frecency.len) return false;
+    for (self.frecency.items, saved.frecency) |view_entry, saved_entry| {
+        if (!std.mem.eql(u8, view_entry.spec, saved_entry.spec) or
+            view_entry.count != saved_entry.count or
+            view_entry.last_ms != saved_entry.last_ms) return false;
+    }
+    return true;
+}
+
+fn searchesMatch(self: *BrowserView, saved: places_mod.Places) bool {
+    if (self.saved_searches.items.len != saved.searches.len) return false;
+    for (self.saved_searches.items, saved.searches) |view_search, saved_search| {
+        if (!std.mem.eql(u8, view_search.spec, saved_search.spec) or
+            !std.mem.eql(u8, view_search.pattern, saved_search.pattern) or
+            view_search.content != saved_search.content) return false;
+    }
+    return true;
+}
+
+fn widgetStoreMatches(store: *const sidewidgets.Store, saved: []const places_mod.WidgetSection) bool {
+    if (store.sections.items.len != saved.len) return false;
+    for (store.sections.items, saved) |view_section, saved_section| {
+        if (!std.mem.eql(u8, view_section.name, saved_section.name) or
+            view_section.widgets.items.len != saved_section.widgets.len) return false;
+        for (view_section.widgets.items, saved_section.widgets) |view_widget, saved_widget| {
+            if (!std.mem.eql(u8, view_widget.kind.name(), saved_widget.kind) or
+                !std.mem.eql(u8, view_widget.text, saved_widget.text) or
+                !std.mem.eql(u8, view_widget.command, saved_widget.command) or
+                !std.mem.eql(u8, view_widget.path, saved_widget.path) or
+                view_widget.interval_secs != saved_widget.interval_secs) return false;
+        }
+    }
+    return true;
+}
+
+fn widgetsMatch(self: *BrowserView, saved: places_mod.Places) bool {
+    return widgetStoreMatches(&self.widgets, saved.widget_sections);
+}
+
+/// Per-field providers whose local state differs from the previous
+/// authoritative snapshot. Unrelated unsaved changes in another view
+/// therefore join this save instead of being overwritten by it.
+const MergeSources = struct {
+    bookmarks: ?*BrowserView = null,
+    recent: ?*BrowserView = null,
+    frecency: ?*BrowserView = null,
+    searches: ?*BrowserView = null,
+    collapsed: ?*BrowserView = null,
+    hidden_sections: ?*BrowserView = null,
+    section_order: ?*BrowserView = null,
+    widgets: ?*BrowserView = null,
+    sidebar_px: ?*BrowserView = null,
+    sidebar_open: ?*BrowserView = null,
+    zebra: ?*BrowserView = null,
+    preview_px: ?*BrowserView = null,
+    side_info: ?*BrowserView = null,
+
+    fn consider(self: *MergeSources, view: *BrowserView, base: places_mod.Places) void {
+        if (!bookmarksMatch(view, base)) self.bookmarks = view;
+        if (!stringsMatch(view.recent.items, base.recent)) self.recent = view;
+        if (!frecencyMatches(view, base)) self.frecency = view;
+        if (!searchesMatch(view, base)) self.searches = view;
+        if (!stringsMatch(view.collapsed.items, base.collapsed)) self.collapsed = view;
+        if (!stringsMatch(view.hidden_sections.items, base.hidden_sections)) self.hidden_sections = view;
+        if (!stringsMatch(view.section_order.items, base.section_order)) self.section_order = view;
+        if (!widgetsMatch(view, base)) self.widgets = view;
+        if (view.sidebar_px != base.sidebar_px) self.sidebar_px = view;
+        if (view.sidebar_open != base.sidebar_open) self.sidebar_open = view;
+        if (view.zebra != base.zebra) self.zebra = view;
+        if (view.preview_px != base.preview_px) self.preview_px = view;
+        if (view.side_info != base.side_info) self.side_info = view;
+    }
+};
+
+fn captureMergedPlaces(base: places_mod.Places, sources: MergeSources, allocator: std.mem.Allocator) !places_mod.Places {
+    const bookmarks = if (sources.bookmarks) |view|
+        try cloneConstStrings(allocator, view.bookmarks.items)
+    else
+        try cloneConstStrings(allocator, base.bookmarks);
+    const labels = try allocator.alloc([]const u8, bookmarks.len);
+    const icons = try allocator.alloc([]const u8, bookmarks.len);
+    for (bookmarks, 0..) |_, i| {
+        if (sources.bookmarks) |view| {
+            labels[i] = try allocator.dupe(u8, if (i < view.bookmark_labels.items.len) view.bookmark_labels.items[i] else "");
+            icons[i] = try allocator.dupe(u8, if (i < view.bookmark_icons.items.len) view.bookmark_icons.items[i] else "");
+        } else {
+            labels[i] = try allocator.dupe(u8, if (i < base.bookmark_labels.len) base.bookmark_labels[i] else "");
+            icons[i] = try allocator.dupe(u8, if (i < base.bookmark_icons.len) base.bookmark_icons[i] else "");
+        }
+    }
+
+    const recent = if (sources.recent) |view|
+        try cloneConstStrings(allocator, view.recent.items)
+    else
+        try cloneConstStrings(allocator, base.recent);
+    const collapsed = if (sources.collapsed) |view|
+        try cloneConstStrings(allocator, view.collapsed.items)
+    else
+        try cloneConstStrings(allocator, base.collapsed);
+    const hidden_sections = if (sources.hidden_sections) |view|
+        try cloneConstStrings(allocator, view.hidden_sections.items)
+    else
+        try cloneConstStrings(allocator, base.hidden_sections);
+    const section_order = if (sources.section_order) |view|
+        try cloneConstStrings(allocator, view.section_order.items)
+    else
+        try cloneConstStrings(allocator, base.section_order);
+
+    const frecency_len = if (sources.frecency) |view| view.frecency.items.len else base.frecency.len;
+    const frecency = try allocator.alloc(places_mod.FrecEntry, frecency_len);
+    if (sources.frecency) |view| {
+        for (view.frecency.items, 0..) |entry, i| {
+            frecency[i] = .{ .spec = try allocator.dupe(u8, entry.spec), .count = entry.count, .last_ms = entry.last_ms };
+        }
+    } else {
+        for (base.frecency, 0..) |entry, i| {
+            frecency[i] = .{ .spec = try allocator.dupe(u8, entry.spec), .count = entry.count, .last_ms = entry.last_ms };
+        }
+    }
+
+    const searches_len = if (sources.searches) |view| view.saved_searches.items.len else base.searches.len;
+    const searches = try allocator.alloc(places_mod.SavedSearch, searches_len);
+    if (sources.searches) |view| {
+        for (view.saved_searches.items, 0..) |search, i| {
+            searches[i] = .{
+                .spec = try allocator.dupe(u8, search.spec),
+                .pattern = try allocator.dupe(u8, search.pattern),
+                .content = search.content,
+            };
+        }
+    } else {
+        for (base.searches, 0..) |search, i| {
+            searches[i] = .{
+                .spec = try allocator.dupe(u8, search.spec),
+                .pattern = try allocator.dupe(u8, search.pattern),
+                .content = search.content,
+            };
+        }
+    }
+
+    const widget_len = if (sources.widgets) |view| view.widgets.sections.items.len else base.widget_sections.len;
+    const widget_sections = try allocator.alloc(places_mod.WidgetSection, widget_len);
+    if (sources.widgets) |view| {
+        for (view.widgets.sections.items, 0..) |section, i| {
+            const widgets = try allocator.alloc(places_mod.Widget, section.widgets.items.len);
+            for (section.widgets.items, 0..) |widget, j| {
+                widgets[j] = .{
+                    .kind = try allocator.dupe(u8, widget.kind.name()),
+                    .text = try allocator.dupe(u8, widget.text),
+                    .command = try allocator.dupe(u8, widget.command),
+                    .path = try allocator.dupe(u8, widget.path),
+                    .interval_secs = widget.interval_secs,
+                };
+            }
+            widget_sections[i] = .{ .name = try allocator.dupe(u8, section.name), .widgets = widgets };
+        }
+    } else {
+        for (base.widget_sections, 0..) |section, i| {
+            const widgets = try allocator.alloc(places_mod.Widget, section.widgets.len);
+            for (section.widgets, 0..) |widget, j| {
+                widgets[j] = .{
+                    .kind = try allocator.dupe(u8, widget.kind),
+                    .text = try allocator.dupe(u8, widget.text),
+                    .command = try allocator.dupe(u8, widget.command),
+                    .path = try allocator.dupe(u8, widget.path),
+                    .interval_secs = widget.interval_secs,
+                };
+            }
+            widget_sections[i] = .{ .name = try allocator.dupe(u8, section.name), .widgets = widgets };
+        }
+    }
+
+    return .{
+        .bookmarks = bookmarks,
+        .bookmark_labels = labels,
+        .bookmark_icons = icons,
+        .recent = recent,
+        .frecency = frecency,
+        .searches = searches,
+        .collection = &.{},
+        .collapsed = collapsed,
+        .hidden_sections = hidden_sections,
+        .section_order = section_order,
+        .widget_sections = widget_sections,
+        .sidebar_px = if (sources.sidebar_px) |view| view.sidebar_px else base.sidebar_px,
+        .sidebar_open = if (sources.sidebar_open) |view| view.sidebar_open else base.sidebar_open,
+        .zebra = if (sources.zebra) |view| view.zebra else base.zebra,
+        .preview_px = if (sources.preview_px) |view| view.preview_px else base.preview_px,
+        .side_info = if (sources.side_info) |view| view.side_info else base.side_info,
+    };
+}
+
+/// Owned replacement for one view's persisted fields, built before
+/// its current state is released so synchronization is transactional.
+const PersistedState = struct {
+    bookmarks: std.ArrayList([]u8) = .empty,
+    bookmark_labels: std.ArrayList([]u8) = .empty,
+    bookmark_icons: std.ArrayList([]u8) = .empty,
+    recent: std.ArrayList([]u8) = .empty,
+    frecency: std.ArrayList(places_mod.FrecOwned) = .empty,
+    collapsed: std.ArrayList([]u8) = .empty,
+    hidden_sections: std.ArrayList([]u8) = .empty,
+    section_order: std.ArrayList([]u8) = .empty,
+    widgets: sidewidgets.Store = .{},
+    searches: std.ArrayList(@import("types.zig").OwnedSearch) = .empty,
+    sidebar_px: i32 = places_mod.DEFAULT_SIDEBAR_PX,
+    sidebar_open: ?bool = null,
+    zebra: bool = false,
+    preview_px: i32 = 300,
+    side_info: bool = false,
+
+    fn init(allocator: std.mem.Allocator, places: places_mod.Places) ?PersistedState {
+        var out: PersistedState = .{};
+        out.bookmarks = cloneStrings(allocator, places.bookmarks) orelse return null;
+        out.bookmark_labels = cloneStrings(allocator, places.bookmark_labels) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        out.bookmark_icons = cloneStrings(allocator, places.bookmark_icons) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        out.recent = cloneStrings(allocator, places.recent) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        out.collapsed = cloneStrings(allocator, places.collapsed) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        out.hidden_sections = cloneStrings(allocator, places.hidden_sections) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        out.section_order = cloneStrings(allocator, places.section_order) orelse {
+            out.deinit(allocator);
+            return null;
+        };
+        for (places.frecency) |entry| {
+            const spec = allocator.dupe(u8, entry.spec) catch {
+                out.deinit(allocator);
+                return null;
+            };
+            out.frecency.append(allocator, .{ .spec = spec, .count = entry.count, .last_ms = entry.last_ms }) catch {
+                allocator.free(spec);
+                out.deinit(allocator);
+                return null;
+            };
+        }
+        for (places.searches) |search| {
+            const spec = allocator.dupe(u8, search.spec) catch {
+                out.deinit(allocator);
+                return null;
+            };
+            const pattern = allocator.dupe(u8, search.pattern) catch {
+                allocator.free(spec);
+                out.deinit(allocator);
+                return null;
+            };
+            out.searches.append(allocator, .{ .spec = spec, .pattern = pattern, .content = search.content }) catch {
+                allocator.free(spec);
+                allocator.free(pattern);
+                out.deinit(allocator);
+                return null;
+            };
+        }
+        out.widgets.loadFrom(allocator, places.widget_sections);
+        if (!widgetStoreMatches(&out.widgets, places.widget_sections)) {
+            out.deinit(allocator);
+            return null;
+        }
+        out.sidebar_px = places_mod.clampSidebarPx(places.sidebar_px);
+        out.sidebar_open = places.sidebar_open;
+        out.zebra = places.zebra;
+        out.preview_px = std.math.clamp(places.preview_px, 220, 700);
+        out.side_info = places.side_info;
+        return out;
+    }
+
+    fn deinit(self: *PersistedState, allocator: std.mem.Allocator) void {
+        freeStrings(allocator, &self.bookmarks);
+        freeStrings(allocator, &self.bookmark_labels);
+        freeStrings(allocator, &self.bookmark_icons);
+        freeStrings(allocator, &self.recent);
+        for (self.frecency.items) |entry| allocator.free(entry.spec);
+        self.frecency.deinit(allocator);
+        self.frecency = .empty;
+        freeStrings(allocator, &self.collapsed);
+        freeStrings(allocator, &self.hidden_sections);
+        freeStrings(allocator, &self.section_order);
+        self.widgets.deinit(allocator);
+        self.widgets = .{};
+        for (self.searches.items) |search| search.deinitOwned(allocator);
+        self.searches.deinit(allocator);
+        self.searches = .empty;
+    }
+
+    fn install(self: *PersistedState, view: *BrowserView, places: places_mod.Places) void {
+        const allocator = view.allocator;
+        if (!bookmarksMatch(view, places)) {
+            freeStrings(allocator, &view.bookmarks);
+            freeStrings(allocator, &view.bookmark_labels);
+            freeStrings(allocator, &view.bookmark_icons);
+            view.bookmarks = self.bookmarks;
+            self.bookmarks = .empty;
+            view.bookmark_labels = self.bookmark_labels;
+            self.bookmark_labels = .empty;
+            view.bookmark_icons = self.bookmark_icons;
+            self.bookmark_icons = .empty;
+        }
+        if (!stringsMatch(view.recent.items, places.recent)) {
+            freeStrings(allocator, &view.recent);
+            view.recent = self.recent;
+            self.recent = .empty;
+        }
+        if (!frecencyMatches(view, places)) {
+            for (view.frecency.items) |entry| allocator.free(entry.spec);
+            view.frecency.deinit(allocator);
+            view.frecency = self.frecency;
+            self.frecency = .empty;
+        }
+        if (!stringsMatch(view.collapsed.items, places.collapsed)) {
+            freeStrings(allocator, &view.collapsed);
+            view.collapsed = self.collapsed;
+            self.collapsed = .empty;
+        }
+        if (!stringsMatch(view.hidden_sections.items, places.hidden_sections)) {
+            freeStrings(allocator, &view.hidden_sections);
+            view.hidden_sections = self.hidden_sections;
+            self.hidden_sections = .empty;
+        }
+        if (!stringsMatch(view.section_order.items, places.section_order)) {
+            freeStrings(allocator, &view.section_order);
+            view.section_order = self.section_order;
+            self.section_order = .empty;
+        }
+        if (!widgetsMatch(view, places)) {
+            sidewidgets.resetRuns(view);
+            view.widgets.deinit(allocator);
+            view.widgets = self.widgets;
+            self.widgets = .{};
+        }
+        if (!searchesMatch(view, places)) {
+            for (view.saved_searches.items) |search| search.deinitOwned(allocator);
+            view.saved_searches.deinit(allocator);
+            view.saved_searches = self.searches;
+            self.searches = .empty;
+        }
+        view.sidebar_px = self.sidebar_px;
+        view.sidebar_open = self.sidebar_open;
+        view.zebra = self.zebra;
+        view.preview_px = self.preview_px;
+        view.side_info = self.side_info;
+    }
+};
+
+fn syncView(view: *BrowserView, places: places_mod.Places) bool {
+    var state = PersistedState.init(view.allocator, places) orelse return false;
+    defer state.deinit(view.allocator);
+    state.install(view, places);
+    return true;
+}
+
+fn registeredIndex(self: *BrowserView) ?usize {
+    for (live_views.items, 0..) |entry, i| if (entry.view == self) return i;
+    return null;
+}
+
+pub fn registerView(self: *BrowserView) void {
+    if (registeredIndex(self) != null) return;
+    if (authoritative) |*current| {
+        if (!syncView(self, current.value)) return;
+    } else {
+        authoritative = Authority.capture(self) orelse return;
+    }
+    const allocator = live_allocator orelse self.allocator;
+    live_allocator = allocator;
+    live_views.append(allocator, .{ .view = self }) catch {
+        if (live_views.items.len == 0) {
+            if (authoritative) |*current| current.deinit();
+            authoritative = null;
+            live_allocator = null;
+        }
+    };
+}
+
+pub fn unregisterView(self: *BrowserView) void {
+    for (live_views.items, 0..) |entry, i| {
+        if (entry.view != self) continue;
+        _ = live_views.orderedRemove(i);
+        if (live_views.items.len == 0) {
+            live_views.deinit(live_allocator orelse self.allocator);
+            live_views = .empty;
+            live_allocator = null;
+            if (authoritative) |*current| current.deinit();
+            authoritative = null;
+        }
+        return;
+    }
+}
+
+/// Publish a bookmark mutation through the full places snapshot.
+fn bookmarksChanged(self: *BrowserView) void {
+    self.savePlaces();
+    if (self.places_on and !self.widgets_dead) self.renderPlaces();
+}
+
 /// Heap ctx on each places row (freed with the row).
 pub const PlaceCtx = struct {
     allocator: std.mem.Allocator,
@@ -789,7 +1354,7 @@ fn onSectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 fn onNewWidgetSection(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
-    openNamePrompt(ctx.view, .new_section, 0, "New Widget Section", "section name", "", null);
+    openNamePrompt(ctx.view, .new_section, null, "New Widget Section", "section name", "", null);
 }
 
 fn onBookmarkHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -862,7 +1427,7 @@ fn onBookmarkRenameItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = ctx.view;
     const i = bookmarkIndexOf(self, ctx.spec) orelse return;
     const current = bookmarkLabelAt(self, i) orelse std.fs.path.basename(self.bookmarks.items[i]);
-    openNamePrompt(self, .rename_bookmark, i, "Rename Bookmark", "bookmark label", current, null);
+    openNamePrompt(self, .rename_bookmark, ctx.spec, "Rename Bookmark", "bookmark label", current, null);
 }
 
 fn onBookmarkIconItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -872,7 +1437,7 @@ fn onBookmarkIconItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     openNamePrompt(
         self,
         .set_bookmark_icon,
-        i,
+        ctx.spec,
         "Bookmark Icon",
         "icon name, emoji, or image path",
         bookmarkIconAt(self, i),
@@ -898,12 +1463,14 @@ const NamePromptCtx = struct {
     allocator: std.mem.Allocator,
     view: *BrowserView,
     purpose: enum { new_section, rename_bookmark, set_bookmark_icon },
-    aux: usize,
+    /// Owned bookmark spec; null for prompts without a bookmark target.
+    target: ?[]u8,
     window: *c.GtkWidget,
     entry: *c.GtkWidget,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
         const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+        if (ctx.target) |target| ctx.allocator.free(target);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -911,7 +1478,7 @@ const NamePromptCtx = struct {
 fn openNamePrompt(
     self: *BrowserView,
     purpose: @FieldType(NamePromptCtx, "purpose"),
-    aux: usize,
+    target: ?[]const u8,
     title: [*:0]const u8,
     placeholder: [*:0]const u8,
     initial: []const u8,
@@ -959,11 +1526,16 @@ fn openNamePrompt(
         c.gtk_window_destroy(@ptrCast(win));
         return;
     };
+    const target_owned = if (target) |value| self.allocator.dupe(u8, value) catch {
+        self.allocator.destroy(ctx);
+        c.gtk_window_destroy(@ptrCast(win));
+        return;
+    } else null;
     ctx.* = .{
         .allocator = self.allocator,
         .view = self,
         .purpose = purpose,
-        .aux = aux,
+        .target = target_owned,
         .window = win,
         .entry = entry,
     };
@@ -994,13 +1566,16 @@ fn onNamePromptOk(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     @memcpy(nbuf[0..n], text[0..n]);
     const name = nbuf[0..n];
     const purpose = ctx.purpose;
-    const aux = ctx.aux;
-    c.gtk_window_destroy(@ptrCast(ctx.window));
     switch (purpose) {
         .new_section => sidewidgets.addSection(self, name),
-        .rename_bookmark => setBookmarkLabel(self, aux, name),
-        .set_bookmark_icon => setBookmarkIcon(self, aux, name),
+        .rename_bookmark => if (ctx.target) |target| {
+            if (bookmarkIndexOf(self, target)) |i| setBookmarkLabel(self, i, name);
+        },
+        .set_bookmark_icon => if (ctx.target) |target| {
+            if (bookmarkIndexOf(self, target)) |i| setBookmarkIcon(self, i, name);
+        },
     }
+    c.gtk_window_destroy(@ptrCast(ctx.window));
 }
 
 /// Activate the row exactly as a click would (navigate here, run the
@@ -1067,6 +1642,7 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    var bookmark_changed = false;
     if (std.mem.startsWith(u8, ctx.spec, "search:")) {
         const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
         if (idx < self.saved_searches.items.len) {
@@ -1074,7 +1650,10 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             _ = self.saved_searches.orderedRemove(idx);
         }
     } else {
-        while (bookmarkIndexOf(self, ctx.spec)) |i| removeBookmarkAt(self, i);
+        while (bookmarkIndexOf(self, ctx.spec)) |i| {
+            removeBookmarkAt(self, i);
+            bookmark_changed = true;
+        }
         var i: usize = 0;
         while (i < self.recent.items.len) {
             if (std.mem.eql(u8, self.recent.items[i], ctx.spec)) {
@@ -1083,8 +1662,12 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             } else i += 1;
         }
     }
-    self.savePlaces();
-    self.renderPlaces();
+    if (bookmark_changed) {
+        bookmarksChanged(self);
+    } else {
+        self.savePlaces();
+        self.renderPlaces();
+    }
 }
 
 pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
@@ -1184,57 +1767,39 @@ pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 }
 
 pub fn savePlaces(self: *BrowserView) void {
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const bm = a.alloc([]const u8, self.bookmarks.items.len) catch return;
-    for (self.bookmarks.items, 0..) |b, i| bm[i] = b;
-    // Labels stay strictly parallel to the bookmarks; a short list
-    // pads out with "".
-    const bl = a.alloc([]const u8, self.bookmarks.items.len) catch return;
-    for (bm, 0..) |_, i| {
-        bl[i] = if (i < self.bookmark_labels.items.len) self.bookmark_labels.items[i] else "";
+    // attach() can migrate a legacy collection before registering the
+    // new face. If another face already owns current process state,
+    // that not-yet-live disk snapshot must not replace it.
+    const source_index = registeredIndex(self);
+    if (live_views.items.len > 0 and source_index == null) return;
+    if (source_index) |i| {
+        if (!live_views.items[i].synced) {
+            if (authoritative) |*current| {
+                live_views.items[i].synced = syncView(self, current.value);
+            }
+            return;
+        }
     }
-    // Icons follow the same strict-parallel rule as the labels.
-    const bi = a.alloc([]const u8, self.bookmarks.items.len) catch return;
-    for (bm, 0..) |_, i| {
-        bi[i] = if (i < self.bookmark_icons.items.len) self.bookmark_icons.items[i] else "";
+
+    const next = if (authoritative) |*current| blk: {
+        var sources: MergeSources = .{};
+        // Other views go first so the explicit saver wins only when
+        // both changed the same field; unrelated pending changes merge.
+        for (live_views.items) |entry| {
+            if (entry.view == self or !entry.synced) continue;
+            sources.consider(entry.view, current.value);
+        }
+        sources.consider(self, current.value);
+        break :blk Authority.captureMerged(self.allocator, current.value, sources) orelse return;
+    } else Authority.capture(self) orelse return;
+    places_mod.save(self.allocator, next.value);
+    for (live_views.items) |*entry| {
+        const view = entry.view;
+        entry.synced = syncView(view, next.value);
+        if (entry.synced and view != self and !view.widgets_dead and view.places_on) view.renderPlaces();
     }
-    const hs = a.alloc([]const u8, self.hidden_sections.items.len) catch return;
-    for (self.hidden_sections.items, 0..) |k, i| hs[i] = k;
-    const so = a.alloc([]const u8, self.section_order.items.len) catch return;
-    for (self.section_order.items, 0..) |k, i| so[i] = k;
-    const rc = a.alloc([]const u8, self.recent.items.len) catch return;
-    for (self.recent.items, 0..) |r, i| rc[i] = r;
-    const fr = a.alloc(places_mod.FrecEntry, self.frecency.items.len) catch return;
-    for (self.frecency.items, 0..) |fe, i| fr[i] = .{ .spec = fe.spec, .count = fe.count, .last_ms = fe.last_ms };
-    const sq = a.alloc(places_mod.SavedSearch, self.saved_searches.items.len) catch return;
-    for (self.saved_searches.items, 0..) |sv, i| {
-        sq[i] = .{ .spec = sv.spec, .pattern = sv.pattern, .content = sv.content };
-    }
-    // `collection` is deliberately written empty: the shelf lives in
-    // the register store now, and places.json only still carries the
-    // field so a pre-register file can be migrated exactly once.
-    const cl = a.alloc([]const u8, self.collapsed.items.len) catch return;
-    for (self.collapsed.items, 0..) |s, i| cl[i] = s;
-    places_mod.save(self.allocator, .{
-        .bookmarks = bm,
-        .bookmark_labels = bl,
-        .bookmark_icons = bi,
-        .recent = rc,
-        .frecency = fr,
-        .searches = sq,
-        .collection = &.{},
-        .collapsed = cl,
-        .hidden_sections = hs,
-        .section_order = so,
-        .widget_sections = self.widgets.toPlaces(a),
-        .sidebar_px = self.sidebar_px,
-        .sidebar_open = self.sidebar_open,
-        .zebra = self.zebra,
-        .preview_px = self.preview_px,
-        .side_info = self.side_info,
-    });
+    if (authoritative) |*current| current.deinit();
+    authoritative = next;
 }
 
 /// The custom label for bookmark `i`, or null when it should derive
@@ -1253,11 +1818,15 @@ pub fn bookmarkIconAt(self: *BrowserView, i: usize) []const u8 {
     return self.bookmark_icons.items[i];
 }
 
-fn bookmarkIndexOf(self: *BrowserView, spec: []const u8) ?usize {
-    for (self.bookmarks.items, 0..) |b, i| {
+fn bookmarkIndexIn(bookmarks: anytype, spec: []const u8) ?usize {
+    for (bookmarks, 0..) |b, i| {
         if (std.mem.eql(u8, b, spec)) return i;
     }
     return null;
+}
+
+fn bookmarkIndexOf(self: *BrowserView, spec: []const u8) ?usize {
+    return bookmarkIndexIn(self.bookmarks.items, spec);
 }
 
 /// Pad an owned-string parallel list with "" up to index `i`.
@@ -1297,8 +1866,7 @@ pub fn moveBookmark(self: *BrowserView, i: usize, up: bool) void {
     std.mem.swap([]u8, &self.bookmark_labels.items[i], &self.bookmark_labels.items[j]);
     if (!padParallel(self, &self.bookmark_icons, @max(i, j))) return;
     std.mem.swap([]u8, &self.bookmark_icons.items[i], &self.bookmark_icons.items[j]);
-    self.savePlaces();
-    self.renderPlaces();
+    bookmarksChanged(self);
 }
 
 /// Set (or with "" clear) the custom label of bookmark `i`.
@@ -1308,8 +1876,7 @@ pub fn setBookmarkLabel(self: *BrowserView, i: usize, label: []const u8) void {
     const owned = self.allocator.dupe(u8, label) catch return;
     self.allocator.free(self.bookmark_labels.items[i]);
     self.bookmark_labels.items[i] = owned;
-    self.savePlaces();
-    self.renderPlaces();
+    bookmarksChanged(self);
 }
 
 /// Set (or with "" reset) the custom icon of bookmark `i`.
@@ -1319,8 +1886,7 @@ pub fn setBookmarkIcon(self: *BrowserView, i: usize, icon: []const u8) void {
     const owned = self.allocator.dupe(u8, icon) catch return;
     self.allocator.free(self.bookmark_icons.items[i]);
     self.bookmark_icons.items[i] = owned;
-    self.savePlaces();
-    self.renderPlaces();
+    bookmarksChanged(self);
 }
 
 pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
@@ -1336,8 +1902,7 @@ pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
     if (empty) |e| self.bookmark_labels.append(self.allocator, e) catch self.allocator.free(e);
     const empty_icon = self.allocator.dupe(u8, "") catch null;
     if (empty_icon) |e| self.bookmark_icons.append(self.allocator, e) catch self.allocator.free(e);
-    self.savePlaces();
-    if (self.places_on) self.renderPlaces();
+    bookmarksChanged(self);
     self.setStatusFmt("bookmarked: {s}", .{spec});
 }
 
@@ -1369,4 +1934,84 @@ test "hostSectionTitle titleizes the bare host name" {
     try t.expectEqualStrings("Box Places", hostSectionTitle("skerit@box", &buf));
     try t.expectEqualStrings("Box Places", hostSectionTitle("udp:box", &buf));
     try t.expectEqualStrings("Aeor Places", hostSectionTitle("user@aeor", &buf));
+}
+
+test "bookmark dialog target resolves by spec after reorder" {
+    const bookmarks = [_][]const u8{ "local:/two", "local:/one" };
+    try std.testing.expectEqual(@as(?usize, 1), bookmarkIndexIn(&bookmarks, "local:/one"));
+}
+
+fn deinitTestPersistedView(view: *BrowserView) void {
+    const allocator = view.allocator;
+    freeStrings(allocator, &view.bookmarks);
+    freeStrings(allocator, &view.bookmark_labels);
+    freeStrings(allocator, &view.bookmark_icons);
+    freeStrings(allocator, &view.recent);
+    for (view.frecency.items) |entry| allocator.free(entry.spec);
+    view.frecency.deinit(allocator);
+    freeStrings(allocator, &view.collapsed);
+    freeStrings(allocator, &view.hidden_sections);
+    freeStrings(allocator, &view.section_order);
+    view.widgets.deinit(allocator);
+    for (view.saved_searches.items) |search| search.deinitOwned(allocator);
+    view.saved_searches.deinit(allocator);
+}
+
+test "full places synchronization replaces unrelated stale fields together" {
+    const t = std.testing;
+    const widgets = [_]places_mod.Widget{.{ .kind = "text", .text = "authoritative widget" }};
+    const sections = [_]places_mod.WidgetSection{.{ .name = "Status", .widgets = &widgets }};
+    const searches = [_]places_mod.SavedSearch{.{ .spec = "local:/src", .pattern = "*.zig" }};
+    const places = places_mod.Places{
+        .bookmarks = &.{"local:/project"},
+        .bookmark_labels = &.{"Project"},
+        .bookmark_icons = &.{"folder-symbolic"},
+        .recent = &.{"local:/current"},
+        .searches = &searches,
+        .hidden_sections = &.{"devices"},
+        .widget_sections = &sections,
+        .sidebar_px = 260,
+        .side_info = true,
+    };
+    var view = BrowserView{ .allocator = t.allocator, .pane = undefined };
+    const stale = try t.allocator.dupe(u8, "local:/stale");
+    try view.recent.append(t.allocator, stale);
+    defer deinitTestPersistedView(&view);
+    try t.expect(syncView(&view, places));
+    try t.expectEqualStrings("local:/project", view.bookmarks.items[0]);
+    try t.expectEqualStrings("local:/current", view.recent.items[0]);
+    try t.expectEqualStrings("*.zig", view.saved_searches.items[0].pattern);
+    try t.expectEqualStrings("authoritative widget", view.widgets.sections.items[0].widgets.items[0].text);
+    try t.expectEqualStrings("devices", view.hidden_sections.items[0]);
+    try t.expectEqual(@as(i32, 260), view.sidebar_px);
+    try t.expect(view.side_info);
+}
+
+test "places merge keeps unsaved changes from different live views" {
+    const t = std.testing;
+    const base = places_mod.Places{
+        .bookmarks = &.{"local:/old-bookmark"},
+        .bookmark_labels = &.{"Old"},
+        .bookmark_icons = &.{""},
+        .recent = &.{"local:/old-recent"},
+    };
+    var bookmark_view = BrowserView{ .allocator = t.allocator, .pane = undefined };
+    defer deinitTestPersistedView(&bookmark_view);
+    var recent_view = BrowserView{ .allocator = t.allocator, .pane = undefined };
+    defer deinitTestPersistedView(&recent_view);
+    try t.expect(syncView(&bookmark_view, base));
+    try t.expect(syncView(&recent_view, base));
+
+    t.allocator.free(bookmark_view.bookmarks.items[0]);
+    bookmark_view.bookmarks.items[0] = try t.allocator.dupe(u8, "local:/new-bookmark");
+    t.allocator.free(recent_view.recent.items[0]);
+    recent_view.recent.items[0] = try t.allocator.dupe(u8, "local:/new-recent");
+
+    var sources: MergeSources = .{};
+    sources.consider(&recent_view, base);
+    sources.consider(&bookmark_view, base);
+    var merged = Authority.captureMerged(t.allocator, base, sources) orelse return error.OutOfMemory;
+    defer merged.deinit();
+    try t.expectEqualStrings("local:/new-bookmark", merged.value.bookmarks[0]);
+    try t.expectEqualStrings("local:/new-recent", merged.value.recent[0]);
 }

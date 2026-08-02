@@ -68,6 +68,7 @@ var files_identity: bool = false;
 /// desktop entry installs (data/dev.sker.sketerm.files.desktop).
 pub const FILES_TITLE = "Sketerm Files";
 pub const FILES_ICON = "dev.sker.sketerm.files";
+pub const TERMINAL_ICON = "dev.sker.sketerm";
 
 /// Broadcast typing mode. Off / group / all — Terminator semantics.
 pub const GroupSend = enum { off, group, all };
@@ -509,9 +510,9 @@ pub const Window = struct {
         // icon name matters on X11 (_NET_WM_ICON); on Wayland the icon
         // follows the app id / prgname main.zig sets, which is why files
         // mode is its own GApplication rather than a window flag.
+        c.gtk_window_set_icon_name(@ptrCast(app_window), if (files_identity) FILES_ICON else TERMINAL_ICON);
         if (files_identity) {
             c.gtk_window_set_title(@ptrCast(app_window), FILES_TITLE);
-            c.gtk_window_set_icon_name(@ptrCast(app_window), FILES_ICON);
         }
 
         // Make this Zig Window reachable from its GtkWindow, so any

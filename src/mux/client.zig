@@ -211,6 +211,10 @@ pub const Conn = struct {
     /// dial failures kind:"unreachable" (welcome capability). Gates
     /// daemon-owned moves and direct remote-to-remote coordination.
     cross_move: bool = false,
+    /// cross_copy honors client_token and retains terminal jobs until
+    /// job_ack, so browser-owned intents can survive view handoff.
+    durable_copy: bool = false,
+    copy_no_replace: bool = false,
     /// The daemon's announced build id (git describe). Empty = a
     /// daemon that predates the announce — stale by definition.
     server_build: [72]u8 = undefined,
@@ -335,6 +339,8 @@ pub const Conn = struct {
         self.snapshot_version = 0;
         self.udp_tickets = false;
         self.cross_move = false;
+        self.durable_copy = false;
+        self.copy_no_replace = false;
         self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
@@ -343,6 +349,8 @@ pub const Conn = struct {
             snapshot: u8 = 0,
             udp_ticket: bool = false,
             cross_move: bool = false,
+            durable_copy: bool = false,
+            copy_no_replace: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -357,6 +365,8 @@ pub const Conn = struct {
             self.server_proto = parsed.value.server_proto orelse reported;
             self.udp_tickets = parsed.value.udp_ticket;
             self.cross_move = parsed.value.cross_move;
+            self.durable_copy = parsed.value.durable_copy;
+            self.copy_no_replace = parsed.value.copy_no_replace;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
@@ -1560,6 +1570,10 @@ test "welcome records older and future daemon profiles without rejecting either"
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 6), conn.proto);
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
+    try std.testing.expect(!conn.durable_copy);
+    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true}");
+    try std.testing.expect(conn.durable_copy);
+    try std.testing.expect(conn.copy_no_replace);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     conn.applyWelcome(a, "{\"proto\":9}");

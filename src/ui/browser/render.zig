@@ -11,6 +11,7 @@ const grouping = @import("../../filebrowser/grouping.zig");
 const profile = @import("../../util/profile.zig");
 const searchmod = @import("search.zig");
 const views = @import("views.zig");
+const dnd = @import("dnd.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
@@ -160,7 +161,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note, qnote, fnote,
         }) catch ""
     else if (tab.vs.total == 0)
-        std.fmt.bufPrint(&count_buf, "{s}{s}{s}", .{ format.listingStatus(state), note, qnote }) catch ""
+        std.fmt.bufPrint(&count_buf, "{s}{s}{s}{s}", .{ format.listingStatus(state), note, qnote, fnote }) catch ""
     else if (tab.root.streaming)
         // Rows are landing chunk by chunk; the count is a floor.
         std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch ""
@@ -774,6 +775,9 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     self.installGridMiddleClick(tab, tab.flowbox.?);
     // Sticky toggling works in the grid too, same capture-phase rule.
     self.installSelectionGestures(tab, @ptrCast(fb), true);
+    const dropt = dnd.newTarget(tab);
+    _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onGridDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(fb, @ptrCast(dropt));
     return tab.flowbox.?;
 }
 
@@ -808,18 +812,32 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
 /// it; a drop on another browser tab moves (same host) or copies
 /// (cross-host). Local entries deliberately drag as a BARE path, not
 /// "local:/x", so a terminal drop is directly usable.
-pub fn addEntryDragSource(tab: *BTab, widget: *c.GtkWidget, full: []const u8) void {
-    var pz: [4500:0]u8 = undefined;
-    const spec_res = if (tab.hc.host) |h|
-        std.fmt.bufPrintZ(&pz, "{s}:{s}", .{ h, full })
-    else
-        std.fmt.bufPrintZ(&pz, "{s}", .{full});
-    const pzs = spec_res catch return;
-    const provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
+pub fn addEntryDragSource(_: *BTab, widget: *c.GtkWidget) void {
     const dsrc = c.gtk_drag_source_new();
-    c.gtk_drag_source_set_content(dsrc, provider);
-    c.g_object_unref(provider);
+    dnd.configureSource(dsrc.?);
+    _ = c.g_signal_connect_data(dsrc, "prepare", @ptrCast(&onGridDragPrepare), @ptrCast(widget), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(widget, @ptrCast(dsrc));
+}
+
+fn onGridDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
+    const child: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const data = c.g_object_get_data(@ptrCast(@alignCast(child)), "sketerm-row") orelse return null;
+    const ctx: *RowCtx = @ptrCast(@alignCast(data));
+    return dnd.provider(ctx.tab, ctx.path);
+}
+
+fn onGridDrop(target: *c.GtkDropTarget, value: *c.GValue, x: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    var dst_dir: []const u8 = tab.root.path;
+    if (tab.flowbox) |fb| {
+        if (c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y))) |child| {
+            if (c.g_object_get_data(@ptrCast(child), "sketerm-row")) |data| {
+                const ctx: *RowCtx = @ptrCast(@alignCast(data));
+                if (ctx.is_dir) dst_dir = ctx.path;
+            }
+        }
+    }
+    return @intFromBool(@import("ops.zig").dropValueIntoAction(tab.view, tab, value, dst_dir, dnd.dropAction(target, tab)));
 }
 
 pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) void {
@@ -867,7 +885,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-img", @ptrCast(ic));
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-px", @ptrFromInt(@as(usize, @intCast(step.tile_icon_px))));
     };
-    addEntryDragSource(tab, child, full);
+    addEntryDragSource(tab, child);
     c.gtk_flow_box_append(fb, child);
 }
 

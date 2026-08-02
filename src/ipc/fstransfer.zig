@@ -75,6 +75,8 @@ pub const Transfer = struct {
     dst_path: []u8,
     staged: []u8,
     resumable: bool,
+    /// The final destination name must still be absent at install.
+    no_replace: bool = false,
     /// Tree-resume semantics: a destination that already exists with
     /// the source's size is skipped without hashing (fsjob parity).
     skip_if_same_size: bool = false,
@@ -331,13 +333,18 @@ pub const Transfer = struct {
                         .op = "rename",
                         .path = self.staged,
                         .to = self.dst_path,
+                        .no_replace = self.no_replace,
                     });
                     return;
                 }
                 self.requestRead();
             },
             .rename => {
-                if (!rep.ok) return self.failFmt("finalize: {s}", .{rep.@"error"});
+                if (!rep.ok) {
+                    if (self.no_replace and std.mem.indexOf(u8, rep.@"error", "EXIST") != null)
+                        self.dst.queueJson(.fs_op, .{ .req = self.nr(), .op = "delete", .path = self.staged }) catch {};
+                    return self.failFmt("finalize: {s}", .{rep.@"error"});
+                }
                 self.req_dst = self.nr();
                 self.state = .hash_start_dst;
                 _ = self.sendDstOp(.{ .req = self.req_dst, .op = "hash", .path = self.dst_path });
@@ -513,6 +520,8 @@ pub const Xfer = struct {
     src_root: []u8,
     dst_root: []u8,
     resumable: bool,
+    /// The top-level destination must be created atomically as absent.
+    no_replace: bool = false,
 
     state: State = .idle,
     /// Relative dir paths ("" = root) still to list during the walk.
@@ -650,6 +659,10 @@ pub const Xfer = struct {
     }
 
     pub fn start(self: *Xfer) void {
+        if (self.no_replace and !self.dst.copy_no_replace) {
+            self.fail("destination daemon lacks safe no-replace support");
+            return;
+        }
         self.list_req = self.nr();
         self.state = .stat_root;
         self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "stat", .path = self.src_root }) catch
@@ -732,7 +745,23 @@ pub const Xfer = struct {
                     self.startNextFile();
                     return;
                 }
-                if (!e.tdir) return self.fail("source is neither file nor directory");
+                if (std.mem.eql(u8, e.kind, "link")) {
+                    const target = e.target orelse return self.fail("source symlink has no readable target");
+                    const rel = self.allocator.dupe(u8, "") catch return self.fail("out of memory");
+                    const owned_target = self.allocator.dupe(u8, target) catch {
+                        self.allocator.free(rel);
+                        return self.fail("out of memory");
+                    };
+                    self.links.append(self.allocator, .{ .rel = rel, .target = owned_target }) catch {
+                        self.allocator.free(rel);
+                        self.allocator.free(owned_target);
+                        return self.fail("out of memory");
+                    };
+                    self.state = .symlinks;
+                    self.setupNext();
+                    return;
+                }
+                if (!std.mem.eql(u8, e.kind, "dir")) return self.fail("source is neither file, link, nor directory");
                 self.enqueueDir("") catch return self.fail("out of memory");
                 self.state = .walking;
                 self.listNext();
@@ -774,8 +803,15 @@ pub const Xfer = struct {
                 self.listNext();
             },
             .mkdirs, .symlinks => {
-                if (!rep.ok and std.mem.indexOf(u8, rep.@"error", "EXIST") == null)
-                    return self.failFmt("destination setup: {s}", .{rep.@"error"});
+                if (!rep.ok) {
+                    const root = switch (self.state) {
+                        .mkdirs => self.dirs.items[self.setup_idx].len == 0,
+                        .symlinks => self.links.items[self.setup_idx].rel.len == 0,
+                        else => false,
+                    };
+                    if ((self.no_replace and root) or std.mem.indexOf(u8, rep.@"error", "EXIST") == null)
+                        return self.failFmt("destination setup: {s}", .{rep.@"error"});
+                }
                 self.setup_idx += 1;
                 self.setupNext();
             },
@@ -865,6 +901,7 @@ pub const Xfer = struct {
             return self.fail("out of memory");
         // Tree resume: completed files (final name, same size) skip.
         t.skip_if_same_size = self.resumable and !self.single_file;
+        t.no_replace = self.no_replace and self.single_file;
         self.cur = t;
         t.start();
         self.afterCurFeed();

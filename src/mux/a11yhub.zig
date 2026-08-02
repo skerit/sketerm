@@ -634,6 +634,8 @@ const Walker = struct {
         const role_num = self.role(dest, path) catch 0;
         const name = self.stringProp(dest, path, ATSPI_ACCESSIBLE, "Name") catch "";
         defer a.free(name);
+        const accessible_id = self.stringProp(dest, path, ATSPI_ACCESSIBLE, "AccessibleId") catch "";
+        defer a.free(accessible_id);
         const desc = self.stringProp(dest, path, ATSPI_ACCESSIBLE, "Description") catch "";
         defer a.free(desc);
         const st = self.states(dest, path) catch [2]u32{ 0, 0 };
@@ -645,6 +647,7 @@ const Walker = struct {
         try printInt(w, a, role_num);
         try w.appendSlice(a, ",\"name\":");
         try printJsonString(w, a, name);
+        try appendAccessibleId(w, a, accessible_id);
         if (desc.len > 0) {
             try w.appendSlice(a, ",\"desc\":");
             try printJsonString(w, a, desc);
@@ -842,6 +845,12 @@ fn printIntI(w: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
     try w.appendSlice(a, s);
 }
 
+fn appendAccessibleId(w: *std.ArrayList(u8), a: std.mem.Allocator, id: []const u8) !void {
+    if (id.len == 0) return;
+    try w.appendSlice(a, ",\"accessible_id\":");
+    try printJsonString(w, a, id);
+}
+
 fn printJsonString(w: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
     try w.append(a, '"');
     for (s) |ch| switch (ch) {
@@ -866,6 +875,15 @@ test "json string escaping is well-formed" {
     defer out.deinit(a);
     try printJsonString(&out, a, "a\"b\\c\n");
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", out.items);
+}
+
+test "AT-SPI AccessibleId is not promoted to a desktop app id" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendAccessibleId(&out, a, "QApplication");
+    try std.testing.expectEqualStrings(",\"accessible_id\":\"QApplication\"", out.items);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"app_id\"") == null);
 }
 
 test "parseUnixPath extracts path and abstract forms" {

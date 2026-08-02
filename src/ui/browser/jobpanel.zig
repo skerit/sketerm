@@ -32,7 +32,7 @@ const MAX_PANEL_HEIGHT = 168;
 const SPARK_W = 96;
 const SPARK_H = 18;
 
-const Kind = enum { daemon, xfer, durable, copy };
+const Kind = enum { daemon, xfer, durable, copy, deferred };
 
 /// Stable identity of a panel row across rebuilds.
 const Key = struct {
@@ -41,23 +41,29 @@ const Key = struct {
     /// ones, unused for durable rows.
     ptr: usize = 0,
     job: u64 = 0,
-    /// Durable ledger token (owned by the Meter, borrowed by a Row).
+    /// Durable/retry token (owned by the Meter, borrowed by a Row).
     token: []const u8 = "",
 
     fn eql(a: Key, b: Key) bool {
         if (a.kind != b.kind) return false;
         return switch (a.kind) {
             .durable => std.mem.eql(u8, a.token, b.token),
-            .daemon => a.ptr == b.ptr and a.job == b.job,
-            .xfer, .copy => a.ptr == b.ptr,
+            .daemon => if (a.token.len > 0 or b.token.len > 0)
+                a.token.len > 0 and b.token.len > 0 and std.mem.eql(u8, a.token, b.token)
+            else
+                a.ptr == b.ptr and a.job == b.job,
+            .xfer, .copy, .deferred => a.ptr == b.ptr,
         };
     }
 
     fn hash(self: Key, h: *std.hash.Wyhash) void {
         h.update(std.mem.asBytes(&@intFromEnum(self.kind)));
-        h.update(std.mem.asBytes(&self.ptr));
-        h.update(std.mem.asBytes(&self.job));
-        h.update(self.token);
+        if ((self.kind == .daemon or self.kind == .durable) and self.token.len > 0) {
+            h.update(self.token);
+        } else {
+            h.update(std.mem.asBytes(&self.ptr));
+            h.update(std.mem.asBytes(&self.job));
+        }
     }
 };
 
@@ -101,6 +107,7 @@ const Row = struct {
     hc: ?*HostConn = null,
     transfer: ?*ActiveTransfer = null,
     copy: ?*jobs.CopyItem = null,
+    deferred: ?*jobs.DeferredTransfer = null,
 
     fn active(self: Row) bool {
         return self.state == .queued or self.state == .running or self.state == .paused;
@@ -133,7 +140,7 @@ const Spark = struct {
 /// Per-row measurement plus the widgets of the current build.
 const Meter = struct {
     key: Key,
-    /// Owned copy of a durable row's token (Key.token points at it).
+    /// Owned copy of a token-bearing row's token (Key.token points at it).
     token: []u8 = &.{},
     sampler: progress.Sampler = .{},
     status: progress.Status = .{},
@@ -241,6 +248,7 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
                 // moveQueued only reorders queued intents.
                 .reorder = d.state == .queued,
                 .dismiss = terminal,
+                .retry = d.mediated and d.state == .failed,
             },
         }) catch return;
     }
@@ -290,6 +298,7 @@ fn transferRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
 
 fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
     for (self.jobs.items) |j| {
+        const successor_active = jobs.copySuccessorActive(self, j);
         const state: RowState = switch (j.state) {
             .running => .running,
             .paused => .paused,
@@ -298,7 +307,12 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .canceled => .canceled,
         };
         out.append(arena, .{
-            .key = .{ .kind = .daemon, .ptr = @intFromPtr(j.hc), .job = j.job },
+            .key = .{
+                .kind = .daemon,
+                .ptr = @intFromPtr(j.hc),
+                .job = j.job,
+                .token = if (j.retry) |retry| retry.token else "",
+            },
             .label = std.fmt.allocPrint(arena, "{s} on {s}", .{ j.label, j.hc.label() }) catch j.label,
             .state = state,
             .done = j.done,
@@ -314,8 +328,8 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
                 .pause = !j.terminal() and j.state != .paused,
                 .unpause = j.state == .paused,
                 .cancel = !j.terminal(),
-                .dismiss = j.terminal(),
-                .retry = j.state == .failed and j.retry != null and !j.retry_scheduled,
+                .dismiss = j.terminal() and !j.retry_scheduled and !successor_active,
+                .retry = j.state == .failed and j.retry != null and !j.retry_scheduled and !successor_active,
             },
             .hc = j.hc,
         }) catch return;
@@ -339,12 +353,34 @@ fn copyQueueRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLi
     }
 }
 
+fn deferredRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
+    for (self.deferred_transfers.items) |item| {
+        const waiting = if (item.wait_for_coordinator)
+            "waiting for a durable coordinator"
+        else if (item.src_hc.state != .ready)
+            "waiting for the source host"
+        else
+            "waiting for the destination host";
+        out.append(arena, .{
+            .key = .{ .kind = .deferred, .ptr = @intFromPtr(item) },
+            .label = std.fmt.allocPrint(arena, "{s} -> {s}", .{ std.fs.path.basename(item.src_path), item.dst_hc.label() }) catch item.src_path,
+            .state = .queued,
+            .src = hostQualified(arena, item.src_hc.host orelse "", item.src_path),
+            .dst = hostQualified(arena, item.dst_hc.host orelse "", item.dst_path),
+            .message = waiting,
+            .controls = .{ .cancel = true },
+            .deferred = item,
+        }) catch return;
+    }
+}
+
 fn collectRows(self: *BrowserView, arena: std.mem.Allocator) []Row {
     var rows: std.ArrayList(Row) = .empty;
     durableRows(self, arena, &rows);
     transferRows(self, arena, &rows);
     daemonRows(self, arena, &rows);
     copyQueueRows(self, arena, &rows);
+    deferredRows(self, arena, &rows);
     return rows.items;
 }
 
@@ -374,7 +410,7 @@ fn syncMeters(self: *BrowserView, rows: []const Row) void {
         const meter = panel.find(r.key) orelse blk: {
             const m = self.allocator.create(Meter) catch continue;
             m.* = .{ .key = r.key };
-            if (r.key.kind == .durable) {
+            if (r.key.token.len > 0) {
                 m.token = self.allocator.dupe(u8, r.key.token) catch {
                     self.allocator.destroy(m);
                     continue;
@@ -517,11 +553,17 @@ fn summaryText(buf: []u8, rows: []const Row, panel: *Panel) []const u8 {
     var running: usize = 0;
     var queued: usize = 0;
     var total_rate: u64 = 0;
+    var files_done: usize = 0;
+    var files_total: usize = 0;
     for (rows) |r| {
         switch (r.state) {
             .running => running += 1,
             .queued, .paused => queued += 1,
             else => {},
+        }
+        if (r.active() and r.files_total > 0) {
+            files_done += @min(r.files_done, r.files_total);
+            files_total += r.files_total;
         }
         const meter = panel.find(r.key) orelse continue;
         if (meter.status.rate_bps) |bps| total_rate += bps;
@@ -529,6 +571,7 @@ fn summaryText(buf: []u8, rows: []const Row, panel: *Panel) []const u8 {
     var rate_buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(buf);
     w.print("{d} running, {d} waiting", .{ running, queued }) catch {};
+    if (files_total > 0) w.print(" - {d} of {d} files", .{ files_done, files_total }) catch {};
     if (total_rate > 0) w.print(" - {s} total", .{progress.formatRate(&rate_buf, total_rate)}) catch {};
     return w.buffered();
 }
@@ -548,6 +591,7 @@ pub const JobBtnCtx = struct {
     transfer: ?*ActiveTransfer = null,
     /// Queued cross-host copy target.
     copy: ?*jobs.CopyItem = null,
+    deferred: ?*jobs.DeferredTransfer = null,
     /// Durable ledger token (owned).
     service_token: ?[]u8 = null,
     kind: enum { pause, resume_, cancel, dismiss, move_up, move_down, expand, retry },
@@ -596,11 +640,14 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         switch (ctx.kind) {
             .move_up => service.moveQueued(token, -1),
             .move_down => service.moveQueued(token, 1),
-            // A terminal durable row is dropped by the same call that
-            // cancels a live one: both end the intent.
-            .cancel, .dismiss => service.cancel(token),
+            .cancel => service.cancel(token),
+            .dismiss => if (!service.dismissMediated(token)) {
+                self.setStatus("could not persist transfer dismissal");
+                return;
+            },
             .pause => service.setPaused(token, true),
             .resume_ => service.setPaused(token, false),
+            .retry => service.retryMediated(token),
             else => {},
         }
         self.renderJobs();
@@ -631,17 +678,51 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         self.renderJobs();
         return;
     }
+    if (ctx.deferred) |item| {
+        if (ctx.kind == .cancel) self.cancelDeferredTransfer(item);
+        self.renderJobs();
+        return;
+    }
     const hc = ctx.hc orelse return;
     switch (ctx.kind) {
         .pause => {
+            for (self.jobs.items) |j| {
+                if (j.hc == hc and j.job == ctx.job) if (j.retry) |retry| {
+                    if (self.transfer_service) |service| if (!service.setMediatedPaused(retry.token, true)) {
+                        self.setStatus("could not persist transfer pause state");
+                        return;
+                    };
+                };
+            }
             self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_pause", .job = ctx.job });
             self.markJob(hc, ctx.job, .paused);
         },
         .resume_ => {
+            for (self.jobs.items) |j| {
+                if (j.hc == hc and j.job == ctx.job) if (j.retry) |retry| {
+                    if (self.transfer_service) |service| if (!service.setMediatedPaused(retry.token, false)) {
+                        self.setStatus("could not persist transfer pause state");
+                        return;
+                    };
+                };
+            }
             self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_resume", .job = ctx.job });
             self.markJob(hc, ctx.job, .running);
         },
-        .cancel => self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = ctx.job }),
+        .cancel => {
+            for (self.jobs.items) |j| {
+                if (j.hc != hc or j.job != ctx.job) continue;
+                if (j.retry) |retry| {
+                    const service = self.transfer_service orelse return;
+                    if (!service.requestMediatedCancel(retry.token)) {
+                        self.setStatus("could not persist transfer cancellation");
+                        return;
+                    }
+                }
+                break;
+            }
+            self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = ctx.job });
+        },
         .retry => {
             for (self.jobs.items) |j| {
                 if (j.hc == hc and j.job == ctx.job) {
@@ -655,6 +736,15 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             while (i < self.jobs.items.len) : (i += 1) {
                 const j = self.jobs.items[i];
                 if (j.hc == hc and j.job == ctx.job) {
+                    if (j.retry) |retry| {
+                        if (self.transfer_service) |service| {
+                            if (!service.dismissMediated(retry.token)) {
+                                self.setStatus("could not persist transfer dismissal");
+                                return;
+                            }
+                        }
+                        self.cancelScheduledRetry(retry.token);
+                    }
                     if (j.undo_op) |u| u.destroy(self.allocator);
                     if (j.undo_trash_orig) |o| self.allocator.free(o);
                     if (j.retry) |r| r.destroy(self.allocator);
@@ -678,6 +768,8 @@ fn meterOf(ctx: *JobBtnCtx, self: *BrowserView) ?*Meter {
         return self.jobs_panel.find(.{ .kind = .xfer, .ptr = @intFromPtr(t) });
     if (ctx.copy) |item|
         return self.jobs_panel.find(.{ .kind = .copy, .ptr = @intFromPtr(item) });
+    if (ctx.deferred) |item|
+        return self.jobs_panel.find(.{ .kind = .deferred, .ptr = @intFromPtr(item) });
     const hc = ctx.hc orelse return null;
     return self.jobs_panel.find(.{ .kind = .daemon, .ptr = @intFromPtr(hc), .job = ctx.job });
 }
@@ -690,6 +782,7 @@ fn identityCtx(self: *BrowserView, row: Row, kind: @FieldType(JobBtnCtx, "kind")
         .job = row.key.job,
         .transfer = row.transfer,
         .copy = row.copy,
+        .deferred = row.deferred,
         .service_token = if (row.key.kind == .durable) (self.allocator.dupe(u8, row.key.token) catch null) else null,
         .kind = kind,
     };
@@ -762,7 +855,17 @@ fn applyRow(row: Row, meter: *Meter) void {
             c.gtk_widget_set_visible(@ptrCast(@alignCast(badge)), 0);
         }
     }
-    if (meter.bar) |bar| c.gtk_progress_bar_set_fraction(bar, fraction(row));
+    if (meter.bar) |bar| {
+        c.gtk_progress_bar_set_fraction(bar, fraction(row));
+        if (row.files_total > 0) {
+            var text_buf: [64]u8 = undefined;
+            var text_z: [64:0]u8 = undefined;
+            const text = std.fmt.bufPrint(&text_buf, "{d}/{d} files", .{ row.files_done, row.files_total }) catch "";
+            c.gtk_progress_bar_set_text(bar, copyZ(&text_z, text));
+        } else {
+            c.gtk_progress_bar_set_text(bar, null);
+        }
+    }
     if (meter.rate_label) |rate| {
         var rate_buf: [32]u8 = undefined;
         var rz: [48:0]u8 = undefined;
@@ -1009,4 +1112,24 @@ pub fn renderJobs(self: *BrowserView) void {
         self.jobs_panel.signature = sig;
     }
     armTick(self, rows);
+}
+
+test "summary reports queued commands and aggregate file progress" {
+    var panel = Panel{};
+    var buf: [160]u8 = undefined;
+    const rows = [_]Row{
+        .{
+            .key = .{ .kind = .durable },
+            .label = "folder",
+            .state = .running,
+            .files_done = 37,
+            .files_total = 120,
+        },
+        .{ .key = .{ .kind = .copy, .ptr = 1 }, .label = "next", .state = .queued },
+        .{ .key = .{ .kind = .copy, .ptr = 2 }, .label = "last", .state = .queued },
+    };
+    try std.testing.expectEqualStrings(
+        "1 running, 2 waiting - 37 of 120 files",
+        summaryText(&buf, &rows, &panel),
+    );
 }
