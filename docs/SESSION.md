@@ -11937,3 +11937,37 @@ captions, min_frame returning strictly newer pixels and erroring when
 unreachable, app_wait min_frames and animating verdicts, the no-a11y-tree
 message, region shorthands, and a forked child confirmed alive before
 close_app and gone after.
+
+## 2026-08-02: Sketerm Viewer V1
+
+`sketerm view` and the installed `sketerm-viewer` alias now run a
+separate `dev.sker.sketerm.viewer` image-viewer identity. The Viewer
+loads local and remote resources through the daemon file service:
+bounded preview first, explicit full-resolution ranged read second,
+with no FUSE mount in the data path. Existing Sketerm mount paths are
+refused so they cannot loop back into the same daemon.
+
+Linux decoding prefers runtime-loaded Glycin 2 and its sandboxed
+loaders; GdkPixbuf is the portable fallback. Both paths normalize to
+RGBA and enforce source and pixel limits before retaining a decoded
+image. One active loader plus one replaceable pending request bounds
+rapid navigation, and generation/liveness fencing prevents stale or
+post-destroy callbacks.
+
+The shared image canvas now powers the Files information panel, Quick
+Look, and the standalone Viewer with fit, actual-size, zoom and pan.
+Files launches the exact visible image order, including filtered and
+expanded-tree rows. A private mode-0600 runtime manifest replaces an
+unbounded argv list; consumption verifies directory, owner, type,
+permissions and symlink safety, while timed and age-based cleanup
+remove abandoned handoffs.
+
+Packaging installs the Viewer desktop entry, icon and alias. Arch
+depends on Glycin and libheif; Debian recommends the Glycin 2 library
+and loaders. Verified: build 33/33; full suite 1146 pass / 5 skip;
+core suite 955 pass / 5 skip; aarch64-macos mux-portable; desktop and
+shell validation; sketerm-mux still links only libc/libm. Isolated GUI
+checks covered preview/full loading, decoder fallback, source-size
+rejection, filtered and expanded-row ordering, rapid navigation,
+manifest cleanup/error handling, side-panel rendering, and Quick Look
+closing during a full-resolution load without GTK criticals.
