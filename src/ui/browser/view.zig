@@ -25,6 +25,7 @@ const emblems_mod = @import("../../filebrowser/emblems.zig");
 const iconload = @import("iconload.zig");
 const Pane = @import("../pane.zig").Pane;
 const file_transfers = @import("../file_transfers.zig");
+const image_canvas = @import("../image_canvas.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const AttrRequest = @import("props.zig").AttrRequest;
@@ -150,6 +151,8 @@ pub const BrowserView = struct {
     /// stage, bold name, key/value metadata grid, note, content head.
     preview_box: *c.GtkWidget = undefined,
     preview_pic: *c.GtkWidget = undefined,
+    preview_canvas: ?image_canvas.Canvas = null,
+    preview_image: image_canvas.Session = .{},
     /// Big themed icon shown in the stage while there is no rendered
     /// preview (exactly one of pic/icon is visible).
     preview_icon: *c.GtkWidget = undefined,
@@ -698,6 +701,7 @@ pub const BrowserView = struct {
     pub const openRemoteFileHc = @import("open.zig").openRemoteFileHc;
     pub const openPathOnHost = @import("open.zig").openPathOnHost;
     pub const openWithDialog = @import("open.zig").openWithDialog;
+    pub const launchViewer = @import("open.zig").launchViewer;
     pub const appChoiceButton = @import("open.zig").appChoiceButton;
     pub const onAppBtnClicked = @import("open.zig").onAppBtnClicked;
     pub const populateHostApps = @import("open.zig").populateHostApps;
@@ -1253,6 +1257,7 @@ pub const BrowserView = struct {
         self.endAttrRequest();
         self.endSnapRequest();
         self.preview_state.deinit(self.allocator);
+        self.preview_image.deinit(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
         if (self.editor_rename) |er| er.destroy(self.allocator);

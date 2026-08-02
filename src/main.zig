@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const Window = @import("ui/window.zig").Window;
+const viewer = @import("viewer.zig");
 
 comptime {
     // macOS: emit the NSAccessibility bridge's export callbacks into the
@@ -27,6 +28,8 @@ const VERSION = @import("version.zig").string;
 const files_entry = @import("filebrowser/entry.zig");
 
 const App = struct {
+    const Mode = enum { terminal, files, viewer };
+
     allocator: std.mem.Allocator,
     /// The PRIMARY window of this process: it owns the control socket,
     /// the quake toggle and layout persistence, and it lives as long as
@@ -43,9 +46,11 @@ const App = struct {
     /// This process was launched as `sketerm files`: it serves the
     /// dedicated file-manager identity. Says nothing about browser
     /// FACES: a browser pane inside a terminal window is unrelated.
-    files_mode: bool = false,
+    mode: Mode = .terminal,
     /// Start location for the file-manager window (owned).
     files_path: ?[]const u8 = null,
+    /// Ordered resource batch for the next standalone Viewer window.
+    viewer_batch: ?viewer.Batch = null,
 };
 
 const HELP_TEXT =
@@ -110,6 +115,11 @@ const HELP_TEXT =
     \\                         pane: inside a durable REMOTE shell the
     \\                         window's socket is on the other machine,
     \\                         and they say so instead of guessing.
+    \\  sketerm view [images...] Image viewer as its OWN application
+    \\                         ("Sketerm Viewer", own icon and taskbar
+    \\                         entry). Local, file:// and host:/path
+    \\                         resources share the daemon preview and
+    \\                         ranged-read pipeline; no FUSE mount.
     \\  sketerm mount <host>[:/path] <mountpoint>
     \\                         FUSE-mount a host's files so LOCAL apps
     \\                         open them via the kernel (ranged reads,
@@ -359,11 +369,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // The dedicated file manager: its own identity, from here on
             // an ordinary GApplication run.
             .window => {
-                g_app.files_mode = true;
+                g_app.mode = .files;
                 Window.setFilesIdentity();
                 if (req.spec) |s| g_app.files_path = allocator.dupe(u8, s) catch null;
             },
         }
+    }
+
+    if (viewerRequest(allocator, argv)) {
+        g_app.mode = .viewer;
     }
 
     // A leftover local daemon from before a binary upgrade keeps
@@ -393,9 +407,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var base: []const u8 = std.mem.span(APP_ID);
         if (c.getenv("SKETERM_APP_ID")) |raw| {
             const env = std.mem.span(raw);
-            if (env.len > 0 and env.len < app_id_buf.len - FILES_ID_SUFFIX.len) base = env;
+            const longest_suffix = @max(FILES_ID_SUFFIX.len, viewer.ID_SUFFIX.len);
+            if (env.len > 0 and env.len < app_id_buf.len - longest_suffix) base = env;
         }
-        const suffix: []const u8 = if (g_app.files_mode) FILES_ID_SUFFIX else "";
+        const suffix: []const u8 = switch (g_app.mode) {
+            .terminal => "",
+            .files => FILES_ID_SUFFIX,
+            .viewer => viewer.ID_SUFFIX,
+        };
         const id = std.fmt.bufPrintZ(&app_id_buf, "{s}{s}", .{ base, suffix }) catch break :blk APP_ID;
         break :blk id.ptr;
     };
@@ -404,7 +423,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // GTK normally gets the Wayland app_id from GApplication, while
     // AT-SPI Name and X11 WM_CLASS still follow the program name.
     c.g_set_prgname(app_id);
-    c.g_set_application_name(if (g_app.files_mode) "Sketerm Files" else "sketerm");
+    c.g_set_application_name(switch (g_app.mode) {
+        .terminal => "sketerm",
+        .files => "Sketerm Files",
+        .viewer => viewer.APP_NAME,
+    });
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
     defer c.g_object_unref(app);
@@ -474,6 +497,13 @@ fn filesRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?file
     return files_entry.parse(args);
 }
 
+fn viewerRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool {
+    const args = allocator.alloc([]const u8, argv.len) catch return false;
+    defer allocator.free(args);
+    for (argv, 0..) |arg, index| args[index] = std.mem.span(arg);
+    return viewer.invocationStart(args) != null;
+}
+
 fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
     const app: *c.GApplication = @ptrCast(@alignCast(user.?));
     c.g_application_quit(app);
@@ -540,7 +570,7 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
     // instance: remember the requested location so activate opens a
     // window there. Only this identity ever grows a browser window from
     // the command line -- a terminal instance is left alone.
-    if (g_app.files_mode) {
+    if (g_app.mode == .files) {
         var n2: c_int = 0;
         var spec: ?[]const u8 = null;
         while (n2 < argc) : (n2 += 1) {
@@ -554,6 +584,27 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         }
         if (g_app.files_path) |old| g_app.allocator.free(old);
         g_app.files_path = if (spec) |s| g_app.allocator.dupe(u8, s) catch null else null;
+    } else if (g_app.mode == .viewer) {
+        const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
+        defer g_app.allocator.free(args);
+        for (0..@intCast(argc)) |index| {
+            const raw = argv_raw[index] orelse break;
+            args[index] = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        }
+        const cwd_raw = c.g_application_command_line_get_cwd(cmdline);
+        const cwd: ?[]const u8 = if (cwd_raw != null) std.mem.span(@as([*:0]const u8, @ptrCast(cwd_raw))) else null;
+        if (viewer.collect(g_app.allocator, args, cwd)) |batch| {
+            if (g_app.viewer_batch) |*old| old.deinit();
+            g_app.viewer_batch = batch;
+        } else |err| {
+            if (g_app.viewer_batch) |*old| old.deinit();
+            g_app.viewer_batch = null;
+            var message: [192:0]u8 = undefined;
+            const text = std.fmt.bufPrintZ(&message, "sketerm: cannot open Viewer resources: {s}\n", .{@errorName(err)}) catch
+                "sketerm: cannot open Viewer resources\n";
+            c.g_application_command_line_printerr_literal(cmdline, text.ptr);
+            return 1;
+        }
     }
 
     if (saw_toggle) {
@@ -590,13 +641,24 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         c.gtk_icon_theme_add_search_path(theme, "data/icons");
     }
 
+    if (g_app.mode == .viewer) {
+        var batch = takeViewerBatch();
+        if (@import("ui/viewer.zig").ViewerWindow.open(g_app.allocator, app, batch)) |_| {
+            // Ownership moved into the window.
+        } else |err| {
+            batch.deinit();
+            std.debug.print("sketerm: viewer window failed: {s}\n", .{@errorName(err)});
+        }
+        return;
+    }
+
     // Launching an already-running identity again = one more window,
     // the normal GApplication behaviour. It MUST be a secondary window:
     // a second is_primary window would quit the whole app when closed
     // and would take over "the primary". (This used to build a second
     // primary and overwrite g_app.window with it.)
     if (g_app.primary) |primary| {
-        if (g_app.files_mode) {
+        if (g_app.mode == .files) {
             const spec = takeFilesPath();
             defer if (spec) |s| g_app.allocator.free(s);
             _ = primary.openFilesWindow(spec) catch |err|
@@ -625,13 +687,13 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     // belong to the terminal identity. So files mode neither saves nor
     // restores a layout; its own state (per-folder view memory,
     // registers, saved queries) is the browser's, and persists already.
-    window.save_on_close = !g_app.no_save and !g_app.files_mode;
+    window.save_on_close = !g_app.no_save and g_app.mode != .files;
     window.debug_images = g_app.debug_images;
     window.hold_override = g_app.hold;
     g_app.primary = window;
 
     var loaded = false;
-    if (g_app.files_mode) {
+    if (g_app.mode == .files) {
         // no layout in files mode -- see save_on_close above
     } else if (g_app.layout_path) |path| {
         loaded = window.loadLayoutFromPath(path) catch false;
@@ -643,7 +705,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         loaded = window.loadDefaultLayoutIfPresent() catch false;
     }
 
-    if (g_app.files_mode) {
+    if (g_app.mode == .files) {
         // The browser tab IS the window's content: no stray shell tab.
         const spec = takeFilesPath();
         defer if (spec) |s| g_app.allocator.free(s);
@@ -670,7 +732,16 @@ fn takeFilesPath() ?[]const u8 {
     return p;
 }
 
+fn takeViewerBatch() viewer.Batch {
+    const batch = g_app.viewer_batch orelse return viewer.Batch.empty(g_app.allocator);
+    g_app.viewer_batch = null;
+    return batch;
+}
+
 fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
+    if (g_app.viewer_batch) |*batch| batch.deinit();
+    g_app.viewer_batch = null;
+    if (g_app.mode == .viewer) return;
     // Every live window, not just the primary: a secondary window (tab
     // drag-out, repeat launch) owns real panes and GUI-owned daemon
     // sessions, and skipping it leaked both. GTK destroys the windows

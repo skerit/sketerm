@@ -15,6 +15,7 @@ const copyToClip = @import("ops.zig").copyToClip;
 const countSelected = @import("nav.zig").countSelected;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
+const isImageName = @import("../../filebrowser/paths.zig").isImageName;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
 const launchLocal = @import("open.zig").launchLocal;
@@ -442,6 +443,8 @@ fn addOpenAppItem(
 /// chooser dialog's local section.
 fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
+    if (isImageName(path))
+        m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
     var namez: [512:0]u8 = undefined;
     var ct: [*c]c.gchar = null;
     if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(path)})) |bz| {
@@ -952,6 +955,19 @@ pub fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const path = pbuf[0..orig.len];
     menuDone(mctx);
     self.openWithDialog(tab, path);
+}
+
+pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return menuDone(ctx);
+    @memcpy(path_buf[0..path.len], path);
+    const copied = path_buf[0..path.len];
+    const tab = ctx.tab;
+    menuDone(ctx);
+    self.launchViewer(tab, copied);
 }
 
 pub fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

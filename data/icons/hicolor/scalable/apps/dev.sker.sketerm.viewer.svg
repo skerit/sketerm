@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Sketerm Viewer</title>
+  <defs>
+    <linearGradient id="bezel" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="64" y1="43" x2="64" y2="99" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#99c1f1"/>
+      <stop offset="1" stop-color="#62a0ea"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="104" height="104" rx="20" fill="url(#bezel)"/>
+  <circle cx="28" cy="28" r="3.5" fill="#ed5e5e"/>
+  <circle cx="40" cy="28" r="3.5" fill="#f9c74f"/>
+  <circle cx="52" cy="28" r="3.5" fill="#90be6d"/>
+  <rect x="24" y="42" width="80" height="62" rx="8" fill="url(#sky)"/>
+  <circle cx="83" cy="59" r="10" fill="#f9c74f"/>
+  <path d="M24 91 45 68 61 83 72 73 104 101v3H24Z" fill="#2ec27e"/>
+  <path d="m24 97 21-20 15 14 12-10 25 23H24Z" fill="#1f8f5f" opacity=".8"/>
+</svg>

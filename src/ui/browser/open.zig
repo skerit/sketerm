@@ -12,9 +12,14 @@ const EditWatch = @import("types.zig").EditWatch;
 const HostConn = @import("types.zig").HostConn;
 const WireApp = @import("types.zig").WireApp;
 const buildHostExecCmd = @import("../../filebrowser/desktop.zig").buildHostExecCmd;
+const colview = @import("colview.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostmount = @import("../hostmount.zig");
 const mimeListContains = @import("../../filebrowser/desktop.zig").mimeListContains;
+const paths = @import("../../filebrowser/paths.zig");
+const platform = @import("../../util/platform.zig");
+const viewer_model = @import("../../viewer.zig");
+const views = @import("views.zig");
 
 /// One remote open waiting for its host's FUSE mount to come up.
 pub const PendingOpen = struct {
@@ -159,6 +164,222 @@ pub fn openPathOnHost(self: *BrowserView, hc: *HostConn, path: []const u8) void 
         launchLocal(path);
     } else {
         self.openRemoteFileHc(hc, path, null);
+    }
+}
+
+var viewer_manifest_serial: u64 = 0;
+
+fn sweepViewerManifests(directory: [:0]const u8) void {
+    const dir = c.opendir(directory.ptr) orelse return;
+    defer _ = c.closedir(dir);
+    const now = c.time(null);
+    while (c.readdir(dir)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (!std.mem.startsWith(u8, name, viewer_model.MANIFEST_PREFIX)) continue;
+        var path_buf: [4096:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ directory, name }) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(path.ptr, &st) != 0 or
+            st.st_uid != c.geteuid() or
+            (st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
+        const modified = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+        if (modified + 300 < now) _ = c.unlink(path.ptr);
+    }
+}
+
+fn writeViewerManifest(bytes: []const u8, out: *[4096:0]u8) ?[:0]const u8 {
+    var dir_buf: [4096:0]u8 = undefined;
+    const dir = viewer_model.ensureManifestDirectory(&dir_buf) orelse return null;
+    sweepViewerManifests(dir);
+    var fd: c_int = -1;
+    var path: [:0]u8 = undefined;
+    var attempts: u8 = 0;
+    while (attempts < 8) : (attempts += 1) {
+        viewer_manifest_serial +%= 1;
+        path = std.fmt.bufPrintZ(out, "{s}/viewer-batch-{d}-{x}", .{
+            dir,
+            c.getpid(),
+            @as(u64, @bitCast(c.g_get_monotonic_time())) ^ viewer_manifest_serial,
+        }) catch return null;
+        fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+        if (fd >= 0) break;
+    }
+    if (fd < 0) return null;
+    if (c.fchmod(fd, @as(c.mode_t, 0o600)) != 0) {
+        _ = c.close(fd);
+        _ = c.unlink(path.ptr);
+        return null;
+    }
+    var open = true;
+    var installed = false;
+    defer {
+        if (open) _ = c.close(fd);
+        if (!installed) _ = c.unlink(path.ptr);
+    }
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const n = c.write(fd, bytes.ptr + at, bytes.len - at);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) return null;
+        at += @intCast(n);
+    }
+    if (c.fsync(fd) != 0) return null;
+    const close_rc = c.close(fd);
+    open = false;
+    if (close_rc != 0) return null;
+    installed = true;
+    return path;
+}
+
+const ManifestCleanup = struct {
+    allocator: std.mem.Allocator,
+    path: [:0]u8,
+};
+
+fn cleanupViewerManifest(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const cleanup: *ManifestCleanup = @ptrCast(@alignCast(user.?));
+    _ = c.unlink(cleanup.path.ptr);
+    cleanup.allocator.free(cleanup.path);
+    cleanup.allocator.destroy(cleanup);
+    return 0;
+}
+
+fn scheduleViewerManifestCleanup(path: []const u8) void {
+    const allocator = std.heap.c_allocator;
+    const cleanup = allocator.create(ManifestCleanup) catch return;
+    cleanup.* = .{
+        .allocator = allocator,
+        .path = allocator.dupeZ(u8, path) catch {
+            allocator.destroy(cleanup);
+            return;
+        },
+    };
+    if (c.g_timeout_add_seconds(60, @ptrCast(&cleanupViewerManifest), @ptrCast(cleanup)) == 0)
+        _ = cleanupViewerManifest(@ptrCast(cleanup));
+}
+
+/// Launch the internal Viewer with this tab's ordered image sequence without FUSE.
+pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
+    const allocator = self.allocator;
+    var specs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (specs.items) |spec| allocator.free(spec);
+        specs.deinit(allocator);
+    }
+    var initial: usize = 0;
+    var found_current = false;
+    const selected_only = tab.selected.items.len > 1 and blk: {
+        for (tab.selected.items) |path| if (std.mem.eql(u8, path, current)) break :blk true;
+        break :blk false;
+    };
+    if (selected_only) {
+        for (tab.selected.items) |path| {
+            if (!paths.isImageName(path)) continue;
+            const is_current = std.mem.eql(u8, path, current);
+            const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
+            specs.append(allocator, owned) catch {
+                allocator.free(owned);
+                break;
+            };
+            if (is_current) {
+                initial = specs.items.len - 1;
+                found_current = true;
+            }
+        }
+    } else {
+        switch (tab.view_mode) {
+            .icons => {
+                var path_buf: [4096]u8 = undefined;
+                for (tab.root.entries.items) |entry| {
+                    if (entry.tdir or !views.entryVisible(tab, entry) or !paths.isImageName(entry.name)) continue;
+                    const path = tab.root.fullPath(entry, &path_buf) orelse continue;
+                    const is_current = std.mem.eql(u8, path, current);
+                    const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
+                    specs.append(allocator, owned) catch {
+                        allocator.free(owned);
+                        break;
+                    };
+                    if (is_current) {
+                        initial = specs.items.len - 1;
+                        found_current = true;
+                    }
+                }
+            },
+            .details, .compact, .miller => {
+                var pos: c.guint = 0;
+                while (pos < colview.itemCount(tab)) : (pos += 1) {
+                    const item = colview.itemDataAt(tab, pos) orelse continue;
+                    if (item.kind != .entry or item.is_dir or !paths.isImageName(item.path)) continue;
+                    const is_current = std.mem.eql(u8, item.path, current);
+                    const owned = paths.formatSpecAlloc(allocator, tab.hc.host, item.path) catch continue;
+                    specs.append(allocator, owned) catch {
+                        allocator.free(owned);
+                        break;
+                    };
+                    if (is_current) {
+                        initial = specs.items.len - 1;
+                        found_current = true;
+                    }
+                }
+            },
+        }
+    }
+    if (!found_current) {
+        const owned = paths.formatSpecAlloc(allocator, tab.hc.host, current) catch return;
+        initial = specs.items.len;
+        specs.append(allocator, owned) catch {
+            allocator.free(owned);
+            return;
+        };
+    }
+
+    var exe_buf: [4096:0]u8 = undefined;
+    const exe = platform.exePathZ(&exe_buf) orelse return;
+    var viewer_buf: [4096:0]u8 = undefined;
+    const sibling: ?[*:0]const u8 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
+        const candidate = std.fmt.bufPrintZ(&viewer_buf, "{s}/sketerm-viewer", .{exe[0..slash]}) catch break :blk null;
+        if (c.access(candidate.ptr, c.X_OK) != 0) break :blk null;
+        break :blk candidate.ptr;
+    };
+    const manifest = viewer_model.encodeManifest(allocator, specs.items, initial) catch {
+        self.setStatus("image sequence is too large to open in Sketerm Viewer");
+        return;
+    };
+    defer allocator.free(manifest);
+    var manifest_path_buf: [4096:0]u8 = undefined;
+    const manifest_path = writeViewerManifest(manifest, &manifest_path_buf) orelse {
+        self.setStatus("could not create the Sketerm Viewer handoff");
+        return;
+    };
+    var manifest_arg_buf: [4200:0]u8 = undefined;
+    const manifest_arg = std.fmt.bufPrintZ(&manifest_arg_buf, "{s}{s}", .{ viewer_model.MANIFEST_OPTION, manifest_path }) catch {
+        _ = c.unlink(manifest_path.ptr);
+        return;
+    };
+    const argc: usize = if (sibling != null) 2 else 3;
+    const argv = allocator.alloc([*c]u8, argc + 1) catch {
+        _ = c.unlink(manifest_path.ptr);
+        return;
+    };
+    defer allocator.free(argv);
+    argv[0] = @constCast(@as([*c]const u8, if (sibling) |bin| bin else exe.ptr));
+    var arg_at: usize = 1;
+    if (sibling == null) {
+        argv[arg_at] = @constCast(@as([*c]const u8, "view"));
+        arg_at += 1;
+    }
+    argv[arg_at] = @constCast(@as([*c]const u8, manifest_arg.ptr));
+    arg_at += 1;
+    argv[arg_at] = null;
+    var gerr: [*c]c.GError = null;
+    if (c.g_spawn_async(null, argv.ptr, null, @intCast(c.G_SPAWN_DEFAULT), null, null, null, &gerr) == 0) {
+        _ = c.unlink(manifest_path.ptr);
+        if (gerr != null) c.g_error_free(gerr);
+        self.setStatus("could not launch Sketerm Viewer");
+    } else {
+        scheduleViewerManifestCleanup(manifest_path);
+        self.setStatusFmt("opening {s} in Sketerm Viewer", .{std.fs.path.basename(current)});
     }
 }
 

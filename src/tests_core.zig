@@ -66,6 +66,7 @@ comptime {
     _ = @import("ipc/xkblayout.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
+    _ = @import("viewer.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
     _ = @import("mux/dbus.zig");

@@ -130,6 +130,9 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(
         &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-files" }).step,
     );
+    b.getInstallStep().dependOn(
+        &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-viewer" }).step,
+    );
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -46,6 +46,7 @@ comptime {
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
     _ = @import("layout.zig");
+    _ = @import("viewer.zig");
     _ = @import("shader_preset.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");
@@ -57,6 +58,9 @@ comptime {
     _ = @import("ui/pane.zig");
     _ = @import("ui/tab_effects.zig");
     _ = @import("ui/hostmount.zig");
+    _ = @import("ui/image_decoder.zig");
+    _ = @import("ui/image_canvas.zig");
+    _ = @import("ui/viewer.zig");
     // The browser facade only re-exports a few decls, which is NOT
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced

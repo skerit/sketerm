@@ -50,6 +50,13 @@ pub fn formatSpec(buf: []u8, host: ?[]const u8, path: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "local:{s}", .{absolute}) catch absolute;
 }
 
+/// Allocate an unambiguous spec without the fixed-buffer fallback.
+pub fn formatSpecAlloc(allocator: std.mem.Allocator, host: ?[]const u8, path: []const u8) ![]u8 {
+    const absolute = if (path.len == 0) "/" else path;
+    if (host) |h| return std.fmt.allocPrint(allocator, "{s}:{s}", .{ h, absolute });
+    return std.fmt.allocPrint(allocator, "local:{s}", .{absolute});
+}
+
 /// Whether `name` is offered as a path-bar completion for `prefix`
 /// (dotfiles are never suggested; matching is case-insensitive).
 pub fn completionMatches(name: []const u8, prefix: []const u8) bool {
@@ -142,7 +149,7 @@ pub fn browserHost(host: ?[]const u8) ?[]const u8 {
 /// Extensions the preview pane and row thumbnails treat as images
 /// (decodable by gdk-pixbuf).
 pub fn isImageName(name: []const u8) bool {
-    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff", ".avif", ".heic", ".heif" };
+    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".jxl", ".bmp", ".svg", ".ico", ".tif", ".tiff", ".avif", ".heic", ".heif" };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
     return false;
 }
@@ -156,7 +163,7 @@ pub fn isWorkerImageName(name: []const u8) bool {
 pub fn isPreviewMediaName(name: []const u8) bool {
     if (isImageName(name)) return true;
     const exts = [_][]const u8{
-        ".pdf", ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg",
+        ".pdf", ".mp4",  ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg",
         ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac",
     };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
@@ -202,20 +209,32 @@ pub fn urlUnescape(s: []const u8, buf: []u8) ?[]const u8 {
 
 /// True when a LOCAL path sits on a sketerm FUSE mount (whose pin/
 /// evict xattrs control the hydration cache).
+fn mountCovers(path: []const u8, mountpoint: []const u8) bool {
+    if (std.mem.eql(u8, mountpoint, "/")) return path.len > 0 and path[0] == '/';
+    return std.mem.startsWith(u8, path, mountpoint) and
+        (path.len == mountpoint.len or path[mountpoint.len] == '/');
+}
+
 pub fn isSketermMount(path: []const u8) bool {
-    const f = c.fopen("/proc/mounts", "rb") orelse return false;
+    const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return false;
     defer _ = c.fclose(f);
-    var buf: [32 * 1024]u8 = undefined;
-    const n = c.fread(&buf, 1, buf.len, f);
-    var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
-    while (it.next()) |line| {
+    var line_ptr: [*c]u8 = null;
+    var line_cap: usize = 0;
+    defer if (line_ptr != null) c.free(line_ptr);
+    while (true) {
+        const line_len = c.getline(&line_ptr, &line_cap, f);
+        if (line_len < 0) break;
+        const raw_line = line_ptr[0..@intCast(line_len)];
+        const line = std.mem.trimEnd(u8, raw_line, "\r\n");
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         _ = fields.next() orelse continue;
-        const mp = fields.next() orelse continue;
+        const raw_mountpoint = fields.next() orelse continue;
         const fstype = fields.next() orelse continue;
         if (!std.mem.eql(u8, fstype, "fuse.sketerm")) continue;
-        if (std.mem.startsWith(u8, path, mp) and
-            (path.len == mp.len or path[mp.len] == '/')) return true;
+        var mountpoint_buf: [4096]u8 = undefined;
+        const mp = unescapeMnt(&mountpoint_buf, raw_mountpoint);
+        if (mp.len == 0) continue;
+        if (mountCovers(path, mp)) return true;
     }
     return false;
 }
@@ -273,8 +292,25 @@ test "isImageName recognizes previewable extensions" {
     const t = std.testing;
     try t.expect(isImageName("photo.JPG"));
     try t.expect(isImageName("a.webp"));
+    try t.expect(isImageName("a.jxl"));
     try t.expect(!isImageName("notes.txt"));
     try t.expect(!isImageName("jpg"));
+}
+
+test "formatSpecAlloc preserves resources larger than the fixed scratch buffer" {
+    const a = std.testing.allocator;
+    const host = try a.alloc(u8, 300);
+    defer a.free(host);
+    @memset(host, 'h');
+    const path = try a.alloc(u8, SPEC_BUF_LEN);
+    defer a.free(path);
+    path[0] = '/';
+    @memset(path[1..], 'p');
+    const spec = try formatSpecAlloc(a, host, path);
+    defer a.free(spec);
+    try std.testing.expectEqual(host.len + 1 + path.len, spec.len);
+    try std.testing.expectEqualStrings(host, spec[0..host.len]);
+    try std.testing.expectEqualStrings(path, spec[host.len + 1 ..]);
 }
 
 test "isPreviewMediaName includes document video and audio formats" {
@@ -419,6 +455,14 @@ test "unescapeMnt decodes /proc/mounts octal escapes" {
     // Output is capped by the destination buffer.
     var small: [4]u8 = undefined;
     try t.expectEqualStrings("/mnt", unescapeMnt(&small, "/mnt/x"));
+}
+
+test "mount coverage handles root and path boundaries" {
+    const t = std.testing;
+    try t.expect(mountCovers("/image.png", "/"));
+    try t.expect(mountCovers("/mnt/view/image.png", "/mnt/view"));
+    try t.expect(!mountCovers("/mnt/viewer/image.png", "/mnt/view"));
+    try t.expect(!mountCovers("relative.png", "/"));
 }
 
 test "urlUnescape decodes trashinfo Path values" {

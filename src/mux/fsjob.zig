@@ -856,7 +856,7 @@ fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
     return 0;
 }
 
-const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
+const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".jxl", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
 const pdf_exts = [_][]const u8{".pdf"};
 const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
 const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };

@@ -136,6 +136,33 @@ pub fn normalizeArg(buf: []u8, arg: []const u8) []const u8 {
     return paths.formatSpec(buf, authority, path);
 }
 
+/// Allocate the normalized command-line resource without truncating long URIs.
+pub fn normalizeArgAlloc(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
+    const scheme = "file://";
+    if (!std.ascii.startsWithIgnoreCase(arg, scheme)) return allocator.dupe(u8, arg);
+    const rest = arg[scheme.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return allocator.dupe(u8, arg);
+    const authority = rest[0..slash];
+    const raw_path = rest[slash..];
+    const decoded = try allocator.alloc(u8, raw_path.len);
+    defer allocator.free(decoded);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < raw_path.len) {
+        if (pctByte(raw_path[i..])) |b| {
+            decoded[w] = b;
+            w += 1;
+            i += 3;
+        } else {
+            decoded[w] = raw_path[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    const host: ?[]const u8 = if (authority.len == 0 or std.ascii.eqlIgnoreCase(authority, "localhost")) null else authority;
+    return paths.formatSpecAlloc(allocator, host, decoded[0..w]);
+}
+
 /// A file manager registered for `inode/directory` can still be handed
 /// a FILE (drag onto the launcher, "Open With"). Browsing then starts
 /// in the file's PARENT directory -- the start location cannot express
@@ -177,6 +204,20 @@ test "files entry: no files token" {
     try std.testing.expect(parse(&.{ "sketerm", "--restore" }) == null);
     // argv[0] is never the subcommand.
     try std.testing.expect(parse(&.{"files"}) == null);
+}
+
+test "normalizeArgAlloc does not truncate long file URIs" {
+    const a = std.testing.allocator;
+    const suffix = try a.alloc(u8, paths.SPEC_BUF_LEN + 64);
+    defer a.free(suffix);
+    @memset(suffix, 'x');
+    const uri = try std.fmt.allocPrint(a, "file:///tmp/{s}%20end.png", .{suffix});
+    defer a.free(uri);
+    const normalized = try normalizeArgAlloc(a, uri);
+    defer a.free(normalized);
+    try std.testing.expect(std.mem.startsWith(u8, normalized, "local:/tmp/"));
+    try std.testing.expect(std.mem.endsWith(u8, normalized, "x end.png"));
+    try std.testing.expect(normalized.len > paths.SPEC_BUF_LEN);
 }
 
 test "files entry: bare invocation defaults to the dedicated window" {

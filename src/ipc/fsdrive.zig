@@ -449,6 +449,30 @@ pub const Fs = struct {
         return self.job_events.orderedRemove(0);
     }
 
+    /// Wait for one job's terminal event while preserving events for other jobs.
+    pub fn waitJobTerminal(self: *Fs, job: u64, timeout_ms: i64) Error!JobEvent {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            var i: usize = 0;
+            while (i < self.job_events.items.len) {
+                const event = &self.job_events.items[i];
+                if (event.job != job or !event.terminal()) {
+                    i += 1;
+                    continue;
+                }
+                return self.job_events.orderedRemove(i);
+            }
+            const remain = deadline - nowMs();
+            if (remain <= 0) return Error.Timeout;
+            const frame = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+                error.Timeout => return Error.Timeout,
+                else => return Error.NotConnected,
+            };
+            defer frame.deinit(self.allocator);
+            self.stashPush(frame.ftype, frame.payload);
+        }
+    }
+
     /// Block (bounded) until at least one delta is pending or the
     /// timeout passes. Returns the number of pending deltas.
     pub fn waitDelta(self: *Fs, timeout_ms: i64) usize {
