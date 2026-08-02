@@ -11864,3 +11864,76 @@ smoke-udp and xvfb smoke-e2e PASS; Linux-musl and aarch64-macos
 mux-portable builds; sketerm-mux still links libc/libm only. Live GUI
 checks covered a responsive 400-file batch, final-build grouped copy,
 34-byte aggregate selection total, expansion and rename selection.
+
+## 2026-08-02: MCP app tools — freshness receipts, log events, honest verdicts
+
+Feedback from three assistants driving real applications through the MCP
+app tools (a 2001 Win32 game under a Vulkan compat layer, Star Trek:
+Armada, and an ASAN build of a 1995 DOS game) reported the same root
+problem in different shapes: several tools could not distinguish "I do
+not know" from "no", and the resulting confident-but-wrong readings were
+written into project documentation and later retracted. The work below
+makes those states structurally distinct.
+
+**Frame numbers are now the freshness currency.** Every screenshot
+caption states the window's commit counter (`App.Shot.frame`), every
+input tool reports the frame it acted at, and `screenshot_app min_frame`
+blocks until the window has committed something strictly newer —
+returning a described error rather than an image that is not. `wait_change`
+is relative to the caller's last screenshot and can never express "newer
+than the input I just sent"; `min_frame` can. app_click builds its
+handle from the FIRST attempt's frame, so an auto-retry cannot hand back
+a number that accepts pixels the earlier presses already produced.
+
+**Events can be waited on directly.** `app_wait_log` blocks until a log
+line matches and returns it with the current frame number, which is the
+synchronisation primitive for apps whose interesting moments are
+announced in their own stderr and which never visually quiesce. `app_log`
+grew real pattern filtering over a documented regex subset
+(`src/util/pattern.zig`: literals, `.`, classes, `* + ?`, `^ $`,
+top-level `|`; no groups, so parentheses are literal). Zero matches is
+reported as "0 of N scanned lines match" with nothing shown — the
+unfiltered tail is never silently substituted, because to anyone diffing
+output that reads as matched content.
+
+**Verdicts say which state they mean.** `app_wait` reports the frame
+delta it observed with every outcome, gained `min_frames` (liveness by
+commit count), and reports never-settling as a normal ALIVE AND
+ANIMATING state rather than a timeout. App selection separates "no
+sessions exist" / "no app has id N" / "AMBIGUOUS, here is the roster";
+the previous single "unknown app" message read exactly like a crash and
+was misdiagnosed as one. `app_a11y_tree` recognises a registry with no
+widgets under it and says the app publishes no accessible tree at all,
+so falling back to coordinates is a decision instead of a guess.
+
+**Process teardown and debugging.** `Pty.signalTree` escalates
+SIGTERM/SIGKILL to the child's whole process GROUP, so wrapper scripts
+and forked workers die with the session instead of accumulating as
+orphans, and `close_app` waits for the daemon's acknowledgement and says
+so plainly when it does not arrive. The gdb wrapper passes SIGPIPE and
+glibc's thread signals through (batch mode otherwise stops at the first
+harmless signal, reports against it, and quits before the real fault)
+and dumps all threads' backtraces; because the wrapper survives the
+fault and exits 0, `appSummary` marks `exit_status_is_wrapper` with a
+note whenever a debugger signal is inferred.
+
+Smaller: `include_log_delta` on the input tools, a one-shot pointer at
+app_macro_save once 12 inputs are journalled, `[x,y,w,h]` accepted
+alongside `{x,y,w,h}` for regions with an error naming the shape, all
+app-side waits clamped to 120s (under the watchdog) with the schemas
+saying so, `capabilities` explaining that isolated-mode sessions end
+with the server and not on an idle timeout, and the leaked `%%` in four
+schema descriptions fixed.
+
+Verified: zig build; 1149/1154 tests pass (5 skipped), including a new
+test that parses the whole advertised tool list (a mis-nested brace in
+one schema breaks tools/list for every tool and is otherwise invisible)
+and unit tests for the pattern matcher, app selection, frame counters,
+bare a11y trees and region parsing. A scripted MCP session against the
+real server proved end to end: launch args reaching the process verbatim,
+zero-match reporting, pattern classes and alternation, app_wait_log,
+the ambiguity message, capability lifetime text, frame numbers in
+captions, min_frame returning strictly newer pixels and erroring when
+unreachable, app_wait min_frames and animating verdicts, the no-a11y-tree
+message, region shorthands, and a forked child confirmed alive before
+close_app and gone after.
