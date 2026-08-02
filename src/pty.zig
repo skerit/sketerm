@@ -363,9 +363,20 @@ pub const Pty = struct {
         return decodeStatus(status);
     }
 
+    /// Signal the child's whole process group, falling back to the bare
+    /// child when the group is gone. The child called `setsid`, so its
+    /// pgid equals its pid and every descendant that did not create its
+    /// own group is caught — signalling only `child_pid` left a wrapper
+    /// script's real payload (and any forked worker) running forever.
+    fn signalTree(self: *Pty, sig: c_int) void {
+        if (self.child_pid <= 0) return;
+        if (c.kill(-self.child_pid, sig) < 0) _ = c.kill(self.child_pid, sig);
+    }
+
     /// Close master and reap child. Closing the master delivers SIGHUP
     /// to the child via the kernel; most shells exit immediately. If
-    /// the child ignores SIGHUP we escalate to TERM, then KILL.
+    /// the child ignores SIGHUP we escalate to TERM, then KILL — both
+    /// aimed at the whole process GROUP, so descendants die with it.
     /// Returns the decoded exit status (WEXITSTATUS / -signo), or null
     /// if the child could not be reaped (already gone, ECHILD, …).
     pub fn closeAndReap(self: *Pty) ?i32 {
@@ -390,7 +401,7 @@ pub const Pty = struct {
             _ = c.usleep(10 * 1000);
         }
         // Phase 2: SIGTERM, poll briefly.
-        _ = c.kill(self.child_pid, c.SIGTERM);
+        self.signalTree(c.SIGTERM);
         i = 0;
         while (i < 20) : (i += 1) {
             const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
@@ -402,10 +413,16 @@ pub const Pty = struct {
             _ = c.usleep(10 * 1000);
         }
         // Phase 3: SIGKILL, blocking wait. Loop on EINTR.
-        _ = c.kill(self.child_pid, c.SIGKILL);
+        self.signalTree(c.SIGKILL);
         while (true) {
             const r = c.waitpid(self.child_pid, &status, 0);
-            if (r == self.child_pid) return decodeStatus(status);
+            if (r == self.child_pid) {
+                // The group outlives its dead leader while any member
+                // remains (an orphaned process group) — one last sweep
+                // so a forked worker cannot survive the session.
+                _ = c.kill(-self.child_pid, c.SIGKILL);
+                return decodeStatus(status);
+            }
             if (r < 0 and std.posix.errno(r) == .INTR) continue;
             return null;
         }
@@ -617,6 +634,9 @@ fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
     var status: c_int = 0;
     const w = c.waitpid(r.pid, &status, c.WNOHANG);
     if (w == r.pid) {
+        // Sweep the (now leaderless but still live) process group so a
+        // forked worker cannot outlive the session — see signalTree.
+        if (r.attempts >= REAP_SIGTERM_TICK) _ = c.kill(-r.pid, c.SIGKILL);
         std.heap.c_allocator.destroy(r);
         return 0; // G_SOURCE_REMOVE
     }
@@ -631,8 +651,12 @@ fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
     }
     r.attempts += 1;
     switch (r.attempts) {
-        REAP_SIGTERM_TICK => _ = c.kill(r.pid, c.SIGTERM),
-        REAP_SIGKILL_TICK => _ = c.kill(r.pid, c.SIGKILL),
+        REAP_SIGTERM_TICK => {
+            if (c.kill(-r.pid, c.SIGTERM) < 0) _ = c.kill(r.pid, c.SIGTERM);
+        },
+        REAP_SIGKILL_TICK => {
+            if (c.kill(-r.pid, c.SIGKILL) < 0) _ = c.kill(r.pid, c.SIGKILL);
+        },
         REAP_GIVEUP_TICK => {
             // 2 s of failed kills — child is in an unkillable state
             // (uninterruptible sleep, kernel D-state, or PID re-used).
