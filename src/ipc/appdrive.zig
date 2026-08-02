@@ -649,6 +649,37 @@ pub const App = struct {
         return self;
     }
 
+    /// How a `killAndWait` ended, so close_app can report the truth
+    /// instead of asserting a kill it never confirmed.
+    pub const KillOutcome = enum {
+        /// Nothing to do — the process was already gone.
+        already_exited,
+        /// The daemon acknowledged; the session (and its process
+        /// group) is torn down.
+        acknowledged,
+        /// The frame went out but no acknowledgement came back within
+        /// the deadline — the session MAY still be running.
+        unconfirmed,
+    };
+
+    /// Kill the session and WAIT for the daemon's acknowledgement.
+    /// `deinit` alone fires the kill frame into a socket it closes in
+    /// the same breath, which reads as success whether or not the
+    /// daemon ever acted on it. Callers that report "killed" to a user
+    /// must go through here.
+    pub fn killAndWait(self: *App, timeout_ms: i64) KillOutcome {
+        if (self.exited) return .already_exited;
+        self.conn.sendJson(.kill, .{ .name = self.name }) catch return .unconfirmed;
+        const f = self.conn.recvExpectFor(&.{ .ok, .gone }, timeout_ms) catch |err| {
+            // DaemonError = "no such session": already gone daemon-side.
+            return if (err == error.DaemonError) .already_exited else .unconfirmed;
+        };
+        f.deinit(self.allocator);
+        // Suppress deinit's second, unacknowledged kill frame.
+        self.exited = true;
+        return .acknowledged;
+    }
+
     /// Free the client-side state WITHOUT killing the session — a
     /// durable instance's apps outlive the MCP process.
     pub fn detach(self: *App) void {
@@ -2076,6 +2107,11 @@ pub const App = struct {
         /// Surface coordinates of the image's top-left (crop origin).
         ox: u32 = 0,
         oy: u32 = 0,
+        /// The window's commit counter for the pixels in this image —
+        /// the freshness receipt callers assert against (see
+        /// `frameCount` / `waitFrameAfter` / screenshot_app's
+        /// `min_frame`).
+        frame: u64 = 0,
     };
 
     /// Sub-rectangle of a window in surface pixels (screenshot crop).
@@ -2135,7 +2171,7 @@ pub const App = struct {
         if (annot.len == 0 and region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
             const bytes = png.encodeShm(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
                 return Error.OutOfMemory;
-            return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0 };
+            return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0, .frame = win.frames };
         }
 
         var rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
@@ -2196,6 +2232,7 @@ pub const App = struct {
             .scale = @as(f64, @floatFromInt(cw)) / @as(f64, @floatFromInt(rw)),
             .ox = ox,
             .oy = oy,
+            .frame = win.frames,
         };
     }
 
@@ -2252,6 +2289,31 @@ pub const App = struct {
             const win = self.winById(win_id) orelse return false;
             if (win.frames != win.shot_frames and
                 (min_pct <= 0 or win.pctVsBaseline(region) >= min_pct)) return true;
+            if (self.exited or self.presentationGone() or nowMs() >= deadline) return false;
+            _ = self.pumpOnce(25);
+        }
+    }
+
+    /// The window's commit counter (0 = no such window). This is the
+    /// frame SEQUENCE NUMBER every observation reports and `min_frame`
+    /// asserts against: it only ever increases, so "give me pixels
+    /// strictly newer than frame N" becomes expressible instead of
+    /// hoping a capture is not stale.
+    pub fn frameCount(self: *App, win_id: u32) u64 {
+        const win = self.winById(win_id) orelse return 0;
+        return win.frames;
+    }
+
+    /// Pump until the window's commit counter EXCEEDS `min_frame`
+    /// (bounded). False = it never did — the app committed nothing
+    /// newer, or it exited. Unlike waitWindowChange/waitChangeSince
+    /// this is anchored to a number the caller already holds, so
+    /// freshness survives across separate tool calls.
+    pub fn waitFrameAfter(self: *App, win_id: u32, min_frame: u64, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            const win = self.winById(win_id) orelse return false;
+            if (win.frames > min_frame) return true;
             if (self.exited or self.presentationGone() or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }

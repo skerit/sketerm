@@ -119,6 +119,7 @@ comptime {
     _ = @import("util/mounts.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/pattern.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/png.zig");

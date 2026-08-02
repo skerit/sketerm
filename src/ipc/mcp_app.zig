@@ -389,8 +389,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
 
-    const app = appFromArgs(args) orelse
-        return appErr(arena, "unknown app (pass 'app' from launch_app; use list_apps)");
+    const app = switch (mcp.appSelect(arena, args)) {
+        .app => |a| a,
+        .err => |e| return appErr(arena, e),
+    };
     // Catch up to the LIVE frame before any observation or input
     // baseline. The 100ms-boxed drain() only chewed part of a between-
     // calls backlog, so screenshots lagged by whole screens on busy
@@ -444,10 +446,20 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         }
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
+    if (eql(u8, name, "app_wait_log")) return waitLog(arena, app, args);
     if (eql(u8, name, "app_log")) {
         const line_id: u64 = @intCast(@max(argInt(args, "id") orelse 0, 0));
         const from_id: u64 = @intCast(@max(argInt(args, "from_id") orelse 0, 0));
-        const tail: i64 = std.math.clamp(argInt(args, "tail") orelse 60, 1, 500);
+        const filter: ?mcp.pattern.Matcher = switch (mcp.logFilterFrom(arena, args)) {
+            .none => null,
+            .m => |m| m,
+            .err => |e| return appErr(arena, e),
+        };
+        // Filtering scans the widest window the ring serves, then
+        // reports how many lines were SCANNED vs matched — `tail` caps
+        // the matches shown, not the search.
+        const tail: i64 = if (filter != null) 500 else std.math.clamp(argInt(args, "tail") orelse 60, 1, 500);
+        const show_max: usize = @intCast(std.math.clamp(argInt(args, "tail") orelse 60, 1, 500));
         const req = try std.fmt.allocPrint(
             arena,
             "{{\"tail\":{d},\"from_id\":{d},\"id\":{d},\"max_chars\":300}}",
@@ -532,16 +544,53 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         const w = &aw.writer;
         if (fetch.stale)
             try w.writeAll("[STALE: the daemon's fresh log reply was still queued behind streamed frame data after 5s — serving the last cached snapshot instead; retry app_log for current lines]\n");
-        if (r.lines.len == 0) {
+        // A filter narrows what is PRINTED; the scanned window is
+        // reported alongside so "0 matches" can never be mistaken for
+        // the plain tail. Silently serving unmatched lines (the old
+        // behaviour of an unimplemented `grep`) reads as matched
+        // content to anyone diffing the output.
+        var shown: std.ArrayList(LogLineJ) = .empty;
+        defer shown.deinit(arena);
+        var matched: usize = 0;
+        if (filter) |m| {
+            for (r.lines) |l| {
+                if (!m.matches(l.text)) continue;
+                matched += 1;
+                try shown.append(arena, l);
+            }
+            if (shown.items.len > show_max)
+                try shown.replaceRange(arena, 0, shown.items.len - show_max, &.{});
+        } else {
+            try shown.appendSlice(arena, r.lines);
+        }
+        const lines = shown.items;
+        if (filter != null and lines.len == 0) {
+            try w.print(
+                "0 of {d} scanned line(s) match \"{s}\" (ids {d}..{d}). NOTHING is shown — this is not a tail: the pattern simply has not appeared yet. Wait for it with app_wait_log.",
+                .{
+                    r.lines.len,
+                    argStr(args, "pattern") orelse argStr(args, "grep") orelse "",
+                    if (r.lines.len > 0) r.lines[0].id else 0,
+                    if (r.lines.len > 0) r.lines[r.lines.len - 1].id else 0,
+                },
+            );
+        } else if (lines.len == 0) {
             try w.writeAll("(log empty — the app has not printed any complete line yet)");
         } else {
+            if (filter != null) {
+                try w.print("{d} of {d} scanned line(s) match \"{s}\"", .{
+                    matched, r.lines.len, argStr(args, "pattern") orelse argStr(args, "grep") orelse "",
+                });
+                if (matched > lines.len) try w.print(" (newest {d} shown)", .{lines.len});
+                try w.writeAll("; ");
+            }
             try w.print("log lines {d}..{d} (newest id {d})", .{
-                r.lines[0].id, r.lines[r.lines.len - 1].id, r.next_id - 1,
+                lines[0].id, lines[lines.len - 1].id, r.next_id - 1,
             });
             if (r.dropped > 0) try w.print(", {d} oldest dropped by the ring cap", .{r.dropped});
             if (r.markers_dropped > 0) try w.print(", {d} markers rate-limited", .{r.markers_dropped});
             try w.writeAll(" — [+] = shortened, fetch in full with {\"id\":N}\n");
-            for (r.lines) |l| {
+            for (lines) |l| {
                 const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
                 if (l.marker) {
                     const has_shot = app.markerImage(l.id) != null;
@@ -576,31 +625,38 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             }
             return appErr(arena, "no rendered window yet (try app_wait first)");
         }
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, Watchdog.hard_ms);
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         // min_change_pct also thresholds wait_change/stable_ms so
         // continuously-animating apps (a 60Hz software cursor) can
         // still signal/settle on CONTENT changes. Burst reads its own
         // copy below (different default).
         const wait_min_pct: f64 = argFloat(args, "min_change_pct") orelse 0;
+        // Freshness gate. wait_change is relative to the caller's LAST
+        // screenshot, which cannot express "newer than the keypress I
+        // just sent"; min_frame is anchored to the commit counter every
+        // capture reports, so a capture can be PROVEN newer than an
+        // input instead of hoped to be.
+        if (argInt(args, "min_frame")) |mf| {
+            const want: u64 = @intCast(@max(mf, 0));
+            if (!app.waitFrameAfter(win_id, want, timeout_ms)) {
+                const have = app.frameCount(win_id);
+                return appErr(arena, try std.fmt.allocPrint(
+                    arena,
+                    "window {d} committed no frame past {d} within {d}ms — it is still at frame {d}{s}. Nothing was captured (a stale image is worse than an error here).",
+                    .{ win_id, want, timeout_ms, have, if (app.exited) "; the app has EXITED" else "" },
+                ));
+            }
+        }
         // Region is parsed BEFORE the waits/stats: it scopes not just
         // the crop but every pixel-change percentage below — "did THIS
         // rectangle change" is assertable without eyeballing the image.
         var region: ?appdrive.App.Region = null;
         if (args == .object) {
             if (args.object.get("region")) |rv| {
-                if (rv != .object) return appErr(arena, "'region' must be {x,y,w,h}");
-                const gi = struct {
-                    fn f(o: std.json.Value, k: []const u8) ?i64 {
-                        const v = o.object.get(k) orelse return null;
-                        return if (v == .integer) v.integer else null;
-                    }
-                }.f;
-                const rx = gi(rv, "x") orelse 0;
-                const ry = gi(rv, "y") orelse 0;
-                const rw = gi(rv, "w") orelse return appErr(arena, "'region' must be {x,y,w,h}");
-                const rh = gi(rv, "h") orelse return appErr(arena, "'region' must be {x,y,w,h}");
-                if (rx < 0 or ry < 0 or rw <= 0 or rh <= 0) return appErr(arena, "'region' values must be non-negative (w/h > 0)");
-                region = .{ .x = @intCast(rx), .y = @intCast(ry), .w = @intCast(rw), .h = @intCast(rh) };
+                region = mcp.regionOf(rv) orelse return appErr(
+                    arena,
+                    "'region' must be an OBJECT with integer x, y, w, h — e.g. region:{\"x\":0,\"y\":330,\"w\":145,\"h\":150} (a bare [x,y,w,h] array is accepted too). w and h must be > 0 and x/y non-negative.",
+                );
             }
         }
         // Percentages only scope to the rect when a threshold gates
@@ -772,8 +828,17 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         var note: []const u8 = "";
         var repainted = false;
         var stopped: ?AppStop = null;
+        var frame_at_input: ?u64 = null;
         while (true) {
             var piw = PostInputWait.begin(args, app, win_id, want_shot);
+            // Hover-armed widgets (tooltips, menus that open on dwell)
+            // act on a position they saw on an EARLIER frame. The click
+            // itself always delivers enter+motion before the button, so
+            // this is only needed when the app needs a frame in between.
+            if (argBool(args, "move_first")) {
+                _ = app.moveMouse(win_id, @floatFromInt(x), @floatFromInt(y)) catch null;
+                _ = app.waitIdle(60, 400);
+            }
             app.clickEx(win_id, @floatFromInt(x), @floatFromInt(y), button, hold_ms, count) catch {
                 if (probeAppStop(app, 1_000)) |stop| {
                     const detail = try appStopText(arena, stop, "the click");
@@ -787,6 +852,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             note = try piw.finish(arena, app, win_id);
             repainted = piw.repainted;
             stopped = piw.stop;
+            // The freshness handle is the frame BEFORE the first press:
+            // a min_frame taken from a later retry would accept pixels
+            // the earlier attempts had already produced.
+            if (frame_at_input == null) frame_at_input = piw.frame_at_input;
             // Auto-retry only on a WAITED no-repaint verdict — a click
             // that visibly landed must never get a second press, and
             // without a wait there is no verdict to retry on.
@@ -800,6 +869,18 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}\n{s}", .{ x, y, button, note, summary });
             return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
+        // Built once, after the retries: the log delta consumes the
+        // lines it reports, so computing it per attempt would hand the
+        // caller only whatever the LAST press happened to print.
+        note = try std.fmt.allocPrint(arena, "{s} [window {d} frame {d} at input, {d} now — pass min_frame:{d} to screenshot_app for a provably post-click capture]{s}{s}", .{
+            note,
+            win_id,
+            frame_at_input orelse 0,
+            app.frameCount(win_id),
+            frame_at_input orelse 0,
+            mcp.logDeltaNote(arena, app, args),
+            mcp.macroNudge(arena, app),
+        });
         if (attempts > 1) {
             note = try std.fmt.allocPrint(arena, " — auto-retried: {d} attempts, earlier clicks produced no qualifying repaint{s}", .{ attempts, note });
         }
@@ -852,6 +933,86 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         return runActionSteps(arena, app, steps, win_arg, true, "");
     }
     return appToolTail(arena, name, args, app);
+}
+
+/// app_wait_log: block until a log line matches `pattern`, then
+/// return it (optionally with a screenshot taken at that moment).
+///
+/// The events worth synchronising on in a real app — a cinematic
+/// ending, an effect firing, a subsystem reporting ready — are
+/// announced in its own stdout/stderr long before any pixel settles,
+/// and often never quiesce visually at all. Without this the only
+/// approximation was abusing app_wait as a timer around repeated
+/// app_log polls, which costs turns and still misses short-lived
+/// events. For sub-second visual events, prefer the OSC 5522 marker
+/// escape (app_log): it stashes the frame at the exact instant.
+fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
+    const m = switch (mcp.logFilterFrom(arena, args)) {
+        .none => return appErr(arena, "app_wait_log requires 'pattern' (the log-line pattern to wait for)"),
+        .m => |mm| mm,
+        .err => |e| return appErr(arena, e),
+    };
+    const pat = argStr(args, "pattern") orelse argStr(args, "grep") orelse "";
+    const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, mcp.WAIT_CAP_MS);
+    // Default scans the WHOLE ring first, so an event that already
+    // happened resolves immediately; from_id skips history when the
+    // caller specifically needs a NEW occurrence.
+    var from: u64 = @intCast(@max(argInt(args, "from_id") orelse 0, 0));
+    const t0 = monoMs();
+    const deadline = t0 + timeout_ms;
+    var scanned: usize = 0;
+    var newest: u64 = 0;
+    while (true) {
+        if (mcp.logFetchLines(arena, app, from, 500, 300, 5_000) catch null) |got| {
+            for (got.reply.lines) |l| {
+                if (l.id < from) continue;
+                scanned += 1;
+                newest = l.id;
+                if (!m.matches(l.text)) continue;
+                const elapsed = monoMs() - t0;
+                const wid = firstToplevelId(app);
+                const frame = app.frameCount(wid);
+                const head = try std.fmt.allocPrint(
+                    arena,
+                    "matched \"{s}\" after {d}ms — log line {d}{s}:\n{s}\n(window {d} is at frame {d}; screenshot_app min_frame:{d} guarantees pixels committed after this line)",
+                    .{ pat, elapsed, l.id, if (l.marker) " [marker]" else "", l.text, wid, frame, frame },
+                );
+                if (argBool(args, "screenshot") and wid != 0) {
+                    if (app.screenshotPng(wid, 1568, null, 1)) |shot| {
+                        defer mcp.app_state.allocator.free(shot.png);
+                        const caption = try screenshotCaption(arena, app, wid, shot, head);
+                        if (imageResult(arena, caption, shot.png)) |res| return res;
+                    } else |_| {}
+                }
+                return toolResult(arena, head, false) orelse error.OutOfMemory;
+            }
+            // Follow forward: the next fetch starts past everything
+            // seen, so a long-running wait costs one small round trip
+            // per poll instead of re-scanning the ring.
+            if (got.reply.next_id > 0) from = got.reply.next_id;
+        }
+        if (app.exited or app.presentationGone()) {
+            _ = probeAppStop(app, 500);
+            const summary = try appSummary(arena, app);
+            const msg = try std.fmt.allocPrint(
+                arena,
+                "the app exited before any log line matched \"{s}\" ({d} line(s) scanned in {d}ms)\n{s}",
+                .{ pat, scanned, monoMs() - t0, summary },
+            );
+            return toolResult(arena, msg, true) orelse error.OutOfMemory;
+        }
+        if (Watchdog.fired.load(.acquire))
+            return appErr(arena, "app_wait_log aborted by the MCP hard timeout");
+        if (monoMs() >= deadline) break;
+        // Pumped sleep: keeps frames/exit flowing while we wait.
+        _ = app.pumpOnce(200);
+    }
+    const msg = try std.fmt.allocPrint(
+        arena,
+        "no log line matched \"{s}\" within {d}ms ({d} line(s) scanned, newest id {d}). The app is still running — re-run with from_id:{d} to continue from here.",
+        .{ pat, timeout_ms, scanned, newest, newest },
+    );
+    return toolResult(arena, msg, true) orelse error.OutOfMemory;
 }
 
 /// Execute an ordered batch of action steps against `app` — the
@@ -1449,7 +1610,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const name_sub = argStr(args, "name");
         if (role == null and name_sub == null)
             return appErr(arena, "app_wait_for_element requires 'role' and/or 'name'");
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const deadline = monoMs() + timeout_ms;
         while (true) {
             switch (a11yFetch(arena, app, 5_000)) {
@@ -1467,8 +1628,18 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             }
             if (Watchdog.fired.load(.acquire))
                 return appErr(arena, "element wait aborted by the MCP hard timeout");
-            if (monoMs() >= deadline)
+            if (monoMs() >= deadline) {
+                // Distinguish "not there yet" from "this app has no
+                // accessible tree at all" — the second never resolves,
+                // so waiting again is pure waste.
+                if (app.a11yTree(2_000)) |raw| {
+                    defer mcp.app_state.allocator.free(raw);
+                    const copy = try arena.dupe(u8, raw);
+                    if (mcp.a11yTreeIsBare(arena, copy))
+                        return appErr(arena, "this app publishes NO accessibility tree at all (only the desktop registry is on the bus), so no element will ever appear here — raw SDL/OpenGL/framebuffer apps and games have no toolkit to publish one. Drive it with screenshot_app + app_click, or app_wait_image with a saved template.");
+                } else |_| {}
                 return appErr(arena, "element did not appear before the timeout");
+            }
             var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 300 * 1000 * 1000 };
             _ = c.nanosleep(&ts, null);
         }
@@ -1536,25 +1707,46 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
     }
     if (eql(u8, name, "app_wait")) {
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const was_exited = app.exited;
+        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        // Every verdict carries the frame delta actually observed. Both
+        // failure modes reported from the field were unreadable without
+        // it: a still splash screen "settles" instantly (0 frames, no
+        // sign that the app is merely showing a static image), and an
+        // app busy inside its draw path reads as "settled (no new
+        // frames)" identically to a wedged one.
+        const frames_before = app.frameCount(wid);
+        const t0 = monoMs();
         var outcome: []const u8 = undefined;
-        if (argFloat(args, "change_pct")) |pct| {
+        if (argInt(args, "min_frames")) |mf| {
+            // Liveness by COMMIT COUNT: the only wait that means
+            // anything on an app which never visually quiesces, and the
+            // honest opposite of settling on a static frame.
+            const want: u64 = @intCast(@max(mf, 1));
+            if (wid == 0) return appErr(arena, "no rendered window yet (min_frames needs one)");
+            outcome = if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms))
+                try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, monoMs() - t0 })
+            else
+                try std.fmt.allocPrint(arena, "NOT LIVE: window {d} committed only {d} of the {d} requested frame(s) in {d}ms — it is not painting (frozen, minimised, or rendering into another window)", .{ wid, app.frameCount(wid) - frames_before, want, timeout_ms });
+        } else if (argFloat(args, "change_pct")) |pct| {
             // Visual quiescence: frames may keep committing (a game
             // always renders) — settle when they stop CHANGING much.
             // A region scopes the percentage to that rect.
-            const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
             if (wid == 0) return appErr(arena, "no rendered window yet (change_pct needs one)");
             outcome = if (app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct, regionFrom(args)))
                 try std.fmt.allocPrint(arena, "settled (frames changed <{d:.1}% of pixels for {d}ms)", .{ pct, quiet_ms })
             else
-                try std.fmt.allocPrint(arena, "timeout: still changing >{d:.1}% of pixels per frame after {d}ms", .{ pct, timeout_ms });
+                // NOT an error: for a game or a video this is the
+                // expected steady state, so it must not read as failure.
+                try std.fmt.allocPrint(arena, "ALIVE AND ANIMATING, never quiesced: frames kept changing >{d:.1}% of pixels for the whole {d}ms. This is the normal state for a game/video and is not a failure — to synchronise on something real, wait on the app's own log (app_wait_log) or on a frame count (min_frames)", .{ pct, timeout_ms });
         } else {
             outcome = if (app.waitIdle(quiet_ms, timeout_ms))
-                "settled (no new frames)"
+                try std.fmt.allocPrint(arena, "settled (no new frames for {d}ms). NOTE: no commits is not the same as no work — an app busy inside its draw path, or one showing a static splash, settles here instantly; use min_frames for liveness", .{quiet_ms})
             else
-                "timeout: still rendering — a continuously-animating app never settles this way; pass change_pct (e.g. 2) to wait for VISUAL quiescence instead";
+                "ALIVE AND RENDERING, never quiesced: new frames kept arriving for the whole timeout. This is normal for a continuously-animating app, not a failure — pass change_pct (e.g. 2) for VISUAL quiescence, min_frames for liveness, or app_wait_log to synchronise on an actual event";
         }
+        const delta = app.frameCount(wid) - frames_before;
         // The settle waits return "settled" on exit — say what really
         // happened, with the signal, instead of a bogus quiet verdict.
         if (app.exited) {
@@ -1564,17 +1756,31 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 try std.fmt.allocPrint(arena, "app EXITED during the wait (status {d}{s}) — backtrace/report in app_log", .{ app.exit_status, try exitSuffix(arena, app.exit_status) });
         }
         const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ outcome, summary });
+        const msg = try std.fmt.allocPrint(arena, "{s}\nobserved: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})\n{s}", .{
+            outcome, wid, delta, monoMs() - t0, app.frameCount(wid), summary,
+        });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_a11y_tree")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 5_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 5_000, 0, mcp.WAIT_CAP_MS);
         const tree = app.a11yTree(timeout_ms) catch |err| return appErr(arena, switch (err) {
             appdrive.Error.Timeout => "timed out reading the accessibility tree",
             else => "accessibility read failed",
         });
         defer mcp.app_state.allocator.free(tree);
         const copy = try arena.dupe(u8, tree);
+        // "The app published nothing" and "you asked too early" look
+        // identical in the raw JSON — both are a registry root with a
+        // couple of desktop services under it. Say which one it is:
+        // steering the caller toward the coordinate-free path when that
+        // path does not exist for this app costs whole turns.
+        if (mcp.a11yTreeIsBare(arena, copy)) {
+            const msg = try std.fmt.allocPrint(arena,
+                \\NO ACCESSIBLE TREE: this app publishes no widgets on the a11y bus — the tree holds only the desktop registry and background services, with nothing below them. Raw SDL / OpenGL / framebuffer apps and games have no toolkit to publish one, so this will not appear later and waiting longer will not help. app_perform_action and app_set_value cannot drive this app; use screenshot_app + app_click coordinates instead, and app_template_save / app_find_image / app_wait_image to locate elements without hardcoding pixels. (If the app IS a GTK/Qt program, it may still be starting: retry once after app_wait.)
+                \\{s}
+            , .{copy});
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        }
         // Prepend the AT-SPI role legend so the assistant can read
         // numeric roles without a lookup.
         const msg = try std.fmt.allocPrint(arena,
@@ -1653,7 +1859,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const scale: u32 = @intCast(std.math.clamp(argInt(args, "scale") orelse 0, 0, 8));
         const psm: i32 = @intCast(std.math.clamp(argInt(args, "psm") orelse 6, 0, 13));
         const lang = argStr(args, "lang") orelse "eng";
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 15_000, 0, mcp.WAIT_CAP_MS);
         const do_click = argBool(args, "click");
         const deadline = monoMs() + timeout_ms;
         var seen: ?OcrOut = null;
@@ -1742,7 +1948,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
         const region = regionFrom(args);
         const min_score = argFloat(args, "min_score") orelse 0.9;
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const do_click = argBool(args, "click");
         const btn: u32 = @intCast(argInt(args, "button") orelse 1);
         const deadline = monoMs() + timeout_ms;
@@ -1808,12 +2014,22 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const status = app.exit_status;
         mcp.browser_state.remove(id);
         _ = mcp.app_state.apps.swapRemove(id);
+        // Wait for the daemon to ACK the kill: it tears the session
+        // down by signalling the child's whole process group, so an
+        // acknowledged kill means no descendant survived. Firing the
+        // frame and closing the socket (the old behaviour) reported
+        // "killed" whether or not anything died.
+        const outcome = app.killAndWait(5_000);
         app.deinit();
-        const msg = if (was_exited)
-            try std.fmt.allocPrint(arena, "app session closed (the app had already exited with status {d})", .{status})
-        else
-            "app session killed";
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        const msg: []const u8 = switch (outcome) {
+            .already_exited => if (was_exited)
+                try std.fmt.allocPrint(arena, "app session closed (the app had already exited with status {d})", .{status})
+            else
+                "app session closed (it was already gone on the daemon)",
+            .acknowledged => "app session killed — the daemon signalled the child's whole process group and reaped it; no descendant processes remain",
+            .unconfirmed => "app session closed locally, but the daemon did not acknowledge the kill within 5s — the process MAY still be running; check with list_apps or on the daemon host",
+        };
+        return toolResult(arena, msg, outcome == .unconfirmed) orelse error.OutOfMemory;
     }
     return appErr(arena, "unknown tool");
 }

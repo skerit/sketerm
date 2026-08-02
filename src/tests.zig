@@ -8,6 +8,7 @@ const std = @import("std");
 comptime {
     _ = @import("util/utf8.zig");
     _ = @import("util/percent.zig");
+    _ = @import("util/pattern.zig");
     _ = @import("util/pathz.zig");
     _ = @import("util/filehash.zig");
     _ = @import("util/shellquote.zig");
