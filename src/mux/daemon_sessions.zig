@@ -298,6 +298,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .cwd = if (w.cwd) |cw| cw else "",
             .pid = w.child_pid,
             .audio = w.audio,
+            .audio_streams = w.audio_streams,
             .display = w.display,
             .wl_display = if (w.wl_display) |p| p else "",
             .pulse_server = if (w.pulse_server) |p| p else "",

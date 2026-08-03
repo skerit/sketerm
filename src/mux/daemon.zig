@@ -231,6 +231,9 @@ pub const SessionInfo = struct {
     /// An uncorked audio stream is playing right now — how a viewer finds
     /// WHICH session is making sound without attaching to each in turn.
     audio: bool = false,
+    /// Bounded per-stream identities reported by the session's internal
+    /// PulseAudio server. Empty when an older daemon has only `audio`.
+    audio_streams: []const pulse.AudioInfo = &.{},
     /// External display session (`display create`) — its child is the
     /// keeper, so the "terminal" is meaningless; what matters is the
     /// environment below.
@@ -405,6 +408,7 @@ pub const Worker = struct {
     viewers: u32 = 0,
     /// Last-pushed audio-playing state (see SessionInfo.audio).
     audio: bool = false,
+    audio_streams: []pulse.AudioInfo = &.{},
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
@@ -430,6 +434,7 @@ pub const Worker = struct {
         if (self.pulse_server) |p| self.allocator.free(p);
         if (self.runtime_dir) |p| self.allocator.free(p);
         if (self.controller) |p| self.allocator.free(p);
+        self.freeAudioInfos(self.audio_streams);
         self.allocator.destroy(self);
     }
 
@@ -441,6 +446,53 @@ pub const Worker = struct {
         const fresh = self.allocator.dupe(u8, val) catch return;
         if (slot.*) |old| self.allocator.free(old);
         slot.* = fresh;
+    }
+
+    fn freeAudioInfos(self: *Worker, infos: []pulse.AudioInfo) void {
+        for (infos) |info| {
+            if (info.application.len > 0) self.allocator.free(info.application);
+            if (info.binary.len > 0) self.allocator.free(info.binary);
+            if (info.media.len > 0) self.allocator.free(info.media);
+            if (info.icon.len > 0) self.allocator.free(info.icon);
+        }
+        if (infos.len > 0) self.allocator.free(infos);
+    }
+
+    fn cloneAudioInfos(self: *Worker, src: []const pulse.AudioInfo) ![]pulse.AudioInfo {
+        if (src.len == 0) return &.{};
+        const out = try self.allocator.alloc(pulse.AudioInfo, src.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |info| {
+                if (info.application.len > 0) self.allocator.free(info.application);
+                if (info.binary.len > 0) self.allocator.free(info.binary);
+                if (info.media.len > 0) self.allocator.free(info.media);
+                if (info.icon.len > 0) self.allocator.free(info.icon);
+            }
+            self.allocator.free(out);
+        }
+        for (src) |info| {
+            var copy = pulse.AudioInfo{ .pid = info.pid, .running = info.running };
+            errdefer {
+                if (copy.application.len > 0) self.allocator.free(copy.application);
+                if (copy.binary.len > 0) self.allocator.free(copy.binary);
+                if (copy.media.len > 0) self.allocator.free(copy.media);
+                if (copy.icon.len > 0) self.allocator.free(copy.icon);
+            }
+            if (info.application.len > 0) copy.application = try self.allocator.dupe(u8, info.application);
+            if (info.binary.len > 0) copy.binary = try self.allocator.dupe(u8, info.binary);
+            if (info.media.len > 0) copy.media = try self.allocator.dupe(u8, info.media);
+            if (info.icon.len > 0) copy.icon = try self.allocator.dupe(u8, info.icon);
+            out[filled] = copy;
+            filled += 1;
+        }
+        return out;
+    }
+
+    pub fn setAudioInfos(self: *Worker, src: []const pulse.AudioInfo) void {
+        const fresh = self.cloneAudioInfos(src) catch return;
+        self.freeAudioInfos(self.audio_streams);
+        self.audio_streams = fresh;
     }
 };
 
@@ -476,6 +528,7 @@ pub const WorkerMeta = struct {
     controller: []const u8 = "",
     /// An uncorked audio stream is playing (see SessionInfo.audio).
     audio: bool = false,
+    audio_streams: []const pulse.AudioInfo = &.{},
     wl: []const u8 = "",
     pa: []const u8 = "",
     rt: []const u8 = "",
@@ -495,6 +548,7 @@ pub const WorkerPush = struct {
     controller_hash: u64 = 0,
     activity: i64 = 0,
     audio: bool = false,
+    audio_hash: u64 = 0,
     last_push_ms: i64 = 0,
 };
 
@@ -2378,7 +2432,10 @@ pub const Daemon = struct {
         var hdr: [5]u8 = undefined;
         for (self.clients.items) |cl| {
             if (audioViewer(cl, s)) {
-                cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
+                if (cl.audio_ok)
+                    cl.queueAudioFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio))
+                else
+                    cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
                 // Only a SUBSCRIBED viewer counts as the clock owner:
                 // attached-but-deaf clients (MCP) must leave streams
                 // on the daemon's real-time self-clock.
@@ -2402,6 +2459,26 @@ pub const Daemon = struct {
             }
         }
         return false;
+    }
+
+    pub const MAX_AUDIO_STREAMS: usize = 16;
+
+    /// Bounded snapshot of every Pulse playback stream in one session.
+    pub fn sessionAudioInfos(self: *Daemon, s: *Session, allocator: std.mem.Allocator) []pulse.AudioInfo {
+        var out: std.ArrayList(pulse.AudioInfo) = .empty;
+        channels: for (self.channels.items) |ch| {
+            if (ch.dead or ch.session != s) continue;
+            const srv = ch.pa orelse continue;
+            var it = srv.streams.valueIterator();
+            while (it.next()) |stream| {
+                out.append(allocator, srv.streamInfo(stream)) catch break :channels;
+                if (out.items.len >= MAX_AUDIO_STREAMS) break :channels;
+            }
+        }
+        return out.toOwnedSlice(allocator) catch {
+            out.deinit(allocator);
+            return &.{};
+        };
     }
 
     /// An attached viewer that explicitly subscribed to playback. Its
@@ -2535,6 +2612,18 @@ pub const Daemon = struct {
                 if (p.payload.len >= 1 and p.payload[0] & 1 != 0) cl.audio_opus = true;
                 if (ch.session.?.audio_capture_base == null)
                     srv.opus_wanted = srv.opus_wanted or cl.audio_opus;
+                // The app may have created streams before this viewer's
+                // subscribe reached the daemon. Those units were correctly
+                // withheld from an unsubscribed client, so replay their
+                // current descriptors now instead of leaving the GUI with
+                // audible PCM but no voice/identity to route it into.
+                var descriptors: std.ArrayList(u8) = .empty;
+                defer descriptors.deinit(self.allocator);
+                var it = srv.streams.iterator();
+                while (it.next()) |entry| {
+                    srv.appendStreamDescriptor(&descriptors, entry.key_ptr.*, entry.value_ptr) catch break;
+                }
+                if (descriptors.items.len > 0) self.queueAudioUnitsTo(cl, ch, descriptors.items);
             } else {
                 srv.applyUnit(p.tag, p.payload) catch {};
             }
@@ -3080,20 +3169,23 @@ pub const Daemon = struct {
                 if (ch.session != s or ch.dead) continue;
                 const srv = ch.pa orelse continue;
                 var hdr: [5]u8 = undefined;
-                cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
+                if (cl.audio_ok)
+                    cl.queueAudioFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio))
+                else
+                    cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
                 if (cl.audio_ok) srv.has_viewer = true;
                 var units: std.ArrayList(u8) = .empty;
                 defer units.deinit(self.allocator);
                 var it = srv.streams.iterator();
                 while (it.next()) |e| {
-                    var pl: [10]u8 = undefined;
-                    std.mem.writeInt(u32, pl[0..4], e.key_ptr.*, .little);
-                    pl[4] = e.value_ptr.format;
-                    pl[5] = e.value_ptr.channels;
-                    std.mem.writeInt(u32, pl[6..10], e.value_ptr.rate, .little);
-                    pulse.appendUnit(&units, self.allocator, .open, &pl) catch break;
+                    srv.appendStreamDescriptor(&units, e.key_ptr.*, e.value_ptr) catch break;
                 }
-                if (units.items.len > 0) self.queueUnitsTo(cl, ch, units.items);
+                if (units.items.len > 0) {
+                    if (cl.audio_ok)
+                        self.queueAudioUnitsTo(cl, ch, units.items)
+                    else
+                        self.queueUnitsTo(cl, ch, units.items);
+                }
             }
         }
         if (cl.native_state_max < wire.LEGACY_NATIVE_STATE_VERSION or
@@ -3404,6 +3496,11 @@ pub const Daemon = struct {
             for (ctrl_bufs.items) |b| self.allocator.free(b);
             ctrl_bufs.deinit(self.allocator);
         }
+        var audio_sets: std.ArrayList([]pulse.AudioInfo) = .empty;
+        defer {
+            for (audio_sets.items) |set| self.allocator.free(set);
+            audio_sets.deinit(self.allocator);
+        }
         const now = nowMs();
         for (self.sessions.items) |s| {
             var n_clients: u32 = 0;
@@ -3429,6 +3526,11 @@ pub const Daemon = struct {
                     cwd = owned;
                 } else |_| {}
             }
+            const audio_streams = self.sessionAudioInfos(s, self.allocator);
+            audio_sets.append(self.allocator, audio_streams) catch {
+                self.allocator.free(audio_streams);
+                return;
+            };
             infos.append(self.allocator, .{
                 .name = s.name,
                 .rows = s.screen.rows,
@@ -3441,6 +3543,7 @@ pub const Daemon = struct {
                 .cwd = cwd,
                 .pid = s.pty.child_pid,
                 .audio = self.sessionAudioRunning(s, null),
+                .audio_streams = audio_streams,
                 .display = s.display,
                 .wl_display = if (s.wl_display_path) |p| p else "",
                 .pulse_server = if (s.pa_socket_path) |p| p else "",

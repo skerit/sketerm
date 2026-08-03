@@ -13,6 +13,7 @@ const platform = @import("../util/platform.zig");
 const mux_client = @import("../mux/client.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
+const pulse = @import("../mux/pulse.zig");
 const ipc_client = @import("client.zig");
 
 const MUX_HELP =
@@ -74,6 +75,7 @@ pub const SessionInfo = struct {
     /// An uncorked audio stream is playing right now (false from an
     /// older daemon) — how "what is making that sound?" gets answered.
     audio: bool = false,
+    audio_streams: []pulse.AudioInfo = &.{},
 };
 
 /// Human-readable activity for the `idle_ms` a session reports. Recent output
@@ -713,7 +715,7 @@ pub fn killSession(allocator: std.mem.Allocator, host: ?[]const u8, name: []cons
     var conn = muxConnect(allocator, host) orelse return false;
     defer conn.deinit();
     conn.sendJson(.kill, .{ .name = name }) catch return false;
-    const f = conn.recvExpect(&.{.ok}) catch return false;
+    const f = conn.recvExpectFor(&.{.ok}, 10_000) catch return false;
     f.deinit(allocator);
     return true;
 }
@@ -722,7 +724,7 @@ pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.
     var conn = muxConnect(allocator, host) orelse return null;
     defer conn.deinit();
     conn.sendFrame(.list, "") catch return null;
-    const f = conn.recvExpect(&.{.welcome}) catch return null;
+    const f = conn.recvExpectFor(&.{.welcome}, 10_000) catch return null;
     defer f.deinit(allocator);
     return std.json.parseFromSlice(Welcome, allocator, f.payload, .{
         .ignore_unknown_fields = true,

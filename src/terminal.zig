@@ -2075,11 +2075,7 @@ pub const Terminal = struct {
         self.allocator.destroy(na);
     }
 
-    /// Socket write for parser replies / mouse / focus reports / user
-    /// input. Routed to the mux daemon (every Terminal is daemon-backed).
-    /// Is this terminal's session putting sound on the LOCAL speakers
-    /// right now (any uncorked remote-audio voice)? The session
-    /// overview uses it to answer "which one is making that sound".
+    /// Whether this session has an uncorked remote-audio voice locally.
     pub fn audioPlaying(self: *Terminal) bool {
         if (comptime builtin.os.tag != .linux) return false;
         const remote = self.remote orelse return false;
@@ -2089,6 +2085,24 @@ pub const Terminal = struct {
         return false;
     }
 
+    /// Snapshot of this session's remote playback streams; caller frees only the slice.
+    pub fn audioInfos(self: *Terminal, allocator: std.mem.Allocator) []@import("mux/pulse.zig").AudioInfo {
+        const AudioInfo = @import("mux/pulse.zig").AudioInfo;
+        if (comptime builtin.os.tag != .linux) return &.{};
+        const remote = self.remote orelse return &.{};
+        var out: std.ArrayList(AudioInfo) = .empty;
+        for (remote.aapps.items) |aa| {
+            const infos = aa.sink.audioInfos(allocator);
+            defer allocator.free(infos);
+            out.appendSlice(allocator, infos) catch break;
+        }
+        return out.toOwnedSlice(allocator) catch {
+            out.deinit(allocator);
+            return &.{};
+        };
+    }
+
+    /// Route parser replies, input and focus reports to the mux daemon.
     pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
         const r = self.remote orelse return;
         if (!r.sendInput(bytes) and r.canSend())
