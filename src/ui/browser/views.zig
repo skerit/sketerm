@@ -102,6 +102,11 @@ pub const State = struct {
 /// mode, so a filtered listing cannot disagree with its own count.
 pub fn entryVisible(tab: *BTab, e: Entry) bool {
     if (!tab.show_hidden and e.name.len > 0 and e.name[0] == '.') return false;
+    // Picker mode composes its own predicate (the mode's file/dir
+    // rule plus the active name filter) with the rules above.
+    if (tab.view.picker) |pk| if (pk.visible) |vf| {
+        if (!vf(pk.ctx, e.name, e.tdir)) return false;
+    };
     if (tab.filter.len == 0) return true;
     return std.ascii.indexOfIgnoreCase(e.name, tab.filter) != null;
 }

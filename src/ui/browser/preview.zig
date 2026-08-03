@@ -1801,6 +1801,9 @@ fn showMultiSummary(self: *BrowserView, tab: *BTab, summary: SelectionSummary) v
 /// target. Every call is a new generation: results from the previous
 /// one are dropped rather than painted over the new entry.
 pub fn updatePreview(self: *BrowserView) void {
+    // Every selection/navigation change funnels through here, so
+    // the picker's selection hook rides it.
+    if (self.picker) |pk| pk.on_selection_changed(pk.ctx);
     // The sidebar card follows every selection change, even with the
     // full panel off; it is deliberately fetch-free.
     const selected_tab = self.currentTab();

@@ -1367,6 +1367,14 @@ pub fn activatePath(tab: *BTab, path_in: []const u8, is_dir: bool) void {
     if (path_in.len >= pathbuf.len) return;
     @memcpy(pathbuf[0..path_in.len], path_in);
     const path = pathbuf[0..path_in.len];
+    // Picker mode: activating a FILE reports it to the picker
+    // instead of opening it; directories still navigate below.
+    if (self.picker) |pk| {
+        if (!is_dir) {
+            pk.on_activate_file(pk.ctx, tab.hc.host, path);
+            return;
+        }
+    }
     if (tab.root.archive.len > 0) {
         if (!is_dir) self.extractAndOpenMember(tab, path);
         return;

@@ -142,6 +142,9 @@ fn onDragEnd(_: *c.GtkDragSource, _: ?*c.GdkDrag, _: c.gboolean, _: ?*anyopaque)
 }
 
 pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
+    // Picker mode: no drag ever starts (every drag source funnels
+    // through here for its content).
+    if (tab.view.picker) |pk| if (pk.suppress_ops) return null;
     const allocator = tab.view.allocator;
     const paths = if (useSelection(tab.drag_selected.items, dragged))
         tab.drag_selected.items

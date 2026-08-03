@@ -149,6 +149,13 @@ pub fn showEntryMenu(
     name: ?[]u8,
     is_dir: bool,
 ) void {
+    // Picker mode: no entry context menu at all (its verbs are file
+    // operations, terminal jumps, and open flows -- none apply).
+    if (self.picker) |pk| if (pk.suppress_ops) {
+        if (path) |p| self.allocator.free(p);
+        if (name) |n| self.allocator.free(n);
+        return;
+    };
     const ctx = self.allocator.create(MenuCtx) catch {
         if (path) |p| self.allocator.free(p);
         if (name) |n| self.allocator.free(n);
@@ -331,14 +338,19 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
         modes.check(mr.label, tab.view_mode == mr.mode, &onHamModeChosen, @ptrCast(hm));
     }
 
-    const panes = m.section();
-    panes.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &BrowserView.onNewTabClicked, @ptrCast(self));
-    panes.item("Split Pane", &BrowserView.onSplitClicked, @ptrCast(self));
-    panes.item("Close Pane", &onMenuClosePane, ctx);
+    // Picker mode: no pane/tab/shell verbs -- the tab strip is
+    // hidden and there is no pane, so every one of these rows would
+    // be a dead end.
+    if (self.picker == null) {
+        const panes = m.section();
+        panes.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &BrowserView.onNewTabClicked, @ptrCast(self));
+        panes.item("Split Pane", &BrowserView.onSplitClicked, @ptrCast(self));
+        panes.item("Close Pane", &onMenuClosePane, ctx);
 
-    const tail = m.section();
-    tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));
-    tail.itemIcon("Preferences…", .{ .name = "preferences-system-symbolic" }, &onMenuPrefs, ctx);
+        const tail = m.section();
+        tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));
+        tail.itemIcon("Preferences…", .{ .name = "preferences-system-symbolic" }, &onMenuPrefs, ctx);
+    }
 
     const popover = root.popup(anchor, @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)), @floatFromInt(c.gtk_widget_get_height(anchor)));
     ctx.popover = popover;
@@ -861,8 +873,9 @@ pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
         if (ch == '\'') w.writeAll("'\\''") catch return menuDone(ctx) else w.writeByte(ch) catch return menuDone(ctx);
     }
     w.writeAll("'\n") catch return menuDone(ctx);
-    ctx.view.pane.terminal.writeRaw(w.buffered());
-    ctx.view.pane.setBrowserVisible(false);
+    const pane = ctx.view.pane orelse return menuDone(ctx);
+    pane.terminal.writeRaw(w.buffered());
+    pane.setBrowserVisible(false);
     menuDone(ctx);
 }
 

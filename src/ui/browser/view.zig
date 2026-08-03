@@ -74,9 +74,34 @@ const tabsmod = @import("tabs.zig");
 const templates_mod = @import("templates.zig");
 const viewsmod = @import("views.zig");
 
+/// Constrained-presentation hooks for the file PICKER (src/ui/
+/// picker.zig). `null` on a BrowserView means normal browsing --
+/// every picker branch in the browser modules is behind that check,
+/// so a null-picker view provably behaves exactly as before.
+pub const PickerHooks = struct {
+    ctx: *anyopaque,
+    /// Double-click/Enter on a FILE reports it here instead of
+    /// opening it (directories still navigate normally).
+    on_activate_file: *const fn (ctx: *anyopaque, host: ?[]const u8, path: []const u8) void,
+    /// Selection or location changed; the picker re-reads the
+    /// current tab's selection.
+    on_selection_changed: *const fn (ctx: *anyopaque) void,
+    /// Extra visibility predicate composed with views.entryVisible
+    /// (the mode's file/dir rule plus the active name filter).
+    visible: ?*const fn (ctx: *anyopaque, name: []const u8, is_dir: bool) bool = null,
+    /// Disable file operations: entry context menus, entry drag
+    /// sources, listing drops and the mutating keyboard chords.
+    suppress_ops: bool = true,
+};
+
 pub const BrowserView = struct {
     allocator: std.mem.Allocator,
-    pane: *Pane,
+    /// The terminal pane this face rides -- null for a paneless
+    /// picker embed (attachForPicker), where every pane-coupled verb
+    /// (shell here, split, close pane, cwd sync) must be dead code.
+    pane: ?*Pane = null,
+    /// Picker presentation hooks; null = normal browsing.
+    picker: ?*PickerHooks = null,
     conns: std.ArrayList(*HostConn) = .empty,
     /// Backoff timers re-dialing hosts whose connection dropped while
     /// tabs were still on them (conn.zig scheduleReconnect).
@@ -824,8 +849,63 @@ pub const BrowserView = struct {
         // A pane owns at most one browser face; re-attaching would
         // orphan the previous one together with its connections.
         if (fromPane(pane)) |existing| return existing;
+        const self = try createCommon(allocator, null);
+        self.pane = pane;
+
+        self.buildUi();
+        @import("places.zig").registerView(self);
+        // The view and selection menus ride the toolbar buildUi just
+        // built.
+        self.installViewMenu();
+        self.installSelectionMenu();
+        // After the menus: their two buttons belong to the collapsible
+        // cluster, and the sidebar toggle below renders places.
+        self.applyChromeState();
+        pane.attachBrowser(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
+
+        self.openStartSpec(start_spec);
+        // The face is already showing (attachBrowser raised it) but had
+        // no tab to focus at the time.
+        self.focusListing();
+        return self;
+    }
+
+    /// A paneless browser face for the file picker: same widgets,
+    /// same connections, no pane coupling. The caller (PickerWindow)
+    /// owns teardown: destroy the widget tree, then call deinit()
+    /// once the destroy has unwound. `hooks` must outlive the view.
+    pub fn attachForPicker(allocator: std.mem.Allocator, hooks: *PickerHooks, start_spec: ?[]const u8) !*BrowserView {
+        const self = try createCommon(allocator, hooks);
+        self.buildUi();
+        // The picker is one location, not a tab set.
+        c.gtk_notebook_set_show_tabs(self.notebook, 0);
+        @import("places.zig").registerView(self);
+        self.installViewMenu();
+        self.installSelectionMenu();
+        // The sidebar is part of the picker's fixed shape.
+        self.sidebar_open = true;
+        self.applyChromeState();
+        self.openStartSpec(start_spec);
+        return self;
+    }
+
+    fn openStartSpec(self: *BrowserView, start_spec: ?[]const u8) void {
+        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
+        if (start_spec) |sp| {
+            const loc = parseSpec(sp);
+            const path = if (loc.path.len > 0 and loc.path[0] == '/') loc.path else home;
+            _ = self.newTab(loc.host, path);
+        } else {
+            _ = self.newTab(null, home);
+        }
+    }
+
+    /// Allocate the view and load its persisted user state (places,
+    /// file colors); no widgets yet. `picker` must be set this early
+    /// because buildUi and the render path both branch on it.
+    fn createCommon(allocator: std.mem.Allocator, picker: ?*PickerHooks) !*BrowserView {
         const self = try allocator.create(BrowserView);
-        self.* = .{ .allocator = allocator, .pane = pane };
+        self.* = .{ .allocator = allocator, .picker = picker };
         self.emblems = emblems_mod.load(allocator);
         self.media.init(allocator);
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
@@ -894,29 +974,6 @@ pub const BrowserView = struct {
             self.migrateCollection(parsed.value.collection);
         }
         self.loadFileColors();
-
-        self.buildUi();
-        @import("places.zig").registerView(self);
-        // The view and selection menus ride the toolbar buildUi just
-        // built.
-        self.installViewMenu();
-        self.installSelectionMenu();
-        // After the menus: their two buttons belong to the collapsible
-        // cluster, and the sidebar toggle below renders places.
-        self.applyChromeState();
-        pane.attachBrowser(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
-
-        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
-        if (start_spec) |sp| {
-            const loc = parseSpec(sp);
-            const path = if (loc.path.len > 0 and loc.path[0] == '/') loc.path else home;
-            _ = self.newTab(loc.host, path);
-        } else {
-            _ = self.newTab(null, home);
-        }
-        // The face is already showing (attachBrowser raised it) but had
-        // no tab to focus at the time.
-        self.focusListing();
         return self;
     }
 
@@ -1464,7 +1521,8 @@ pub const BrowserView = struct {
     /// the action rather than reimplementing it.
     pub fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
-        const ictx = self.pane.input_ctx orelse return;
+        const pane = self.pane orelse return;
+        const ictx = pane.input_ctx orelse return;
         // splitFocused acts on the WINDOW's focused pane; a toolbar
         // click does not focus anything (the buttons are out of the
         // focus chain), so focus is pointed here first or the action
@@ -1552,7 +1610,8 @@ pub const BrowserView = struct {
         // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
         // only under symbolic/legacy/, so on a Breeze theme chain this
         // button -- the one that leaves the browser -- rendered blank.
-        _ = self.barButton(
+        // A paneless picker has no shell to show, so no button.
+        if (self.picker == null) _ = self.barButton(
             keep,
             "sketerm-terminal-symbolic",
             "Shell",
@@ -1825,7 +1884,8 @@ pub const BrowserView = struct {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         self.close_pane_src = 0;
         if (self.widgets_dead) return 0;
-        const ictx = self.pane.input_ctx orelse return 0;
+        const pane = self.pane orelse return 0;
+        const ictx = pane.input_ctx orelse return 0;
         // closeFocusedPane closes the WINDOW's focused pane; see
         // onSplitClicked for why focus must be pointed here first.
         self.focusOwnPane();

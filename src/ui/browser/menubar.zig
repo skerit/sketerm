@@ -122,8 +122,9 @@ fn activeBrowser(win: *Window) ?*BrowserView {
 
 fn browserPane(win: *Window, browser: ?*BrowserView) ?*Pane {
     const bv = browser orelse return null;
+    const bp = bv.pane orelse return null;
     for (win.panes.items) |pane| {
-        if (pane == bv.pane) return pane;
+        if (pane == bp) return pane;
     }
     return null;
 }
