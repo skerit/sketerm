@@ -61,6 +61,7 @@ comptime {
     _ = @import("ui/image_decoder.zig");
     _ = @import("ui/image_canvas.zig");
     _ = @import("ui/viewer.zig");
+    _ = @import("ui/app_switcher.zig");
     // The browser facade only re-exports a few decls, which is NOT
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced

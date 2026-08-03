@@ -1003,12 +1003,22 @@ pub const AppHost = struct {
         }
     }
 
-    /// Raise every floating window of this app (mirror click).
-    /// Embedded windows live in a pane; their host window is hidden
-    /// and childless — presenting it would map an empty shell.
     /// Number of live windows (embedded or floating).
     pub fn windowCount(self: *AppHost) usize {
         return self.windows.count();
+    }
+
+    /// Stable overview metadata hash; pixel commits deliberately do not count.
+    pub fn overviewHash(self: *AppHost, seed: u64) u64 {
+        var hash = seed;
+        var it = self.windows.valueIterator();
+        while (it.next()) |win| {
+            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.surface));
+            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.embedded));
+            if (win.*.app_id) |app_id| hash = std.hash.Wyhash.hash(hash, app_id);
+            if (c.gtk_window_get_title(win.*.window)) |title| hash = std.hash.Wyhash.hash(hash, std.mem.span(title));
+        }
+        return hash;
     }
 
     pub fn presentAll(self: *AppHost) void {
@@ -1018,11 +1028,11 @@ pub const AppHost = struct {
         }
     }
 
-    /// One open window as a picker/switcher sees it. `paintable` is
-    /// the picture's current paintable (borrowed — ref it to keep it).
+    /// One open window as a picker/switcher sees it; each paintable must be unrefed.
     pub const WinInfo = struct {
         surface: u32,
         title: [*:0]const u8,
+        app_id: []const u8,
         embedded: bool,
         paintable: ?*c.GdkPaintable,
     };
@@ -1032,15 +1042,26 @@ pub const AppHost = struct {
         var out: std.ArrayList(WinInfo) = .empty;
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
+            const paintable: ?*c.GdkPaintable = @ptrCast(c.gtk_widget_paintable_new(w.*.overlay));
             const t = c.gtk_window_get_title(w.*.window);
             out.append(allocator, .{
                 .surface = w.*.surface,
                 .title = if (t) |tt| tt else "",
+                .app_id = if (w.*.app_id) |id| id else "",
                 .embedded = w.*.embedded,
-                .paintable = c.gtk_picture_get_paintable(@ptrCast(w.*.picture)),
-            }) catch break;
+                // WidgetPaintable follows later invalidations and captures
+                // popup/subsurface children in the toplevel overlay.
+                .paintable = paintable,
+            }) catch {
+                if (paintable) |value| c.g_object_unref(value);
+                break;
+            };
         }
-        return out.toOwnedSlice(allocator) catch &.{};
+        return out.toOwnedSlice(allocator) catch {
+            for (out.items) |info| if (info.paintable) |value| c.g_object_unref(value);
+            out.deinit(allocator);
+            return &.{};
+        };
     }
 
     /// Raise ONE floating window (switcher activate). Embedded
