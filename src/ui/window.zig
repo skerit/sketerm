@@ -96,7 +96,6 @@ const NotifySlot = struct {
     want_focus: bool,
 };
 
-
 /// Smallest M such that `scale * M` is integer (within 1e-3 tolerance).
 /// 1.0 → 1, 1.5 → 2, 1.25/1.75 → 4. Caps at 16; anything past that we
 /// pretend is integer (no realistic compositor reports those scales).
@@ -914,7 +913,6 @@ pub const Window = struct {
     const copyModeYank = modes.copyModeYank;
     const copyModeRefresh = modes.copyModeRefresh;
 
-
     pub fn present(self: *Window) void {
         c.gtk_window_present(@ptrCast(self.app_window));
     }
@@ -962,6 +960,10 @@ pub const Window = struct {
     /// invoking pane for `sketerm files --tab`), never the pane that
     /// ends up wearing the browser face.
     pub fn newBrowserTabFrom(self: *Window, origin: ?*Pane, spec: ?[]const u8) !void {
+        return self.newBrowserTabFromReveal(origin, spec, null);
+    }
+
+    pub fn newBrowserTabFromReveal(self: *Window, origin: ?*Pane, spec: ?[]const u8, reveal: ?[]const u8) !void {
         var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
         const start_spec: ?[]const u8 = if (spec) |s|
             files_entry.startLocation(&spec_buf, s)
@@ -982,6 +984,7 @@ pub const Window = struct {
             return err;
         };
         self.installBrowserHooks(bv);
+        if (reveal) |target| bv.queueReveal(target);
     }
 
     /// Put a browser face on `pane` itself (`sketerm files --here`):
@@ -1648,9 +1651,9 @@ pub const Window = struct {
     /// again): another browser window, the way a file manager behaves.
     /// Inherits this window's config; wears the files title/icon because
     /// the whole PROCESS does.
-    pub fn openFilesWindow(self: *Window, spec: ?[]const u8) !*Window {
+    pub fn openFilesWindow(self: *Window, spec: ?[]const u8, reveal: ?[]const u8) !*Window {
         const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
-        try win.newBrowserTabFrom(null, spec);
+        try win.newBrowserTabFromReveal(null, spec, reveal);
         return win;
     }
 
@@ -2005,9 +2008,6 @@ pub const Window = struct {
 
     // ── tab context menu (right-click a tab) ─────────────────────────
 
-
-
-
     const PaneTitleCtx = struct {
         window: *Window,
         pane: *Pane,
@@ -2174,7 +2174,6 @@ pub const Window = struct {
         pane.setFontSize(base);
     }
 
-
     const PromptDir = enum { prev, next };
 
     fn jumpPromptOnFocused(self: *Window, dir: PromptDir) void {
@@ -2320,7 +2319,6 @@ pub const Window = struct {
     const registerNotifySlot = remotectl.registerNotifySlot;
     const dropNotifySlotsForPane = remotectl.dropNotifySlotsForPane;
     const ipcDispatchTrampoline = remotectl.ipcDispatchTrampoline;
-
 
     // ── Durable tabs + app sessions: split out to ui/muxtabs.zig ──
     // Aliased so `self.method()` call sites and Window.Type references
@@ -2510,7 +2508,6 @@ pub const Window = struct {
         c.gtk_box_append(@ptrCast(wrap), box);
     }
 
-
     // ── Background layer (image / gradient) ─────────────────────
 
     /// Locate the shell-integration script directory (shared
@@ -2554,8 +2551,6 @@ pub const Window = struct {
     }
 
     // ── Per-tab colours ──────────────────────────────────────────
-
-
 
     /// Tell the compositor that our content is no longer opaque when
     /// background_opacity < 1.0. Only takes effect under Wayland with
@@ -2963,7 +2958,6 @@ pub const Window = struct {
         const is_pinned = c.adw_tab_page_get_pinned(page) != 0;
         c.adw_tab_view_set_page_pinned(self.tab_view, page, if (is_pinned) 0 else 1);
     }
-
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
@@ -3043,7 +3037,6 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         else => {},
     }
 }
-
 
 /// Public entry-point used by the command palette. Tries the
 /// focused pane's input controller first (covers per-pane actions
@@ -3186,7 +3179,6 @@ fn onScreenshotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
     _ = c.g_file_replace_contents(file, @ptrCast(ptr), sz, null, 0, c.G_FILE_CREATE_NONE, null, null, &gerr);
     if (gerr != null) c.g_error_free(gerr);
 }
-
 
 const UploadPickCtx = struct {
     win: *Window,
@@ -3331,7 +3323,6 @@ fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }
-
 
 /// Walk every tab page and return the one whose widget tree contains
 /// `pane`. O(tabs × panes-per-tab) — both small for any realistic

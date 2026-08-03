@@ -412,7 +412,7 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const bv = target;
     switch (ctx.verb) {
         .new_tab => win.newBrowserTabFrom(if (target) |v| v.pane else null, null) catch {},
-        .new_window => _ = win.openFilesWindow(null) catch {},
+        .new_window => _ = win.openFilesWindow(null, null) catch {},
         .split_pane => if (target) |v| {
             v.focusOwnPane();
             win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {};

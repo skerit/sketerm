@@ -2432,6 +2432,11 @@ fn paintPreview(self: *BrowserView, item: *const CacheItem) void {
         c.gtk_label_set_text(ql.note, &nz);
         c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.note)), @intFromBool(nn > 0));
         c.gtk_label_set_text(ql.status, if (item.failed) "preview unavailable" else "");
+        ql.canvas.setAccessible(
+            std.fs.path.basename(ql.path),
+            if (item.failed) "Preview unavailable" else "Preview image",
+            false,
+        );
     }
 }
 
@@ -2576,6 +2581,15 @@ const NavList = struct {
         }
         return null;
     }
+
+    fn count(self: NavList) usize {
+        if (self.selection) return self.tab.selected.items.len;
+        var total: usize = 0;
+        for (self.tab.root.entries.items) |e| if (visible(self.tab, e)) {
+            total += 1;
+        };
+        return total;
+    }
 };
 
 // ── Quick Look overlay ──────────────────────────────────────────
@@ -2587,11 +2601,13 @@ pub const QuickLook = struct {
     view: *BrowserView,
     window: *c.GtkWidget,
     title: *c.GtkLabel,
+    position: *c.GtkLabel,
     /// Everything below the name line of the metadata block.
     meta: *c.GtkLabel,
     picture: *c.GtkWidget,
     canvas: image_canvas.Canvas,
     full_button: *c.GtkWidget,
+    play_button: *c.GtkWidget,
     full_target: *viewer_ui.LoadTarget,
     /// Generator metadata / summary line under the image (formatted
     /// "Label: value" text, never the raw dump).
@@ -2608,6 +2624,7 @@ pub const QuickLook = struct {
         self.full_target.cancel();
         c.gtk_widget_set_visible(self.picture, 0);
         c.gtk_widget_set_visible(self.full_button, 0);
+        c.gtk_widget_set_sensitive(self.play_button, 0);
         c.gtk_label_set_text(self.note, "");
         c.gtk_widget_set_visible(@ptrCast(@alignCast(self.note)), 0);
         c.gtk_label_set_text(self.text, "");
@@ -2619,6 +2636,7 @@ pub const QuickLook = struct {
     fn destroy(self: *QuickLook) void {
         const view = self.view;
         view.preview_state.ql = null;
+        view.preview_image.setPlaybackCallback(null, null);
         self.full_target.close();
         view.preview_image.detach(&self.canvas);
         const window = self.window;
@@ -2719,7 +2737,13 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_label_set_selectable(@ptrCast(title), 1);
     c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_widget_add_css_class(title, "title-4");
-    c.gtk_box_append(@ptrCast(box), title);
+    c.gtk_widget_set_hexpand(title, 1);
+    const title_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+    c.gtk_box_append(@ptrCast(title_row), title);
+    const position = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(position, "dim-label");
+    c.gtk_box_append(@ptrCast(title_row), position);
+    c.gtk_box_append(@ptrCast(box), title_row);
 
     const meta = c.gtk_label_new("");
     c.gtk_label_set_xalign(@ptrCast(meta), 0);
@@ -2776,12 +2800,39 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_widget_add_css_class(status, "dim-label");
     c.gtk_box_append(@ptrCast(box), status);
 
+    const controls = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+    c.gtk_widget_set_halign(controls, c.GTK_ALIGN_CENTER);
+    const zoom_out = c.gtk_button_new_from_icon_name("zoom-out-symbolic").?;
+    c.gtk_widget_set_tooltip_text(zoom_out, "Zoom Out (-)");
+    const zoom_in = c.gtk_button_new_from_icon_name("zoom-in-symbolic").?;
+    c.gtk_widget_set_tooltip_text(zoom_in, "Zoom In (+)");
+    const fit = c.gtk_button_new_from_icon_name("zoom-fit-best-symbolic").?;
+    c.gtk_widget_set_tooltip_text(fit, "Fit to Window (F)");
+    const fill = c.gtk_button_new_from_icon_name("view-fullscreen-symbolic").?;
+    c.gtk_widget_set_tooltip_text(fill, "Fill Window (C)");
+    const actual = c.gtk_button_new_from_icon_name("zoom-original-symbolic").?;
+    c.gtk_widget_set_tooltip_text(actual, "Actual Size (0)");
+    const rotate_left = c.gtk_button_new_from_icon_name("object-rotate-left-symbolic").?;
+    c.gtk_widget_set_tooltip_text(rotate_left, "Rotate View Left ([)");
+    const rotate_right = c.gtk_button_new_from_icon_name("object-rotate-right-symbolic").?;
+    c.gtk_widget_set_tooltip_text(rotate_right, "Rotate View Right (])");
+    const play = c.gtk_button_new_from_icon_name("media-playback-pause-symbolic").?;
+    c.gtk_widget_set_tooltip_text(play, "Pause or Resume Animation (P)");
+    c.gtk_widget_set_sensitive(play, 0);
+    const copy = c.gtk_button_new_from_icon_name("edit-copy-symbolic").?;
+    c.gtk_widget_set_tooltip_text(copy, "Copy Image");
+    const reload = c.gtk_button_new_from_icon_name("view-refresh-symbolic").?;
+    c.gtk_widget_set_tooltip_text(reload, "Reload Preview (R)");
+    for ([_]*c.GtkWidget{ zoom_out, zoom_in, fit, fill, actual, rotate_left, rotate_right, play, copy, reload }) |button|
+        c.gtk_box_append(@ptrCast(controls), button);
+    c.gtk_box_append(@ptrCast(box), controls);
+
     const full_button = c.gtk_button_new_with_label("View full resolution");
     c.gtk_widget_set_halign(full_button, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_visible(full_button, 0);
     c.gtk_box_append(@ptrCast(box), full_button);
 
-    const hint = c.gtk_label_new("Space or Esc closes  \u{00b7}  arrows move  \u{00b7}  Enter opens");
+    const hint = c.gtk_label_new("Space or Esc closes  \u{00b7}  arrows/swipe move  \u{00b7}  Enter opens");
     c.gtk_widget_set_halign(hint, c.GTK_ALIGN_CENTER);
     c.gtk_widget_add_css_class(hint, "dim-label");
     c.gtk_widget_add_css_class(hint, "caption");
@@ -2800,10 +2851,12 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         .view = self,
         .window = window,
         .title = @ptrCast(@alignCast(title)),
+        .position = @ptrCast(@alignCast(position)),
         .meta = @ptrCast(@alignCast(meta)),
         .picture = picture,
         .canvas = canvas,
         .full_button = full_button,
+        .play_button = play,
         .full_target = full_target,
         .note = @ptrCast(@alignCast(note)),
         .text_scroll = text_scroll,
@@ -2813,6 +2866,10 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         .host = host,
     };
     ql.canvas.enableInput();
+    ql.canvas.on_navigate = &onQuickLookNavigate;
+    ql.canvas.navigate_ctx = @ptrCast(self);
+    ql.canvas.on_rotate = &onQuickLookRotateGesture;
+    ql.canvas.rotate_ctx = @ptrCast(self);
     self.preview_image.attach(self.allocator, &ql.canvas) catch {
         ql.full_target.close();
         c.gtk_window_destroy(@ptrCast(@alignCast(window)));
@@ -2821,7 +2878,9 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         self.allocator.destroy(ql);
         return false;
     };
+    self.preview_image.setPlaybackCallback(@ptrCast(ql), &onQuickLookPlaybackChanged);
     self.preview_state.ql = ql;
+    updateQuickLookPosition(ql);
 
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
@@ -2829,6 +2888,16 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_widget_add_controller(window, @ptrCast(keys));
     _ = c.g_signal_connect_data(window, "close-request", @ptrCast(&onQuickLookCloseRequest), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(full_button, "clicked", @ptrCast(&onQuickLookFull), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(zoom_out, "clicked", @ptrCast(&onQuickLookZoomOut), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(zoom_in, "clicked", @ptrCast(&onQuickLookZoomIn), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(fit, "clicked", @ptrCast(&onQuickLookFit), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(fill, "clicked", @ptrCast(&onQuickLookFill), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(actual, "clicked", @ptrCast(&onQuickLookActual), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(rotate_left, "clicked", @ptrCast(&onQuickLookRotateLeft), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(rotate_right, "clicked", @ptrCast(&onQuickLookRotateRight), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(play, "clicked", @ptrCast(&onQuickLookPlay), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(copy, "clicked", @ptrCast(&onQuickLookCopy), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(reload, "clicked", @ptrCast(&onQuickLookReload), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
 
     c.gtk_window_present(@ptrCast(window));
     self.updatePreview();
@@ -2872,24 +2941,30 @@ fn onQuickLookFullLoaded(user: ?*anyopaque, result: *viewer_ui.LoadResult) void 
         c.gtk_widget_set_sensitive(ql.full_button, 1);
         return;
     };
-    const texture = viewer_ui.textureFromDecoded(decoded) orelse {
-        c.gtk_label_set_text(ql.status, "full-resolution texture failed");
+    ql.view.preview_image.setDecoded(ql.view.allocator, decoded) catch {
+        c.gtk_label_set_text(ql.status, "full-resolution textures failed");
         c.gtk_widget_set_sensitive(ql.full_button, 1);
         return;
     };
-    ql.view.preview_image.setTexture(texture);
-    c.g_object_unref(@ptrCast(texture));
+    const first = decoded.first();
+    c.gtk_widget_set_sensitive(ql.play_button, @intFromBool(decoded.animated()));
+    c.gtk_button_set_icon_name(@ptrCast(ql.play_button), "media-playback-pause-symbolic");
     var buf: [96:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "full resolution  {d} x {d}", .{ decoded.width, decoded.height }) catch "full resolution";
+    const text = std.fmt.bufPrintZ(&buf, "full resolution  {d} x {d}{s}", .{
+        first.width,
+        first.height,
+        if (decoded.animated()) "  animated" else "",
+    }) catch "full resolution";
     c.gtk_label_set_text(ql.status, text.ptr);
     c.gtk_widget_set_visible(ql.full_button, 0);
+    ql.canvas.setAccessible(std.fs.path.basename(ql.path), text, false);
 }
 
 pub fn onQuickLookKey(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
     _: c_uint,
-    _: c.GdkModifierType,
+    modifiers: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
@@ -2910,8 +2985,22 @@ pub fn onQuickLookKey(
             self.quickLookActivate();
             return 1;
         },
+        c.GDK_KEY_plus, c.GDK_KEY_equal, c.GDK_KEY_KP_Add => if (self.preview_state.ql) |ql| ql.canvas.zoomBy(1.2) else return 0,
+        c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => if (self.preview_state.ql) |ql| ql.canvas.zoomBy(1.0 / 1.2) else return 0,
+        c.GDK_KEY_0, c.GDK_KEY_KP_0 => if (self.preview_state.ql) |ql| ql.canvas.actual() else return 0,
+        c.GDK_KEY_f, c.GDK_KEY_F => if (self.preview_state.ql) |ql| ql.canvas.fit() else return 0,
+        c.GDK_KEY_c, c.GDK_KEY_C => {
+            if (modifiers & c.GDK_CONTROL_MASK != 0) {
+                if (self.preview_state.ql) |ql| quickLookCopy(ql) else return 0;
+            } else if (self.preview_state.ql) |ql| ql.canvas.fill() else return 0;
+        },
+        c.GDK_KEY_bracketleft => if (self.preview_state.ql) |ql| quickLookRotate(ql, -1) else return 0,
+        c.GDK_KEY_bracketright => if (self.preview_state.ql) |ql| quickLookRotate(ql, 1) else return 0,
+        c.GDK_KEY_p, c.GDK_KEY_P => if (self.preview_state.ql) |ql| quickLookTogglePlayback(ql) else return 0,
+        c.GDK_KEY_r, c.GDK_KEY_R => quickLookReload(self),
         else => return 0,
     }
+    return 1;
 }
 
 /// Move the overlay's cursor without closing it. Clamped at both
@@ -2928,6 +3017,119 @@ pub fn quickLookStep(self: *BrowserView, delta: isize) void {
     const owned = self.allocator.dupe(u8, path) catch return;
     self.allocator.free(ql.path);
     ql.path = owned;
+    updateQuickLookPosition(ql);
+    self.updatePreview();
+}
+
+fn updateQuickLookPosition(ql: *QuickLook) void {
+    const tab = ql.view.currentTab() orelse return;
+    const list = NavList.of(tab);
+    const at = list.indexOf(ql.path) orelse return;
+    var buf: [64:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, "{d} of {d}", .{ at + 1, list.count() }) catch "";
+    c.gtk_label_set_text(ql.position, text.ptr);
+}
+
+fn onQuickLookNavigate(user: ?*anyopaque, delta: isize) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.quickLookStep(delta);
+}
+
+fn onQuickLookRotateGesture(user: ?*anyopaque, delta: i8) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (self.preview_state.ql) |ql| quickLookRotate(ql, delta);
+}
+
+fn quickLookRotate(ql: *QuickLook, delta: i8) void {
+    ql.view.preview_image.rotate(delta);
+    var buf: [96:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, "view rotation {d} degrees", .{ql.view.preview_image.rotationDegrees()}) catch "view rotated";
+    c.gtk_label_set_text(ql.status, text.ptr);
+    ql.canvas.setAccessible(std.fs.path.basename(ql.path), text, false);
+}
+
+fn quickLookTogglePlayback(ql: *QuickLook) void {
+    if (!ql.view.preview_image.animated()) return;
+    ql.view.preview_image.togglePlayback();
+}
+
+fn onQuickLookPlaybackChanged(user: ?*anyopaque) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    const playing = ql.view.preview_image.isPlaying();
+    c.gtk_button_set_icon_name(@ptrCast(ql.play_button), if (playing) "media-playback-pause-symbolic" else "media-playback-start-symbolic");
+    c.gtk_label_set_text(ql.status, if (playing) "animation playing" else "animation paused");
+    ql.canvas.setAccessible(std.fs.path.basename(ql.path), if (playing) "Animation playing" else "Animation paused", false);
+}
+
+fn quickLookCopy(ql: *QuickLook) void {
+    const texture = ql.view.preview_image.currentTexture() orelse return;
+    const clipboard = c.gtk_widget_get_clipboard(ql.window) orelse return;
+    c.gdk_clipboard_set_texture(clipboard, texture);
+    c.gtk_label_set_text(ql.status, "image copied to clipboard");
+}
+
+fn onQuickLookZoomOut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    ql.canvas.zoomBy(1.0 / 1.2);
+}
+
+fn onQuickLookZoomIn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    ql.canvas.zoomBy(1.2);
+}
+
+fn onQuickLookFit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    ql.canvas.fit();
+}
+
+fn onQuickLookFill(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    ql.canvas.fill();
+}
+
+fn onQuickLookActual(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    ql.canvas.actual();
+}
+
+fn onQuickLookRotateLeft(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    quickLookRotate(@ptrCast(@alignCast(user.?)), -1);
+}
+
+fn onQuickLookRotateRight(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    quickLookRotate(@ptrCast(@alignCast(user.?)), 1);
+}
+
+fn onQuickLookPlay(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    quickLookTogglePlayback(@ptrCast(@alignCast(user.?)));
+}
+
+fn onQuickLookCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    quickLookCopy(@ptrCast(@alignCast(user.?)));
+}
+
+fn onQuickLookReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
+    quickLookReload(ql.view);
+}
+
+fn quickLookReload(self: *BrowserView) void {
+    const ql = self.preview_state.ql orelse return;
+    const tab = self.currentTab() orelse return;
+    const entry = entryForPath(tab, ql.path);
+    var key_buf: [4700]u8 = undefined;
+    const key = cacheKey(&key_buf, tab.hc, ql.path, if (entry) |e| e.mtime_ms else 0) orelse return;
+    var i: usize = 0;
+    while (i < self.preview_state.cache.items.len) : (i += 1) {
+        if (!std.mem.eql(u8, self.preview_state.cache.items[i].key, key)) continue;
+        var dead = self.preview_state.cache.orderedRemove(i);
+        dead.deinit(self.allocator);
+        break;
+    }
+    ql.full_target.cancel();
+    self.preview_image.clear();
+    c.gtk_label_set_text(ql.status, "reloading preview...");
     self.updatePreview();
 }
 

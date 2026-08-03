@@ -27,6 +27,8 @@ pub const Request = struct {
     /// Explicit start location (path, spec or file:// URI); null =
     /// derive it from the invoking pane.
     spec: ?[]const u8 = null,
+    /// Host-qualified file to select after the parent directory streams in.
+    reveal: ?[]const u8 = null,
     /// `--help` / `-h` after the subcommand: print the usage text and
     /// do nothing else, whatever the mode says.
     help: bool = false,
@@ -62,6 +64,9 @@ pub fn parse(args: []const []const u8) ?Request {
             req.mode = .window;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             req.help = true;
+        } else if (std.mem.startsWith(u8, a, "--select=")) {
+            const value = a["--select=".len..];
+            if (value.len > 0) req.reveal = value;
         } else if (req.spec == null and a.len > 0 and a[0] != '-') {
             req.spec = a;
         }
@@ -242,6 +247,12 @@ test "files entry: mode flags and spec" {
 
     // --window is the explicit spelling of the default.
     try std.testing.expectEqual(Mode.window, parse(&.{ "sketerm", "files", "--window" }).?.mode);
+}
+
+test "files entry: reveal target is independent of start directory" {
+    const req = parse(&.{ "sketerm-files", "user@box:/photos", "--select=user@box:/photos/cat.jpg" }).?;
+    try std.testing.expectEqualStrings("user@box:/photos", req.spec.?);
+    try std.testing.expectEqualStrings("user@box:/photos/cat.jpg", req.reveal.?);
 }
 
 test "files entry: a directory named files is a spec, not a second subcommand" {

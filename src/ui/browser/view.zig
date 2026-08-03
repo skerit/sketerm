@@ -960,6 +960,33 @@ pub const BrowserView = struct {
         self.focusListing();
     }
 
+    /// Select a host-qualified file once the current streamed listing contains it.
+    pub fn queueReveal(self: *BrowserView, spec: []const u8) void {
+        const tab = self.currentTab() orelse return;
+        const loc = parseSpec(spec);
+        const same_host = if (loc.host) |host|
+            if (tab.hc.host) |tab_host| std.mem.eql(u8, host, tab_host) else false
+        else
+            tab.hc.host == null;
+        if (!same_host or loc.path.len == 0) return;
+        const owned_path = self.allocator.dupe(u8, loc.path) catch return;
+        const owned_host = self.allocator.dupe(u8, loc.host orelse "") catch {
+            self.allocator.free(owned_path);
+            return;
+        };
+        if (tab.pending_reveal) |old| self.allocator.free(old);
+        if (tab.pending_reveal_host) |old| self.allocator.free(old);
+        tab.pending_reveal = owned_path;
+        tab.pending_reveal_host = owned_host;
+        if (std.fs.path.basename(loc.path).len > 0 and std.fs.path.basename(loc.path)[0] == '.') tab.show_hidden = true;
+        if (tab.filter.len > 0) {
+            self.allocator.free(tab.filter);
+            tab.filter = &.{};
+        }
+        tab.vs.collapsed.clearRetainingCapacity();
+        self.renderCurrent();
+    }
+
     /// After a NAVIGATION, focus belongs inside the face. Destroying
     /// the clicked row makes GTK move focus to some visible widget
     /// OUTSIDE the browser (the window tab bar), where the lost-focus

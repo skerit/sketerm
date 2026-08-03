@@ -405,6 +405,17 @@ fn freeNavigationState(req: u32, previous_host_ready: bool) FreeNavigationState 
 }
 
 pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
+    if (tab.pending_reveal) |path| {
+        const parent = std.fs.path.dirname(path) orelse "/";
+        const reveal_host = tab.pending_reveal_host orelse "";
+        const target_host = hc.host orelse "";
+        if (!std.mem.eql(u8, parent, candidate.path) or !std.mem.eql(u8, reveal_host, target_host)) {
+            self.allocator.free(path);
+            tab.pending_reveal = null;
+            if (tab.pending_reveal_host) |host| self.allocator.free(host);
+            tab.pending_reveal_host = null;
+        }
+    }
     if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
         const owned = self.allocator.dupe(u8, canonical) catch null;
         if (owned) |path| {
