@@ -53,7 +53,9 @@ const CMD_SET_SINK_INPUT_MUTE = 69;
 const CMD_SET_PLAYBACK_STREAM_BUFFER_ATTR = 72;
 const CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE = 74;
 const CMD_UPDATE_PLAYBACK_STREAM_PROPLIST = 81;
+const CMD_UPDATE_CLIENT_PROPLIST = 82;
 const CMD_REMOVE_PLAYBACK_STREAM_PROPLIST = 84;
+const CMD_REMOVE_CLIENT_PROPLIST = 85;
 const CMD_REQUEST = 61;
 
 /// The application-facing playback window must cover a real remote round
@@ -99,6 +101,9 @@ pub const UnitTag = enum(u8) {
     close = 3,
     /// u32 stream, u8 corked. Daemon → viewer.
     cork = 4,
+    /// u32 stream, u8 version, u32 pid, then four u16-length strings:
+    /// application, binary, media title, icon name. Daemon → viewer.
+    metadata = 5,
     /// u32 stream, u64 bytes played locally. Viewer → daemon — this
     /// is the CLOCK: the daemon requests exactly this much more from
     /// the app, so the app paces itself to real playback.
@@ -118,6 +123,72 @@ pub const UnitTag = enum(u8) {
     pcm_opus = 19,
     _,
 };
+
+pub const AudioInfo = struct {
+    application: []const u8 = "",
+    binary: []const u8 = "",
+    media: []const u8 = "",
+    icon: []const u8 = "",
+    pid: u32 = 0,
+    running: bool = false,
+};
+
+const META_VERSION: u8 = 1;
+/// Sizing input for the broker's worker-control buffer — see
+/// `WORKER_META_BUF` in daemon_serve.zig before raising this.
+pub const META_STRING_MAX: usize = 128;
+const PROPLIST_VALUE_MAX: usize = 64 << 10;
+
+fn boundedUtf8(value_in: []const u8) ?[]const u8 {
+    const value = std.mem.trimEnd(u8, value_in, "\x00");
+    if (!std.unicode.utf8ValidateSlice(value)) return null;
+    var end = @min(value.len, META_STRING_MAX);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(value[0..end])) end -= 1;
+    return value[0..end];
+}
+
+pub fn appendMetadataUnit(out: *std.ArrayList(u8), a: std.mem.Allocator, stream: u32, info: AudioInfo) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    var fixed: [9]u8 = undefined;
+    std.mem.writeInt(u32, fixed[0..4], stream, .little);
+    fixed[4] = META_VERSION;
+    std.mem.writeInt(u32, fixed[5..9], info.pid, .little);
+    try payload.appendSlice(a, &fixed);
+    inline for (.{ info.application, info.binary, info.media, info.icon }) |value| {
+        const clipped = boundedUtf8(value) orelse "";
+        var len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len, @intCast(clipped.len), .little);
+        try payload.appendSlice(a, &len);
+        try payload.appendSlice(a, clipped);
+    }
+    try appendUnit(out, a, .metadata, payload.items);
+}
+
+pub fn decodeMetadata(payload: []const u8) ?struct { stream: u32, info: AudioInfo } {
+    if (payload.len < 9 or payload[4] != META_VERSION) return null;
+    var pos: usize = 9;
+    var values: [4][]const u8 = undefined;
+    for (&values) |*value| {
+        if (pos + 2 > payload.len) return null;
+        const len = std.mem.readInt(u16, payload[pos..][0..2], .little);
+        pos += 2;
+        if (pos + len > payload.len) return null;
+        value.* = payload[pos .. pos + len];
+        pos += len;
+    }
+    if (pos != payload.len) return null;
+    return .{
+        .stream = std.mem.readInt(u32, payload[0..4], .little),
+        .info = .{
+            .application = values[0],
+            .binary = values[1],
+            .media = values[2],
+            .icon = values[3],
+            .pid = std.mem.readInt(u32, payload[5..9], .little),
+        },
+    };
+}
 
 pub fn appendUnit(out: *std.ArrayList(u8), a: std.mem.Allocator, tag: UnitTag, payload: []const u8) !void {
     var hdr: [5]u8 = undefined;
@@ -313,24 +384,161 @@ const Tr = struct {
     }
     /// Skip a whole proplist.
     fn skipProplist(r: *Tr) Error!void {
-        if (try r.tag() != 'P') return Error.Protocol;
-        while (true) {
-            const t = try r.tag();
-            if (t == 'N') return; // terminator
-            if (t != 't') return Error.Protocol;
-            const end = std.mem.indexOfScalarPos(u8, r.buf, r.pos, 0) orelse return Error.Protocol;
-            r.pos = end + 1;
-            if (try r.tag() != 'L') return Error.Protocol;
-            const len = try r.rawU32();
-            if (try r.tag() != 'x') return Error.Protocol;
-            const xlen = try r.rawU32();
-            if (xlen != len or r.pos + xlen > r.buf.len) return Error.Protocol;
-            r.pos += xlen;
-        }
+        try walkProplist(r, null, null);
     }
 };
 
 // ── the server ──────────────────────────────────────────────────
+
+const Metadata = struct {
+    const application_bit: u8 = 1 << 0;
+    const binary_bit: u8 = 1 << 1;
+    const media_name_bit: u8 = 1 << 2;
+    const media_title_bit: u8 = 1 << 3;
+    const application_icon_bit: u8 = 1 << 4;
+    const media_icon_bit: u8 = 1 << 5;
+    const pid_bit: u8 = 1 << 6;
+
+    application: []u8 = &.{},
+    binary: []u8 = &.{},
+    media_name: []u8 = &.{},
+    media_title: []u8 = &.{},
+    application_icon: []u8 = &.{},
+    media_icon: []u8 = &.{},
+    pid: u32 = 0,
+    present: u8 = 0,
+
+    fn deinit(self: *Metadata, a: std.mem.Allocator) void {
+        if (self.application.len > 0) a.free(self.application);
+        if (self.binary.len > 0) a.free(self.binary);
+        if (self.media_name.len > 0) a.free(self.media_name);
+        if (self.media_title.len > 0) a.free(self.media_title);
+        if (self.application_icon.len > 0) a.free(self.application_icon);
+        if (self.media_icon.len > 0) a.free(self.media_icon);
+        self.* = .{};
+    }
+
+    fn clear(self: *Metadata, a: std.mem.Allocator) void {
+        self.deinit(a);
+    }
+
+    fn has(self: *const Metadata, bit: u8) bool {
+        return self.present & bit != 0;
+    }
+
+    fn setString(self: *Metadata, a: std.mem.Allocator, slot: *[]u8, bit: u8, value_in: []const u8, overwrite: bool) Error!void {
+        if (!overwrite and self.has(bit)) return;
+        const value = boundedUtf8(value_in) orelse return;
+        const fresh: []u8 = if (value.len > 0) try a.dupe(u8, value) else &.{};
+        if (slot.*.len > 0) a.free(slot.*);
+        slot.* = fresh;
+        self.present |= bit;
+    }
+
+    fn apply(self: *Metadata, a: std.mem.Allocator, key: []const u8, value: []const u8, overwrite: bool) Error!void {
+        if (std.mem.eql(u8, key, "application.name")) {
+            try self.setString(a, &self.application, application_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "application.process.binary")) {
+            try self.setString(a, &self.binary, binary_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "media.name")) {
+            try self.setString(a, &self.media_name, media_name_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "media.title")) {
+            try self.setString(a, &self.media_title, media_title_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "application.icon_name")) {
+            try self.setString(a, &self.application_icon, application_icon_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "media.icon_name")) {
+            try self.setString(a, &self.media_icon, media_icon_bit, value, overwrite);
+        } else if (std.mem.eql(u8, key, "application.process.id")) {
+            if (overwrite or !self.has(pid_bit)) {
+                const trimmed = std.mem.trimEnd(u8, value, "\x00");
+                self.pid = std.fmt.parseInt(u32, trimmed, 10) catch 0;
+                self.present |= pid_bit;
+            }
+        }
+    }
+
+    fn remove(self: *Metadata, a: std.mem.Allocator, key: []const u8) void {
+        if (std.mem.eql(u8, key, "application.name")) {
+            self.removeString(a, &self.application, application_bit);
+        } else if (std.mem.eql(u8, key, "application.process.binary")) {
+            self.removeString(a, &self.binary, binary_bit);
+        } else if (std.mem.eql(u8, key, "media.name")) {
+            self.removeString(a, &self.media_name, media_name_bit);
+        } else if (std.mem.eql(u8, key, "media.title")) {
+            self.removeString(a, &self.media_title, media_title_bit);
+        } else if (std.mem.eql(u8, key, "application.icon_name")) {
+            self.removeString(a, &self.application_icon, application_icon_bit);
+        } else if (std.mem.eql(u8, key, "media.icon_name")) {
+            self.removeString(a, &self.media_icon, media_icon_bit);
+        } else if (std.mem.eql(u8, key, "application.process.id")) {
+            self.pid = 0;
+            self.present &= ~pid_bit;
+        }
+    }
+
+    fn removeString(self: *Metadata, a: std.mem.Allocator, slot: *[]u8, bit: u8) void {
+        if (slot.*.len > 0) a.free(slot.*);
+        slot.* = &.{};
+        self.present &= ~bit;
+    }
+};
+
+const ProplistVisitor = *const fn (?*anyopaque, []const u8, []const u8) Error!void;
+
+fn validProplistKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    for (key) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-' and byte != '_') return false;
+    }
+    return true;
+}
+
+fn walkProplist(r: *Tr, context: ?*anyopaque, visitor: ?ProplistVisitor) Error!void {
+    if (try r.tag() != 'P') return Error.Protocol;
+    while (true) {
+        const t = try r.tag();
+        if (t == 'N') return;
+        if (t != 't') return Error.Protocol;
+        const end = std.mem.indexOfScalarPos(u8, r.buf, r.pos, 0) orelse return Error.Protocol;
+        const key = r.buf[r.pos..end];
+        if (!validProplistKey(key)) return Error.Protocol;
+        r.pos = end + 1;
+        if (try r.tag() != 'L') return Error.Protocol;
+        const len = try r.rawU32();
+        if (try r.tag() != 'x') return Error.Protocol;
+        const xlen = try r.rawU32();
+        if (xlen != len or xlen > PROPLIST_VALUE_MAX or r.pos + xlen > r.buf.len) return Error.Protocol;
+        if (visitor) |visit| try visit(context, key, r.buf[r.pos .. r.pos + xlen]);
+        r.pos += xlen;
+    }
+}
+
+const ApplyProperties = struct {
+    allocator: std.mem.Allocator,
+    metadata: *Metadata,
+    overwrite: bool,
+
+    fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) Error!void {
+        const self: *ApplyProperties = @ptrCast(@alignCast(raw.?));
+        try self.metadata.apply(self.allocator, key, value, self.overwrite);
+    }
+};
+
+fn readProplist(r: *Tr, a: std.mem.Allocator, meta: *Metadata, mode: u32) Error!void {
+    if (mode > 2) return Error.Protocol;
+    // PA_UPDATE_SET replaces the complete list; MERGE keeps existing
+    // values, while REPLACE overwrites only keys present in the update.
+    if (mode == 0) meta.clear(a);
+    var apply = ApplyProperties{ .allocator = a, .metadata = meta, .overwrite = mode != 1 };
+    try walkProplist(r, @ptrCast(&apply), &ApplyProperties.visit);
+}
+
+fn removeProperties(r: *Tr, a: std.mem.Allocator, meta: *Metadata) Error!void {
+    while (true) {
+        const key = try r.str() orelse return;
+        meta.remove(a, key);
+    }
+}
 
 pub const Stream = struct {
     format: u8 = 3, // s16le
@@ -372,11 +580,13 @@ pub const Stream = struct {
     opus_enc: ?opuscodec.Encoder = null,
     /// Partial 20 ms frame awaiting more samples.
     fbuf: std.ArrayList(u8) = .empty,
+    metadata: Metadata = .{},
 
     fn deinitOwned(self: *Stream, a: std.mem.Allocator) void {
         if (self.opus_enc) |*e| e.deinit();
         self.opus_enc = null;
         self.fbuf.deinit(a);
+        self.metadata.deinit(a);
     }
 
     fn bytesPerSec(self: *const Stream) u64 {
@@ -394,6 +604,7 @@ pub const Server = struct {
     version: u32 = VERSION,
     authorized: bool = false,
     streams: std.AutoHashMapUnmanaged(u32, Stream) = .empty,
+    metadata: Metadata = .{},
     next_stream: u32 = 0,
     dead: bool = false,
     /// Any proto>=5 viewer attached (the daemon updates this each
@@ -423,6 +634,56 @@ pub const Server = struct {
         var it = self.streams.valueIterator();
         while (it.next()) |st| st.deinitOwned(self.allocator);
         self.streams.deinit(self.allocator);
+        self.metadata.deinit(self.allocator);
+    }
+
+    pub fn streamInfo(self: *const Server, stream: *const Stream) AudioInfo {
+        const stream_meta = &stream.metadata;
+        const client_meta = &self.metadata;
+        const media = if (stream_meta.media_title.len > 0)
+            stream_meta.media_title
+        else
+            stream_meta.media_name;
+        const stream_icon = if (stream_meta.media_icon.len > 0)
+            stream_meta.media_icon
+        else
+            stream_meta.application_icon;
+        const client_icon = if (client_meta.media_icon.len > 0)
+            client_meta.media_icon
+        else
+            client_meta.application_icon;
+        return .{
+            .application = if (stream_meta.has(Metadata.application_bit)) stream_meta.application else client_meta.application,
+            .binary = if (stream_meta.has(Metadata.binary_bit)) stream_meta.binary else client_meta.binary,
+            .media = media,
+            .icon = if (stream_icon.len > 0) stream_icon else client_icon,
+            .pid = if (stream_meta.has(Metadata.pid_bit)) stream_meta.pid else client_meta.pid,
+            .running = !stream.corked,
+        };
+    }
+
+    pub fn appendStreamDescriptor(self: *const Server, out: *std.ArrayList(u8), stream_id: u32, stream: *const Stream) !void {
+        var open: [10]u8 = undefined;
+        std.mem.writeInt(u32, open[0..4], stream_id, .little);
+        open[4] = stream.format;
+        open[5] = stream.channels;
+        std.mem.writeInt(u32, open[6..10], stream.rate, .little);
+        try appendUnit(out, self.allocator, .open, &open);
+        try appendMetadataUnit(out, self.allocator, stream_id, self.streamInfo(stream));
+        var cork: [5]u8 = undefined;
+        std.mem.writeInt(u32, cork[0..4], stream_id, .little);
+        cork[4] = @intFromBool(stream.corked);
+        try appendUnit(out, self.allocator, .cork, &cork);
+    }
+
+    fn emitMetadata(self: *Server, stream_id: u32) Error!void {
+        const stream = self.streams.getPtr(stream_id) orelse return;
+        try appendMetadataUnit(&self.units, self.allocator, stream_id, self.streamInfo(stream));
+    }
+
+    fn emitAllMetadata(self: *Server) Error!void {
+        var it = self.streams.iterator();
+        while (it.next()) |entry| try self.emitMetadata(entry.key_ptr.*);
     }
 
     /// Feed app→server socket bytes; complete frames dispatch,
@@ -676,10 +937,12 @@ pub const Server = struct {
             },
             CMD_SET_CLIENT_NAME => {
                 if (self.version >= 13) {
-                    try r.skipProplist();
+                    try readProplist(&r, self.allocator, &self.metadata, 2);
                 } else {
-                    _ = try r.str();
+                    const name = try r.str() orelse "";
+                    try self.metadata.setString(self.allocator, &self.metadata.application, Metadata.application_bit, name, true);
                 }
+                try self.emitAllMetadata();
                 var t = try self.replyHead(tag);
                 if (self.version >= 13) try t.u32be(1); // client index
                 try self.finishFrame();
@@ -857,6 +1120,60 @@ pub const Server = struct {
                 _ = try self.replyHead(tag);
                 try self.finishFrame();
             },
+            CMD_SET_PLAYBACK_STREAM_NAME => {
+                const idx = try r.u32be();
+                const name = try r.str() orelse return self.sendError(tag, ERR_INVALID);
+                if (!std.unicode.utf8ValidateSlice(name)) return self.sendError(tag, ERR_INVALID);
+                const s = self.streams.getPtr(idx) orelse return self.sendError(tag, ERR_NOENTITY);
+                try s.metadata.setString(self.allocator, &s.metadata.media_name, Metadata.media_name_bit, name, true);
+                try self.emitMetadata(idx);
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
+            CMD_UPDATE_PLAYBACK_STREAM_PROPLIST => {
+                const idx = try r.u32be();
+                const mode = try r.u32be();
+                if (mode > 2) {
+                    try r.skipProplist();
+                    return self.sendError(tag, ERR_INVALID);
+                }
+                const s = self.streams.getPtr(idx) orelse {
+                    try r.skipProplist();
+                    return self.sendError(tag, ERR_NOENTITY);
+                };
+                try readProplist(&r, self.allocator, &s.metadata, mode);
+                try self.emitMetadata(idx);
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
+            CMD_REMOVE_PLAYBACK_STREAM_PROPLIST => {
+                const idx = try r.u32be();
+                const s = self.streams.getPtr(idx) orelse {
+                    while (try r.str() != null) {}
+                    return self.sendError(tag, ERR_NOENTITY);
+                };
+                try removeProperties(&r, self.allocator, &s.metadata);
+                try self.emitMetadata(idx);
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
+            CMD_UPDATE_CLIENT_PROPLIST => {
+                const mode = try r.u32be();
+                if (mode > 2) {
+                    try r.skipProplist();
+                    return self.sendError(tag, ERR_INVALID);
+                }
+                try readProplist(&r, self.allocator, &self.metadata, mode);
+                try self.emitAllMetadata();
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
+            CMD_REMOVE_CLIENT_PROPLIST => {
+                try removeProperties(&r, self.allocator, &self.metadata);
+                try self.emitAllMetadata();
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
             // Accepted, trivially acknowledged (their real replies
             // ARE empty acks — anything with a payload gets its own
             // handler above; an empty reply where the client expects
@@ -864,11 +1181,8 @@ pub const Server = struct {
             CMD_SUBSCRIBE,
             CMD_EXIT,
             CMD_TRIGGER_PLAYBACK_STREAM,
-            CMD_SET_PLAYBACK_STREAM_NAME,
             CMD_SET_SINK_INPUT_VOLUME,
             CMD_SET_SINK_INPUT_MUTE,
-            CMD_UPDATE_PLAYBACK_STREAM_PROPLIST,
-            CMD_REMOVE_PLAYBACK_STREAM_PROPLIST,
             => {
                 _ = try self.replyHead(tag);
                 try self.finishFrame();
@@ -880,7 +1194,13 @@ pub const Server = struct {
 
     /// v13 request/reply layout, matching protocol-native.c.
     fn createPlayback(self: *Server, r: *Tr, tag: u32) Error!void {
-        if (self.version < 13) _ = try r.str(); // legacy stream name
+        var metadata: Metadata = .{};
+        var metadata_transferred = false;
+        defer if (!metadata_transferred) metadata.deinit(self.allocator);
+        if (self.version < 13) {
+            const name = try r.str() orelse "";
+            try metadata.setString(self.allocator, &metadata.media_name, Metadata.media_name_bit, name, true);
+        }
         const ss = try r.sampleSpec();
         _ = try r.channelMap();
         _ = try r.u32be(); // sink index
@@ -899,7 +1219,7 @@ pub const Server = struct {
         if (self.version >= 13) {
             _ = try r.boolean(); // muted
             _ = try r.boolean(); // adjust_latency
-            try r.skipProplist();
+            try readProplist(r, self.allocator, &metadata, 0);
         }
         if (self.version >= 14) {
             _ = try r.boolean(); // volume_set
@@ -940,17 +1260,12 @@ pub const Server = struct {
             .tlength = tlength,
             .minreq = minreq,
             .corked = corked,
+            .metadata = metadata,
             // The reply's `missing` below grants a full buffer.
             .req_sent = tlength,
         });
-        {
-            var pl: [10]u8 = undefined;
-            std.mem.writeInt(u32, pl[0..4], idx, .little);
-            pl[4] = ss.format;
-            pl[5] = ss.channels;
-            std.mem.writeInt(u32, pl[6..10], ss.rate, .little);
-            try appendUnit(&self.units, self.allocator, .open, &pl);
-        }
+        metadata_transferred = true;
+        try self.appendStreamDescriptor(&self.units, idx, self.streams.getPtr(idx).?);
 
         var t = try self.replyHead(tag);
         try t.u32be(idx); // channel (data frames use this)
@@ -1134,6 +1449,149 @@ fn clientFrame(a: std.mem.Allocator, out: *std.ArrayList(u8), fields: []const u8
     std.mem.writeInt(u32, desc[4..8], CONTROL_CHANNEL, .big);
     try out.appendSlice(a, &desc);
     try out.appendSlice(a, fields);
+}
+
+fn testProplist(a: std.mem.Allocator, out: *std.ArrayList(u8), properties: []const struct { key: []const u8, value: []const u8 }) !void {
+    try out.append(a, 'P');
+    for (properties) |property| {
+        try out.append(a, 't');
+        try out.appendSlice(a, property.key);
+        try out.append(a, 0);
+        try out.append(a, 'L');
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(property.value.len + 1), .big);
+        try out.appendSlice(a, &len);
+        try out.append(a, 'x');
+        try out.appendSlice(a, &len);
+        try out.appendSlice(a, property.value);
+        try out.append(a, 0);
+    }
+    try out.append(a, 'N');
+}
+
+test "audio metadata proplists are bounded, inherited and encoded" {
+    const a = t_.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try testProplist(a, &raw, &.{
+        .{ .key = "application.name", .value = "Firefox" },
+        .{ .key = "application.process.binary", .value = "firefox" },
+        .{ .key = "application.process.id", .value = "321" },
+        .{ .key = "application.icon_name", .value = "firefox" },
+    });
+    var server_meta: Metadata = .{};
+    defer server_meta.deinit(a);
+    var reader = Tr{ .buf = raw.items };
+    try readProplist(&reader, a, &server_meta, 0);
+    try t_.expectEqualStrings("Firefox", server_meta.application);
+    try t_.expectEqualStrings("firefox", server_meta.binary);
+    try t_.expectEqual(@as(u32, 321), server_meta.pid);
+
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.metadata = server_meta;
+    server_meta = .{};
+    var stream_meta: Metadata = .{};
+    try stream_meta.setString(a, &stream_meta.media_name, Metadata.media_name_bit, "A very important call", true);
+    try srv.streams.put(a, 7, .{ .corked = true, .metadata = stream_meta });
+    stream_meta = .{};
+    try srv.appendStreamDescriptor(&srv.units, 7, srv.streams.getPtr(7).?);
+
+    const opened = peelUnit(srv.units.items).?;
+    try t_.expectEqual(UnitTag.open, opened.tag);
+    const meta = peelUnit(srv.units.items[opened.consumed..]).?;
+    try t_.expectEqual(UnitTag.metadata, meta.tag);
+    const decoded = decodeMetadata(meta.payload).?;
+    try t_.expectEqual(@as(u32, 7), decoded.stream);
+    try t_.expectEqualStrings("Firefox", decoded.info.application);
+    try t_.expectEqualStrings("A very important call", decoded.info.media);
+    try t_.expectEqual(@as(u32, 321), decoded.info.pid);
+    const cork = peelUnit(srv.units.items[opened.consumed + meta.consumed ..]).?;
+    try t_.expectEqual(UnitTag.cork, cork.tag);
+    try t_.expectEqual(@as(u8, 1), cork.payload[4]);
+}
+
+test "audio metadata preserves Pulse property semantics and UTF-8 boundaries" {
+    const a = t_.allocator;
+    var meta: Metadata = .{};
+    defer meta.deinit(a);
+
+    try meta.apply(a, "media.name", "fallback stream name", true);
+    try meta.apply(a, "media.title", "Track title", true);
+    try meta.apply(a, "application.icon_name", "player", true);
+    try meta.apply(a, "media.icon_name", "album-art", true);
+    meta.remove(a, "media.name");
+    meta.remove(a, "application.icon_name");
+    try t_.expectEqualStrings("Track title", meta.media_title);
+    try t_.expectEqualStrings("album-art", meta.media_icon);
+
+    var long: [130]u8 = undefined;
+    @memset(long[0..127], 'x');
+    @memcpy(long[127..130], "€");
+    try meta.apply(a, "application.name", &long, true);
+    try t_.expectEqual(@as(usize, 127), meta.application.len);
+    try t_.expect(std.unicode.utf8ValidateSlice(meta.application));
+
+    const old = try a.dupe(u8, meta.application);
+    defer a.free(old);
+    try meta.apply(a, "application.name", "\xffinvalid", true);
+    try t_.expectEqualStrings(old, meta.application);
+
+    // MERGE keeps even an explicitly empty property; REPLACE changes it.
+    try meta.apply(a, "application.process.binary", "", true);
+    try meta.apply(a, "application.process.binary", "ignored", false);
+    try t_.expectEqualStrings("", meta.binary);
+    try meta.apply(a, "application.process.binary", "replacement", true);
+    try t_.expectEqualStrings("replacement", meta.binary);
+}
+
+test "Pulse proplists reject invalid keys and oversized values" {
+    const a = t_.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+
+    try testProplist(a, &raw, &.{.{ .key = "invalid key", .value = "value" }});
+    var reader = Tr{ .buf = raw.items };
+    var meta: Metadata = .{};
+    defer meta.deinit(a);
+    try t_.expectError(Error.Protocol, readProplist(&reader, a, &meta, 0));
+
+    raw.clearRetainingCapacity();
+    const large = try a.alloc(u8, PROPLIST_VALUE_MAX);
+    defer a.free(large);
+    @memset(large, 'x');
+    try testProplist(a, &raw, &.{.{ .key = "application.name", .value = large }});
+    reader = .{ .buf = raw.items };
+    try t_.expectError(Error.Protocol, readProplist(&reader, a, &meta, 0));
+}
+
+test "set playback stream name rejects invalid UTF-8" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    var metadata: Metadata = .{};
+    try metadata.setString(a, &metadata.media_name, Metadata.media_name_bit, "original", true);
+    try srv.streams.put(a, 0, .{ .metadata = metadata });
+    metadata = .{};
+
+    var fields: std.ArrayList(u8) = .empty;
+    defer fields.deinit(a);
+    const w = Tw{ .buf = &fields, .a = a };
+    try w.u32be(CMD_SET_PLAYBACK_STREAM_NAME);
+    try w.u32be(17);
+    try w.u32be(0);
+    try w.str("\xffinvalid");
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    try clientFrame(a, &frame, fields.items);
+    try srv.feed(frame.items);
+
+    var reply = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+    try t_.expectEqual(@as(u32, CMD_ERROR), try reply.u32be());
+    try t_.expectEqual(@as(u32, 17), try reply.u32be());
+    try t_.expectEqual(@as(u32, ERR_INVALID), try reply.u32be());
+    try t_.expectEqualStrings("original", srv.streams.get(0).?.metadata.media_name);
 }
 
 test "auth + client name + create stream + pcm flows to units" {

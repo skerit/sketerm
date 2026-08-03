@@ -11,6 +11,7 @@ const log = @import("log.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
 const fsserve = @import("fsserve.zig");
+const pulse = @import("pulse.zig");
 const snapshot = @import("snapshot.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
@@ -186,13 +187,20 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
     self.broadcastPeerInfo(s);
 }
 
+/// Worst-case 'M' JSON: every audio stream at the metadata string cap
+/// with every byte \uXXXX-escaped (6x), plus generous room for the
+/// title/cwd/path fields. Derived from the pulse constants so growing
+/// either one grows this buffer instead of silently truncating the
+/// datagram (a truncated push fails to parse FOREVER — the hash matches
+/// so it is never resent).
+const WORKER_META_BUF: usize =
+    dmod.Daemon.MAX_AUDIO_STREAMS * (4 * pulse.META_STRING_MAX * 6 + 256) + 32768;
+
 /// Broker side: read one control datagram from a worker. 'Y' = ready
 /// (resolve the deferred spawn `.ok`), 'M' = metadata push; n<=0 means the
 /// worker exited (before 'Y' = spawn failed → resolve spawn `.err`).
-/// The buffer comfortably exceeds the worst-case 'M' JSON (a 256-byte
-/// title + 1024-byte cwd, each up to ~6x under \uXXXX escaping).
 pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
-    var buf: [16384]u8 = undefined;
+    var buf: [WORKER_META_BUF]u8 = undefined;
     var passed: c_int = -1;
     const n = controlRecv(w.control_fd, &buf, &passed);
     if (passed >= 0) _ = c.close(passed); // workers never pass fds up
@@ -232,6 +240,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.ttl_secs = m.ttl_secs;
             w.viewers = m.viewers;
             w.audio = m.audio;
+            w.setAudioInfos(m.audio_streams);
             if (self.allocator.dupe(u8, m.title)) |t| {
                 if (w.title) |old| self.allocator.free(old);
                 w.title = t;
@@ -322,6 +331,17 @@ pub fn maybePushMeta(self: *Daemon) void {
     const controller = self.controllerLabel(s, &ctrl_buf);
     const ch = std.hash.Wyhash.hash(0, controller);
     const audio = self.sessionAudioRunning(s, null);
+    const audio_streams = self.sessionAudioInfos(s, self.allocator);
+    defer self.allocator.free(audio_streams);
+    var audio_hash: u64 = 0;
+    for (audio_streams) |info| {
+        audio_hash = std.hash.Wyhash.hash(audio_hash, info.application);
+        audio_hash = std.hash.Wyhash.hash(audio_hash, info.binary);
+        audio_hash = std.hash.Wyhash.hash(audio_hash, info.media);
+        audio_hash = std.hash.Wyhash.hash(audio_hash, info.icon);
+        audio_hash = std.hash.Wyhash.hash(audio_hash, std.mem.asBytes(&info.pid));
+        audio_hash = std.hash.Wyhash.hash(audio_hash, std.mem.asBytes(&info.running));
+    }
     const structural = !self.wpush.inited or
         n_clients != self.wpush.clients or
         s.exited != self.wpush.exited or
@@ -329,7 +349,8 @@ pub fn maybePushMeta(self: *Daemon) void {
         s.screen.cols != self.wpush.cols or
         th != self.wpush.title_hash or
         ch != self.wpush.controller_hash or
-        audio != self.wpush.audio;
+        audio != self.wpush.audio or
+        audio_hash != self.wpush.audio_hash;
     const activity_moved = s.last_activity_ms != self.wpush.activity;
     const now = nowMs();
     if (!structural and !(activity_moved and now - self.wpush.last_push_ms >= 200)) return;
@@ -354,6 +375,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .viewers = n_clients,
         .controller = controller,
         .audio = audio,
+        .audio_streams = audio_streams,
         .wl = if (s.wl_display_path) |p| p else "",
         .pa = if (s.pa_socket_path) |p| p else "",
         .rt = if (s.runtime_dir_path) |p| p else "",
@@ -374,6 +396,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .controller_hash = ch,
         .activity = s.last_activity_ms,
         .audio = audio,
+        .audio_hash = audio_hash,
         .last_push_ms = now,
     };
 }

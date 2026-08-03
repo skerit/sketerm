@@ -19,6 +19,7 @@ const c = @import("c.zig").c;
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const display_cli = @import("mux/display.zig");
+const pulse = @import("mux/pulse.zig");
 const pipe_mod = @import("wlhost/pipe.zig");
 const compositor_mod = @import("wlhost/compositor.zig");
 
@@ -107,6 +108,29 @@ fn paBool(out: *std.ArrayList(u8), a: std.mem.Allocator, v: bool) void {
     out.append(a, if (v) @as(u8, '1') else '0') catch fail("oom");
 }
 
+fn paString(out: *std.ArrayList(u8), a: std.mem.Allocator, value: []const u8) void {
+    out.append(a, 't') catch fail("oom");
+    out.appendSlice(a, value) catch fail("oom");
+    out.append(a, 0) catch fail("oom");
+}
+
+const PaProperty = struct { key: []const u8, value: []const u8 };
+
+fn paProplist(out: *std.ArrayList(u8), a: std.mem.Allocator, properties: []const PaProperty) void {
+    out.append(a, 'P') catch fail("oom");
+    for (properties) |property| {
+        paString(out, a, property.key);
+        paU32(out, a, @intCast(property.value.len + 1));
+        out.append(a, 'x') catch fail("oom");
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(property.value.len + 1), .big);
+        out.appendSlice(a, &len) catch fail("oom");
+        out.appendSlice(a, property.value) catch fail("oom");
+        out.append(a, 0) catch fail("oom");
+    }
+    out.append(a, 'N') catch fail("oom");
+}
+
 fn paFrameSend(fd: c_int, a: std.mem.Allocator, fields: []const u8) void {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(a);
@@ -123,6 +147,22 @@ fn paFrameSend(fd: c_int, a: std.mem.Allocator, fields: []const u8) void {
     }
 }
 
+fn paDataSend(fd: c_int, a: std.mem.Allocator, channel: u32, bytes: []const u8) void {
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    var desc: [PA_DESC_SIZE]u8 = [_]u8{0} ** PA_DESC_SIZE;
+    std.mem.writeInt(u32, desc[0..4], @intCast(bytes.len), .big);
+    std.mem.writeInt(u32, desc[4..8], channel, .big);
+    frame.appendSlice(a, &desc) catch fail("oom");
+    frame.appendSlice(a, bytes) catch fail("oom");
+    var off: usize = 0;
+    while (off < frame.items.len) {
+        const n = c.write(fd, frame.items.ptr + off, frame.items.len - off);
+        if (n <= 0) fail("audio: short PCM write to the pulse socket");
+        off += @intCast(n);
+    }
+}
+
 /// Does the daemon's raw `list` reply currently say `"audio":true`?
 fn listSaysAudio(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("audio: list connect");
@@ -133,11 +173,30 @@ fn listSaysAudio(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     return std.mem.indexOf(u8, f.payload, "\"audio\":true") != null;
 }
 
-fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server: []const u8) void {
+fn listContains(allocator: std.mem.Allocator, sock_path: []const u8, needle: []const u8) bool {
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("audio: list connect");
+    defer conn.deinit();
+    conn.sendFrame(.list, "") catch fail("audio: list send");
+    const f = conn.recvExpect(&.{.welcome}) catch fail("audio: list recv");
+    defer f.deinit(allocator);
+    return std.mem.indexOf(u8, f.payload, needle) != null;
+}
+
+fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, session_name: []const u8, pulse_server: []const u8) void {
     const a = allocator;
     // "unix:<path>" — the scheme was asserted at create.
     const pa_path = pulse_server["unix:".len..];
     if (listSaysAudio(a, sock_path)) fail("audio: flag already true with no stream");
+
+    // Attach a deaf viewer before the stream exists. The stream's initial
+    // descriptors are withheld until this viewer subscribes, which is the
+    // startup ordering that used to produce audible but unidentified audio.
+    var viewer = client_mod.Conn.connect(a, sock_path) catch fail("audio: viewer connect");
+    defer viewer.deinit();
+    viewer.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("audio: viewer hello");
+    (viewer.recvExpectFor(&.{.welcome}, 15_000) catch fail("audio: viewer welcome")).deinit(a);
+    viewer.sendJson(.attach, .{ .name = session_name, .kind = "gui", .read_only = true }) catch fail("audio: viewer attach");
+    (viewer.recvExpectFor(&.{.snapshot}, 15_000) catch fail("audio: viewer snapshot")).deinit(a);
 
     const fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (fd < 0) fail("audio: socket");
@@ -160,10 +219,15 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server:
         paFrameSend(fd, a, fields.items);
         fields.clearRetainingCapacity();
     }
-    { // SET_CLIENT_NAME with empty proplist
+    { // SET_CLIENT_NAME with the application identity used by the overview
         paU32(&fields, a, 9); // CMD_SET_CLIENT_NAME
         paU32(&fields, a, 2);
-        fields.appendSlice(a, "PN") catch fail("oom"); // empty proplist
+        paProplist(&fields, a, &.{
+            .{ .key = "application.name", .value = "Smoke Player" },
+            .{ .key = "application.process.binary", .value = "smoke-player" },
+            .{ .key = "application.process.id", .value = "4242" },
+            .{ .key = "application.icon_name", .value = "multimedia-player" },
+        });
         paFrameSend(fd, a, fields.items);
         fields.clearRetainingCapacity();
     }
@@ -193,7 +257,7 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server:
         while (i < 7) : (i += 1) paBool(&fields, a, false);
         paBool(&fields, a, false); // muted
         paBool(&fields, a, true); // adjust_latency
-        fields.appendSlice(a, "PN") catch fail("oom"); // proplist
+        paProplist(&fields, a, &.{.{ .key = "media.name", .value = "Smoke Song" }});
         paBool(&fields, a, false); // v14: volume_set
         paBool(&fields, a, false); // v14: early_requests
         paBool(&fields, a, false); // v15: muted_set
@@ -203,12 +267,115 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server:
         fields.clearRetainingCapacity();
     }
 
+    const chan_open = viewer.recvExpectFor(&.{.chan_open}, 15_000) catch fail("audio: viewer never received channel open");
+    const channel = (wire.decodeChanOpen(chan_open.payload) orelse fail("audio: malformed channel open"));
+    if (channel.kind != .audio) fail("audio: viewer received a non-audio channel");
+    chan_open.deinit(a);
+    var subscribe_units: std.ArrayList(u8) = .empty;
+    defer subscribe_units.deinit(a);
+    pulse.appendUnit(&subscribe_units, a, .subscribe, "") catch fail("oom");
+    var subscribe_payload: std.ArrayList(u8) = .empty;
+    defer subscribe_payload.deinit(a);
+    var channel_id: [4]u8 = undefined;
+    std.mem.writeInt(u32, &channel_id, channel.id, .little);
+    subscribe_payload.appendSlice(a, &channel_id) catch fail("oom");
+    subscribe_payload.appendSlice(a, subscribe_units.items) catch fail("oom");
+    viewer.sendFrame(.chan_data, subscribe_payload.items) catch fail("audio: subscribe send");
+
+    const descriptors = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: descriptors not replayed on subscribe");
+    defer descriptors.deinit(a);
+    if (descriptors.payload.len < 4 or std.mem.readInt(u32, descriptors.payload[0..4], .little) != channel.id)
+        fail("audio: descriptors arrived on the wrong channel");
+    const opened = pulse.peelUnit(descriptors.payload[4..]) orelse fail("audio: missing open descriptor");
+    if (opened.tag != .open) fail("audio: first replayed unit was not open");
+    const metadata = pulse.peelUnit(descriptors.payload[4 + opened.consumed ..]) orelse fail("audio: missing metadata descriptor");
+    if (metadata.tag != .metadata) fail("audio: metadata did not follow open");
+    const cork = pulse.peelUnit(descriptors.payload[4 + opened.consumed + metadata.consumed ..]) orelse fail("audio: missing cork descriptor");
+    if (cork.tag != .cork or cork.payload.len < 5 or cork.payload[4] != 0) fail("audio: initial cork state was not replayed");
+
+    paDataSend(fd, a, 0, "\x01\x02\x03\x04");
+    const pcm = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: subscribed viewer did not receive PCM");
+    defer pcm.deinit(a);
+    if (pcm.payload.len < 4) fail("audio: malformed PCM channel data");
+    const pcm_unit = pulse.peelUnit(pcm.payload[4..]) orelse fail("audio: malformed PCM unit");
+    if (pcm_unit.tag != .pcm) fail("audio: PCM overtook stream descriptors");
+
+    // Reattaching on the same subscribed connection keeps audio_ok set.
+    // Descriptor replay must therefore share PCM's priority lane: putting
+    // descriptors on the normal lane lets fresh PCM overtake them behind
+    // the snapshot backlog.
+    viewer.sendJson(.attach, .{ .name = session_name, .kind = "gui", .read_only = true }) catch fail("audio: subscribed reattach");
+    _ = c.usleep(100_000);
+    paDataSend(fd, a, 0, "\x05\x06\x07\x08");
+    const reopened = viewer.recvExpectFor(&.{.chan_open}, 15_000) catch fail("audio: subscribed reattach omitted channel open");
+    const reopened_channel = wire.decodeChanOpen(reopened.payload) orelse fail("audio: malformed reattached channel open");
+    if (reopened_channel.id != channel.id or reopened_channel.kind != .audio) fail("audio: wrong reattached audio channel");
+    reopened.deinit(a);
+    const replayed = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: subscribed reattach descriptors were overtaken");
+    const replayed_unit = if (replayed.payload.len >= 4) pulse.peelUnit(replayed.payload[4..]) else null;
+    if (replayed_unit == null or replayed_unit.?.tag != .open) fail("audio: subscribed reattach did not replay descriptors first");
+    replayed.deinit(a);
+    const replayed_pcm = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: PCM missing after subscribed reattach descriptors");
+    const replayed_pcm_unit = if (replayed_pcm.payload.len >= 4) pulse.peelUnit(replayed_pcm.payload[4..]) else null;
+    if (replayed_pcm_unit == null or replayed_pcm_unit.?.tag != .pcm) fail("audio: subscribed reattach descriptor order was malformed");
+    replayed_pcm.deinit(a);
+
     // The daemon's poll loop must notice the uncorked stream, and in
     // broker mode the worker's 'M' push must carry it to the broker.
     var tries: usize = 0;
     while (tries < 100) : (tries += 1) {
         if (listSaysAudio(allocator, sock_path)) break;
         if (tries == 99) fail("audio: list never reported the uncorked stream as \"audio\":true");
+        _ = c.usleep(50_000);
+    }
+    if (!listContains(a, sock_path, "\"application\":\"Smoke Player\"")) fail("audio: list omitted application metadata");
+    if (!listContains(a, sock_path, "\"binary\":\"smoke-player\"")) fail("audio: list omitted binary metadata");
+    if (!listContains(a, sock_path, "\"media\":\"Smoke Song\"")) fail("audio: list omitted media metadata");
+    if (!listContains(a, sock_path, "\"icon\":\"multimedia-player\"")) fail("audio: list omitted icon metadata");
+    if (!listContains(a, sock_path, "\"pid\":4242")) fail("audio: list omitted pid metadata");
+
+    { // Dynamic title updates must propagate while the audio flag stays true.
+        paU32(&fields, a, 46); // CMD_SET_PLAYBACK_STREAM_NAME
+        paU32(&fields, a, 4);
+        paU32(&fields, a, 0);
+        paString(&fields, a, "Smoke Song Two");
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        if (listContains(a, sock_path, "\"media\":\"Smoke Song Two\"")) break;
+        if (tries == 99) fail("audio: changed media title never reached list metadata");
+        _ = c.usleep(50_000);
+    }
+
+    { // Corking keeps identity but clears the running/audio state.
+        paU32(&fields, a, 41); // CMD_CORK_PLAYBACK_STREAM
+        paU32(&fields, a, 5);
+        paU32(&fields, a, 0);
+        paBool(&fields, a, true);
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        if (!listSaysAudio(a, sock_path)) break;
+        if (tries == 99) fail("audio: corked stream remained active");
+        _ = c.usleep(50_000);
+    }
+    if (!listContains(a, sock_path, "\"running\":false")) fail("audio: cork state missing from stream metadata");
+    { // Uncork again so close exercises the active-stream teardown.
+        paU32(&fields, a, 41);
+        paU32(&fields, a, 6);
+        paU32(&fields, a, 0);
+        paBool(&fields, a, false);
+        paFrameSend(fd, a, fields.items);
+        fields.clearRetainingCapacity();
+    }
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        if (listSaysAudio(a, sock_path)) break;
+        if (tries == 99) fail("audio: uncorked stream did not become active again");
         _ = c.usleep(50_000);
     }
 
@@ -220,7 +387,7 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, pulse_server:
         if (tries == 99) fail("audio: flag stuck true after the stream's client vanished");
         _ = c.usleep(50_000);
     }
-    std.debug.print("smoke-display: session audio flag ok\n", .{});
+    std.debug.print("smoke-display: session audio metadata + subscribe replay ok\n", .{});
 }
 
 /// One attached viewer. `has_control` mirrors the daemon's
@@ -508,7 +675,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     std.debug.print("smoke-display: inspect + list ok\n", .{});
 
     // ── an uncorked stream flips list's audio flag (and back) ─────
-    audioStage(allocator, sock_path, pulse_server);
+    audioStage(allocator, sock_path, "dsp1", pulse_server);
 
     // ── the controller lease, against a real external app ─────────
     if (c.access("/usr/bin/weston-terminal", c.X_OK) == 0)

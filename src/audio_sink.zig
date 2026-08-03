@@ -42,21 +42,44 @@ pub const AudioSink = struct {
         channels: u8 = 2,
         rate: u32 = 44100,
         corked: bool = false,
+        application: []u8 = &.{},
+        binary: []u8 = &.{},
+        media: []u8 = &.{},
+        icon: []u8 = &.{},
+        pid: u32 = 0,
         last_latency_us: u64 = 0,
         /// Lazily-created Opus decoder for pcm_opus units.
         dec: ?opuscodec.Decoder = null,
         dec_failed: bool = false,
     };
 
-    /// Any uncorked voice: this sink is putting sound on the local
-    /// speakers right now (the daemon's sink-RUNNING view, seen from
-    /// the playing end).
+    /// Whether any remote voice is uncorked, even if local playback failed.
     pub fn playing(self: *const AudioSink) bool {
         var it = self.voices.valueIterator();
         while (it.next()) |v| {
             if (!v.*.corked) return true;
         }
         return false;
+    }
+
+    /// Snapshot of the remote playback streams; caller frees only the slice.
+    pub fn audioInfos(self: *const AudioSink, allocator: std.mem.Allocator) []pulse.AudioInfo {
+        var out: std.ArrayList(pulse.AudioInfo) = .empty;
+        var it = self.voices.valueIterator();
+        while (it.next()) |v| {
+            out.append(allocator, .{
+                .application = v.*.application,
+                .binary = v.*.binary,
+                .media = v.*.media,
+                .icon = v.*.icon,
+                .pid = v.*.pid,
+                .running = !v.*.corked,
+            }) catch break;
+        }
+        return out.toOwnedSlice(allocator) catch {
+            out.deinit(allocator);
+            return &.{};
+        };
     }
 
     pub fn create(allocator: std.mem.Allocator) !*AudioSink {
@@ -102,8 +125,18 @@ pub const AudioSink = struct {
             _ = c.pa_stream_disconnect(s);
             c.pa_stream_unref(s);
         }
+        if (v.application.len > 0) self.allocator.free(v.application);
+        if (v.binary.len > 0) self.allocator.free(v.binary);
+        if (v.media.len > 0) self.allocator.free(v.media);
+        if (v.icon.len > 0) self.allocator.free(v.icon);
         v.pending.deinit(self.allocator);
         self.allocator.destroy(v);
+    }
+
+    fn replaceMeta(self: *AudioSink, slot: *[]u8, value: []const u8) void {
+        const fresh: []u8 = if (value.len > 0) self.allocator.dupe(u8, value) catch return else &.{};
+        if (slot.*.len > 0) self.allocator.free(slot.*);
+        slot.* = fresh;
     }
 
     /// One chan_data payload from the daemon.
@@ -186,6 +219,15 @@ pub const AudioSink = struct {
                         if (op != null) c.pa_operation_unref(op);
                     }
                 }
+            },
+            .metadata => {
+                const decoded = pulse.decodeMetadata(payload) orelse return;
+                const v = self.voices.get(decoded.stream) orelse return;
+                self.replaceMeta(&v.application, decoded.info.application);
+                self.replaceMeta(&v.binary, decoded.info.binary);
+                self.replaceMeta(&v.media, decoded.info.media);
+                self.replaceMeta(&v.icon, decoded.info.icon);
+                v.pid = decoded.info.pid;
             },
             else => {},
         }
@@ -334,3 +376,40 @@ pub const AudioSink = struct {
         v.sink.pump(v);
     }
 };
+
+test "audio metadata and initial cork state follow stream descriptors" {
+    const a = std.testing.allocator;
+    const sink = try a.create(AudioSink);
+    sink.* = .{ .allocator = a };
+    defer sink.destroy();
+
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(a);
+    var open: [10]u8 = undefined;
+    std.mem.writeInt(u32, open[0..4], 7, .little);
+    open[4] = 3;
+    open[5] = 2;
+    std.mem.writeInt(u32, open[6..10], 48_000, .little);
+    try pulse.appendUnit(&units, a, .open, &open);
+    try pulse.appendMetadataUnit(&units, a, 7, .{
+        .application = "Firefox",
+        .binary = "firefox",
+        .media = "Conference call",
+        .icon = "firefox",
+        .pid = 1234,
+    });
+    var cork: [5]u8 = undefined;
+    std.mem.writeInt(u32, cork[0..4], 7, .little);
+    cork[4] = 1;
+    try pulse.appendUnit(&units, a, .cork, &cork);
+    sink.feed(units.items);
+
+    try std.testing.expect(!sink.playing());
+    const infos = sink.audioInfos(a);
+    defer a.free(infos);
+    try std.testing.expectEqual(@as(usize, 1), infos.len);
+    try std.testing.expectEqualStrings("Firefox", infos[0].application);
+    try std.testing.expectEqualStrings("Conference call", infos[0].media);
+    try std.testing.expectEqual(@as(u32, 1234), infos[0].pid);
+    try std.testing.expect(!infos[0].running);
+}
