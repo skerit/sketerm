@@ -629,6 +629,31 @@ pub fn build(b: *std.Build) void {
     smoke_trans_step.dependOn(&smoke_trans_run.step);
     }
 
+    // Proportional-text editor spike — `zig build spike-editor-text`.
+    // Proves the Atlas + HarfBuzz + gl.zig stack renders variable-
+    // width text headlessly (EGL surfaceless, same as smoke-cell) and
+    // that shaping cluster maps support pixel<->byte hit testing.
+    if (has_egl) {
+    const spike_editor_mod = b.createModule(.{
+        .root_source_file = b.path("src/spike_editor_text.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, spike_editor_mod, cbindings_mod);
+    spike_editor_mod.addImport("build_options", glib_opts_mod);
+    spike_editor_mod.linkSystemLibrary("EGL", .{});
+    const spike_editor = b.addExecutable(.{
+        .name = "sketerm-spike-editor-text",
+        .root_module = spike_editor_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(spike_editor);
+    const spike_editor_run = b.addRunArtifact(spike_editor);
+    const spike_editor_step = b.step("spike-editor-text", "Headless proportional-text render spike (editor foundation)");
+    spike_editor_step.dependOn(&spike_editor_run.step);
+    }
+
     // Desktop-GL core shader smoke — `zig build smoke-gl-core`.
     // Compiles every shader under a GL 3.3 core context: the macOS
     // GDK path, provable on a Linux box via Mesa's EGL desktop-GL.
