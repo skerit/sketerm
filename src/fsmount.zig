@@ -38,6 +38,9 @@ fn errnoOf(err: fsdrive.Error, last: []const u8) i32 {
         error.OutOfMemory => return c.ENOMEM,
         error.BadReply => return c.EIO,
         error.BadRequest => return c.EINVAL,
+        // Only an atomic install can conflict, which the mount never
+        // issues; the honest translation is "the file moved on".
+        error.Conflict => return c.ESTALE,
         error.FsOpFailed => {},
     }
     const map = .{

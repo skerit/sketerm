@@ -1593,6 +1593,10 @@ pub const FsOpReq = struct {
     /// cross_copy: cap the initial per-side dial attempts (0 = full
     /// budget); direct remote-to-remote attempts fail fast with it.
     dial_tries: u32 = 0,
+    /// install: the mtime_ns the client last saw on the destination.
+    /// Null means "install unconditionally" (a fresh file, or a
+    /// caller that does not guard against concurrent edits).
+    expected_mtime_ns: ?i64 = null,
 };
 
 /// One change inside an fs_delta. upsert carries `entry`; del only
@@ -1647,6 +1651,8 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         fsStat(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "read")) {
         fsRead(self, cl, r);
+    } else if (std.mem.eql(u8, r.op, "install")) {
+        fsInstall(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "apps")) {
         fsApps(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "homedir")) {
@@ -2275,7 +2281,100 @@ pub fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .ok = true,
         .size = size,
         .eof = r.off + got >= size,
+        // Identity of the bytes just handed out, taken from the SAME
+        // fd they were read through: an editor that stats separately
+        // races a writer between the two calls.
+        .mtime_ns = fsserve.mtimeNs(&st),
+        .ino = @as(u64, @intCast(st.st_ino)),
     });
+}
+
+/// Fresh single-path stat as a wire Entry, for replies that hand the
+/// client its next baseline. Null when the path cannot be stat'ed.
+fn entryAt(arena: std.mem.Allocator, path: []const u8) ?fsserve.Entry {
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return fsserve.statEntry(arena, "/", ".");
+    return fsserve.statEntry(arena, std.fs.path.dirname(path) orelse "/", base);
+}
+
+/// Atomic save: install the staged regular file `path` over `to`.
+///
+/// The destination's permission bits and ownership are inherited (a
+/// save must not turn a 0755 script into a 0644 one), the staged file
+/// is fsynced before the rename and the destination's parent
+/// directory after it, and a destination whose mtime_ns no longer
+/// matches `expected_mtime_ns` is refused as `conflict` with a fresh
+/// entry so the caller can show the external change. Every failure
+/// after the staged-file check leaves the temp in place — the caller
+/// owns it and cleans up.
+pub fn fsInstall(self: *Daemon, cl: *Client, r: FsOpReq) void {
+    if (r.to.len == 0 or r.to[0] != '/') return fsReplyErr(cl, r.req, "to must be absolute");
+    var z1: [4096]u8 = undefined;
+    var z2: [4096]u8 = undefined;
+    const tmp = pathZ(&z1, r.path) catch return fsReplyErr(cl, r.req, "staged path too long");
+    const dest = pathZ(&z2, r.to) catch return fsReplyErr(cl, r.req, "destination path too long");
+
+    var tst: c.struct_stat = undefined;
+    if (c.lstat(tmp, &tst) != 0) return fsReplyErr(cl, r.req, "staged file missing");
+    if ((tst.st_mode & c.S_IFMT) != c.S_IFREG)
+        return fsReplyErr(cl, r.req, "staged path is not a regular file");
+
+    var dst: c.struct_stat = undefined;
+    const dest_exists = c.stat(dest, &dst) == 0;
+    if (dest_exists) {
+        if (r.expected_mtime_ns) |want| {
+            if (fsserve.mtimeNs(&dst) != want) {
+                var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena_state.deinit();
+                cl.queueJson(.fs_reply, .{
+                    .req = r.req,
+                    .ok = false,
+                    .@"error" = "conflict",
+                    .entry = entryAt(arena_state.allocator(), r.to),
+                });
+                return;
+            }
+        }
+    }
+
+    // One fd serves both the metadata inheritance and the durability
+    // barrier; fchmod/fchown need ownership, not write access.
+    const fd = c.open(tmp, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return fsReplyErr(cl, r.req, "cannot open staged file");
+    if (dest_exists) {
+        _ = c.fchmod(fd, @intCast(dst.st_mode & 0o7777));
+        // EPERM is the normal answer for an unprivileged daemon; a
+        // save must not fail because it could not also move owners.
+        _ = c.fchown(fd, dst.st_uid, dst.st_gid);
+    }
+    const sync_rc = c.fsync(fd);
+    _ = c.close(fd);
+    if (sync_rc != 0) return fsReplyErr(cl, r.req, "cannot fsync staged file");
+
+    const rc = c.rename(tmp, dest);
+    if (rc != 0) {
+        var msg: [96]u8 = undefined;
+        const text = std.fmt.bufPrint(&msg, "install rename failed: {s}", .{
+            fsserve.errnoName(rc),
+        }) catch "install rename failed";
+        return fsReplyErr(cl, r.req, text);
+    }
+
+    const parent = std.fs.path.dirname(r.to) orelse return fsReplyErr(cl, r.req, "destination has no parent");
+    var dz: [4096]u8 = undefined;
+    const dfd = c.open(
+        pathZ(&dz, parent) catch return fsReplyErr(cl, r.req, "destination parent path too long"),
+        c.O_RDONLY | c.O_DIRECTORY,
+    );
+    if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open destination parent");
+    defer _ = c.close(dfd);
+    if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync destination parent");
+
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const e = entryAt(arena_state.allocator(), r.to) orelse
+        return fsReplyErr(cl, r.req, "installed but stat failed");
+    cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .entry = e });
 }
 
 pub const AppEntry = struct {

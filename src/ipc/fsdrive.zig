@@ -36,6 +36,10 @@ pub const OP_CAP_MS: i64 = 120_000;
 /// slow uplink as a dead link).
 const WRITE_MIN_RATE: u64 = 32 * 1024; // bytes/sec
 
+/// Bytes per staged fs_write in writeFileAtomic — the same 1 MiB
+/// fstransfer moves, comfortably inside wire.MAX_FRAME.
+pub const SAVE_CHUNK: usize = 1 << 20;
+
 pub const Error = error{
     NotConnected,
     Timeout,
@@ -44,6 +48,9 @@ pub const Error = error{
     BadReply,
     /// Caller-side argument the client library refuses to send.
     BadRequest,
+    /// install: the destination changed underneath the caller. The
+    /// destination's fresh identity is in `lastConflict()`.
+    Conflict,
     OutOfMemory,
 };
 
@@ -98,7 +105,36 @@ pub const WriteFlags = struct {
     }
 };
 
-pub const ReadInfo = struct { size: u64, eof: bool };
+/// Result of a ranged read. `mtime_ns`/`ino` come from the fd the
+/// bytes were read through, so they are a race-free baseline for a
+/// later conflict-checked save (0 from a daemon that predates them).
+pub const ReadInfo = struct {
+    size: u64,
+    eof: bool,
+    mtime_ns: i64 = 0,
+    ino: u64 = 0,
+};
+
+/// The destination's stat identity after an install — the caller's
+/// next conflict baseline, and what a refused install reports about
+/// the file that changed. Scalars only: no arena to outlive the call.
+pub const InstallResult = struct {
+    mtime_ns: i64 = 0,
+    mtime_ms: i64 = 0,
+    size: u64 = 0,
+    mode: u32 = 0,
+    ino: u64 = 0,
+
+    fn of(e: Entry) InstallResult {
+        return .{
+            .mtime_ns = e.mtime_ns,
+            .mtime_ms = e.mtime_ms,
+            .size = e.size,
+            .mode = e.mode,
+            .ino = e.ino,
+        };
+    }
+};
 
 pub const StatFs = struct {
     bsize: u64 = 0,
@@ -154,6 +190,8 @@ const Reply = struct {
     cache: []const u8 = "",
     templates: []const u8 = "",
     dev: u64 = 0,
+    mtime_ns: i64 = 0,
+    ino: u64 = 0,
 };
 
 /// The host's own directory identities. Resolved by the daemon that
@@ -279,6 +317,10 @@ pub const Fs = struct {
     job_events: std.ArrayList(JobEvent) = .empty,
     last_err: [192]u8 = undefined,
     last_err_len: usize = 0,
+    /// Set by the last install refused as `conflict`.
+    conflict: ?InstallResult = null,
+    /// Distinguishes concurrent atomic saves from one connection.
+    save_seq: u32 = 0,
 
     /// Adopt an already hello-probed connection (ownership moves).
     pub fn initConn(allocator: std.mem.Allocator, conn: client.Conn) Fs {
@@ -301,6 +343,11 @@ pub const Fs = struct {
 
     pub fn lastErr(self: *const Fs) []const u8 {
         return self.last_err[0..self.last_err_len];
+    }
+
+    /// The destination identity reported by the last Error.Conflict.
+    pub fn lastConflict(self: *const Fs) ?InstallResult {
+        return self.conflict;
     }
 
     /// Exposes the transport for integration into an external poll loop.
@@ -491,6 +538,17 @@ pub const Fs = struct {
     /// stale replies meanwhile. On success the parsed Reply is arena-
     /// allocated into `arena`.
     fn awaitReply(self: *Fs, arena: std.mem.Allocator, req: u32, timeout_ms: i64) Error!Reply {
+        const rep = try self.awaitReplyRaw(arena, req, timeout_ms);
+        if (!rep.ok) {
+            self.setErr(rep.@"error");
+            return Error.FsOpFailed;
+        }
+        return rep;
+    }
+
+    /// awaitReply without the ok check: for verbs whose FAILURE reply
+    /// carries payload the caller needs (install's conflict entry).
+    fn awaitReplyRaw(self: *Fs, arena: std.mem.Allocator, req: u32, timeout_ms: i64) Error!Reply {
         const cap_deadline = nowMs() + @max(timeout_ms, OP_CAP_MS);
         while (true) {
             const cap_remain = cap_deadline - nowMs();
@@ -511,10 +569,6 @@ pub const Fs = struct {
                         .allocate = .alloc_always,
                     }) catch return Error.BadReply;
                     if (rep.req != req) continue; // stale (abandoned request)
-                    if (!rep.ok) {
-                        self.setErr(rep.@"error");
-                        return Error.FsOpFailed;
-                    }
                     return rep;
                 },
                 .err => {
@@ -559,6 +613,8 @@ pub const Fs = struct {
             dial_tries: u32 = 0,
             attrs: []const u8 = "",
             image_codecs: []const u8 = "",
+            /// install: the destination mtime the caller last saw.
+            expected_mtime_ns: ?i64 = null,
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -801,7 +857,12 @@ pub const Fs = struct {
                         self.setErr(rep.@"error");
                         return Error.FsOpFailed;
                     }
-                    return .{ .size = rep.size, .eof = rep.eof };
+                    return .{
+                        .size = rep.size,
+                        .eof = rep.eof,
+                        .mtime_ns = rep.mtime_ns,
+                        .ino = rep.ino,
+                    };
                 },
                 .err => {
                     self.setErr(f.payload);
@@ -835,6 +896,82 @@ pub const Fs = struct {
         const upload_ms: i64 = @intCast(@min(@as(u64, @intCast(OP_CAP_MS - OP_TIMEOUT_MS)), data.len / (WRITE_MIN_RATE / 1000)));
         const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS + upload_ms);
         return rep.written;
+    }
+
+    // ── atomic save ─────────────────────────────────────────────
+
+    /// Install the staged file `path_tmp` over `dest`: the daemon
+    /// inherits the destination's mode/owner, fsyncs, renames, and
+    /// fsyncs the destination's parent.
+    ///
+    /// @return the destination's post-install identity — the caller's
+    /// next `expected_mtime_ns` without a second round trip.
+    /// @throws Conflict when the destination's mtime_ns no longer
+    /// matches `expected_mtime_ns` (see lastConflict); the temp is
+    /// left in place for the caller to clean up.
+    pub fn install(self: *Fs, path_tmp: []const u8, dest: []const u8, expected_mtime_ns: ?i64) Error!InstallResult {
+        const req = self.nextReq();
+        try self.sendOp("install", req, .{
+            .path = path_tmp,
+            .to = dest,
+            .expected_mtime_ns = expected_mtime_ns,
+        });
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rep = try self.awaitReplyRaw(scratch.allocator(), req, OP_TIMEOUT_MS);
+        if (!rep.ok) {
+            self.setErr(rep.@"error");
+            if (std.mem.eql(u8, rep.@"error", "conflict")) {
+                self.conflict = if (rep.entry) |e| InstallResult.of(e) else .{};
+                return Error.Conflict;
+            }
+            return Error.FsOpFailed;
+        }
+        const e = rep.entry orelse return Error.BadReply;
+        self.conflict = null;
+        return InstallResult.of(e);
+    }
+
+    /// Write `bytes` to `dest` atomically: stage into a hidden
+    /// sibling temp, chunk it up, then install. `dest` is never
+    /// observed half-written, and a failed save never truncates it.
+    ///
+    /// The temp is a SIBLING so the install is a same-filesystem
+    /// rename; it is removed on every failure path, including a
+    /// refused (conflicting) install.
+    pub fn writeFileAtomic(self: *Fs, dest: []const u8, bytes: []const u8, expected_mtime_ns: ?i64) Error!InstallResult {
+        if (dest.len == 0 or dest[0] != '/') return Error.BadRequest;
+        const base = std.fs.path.basename(dest);
+        if (base.len == 0) return Error.BadRequest;
+        const dir = std.fs.path.dirname(dest) orelse "/";
+
+        var tmp_buf: [4096]u8 = undefined;
+        self.save_seq +%= 1;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/.{s}.sketerm-save.{x}{x}", .{
+            if (std.mem.eql(u8, dir, "/")) "" else dir,
+            base,
+            @as(u32, @bitCast(c.getpid())),
+            self.save_seq,
+        }) catch return Error.BadRequest;
+
+        // Every failure below owns the temp: a save that dies halfway
+        // must not leave staged litter next to the user's file.
+        errdefer self.unlink(tmp) catch {};
+
+        var off: usize = 0;
+        var first = true;
+        while (first or off < bytes.len) {
+            first = false;
+            const end = @min(bytes.len, off + SAVE_CHUNK);
+            const n = try self.write(tmp, off, bytes[off..end], .{
+                .create = off == 0,
+                .exclusive = off == 0,
+            });
+            if (n == 0 and end > off) return Error.BadReply;
+            off += @intCast(n);
+        }
+
+        return self.install(tmp, dest, expected_mtime_ns);
     }
 
     // ── jobs (subprocess verbs) ─────────────────────────────────
