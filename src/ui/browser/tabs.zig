@@ -267,6 +267,12 @@ pub fn openInNewTab(tab: *BTab, path: []const u8) void {
         @memcpy(hbuf[0..h.len], h);
         host = hbuf[0..h.len];
     }
+    // The picker hides its tab strip; a second tab would be
+    // unreachable chrome, so middle-click navigates in place.
+    if (tab.view.picker != null) {
+        tab.view.navigate(tab, host, pbuf[0..path.len]);
+        return;
+    }
     _ = tab.view.newTab(host, pbuf[0..path.len]);
 }
 

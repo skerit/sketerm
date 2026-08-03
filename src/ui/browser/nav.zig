@@ -846,6 +846,19 @@ pub fn quickLookKey(self: *BrowserView) bool {
     return self.quickLookToggle();
 }
 
+/// The chords a picker (suppress_ops) never runs: everything that
+/// mutates files or types into the pane's shell. Compared by run
+/// pointer so the table itself stays untouched.
+fn chordIsFileOp(run: *const fn (*BrowserView) bool) bool {
+    const blocked = [_]*const fn (*BrowserView) bool{
+        &chordUndo,     &chordRedo,   &chordCut,      &chordPaste,
+        &chordTrash,    &chordDelete, &chordRename,   &chordCopyPeer,
+        &chordMovePeer,
+    };
+    for (blocked) |b| if (run == b) return true;
+    return false;
+}
+
 pub fn onBrowserKey(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
@@ -859,6 +872,7 @@ pub fn onBrowserKey(
     for (browser_chords) |chord| {
         if (chord.keyval != lower_pre or chord.mods != mods) continue;
         const run = chord.run orelse continue;
+        if (self.picker) |pk| if (pk.suppress_ops and chordIsFileOp(run)) continue;
         if (run(self)) return 1;
     }
     // Type-ahead: plain printable keys jump to the first matching
@@ -866,7 +880,8 @@ pub fn onBrowserKey(
     // claims, since this handler is bubble-phase and a focused
     // entry has already consumed its own input.
     if ((mods == 0 or mods == c.GDK_SHIFT_MASK) and self.typeahead(keyval)) return 1;
-    const ictx = self.pane.input_ctx orelse return 0;
+    const pane = self.pane orelse return 0;
+    const ictx = pane.input_ctx orelse return 0;
     const lower_kv: c_uint = lower_pre;
     const bindings: []const input.Binding = if (ictx.bindings.len > 0) ictx.bindings else &input.default_bindings;
     if (input.matchBinding(bindings, lower_kv, state) orelse input.matchBinding(bindings, keyval, state)) |action| {
@@ -904,20 +919,22 @@ pub fn onNewTabClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onTerminalClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    self.pane.setBrowserVisible(false);
+    const pane = self.pane orelse return;
+    pane.setBrowserVisible(false);
 }
 
 pub fn onCwdSyncClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const tab = self.currentTab() orelse return;
-    const cwd = self.pane.terminal.cwd orelse {
+    const pane = self.pane orelse return;
+    const cwd = pane.terminal.cwd orelse {
         self.setStatus("the terminal session has not reported a directory yet");
         return;
     };
     var buf: [4096]u8 = undefined;
     if (cwd.len >= buf.len) return;
     @memcpy(buf[0..cwd.len], cwd);
-    const raw: ?[]const u8 = if (self.pane.terminal.remote) |remote| remote.host else null;
+    const raw: ?[]const u8 = if (pane.terminal.remote) |remote| remote.host else null;
     const host = @import("../../filebrowser/paths.zig").browserHost(raw);
     self.navigate(tab, host, buf[0..cwd.len]);
 }

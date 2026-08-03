@@ -141,6 +141,7 @@ comptime {
     _ = @import("filebrowser/registers.zig");
     _ = @import("filebrowser/query.zig");
     _ = @import("filebrowser/snapshots.zig");
+    _ = @import("filebrowser/picker.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

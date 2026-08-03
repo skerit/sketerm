@@ -981,8 +981,9 @@ pub fn onMenuExportSel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         }
     }
     cmd.appendSlice(self.allocator, "'\n") catch return menuDone(ctx);
-    self.pane.terminal.writeRaw(cmd.items);
-    self.pane.setBrowserVisible(false);
+    const pane = self.pane orelse return menuDone(ctx);
+    pane.terminal.writeRaw(cmd.items);
+    pane.setBrowserVisible(false);
     self.setStatusFmt("exported {d} path(s) as $SK_SEL / $SK_SEL_ALL", .{paths.len});
     menuDone(ctx);
 }
@@ -1098,8 +1099,9 @@ pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     cmd.appendSlice(self.allocator, " && touch ") catch return menuDone(ctx);
     appendQuoted(&cmd, self.allocator, done) catch return menuDone(ctx);
     cmd.append(self.allocator, '\n') catch return menuDone(ctx);
-    self.pane.terminal.writeRaw(cmd.items);
-    self.pane.setBrowserVisible(false);
+    const pane = self.pane orelse return menuDone(ctx);
+    pane.terminal.writeRaw(cmd.items);
+    pane.setBrowserVisible(false);
     self.setStatus("edit the names, save, and quit the editor to apply");
     menuDone(ctx);
 }
@@ -2113,6 +2115,7 @@ fn fromGdkAction(action: c.GdkDragAction) DropAction {
 
 /// Apply every internal drag spec in one payload to the same target.
 pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst_dir: []const u8, action: c.GdkDragAction) bool {
+    if (self.picker) |pk| if (pk.suppress_ops) return false;
     var specs = dnd.ValueIter.init(self.allocator, value);
     defer specs.deinit();
     var owned: std.ArrayList([]u8) = .empty;
@@ -2221,6 +2224,7 @@ pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_
 }
 
 fn dropSpecIntoActionBatch(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction, batch_id: u64, batch_total: usize, manifest_token: ?[]const u8, manifest_index: ?usize) bool {
+    if (self.picker) |pk| if (pk.suppress_ops) return false;
     if (spec.len == 0) return false;
     const loc = parseSpec(spec);
     const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
@@ -2350,7 +2354,8 @@ pub fn feedDropProbe(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
 pub fn peerView(self: *BrowserView) ?*BrowserView {
     const lookup = self.on_peer orelse return null;
     const ctx = self.hooks_ctx orelse return null;
-    const peer = lookup(ctx, self.pane) orelse return null;
+    const pane = self.pane orelse return null;
+    const peer = lookup(ctx, pane) orelse return null;
     return if (peer == self) null else peer;
 }
 

@@ -755,23 +755,38 @@ fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 
 fn onChooseFont(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Select font file (.ttf / .otf)");
+    // Sketerm's own picker (src/ui/picker.zig), not the GTK stock
+    // dialog: same browser everywhere, remote-capable, ours to keep.
     const root = c.gtk_widget_get_root(@ptrCast(btn));
-    c.gtk_file_dialog_open(dialog, @ptrCast(@alignCast(root)), null, @ptrCast(&onChooseFontDone), @ptrCast(ctx));
+    const parent: ?*c.GtkWindow = if (root) |r| @ptrCast(@alignCast(r)) else null;
+    _ = @import("picker.zig").PickerWindow.open(
+        ctx.allocator,
+        parent,
+        .{
+            .mode = .open_file,
+            .title = "Select font file (.ttf / .otf)",
+            .filters = &.{
+                .{ .label = "Font files", .patterns = &.{ "*.ttf", "*.otf", "*.ttc", "*.otb" } },
+            },
+        },
+        &onChooseFontPicked,
+        @ptrCast(ctx),
+    ) catch return;
 }
 
-fn onChooseFontDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onChooseFontPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {
+    // A null result (cancel/teardown) must not touch ctx: on parent
+    // teardown the Ctx may already be gone.
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
     const ctx = cast.userData(Ctx, user);
-    const file = c.gtk_file_dialog_open_finish(@ptrCast(@alignCast(source)), result, null) orelse return;
-    defer c.g_object_unref(@ptrCast(@alignCast(file)));
-    const path_z = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_z);
-    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(path_z)));
+    const loc = @import("../filebrowser/paths.zig").parseSpec(res.specs[0]);
+    // FreeType loads the file locally; a remote pick cannot apply.
+    if (loc.host != null) return;
     // Owned via Config.arena (allocator-independent: dupe into our
     // Ctx allocator since the working cfg in the dialog has no arena
     // — apply path will arena-dupe on persist).
-    const dup = ctx.dupe(slice) catch return;
+    const dup = ctx.dupe(loc.path) catch return;
     ctx.edit.font_path = dup;
     ctx.ev();
 }
