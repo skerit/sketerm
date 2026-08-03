@@ -99,6 +99,13 @@ pub fn mtimeMs(st: *const c.struct_stat) i64 {
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
 }
 
+/// Modification time in nanoseconds. The identity an atomic save
+/// compares against: millisecond granularity silently merges two
+/// edits landing inside the same millisecond.
+pub fn mtimeNs(st: *const c.struct_stat) i64 {
+    return timespecNs(if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec);
+}
+
 fn atimeMs(st: *const c.struct_stat) i64 {
     const ts = if (@hasField(c.struct_stat, "st_atim")) st.st_atim else st.st_atimespec;
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);

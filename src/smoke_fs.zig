@@ -2962,6 +2962,196 @@ fn crossStage(
     std.debug.print("smoke-fs: cross-host copy reconnect/resume OK\n", .{});
 }
 
+/// Push a path's mtime two seconds forward: an "external edit" whose
+/// mtime is guaranteed to differ, without sleeping for a filesystem's
+/// timestamp granularity.
+fn bumpMtime(path: []const u8) void {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("bump path");
+    var st: c.struct_stat = undefined;
+    if (c.lstat(p, &st) != 0) fail("bump lstat");
+    const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+    var times = [_]c.struct_timespec{
+        .{ .tv_sec = mts.tv_sec, .tv_nsec = 0 },
+        .{ .tv_sec = mts.tv_sec + 2, .tv_nsec = 0 },
+    };
+    if (c.utimensat(c.AT_FDCWD, p, &times, 0) != 0) fail("bump utimensat");
+}
+
+fn modeOf(path: []const u8) u32 {
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(pathz.pathZ(&z, path) catch fail("mode path"), &st) != 0) fail("mode lstat");
+    return @intCast(st.st_mode & 0o7777);
+}
+
+fn mtimeNsOf(path: []const u8) i64 {
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(pathz.pathZ(&z, path) catch fail("mtime path"), &st) != 0) fail("mtime lstat");
+    return fsserve.mtimeNs(&st);
+}
+
+/// True when the directory still holds a `.sketerm-save.` staging
+/// file — the litter a failed atomic save must never leave behind.
+fn hasStagedTemp(dir: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    const d = c.opendir(pathz.pathZ(&z, dir) catch fail("temp scan path")) orelse fail("temp scan opendir");
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |de| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+        if (std.mem.indexOf(u8, name, ".sketerm-save.") != null) return true;
+    }
+    return false;
+}
+
+/// The atomic-save primitive an editor saves through: staged temp →
+/// mode/owner inheritance → fsync → rename → parent fsync, with the
+/// destination's mtime_ns as the external-modification guard.
+fn saveStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-save");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("save: fs connect");
+    defer fs.deinit();
+
+    // Each path gets its OWN buffer: a shared one silently re-points
+    // every earlier slice the moment the next path is formatted.
+    var script_buf: [4096]u8 = undefined;
+    const script = std.fmt.bufPrint(&script_buf, "{s}/run.sh", .{dir}) catch unreachable;
+
+    // ── replace an existing executable file ────────────────────
+    touch(dir, "run.sh", "#!/bin/sh\nold\n");
+    {
+        var z: [4096]u8 = undefined;
+        _ = c.chmod(pathz.pathZ(&z, script) catch fail("chmod path"), 0o755);
+    }
+    const first_ino = inodeOf(script);
+    const baseline = mtimeNsOf(script);
+
+    const saved = fs.writeFileAtomic(script, "#!/bin/sh\nnew\n", baseline) catch
+        failErr("save: writeFileAtomic", fs.lastErr());
+    expectText(script, "#!/bin/sh\nnew\n", "save: content replaced");
+    // A save must not silently disarm a script: the destination's
+    // permission bits are inherited by the staged file.
+    if (modeOf(script) != 0o755) fail("save: destination mode not preserved");
+    if (saved.mtime_ns != mtimeNsOf(script)) fail("save: reply mtime_ns is not the file's");
+    if (saved.mode != 0o755 or saved.size != 14) fail("save: reply entry fields");
+    if (saved.ino == 0) fail("save: reply carries no inode");
+    // Atomic means a NEW inode swapped in, never a truncate in place.
+    if (saved.ino == first_ino) fail("save: destination was written in place");
+    if (hasStagedTemp(dir)) fail("save: staging temp survived a successful save");
+
+    // ── the external-modification guard ────────────────────────
+    {
+        var z: [4096]u8 = undefined;
+        const p = pathz.pathZ(&z, script) catch fail("ext path");
+        const f = c.fopen(p, "wb") orelse fail("ext open");
+        _ = c.fwrite("edited elsewhere\n", 1, 17, f);
+        _ = c.fclose(f);
+    }
+    bumpMtime(script);
+    const external_ns = mtimeNsOf(script);
+    if (external_ns == saved.mtime_ns) fail("save: external edit did not move mtime");
+
+    if (fs.writeFileAtomic(script, "clobber\n", saved.mtime_ns)) |_| {
+        fail("save: a stale save was accepted");
+    } else |err| {
+        if (err != fsdrive.Error.Conflict) fail("save: stale save failed as the wrong error");
+    }
+    const conflict = fs.lastConflict() orelse fail("save: conflict carried no entry");
+    // The fresh entry is what lets an editor say WHAT it would have
+    // overwritten without a second round trip.
+    if (conflict.mtime_ns != external_ns) fail("save: conflict entry mtime is not the file's");
+    if (conflict.size != 17) fail("save: conflict entry size");
+    expectText(script, "edited elsewhere\n", "save: refused save left the file alone");
+    if (hasStagedTemp(dir)) fail("save: refused save left its staging temp behind");
+
+    // Re-saving against the FRESH baseline (an editor reloading and
+    // trying again) goes through.
+    _ = fs.writeFileAtomic(script, "reconciled\n", conflict.mtime_ns) catch
+        failErr("save: reconciled save", fs.lastErr());
+    expectText(script, "reconciled\n", "save: reconciled content");
+
+    // ── brand-new file: no destination, no baseline ────────────
+    var fresh_buf: [4096]u8 = undefined;
+    const fresh = std.fmt.bufPrint(&fresh_buf, "{s}/fresh.txt", .{dir}) catch unreachable;
+    const created = fs.writeFileAtomic(fresh, "hello editor\n", null) catch
+        failErr("save: create", fs.lastErr());
+    expectText(fresh, "hello editor\n", "save: created content");
+    if (created.size != 13) fail("save: created size");
+    if (modeOf(fresh) != 0o644) fail("save: created mode");
+    if (hasStagedTemp(dir)) fail("save: create left a staging temp");
+
+    // A guarded save of a file that does NOT exist installs: there is
+    // nothing to conflict with.
+    var guarded_buf: [4096]u8 = undefined;
+    const guarded = std.fmt.bufPrint(&guarded_buf, "{s}/guarded.txt", .{dir}) catch unreachable;
+    _ = fs.writeFileAtomic(guarded, "x\n", 12345) catch
+        failErr("save: guarded create", fs.lastErr());
+    expectText(guarded, "x\n", "save: guarded create content");
+
+    // ── multi-chunk payload (the staged write loops) ───────────
+    var big_buf: [4096]u8 = undefined;
+    const big_path = std.fmt.bufPrint(&big_buf, "{s}/big.bin", .{dir}) catch unreachable;
+    const big = allocator.alloc(u8, fsdrive.SAVE_CHUNK + 4096) catch fail("save: oom");
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 17 +% 3);
+    const big_saved = fs.writeFileAtomic(big_path, big, null) catch
+        failErr("save: chunked", fs.lastErr());
+    if (big_saved.size != big.len) fail("save: chunked size");
+    {
+        var back: std.ArrayList(u8) = .empty;
+        defer back.deinit(allocator);
+        var off: u64 = 0;
+        while (true) {
+            const info = fs.read(big_path, off, 1 << 20, &back) catch failErr("save: chunk read", fs.lastErr());
+            off = back.items.len;
+            if (info.eof) break;
+        }
+        if (!std.mem.eql(u8, back.items, big)) fail("save: chunked bytes mismatch");
+    }
+
+    // ── read carries the identity a save is guarded on ─────────
+    {
+        var back: std.ArrayList(u8) = .empty;
+        defer back.deinit(allocator);
+        const info = fs.read(script, 0, 1 << 20, &back) catch failErr("save: read", fs.lastErr());
+        if (!info.eof) fail("save: read not eof");
+        if (info.mtime_ns != mtimeNsOf(script)) fail("save: read reply mtime_ns wrong");
+        if (info.ino != inodeOf(script)) fail("save: read reply ino wrong");
+        // The whole point: what read handed back can be saved against.
+        _ = fs.writeFileAtomic(script, "round trip\n", info.mtime_ns) catch
+            failErr("save: save against read baseline", fs.lastErr());
+    }
+
+    // ── install's own contract: a refused install leaves the
+    // staged file alone (the caller owns it) ───────────────────
+    {
+        var staged_buf: [4096]u8 = undefined;
+        const staged = std.fmt.bufPrint(&staged_buf, "{s}/staged.tmp", .{dir}) catch unreachable;
+        _ = fs.write(staged, 0, "staged bytes\n", .{ .create = true, .truncate = true }) catch
+            failErr("save: stage write", fs.lastErr());
+        const dest = fresh;
+        if (fs.install(staged, dest, 1)) |_| {
+            fail("save: install ignored a stale baseline");
+        } else |err| {
+            if (err != fsdrive.Error.Conflict) fail("save: install conflict is the wrong error");
+        }
+        if (!exists(staged)) fail("save: install consumed the staged file on refusal");
+        expectText(dest, "hello editor\n", "save: refused install left the destination alone");
+        fs.unlink(staged) catch failErr("save: unlink staged", fs.lastErr());
+
+        // A directory is not something to install.
+        if (fs.install(dir, dest, null)) |_| {
+            fail("save: installed a directory");
+        } else |err| {
+            if (err != fsdrive.Error.FsOpFailed) fail("save: directory install wrong error");
+        }
+    }
+
+    std.debug.print("smoke-fs: atomic save (" ++ tag ++ ") OK\n", .{});
+}
+
 fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -3015,6 +3205,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     policyStage(allocator, sock_path, "mono");
     mediaStage(allocator, sock_path, "mono");
     queryStage(allocator, sock_path, "mono");
+    saveStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -3075,6 +3266,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     policyStage(allocator, bsock, "broker");
     mediaStage(allocator, bsock, "broker");
     queryStage(allocator, bsock, "broker");
+    saveStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
         defer conn.deinit();
