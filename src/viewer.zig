@@ -225,24 +225,45 @@ pub fn collect(allocator: std.mem.Allocator, args: []const []const u8, cwd: ?[]c
 }
 
 pub const Viewport = struct {
+    pub const Mode = enum { fit, fill, actual, manual };
     pub const min_zoom: f64 = 0.05;
     pub const max_zoom: f64 = 16.0;
 
     zoom: f64 = 1.0,
-    fit: bool = true,
+    mode: Mode = .fit,
 
     pub fn actual(self: *Viewport) void {
-        self.fit = false;
+        self.mode = .actual;
         self.zoom = 1.0;
     }
 
     pub fn useFit(self: *Viewport) void {
-        self.fit = true;
+        self.mode = .fit;
+    }
+
+    pub fn useFill(self: *Viewport) void {
+        self.mode = .fill;
+    }
+
+    pub fn setManual(self: *Viewport, zoom: f64) void {
+        self.mode = .manual;
+        self.zoom = std.math.clamp(zoom, min_zoom, max_zoom);
     }
 
     pub fn scaleBy(self: *Viewport, factor: f64) void {
-        self.fit = false;
-        self.zoom = std.math.clamp(self.zoom * factor, min_zoom, max_zoom);
+        self.setManual(self.zoom * factor);
+    }
+
+    /// Scale used by the current mode for an image inside a viewport.
+    pub fn effectiveScale(self: Viewport, viewport_width: f64, viewport_height: f64, image_width: f64, image_height: f64) f64 {
+        if (image_width <= 0 or image_height <= 0 or viewport_width <= 0 or viewport_height <= 0)
+            return self.zoom;
+        return switch (self.mode) {
+            .fit => @min(viewport_width / image_width, viewport_height / image_height),
+            .fill => @max(viewport_width / image_width, viewport_height / image_height),
+            .actual => 1.0,
+            .manual => self.zoom,
+        };
     }
 
     /// Scroll adjustment preserving the image point under `anchor`.
@@ -294,14 +315,24 @@ test "viewer batch preserves a long remote resource" {
 test "viewer viewport clamps and preserves an anchored image point" {
     var viewport: Viewport = .{};
     viewport.scaleBy(2);
-    try std.testing.expect(!viewport.fit);
+    try std.testing.expectEqual(Viewport.Mode.manual, viewport.mode);
     try std.testing.expectEqual(@as(f64, 2), viewport.zoom);
     try std.testing.expectEqual(@as(f64, 250), Viewport.anchoredScroll(100, 50, 1, 2));
     viewport.zoom = Viewport.max_zoom;
     viewport.scaleBy(2);
     try std.testing.expectEqual(Viewport.max_zoom, viewport.zoom);
     viewport.actual();
+    try std.testing.expectEqual(Viewport.Mode.actual, viewport.mode);
     try std.testing.expectEqual(@as(f64, 1), viewport.zoom);
+}
+
+test "viewer viewport computes fit and fill scales" {
+    var viewport: Viewport = .{};
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), viewport.effectiveScale(500, 500, 1000, 500), 0.0001);
+    viewport.useFill();
+    try std.testing.expectApproxEqAbs(@as(f64, 1), viewport.effectiveScale(500, 500, 1000, 500), 0.0001);
+    viewport.setManual(2.5);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), viewport.effectiveScale(500, 500, 1000, 500), 0.0001);
 }
 
 test "viewer manifest preserves ordering initial index and path bytes" {

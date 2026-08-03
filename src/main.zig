@@ -49,6 +49,8 @@ const App = struct {
     mode: Mode = .terminal,
     /// Start location for the file-manager window (owned).
     files_path: ?[]const u8 = null,
+    /// File selected after the next Files window's streamed listing arrives.
+    files_reveal: ?[]const u8 = null,
     /// Ordered resource batch for the next standalone Viewer window.
     viewer_batch: ?viewer.Batch = null,
 };
@@ -361,17 +363,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // They must never register a GApplication: a second app
             // identity would open a window of its own instead of
             // touching the pane the user asked about.
-            .here, .tab => return @import("ipc/client.zig").browserInPane(
-                allocator,
-                req.mode == .here,
-                req.spec,
-            ),
+            .here, .tab => {
+                if (req.reveal != null) {
+                    _ = c.fputs("sketerm files: --select is only supported for dedicated Files windows\n", platform.stderr());
+                    return 2;
+                }
+                return @import("ipc/client.zig").browserInPane(
+                    allocator,
+                    req.mode == .here,
+                    req.spec,
+                );
+            },
             // The dedicated file manager: its own identity, from here on
             // an ordinary GApplication run.
             .window => {
                 g_app.mode = .files;
                 Window.setFilesIdentity();
                 if (req.spec) |s| g_app.files_path = allocator.dupe(u8, s) catch null;
+                if (req.reveal) |s| g_app.files_reveal = allocator.dupe(u8, s) catch null;
             },
         }
     }
@@ -571,19 +580,17 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
     // window there. Only this identity ever grows a browser window from
     // the command line -- a terminal instance is left alone.
     if (g_app.mode == .files) {
-        var n2: c_int = 0;
-        var spec: ?[]const u8 = null;
-        while (n2 < argc) : (n2 += 1) {
-            const a_raw = argv_raw[@intCast(n2)];
-            if (a_raw == null) break;
-            const a = std.mem.span(@as([*:0]const u8, @ptrCast(a_raw)));
-            if (n2 > 0 and a.len > 0 and a[0] != '-' and !std.mem.eql(u8, a, "files")) {
-                spec = a;
-                break;
-            }
+        const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
+        defer g_app.allocator.free(args);
+        for (0..@intCast(argc)) |index| {
+            const raw = argv_raw[index] orelse break;
+            args[index] = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
         }
+        const request = files_entry.parse(args);
         if (g_app.files_path) |old| g_app.allocator.free(old);
-        g_app.files_path = if (spec) |s| g_app.allocator.dupe(u8, s) catch null else null;
+        if (g_app.files_reveal) |old| g_app.allocator.free(old);
+        g_app.files_path = if (request) |req| if (req.spec) |s| g_app.allocator.dupe(u8, s) catch null else null else null;
+        g_app.files_reveal = if (request) |req| if (req.reveal) |s| g_app.allocator.dupe(u8, s) catch null else null else null;
     } else if (g_app.mode == .viewer) {
         const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
         defer g_app.allocator.free(args);
@@ -661,7 +668,9 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         if (g_app.mode == .files) {
             const spec = takeFilesPath();
             defer if (spec) |s| g_app.allocator.free(s);
-            _ = primary.openFilesWindow(spec) catch |err|
+            const reveal = takeFilesReveal();
+            defer if (reveal) |s| g_app.allocator.free(s);
+            _ = primary.openFilesWindow(spec, reveal) catch |err|
                 std.debug.print("sketerm: files window failed: {s}\n", .{@errorName(err)});
         } else {
             _ = primary.openShellWindow() catch |err|
@@ -709,7 +718,9 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         // The browser tab IS the window's content: no stray shell tab.
         const spec = takeFilesPath();
         defer if (spec) |s| g_app.allocator.free(s);
-        window.newBrowserTabFrom(null, spec) catch |err| {
+        const reveal = takeFilesReveal();
+        defer if (reveal) |s| g_app.allocator.free(s);
+        window.newBrowserTabFromReveal(null, spec, reveal) catch |err| {
             std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -732,6 +743,12 @@ fn takeFilesPath() ?[]const u8 {
     return p;
 }
 
+fn takeFilesReveal() ?[]const u8 {
+    const value = g_app.files_reveal;
+    g_app.files_reveal = null;
+    return value;
+}
+
 fn takeViewerBatch() viewer.Batch {
     const batch = g_app.viewer_batch orelse return viewer.Batch.empty(g_app.allocator);
     g_app.viewer_batch = null;
@@ -741,7 +758,14 @@ fn takeViewerBatch() viewer.Batch {
 fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.viewer_batch) |*batch| batch.deinit();
     g_app.viewer_batch = null;
-    if (g_app.mode == .viewer) return;
+    if (g_app.files_path) |path| g_app.allocator.free(path);
+    g_app.files_path = null;
+    if (g_app.files_reveal) |path| g_app.allocator.free(path);
+    g_app.files_reveal = null;
+    if (g_app.mode == .viewer) {
+        @import("ui/hostmount.zig").shutdownAll();
+        return;
+    }
     // Every live window, not just the primary: a secondary window (tab
     // drag-out, repeat launch) owns real panes and GUI-owned daemon
     // sessions, and skipping it leaked both. GTK destroys the windows

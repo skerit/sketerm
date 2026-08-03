@@ -579,6 +579,9 @@ pub const BTab = struct {
     fwd: std.ArrayList([]u8) = .empty,
     navigation_generation: u64 = 0,
     selected: std.ArrayList([]u8) = .empty,
+    /// Full path selected once it appears in a streamed listing.
+    pending_reveal: ?[]u8 = null,
+    pending_reveal_host: ?[]u8 = null,
     /// Selection captured on button-down before GTK collapses it while
     /// deciding whether the gesture becomes a click or a drag.
     drag_selected: std.ArrayList([]u8) = .empty,
@@ -865,6 +868,8 @@ pub const BTab = struct {
         self.fwd.deinit(a);
         for (self.selected.items) |p| a.free(p);
         self.selected.deinit(a);
+        if (self.pending_reveal) |path| a.free(path);
+        if (self.pending_reveal_host) |host| a.free(host);
         for (self.drag_selected.items) |p| a.free(p);
         self.drag_selected.deinit(a);
         for (self.attr_columns.items) |name| a.free(name);

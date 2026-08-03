@@ -175,6 +175,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     else
         counted;
     self.setStatus(cmsg);
+    applyPendingReveal(self, tab);
 
     // Fetching runs LAST: the rows it measures against are the ones
     // just built, and the request itself is coalesced behind a timer.
@@ -188,6 +189,45 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // every chord goes dead. Self-guarding: focus that legitimately
     // sits elsewhere is left alone.
     if (self.currentTab() == tab) self.refocusListingIfLost();
+}
+
+fn applyPendingReveal(self: *BrowserView, tab: *BTab) void {
+    const path = tab.pending_reveal orelse return;
+    switch (tab.view_mode) {
+        .details, .compact, .miller => {
+            const pos = @import("colview.zig").positionForPath(tab, path) orelse return revealMissing(self, tab, path);
+            @import("colview.zig").focusRow(tab, pos, true);
+        },
+        .icons => {
+            const flowbox = tab.flowbox orelse return;
+            var index: c_int = 0;
+            while (c.gtk_flow_box_get_child_at_index(flowbox, index)) |child| : (index += 1) {
+                const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+                const row: *RowCtx = @ptrCast(@alignCast(data));
+                if (!std.mem.eql(u8, row.path, path)) continue;
+                c.gtk_flow_box_unselect_all(flowbox);
+                c.gtk_flow_box_select_child(flowbox, child);
+                _ = c.gtk_widget_grab_focus(@ptrCast(child));
+                break;
+            } else return revealMissing(self, tab, path);
+        },
+    }
+    const name = std.fs.path.basename(path);
+    self.setStatusFmt("selected {s}", .{name});
+    self.allocator.free(path);
+    tab.pending_reveal = null;
+    if (tab.pending_reveal_host) |host| self.allocator.free(host);
+    tab.pending_reveal_host = null;
+}
+
+fn revealMissing(self: *BrowserView, tab: *BTab, path: []u8) void {
+    if (!tab.root.loaded or tab.root.streaming) return;
+    const name = std.fs.path.basename(path);
+    self.setStatusFmt("could not select {s}: it is not in this folder", .{name});
+    self.allocator.free(path);
+    tab.pending_reveal = null;
+    if (tab.pending_reveal_host) |host| self.allocator.free(host);
+    tab.pending_reveal_host = null;
 }
 
 /// How much of the directory a media-column sort actually covers.

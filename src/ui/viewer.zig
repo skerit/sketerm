@@ -6,15 +6,18 @@ const model = @import("../viewer.zig");
 const paths = @import("../filebrowser/paths.zig");
 const decoder = @import("image_decoder.zig");
 const image_canvas = @import("image_canvas.zig");
+const hostmount = @import("hostmount.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
+const platform = @import("../util/platform.zig");
 
-pub const Variant = enum { preview, original };
+pub const Variant = enum { preview, original, external_copy };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
 const ORIGINAL_BYTES_MAX: usize = 128 << 20;
 const PREVIEW_PIXELS_MAX: usize = 4 * 1024 * 1024;
 const ORIGINAL_PIXELS_MAX: usize = 64 * 1024 * 1024;
+const ORIGINAL_ANIMATION_BYTES_MAX: usize = 256 << 20;
 const LOAD_TIMEOUT_MS: i64 = 120_000;
 
 pub const LoadResult = struct {
@@ -23,9 +26,17 @@ pub const LoadResult = struct {
     source_bytes: usize = 0,
     message: [160]u8 = undefined,
     message_len: usize = 0,
+    metadata: [1024]u8 = undefined,
+    metadata_len: usize = 0,
+    materialized: [4096:0]u8 = @splat(0),
+    materialized_len: usize = 0,
 
     pub fn messageText(self: *const LoadResult) []const u8 {
         return self.message[0..self.message_len];
+    }
+
+    pub fn metadataText(self: *const LoadResult) []const u8 {
+        return self.metadata[0..self.metadata_len];
     }
 
     fn setError(self: *LoadResult, err: anyerror) void {
@@ -36,6 +47,7 @@ pub const LoadResult = struct {
 
     fn deinit(self: *LoadResult) void {
         if (self.decoded) |*image| image.deinit(std.heap.c_allocator);
+        if (self.materialized_len > 0) _ = c.unlink(&self.materialized);
     }
 };
 
@@ -224,12 +236,56 @@ fn readAll(fs: *fsdrive.Fs, path: []const u8, cap: usize) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn fetch(work: *LoadWork) !struct { bytes: []u8, source_size: usize } {
+const FetchPayload = struct {
+    bytes: []u8,
+    source_size: usize,
+    metadata: [1024]u8 = undefined,
+    metadata_len: usize = 0,
+};
+
+fn fetchMetadata(fs: *fsdrive.Fs, resource: model.Resource, payload: *FetchPayload) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const dir = std.fs.path.dirname(resource.path) orelse "/";
+    const names = [_][]const u8{std.fs.path.basename(resource.path)};
+    const results = fs.mediaMeta(arena.allocator(), dir, &names, 15_000) catch return;
+    if (results.len == 0) return;
+    const interesting = [_]struct { key: []const u8, label: []const u8 }{
+        .{ .key = "media.format", .label = "Format" },
+        .{ .key = "media.bit_depth", .label = "Bit depth" },
+        .{ .key = "image.orientation", .label = "Orientation" },
+        .{ .key = "exif.datetime_original", .label = "Captured" },
+        .{ .key = "exif.make", .label = "Camera maker" },
+        .{ .key = "exif.model", .label = "Camera" },
+        .{ .key = "exif.lens", .label = "Lens" },
+        .{ .key = "exif.exposure_time", .label = "Exposure" },
+        .{ .key = "exif.f_number", .label = "Aperture" },
+        .{ .key = "exif.iso", .label = "ISO" },
+        .{ .key = "exif.focal_length", .label = "Focal length" },
+    };
+    var writer = std.Io.Writer.fixed(payload.metadata[0 .. payload.metadata.len - 1]);
+    for (interesting) |field| {
+        const value = results[0].get(field.key) orelse continue;
+        if (writer.buffered().len > 0) writer.writeByte('\n') catch break;
+        writer.print("{s}: {s}", .{ field.label, value }) catch break;
+    }
+    payload.metadata_len = writer.buffered().len;
+    payload.metadata[payload.metadata_len] = 0;
+}
+
+fn fetch(work: *LoadWork) !FetchPayload {
     const spec = work.spec;
     const variant = work.variant;
     const resource = model.Resource.parse(spec);
-    if (resource.host == null and paths.isSketermMount(resource.path))
-        return error.SketermFusePathNotSupported;
+    if (resource.host == null) {
+        if (paths.isSketermMount(resource.path)) return error.SketermFusePathNotSupported;
+        var path_buf: [4096:0]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{resource.path}) catch return error.PathTooLong;
+        var real_buf: [4096:0]u8 = undefined;
+        if (c.realpath(path_z.ptr, &real_buf)) |resolved| {
+            if (paths.isSketermMount(std.mem.span(resolved))) return error.SketermFusePathNotSupported;
+        }
+    }
     var fs = try connectFs(resource.host);
     defer fs.deinit();
     if (!work.target.registerFd(work.generation, fs.conn.fd)) return error.Canceled;
@@ -238,9 +294,11 @@ fn fetch(work: *LoadWork) !struct { bytes: []u8, source_size: usize } {
     defer probe_bytes.deinit(std.heap.c_allocator);
     const source = try fs.read(resource.path, 0, 0, &probe_bytes);
     if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
-    if (variant == .original) {
+    if (variant == .original or variant == .external_copy) {
         const bytes = try readAll(&fs, resource.path, ORIGINAL_BYTES_MAX);
-        return .{ .source_size = bytes.len, .bytes = bytes };
+        var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes };
+        fetchMetadata(&fs, resource, &payload);
+        return payload;
     }
 
     const job = try fs.startPreviewCodecs(resource.path, "png");
@@ -252,7 +310,9 @@ fn fetch(work: *LoadWork) !struct { bytes: []u8, source_size: usize } {
         return err;
     };
     if (!event.keep) fs.unlink(event.path) catch {};
-    return .{ .source_size = bytes.len, .bytes = bytes };
+    var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
+    fetchMetadata(&fs, resource, &payload);
+    return payload;
 }
 
 fn loadThread(first: *LoadWork) void {
@@ -263,9 +323,20 @@ fn loadThread(first: *LoadWork) void {
         if (fetch(work)) |payload| {
             defer allocator.free(payload.bytes);
             work.result.source_bytes = payload.source_size;
-            if (work.target.current(work.generation)) {
+            work.result.metadata_len = payload.metadata_len;
+            @memcpy(work.result.metadata[0..payload.metadata_len], payload.metadata[0..payload.metadata_len]);
+            work.result.metadata[payload.metadata_len] = 0;
+            if (work.target.current(work.generation) and work.variant == .external_copy) {
+                materializeOpenCopy(work, payload.bytes, &work.result) catch |err| work.result.setError(err);
+            } else if (work.target.current(work.generation)) {
                 const max_pixels = if (work.variant == .preview) PREVIEW_PIXELS_MAX else ORIGINAL_PIXELS_MAX;
-                work.result.decoded = decoder.decodeBytes(allocator, payload.bytes, max_pixels) catch |err| blk: {
+                work.result.decoded = decoder.decodeBytes(allocator, payload.bytes, .{
+                    .max_pixels = max_pixels,
+                    .max_animation_bytes = if (work.variant == .preview) PREVIEW_PIXELS_MAX * 4 else ORIGINAL_ANIMATION_BYTES_MAX,
+                    .max_frames = if (work.variant == .preview) 1 else 240,
+                    .cancel_context = @ptrCast(work),
+                    .should_cancel = &decodeStillCurrent,
+                }) catch |err| blk: {
                     work.result.setError(err);
                     break :blk null;
                 };
@@ -293,6 +364,67 @@ fn loadThread(first: *LoadWork) void {
     }
 }
 
+fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) !void {
+    const resource = model.Resource.parse(work.spec);
+    const cache = c.g_get_user_cache_dir() orelse return error.NoCacheDirectory;
+    var dir_buf: [4096:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/viewer-open", .{std.mem.span(cache)}) catch return error.PathTooLong;
+    if (c.g_mkdir_with_parents(dir.ptr, 0o700) != 0) return error.CacheDirectoryFailed;
+    var dir_stat: c.struct_stat = undefined;
+    if (c.lstat(dir.ptr, &dir_stat) != 0 or dir_stat.st_uid != c.geteuid() or
+        (dir_stat.st_mode & c.S_IFMT) != c.S_IFDIR)
+        return error.UnsafeCacheDirectory;
+    if ((dir_stat.st_mode & 0o777) != 0o700 and c.chmod(dir.ptr, @as(c.mode_t, 0o700)) != 0)
+        return error.UnsafeCacheDirectory;
+    sweepOpenCopies(dir);
+    const name = resource.name();
+    const safe_name = if (name.len > 0 and name.len < 512) name else "remote-image";
+    const path = std.fmt.bufPrintZ(&result.materialized, "{s}/open-{d}-{d}-{s}", .{
+        dir,
+        c.getpid(),
+        c.g_get_monotonic_time(),
+        safe_name,
+    }) catch return error.PathTooLong;
+    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return error.OpenCopyFailed;
+    var installed = false;
+    defer {
+        _ = c.close(fd);
+        if (!installed) _ = c.unlink(path.ptr);
+    }
+    var at: usize = 0;
+    while (at < bytes.len) {
+        if (!work.target.current(work.generation)) return error.Canceled;
+        const written = c.write(fd, bytes.ptr + at, bytes.len - at);
+        if (written < 0 and std.posix.errno(written) == .INTR) continue;
+        if (written <= 0) return error.OpenCopyFailed;
+        at += @intCast(written);
+    }
+    installed = true;
+    result.materialized_len = path.len;
+}
+
+fn sweepOpenCopies(directory: [:0]const u8) void {
+    const dir = c.opendir(directory.ptr) orelse return;
+    defer _ = c.closedir(dir);
+    const now = c.time(null);
+    while (c.readdir(dir)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (!std.mem.startsWith(u8, name, "open-")) continue;
+        var path_buf: [4096:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ directory, name }) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(path.ptr, &st) != 0 or st.st_uid != c.geteuid() or (st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
+        const modified = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+        if (modified + 3600 < now) _ = c.unlink(path.ptr);
+    }
+}
+
+fn decodeStillCurrent(user: ?*anyopaque) bool {
+    const work: *LoadWork = @ptrCast(@alignCast(user.?));
+    return !work.target.current(work.generation);
+}
+
 fn loadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const work: *LoadWork = @ptrCast(@alignCast(user.?));
     const target = work.target;
@@ -309,14 +441,15 @@ fn loadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 }
 
 pub fn textureFromDecoded(image: *const decoder.Decoded) ?*c.GdkTexture {
-    const bytes = c.g_bytes_new(image.rgba.ptr, image.rgba.len) orelse return null;
+    const frame = image.first();
+    const bytes = c.g_bytes_new(frame.rgba.ptr, frame.rgba.len) orelse return null;
     defer c.g_bytes_unref(bytes);
     return @ptrCast(@alignCast(c.gdk_memory_texture_new(
-        @intCast(image.width),
-        @intCast(image.height),
+        @intCast(frame.width),
+        @intCast(frame.height),
         c.GDK_MEMORY_R8G8B8A8,
         bytes,
-        @intCast(image.width * 4),
+        @intCast(frame.width * 4),
     )));
 }
 
@@ -330,13 +463,17 @@ pub const ViewerWindow = struct {
     canvas: image_canvas.Canvas,
     session: image_canvas.Session = .{},
     target: *LoadTarget,
+    open_target: *LoadTarget,
     status: *c.GtkLabel,
     position: *c.GtkLabel,
     zoom_label: *c.GtkLabel,
     original_button: *c.GtkWidget,
+    play_button: *c.GtkWidget,
+    metadata_label: *c.GtkLabel,
     prev_button: *c.GtkWidget,
     next_button: *c.GtkWidget,
     fullscreen: bool = false,
+    pending_mount: ?*MountOpen = null,
 
     pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, batch: model.Batch) !*ViewerWindow {
         const self = try allocator.create(ViewerWindow);
@@ -367,10 +504,51 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_tooltip_text(fit_button, "Fit to Window (F)");
         const actual_button = c.gtk_button_new_from_icon_name("zoom-original-symbolic").?;
         c.gtk_widget_set_tooltip_text(actual_button, "Actual Size (0)");
+        const fill_button = c.gtk_button_new_from_icon_name("view-fullscreen-symbolic").?;
+        c.gtk_widget_set_tooltip_text(fill_button, "Fill Window (C)");
+        const rotate_left = c.gtk_button_new_from_icon_name("object-rotate-left-symbolic").?;
+        c.gtk_widget_set_tooltip_text(rotate_left, "Rotate View Left ([)");
+        const rotate_right = c.gtk_button_new_from_icon_name("object-rotate-right-symbolic").?;
+        c.gtk_widget_set_tooltip_text(rotate_right, "Rotate View Right (])");
+        const play_button = c.gtk_button_new_from_icon_name("media-playback-pause-symbolic").?;
+        c.gtk_widget_set_tooltip_text(play_button, "Pause or Resume Animation (Space)");
+        c.gtk_widget_set_sensitive(play_button, 0);
         const fullscreen_button = c.gtk_button_new_from_icon_name("view-fullscreen-symbolic").?;
         c.gtk_widget_set_tooltip_text(fullscreen_button, "Fullscreen (F11)");
+        const menu_button = c.gtk_menu_button_new().?;
+        c.gtk_menu_button_set_icon_name(@ptrCast(menu_button), "open-menu-symbolic");
+        c.gtk_widget_set_tooltip_text(menu_button, "Image Actions");
+        const action_popover = c.gtk_popover_new().?;
+        const action_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
+        c.gtk_widget_set_margin_start(action_box, 6);
+        c.gtk_widget_set_margin_end(action_box, 6);
+        c.gtk_widget_set_margin_top(action_box, 6);
+        c.gtk_widget_set_margin_bottom(action_box, 6);
+        const metadata_label = c.gtk_label_new("Image metadata appears here after loading").?;
+        c.gtk_label_set_xalign(@ptrCast(metadata_label), 0);
+        c.gtk_label_set_wrap(@ptrCast(metadata_label), 1);
+        c.gtk_label_set_selectable(@ptrCast(metadata_label), 1);
+        c.gtk_widget_set_size_request(metadata_label, 280, -1);
+        c.gtk_widget_set_margin_start(metadata_label, 8);
+        c.gtk_widget_set_margin_end(metadata_label, 8);
+        c.gtk_widget_set_margin_top(metadata_label, 4);
+        c.gtk_widget_set_margin_bottom(metadata_label, 6);
+        c.gtk_widget_add_css_class(metadata_label, "dim-label");
+        c.gtk_box_append(@ptrCast(action_box), metadata_label);
+        c.gtk_box_append(@ptrCast(action_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?);
+        const copy_button = actionButton(action_box, "Copy Image", "edit-copy-symbolic");
+        const open_with_button = actionButton(action_box, "Open With...", "document-open-symbolic");
+        const reveal_button = actionButton(action_box, "Show in Sketerm Files", "folder-open-symbolic");
+        const reload_button = actionButton(action_box, "Reload", "view-refresh-symbolic");
+        c.gtk_popover_set_child(@ptrCast(action_popover), action_box);
+        c.gtk_menu_button_set_popover(@ptrCast(menu_button), action_popover);
+        c.adw_header_bar_pack_end(@ptrCast(header), menu_button);
         c.adw_header_bar_pack_end(@ptrCast(header), fullscreen_button);
+        c.adw_header_bar_pack_end(@ptrCast(header), play_button);
+        c.adw_header_bar_pack_end(@ptrCast(header), rotate_right);
+        c.adw_header_bar_pack_end(@ptrCast(header), rotate_left);
         c.adw_header_bar_pack_end(@ptrCast(header), actual_button);
+        c.adw_header_bar_pack_end(@ptrCast(header), fill_button);
         c.adw_header_bar_pack_end(@ptrCast(header), fit_button);
         c.adw_header_bar_pack_end(@ptrCast(header), zoom_in);
         c.adw_header_bar_pack_end(@ptrCast(header), @ptrCast(@alignCast(zoom_label)));
@@ -403,6 +581,8 @@ pub const ViewerWindow = struct {
 
         const target = LoadTarget.create(&onLoaded, @ptrCast(self)) orelse return error.OutOfMemory;
         errdefer target.close();
+        const open_target = LoadTarget.create(&onOpenCopyLoaded, @ptrCast(self)) orelse return error.OutOfMemory;
+        errdefer open_target.close();
         self.* = .{
             .allocator = allocator,
             .window = window,
@@ -410,17 +590,25 @@ pub const ViewerWindow = struct {
             .index = batch.initial_index,
             .canvas = canvas,
             .target = target,
+            .open_target = open_target,
             .status = @ptrCast(@alignCast(status)),
             .position = @ptrCast(@alignCast(position)),
             .zoom_label = @ptrCast(@alignCast(zoom_label)),
             .original_button = original,
+            .play_button = play_button,
+            .metadata_label = @ptrCast(@alignCast(metadata_label)),
             .prev_button = prev_button,
             .next_button = next_button,
         };
         self.canvas.enableInput();
         self.canvas.on_zoom = &onCanvasZoom;
         self.canvas.zoom_ctx = @ptrCast(self);
+        self.canvas.on_navigate = &onCanvasNavigate;
+        self.canvas.navigate_ctx = @ptrCast(self);
+        self.canvas.on_rotate = &onCanvasRotate;
+        self.canvas.rotate_ctx = @ptrCast(self);
         try self.session.attach(allocator, &self.canvas);
+        self.session.setPlaybackCallback(@ptrCast(self), &onSessionPlaybackChanged);
 
         c.g_object_set_data_full(@ptrCast(window), VIEWER_QDATA, @ptrCast(self), @ptrCast(&destroyViewer));
         _ = c.g_signal_connect_data(open_button, "clicked", @ptrCast(&onOpenClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -429,9 +617,17 @@ pub const ViewerWindow = struct {
         _ = c.g_signal_connect_data(zoom_out, "clicked", @ptrCast(&onZoomOut), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(zoom_in, "clicked", @ptrCast(&onZoomIn), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(fit_button, "clicked", @ptrCast(&onFit), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(fill_button, "clicked", @ptrCast(&onFill), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(actual_button, "clicked", @ptrCast(&onActual), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(rotate_left, "clicked", @ptrCast(&onRotateLeft), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(rotate_right, "clicked", @ptrCast(&onRotateRight), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(play_button, "clicked", @ptrCast(&onPlayPause), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(fullscreen_button, "clicked", @ptrCast(&onFullscreen), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(original, "clicked", @ptrCast(&onOriginal), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(copy_button, "clicked", @ptrCast(&onCopy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(open_with_button, "clicked", @ptrCast(&onOpenWith), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(reveal_button, "clicked", @ptrCast(&onReveal), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(reload_button, "clicked", @ptrCast(&onReload), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         const keys = c.gtk_event_controller_key_new();
         c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -444,6 +640,9 @@ pub const ViewerWindow = struct {
 
     fn destroyViewer(user: ?*anyopaque) callconv(.c) void {
         const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        if (self.pending_mount) |pending| pending.viewer = null;
+        self.pending_mount = null;
+        self.open_target.close();
         self.target.close();
         self.session.deinit(self.allocator);
         self.batch.deinit();
@@ -458,12 +657,15 @@ pub const ViewerWindow = struct {
     fn showCurrent(self: *ViewerWindow) void {
         self.session.clear();
         self.canvas.fit();
+        c.gtk_widget_set_sensitive(self.play_button, 0);
+        c.gtk_label_set_text(self.metadata_label, "Loading image metadata...");
         c.gtk_widget_set_visible(self.original_button, 0);
         const resource = self.current() orelse {
             c.gtk_label_set_text(self.status, "Open an image to begin");
             c.gtk_label_set_text(self.position, "");
             c.gtk_widget_set_sensitive(self.prev_button, 0);
             c.gtk_widget_set_sensitive(self.next_button, 0);
+            self.canvas.setAccessible("Image viewer", "No image open", false);
             return;
         };
         var title: [512:0]u8 = undefined;
@@ -473,6 +675,7 @@ pub const ViewerWindow = struct {
         const pos_z = std.fmt.bufPrintZ(&pos, "{d} of {d}", .{ self.index + 1, self.batch.specs.len }) catch "";
         c.gtk_label_set_text(self.position, pos_z.ptr);
         c.gtk_label_set_text(self.status, "Loading preview...");
+        self.canvas.setAccessible(resource.name(), "Loading preview", true);
         c.gtk_widget_set_sensitive(self.prev_button, @intFromBool(self.index > 0));
         c.gtk_widget_set_sensitive(self.next_button, @intFromBool(self.index + 1 < self.batch.specs.len));
         if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
@@ -482,6 +685,7 @@ pub const ViewerWindow = struct {
         const resource = self.current() orelse return;
         c.gtk_widget_set_sensitive(self.original_button, 0);
         c.gtk_label_set_text(self.status, "Loading full resolution through the file service...");
+        self.canvas.setAccessible(resource.name(), "Loading full resolution", true);
         if (!self.target.start(resource.spec, .original)) {
             c.gtk_widget_set_sensitive(self.original_button, 1);
             c.gtk_label_set_text(self.status, "Could not start full-resolution loader");
@@ -512,7 +716,47 @@ pub const ViewerWindow = struct {
         self.index = 0;
         self.showCurrent();
     }
+
+    fn rotate(self: *ViewerWindow, delta: i8) void {
+        self.session.rotate(delta);
+        self.updateAccessibleState();
+    }
+
+    fn updatePlaybackButton(self: *ViewerWindow) void {
+        const animated = self.session.animated();
+        c.gtk_widget_set_sensitive(self.play_button, @intFromBool(animated));
+        c.gtk_button_set_icon_name(@ptrCast(self.play_button), if (self.session.isPlaying())
+            "media-playback-pause-symbolic"
+        else
+            "media-playback-start-symbolic");
+    }
+
+    fn updateAccessibleState(self: *ViewerWindow) void {
+        const resource = self.current() orelse return;
+        var detail: [256:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&detail, "Item {d} of {d}; rotation {d} degrees{s}", .{
+            self.index + 1,
+            self.batch.specs.len,
+            self.session.rotationDegrees(),
+            if (self.session.animated()) if (self.session.isPlaying()) "; animation playing" else "; animation paused" else "",
+        }) catch "Image loaded";
+        self.canvas.setAccessible(resource.name(), text, false);
+    }
 };
+
+fn actionButton(box: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8) *c.GtkWidget {
+    const button = c.gtk_button_new().?;
+    c.gtk_button_set_has_frame(@ptrCast(button), 0);
+    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+    c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name(icon).?);
+    const text = c.gtk_label_new(label).?;
+    c.gtk_label_set_xalign(@ptrCast(text), 0);
+    c.gtk_widget_set_hexpand(text, 1);
+    c.gtk_box_append(@ptrCast(row), text);
+    c.gtk_button_set_child(@ptrCast(button), row);
+    c.gtk_box_append(@ptrCast(box), button);
+    return button;
+}
 
 fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
@@ -529,37 +773,86 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
             result.messageText(),
         }) catch "Unable to load image";
         c.gtk_label_set_text(self.status, text.ptr);
+        if (self.current()) |resource| self.canvas.setAccessible(resource.name(), text, false);
         if (result.variant == .original) {
             c.gtk_widget_set_sensitive(self.original_button, 1);
             c.gtk_widget_set_visible(self.original_button, 1);
         }
         return;
     };
-    const texture = textureFromDecoded(image) orelse {
-        c.gtk_label_set_text(self.status, "Unable to create image texture");
+    self.session.setDecoded(self.allocator, image) catch {
+        c.gtk_label_set_text(self.status, "Unable to create image textures");
+        if (self.current()) |resource| self.canvas.setAccessible(resource.name(), "Unable to create image textures", false);
         return;
     };
-    self.session.setTexture(texture);
-    c.g_object_unref(@ptrCast(texture));
+    const first = image.first();
+    self.updatePlaybackButton();
+    if (result.metadata_len > 0)
+        c.gtk_label_set_text(self.metadata_label, result.metadataText().ptr)
+    else
+        c.gtk_label_set_text(self.metadata_label, "No embedded image metadata");
     var status: [256:0]u8 = undefined;
     const backend = switch (image.backend) {
         .glycin => "Glycin",
         .gdk_pixbuf => "GdkPixbuf",
     };
-    const text = std.fmt.bufPrintZ(&status, "{s}  {d} x {d}  {s}", .{
+    var size_buf: [48]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&status, "{s}  {d} x {d}  {s}  {s}{s}", .{
         if (result.variant == .preview) "Preview" else "Full resolution",
-        image.width,
-        image.height,
+        first.width,
+        first.height,
         backend,
+        formatBytes(&size_buf, result.source_bytes),
+        if (image.animated()) "  Animated" else "",
     }) catch "Image loaded";
     c.gtk_label_set_text(self.status, text.ptr);
     c.gtk_widget_set_visible(self.original_button, @intFromBool(result.variant == .preview));
     c.gtk_widget_set_sensitive(self.original_button, 1);
+    self.updateAccessibleState();
+    if (result.variant == .preview) {
+        if (self.current()) |resource| {
+            if (resource.host == null and mayAnimate(resource.name())) {
+                c.gtk_widget_set_sensitive(self.original_button, 0);
+                c.gtk_label_set_text(self.status, "Preview ready; loading animation and full resolution...");
+                if (self.target.start(resource.spec, .original)) return;
+                c.gtk_widget_set_sensitive(self.original_button, 1);
+            }
+        }
+    }
 }
 
-fn onCanvasZoom(user: ?*anyopaque, zoom: f64, fit: bool) void {
+fn onOpenCopyLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
-    if (fit) return c.gtk_label_set_text(self.zoom_label, "Fit");
+    if (result.materialized_len == 0) {
+        var buf: [256:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Could not prepare the remote image: {s}", .{result.messageText()}) catch
+            "Could not prepare the remote image";
+        c.gtk_label_set_text(self.status, text.ptr);
+        return;
+    }
+    if (showAppChooserPath(self, result.materialized[0..result.materialized_len], true)) {
+        result.materialized_len = 0;
+        c.gtk_label_set_text(self.status, "Remote image ready for an external application");
+    }
+}
+
+fn formatBytes(buf: []u8, bytes: usize) []const u8 {
+    if (bytes >= 1024 * 1024) return std.fmt.bufPrint(buf, "{d:.1} MiB", .{@as(f64, @floatFromInt(bytes)) / (1024 * 1024)}) catch "";
+    if (bytes >= 1024) return std.fmt.bufPrint(buf, "{d:.1} KiB", .{@as(f64, @floatFromInt(bytes)) / 1024}) catch "";
+    return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
+}
+
+fn mayAnimate(name: []const u8) bool {
+    const ext = std.fs.path.extension(name);
+    return std.ascii.eqlIgnoreCase(ext, ".gif") or std.ascii.eqlIgnoreCase(ext, ".png") or
+        std.ascii.eqlIgnoreCase(ext, ".apng") or std.ascii.eqlIgnoreCase(ext, ".webp") or
+        std.ascii.eqlIgnoreCase(ext, ".avif") or std.ascii.eqlIgnoreCase(ext, ".jxl");
+}
+
+fn onCanvasZoom(user: ?*anyopaque, zoom: f64, mode: model.Viewport.Mode) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    if (mode == .fit) return c.gtk_label_set_text(self.zoom_label, "Fit");
+    if (mode == .fill) return c.gtk_label_set_text(self.zoom_label, "Fill");
     var buf: [24:0]u8 = undefined;
     const text = std.fmt.bufPrintZ(&buf, "{d}%", .{@as(u32, @intFromFloat(@round(zoom * 100)))}) catch "";
     c.gtk_label_set_text(self.zoom_label, text.ptr);
@@ -590,6 +883,11 @@ fn onFit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.canvas.fit();
 }
 
+fn onFill(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.canvas.fill();
+}
+
 fn onActual(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
     self.canvas.actual();
@@ -598,6 +896,62 @@ fn onActual(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn onOriginal(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
     self.loadOriginal();
+}
+
+fn onRotateLeft(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.rotate(-1);
+}
+
+fn onRotateRight(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.rotate(1);
+}
+
+fn onPlayPause(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.session.togglePlayback();
+}
+
+fn onSessionPlaybackChanged(user: ?*anyopaque) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.updatePlaybackButton();
+    self.updateAccessibleState();
+}
+
+fn onCanvasNavigate(user: ?*anyopaque, delta: isize) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.move(delta);
+}
+
+fn onCanvasRotate(user: ?*anyopaque, delta: i8) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.rotate(delta);
+}
+
+fn onCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const texture = self.session.currentTexture() orelse return;
+    const clipboard = c.gtk_widget_get_clipboard(self.window) orelse return;
+    c.gdk_clipboard_set_texture(clipboard, texture);
+    c.gtk_label_set_text(self.status, "Image copied to clipboard");
+}
+
+fn onReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    self.showCurrent();
+}
+
+fn onOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const resource = self.current() orelse return;
+    if (resource.host) |host| return openWithRemote(self, host, resource.path);
+    showAppChooser(self, resource.path);
+}
+
+fn onReveal(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    revealCurrent(self);
 }
 
 fn onFullscreen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -644,9 +998,187 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifie
         c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => self.canvas.zoomBy(1.0 / 1.2),
         c.GDK_KEY_0, c.GDK_KEY_KP_0 => self.canvas.actual(),
         c.GDK_KEY_f, c.GDK_KEY_F => self.canvas.fit(),
+        c.GDK_KEY_c, c.GDK_KEY_C => self.canvas.fill(),
+        c.GDK_KEY_bracketleft => self.rotate(-1),
+        c.GDK_KEY_bracketright => self.rotate(1),
+        c.GDK_KEY_space, c.GDK_KEY_KP_Space => if (self.session.animated()) {
+            self.session.togglePlayback();
+        } else return 0,
+        c.GDK_KEY_r, c.GDK_KEY_R => self.showCurrent(),
         c.GDK_KEY_F11 => toggleFullscreen(self),
         c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
         else => return 0,
     }
     return 1;
+}
+
+const APP_CHOOSER_FILE = "sketerm-viewer-app-file";
+
+fn showAppChooser(self: *ViewerWindow, path: []const u8) void {
+    _ = showAppChooserPath(self, path, false);
+}
+
+const ChooserCopy = struct {
+    path: [:0]u8,
+};
+
+fn freeChooserCopy(user: ?*anyopaque) callconv(.c) void {
+    const copy: *ChooserCopy = @ptrCast(@alignCast(user.?));
+    _ = c.unlink(copy.path.ptr);
+    std.heap.c_allocator.free(copy.path);
+    std.heap.c_allocator.destroy(copy);
+}
+
+fn delayedChooserCopyCleanup(user: ?*anyopaque) callconv(.c) c.gboolean {
+    freeChooserCopy(user);
+    return 0;
+}
+
+fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) bool {
+    var path_buf: [4096:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch {
+        c.gtk_label_set_text(self.status, "Path is too long for Open With");
+        return false;
+    };
+    const file = c.g_file_new_for_path(path_z.ptr) orelse return false;
+    const dialog = c.gtk_app_chooser_dialog_new(@ptrCast(self.window), c.GTK_DIALOG_MODAL, file) orelse {
+        c.g_object_unref(file);
+        return false;
+    };
+    _ = c.g_object_ref(file);
+    c.g_object_set_data_full(@ptrCast(dialog), APP_CHOOSER_FILE, @ptrCast(file), @ptrCast(&c.g_object_unref));
+    c.g_object_unref(file);
+    if (owned_copy) {
+        const allocator = std.heap.c_allocator;
+        const copy = allocator.create(ChooserCopy) catch {
+            c.gtk_window_destroy(@ptrCast(dialog));
+            return false;
+        };
+        copy.* = .{ .path = allocator.dupeZ(u8, path) catch {
+            allocator.destroy(copy);
+            c.gtk_window_destroy(@ptrCast(dialog));
+            return false;
+        } };
+        c.g_object_set_data_full(@ptrCast(dialog), "sketerm-viewer-open-copy", @ptrCast(copy), @ptrCast(&freeChooserCopy));
+    }
+    c.gtk_app_chooser_dialog_set_heading(@ptrCast(dialog), "Open image with another application");
+    _ = c.g_signal_connect_data(dialog, "response", @ptrCast(&onAppChooserResponse), null, null, c.G_CONNECT_DEFAULT);
+    c.gtk_window_present(@ptrCast(dialog));
+    return true;
+}
+
+fn onAppChooserResponse(dialog: *c.GtkDialog, response: c_int, _: ?*anyopaque) callconv(.c) void {
+    if (response == c.GTK_RESPONSE_OK) {
+        const app = c.gtk_app_chooser_get_app_info(@ptrCast(dialog));
+        const file_any = c.g_object_get_data(@ptrCast(dialog), APP_CHOOSER_FILE);
+        if (app != null and file_any != null) {
+            var files: ?*c.GList = null;
+            files = c.g_list_append(files, file_any);
+            _ = c.g_app_info_launch(app, files, null, null);
+            c.g_list_free(files);
+            c.g_object_unref(app);
+            if (c.g_object_steal_data(@ptrCast(dialog), "sketerm-viewer-open-copy")) |raw| {
+                if (c.g_timeout_add_seconds(60, @ptrCast(&delayedChooserCopyCleanup), raw) == 0)
+                    freeChooserCopy(raw);
+            }
+        }
+    }
+    c.gtk_window_destroy(@ptrCast(dialog));
+}
+
+const MountOpen = struct {
+    viewer: ?*ViewerWindow,
+    host: []u8,
+    path: []u8,
+};
+
+fn openWithRemote(self: *ViewerWindow, host: []const u8, path: []const u8) void {
+    if (self.pending_mount != null) {
+        c.gtk_label_set_text(self.status, "An external application handoff is already being prepared");
+        return;
+    }
+    const allocator = std.heap.c_allocator;
+    const pending = allocator.create(MountOpen) catch return;
+    pending.* = .{
+        .viewer = self,
+        .host = allocator.dupe(u8, host) catch {
+            allocator.destroy(pending);
+            return;
+        },
+        .path = allocator.dupe(u8, path) catch {
+            allocator.free(pending.host);
+            allocator.destroy(pending);
+            return;
+        },
+    };
+    self.pending_mount = pending;
+    c.gtk_label_set_text(self.status, "Preparing the remote file for an external application...");
+    hostmount.whenReady(allocator, host, @ptrCast(pending), &onOpenWithMountReady);
+}
+
+fn onOpenWithMountReady(user: ?*anyopaque, mounted: bool) void {
+    const pending: *MountOpen = @ptrCast(@alignCast(user.?));
+    defer {
+        const allocator = std.heap.c_allocator;
+        allocator.free(pending.host);
+        allocator.free(pending.path);
+        allocator.destroy(pending);
+    }
+    const self = pending.viewer orelse return;
+    if (self.pending_mount == pending) self.pending_mount = null;
+    if (!mounted) {
+        startOpenCopy(self, pending.host, pending.path);
+        return;
+    }
+    var path_buf: [8192]u8 = undefined;
+    const local = hostmount.localPath(&path_buf, pending.host, pending.path) orelse {
+        startOpenCopy(self, pending.host, pending.path);
+        return;
+    };
+    showAppChooser(self, local);
+}
+
+fn startOpenCopy(self: *ViewerWindow, host: []const u8, path: []const u8) void {
+    const spec = paths.formatSpecAlloc(self.allocator, host, path) catch return;
+    defer self.allocator.free(spec);
+    c.gtk_label_set_text(self.status, "Mount unavailable; downloading a temporary copy...");
+    if (!self.open_target.start(spec, .external_copy))
+        c.gtk_label_set_text(self.status, "Could not start the temporary-copy download");
+}
+
+fn revealCurrent(self: *ViewerWindow) void {
+    const resource = self.current() orelse return;
+    const parent = std.fs.path.dirname(resource.path) orelse "/";
+    const parent_spec = paths.formatSpecAlloc(self.allocator, resource.host, parent) catch return;
+    defer self.allocator.free(parent_spec);
+    const reveal_arg = std.fmt.allocPrintSentinel(self.allocator, "--select={s}", .{resource.spec}, 0) catch return;
+    defer self.allocator.free(reveal_arg);
+    var exe_buf: [4096:0]u8 = undefined;
+    const exe = platform.exePathZ(&exe_buf) orelse return;
+    var sibling_buf: [4096:0]u8 = undefined;
+    const sibling: ?[:0]const u8 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
+        const candidate = std.fmt.bufPrintZ(&sibling_buf, "{s}/sketerm-files", .{exe[0..slash]}) catch break :blk null;
+        if (c.access(candidate.ptr, c.X_OK) != 0) break :blk null;
+        break :blk candidate;
+    };
+    const parent_z = self.allocator.dupeZ(u8, parent_spec) catch return;
+    defer self.allocator.free(parent_z);
+    var argv: [6]?[*:0]u8 = @splat(null);
+    var at: usize = 0;
+    argv[at] = @constCast(if (sibling) |bin| bin.ptr else exe.ptr);
+    at += 1;
+    if (sibling == null) {
+        argv[at] = @constCast(@as([*:0]const u8, "files"));
+        at += 1;
+    }
+    argv[at] = parent_z.ptr;
+    at += 1;
+    argv[at] = reveal_arg.ptr;
+    at += 1;
+    var gerr: [*c]c.GError = null;
+    if (c.g_spawn_async(null, @ptrCast(&argv), null, @intCast(c.G_SPAWN_DEFAULT), null, null, null, &gerr) == 0) {
+        if (gerr != null) c.g_error_free(gerr);
+        c.gtk_label_set_text(self.status, "Could not open Sketerm Files");
+    } else c.gtk_label_set_text(self.status, "Showing image in Sketerm Files");
 }
