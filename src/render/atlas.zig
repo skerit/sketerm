@@ -64,13 +64,14 @@ const Page = struct {
 };
 
 const GlyphRef = struct {
-    /// Either codepoint (kind=.codepoint) or font glyph index (kind=.gid),
-    /// with `BOLD_KEY_BIT` OR-ed in for bold variants — the same encoding
-    /// the `cache` / `glyph_cache` maps use, so eviction removes the right
-    /// entry without a separate bold flag.
-    key: u32,
+    /// Either codepoint (kind=.codepoint), font glyph index (kind=.gid)
+    /// — both with `BOLD_KEY_BIT` OR-ed in for bold variants, the same
+    /// encoding the `cache` / `glyph_cache` maps use — or a packed
+    /// (face_idx+1)<<32 | gid key (kind=.face_gid) matching
+    /// `face_gid_cache`, so eviction removes the right entry.
+    key: u64,
     kind: Kind,
-    pub const Kind = enum { codepoint, gid };
+    pub const Kind = enum { codepoint, gid, face_gid };
 };
 
 /// Bold / italic glyphs share the `cache` / `glyph_cache` maps with
@@ -197,6 +198,17 @@ pub const Atlas = struct {
     /// Whether FcInit() ran successfully. Required for FcFontMatch.
     fc_initialized: bool = false,
 
+    /// Shaping-capable fallback faces for the editor's font itemization.
+    /// Unlike `fallback_faces` each entry carries its own hb_font so
+    /// gid-keyed shaping (hb_shape output) works per face.
+    shape_fallbacks: std.ArrayList(ShapeFace) = .empty,
+    /// Codepoint → shape_fallbacks index (null = negative cache).
+    cp_to_shape_fallback: std.AutoHashMap(u32, ?u16) = undefined,
+    /// (face_idx+1)<<32 | gid → Glyph for shape-fallback faces. Kept
+    /// separate from `glyph_cache` because its u32 keys have the style
+    /// bits (0x4000_0000 / 0x2000_0000) burned into the high range.
+    face_gid_cache: std.AutoHashMap(u64, Glyph) = undefined,
+
     pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, size_px: u16) !*Atlas {
         return initOpts(allocator, font_path, size_px, 0);
     }
@@ -272,6 +284,8 @@ pub const Atlas = struct {
             .pixel_size = size_px,
             .cp_to_fallback = std.AutoHashMap(u32, ?usize).init(allocator),
             .fc_initialized = fc_ok,
+            .cp_to_shape_fallback = std.AutoHashMap(u32, ?u16).init(allocator),
+            .face_gid_cache = std.AutoHashMap(u64, Glyph).init(allocator),
         };
         // Pre-grow caches so ASCII pre-warm + first session content
         // don't pay 4-5 rehashes climbing from default capacity.
@@ -370,6 +384,13 @@ pub const Atlas = struct {
         for (self.fallback_faces.items) |fb| _ = c.FT_Done_Face(fb);
         self.fallback_faces.deinit(self.allocator);
         self.cp_to_fallback.deinit();
+        for (self.shape_fallbacks.items) |sf| {
+            if (sf.hb) |f| c.hb_font_destroy(f);
+            _ = c.FT_Done_Face(sf.face);
+        }
+        self.shape_fallbacks.deinit(self.allocator);
+        self.cp_to_shape_fallback.deinit();
+        self.face_gid_cache.deinit();
         if (self.ft_face_bold) |bf| _ = c.FT_Done_Face(bf);
         if (self.ft_face_italic) |f| _ = c.FT_Done_Face(f);
         if (self.ft_face_bold_italic) |f| _ = c.FT_Done_Face(f);
@@ -707,6 +728,158 @@ pub const Atlas = struct {
         return g;
     }
 
+    /// A shaping-capable fallback face: FT face for raster/coverage plus
+    /// its own hb_font so gid-keyed shaping works in this face's
+    /// namespace.
+    pub const ShapeFace = struct {
+        face: c.FT_Face,
+        hb: ?*c.hb_font_t,
+    };
+
+    /// The FT face + hb font a (bold, italic) primary run shapes and
+    /// rasterizes with — same selection as the internal styledFace, so
+    /// gids from the returned hb font resolve via lookupOrLoadById with
+    /// the same style flags.
+    pub fn primaryShapeFace(self: *const Atlas, bold: bool, italic: bool) ShapeFace {
+        const sf = self.styledFace(bold, italic);
+        return .{ .face = sf.face, .hb = sf.hb orelse self.hb_font };
+    }
+
+    pub fn shapeFallback(self: *const Atlas, idx: u16) ShapeFace {
+        return self.shape_fallbacks.items[idx];
+    }
+
+    /// Locate (or lazily load + register) a shape fallback face covering
+    /// `cp`. Mirrors findFallbackFace (fontconfig charset match, colour
+    /// preference for emoji codepoints, strike-size selection) but each
+    /// registered face gets an hb_font. Positive and negative results
+    /// are cached per codepoint.
+    pub fn shapeFallbackForCp(self: *Atlas, cp: u32) ?u16 {
+        if (self.cp_to_shape_fallback.get(cp)) |entry| return entry;
+        if (!self.fc_initialized) {
+            _ = self.cp_to_shape_fallback.put(cp, null) catch {};
+            return null;
+        }
+        // Already-registered face covering this cp?
+        for (self.shape_fallbacks.items, 0..) |sf, idx| {
+            if (c.FT_Get_Char_Index(sf.face, cp) != 0) {
+                const i16idx: u16 = @intCast(idx);
+                _ = self.cp_to_shape_fallback.put(cp, i16idx) catch {};
+                return i16idx;
+            }
+        }
+        const miss = struct {
+            fn mark(a: *Atlas, mcp: u32) ?u16 {
+                _ = a.cp_to_shape_fallback.put(mcp, null) catch {};
+                return null;
+            }
+        }.mark;
+        const pattern = c.FcPatternCreate() orelse return miss(self, cp);
+        defer c.FcPatternDestroy(pattern);
+        const charset = c.FcCharSetCreate() orelse return miss(self, cp);
+        defer c.FcCharSetDestroy(charset);
+        _ = c.FcCharSetAddChar(charset, cp);
+        _ = c.FcPatternAddCharSet(pattern, c.FC_CHARSET, charset);
+        if (isEmojiCp(cp)) {
+            _ = c.FcPatternAddBool(pattern, c.FC_COLOR, c.FcTrue);
+        } else {
+            _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
+        }
+        _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pattern);
+
+        var result: c.FcResult = undefined;
+        const match = c.FcFontMatch(null, pattern, &result) orelse return miss(self, cp);
+        defer c.FcPatternDestroy(match);
+
+        var file_ptr: [*c]c.FcChar8 = undefined;
+        if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch)
+            return miss(self, cp);
+        const file_z: [*:0]const u8 = @ptrCast(file_ptr);
+
+        var fb_face: c.FT_Face = undefined;
+        if (c.FT_New_Face(self.ft_lib, file_z, 0, &fb_face) != 0) return miss(self, cp);
+        if (!setFaceSize(fb_face, self.pixel_size)) {
+            _ = c.FT_Done_Face(fb_face);
+            return miss(self, cp);
+        }
+        // The matched font may still not cover cp (fontconfig substitutes
+        // rather than failing) — cache the negative rather than register
+        // a useless face.
+        if (c.FT_Get_Char_Index(fb_face, cp) == 0) {
+            _ = c.FT_Done_Face(fb_face);
+            return miss(self, cp);
+        }
+        const hb = c.hb_ft_font_create_referenced(fb_face);
+        const idx: u16 = @intCast(self.shape_fallbacks.items.len);
+        self.shape_fallbacks.append(self.allocator, .{ .face = fb_face, .hb = hb }) catch {
+            if (hb) |f| c.hb_font_destroy(f);
+            _ = c.FT_Done_Face(fb_face);
+            return null;
+        };
+        _ = self.cp_to_shape_fallback.put(cp, idx) catch {};
+        return idx;
+    }
+
+    /// Glyph-id keyed lookup in a shape-fallback face's namespace.
+    /// Colour (emoji) strikes go through the same FT_LOAD_COLOR +
+    /// rescale path as primary-face lookups.
+    pub fn lookupOrLoadFaceGid(self: *Atlas, face_idx: u16, gid: u32) !Glyph {
+        const key: u64 = (@as(u64, face_idx) + 1) << 32 | gid;
+        if (self.face_gid_cache.get(key)) |g| {
+            self.touchPage(g.layer);
+            return g;
+        }
+        const face = self.shape_fallbacks.items[face_idx].face;
+        const g = try self.loadGlyphFromFace(face, gid, false);
+        try self.face_gid_cache.put(key, g);
+        try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+            .key = key,
+            .kind = .face_gid,
+        });
+        return g;
+    }
+
+    /// Shape a UTF-8 run with an EXPLICIT hb_font and direction (the
+    /// editor's itemization path — the run's face was chosen per
+    /// script/coverage before shaping). Script/language are guessed
+    /// from the content, direction is forced. Cached like shapeRun;
+    /// the returned slice is OWNED BY THE ATLAS.
+    pub fn shapeWithFont(self: *Atlas, font: *c.hb_font_t, text: []const u8, rtl: bool) ![]ShapedGlyph {
+        const buf = self.hb_buf orelse return error.NoHarfBuzzFont;
+        var key = std.hash.Wyhash.hash(0x51ED_1704, text);
+        key ^= @intFromPtr(font) *% 0x9E37_79B9_7F4A_7C15;
+        if (rtl) key ^= 0x0D0A_C0DE_0D0A_C0DE;
+        if (self.shape_cache.get(key)) |cached| return cached;
+
+        c.hb_buffer_clear_contents(buf);
+        c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
+        c.hb_buffer_guess_segment_properties(buf);
+        c.hb_buffer_set_direction(buf, if (rtl) c.HB_DIRECTION_RTL else c.HB_DIRECTION_LTR);
+        c.hb_shape(font, buf, if (self.n_features > 0) &self.features else null, @intCast(self.n_features));
+        var glyph_count: c_uint = 0;
+        const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
+        const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
+        if (self.shape_cache.count() >= 4096) self.shapeCacheEvictOne();
+        const out = try self.allocator.alloc(ShapedGlyph, glyph_count);
+        var i: c_uint = 0;
+        while (i < glyph_count) : (i += 1) {
+            out[i] = .{
+                .glyph_id = infos[i].codepoint,
+                .x_advance = positions[i].x_advance,
+                .y_advance = positions[i].y_advance,
+                .x_offset = positions[i].x_offset,
+                .y_offset = positions[i].y_offset,
+                .cluster = infos[i].cluster,
+            };
+        }
+        self.shape_cache.put(key, out) catch {
+            self.allocator.free(out);
+            return error.OutOfMemory;
+        };
+        return out;
+    }
+
     /// Ask fontconfig for a styled variant (weight/slant) of the
     /// primary face's family and load it with FreeType. Returns null
     /// when no genuine variant exists (caller then synthesizes: bold
@@ -1040,8 +1213,9 @@ pub const Atlas = struct {
         const p = &self.pages[idx];
         for (p.glyphs_on_page.items) |ref| {
             switch (ref.kind) {
-                .codepoint => _ = self.cache.remove(ref.key),
-                .gid => _ = self.glyph_cache.remove(ref.key),
+                .codepoint => _ = self.cache.remove(@intCast(ref.key)),
+                .gid => _ = self.glyph_cache.remove(@intCast(ref.key)),
+                .face_gid => _ = self.face_gid_cache.remove(ref.key),
             }
         }
         p.glyphs_on_page.clearRetainingCapacity();
