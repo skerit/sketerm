@@ -819,21 +819,28 @@ pub fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn,
     };
     defer snap.deinit(self.allocator);
 
+    return attachMuxPrepared(self, conn, name, host, snap.payload, takeover, profile, lease);
+}
+
+/// Finish an attach whose transport handshake and snapshot ran off-thread.
+pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
+    var conn = conn_in;
+
     // App sessions in window view mode attach TABLESS (their
     // floating windows are the only UI — a desktop launcher does
     // not open a terminal). Snapshot header byte 8 is the app
     // flag. Takeover keeps the tab path: the user explicitly
     // attached from inside a pane.
-    const envelope = @import("../mux/snapshot.zig").peelEnvelope(snap.payload) catch {
+    const envelope = @import("../mux/snapshot.zig").peelEnvelope(snapshot_payload) catch {
         conn.deinit();
         return error.BadSnapshot;
     };
     if (takeover == null and self.config.app_view == .window and envelope.app) {
-        return attachMuxApp(self, conn, name, host, snap.payload, lease == .read_only, lease == .control);
+        return attachMuxApp(self, conn, name, host, snapshot_payload, lease == .read_only, lease == .control);
     }
 
     crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
-    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snap.payload, null, lease == .read_only, lease == .control);
+    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, null, lease == .read_only, lease == .control);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile });
 

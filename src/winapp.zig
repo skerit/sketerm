@@ -163,6 +163,54 @@ pub const WsHost = struct {
         self.allocator.destroy(self);
     }
 
+    pub const WinInfo = struct {
+        id: u32,
+        title: [*:0]const u8,
+        paintable: ?*c.GdkPaintable,
+    };
+
+    /// Snapshot of open streamed windows; each paintable must be unrefed.
+    pub fn windowInfos(self: *WsHost, allocator: std.mem.Allocator) []WinInfo {
+        var out: std.ArrayList(WinInfo) = .empty;
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| {
+            const paintable: ?*c.GdkPaintable = @ptrCast(c.gtk_widget_paintable_new(w.*.picture));
+            out.append(allocator, .{
+                .id = w.*.id,
+                .title = if (c.gtk_window_get_title(w.*.window)) |title| title else "",
+                .paintable = paintable,
+            }) catch {
+                if (paintable) |value| c.g_object_unref(value);
+                break;
+            };
+        }
+        return out.toOwnedSlice(allocator) catch {
+            for (out.items) |info| if (info.paintable) |value| c.g_object_unref(value);
+            out.deinit(allocator);
+            return &.{};
+        };
+    }
+
+    pub fn presentWindow(self: *WsHost, id: u32) void {
+        const win = self.windows.get(id) orelse return;
+        c.gtk_window_present(win.window);
+    }
+
+    pub fn windowCount(self: *const WsHost) usize {
+        return self.windows.count();
+    }
+
+    /// Stable overview metadata hash; pixel commits deliberately do not count.
+    pub fn overviewHash(self: *const WsHost, seed: u64) u64 {
+        var hash = seed;
+        var it = self.windows.valueIterator();
+        while (it.next()) |win| {
+            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.id));
+            if (c.gtk_window_get_title(win.*.window)) |title| hash = std.hash.Wyhash.hash(hash, std.mem.span(title));
+        }
+        return hash;
+    }
+
     pub fn takeOut(self: *WsHost) []const u8 {
         return self.out.items;
     }
