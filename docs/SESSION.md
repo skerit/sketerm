@@ -12006,3 +12006,39 @@ Isolated GUI runs proved infinite and finite animation, replay,
 pause/resume, fill, rotation, copy, metadata/accessibility, Quick Look
 promotion, exact Files reveal, and clean status-0 shutdown without GTK
 or GLib criticals.
+
+## 2026-08-03: Session Overview redesign — audio identity, thumbnails, reuse
+
+The Session Overview (palette, formerly "App Windows") is now a real
+task overview: an Adwaita CSD window with search, grouped boxed lists
+(Playing Audio / Application Windows / Attached Sessions / Available
+Sessions), live GtkWidgetPaintable thumbnails for native and streamed
+windows, per-row attach/focus/stop actions, and keyboard navigation
+with selection preserved across refreshes.
+
+Audio is identified, not just flagged. The session's internal
+PulseAudio server now parses client and stream proplists (application
+name/binary/pid/icon, media name/title; bounded, UTF-8-safe, PA
+merge/replace/set semantics) and ships them as a `metadata` audio unit
+plus `audio_streams` summaries in `list` replies, through the broker's
+'M' push as well. Stream descriptors (open/metadata/cork) replay on
+subscribe over the audio-priority lane, closing the startup race that
+produced audible-but-unidentified sound; smoke-mux and smoke-broker
+assert the replay, ordering and cork transitions end to end.
+
+The overview polls without connection churn: one persistent connection
+per daemon serves every list poll and session stop (serialized ops,
+one redial on a dead idle conn), the first remote dial rides a UDP
+ticket minted over an existing attached connection when possible, and
+attaching a session consumes the idle connection instead of dialing.
+Daemon discovery re-runs each refresh cycle and prunes vanished
+assistant daemons. Stops in flight keep every matching button
+insensitive across re-renders; the status line derives from live
+state. The broker worker-control buffer is comptime-sized from the
+metadata constants so growth cannot silently truncate 'M' datagrams.
+
+Verified: full suite 1172 pass / 5 skip; core 971 pass / 5 skip;
+smoke-mux, smoke-broker, smoke-e2e; portable mux build; mux binary
+still links only libc/libm. Isolated GUI runs proved stable
+connection counts across polls, kill and attach flows, live
+thumbnails, and search filtering.
