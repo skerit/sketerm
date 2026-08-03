@@ -15,6 +15,7 @@ const image_pass = @import("render/image_pass.zig");
 const cell_pass = @import("render/cell_pass.zig");
 const grid_pass = @import("render/grid_pass.zig");
 const shader_pass = @import("render/shader_pass.zig");
+const editor_pass = @import("render/editor_pass.zig");
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -94,6 +95,7 @@ pub fn main() !u8 {
     failures += try check("image_pass", image_pass.VERT_SRC, image_pass.FRAG_SRC);
     failures += try check("cell_pass", cell_pass.VERT_SRC, cell_pass.FRAG_SRC);
     failures += try check("grid_pass", grid_pass.VERT_SRC, grid_pass.FRAG_SRC);
+    failures += try check("editor_pass", editor_pass.VERT_SRC, editor_pass.FRAG_SRC);
 
     // shader_pass: identity dim shader and the real shipped CRT
     // preset, wrapped exactly the way ensureProgram wraps them.

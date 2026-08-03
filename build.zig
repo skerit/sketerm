@@ -654,6 +654,32 @@ pub fn build(b: *std.Build) void {
     spike_editor_step.dependOn(&spike_editor_run.step);
     }
 
+    // Headless editor-pipeline smoke — `zig build smoke-editor`.
+    // Renders a real Document through editor_font itemization +
+    // editor_layout + EditorPass (EGL surfaceless, same as smoke-cell),
+    // asserting itemization, bidi order, hit testing, cache
+    // invalidation, and rendered selection/caret pixels.
+    if (has_egl) {
+    const smoke_editor_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_editor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_editor_mod, cbindings_mod);
+    smoke_editor_mod.addImport("build_options", glib_opts_mod);
+    smoke_editor_mod.linkSystemLibrary("EGL", .{});
+    const smoke_editor = b.addExecutable(.{
+        .name = "sketerm-smoke-editor",
+        .root_module = smoke_editor_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(smoke_editor);
+    const smoke_editor_run = b.addRunArtifact(smoke_editor);
+    const smoke_editor_step = b.step("smoke-editor", "Headless editor text pipeline render check");
+    smoke_editor_step.dependOn(&smoke_editor_run.step);
+    }
+
     // Desktop-GL core shader smoke — `zig build smoke-gl-core`.
     // Compiles every shader under a GL 3.3 core context: the macOS
     // GDK path, provable on a Linux box via Mesa's EGL desktop-GL.
