@@ -190,6 +190,11 @@ comptime {
     _ = @import("winstream/keymap.zig");
     _ = @import("remote_window.zig");
     _ = @import("terminal.zig");
+    _ = @import("editor/rope.zig");
+    _ = @import("editor/transaction.zig");
+    _ = @import("editor/document.zig");
+    _ = @import("editor/selection.zig");
+    _ = @import("editor/unicode.zig");
 }
 
 test {
