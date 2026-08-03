@@ -11971,3 +11971,38 @@ checks covered preview/full loading, decoder fallback, source-size
 rejection, filtered and expanded-row ordering, rapid navigation,
 manifest cleanup/error handling, side-panel rendering, and Quick Look
 closing during a full-resolution load without GTK criticals.
+
+### Viewer V1 completion
+
+The shared canvas now has fit, fill, actual-size and manual modes,
+pointer-anchored wheel zoom, pinch zoom, drag pan, swipe navigation and
+temporary quarter-turn rotation. Standalone Viewer and Quick Look expose
+the same controls and keyboard equivalents. Their accessible image state
+reports the resource, sequence position, dimensions, effective zoom,
+rotation, loading state and animation playback state.
+
+Glycin and GdkPixbuf decoding now retain bounded multi-frame GIF, APNG
+and animated WebP sequences. Frame delays, finite play counts, a shared
+per-session animation clock, pause/resume, monotonic catch-up and cached
+rotated frames keep playback correct without one timer per canvas.
+Decoded animation bytes, frame count and per-frame pixels all have
+independent limits, and cancellation is checked while frame rows are
+copied.
+
+Viewer actions now include Copy Image, reload, Open With and Show in
+Sketerm Files. Internal image loading still never creates FUSE mounts;
+Open With may explicitly mount a remote resource for an unrelated local
+application and falls back to a bounded daemon download when mounting is
+unavailable. Temporary copies live in a verified private cache, canceled
+copies are removed, launched copies expire, and stale copies are swept.
+Show in Files opens the parent and selects the exact local or remote file
+after its streamed listing arrives, including hidden, filtered and
+grouped views.
+
+Verified on the completed V1: build 33/33; full suite 1166 pass / 5
+skip; core suite 967 pass / 5 skip; aarch64-macos portable mux build;
+desktop/SVG validation; and the mux binary still links only libc/libm.
+Isolated GUI runs proved infinite and finite animation, replay,
+pause/resume, fill, rotation, copy, metadata/accessibility, Quick Look
+promotion, exact Files reveal, and clean status-0 shutdown without GTK
+or GLib criticals.
