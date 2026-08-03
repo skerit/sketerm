@@ -15,6 +15,11 @@ const std = @import("std");
 
 comptime {
     _ = @import("config.zig");
+    _ = @import("editor/document.zig");
+    _ = @import("editor/rope.zig");
+    _ = @import("editor/selection.zig");
+    _ = @import("editor/transaction.zig");
+    _ = @import("editor/unicode.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");
