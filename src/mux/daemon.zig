@@ -74,14 +74,9 @@ pub fn nowMs() i64 {
 /// emits OSC 7 — clients (which have no local pid for a daemon-backed pane)
 /// rely on it for `list` and layout-save. Writes into `buf`, returns the
 /// slice or null. Linux-only; harmless elsewhere (readlink fails → null).
-pub fn cwdOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
-    if (pid <= 0) return null;
-    var path_buf: [64]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
-    const n = c.readlink(link.ptr, buf.ptr, buf.len);
-    if (n <= 0) return null;
-    return buf[0..@intCast(n)];
-}
+/// Working directory of a live session's child. The Linux-vs-macOS
+/// split lives in the platform layer — see `platform.cwdOfPid`.
+pub const cwdOfPid = platform.cwdOfPid;
 
 pub const SpawnReq = struct {
     name: []const u8 = "",
