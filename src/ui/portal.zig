@@ -8,13 +8,19 @@
 //! src/portal.zig; selection happens through docs/portal.md's opt-in
 //! portals.conf line, never automatically.
 //!
-//! Deliberate simplifications (documented in docs/portal.md):
-//! - parent_window handles are NOT imported (xdg-foreign); the picker
-//!   presents as a free-standing modal window instead.
-//! - mimetype filter entries (type 1) are ignored; glob entries map.
-//! - REMOTE picks (host-qualified specs) cannot mean anything to a
-//!   portal consumer: they are dropped, and a selection with no local
-//!   member answers response 2 (other error).
+//! Portal-specific picker behaviour (all of it opt-in per call, so
+//! the plain picker keeps its own rules):
+//! - parent_window handles ARE imported: the dialog is a transient
+//!   child of the caller's window (xdg_foreign on Wayland,
+//!   XSetTransientForHint on X11 -- src/ui/picker.zig).
+//! - filters carry both globs and mimetypes; `current_filter` picks
+//!   the entry selected on open, and the accepted filter is echoed
+//!   back in the results.
+//! - the active filter governs TYPED names too (enforce_filter): an
+//!   app that asked for *.png must not be handed notes.txt.
+//! - REMOTE picks cannot mean anything to a portal consumer, so the
+//!   picker refuses them in the dialog (local_only) instead of
+//!   dropping them silently on the way out.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -101,7 +107,25 @@ const ActiveCall = struct {
     /// Close() arrived: the pending reply becomes response 2.
     closed: bool = false,
     done: bool = false,
+    /// The caller's `filters` array and (when it sent one that was
+    /// not in that array) its `current_filter`, kept referenced so
+    /// the reply can echo the ORIGINAL variant rather than rebuild
+    /// one. Unreffed in finish().
+    filters_v: ?*c.GVariant = null,
+    current_v: ?*c.GVariant = null,
+    /// Source index in the caller's filter list per picker filter;
+    /// SRC_CURRENT means "the appended current_filter" (owned).
+    filter_srcs: []usize = &.{},
+    /// Defaults echoed for the `choices` option (owned, "id\x00value").
+    choices: [][]u8 = &.{},
+    /// Picker filter index the user accepted under (null = All files).
+    chosen_filter: ?usize = null,
+    /// Watch on the calling bus name: a frontend that dies takes its
+    /// dialog with it.
+    watch_id: c.guint = 0,
 };
+
+const SRC_CURRENT = std.math.maxInt(usize);
 
 pub fn run(allocator: std.mem.Allocator) u8 {
     g_portal = .{ .allocator = allocator };
@@ -262,9 +286,6 @@ fn handleChooser(
     var parent_c: [*c]const u8 = null;
     var title_c: [*c]const u8 = null;
     var opts: ?*c.GVariant = null;
-    // parent_window (arg 3) is deliberately skipped: foreign-handle
-    // import is not attempted; the picker presents free-standing
-    // (docs/portal.md).
     c.g_variant_get(parameters, "(&o&s&s&s@a{sv})", &handle_c, &appid_c, &parent_c, &title_c, &opts);
     defer if (opts) |o| c.g_variant_unref(o);
 
@@ -291,7 +312,8 @@ fn handleChooser(
     defer arena.deinit();
     const a = arena.allocator();
 
-    const filters = try collectFilters(a, opts);
+    var fset = try collectFilters(alloc, a, opts);
+    errdefer fset.release(alloc);
 
     var initial: ?[]const u8 = if (folder_c != null and folder_c.* != 0) spanZ(folder_c) else null;
     var suggested: ?[]const u8 = if (name_c != null and name_c.* != 0) spanZ(name_c) else null;
@@ -333,6 +355,12 @@ fn handleChooser(
         null;
     const title: ?[]const u8 = if (title_c != null and title_c.* != 0) spanZ(title_c) else null;
 
+    const choices = try collectChoiceDefaults(alloc, opts);
+    errdefer {
+        for (choices) |ch| alloc.free(ch);
+        alloc.free(choices);
+    }
+
     const call = try alloc.create(ActiveCall);
     errdefer alloc.destroy(call);
     const handle_owned = try alloc.dupeZ(u8, spanZ(handle_c));
@@ -341,7 +369,16 @@ fn handleChooser(
         .invocation = invocation,
         .method = method,
         .handle_path = handle_owned,
+        .filters_v = fset.filters_v,
+        .current_v = fset.current_v,
+        .filter_srcs = fset.srcs,
+        .choices = choices,
     };
+    // Ownership of the filter refs/indices has moved into `call`;
+    // disarm the errdefer above so nothing is released twice.
+    fset.filters_v = null;
+    fset.current_v = null;
+    fset.srcs = &.{};
     call.names = names.toOwnedSlice(alloc) catch blk: {
         break :blk &.{};
     };
@@ -359,13 +396,33 @@ fn handleChooser(
         null,
     );
 
+    // A frontend that dies mid-call leaves an orphan dialog on the
+    // user's screen otherwise; the watch cancels it.
+    const sender = c.g_dbus_method_invocation_get_sender(invocation);
+    if (sender != null) {
+        call.watch_id = c.g_bus_watch_name_on_connection(
+            g_portal.conn,
+            sender,
+            c.G_BUS_NAME_WATCHER_FLAGS_NONE,
+            null,
+            @ptrCast(&onCallerVanished),
+            @ptrCast(call),
+            null,
+        );
+    }
+
+    const parent_handle: ?[]const u8 = if (parent_c != null and parent_c.* != 0) spanZ(parent_c) else null;
     const req = fpicker.Request{
         .mode = policy.modeFor(method, multiple, directory),
         .initial_spec = initial,
-        .filters = filters,
+        .filters = fset.filters,
+        .active_filter = fset.active,
         .suggested_name = suggested,
         .title = title,
         .accept_label = accept,
+        .enforce_filter = true,
+        .local_only = true,
+        .foreign_parent = parent_handle,
     };
     call.picker = PickerWindow.open(alloc, null, req, &onPickerResult, @ptrCast(call)) catch {
         finish(call, policy.RESPONSE_OTHER, &.{});
@@ -373,46 +430,139 @@ fn handleChooser(
     };
 }
 
-/// Decode the portal filter list (a(sa(us))) into picker filters via
-/// the pure mapper. Allocation from the caller's arena.
-fn collectFilters(a: std.mem.Allocator, opts: ?*c.GVariant) ![]const fpicker.Filter {
-    const filters_v = c.g_variant_lookup_value(opts, "filters", c.G_VARIANT_TYPE("a(sa(us))")) orelse
+fn onCallerVanished(_: ?*c.GDBusConnection, _: [*c]const c.gchar, user: ?*anyopaque) callconv(.c) void {
+    const call = cast.userData(ActiveCall, user);
+    if (call.done) return;
+    call.closed = true;
+    if (call.picker) |p| p.cancel();
+}
+
+/// The `choices` option (a(ssa(ss)s)) has no widgets in this picker
+/// yet; echoing each choice's declared default keeps callers that
+/// read the results dict from seeing a missing key. Returns
+/// "id\x00value" pairs (owned by `alloc`).
+fn collectChoiceDefaults(alloc: std.mem.Allocator, opts: ?*c.GVariant) ![][]u8 {
+    const v = c.g_variant_lookup_value(opts, "choices", c.G_VARIANT_TYPE("a(ssa(ss)s)")) orelse
         return &.{};
-    defer c.g_variant_unref(filters_v);
+    defer c.g_variant_unref(v);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |o| alloc.free(o);
+        out.deinit(alloc);
+    }
+    var it: c.GVariantIter = undefined;
+    _ = c.g_variant_iter_init(&it, v);
+    while (c.g_variant_iter_next_value(&it)) |child| {
+        defer c.g_variant_unref(child);
+        const id_v = c.g_variant_get_child_value(child, 0);
+        defer c.g_variant_unref(id_v);
+        const def_v = c.g_variant_get_child_value(child, 3);
+        defer c.g_variant_unref(def_v);
+        const id = spanZ(c.g_variant_get_string(id_v, null));
+        const def = spanZ(c.g_variant_get_string(def_v, null));
+        if (id.len == 0 or def.len == 0) continue;
+        const pair = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ id, def });
+        try out.append(alloc, pair);
+    }
+    return out.toOwnedSlice(alloc);
+}
 
-    // Structural child_value/get_string access only: the varargs
-    // conversion paths (iter_loop "&s", lookup "^&ay") returned
-    // corrupt borrows through the translated bindings.
-    var raw: std.ArrayList(policy.RawFilter) = .empty;
-    var outer: c.GVariantIter = undefined;
-    _ = c.g_variant_iter_init(&outer, filters_v);
-    while (c.g_variant_iter_next_value(&outer)) |fv| {
-        defer c.g_variant_unref(fv);
-        const label_v = c.g_variant_get_child_value(fv, 0);
-        defer c.g_variant_unref(label_v);
-        const entries_v = c.g_variant_get_child_value(fv, 1);
-        defer c.g_variant_unref(entries_v);
+/// Everything the filter options amount to: what the picker shows,
+/// which entry starts selected, and how to get back to the caller's
+/// own filter variants when the reply echoes `current_filter`.
+const FilterSet = struct {
+    filters: []const fpicker.Filter = &.{},
+    active: usize = 0,
+    /// Owned by the LONG-LIVED allocator (moves into the ActiveCall).
+    srcs: []usize = &.{},
+    filters_v: ?*c.GVariant = null,
+    current_v: ?*c.GVariant = null,
 
-        var entries: std.ArrayList(policy.RawEntry) = .empty;
-        var it: c.GVariantIter = undefined;
-        _ = c.g_variant_iter_init(&it, entries_v);
-        while (c.g_variant_iter_next_value(&it)) |ev| {
-            defer c.g_variant_unref(ev);
-            const kind_v = c.g_variant_get_child_value(ev, 0);
-            defer c.g_variant_unref(kind_v);
-            const pat_v = c.g_variant_get_child_value(ev, 1);
-            defer c.g_variant_unref(pat_v);
-            try entries.append(a, .{
-                .kind = c.g_variant_get_uint32(kind_v),
-                .pattern = try a.dupe(u8, spanZ(c.g_variant_get_string(pat_v, null))),
-            });
-        }
-        try raw.append(a, .{
-            .label = try a.dupe(u8, spanZ(c.g_variant_get_string(label_v, null))),
-            .entries = try entries.toOwnedSlice(a),
+    fn release(self: *FilterSet, alloc: std.mem.Allocator) void {
+        if (self.srcs.len > 0) alloc.free(self.srcs);
+        self.srcs = &.{};
+        if (self.filters_v) |v| c.g_variant_unref(v);
+        if (self.current_v) |v| c.g_variant_unref(v);
+        self.filters_v = null;
+        self.current_v = null;
+    }
+};
+
+/// One a(us) entry list off a (sa(us)) filter variant.
+/// Structural child_value/get_string access only: the varargs
+/// conversion paths (iter_loop "&s", lookup "^&ay") returned corrupt
+/// borrows through the translated bindings.
+fn readRawFilter(a: std.mem.Allocator, fv: *c.GVariant) !policy.RawFilter {
+    const label_v = c.g_variant_get_child_value(fv, 0);
+    defer c.g_variant_unref(label_v);
+    const entries_v = c.g_variant_get_child_value(fv, 1);
+    defer c.g_variant_unref(entries_v);
+
+    var entries: std.ArrayList(policy.RawEntry) = .empty;
+    var it: c.GVariantIter = undefined;
+    _ = c.g_variant_iter_init(&it, entries_v);
+    while (c.g_variant_iter_next_value(&it)) |ev| {
+        defer c.g_variant_unref(ev);
+        const kind_v = c.g_variant_get_child_value(ev, 0);
+        defer c.g_variant_unref(kind_v);
+        const pat_v = c.g_variant_get_child_value(ev, 1);
+        defer c.g_variant_unref(pat_v);
+        try entries.append(a, .{
+            .kind = c.g_variant_get_uint32(kind_v),
+            .pattern = try a.dupe(u8, spanZ(c.g_variant_get_string(pat_v, null))),
         });
     }
-    return policy.mapFilters(a, raw.items);
+    return .{
+        .label = try a.dupe(u8, spanZ(c.g_variant_get_string(label_v, null))),
+        .entries = try entries.toOwnedSlice(a),
+    };
+}
+
+/// Decode `filters` (a(sa(us))) and `current_filter` ((sa(us))) into
+/// picker filters via the pure mapper. `a` is the call arena (picker
+/// copies everything at open); `alloc` owns what outlives the call.
+fn collectFilters(alloc: std.mem.Allocator, a: std.mem.Allocator, opts: ?*c.GVariant) !FilterSet {
+    var set = FilterSet{};
+    errdefer set.release(alloc);
+    set.filters_v = c.g_variant_lookup_value(opts, "filters", c.G_VARIANT_TYPE("a(sa(us))"));
+    set.current_v = c.g_variant_lookup_value(opts, "current_filter", c.G_VARIANT_TYPE("(sa(us))"));
+
+    var raw: std.ArrayList(policy.RawFilter) = .empty;
+    if (set.filters_v) |fv| {
+        var outer: c.GVariantIter = undefined;
+        _ = c.g_variant_iter_init(&outer, fv);
+        while (c.g_variant_iter_next_value(&outer)) |child| {
+            defer c.g_variant_unref(child);
+            try raw.append(a, try readRawFilter(a, child));
+        }
+    }
+    const listed = raw.items.len;
+
+    // current_filter need not be a member of `filters` (GTK's own
+    // backend tolerates that too); an outsider is appended so the
+    // user can still see and leave the selection.
+    var current_src: ?usize = null;
+    if (set.current_v) |cv| {
+        const cur = try readRawFilter(a, cv);
+        if (policy.findRawFilter(raw.items, cur)) |i| {
+            current_src = i;
+        } else if (cur.entries.len > 0) {
+            try raw.append(a, cur);
+            current_src = raw.items.len - 1;
+        }
+    }
+
+    const mapped = try policy.mapFilters(a, raw.items);
+    set.filters = try policy.pickerFilters(a, mapped);
+    set.active = if (current_src) |src|
+        (policy.mappedIndexOfSrc(mapped, src) orelse mapped.len)
+    else
+        0;
+
+    const srcs = try alloc.alloc(usize, mapped.len);
+    for (mapped, 0..) |m, i| srcs[i] = if (m.src >= listed) SRC_CURRENT else m.src;
+    set.srcs = srcs;
+    return set;
 }
 
 // -- Request object (Close) --------------------------------------
@@ -453,6 +603,7 @@ fn onPickerResult(ctx: ?*anyopaque, result: ?fpicker.Result) void {
         finish(call, if (call.closed) policy.RESPONSE_OTHER else policy.RESPONSE_CANCELLED, &.{});
         return;
     }
+    call.chosen_filter = result.?.filter_index;
 
     var arena = std.heap.ArenaAllocator.init(call.allocator);
     defer arena.deinit();
@@ -500,6 +651,29 @@ fn finish(call: *ActiveCall, response: u32, uris: []const [:0]const u8) void {
         for (uris) |u| c.g_variant_builder_add(&ub, "s", u.ptr);
         c.g_variant_builder_add(&results, "{sv}", "uris", c.g_variant_builder_end(&ub));
     }
+    if (response == policy.RESPONSE_OK) {
+        if (currentFilterVariant(call)) |cf| {
+            // Our own ref: the "v" format sinks/refs it, so drop ours.
+            c.g_variant_builder_add(&results, "{sv}", "current_filter", cf);
+            c.g_variant_unref(cf);
+        }
+        if (call.choices.len > 0) {
+            var cb: c.GVariantBuilder = undefined;
+            c.g_variant_builder_init(&cb, c.G_VARIANT_TYPE("a(ss)"));
+            for (call.choices) |pair| {
+                const sep = std.mem.indexOfScalar(u8, pair, 0) orelse continue;
+                // Both halves are NUL-terminated in place: the
+                // separator ends the id, the allocation's own
+                // terminator is not guaranteed, so copy out.
+                var idz: [128:0]u8 = undefined;
+                var valz: [128:0]u8 = undefined;
+                const id = std.fmt.bufPrintZ(&idz, "{s}", .{pair[0..sep]}) catch continue;
+                const val = std.fmt.bufPrintZ(&valz, "{s}", .{pair[sep + 1 ..]}) catch continue;
+                c.g_variant_builder_add(&cb, "(ss)", id.ptr, val.ptr);
+            }
+            c.g_variant_builder_add(&results, "{sv}", "choices", c.g_variant_builder_end(&cb));
+        }
+    }
     c.g_dbus_method_invocation_return_value(
         call.invocation,
         c.g_variant_new("(u@a{sv})", response, c.g_variant_builder_end(&results)),
@@ -509,9 +683,33 @@ fn finish(call: *ActiveCall, response: u32, uris: []const [:0]const u8) void {
         _ = c.g_dbus_connection_unregister_object(g_portal.conn, call.request_reg);
         call.request_reg = 0;
     }
+    if (call.watch_id != 0) {
+        c.g_bus_unwatch_name(call.watch_id);
+        call.watch_id = 0;
+    }
     const alloc = call.allocator;
     for (call.names) |n| alloc.free(n);
     if (call.names.len > 0) alloc.free(call.names);
+    for (call.choices) |ch| alloc.free(ch);
+    if (call.choices.len > 0) alloc.free(call.choices);
+    if (call.filter_srcs.len > 0) alloc.free(call.filter_srcs);
+    if (call.filters_v) |v| c.g_variant_unref(v);
+    if (call.current_v) |v| c.g_variant_unref(v);
     alloc.free(call.handle_path);
     alloc.destroy(call);
+}
+
+/// The caller's own (sa(us)) variant for the filter the user accepted
+/// under -- a floating reference the results builder consumes.
+fn currentFilterVariant(call: *ActiveCall) ?*c.GVariant {
+    const idx = call.chosen_filter orelse return null;
+    if (idx >= call.filter_srcs.len) return null;
+    const src = call.filter_srcs[idx];
+    if (src == SRC_CURRENT) {
+        const cv = call.current_v orelse return null;
+        return c.g_variant_ref(cv);
+    }
+    const fv = call.filters_v orelse return null;
+    if (src >= c.g_variant_n_children(fv)) return null;
+    return c.g_variant_get_child_value(fv, src);
 }
