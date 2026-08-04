@@ -180,10 +180,21 @@ was needed — pkgconf's defaults cover the brew prefix.
   hammers the capture-denied path. Whether the Darwin datagram control
   channel contributes cannot be A/B tested, because without it macOS
   spawns no sessions at all.
-  Next step for whoever picks this up: preserve the rig's runtime dir
-  (it is `removeTreeBestEffort`'d on exit) so its `mux.log` survives a
-  failing run, and check for fd exhaustion across repeated denied
-  captures.
+  **Strongest lead: the rig ORPHANS one `sketerm-mux --broker` per
+  run.** After ~14 smoke-e2e runs there were 14 daemons with `ppid 1`,
+  each still holding an `XDG_RUNTIME_DIR=/tmp/sketerm-smoke-e2e-<pid>`
+  whose directory had already been deleted. `teardown()` kills only the
+  daemon it forked itself (`daemon_pid`), so this is a SECOND daemon —
+  almost certainly one the GUI child autostarted via
+  `connectLocalAutostart` because the rig's own daemon was not
+  listening yet. Two daemons racing for one isolated socket is a very
+  plausible source of a dropped client connection, and it is a leak
+  regardless: nothing may orphan daemons by design.
+  Next steps: have the rig record and reap any daemon the GUI
+  autostarts (or wait for its own socket before launching the GUI), and
+  preserve the runtime dir (it is `removeTreeBestEffort`'d on exit) so
+  `mux.log` survives a failing run. Also worth checking fd exhaustion
+  across repeated denied captures.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
 - **No filesystem watcher backend — the one real feature gap.**
