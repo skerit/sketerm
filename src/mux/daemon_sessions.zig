@@ -28,6 +28,7 @@ const removeTreeBestEffort = dmod.removeTreeBestEffort;
 const SessionInfo = dmod.SessionInfo;
 const RenameReq = dmod.RenameReq;
 const controlSend = @import("daemon_serve.zig").controlSend;
+const WORKER_META_BUF = @import("daemon_serve.zig").WORKER_META_BUF;
 const runWorker = @import("daemon_serve.zig").runWorker;
 const version = @import("../version.zig");
 const a11yhub = @import("a11yhub.zig");
@@ -183,10 +184,12 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     }
 
-    // SEQPACKET so each control message (and its SCM_RIGHTS fd) is one
-    // clean datagram on the broker↔worker channel.
+    // A datagram channel, so each control message (and its SCM_RIGHTS
+    // fd) stays one clean unit on the broker↔worker channel — sized to
+    // carry the largest metadata push. See platform.controlSocketpair
+    // for the Linux-vs-Darwin split behind it.
     var sp: [2]c_int = undefined;
-    if (c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &sp) != 0) {
+    if (platform.controlSocketpair(&sp, WORKER_META_BUF) != 0) {
         cl.queueErr("spawn failed: socketpair (fd exhaustion?)");
         return;
     }

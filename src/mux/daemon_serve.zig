@@ -40,9 +40,12 @@ const wallMs = dmod.wallMs;
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
 // A worker process owns one session and receives its clients as fds
-// passed by the broker over a SOCK_SEQPACKET control socketpair. Each
+// passed by the broker over a datagram control socketpair (SEQPACKET on
+// Linux, DGRAM on Darwin — see platform.controlSocketpair). Each
 // control message is one datagram: [opcode][payload], with at most one
-// fd in SCM_RIGHTS. Opcodes: 'A' attach (payload
+// fd in SCM_RIGHTS. A non-positive recv means the channel is gone —
+// test `n <= 0`, never `n == 0`, since Darwin reports a closed peer as
+// -1/ECONNRESET. Opcodes: 'A' attach (payload
 // [proto][video][kind][native_state_max][snapshot][audio][winstream]
 // + the client fd),
 // 'K' kill. (list/rename/metadata join in B3.)
@@ -193,7 +196,7 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
 /// either one grows this buffer instead of silently truncating the
 /// datagram (a truncated push fails to parse FOREVER — the hash matches
 /// so it is never resent).
-const WORKER_META_BUF: usize =
+pub const WORKER_META_BUF: usize =
     dmod.Daemon.MAX_AUDIO_STREAMS * (4 * pulse.META_STRING_MAX * 6 + 256) + 32768;
 
 /// Broker side: read one control datagram from a worker. 'Y' = ready
@@ -385,7 +388,8 @@ pub fn maybePushMeta(self: *Daemon) void {
         .activity = s.last_activity_ms,
         .child_pid = s.pty.child_pid,
         // Bounded so one JSON datagram stays well under the broker's
-        // recv buffer (a SOCK_SEQPACKET over-long datagram is truncated).
+        // recv buffer (an over-long datagram is truncated, and on Darwin
+        // refused outright once it passes the socket buffer).
         .title = title[0..@min(title.len, 256)],
         .cwd = cwd[0..@min(cwd.len, 1024)],
         .display = s.display,
