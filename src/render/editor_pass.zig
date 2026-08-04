@@ -47,6 +47,7 @@ const Document = @import("../editor/document.zig").Document;
 const SelectionSet = @import("../editor/selection.zig").SelectionSet;
 const search = @import("../editor/search.zig");
 const theme_mod = @import("../editor/theme.zig");
+const structure = @import("../editor/structure.zig");
 
 pub const KIND_BG: f32 = 0;
 pub const KIND_GLYPH: f32 = 1;
@@ -154,6 +155,19 @@ pub const Colors = struct {
     /// Opaque backing behind an IME composition (masks the document
     /// glyphs the composition is drawn over).
     preedit_bg: [4]f32 = .{ 0.09, 0.09, 0.12, 1.0 },
+    /// Box behind each half of the bracket pair around the caret.
+    bracket: [4]f32 = .{ 0.44, 0.83, 0.78, 0.42 },
+    /// Badge standing in for a folded region's hidden lines.
+    fold_badge: [4]f32 = .{ 0.50, 0.53, 0.57, 0.25 },
+    /// Gutter chevron + the badge's dots.
+    fold_fg: [4]f32 = .{ 0.60, 0.64, 0.68, 1.0 },
+};
+
+/// One gutter fold affordance. `folded` picks the glyph direction and
+/// is what makes the marker a toggle rather than a decoration.
+pub const FoldMarker = struct {
+    line: usize,
+    folded: bool,
 };
 
 pub const View = struct {
@@ -168,6 +182,10 @@ pub const View = struct {
     margin_x: f32 = 8,
     /// Draw the line-number gutter.
     show_line_numbers: bool = true,
+    /// Reserve the fold column. A VIEW flag, not "does this viewport
+    /// contain a marker": the gutter's width must not change while you
+    /// scroll, or the text shifts sideways under the caret.
+    show_fold_column: bool = false,
     /// Band behind the caret row (single collapsed caret only).
     highlight_current_line: bool = false,
     /// Blink phase — false hides the document carets (never the
@@ -197,6 +215,16 @@ pub const Frame = struct {
     matches: []const search.Match = &.{},
     current_match: ?usize = null,
     preedit: ?Preedit = null,
+    /// Folded regions. Hidden lines are SKIPPED by the layout walk, so
+    /// a folded document costs less to render, not more.
+    folds: ?*const structure.FoldState = null,
+    /// Gutter affordances for the lines this frame will draw, sorted
+    /// by line. The caller computes them for the visible range only
+    /// (see EditorView.ensureFoldMarkers).
+    fold_markers: []const FoldMarker = &.{},
+    /// Byte ranges to box as the caret's bracket pair (0, 1 or 2 per
+    /// caret).
+    brackets: []const structure.Range = &.{},
     /// Per-highlight-kind glyph colours. Null = every glyph paints in
     /// `colors.text` (plain text, or syntax highlighting switched off).
     /// The layout tags each glyph with its kind; `Kind.none` resolves
@@ -357,18 +385,27 @@ pub const EditorPass = struct {
         });
     }
 
-    /// Gutter width for a document of `n_lines` (0 when line numbers
-    /// are off). Shared with the caller's hit testing.
-    pub fn gutterWidth(atlas: *Atlas, n_lines: usize, show: bool) !f32 {
-        if (!show) return 0;
-        var digits: usize = 1;
-        var v = n_lines;
-        while (v >= 10) : (v /= 10) digits += 1;
-        const digit_g = try atlas.lookupOrLoad('0', false, false);
-        return @as(f32, @floatFromInt(digits)) * digit_g.advance + GUTTER_PAD * 2;
+    /// Gutter width for a document of `n_lines` (0 when neither line
+    /// numbers nor a fold column are wanted). Shared with the caller's
+    /// hit testing — EditorView.gutterWidth must pass the SAME flags or
+    /// clicks land on the wrong column.
+    pub fn gutterWidth(atlas: *Atlas, n_lines: usize, show: bool, fold_col: bool) !f32 {
+        var w: f32 = 0;
+        if (show) {
+            var digits: usize = 1;
+            var v = n_lines;
+            while (v >= 10) : (v /= 10) digits += 1;
+            const digit_g = try atlas.lookupOrLoad('0', false, false);
+            w += @as(f32, @floatFromInt(digits)) * digit_g.advance + GUTTER_PAD * 2;
+        }
+        if (fold_col) w += FOLD_COL_W;
+        return w;
     }
 
     const GUTTER_PAD: f32 = 6;
+    /// Width of the fold column, on the TEXT side of the line numbers
+    /// (VS Code's placement).
+    pub const FOLD_COL_W: f32 = 14;
 
     /// Rebuild the instance list for the current document/selection
     /// state: current-line band, match highlights, selection rects,
@@ -394,7 +431,7 @@ pub const EditorPass = struct {
         const asc = layout.ascent();
         const n_lines = doc.rope.lineCount();
 
-        const gutter_w = try gutterWidth(atlas, n_lines, view.show_line_numbers);
+        const gutter_w = try gutterWidth(atlas, n_lines, view.show_line_numbers, view.show_fold_column);
         const text_x0 = gutter_w + view.margin_x - view.scroll_x;
         self.text_origin_x = text_x0;
         // Document-side geometry is clipped here; the gutter itself
@@ -418,9 +455,15 @@ pub const EditorPass = struct {
         // sits `offset` px above the top edge, and the rows of the
         // anchor line ABOVE it are off-screen.
         var li: usize = @min(view.anchor.line, n_lines -| 1);
+        // The anchor must never sit on a hidden line; if a fold landed
+        // on it between frames, start at the next visible one.
+        if (frame.folds) |f| li = f.nextVisible(li);
         var y: f32 = -view.anchor.offset - @as(f32, @floatFromInt(view.anchor.row)) * line_h;
 
-        while (li < n_lines and y < view.height_px) : (li += 1) {
+        // Hidden lines are SKIPPED in the step, never visited and
+        // `continue`d: folding a 100k-line region must not cost 100k
+        // interval lookups per frame.
+        while (li < n_lines and y < view.height_px) : (li = nextVisibleLine(frame.folds, li + 1)) {
             const ll = try layout.line(doc, li);
             self.lines_laid_out += 1;
             if (frame.rows) |ri| ri.note(li, @intCast(ll.rows.len));
@@ -457,8 +500,10 @@ pub const EditorPass = struct {
                 try self.addRangeRects(ll, m.start, m.end, text_x0, y, line_h, col);
             }
 
-            // Line number, right-aligned in the gutter, on the first row.
-            if (gutter_w > 0) {
+            // Line number, right-aligned in the number field (the fold
+            // column sits to its right and is not part of it).
+            const num_w = gutter_w - (if (view.show_fold_column) FOLD_COL_W else 0);
+            if (view.show_line_numbers and num_w > 0) {
                 var buf: [20]u8 = undefined;
                 const s = std.fmt.bufPrint(&buf, "{d}", .{li + 1}) catch unreachable;
                 var w: f32 = 0;
@@ -466,11 +511,19 @@ pub const EditorPass = struct {
                     const g = try atlas.lookupOrLoad(ch, false, false);
                     w += g.advance;
                 }
-                var gx = gutter_w - GUTTER_PAD - w;
+                var gx = num_w - GUTTER_PAD - w;
                 for (s) |ch| {
                     const g = try atlas.lookupOrLoad(ch, false, false);
                     try self.addGlyphRaw(g, gx, y + asc, 0, colors.gutter_fg, KIND_GUTTER_GLYPH);
                     gx += g.advance;
+                }
+            }
+
+            // Fold chevron. Drawn as geometry rather than a glyph so it
+            // does not depend on the font covering any arrow codepoint.
+            if (view.show_fold_column) {
+                if (markerFor(frame.fold_markers, li)) |m| {
+                    try self.addChevron(num_w, y, line_h, m.folded, colors.fold_fg);
                 }
             }
 
@@ -498,6 +551,31 @@ pub const EditorPass = struct {
                 );
             }
 
+            // Bracket-pair boxes. KIND_BG, so they paint UNDER the
+            // glyphs whatever order they are appended in and the
+            // bracket character stays readable through the tint.
+            for (frame.brackets) |br| {
+                if (br.end <= ll.byte_start or br.start > ll.byte_end) continue;
+                try self.addRangeRects(ll, br.start, br.end, text_x0, y, line_h, colors.bracket);
+            }
+
+            // Folded-region badge, at the end of the header line's last
+            // row: the affordance that says "content is hidden here".
+            if (frame.folds) |f| {
+                if (f.entryAtLine(li) != null) {
+                    const last = ll.rows[ll.rows.len - 1];
+                    const last_row: f32 = @floatFromInt(ll.rows.len - 1);
+                    try self.addFoldBadge(
+                        atlas,
+                        text_x0 + (last.x1 - last.x0) + 6,
+                        y + last_row * line_h,
+                        line_h,
+                        asc,
+                        colors,
+                    );
+                }
+            }
+
             // Caret bars. A caret at the line's trailing edge
             // (byte == byte_end) also renders here.
             for (sels.sels.items, 0..) |sel, si| {
@@ -520,6 +598,73 @@ pub const EditorPass = struct {
                     try self.addPreedit(pe, text_x0 + cp.x, row_y, line_h, asc, colors);
                 }
             }
+        }
+    }
+
+    /// First visible line at or after `line` (identity with no folds).
+    fn nextVisibleLine(folds: ?*const structure.FoldState, line: usize) usize {
+        const f = folds orelse return line;
+        return f.nextVisible(line);
+    }
+
+    fn markerFor(markers: []const FoldMarker, line: usize) ?FoldMarker {
+        // Linear: the list only ever covers one viewport.
+        for (markers) |m| {
+            if (m.line == line) return m;
+        }
+        return null;
+    }
+
+    /// A triangle approximated by stacked rects: pointing DOWN when the
+    /// region is open, RIGHT when it is folded.
+    ///
+    /// KIND_GUTTER_BG, NOT KIND_GUTTER_GLYPH: the *_GLYPH kinds make
+    /// the fragment shader sample the atlas, and a rect carries no UVs,
+    /// so a chevron tagged as a glyph is drawn perfectly invisibly.
+    /// The gutter background is appended before any line is walked, so
+    /// within that kind's draw the chevron still lands on top of it.
+    fn addChevron(self: *EditorPass, col_x: f32, y: f32, line_h: f32, folded: bool, color: [4]f32) !void {
+        const size: f32 = @min(8.0, line_h - 4);
+        if (size < 3) return;
+        const x0 = col_x + (FOLD_COL_W - size) / 2;
+        const y0 = y + (line_h - size) / 2;
+        const steps: usize = 4;
+        const step = size / @as(f32, @floatFromInt(steps));
+        var i: usize = 0;
+        while (i < steps) : (i += 1) {
+            const t: f32 = @floatFromInt(i);
+            if (folded) {
+                // Right-pointing: a column per step, shrinking in height.
+                const h = size - 2 * t * step;
+                if (h <= 0) break;
+                try self.addRectRaw(KIND_GUTTER_BG, x0 + t * step, y0 + t * step, step, h, color);
+            } else {
+                // Down-pointing: a row per step, shrinking in width.
+                const w = size - 2 * t * step;
+                if (w <= 0) break;
+                try self.addRectRaw(KIND_GUTTER_BG, x0 + t * step, y0 + t * step, w, step, color);
+            }
+        }
+    }
+
+    /// The "content hidden here" badge: a tinted pill with three dots.
+    fn addFoldBadge(
+        self: *EditorPass,
+        atlas: *Atlas,
+        x: f32,
+        row_y: f32,
+        line_h: f32,
+        asc: f32,
+        colors: Colors,
+    ) !void {
+        const dot = try atlas.lookupOrLoad('.', false, false);
+        const w = dot.advance * 3 + 8;
+        try self.addRect(KIND_BG, x, row_y + 2, w, line_h - 4, colors.fold_badge);
+        var gx = x + 4;
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            try self.addGlyph(dot, gx, row_y + asc, 0, colors.fold_fg);
+            gx += dot.advance;
         }
     }
 

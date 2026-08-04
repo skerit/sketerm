@@ -367,6 +367,14 @@ pub const Config = struct {
     /// Tree-sitter syntax highlighting (src/editor/syntax.zig). Off
     /// renders every document as plain text in the theme's foreground.
     editor_syntax: bool = true,
+    /// Box the bracket pair around the caret. App level, like every
+    /// other editor view flag.
+    editor_bracket_match: bool = true,
+    /// Code folding: gutter fold column, chevrons and the fold actions.
+    editor_folding: bool = true,
+    /// Derive fold regions from INDENTATION for files with no grammar.
+    /// Off means such files simply have no folds.
+    editor_fold_indent_fallback: bool = true,
     /// Colour theme name — see `editor/theme.zig`'s `byName`, which
     /// falls back to "dark" for anything it does not know.
     editor_theme: []const u8 = "dark",
@@ -841,6 +849,10 @@ pub const Config = struct {
         if (!self.editor_highlight_current_line)
             try w.writeAll("editor_highlight_current_line = false\n");
         if (!self.editor_syntax) try w.writeAll("editor_syntax = false\n");
+        if (!self.editor_bracket_match) try w.writeAll("editor_bracket_match = false\n");
+        if (!self.editor_folding) try w.writeAll("editor_folding = false\n");
+        if (!self.editor_fold_indent_fallback)
+            try w.writeAll("editor_fold_indent_fallback = false\n");
         if (!std.mem.eql(u8, self.editor_theme, "dark"))
             try w.print("editor_theme = {s}\n", .{self.editor_theme});
 
@@ -1383,6 +1395,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_highlight_current_line = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_syntax")) {
         cfg.editor_syntax = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_bracket_match")) {
+        cfg.editor_bracket_match = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_folding")) {
+        cfg.editor_folding = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_fold_indent_fallback")) {
+        cfg.editor_fold_indent_fallback = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_theme")) {
         cfg.editor_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
