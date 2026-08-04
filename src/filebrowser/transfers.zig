@@ -24,6 +24,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
+const platform = @import("../util/platform.zig");
 const profile = @import("../util/profile.zig");
 
 pub const VERSION: u32 = 5;
@@ -464,9 +465,22 @@ pub fn lockLegacy(allocator: std.mem.Allocator) !?LegacyLock {
         _ = c.close(fd);
         return null;
     }
-    if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
-        _ = c.close(fd);
-        return null;
+    // Linux keeps fcntl and flock in independent lock spaces, so the
+    // flock has to be taken as well to exclude a NEW binary (which locks
+    // records with flock) while the fcntl above excludes an OLD one.
+    //
+    // Darwin runs both kinds through ONE advisory-lock list per vnode,
+    // as distinct owners: they conflict across processes — verified both
+    // directions — which is exactly the exclusion this wants, and they
+    // therefore also conflict with each other inside this process, so
+    // the call below would fail EWOULDBLOCK against the lock just taken
+    // and abandon every migration. One fcntl lock already covers both
+    // sides there.
+    if (comptime platform.is_linux) {
+        if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+            _ = c.close(fd);
+            return null;
+        }
     }
     return .{ .fd = fd };
 }
