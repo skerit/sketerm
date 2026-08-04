@@ -222,39 +222,39 @@ was needed — pkgconf's defaults cover the brew prefix.
   across repeated denied captures.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
-- **No filesystem watcher backend — the one real feature gap.**
-  `fsserve.Watcher` is inotify-backed and inert elsewhere
-  (`fsserve.live_deltas` is the predicate), so on macOS:
-  * a directory VIEW serves its initial listing and never updates —
-    including for changes the daemon itself makes through the mutation
-    verbs, since those are observed through the same watch rather than
-    synthesised. A browser listing goes stale until re-listed.
-  * live queries (`live_find`) refuse honestly: "live queries need the
-    platform watcher backend".
+- **Live views/queries run on kqueue here, with one named gap.**
+  `fsserve.Watcher` now has two backends behind a single event
+  vocabulary (`Mask`, which IS inotify's bit values — pinned by a
+  comptime assert on Linux so the shared decoder cannot drift):
+  inotify, and a kqueue directory watcher for macOS. kqueue only
+  reports WHICH DIRECTORY changed, so the Darwin side re-reads that
+  directory and diffs it against a snapshot to recover the per-entry
+  events, handing them back in inotify's record layout through
+  `Watcher.readInto` — which is why neither consumer may `read()` the
+  fd directly any more.
 
-  The `smoke-fs` stages asserting either are gated on that predicate;
-  the mutation verbs stay under test there via a re-list. **This gate
-  is a placeholder for the backend, not the intended end state.**
+  Measured on macOS 26 (`EVFILT_VNODE` on a directory fd): NOTE_WRITE
+  fires for an entry created, deleted or renamed, and NOTE_DELETE for
+  the watched directory itself — but **appending to an existing CHILD
+  fires nothing**, because that never touches the directory. So
+  `fsserve.watch_sees_child_writes` is false here: inotify's
+  IN_CLOSE_WRITE has no kqueue equivalent short of one fd per FILE
+  instead of per directory, which does not scale to a large listing
+  (macOS ships a 256 soft `RLIMIT_NOFILE`). A size/mtime change is
+  still picked up the next time anything else in that directory moves.
 
-  Design notes for whoever lands it — the choice is not obvious:
-  * **kqueue** (`EVFILT_VNODE` on a directory fd) is the natural fit
-    for a poll loop, but reports only *that* a directory changed, not
-    which entry, so it needs a per-watch snapshot and a readdir+diff to
-    synthesise per-name events. Worse, a child's *content* change does
-    not fire the directory's event at all, so `IN_CLOSE_WRITE`
-    equivalence needs one fd per FILE — an fd-budget problem on large
-    trees (macOS ships a 256 soft `RLIMIT_NOFILE`).
-  * **FSEvents** gives recursive path notifications including content
-    changes, but wants a CFRunLoop, so it needs a dedicated thread
-    feeding the poll loop through a pipe — which cuts against the
-    daemon's single-threaded design, though CoreServices itself is
-    fine (the daemon already links AppKit/ScreenCaptureKit here).
+  Everything else is exact on both backends: the browser refreshing on
+  create/delete/rename (including the daemon's own mutation verbs) and
+  live queries (`live_find`), which match on NAMES. `smoke-fs` runs
+  every live-delta and live-query stage on macOS now; only the single
+  append assertion is keyed on `watch_sees_child_writes`.
 
-  Whichever lands must keep the inotify bit vocabulary as the neutral
-  event encoding (`EventIter` decodes it, and both consumers —
-  `daemon_serve.fsWatchReadable` and `fsjob.runLiveFind` — read the
-  watcher fd directly, so they need a `Watcher.readInto`-shaped seam
-  rather than a raw `read()`).
+  If IN_CLOSE_WRITE parity is ever wanted, the remaining option is
+  **FSEvents** — recursive, includes content changes, but wants a
+  CFRunLoop and therefore a dedicated thread feeding the poll loop
+  through a pipe, which cuts against the daemon's single-threaded
+  design (CoreServices itself is fine; AppKit/ScreenCaptureKit are
+  already linked here).
 
 ## Window-streaming agent friction (2026-06, hardware)
 

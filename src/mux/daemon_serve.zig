@@ -2534,7 +2534,7 @@ pub fn fsWatchReadable(self: *Daemon) void {
     var buf: [16 * 1024]u8 = undefined;
     var overflow = false;
     while (true) {
-        const n = c.read(self.fs_watch.fd, &buf, buf.len);
+        const n = self.fs_watch.readInto(&buf);
         if (n <= 0) break; // EAGAIN → drained
         var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
         while (it.next()) |ev| {
