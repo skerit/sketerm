@@ -233,13 +233,21 @@ fn checkTerminfo(allocator: std.mem.Allocator) u32 {
     dirs_buf[n] = "/usr/share/terminfo";
     n += 1;
 
+    // Two on-disk layouts. ncurses buckets entries by first letter
+    // ("s/"), but on a case-INSENSITIVE filesystem it uses that
+    // letter's hex code instead ("73/") so "s" and "S" cannot collide
+    // — which is what macOS's own `tic` writes into ~/.terminfo. Probe
+    // both, or an installed entry reads as missing on every Mac.
+    const buckets = [_][]const u8{ "s", "73" };
     for (dirs_buf[0..n]) |d| {
-        const p = std.fmt.allocPrintSentinel(allocator, "{s}/s/sketerm-256color", .{d}, 0) catch continue;
-        defer allocator.free(p);
-        if (c.fopen(p.ptr, "rb")) |fh| {
-            _ = c.fclose(fh);
-            _ = c.printf("terminfo  ok  %s\n", p.ptr);
-            return 0;
+        for (buckets) |b| {
+            const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}/sketerm-256color", .{ d, b }, 0) catch continue;
+            defer allocator.free(p);
+            if (c.fopen(p.ptr, "rb")) |fh| {
+                _ = c.fclose(fh);
+                _ = c.printf("terminfo  ok  %s\n", p.ptr);
+                return 0;
+            }
         }
     }
     const term = if (c.getenv("TERM")) |t| std.mem.span(t) else "";
