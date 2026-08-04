@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
+const platform = @import("platform.zig");
 
 /// Longest breadcrumb kept. Truncation is fine; the leading words carry
 /// the operation ("ipc attach-session 'X' @ host").
@@ -47,7 +48,7 @@ pub fn install() void {
     if (defaultPath(&buf)) |p| g.fd = openLog(p);
 
     var sa = std.mem.zeroes(c.struct_sigaction);
-    sa.__sigaction_handler = .{ .sa_sigaction = &onFatal };
+    platform.setSigAction(&sa, &onFatal);
     // RESETHAND: entering the handler restores the default disposition, so
     // the re-raise below dumps core and a fault INSIDE the handler cannot
     // loop forever. SA_RESETHAND does not fit a positive c_int, so the
@@ -144,7 +145,17 @@ pub fn formatRecord(buf: []u8, r: Record) []const u8 {
         },
     ) catch {
         // Truncating fallback: the signal name alone still beats silence.
-        const short = std.fmt.bufPrint(buf, "sketerm: FATAL signal {d}\n", .{r.sig}) catch return buf[0..0];
+        // The number's width is platform-dependent (SIGBUS is 7 on Linux
+        // but 10 on Darwin), so a buffer that holds the short form on one
+        // OS can overflow it on the other — degrade to a numberless
+        // notice, clipped to whatever room there is, rather than to the
+        // empty string this used to return.
+        const short = std.fmt.bufPrint(buf, "sketerm: FATAL signal {d}\n", .{r.sig}) catch {
+            const notice = "sketerm: FATAL signal\n";
+            const n = @min(buf.len, notice.len);
+            @memcpy(buf[0..n], notice[0..n]);
+            return buf[0..n];
+        };
         return short;
     };
     return line;

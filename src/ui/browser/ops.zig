@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const platform = @import("../../util/platform.zig");
 const wire = @import("../../mux/wire.zig");
 
 const BTab = @import("types.zig").BTab;
@@ -1247,6 +1248,14 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 pub fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg: []const u8) void {
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
+    // The pin/evict control channel is a sketerm FUSE mount's xattr, and
+    // fsmount is a Linux /dev/fuse client — there is no such mount to
+    // poke on macOS (whose setxattr(2) takes a different argument list
+    // anyway, so the call must not even be analysed there).
+    if (comptime !platform.is_linux) {
+        self.setStatusFmt("{s}: sketerm mounts are Linux-only", .{attr});
+        return menuDone(ctx);
+    }
     var z: [4300:0]u8 = undefined;
     const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return menuDone(ctx);
     if (c.setxattr(pz.ptr, attr.ptr, "1", 1, 0) != 0) {
