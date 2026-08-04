@@ -116,6 +116,9 @@ const muxclient = @import("../mux/client.zig");
 const input = @import("input.zig");
 const Config = @import("../config.zig").Config;
 const fpicker = @import("../filebrowser/picker.zig");
+const editorlsp = @import("editorlsp.zig");
+const lsp_session = @import("../lsp/session.zig");
+const lsp_pos = @import("../lsp/position.zig");
 const PickerWindow = @import("picker.zig").PickerWindow;
 
 /// Open size cap: bigger files are refused with a clear error.
@@ -555,8 +558,26 @@ pub const ETab = struct {
     /// cleared by its own selection change.
     structural_move: bool = false,
 
+    /// Language-server state: document sync queue, diagnostics store
+    /// and the connection this document is attached to. Null until a
+    /// server claims the file (no configured server, no installed
+    /// binary, an unknown language and a remote spec all leave it
+    /// null, silently).
+    lsp: ?*editorlsp.TabState = null,
+    /// LSP position (0-based, in the server's encoding) to put the
+    /// caret on once the async load lands — a go-to-definition that
+    /// had to open the file first.
+    want_pos: ?lsp_pos.Position = null,
+
     fn destroy(self: *ETab) void {
         const a = self.view.allocator;
+        // Normally `Manager.detachTab` has already run (closeTabForce);
+        // this is the last-resort free for a tab destroyed on an error
+        // path before it was ever listed.
+        if (self.lsp) |st| {
+            st.destroy();
+            self.lsp = null;
+        }
         // A queued parse timer is fenced (DlgCtx) and resolves to
         // nothing once this tab's id is gone — no removal needed.
         if (self.hl) |hl| {
@@ -779,6 +800,14 @@ pub const EditorView = struct {
     /// header bar carries those buttons instead), and a change hook the
     /// host uses to keep its title in sync. All null/unused for a pane
     /// face, which keeps the pane path exactly as it was.
+    /// Language-server client, created lazily the first time a document
+    /// with a servable language is opened. Null costs nothing, so an
+    /// editor face that only ever shows plain text never builds one.
+    lsp: ?*editorlsp.Manager = null,
+    /// The rename dialog's entry while it is up (its response callback
+    /// has to read the text back out). Owned by the dialog.
+    rename_entry: ?*c.GtkWidget = null,
+
     standalone_config: ?*const Config = null,
     toolbar_box: ?*c.GtkWidget = null,
     on_changed: ?*const fn (ctx: *anyopaque) void = null,
@@ -878,6 +907,18 @@ pub const EditorView = struct {
             self.ensureHighlighter(t);
             t.layout.invalidateAll();
             self.applyWrapWidth(t);
+        }
+        // LSP: switching it off tears every server down; switching it
+        // on (or changing a [lsp.*] section) re-attaches every tab, so
+        // a config change lands without restarting the editor.
+        if (!cfg.editor_lsp) {
+            if (self.lsp) |m| {
+                m.destroy();
+                self.lsp = null;
+                for (self.tabs.items) |t| t.lsp = null;
+            }
+        } else {
+            for (self.tabs.items) |t| self.attachLsp(t);
         }
         self.queueRender();
     }
@@ -1557,6 +1598,10 @@ pub const EditorView = struct {
         self.stopBlink();
         self.stopScrollbarSync();
         self.detachIm();
+        // LSP popovers are parented to the GLArea with
+        // gtk_widget_set_parent and MUST be unparented before it
+        // finalizes (menu.zig documents the same rule).
+        if (self.lsp) |m| m.unparentPopups();
     }
 
     /// The GLArea can die without detachEditor running (whole-window
@@ -1593,6 +1638,12 @@ pub const EditorView = struct {
         self.stopScrollbarSync();
         self.clearPreedit();
         self.detachIm();
+        // Before the tabs: the manager owns each tab's TabState and
+        // tells every server its documents are closing.
+        if (self.lsp) |m| {
+            m.destroy();
+            self.lsp = null;
+        }
         for (self.tabs.items) |t| t.destroy();
         self.tabs.deinit(self.allocator);
         if (self.atlas) |a| {
@@ -1961,6 +2012,7 @@ pub const EditorView = struct {
         tab.layout.theme = self.theme;
         self.ensureHighlighter(tab);
         if (tab.spec != null) self.startLoad(tab);
+        self.attachLsp(tab);
         self.refresh(tab);
         return tab;
     }
@@ -2041,6 +2093,9 @@ pub const EditorView = struct {
 
     fn closeTabForce(self: *EditorView, tab: *ETab) void {
         tab.io_gen = 0; // orphan any in-flight IO
+        // didClose + drop this tab's pending requests, while the
+        // document (and its URI) still exist.
+        if (self.lsp) |m| m.detachTab(tab);
         for (self.tabs.items, 0..) |t, i| {
             if (t == tab) {
                 _ = self.tabs.orderedRemove(i);
@@ -2061,6 +2116,167 @@ pub const EditorView = struct {
             self.updateStatus();
             self.queueRender();
         }
+    }
+
+    // ---- language server ----------------------------------------------
+    //
+    // The LSP client lives in editorlsp.zig; everything here is the
+    // narrow surface it needs back from the view. Keeping it to named
+    // methods (rather than reaching into fields from the other module)
+    // is what lets the pane face and the standalone window share it
+    // without either knowing about the other.
+
+    /// Give `tab` a language server if one is configured and installed.
+    /// Creates the manager on first use; silent when nothing claims the
+    /// document's language.
+    fn attachLsp(self: *EditorView, tab: *ETab) void {
+        const conf: *const Config = if (self.ownerWindow()) |win|
+            &win.config
+        else
+            self.standalone_config orelse return;
+        if (!conf.editor_lsp) return;
+        if (self.lsp == null) self.lsp = editorlsp.Manager.create(self);
+        const m = self.lsp orelse return;
+        m.attachTab(tab);
+    }
+
+    pub fn activeTab(self: *EditorView) ?*ETab {
+        return self.active;
+    }
+
+    pub fn findTabByIdPublic(self: *EditorView, id: u64) ?*ETab {
+        return self.findTabById(id);
+    }
+
+    pub fn setStatusText(self: *EditorView, text: [*:0]const u8) void {
+        self.setStatus(text);
+    }
+
+    pub fn queueRenderExternal(self: *EditorView) void {
+        self.queueRender();
+    }
+
+    pub fn updateStatusExternal(self: *EditorView) void {
+        self.updateStatus();
+    }
+
+    /// Post-edit bookkeeping for an edit the LSP client applied
+    /// (completion accept, rename, formatting) — the same path a typed
+    /// edit takes, so highlighting, folds, find results and the server
+    /// itself all follow.
+    pub fn afterExternalEdit(self: *EditorView, tab: *ETab) void {
+        tab.goal_x = null;
+        self.afterDocEdit(tab);
+    }
+
+    pub fn afterExternalMove(self: *EditorView, tab: *ETab) void {
+        tab.goal_x = null;
+        self.afterMove(tab);
+    }
+
+    /// Open `spec` and put the caret on (line, col). Goes through the
+    /// ordinary tab machinery: an already-open file is focused rather
+    /// than opened twice, and a not-yet-loaded one gets its caret once
+    /// the async load lands.
+    pub fn openSpecAtLineCol(self: *EditorView, spec: []const u8, line: u32, col: u32) void {
+        for (self.tabs.items) |t| {
+            const ts = t.spec orelse continue;
+            if (!std.mem.eql(u8, ts, spec)) continue;
+            self.tabhost.setCurrentPage(t.page);
+            self.active = t;
+            self.applyWantPos(t, .{ .line = line, .character = col });
+            return;
+        }
+        const tab = self.newTab(spec) orelse return;
+        tab.want_pos = .{ .line = line, .character = col };
+    }
+
+    /// Put the caret on an LSP position. `character` is in the server's
+    /// negotiated encoding, so it goes through the position mapper
+    /// rather than being treated as a byte column.
+    fn applyWantPos(self: *EditorView, tab: *ETab, p: lsp_pos.Position) void {
+        const enc: lsp_pos.Encoding = blk: {
+            const st = tab.lsp orelse break :blk .utf16;
+            const cn = st.conn orelse break :blk .utf16;
+            break :blk cn.sess.caps.encoding;
+        };
+        const off = lsp_pos.positionToOffset(&tab.doc.rope, p, enc);
+        tab.sels.keepPrimaryOnly();
+        if (tab.sels.sels.items.len == 0) {
+            tab.sels.sels.append(self.allocator, Selection.caret(off)) catch return;
+        } else tab.sels.sels.items[0] = Selection.caret(off);
+        tab.goal_x = null;
+        self.revealCaretLines(tab);
+        self.refresh(tab);
+    }
+
+    /// The caret's rectangle in WIDGET coordinates — what a popover
+    /// points at. Deliberately the same geometry `setImCursorLocation`
+    /// ships to the input method, so a completion list and an IME
+    /// candidate window never disagree about where the caret is.
+    pub fn caretRectPx(self: *EditorView) ?c.GdkRectangle {
+        if (self.widgets_dead) return null;
+        const tab = self.active orelse return null;
+        if (self.atlas == null) return null;
+        const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (scale <= 0) return null;
+        self.ensureRows(tab);
+        const cv = self.caretVisual(tab, tab.sels.primary().head);
+        const line_h = self.lineHeight();
+        const rel_row: f32 = @floatFromInt(
+            (tab.rows.rowsBefore(cv.line) + cv.row) -| viewport_mod.anchorRow(&tab.rows, tab.anchor),
+        );
+        return .{
+            .x = @intFromFloat((self.pass.text_origin_x + cv.x) / scale),
+            .y = @intFromFloat((rel_row * line_h - tab.anchor.offset) / scale),
+            .width = 1,
+            .height = @intFromFloat(line_h / scale),
+        };
+    }
+
+    /// Ask for a new symbol name, then hand it to the LSP client.
+    pub fn promptRename(self: *EditorView, current: []const u8) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse return;
+        const ctx = DlgCtx.create(self, tab) orelse return;
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(
+            c.adw_alert_dialog_new("Rename symbol", null),
+        ));
+        const entry = c.gtk_entry_new();
+        const z = self.allocator.dupeZ(u8, current) catch {
+            ctx.destroy();
+            return;
+        };
+        defer self.allocator.free(z);
+        c.gtk_editable_set_text(@ptrCast(entry), z.ptr);
+        c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+        c.adw_alert_dialog_set_extra_child(dialog, entry);
+        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+        c.adw_alert_dialog_add_response(dialog, "rename", "Rename");
+        c.adw_alert_dialog_set_response_appearance(dialog, "rename", c.ADW_RESPONSE_SUGGESTED);
+        c.adw_alert_dialog_set_default_response(dialog, "rename");
+        c.adw_alert_dialog_set_close_response(dialog, "cancel");
+        // The entry lives on the dialog, so it is alive for as long as
+        // the response callback can fire.
+        self.rename_entry = entry;
+        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onRenameResponse, @ptrCast(ctx));
+    }
+
+    fn onRenameResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
+        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
+        const r = ctx.resolve() orelse return;
+        const entry = r.view.rename_entry;
+        r.view.rename_entry = null;
+        if (!std.mem.eql(u8, resp, "rename")) return;
+        const e = entry orelse return;
+        const raw = c.gtk_editable_get_text(@ptrCast(e));
+        if (raw == null) return;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        const m = r.view.lsp orelse return;
+        m.submitRename(name);
     }
 
     // ---- GL lifecycle -------------------------------------------------
@@ -2185,6 +2401,7 @@ pub const EditorView = struct {
             .folds = &tab.folds,
             .fold_markers = tab.fold_markers.items,
             .brackets = tab.brackets.items,
+            .diagnostics = if (self.lsp) |m| m.diagnosticsFor(tab) else &.{},
             // Only when this tab is actually highlighted: with no
             // highlighter every glyph's kind is `.none`, and paying the
             // theme lookup to arrive back at `colors.text` is noise.
@@ -2901,6 +3118,13 @@ pub const EditorView = struct {
         tab.sel_stack.clear();
         self.syncFolds(tab);
         if (self.find_open) self.recomputeMatches(tab, false);
+        // The edit was already captured by the LSP document observer
+        // (Document slot 2); this only arms the debounce that flushes
+        // it, and lets an open completion list follow the caret.
+        if (self.lsp) |m| {
+            m.onEdited(tab);
+            m.onCaretMoved();
+        }
         self.refresh(tab);
     }
 
@@ -3013,7 +3237,7 @@ pub const EditorView = struct {
             c.gtk_label_set_text(self.status_label, "");
             return;
         };
-        var buf: [200:0]u8 = undefined;
+        var buf: [520:0]u8 = undefined;
         if (tab.loading) {
             c.gtk_label_set_text(self.status_label, "Loading…");
             return;
@@ -3021,10 +3245,15 @@ pub const EditorView = struct {
         const lc = tab.doc.rope.offsetToLineCol(tab.sels.primary().head);
         const carets = tab.sels.count();
         const wrap_note: []const u8 = if (tab.wrap) "  —  Wrap" else "";
+        // The diagnostic under the caret (or the document's error /
+        // warning counts) rides the same line — the editor has no
+        // second status surface to put it on.
+        var lsp_buf: [260]u8 = undefined;
+        const lsp_note: []const u8 = if (self.lsp) |m| m.statusSummary(tab, &lsp_buf) else "";
         const txt = if (carets > 1)
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}  —  {d} carets{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note }) catch return
+            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note }) catch return
         else
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}{s}", .{ lc.line + 1, lc.col + 1, wrap_note }) catch return;
+            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note }) catch return;
         c.gtk_label_set_text(self.status_label, txt.ptr);
     }
 
@@ -3170,6 +3399,10 @@ pub const EditorView = struct {
                 tab.br_valid = false;
                 tab.sel_stack.clear();
                 tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
+                // The observer the swap dropped has to be re-installed
+                // and the server told the content changed wholesale;
+                // a first-time load is where the server is attached.
+                if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
                 tab.layout.invalidateAll();
                 tab.rows_lines = 0;
                 tab.anchor = .{};
@@ -3186,6 +3419,10 @@ pub const EditorView = struct {
                     tab.want_cursor = null;
                     tab.sels.keepPrimaryOnly();
                     tab.sels.sels.items[0] = Selection.caret(caret);
+                }
+                if (tab.want_pos) |p| {
+                    tab.want_pos = null;
+                    self.applyWantPos(tab, p);
                 }
                 const was_reload = job.keep_position and tab.keep_active;
                 tab.keep_active = false;
@@ -3218,6 +3455,7 @@ pub const EditorView = struct {
                 tab.seen = job.disk;
                 self.clearAlert(tab);
                 if (tab.doc.revision == job.revision) tab.doc.markSaved();
+                if (self.lsp) |m| m.onSaved(tab);
                 if (tab.close_after_save) {
                     tab.close_after_save = false;
                     if (!tab.isDirty()) {
@@ -3640,7 +3878,14 @@ pub const EditorView = struct {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         const tab = self.active orelse return;
         if (text.len == 0) return;
+        // A symbol/results popup filters on typed characters instead of
+        // inserting them; a completion popup lets them through so the
+        // document keeps up with the prefix.
+        if (self.lsp) |m| {
+            if (m.handleText(text)) return;
+        }
         self.insertText(tab, text);
+        if (self.lsp) |m| m.maybeTrigger(text);
     }
 
     fn copySelection(self: *EditorView, tab: *ETab) void {
@@ -3799,6 +4044,13 @@ pub const EditorView = struct {
         const alt = (mods & c.GDK_ALT_MASK) != 0;
         const lower = c.gdk_keyval_to_lower(keyval);
 
+        // An open LSP popup owns the navigation keys first: Up/Down
+        // move its selection, Enter/Tab accept, Escape dismisses.
+        if (self.lsp) |m| {
+            if (m.handleKey(keyval, ctrl)) return 1;
+        }
+        if (self.handleLspKey(keyval, lower, ctrl, shift, alt)) return 1;
+
         if (!alt) {
             if (self.active) |tab| {
                 if (self.handleEditKey(tab, keyval, ctrl, shift)) return 1;
@@ -3941,6 +4193,91 @@ pub const EditorView = struct {
         return 0;
     }
 
+    /// Language-server chords. Deliberately the VS Code set, so muscle
+    /// memory carries over:
+    ///
+    ///   Ctrl+Space          completion
+    ///   Ctrl+I              hover (also shows the diagnostic at the caret)
+    ///   F12 / Shift+F12     definition / references
+    ///   Ctrl+F12            type definition
+    ///   Ctrl+Shift+F12      declaration
+    ///   F8 / Shift+F8       next / previous diagnostic
+    ///   Ctrl+Shift+O        document symbols
+    ///   Ctrl+T              workspace symbols
+    ///   F2                  rename
+    ///   Ctrl+Shift+I        format (the selection, when there is one)
+    ///
+    /// A chord whose feature has no server behind it reports on the
+    /// status line and is still CONSUMED: falling through to the pane's
+    /// binding table would make F12 do something unrelated depending on
+    /// whether zls happens to be installed.
+    fn handleLspKey(self: *EditorView, keyval: c_uint, lower: c_uint, ctrl: bool, shift: bool, alt: bool) bool {
+        if (alt) return false;
+        if (self.active == null) return false;
+        const conf: *const Config = if (self.ownerWindow()) |win|
+            &win.config
+        else
+            self.standalone_config orelse return false;
+        if (!conf.editor_lsp) return false;
+
+        const want: ?enum {
+            completion,
+            hover,
+            definition,
+            declaration,
+            type_definition,
+            references,
+            doc_symbols,
+            workspace_symbols,
+            rename,
+            format,
+            diag_next,
+            diag_prev,
+        } = blk: {
+            if (ctrl and !shift and keyval == c.GDK_KEY_space) break :blk .completion;
+            if (ctrl and !shift and lower == c.GDK_KEY_i) break :blk .hover;
+            if (ctrl and shift and lower == c.GDK_KEY_i) break :blk .format;
+            if (ctrl and shift and lower == c.GDK_KEY_o) break :blk .doc_symbols;
+            if (ctrl and !shift and lower == c.GDK_KEY_t) break :blk .workspace_symbols;
+            if (keyval == c.GDK_KEY_F2 and !ctrl and !shift) break :blk .rename;
+            if (keyval == c.GDK_KEY_F8) break :blk if (shift) .diag_prev else .diag_next;
+            if (keyval == c.GDK_KEY_F12) {
+                if (ctrl and shift) break :blk .declaration;
+                if (ctrl) break :blk .type_definition;
+                if (shift) break :blk .references;
+                break :blk .definition;
+            }
+            break :blk null;
+        };
+        const action = want orelse return false;
+
+        if (self.lsp == null) {
+            // Nothing has ever claimed a document here; create the
+            // manager so the "no language server" report is honest
+            // about the CURRENT tab rather than silently doing nothing.
+            if (self.active) |tab| self.attachLsp(tab);
+        }
+        const m = self.lsp orelse {
+            self.setStatus("No language server for this file.");
+            return true;
+        };
+        switch (action) {
+            .completion => m.requestCompletion(true),
+            .hover => m.requestHover(),
+            .definition => m.requestDefinition(.definition),
+            .declaration => m.requestDefinition(.declaration),
+            .type_definition => m.requestDefinition(.type_definition),
+            .references => m.requestDefinition(.references),
+            .doc_symbols => m.requestDocumentSymbols(),
+            .workspace_symbols => m.requestWorkspaceSymbols(),
+            .rename => m.startRename(),
+            .format => m.requestFormatting(),
+            .diag_next => m.stepDiagnostic(true),
+            .diag_prev => m.stepDiagnostic(false),
+        }
+        return true;
+    }
+
     /// Movement + structural edit keys. @return true when consumed.
     fn handleEditKey(self: *EditorView, tab: *ETab, keyval: c_uint, ctrl: bool, shift: bool) bool {
         const a = self.allocator;
@@ -4027,6 +4364,7 @@ pub const EditorView = struct {
     }
 
     fn afterMove(self: *EditorView, tab: *ETab) void {
+        if (self.lsp) |m| m.onCaretMoved();
         // A caret that walked into hidden text opens the fold; a caret
         // move that is not an expand/shrink drops the structural trail
         // (otherwise Shrink would replay a selection you have left).
