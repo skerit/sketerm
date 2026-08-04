@@ -19,6 +19,7 @@ const fsjob = @import("mux/fsjob.zig");
 const fsjournal = @import("mux/fsjournal.zig");
 const imagecodec = @import("util/imagecodec.zig");
 const pathz = @import("util/pathz.zig");
+const reload = @import("editor/reload.zig");
 const thumbs_mod = @import("filebrowser/thumbs.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -3005,6 +3006,132 @@ fn hasStagedTemp(dir: []const u8) bool {
     return false;
 }
 
+/// Observe one path exactly the way the editor's disk probe does.
+fn probeState(fs: *fsdrive.Fs, allocator: std.mem.Allocator, path: []const u8) reload.DiskState {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const e = fs.statFollow(arena.allocator(), path) catch |err| {
+        if (err == fsdrive.Error.FsOpFailed) return .{ .known = true, .present = false };
+        failErr("probe: stat transport", fs.lastErr());
+    };
+    return .{
+        .known = true,
+        .present = true,
+        .mtime_ns = e.mtime_ns,
+        .mtime_ms = e.mtime_ms,
+        .size = e.size,
+        .ino = e.ino,
+        .mode = e.mode,
+    };
+}
+
+/// The editor's external-modification detector, end to end against a
+/// real daemon: the identity a stat reports, and the verdict the pure
+/// predicate draws from it, for every way a file can change under an
+/// open document.
+fn probeStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-probe");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("probe: fs connect");
+    defer fs.deinit();
+
+    var doc_buf: [4096]u8 = undefined;
+    const doc = std.fmt.bufPrint(&doc_buf, "{s}/doc.txt", .{dir}) catch unreachable;
+    touch(dir, "doc.txt", "one\n");
+
+    // Baseline, as an editor takes it at load time.
+    const base = probeState(&fs, allocator, doc);
+    if (!base.present or base.ino == 0) fail("probe: baseline has no identity");
+    if (reload.compare(base, probeState(&fs, allocator, doc)) != .unchanged)
+        fail("probe: an untouched file reported a change");
+
+    // ── the atomic writer: temp + rename, NEW inode ────────────
+    const installed = fs.writeFileAtomic(doc, "two\n", base.mtime_ns) catch
+        failErr("probe: atomic rewrite", fs.lastErr());
+    if (installed.ino == base.ino) fail("probe: atomic save did not change the inode");
+    const after_install = probeState(&fs, allocator, doc);
+    if (after_install.ino != installed.ino) fail("probe: stat disagrees with the install reply");
+    if (reload.compare(base, after_install) != .replaced)
+        fail("probe: an atomic rewrite was not seen as a replacement");
+    // Same verdict when the new file's mtime is OLDER than ours: the
+    // inode is what carries the truth (a staged temp can predate us).
+    {
+        var older = after_install;
+        older.mtime_ns = base.mtime_ns - 1_000_000;
+        older.mtime_ms = base.mtime_ms - 1;
+        older.size = base.size;
+        if (reload.compare(base, older) != .replaced)
+            fail("probe: a backdated replacement escaped detection");
+    }
+
+    // ── an in-place rewrite: same inode, new mtime/size ────────
+    {
+        var z: [4096]u8 = undefined;
+        const p = pathz.pathZ(&z, doc) catch fail("probe: path");
+        const f = c.fopen(p, "wb") orelse fail("probe: reopen");
+        _ = c.fwrite("three\n", 1, 6, f);
+        _ = c.fclose(f);
+    }
+    bumpMtime(doc);
+    const after_edit = probeState(&fs, allocator, doc);
+    if (after_edit.ino != after_install.ino) fail("probe: in-place write moved the inode");
+    if (reload.compare(after_install, after_edit) != .modified)
+        fail("probe: an in-place rewrite was not seen as a modification");
+
+    // ── permission-only change ─────────────────────────────────
+    {
+        var z: [4096]u8 = undefined;
+        _ = c.chmod(pathz.pathZ(&z, doc) catch fail("probe: chmod path"), 0o600);
+    }
+    const after_chmod = probeState(&fs, allocator, doc);
+    if (reload.compare(after_edit, after_chmod) != .permissions)
+        fail("probe: a mode change was not seen as a permission change");
+
+    // ── symlinked document: the LINK's lstat must not be what a
+    // document is compared against ─────────────────────────────
+    var link_buf: [4096]u8 = undefined;
+    const link = std.fmt.bufPrint(&link_buf, "{s}/link.txt", .{dir}) catch unreachable;
+    {
+        var z1: [4096]u8 = undefined;
+        var z2: [4096]u8 = undefined;
+        if (c.symlink(
+            pathz.pathZ(&z1, doc) catch fail("probe: link target"),
+            pathz.pathZ(&z2, link) catch fail("probe: link path"),
+        ) != 0) fail("probe: symlink");
+    }
+    const via_link = probeState(&fs, allocator, link);
+    if (via_link.ino != after_chmod.ino) fail("probe: statFollow did not resolve the symlink");
+    {
+        // The raw (lstat) stat sees the link itself — the identity that
+        // would silently never change when the target is rewritten.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const raw = fs.statPath(arena.allocator(), link) catch failErr("probe: lstat link", fs.lastErr());
+        if (!std.mem.eql(u8, raw.kind, "link")) fail("probe: symlink did not stat as a link");
+        if (raw.ino == via_link.ino) fail("probe: link and target share an inode?");
+    }
+    // A rewrite of the target is visible THROUGH the link.
+    const link_base = via_link;
+    _ = fs.writeFileAtomic(doc, "four\n", null) catch failErr("probe: target rewrite", fs.lastErr());
+    if (reload.compare(link_base, probeState(&fs, allocator, link)) != .replaced)
+        fail("probe: a rewrite behind a symlink was invisible");
+
+    // ── deletion, and the reappearance after it ────────────────
+    const before_delete = probeState(&fs, allocator, doc);
+    fs.unlink(doc) catch failErr("probe: unlink", fs.lastErr());
+    const gone = probeState(&fs, allocator, doc);
+    if (gone.present) fail("probe: a deleted file still reported present");
+    if (reload.compare(before_delete, gone) != .deleted)
+        fail("probe: a deleted file was not seen as deleted");
+    // Save-as-recreate: with the file gone the editor drops its guard.
+    _ = fs.writeFileAtomic(doc, "five\n", null) catch failErr("probe: recreate", fs.lastErr());
+    expectText(doc, "five\n", "probe: recreated content");
+    if (reload.compare(gone, probeState(&fs, allocator, doc)) != .reappeared)
+        fail("probe: a recreated file was not seen as reappearing");
+
+    std.debug.print("smoke-fs: external-change probe (" ++ tag ++ ") OK\n", .{});
+}
+
 /// The atomic-save primitive an editor saves through: staged temp →
 /// mode/owner inheritance → fsync → rename → parent fsync, with the
 /// destination's mtime_ns as the external-modification guard.
@@ -3385,6 +3512,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mediaStage(allocator, sock_path, "mono");
     queryStage(allocator, sock_path, "mono");
     saveStage(allocator, sock_path, "mono");
+    probeStage(allocator, sock_path, "mono");
     jobVerbStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
@@ -3447,6 +3575,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mediaStage(allocator, bsock, "broker");
     queryStage(allocator, bsock, "broker");
     saveStage(allocator, bsock, "broker");
+    probeStage(allocator, bsock, "broker");
     jobVerbStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");

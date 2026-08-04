@@ -294,6 +294,40 @@ pub fn main() u8 {
             if (!saved2) return fail("editor wrap/edge chord sequence did not round-trip through a save");
         }
 
+        // External modification of a CLEAN buffer must reload itself,
+        // quietly. The rewrite is an ATOMIC one (temp + rename, so a
+        // NEW inode) — the case an mtime-only check misses. The probe
+        // is driven by focusing the pane, which is what a user coming
+        // back to the editor does.
+        {
+            var tmp_buf: [600]u8 = undefined;
+            const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}/e2e-editor.new", .{rt}) catch return fail("editor tmp path");
+            const f = c.fopen(tmp.ptr, "wb") orelse return fail("editor external write open");
+            const body = "changed on disk\n";
+            _ = c.fwrite(body.ptr, 1, body.len, f);
+            _ = c.fclose(f);
+            if (c.rename(tmp.ptr, efile.ptr) != 0) return fail("editor external rename");
+
+            const freq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{epane}) catch return fail("fmt");
+            const fresp = roundtrip(allocator, sock_path, freq) orelse return fail("editor focus roundtrip");
+            defer allocator.free(fresp);
+            if (std.mem.indexOf(u8, fresp, "\"ok\":true") == null) return fail("editor focus not ok");
+
+            var reloaded = false;
+            var rt_tries: u32 = 0;
+            while (rt_tries < 50) : (rt_tries += 1) {
+                _ = c.usleep(200_000);
+                const greq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{epane}) catch return fail("fmt");
+                const gresp = roundtrip(allocator, sock_path, greq) orelse continue;
+                defer allocator.free(gresp);
+                if (std.mem.indexOf(u8, gresp, "changed on disk") != null) {
+                    reloaded = true;
+                    break;
+                }
+            }
+            if (!reloaded) return fail("editor did not auto-reload a clean buffer after an external atomic rewrite");
+        }
+
         const creq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{epane}) catch return fail("fmt");
         const cresp = roundtrip(allocator, sock_path, creq) orelse return fail("editor close roundtrip");
         defer allocator.free(cresp);

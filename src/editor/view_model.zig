@@ -9,9 +9,10 @@
 //! overlap-clamped) and map the selections through with `.editor`
 //! bias, so undo restores them as a unit.
 //!
-//! Gotcha: Document's history does not expose its inverse edits, so
-//! undo/redo restores selections by CLAMPING to the new length, not
-//! by exact mapping.
+//! Undo/redo move selections properly: Document hands back the edits
+//! it applied plus the selection recorded before the undone
+//! transaction, so `undo` restores the pre-edit selection and falls
+//! back to MAPPING through the inverse edits — never a blind clamp.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -161,8 +162,14 @@ fn replaceSelections(alloc: Allocator, doc: *Document, sels: *SelectionSet, text
         prev_end = end;
         try tx.addReplace(alloc, start, end - start, text);
     }
-    _ = try doc.applyTransaction(&tx);
+    _ = try doc.applyTransactionSel(&tx, snapshotOf(sels));
     sels.mapThrough(tx.edits.items, .editor);
+}
+
+/// Borrowed view of the current selection for the undo history (the
+/// document copies what it keeps).
+pub fn snapshotOf(sels: *const SelectionSet) @import("document.zig").SelSnapshot {
+    return .{ .sels = sels.sels.items, .primary = sels.primary_index };
 }
 
 /// Insert `text` at every selection (replacing ranges). Multi-caret
@@ -254,17 +261,36 @@ fn deleteDirectional(alloc: Allocator, doc: *Document, sels: *SelectionSet, word
         try tx.addDelete(alloc, start, end - start);
     }
     if (tx.edits.items.len == 0) return;
-    _ = try doc.applyTransaction(&tx);
+    _ = try doc.applyTransactionSel(&tx, snapshotOf(sels));
     sels.mapThrough(tx.edits.items, .editor);
 }
 
-pub fn undo(doc: *Document, sels: *SelectionSet) !void {
-    _ = try doc.undo();
-    clampSelections(doc, sels);
+/// Undo, moving the selections with the change: the recorded pre-edit
+/// selection is restored when the transaction carried one (what the
+/// user had before they typed), else the live selections are MAPPED
+/// through the inverse edits — never blind-clamped.
+pub fn undo(alloc: Allocator, doc: *Document, sels: *SelectionSet) !void {
+    const change = try doc.undo();
+    try applyChange(alloc, doc, sels, change);
 }
 
-pub fn redo(doc: *Document, sels: *SelectionSet) !void {
-    _ = try doc.redo();
+pub fn redo(alloc: Allocator, doc: *Document, sels: *SelectionSet) !void {
+    const change = try doc.redo();
+    try applyChange(alloc, doc, sels, change);
+}
+
+fn applyChange(alloc: Allocator, doc: *Document, sels: *SelectionSet, change: @import("document.zig").Change) !void {
+    if (change.restore) |snap| {
+        if (snap.sels.len > 0) {
+            sels.sels.clearRetainingCapacity();
+            try sels.sels.appendSlice(alloc, snap.sels);
+            sels.primary_index = @min(snap.primary, sels.sels.items.len - 1);
+            sels.normalize();
+            clampSelections(doc, sels);
+            return;
+        }
+    }
+    sels.mapThrough(change.edits, .editor);
     clampSelections(doc, sels);
 }
 
@@ -396,7 +422,7 @@ test "view_model multi-caret insert applies once per caret" {
     try testing.expectEqual(@as(usize, 6), sels.sels.items[1].head);
     try testing.expectEqual(@as(usize, 11), sels.sels.items[2].head);
     // One undo unit for the whole multi-edit.
-    try undo(&doc, &sels);
+    try undo(a, &doc, &sels);
     try expectText(&doc, "one two three");
 }
 
@@ -530,6 +556,63 @@ test "view_model word and line ranges" {
     try testing.expectEqual(@as(usize, 12), l2.end());
 }
 
+test "view_model undo restores the pre-edit selection, redo maps forward" {
+    const a = testing.allocator;
+    var doc = try docOf("one two three");
+    defer doc.deinit();
+    // Select "two" and type over it.
+    var sels = try SelectionSet.initSingle(a, .{ .anchor = 4, .head = 7 });
+    defer sels.deinit(a);
+    try insertText(a, &doc, &sels, "TWENTY");
+    try expectText(&doc, "one TWENTY three");
+    try testing.expectEqual(@as(usize, 10), sels.primary().head);
+
+    try undo(a, &doc, &sels);
+    try expectText(&doc, "one two three");
+    // The replaced RANGE is back, not a clamped caret.
+    try testing.expectEqual(@as(usize, 4), sels.primary().anchor);
+    try testing.expectEqual(@as(usize, 7), sels.primary().head);
+
+    try redo(a, &doc, &sels);
+    try expectText(&doc, "one TWENTY three");
+    try testing.expectEqual(@as(usize, 10), sels.primary().head);
+}
+
+test "view_model undo maps a selection that lies AFTER the undone edit" {
+    const a = testing.allocator;
+    var doc = try docOf("0123456789");
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, Selection.caret(2));
+    defer sels.deinit(a);
+    try insertText(a, &doc, &sels, "abcd");
+    // Move the caret far to the right of the insertion, then undo: a
+    // clamp would leave it at 14, mapping puts it back at 10.
+    sels.sels.items[0] = Selection.caret(14);
+    const change = try doc.undo();
+    sels.mapThrough(change.edits, .editor);
+    clampSelections(&doc, &sels);
+    try expectText(&doc, "0123456789");
+    try testing.expectEqual(@as(usize, 10), sels.primary().head);
+}
+
+test "view_model multi-caret undo restores every caret" {
+    const a = testing.allocator;
+    var doc = try docOf("a b c");
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, Selection.caret(0));
+    defer sels.deinit(a);
+    try sels.add(a, Selection.caret(2));
+    try sels.add(a, Selection.caret(4));
+    try insertText(a, &doc, &sels, "X");
+    try expectText(&doc, "Xa Xb Xc");
+    try undo(a, &doc, &sels);
+    try expectText(&doc, "a b c");
+    try testing.expectEqual(@as(usize, 3), sels.count());
+    try testing.expectEqual(@as(usize, 0), sels.sels.items[0].head);
+    try testing.expectEqual(@as(usize, 2), sels.sels.items[1].head);
+    try testing.expectEqual(@as(usize, 4), sels.sels.items[2].head);
+}
+
 test "view_model undo clamps selections" {
     const a = testing.allocator;
     var doc = try docOf("ab");
@@ -538,9 +621,9 @@ test "view_model undo clamps selections" {
     defer sels.deinit(a);
     try insertText(a, &doc, &sels, "cdefgh");
     try testing.expectEqual(@as(usize, 8), sels.primary().head);
-    try undo(&doc, &sels);
+    try undo(a, &doc, &sels);
     try expectText(&doc, "ab");
     try testing.expect(sels.primary().head <= 2);
-    try redo(&doc, &sels);
+    try redo(a, &doc, &sels);
     try expectText(&doc, "abcdefgh");
 }

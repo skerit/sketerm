@@ -12223,3 +12223,66 @@ window goes.
 Editor Window" next to the in-pane item, spawning the sibling binary
 through the new `src/ui/siblingapp.zig` — the Viewer's cross-identity
 spawn generalized.
+
+## Editor: external-modification detection, reload UX, undo selections
+
+An open document now notices when its file changes underneath it.
+
+**Detection is a batched stat poll, not a daemon directory watch.**
+`EditorView.checkDisk` groups every open document by HOST, and each
+host gets ONE detached-thread job that opens ONE connection and stats
+every one of that host's documents through it (`ProbeJob`), delivered
+back with `g_idle_add` like the existing load/save jobs. The rejected
+alternative was `fs_op open_view`: it is DIRECTORY-scoped (opening one
+file in a large tree would cost a full stat-per-entry listing of its
+siblings), it needs a persistent connection parked on the GLib loop
+(which for a remote host cannot be established without a worker
+thread), its inotify backend is Linux-only — so a remote macOS/BSD
+host would behave differently, breaking "remote works identically" —
+and its mask deliberately omits `IN_MODIFY`, so a writer holding the
+fd open produces nothing until close and a stat backstop is needed
+anyway. Batching per host is strictly stronger than the required
+per-(host, dir) dedupe: twenty tabs are one round trip whether they
+share a directory or not. Triggers are canvas focus-in, pane/IPC
+focus, tab switch and a click into the canvas, rate-limited to one
+probe per 400 ms with never more than one in flight. There is no
+before-save probe on purpose: the save is an mtime-guarded daemon-side
+install, which is race-free in a way no client poll can be.
+
+**The predicate is pure and shared** (`src/editor/reload.zig`,
+GTK-free, in both test roots): `(present, mtime_ns/ms, size, ino,
+mode)` in, `unchanged | modified | replaced | permissions | deleted |
+reappeared` out. `ino` is what catches the atomic writer (temp +
+rename): the replacement's mtime can legitimately be OLDER than the
+baseline. Symlinked documents are followed — the daemon's `stat` is an
+LSTAT, so a dotfile symlink would otherwise report an identity that
+never moves; `fsdrive.Fs.statFollow` resolves up to 8 hops. A probe
+that could not be TAKEN (dead link) is discarded, never reported as a
+deletion.
+
+**UX.** A clean buffer reloads silently, keeping caret, selections and
+scroll anchor (clamped into the new text), with a status-line note. A
+dirty buffer raises a non-modal inline banner above the canvas —
+Reload / Save Anyway / Dismiss — never a dialog, because it fires
+while the user is typing. A deleted file raises the same banner with
+Save (recreate); the buffer keeps its content and the absent baseline
+drops the save guard. Dismiss silences only THAT on-disk state. A
+permission-only change re-baselines silently. The old modal save
+conflict dialog is GONE: a refused save raises the SAME banner with
+"Save refused" wording, so a refusal and an observed change can never
+produce two competing prompts.
+
+**Undo selections are mapped, not clamped.** `Document.undo`/`redo`
+now return a `Change` carrying the edits they applied (borrowed from
+the consumed history entry, valid until the next mutation) plus the
+selection recorded before the undone transaction
+(`applyTransactionSel`, coalesced typing keeps the group's FIRST
+snapshot). `view_model.undo` restores that selection when present and
+otherwise maps the live selections through the inverse edits.
+
+Covered by unit tests in both roots (predicate, clamping, undo
+mapping), a new `smoke-fs` stage (`probeStage`, monolith AND broker)
+that walks a real daemon through atomic rewrite / in-place rewrite /
+chmod / symlink / delete / recreate, and a `smoke-e2e` stage asserting
+the clean-buffer auto-reload after an external `rename()` over the
+open file.

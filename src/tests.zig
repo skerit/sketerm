@@ -197,6 +197,7 @@ comptime {
     _ = @import("editor/transaction.zig");
     _ = @import("editor/document.zig");
     _ = @import("editor/selection.zig");
+    _ = @import("editor/reload.zig");
     _ = @import("editor/unicode.zig");
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
