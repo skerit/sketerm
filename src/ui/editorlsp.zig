@@ -883,6 +883,7 @@ pub const Manager = struct {
     fn ready(self: *Manager, what: []const u8) ?Ready {
         const tab = self.view.activeTab() orelse return null;
         const st = tab.lsp orelse {
+            dbg("{s}: no tab state", .{what});
             self.reportNoServer(what);
             return null;
         };
@@ -941,6 +942,7 @@ pub const Manager = struct {
         }
         const caret = r.tab.sels.primary().head;
         const word_start = wordStart(&r.tab.doc, caret);
+        dbg("completion at {d} (prefix from {d}), explicit={}", .{ caret, word_start, explicit });
         const trigger_kind: u8 = if (explicit) 1 else 2;
         var extra: [64]u8 = undefined;
         const ex = std.fmt.bufPrint(&extra, ",\"context\":{{\"triggerKind\":{d}}}", .{trigger_kind}) catch "";
@@ -952,11 +954,21 @@ pub const Manager = struct {
 
     fn onCompletion(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
         const tab = maybe_tab orelse return;
-        if (env.has_error) return;
+        if (env.has_error) {
+            dbg("completion error: {s}", .{env.err_message});
+            return;
+        }
         // Staleness: the document moved on, so every range in this
         // answer is measured against text that no longer exists.
-        if (tab.doc.revision != req.revision) return;
-        const items = completionItems(env.result) orelse return;
+        if (tab.doc.revision != req.revision) {
+            dbg("completion dropped: stale (req {d}, doc {d})", .{ req.revision, tab.doc.revision });
+            return;
+        }
+        const items = completionItems(env.result) orelse {
+            dbg("completion: no items array in the answer", .{});
+            return;
+        };
+        dbg("completion: {d} raw items (rev {d} vs {d})", .{ items.len, req.revision, tab.doc.revision });
         self.list.clearItems();
         self.list.mode = .completion;
         self.list.tab_id = tab.id;
@@ -972,7 +984,9 @@ pub const Manager = struct {
             if (raw != .object) continue;
             const o = raw.object;
             const label = strOf(o.get("label")) orelse continue;
-            const detail = strOf(o.get("detail")) orelse strOf(o.get("sortText")) orelse "";
+            // NOT sortText as a fallback: servers put ranking keys
+            // there ("11", "15"), which reads as noise in the list.
+            const detail = strOf(o.get("detail")) orelse completionKindName(o.get("kind"));
             var insert = strOf(o.get("insertText")) orelse label;
             var item = Item{
                 .label = self.alloc.dupe(u8, label) catch continue,
@@ -1645,6 +1659,7 @@ pub const Manager = struct {
     fn showPopup(self: *Manager) void {
         if (self.view.widgets_dead) return;
         if (!self.ensurePopup()) return;
+        dbg("popup: {d} rows ({s})", .{ self.list.shown.items.len, @tagName(self.list.mode) });
         self.rebuildRows();
         self.positionAtCaret(self.list.popover.?);
         c.gtk_popover_popup(@ptrCast(self.list.popover.?));
@@ -2072,6 +2087,25 @@ fn subsequenceFold(haystack: []const u8, needle: []const u8) bool {
         hi += 1;
     }
     return true;
+}
+
+/// LSP `CompletionItemKind` -> a word for the list's right column.
+fn completionKindName(v: ?std.json.Value) []const u8 {
+    const val = v orelse return "";
+    const k = switch (val) {
+        .integer => |i| i,
+        else => return "",
+    };
+    return switch (k) {
+        1 => "text",       2 => "method",    3 => "function",  4 => "constructor",
+        5 => "field",      6 => "variable",  7 => "class",     8 => "interface",
+        9 => "module",     10 => "property", 11 => "unit",     12 => "value",
+        13 => "enum",      14 => "keyword",  15 => "snippet",  16 => "color",
+        17 => "file",      18 => "reference", 19 => "folder",  20 => "enum member",
+        21 => "constant",  22 => "struct",   23 => "event",    24 => "operator",
+        25 => "type parameter",
+        else => "",
+    };
 }
 
 fn symbolKindName(v: ?std.json.Value) []const u8 {

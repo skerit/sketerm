@@ -134,6 +134,8 @@ const Plan = struct {
     root_files: []const u8,
     /// Raw JSON `initializationOptions` for this server.
     init_options: []const u8 = "",
+    /// Prefix typed at the end of the document before Ctrl+Space.
+    completion_prefix: []const u8,
     /// Document basename (its extension picks the languageId).
     file: []const u8,
     /// Marker file that makes the project directory the workspace root.
@@ -202,6 +204,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .marker = "tsconfig.json",
             .marker_body = "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\"},\"include\":[\"*.ts\"]}\n",
             .body = TS_BODY,
+            .completion_prefix = "gre",
             .real_server = true,
         };
     }
@@ -215,6 +218,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
         .marker = "build.zig",
         .marker_body = "// workspace root marker\n",
         .body = ZIG_BODY,
+        .completion_prefix = "stub",
         .real_server = false,
     };
 }
@@ -251,6 +255,27 @@ fn diagPixels(rgba: []const u8, img_w: u32, img_h: u32) usize {
         }
     }
     return hits;
+}
+
+/// Id of the most recently committed popup surface, if any. A
+/// GtkPopover is its own xdg_popup, so the toplevel's screenshot does
+/// NOT contain it — the popup has to be captured in its own right.
+fn newestPopup(app: *appdrive.App) ?u32 {
+    var best: ?u32 = null;
+    var best_ms: i64 = -1;
+    for (app.windows.items) |w| {
+        if (!w.popup or w.w <= 0 or w.frames == 0) continue;
+        if (w.last_commit_ms > best_ms) {
+            best_ms = w.last_commit_ms;
+            best = w.id;
+        }
+    }
+    return best;
+}
+
+fn savePopupPng(app: *appdrive.App, path: [*:0]const u8) void {
+    const id = newestPopup(app) orelse return;
+    savePng(app, id, path);
 }
 
 fn savePng(app: *appdrive.App, win_id: u32, path: [*:0]const u8) void {
@@ -469,15 +494,20 @@ pub fn main() u8 {
     }
     pumpFor(app, 400);
     savePng(app, win_id, "zig-out/smoke-lsp-gui-hover.png");
+    savePopupPng(app, "zig-out/smoke-lsp-gui-hover-popup.png");
     say("PASS hover popup -> zig-out/smoke-lsp-gui-hover.png", .{});
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 500);
 
     // ── 4. completion (Ctrl+Space) ────────────────────────────────
     //
-    // Typing a character first puts a prefix under the caret, which is
-    // what a server needs to have anything to offer.
-    app.typeText(win_id, "g") catch {};
+    // Position matters: a real server correctly offers NOTHING inside
+    // the name being declared (F8 left the caret on `wrong`), so go to
+    // the end of the document — an expression position — and type a
+    // prefix there.
+    app.pressKey(win_id, "ctrl+End") catch {};
+    pumpFor(app, 300);
+    app.typeText(win_id, plan.completion_prefix) catch {};
     pumpFor(app, 600);
     const popups_before_completion = popupCount(app);
     app.pressKey(win_id, "ctrl+space") catch {};
@@ -496,6 +526,7 @@ pub fn main() u8 {
     }
     pumpFor(app, 600);
     savePng(app, win_id, "zig-out/smoke-lsp-gui-completion.png");
+    savePopupPng(app, "zig-out/smoke-lsp-gui-completion-popup.png");
     say("PASS completion popup -> zig-out/smoke-lsp-gui-completion.png", .{});
 
     // Down + Enter accepts an item: the document must change, which is
@@ -520,9 +551,8 @@ pub fn main() u8 {
 
     // ── 5. go to definition (F12) ─────────────────────────────────
     //
-    // Only asserted for a real server: the stub answers with the first
-    // occurrence of the word, which is a jump the screenshot records
-    // but which proves less.
+    // The accepted item left the caret just past the inserted symbol,
+    // which is exactly where a definition lookup should work.
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 300);
     app.pressKey(win_id, "F12") catch {};
