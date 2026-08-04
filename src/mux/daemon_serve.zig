@@ -237,6 +237,10 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.last_activity_ms = m.activity;
             if (m.child_pid != 0) w.child_pid = m.child_pid;
             w.display = m.display;
+            w.xwayland = m.xwayland;
+            w.gpu = m.gpu;
+            w.output_width = m.output_width;
+            w.output_height = m.output_height;
             w.ttl_secs = m.ttl_secs;
             w.viewers = m.viewers;
             w.audio = m.audio;
@@ -261,6 +265,8 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.setOwned(&w.wl_display, m.wl);
             w.setOwned(&w.pulse_server, m.pa);
             w.setOwned(&w.runtime_dir, m.rt);
+            w.setOwned(&w.x_display, m.x);
+            w.setOwned(&w.xauthority, m.xa);
         },
         else => {},
     }
@@ -281,6 +287,12 @@ pub fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) void {
         w.setOwned(&w.wl_display, parsed.value.wl);
         w.setOwned(&w.pulse_server, parsed.value.pa);
         w.setOwned(&w.runtime_dir, parsed.value.rt);
+        w.setOwned(&w.x_display, parsed.value.x);
+        w.setOwned(&w.xauthority, parsed.value.xa);
+        w.xwayland = parsed.value.xwayland;
+        w.gpu = parsed.value.gpu;
+        w.output_width = parsed.value.output_width;
+        w.output_height = parsed.value.output_height;
         return;
     }
     w.child_pid = std.fmt.parseInt(i32, payload, 10) catch 0;
@@ -302,6 +314,12 @@ pub fn replyPendingSpawn(self: *Daemon, w: *Worker, ok: bool) void {
                     .wl_display = if (w.wl_display) |p| p else "",
                     .pulse_server = if (w.pulse_server) |p| p else "",
                     .runtime_dir = if (w.runtime_dir) |p| p else "",
+                    .xwayland = w.xwayland,
+                    .x_display = if (w.x_display) |p| p else "",
+                    .xauthority = if (w.xauthority) |p| p else "",
+                    .gpu = w.gpu,
+                    .output_width = w.output_width,
+                    .output_height = w.output_height,
                 });
             } else if (w.spawn_err) |reason| {
                 var ebuf: [192]u8 = undefined;
@@ -371,6 +389,10 @@ pub fn maybePushMeta(self: *Daemon) void {
         .title = title[0..@min(title.len, 256)],
         .cwd = cwd[0..@min(cwd.len, 1024)],
         .display = s.display,
+        .xwayland = s.xwayland != null,
+        .gpu = s.gpu,
+        .output_width = s.output_width,
+        .output_height = s.output_height,
         .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
         .viewers = n_clients,
         .controller = controller,
@@ -379,6 +401,8 @@ pub fn maybePushMeta(self: *Daemon) void {
         .wl = if (s.wl_display_path) |p| p else "",
         .pa = if (s.pa_socket_path) |p| p else "",
         .rt = if (s.runtime_dir_path) |p| p else "",
+        .x = if (s.xwayland) |*xwl| xwl.display_name else "",
+        .xa = if (s.xwayland) |*xwl| xwl.auth_path else "",
     };
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -454,6 +478,7 @@ pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) void {
 /// isolated-rt sockets (the broker's socket dir). The caller spawns the one
 /// session and runs the loop.
 pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []const u8, broker_sock: []const u8) !*Daemon {
+    _ = c.fcntl(control_fd, c.F_SETFD, c.FD_CLOEXEC);
     const self = try allocator.create(Daemon);
     self.* = .{
         .allocator = allocator,
@@ -496,6 +521,12 @@ pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq,
             .wl = if (s.wl_display_path) |p| p else "",
             .pa = if (s.pa_socket_path) |p| p else "",
             .rt = if (s.runtime_dir_path) |p| p else "",
+            .x = if (s.xwayland) |*xwl| xwl.display_name else "",
+            .xa = if (s.xwayland) |*xwl| xwl.auth_path else "",
+            .xwayland = s.xwayland != null,
+            .gpu = s.gpu,
+            .output_width = s.output_width,
+            .output_height = s.output_height,
         }, .{}, &yaw.writer)) |_| {
             controlSend(control_fd, yaw.written(), -1);
         } else |_| controlSend(control_fd, "Y", -1);
@@ -671,6 +702,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // terminal job survives until an explicit job_ack.
                 .durable_copy = true,
                 .copy_no_replace = true,
+                // Additive JSON display fields plus guarded display-only
+                // destruction. New clients must gate those requests because
+                // old daemons silently ignore unknown JSON members.
+                .display_v2 = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),

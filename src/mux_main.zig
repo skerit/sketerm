@@ -21,7 +21,7 @@ const HELP =
     \\Usage: sketerm-mux [--socket PATH]
     \\       sketerm-mux --proxy
     \\       sketerm-mux --udp-listen [--udp-port LO:HI]
-    \\       sketerm-mux display <create|inspect|list|destroy> ...
+    \\       sketerm-mux display <create|run|inspect|list|destroy> ...
     \\
     \\Runs in the foreground, listening on PATH (default
     \\$XDG_RUNTIME_DIR/sketerm/mux.sock). Clients (the sketerm GUI or
@@ -86,6 +86,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // Everything after the keyword belongs to the subcommand.
             var rest: std.ArrayList([]const u8) = .empty;
             defer rest.deinit(allocator);
+            // Preserve a global `--socket PATH` parsed before `display`.
+            // A display-local option comes later and therefore wins.
+            if (sock_path) |path| {
+                rest.append(allocator, "--socket") catch return 1;
+                rest.append(allocator, path) catch return 1;
+            }
             var j: usize = i + 1;
             while (j < argv.len) : (j += 1) rest.append(allocator, std.mem.span(argv[j])) catch return 1;
             return @import("mux/display.zig").run(allocator, rest.items);

@@ -223,6 +223,8 @@ pub const Conn = struct {
     /// request — an older daemon would answer `.err`, which a
     /// multiplexed GUI connection could misattribute.
     udp_tickets: bool = false,
+    /// Display output geometry and guarded display-only kill requests.
+    display_v2: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -341,6 +343,7 @@ pub const Conn = struct {
         self.cross_move = false;
         self.durable_copy = false;
         self.copy_no_replace = false;
+        self.display_v2 = false;
         self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
@@ -351,6 +354,7 @@ pub const Conn = struct {
             cross_move: bool = false,
             durable_copy: bool = false,
             copy_no_replace: bool = false,
+            display_v2: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -367,6 +371,7 @@ pub const Conn = struct {
             self.cross_move = parsed.value.cross_move;
             self.durable_copy = parsed.value.durable_copy;
             self.copy_no_replace = parsed.value.copy_no_replace;
+            self.display_v2 = parsed.value.display_v2;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)

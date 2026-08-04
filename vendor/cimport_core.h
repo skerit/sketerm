@@ -31,7 +31,9 @@ struct timespec { long tv_sec; long tv_nsec; };
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/resource.h> /* broker: per-worker RLIMIT_AS memory containment */
+#include <sys/file.h>     /* X display lock reclamation */
 #ifdef __linux__
+#include <sys/prctl.h>    /* satellite dies with its owning daemon */
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <sys/inotify.h> /* fsserve: live directory-view deltas */
 #include <sys/xattr.h>   /* fsserve: user.sketerm.tags file tags */
