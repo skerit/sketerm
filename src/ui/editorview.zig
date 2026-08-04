@@ -80,6 +80,7 @@ const TabHost = tabhost_mod.TabHost;
 const pane_mod = @import("pane.zig");
 const Pane = pane_mod.Pane;
 const paths = @import("../filebrowser/paths.zig");
+const imhost = @import("imhost.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const input = @import("input.zig");
@@ -561,7 +562,9 @@ pub const EditorView = struct {
     tabhost: TabHost = undefined,
     area: *c.GtkGLArea = undefined,
     status_label: *c.GtkLabel = undefined,
-    im_ctx: ?*c.GtkIMContext = null,
+    /// Shared IM plumbing (compose / dead keys / IME). Severed in
+    /// prepareDestroy / the area's ::destroy — see ImHost.detach.
+    im: ?*imhost.ImHost = null,
     widgets_dead: bool = false,
 
     // Scrollbars (vertical range in ESTIMATED rows, horizontal in px).
@@ -1024,20 +1027,9 @@ pub const EditorView = struct {
     /// Same reasoning as Pane.detachIm: the IM context is not owned
     /// by the widget tree, so it must be severed before/at teardown.
     fn detachIm(self: *EditorView) void {
-        const im = self.im_ctx orelse return;
-        self.im_ctx = null;
-        const im_obj: ?*anyopaque = @ptrCast(im);
-        _ = c.g_signal_handlers_disconnect_matched(
-            im_obj,
-            c.G_SIGNAL_MATCH_DATA,
-            0,
-            0,
-            null,
-            null,
-            @ptrCast(self),
-        );
-        c.gtk_im_context_set_client_widget(@ptrCast(im), null);
-        c.g_object_unref(im_obj);
+        const im = self.im orelse return;
+        self.im = null;
+        im.deinit();
     }
 
     /// The Window whose widget tree hosts this face.
@@ -1150,15 +1142,25 @@ pub const EditorView = struct {
 
         // Keyboard: IM context first (dead keys / compose), our chord
         // handler for what the IM leaves, pane bindings as fallback.
-        const im = c.gtk_im_multicontext_new();
-        c.gtk_im_context_set_client_widget(@ptrCast(im), area_widget);
-        _ = c.g_signal_connect_data(im, "commit", @ptrCast(&onImCommit), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(im, "preedit-start", @ptrCast(&onPreeditStart), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(im, "preedit-changed", @ptrCast(&onPreeditChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(im, "preedit-end", @ptrCast(&onPreeditEnd), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        self.im_ctx = @ptrCast(im);
         const keys = c.gtk_event_controller_key_new();
-        c.gtk_event_controller_key_set_im_context(@ptrCast(keys), @ptrCast(im));
+        // imhost.zig owns the IM plumbing (shared with the terminal
+        // pane and the forwarded-app host). Under `input_method =
+        // auto` this face resolves to GtkIMContextSimple unless the
+        // session declares a real input method — it used to be an
+        // unconditional multicontext, which silently dropped every
+        // dead key on Wayland.
+        self.im = imhost.ImHost.attach(
+            self.allocator,
+            area_widget,
+            @ptrCast(keys),
+            .editor,
+            .{
+                .ctx = @ptrCast(self),
+                .on_commit = onImCommit,
+                .on_preedit = onPreedit,
+                .on_preedit_end = onPreeditEndCb,
+            },
+        ) catch null;
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKeyPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(keys));
 
@@ -1855,7 +1857,7 @@ pub const EditorView = struct {
 
     /// Where the IME should put its candidate window.
     fn setImCursorLocation(self: *EditorView, tab: *ETab, cv: anytype) void {
-        const im = self.im_ctx orelse return;
+        const im = self.im orelse return;
         if (self.atlas == null) return;
         const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
         if (scale <= 0) return;
@@ -1864,13 +1866,15 @@ pub const EditorView = struct {
         const rel_row: f32 = @floatFromInt(
             (tab.rows.rowsBefore(cv.line) + cv.row) -| viewport_mod.anchorRow(&tab.rows, tab.anchor),
         );
-        var rect: c.GdkRectangle = .{
+        // Debounced inside ImHost against the last rectangle sent —
+        // this runs from every caret move, and the call can be a D-Bus
+        // round trip to ibus/fcitx.
+        im.setCursorLocation(.{
             .x = @intFromFloat((self.pass.text_origin_x + cv.x) / scale),
             .y = @intFromFloat((rel_row * line_h - tab.anchor.offset) / scale),
             .width = 1,
             .height = @intFromFloat(line_h / scale),
-        };
-        c.gtk_im_context_set_cursor_location(im, &rect);
+        });
     }
 
     // ---- scrollbars ---------------------------------------------------
@@ -1977,51 +1981,33 @@ pub const EditorView = struct {
         return l.line(doc, 0) catch null;
     }
 
-    /// Rebuild the throwaway preedit document from the IM context.
-    fn refreshPreedit(self: *EditorView) void {
-        const im = self.im_ctx orelse return;
-        var text: [*c]u8 = null;
-        var attrs: ?*c.PangoAttrList = null;
-        var cursor: c_int = 0;
-        c.gtk_im_context_get_preedit_string(im, &text, @ptrCast(&attrs), &cursor);
-        defer {
-            if (text != null) c.g_free(text);
-            if (attrs) |a| c.pango_attr_list_unref(a);
-        }
+    /// Rebuild the throwaway preedit document from the IM text.
+    /// `cursor_chars` is GTK's character offset; the pass wants bytes.
+    fn setPreedit(self: *EditorView, span: []const u8, cursor_chars: usize) void {
         self.clearPreedit();
-        if (text == null) return;
-        const span = std.mem.span(@as([*:0]const u8, @ptrCast(text)));
         if (span.len == 0) return;
         var doc = Document.initFromBytes(self.allocator, span) catch return;
         self.preedit_doc = doc;
         doc = undefined;
         self.preedit_layout = Layout.init(self.allocator, &self.book);
         self.preedit_layout.?.tab_cols = self.tab_width;
-        // `cursor` is a CHARACTER offset; the pass wants bytes.
-        const cp_idx: usize = if (cursor < 0) 0 else @intCast(cursor);
         var byte: usize = 0;
         var seen: usize = 0;
-        while (byte < span.len and seen < cp_idx) : (seen += 1) {
+        while (byte < span.len and seen < cursor_chars) : (seen += 1) {
             byte += std.unicode.utf8ByteSequenceLength(span[byte]) catch 1;
         }
         self.preedit_cursor = @min(byte, span.len);
         self.noteActivity();
     }
 
-    fn onPreeditStart(_: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
+    fn onPreedit(user: ?*anyopaque, text: []const u8, cursor_chars: usize) void {
         const self = cast.userData(EditorView, user);
-        self.refreshPreedit();
-        self.queueRender();
-    }
-
-    fn onPreeditChanged(_: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        self.refreshPreedit();
+        self.setPreedit(text, cursor_chars);
         if (self.active) |tab| self.ensureCaretVisible(tab);
         self.queueRender();
     }
 
-    fn onPreeditEnd(_: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
+    fn onPreeditEndCb(user: ?*anyopaque) void {
         const self = cast.userData(EditorView, user);
         self.clearPreedit();
         self.queueRender();
@@ -2045,7 +2031,7 @@ pub const EditorView = struct {
 
     fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
-        if (self.im_ctx) |im| c.gtk_im_context_focus_in(im);
+        if (self.im) |im| im.focusIn();
         self.suppressTabViewEdgeKeys(true);
         // Coming back to the editor is exactly when a stale buffer
         // starts to matter (this also covers the toplevel regaining
@@ -2058,7 +2044,7 @@ pub const EditorView = struct {
 
     fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
-        if (self.im_ctx) |im| c.gtk_im_context_focus_out(im);
+        if (self.im) |im| im.focusOut();
         self.suppressTabViewEdgeKeys(false);
         self.clearPreedit();
         self.caret_on = true;
@@ -2963,12 +2949,11 @@ pub const EditorView = struct {
         self.afterDocEdit(tab);
     }
 
-    fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
+    fn onImCommit(user: ?*anyopaque, text: []const u8) void {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         const tab = self.active orelse return;
-        const len = std.mem.len(text);
-        if (len == 0) return;
-        self.insertText(tab, text[0..len]);
+        if (text.len == 0) return;
+        self.insertText(tab, text);
     }
 
     fn copySelection(self: *EditorView, tab: *ETab) void {

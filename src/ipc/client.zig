@@ -54,6 +54,13 @@ const CLI_HELP =
     \\  set-title [--tab N | --pane N] <title>
     \\  set-tab-color [--tab N] <#RRGGBB|none>
     \\                                    colour swatch on the tab
+    \\  im-probe <hwcodes>                debug: feed comma-separated
+    \\                                    hardware keycodes (evdev + 8)
+    \\                                    through the FOCUSED face's
+    \\                                    input method and report what
+    \\                                    it committed — the only way to
+    \\                                    test dead-key composition,
+    \\                                    which send-text/send-keys skip
     \\  action [--pane N] <name>          run a bindable action by its
     \\                                    keybind.* name (zoom_pane,
     \\                                    copy_mode, show_scrollback, …)

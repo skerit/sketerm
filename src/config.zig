@@ -40,6 +40,31 @@ pub const ExitAction = enum { close, restart, hold };
 /// interactively inside the tab (pop-out available either way).
 pub const AppView = enum { window, tab };
 
+/// Which GtkIMContext implementation the keyboard faces use.
+///
+/// There is no value that gives both compose/dead keys and real input
+/// methods (see src/ui/imhost.zig for the mechanism):
+///
+/// - `simple` — GTK's in-process Compose tables. Dead keys (`^`+`e` ->
+///   `ê`, AltGr sequences, Compose) always work; no CJK/IME support.
+/// - `multi` — GTK's per-display IM module, i.e. real input methods
+///   (ibus/fcitx, candidate windows). On Wayland the module GTK picks
+///   has no compose engine, so dead keys survive only if the
+///   compositor's own IME composes them (GNOME/ibus yes; bare
+///   KWin/sway no).
+/// - `auto` — `multi` where the user has visibly configured an input
+///   method (`$GTK_IM_MODULE` or the `gtk-im-module` GtkSettings
+///   property naming something other than none/simple), `simple`
+///   otherwise. GNOME/ibus sessions often set NEITHER, so IME users
+///   there may have to say `input_method = multi` explicitly.
+///
+/// Deliberate asymmetry under `auto`: the TERMINAL always resolves to
+/// `simple` (its dead-key behaviour is what users type shells with and
+/// `auto` must not be able to take it away), while the editor and the
+/// forwarded-app host IM follow the heuristic. An explicit `simple` or
+/// `multi` overrides every face.
+pub const InputMethod = enum { auto, simple, multi };
+
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
@@ -252,6 +277,9 @@ pub const Config = struct {
     app_keyboard_layout: []const u8 = "",
     /// Default view for forwarded-app sessions (see AppView).
     app_view: AppView = .window,
+    /// GtkIMContext strategy for every keyboard face (see InputMethod).
+    /// Applies to faces created after the change.
+    input_method: InputMethod = .auto,
     /// Comma-separated app names the launcher always starts with GPU
     /// rendering (linux-dmabuf instead of software GL) — matched
     /// case-insensitively against the .desktop Name or the Exec
@@ -792,6 +820,8 @@ pub const Config = struct {
         if (self.app_keyboard_layout.len > 0)
             try w.print("app_keyboard_layout = {s}\n", .{self.app_keyboard_layout});
         if (self.app_view != .window) try w.print("app_view = {s}\n", .{@tagName(self.app_view)});
+        if (self.input_method != .auto)
+            try w.print("input_method = {s}\n", .{@tagName(self.input_method)});
         if (self.gpu_apps.len > 0) try w.print("gpu_apps = {s}\n", .{self.gpu_apps});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
@@ -1299,6 +1329,11 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         if (std.mem.eql(u8, value, "window")) cfg.app_view = .window
         else if (std.mem.eql(u8, value, "tab")) cfg.app_view = .tab
         else return error.BadAppView;
+    } else if (std.mem.eql(u8, key, "input_method")) {
+        if (std.mem.eql(u8, value, "auto")) cfg.input_method = .auto
+        else if (std.mem.eql(u8, value, "simple")) cfg.input_method = .simple
+        else if (std.mem.eql(u8, value, "multi")) cfg.input_method = .multi
+        else return error.BadInputMethod;
     } else if (std.mem.eql(u8, key, "gpu_apps")) {
         cfg.gpu_apps = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
@@ -1626,6 +1661,7 @@ test "config: palette + scheme + new keys round-trip" {
     cfg.close_button_on_tab = false;
     cfg.exit_action = .hold;
     cfg.app_view = .tab;
+    cfg.input_method = .multi;
     cfg.bell_visible = false;
     cfg.bell_urgent = false;
     cfg.word_chars = "abc";
@@ -1651,6 +1687,7 @@ test "config: palette + scheme + new keys round-trip" {
     try std.testing.expectEqual(false, parsed.close_button_on_tab);
     try std.testing.expectEqual(ExitAction.hold, parsed.exit_action);
     try std.testing.expectEqual(AppView.tab, parsed.app_view);
+    try std.testing.expectEqual(InputMethod.multi, parsed.input_method);
     try std.testing.expectEqual(false, parsed.bell_visible);
     try std.testing.expectEqual(false, parsed.bell_urgent);
     try std.testing.expectEqualStrings("abc", parsed.word_chars);

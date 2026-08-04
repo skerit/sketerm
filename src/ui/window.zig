@@ -507,6 +507,14 @@ pub const Window = struct {
         };
         next_window_id += 1;
 
+        // IM strategy is an app-level key; every face reads it at
+        // construction time (imhost.resolve).
+        @import("imhost.zig").setPreference(switch (self.config.input_method) {
+            .auto => .auto,
+            .simple => .simple,
+            .multi => .multi,
+        });
+
         // The file-manager identity dresses EVERY window it owns. The
         // icon name matters on X11 (_NET_WM_ICON); on Wayland the icon
         // follows the app id / prgname main.zig sets, which is why files

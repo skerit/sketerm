@@ -191,10 +191,6 @@ pub const Pane = struct {
     /// GLib timeout id driving the 200 ms bell-flash fade (0 = not
     /// running). One-shot burst per bell.
     bell_timer: c_uint = 0,
-    /// Last cursor (row, col) reported to the IM context. -1 = never
-    /// reported — first call sets the actual coords.
-    last_im_row: i32 = -1,
-    last_im_col: i32 = -1,
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
@@ -1084,26 +1080,9 @@ pub const Pane = struct {
 
     pub fn detachIm(self: *Pane) void {
         const ictx = self.input_ctx orelse return;
-        const im = ictx.im_ctx orelse return;
-        ictx.im_ctx = null;
-        // Disconnect every handler attached with `ictx` as user_data.
-        // `g_signal_handlers_disconnect_by_data` is a macro in glib;
-        // spell out the underlying call because the cImport
-        // translation of the macro form loses the gpointer target
-        // types.
-        const im_obj: ?*anyopaque = @ptrCast(im);
-        const ictx_data: ?*anyopaque = @ptrCast(ictx);
-        _ = c.g_signal_handlers_disconnect_matched(
-            im_obj,
-            c.G_SIGNAL_MATCH_DATA,
-            0,
-            0,
-            null,
-            null,
-            ictx_data,
-        );
-        c.gtk_im_context_set_client_widget(@ptrCast(im), null);
-        c.g_object_unref(im_obj);
+        const im = ictx.im orelse return;
+        ictx.im = null;
+        im.deinit();
     }
 
     fn freeSpawnArgv(self: *Pane) void {
@@ -2490,25 +2469,17 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     if (screen.dirty and screen.sync_output) return 1;
 
     if (screen.dirty) {
-        // Update IME cursor location so fcitx5 / ibus position
-        // their popups at the right cell. Only fire when the cursor
-        // ACTUALLY moved — `gtk_im_context_set_cursor_location` can
-        // hop into IBus/fcitx via D-Bus / Wayland IPC, which is too
-        // expensive to do on every dirty redraw.
-        if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| if (self.atlas) |atlas| {
-            const cur_row: i32 = screen.row;
-            const cur_col: i32 = screen.col;
-            if (cur_row != self.last_im_row or cur_col != self.last_im_col) {
-                self.last_im_row = cur_row;
-                self.last_im_col = cur_col;
-                var rect = c.GdkRectangle{
-                    .x = cur_col * @as(c_int, atlas.cell_w),
-                    .y = cur_row * @as(c_int, atlas.cell_h),
-                    .width = atlas.cell_w,
-                    .height = atlas.cell_h,
-                };
-                c.gtk_im_context_set_cursor_location(im, &rect);
-            }
+        // Update IME cursor location so fcitx5 / ibus position their
+        // popups at the right cell. ImHost.setCursorLocation debounces
+        // against the last rectangle sent (the call can hop into
+        // IBus/fcitx over D-Bus), so this may run per dirty redraw.
+        if (self.input_ctx) |ictx| if (ictx.im) |im| if (self.atlas) |atlas| {
+            im.setCursorLocation(.{
+                .x = @as(c_int, screen.col) * @as(c_int, atlas.cell_w),
+                .y = @as(c_int, screen.row) * @as(c_int, atlas.cell_h),
+                .width = atlas.cell_w,
+                .height = atlas.cell_h,
+            });
         };
 
         screen.dirty = false;
@@ -2797,9 +2768,7 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     //     composed text to enabled clients). GtkEventControllerKey
     //     does NOT auto-fire focus_in/out — GtkText/GtkEntry call
     //     it from their own focus handlers; we have to do the same.
-    if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| {
-        c.gtk_im_context_focus_in(im);
-    };
+    if (self.input_ctx) |ictx| if (ictx.im) |im| im.focusIn();
     // Cursor style + focus border switch on focus change — force a
     // repaint so the swap is immediate.
     self.terminal.screen.cursor_blink_on = true;
@@ -2821,9 +2790,7 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     if (self.terminal.screen.focus_reports) {
         self.terminal.writeRaw("\x1b[O");
     }
-    if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| {
-        c.gtk_im_context_focus_out(im);
-    };
+    if (self.input_ctx) |ictx| if (ictx.im) |im| im.focusOut();
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));

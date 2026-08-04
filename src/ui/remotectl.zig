@@ -504,6 +504,34 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             .title = scr.last_title orelse "",
             .seq = pane.terminal.activity_seq,
         });
+    } else if (eql(u8, req.cmd, "im-probe")) {
+        // Debug hook: push hardware keycodes (GDK code = evdev + 8,
+        // comma-separated in `data`) through the FOCUSED face's IM
+        // context exactly the way GtkEventControllerKey does, and
+        // report what it committed. This is the repeatable form of
+        // "does this face still compose dead keys?" — the answer
+        // differs per face and per compositor, and it is invisible to
+        // send-text/send-keys, which bypass the IM entirely.
+        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "im-probe requires data (comma-separated hardware keycodes)");
+        const im = @import("imhost.zig").focusedHost(null) orelse
+            return ipc_protocol.writeErr(out, allocator, "no focused face with an IM context");
+        im.probeReset();
+        var consumed_all = true;
+        var it = std.mem.splitScalar(u8, data, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " \t");
+            if (t.len == 0) continue;
+            const hw = std.fmt.parseInt(u32, t, 10) catch
+                return ipc_protocol.writeErr(out, allocator, "im-probe keycodes must be decimal");
+            if (!im.probeFeed(hw)) consumed_all = false;
+        }
+        try ipc_protocol.writeOk(out, allocator, "im", .{
+            .face = @tagName(im.face),
+            .strategy = @tagName(im.strategy),
+            .committed = im.probeText(),
+            .all_consumed = consumed_all,
+        });
+        im.probeReset();
     } else if (eql(u8, req.cmd, "screenshot")) {
         const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "screenshot requires data (output .png path)");
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");

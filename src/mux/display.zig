@@ -19,7 +19,7 @@ pub const HELP =
     \\Usage: sketerm-mux display <command> [options]
     \\
     \\  create [--name NAME] [--size WxH] [--isolated] [--gpu]
-    \\         [--xwayland|--no-xwayland]
+    \\         [--xwayland|--no-xwayland] [--kb-layout NAME]
     \\         [--ttl SECS] [--json]
     \\  run    [--name NAME] [--size WxH] [--isolated] [--gpu]
     \\         [--xwayland|--no-xwayland]
@@ -49,6 +49,8 @@ const CREATE_HELP =
     \\  --xwayland     require rootless X11 compatibility
     \\  --no-xwayland  disable automatic rootless X11 compatibility
     \\  --ttl SECS     destroy after this long with no viewer or Wayland client
+    \\  --kb-layout N  xkb layout for the session seat (default us); needed to
+    \\                 type keys a us map cannot express, e.g. dead keys
     \\  --json         print machine-readable session, output, and environment
     \\  --socket PATH  talk to a specific daemon instance
     \\
@@ -109,6 +111,7 @@ const Args = struct {
     xwayland: enum { auto, required, disabled } = .auto,
     ttl: u32 = 0,
     ttl_set: bool = false,
+    kb_layout: []const u8 = "",
     json: bool = false,
     help: bool = false,
     size_set: bool = false,
@@ -221,6 +224,9 @@ fn parseArgs(argv: []const []const u8) ?Args {
             a.output_width = size[0];
             a.output_height = size[1];
             a.size_set = true;
+        } else if (std.mem.eql(u8, s, "--kb-layout") and i + 1 < argv.len) {
+            i += 1;
+            a.kb_layout = argv[i];
         } else if (std.mem.eql(u8, s, "--isolated")) {
             a.isolated = true;
         } else if (std.mem.eql(u8, s, "--gpu")) {
@@ -473,6 +479,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         .ttl_secs = a.ttl,
         .output_width = a.output_width,
         .output_height = a.output_height,
+        .kb_layout = a.kb_layout,
         .rows = @as(u16, 24),
         .cols = @as(u16, 80),
     }) catch {

@@ -8,6 +8,7 @@ const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const clipboard = @import("clipboard.zig");
+const imhost = @import("imhost.zig");
 
 pub const Ctx = struct {
     widget: *c.GtkWidget,
@@ -28,8 +29,9 @@ pub const Ctx = struct {
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
     shortcut_ctx: ?*anyopaque = null,
-    /// Input method for IME composition (fcitx5 / ibus).
-    im_ctx: ?*c.GtkIMContext = null,
+    /// Shared IM plumbing (compose / dead keys / IME). Owned here;
+    /// severed by Pane.detachIm before the GLArea dies.
+    im: ?*imhost.ImHost = null,
     /// Last keyval seen on key-pressed (for repeat detection — kitty
     /// kbd flag 0x02 emits event=2 on repeats vs event=1 on first
     /// press). Cleared on key-released so the next press is "fresh".
@@ -505,55 +507,26 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     const ctx = try allocator.create(Ctx);
     ctx.* = .{ .widget = widget, .terminal = terminal };
 
-    // GtkIMContextSimple: in-process compose-table handling. Picked
-    // over GtkIMMulticontext because on any Wayland display advertising
-    // zwp_text_input_manager_v3, GTK resolves a multicontext to its
-    // `wayland` module (gtkimmodule.c keys on a display-level registry
-    // query). That module derives from GtkIMContext, NOT from
-    // GtkIMContextSimple, and its filter_keypress only commits
-    // gdk_keyval_to_unicode(keyval) -- which is 0 for every dead
-    // keysym. It has no compose engine and no dead-key state, so dead
-    // keys (^, ", AltGr+= -> ~, ` -> grave) fall through unconsumed and
-    // the next letter commits bare. Composition then only happens if
-    // the compositor's own IME does it (ibus under GNOME does; a bare
-    // KWin/sway session does not; sketerm's wlhost relays only what its
-    // host GUI composes). Simple always composes, via the same Compose
-    // tables xkbcommon uses, at the cost of real IME support (CJK).
-    //
-    // NOTE: an earlier version of this comment blamed GtkGraphicsOffload
-    // for the failure. That was wrong -- measured both ways in a 2x2
-    // probe (Simple/Multi x offload/no-offload), offload has zero effect
-    // on IM behaviour. The conclusion (use Simple) was right anyway, but
-    // the false reason led to the editor face adopting a multicontext on
-    // the assumption that not being offloaded made it safe. It does not.
-    const im = c.gtk_im_context_simple_new();
-    c.gtk_im_context_set_client_widget(@ptrCast(im), widget);
-    _ = c.g_signal_connect_data(
-        im,
-        "commit",
-        @ptrCast(&onImCommit),
-        @ptrCast(ctx),
-        null,
-        c.G_CONNECT_DEFAULT,
-    );
-    _ = c.g_signal_connect_data(
-        im,
-        "preedit-changed",
-        @ptrCast(&onImPreeditChanged),
-        @ptrCast(ctx),
-        null,
-        c.G_CONNECT_DEFAULT,
-    );
-    ctx.im_ctx = @ptrCast(im);
-
     const ctrl = c.gtk_event_controller_key_new();
-    // Hand the IM context to the controller. GTK4 then routes key
-    // events through the IM context BEFORE our key-pressed handler
-    // runs, auto-fires focus-in/focus-out, and tracks dead-key state.
-    // Without this, dead-key composition (AZERTY ^ + e → ê, AltGr+= +
-    // space → ~, ` + a → à) silently drops because the manual filter_
-    // keypress call fights GTK's own IM event routing.
-    c.gtk_event_controller_key_set_im_context(@ptrCast(ctrl), @ptrCast(im));
+
+    // IM plumbing lives in imhost.zig (shared with the editor canvas
+    // and the forwarded-app host). The terminal face resolves to
+    // GtkIMContextSimple under `input_method = auto`, unconditionally:
+    // dead keys in a shell are load-bearing and `auto` must not be
+    // able to trade them away. See imhost.Strategy for the tradeoff.
+    ctx.im = imhost.ImHost.attach(
+        allocator,
+        widget,
+        @ptrCast(ctrl),
+        .terminal,
+        .{
+            .ctx = @ptrCast(ctx),
+            .on_commit = onImCommit,
+            .on_preedit = onImPreedit,
+            .on_preedit_end = onImPreeditEnd,
+        },
+    ) catch null;
+
     _ = c.g_signal_connect_data(
         ctrl,
         "key-pressed",
@@ -625,38 +598,30 @@ fn onKeyReleased(
     if (n > 0) ctx.terminal.writeUserInput(buf[0..n]);
 }
 
-fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
+fn onImCommit(user: ?*anyopaque, text: []const u8) void {
     const ctx = cast.userData(Ctx, user);
-    const len = std.mem.len(text);
-    if (len > 0) ctx.terminal.writeUserInput(text[0..len]);
-    // Clear any preedit on commit.
-    const screen = ctx.terminal.screen;
-    if (screen.preedit_text) |old| {
-        screen.allocator.free(old);
-        screen.preedit_text = null;
-        screen.dirty = true;
-        c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
-    }
+    if (text.len > 0) ctx.terminal.writeUserInput(text);
+    // Clear any preedit on commit (preedit-end also fires, but not
+    // every IM emits it before the commit).
+    setPreedit(ctx, "");
 }
 
-fn onImPreeditChanged(im: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Ctx, user);
-    var str: [*c]u8 = null;
-    var attrs: ?*c.PangoAttrList = null;
-    var cur: c_int = 0;
-    c.gtk_im_context_get_preedit_string(im, &str, &attrs, &cur);
-    if (attrs) |a| c.pango_attr_list_unref(a);
-    defer if (str != null) c.g_free(str);
+/// Composition text is rendered as grid cells by GridPass — the
+/// character cursor is unused here, cells are laid out from the byte
+/// string starting at the terminal cursor.
+fn onImPreedit(user: ?*anyopaque, text: []const u8, _: usize) void {
+    setPreedit(cast.userData(Ctx, user), text);
+}
 
+fn onImPreeditEnd(user: ?*anyopaque) void {
+    setPreedit(cast.userData(Ctx, user), "");
+}
+
+fn setPreedit(ctx: *Ctx, text: []const u8) void {
     const screen = ctx.terminal.screen;
+    if (screen.preedit_text == null and text.len == 0) return;
     if (screen.preedit_text) |old| screen.allocator.free(old);
-    screen.preedit_text = null;
-    if (str != null) {
-        const slen = std.mem.len(@as([*:0]const u8, @ptrCast(str)));
-        if (slen > 0) {
-            screen.preedit_text = screen.allocator.dupe(u8, str[0..slen]) catch null;
-        }
-    }
+    screen.preedit_text = if (text.len > 0) screen.allocator.dupe(u8, text) catch null else null;
     screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
 }
