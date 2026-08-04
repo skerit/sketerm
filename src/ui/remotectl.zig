@@ -454,6 +454,15 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "send-text")) {
         const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-text requires data");
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        // An editor-visible pane receives text into its document (at
+        // every caret), not into the hidden shell underneath.
+        if (pane.editorFaceVisible()) {
+            if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
+                if (!ev.ipcInsertText(data))
+                    return ipc_protocol.writeErr(out, allocator, "editor has no open document");
+                return ipc_protocol.writeOk(out, allocator, null, {});
+            }
+        }
         if (req.paste)
             clipboard.pasteText(pane.terminal, data)
         else
@@ -462,6 +471,16 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "send-keys")) {
         const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-keys requires data (chords like \"ctrl+c up enter\")");
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        // Editor-visible pane: a small editor chord set (enter, tab,
+        // backspace, delete, escape, ctrl+s, ctrl+z, ctrl+y) instead
+        // of PTY byte encoding.
+        if (pane.editorFaceVisible()) {
+            if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
+                if (!ev.ipcSendKeys(data))
+                    return ipc_protocol.writeErr(out, allocator, "unsupported editor chord (supported: enter tab backspace delete escape ctrl+s ctrl+z ctrl+y)");
+                return ipc_protocol.writeOk(out, allocator, null, {});
+            }
+        }
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(allocator);
         @import("../ipc/keys.zig").encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
@@ -574,6 +593,24 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // Asked for from inside a pane (`sketerm files --tab`): show
         // what was asked for. Scripted use (no address) keeps the
         // non-stealing behaviour of new-tab.
+        if (origin != null) {
+            if (target.last_created_page) |page| c.adw_tab_view_set_selected_page(target.tab_view, page);
+            c.gtk_window_present(@ptrCast(target.app_window));
+        }
+        try ipc_protocol.writeOk(out, allocator, "created", .{
+            .tab = winmod.next_tab_id - 1,
+            .pane = next_pane_id - 1,
+        });
+    } else if (eql(u8, req.cmd, "new-editor-tab")) {
+        // Same addressing as new-browser-tab: a pane address means "an
+        // editor tab in THAT pane's window"; no address = the window
+        // in front. `data` is an optional file spec to open.
+        const origin: ?*Pane = if (req.pane != null or req.session != null)
+            reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+        else
+            null;
+        const target = if (origin) |p| ownerWindow(self, p) else activeOrSelf(self);
+        try target.newEditorTabAt(req.data);
         if (origin != null) {
             if (target.last_created_page) |page| c.adw_tab_view_set_selected_page(target.tab_view, page);
             c.gtk_window_present(@ptrCast(target.app_window));

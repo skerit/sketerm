@@ -987,6 +987,42 @@ pub const Window = struct {
         if (reveal) |target| bv.queueReveal(target);
     }
 
+    /// New tab whose pane wears the text-editor face (the shell
+    /// session underneath stays one toolbar click away).
+    pub fn newEditorTab(self: *Window) !void {
+        try self.newEditorTabAt(null);
+    }
+
+    /// Editor tab opening `spec` (host-qualified allowed); null = an
+    /// empty Untitled buffer.
+    pub fn newEditorTabAt(self: *Window, spec: ?[]const u8) !void {
+        // Same appended-pane rule as newBrowserTabFromReveal.
+        const before = self.panes.items.len;
+        try self.newShellTab("Editor");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("editorview.zig").EditorView.attach(self.allocator, pane, spec) catch |err| {
+            logActionError("new_editor_tab attach", err);
+            return err;
+        };
+    }
+
+    /// Put an editor face on `pane` itself (the browser's "Edit in
+    /// Sketerm Editor"). A pane already wearing one gains a document
+    /// tab instead (attach handles that).
+    pub fn openEditorOn(self: *Window, pane: *Pane, spec: ?[]const u8) !void {
+        _ = try @import("editorview.zig").EditorView.attach(self.allocator, pane, spec);
+    }
+
+    /// Unsaved editor tabs across every pane of this window.
+    pub fn editorDirtyTotal(self: *Window) usize {
+        var n: usize = 0;
+        for (self.panes.items) |p| {
+            if (@import("editorview.zig").EditorView.fromPane(p)) |ev| n += ev.dirtyCount();
+        }
+        return n;
+    }
+
     /// Put a browser face on `pane` itself (`sketerm files --here`):
     /// the pane's shell stays alive underneath, one toolbar click away.
     /// A pane that ALREADY wears a browser face gains a browser tab
@@ -3030,6 +3066,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // pane-local dispatch consumes it otherwise): say so, rather
         // than let the action look broken.
         .toggle_browser_face => showToast(self, "This pane has no file browser. Use New File Browser Tab."),
+        .new_editor_tab => self.newEditorTab() catch |err| logActionError("new_editor_tab", err),
+        // Only reached when the focused pane has NO editor face.
+        .toggle_editor_face => showToast(self, "This pane has no editor. Use New Editor Tab."),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
@@ -3411,6 +3450,40 @@ const PendingCloseWin = struct { win: *Window };
 fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
 
+    // Unsaved editor buffers in this tab veto the close until the
+    // user confirms discarding them (saving happens inside the
+    // editor face; this gate only prevents silent loss).
+    {
+        const child = c.adw_tab_page_get_child(page);
+        var dirty: usize = 0;
+        if (child != null) {
+            for (self.panes.items) |p| {
+                if (!widgetIsAncestor(@ptrCast(child), p.widget())) continue;
+                if (@import("editorview.zig").EditorView.fromPane(p)) |ev| dirty += ev.dirtyCount();
+            }
+        }
+        if (dirty > 0) {
+            const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(
+                "Discard unsaved changes?",
+                "This tab has editor files with unsaved changes. Closing it discards them.",
+            )));
+            c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+            c.adw_alert_dialog_add_response(dialog, "close", "Discard and Close");
+            c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
+            c.adw_alert_dialog_set_default_response(dialog, "cancel");
+            c.adw_alert_dialog_set_close_response(dialog, "cancel");
+            const pending = self.allocator.create(PendingCloseTab) catch {
+                c.adw_tab_view_close_page_finish(view, page, 1);
+                return 1;
+            };
+            pending.* = .{ .win = self, .page = page };
+            _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
+            c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
+            render_kick.dialogPresented(self.app_window);
+            return 1;
+        }
+    }
+
     if (self.config.confirm_close == .never) {
         c.adw_tab_view_close_page_finish(view, page, 1);
         return 1;
@@ -3478,6 +3551,32 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     if (self.save_on_close and self.is_primary) {
         self.saveLayoutQuietly();
         self.layout_saved_final = true;
+    }
+
+    // Unsaved editor buffers veto the close regardless of the
+    // confirm_close policy — silent loss of edits is never OK.
+    {
+        const dirty = self.editorDirtyTotal();
+        if (dirty > 0) {
+            var body: [160:0]u8 = undefined;
+            const b = std.fmt.bufPrintZ(&body, "There {s} {d} editor file{s} with unsaved changes. Closing the window discards them.", .{
+                if (dirty == 1) @as([]const u8, "is") else @as([]const u8, "are"),
+                dirty,
+                if (dirty == 1) @as([]const u8, "") else @as([]const u8, "s"),
+            }) catch "There are editor files with unsaved changes.";
+            const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Discard unsaved changes?", b.ptr)));
+            c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+            c.adw_alert_dialog_add_response(dialog, "close", "Discard and Close");
+            c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
+            c.adw_alert_dialog_set_default_response(dialog, "cancel");
+            c.adw_alert_dialog_set_close_response(dialog, "cancel");
+            const pending = self.allocator.create(PendingCloseWin) catch return 0;
+            pending.* = .{ .win = self };
+            _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
+            c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
+            render_kick.dialogPresented(self.app_window);
+            return 1;
+        }
     }
 
     if (self.config.confirm_close == .never) return 0;

@@ -209,6 +209,58 @@ pub fn main() u8 {
     if (std.mem.count(u8, after_browser_close, "\"id\":") != std.mem.count(u8, list3, "\"id\":"))
         return fail("browser split close did not remove its pane");
 
+    // 6b. Editor face end-to-end: a new editor tab on a (not yet
+    // existing) file spec, text typed over IPC, Ctrl+S saved through
+    // the daemon, file content asserted, pane closed.
+    {
+        var efile_buf: [512]u8 = undefined;
+        const efile = std.fmt.bufPrintZ(&efile_buf, "{s}/e2e-editor.txt", .{rt}) catch return fail("editor path");
+        var ereq_buf: [700]u8 = undefined;
+        const ereq = std.fmt.bufPrint(&ereq_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return fail("editor req fmt");
+        const eresp = roundtrip(allocator, sock_path, ereq) orelse return fail("new-editor-tab roundtrip");
+        defer allocator.free(eresp);
+        if (std.mem.indexOf(u8, eresp, "\"ok\":true") == null) return fail("new-editor-tab not ok");
+        const epane = parseNumAfter(eresp, "\"pane\":") orelse return fail("new-editor-tab reply has no pane id");
+        // Let the tab spawn and the async (missing-file) load resolve.
+        _ = c.usleep(1_000_000);
+
+        var treq_buf: [256]u8 = undefined;
+        const treq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"hello editor\"}}\n", .{epane}) catch return fail("fmt");
+        const tresp = roundtrip(allocator, sock_path, treq) orelse return fail("editor send-text roundtrip");
+        defer allocator.free(tresp);
+        if (std.mem.indexOf(u8, tresp, "\"ok\":true") == null) return fail("editor send-text not ok");
+
+        const kreq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return fail("fmt");
+        const kresp = roundtrip(allocator, sock_path, kreq) orelse return fail("editor save roundtrip");
+        defer allocator.free(kresp);
+        if (std.mem.indexOf(u8, kresp, "\"ok\":true") == null) return fail("editor ctrl+s not ok");
+
+        // The save is a daemon-backed async write: poll the file.
+        var saved = false;
+        var etries: u32 = 0;
+        while (etries < 50) : (etries += 1) {
+            _ = c.usleep(200_000);
+            const f = c.fopen(efile.ptr, "rb") orelse continue;
+            var content: [64]u8 = undefined;
+            const n = c.fread(&content, 1, content.len, f);
+            _ = c.fclose(f);
+            if (std.mem.eql(u8, content[0..n], "hello editor")) {
+                saved = true;
+                break;
+            }
+        }
+        if (!saved) return fail("editor save never produced the expected file content");
+
+        const creq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{epane}) catch return fail("fmt");
+        const cresp = roundtrip(allocator, sock_path, creq) orelse return fail("editor close roundtrip");
+        defer allocator.free(cresp);
+        if (std.mem.indexOf(u8, cresp, "\"ok\":true") == null) return fail("editor close-pane not ok");
+        _ = c.usleep(500_000);
+        const after_editor = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("GUI stopped serving after editor close");
+        defer allocator.free(after_editor);
+        if (std.mem.indexOf(u8, after_editor, "\"ok\":true") == null) return fail("GUI unhealthy after editor close");
+    }
+
     // 7. A stale SKETERM_PANE_ID (the GUI restarted since the pane's
     // shell was spawned, so its baked-in id no longer matches a live
     // pane) must NOT fail an attach with "no such pane" — the takeover
@@ -265,6 +317,19 @@ pub fn main() u8 {
 
     _ = c.fputs("smoke-e2e: PASS\n", platform.stdout());
     return 0;
+}
+
+/// First unsigned integer following `key` in `text` (JSON scraping).
+fn parseNumAfter(text: []const u8, key: []const u8) ?u32 {
+    const at = std.mem.indexOf(u8, text, key) orelse return null;
+    var i = at + key.len;
+    var v: u32 = 0;
+    var any = false;
+    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+        v = v * 10 + (text[i] - '0');
+        any = true;
+    }
+    return if (any) v else null;
 }
 
 /// One connect → one request line → one response line. Caller frees.

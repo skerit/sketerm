@@ -21,6 +21,9 @@ pub const Ctx = struct {
     /// Swap the pane's file-browser and terminal faces. @return false
     /// when the pane has no browser face, so the key falls through.
     browser_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Swap the pane's editor and terminal faces. @return false when
+    /// the pane has no editor face, so the key falls through.
+    editor_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
     /// Optional shortcut sink for tab/split/etc actions. May be null
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
@@ -165,6 +168,12 @@ pub const Action = enum {
     /// terminal face. Dispatched locally (the Pane owns both faces);
     /// a pane with no browser face leaves the key to the terminal.
     toggle_browser_face,
+    /// Open a text-editor tab (src/ui/editorview.zig): a shell pane
+    /// wearing the editor face.
+    new_editor_tab,
+    /// Flip the focused pane between its editor face and its
+    /// terminal face. Dispatched locally like toggle_browser_face.
+    toggle_editor_face,
     /// Detach the focused mux pane: the session keeps running on the
     /// daemon; the pane lands in a fresh local shell. No-op on
     /// non-mux panes.
@@ -357,6 +366,8 @@ pub fn actionName(a: Action) []const u8 {
         .new_browser_split => "new_browser_split",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
+        .new_editor_tab => "new_editor_tab",
+        .toggle_editor_face => "toggle_editor_face",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -438,6 +449,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_browser_split => "Split into a second file browser pane",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
+        .new_editor_tab => "New text editor tab",
+        .toggle_editor_face => "Show the text editor / show the shell (this pane)",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
@@ -736,6 +749,10 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             // A pane with no browser face has nothing to swap to; the
             // key belongs to whatever is listening next (the shell).
             const flip = ctx.browser_toggle orelse return 0;
+            return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
+        .toggle_editor_face => {
+            const flip = ctx.editor_toggle orelse return 0;
             return if (flip(ctx.pane_ctx)) 1 else 0;
         },
         .paste_clipboard => {

@@ -20,6 +20,8 @@ comptime {
     _ = @import("editor/selection.zig");
     _ = @import("editor/transaction.zig");
     _ = @import("editor/unicode.zig");
+    _ = @import("editor/model.zig");
+    _ = @import("editor/view_model.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");

@@ -122,27 +122,13 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_box_append(@ptrCast(content), scroller);
     c.gtk_box_append(@ptrCast(page), content);
 
-    const label = c.gtk_label_new("...");
-    c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
-    // An ellipsizing label reports the ellipsis itself as its minimum
-    // width, so without width_chars the notebook collapses every tab
-    // to "...". width_chars is the floor it always gets,
-    // max_width_chars the ceiling before it ellipsizes.
-    c.gtk_label_set_width_chars(@ptrCast(label), 14);
-    c.gtk_label_set_max_width_chars(@ptrCast(label), 24);
-    const label_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-    c.gtk_box_append(@ptrCast(label_box), label);
-    const close_btn = c.gtk_button_new_from_icon_name("window-close-symbolic");
-    c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
-    c.gtk_box_append(@ptrCast(label_box), close_btn);
-
     tab.* = .{
         .view = self,
         .hc = hc,
         .root = dir,
         .page = page,
         .colview = undefined,
-        .tab_label = @ptrCast(@alignCast(label)),
+        .tab_label = undefined,
         .scroller = scroller,
         .miller_box = miller_box,
         .empty_box = empty_box,
@@ -164,8 +150,6 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // rest of the columns behind a horizontal scrollbar.
     colview.installWidthFit(tab);
 
-    _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-
     // The content box behind the rows: the background menu for the
     // states where the rows are HIDDEN (empty folder, failed listing)
     // and the column view's gesture therefore cannot fire. Bubble
@@ -179,7 +163,6 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // Mouse side buttons navigate history anywhere in the listing;
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
-    self.installTabConveniences(tab, label_box);
     // Ctrl+wheel zoom, then the config defaults, then the folder's
     // remembered view settings (an explicit TabState restore runs
     // after newTab and wins over everything).
@@ -195,8 +178,24 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     }
     self.applyFolderMemory(tab);
 
-    const page_idx = c.gtk_notebook_append_page(self.notebook, page, label_box);
-    c.gtk_notebook_set_current_page(self.notebook, page_idx);
+    // The label + close button + middle-click/scroll gestures are the
+    // shared tab-host recipe; the browser layers its own right-click
+    // menu and file-drop target on the returned label box.
+    const handle = self.tabhost.addPage(page.?, "...") orelse {
+        for (self.tabs.items, 0..) |t, j| {
+            if (t == tab) {
+                _ = self.tabs.orderedRemove(j);
+                break;
+            }
+        }
+        colview.invalidateBackingRefs(tab);
+        tab.deinit();
+        self.setStatus("cannot open a tab: out of memory");
+        return null;
+    };
+    tab.tab_label = handle.label;
+    self.installTabConveniences(tab, handle.box);
+    self.tabhost.setCurrentPage(page.?);
     self.updateTabLabel(tab);
     self.openDir(tab, dir);
     // Render once now: the listing area then says "Listing..." (or the
