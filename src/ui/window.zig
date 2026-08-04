@@ -1823,17 +1823,28 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
     }
 
+    /// Split whatever currently has keyboard focus. A no-op when focus
+    /// is not on a pane (an empty window, a dialog, a background tab).
     pub fn splitFocused(self: *Window, orientation: c_uint) !void {
-        // Splitting a zoomed layout would wire the new pane into a
-        // hidden tree — restore the real layout first.
-        self.unzoomPane();
-        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
-
         // Find the focused Pane. The wrapper Box isn't focusable, so
         // gtk_window_get_focus returns the inner GLArea. Match against
         // p.area, then operate on p.widget() (== the wrapper) for
         // reparenting.
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
         const focused_pane = self.paneForWidget(focus) orelse return;
+        try self.splitPane(focused_pane, orientation);
+    }
+
+    /// Split a SPECIFIC pane. Callers that already know which pane they
+    /// mean — `sketerm cli split --pane N`, the palette acting on a
+    /// referenced pane — must use this rather than focusing the pane and
+    /// calling splitFocused: focus does not follow a `grab_focus` on a
+    /// widget in a background tab, so that route silently split whatever
+    /// happened to be focused instead, or nothing at all.
+    pub fn splitPane(self: *Window, focused_pane: *Pane, orientation: c_uint) !void {
+        // Splitting a zoomed layout would wire the new pane into a
+        // hidden tree — restore the real layout first.
+        self.unzoomPane();
         const focused_w = focused_pane.widget();
 
         const parent = c.gtk_widget_get_parent(focused_w) orelse return;

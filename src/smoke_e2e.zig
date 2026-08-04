@@ -472,7 +472,17 @@ pub fn main() u8 {
     // callbacks before their child widgets are destroyed.
     const split_browser = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return fail("browser split roundtrip");
     defer allocator.free(split_browser);
-    if (std.mem.indexOf(u8, split_browser, "\"ok\":true") == null) return fail("browser split not ok");
+    if (std.mem.indexOf(u8, split_browser, "\"ok\":true") == null) {
+        // Show the daemon's own reason — "not ok" alone says nothing
+        // about WHICH way it went wrong (missing pane vs failed split).
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: browser split reply: %.*s\n", @as(c_int, @intCast(@min(split_browser.len, 500))), split_browser.ptr);
+        const l = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n");
+        if (l) |ls| {
+            defer allocator.free(ls);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tree at failure: %.*s\n", @as(c_int, @intCast(@min(ls.len, 1500))), ls.ptr);
+        }
+        return fail("browser split not ok");
+    }
     const browser_here = roundtrip(allocator, sock_path, "{\"cmd\":\"browser-here\",\"pane\":4,\"data\":\"/\"}\n") orelse return fail("browser-here roundtrip");
     defer allocator.free(browser_here);
     if (std.mem.indexOf(u8, browser_here, "\"ok\":true") == null) return fail("browser-here not ok");

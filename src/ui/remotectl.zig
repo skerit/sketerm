@@ -428,9 +428,15 @@ pub fn ipcDispatchTrampoline(ctx: *anyopaque, req: ipc_protocol.Request, out: *s
         req.session orelse "-",
     });
     defer crashlog.clear();
-    ipcDispatch(self, req, out, allocator) catch {
+    ipcDispatch(self, req, out, allocator) catch |err| {
+        // Name the error. A bare "internal error" tells the caller
+        // nothing about WHICH way a command went wrong, and this is the
+        // reply every scripted client and smoke rig sees when a handler
+        // fails — the breadcrumb above is only written on a crash.
         out.clearRetainingCapacity();
-        ipc_protocol.writeErr(out, allocator, "internal error") catch {};
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "internal error: {s}", .{@errorName(err)}) catch "internal error";
+        ipc_protocol.writeErr(out, allocator, msg) catch {};
     };
 }
 
@@ -695,13 +701,18 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "split")) {
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
         const win = ownerWindow(self, pane);
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
         const dir = req.direction orelse "h";
         const orient: c_uint = if (eql(u8, dir, "v"))
             @intCast(c.GTK_ORIENTATION_VERTICAL)
         else
             @intCast(c.GTK_ORIENTATION_HORIZONTAL);
-        try win.splitFocused(orient);
+        // Split the pane that was ASKED for. This used to grab focus and
+        // then split "the focused pane", which only agreed with the
+        // request while that pane's tab happened to be selected —
+        // anything that selects another tab first (an app session
+        // materializing its log tab, say) made this split the wrong pane
+        // or silently nothing.
+        try win.splitPane(pane, orient);
         try ipc_protocol.writeOk(out, allocator, "created", .{
             .pane = next_pane_id - 1,
         });
