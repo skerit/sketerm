@@ -491,9 +491,12 @@ pub fn build(b: *std.Build) void {
     smoke_step.dependOn(&smoke_run.step);
     }
 
-    // IPC end-to-end smoke — `zig build smoke-e2e`. Launches the
-    // built app (needs a display; SKIPs without one), drives it via
-    // the remote-control socket, asserts on get-text output.
+    // End-to-end GUI smoke — `zig build smoke-e2e`. Fully headless and
+    // self-hosted: it starts a private daemon, asks it for a display
+    // session, and runs the built app as a Wayland client of sketerm's
+    // own compositor. Drives it over the remote-control socket AND over
+    // a real seat (keys/clicks + pixel assertions). No Xvfb — X11
+    // changes GTK's input-method behaviour and produces false greens.
     const smoke_e2e_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_e2e.zig"),
         .target = target,
@@ -513,7 +516,7 @@ pub fn build(b: *std.Build) void {
     // first, and the cwd must be the project root (default).
     smoke_e2e_run.step.dependOn(b.getInstallStep());
     smoke_e2e_run.setCwd(b.path("."));
-    const smoke_e2e_step = b.step("smoke-e2e", "End-to-end smoke via remote-control socket (needs display)");
+    const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
 
     // macOS NSAccessibility smoke — `zig build smoke-a11y`. Drives a

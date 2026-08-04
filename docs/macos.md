@@ -74,6 +74,14 @@ zig build smoke-mux  # daemon end-to-end
 zig build smoke-e2e  # GUI end-to-end (opens a real window)
 ```
 
+On Linux `smoke-e2e` hosts its own display (a `sketerm-mux display`
+session); macOS has no Wayland hub, so the GUI talks to the WindowServer
+and the harness skips the real-seat stages (click/type/pixel diffs and
+the Wayland input-method assertion). Those are Linux-only coverage.
+
+```
+```
+
 brew's zig 0.16.0 matches the pinned toolchain; `/opt/homebrew/bin`
 must be on PATH (pkg-config lives there). No PKG_CONFIG_PATH fiddling
 was needed — pkgconf's defaults cover the brew prefix.
