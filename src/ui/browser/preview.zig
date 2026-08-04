@@ -889,7 +889,8 @@ fn sweepRemoteThumbCache(dirz: [*:0]const u8) void {
         const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dirz), name }) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(p.ptr, &st) != 0) continue;
-        var it = Item{ .mtime = @intCast(st.st_mtim.tv_sec), .name = undefined };
+        const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        var it = Item{ .mtime = @intCast(mts.tv_sec), .name = undefined };
         @memcpy(&it.name, name);
         items.append(a, it) catch break;
         if (items.items.len >= REMOTE_THUMB_CACHE_MAX_FILES * 2) break;

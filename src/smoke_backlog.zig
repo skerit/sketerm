@@ -117,8 +117,9 @@ fn newestWlDisplay(sock_path: []const u8, out: *[256]u8) []const u8 {
         const full = std.fmt.bufPrintZ(&pbuf, "{s}/{s}", .{ sock_path[0..dir_end], name }) catch continue;
         var st: c.struct_stat = undefined;
         if (c.stat(full.ptr, &st) != 0) continue;
-        const sec: i64 = st.st_mtim.tv_sec;
-        const nsec: i64 = st.st_mtim.tv_nsec;
+        const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        const sec: i64 = mts.tv_sec;
+        const nsec: i64 = mts.tv_nsec;
         if (sec > best_sec or (sec == best_sec and nsec > best_nsec)) {
             best_sec = sec;
             best_nsec = nsec;
