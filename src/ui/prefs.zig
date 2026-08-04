@@ -18,6 +18,7 @@ const ExitAction = @import("../config.zig").ExitAction;
 const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
 const editor_theme = @import("../editor/theme.zig");
+const lsp_proc = @import("../lsp/proc.zig");
 
 // Forward-declare the Window pointer type. We can't import window.zig
 // directly without creating a cycle, so we receive it as anyopaque and
@@ -1298,6 +1299,8 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addEditorThemeRow(@ptrCast(@alignCast(syntax_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(syntax_group)));
 
+    buildLspGroup(page, ctx);
+
     // Font is PER-PROFILE, like the terminal font it falls back to.
     const font_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
@@ -1305,6 +1308,124 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addEditorFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Editor font size", "0 = follow the profile's terminal font size.", 0, 96, &ctx.edit.editor_font_size, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
+}
+
+// ── Language servers ────────────────────────────────────────────
+//
+// App-level, not per-profile: a language server serves a LANGUAGE, and
+// which pane profile a document happens to be open under says nothing
+// about that (CLAUDE.md's ProfileSettings split).
+//
+// The per-server rows write through `Config.lspServerMut`, which
+// materializes a `[lsp.<name>]` section the first time a server is
+// edited. Untouched servers keep no section at all and so keep
+// following the built-in table.
+
+const LspField = enum { command, args, languages, root_files };
+
+const LspRowCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    /// Registry name; lives in the dialog arena.
+    name: []const u8,
+    field: LspField,
+};
+
+const LspEnableCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    name: []const u8,
+};
+
+fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    const group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Language servers");
+    c.adw_preferences_group_set_description(
+        @ptrCast(@alignCast(group)),
+        "LSP gives the editor diagnostics (Ctrl+Space completion, Ctrl+I hover, F12 go to definition, Shift+F12 references, F8 next problem, Ctrl+Shift+O symbols, F2 rename, Ctrl+Shift+I format). A server that is not installed is skipped silently.",
+    );
+    addSwitchRow(@ptrCast(@alignCast(group)), ctx, "Enable language servers", "Off never spawns a server.", &ctx.cfg.editor_lsp, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(group)), ctx, "Show diagnostics", "Squiggles in the text and a stripe in the gutter.", &ctx.cfg.editor_lsp_diagnostics, applyOnly);
+    addSpinRowU16(
+        @ptrCast(@alignCast(group)),
+        ctx,
+        "Change debounce (ms)",
+        "How long after the last keystroke the document is pushed to the server. Asking for a feature always pushes first.",
+        10,
+        5000,
+        &ctx.cfg.editor_lsp_debounce_ms,
+        applyOnly,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
+
+    const list = ctx.cfg.lspServerList(ctx.arena.allocator()) catch return;
+    for (list) |srv| {
+        const name = ctx.dupe(srv.name) catch continue;
+        const sub = c.adw_preferences_group_new();
+        var title_z = cast.sliceToZ(64, name);
+        c.adw_preferences_group_set_title(@ptrCast(@alignCast(sub)), &title_z);
+        var desc: [256:0]u8 = undefined;
+        const installed = lsp_proc.onPath(ctx.allocator, srv.command);
+        const d = std.fmt.bufPrintZ(&desc, "{s}  —  {s}", .{
+            if (srv.languages.len > 0) srv.languages else "no languages",
+            if (installed) "installed" else "not found on PATH",
+        }) catch "";
+        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sub)), d.ptr);
+        addLspEnableRow(@ptrCast(@alignCast(sub)), ctx, name, srv.enabled);
+        addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .command, "Command", srv.command);
+        addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .args, "Arguments", srv.args);
+        addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .languages, "Languages", srv.languages);
+        addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .root_files, "Root markers", srv.root_files);
+        c.adw_preferences_page_add(page, @ptrCast(@alignCast(sub)));
+    }
+}
+
+fn addLspEnableRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, name: []const u8, on: bool) void {
+    const row = c.adw_switch_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Enabled");
+    c.adw_switch_row_set_active(@ptrCast(@alignCast(row)), if (on) 1 else 0);
+    const rctx = ctx.allocator.create(LspEnableCtx) catch return;
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name };
+    _ = c.g_signal_connect_data(row, "notify::active", @ptrCast(&lspEnableChanged), @ptrCast(rctx), @ptrCast(cast.destroyCtx(LspEnableCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn lspEnableChanged(row: *c.AdwSwitchRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const rctx = cast.userData(LspEnableCtx, user);
+    const srv = rctx.parent.cfg.lspServerMut(rctx.parent.arena.allocator(), rctx.name) orelse return;
+    srv.enabled = c.adw_switch_row_get_active(row) != 0;
+    rctx.parent.ev();
+}
+
+fn addLspEntryRow(
+    group: *c.AdwPreferencesGroup,
+    ctx: *Ctx,
+    name: []const u8,
+    field: LspField,
+    title: [*:0]const u8,
+    value: []const u8,
+) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    var z = cast.sliceToZ(256, value);
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    const rctx = ctx.allocator.create(LspRowCtx) catch return;
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name, .field = field };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&lspEntryChanged), @ptrCast(rctx), @ptrCast(cast.destroyCtx(LspRowCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn lspEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const rctx = cast.userData(LspRowCtx, user);
+    const text = rctx.parent.dupe(cast.editableText(row)) catch return;
+    const srv = rctx.parent.cfg.lspServerMut(rctx.parent.arena.allocator(), rctx.name) orelse return;
+    switch (rctx.field) {
+        .command => srv.command = text,
+        .args => srv.args = text,
+        .languages => srv.languages = text,
+        .root_files => srv.root_files = text,
+    }
+    rctx.parent.ev();
 }
 
 /// Theme picker, built from `editor/theme.zig`'s own list so adding a
