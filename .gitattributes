@@ -1,0 +1,12 @@
+# makepkg rewrites dist/PKGBUILD's `pkgver=` line on every build, which
+# left the file perpetually dirty and made `git pull` complain. The
+# `pkgver` clean filter normalizes that one line on the way INTO git, so
+# the local rewrite is invisible; the real version is derived at build
+# time by pkgver() from build.zig.zon anyway, making the stored value
+# meaningless. Requires a local filter driver (see docs/packaging note):
+#
+#   git config filter.pkgver.clean  "sed -E 's/^pkgver=.*/pkgver=0.0.0/'"
+#   git config filter.pkgver.smudge cat
+#
+# A clone WITHOUT that config is fine: git no-ops on an undefined driver.
+dist/PKGBUILD filter=pkgver
