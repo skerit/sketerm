@@ -212,6 +212,69 @@ pub const Rope = struct {
         return try self.joinNodes(l.?, r.?);
     }
 
+    fn leftmostLeaf(node: *Node) *Node {
+        var n = node;
+        while (true) switch (n.kind) {
+            .leaf => return n,
+            .inner => |in| n = in.left,
+        };
+    }
+
+    fn rightmostLeaf(node: *Node) *Node {
+        var n = node;
+        while (true) switch (n.kind) {
+            .leaf => return n,
+            .inner => |in| n = in.right,
+        };
+    }
+
+    /// Appends `text` to the rightmost leaf, fixing aggregates down the
+    /// right spine. Caller guarantees the leaf has capacity.
+    fn appendToRightmost(node: *Node, text: []const u8) void {
+        const added_nl = countNewlines(text);
+        var n = node;
+        while (true) {
+            n.bytes += text.len;
+            n.newlines += added_nl;
+            switch (n.kind) {
+                .leaf => |l| {
+                    std.debug.assert(@as(usize, l.len) + text.len <= MAX_LEAF);
+                    @memcpy(l.data[l.len .. l.len + text.len], text);
+                    n.kind.leaf.len = @intCast(@as(usize, l.len) + text.len);
+                    return;
+                },
+                .inner => |in| n = in.right,
+            }
+        }
+    }
+
+    /// `join`, additionally fusing the two leaves that meet at the seam
+    /// when they fit in one.
+    ///
+    /// Without this, every edit that cuts a leaf leaves the two halves
+    /// behind forever: a session of scattered single-byte deletes grows
+    /// one leaf per edit and the tree's leaf storage (MAX_LEAF per leaf
+    /// regardless of fill) drifts toward 2048x the document size. Only
+    /// the SEAM needs checking — that is the one place an edit can
+    /// create undersized neighbours.
+    fn joinCompact(self: *Rope, l: ?*Node, r: ?*Node) Allocator.Error!?*Node {
+        const ln = l orelse return r;
+        const rn = r orelse return l;
+        const last = rightmostLeaf(ln);
+        const first = leftmostLeaf(rn);
+        const donor_len: usize = first.kind.leaf.len;
+        if (@as(usize, last.kind.leaf.len) + donor_len <= MAX_LEAF) {
+            // Splitting at the first leaf's own length is a split on a
+            // leaf boundary, so `s.left` IS that leaf, unsplit.
+            const s = try self.split(rn, donor_len);
+            const donor = s.left.?;
+            appendToRightmost(ln, leafSlice(donor));
+            self.freeNode(donor);
+            return try self.join(ln, s.right);
+        }
+        return try self.joinNodes(ln, rn);
+    }
+
     const SplitResult = struct { left: ?*Node, right: ?*Node };
 
     /// Splits `node` at byte position `k` (0 <= k <= node.bytes),
@@ -280,8 +343,8 @@ pub const Rope = struct {
         self.root = null;
         const s = try self.split(root, offset);
         const mid = try self.buildBalanced(text);
-        const lm = try self.join(s.left, mid);
-        self.root = try self.join(lm, s.right);
+        const lm = try self.joinCompact(s.left, mid);
+        self.root = try self.joinCompact(lm, s.right);
     }
 
     /// In-place leaf insertion when the target leaf has capacity.
@@ -334,7 +397,7 @@ pub const Rope = struct {
         const s1 = try self.split(root, start);
         const s2 = try self.split(s1.right.?, end - start);
         if (s2.left) |mid| self.freeTree(mid);
-        self.root = try self.join(s1.left, s2.right);
+        self.root = try self.joinCompact(s1.left, s2.right);
     }
 
     // ---- queries ------------------------------------------------------
@@ -516,6 +579,53 @@ pub const Rope = struct {
     pub fn checkInvariants(self: *const Rope) void {
         if (self.root) |n| checkNode(n);
     }
+
+    pub const Stats = struct {
+        leaves: usize = 0,
+        inners: usize = 0,
+        height: u16 = 0,
+        /// Bytes actually stored.
+        used: usize = 0,
+        /// Bytes of leaf storage held (leaves * MAX_LEAF), i.e. what the
+        /// tree costs regardless of fill.
+        capacity: usize = 0,
+
+        /// capacity/used — 1.0 is a perfectly packed tree. A rope whose
+        /// leaves never merge drifts toward MAX_LEAF here.
+        pub fn amplification(self: Stats) f64 {
+            if (self.used == 0) return 1.0;
+            return @as(f64, @floatFromInt(self.capacity)) / @as(f64, @floatFromInt(self.used));
+        }
+    };
+
+    fn walkStats(node: *const Node, out: *Stats) void {
+        switch (node.kind) {
+            .leaf => |l| {
+                out.leaves += 1;
+                out.used += l.len;
+                out.capacity += MAX_LEAF;
+            },
+            .inner => |in| {
+                out.inners += 1;
+                walkStats(in.left, out);
+                walkStats(in.right, out);
+            },
+        }
+    }
+
+    /// Shape of the tree. O(n) in node count — for tests and benchmarks.
+    pub fn stats(self: *const Rope) Stats {
+        var s = Stats{};
+        if (self.root) |n| {
+            walkStats(n, &s);
+            s.height = n.height;
+        }
+        return s;
+    }
+
+    pub fn leafCount(self: *const Rope) usize {
+        return self.stats().leaves;
+    }
 };
 
 // ======================================================================
@@ -605,6 +715,30 @@ test "rope range iterator" {
     const got = try r.sliceAlloc(testing.allocator, start, end);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(buf[start..end], got);
+}
+
+test "rope re-merges the leaves an edit cut apart" {
+    const alloc = testing.allocator;
+    const n = MAX_LEAF * 4;
+    const buf = try alloc.alloc(u8, n);
+    defer alloc.free(buf);
+    for (buf, 0..) |*b, i| b.* = if (i % 37 == 0) '\n' else 'z';
+
+    var r = try Rope.initFromBytes(alloc, buf);
+    defer r.deinit();
+    const before = r.stats().leaves;
+
+    // Cutting a leaf in half and dropping one byte leaves two halves
+    // that fit in one leaf: they must fuse back, not accumulate.
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const pos = MAX_LEAF + 1 + (i % 97);
+        try r.delete(pos, pos + 1);
+        try r.insert(pos, "y");
+    }
+    r.checkInvariants();
+    try testing.expectEqual(before, r.stats().leaves);
+    try testing.expectEqual(n, r.len());
 }
 
 test "rope fuzz vs byte-array oracle" {
