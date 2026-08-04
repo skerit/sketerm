@@ -26,6 +26,7 @@ const SelectionSet = sel_mod.SelectionSet;
 const Selection = sel_mod.Selection;
 const unicode = @import("editor/unicode.zig");
 const syntax = @import("editor/syntax.zig");
+const structure = @import("editor/structure.zig");
 const theme_mod = @import("editor/theme.zig");
 
 const c_egl = @cImport({
@@ -690,6 +691,179 @@ pub fn main() !u8 {
                 .{ns2ms(e1 - e0)},
             );
         }
+    }
+
+    // --- Structure: brackets, folding, expand-selection ---------------
+    // All three read the SAME trees the highlighting does. This stage
+    // proves the RENDERED result, not just the query: bracket boxes
+    // must appear as pixels, and folding must make the frame lay out
+    // FEWER lines while the hidden text stays out of the picture.
+    {
+        const th = &theme_mod.dark;
+        var zdoc = try Document.initFromBytes(allocator, HL_SRC);
+        defer zdoc.deinit();
+        var hl = try syntax.Highlighter.init(allocator, .zig);
+        defer hl.deinit();
+        hl.attach(&zdoc);
+        try hl.parse(&zdoc);
+
+        var zlayout = Layout.init(allocator, &book);
+        defer zlayout.deinit();
+        zlayout.hl = &hl;
+        zlayout.theme = th;
+
+        // 1. Bracket matching through the tree, including the two
+        //    cases a naive scanner gets wrong.
+        const body_open = std.mem.indexOfScalar(u8, HL_SRC, '{').?;
+        const pair = (try hl.bracketAt(&zdoc, body_open)) orelse {
+            std.debug.print("smoke-editor: FAIL — no bracket pair for the fn body\n", .{});
+            return 11;
+        };
+        if (pair.close.start != std.mem.lastIndexOfScalar(u8, HL_SRC, '}').?) {
+            std.debug.print("smoke-editor: FAIL — fn body brace matched the wrong closer\n", .{});
+            return 11;
+        }
+        // The '{' inside the format string "{s} {d}" is inside a string
+        // token, so the tree reports NO pair for it.
+        const in_string = std.mem.indexOf(u8, HL_SRC, "{s}").?;
+        if ((try hl.bracketAt(&zdoc, in_string)) != null) {
+            std.debug.print("smoke-editor: FAIL — a brace inside a string literal matched\n", .{});
+            return 11;
+        }
+        // …and the fallback scanner, which has no tree, does match it —
+        // the documented difference.
+        if (structure.scanMatch(&zdoc.rope, in_string) == null) {
+            std.debug.print("smoke-editor: FAIL — fallback scanner found no pair at all\n", .{});
+            return 11;
+        }
+
+        var zsels = try SelectionSet.initSingle(allocator, Selection.caret(body_open));
+        defer zsels.deinit(allocator);
+
+        c.glClearColor(th.bg[0], th.bg[1], th.bg[2], th.bg[3]);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        try pass.buildFrame(.{
+            .layout = &zlayout,
+            .doc = &zdoc,
+            .sels = &zsels,
+            .view = .{
+                .width_px = @floatFromInt(W),
+                .height_px = @floatFromInt(H),
+                .show_fold_column = true,
+            },
+            .colors = .{ .text = th.fg, .bracket = th.bracket, .fold_fg = th.fold_fg, .fold_badge = th.fold_badge },
+            .theme = th,
+            .brackets = &[_]structure.Range{ pair.open, pair.close },
+        });
+        pass.draw(atlas, W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        // The box is translucent, so look for the COMPOSITE of the
+        // bracket colour over the theme background.
+        var want: [4]f32 = .{ 0, 0, 0, 1 };
+        inline for (0..3) |ci| {
+            want[ci] = th.bracket[ci] * th.bracket[3] + th.bg[ci] * (1 - th.bracket[3]);
+        }
+        var bracket_px: usize = 0;
+        var bi: usize = 0;
+        while (bi < fb_bytes) : (bi += 4) {
+            if (nearColor(.{ fb[bi], fb[bi + 1], fb[bi + 2] }, want)) bracket_px += 1;
+        }
+        const unfolded_lines = pass.lines_laid_out;
+        std.debug.print(
+            "smoke-editor: structure bracket boxes px={d} unfolded_lines={d}\n",
+            .{ bracket_px, unfolded_lines },
+        );
+        if (bracket_px < 20) {
+            std.debug.print("smoke-editor: FAIL — bracket pair drew no visible box\n", .{});
+            return 11;
+        }
+
+        // 2. Folding. The tree heads a region at the `pub fn` line;
+        //    folding it must hide its body and cost FEWER laid-out
+        //    lines, and the row index must agree.
+        const fn_line = zdoc.rope.offsetToLineCol(std.mem.indexOf(u8, HL_SRC, "pub fn").?).line;
+        const region = (try hl.foldRegionAtLine(&zdoc, fn_line)) orelse {
+            std.debug.print("smoke-editor: FAIL — no foldable region at the fn line\n", .{});
+            return 11;
+        };
+        var folds = structure.FoldState.init(allocator);
+        defer folds.deinit();
+        try folds.fold(structure.firstNonBlankOffset(&zdoc, fn_line), region);
+
+        var rows = viewport_mod.RowIndex.init(allocator);
+        defer rows.deinit();
+        const zlines = zdoc.rope.lineCount();
+        rows.reset(true, zlines);
+        for (folds.hidden.items) |sp| {
+            var l = sp.start_line;
+            while (l <= sp.end_line and l < zlines) : (l += 1) rows.setHidden(l, true);
+        }
+        if (rows.totalRows(zlines) != zlines - folds.hiddenLines()) {
+            std.debug.print("smoke-editor: FAIL — row index disagrees with the hidden set\n", .{});
+            return 11;
+        }
+
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        try pass.buildFrame(.{
+            .layout = &zlayout,
+            .doc = &zdoc,
+            .sels = &zsels,
+            .view = .{
+                .width_px = @floatFromInt(W),
+                .height_px = @floatFromInt(H),
+                .show_fold_column = true,
+            },
+            .colors = .{ .text = th.fg, .bracket = th.bracket, .fold_fg = th.fold_fg, .fold_badge = th.fold_badge },
+            .theme = th,
+            .folds = &folds,
+            .fold_markers = &[_]editor_pass.FoldMarker{.{ .line = fn_line, .folded = true }},
+            .rows = &rows,
+        });
+        pass.draw(atlas, W, H);
+        c.glFinish();
+        const folded_lines = pass.lines_laid_out;
+        std.debug.print(
+            "smoke-editor: structure folded region {d}..{d} hidden={d} folded_lines={d}\n",
+            .{ region.start_line, region.end_line, folds.hiddenLines(), folded_lines },
+        );
+        if (folded_lines + folds.hiddenLines() != unfolded_lines) {
+            std.debug.print(
+                "smoke-editor: FAIL — folding did not remove exactly the hidden lines from the frame\n",
+                .{},
+            );
+            return 11;
+        }
+
+        // 3. Expand / shrink retraces exactly.
+        var stack = structure.SelectionStack.init(allocator);
+        defer stack.deinit();
+        const name_at = std.mem.indexOf(u8, HL_SRC, "\"sketerm\"").? + 2;
+        zsels.keepPrimaryOnly();
+        zsels.sels.items[0] = Selection.caret(name_at);
+        var widths: [4]usize = undefined;
+        var steps: usize = 0;
+        while (steps < widths.len) : (steps += 1) {
+            const cur = zsels.sels.items[0];
+            const r = (try hl.expandRange(&zdoc, cur.start(), cur.end())) orelse break;
+            try stack.push(&zsels);
+            zsels.sels.items[0] = .{ .anchor = r.start, .head = r.end };
+            widths[steps] = r.end - r.start;
+            if (steps > 0 and widths[steps] <= widths[steps - 1]) {
+                std.debug.print("smoke-editor: FAIL — expand did not grow the selection\n", .{});
+                return 11;
+            }
+        }
+        if (steps < 3) {
+            std.debug.print("smoke-editor: FAIL — expand stopped after {d} steps\n", .{steps});
+            return 11;
+        }
+        while (try stack.pop(&zsels)) {}
+        if (!zsels.sels.items[0].isCaret() or zsels.sels.items[0].head != name_at) {
+            std.debug.print("smoke-editor: FAIL — shrink did not retrace expand\n", .{});
+            return 11;
+        }
+        std.debug.print("smoke-editor: PASS structure (brackets, folding, expand/shrink {d} steps)\n", .{steps});
     }
 
     // --- Syntax perf on a ~1MB source ---------------------------------

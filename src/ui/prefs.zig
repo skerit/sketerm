@@ -1292,6 +1292,9 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const syntax_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(syntax_group)), "Syntax");
     addSwitchRow(@ptrCast(@alignCast(syntax_group)), ctx, "Syntax highlighting", "Colour code by structure (Zig, C, JSON, Markdown). Off renders every document as plain text.", &ctx.cfg.editor_syntax, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(syntax_group)), ctx, "Bracket matching", "Box the bracket pair around the caret. Ctrl+M jumps to the match. Brackets inside strings and comments are ignored when the file has a grammar.", &ctx.cfg.editor_bracket_match, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(syntax_group)), ctx, "Code folding", "Fold column in the gutter plus Ctrl+Shift+[ / ] at the caret and Ctrl+Alt+[ / ] for all.", &ctx.cfg.editor_folding, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(syntax_group)), ctx, "Fold by indentation without a grammar", "Files sketerm has no grammar for still fold, using indentation. Off leaves them unfoldable.", &ctx.cfg.editor_fold_indent_fallback, applyOnly);
     addEditorThemeRow(@ptrCast(@alignCast(syntax_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(syntax_group)));
 

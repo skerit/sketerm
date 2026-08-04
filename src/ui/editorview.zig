@@ -49,6 +49,34 @@
 //! - Ctrl+Shift+S / Ctrl+Shift+Z are claimed by the editor face
 //!   (Save As / Redo), shadowing the global save_layout /
 //!   restore_closed_tab while the editor has focus.
+//!
+//! ## Structure (brackets / folding / expand-selection)
+//!
+//! All three read the tree-sitter trees the highlighting already
+//! keeps — see editor/syntax.zig for the queries and
+//! editor/structure.zig for the fold-anchoring rationale. Behaviour
+//! that is a DECISION rather than a consequence:
+//! - Bracket matching asks the tree first and takes its "no pair"
+//!   answer as final; that is what keeps a bracket inside a string or
+//!   a comment from matching. The depth-counting scanner runs only
+//!   when there is no tree at all (no grammar, or `editor_syntax`
+//!   off), and cannot see strings or comments.
+//! - Folding never adds an absolute `scroll_y`. A folded line weighs
+//!   ZERO rows in the RowIndex, so the anchor, the scrollbar and every
+//!   row conversion stay correct with no second code path — which is
+//!   also why the index is now allocated when folds exist even with
+//!   soft wrap off.
+//! - Folding a region containing carets pulls them to the header line;
+//!   moving a caret INTO hidden text (Right off the end of a header, a
+//!   find match, goto-line) unfolds instead. Up/Down never need that:
+//!   `stepVisualRow` steps over folds.
+//! - Fold regions are re-derived from the tree after every parse and
+//!   NOT while it lags, so a fold keeps its last known lines for the
+//!   length of the debounce rather than snapping to the indentation
+//!   fallback for one frame.
+//! - Shrink-selection replays a recorded stack, it never re-derives a
+//!   smaller node: with several carets those are different sets. Any
+//!   non-structural caret move or edit drops the stack.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -74,6 +102,8 @@ const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("../editor/view_model.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
+const structure = @import("../editor/structure.zig");
+const tr = @import("../editor/transaction.zig");
 const theme_mod = @import("../editor/theme.zig");
 const tabhost_mod = @import("tabhost.zig");
 const TabHost = tabhost_mod.TabHost;
@@ -424,6 +454,8 @@ pub const ETab = struct {
     /// mismatch means it must be reset before it is trusted.
     rows_lines: usize = 0,
     rows_wrap_width: f32 = 0,
+    /// Fold epoch the row index's hidden flags were stamped for.
+    rows_folds: u64 = 0,
     /// Horizontal scroll, px (wrap off only).
     scroll_x: f32 = 0,
     /// Widest row seen so far, px — the horizontal scrollbar's range
@@ -476,6 +508,53 @@ pub const ETab = struct {
     /// Non-zero while a debounced re-parse is queued.
     parse_timer: c_uint = 0,
 
+    // ---- structure (brackets / folds / expand-selection) -------------
+    //
+    // Every cache below is keyed on `(doc.revision, hl.gen)` — the same
+    // pair the layout cache and the highlighter's own kind window use —
+    // plus whatever else the answer depends on. Nothing here may run a
+    // whole-document tree query per frame.
+
+    /// Folded regions, anchored by byte offset (editor/structure.zig
+    /// explains why an offset and not a line number).
+    folds: structure.FoldState,
+    /// Bumped whenever the HIDDEN set actually changes; `ensureRows`
+    /// watches it to know when to re-stamp the row index.
+    folds_epoch: u64 = 0,
+    /// (revision, highlighter gen) `folds` was last re-resolved at.
+    folds_rev: u64 = 0,
+    folds_gen: u64 = 0,
+    folds_valid: bool = false,
+
+    /// Gutter fold affordances for the visible line range.
+    fold_markers: std.ArrayList(editor_pass.FoldMarker) = .empty,
+    /// Cache key for `fold_markers`: revision, highlighter gen, the
+    /// visible line range, and the fold epoch (folding changes which
+    /// markers point which way).
+    fm_rev: u64 = 0,
+    fm_gen: u64 = 0,
+    fm_epoch: u64 = 0,
+    fm_from: usize = 0,
+    fm_to: usize = 0,
+    fm_valid: bool = false,
+
+    /// Bracket boxes for the current carets (two ranges per matched
+    /// caret).
+    brackets: std.ArrayList(structure.Range) = .empty,
+    /// Cache key: revision, highlighter gen, and a hash of the caret
+    /// heads — a caret move is the only other thing that can change the
+    /// answer.
+    br_rev: u64 = 0,
+    br_gen: u64 = 0,
+    br_carets: u64 = 0,
+    br_valid: bool = false,
+
+    /// Expand/shrink trail (structure.SelectionStack).
+    sel_stack: structure.SelectionStack,
+    /// True while an expand/shrink is running, so the trail is not
+    /// cleared by its own selection change.
+    structural_move: bool = false,
+
     fn destroy(self: *ETab) void {
         const a = self.view.allocator;
         // A queued parse timer is fenced (DlgCtx) and resolves to
@@ -485,7 +564,11 @@ pub const ETab = struct {
             a.destroy(hl);
             self.hl = null;
         }
-        self.doc.observer = null;
+        self.doc.clearObservers();
+        self.folds.deinit();
+        self.fold_markers.deinit(a);
+        self.brackets.deinit(a);
+        self.sel_stack.deinit();
         self.layout.hl = null;
         self.layout.deinit();
         self.rows.deinit();
@@ -496,6 +579,17 @@ pub const ETab = struct {
         if (self.spec) |s| a.free(s);
         if (self.keep_sels.len > 0) a.free(self.keep_sels);
         a.destroy(self);
+    }
+
+    /// Fold anchors are POSITIONS, so they map through every edit
+    /// exactly like selections do — and because the hook is on
+    /// `applyEdits`, undo and redo carry them too.
+    fn observeFoldEdits(ctx: *anyopaque, _: *const Document, edits: []const tr.Edit) void {
+        const self: *ETab = @ptrCast(@alignCast(ctx));
+        if (!self.folds.isEmpty()) self.folds.mapThrough(edits);
+        self.folds_valid = false;
+        self.fm_valid = false;
+        self.br_valid = false;
     }
 
     fn clearMatches(self: *ETab) void {
@@ -662,6 +756,15 @@ pub const EditorView = struct {
     line_numbers: bool = true,
     highlight_current_line: bool = true,
     syntax_on: bool = true,
+    /// Box the bracket pair around the caret (`editor_bracket_match`).
+    bracket_match: bool = true,
+    /// Code folding: gutter column, chevrons, fold actions
+    /// (`editor_folding`).
+    folding: bool = true,
+    /// Derive fold regions from INDENTATION when the file has no
+    /// grammar (`editor_fold_indent_fallback`). Off means files with no
+    /// grammar simply have no folds.
+    fold_indent_fallback: bool = true,
     /// Colours for text, chrome and every highlight kind. Points at a
     /// comptime constant in `editor/theme.zig`, so it never dangles
     /// across a config-arena swap.
@@ -726,6 +829,9 @@ pub const EditorView = struct {
         self.line_numbers = cfg.editor_line_numbers;
         self.highlight_current_line = cfg.editor_highlight_current_line;
         self.syntax_on = cfg.editor_syntax;
+        self.bracket_match = cfg.editor_bracket_match;
+        self.folding = cfg.editor_folding;
+        self.fold_indent_fallback = cfg.editor_fold_indent_fallback;
         self.theme = theme_mod.byName(cfg.editor_theme);
         self.applyThemeColors();
 
@@ -818,9 +924,9 @@ pub const EditorView = struct {
     }
 
     fn dropHighlighter(self: *EditorView, tab: *ETab) void {
-        tab.doc.observer = null;
         tab.layout.hl = null;
         if (tab.hl) |hl| {
+            tab.doc.removeObserver(@ptrCast(hl));
             hl.deinit();
             self.allocator.destroy(hl);
         }
@@ -890,6 +996,445 @@ pub const EditorView = struct {
             }
         }
         return 0; // G_SOURCE_REMOVE
+    }
+
+    // ---- structure: brackets, folds, expand-selection -----------------
+    //
+    // Everything here is derived from the SAME tree-sitter trees the
+    // highlighting uses (editor/syntax.zig grew the queries; there is
+    // no second parser). The documented fallbacks in
+    // editor/structure.zig — a depth-counting bracket scanner and
+    // indentation-derived fold regions — are consulted ONLY when there
+    // is no usable tree, i.e. no grammar for the file type or
+    // `editor_syntax = false`. A tree that merely LAGS the document is
+    // not a fallback trigger for folds (the last known regions stand
+    // until the parse lands) but IS one for brackets, where a wrong box
+    // for one frame is cheaper than none.
+
+    /// Carets past this many stop getting bracket boxes. A thousand
+    /// carets times two tree descents per frame is not worth it, and
+    /// nobody can read that many highlights anyway.
+    const MAX_BRACKET_CARETS: usize = 64;
+
+    /// Hash of every selection's endpoints — the third key (after
+    /// revision and highlighter generation) the bracket cache needs,
+    /// because moving a caret changes the answer without touching
+    /// either of the other two.
+    fn caretHash(sels: *const SelectionSet) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (sels.sels.items) |s| {
+            h.update(std.mem.asBytes(&s.anchor));
+            h.update(std.mem.asBytes(&s.head));
+        }
+        return h.final();
+    }
+
+    fn hlGen(tab: *ETab) u64 {
+        return if (tab.hl) |h| h.gen else 0;
+    }
+
+    /// Gutter width for this tab, with the SAME flags the render pass
+    /// uses. Hit testing and the wrap width both go through here so
+    /// they cannot drift from what was drawn.
+    fn gutterWidthOf(self: *EditorView, tab: *ETab) f32 {
+        const atlas = self.atlas orelse return 0;
+        return EditorPass.gutterWidth(
+            atlas,
+            tab.doc.rope.lineCount(),
+            self.line_numbers,
+            self.folding,
+        ) catch 0;
+    }
+
+    /// Width of the line-number field alone (the fold column sits to
+    /// its right).
+    fn numberFieldWidth(self: *EditorView, tab: *ETab) f32 {
+        const w = self.gutterWidthOf(tab);
+        return if (self.folding) @max(0, w - EditorPass.FOLD_COL_W) else w;
+    }
+
+    // ---- folds ---------------------------------------------------------
+
+    /// The foldable region headed by `line`: from the tree when one is
+    /// current, from indentation otherwise.
+    fn foldRegionAtLine(self: *EditorView, tab: *ETab, line: usize) ?structure.FoldRegion {
+        if (tab.hl) |hl| {
+            if (!hl.isStale(&tab.doc)) return hl.foldRegionAtLine(&tab.doc, line) catch null;
+            return null;
+        }
+        if (!self.fold_indent_fallback) return null;
+        return structure.indentRegionAt(&tab.doc, line, self.tab_width);
+    }
+
+    /// The innermost region CONTAINING `offset` whose header is another
+    /// line — "fold the block I am inside".
+    fn foldRegionEnclosing(self: *EditorView, tab: *ETab, offset: usize) ?structure.FoldRegion {
+        if (tab.hl) |hl| {
+            if (!hl.isStale(&tab.doc)) return hl.foldRegionEnclosing(&tab.doc, offset) catch null;
+            return null;
+        }
+        if (!self.fold_indent_fallback) return null;
+        // Indentation fallback: walk up looking for a shallower header.
+        const line = tab.doc.rope.offsetToLineCol(offset).line;
+        var l = line;
+        while (l > 0) {
+            l -= 1;
+            const r = structure.indentRegionAt(&tab.doc, l, self.tab_width) orelse continue;
+            if (r.hides(line)) return r;
+        }
+        return null;
+    }
+
+    const FoldCtx = struct {
+        view: *EditorView,
+        tab: *ETab,
+
+        fn atLine(ctx: ?*anyopaque, line: usize) ?structure.FoldRegion {
+            const self: *FoldCtx = @ptrCast(@alignCast(ctx.?));
+            return self.view.foldRegionAtLine(self.tab, line);
+        }
+    };
+
+    /// Re-derive every fold's region from its (already mapped) anchor.
+    ///
+    /// Deliberately SKIPPED while a highlighted document's tree lags:
+    /// resolving against the indentation fallback there would quietly
+    /// replace tree-derived regions with indentation ones. The last
+    /// known regions stand until the re-parse lands, which for anything
+    /// under SYNC_PARSE_LIMIT is the same turn of the main loop.
+    fn syncFolds(self: *EditorView, tab: *ETab) void {
+        if (tab.folds.isEmpty()) return;
+        var gen: u64 = 0;
+        if (tab.hl) |hl| {
+            if (hl.isStale(&tab.doc)) return;
+            gen = hl.gen;
+        }
+        if (tab.folds_valid and tab.folds_rev == tab.doc.revision and tab.folds_gen == gen) return;
+        const before = self.foldSignature(tab);
+        var ctx = FoldCtx{ .view = self, .tab = tab };
+        tab.folds.resolve(&tab.doc, .{ .ctx = &ctx, .at_line = FoldCtx.atLine }) catch {};
+        tab.folds_rev = tab.doc.revision;
+        tab.folds_gen = gen;
+        tab.folds_valid = true;
+        if (self.foldSignature(tab) != before) {
+            tab.folds_epoch += 1;
+            tab.fm_valid = false;
+            self.ensureRows(tab);
+        }
+    }
+
+    /// Cheap identity of the HIDDEN set — only a real change may bump
+    /// the epoch, or every parse would rebuild the row index.
+    fn foldSignature(self: *EditorView, tab: *ETab) u64 {
+        _ = self;
+        var h = std.hash.Wyhash.init(0xF01D);
+        for (tab.folds.hidden.items) |sp| {
+            h.update(std.mem.asBytes(&sp.start_line));
+            h.update(std.mem.asBytes(&sp.end_line));
+        }
+        return h.final();
+    }
+
+    /// First and last line the next frame will draw, folds accounted
+    /// for. O(viewport).
+    fn visibleLineSpan(self: *EditorView, tab: *ETab) struct { from: usize, to: usize } {
+        const n = tab.doc.rope.lineCount();
+        if (n == 0) return .{ .from = 0, .to = 0 };
+        var li = tab.folds.nextVisible(@min(tab.anchor.line, n - 1));
+        if (li >= n) li = tab.folds.prevVisible(n - 1);
+        const from = li;
+        var rows_left: isize = @intCast(self.viewportRows() + 1);
+        while (li + 1 < n and rows_left > 0) {
+            rows_left -= @max(1, @as(isize, tab.rows.rowsOf(li)));
+            const next = tab.folds.nextVisible(li + 1);
+            if (next >= n) break;
+            li = next;
+        }
+        return .{ .from = from, .to = @min(li, n - 1) };
+    }
+
+    /// Gutter fold affordances for [from, to]. Cached on (revision,
+    /// highlighter gen, fold epoch, line range) so scrolling one row
+    /// recomputes and sitting still does not.
+    fn ensureFoldMarkers(self: *EditorView, tab: *ETab, from: usize, to: usize) void {
+        if (!self.folding) {
+            tab.fold_markers.clearRetainingCapacity();
+            return;
+        }
+        const gen = hlGen(tab);
+        if (tab.fm_valid and tab.fm_rev == tab.doc.revision and tab.fm_gen == gen and
+            tab.fm_epoch == tab.folds_epoch and tab.fm_from == from and tab.fm_to == to) return;
+        tab.fm_rev = tab.doc.revision;
+        tab.fm_gen = gen;
+        tab.fm_epoch = tab.folds_epoch;
+        tab.fm_from = from;
+        tab.fm_to = to;
+        tab.fm_valid = true;
+        tab.fold_markers.clearRetainingCapacity();
+
+        const n = tab.doc.rope.lineCount();
+        if (n == 0) return;
+        const b0 = tab.doc.rope.lineToOffset(from);
+        const b1 = if (to + 1 < n) tab.doc.rope.lineToOffset(to + 1) else tab.doc.rope.len();
+
+        var regions: []structure.FoldRegion = &.{};
+        var owned = false;
+        if (tab.hl) |hl| {
+            if (!hl.isStale(&tab.doc)) {
+                if (hl.foldRegionsIn(self.allocator, &tab.doc, b0, b1)) |r| {
+                    regions = r;
+                    owned = true;
+                } else |_| {}
+            }
+        } else if (self.fold_indent_fallback) {
+            if (structure.indentRegions(self.allocator, &tab.doc, from, to, self.tab_width)) |r| {
+                regions = r;
+                owned = true;
+            } else |_| {}
+        }
+        defer if (owned) self.allocator.free(regions);
+
+        for (regions) |r| {
+            if (r.start_line < from or r.start_line > to) continue;
+            tab.fold_markers.append(self.allocator, .{
+                .line = r.start_line,
+                .folded = tab.folds.entryAtLine(r.start_line) != null,
+            }) catch return;
+        }
+    }
+
+    /// Bookkeeping every fold mutation shares: bump the epoch (which is
+    /// what makes `ensureRows` re-stamp the row index), pull the anchor
+    /// off a line that just became hidden, repaint.
+    fn noteFoldChange(self: *EditorView, tab: *ETab) void {
+        tab.folds_epoch += 1;
+        tab.fm_valid = false;
+        tab.folds_valid = false;
+        self.ensureRows(tab);
+        if (tab.folds.isHidden(tab.anchor.line)) {
+            tab.anchor = .{ .line = tab.folds.prevVisible(tab.anchor.line), .row = 0, .offset = 0 };
+        }
+        self.clampAnchor(tab, self.viewportHeightPx());
+        self.updateStatus();
+        self.queueRender();
+    }
+
+    /// Move any caret that just went behind a fold to the end of the
+    /// header line — a caret you cannot see is worse than a caret that
+    /// moved.
+    fn pullCaretsOutOfFolds(self: *EditorView, tab: *ETab) void {
+        _ = self;
+        if (tab.folds.isEmpty()) return;
+        for (tab.sels.sels.items) |*s| {
+            const lh = tab.doc.rope.offsetToLineCol(s.head).line;
+            if (tab.folds.isHidden(lh)) {
+                const header = tab.folds.prevVisible(lh);
+                s.head = vm.lineBoundsAt(&tab.doc, tab.doc.rope.lineToOffset(header)).end;
+            }
+            const la = tab.doc.rope.offsetToLineCol(s.anchor).line;
+            if (tab.folds.isHidden(la)) {
+                const header = tab.folds.prevVisible(la);
+                s.anchor = vm.lineBoundsAt(&tab.doc, tab.doc.rope.lineToOffset(header)).end;
+            }
+        }
+        tab.sels.normalize();
+    }
+
+    /// Unfold whatever hides a caret. Called after every ordinary move,
+    /// so walking Right off the end of a folded header opens it rather
+    /// than teleporting the caret into invisible text. (Up/Down never
+    /// need it: `stepVisualRow` steps over folds.)
+    fn revealCaretLines(self: *EditorView, tab: *ETab) void {
+        if (tab.folds.isEmpty()) return;
+        var changed = false;
+        for (tab.sels.sels.items) |s| {
+            const l = tab.doc.rope.offsetToLineCol(s.head).line;
+            if (!tab.folds.isHidden(l)) continue;
+            changed = (tab.folds.revealLine(l) catch false) or changed;
+        }
+        if (changed) self.noteFoldChange(tab);
+    }
+
+    fn applyFold(self: *EditorView, tab: *ETab, region: structure.FoldRegion) void {
+        const anchor = structure.firstNonBlankOffset(&tab.doc, region.start_line);
+        tab.folds.fold(anchor, region) catch return;
+        tab.folds_valid = true;
+        tab.folds_rev = tab.doc.revision;
+        tab.folds_gen = hlGen(tab);
+        self.pullCaretsOutOfFolds(tab);
+        self.noteFoldChange(tab);
+    }
+
+    /// Fold the region headed by the caret's line, or the innermost one
+    /// containing it.
+    pub fn foldAtCaret(self: *EditorView, tab: *ETab) void {
+        if (!self.folding) return;
+        self.syncFolds(tab);
+        const head = tab.sels.primary().head;
+        const line = tab.doc.rope.offsetToLineCol(head).line;
+        const region = self.foldRegionAtLine(tab, line) orelse
+            self.foldRegionEnclosing(tab, head) orelse return;
+        self.applyFold(tab, region);
+    }
+
+    /// Unfold the region headed by the caret's line, else whichever one
+    /// hides it.
+    pub fn unfoldAtCaret(self: *EditorView, tab: *ETab) void {
+        if (!self.folding) return;
+        const head = tab.sels.primary().head;
+        const line = tab.doc.rope.offsetToLineCol(head).line;
+        var changed = tab.folds.unfoldAtLine(line) catch false;
+        if (!changed) changed = (tab.folds.unfoldCovering(line) catch null) != null;
+        if (!changed) return;
+        self.noteFoldChange(tab);
+    }
+
+    /// Toggle the fold headed by `line` (the gutter chevron's action).
+    pub fn toggleFoldLine(self: *EditorView, tab: *ETab, line: usize) void {
+        if (!self.folding) return;
+        self.syncFolds(tab);
+        if (tab.folds.entryAtLine(line) != null) {
+            _ = tab.folds.unfoldAtLine(line) catch {};
+            self.noteFoldChange(tab);
+            return;
+        }
+        const region = self.foldRegionAtLine(tab, line) orelse return;
+        self.applyFold(tab, region);
+    }
+
+    pub fn foldAll(self: *EditorView, tab: *ETab) void {
+        if (!self.folding) return;
+        const n = tab.doc.rope.lineCount();
+        if (n == 0) return;
+        var regions: []structure.FoldRegion = &.{};
+        var owned = false;
+        if (tab.hl) |hl| {
+            if (hl.isStale(&tab.doc)) hl.parse(&tab.doc) catch {};
+            if (hl.foldRegionsIn(self.allocator, &tab.doc, 0, tab.doc.rope.len())) |r| {
+                regions = r;
+                owned = true;
+            } else |_| {}
+        } else if (self.fold_indent_fallback) {
+            if (structure.indentRegions(self.allocator, &tab.doc, 0, n - 1, self.tab_width)) |r| {
+                regions = r;
+                owned = true;
+            } else |_| {}
+        }
+        defer if (owned) self.allocator.free(regions);
+        if (regions.len == 0) return;
+        for (regions) |r| {
+            tab.folds.fold(structure.firstNonBlankOffset(&tab.doc, r.start_line), r) catch break;
+        }
+        tab.folds_valid = true;
+        tab.folds_rev = tab.doc.revision;
+        tab.folds_gen = hlGen(tab);
+        self.pullCaretsOutOfFolds(tab);
+        self.noteFoldChange(tab);
+    }
+
+    pub fn unfoldAll(self: *EditorView, tab: *ETab) void {
+        if (tab.folds.isEmpty()) return;
+        tab.folds.clear();
+        self.noteFoldChange(tab);
+    }
+
+    // ---- brackets ------------------------------------------------------
+
+    /// The pair around/adjacent to `offset`. The TREE is the primary
+    /// source and its "no pair" answer is final — that is what keeps a
+    /// bracket inside a string or a comment from matching. The scanner
+    /// runs only when there is no tree at all.
+    fn bracketPairAt(self: *EditorView, tab: *ETab, offset: usize) ?structure.BracketPair {
+        _ = self;
+        if (tab.hl) |hl| {
+            if (!hl.isStale(&tab.doc)) return hl.bracketAt(&tab.doc, offset) catch null;
+        }
+        return structure.scanMatch(&tab.doc.rope, offset);
+    }
+
+    fn ensureBrackets(self: *EditorView, tab: *ETab) void {
+        if (!self.bracket_match) {
+            tab.brackets.clearRetainingCapacity();
+            return;
+        }
+        const gen = hlGen(tab);
+        const carets = caretHash(&tab.sels);
+        if (tab.br_valid and tab.br_rev == tab.doc.revision and
+            tab.br_gen == gen and tab.br_carets == carets) return;
+        tab.br_rev = tab.doc.revision;
+        tab.br_gen = gen;
+        tab.br_carets = carets;
+        tab.br_valid = true;
+        tab.brackets.clearRetainingCapacity();
+        for (tab.sels.sels.items, 0..) |sel, i| {
+            if (i >= MAX_BRACKET_CARETS) break;
+            const pair = self.bracketPairAt(tab, sel.head) orelse continue;
+            tab.brackets.append(self.allocator, pair.open) catch return;
+            tab.brackets.append(self.allocator, pair.close) catch return;
+        }
+    }
+
+    /// Jump every caret to the other half of its bracket pair.
+    pub fn gotoMatchingBracket(self: *EditorView, tab: *ETab, extend: bool) void {
+        var moved = false;
+        for (tab.sels.sels.items) |*s| {
+            const pair = self.bracketPairAt(tab, s.head) orelse continue;
+            const at_open = s.head <= pair.open.end;
+            const target = if (at_open) pair.close.start else pair.open.start;
+            s.head = target;
+            if (!extend) s.anchor = target;
+            moved = true;
+        }
+        if (!moved) {
+            self.setStatus("No matching bracket.");
+            return;
+        }
+        tab.sels.normalize();
+        tab.goal_x = null;
+        self.afterMove(tab);
+    }
+
+    // ---- structural selection ------------------------------------------
+
+    /// Grow every selection to its smallest strictly-enclosing syntax
+    /// node, remembering the previous set so `shrinkSelection` retraces
+    /// it exactly.
+    pub fn expandSelection(self: *EditorView, tab: *ETab) void {
+        const hl = tab.hl orelse {
+            self.setStatus("No syntax tree for this file.");
+            return;
+        };
+        if (hl.isStale(&tab.doc)) hl.parse(&tab.doc) catch return;
+        tab.sel_stack.syncRevision(tab.doc.revision);
+        tab.sel_stack.push(&tab.sels) catch return;
+        var any = false;
+        for (tab.sels.sels.items) |*s| {
+            const r = (hl.expandRange(&tab.doc, s.start(), s.end()) catch null) orelse continue;
+            const reversed = s.anchor > s.head;
+            s.anchor = if (reversed) r.end else r.start;
+            s.head = if (reversed) r.start else r.end;
+            any = true;
+        }
+        if (!any) {
+            tab.sel_stack.dropTop();
+            return;
+        }
+        tab.sels.normalize();
+        tab.structural_move = true;
+        defer tab.structural_move = false;
+        self.afterMove(tab);
+    }
+
+    /// Undo one expand step. Nothing to do when the trail is empty —
+    /// shrink never GUESSES a smaller node, because with several carets
+    /// re-derivation and the recorded set are not the same thing.
+    pub fn shrinkSelection(self: *EditorView, tab: *ETab) void {
+        tab.sel_stack.syncRevision(tab.doc.revision);
+        const ok = tab.sel_stack.pop(&tab.sels) catch false;
+        if (!ok) return;
+        tab.structural_move = true;
+        defer tab.structural_move = false;
+        self.afterMove(tab);
     }
 
     /// Rebuild the atlas against the current font inputs under the
@@ -977,6 +1522,9 @@ pub const EditorView = struct {
             tab.sels.sels.append(self.allocator, Selection.caret(off)) catch return;
         } else tab.sels.sels.items[0] = Selection.caret(off);
         tab.goal_x = null;
+        // Jumping to a line inside a folded region opens it — a goto
+        // that leaves the caret invisible is a bug, not a feature.
+        self.revealCaretLines(tab);
         self.refresh(tab);
     }
 
@@ -1390,7 +1938,10 @@ pub const EditorView = struct {
             .layout = Layout.init(self.allocator, &self.book),
             .rows = RowIndex.init(self.allocator),
             .wrap = self.soft_wrap_default,
+            .folds = structure.FoldState.init(self.allocator),
+            .sel_stack = structure.SelectionStack.init(self.allocator),
         };
+        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
         tab.layout.tab_cols = self.tab_width;
         self.next_tab_id += 1;
         if (spec) |s| tab.spec = self.allocator.dupe(u8, s) catch null;
@@ -1606,14 +2157,19 @@ pub const EditorView = struct {
         c.glClear(c.GL_COLOR_BUFFER_BIT);
         const atlas = self.atlas orelse return 1;
         const tab = self.active orelse return 1;
+        self.syncFolds(tab);
         self.ensureRows(tab);
         self.clampAnchor(tab, @floatFromInt(ph));
+        const span = self.visibleLineSpan(tab);
+        self.ensureFoldMarkers(tab, span.from, span.to);
+        self.ensureBrackets(tab);
         const view = editor_pass.View{
             .width_px = @floatFromInt(pw),
             .height_px = @floatFromInt(ph),
             .anchor = tab.anchor,
             .scroll_x = tab.scroll_x,
             .show_line_numbers = self.line_numbers,
+            .show_fold_column = self.folding,
             .highlight_current_line = self.highlight_current_line,
             .caret_on = self.caret_on or self.typing_hold,
         };
@@ -1626,6 +2182,9 @@ pub const EditorView = struct {
             .rows = &tab.rows,
             .matches = tab.matches,
             .current_match = tab.current_match,
+            .folds = &tab.folds,
+            .fold_markers = tab.fold_markers.items,
+            .brackets = tab.brackets.items,
             // Only when this tab is actually highlighted: with no
             // highlighter every glyph's kind is `.none`, and paying the
             // theme lookup to arrive back at `colors.text` is noise.
@@ -1692,7 +2251,8 @@ pub const EditorView = struct {
             const atlas = self.atlas orelse break :blk null;
             const total = self.viewportWidthPx();
             if (total <= 0) break :blk null;
-            const gutter = EditorPass.gutterWidth(atlas, tab.doc.rope.lineCount(), self.line_numbers) catch 0;
+            _ = atlas;
+            const gutter = self.gutterWidthOf(tab);
             // The right margin keeps the last glyph off the scrollbar.
             break :blk @max(40.0, total - gutter - 8 - 8);
         };
@@ -1727,11 +2287,21 @@ pub const EditorView = struct {
         _ = self;
         const n = tab.doc.rope.lineCount();
         const ww = tab.layout.wrap_width orelse 0;
-        if (tab.rows_lines == n and tab.rows.enabled == (tab.layout.wrap_width != null) and
+        // Folds need the index even with wrap off: a hidden line weighs
+        // zero rows, which is how the scrollbar and every row<->anchor
+        // conversion stay fold-correct (render/editor_viewport.zig).
+        const want_enabled = tab.layout.wrap_width != null or !tab.folds.isEmpty();
+        if (tab.rows_lines == n and tab.rows.enabled == want_enabled and
+            tab.rows_folds == tab.folds_epoch and
             @abs(tab.rows_wrap_width - ww) < 0.5) return;
-        tab.rows.reset(tab.layout.wrap_width != null, n);
+        tab.rows.reset(want_enabled, n);
         tab.rows_lines = n;
         tab.rows_wrap_width = ww;
+        tab.rows_folds = tab.folds_epoch;
+        for (tab.folds.hidden.items) |sp| {
+            var l = sp.start_line;
+            while (l <= sp.end_line and l < n) : (l += 1) tab.rows.setHidden(l, true);
+        }
     }
 
     /// Wrapped rows of `line`, laying it out only when wrap is on.
@@ -1752,23 +2322,31 @@ pub const EditorView = struct {
         if (line_h <= 0) return;
         const n_lines = tab.doc.rope.lineCount();
         var acc = tab.anchor.offset + dy;
-        var line = @min(tab.anchor.line, n_lines -| 1);
+        var line = tab.folds.nextVisible(@min(tab.anchor.line, n_lines -| 1));
+        if (line >= n_lines) line = tab.folds.prevVisible(n_lines -| 1);
         var row: i64 = tab.anchor.row;
         while (acc >= line_h) {
             const rows = self.rowsOfLine(tab, line);
             if (row + 1 < rows) {
                 row += 1;
-            } else if (line + 1 < n_lines) {
-                line += 1;
+            } else {
+                const next = tab.folds.nextVisible(line + 1);
+                if (next >= n_lines) break;
+                line = next;
                 row = 0;
-            } else break;
+            }
             acc -= line_h;
         }
         while (acc < 0) {
             if (row > 0) {
                 row -= 1;
             } else if (line > 0) {
-                line -= 1;
+                const prev = tab.folds.prevVisible(line - 1);
+                if (prev == line) {
+                    acc = 0;
+                    break;
+                }
+                line = prev;
                 row = @as(i64, self.rowsOfLine(tab, line)) - 1;
             } else {
                 acc = 0;
@@ -1823,24 +2401,41 @@ pub const EditorView = struct {
         const line_h = self.lineHeight();
         const n_lines = tab.doc.rope.lineCount();
         if (n_lines == 0) return 0;
-        const gutter = EditorPass.gutterWidth(atlas, n_lines, self.line_numbers) catch 0;
+        _ = atlas;
+        _ = line_h;
+        const gutter = self.gutterWidthOf(tab);
         const text_x0 = gutter + 8 - tab.scroll_x;
+        const hit = self.locateY(tab, y) orelse return 0;
+        const ll = tab.layout.line(&tab.doc, hit.line) catch
+            return tab.doc.rope.lineToOffset(hit.line);
+        return ll.byte_start + Layout.xToByte(ll, hit.row, x - text_x0);
+    }
 
-        var li = @min(tab.anchor.line, n_lines - 1);
+    /// Device-pixel y -> (visible line, wrapped row within it). Walks
+    /// forward from the anchor, SKIPPING folded lines exactly the way
+    /// the render pass does, so a click lands on what was drawn.
+    fn locateY(self: *EditorView, tab: *ETab, y: f32) ?struct { line: usize, row: u32 } {
+        const n_lines = tab.doc.rope.lineCount();
+        if (n_lines == 0) return null;
+        const line_h = self.lineHeight();
+        if (line_h <= 0) return null;
+        var li = tab.folds.nextVisible(@min(tab.anchor.line, n_lines - 1));
+        if (li >= n_lines) li = tab.folds.prevVisible(n_lines - 1);
         var top: f32 = -tab.anchor.offset - @as(f32, @floatFromInt(tab.anchor.row)) * line_h;
         while (true) {
-            const ll = tab.layout.line(&tab.doc, li) catch return tab.doc.rope.lineToOffset(li);
+            const ll = tab.layout.line(&tab.doc, li) catch return .{ .line = li, .row = 0 };
             const bottom = top + @as(f32, @floatFromInt(ll.rows.len)) * line_h;
-            if (y < bottom or li + 1 >= n_lines) {
+            const next = tab.folds.nextVisible(li + 1);
+            if (y < bottom or next >= n_lines) {
                 var row: u32 = 0;
                 if (y > top) {
                     const r: usize = @intFromFloat(@floor((y - top) / line_h));
                     row = @intCast(@min(r, ll.rows.len - 1));
                 }
-                return ll.byte_start + Layout.xToByte(ll, row, x - text_x0);
+                return .{ .line = li, .row = row };
             }
             top = bottom;
-            li += 1;
+            li = next;
         }
     }
 
@@ -2239,6 +2834,9 @@ pub const EditorView = struct {
         tab.sels.keepPrimaryOnly();
         tab.sels.sels.items[0] = .{ .anchor = m.start, .head = m.end };
         tab.goal_x = null;
+        // A match inside a folded region unfolds it, for the same
+        // reason goto does.
+        self.revealCaretLines(tab);
         self.updateFindCount(tab);
         self.ensureCaretVisible(tab);
         self.updateStatus();
@@ -2267,7 +2865,6 @@ pub const EditorView = struct {
         self.recomputeMatches(tab, false);
         if (tab.matches.len == 0) return;
         const with = entryText(self.replace_entry);
-        const tr = @import("../editor/transaction.zig");
         var tx = tr.Transaction.init(tab.doc.revision);
         defer tx.deinit(self.allocator);
         var prev_end: usize = 0;
@@ -2298,6 +2895,11 @@ pub const EditorView = struct {
         // document's observer (Document.EditObserver); this only picks
         // the moment to re-parse.
         self.scheduleParse(tab);
+        // The fold anchors already mapped through the edit (ETab's
+        // second document observer); this re-derives their regions from
+        // the fresh tree.
+        tab.sel_stack.clear();
+        self.syncFolds(tab);
         if (self.find_open) self.recomputeMatches(tab, false);
         self.refresh(tab);
     }
@@ -2559,6 +3161,15 @@ pub const EditorView = struct {
                 // the language (a shebang only becomes visible now) and
                 // re-attach the observer the swap just dropped.
                 self.ensureHighlighter(tab);
+                // Folds anchor into the OLD document's byte space and
+                // the trail describes its offsets; both die with it.
+                tab.folds.clear();
+                tab.folds_epoch += 1;
+                tab.folds_valid = false;
+                tab.fm_valid = false;
+                tab.br_valid = false;
+                tab.sel_stack.clear();
+                tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
                 tab.layout.invalidateAll();
                 tab.rows_lines = 0;
                 tab.anchor = .{};
@@ -3089,20 +3700,27 @@ pub const EditorView = struct {
         var line = start.line;
         var row: i64 = start.row;
         var left = delta;
+        // Folded lines are stepped OVER, never into: Down at the last
+        // visible row of a folded header lands on the line after the
+        // region, which is what makes arrow keys sane across a fold.
         while (left > 0) : (left -= 1) {
             const rows = self.rowsOfLine(tab, line);
             if (row + 1 < rows) {
                 row += 1;
-            } else if (line + 1 < n_lines) {
-                line += 1;
+            } else {
+                const next = tab.folds.nextVisible(line + 1);
+                if (next >= n_lines) return null;
+                line = next;
                 row = 0;
-            } else return null;
+            }
         }
         while (left < 0) : (left += 1) {
             if (row > 0) {
                 row -= 1;
             } else if (line > 0) {
-                line -= 1;
+                const prev = tab.folds.prevVisible(line - 1);
+                if (prev == line) return null;
+                line = prev;
                 row = @as(i64, self.rowsOfLine(tab, line)) - 1;
             } else return null;
         }
@@ -3233,11 +3851,35 @@ pub const EditorView = struct {
                             self.requestCloseTab(tab);
                             return 1;
                         },
+                        // Go to matching bracket. Ctrl+M is free here
+                        // (the global Ctrl+SHIFT+M is zoom_pane and is
+                        // NOT shadowed).
+                        c.GDK_KEY_m => {
+                            self.gotoMatchingBracket(tab, false);
+                            return 1;
+                        },
                         else => {},
                     }
                 }
                 if (ctrl and shift) {
                     switch (lower) {
+                        // Fold / unfold at the caret — VS Code's
+                        // Ctrl+Shift+[ and Ctrl+Shift+]. GDK reports
+                        // the SHIFTED keyvals, so both spellings are
+                        // matched.
+                        c.GDK_KEY_bracketleft, c.GDK_KEY_braceleft => {
+                            self.foldAtCaret(tab);
+                            return 1;
+                        },
+                        c.GDK_KEY_bracketright, c.GDK_KEY_braceright => {
+                            self.unfoldAtCaret(tab);
+                            return 1;
+                        },
+                        c.GDK_KEY_m => {
+                            // Extend the selection to the match.
+                            self.gotoMatchingBracket(tab, true);
+                            return 1;
+                        },
                         c.GDK_KEY_z => {
                             vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
                             self.afterDocEdit(tab);
@@ -3256,6 +3898,35 @@ pub const EditorView = struct {
             if (lower == c.GDK_KEY_z and !ctrl and !shift) {
                 self.toggleWrap(tab);
                 return 1;
+            }
+            // Shift+Alt+Right / Left: expand / shrink the selection to
+            // the enclosing syntax node (VS Code's chord).
+            if (shift and !ctrl) {
+                switch (keyval) {
+                    c.GDK_KEY_Right, c.GDK_KEY_KP_Right => {
+                        self.expandSelection(tab);
+                        return 1;
+                    },
+                    c.GDK_KEY_Left, c.GDK_KEY_KP_Left => {
+                        self.shrinkSelection(tab);
+                        return 1;
+                    },
+                    else => {},
+                }
+            }
+            // Ctrl+Alt+[ / ]: fold all / unfold all.
+            if (ctrl and !shift) {
+                switch (lower) {
+                    c.GDK_KEY_bracketleft, c.GDK_KEY_braceleft => {
+                        self.foldAll(tab);
+                        return 1;
+                    },
+                    c.GDK_KEY_bracketright, c.GDK_KEY_braceright => {
+                        self.unfoldAll(tab);
+                        return 1;
+                    },
+                    else => {},
+                }
             }
         }
 
@@ -3356,6 +4027,11 @@ pub const EditorView = struct {
     }
 
     fn afterMove(self: *EditorView, tab: *ETab) void {
+        // A caret that walked into hidden text opens the fold; a caret
+        // move that is not an expand/shrink drops the structural trail
+        // (otherwise Shrink would replay a selection you have left).
+        self.revealCaretLines(tab);
+        if (!tab.structural_move) tab.sel_stack.clear();
         self.ensureCaretVisible(tab);
         self.updateStatus();
         self.queueRender();
@@ -3375,6 +4051,19 @@ pub const EditorView = struct {
         const mods = state & input.SIGNIFICANT_MODS;
         const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
         const shift = (mods & c.GDK_SHIFT_MASK) != 0;
+        // Fold column: a click there toggles, never moves the caret.
+        if (self.folding and n_press == 1) {
+            const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+            const dx: f32 = @as(f32, @floatCast(x)) * scale;
+            const num_w = self.numberFieldWidth(tab);
+            if (dx >= num_w and dx < num_w + EditorPass.FOLD_COL_W) {
+                if (self.locateY(tab, @as(f32, @floatCast(y)) * scale)) |hit| {
+                    self.toggleFoldLine(tab, hit.line);
+                }
+                self.drag_anchor = null;
+                return;
+            }
+        }
         const pos = self.hitTest(tab, x, y);
         tab.goal_x = null;
         if (n_press >= 3) {

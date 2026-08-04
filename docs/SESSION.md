@@ -12378,3 +12378,58 @@ severed from the deferred `Pane.deinit`. The four hand-copied detach
 lists are now one `Pane.severFaces`, and `editor_prepare_destroy` takes
 a `widgets_dead` flag so the compiler forces each caller to state
 whether the widgets are still alive.
+
+## Editor: bracket matching, code folding, structural selection
+
+Three structure-aware features on the GPU editor, all reading the
+tree-sitter trees `editor/syntax.zig` already keeps incrementally.
+There is no second parser and no hand-rolled brace scanner on the
+primary path; the query machinery grew inside `syntax.zig`
+(`bracketAt`, `expandRange`, `foldRegionAtLine`, `foldRegionEnclosing`,
+`foldRegionsIn`) and the plain-data half lives in a new GTK-free,
+tree-sitter-free `editor/structure.zig`.
+
+**Bracket matching.** The pair around or adjacent to each caret is
+boxed, and Ctrl+M jumps to the match (Ctrl+Shift+M extends). The tree
+is the primary source and its "no pair" answer is FINAL, which is what
+makes a bracket inside a string or a comment not match: in the tree a
+literal is one token, so a bracket byte inside it is not a leaf of its
+own. The depth-counting scanner in `structure.zig` is consulted only
+when there is no tree at all (no grammar, or `editor_syntax = false`)
+and is documented as unable to see strings or comments.
+
+**Code folding.** Gutter fold column with clickable chevrons, a `...`
+badge on a folded header, Ctrl+Shift+[ / ] at the caret and
+Ctrl+Alt+[ / ] for all. Regions come from the tree (any node spanning
+at least two lines, NARROWEST per header so a grammar's whole-file
+container cannot fold the document from line 0) and from indentation
+for files with no grammar.
+
+A fold is anchored to the BYTE OFFSET of its header's first content
+byte, mapped through every transaction with `transaction.mapOffset` —
+the same machinery selections use, so undo and redo are free — and then
+RE-RESOLVED against the tree. That is what makes "delete the closing
+brace" unfold rather than hide the wrong lines, and it needed a second
+pre-edit observer slot on `Document` (the highlighter owns the first).
+
+Folding does NOT reintroduce an absolute `scroll_y`. A hidden line
+weighs zero rows in the Fenwick `RowIndex`, so the anchor, the
+scrollbar and every row conversion stay fold-correct with no second
+code path; the index is now allocated whenever folds exist, even with
+soft wrap off. Folding a region containing carets pulls them to the
+header; a caret moving INTO hidden text (Right off a header, a find
+match, goto-line) unfolds instead.
+
+**Structural selection.** Shift+Alt+Right grows every selection to its
+smallest strictly-enclosing syntax node; Shift+Alt+Left pops a recorded
+stack rather than re-deriving a smaller node, because with several
+carets those are not the same set. Any non-structural move or edit
+drops the stack.
+
+Config: `editor_bracket_match`, `editor_folding`,
+`editor_fold_indent_fallback` (all app level, like the other editor
+view flags), with prefs switches. Caches are keyed on
+`(doc.revision, highlighter.gen)` plus whatever else the answer depends
+on — the caret hash for brackets, the visible line range and fold epoch
+for gutter markers — so nothing runs a whole-document tree query per
+frame.

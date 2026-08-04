@@ -34,6 +34,12 @@ pub const Theme = struct {
     match: [4]f32,
     match_current: [4]f32,
     preedit_bg: [4]f32,
+    /// Box behind each half of the bracket pair around the caret.
+    bracket: [4]f32,
+    /// Badge drawn where a folded region's hidden lines were.
+    fold_badge: [4]f32,
+    /// The gutter's fold chevron (and the badge's dots).
+    fold_fg: [4]f32,
     /// Indexed by `@intFromEnum(Kind)`.
     kinds: [syntax.KIND_COUNT]Style,
 
@@ -133,6 +139,9 @@ pub const dark = Theme{
     .match = rgba(0xD9B840, 0.32),
     .match_current = rgba(0xF2B833, 0.65),
     .preedit_bg = rgb(0x17191F),
+    .bracket = rgba(0x6FD3C8, 0.42),
+    .fold_badge = rgba(0x808891, 0.25),
+    .fold_fg = rgb(0x9AA3AD),
     .kinds = kindTable(darkStyle),
 };
 
@@ -148,6 +157,9 @@ pub const light = Theme{
     .match = rgba(0xE0C25A, 0.45),
     .match_current = rgba(0xE8A21F, 0.70),
     .preedit_bg = rgb(0xF2F2EC),
+    .bracket = rgba(0x1F8C7E, 0.32),
+    .fold_badge = rgba(0x9198A0, 0.28),
+    .fold_fg = rgb(0x6E757D),
     .kinds = kindTable(lightStyle),
 };
 
