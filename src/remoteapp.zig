@@ -150,6 +150,36 @@ fn headlessNotice(name: []const u8, host: []const u8, wayland: bool) void {
     }
 }
 
+/// Is `name` absent from the host's session list? True means the app
+/// already exited — distinguishing "no viewer here" from "there is
+/// nothing left to view". Unreachable daemon answers false: the
+/// headless notice is the safer of the two claims.
+fn sessionGone(allocator: std.mem.Allocator, name: []const u8, host: ?[]const u8) bool {
+    const mux_cli = @import("ipc/mux_cli.zig");
+    const parsed = mux_cli.fetchSessions(allocator, host) orelse return false;
+    defer parsed.deinit();
+    for (parsed.value.sessions) |s| {
+        if (std.mem.eql(u8, s.name, name)) return false;
+    }
+    return true;
+}
+
+/// The app exited before any viewer could attach. Say that plainly —
+/// and on a Mac host name the trap that causes it most often.
+fn exitedNotice(name: []const u8, host: []const u8, wayland: bool) void {
+    std.debug.print(
+        "sketerm app: '{s}' EXITED on {s} before a window ever appeared — the command failed to start, it did not stay headless.\n" ++
+            "  cwd is the daemon's own (normally $HOME) and its environment is minimal, so pass host-absolute paths.\n",
+        .{ name, host },
+    );
+    if (!wayland) {
+        std.debug.print(
+            "  On a Mac host:  Apple's OWN apps (Calculator, TextEdit, Safari, …) are SIGKILLed the instant they are started this way — macOS launch constraints refuse to let them be an ordinary child process. Use a third-party or self-built binary.\n",
+            .{},
+        );
+    }
+}
+
 /// Spawn an app session over the chosen transport, then have the
 /// running GUI attach and render it. Inside a sketerm pane THIS pane
 /// becomes the session view (like `sketerm mux attach`); outside, a
@@ -226,8 +256,15 @@ fn runNativeApp(
     if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, attach_host, true)) {
         // guiCommand already printed the specific reason (e.g. "no
         // running sketerm window found", or "attach failed: no such
-        // session"); the session itself is unaffected by a failed
-        // viewer attach.
+        // session"). Usually the session is unaffected by a failed
+        // viewer attach — but an app that exits INSTANTLY is already
+        // gone from the daemon by the time the GUI tries, and telling
+        // the user it "is running HEADLESS" is then simply false. Ask
+        // the daemon which of the two happened.
+        if (sessionGone(allocator, name, attach_host)) {
+            exitedNotice(name, attach_host, wayland);
+            return 1;
+        }
         headlessNotice(name, attach_host, wayland);
         return 0;
     }
