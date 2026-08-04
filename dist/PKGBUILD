@@ -132,6 +132,14 @@ package() {
     install -Dm644 data/icons/hicolor/scalable/actions/sketerm-preview-pane-symbolic.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-preview-pane-symbolic.svg"
 
+    # xdg-desktop-portal FileChooser backend (OPT-IN: installing these
+    # files only makes the backend selectable; nothing uses it until
+    # the user names it in portals.conf -- see docs/portal.md).
+    install -Dm644 data/sketerm.portal \
+        "$pkgdir/usr/share/xdg-desktop-portal/portals/sketerm.portal"
+    install -Dm644 data/org.freedesktop.impl.portal.desktop.sketerm.service \
+        "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
+
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 

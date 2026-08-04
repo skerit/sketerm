@@ -36,6 +36,9 @@ pub const Request = struct {
     suggested_name: ?[]const u8 = null,
     /// Window title override (null = a mode-derived default).
     title: ?[]const u8 = null,
+    /// Primary-button label override (null = primaryLabel(mode));
+    /// used by the portal backend's accept_label option.
+    accept_label: ?[]const u8 = null,
 };
 
 /// Host-qualified specs chosen by the user. `name` repeats the leaf
