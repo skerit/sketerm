@@ -192,3 +192,8 @@ the same terms.
 Shader presets under `data/shaders/` carry per-file licenses (MIT,
 public domain, GPL — see `data/shaders/README`); all are compatible
 with the GPL-3 core.
+
+The vendored Tree-sitter runtime and grammars under `vendor/tree-sitter/`
+(editor syntax highlighting) are MIT, with an ICU-derived unicode
+subdirectory; upstream commits, licenses and the layout rationale are
+recorded in its `PROVENANCE.txt`.

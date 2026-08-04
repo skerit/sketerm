@@ -17,6 +17,7 @@ const CursorShape = @import("../config.zig").CursorShape;
 const ExitAction = @import("../config.zig").ExitAction;
 const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
+const editor_theme = @import("../editor/theme.zig");
 
 // Forward-declare the Window pointer type. We can't import window.zig
 // directly without creating a cycle, so we receive it as anyopaque and
@@ -1250,6 +1251,12 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Highlight current line", "A subtle band behind the caret's row. Hidden while a selection or several carets are active.", &ctx.cfg.editor_highlight_current_line, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(view_group)));
 
+    const syntax_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(syntax_group)), "Syntax");
+    addSwitchRow(@ptrCast(@alignCast(syntax_group)), ctx, "Syntax highlighting", "Colour code by structure (Zig, C, JSON, Markdown). Off renders every document as plain text.", &ctx.cfg.editor_syntax, applyOnly);
+    addEditorThemeRow(@ptrCast(@alignCast(syntax_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(syntax_group)));
+
     // Font is PER-PROFILE, like the terminal font it falls back to.
     const font_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
@@ -1257,6 +1264,34 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addEditorFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Editor font size", "0 = follow the profile's terminal font size.", 0, 96, &ctx.edit.editor_font_size, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
+}
+
+/// Theme picker, built from `editor/theme.zig`'s own list so adding a
+/// theme there is the only edit needed.
+fn addEditorThemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(null);
+    var sel: c_uint = 0;
+    for (editor_theme.all, 0..) |t, i| {
+        var z = cast.sliceToZ(64, t.name);
+        c.gtk_string_list_append(items, &z);
+        if (std.ascii.eqlIgnoreCase(t.name, ctx.cfg.editor_theme)) sel = @intCast(i);
+    }
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Theme");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Colours for syntax, selection, caret and gutter.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), sel);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = editorThemeSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn editorThemeSelected(ctx: *Ctx, idx: c_uint) void {
+    if (idx >= editor_theme.all.len) return;
+    ctx.cfg.editor_theme = ctx.dupe(editor_theme.all[idx].name) catch return;
+    ctx.ev();
 }
 
 fn addEditorFontFamilyRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {

@@ -619,6 +619,24 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             .tab = winmod.next_tab_id - 1,
             .pane = next_pane_id - 1,
         });
+    } else if (eql(u8, req.cmd, "editor-here")) {
+        // `sketerm edit --here`: the addressed pane itself wears the
+        // editor face (its shell stays one toolbar click away). Same
+        // explicit-address rule as browser-here — converting some other
+        // pane is exactly the surprise this guards against. A pane
+        // already wearing the face gains a document tab.
+        if (req.pane == null and req.session == null)
+            return ipc_protocol.writeErr(out, allocator, "editor-here requires a pane (--pane N or a session name)");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const win = ownerWindow(self, pane);
+        win.openEditorOn(pane, req.data) catch |err| {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "editor attach failed: {s}", .{@errorName(err)}) catch "editor attach failed";
+            return ipc_protocol.writeErr(out, allocator, msg);
+        };
+        if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
+        c.gtk_window_present(@ptrCast(win.app_window));
+        try ipc_protocol.writeOk(out, allocator, "pane", pane.id);
     } else if (eql(u8, req.cmd, "browser-here")) {
         // `sketerm files --here`: the addressed pane itself wears the
         // browser face, in its own window. Explicit address only:

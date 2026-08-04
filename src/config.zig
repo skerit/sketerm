@@ -336,6 +336,12 @@ pub const Config = struct {
     editor_line_numbers: bool = true,
     /// Subtle band behind the caret's visual row (single caret only).
     editor_highlight_current_line: bool = true,
+    /// Tree-sitter syntax highlighting (src/editor/syntax.zig). Off
+    /// renders every document as plain text in the theme's foreground.
+    editor_syntax: bool = true,
+    /// Colour theme name — see `editor/theme.zig`'s `byName`, which
+    /// falls back to "dark" for anything it does not know.
+    editor_theme: []const u8 = "dark",
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -517,6 +523,7 @@ pub const Config = struct {
         out.gpu_apps = try arena.dupe(u8, self.gpu_apps);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
+        out.editor_theme = try arena.dupe(u8, self.editor_theme);
         out.keybinds = .empty;
         try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
         for (self.keybinds.items) |kb| {
@@ -803,6 +810,9 @@ pub const Config = struct {
         if (!self.editor_line_numbers) try w.writeAll("editor_line_numbers = false\n");
         if (!self.editor_highlight_current_line)
             try w.writeAll("editor_highlight_current_line = false\n");
+        if (!self.editor_syntax) try w.writeAll("editor_syntax = false\n");
+        if (!std.mem.eql(u8, self.editor_theme, "dark"))
+            try w.print("editor_theme = {s}\n", .{self.editor_theme});
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -1336,6 +1346,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_line_numbers = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_highlight_current_line")) {
         cfg.editor_highlight_current_line = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_syntax")) {
+        cfg.editor_syntax = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_theme")) {
+        cfg.editor_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {

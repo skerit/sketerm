@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Sketerm Editor</title>
+  <defs>
+    <linearGradient id="bezel" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="page" x1="64" y1="42" x2="64" y2="106" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f6f5f4"/>
+      <stop offset="1" stop-color="#deddda"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Window body: same bezel as the terminal, files and viewer icons -->
+  <rect x="12" y="12" width="104" height="104" rx="20" ry="20" fill="url(#bezel)"/>
+
+  <!-- Title-bar dots -->
+  <circle cx="28" cy="28" r="3.5" fill="#ed5e5e"/>
+  <circle cx="40" cy="28" r="3.5" fill="#f9c74f"/>
+  <circle cx="52" cy="28" r="3.5" fill="#90be6d"/>
+
+  <!-- Document page -->
+  <rect x="24" y="42" width="80" height="62" rx="8" fill="url(#page)"/>
+
+  <!-- Gutter: line numbers as short marks, mirroring the editor's own -->
+  <rect x="30" y="52" width="7" height="4" rx="2" fill="#9a9996"/>
+  <rect x="30" y="63" width="7" height="4" rx="2" fill="#9a9996"/>
+  <rect x="30" y="74" width="7" height="4" rx="2" fill="#9a9996"/>
+  <rect x="30" y="85" width="7" height="4" rx="2" fill="#9a9996"/>
+  <rect x="42" y="46" width="1.5" height="54" fill="#c0bfbc"/>
+
+  <!-- Text lines; the third is the "current" one, highlighted -->
+  <rect x="49" y="51" width="46" height="5" rx="2.5" fill="#3584e4"/>
+  <rect x="49" y="62" width="34" height="5" rx="2.5" fill="#77767b"/>
+  <rect x="47" y="71" width="50" height="11" rx="3" fill="#cfe3fb"/>
+  <rect x="49" y="73.5" width="28" height="5" rx="2.5" fill="#2ec27e"/>
+  <rect x="49" y="84" width="41" height="5" rx="2.5" fill="#77767b"/>
+
+  <!-- Caret on the highlighted line -->
+  <rect x="79" y="71" width="3" height="11" rx="1.5" fill="#e01b24"/>
+</svg>

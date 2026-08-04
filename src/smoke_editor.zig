@@ -25,6 +25,8 @@ const sel_mod = @import("editor/selection.zig");
 const SelectionSet = sel_mod.SelectionSet;
 const Selection = sel_mod.Selection;
 const unicode = @import("editor/unicode.zig");
+const syntax = @import("editor/syntax.zig");
+const theme_mod = @import("editor/theme.zig");
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -103,6 +105,37 @@ fn checkRtlLine(
     std.debug.print("smoke-editor: PASS {s} itemization + rtl order\n", .{name});
     return null;
 }
+
+fn ns2ms(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// True when a framebuffer pixel is (within AA slack) one of the
+/// theme's kind colours.
+fn nearColor(px: [3]u8, want: [4]f32) bool {
+    inline for (0..3) |ch| {
+        const w: i32 = @intFromFloat(@round(want[ch] * 255.0));
+        const d = @as(i32, px[ch]) - w;
+        if (d > 10 or d < -10) return false;
+    }
+    return true;
+}
+
+/// Zig source with at least one token of every kind the smoke asserts.
+const HL_SRC =
+    \\const std = @import("std");
+    \\
+    \\// The quick brown fox jumps over the lazy dog.
+    \\pub fn main() void {
+    \\    const count: u32 = 42;
+    \\    const name = "sketerm";
+    \\    var total: usize = 0;
+    \\    while (total < count) : (total += 1) {
+    \\        std.debug.print("{s} {d}\n", .{ name, total });
+    \\    }
+    \\}
+    \\
+;
 
 fn nowNs() u64 {
     var ts: c.struct_timespec = undefined;
@@ -541,6 +574,156 @@ pub fn main() !u8 {
                 blayout.invalidateAll();
             }
         }
+    }
+
+    // --- Syntax highlighting: distinct glyph colours in the FB -------
+    // The renderer must actually PAINT per-kind colours, not just carry
+    // kinds around: assert the theme's keyword / string / comment /
+    // number colours all appear in the framebuffer.
+    {
+        const th = &theme_mod.dark;
+        var zdoc = try Document.initFromBytes(allocator, HL_SRC);
+        defer zdoc.deinit();
+        var hl = try syntax.Highlighter.init(allocator, .zig);
+        defer hl.deinit();
+        hl.attach(&zdoc);
+        const p0 = nowNs();
+        try hl.parse(&zdoc);
+        const p1 = nowNs();
+        const spans = try hl.spansAlloc(allocator, &zdoc, 0, zdoc.rope.len());
+        defer allocator.free(spans);
+        const p2 = nowNs();
+        std.debug.print(
+            "smoke-editor: syntax small({d} bytes) parse={d:.3}ms query={d:.3}ms spans={d} reads={d}\n",
+            .{ zdoc.rope.len(), ns2ms(p1 - p0), ns2ms(p2 - p1), spans.len, hl.reads },
+        );
+
+        var zlayout = Layout.init(allocator, &book);
+        defer zlayout.deinit();
+        zlayout.hl = &hl;
+        zlayout.theme = th;
+        var zsels = try SelectionSet.initSingle(allocator, Selection.caret(0));
+        defer zsels.deinit(allocator);
+
+        c.glClearColor(th.bg[0], th.bg[1], th.bg[2], th.bg[3]);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        try pass.buildFrame(.{
+            .layout = &zlayout,
+            .doc = &zdoc,
+            .sels = &zsels,
+            .view = .{ .width_px = @floatFromInt(W), .height_px = @floatFromInt(H) },
+            .colors = .{
+                .text = th.fg,
+                .gutter_bg = th.gutter_bg,
+                .gutter_fg = th.gutter_fg,
+                .caret = th.caret,
+            },
+            .theme = th,
+        });
+        pass.draw(atlas, W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+        const probes = [_]syntax.Kind{ .keyword, .string, .comment, .number, .type };
+        var hits = [_]usize{0} ** probes.len;
+        var distinct = std.AutoHashMap(u32, void).init(allocator);
+        defer distinct.deinit();
+        var i: usize = 0;
+        while (i < fb_bytes) : (i += 4) {
+            const px = [3]u8{ fb[i], fb[i + 1], fb[i + 2] };
+            for (probes, 0..) |k, pi| {
+                if (nearColor(px, th.colorOf(k))) hits[pi] += 1;
+            }
+            // Quantised palette of the strongly-lit pixels (glyph
+            // cores; AA edges quantise onto the background).
+            if (@as(u16, px[0]) + px[1] + px[2] > 0x140) {
+                const q: u32 = (@as(u32, px[0] >> 4) << 8) |
+                    (@as(u32, px[1] >> 4) << 4) | (px[2] >> 4);
+                try distinct.put(q, {});
+            }
+        }
+        std.debug.print(
+            "smoke-editor: syntax pixels keyword={d} string={d} comment={d} number={d} type={d} distinct_colours={d}\n",
+            .{ hits[0], hits[1], hits[2], hits[3], hits[4], distinct.count() },
+        );
+        for (probes, hits) |k, n| {
+            if (n < 8) {
+                std.debug.print(
+                    "smoke-editor: FAIL — no {s} pixels rendered\n",
+                    .{@tagName(k)},
+                );
+                return 10;
+            }
+        }
+        if (distinct.count() < 4) {
+            std.debug.print("smoke-editor: FAIL — highlighting produced too few distinct colours\n", .{});
+            return 10;
+        }
+
+        var flipped2 = try allocator.alloc(u8, fb_bytes);
+        defer allocator.free(flipped2);
+        const rb: usize = @intCast(W * 4);
+        var r2: usize = 0;
+        while (r2 < H) : (r2 += 1) {
+            const src = fb[(@as(usize, @intCast(H)) - 1 - r2) * rb ..][0..rb];
+            const dst = flipped2[r2 * rb ..][0..rb];
+            @memcpy(dst, src);
+            var pxi: usize = 3;
+            while (pxi < rb) : (pxi += 4) dst[pxi] = 255;
+        }
+        if (c.stbi_write_png("zig-out/smoke-editor-syntax.png", W, H, 4, flipped2.ptr, @intCast(rb)) != 0)
+            std.debug.print("smoke-editor: wrote zig-out/smoke-editor-syntax.png\n", .{});
+
+        // Typing latency: an incremental re-parse after a one-character
+        // insert, which is what the editor pays per keystroke.
+        {
+            const tr2 = @import("editor/transaction.zig");
+            var tx = tr2.Transaction.init(zdoc.revision);
+            defer tx.deinit(allocator);
+            try tx.addInsert(allocator, zdoc.rope.len(), "x");
+            const e0 = nowNs();
+            _ = try zdoc.applyTransaction(&tx);
+            try hl.parse(&zdoc);
+            const e1 = nowNs();
+            std.debug.print(
+                "smoke-editor: syntax incremental keystroke reparse={d:.3}ms\n",
+                .{ns2ms(e1 - e0)},
+            );
+        }
+    }
+
+    // --- Syntax perf on a ~1MB source ---------------------------------
+    {
+        var big: std.ArrayList(u8) = .empty;
+        defer big.deinit(allocator);
+        while (big.items.len < 1024 * 1024) try big.appendSlice(allocator, HL_SRC);
+        var bdoc = try Document.initFromBytes(allocator, big.items);
+        defer bdoc.deinit();
+        var bhl = try syntax.Highlighter.init(allocator, .zig);
+        defer bhl.deinit();
+        bhl.attach(&bdoc);
+        const b0 = nowNs();
+        try bhl.parse(&bdoc);
+        const b1 = nowNs();
+        const full_reads = bhl.reads;
+        // One viewport's worth of highlighting, deep in the document —
+        // the only query cost a frame actually pays.
+        const mid = bdoc.rope.len() / 2;
+        const win = try bhl.spansAlloc(allocator, &bdoc, mid, mid + 4096);
+        defer allocator.free(win);
+        const b2 = nowNs();
+        const tr2 = @import("editor/transaction.zig");
+        var tx = tr2.Transaction.init(bdoc.revision);
+        defer tx.deinit(allocator);
+        try tx.addInsert(allocator, mid, "x");
+        const b3 = nowNs();
+        _ = try bdoc.applyTransaction(&tx);
+        try bhl.parse(&bdoc);
+        const b4 = nowNs();
+        std.debug.print(
+            "smoke-editor: syntax big({d} bytes) full_parse={d:.2}ms viewport_query={d:.3}ms incremental_reparse={d:.2}ms reads={d} spans={d}\n",
+            .{ bdoc.rope.len(), ns2ms(b1 - b0), ns2ms(b2 - b1), ns2ms(b4 - b3), full_reads, win.len },
+        );
     }
 
     std.debug.print(

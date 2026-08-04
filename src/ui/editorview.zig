@@ -60,6 +60,8 @@ const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("../editor/view_model.zig");
 const editor_model = @import("../editor/model.zig");
+const syntax = @import("../editor/syntax.zig");
+const theme_mod = @import("../editor/theme.zig");
 const tabhost_mod = @import("tabhost.zig");
 const TabHost = tabhost_mod.TabHost;
 const pane_mod = @import("pane.zig");
@@ -75,7 +77,16 @@ const PickerWindow = @import("picker.zig").PickerWindow;
 /// Open size cap: bigger files are refused with a clear error.
 pub const MAX_FILE_BYTES: usize = 64 << 20;
 
-const BG_COLOR = [4]f32{ 0.09, 0.09, 0.12, 1.0 };
+/// Documents up to this size re-parse SYNCHRONOUSLY on every edit —
+/// a full tree-sitter parse of ~100KB is well under a frame, and the
+/// incremental path makes the common keystroke far cheaper still.
+/// Bigger documents debounce (see `scheduleParse`); the GUI is
+/// single-threaded by design, so a timer is the only lever.
+const SYNC_PARSE_LIMIT: usize = 128 * 1024;
+const PARSE_DEBOUNCE_MS: c_uint = 40;
+/// Bytes of the first line inspected for a shebang when the filename
+/// carries no usable extension.
+const SHEBANG_PROBE: usize = 256;
 
 /// Refcounted liveness fence shared by IO worker threads, GLib idle
 /// deliveries, clipboard reads and dialog callbacks. The mutex only
@@ -313,9 +324,24 @@ pub const ETab = struct {
     /// Caret to restore once an async load lands.
     want_cursor: ?usize = null,
     close_after_save: bool = false,
+    /// Syntax highlighter, null for plain text (unknown language or
+    /// `editor_syntax = false`). Owned.
+    hl: ?*syntax.Highlighter = null,
+    hl_lang: ?syntax.Lang = null,
+    /// Non-zero while a debounced re-parse is queued.
+    parse_timer: c_uint = 0,
 
     fn destroy(self: *ETab) void {
         const a = self.view.allocator;
+        // A queued parse timer is fenced (DlgCtx) and resolves to
+        // nothing once this tab's id is gone — no removal needed.
+        if (self.hl) |hl| {
+            hl.deinit();
+            a.destroy(hl);
+            self.hl = null;
+        }
+        self.doc.observer = null;
+        self.layout.hl = null;
         self.layout.deinit();
         self.rows.deinit();
         self.sels.deinit(a);
@@ -444,8 +470,25 @@ pub const EditorView = struct {
     soft_wrap_default: bool = false,
     line_numbers: bool = true,
     highlight_current_line: bool = true,
+    syntax_on: bool = true,
+    /// Colours for text, chrome and every highlight kind. Points at a
+    /// comptime constant in `editor/theme.zig`, so it never dangles
+    /// across a config-arena swap.
+    theme: *const theme_mod.Theme = &theme_mod.dark,
 
     drag_anchor: ?usize = null,
+
+    /// STANDALONE hosting (ui/editorwin.zig): the face has no pane and
+    /// no sketerm Window, so `ownerWindow()` never resolves and these
+    /// three fields carry what the window would otherwise supply — the
+    /// config to read settings from, the toolbar to hide (the window's
+    /// header bar carries those buttons instead), and a change hook the
+    /// host uses to keep its title in sync. All null/unused for a pane
+    /// face, which keeps the pane path exactly as it was.
+    standalone_config: ?*const Config = null,
+    toolbar_box: ?*c.GtkWidget = null,
+    on_changed: ?*const fn (ctx: *anyopaque) void = null,
+    changed_ctx: ?*anyopaque = null,
 
     // ---- attach / teardown ------------------------------------------
 
@@ -482,13 +525,18 @@ pub const EditorView = struct {
     /// applyConfigChange, which frees the arena those slices lived in
     /// — Window.applyConfigChange calls it for every editor face).
     pub fn syncConfig(self: *EditorView) void {
-        const win = self.ownerWindow() orelse return;
-        const cfg = &win.config;
+        const cfg: *const Config = if (self.ownerWindow()) |win|
+            &win.config
+        else
+            self.standalone_config orelse return;
         self.tab_width = @max(1, cfg.editor_tab_width);
         self.insert_spaces = cfg.editor_insert_spaces;
         self.soft_wrap_default = cfg.editor_soft_wrap;
         self.line_numbers = cfg.editor_line_numbers;
         self.highlight_current_line = cfg.editor_highlight_current_line;
+        self.syntax_on = cfg.editor_syntax;
+        self.theme = theme_mod.byName(cfg.editor_theme);
+        self.applyThemeColors();
 
         // Font: the editor keys win, else this profile's terminal font.
         const pane = self.pane;
@@ -527,10 +575,130 @@ pub const EditorView = struct {
 
         for (self.tabs.items) |t| {
             t.layout.tab_cols = self.tab_width;
+            t.layout.theme = self.theme;
+            // Language/on-off may have changed with the config; this
+            // also re-invalidates the layout cache.
+            self.ensureHighlighter(t);
             t.layout.invalidateAll();
             self.applyWrapWidth(t);
         }
         self.queueRender();
+    }
+
+    /// Project the theme onto the pass's chrome colours. The per-glyph
+    /// foreground comes from the theme directly (Frame.theme); these
+    /// are the things the pass paints AROUND the text.
+    fn applyThemeColors(self: *EditorView) void {
+        const t = self.theme;
+        self.colors = .{
+            .text = t.fg,
+            .selection = t.selection,
+            .caret = t.caret,
+            .gutter_bg = t.gutter_bg,
+            .gutter_fg = t.gutter_fg,
+            .current_line = t.current_line,
+            .match = t.match,
+            .match_current = t.match_current,
+            .preedit_bg = t.preedit_bg,
+        };
+    }
+
+    // ---- syntax highlighting -------------------------------------------
+
+    /// Language for `tab`: filename first, then a shebang read out of
+    /// the document head. Null = plain text (also when highlighting is
+    /// switched off).
+    fn detectLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
+        if (!self.syntax_on) return null;
+        var buf: [SHEBANG_PROBE]u8 = undefined;
+        var head: []const u8 = "";
+        const n = @min(buf.len, tab.doc.rope.len());
+        if (n > 0) {
+            var it = tab.doc.rope.iterateRange(0, n);
+            var w: usize = 0;
+            while (it.next()) |chunk| {
+                @memcpy(buf[w .. w + chunk.len], chunk);
+                w += chunk.len;
+            }
+            head = buf[0..w];
+            if (std.mem.indexOfScalar(u8, head, '\n')) |nl| head = head[0..nl];
+        }
+        return syntax.detect(tab.spec, head);
+    }
+
+    fn dropHighlighter(self: *EditorView, tab: *ETab) void {
+        tab.doc.observer = null;
+        tab.layout.hl = null;
+        if (tab.hl) |hl| {
+            hl.deinit();
+            self.allocator.destroy(hl);
+        }
+        tab.hl = null;
+        tab.hl_lang = null;
+    }
+
+    /// Bring `tab`'s highlighter in line with its spec, its content and
+    /// the config. Call after anything that changes the language, the
+    /// document IDENTITY (a load replaces `tab.doc` wholesale, which
+    /// drops the observer with it) or the `editor_syntax` setting.
+    fn ensureHighlighter(self: *EditorView, tab: *ETab) void {
+        const want = self.detectLang(tab);
+        if (want == null) {
+            if (tab.hl != null) {
+                self.dropHighlighter(tab);
+                tab.layout.invalidateAll();
+            }
+            return;
+        }
+        if (tab.hl == null or tab.hl_lang.? != want.?) {
+            self.dropHighlighter(tab);
+            const hl = self.allocator.create(syntax.Highlighter) catch return;
+            hl.* = syntax.Highlighter.init(self.allocator, want.?) catch {
+                self.allocator.destroy(hl);
+                return;
+            };
+            tab.hl = hl;
+            tab.hl_lang = want;
+        } else {
+            // Same language, new (or reloaded) text: no incremental
+            // relationship to the old tree.
+            tab.hl.?.reset();
+        }
+        tab.hl.?.attach(&tab.doc);
+        tab.layout.hl = tab.hl;
+        tab.layout.theme = self.theme;
+        tab.layout.invalidateAll();
+        self.scheduleParse(tab);
+    }
+
+    /// Re-parse now for a small document, or at most once per
+    /// `PARSE_DEBOUNCE_MS` for a big one. Never a worker thread: the
+    /// GUI is single-threaded (CLAUDE.md), and a stale highlighter is
+    /// a supported state — the affected lines simply render
+    /// unhighlighted until the parse lands.
+    fn scheduleParse(self: *EditorView, tab: *ETab) void {
+        const hl = tab.hl orelse return;
+        if (!hl.isStale(&tab.doc)) return;
+        if (tab.doc.rope.len() <= SYNC_PARSE_LIMIT) {
+            hl.parse(&tab.doc) catch {};
+            return;
+        }
+        if (tab.parse_timer != 0) return;
+        const ctx = DlgCtx.create(self, tab) orelse return;
+        tab.parse_timer = c.g_timeout_add(PARSE_DEBOUNCE_MS, @ptrCast(&onParseTimer), @ptrCast(ctx));
+    }
+
+    fn onParseTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        if (ctx.resolve()) |r| {
+            r.tab.parse_timer = 0;
+            if (r.tab.hl) |hl| {
+                hl.parse(&r.tab.doc) catch {};
+                r.view.queueRender();
+            }
+        }
+        return 0; // G_SOURCE_REMOVE
     }
 
     /// Rebuild the atlas against the current font inputs under the
@@ -578,6 +746,47 @@ pub const EditorView = struct {
             }
         }
         return self;
+    }
+
+    /// A PANELESS editor face for the standalone Sketerm Editor window
+    /// (ui/editorwin.zig), the same shape BrowserView.attachForPicker
+    /// has: identical widgets and IO, no pane coupling. `cfg` must
+    /// outlive the view (the host window owns it); the caller parents
+    /// `root_box`, and owns teardown — destroy the widget tree, then
+    /// deinit() once the destroy has unwound.
+    pub fn attachStandalone(allocator: std.mem.Allocator, cfg: *const Config) !*EditorView {
+        const self = try allocator.create(EditorView);
+        self.* = .{ .allocator = allocator, .pass = EditorPass.init(allocator) };
+        errdefer allocator.destroy(self);
+        self.fence = Fence.create(self) orelse return error.OutOfMemory;
+        self.standalone_config = cfg;
+        self.buildUi();
+        // The window's header bar carries Open / Save / Save As, and
+        // "show this pane's shell" means nothing with no pane.
+        if (self.toolbar_box) |bar| c.gtk_widget_set_visible(bar, 0);
+        self.syncConfig();
+        self.startBlink();
+        return self;
+    }
+
+    /// Move the caret to 1-based `line` / `col` (BYTE column, clamped
+    /// to the line) and reveal it. The standalone `--line N[:col]`
+    /// entry point; the host applies it once the async load has landed.
+    pub fn gotoLineCol(self: *EditorView, tab: *ETab, line: usize, col: usize) void {
+        const lines = tab.doc.rope.lineCount();
+        const target_line = @min(line -| 1, lines -| 1);
+        const start = tab.doc.rope.lineToOffset(target_line);
+        const line_end = if (target_line + 1 < lines)
+            tab.doc.rope.lineToOffset(target_line + 1) -| 1
+        else
+            tab.doc.rope.len();
+        const off = @min(start + (col -| 1), line_end);
+        tab.sels.keepPrimaryOnly();
+        if (tab.sels.sels.items.len == 0) {
+            tab.sels.sels.append(self.allocator, Selection.caret(off)) catch return;
+        } else tab.sels.sels.items[0] = Selection.caret(off);
+        tab.goal_x = null;
+        self.refresh(tab);
     }
 
     /// The EditorView riding `pane`, if any.
@@ -694,6 +903,7 @@ pub const EditorView = struct {
         c.gtk_box_append(@ptrCast(bar), spacer);
         _ = self.barButton(bar, "sketerm-terminal-symbolic", "Show this pane's shell", &onTerminalClicked);
         c.gtk_box_append(@ptrCast(vbox), bar);
+        self.toolbar_box = bar;
 
         // Document tabs: the shared strip mechanics, pages are empty
         // placeholders (one GLArea below renders the active tab).
@@ -936,6 +1146,8 @@ pub const EditorView = struct {
         self.tabhost.setCurrentPage(page.?);
         self.active = tab;
         self.applyWrapWidth(tab);
+        tab.layout.theme = self.theme;
+        self.ensureHighlighter(tab);
         if (tab.spec != null) self.startLoad(tab);
         self.refresh(tab);
         return tab;
@@ -1126,7 +1338,8 @@ pub const EditorView = struct {
         const pw: c_int = w * scale;
         const ph: c_int = h * scale;
         c.glViewport(0, 0, pw, ph);
-        c.glClearColor(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2], BG_COLOR[3]);
+        const bg = self.theme.bg;
+        c.glClearColor(bg[0], bg[1], bg[2], bg[3]);
         c.glClear(c.GL_COLOR_BUFFER_BIT);
         const atlas = self.atlas orelse return 1;
         const tab = self.active orelse return 1;
@@ -1150,6 +1363,10 @@ pub const EditorView = struct {
             .rows = &tab.rows,
             .matches = tab.matches,
             .current_match = tab.current_match,
+            // Only when this tab is actually highlighted: with no
+            // highlighter every glyph's kind is `.none`, and paying the
+            // theme lookup to arrive back at `colors.text` is noise.
+            .theme = if (tab.hl != null) self.theme else null,
         };
         if (self.preeditLine()) |pl| {
             frame.preedit = .{
@@ -1229,7 +1446,7 @@ pub const EditorView = struct {
     }
 
     /// Toggle soft wrap for the active tab, keeping the caret in view.
-    fn toggleWrap(self: *EditorView, tab: *ETab) void {
+    pub fn toggleWrap(self: *EditorView, tab: *ETab) void {
         tab.wrap = !tab.wrap;
         if (!tab.wrap) tab.rows_lines = 0;
         self.applyWrapWidth(tab);
@@ -1633,7 +1850,7 @@ pub const EditorView = struct {
 
     /// Open (or focus) the find bar; `replace` also reveals the second
     /// row. A selection on one line seeds the needle.
-    fn openFind(self: *EditorView, replace: bool) void {
+    pub fn openFind(self: *EditorView, replace: bool) void {
         const tab = self.active orelse return;
         if (!self.find_open) {
             const sel = tab.sels.primary();
@@ -1782,6 +1999,10 @@ pub const EditorView = struct {
     /// keyed on `doc.revision`, the latter on the line count plus the
     /// per-line `note` the renderer makes.)
     fn afterDocEdit(self: *EditorView, tab: *ETab) void {
+        // The edit already replayed onto the syntax trees through the
+        // document's observer (Document.EditObserver); this only picks
+        // the moment to re-parse.
+        self.scheduleParse(tab);
         if (self.find_open) self.recomputeMatches(tab, false);
         self.refresh(tab);
     }
@@ -1886,6 +2107,11 @@ pub const EditorView = struct {
 
     fn updateStatus(self: *EditorView) void {
         if (self.widgets_dead) return;
+        // Every path that changes the caret, the active tab, the tab
+        // set or a dirty flag funnels through here, so this is the one
+        // place a standalone host has to watch to keep its window title
+        // honest.
+        if (self.on_changed) |cb| cb(self.changed_ctx orelse undefined);
         const tab = self.active orelse {
             c.gtk_label_set_text(self.status_label, "");
             return;
@@ -2016,6 +2242,10 @@ pub const EditorView = struct {
                 tab.doc.deinit();
                 tab.doc = new_doc;
                 new_doc = undefined;
+                // The loaded text is a different document: re-detect
+                // the language (a shebang only becomes visible now) and
+                // re-attach the observer the swap just dropped.
+                self.ensureHighlighter(tab);
                 tab.layout.invalidateAll();
                 tab.rows_lines = 0;
                 tab.anchor = .{};
@@ -2126,7 +2356,7 @@ pub const EditorView = struct {
 
     // ---- Save As / Open pickers ---------------------------------------
 
-    fn saveTabAs(self: *EditorView, tab: *ETab) void {
+    pub fn saveTabAs(self: *EditorView, tab: *ETab) void {
         const ctx = DlgCtx.create(self, tab) orelse return;
         var name_buf: [256]u8 = undefined;
         const suggested: []const u8 = blk: {
@@ -2160,6 +2390,9 @@ pub const EditorView = struct {
         if (r.tab.spec) |old| r.view.allocator.free(old);
         r.tab.spec = owned;
         r.tab.mtime_ns = 0;
+        // "Save As untitled.zig" is the moment the language becomes
+        // knowable for a buffer that never had a filename.
+        r.view.ensureHighlighter(r.tab);
         r.view.refresh(r.tab);
         r.view.startSave(r.tab, null);
     }
@@ -2168,7 +2401,7 @@ pub const EditorView = struct {
         fence: *Fence,
     };
 
-    fn openPicker(self: *EditorView) void {
+    pub fn openPicker(self: *EditorView) void {
         const ctx = std.heap.c_allocator.create(OpenCtx) catch return;
         self.fence.ref();
         ctx.* = .{ .fence = self.fence };

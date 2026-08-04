@@ -12191,3 +12191,35 @@ mux-portable still builds and sketerm-mux links only libc/libm;
 smoke-editor, spike-editor-text, smoke-fs (atomic save, monolith and
 broker), smoke-gl-core and xvfb smoke-e2e (with the new editor stage)
 all green; portal driven end to end over an isolated session bus.
+
+## Sketerm Editor as its own application
+
+`sketerm edit [files...]` is the fourth application identity, built on
+the same three precedents as the others: a GTK-free invocation module
+(`src/editor_app.zig`, mirroring `viewer.zig` and
+`filebrowser/entry.zig`), a `Mode` in main.zig that suffixes the
+GApplication id (`dev.sker.sketerm.editor`) and the program name, and a
+`sketerm-editor` alias of the same executable so taskbars cannot merge
+it with the terminal. Desktop entry, app icon and packaging follow the
+Files/Viewer shape; the entry declares a text MimeType set so it can be
+the session's default text editor.
+
+The window (`src/ui/editorwin.zig`) is composition, not a second
+editor: it hosts a PANELESS `EditorView` through the new
+`EditorView.attachStandalone`, exactly as `ui/picker.zig` hosts a
+paneless BrowserView. `EditorView.pane` was already optional, so the
+view needed only a config pointer to read settings from with no Window
+in the tree, a handle on its own toolbar (the header bar carries
+Open/Save/Save As instead), a change hook for the window title, and
+`gotoLineCol` for `--line N[:col]`. The status line stays the view's
+own footer. Unsaved buffers veto the close with Cancel / Discard /
+Save All, and Save All waits (bounded) for the async saves before the
+window goes.
+
+`--here` / `--tab` are pure IPC into a running terminal, like
+`sketerm files`: `--tab` reuses `new-editor-tab`, `--here` is the new
+`editor-here` verb (explicit pane address required, same rule as
+`browser-here`). The browser's context menu grew "Edit in a Sketerm
+Editor Window" next to the in-pane item, spawning the sibling binary
+through the new `src/ui/siblingapp.zig` — the Viewer's cross-identity
+spawn generalized.

@@ -26,9 +26,10 @@ const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
 const FILES_ID_SUFFIX = ".files";
 const VERSION = @import("version.zig").string;
 const files_entry = @import("filebrowser/entry.zig");
+const editor_app = @import("editor_app.zig");
 
 const App = struct {
-    const Mode = enum { terminal, files, viewer };
+    const Mode = enum { terminal, files, viewer, editor };
 
     allocator: std.mem.Allocator,
     /// The PRIMARY window of this process: it owns the control socket,
@@ -53,6 +54,9 @@ const App = struct {
     files_reveal: ?[]const u8 = null,
     /// Ordered resource batch for the next standalone Viewer window.
     viewer_batch: ?viewer.Batch = null,
+    /// Documents (and optional caret) for the next standalone Editor
+    /// window.
+    editor_request: ?editor_app.Request = null,
 };
 
 const HELP_TEXT =
@@ -131,6 +135,19 @@ const HELP_TEXT =
     \\                         pane: inside a durable REMOTE shell the
     \\                         window's socket is on the other machine,
     \\                         and they say so instead of guessing.
+    \\  sketerm edit [files...] Text editor as its OWN application
+    \\                         ("Sketerm Editor", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.editor): each
+    \\                         invocation opens an editor window with
+    \\                         those documents. Files may be /path,
+    \\                         host:/path or file:// URIs; remote files
+    \\                         load and save through the daemon.
+    \\                         --line N[:col] places the caret.
+    \\  sketerm edit --here|--tab [files...]
+    \\                         Editor face in the pane you typed this
+    \\                         in (--here) or a new tab of that pane's
+    \\                         window (--tab), like `sketerm files`.
+    \\                         Needs to be run from inside a pane.
     \\  sketerm view [images...] Image viewer as its OWN application
     \\                         ("Sketerm Viewer", own icon and taskbar
     \\                         entry). Local, file:// and host:/path
@@ -434,6 +451,36 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    // `sketerm edit ...`: the same three-programs-behind-one-word shape
+    // as `sketerm files`.
+    if (editorRequest(allocator, argv)) |parsed| {
+        var req = parsed;
+        defer req.deinit();
+        if (req.help) {
+            _ = c.fputs(HELP_TEXT, platform.stdout());
+            return 0;
+        }
+        switch (req.mode) {
+            // --here / --tab act on an EXISTING pane: pure socket
+            // clients over the running terminal's control socket, never
+            // a second app identity of our own.
+            .here, .tab => {
+                if (req.specs.len > 1)
+                    _ = c.fputs("sketerm edit: --here/--tab open ONE file; opening the first (use plain `sketerm edit` for several)\n", platform.stderr());
+                if (req.position != null)
+                    _ = c.fputs("sketerm edit: --line applies to standalone editor windows only\n", platform.stderr());
+                return @import("ipc/client.zig").editorInPane(
+                    allocator,
+                    req.mode == .here,
+                    if (req.specs.len > 0) req.specs[0] else null,
+                );
+            },
+            // The dedicated editor: its own identity, an ordinary
+            // GApplication run from here on.
+            .window => g_app.mode = .editor,
+        }
+    }
+
     if (viewerRequest(allocator, argv)) {
         g_app.mode = .viewer;
     }
@@ -465,13 +512,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var base: []const u8 = std.mem.span(APP_ID);
         if (c.getenv("SKETERM_APP_ID")) |raw| {
             const env = std.mem.span(raw);
-            const longest_suffix = @max(FILES_ID_SUFFIX.len, viewer.ID_SUFFIX.len);
+            const longest_suffix = @max(FILES_ID_SUFFIX.len, @max(viewer.ID_SUFFIX.len, editor_app.ID_SUFFIX.len));
             if (env.len > 0 and env.len < app_id_buf.len - longest_suffix) base = env;
         }
         const suffix: []const u8 = switch (g_app.mode) {
             .terminal => "",
             .files => FILES_ID_SUFFIX,
             .viewer => viewer.ID_SUFFIX,
+            .editor => editor_app.ID_SUFFIX,
         };
         const id = std.fmt.bufPrintZ(&app_id_buf, "{s}{s}", .{ base, suffix }) catch break :blk APP_ID;
         break :blk id.ptr;
@@ -485,6 +533,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .terminal => "sketerm",
         .files => "Sketerm Files",
         .viewer => viewer.APP_NAME,
+        .editor => editor_app.APP_NAME,
     });
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
@@ -553,6 +602,23 @@ fn filesRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?file
     defer allocator.free(args);
     for (argv, 0..) |a, n| args[n] = std.mem.span(a);
     return files_entry.parse(args);
+}
+
+/// Parse argv as a `sketerm edit ...` invocation, or null when it is
+/// not one. Relative file arguments resolve against the invoking
+/// shell's cwd (this process's, at this point in startup); the
+/// forwarded-invocation path in onCommandLine re-parses against the
+/// cwd GApplication hands it instead.
+fn editorRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?editor_app.Request {
+    const args = allocator.alloc([]const u8, argv.len) catch return null;
+    defer allocator.free(args);
+    for (argv, 0..) |a, n| args[n] = std.mem.span(a);
+    var cwd_buf: [4096:0]u8 = undefined;
+    const cwd: ?[]const u8 = if (c.getcwd(&cwd_buf, cwd_buf.len) != null)
+        std.mem.span(@as([*:0]const u8, &cwd_buf))
+    else
+        null;
+    return editor_app.collect(allocator, args, cwd) catch null;
 }
 
 fn viewerRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool {
@@ -640,6 +706,24 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         if (g_app.files_reveal) |old| g_app.allocator.free(old);
         g_app.files_path = if (request) |req| if (req.spec) |s| g_app.allocator.dupe(u8, s) catch null else null else null;
         g_app.files_reveal = if (request) |req| if (req.reveal) |s| g_app.allocator.dupe(u8, s) catch null else null else null;
+    } else if (g_app.mode == .editor) {
+        const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
+        defer g_app.allocator.free(args);
+        for (0..@intCast(argc)) |index| {
+            const raw = argv_raw[index] orelse break;
+            args[index] = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        }
+        const cwd_raw = c.g_application_command_line_get_cwd(cmdline);
+        const cwd: ?[]const u8 = if (cwd_raw != null) std.mem.span(@as([*:0]const u8, @ptrCast(cwd_raw))) else null;
+        if (g_app.editor_request) |*old| old.deinit();
+        g_app.editor_request = editor_app.collect(g_app.allocator, args, cwd) catch |err| {
+            g_app.editor_request = null;
+            var message: [192:0]u8 = undefined;
+            const text = std.fmt.bufPrintZ(&message, "sketerm: cannot open Editor documents: {s}\n", .{@errorName(err)}) catch
+                "sketerm: cannot open Editor documents\n";
+            c.g_application_command_line_printerr_literal(cmdline, text.ptr);
+            return 1;
+        };
     } else if (g_app.mode == .viewer) {
         const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
         defer g_app.allocator.free(args);
@@ -695,6 +779,14 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     if (c.gdk_display_get_default()) |display| {
         const theme = c.gtk_icon_theme_get_for_display(display);
         c.gtk_icon_theme_add_search_path(theme, "data/icons");
+    }
+
+    if (g_app.mode == .editor) {
+        var req = takeEditorRequest();
+        defer req.deinit();
+        _ = @import("ui/editorwin.zig").EditorWindow.open(g_app.allocator, app, req, g_app.config_path) catch |err|
+            std.debug.print("sketerm: editor window failed: {s}\n", .{@errorName(err)});
+        return;
     }
 
     if (g_app.mode == .viewer) {
@@ -798,6 +890,12 @@ fn takeFilesReveal() ?[]const u8 {
     return value;
 }
 
+fn takeEditorRequest() editor_app.Request {
+    const req = g_app.editor_request orelse return editor_app.Request.empty(g_app.allocator);
+    g_app.editor_request = null;
+    return req;
+}
+
 fn takeViewerBatch() viewer.Batch {
     const batch = g_app.viewer_batch orelse return viewer.Batch.empty(g_app.allocator);
     g_app.viewer_batch = null;
@@ -807,6 +905,11 @@ fn takeViewerBatch() viewer.Batch {
 fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.viewer_batch) |*batch| batch.deinit();
     g_app.viewer_batch = null;
+    if (g_app.editor_request) |*req| req.deinit();
+    g_app.editor_request = null;
+    // The editor owns no panes, no daemon sessions and no layout: its
+    // windows tear themselves down through their own destroy handlers.
+    if (g_app.mode == .editor) return;
     if (g_app.files_path) |path| g_app.allocator.free(path);
     g_app.files_path = null;
     if (g_app.files_reveal) |path| g_app.allocator.free(path);

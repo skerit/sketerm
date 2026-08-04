@@ -457,8 +457,15 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
     if (isImageName(path))
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
-    if (!ctx.is_dir)
-        m.itemIcon("Edit in Sketerm Editor", .{ .name = "document-edit-symbolic" }, &onMenuEditor, ctx);
+    if (!ctx.is_dir) {
+        // Two destinations, the same split the Viewer has: in the pane
+        // you are looking at, or as the dedicated Sketerm Editor
+        // application (own window, own taskbar entry). The in-pane item
+        // needs a pane, which the picker embed has not got.
+        if (self.pane != null)
+            m.itemIcon("Edit in Sketerm Editor", .{ .name = "document-edit-symbolic" }, &onMenuEditor, ctx);
+        m.itemIcon("Edit in a Sketerm Editor Window", .{ .name = "document-edit-symbolic" }, &onMenuEditorWindow, ctx);
+    }
     var namez: [512:0]u8 = undefined;
     var ct: [*c]c.gchar = null;
     if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(path)})) |bz| {
@@ -990,6 +997,26 @@ pub fn onMenuEditor(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const pane = self.pane orelse return;
     const win = self.ownerWindow() orelse return;
     win.openEditorOn(pane, copied) catch return;
+}
+
+/// "Edit in a Sketerm Editor Window": the dedicated editor identity,
+/// spawned as its own process the way the Viewer item does — a separate
+/// GApplication is what gives it its own window list, icon and app id.
+pub fn onMenuEditorWindow(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    const tab = ctx.tab;
+    // Format the spec BEFORE menuDone frees the ctx storage.
+    var spec_buf: [4300]u8 = undefined;
+    const spec = @import("../../filebrowser/paths.zig").formatSpec(&spec_buf, tab.hc.host, path);
+    var copy_buf: [4300]u8 = undefined;
+    if (spec.len > copy_buf.len) return menuDone(ctx);
+    @memcpy(copy_buf[0..spec.len], spec);
+    const copied = copy_buf[0..spec.len];
+    menuDone(ctx);
+    if (!@import("../siblingapp.zig").openInEditor(copied, null))
+        self.setStatus("could not launch Sketerm Editor");
 }
 
 pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
