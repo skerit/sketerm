@@ -26,6 +26,14 @@ pub const WsHost = struct {
     dead: bool = false,
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     flush_ctx: ?*anyopaque = null,
+    /// Fired the first time a remote window actually appears. The
+    /// session counts as having shown a window only from here —
+    /// channel-open alone must not, or an app that dies before
+    /// presenting anything takes the wrong exit path and the user
+    /// never sees why. Mirrors the native side's first-toplevel-frame
+    /// signal.
+    on_window: ?*const fn (ctx: ?*anyopaque) void = null,
+    window_ctx: ?*anyopaque = null,
 
     const Win = struct {
         host: *WsHost,
@@ -380,6 +388,9 @@ pub const WsHost = struct {
         c.gtk_widget_add_controller(@ptrCast(window), key);
 
         c.gtk_window_present(window);
+        // Announce only once the window is fully built and mapped, so a
+        // failure above never counts as "a window was shown".
+        if (self.on_window) |f| f(self.window_ctx);
         return win;
     }
 

@@ -1917,13 +1917,30 @@ pub const Terminal = struct {
         wa.* = .{ .terminal = self, .id = id, .host = host };
         host.on_flush = wsappFlushCb;
         host.flush_ctx = wa;
+        host.on_window = wsappFirstWindow;
+        host.window_ctx = wa;
         remote.wsapps.append(self.allocator, wa) catch {
             host.destroy();
             self.allocator.destroy(wa);
             self.sendChanClose(id);
             return;
         };
+    }
+
+    /// First remote window of a window-stream channel — the winstream
+    /// twin of `nappFirstWindow`. This used to be set at channel OPEN,
+    /// which broke the same invariant the native side documents: an app
+    /// that exits before presenting anything (a macOS system binary
+    /// SIGKILLed by launch constraints, say) then counted as having
+    /// shown a window, so the session was dropped silently instead of
+    /// materializing the held log tab that explains the exit.
+    fn wsappFirstWindow(ctx: ?*anyopaque) void {
+        const wa = @import("util/cast.zig").userData(WsApp, ctx);
+        const t = wa.terminal;
+        const remote = t.remote orelse return;
+        if (remote.app_window_opened) return;
         remote.app_window_opened = true;
+        if (t.on_app_window) |f| f(t.user_ctx);
     }
 
     fn wsappData(self: *Terminal, wa: *WsApp, bytes: []const u8) void {
