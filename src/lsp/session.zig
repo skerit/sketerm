@@ -144,7 +144,7 @@ pub const Session = struct {
     /// Bumped per didChange, per document — LSP versions are per-URI.
     /// The editor opens one document per tab, so the tab's own counter
     /// is the version and lives on the caller's side.
-    last_error: [160]u8 = undefined,
+    last_error: [240]u8 = undefined,
     last_error_len: usize = 0,
 
     pub fn init(alloc: Allocator, handler: Handler) Session {
@@ -162,9 +162,23 @@ pub const Session = struct {
         return self.last_error[0..self.last_error_len];
     }
 
+    /// Record a diagnostic message, TRUNCATING rather than failing.
+    /// Formatting straight into `last_error` would, on overflow, leave
+    /// a partially-written buffer and a length of 5 ("error"), i.e. a
+    /// misleading five-character prefix of the real message — which is
+    /// exactly how a server's "initialize failed: <long reason>" once
+    /// read as "initi".
     fn setErr(self: *Session, comptime fmt: []const u8, args: anytype) void {
-        const s = std.fmt.bufPrint(&self.last_error, fmt, args) catch "error";
-        self.last_error_len = s.len;
+        var tmp: [512]u8 = undefined;
+        var n: usize = 0;
+        if (std.fmt.bufPrint(&tmp, fmt, args)) |s| {
+            n = s.len;
+        } else |_| {
+            n = tmp.len;
+        }
+        n = @min(n, self.last_error.len);
+        @memcpy(self.last_error[0..n], tmp[0..n]);
+        self.last_error_len = n;
     }
 
     fn setState(self: *Session, s: State) void {
@@ -386,7 +400,7 @@ pub const Session = struct {
 
     /// Send `initialize`. `root_uri` may be empty (a single file with
     /// no project); `client_pid` lets the server exit if we vanish.
-    pub fn start(self: *Session, root_uri: []const u8, client_pid: i32) void {
+    pub fn start(self: *Session, root_uri: []const u8, client_pid: i32, init_options: []const u8) void {
         if (self.state != .idle) return;
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.alloc);
@@ -401,6 +415,13 @@ pub const Session = struct {
             params.appendSlice(self.alloc, "\"rootUri\":null,") catch return;
         }
         params.appendSlice(self.alloc, CLIENT_CAPS) catch return;
+        // Server-specific pass-through. Only a syntactically valid JSON
+        // OBJECT is forwarded: a typo in config must not make every
+        // `initialize` malformed.
+        if (init_options.len > 0 and isJsonObject(self.alloc, init_options)) {
+            params.appendSlice(self.alloc, ",\"initializationOptions\":") catch return;
+            params.appendSlice(self.alloc, init_options) catch return;
+        }
         params.append(self.alloc, '}') catch return;
         _ = self.sendRequest(.initialize, "initialize", params.items, .{ .id = 0, .kind = .initialize });
         self.setState(.initializing);
@@ -495,6 +516,12 @@ pub const Session = struct {
         self.sendNotification("textDocument/didSave", p.items);
     }
 };
+
+fn isJsonObject(alloc: Allocator, text: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
 
 /// The client capabilities sketerm advertises. A constant rather than a
 /// builder: every field is a fact about this editor, none of them

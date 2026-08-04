@@ -166,6 +166,25 @@ pub fn spawn(
     };
 }
 
+/// Full path `command` resolves to, or null. Caller frees.
+pub fn resolveOnPath(alloc: std.mem.Allocator, command: []const u8) ?[]u8 {
+    if (command.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, command, '/') != null) {
+        const z = alloc.dupeZ(u8, command) catch return null;
+        defer alloc.free(z);
+        if (c.access(z.ptr, c.X_OK) != 0) return null;
+        return alloc.dupe(u8, command) catch null;
+    }
+    const path = @import("../util/profile.zig").getenv("PATH") orelse return null;
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |dir| {
+        var buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, command }) catch continue;
+        if (c.access(full.ptr, c.X_OK) == 0) return alloc.dupe(u8, full) catch null;
+    }
+    return null;
+}
+
 /// Whether `command` resolves on PATH (or is an existing absolute
 /// path). Used to skip a server SILENTLY when it is not installed —
 /// the one place we can tell "not configured" from "not present".

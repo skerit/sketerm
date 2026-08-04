@@ -55,6 +55,18 @@ const proc = @import("../lsp/proc.zig");
 const diagnostics = @import("../lsp/diagnostics.zig");
 const docsync = @import("../lsp/docsync.zig");
 
+/// `SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
+/// published diagnostics to stderr. There is no other way to see why a
+/// server did not attach: every failure on that path is deliberately
+/// silent for the user.
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    const on = @import("../util/profile.zig").getenv("SKETERM_LSP_DEBUG") != null;
+    if (!on) return;
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "sketerm: lsp: " ++ fmt ++ "\n", args) catch return;
+    _ = c.fprintf(@import("../util/platform.zig").stderr(), "%s", s.ptr);
+}
+
 /// Completion re-request debounce while the popup is open. Short: the
 /// list must feel attached to the keystrokes.
 const COMPLETION_DEBOUNCE_MS: c_uint = 120;
@@ -555,12 +567,13 @@ pub const Manager = struct {
             cn.destroy();
             return null;
         };
-        cn.sess.start(cn.root_uri, c.getpid());
+        cn.sess.start(cn.root_uri, c.getpid(), srv.init_options);
         cn.pumpWrite();
         return cn;
     }
 
     fn onServerReady(self: *Manager, cn: *Conn) void {
+        dbg("{s} ready (sync={s} completion={} hover={} definition={})", .{ cn.name, @tagName(cn.sess.caps.sync), cn.sess.caps.completion, cn.sess.caps.hover, cn.sess.caps.definition });
         // Open every already-attached document now that the server has
         // told us what it can do (didOpen is refused before `.ready`).
         for (self.view.tabs.items) |tab| {
@@ -573,6 +586,7 @@ pub const Manager = struct {
     }
 
     fn onServerDead(self: *Manager, cn: *Conn) void {
+        dbg("{s} dead: {s} / stderr: {s}", .{ cn.name, cn.sess.errText(), cn.stderrText() });
         for (self.view.tabs.items) |tab| {
             const st = tab.lsp orelse continue;
             if (st.conn != cn) continue;
@@ -611,7 +625,11 @@ pub const Manager = struct {
 
         const dir = servers.dirnameOf(loc.path);
         const root = servers.findRoot(dir, srv.root_files, dirExists, null);
-        const cn = self.findConn(srv.name, root) orelse self.spawnConn(srv, root) orelse return;
+        dbg("{s} -> {s} ({s}) root={s}", .{ spec, srv.name, srv.command, root });
+        const cn = self.findConn(srv.name, root) orelse self.spawnConn(srv, root) orelse {
+            dbg("could not spawn {s}", .{srv.command});
+            return;
+        };
 
         const st = tab.lsp orelse blk: {
             const fresh = TabState.create(self.alloc, tab) orelse return;
@@ -635,9 +653,15 @@ pub const Manager = struct {
     fn openDocument(self: *Manager, tab: *ETab, st: *TabState) void {
         const cn = st.conn orelse return;
         if (st.sync.open) return;
+        // Before `.ready` the session refuses notifications, so marking
+        // the document open here would strand it: `onServerReady` skips
+        // documents it believes are already open, and the server would
+        // never see this one at all.
+        if (cn.sess.state != .ready) return;
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.version = 1;
+        dbg("didOpen {s} ({s}, {d} bytes)", .{ st.sync.uri, st.sync.language_id, text.len });
         cn.sess.didOpen(st.sync.uri, st.sync.language_id, st.sync.version, text);
         st.sync.open = true;
         st.sync.clearQueue();
@@ -792,7 +816,10 @@ pub const Manager = struct {
             .string => |s| s,
             else => return,
         };
-        const tab = self.tabForUri(cn, uri) orelse return;
+        const tab = self.tabForUri(cn, uri) orelse {
+            dbg("diagnostics for an unknown uri: {s}", .{uri});
+            return;
+        };
         const st = tab.lsp orelse return;
         const arr = switch (obj.get("diagnostics") orelse std.json.Value.null) {
             .array => |a| a,
@@ -825,6 +852,7 @@ pub const Manager = struct {
                 .source = @constCast(src),
             }) catch break;
         }
+        dbg("diagnostics for {s}: {d}", .{ uri, list.items.len });
         st.diags.replace(tab.doc.revision, list.items) catch {};
         self.view.queueRenderExternal();
         self.view.updateStatusExternal();
