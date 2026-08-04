@@ -248,6 +248,34 @@ TCC grants survive this: they pin to the `sketerm-dev` certificate, not
 the binary hash, so a re-signed build keeps both Screen Recording and
 Accessibility with no re-granting.
 
+## If the daemon dies (no physical access needed)
+
+Every failure mode recovers without touching the machine. Verified on
+hardware 2026-08-04:
+
+| What happened | Recovery |
+|---|---|
+| Crashed, OOM-killed, `kill -9` | **Automatic.** `KeepAlive` relaunches it in seconds — confirmed by SIGKILLing it and watching the pid change. |
+| Agent unloaded (`launchctl bootout`) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.sker.sketerm-mux.plist` **over SSH**. |
+| Wrong build running | `dist/deploy-macos.sh` in a mux session, then `kickstart` — see "Remote redeploy". |
+| Reboot | **Automatic**, provided the Mac auto-logs in (a LaunchAgent needs an Aqua session to load at all). |
+
+> **Correction to Why #1 below:** bootstrapping over SSH does NOT
+> strand the agent on macOS 26 when you target the `gui/<uid>` domain
+> explicitly. Tested end to end: booted the agent out, re-bootstrapped
+> it from an SSH shell, and a forwarded app then captured and streamed
+> to a client with no `CGS_REQUIRE_INIT` abort and no TCC refusal.
+> Do not confuse this with the FIRST setup, which still needs the
+> desktop — not for launchd, but because `codesign` cannot reach the
+> login keychain over SSH.
+
+For a machine you administer remotely, check that a reboot really does
+come back: `defaults read /Library/Preferences/com.apple.loginwindow
+autoLoginUser` should name the user, `/etc/kcpassword` should exist,
+and `fdesetup status` should say FileVault is Off — FileVault blocks
+auto-login until someone unlocks the disk at the console, and with no
+GUI login there is no Aqua session and therefore no daemon.
+
 ## The everyday dev loop
 
 ```bash
