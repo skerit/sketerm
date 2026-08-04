@@ -12555,3 +12555,58 @@ own compositor against `typescript-language-server` when it is
 installed (the stub otherwise), asserting the diagnostic stripe renders
 and that the hover and completion popups actually open, with
 screenshots in `zig-out/`.
+
+## Git awareness in the file browser
+
+**One path for local and remote.** The browser's version-control
+overlay used to run `git status` through `popen` on a GUI-side worker
+thread for local roots, and paint badges only when `tab.hc.host ==
+null` -- so a remote repository silently showed nothing even though the
+daemon's `git_status` job was already being submitted for it. Both
+kinds of root now submit that same job to the daemon that owns the
+files, and the GUI runs no git of its own. An ssh host renders exactly
+what a local one does.
+
+**The decisions moved out of the widgets.** `filebrowser/gitstatus.zig`
+owns the porcelain character mapping, the precedence ladder
+(`conflicted > deleted > renamed > modified > typechange > added >
+untracked > ignored`), the ancestor rollup, the badge/CSS choice, the
+status summary and the refresh cache -- GTK-free, so both test roots
+cover it.
+
+**Visual language.** A row that a record names carries the porcelain
+LETTER in a libadwaita status class (`success` for added/untracked,
+`warning` for modified, `error` for deleted/conflicted, `accent` for
+renamed), so both themes stay readable without a hardcoded hex. A
+directory whose badge came from something BELOW it gets a neutral `*`
+instead, in the rolled-up colour, so it can never be misread as a
+changed file. Ignored entries get no chip at all -- just a faded name,
+which is informative without competing with real changes. Icons view
+puts the same chip on a shrink-wrapped `GtkOverlay` over the tile icon:
+no extra row, no ragged grid, tile widths unchanged.
+
+**Rollup and cost.** One record folds into its exact path plus every
+ancestor segment, so a directory row is a single hash probe and no
+extra job is ever issued per row. Ignored never propagates upward: a
+directory of build output would otherwise wear a permanent badge, which
+is the opposite of what the ignore rule asked for. The daemon caps the
+record stream at 4096; the fold is capped at 20000 entries.
+
+**Refresh policy.** Navigation, tab switch, explicit reload, host
+connect, and the watch deltas that a completed file operation produces
+(750 ms trailing debounce) -- never a poll. A 30 s per-(host, root)
+recency cache suppresses repeated asks for the SAME root; a different
+root always re-asks, because the overlay is per view and would
+otherwise be empty.
+
+**What `git_status` does not give a browser.** `runGitStatus` in
+`src/mux/fsjob.zig` runs `git status --porcelain --no-renames -z` and
+emits one collapsed status CHARACTER per record. So: renames arrive as
+a separate delete + add (`--no-renames`), ignored files never arrive at
+all (no `--ignored`), staged-vs-unstaged is lost (the X/Y pair is
+collapsed to one char), `AA`/`DD` conflicts are reported as plain
+add/delete, and there is no branch name, no ahead/behind, and no way to
+tell a clean repository from a directory that is not in one (both
+answer `done` with zero records). The browser therefore shows the
+change summary it can compute and no branch. Widening that is a daemon
+change, not a browser one.
