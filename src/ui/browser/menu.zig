@@ -457,6 +457,8 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
     if (isImageName(path))
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
+    if (!ctx.is_dir)
+        m.itemIcon("Edit in Sketerm Editor", .{ .name = "document-edit-symbolic" }, &onMenuEditor, ctx);
     var namez: [512:0]u8 = undefined;
     var ct: [*c]c.gchar = null;
     if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(path)})) |bz| {
@@ -968,6 +970,26 @@ pub fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const path = pbuf[0..orig.len];
     menuDone(mctx);
     self.openWithDialog(tab, path);
+}
+
+/// Open the clicked file in this pane's editor face (created on
+/// demand). Host-qualified, so remote files edit over the daemon.
+pub fn onMenuEditor(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    const tab = ctx.tab;
+    // Format the spec BEFORE menuDone frees the ctx storage.
+    var spec_buf: [4300]u8 = undefined;
+    const spec = @import("../../filebrowser/paths.zig").formatSpec(&spec_buf, tab.hc.host, path);
+    var copy_buf: [4300]u8 = undefined;
+    if (spec.len > copy_buf.len) return menuDone(ctx);
+    @memcpy(copy_buf[0..spec.len], spec);
+    const copied = copy_buf[0..spec.len];
+    menuDone(ctx);
+    const pane = self.pane orelse return;
+    const win = self.ownerWindow() orelse return;
+    win.openEditorOn(pane, copied) catch return;
 }
 
 pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

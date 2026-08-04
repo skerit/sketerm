@@ -186,6 +186,15 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 }
             }
 
+            // Editor face: reopen the saved files (async loads).
+            if (p.editor) |estate| {
+                if (estate.files.len > 0) {
+                    _ = @import("editorview.zig").EditorView.attachState(self.allocator, pane, estate) catch |err| {
+                        std.debug.print("sketerm: editor restore failed: {s}\n", .{@errorName(err)});
+                    };
+                }
+            }
+
             node_out.* = .{ .leaf = pane };
             return pane.widget();
         },
@@ -548,6 +557,14 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
                 const bv = @import("browser.zig").BrowserView.fromPane(p) orelse break :blk null;
                 break :blk try bv.paneState(arena);
             };
+            // Editor face: open file specs + cursors (dirty buffers
+            // are not persisted).
+            const editor_state = blk: {
+                const ev = @import("editorview.zig").EditorView.fromPane(p) orelse break :blk null;
+                const state = try ev.paneState(arena);
+                if (state.files.len == 0) break :blk null;
+                break :blk state;
+            };
             return .{
                 .cwd = cwd,
                 .command = cmd,
@@ -560,6 +577,7 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
                 .mux_host = mux_host,
                 .browser_tabs = browser_tabs,
                 .browser = browser_state,
+                .editor = editor_state,
             };
         }
     }

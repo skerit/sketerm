@@ -53,7 +53,7 @@ const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
 pub const MenuAction = menu.Action;
 
-const FONT_CANDIDATES = if (@import("../util/platform.zig").is_macos) [_][*:0]const u8{
+pub const FONT_CANDIDATES = if (@import("../util/platform.zig").is_macos) [_][*:0]const u8{
     // System fonts every macOS install ships. Menlo is a .ttc
     // collection — FreeType opens face index 0 (Menlo-Regular).
     "/System/Library/Fonts/Menlo.ttc",
@@ -274,6 +274,14 @@ pub const Pane = struct {
     /// Put GTK focus inside the browser face (its listing). Called
     /// whenever that face becomes the visible one.
     browser_focus: ?*const fn (*anyopaque) void = null,
+
+    /// Editor face (src/ui/editorview.zig), same five-pointer contract
+    /// and two-phase teardown as the browser face above.
+    editor_widget: ?*c.GtkWidget = null,
+    editor_ctx: ?*anyopaque = null,
+    editor_prepare_destroy: ?*const fn (*anyopaque) void = null,
+    editor_deinit: ?*const fn (*anyopaque) void = null,
+    editor_focus: ?*const fn (*anyopaque) void = null,
     /// "File browser hidden - click to show it" strip, shown on the
     /// TERMINAL face while a browser face exists on this pane. Without
     /// it the browser is unreachable once hidden: only its own toolbar
@@ -515,6 +523,7 @@ pub const Pane = struct {
             ictx.pane_ctx = @ptrCast(self);
             ictx.autohide_set = setCursorHiddenSink;
             ictx.browser_toggle = toggleBrowserFaceSink;
+            ictx.editor_toggle = toggleEditorFaceSink;
         }
 
         // Resize → TIOCSWINSZ → SIGWINCH child.
@@ -674,6 +683,13 @@ pub const Pane = struct {
         return self.toggleBrowserFace();
     }
 
+    /// Wired into input.zig's editor_toggle: the `toggle_editor_face`
+    /// action, dispatched without input.zig importing pane.zig.
+    fn toggleEditorFaceSink(ctx: ?*anyopaque) bool {
+        const self = cast.userData(Pane, ctx);
+        return self.toggleEditorFace();
+    }
+
     /// Push the current focus / dim settings into the renderer. Called
     /// on focus change AND when dim factors change via prefs. The dim
     /// is a uniform post-process (shader_pass), not a per-cell
@@ -794,6 +810,8 @@ pub const Pane = struct {
         // Browser face: its fd watch + connection must not outlive
         // the pane (the callback holds a raw *BrowserView).
         self.detachBrowser();
+        // Editor face: in-flight IO jobs must see the fence die.
+        self.detachEditor();
         // A pane deinited while its widgets still exist (window
         // teardown order varies) must not leave the destroy fence
         // pointing at freed memory.
@@ -886,6 +904,11 @@ pub const Pane = struct {
     pub fn setBrowserVisible(self: *Pane, show: bool) void {
         const bw = self.browser_widget orelse return;
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
+        if (show) {
+            // Faces are exclusive: raising the browser hides an
+            // editor face too.
+            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
+        }
         if (self.offload_widget) |ow|
             c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
         setBrowserBanner(self, !show);
@@ -954,6 +977,90 @@ pub const Pane = struct {
         }
         // No face left to go back to.
         if (!self.widgets_dead) setBrowserBanner(self, false);
+    }
+
+    /// Attach a text-editor face: the widget joins the pane's wrapper
+    /// box as another face; the terminal stays alive underneath. Same
+    /// ownership contract as attachBrowser.
+    pub fn attachEditor(
+        self: *Pane,
+        face: *c.GtkWidget,
+        ctx: *anyopaque,
+        prepare_destroy_cb: *const fn (*anyopaque) void,
+        deinit_cb: *const fn (*anyopaque) void,
+        focus_cb: *const fn (*anyopaque) void,
+    ) void {
+        const wrap = self.wrapper_box orelse return;
+        self.detachEditor();
+        self.editor_widget = face;
+        self.editor_ctx = ctx;
+        self.editor_prepare_destroy = prepare_destroy_cb;
+        self.editor_deinit = deinit_cb;
+        self.editor_focus = focus_cb;
+        c.gtk_widget_set_vexpand(face, 1);
+        c.gtk_widget_set_hexpand(face, 1);
+        c.gtk_box_append(@ptrCast(wrap), face);
+        self.setEditorVisible(true);
+    }
+
+    /// Flip between the editor face and whatever else the pane shows
+    /// (terminal, or a browser face — showing the editor hides both).
+    pub fn setEditorVisible(self: *Pane, show: bool) void {
+        const ew = self.editor_widget orelse return;
+        c.gtk_widget_set_visible(ew, if (show) @as(c_int, 1) else 0);
+        if (show) {
+            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
+            if (self.editor_focus) |focus| {
+                if (self.editor_ctx) |ctx| focus(ctx);
+            }
+        } else {
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        }
+    }
+
+    pub fn hasEditorFace(self: *Pane) bool {
+        return self.editor_widget != null;
+    }
+
+    pub fn editorFaceVisible(self: *Pane) bool {
+        const ew = self.editor_widget orelse return false;
+        return c.gtk_widget_get_visible(ew) != 0;
+    }
+
+    /// Swap editor face and shell. @return false when there is no
+    /// editor face to swap to.
+    pub fn toggleEditorFace(self: *Pane) bool {
+        if (!self.hasEditorFace()) return false;
+        self.setEditorVisible(!self.editorFaceVisible());
+        return true;
+    }
+
+    /// Two-phase editor teardown, tolerant of dead widgets — mirror
+    /// of detachBrowser.
+    pub fn detachEditor(self: *Pane) void {
+        const ctx = self.editor_ctx;
+        const prepare_destroy_cb = self.editor_prepare_destroy;
+        const deinit_cb = self.editor_deinit;
+        const face = self.editor_widget;
+        self.editor_ctx = null;
+        self.editor_prepare_destroy = null;
+        self.editor_deinit = null;
+        self.editor_focus = null;
+        self.editor_widget = null;
+        if (ctx) |editor_ctx| {
+            if (prepare_destroy_cb) |cb| cb(editor_ctx);
+        }
+        if (face) |ew| {
+            if (!self.widgets_dead) {
+                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), ew);
+                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            }
+        }
+        if (ctx) |editor_ctx| {
+            if (deinit_cb) |cb| cb(editor_ctx);
+        }
     }
 
     fn onWrapperDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {

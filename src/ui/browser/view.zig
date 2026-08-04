@@ -71,6 +71,7 @@ const mediacols = @import("mediacols.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const selmod = @import("selection.zig");
 const tabsmod = @import("tabs.zig");
+const tabhost_mod = @import("../tabhost.zig");
 const templates_mod = @import("templates.zig");
 const viewsmod = @import("views.zig");
 
@@ -136,6 +137,10 @@ pub const BrowserView = struct {
 
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
+    /// Shared notebook tab-strip mechanics (label recipe, close,
+    /// middle-click, scroll-to-switch, strip gestures). Owns
+    /// `notebook`, which stays mirrored here for the existing code.
+    tabhost: tabhost_mod.TabHost = undefined,
     /// Editable face of the location control; the breadcrumb face
     /// and the history dropdowns live in `locbar`.
     path_entry: *c.GtkEntry = undefined,
@@ -242,9 +247,6 @@ pub const BrowserView = struct {
     side_card_sub2: *c.GtkLabel = undefined,
     places_list: *c.GtkListBox = undefined,
     places_on: bool = false,
-    /// Smooth-scroll accumulator for scroll-to-switch on the tab
-    /// strip (one tab per ~1.0 of delta).
-    tab_scroll_accum: f64 = 0,
     /// The Places toggle, so the persisted open state and the button
     /// can never disagree.
     places_toggle: *c.GtkToggleButton = undefined,
@@ -1653,10 +1655,12 @@ pub const BrowserView = struct {
         c.gtk_widget_set_visible(sbar, 0);
         c.gtk_box_append(@ptrCast(vbox), sbar);
 
-        const notebook = c.gtk_notebook_new();
-        c.gtk_notebook_set_scrollable(@ptrCast(notebook), 1);
-        c.gtk_widget_set_hexpand(notebook, 1);
-        c.gtk_widget_set_vexpand(notebook, 1);
+        self.tabhost = tabhost_mod.TabHost.init(self.allocator);
+        self.tabhost.ctx = @ptrCast(self);
+        self.tabhost.on_close = &hostCloseCb;
+        self.tabhost.on_new = &hostNewCb;
+        self.tabhost.on_strip_menu = &hostStripMenuCb;
+        const notebook = self.tabhost.widget();
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         // Content row: places | (notebook | preview). The sidebar is a
@@ -1755,7 +1759,7 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(vbox, "destroy", @ptrCast(&onRootDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         self.root_box = vbox;
-        self.notebook = @ptrCast(@alignCast(notebook));
+        self.notebook = self.tabhost.notebook;
         self.path_entry = @ptrCast(@alignCast(entry));
         self.back_button = back;
         self.fwd_button = fwd;
@@ -1772,7 +1776,30 @@ pub const BrowserView = struct {
         self.content_paned = content.?;
         self.right_box = right.?;
         self.right_cluster = cluster.?;
-        @import("tabs.zig").installTabBarGestures(self);
+        self.tabhost.installStripGestures();
+    }
+
+    /// TabHost close request (close button / middle click on a tab
+    /// label): route to the browser's own closeTab.
+    fn hostCloseCb(ctx: ?*anyopaque, page: *c.GtkWidget) void {
+        const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+        for (self.tabs.items) |t| {
+            if (t.page == page) {
+                self.closeTab(t);
+                return;
+            }
+        }
+    }
+
+    /// TabHost strip double-click: same behavior as the new-tab
+    /// button — the new tab opens on the current tab's directory.
+    fn hostNewCb(ctx: ?*anyopaque) void {
+        BrowserView.onNewTabClicked(undefined, ctx);
+    }
+
+    fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
+        const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+        tabsmod.showStripMenu(self, x, y);
     }
 
     /// The browser's widgets are gone: nothing deferred may touch them

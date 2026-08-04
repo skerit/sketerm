@@ -109,6 +109,10 @@ const ENTRIES = [_]Entry{
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",
        .desc = "Swap this pane between its file browser and its shell. Both stay alive; neither is closed.", .action = .toggle_browser_face },
+    .{ .icon = "document-edit-symbolic", .title = "New Editor Tab",
+       .desc = "Edit text files (local or remote) with multi-caret editing; the pane's shell is one click away.", .action = .new_editor_tab },
+    .{ .icon = "document-edit-symbolic", .title = "Show Editor / Show Shell",
+       .desc = "Swap this pane between its text editor and its shell. Both stay alive; neither is closed.", .action = .toggle_editor_face },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",

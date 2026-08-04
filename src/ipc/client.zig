@@ -45,6 +45,9 @@ const CLI_HELP =
     \\                                    REMOTE path)
     \\  record-stop [--pane N]            stop the session recording
     \\  new-tab [--cwd DIR] [--title T]   open a shell tab
+    \\  new-editor-tab [spec]             open a text-editor tab; the
+    \\                                    optional spec is a file path
+    \\                                    (/path or host:/path)
     \\  split [--pane N] [--dir h|v]      split a pane (h = side by side)
     \\  focus (--pane N | --tab N)        focus a pane or select a tab
     \\  close-pane [--pane N]             close a pane

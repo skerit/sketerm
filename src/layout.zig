@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const browser_model = @import("filebrowser/model.zig");
+const editor_model = @import("editor/model.zig");
 
 pub const Orient = enum { horizontal, vertical };
 
@@ -45,6 +46,9 @@ pub const PaneSpec = struct {
     /// Versioned full browser state. `browser_tabs` remains as the
     /// compatibility reader for layouts written by the first prototype.
     browser: ?browser_model.PaneState = null,
+    /// Text-editor face: open file specs + active index + cursors.
+    /// Dirty (unsaved) buffers are NOT persisted — see editor/model.zig.
+    editor: ?editor_model.PaneState = null,
 };
 
 pub const SplitSpec = struct {
@@ -194,6 +198,35 @@ pub fn defaultLayoutPath(allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/default.json", .{home});
     }
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-default.json", .{});
+}
+
+test "round trip preserves editor pane state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/editor.json", .{real_path});
+
+    const cmd = [_][]const u8{"sh"};
+    const files = [_]editor_model.FileState{
+        .{ .spec = "/tmp/a.txt", .cursor = 7 },
+        .{ .spec = "box:/etc/hosts", .cursor = 0 },
+    };
+    var tabs = [_]TabSpec{.{ .title = "ed", .tree = .{ .pane = .{
+        .cwd = "/",
+        .command = &cmd,
+        .editor = .{ .files = &files, .active = 1 },
+    } } }};
+    try save(Layout{ .tabs = &tabs }, file_path);
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    const state = parsed.value.tabs[0].tree.pane.editor.?;
+    try std.testing.expectEqual(@as(u64, 1), state.active);
+    try std.testing.expectEqual(@as(usize, 2), state.files.len);
+    try std.testing.expectEqualStrings("box:/etc/hosts", state.files[1].spec);
+    try std.testing.expectEqual(@as(u64, 7), state.files[0].cursor);
 }
 
 test "round trip with split tree" {
