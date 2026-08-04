@@ -49,6 +49,7 @@ comptime {
     _ = @import("filebrowser/fileicon.zig");
     _ = @import("filebrowser/format.zig");
     _ = @import("filebrowser/grouping.zig");
+    _ = @import("filebrowser/gitstatus.zig");
     _ = @import("filebrowser/hexdump.zig");
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/paths.zig");
