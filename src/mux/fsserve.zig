@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
+const platform = @import("../util/platform.zig");
 
 const is_linux = builtin.os.tag == .linux;
 
@@ -64,8 +65,7 @@ pub const Entry = struct {
     /// CHILD_COUNT_CAP). Counted daemon-side so remote listings get it
     /// without extra round trips.
     children: i64 = -1,
-    /// user.sketerm.tags xattr, comma-separated ("" = none; always ""
-    /// on platforms without lgetxattr).
+    /// user.sketerm.tags xattr, comma-separated ("" = none).
     tags: []const u8 = "",
     /// Values for the extended attributes the CLIENT asked for, in
     /// request order; "" means absent. Only present when requested,
@@ -285,9 +285,9 @@ pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u
         }
         e.attrs = values;
     }
-    if (comptime is_linux) {
+    {
         var tag_buf: [256]u8 = undefined;
-        const tn = c.lgetxattr(full, TAGS_XATTR, &tag_buf, tag_buf.len);
+        const tn = platform.lgetxattr(full, TAGS_XATTR, &tag_buf);
         if (tn > 0) {
             if (std.unicode.utf8ValidateSlice(tag_buf[0..@intCast(tn)]))
                 e.tags = arena.dupe(u8, tag_buf[0..@intCast(tn)]) catch "";
@@ -302,9 +302,8 @@ pub const TAGS_XATTR = "user.sketerm.tags";
 /// Read one extended attribute; null when absent, unreadable, or not
 /// valid UTF-8 (the browser shows attributes as text).
 pub fn getAttr(arena: std.mem.Allocator, path: [*:0]const u8, name: [*:0]const u8) ?[]const u8 {
-    if (comptime !is_linux) return null;
     var buf: [MAX_ATTR_VALUE]u8 = undefined;
-    const n = c.lgetxattr(path, name, &buf, buf.len);
+    const n = platform.lgetxattr(path, name, &buf);
     if (n <= 0) return null;
     const value = buf[0..@intCast(n)];
     if (!std.unicode.utf8ValidateSlice(value)) return null;
@@ -315,25 +314,23 @@ pub fn getAttr(arena: std.mem.Allocator, path: [*:0]const u8, name: [*:0]const u
 /// Refuses anything outside the `user.` namespace: the browser must
 /// not be a path to editing security or system attributes.
 pub fn setAttr(path: [*:0]const u8, name: []const u8, value: []const u8) bool {
-    if (comptime !is_linux) return false;
     if (!std.mem.startsWith(u8, name, "user.")) return false;
     var name_z: [256:0]u8 = undefined;
     if (name.len >= name_z.len) return false;
     @memcpy(name_z[0..name.len], name);
     name_z[name.len] = 0;
     if (value.len == 0) {
-        _ = c.lremovexattr(path, &name_z);
+        platform.lremovexattr(path, &name_z);
         return true; // absent == cleared
     }
     if (value.len > MAX_ATTR_VALUE) return false;
-    return c.lsetxattr(path, &name_z, value.ptr, value.len, 0) == 0;
+    return platform.lsetxattr(path, &name_z, value);
 }
 
 /// Every `user.` attribute on one file, names and values.
 pub fn listAttrs(arena: std.mem.Allocator, path: [*:0]const u8) []const Attr {
-    if (comptime !is_linux) return &.{};
     var names: [16 * 1024]u8 = undefined;
-    const n = c.llistxattr(path, &names, names.len);
+    const n = platform.llistxattr(path, &names);
     if (n <= 0) return &.{};
     var out: std.ArrayList(Attr) = .empty;
     var it = std.mem.splitScalar(u8, names[0..@intCast(n)], 0);
@@ -352,15 +349,13 @@ pub fn listAttrs(arena: std.mem.Allocator, path: [*:0]const u8) []const Attr {
     return out.items;
 }
 
-/// Set (or clear with "") the tags xattr. Linux-only; elsewhere a
-/// described error.
+/// Set (or clear with "") the tags xattr.
 pub fn setTags(path: [*:0]const u8, tags: []const u8) bool {
-    if (comptime !is_linux) return false;
     if (tags.len == 0) {
-        _ = c.lremovexattr(path, TAGS_XATTR);
+        platform.lremovexattr(path, TAGS_XATTR);
         return true; // absent == cleared
     }
-    return c.lsetxattr(path, TAGS_XATTR, tags.ptr, tags.len, 0) == 0;
+    return platform.lsetxattr(path, TAGS_XATTR, tags);
 }
 
 pub const Listing = struct {
@@ -538,6 +533,15 @@ fn fallbackTemplates(home: []const u8, buf: []u8) []const u8 {
 }
 
 // ── inotify watcher (Linux; inert elsewhere) ────────────────────
+
+/// Whether a directory view gets live content deltas at all. The
+/// watcher below is inotify-backed, so everywhere else a view answers
+/// its initial listing and then stays silent — including for changes
+/// the daemon itself makes through the mutation verbs, since those are
+/// observed through the same watch rather than synthesised. Clients
+/// that must not show a stale directory have to re-list on those
+/// platforms.
+pub const live_deltas = is_linux;
 
 /// Directory-content event mask for views. IN_MODIFY is deliberately
 /// absent (a busy writer would flood; size updates land on
