@@ -605,6 +605,56 @@ pub const zxdg_toplevel_decoration_v1 = Interface{
     },
 };
 
+// ─── xdg-foreign v2 ─────────────────────────────────────────────
+// Cross-client window parenting: a client exports its toplevel and
+// hands the opaque handle to another process (over D-Bus), which
+// imports it and parents a dialog to it. GTK4's portal
+// `parent_window` path is the motivating consumer. Only v2 is
+// advertised — see the note on the globals table in compositor.zig.
+// Transcribed from unstable/xdg-foreign/xdg-foreign-unstable-v2.xml;
+// every interface there is at version 1.
+
+pub const zxdg_exporter_v2 = Interface{
+    .name = "zxdg_exporter_v2",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "export_toplevel", .sig = "no", .new_id_iface = &zxdg_exported_v2 },
+    },
+};
+
+pub const zxdg_importer_v2 = Interface{
+    .name = "zxdg_importer_v2",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "import_toplevel", .sig = "ns", .new_id_iface = &zxdg_imported_v2 },
+    },
+};
+
+pub const zxdg_exported_v2 = Interface{
+    .name = "zxdg_exported_v2",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "handle", .sig = "s" },
+    },
+};
+
+pub const zxdg_imported_v2 = Interface{
+    .name = "zxdg_imported_v2",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_parent_of", .sig = "o" },
+    },
+    .events = &.{
+        .{ .name = "destroyed", .sig = "" },
+    },
+};
+
 // ─── primary selection (middle-click paste) ─────────────────────
 
 pub const zwp_primary_selection_offer_v1 = Interface{
@@ -977,7 +1027,8 @@ pub const all = [_]*const Interface{
     &zwp_idle_inhibit_manager_v1,    &zwp_idle_inhibitor_v1,                   &zwp_pointer_gestures_v1,         &zwp_pointer_gesture_swipe_v1,
     &zwp_pointer_gesture_pinch_v1,   &zwp_pointer_gesture_hold_v1,             &zwp_linux_dmabuf_v1,             &zwp_linux_buffer_params_v1,
     &zwp_linux_dmabuf_feedback_v1,   &zxdg_output_manager_v1,                  &zxdg_output_v1,
-    &wl_fixes,
+    &wl_fixes,                       &zxdg_exporter_v2,                        &zxdg_importer_v2,
+    &zxdg_exported_v2,               &zxdg_imported_v2,
 };
 
 // ─── tests ──────────────────────────────────────────────────────

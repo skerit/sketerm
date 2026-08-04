@@ -140,13 +140,20 @@ import, is ignored the same way.
   pick usable would mean copying or FUSE-mounting it locally and
   handing over that path -- a separate design decision (ownership,
   lifetime, cleanup), deliberately not taken here.
-- **Wayland parenting needs a compositor with `xdg_foreign`.** The
-  import path is exercised by the test rig, but sketerm's own
-  compositor does not implement `zxdg_exporter_v2`, so GDK reports
-  "Server is missing xdg_foreign support" there and the dialog stays
-  unparented. The X11 branch is likewise not exercised by any test in
-  this repo: X sessions are off-limits for GUI testing here (see
-  CLAUDE.md), and no X11 desktop is available to the suite.
+- **Wayland parenting needs a compositor with `xdg_foreign`.**
+  sketerm's own compositor now advertises `zxdg_exporter_v2` /
+  `zxdg_importer_v2` (v2 only -- see `src/wlhost/compositor.zig`), so
+  a handle exported by one client of a session resolves for another
+  and GDK no longer reports "Server is missing xdg_foreign support".
+  What the relationship then *does* is bounded by the view layer: a
+  parent in the SAME client connection becomes a real transient-for on
+  the host window, while a cross-connection parent (the portal case) is
+  recorded in compositor state only -- one host window per connection
+  is all the forwarding model can address today, so the dialog is not
+  stacked or positioned over the caller. The X11 branch is not
+  exercised by any test in this repo: X sessions are off-limits for GUI
+  testing here (see CLAUDE.md), and no X11 desktop is available to the
+  suite.
 - `choices` are echoed at their defaults but not presented; the
   `writable` option is ignored (it only means anything to a
   document-portal-backed sandbox, which this backend does not
