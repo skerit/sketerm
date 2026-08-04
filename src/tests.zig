@@ -203,6 +203,7 @@ comptime {
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
     _ = @import("editor/search.zig");
+    _ = @import("editor/structure.zig");
     _ = @import("editor/syntax.zig");
     _ = @import("editor/theme.zig");
     _ = @import("render/editor_font.zig");

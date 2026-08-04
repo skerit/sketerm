@@ -101,8 +101,14 @@ pub const Document = struct {
     undo_stack: std.ArrayList(HistEntry),
     redo_stack: std.ArrayList(HistEntry),
     typing: ?Typing,
-    /// Optional pre-edit hook; see `EditObserver`. Not owned.
-    observer: ?EditObserver = null,
+    /// Pre-edit hooks; see `EditObserver`. Not owned.
+    ///
+    /// A fixed pair rather than a list: the subscriber set is static
+    /// (the incremental highlighter, and the editor's position anchors
+    /// for code folding) and this fires on every keystroke, so an
+    /// allocation here would be a hot-path cost for no flexibility
+    /// anyone needs.
+    observers: [2]?EditObserver = .{ null, null },
     /// The history entry the last undo/redo consumed, kept alive only
     /// so the `Change` handed back can point at its buffers. Freed at
     /// the next mutation.
@@ -173,6 +179,32 @@ pub const Document = struct {
         if (self.consumed) |*e| e.deinitFree(self.alloc);
         self.consumed = null;
         self.consumed_view.clearRetainingCapacity();
+    }
+
+    /// Install (or replace, matching on `ctx`) a pre-edit hook. Silent
+    /// no-op when both slots are taken by other contexts — that would
+    /// be a programming error, and losing highlighting is preferable
+    /// to aborting the editor.
+    pub fn addObserver(self: *Document, ob: EditObserver) void {
+        for (&self.observers) |*slot| {
+            if (slot.*) |cur| {
+                if (cur.ctx != ob.ctx) continue;
+            }
+            slot.* = ob;
+            return;
+        }
+    }
+
+    pub fn removeObserver(self: *Document, ctx: *anyopaque) void {
+        for (&self.observers) |*slot| {
+            if (slot.*) |cur| {
+                if (cur.ctx == ctx) slot.* = null;
+            }
+        }
+    }
+
+    pub fn clearObservers(self: *Document) void {
+        self.observers = .{ null, null };
     }
 
     pub fn isDirty(self: *const Document) bool {
@@ -395,7 +427,9 @@ pub const Document = struct {
     fn applyEdits(self: *Document, edits: []const tr.Edit) Allocator.Error!std.ArrayList(OwnedEdit) {
         // Before ANY mutation, while the old text and its line
         // structure are still readable.
-        if (self.observer) |ob| ob.before_apply(ob.ctx, self, edits);
+        for (self.observers) |maybe| {
+            if (maybe) |ob| ob.before_apply(ob.ctx, self, edits);
+        }
 
         var inverse: std.ArrayList(OwnedEdit) = .empty;
         errdefer freeEntryList(self.alloc, &inverse);
