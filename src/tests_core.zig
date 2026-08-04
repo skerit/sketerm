@@ -44,6 +44,7 @@ comptime {
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/snapshots.zig");
     _ = @import("filebrowser/picker.zig");
+    _ = @import("portal.zig");
     _ = @import("filebrowser/viewmem.zig");
     _ = @import("filebrowser/xferqueue.zig");
     _ = @import("fsmount.zig");

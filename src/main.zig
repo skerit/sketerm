@@ -140,6 +140,11 @@ const HELP_TEXT =
     \\                         FUSE-mount a host's files so LOCAL apps
     \\                         open them via the kernel (ranged reads,
     \\                         write-through; fusermount3 -u to stop).
+    \\  sketerm portal         xdg-desktop-portal FileChooser backend
+    \\                         serving the native sketerm picker to any
+    \\                         portal-using app. OPT-IN: see docs/portal.md
+    \\                         (portals.conf + the shipped .portal file);
+    \\                         normally D-Bus-activated, not run by hand.
     \\  sketerm doctor [host]  Health check: binary/daemon version skew,
     \\                         socket liveness, terminfo, capabilities.
     \\                         With a host, also probes the REMOTE
@@ -340,6 +345,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             full.appendSlice(allocator, rest) catch return 1;
         }
         return display.run(allocator, full.items);
+    }
+
+    // `sketerm portal` — opt-in xdg-desktop-portal FileChooser backend:
+    // its own hold()-ed GApplication owning the impl.portal bus name,
+    // serving the native picker to sandboxed/portal-using apps. Never
+    // selected unless the user lists it in portals.conf (docs/portal.md).
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "portal")) {
+        return @import("ui/portal.zig").run(allocator);
     }
 
     // `sketerm doctor [host]` — health check; socket-only, no

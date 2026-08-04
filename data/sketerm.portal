@@ -1,0 +1,3 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.sketerm
+Interfaces=org.freedesktop.impl.portal.FileChooser

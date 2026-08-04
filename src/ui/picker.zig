@@ -34,6 +34,8 @@ pub const PickerWindow = struct {
     /// Selected filter index; == filters.len means "All files".
     active_filter: usize = 0,
     suggested_name: ?[]u8 = null,
+    /// Primary-button label override (owned copy).
+    accept_label: ?[]u8 = null,
     cb: ResultCb,
     cb_ctx: ?*anyopaque,
     delivered: bool = false,
@@ -60,6 +62,7 @@ pub const PickerWindow = struct {
         }
         try self.copyFilters(req.filters);
         if (req.suggested_name) |sn| self.suggested_name = try allocator.dupe(u8, sn);
+        if (req.accept_label) |al| self.accept_label = try allocator.dupe(u8, al);
         self.hooks = .{
             .ctx = @ptrCast(self),
             .on_activate_file = &onActivateFile,
@@ -118,6 +121,8 @@ pub const PickerWindow = struct {
         self.filters = &.{};
         if (self.suggested_name) |sn| self.allocator.free(sn);
         self.suggested_name = null;
+        if (self.accept_label) |al| self.allocator.free(al);
+        self.accept_label = null;
     }
 
     // -- window construction -------------------------------------
@@ -200,11 +205,19 @@ pub const PickerWindow = struct {
 
         if (self.filters.len > 0) self.buildFilterDropdown(footer.?);
 
-        const cancel = c.gtk_button_new_with_label("Cancel");
-        _ = c.g_signal_connect_data(cancel, "clicked", @ptrCast(&onCancelClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(footer), cancel);
+        const cancel_btn = c.gtk_button_new_with_label("Cancel");
+        _ = c.g_signal_connect_data(cancel_btn, "clicked", @ptrCast(&onCancelClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(footer), cancel_btn);
 
-        const primary = c.gtk_button_new_with_label(fpicker.primaryLabel(self.mode));
+        // gtk_button_new_with_label copies, so a stack copy is fine.
+        var albuf: [128:0]u8 = undefined;
+        const primary_label: [*:0]const u8 = if (self.accept_label) |al| blk: {
+            const n = @min(al.len, albuf.len - 1);
+            @memcpy(albuf[0..n], al[0..n]);
+            albuf[n] = 0;
+            break :blk &albuf;
+        } else fpicker.primaryLabel(self.mode);
+        const primary = c.gtk_button_new_with_label(primary_label);
         c.gtk_widget_add_css_class(primary, "suggested-action");
         _ = c.g_signal_connect_data(primary, "clicked", @ptrCast(&onPrimaryClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(footer), primary);
@@ -359,6 +372,10 @@ pub const PickerWindow = struct {
 
     fn onCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(PickerWindow, user);
+        // The widget tree is about to die; fence the browser's
+        // destroy-time signal storm (sorter/selection callbacks) the
+        // same way Pane.prepareDestroyCb does.
+        self.view.widgets_dead = true;
         if (!self.delivered) {
             self.delivered = true;
             self.cb(self.cb_ctx, null);
@@ -371,6 +388,7 @@ pub const PickerWindow = struct {
     /// so the null delivery has to be honored here too.
     fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(PickerWindow, user);
+        self.view.widgets_dead = true;
         if (!self.delivered) {
             self.delivered = true;
             self.cb(self.cb_ctx, null);
@@ -389,6 +407,17 @@ pub const PickerWindow = struct {
         return 0;
     }
 
+    /// Programmatic cancel (e.g. the portal's Request.Close): fence
+    /// the browser BEFORE the widget tree dies -- GtkWindow dispose
+    /// destroys children before emitting "destroy", so the destroy
+    /// handler's fence is too late for the teardown signal storm --
+    /// then destroy; the callback fires with null via the destroy
+    /// fence.
+    pub fn cancel(self: *PickerWindow) void {
+        self.view.widgets_dead = true;
+        c.gtk_window_destroy(self.window);
+    }
+
     // -- delivery ------------------------------------------------
 
     /// Invoke the callback exactly once and self-destruct.
@@ -396,6 +425,7 @@ pub const PickerWindow = struct {
         if (self.delivered) return;
         self.delivered = true;
         self.cb(self.cb_ctx, .{ .specs = specs, .name = name });
+        self.view.widgets_dead = true;
         c.gtk_window_destroy(self.window);
     }
 
@@ -403,6 +433,7 @@ pub const PickerWindow = struct {
         if (self.delivered) return;
         self.delivered = true;
         self.cb(self.cb_ctx, null);
+        self.view.widgets_dead = true;
         c.gtk_window_destroy(self.window);
     }
 
