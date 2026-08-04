@@ -96,13 +96,18 @@ You should see one line with a 40-hex SHA-1 and `"sketerm-dev"`.
 > policy. Trust it from Keychain Access (double-click → Trust → Code
 > Signing → Always Trust) if you want the clean listing.
 
-> **Part 2 cannot be run over SSH — not just for the audit-session
-> reason in Why #1/#2, but because `codesign` cannot reach your login
-> keychain there.** An SSH session is not allowed to prompt for the
-> unlock, so `security` reports `User interaction is not allowed.` and
-> codesign fails with the unhelpful `errSecInternalComponent`. That
-> error means "cannot get at the private key", not "bad certificate".
-> Run the deploy from a Terminal on the Mac's own desktop.
+> **The FIRST Part 2 cannot be run over SSH — not just for the
+> audit-session reason in Why #1/#2, but because `codesign` cannot
+> reach your login keychain there.** An SSH session is not allowed to
+> prompt for the unlock, so `security` reports `User interaction is not
+> allowed.` and codesign fails with the unhelpful
+> `errSecInternalComponent`. That error means "cannot get at the
+> private key", not "bad certificate". Run that first deploy from a
+> Terminal on the Mac's own desktop.
+>
+> **Every LATER deploy can be done entirely over SSH — see "Remote
+> redeploy" below.** Once the agent exists you never need the desktop
+> again.
 
 ---
 
@@ -205,6 +210,43 @@ tail -f /tmp/sketerm-mux.log
 > is running headless.
 
 ---
+
+## Remote redeploy (no physical access)
+
+Once the LaunchAgent exists, **the desktop is no longer needed** —
+including for `codesign`. The trick is that the daemon is itself in the
+Aqua session, so anything it spawns inherits that security session and
+can therefore reach the unlocked login keychain. Run the deploy inside
+a session the daemon hosts:
+
+```bash
+sketerm mux spawn deployer --rows 40 --cols 200
+sketerm mux send deployer --enter \
+  '/path/to/sketerm/dist/deploy-macos.sh > /tmp/deploy.out 2>&1; echo "RC=$?" >> /tmp/deploy.out'
+# poll /tmp/deploy.out for RC=
+sketerm mux kill deployer
+launchctl kickstart -k gui/$(id -u)/dev.sker.sketerm-mux   # SSH is fine
+```
+
+Two things make this work, both verified on hardware 2026-08-04:
+
+- **codesign succeeds inside a daemon-hosted session** and fails from
+  the SSH shell that started it — same user, same binary, same moment.
+  That is the whole difference, and it is the security session, not the
+  keychain being locked.
+- **`launchctl kickstart` is fine over SSH.** The audit-session warning
+  in Why #1 applies to `bootstrap` (creating the agent in the right
+  domain); restarting one that is already correctly bootstrapped is
+  not the same operation.
+
+Use **absolute paths** — the session's cwd is the daemon's own
+(normally `$HOME`), not your repo. `kickstart` kills the daemon and so
+kills the deployer session with it; run it last, and note the deploy
+script deliberately does not restart a loaded daemon by itself.
+
+TCC grants survive this: they pin to the `sketerm-dev` certificate, not
+the binary hash, so a re-signed build keeps both Screen Recording and
+Accessibility with no re-granting.
 
 ## The everyday dev loop
 
