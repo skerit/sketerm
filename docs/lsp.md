@@ -220,7 +220,16 @@ command = typescript-language-server
 args = --stdio
 languages = typescript, typescriptreact, javascript, javascriptreact
 root_files = tsconfig.json, package.json, .git
+init_options = {"tsserver":{"path":"/opt/ts/node_modules/typescript/lib/tsserver.js"}}
 ```
+
+`init_options` is a raw JSON object passed through as
+`initialize.initializationOptions`. Several widely-used servers are
+unusable without it (typescript-language-server needs a `tsserver.path`
+when the workspace has no local `typescript`; rust-analyzer takes its
+settings there), and it is server-specific by definition, so it is a
+pass-through string rather than a typed schema. Malformed JSON is
+dropped rather than corrupting every `initialize`.
 
 A `[lsp.<name>]` section whose name matches a built-in is **seeded from
 that built-in** at parse time, so a section carrying only `args` keeps
@@ -273,3 +282,16 @@ that dies takes its diagnostics down with it and the editor keeps working.
   diagnostics against it, so an off-by-one range makes the two copies
   diverge and the stage fail. The whole stage runs twice, once per
   position encoding, over a document full of astral-plane characters.
+* `zig build smoke-lsp-gui` — the REAL editor GUI on sketerm's own
+  Wayland compositor (private daemon on a short socket, display session,
+  viewer attached before the GUI — never Xvfb), driving
+  `typescript-language-server` when it is on PATH and the stub
+  otherwise. Asserts the diagnostic stripe renders, that Ctrl+I and
+  Ctrl+Space actually open popups (a GtkPopover is its own xdg_popup, so
+  this is observable rather than inferred), that accepting an item
+  changes the document, and that F12 moves the caret. One screenshot per
+  claim lands in `zig-out/`.
+
+`SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
+published diagnostics to stderr — the client is silent by design, so
+there is no other way to see why a server did not attach.
