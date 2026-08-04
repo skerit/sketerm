@@ -341,6 +341,12 @@ pub const Session = struct {
     wl_hub_fd: c_int = -1,
     /// Owned display socket path, unlinked on teardown.
     wl_display_path: ?[]u8 = null,
+    /// xdg-foreign handle namespace shared by every Wayland connection
+    /// of this session — each connection has its own Compositor, so
+    /// only a shared registry lets one client import a handle another
+    /// exported (the portal dialog case). Torn down after the session's
+    /// channels, which is the order removeSession/reap already use.
+    foreign: wlcomp.ForeignRegistry = .{},
     /// Audio hub: the daemon IS the session's PulseAudio server
     /// (mux/pulse.zig). -1 = no audio forwarding for this session.
     pa_hub_fd: c_int = -1,
@@ -390,6 +396,7 @@ pub const Session = struct {
             self.allocator.free(p);
         }
         if (self.a11y) |*h| h.deinit();
+        self.foreign.deinit();
         if (self.pty.closeAndReap()) |code| self.exit_status = code;
         self.parser.deinit();
         self.screen.deinit();
@@ -1776,6 +1783,10 @@ pub const Daemon = struct {
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     channels: std.ArrayList(*Channel) = .empty,
+    /// An xdg-foreign teardown queued events on a brain that is not the
+    /// one currently being fed; the next tick flushes every brain with
+    /// pending output (see Session.foreign).
+    foreign_flush_pending: bool = false,
     /// In-flight file uploads (file_* frames), keyed by (client, xfer).
     uploads: std.ArrayList(*Upload) = .empty,
     /// In-flight file downloads (file_get), keyed by (client, xfer).
@@ -2319,6 +2330,7 @@ pub const Daemon = struct {
         if (self.control_fd >= 0 and !self.is_broker) self.maybePushMeta();
         self.refreshDetachedFsJobs();
         self.reap();
+        self.flushPendingBrains();
     }
 
     fn acceptClient(self: *Daemon) void {
@@ -2871,6 +2883,15 @@ pub const Daemon = struct {
         return self.drm_device;
     }
 
+    /// An xdg-foreign event landed in a brain other than the one being
+    /// fed. Only latch it: this can fire from inside another channel's
+    /// feed, or from a Compositor.deinit during dropDeadChannels.
+    fn foreignWake(ctx: ?*anyopaque, comp: *wlcomp.Compositor) void {
+        _ = comp;
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.foreign_flush_pending = true;
+    }
+
     /// Bridge one accepted app connection as a session-owned channel.
     fn openAppChannel(self: *Daemon, s: *Session, fd: c_int, auxiliary: bool) void {
         const native = self.allocator.create(Native) catch {
@@ -2899,6 +2920,12 @@ pub const Daemon = struct {
         };
         brain.output_width = s.output_width;
         brain.output_height = s.output_height;
+        // xdg-foreign resolves across the session's connections, and a
+        // revoked handle queues `destroyed` on a brain nobody is about
+        // to feed — flag the sweep instead of flushing re-entrantly.
+        s.foreign.wake = foreignWake;
+        s.foreign.wake_ctx = self;
+        brain.foreign_shared = &s.foreign;
         brain.keymap = s.kb_keymap;
         brain.materialize_dmabuf_pools = false;
         // Opt-in (see get_registry); the softgl force in pty.zig is
@@ -3042,6 +3069,7 @@ pub const Daemon = struct {
     const collectFds = daemon_native.collectFds;
     const nativeProcess = daemon_native.nativeProcess;
     const flushBrain = daemon_native.flushBrain;
+    const flushPendingBrains = daemon_native.flushPendingBrains;
     const POOL_CHUNK = daemon_native.POOL_CHUNK;
     const queueDmabufProtocolError = daemon_native.queueDmabufProtocolError;
     const nativeAction = daemon_native.nativeAction;

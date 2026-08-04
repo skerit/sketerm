@@ -101,6 +101,10 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
             (g.iface == &protocol.wl_data_device_manager and ver >= 4) or
             g.iface == &protocol.wl_fixes)
             self.used_post_v8_request = true;
+        // Same gate, one state-sync version later: a v9 replica has no
+        // xdg-foreign interfaces at all, so even this bind is fatal.
+        if (g.iface == &protocol.zxdg_exporter_v2 or g.iface == &protocol.zxdg_importer_v2)
+            self.used_foreign = true;
         if (g.iface == &protocol.wl_seat) self.seat_version = ver;
         if (g.iface == &protocol.wl_compositor) self.compositor_version = ver;
         if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
@@ -544,6 +548,40 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
                 if (self.surfaces.getPtr(sid)) |surf| surf.deco = @intCast(mode);
                 if (self.view.toplevel_decoration) |cb| cb(self.view.ctx, sid, mode == 2);
             }
+        },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.zxdg_exporter_v2) switch (hdr.opcode) {
+        0 => try self.destroyObject(hdr.object), // destroy
+        1 => { // export_toplevel(id, surface)
+            const id = (try it.next()).?.new_id;
+            const sid = (try it.next()).?.object;
+            try self.register(id, &protocol.zxdg_exported_v2);
+            try self.exportToplevel(id, sid);
+        },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.zxdg_exported_v2) switch (hdr.opcode) {
+        0 => { // destroy — revokes the handle for every importer
+            self.dropExport(hdr.object);
+            try self.destroyObject(hdr.object);
+        },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.zxdg_importer_v2) switch (hdr.opcode) {
+        0 => try self.destroyObject(hdr.object), // destroy
+        1 => { // import_toplevel(id, handle)
+            const id = (try it.next()).?.new_id;
+            const handle = (try it.next()).?.string orelse return Error.Protocol;
+            try self.register(id, &protocol.zxdg_imported_v2);
+            try self.importToplevel(id, handle);
+        },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.zxdg_imported_v2) switch (hdr.opcode) {
+        0 => { // destroy — the relationship dies with the object
+            self.dropImport(hdr.object);
+            try self.destroyObject(hdr.object);
+        },
+        1 => { // set_parent_of(surface)
+            const child = (try it.next()).?.object;
+            try self.importedSetParentOf(hdr.object, child);
         },
         else => return Error.Protocol,
     } else if (iface == &protocol.wl_data_device_manager) switch (hdr.opcode) {

@@ -165,11 +165,31 @@ pub fn nativeProcess(self: *Daemon, ch: *Channel) void {
             if (ch.session) |s|
                 s.native_state_min = @max(s.native_state_min, wire.CORE_BUMP_STATE_VERSION);
         }
+        // ... and for xdg-foreign, whose interfaces a v9 replica's
+        // protocol tables do not contain at all.
+        if (nv.brain.used_foreign) {
+            if (ch.session) |s|
+                s.native_state_min = @max(s.native_state_min, wire.FOREIGN_STATE_VERSION);
+        }
         flushBrain(self, ch);
     }
     if (units.items.len > 0 and !ch.dead) queueUnits(self, ch, units.items);
     if (fail) self.closeChannel(ch, true);
     if (close_after_flush and !ch.dead) self.channelWritable(ch);
+}
+
+/// Flush every brain holding output after an xdg-foreign teardown
+/// queued events on a connection other than the one being fed. That
+/// client may be idle for minutes, so its `destroyed` cannot wait for
+/// its own next request.
+pub fn flushPendingBrains(self: *Daemon) void {
+    if (!self.foreign_flush_pending) return;
+    self.foreign_flush_pending = false;
+    for (self.channels.items) |ch| {
+        if (ch.dead) continue;
+        const nv = ch.native orelse continue;
+        if (nv.brain.out.items.len > 0) flushBrain(self, ch);
+    }
 }
 
 /// Apply the brain's queued output (events toward the app,

@@ -152,6 +152,89 @@ const Global = struct {
     version: u32,
 };
 
+/// libc CSPRNG. Declared directly rather than through a `@cImport`
+/// module so wlhost keeps its "no C bindings" property: every target
+/// that compiles this file already links libc, and both glibc/musl
+/// and macOS provide getentropy.
+extern "c" fn getentropy(buf: [*]u8, len: usize) c_int;
+
+/// xdg-foreign handle: 16 bytes of kernel entropy, lowercase hex.
+pub const foreign_handle_len = 32;
+pub const ForeignHandle = [foreign_handle_len]u8;
+
+/// One live zxdg_exported_v2. Handles are fixed-size arrays, so an
+/// entry owns no allocation and a purge can never fail.
+pub const ForeignExport = struct {
+    handle: ForeignHandle,
+    /// Compositor (= client connection) that exported. Compositors are
+    /// never moved after their first request, so the pointer is a
+    /// stable client identity; every entry is purged in deinit.
+    owner: *Compositor,
+    /// zxdg_exported_v2 object id in the owner's id space.
+    id: u32,
+    /// Exported wl_surface id in the owner's id space.
+    surface: u32,
+};
+
+/// One live zxdg_imported_v2. `live` goes false once `destroyed` has
+/// been sent; the object itself survives until the client destroys it.
+pub const ForeignImport = struct {
+    handle: ForeignHandle,
+    owner: *Compositor,
+    /// zxdg_imported_v2 object id in the owner's id space.
+    id: u32,
+    /// Child wl_surface set via set_parent_of (0 = none yet).
+    child: u32 = 0,
+    live: bool = true,
+
+    /// Undo whatever this import established on its child, telling the
+    /// child's own view when the relationship was one it could see.
+    fn clearParent(imp: *ForeignImport) void {
+        if (imp.child == 0) return;
+        const child = imp.child;
+        imp.child = 0;
+        const surf = imp.owner.surfaces.getPtr(child) orelse return;
+        surf.foreign_parent = 0;
+        surf.foreign_parent_remote = false;
+        if (surf.tl_parent != 0) {
+            surf.tl_parent = 0;
+            if (imp.owner.view.toplevel_parent) |cb| cb(imp.owner.view.ctx, child, 0);
+        }
+    }
+};
+
+/// The handle namespace xdg-foreign resolves against. One Compositor
+/// serves exactly one client connection, so a registry shared by every
+/// connection of a session is what makes cross-client import work; the
+/// per-compositor fallback keeps a standalone Compositor self-contained.
+pub const ForeignRegistry = struct {
+    exports: std.ArrayList(ForeignExport) = .empty,
+    imports: std.ArrayList(ForeignImport) = .empty,
+    /// Latched from the first compositor that appends. Every sharer is
+    /// expected to use the same allocator (the daemon's gpa).
+    allocator: ?std.mem.Allocator = null,
+    /// Called after an event was queued on a compositor OTHER than the
+    /// one currently being fed — that compositor's output would
+    /// otherwise sit until its own client next sends something.
+    wake: ?*const fn (ctx: ?*anyopaque, comp: *Compositor) void = null,
+    wake_ctx: ?*anyopaque = null,
+
+    pub fn deinit(self: *ForeignRegistry) void {
+        const a = self.allocator orelse return;
+        self.exports.deinit(a);
+        self.imports.deinit(a);
+        self.* = .{};
+    }
+
+    fn find(self: *ForeignRegistry, handle: []const u8) ?*ForeignExport {
+        if (handle.len != foreign_handle_len) return null;
+        for (self.exports.items) |*e| {
+            if (std.mem.eql(u8, &e.handle, handle)) return e;
+        }
+        return null;
+    }
+};
+
 const RelPointer = struct { id: u32, pointer: u32 };
 
 const Constraint = struct {
@@ -281,6 +364,15 @@ pub const globals = [_]Global{
     // wl_registry has no destructor of its own; this is how a client
     // drops one without leaking a server object.
     .{ .name = 24, .iface = &protocol.wl_fixes, .version = 1 },
+    // xdg-foreign, v2 ONLY (both unstable interfaces are at version 1).
+    // GDK binds whichever of v1/v2 it sees, but picks the EXPORTER v2
+    // first and the IMPORTER v1 first — so a compositor advertising
+    // both must share one handle namespace between them or GTK exports
+    // a v2 handle it then cannot import. Advertising v2 alone removes
+    // that trap, and v2 is what GTK4 and Qt use; no toolkit here is
+    // v1-only (GTK3 has no xdg-foreign at all).
+    .{ .name = 25, .iface = &protocol.zxdg_exporter_v2, .version = 1 },
+    .{ .name = 26, .iface = &protocol.zxdg_importer_v2, .version = 1 },
 };
 
 const Pool = struct {
@@ -384,6 +476,13 @@ pub const Surface = struct {
     min_h: i32 = 0,
     /// set_parent target (surface id, 0 = none).
     tl_parent: u32 = 0,
+    /// zxdg_imported_v2.set_parent_of: the exported wl_surface id, in
+    /// the EXPORTING client's id space (0 = none). It equals tl_parent
+    /// when the exporter is this same connection; otherwise it names a
+    /// surface this compositor cannot address.
+    foreign_parent: u32 = 0,
+    /// True when `foreign_parent` lives in another client connection.
+    foreign_parent_remote: bool = false,
 
     pub fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
         self.frame_cbs.deinit(a);
@@ -604,6 +703,17 @@ pub const Compositor = struct {
     /// wl_fixes, wl_surface.get_release). Same purpose as
     /// `used_dmabuf_feedback`, one version later.
     used_post_v8_request: bool = false,
+    /// The app bound an xdg-foreign global. Same viewer gate as
+    /// `used_post_v8_request`: a replica whose tables predate
+    /// zxdg_exporter_v2 cannot even parse the bind, let alone restore
+    /// a state blob naming the interface.
+    used_foreign: bool = false,
+    /// Handle namespace for xdg-foreign. Left null, every compositor
+    /// exports into its own `foreign_local` and only its own client can
+    /// import — pointing every connection of a session at one shared
+    /// registry is what makes cross-client parenting resolve.
+    foreign_shared: ?*ForeignRegistry = null,
+    foreign_local: ForeignRegistry = .{},
     /// The daemon brain tracks pool identity but has no pixel consumer;
     /// replicas retain the default and allocate their renderable copy.
     materialize_dmabuf_pools: bool = true,
@@ -690,6 +800,11 @@ pub const Compositor = struct {
 
     pub fn deinit(self: *Compositor) void {
         const a = self.allocator;
+        // Before anything else: a client that exited without destroying
+        // its objects still owes every importer a `destroyed`, and the
+        // sends below need this compositor's queue to still exist.
+        self.foreignPurgeClient();
+        self.foreign_local.deinit();
         self.out.deinit(a);
         self.inbuf.deinit(a);
         self.objects.deinit(a);
@@ -2027,7 +2142,216 @@ pub const Compositor = struct {
     }
 
     pub fn notifyGone(self: *Compositor, sid: u32) void {
+        self.foreignSurfaceGone(sid);
         if (self.view.toplevel_gone) |cb| cb(self.view.ctx, sid);
+    }
+
+    // ── xdg-foreign v2 ──────────────────────────────────────────
+    // The registry may be shared by every connection of a session, so
+    // these run against `foreignReg()`, never against a private map,
+    // and every event is addressed to the entry's OWN compositor.
+
+    pub fn foreignReg(self: *Compositor) *ForeignRegistry {
+        return self.foreign_shared orelse &self.foreign_local;
+    }
+
+    /// 16 bytes of kernel entropy as lowercase hex. Unguessable is the
+    /// point: a handle is the only capability needed to parent a window
+    /// onto someone else's toplevel, and it travels over D-Bus where an
+    /// unrelated peer may observe the traffic. A counter would be
+    /// trivially forgeable. getentropy cannot fail for 16 bytes on a
+    /// live kernel; the mix below only exists so a hypothetical failure
+    /// degrades to "still unique" instead of "all-zero handle".
+    fn mintHandle(self: *Compositor) ForeignHandle {
+        var raw: [16]u8 = undefined;
+        if (getentropy(&raw, raw.len) != 0) {
+            var seed: u64 = @intFromPtr(self) ^ (@as(u64, self.serial) << 32) ^ self.pool_serial_ctr;
+            for (0..2) |i| {
+                seed +%= 0x9e3779b97f4a7c15;
+                var z = seed;
+                z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+                z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+                z ^= z >> 31;
+                std.mem.writeInt(u64, raw[i * 8 ..][0..8], z, .little);
+            }
+        }
+        var out: ForeignHandle = undefined;
+        const hex = "0123456789abcdef";
+        for (raw, 0..) |byte, i| {
+            out[i * 2] = hex[byte >> 4];
+            out[i * 2 + 1] = hex[byte & 0xf];
+        }
+        return out;
+    }
+
+    /// zxdg_exporter_v2.export_toplevel. `exported` is already
+    /// registered; the handle event goes out immediately, per spec.
+    pub fn exportToplevel(self: *Compositor, exported: u32, sid: u32) Error!void {
+        const is_toplevel = if (self.surfaces.get(sid)) |s| s.toplevel != 0 else false;
+        if (!is_toplevel) {
+            // zxdg_exporter_v2.error.invalid_surface. Replicas re-parse
+            // an authoritative stream and must not judge it.
+            if (self.lenient) return;
+            return self.fatalCode(exported, 0, "zxdg_exporter_v2.export_toplevel: not an xdg_toplevel");
+        }
+        const reg = self.foreignReg();
+        if (reg.allocator == null) reg.allocator = self.allocator;
+        var handle = self.mintHandle();
+        // Collision is a ~2^-128 event; retrying is cheaper than
+        // reasoning about what a duplicate would mean.
+        while (reg.find(&handle) != null) handle = self.mintHandle();
+        try reg.exports.append(reg.allocator.?, .{
+            .handle = handle,
+            .owner = self,
+            .id = exported,
+            .surface = sid,
+        });
+        // A handle the client never learned would sit in the registry
+        // until its object died; drop it with the failed send instead.
+        errdefer _ = reg.exports.pop();
+        const cap = wire.header_size + 4 + ((foreign_handle_len + 1 + 3) & ~@as(usize, 3));
+        var buf: [cap]u8 = undefined;
+        var b = wire.Builder.init(&buf, exported, 0); // handle
+        b.putString(&handle);
+        try self.send(try b.finish());
+    }
+
+    /// zxdg_importer_v2.import_toplevel. An unknown (or already
+    /// revoked) handle is answered with `destroyed` right away — the
+    /// object stays alive and inert until the client destroys it.
+    pub fn importToplevel(self: *Compositor, imported: u32, handle: []const u8) Error!void {
+        const reg = self.foreignReg();
+        if (reg.allocator == null) reg.allocator = self.allocator;
+        const known = reg.find(handle) != null;
+        var entry = ForeignImport{
+            .handle = undefined,
+            .owner = self,
+            .id = imported,
+            .live = known,
+        };
+        if (known) {
+            @memcpy(&entry.handle, handle[0..foreign_handle_len]);
+        } else {
+            @memset(&entry.handle, 0);
+        }
+        try reg.imports.append(reg.allocator.?, entry);
+        if (!known) try self.sendImportDestroyed(imported);
+    }
+
+    fn sendImportDestroyed(self: *Compositor, imported: u32) Error!void {
+        var buf: [8]u8 = undefined;
+        var b = wire.Builder.init(&buf, imported, 0); // destroyed
+        try self.send(try b.finish());
+    }
+
+    /// zxdg_imported_v2.set_parent_of. Realised through exactly the
+    /// same state as xdg_toplevel.set_parent when the exporter is this
+    /// client (`Surface.tl_parent` + the toplevel_parent View
+    /// callback). Across clients the parent surface has no id in this
+    /// compositor's space, so only `Surface.foreign_parent` records it.
+    pub fn importedSetParentOf(self: *Compositor, imported: u32, child: u32) Error!void {
+        const child_is_toplevel = if (self.surfaces.get(child)) |s| s.toplevel != 0 else false;
+        if (!child_is_toplevel) {
+            // zxdg_imported_v2.error.invalid_surface.
+            if (self.lenient) return;
+            return self.fatalCode(imported, 0, "zxdg_imported_v2.set_parent_of: not an xdg_toplevel");
+        }
+        const reg = self.foreignReg();
+        var slot: ?*ForeignImport = null;
+        for (reg.imports.items) |*imp| {
+            if (imp.owner == self and imp.id == imported) slot = imp;
+        }
+        const imp = slot orelse return;
+        // A dead import's relationship is invalid by definition.
+        if (!imp.live) return;
+        const exp = reg.find(&imp.handle) orelse return;
+        imp.child = child;
+        const surf = self.surfaces.getPtr(child) orelse return;
+        surf.foreign_parent = exp.surface;
+        surf.foreign_parent_remote = exp.owner != self;
+        if (exp.owner == self) {
+            surf.tl_parent = exp.surface;
+            if (self.view.toplevel_parent) |cb| cb(self.view.ctx, child, exp.surface);
+        }
+    }
+
+    /// Revoke an export: every importer holding the handle is told
+    /// `destroyed` and loses its relationship. Used by
+    /// zxdg_exported_v2.destroy, by the exported surface dying, and by
+    /// the exporting client disappearing.
+    fn revokeExport(self: *Compositor, idx: usize) void {
+        const reg = self.foreignReg();
+        const handle = reg.exports.items[idx].handle;
+        _ = reg.exports.swapRemove(idx);
+        for (reg.imports.items) |*imp| {
+            if (!imp.live or !std.mem.eql(u8, &imp.handle, &handle)) continue;
+            imp.live = false;
+            imp.clearParent();
+            imp.owner.sendImportDestroyed(imp.id) catch {};
+            // The importing client is a different connection whose
+            // queue nobody is about to drain.
+            if (imp.owner != self) {
+                if (reg.wake) |w| w(reg.wake_ctx, imp.owner);
+            }
+        }
+    }
+
+    /// zxdg_exported_v2.destroy.
+    pub fn dropExport(self: *Compositor, exported: u32) void {
+        const reg = self.foreignReg();
+        var i = reg.exports.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = reg.exports.items[i];
+            if (e.owner == self and e.id == exported) self.revokeExport(i);
+        }
+    }
+
+    /// zxdg_imported_v2.destroy.
+    pub fn dropImport(self: *Compositor, imported: u32) void {
+        const reg = self.foreignReg();
+        var i = reg.imports.items.len;
+        while (i > 0) {
+            i -= 1;
+            const imp = &reg.imports.items[i];
+            if (imp.owner != self or imp.id != imported) continue;
+            imp.clearParent();
+            _ = reg.imports.swapRemove(i);
+        }
+    }
+
+    /// A toplevel (or its surface) went away: exports of it are
+    /// revoked, and imports parented ONTO it forget their child.
+    fn foreignSurfaceGone(self: *Compositor, sid: u32) void {
+        const reg = self.foreignReg();
+        var i = reg.exports.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = reg.exports.items[i];
+            if (e.owner == self and e.surface == sid) self.revokeExport(i);
+        }
+        for (reg.imports.items) |*imp| {
+            if (imp.owner == self and imp.child == sid) imp.child = 0;
+        }
+    }
+
+    /// Drop everything this client owns. Called from deinit, so it
+    /// covers a client that exited without destroying a single object.
+    fn foreignPurgeClient(self: *Compositor) void {
+        const reg = self.foreignReg();
+        var i = reg.exports.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (reg.exports.items[i].owner == self) self.revokeExport(i);
+        }
+        i = reg.imports.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (reg.imports.items[i].owner != self) continue;
+            // No clearParent: our own surfaces are going away
+            // with us, and a cross-client child is never ours.
+            _ = reg.imports.swapRemove(i);
+        }
     }
 
     pub fn nextSerial(self: *Compositor) u32 {
@@ -2073,7 +2397,13 @@ pub const Compositor = struct {
     // capability signal for the core version bumps (wl_compositor 7,
     // wl_shm 2, wl_data_device_manager 4, wl_seat 10, wl_fixes): a v8
     // replica's tables lack those requests.
-    const state_sync_version: u8 = 9;
+    // v10 adds no fields either: it is the capability signal for
+    // xdg-foreign. A v9 replica has no zxdg_exporter_v2 in its tables,
+    // so both the app's bind and an objects list naming the interface
+    // are fatal there. Foreign relations themselves are NOT serialized
+    // — the brain is the authority for them and a replica only needs to
+    // keep parsing.
+    const state_sync_version: u8 = 10;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -6812,4 +7142,372 @@ test "virtual output size follows configured pixels and fractional scale" {
     try t.expectEqual([2]i32{ 1024, 768 }, comp.logicalOutputSize());
     comp.scale120 = 180;
     try t.expectEqual([2]i32{ 682, 512 }, comp.logicalOutputSize());
+}
+
+// ─── xdg-foreign v2 tests ───────────────────────────────────────
+
+/// wl_compositor(3) + xdg_wm_base(4) bound, then one toplevel built
+/// as surface `sid` → xdg_surface `sid+1` → xdg_toplevel `sid+2`.
+fn foreignToplevel(comp: *Compositor, sid: u32) !void {
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 3, 0); // create_surface
+    b.putNewId(sid);
+    try req(comp, try b.finish());
+    var xb = wire.Builder.init(&buf, 4, 2); // get_xdg_surface
+    xb.putNewId(sid + 1);
+    xb.putObject(sid);
+    try req(comp, try xb.finish());
+    var tb = wire.Builder.init(&buf, sid + 1, 1); // get_toplevel
+    tb.putNewId(sid + 2);
+    try req(comp, try tb.finish());
+}
+
+/// registry + wl_compositor(3) + xdg_wm_base(4) + both xdg-foreign
+/// managers (exporter 5, importer 6), the id layout every test below
+/// builds on.
+fn foreignSetup(comp: *Compositor) !void {
+    try getRegistry(comp);
+    try bindGlobal(comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(comp, 5, "xdg_wm_base", 6, 4);
+    try bindGlobal(comp, 25, "zxdg_exporter_v2", 1, 5);
+    try bindGlobal(comp, 26, "zxdg_importer_v2", 1, 6);
+}
+
+/// export_toplevel(exported, surface) on the exporter bound as id 5,
+/// returning the handle string carried by the handle event.
+fn foreignExport(comp: *Compositor, exported: u32, sid: u32) !ForeignHandle {
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 5, 1);
+    b.putNewId(exported);
+    b.putObject(sid);
+    try req(comp, try b.finish());
+
+    var out: ForeignHandle = undefined;
+    var found = false;
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        if (p.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(p.unit.payload)).?;
+            if (hdr.object == exported and hdr.opcode == 0) {
+                const body = p.unit.payload[wire.header_size..hdr.size];
+                var it = wire.ArgIter.init(body, "s");
+                const s = (try it.next()).?.string.?;
+                try t.expectEqual(foreign_handle_len, s.len);
+                @memcpy(&out, s);
+                found = true;
+            }
+        }
+        pos += p.consumed;
+    }
+    comp.clearOut();
+    try t.expect(found);
+    return out;
+}
+
+/// import_toplevel(imported, handle) on the importer bound as id 6.
+fn foreignImport(comp: *Compositor, imported: u32, handle: []const u8) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, 6, 1);
+    b.putNewId(imported);
+    b.putString(handle);
+    try req(comp, try b.finish());
+}
+
+/// Whether a `destroyed` event (opcode 0) for `imported` is queued.
+fn sawImportDestroyed(comp: *Compositor, imported: u32) !bool {
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(comp, &evs);
+    for (evs.items) |e| {
+        if (e[0] == imported and e[1] == 0) return true;
+    }
+    return false;
+}
+
+test "xdg-foreign: globals bind at v1 and a higher bind is refused" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+
+    // The announcement carries version 1 for both managers.
+    try getRegistry(&comp);
+    var seen: usize = 0;
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        const hdr = (try wire.parseHeader(p.unit.payload)).?;
+        const body = p.unit.payload[wire.header_size..hdr.size];
+        var it = wire.ArgIter.init(body, "usu");
+        _ = try it.next();
+        const name = (try it.next()).?.string.?;
+        const ver = (try it.next()).?.uint;
+        if (std.mem.eql(u8, name, "zxdg_exporter_v2") or
+            std.mem.eql(u8, name, "zxdg_importer_v2"))
+        {
+            try t.expectEqual(@as(u32, 1), ver);
+            seen += 1;
+        }
+        pos += p.consumed;
+    }
+    comp.clearOut();
+    try t.expectEqual(@as(usize, 2), seen);
+
+    // v1 is the only legal bind; the gate latches the viewer version.
+    try t.expect(!comp.used_foreign);
+    try bindGlobal(&comp, 25, "zxdg_exporter_v2", 1, 5);
+    try t.expect(!comp.dead);
+    try t.expect(comp.used_foreign);
+
+    // Binding above the advertised version is a protocol error.
+    try bindGlobal(&comp, 26, "zxdg_importer_v2", 2, 6);
+    try t.expect(comp.dead);
+}
+
+test "xdg-foreign: export mints an unguessable handle, non-toplevels are refused" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    try foreignSetup(&comp);
+    try foreignToplevel(&comp, 10); // surface 10, toplevel 12
+    comp.clearOut();
+
+    const h1 = try foreignExport(&comp, 20, 10);
+    const h2 = try foreignExport(&comp, 21, 10);
+    // A surface may be exported repeatedly; each export is distinct.
+    try t.expect(!std.mem.eql(u8, &h1, &h2));
+    for (h1) |ch| try t.expect(std.mem.indexOfScalar(u8, "0123456789abcdef", ch) != null);
+    // Entropy, not a counter: the two handles differ in most bytes.
+    var same: usize = 0;
+    for (h1, h2) |a, b| same += @intFromBool(a == b);
+    try t.expect(same < foreign_handle_len / 2);
+    try t.expectEqual(@as(usize, 2), comp.foreignReg().exports.items.len);
+
+    // A surface with no toplevel role is invalid_surface (fatal).
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 3, 0); // create_surface(30)
+    b.putNewId(30);
+    try req(&comp, try b.finish());
+    _ = try foreignExportRefused(&comp, 31, 30);
+}
+
+fn foreignExportRefused(comp: *Compositor, exported: u32, sid: u32) !void {
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 5, 1);
+    b.putNewId(exported);
+    b.putObject(sid);
+    try req(comp, try b.finish());
+    try t.expect(comp.dead);
+}
+
+test "xdg-foreign: same-client import parents exactly like set_parent" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    try foreignSetup(&comp);
+    try foreignToplevel(&comp, 10); // parent surface 10
+    tv.child_sid = 40;
+    try foreignToplevel(&comp, 40); // child surface 40
+    comp.clearOut();
+
+    const handle = try foreignExport(&comp, 20, 10);
+    try foreignImport(&comp, 21, &handle);
+    // A known handle is NOT answered with destroyed.
+    try t.expect(!try sawImportDestroyed(&comp, 21));
+
+    var buf: [32]u8 = undefined;
+    var b = wire.Builder.init(&buf, 21, 1); // set_parent_of(40)
+    b.putObject(40);
+    try req(&comp, try b.finish());
+
+    // Same state and the same View callback as xdg_toplevel.set_parent.
+    try t.expectEqual(@as(u32, 10), comp.surfaces.get(40).?.tl_parent);
+    try t.expectEqual(@as(u32, 10), comp.surfaces.get(40).?.foreign_parent);
+    try t.expect(!comp.surfaces.get(40).?.foreign_parent_remote);
+    try t.expectEqual(@as(u32, 10), tv.child_parent);
+
+    // Destroying the zxdg_imported_v2 invalidates the relationship.
+    var db = wire.Builder.init(&buf, 21, 0);
+    try req(&comp, try db.finish());
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(40).?.tl_parent);
+    try t.expectEqual(@as(u32, 0), tv.child_parent);
+    try t.expectEqual(@as(usize, 0), comp.foreignReg().imports.items.len);
+    try t.expect(!comp.dead);
+}
+
+test "xdg-foreign: an unknown handle is answered with destroyed" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    try foreignSetup(&comp);
+    try foreignToplevel(&comp, 10);
+    comp.clearOut();
+
+    try foreignImport(&comp, 21, "ffffffffffffffffffffffffffffffff");
+    try t.expect(try sawImportDestroyed(&comp, 21));
+
+    // A dead import is inert: set_parent_of establishes nothing, and
+    // the object still destroys cleanly.
+    var buf: [32]u8 = undefined;
+    var b = wire.Builder.init(&buf, 21, 1);
+    b.putObject(10);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(10).?.tl_parent);
+    var db = wire.Builder.init(&buf, 21, 0);
+    try req(&comp, try db.finish());
+    try t.expect(!comp.dead);
+
+    // A handle of the wrong length can never match either.
+    try foreignImport(&comp, 22, "short");
+    try t.expect(try sawImportDestroyed(&comp, 22));
+    try t.expect(!comp.dead);
+}
+
+test "xdg-foreign: cross-client import resolves and the exporter's death notifies it" {
+    // Two connections = two Compositors, which is exactly the portal
+    // case (app exports, the picker process imports). Only the shared
+    // registry makes the handle resolvable at all.
+    var reg = ForeignRegistry{};
+    defer reg.deinit();
+
+    var atv = TestView{};
+    var app = try Compositor.init(t.allocator, atv.view());
+    defer app.deinit();
+    app.foreign_shared = &reg;
+
+    var dtv = TestView{};
+    var dialog = try Compositor.init(t.allocator, dtv.view());
+    defer dialog.deinit();
+    dialog.foreign_shared = &reg;
+
+    try foreignSetup(&app);
+    try foreignToplevel(&app, 10);
+    app.clearOut();
+    try foreignSetup(&dialog);
+    dtv.child_sid = 10;
+    try foreignToplevel(&dialog, 10); // same ids, different id space
+    dialog.clearOut();
+
+    const handle = try foreignExport(&app, 20, 10);
+    try foreignImport(&dialog, 21, &handle);
+    try t.expect(!try sawImportDestroyed(&dialog, 21));
+
+    var buf: [32]u8 = undefined;
+    var b = wire.Builder.init(&buf, 21, 1); // set_parent_of(10)
+    b.putObject(10);
+    try req(&dialog, try b.finish());
+
+    // The relation is recorded and flagged as pointing outside this
+    // connection's id space; tl_parent stays clear because surface 10
+    // in THIS compositor is the child itself, not the parent.
+    try t.expectEqual(@as(u32, 10), dialog.surfaces.get(10).?.foreign_parent);
+    try t.expect(dialog.surfaces.get(10).?.foreign_parent_remote);
+    try t.expectEqual(@as(u32, 0), dialog.surfaces.get(10).?.tl_parent);
+    try t.expectEqual(@as(u32, 0), dtv.child_parent);
+
+    // The exporting toplevel goes away: the importer is told, its
+    // relationship is dropped, and the handle stops resolving.
+    var tb = wire.Builder.init(&buf, 12, 0); // xdg_toplevel.destroy
+    try req(&app, try tb.finish());
+    try t.expect(try sawImportDestroyed(&dialog, 21));
+    try t.expectEqual(@as(usize, 0), reg.exports.items.len);
+    try t.expectEqual(@as(u32, 0), dialog.surfaces.get(10).?.foreign_parent);
+
+    // A re-import of the revoked handle is refused immediately.
+    try foreignImport(&dialog, 22, &handle);
+    try t.expect(try sawImportDestroyed(&dialog, 22));
+    try t.expect(!app.dead);
+    try t.expect(!dialog.dead);
+}
+
+test "xdg-foreign: an exporting client that just vanishes still notifies importers" {
+    var reg = ForeignRegistry{};
+    defer reg.deinit();
+
+    var dtv = TestView{};
+    var dialog = try Compositor.init(t.allocator, dtv.view());
+    defer dialog.deinit();
+    dialog.foreign_shared = &reg;
+    try foreignSetup(&dialog);
+
+    var handle: ForeignHandle = undefined;
+    var woken: usize = 0;
+    const Wake = struct {
+        fn cb(ctx: ?*anyopaque, comp: *Compositor) void {
+            _ = comp;
+            const n: *usize = @ptrCast(@alignCast(ctx.?));
+            n.* += 1;
+        }
+    };
+    reg.wake = Wake.cb;
+    reg.wake_ctx = &woken;
+
+    { // The exporting client's whole connection, then gone.
+        var atv = TestView{};
+        var app = try Compositor.init(t.allocator, atv.view());
+        defer app.deinit(); // no destroy requests at all — a crash
+        app.foreign_shared = &reg;
+        try foreignSetup(&app);
+        try foreignToplevel(&app, 10);
+        app.clearOut();
+        handle = try foreignExport(&app, 20, 10);
+        try foreignImport(&dialog, 21, &handle);
+        try t.expect(!try sawImportDestroyed(&dialog, 21));
+    }
+
+    // deinit purged the export and told the importer, on the
+    // importer's own queue, with a wake so the daemon flushes it.
+    try t.expectEqual(@as(usize, 0), reg.exports.items.len);
+    try t.expect(try sawImportDestroyed(&dialog, 21));
+    try t.expect(woken > 0);
+    try t.expect(!dialog.dead);
+}
+
+test "xdg-foreign: a client's own imports and exports die with it" {
+    var reg = ForeignRegistry{};
+    defer reg.deinit();
+    {
+        var tv = TestView{};
+        var comp = try Compositor.init(t.allocator, tv.view());
+        defer comp.deinit();
+        comp.foreign_shared = &reg;
+        try foreignSetup(&comp);
+        try foreignToplevel(&comp, 10);
+        comp.clearOut();
+        const handle = try foreignExport(&comp, 20, 10);
+        try foreignImport(&comp, 21, &handle);
+        try t.expectEqual(@as(usize, 1), reg.exports.items.len);
+        try t.expectEqual(@as(usize, 1), reg.imports.items.len);
+    }
+    try t.expectEqual(@as(usize, 0), reg.exports.items.len);
+    try t.expectEqual(@as(usize, 0), reg.imports.items.len);
+}
+
+test "xdg-foreign: a replica never judges the authoritative stream" {
+    // Replicas re-parse the brain's request stream and have no shared
+    // registry, so every foreign request must be inert there rather
+    // than fatal.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.lenient = true;
+    try foreignSetup(&comp);
+    try foreignToplevel(&comp, 10);
+    comp.clearOut();
+
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 3, 0); // create_surface(30), no role
+    b.putNewId(30);
+    try req(&comp, try b.finish());
+    var eb = wire.Builder.init(&buf, 5, 1); // export a non-toplevel
+    eb.putNewId(31);
+    eb.putObject(30);
+    try req(&comp, try eb.finish());
+    try t.expect(!comp.dead);
+
+    try foreignImport(&comp, 32, "0123456789abcdef0123456789abcdef");
+    var sb = wire.Builder.init(&buf, 32, 1); // set_parent_of(30), no role
+    sb.putObject(30);
+    try req(&comp, try sb.finish());
+    try t.expect(!comp.dead);
 }
