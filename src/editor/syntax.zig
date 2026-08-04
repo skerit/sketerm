@@ -43,6 +43,9 @@ const Document = @import("document.zig").Document;
 const Rope = @import("rope.zig").Rope;
 const tr = @import("transaction.zig");
 const pattern = @import("../util/pattern.zig");
+const structure = @import("structure.zig");
+const FoldRegion = structure.FoldRegion;
+const BracketPair = structure.BracketPair;
 
 /// Plain-C header; safe for the in-process `@cImport` that GTK headers
 /// crash (see CLAUDE.md — the out-of-process TranslateC step exists for
@@ -710,7 +713,7 @@ pub const Highlighter = struct {
     /// each call site remembering to. Clears when the document is
     /// replaced wholesale, so re-attach after a reload.
     pub fn attach(self: *Highlighter, doc: *Document) void {
-        doc.observer = .{ .ctx = self, .before_apply = observeEdits };
+        doc.addObserver(.{ .ctx = self, .before_apply = observeEdits });
     }
 
     fn observeEdits(ctx: *anyopaque, doc: *const Document, edits: []const tr.Edit) void {
@@ -942,6 +945,263 @@ pub const Highlighter = struct {
         var one: [1]u8 = .{0};
         try self.fillKinds(doc, offset, offset + 1, &one);
         return @enumFromInt(one[0]);
+    }
+
+    // ==================================================================
+    // Structural queries (brackets / folds / expand-selection)
+    // ==================================================================
+    //
+    // These read the SAME trees the highlighting does — there is no
+    // second parser and no hand-rolled brace scanner on this path (the
+    // one in structure.zig is the documented no-grammar fallback).
+    //
+    // All of them are O(tree depth) or O(nodes intersecting the byte
+    // range asked for), never O(document): a per-frame call from the
+    // renderer may only ever pay for the viewport. `Error.Stale` is
+    // returned on exactly the same condition `fillKinds` uses, so a
+    // caller can never act on last revision's structure.
+
+    /// Nodes a range walk will visit before giving up. A pathological
+    /// tree (minified JSON on one line) must not turn a fold-all into a
+    /// multi-second stall; the list is simply truncated.
+    pub const WALK_BUDGET: usize = 200_000;
+
+    /// The tree structural queries read: layer 0, the primary grammar.
+    /// Markdown's second (inline) layer describes spans inside a
+    /// paragraph, never blocks or brackets, so it has nothing to add
+    /// here.
+    fn primaryTree(self: *const Highlighter) ?*ts.TSTree {
+        if (self.layers.len == 0) return null;
+        return self.layers[0].tree;
+    }
+
+    /// Matched bracket pair for a caret at `offset`, resolved through
+    /// the tree.
+    ///
+    /// The tree is what makes this correct where a scanner is not: a
+    /// bracket byte inside a string or a comment is not a leaf of its
+    /// own (the whole literal is one token), so the leaf-identity test
+    /// below rejects it and we report NO pair rather than a wrong one.
+    /// Null therefore means "no pair here", which is the honest answer
+    /// for `"a ( b"` — and the caller does not fall back to the
+    /// scanner when a tree exists, or that correctness would be undone.
+    pub fn bracketAt(self: *Highlighter, doc: *const Document, offset: usize) Error!?BracketPair {
+        if (self.isStale(doc)) return Error.Stale;
+        const tree = self.primaryTree() orelse return null;
+        const root = ts.ts_tree_root_node(tree);
+        if (ts.ts_node_is_null(root)) return null;
+
+        var probes: [2]usize = undefined;
+        var n_probes: usize = 0;
+        if (offset < doc.rope.len()) {
+            probes[n_probes] = offset;
+            n_probes += 1;
+        }
+        if (offset > 0) {
+            probes[n_probes] = offset - 1;
+            n_probes += 1;
+        }
+        for (probes[0..n_probes]) |pos| {
+            const ch = structure.byteAt(&doc.rope, pos) orelse continue;
+            const kind = structure.classifyBracket(ch) orelse continue;
+            if (self.pairAtLeaf(doc, root, pos, kind)) |pair| return pair;
+        }
+        return null;
+    }
+
+    fn pairAtLeaf(
+        self: *Highlighter,
+        doc: *const Document,
+        root: ts.TSNode,
+        pos: usize,
+        kind: structure.BracketKind,
+    ) ?BracketPair {
+        _ = self;
+        const leaf = ts.ts_node_descendant_for_byte_range(root, @intCast(pos), @intCast(pos + 1));
+        if (ts.ts_node_is_null(leaf)) return null;
+        // The bracket must BE a leaf token: inside a string or comment
+        // the smallest node covering it is the whole literal, which
+        // fails this test — that is the string/comment defence.
+        if (ts.ts_node_start_byte(leaf) != pos or ts.ts_node_end_byte(leaf) != pos + 1) return null;
+        const parent = ts.ts_node_parent(leaf);
+        if (ts.ts_node_is_null(parent)) return null;
+
+        const want: u8 = if (kind.opening) structure.CLOSERS[kind.idx] else structure.OPENERS[kind.idx];
+        const n = ts.ts_node_child_count(parent);
+        var found: ?usize = null;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const child = ts.ts_node_child(parent, i);
+            const s = ts.ts_node_start_byte(child);
+            const e = ts.ts_node_end_byte(child);
+            if (e != s + 1) continue;
+            if (kind.opening and s <= pos) continue;
+            if (!kind.opening and s >= pos) continue;
+            const b = structure.byteAt(&doc.rope, s) orelse continue;
+            if (b != want) continue;
+            // Opener: the FIRST matching closer after it. Closer: the
+            // LAST matching opener before it. Both are direct siblings,
+            // so nesting lives in grandchildren and cannot confuse us.
+            if (kind.opening) {
+                found = s;
+                break;
+            }
+            found = s;
+        }
+        const other = found orelse return null;
+        return if (kind.opening)
+            .{ .open = .{ .start = pos, .end = pos + 1 }, .close = .{ .start = other, .end = other + 1 } }
+        else
+            .{ .open = .{ .start = other, .end = other + 1 }, .close = .{ .start = pos, .end = pos + 1 } };
+    }
+
+    /// Smallest node STRICTLY containing [start, end) — the target of
+    /// one expand-selection step. Null at the root (nothing left to
+    /// expand to).
+    pub fn expandRange(
+        self: *Highlighter,
+        doc: *const Document,
+        start: usize,
+        end: usize,
+    ) Error!?structure.Range {
+        if (self.isStale(doc)) return Error.Stale;
+        const tree = self.primaryTree() orelse return null;
+        const root = ts.ts_tree_root_node(tree);
+        if (ts.ts_node_is_null(root)) return null;
+        var node = ts.ts_node_named_descendant_for_byte_range(root, @intCast(start), @intCast(end));
+        if (ts.ts_node_is_null(node)) node = root;
+        while (true) {
+            const s: usize = ts.ts_node_start_byte(node);
+            const e: usize = ts.ts_node_end_byte(node);
+            if (s <= start and e >= end and (s < start or e > end))
+                return .{ .start = s, .end = e };
+            const parent = ts.ts_node_parent(node);
+            if (ts.ts_node_is_null(parent)) return null;
+            node = parent;
+        }
+    }
+
+    /// Foldable region headed by `line`, or null.
+    ///
+    /// Resolved by walking UP from the line's first non-blank byte, so
+    /// it costs O(tree depth) — this is the call the fold state's
+    /// re-resolve makes once per fold after every edit.
+    pub fn foldRegionAtLine(
+        self: *Highlighter,
+        doc: *const Document,
+        line: usize,
+    ) Error!?FoldRegion {
+        if (self.isStale(doc)) return Error.Stale;
+        const tree = self.primaryTree() orelse return null;
+        const root = ts.ts_tree_root_node(tree);
+        if (ts.ts_node_is_null(root)) return null;
+        const off = structure.firstNonBlankOffset(doc, line);
+        var node = ts.ts_node_descendant_for_byte_range(root, @intCast(off), @intCast(off));
+        if (ts.ts_node_is_null(node)) return null;
+        while (true) {
+            // The INNERMOST region headed here, matching
+            // structure.normalizeRegions' narrowest-wins rule (see the
+            // rationale there) so the gutter marker and this resolver
+            // can never disagree about what line N folds.
+            if (foldOf(node)) |r| {
+                if (r.start_line == line) return r;
+            }
+            const parent = ts.ts_node_parent(node);
+            if (ts.ts_node_is_null(parent)) break;
+            node = parent;
+        }
+        return null;
+    }
+
+    /// The innermost foldable region containing `offset` whose header
+    /// is a DIFFERENT line — "fold the block I am inside".
+    pub fn foldRegionEnclosing(
+        self: *Highlighter,
+        doc: *const Document,
+        offset: usize,
+    ) Error!?FoldRegion {
+        if (self.isStale(doc)) return Error.Stale;
+        const tree = self.primaryTree() orelse return null;
+        const root = ts.ts_tree_root_node(tree);
+        if (ts.ts_node_is_null(root)) return null;
+        const line = doc.rope.offsetToLineCol(offset).line;
+        var node = ts.ts_node_descendant_for_byte_range(root, @intCast(offset), @intCast(offset));
+        if (ts.ts_node_is_null(node)) return null;
+        while (true) {
+            if (foldOf(node)) |r| {
+                if (r.start_line < line and r.end_line >= line) return r;
+            }
+            const parent = ts.ts_node_parent(node);
+            if (ts.ts_node_is_null(parent)) return null;
+            node = parent;
+        }
+    }
+
+    /// Every foldable region whose HEADER byte lies in [from, to).
+    /// Caller owns the slice; it is normalized (sorted, one per header).
+    ///
+    /// Pass the viewport's byte range for gutter markers and the whole
+    /// document for fold-all. The walk prunes any subtree that does not
+    /// intersect the range, so the viewport call is O(visible nodes).
+    pub fn foldRegionsIn(
+        self: *Highlighter,
+        alloc: std.mem.Allocator,
+        doc: *const Document,
+        from: usize,
+        to: usize,
+    ) Error![]FoldRegion {
+        if (self.isStale(doc)) return Error.Stale;
+        var out: std.ArrayList(FoldRegion) = .empty;
+        errdefer out.deinit(alloc);
+        const tree = self.primaryTree() orelse return out.toOwnedSlice(alloc);
+        const root = ts.ts_tree_root_node(tree);
+        if (!ts.ts_node_is_null(root)) {
+            var budget: usize = WALK_BUDGET;
+            try collectFolds(alloc, root, from, to, &out, &budget, 0);
+        }
+        const kept = structure.normalizeRegions(out.items);
+        out.shrinkRetainingCapacity(kept.len);
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// A node's fold region, or null when it does not hide a line.
+    /// `end_line - 1` keeps the closing delimiter's line visible, which
+    /// is what makes a folded `fn f() {` still show its `}`.
+    fn foldOf(node: ts.TSNode) ?FoldRegion {
+        const sp = ts.ts_node_start_point(node);
+        const ep = ts.ts_node_end_point(node);
+        if (ep.row < sp.row + 2) return null;
+        return .{ .start_line = sp.row, .end_line = ep.row - 1 };
+    }
+
+    /// Recursion depth cap. Grammars nest a few tens deep at worst;
+    /// this only exists so a pathological input cannot blow the stack.
+    const WALK_DEPTH: usize = 256;
+
+    fn collectFolds(
+        alloc: std.mem.Allocator,
+        node: ts.TSNode,
+        from: usize,
+        to: usize,
+        out: *std.ArrayList(FoldRegion),
+        budget: *usize,
+        depth: usize,
+    ) Error!void {
+        if (depth >= WALK_DEPTH) return;
+        const n = ts.ts_node_child_count(node);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (budget.* == 0) return;
+            budget.* -= 1;
+            const child = ts.ts_node_child(node, i);
+            const s: usize = ts.ts_node_start_byte(child);
+            const e: usize = ts.ts_node_end_byte(child);
+            if (e <= from or s >= to) continue;
+            if (s >= from) {
+                if (foldOf(child)) |r| try out.append(alloc, r);
+            }
+            try collectFolds(alloc, child, from, to, out, budget, depth + 1);
+        }
     }
 };
 
@@ -1266,6 +1526,239 @@ test "syntax: attach makes every mutation path incremental, undo included" {
     const spans = try hl.spansAlloc(a, &doc, 0, doc.rope.len());
     defer a.free(spans);
     for (spans) |s| try testing.expect(s.kind != .comment);
+}
+
+test "syntax: tree bracket matching ignores brackets in strings and comments" {
+    const a = testing.allocator;
+    const src =
+        \\pub fn main() void {
+        \\    const s = "unbalanced ( in a string";
+        \\    // and a ) in a comment
+        \\    if (a[0] == 1) {}
+        \\}
+        \\
+    ;
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .zig);
+    defer hl.deinit();
+    try hl.parse(&doc);
+
+    // fn parameter list.
+    const open_paren = std.mem.indexOf(u8, src, "()").?;
+    const p = (try hl.bracketAt(&doc, open_paren)).?;
+    try testing.expectEqual(open_paren, p.open.start);
+    try testing.expectEqual(open_paren + 1, p.close.start);
+
+    // The function body's braces, from the caret sitting just AFTER
+    // the opening one.
+    const body_open = std.mem.indexOfScalar(u8, src, '{').?;
+    const bp = (try hl.bracketAt(&doc, body_open + 1)).?;
+    try testing.expectEqual(body_open, bp.open.start);
+    try testing.expectEqual(std.mem.lastIndexOfScalar(u8, src, '}').?, bp.close.start);
+
+    // The '(' inside the string literal is not a bracket at all.
+    const in_string = std.mem.indexOf(u8, src, "( in a string").?;
+    try testing.expect((try hl.bracketAt(&doc, in_string)) == null);
+    // Nor the ')' inside the comment.
+    const in_comment = std.mem.indexOf(u8, src, ") in a comment").?;
+    try testing.expect((try hl.bracketAt(&doc, in_comment)) == null);
+
+    // Brackets.
+    const sq = std.mem.indexOfScalar(u8, src, '[').?;
+    const sp = (try hl.bracketAt(&doc, sq)).?;
+    try testing.expectEqual(sq, sp.open.start);
+    try testing.expectEqual(sq + 2, sp.close.start);
+
+    // A caret nowhere near a bracket.
+    try testing.expect((try hl.bracketAt(&doc, 0)) == null);
+    // Stale trees never answer.
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(a);
+    try tx.addInsert(a, 0, "//\n");
+    hl.noteEdits(&doc, tx.edits.items);
+    _ = try doc.applyTransaction(&tx);
+    try testing.expectError(Error.Stale, hl.bracketAt(&doc, 0));
+}
+
+test "syntax: expandRange grows to the enclosing node, step by step" {
+    const a = testing.allocator;
+    const src =
+        \\pub fn main() void {
+        \\    const total = alpha + beta;
+        \\}
+        \\
+    ;
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .zig);
+    defer hl.deinit();
+    try hl.parse(&doc);
+
+    const alpha = std.mem.indexOf(u8, src, "alpha").?;
+    // A caret inside `alpha` expands to the identifier first.
+    var r = (try hl.expandRange(&doc, alpha + 2, alpha + 2)).?;
+    try testing.expectEqual(alpha, r.start);
+    try testing.expectEqual(alpha + 5, r.end);
+
+    // Then to `alpha + beta`.
+    var seen: usize = 0;
+    var prev = r;
+    while (try hl.expandRange(&doc, r.start, r.end)) |next| {
+        try testing.expect(next.start <= prev.start and next.end >= prev.end);
+        try testing.expect(next.start < prev.start or next.end > prev.end);
+        prev = next;
+        r = next;
+        seen += 1;
+        if (seen > 20) break;
+    }
+    // It terminated by reaching the root, having grown several times.
+    try testing.expect(seen >= 3);
+    try testing.expectEqual(@as(usize, 0), r.start);
+    try testing.expectEqual(doc.rope.len(), r.end);
+}
+
+test "syntax: fold regions come from the tree and keep the closer visible" {
+    const a = testing.allocator;
+    const src =
+        \\pub fn main() void {
+        \\    if (x) {
+        \\        one();
+        \\        two();
+        \\    }
+        \\}
+        \\const short = 1;
+        \\
+    ;
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .zig);
+    defer hl.deinit();
+    try hl.parse(&doc);
+
+    const regions = try hl.foldRegionsIn(a, &doc, 0, doc.rope.len());
+    defer a.free(regions);
+    try testing.expect(regions.len >= 2);
+    // Line 0 heads the function; its `}` on line 5 stays visible.
+    try testing.expectEqual(@as(usize, 0), regions[0].start_line);
+    try testing.expectEqual(@as(usize, 4), regions[0].end_line);
+    // Line 1 heads the if-block, whose `}` is on line 4.
+    try testing.expectEqual(@as(usize, 1), regions[1].start_line);
+    try testing.expectEqual(@as(usize, 3), regions[1].end_line);
+    // One region per header line, sorted.
+    var prev: usize = 0;
+    for (regions) |rg| {
+        try testing.expect(rg.start_line >= prev);
+        try testing.expect(rg.end_line > rg.start_line);
+        prev = rg.start_line;
+    }
+    // A one-line statement is not foldable.
+    for (regions) |rg| try testing.expect(rg.start_line != 6);
+
+    // The by-line resolver agrees with the sweep.
+    const at0 = (try hl.foldRegionAtLine(&doc, 0)).?;
+    try testing.expectEqual(@as(usize, 4), at0.end_line);
+    const at1 = (try hl.foldRegionAtLine(&doc, 1)).?;
+    try testing.expectEqual(@as(usize, 3), at1.end_line);
+    try testing.expect((try hl.foldRegionAtLine(&doc, 6)) == null);
+
+    // "Fold the block I am inside", from a caret on line 2.
+    const inner = std.mem.indexOf(u8, src, "one()").?;
+    const enc = (try hl.foldRegionEnclosing(&doc, inner)).?;
+    try testing.expectEqual(@as(usize, 1), enc.start_line);
+
+    // Restricting the byte range restricts the headers reported.
+    const line2 = doc.rope.lineToOffset(2);
+    const narrow = try hl.foldRegionsIn(a, &doc, line2, doc.rope.len());
+    defer a.free(narrow);
+    for (narrow) |rg| try testing.expect(rg.start_line >= 2);
+}
+
+test "syntax: fold state re-resolves through the tree after an edit" {
+    const a = testing.allocator;
+    const src =
+        \\pub fn main() void {
+        \\    one();
+        \\    two();
+        \\}
+        \\
+    ;
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .zig);
+    defer hl.deinit();
+    hl.attach(&doc);
+    try hl.parse(&doc);
+
+    const Ctx = struct {
+        hl: *Highlighter,
+        doc: *const Document,
+        fn atLine(ctx: ?*anyopaque, line: usize) ?FoldRegion {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            return s.hl.foldRegionAtLine(s.doc, line) catch null;
+        }
+    };
+    var ctx = Ctx{ .hl = &hl, .doc = &doc };
+    const resolver = structure.Resolver{ .ctx = &ctx, .at_line = Ctx.atLine };
+
+    var folds = structure.FoldState.init(a);
+    defer folds.deinit();
+    try folds.fold(structure.firstNonBlankOffset(&doc, 0), (try hl.foldRegionAtLine(&doc, 0)).?);
+    try testing.expect(folds.isHidden(1));
+
+    // Insert a line above: the anchor maps, the region re-derives.
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(a);
+    try tx.addInsert(a, 0, "// header\n");
+    folds.mapThrough(tx.edits.items);
+    _ = try doc.applyTransaction(&tx);
+    try hl.parse(&doc);
+    try folds.resolve(&doc, resolver);
+    try testing.expectEqual(@as(usize, 1), folds.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), folds.entries.items[0].region.start_line);
+    try testing.expect(folds.isHidden(2));
+    try testing.expect(!folds.isHidden(1));
+
+    // Collapse the body onto the header line: no multi-line node is
+    // headed there any more, so the entry is dropped rather than
+    // hiding the wrong lines.
+    const text = try doc.textAlloc(a);
+    defer a.free(text);
+    const ob = std.mem.indexOfScalar(u8, text, '{').?;
+    const cb = std.mem.indexOfScalar(u8, text, '}').?;
+    var tx2 = tr.Transaction.init(doc.revision);
+    defer tx2.deinit(a);
+    try tx2.addDelete(a, ob + 1, cb - ob - 1);
+    folds.mapThrough(tx2.edits.items);
+    _ = try doc.applyTransaction(&tx2);
+    try hl.parse(&doc);
+    try folds.resolve(&doc, resolver);
+    try testing.expectEqual(@as(usize, 0), folds.entries.items.len);
+    try testing.expect(!folds.isHidden(2));
+}
+
+test "syntax: an unterminated block still folds (documented)" {
+    // Deleting only the closing brace leaves a node that still spans
+    // several lines, so the fold survives — the tree, not a brace
+    // counter, decides, and it reports the block as running to EOF.
+    const a = testing.allocator;
+    var doc = try openDoc("pub fn main() void {\n    one();\n    two();\n}\n");
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .zig);
+    defer hl.deinit();
+    hl.attach(&doc);
+    try hl.parse(&doc);
+    try testing.expect((try hl.foldRegionAtLine(&doc, 0)) != null);
+
+    const text = try doc.textAlloc(a);
+    defer a.free(text);
+    const cb = std.mem.indexOfScalar(u8, text, '}').?;
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(a);
+    try tx.addDelete(a, cb, 1);
+    _ = try doc.applyTransaction(&tx);
+    try hl.parse(&doc);
+    try testing.expect((try hl.foldRegionAtLine(&doc, 0)) != null);
 }
 
 test "syntax: reset drops the incremental relationship" {
