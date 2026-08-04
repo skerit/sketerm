@@ -29,6 +29,13 @@ pub const Server = struct {
     /// directory containing one becomes the workspace root. Empty =
     /// the document's own directory.
     root_files: []const u8 = "",
+    /// Raw JSON object passed as `initialize.initializationOptions`.
+    /// Several widely-used servers are unusable without it
+    /// (typescript-language-server's `tsserver.path`, rust-analyzer's
+    /// settings), and it is server-specific by definition — so it is a
+    /// pass-through string, not a typed schema. Malformed JSON is
+    /// dropped rather than corrupting the request.
+    init_options: []const u8 = "",
     enabled: bool = true,
 
     pub fn handles(self: *const Server, language_id: []const u8) bool {

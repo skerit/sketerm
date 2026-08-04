@@ -126,7 +126,7 @@ const FULL_CAPS =
 
 /// Bring a session all the way to `.ready` with the full capability set.
 fn readySession(alloc: std.mem.Allocator, s: *Session) !void {
-    s.start("file:///proj", 1234);
+    s.start("file:///proj", 1234, "");
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);
     try drain(alloc, s, &sent);
@@ -183,7 +183,7 @@ test "session: an empty capability set disables every feature" {
     defer rec.deinit();
     var s = Session.init(alloc, rec.handler());
     defer s.deinit();
-    s.start("", 1);
+    s.start("", 1, "");
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);
     try drain(alloc, &s, &sent);
@@ -208,7 +208,7 @@ test "session: positionEncoding utf-8 is honoured when offered" {
     defer rec.deinit();
     var s = Session.init(alloc, rec.handler());
     defer s.deinit();
-    s.start("", 1);
+    s.start("", 1, "");
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);
     try drain(alloc, &s, &sent);
@@ -226,7 +226,7 @@ test "session: initialize failure kills the session instead of hanging" {
     defer rec.deinit();
     var s = Session.init(alloc, rec.handler());
     defer s.deinit();
-    s.start("", 1);
+    s.start("", 1, "");
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);
     try drain(alloc, &s, &sent);
@@ -271,7 +271,7 @@ test "session: a full-sync server gets the whole document, never the ranges" {
     defer rec.deinit();
     var s = Session.init(alloc, rec.handler());
     defer s.deinit();
-    s.start("", 1);
+    s.start("", 1, "");
     var boot: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &boot);
     try drain(alloc, &s, &boot);

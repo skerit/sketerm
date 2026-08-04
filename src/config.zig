@@ -633,6 +633,7 @@ pub const Config = struct {
                 .command = try arena.dupe(u8, s.command),
                 .args = try arena.dupe(u8, s.args),
                 .root_files = try arena.dupe(u8, s.root_files),
+                .init_options = try arena.dupe(u8, s.init_options),
                 .enabled = s.enabled,
             });
         }
@@ -1026,6 +1027,7 @@ pub const Config = struct {
             if (srv.args.len > 0) try w.print("args = {s}\n", .{srv.args});
             if (srv.languages.len > 0) try w.print("languages = {s}\n", .{srv.languages});
             if (srv.root_files.len > 0) try w.print("root_files = {s}\n", .{srv.root_files});
+            if (srv.init_options.len > 0) try w.print("init_options = {s}\n", .{srv.init_options});
             if (!srv.enabled) try w.writeAll("enabled = false\n");
         }
     }
@@ -1317,6 +1319,8 @@ fn applyLspKv(srv: *LspServer, arena: std.mem.Allocator, key: []const u8, value:
         srv.languages = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "root_files")) {
         srv.root_files = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "init_options")) {
+        srv.init_options = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "enabled")) {
         srv.enabled = try parseBool(value);
     } else return error.UnknownKey;
