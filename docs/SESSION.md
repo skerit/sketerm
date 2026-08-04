@@ -12433,3 +12433,50 @@ view flags), with prefs switches. Caches are keyed on
 on — the caret hash for brackets, the visible line range and fold epoch
 for gutter markers — so nothing runs a whole-document tree query per
 frame.
+
+## Portal FileChooser: filters, parents, and honest refusals
+
+The opt-in `sketerm portal` backend grew the pieces its first cut
+deliberately skipped, all of them driven for real over an isolated
+`dbus-run-session` bus with a small GDBus client and screenshotted on
+sketerm's own compositor.
+
+**Filters.** `fpicker.Filter` now carries `mimes` alongside its glob
+patterns, so portal type-1 entries are honoured instead of dropped
+(and a mimetype-only filter is no longer thrown away). The mime of a
+listed name comes from GIO's guess on the NAME -- never file content,
+since the row may live on another host and the GUI never touches the
+disk -- with `g_content_type_is_a` as a second chance so a `text/plain`
+filter still takes `text/x-zig`. `current_filter` selects the entry on
+open (one the caller did not list is appended rather than ignored),
+and the filter the user accepted under is echoed back in the results
+as the caller's OWN variant, which is why `mapFilters` reports source
+indices.
+
+**The filter governs typed names -- in portal mode only.** An app that
+asked for `*.png` must not be handed `notes.txt` because someone typed
+it, so `enforce_filter` refuses that in the dialog (status line + error
+entry). The plain picker keeps GTK's rule, where the filter is about
+the listing; "All files" is always in the dropdown, so the strict rule
+is a confirmation step and never a dead end.
+
+**Refusals are stated, not silent.** A pick on a remote host raises
+"File is on another host" and leaves the dialog open (`local_only`),
+instead of being dropped on the way out and answering the app with a
+generic failure. Materialising remote files locally remains an open
+design question, not a gap to fill in passing. A typed save path whose
+parent directory does not exist costs one extra daemon `stat` and a
+refusal, rather than succeeding here and failing later inside the
+consumer's write; no directory is ever created implicitly.
+
+**Parent windows.** `parent_window` is imported at realize:
+`gdk_wayland_toplevel_set_transient_for_exported` on Wayland, and on
+X11 `XSetTransientForHint` on the raw XIDs, because GTK4 dropped
+GTK3's foreign windows and offers nothing else. Both backends are
+reached through `dlsym` (libX11 through `dlopen`, only when an `x11:`
+handle actually arrives), so a GTK built without a backend degrades to
+an unparented dialog instead of a binary that will not link.
+
+Also: a frontend that vanishes from the bus mid-call now takes its
+dialog with it, and `choices` defaults are echoed in the results even
+though the widgets are not drawn yet.
