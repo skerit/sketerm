@@ -4,9 +4,9 @@
 //! backs live directory VIEWS — a listing is a subscription, not a
 //! one-shot reply (docs/filebrowser-roadmap.md, decision 1). View
 //! bookkeeping itself lives in daemon.zig (it owns *Client); this
-//! module is libc-only, GTK-free, musl-clean, and compiles on macOS
-//! (watching degrades to "no live deltas" there until an FSEvents
-//! backend exists — Linux is never gated on it).
+//! module is libc-only, GTK-free, musl-clean, and watches on both
+//! Linux (inotify) and macOS (kqueue) behind one event vocabulary —
+//! see `Watcher` for the one capability the two do not share.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -534,14 +534,15 @@ fn fallbackTemplates(home: []const u8, buf: []u8) []const u8 {
 
 // ── inotify watcher (Linux; inert elsewhere) ────────────────────
 
-/// Whether a directory view gets live content deltas at all. The
-/// watcher below is inotify-backed, so everywhere else a view answers
-/// its initial listing and then stays silent — including for changes
-/// the daemon itself makes through the mutation verbs, since those are
-/// observed through the same watch rather than synthesised. Clients
-/// that must not show a stale directory have to re-list on those
-/// platforms.
-pub const live_deltas = is_linux;
+/// Whether the watcher reports a CHILD's content change — inotify's
+/// IN_CLOSE_WRITE. inotify does. A kqueue directory watch does NOT:
+/// appending to an existing file never touches the directory, so its
+/// NOTE_WRITE never fires (verified on macOS 26). Catching it would
+/// need one fd per FILE instead of per directory, which does not scale
+/// to a large listing. A size/mtime change is still picked up the next
+/// time anything else in that directory moves, and every entry-level
+/// change — create, delete, rename — is exact on both backends.
+pub const watch_sees_child_writes = is_linux;
 
 /// Directory-content event mask for views. IN_MODIFY is deliberately
 /// absent (a busy writer would flood; size updates land on
@@ -549,37 +550,320 @@ pub const live_deltas = is_linux;
 /// arrives as IN_DELETE_SELF / IN_MOVE_SELF → the view is `gone`.
 pub const Watcher = struct {
     fd: c_int = -1,
+    /// kqueue backend bookkeeping (Darwin). Unused on Linux, where the
+    /// kernel keeps all of this behind the inotify descriptor.
+    kq: KqState = .{},
 
-    /// Lazily create the inotify fd (nonblocking, cloexec). False on
-    /// platforms without inotify — views then serve the initial
+    /// Lazily create the watch fd (nonblocking, cloexec). False when
+    /// the platform has no backend — views then serve the initial
     /// listing with no live deltas.
     pub fn ensure(self: *Watcher) bool {
-        if (comptime !is_linux) return false;
         if (self.fd >= 0) return true;
-        self.fd = c.inotify_init1(c.IN_NONBLOCK | c.IN_CLOEXEC);
+        if (comptime is_linux) {
+            self.fd = c.inotify_init1(c.IN_NONBLOCK | c.IN_CLOEXEC);
+        } else {
+            // A kqueue fd is pollable, so it drops straight into the
+            // daemon's existing poll set like the inotify one.
+            self.fd = c.kqueue();
+            if (self.fd >= 0) _ = c.fcntl(self.fd, c.F_SETFD, c.FD_CLOEXEC);
+        }
         return self.fd >= 0;
     }
 
-    /// Watch a directory; returns the kernel watch descriptor (shared
-    /// for equal paths — the caller refcounts across views) or -1.
+    /// Watch a directory; returns the watch descriptor (shared for
+    /// equal paths — the caller refcounts across views) or -1.
     pub fn add(self: *Watcher, path: [*:0]const u8) c_int {
-        if (comptime !is_linux) return -1;
         if (self.fd < 0) return -1;
-        const mask: u32 = c.IN_CREATE | c.IN_DELETE | c.IN_MOVED_FROM | c.IN_MOVED_TO |
-            c.IN_CLOSE_WRITE | c.IN_ATTRIB | c.IN_DELETE_SELF | c.IN_MOVE_SELF;
-        return c.inotify_add_watch(self.fd, path, mask);
+        if (comptime is_linux) {
+            const mask: u32 = c.IN_CREATE | c.IN_DELETE | c.IN_MOVED_FROM | c.IN_MOVED_TO |
+                c.IN_CLOSE_WRITE | c.IN_ATTRIB | c.IN_DELETE_SELF | c.IN_MOVE_SELF;
+            return c.inotify_add_watch(self.fd, path, mask);
+        }
+        return self.kq.add(self.fd, path);
     }
 
     pub fn remove(self: *Watcher, wd: c_int) void {
-        if (comptime !is_linux) return;
-        if (self.fd >= 0 and wd >= 0) _ = c.inotify_rm_watch(self.fd, wd);
+        if (wd < 0) return;
+        if (comptime is_linux) {
+            if (self.fd >= 0) _ = c.inotify_rm_watch(self.fd, wd);
+            return;
+        }
+        self.kq.remove(wd);
+    }
+
+    /// Drain ready events into `buf` as inotify-layout records, so
+    /// `EventIter` decodes both backends identically. Returns the byte
+    /// count, 0 when drained (the callers loop until <= 0).
+    ///
+    /// This is the seam the two backends differ behind. inotify hands
+    /// the records over directly; kqueue only says WHICH DIRECTORY
+    /// changed, so the Darwin side re-reads that directory and diffs it
+    /// against a snapshot to recover the per-entry events.
+    pub fn readInto(self: *Watcher, buf: []u8) isize {
+        if (self.fd < 0) return 0;
+        if (comptime is_linux) return c.read(self.fd, buf.ptr, buf.len);
+        return self.kq.readInto(self.fd, buf);
     }
 
     pub fn deinit(self: *Watcher) void {
+        if (comptime !is_linux) self.kq.deinit();
         if (self.fd >= 0) _ = c.close(self.fd);
         self.fd = -1;
     }
 };
+
+/// The kqueue directory watcher (Darwin; inert and unreferenced on
+/// Linux). Verified kqueue semantics on macOS 26, which is what shapes
+/// this: a directory's NOTE_WRITE fires for an entry created, deleted
+/// or renamed, and NOTE_DELETE for the watched directory itself — but
+/// appending to an existing CHILD fires nothing, because that does not
+/// touch the directory. So entry-level changes are recovered exactly,
+/// while a child's content change is only noticed the next time
+/// something else in that directory moves. That is the one behaviour
+/// inotify has and this does not; catching it would need one fd per
+/// FILE rather than per directory.
+const KqState = struct {
+    watches: std.ArrayListUnmanaged(*Watch) = .empty,
+    /// Encoded records produced but not yet handed to a caller, so a
+    /// diff that overflows the caller's buffer is never lost.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    pending_off: usize = 0,
+    next_wd: c_int = 1,
+
+    const alloc = std.heap.c_allocator;
+
+    const Snap = struct { name: []u8, size: u64, mtime_ns: i64 };
+
+    const Watch = struct {
+        wd: c_int,
+        fd: c_int,
+        path: [:0]u8,
+        snap: std.ArrayListUnmanaged(Snap) = .empty,
+
+        fn clearSnap(self: *Watch) void {
+            for (self.snap.items) |e| alloc.free(e.name);
+            self.snap.clearRetainingCapacity();
+        }
+    };
+
+    fn find(self: *KqState, wd: c_int) ?*Watch {
+        for (self.watches.items) |w| if (w.wd == wd) return w;
+        return null;
+    }
+
+    fn add(self: *KqState, kqfd: c_int, path: [*:0]const u8) c_int {
+        const want = std.mem.span(path);
+        // inotify returns the SAME descriptor for a path already
+        // watched and the callers refcount on that; match it.
+        for (self.watches.items) |w| {
+            if (std.mem.eql(u8, w.path, want)) return w.wd;
+        }
+        const dfd = c.open(path, c.O_EVTONLY | c.O_CLOEXEC);
+        if (dfd < 0) return -1;
+        const w = alloc.create(Watch) catch {
+            _ = c.close(dfd);
+            return -1;
+        };
+        const owned = alloc.dupeZ(u8, want) catch {
+            _ = c.close(dfd);
+            alloc.destroy(w);
+            return -1;
+        };
+        w.* = .{ .wd = self.next_wd, .fd = dfd, .path = owned };
+        self.watches.append(alloc, w) catch {
+            _ = c.close(dfd);
+            alloc.free(owned);
+            alloc.destroy(w);
+            return -1;
+        };
+        self.next_wd += 1;
+
+        var ch = std.mem.zeroes(c.struct_kevent);
+        ch.ident = @intCast(dfd);
+        ch.filter = @intCast(c.EVFILT_VNODE);
+        ch.flags = @intCast(c.EV_ADD | c.EV_CLEAR);
+        ch.fflags = @intCast(c.NOTE_WRITE | c.NOTE_DELETE | c.NOTE_RENAME |
+            c.NOTE_ATTRIB | c.NOTE_EXTEND | c.NOTE_LINK | c.NOTE_REVOKE);
+        ch.udata = @ptrFromInt(@as(usize, @intCast(w.wd)));
+        _ = c.kevent(kqfd, &ch, 1, null, 0, null);
+
+        rescan(w, null); // baseline: later diffs are against this
+        return w.wd;
+    }
+
+    fn remove(self: *KqState, wd: c_int) void {
+        for (self.watches.items, 0..) |w, i| {
+            if (w.wd != wd) continue;
+            // Closing the fd deregisters the kevent with it.
+            _ = c.close(w.fd);
+            w.clearSnap();
+            w.snap.deinit(alloc);
+            alloc.free(w.path);
+            alloc.destroy(w);
+            _ = self.watches.swapRemove(i);
+            return;
+        }
+    }
+
+    fn deinit(self: *KqState) void {
+        for (self.watches.items) |w| {
+            _ = c.close(w.fd);
+            w.clearSnap();
+            w.snap.deinit(alloc);
+            alloc.free(w.path);
+            alloc.destroy(w);
+        }
+        self.watches.deinit(alloc);
+        self.pending.deinit(alloc);
+        self.pending_off = 0;
+    }
+
+    /// Re-read the directory, and when `out` is given emit one record
+    /// per difference against the previous snapshot. The snapshot is
+    /// replaced either way.
+    fn rescan(w: *Watch, out: ?*std.ArrayListUnmanaged(u8)) void {
+        var fresh: std.ArrayListUnmanaged(Snap) = .empty;
+        const d = c.opendir(w.path.ptr);
+        if (d != null) {
+            defer _ = c.closedir(d);
+            while (c.readdir(d)) |ent| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                var full: [4096]u8 = undefined;
+                const p = joinZ(&full, w.path, name) catch continue;
+                var st: c.struct_stat = undefined;
+                var size: u64 = 0;
+                var mns: i64 = 0;
+                if (c.lstat(p, &st) == 0) {
+                    size = @intCast(st.st_size);
+                    mns = mtimeNs(&st);
+                }
+                const owned = alloc.dupe(u8, name) catch continue;
+                fresh.append(alloc, .{ .name = owned, .size = size, .mtime_ns = mns }) catch {
+                    alloc.free(owned);
+                };
+            }
+        }
+        if (out) |o| {
+            // Gone: in the old snapshot, absent now.
+            for (w.snap.items) |old| {
+                var still = false;
+                for (fresh.items) |n| {
+                    if (std.mem.eql(u8, n.name, old.name)) {
+                        still = true;
+                        break;
+                    }
+                }
+                if (!still) emit(o, w.wd, Mask.delete, old.name);
+            }
+            for (fresh.items) |n| {
+                var prev: ?Snap = null;
+                for (w.snap.items) |old| {
+                    if (std.mem.eql(u8, n.name, old.name)) {
+                        prev = old;
+                        break;
+                    }
+                }
+                if (prev) |p0| {
+                    // Content moved while the directory changed for
+                    // some other reason — report it like IN_CLOSE_WRITE
+                    // so a listing's size/mtime column catches up.
+                    if (p0.size != n.size or p0.mtime_ns != n.mtime_ns)
+                        emit(o, w.wd, Mask.close_write, n.name);
+                } else emit(o, w.wd, Mask.create, n.name);
+            }
+        }
+        w.clearSnap();
+        w.snap.deinit(alloc);
+        w.snap = fresh;
+    }
+
+    /// Append one inotify-layout record: [wd][mask][cookie][len][name].
+    fn emit(out: *std.ArrayListUnmanaged(u8), wd: c_int, mask: u32, name: []const u8) void {
+        var hdr: [16]u8 = undefined;
+        const nlen: u32 = @intCast(name.len + 1); // + NUL, as the kernel pads
+        std.mem.writeInt(u32, hdr[0..4], @bitCast(wd), .little);
+        std.mem.writeInt(u32, hdr[4..8], mask, .little);
+        std.mem.writeInt(u32, hdr[8..12], 0, .little);
+        std.mem.writeInt(u32, hdr[12..16], nlen, .little);
+        out.appendSlice(alloc, &hdr) catch return;
+        out.appendSlice(alloc, name) catch return;
+        out.append(alloc, 0) catch return;
+    }
+
+    fn readInto(self: *KqState, kqfd: c_int, buf: []u8) isize {
+        if (self.pending_off >= self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            self.pending_off = 0;
+            var evs: [32]c.struct_kevent = undefined;
+            var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 0 };
+            const n = c.kevent(kqfd, null, 0, &evs, evs.len, &ts);
+            if (n <= 0) return 0;
+            for (evs[0..@intCast(n)]) |ev| {
+                const wd: c_int = @intCast(@intFromPtr(ev.udata));
+                const w = self.find(wd) orelse continue;
+                if (ev.fflags & @as(c_uint, @intCast(c.NOTE_DELETE | c.NOTE_RENAME | c.NOTE_REVOKE)) != 0) {
+                    emit(&self.pending, wd, Mask.delete_self, "");
+                    continue;
+                }
+                rescan(w, &self.pending);
+            }
+            if (self.pending.items.len == 0) return 0;
+        }
+        // Hand over whole records only — a torn tail would be dropped
+        // by EventIter, and these are the only copy.
+        const rest = self.pending.items[self.pending_off..];
+        var taken: usize = 0;
+        while (taken + 16 <= rest.len) {
+            const nlen = std.mem.readInt(u32, rest[taken + 12 ..][0..4], .little);
+            const rec = 16 + @as(usize, nlen);
+            if (taken + rec > rest.len) break;
+            if (taken + rec > buf.len) break;
+            taken += rec;
+        }
+        if (taken == 0) return 0; // caller's buffer cannot hold one record
+        @memcpy(buf[0..taken], rest[0..taken]);
+        self.pending_off += taken;
+        return @intCast(taken);
+    }
+};
+
+/// The event vocabulary, shared by both backends. These ARE inotify's
+/// bit values, so on Linux the kernel's own words need no translation
+/// and the kqueue backend below simply speaks the same language.
+pub const Mask = struct {
+    pub const attrib: u32 = 0x00000004;
+    pub const close_write: u32 = 0x00000008;
+    pub const moved_from: u32 = 0x00000040;
+    pub const moved_to: u32 = 0x00000080;
+    pub const create: u32 = 0x00000100;
+    pub const delete: u32 = 0x00000200;
+    pub const delete_self: u32 = 0x00000400;
+    pub const move_self: u32 = 0x00000800;
+    pub const unmount: u32 = 0x00002000;
+    pub const q_overflow: u32 = 0x00004000;
+    pub const ignored: u32 = 0x00008000;
+};
+
+// The values above ARE inotify's, so the Linux backend hands its
+// records straight through untranslated. Pin that: a mismatch would
+// silently mis-decode every event on Linux, which is the platform
+// that cannot be exercised from a macOS dev box.
+comptime {
+    if (is_linux) {
+        std.debug.assert(Mask.attrib == c.IN_ATTRIB);
+        std.debug.assert(Mask.close_write == c.IN_CLOSE_WRITE);
+        std.debug.assert(Mask.moved_from == c.IN_MOVED_FROM);
+        std.debug.assert(Mask.moved_to == c.IN_MOVED_TO);
+        std.debug.assert(Mask.create == c.IN_CREATE);
+        std.debug.assert(Mask.delete == c.IN_DELETE);
+        std.debug.assert(Mask.delete_self == c.IN_DELETE_SELF);
+        std.debug.assert(Mask.move_self == c.IN_MOVE_SELF);
+        std.debug.assert(Mask.unmount == c.IN_UNMOUNT);
+        std.debug.assert(Mask.q_overflow == c.IN_Q_OVERFLOW);
+        std.debug.assert(Mask.ignored == c.IN_IGNORED);
+    }
+}
 
 /// One parsed inotify event. `name` points into the read buffer.
 pub const InoEvent = struct {
@@ -588,19 +872,16 @@ pub const InoEvent = struct {
     name: []const u8,
 
     pub fn isOverflow(self: InoEvent) bool {
-        if (comptime !is_linux) return false;
-        return self.mask & c.IN_Q_OVERFLOW != 0;
+        return self.mask & Mask.q_overflow != 0;
     }
     /// The watched directory itself is gone (deleted/moved/unmounted)
     /// or the kernel dropped the watch.
     pub fn isSelfGone(self: InoEvent) bool {
-        if (comptime !is_linux) return false;
-        return self.mask & (c.IN_DELETE_SELF | c.IN_MOVE_SELF | c.IN_UNMOUNT | c.IN_IGNORED) != 0;
+        return self.mask & (Mask.delete_self | Mask.move_self | Mask.unmount | Mask.ignored) != 0;
     }
     /// Entry removed from the directory.
     pub fn isRemove(self: InoEvent) bool {
-        if (comptime !is_linux) return false;
-        return self.mask & (c.IN_DELETE | c.IN_MOVED_FROM) != 0;
+        return self.mask & (Mask.delete | Mask.moved_from) != 0;
     }
 };
 
