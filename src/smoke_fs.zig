@@ -24,6 +24,13 @@ const thumbs_mod = @import("filebrowser/thumbs.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// Modification time of a stat buffer. glibc/musl spell the field
+/// `st_mtim`, Darwin `st_mtimespec` — the whole difference, in one
+/// place rather than at every comparison below.
+fn mtime(st: c.struct_stat) c.struct_timespec {
+    return if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+}
+
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-fs: FAIL: " ++ msg ++ "\n", .{});
     std.process.exit(1);
@@ -45,7 +52,18 @@ fn mkTmpDir(buf: *[64]u8, comptime tag: []const u8) []const u8 {
     @memcpy(buf[0..tmpl.len], tmpl);
     buf[tmpl.len] = 0;
     const p = c.mkdtemp(@ptrCast(buf)) orelse fail("mkdtemp");
-    return std.mem.span(@as([*:0]u8, @ptrCast(p)));
+    // Canonicalise. On macOS /tmp is a SYMLINK to /private/tmp, and the
+    // daemon answers with resolved paths — so every "the listing echoed
+    // back the path I asked for" assertion below would compare
+    // /tmp/... against /private/tmp/... and fail. Harmless on Linux,
+    // where realpath returns the same string.
+    var real: [4096]u8 = undefined;
+    const rp = c.realpath(@ptrCast(p), &real) orelse fail("tmp dir realpath");
+    const span = std.mem.span(@as([*:0]u8, @ptrCast(rp)));
+    if (span.len >= buf.len) fail("tmp dir path too long once canonical");
+    @memcpy(buf[0..span.len], span);
+    buf[span.len] = 0;
+    return buf[0..span.len];
 }
 
 fn touch(dir: []const u8, name: []const u8, content: []const u8) void {
@@ -209,8 +227,14 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     if (!dlog.expectChildren(&fs, 1, "sub", 1)) fail("async child-count delta never arrived");
 
     // ── live deltas: external create / write / delete ──────────
+    // Deltas are inotify-backed, so a view elsewhere serves its initial
+    // listing and nothing more (fsserve.live_deltas). The filesystem
+    // work and the mutation VERBS below still run on every platform —
+    // only the delta OBSERVATIONS are gated, and where they are absent
+    // a fresh listing checks the same end state instead.
+    const deltas = fsserve.live_deltas;
     touch(dir, "c.txt", "x");
-    if (!dlog.expectSized(&fs, 1, "c.txt", 1)) fail("create delta never reached final size");
+    if (deltas and !dlog.expectSized(&fs, 1, "c.txt", 1)) fail("create delta never reached final size");
 
     {
         var z2: [4096]u8 = undefined;
@@ -219,13 +243,13 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         _ = c.fwrite("more!", 1, 5, f);
         _ = c.fclose(f);
     }
-    if (!dlog.expectSized(&fs, 1, "a.txt", 13)) fail("write delta never reached final size");
+    if (deltas and !dlog.expectSized(&fs, 1, "a.txt", 13)) fail("write delta never reached final size");
 
     {
         var z2: [4096]u8 = undefined;
         _ = c.unlink(fsserve.joinZ(&z2, dir, "c.txt") catch fail("del path"));
     }
-    _ = dlog.expect(&fs, 1, "del", "c.txt") orelse fail("delete delta never arrived");
+    if (deltas) _ = dlog.expect(&fs, 1, "del", "c.txt") orelse fail("delete delta never arrived");
 
     // ── mutation verbs, observed through the same view ─────────
     var pbuf: [4096]u8 = undefined;
@@ -233,8 +257,10 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     w.print("{s}/made", .{dir}) catch fail("fmt");
     const made_path = w.buffered();
     fs.mkdir(made_path) catch failErr("mkdir", fs.lastErr());
-    const made = dlog.expect(&fs, 1, "upsert", "made") orelse fail("mkdir delta");
-    if (!made.tdir) fail("mkdir delta not dir");
+    if (deltas) {
+        const made = dlog.expect(&fs, 1, "upsert", "made") orelse fail("mkdir delta");
+        if (!made.tdir) fail("mkdir delta not dir");
+    }
 
     var p2buf: [4096]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&p2buf);
@@ -244,11 +270,26 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     var w3 = std.Io.Writer.fixed(&p3buf);
     w3.print("{s}/a.txt", .{dir}) catch fail("fmt3");
     fs.rename(w3.buffered(), renamed_path) catch failErr("rename", fs.lastErr());
-    _ = dlog.expect(&fs, 1, "del", "a.txt") orelse fail("rename del delta");
-    if (!dlog.expectSized(&fs, 1, "renamed.txt", 13)) fail("rename upsert delta");
+    if (deltas) {
+        _ = dlog.expect(&fs, 1, "del", "a.txt") orelse fail("rename del delta");
+        if (!dlog.expectSized(&fs, 1, "renamed.txt", 13)) fail("rename upsert delta");
+    }
 
     fs.deletePath(renamed_path) catch failErr("delete", fs.lastErr());
-    _ = dlog.expect(&fs, 1, "del", "renamed.txt") orelse fail("verb delete delta");
+    if (deltas) {
+        _ = dlog.expect(&fs, 1, "del", "renamed.txt") orelse fail("verb delete delta");
+    } else {
+        // No watcher: prove the same end state through a fresh listing,
+        // so the verbs above stay under test where deltas cannot be.
+        var l2 = fs.openView(2, dir) catch fail("re-list after verbs");
+        defer l2.deinit();
+        defer fs.closeView(2) catch {};
+        const made2 = findEntry(&l2, "made") orelse fail("mkdir verb had no effect");
+        if (!made2.tdir) fail("mkdir verb did not make a dir");
+        if (findEntry(&l2, "a.txt") != null) fail("rename verb left the source behind");
+        if (findEntry(&l2, "renamed.txt") != null) fail("delete verb had no effect");
+        if (findEntry(&l2, "c.txt") != null) fail("external delete not reflected in a re-list");
+    }
 
     // ── ranged write + read + stat + symlink ───────────────────
     var wbin: [4096]u8 = undefined;
@@ -314,7 +355,9 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         var z2: [4096]u8 = undefined;
         _ = c.rmdir(pathz.pathZ(&z2, gone_dir) catch fail("gone path"));
     }
-    if (!dlog.expectGone(&fs, 2)) fail("gone delta never arrived");
+    // Self-destruction of the watched dir also arrives via the watcher
+    // (IN_DELETE_SELF / IN_MOVE_SELF), so it is gated with the rest.
+    if (deltas and !dlog.expectGone(&fs, 2)) fail("gone delta never arrived");
     fs.closeView(2) catch failErr("close gone view", fs.lastErr());
 
     // ── close_view stops the stream ────────────────────────────
@@ -513,7 +556,7 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
     const first_ino = st.st_ino;
     var src_st: c.struct_stat = undefined;
     if (c.stat(pathz.pathZ(&z, src) catch fail("wire src path"), &src_st) != 0) fail("wire src stat");
-    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec) fail("wire thumb freshness stamp wrong");
+    if (mtime(st).tv_sec != mtime(src_st).tv_sec) fail("wire thumb freshness stamp wrong");
 
     // No freedesktop PNG may have been installed for this source.
     const cache_root = std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("XDG_CACHE_HOME") orelse fail("no cache home"))));
@@ -533,8 +576,8 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
     // A changed source misses and reinstalls (new inode, new stamp).
     {
         var ts = [2]c.struct_timespec{
-            .{ .tv_sec = src_st.st_mtim.tv_sec + 5, .tv_nsec = 0 },
-            .{ .tv_sec = src_st.st_mtim.tv_sec + 5, .tv_nsec = 0 },
+            .{ .tv_sec = mtime(src_st).tv_sec + 5, .tv_nsec = 0 },
+            .{ .tv_sec = mtime(src_st).tv_sec + 5, .tv_nsec = 0 },
         };
         if (c.utimensat(c.AT_FDCWD, pathz.pathZ(&z, src) catch fail("wire src path"), &ts, 0) != 0)
             fail("wire src touch");
@@ -544,7 +587,7 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
     if (c.stat(pathz.pathZ(&z, third.assetPath()) catch fail("wire path"), &st) != 0)
         fail("wire thumb refresh missing");
     if (st.st_ino == first_ino) fail("stale wire thumb served after source change");
-    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec + 5) fail("wire thumb refresh stamp wrong");
+    if (mtime(st).tv_sec != mtime(src_st).tv_sec + 5) fail("wire thumb refresh stamp wrong");
 
     // The 512px preview tier: same regime, its own xl/ cache dir, no
     // x-large freedesktop PNG, and it never collides with the 128px
@@ -556,7 +599,7 @@ fn wireThumbStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8
     if (std.mem.eql(u8, pv.assetPath(), third.assetPath())) fail("preview collided with thumbnail entry");
     if (c.stat(pathz.pathZ(&z, pv.assetPath()) catch fail("wire path"), &st) != 0)
         fail("wire preview cache file missing");
-    if (st.st_mtim.tv_sec != src_st.st_mtim.tv_sec + 5) fail("wire preview freshness stamp wrong");
+    if (mtime(st).tv_sec != mtime(src_st).tv_sec + 5) fail("wire preview freshness stamp wrong");
     const pv_ino = st.st_ino;
     var xl_buf: [4096]u8 = undefined;
     const fd_xl = thumbs_mod.thumbPathTier(cache_root, src, .x_large, &xl_buf) orelse fail("fd xl path");
@@ -1900,89 +1943,101 @@ fn queryStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag:
     const gamma = std.fmt.bufPrint(&pb[3], "{s}/gamma.txt", .{dir}) catch unreachable;
     const moved = std.fmt.bufPrint(&pb[4], "{s}/moved-away", .{dir}) catch unreachable;
 
-    // ── live filename query ────────────────────────────────────
-    const job = fs.startLiveFind(dir, "*.txt") catch failErr("start live_find", fs.lastErr());
-    var rows = LiveRows{ .allocator = allocator, .job = job };
-    defer rows.deinit();
+    // Live queries are a recursive-WATCHER feature: where no watcher
+    // backend exists the daemon answers "live queries need the platform
+    // watcher backend" instead of silently degrading to polling, so the
+    // streamed-contract assertions below only apply where one does
+    // (fsserve.live_deltas). Panelize after this block is watcher-free
+    // and stays under test everywhere.
+    if (fsserve.live_deltas) {
+        // ── live filename query ────────────────────────────────────
+        const job = fs.startLiveFind(dir, "*.txt") catch failErr("start live_find", fs.lastErr());
+        var rows = LiveRows{ .allocator = allocator, .job = job };
+        defer rows.deinit();
 
-    const Want = struct {
-        var path: []const u8 = "";
-        fn ready(r: *const LiveRows) bool {
-            return r.ready;
-        }
-        fn present(r: *const LiveRows) bool {
-            return r.has(path);
-        }
-        fn absent(r: *const LiveRows) bool {
-            return !r.has(path);
-        }
-        fn empty(r: *const LiveRows) bool {
-            return r.paths.items.len == 0;
-        }
-    };
+        const Want = struct {
+            var path: []const u8 = "";
+            fn ready(r: *const LiveRows) bool {
+                return r.ready;
+            }
+            fn present(r: *const LiveRows) bool {
+                return r.has(path);
+            }
+            fn absent(r: *const LiveRows) bool {
+                return !r.has(path);
+            }
+            fn empty(r: *const LiveRows) bool {
+                return r.paths.items.len == 0;
+            }
+        };
 
-    expectLive(&rows, &fs, Want.ready, "initial scan complete");
-    // The status event reports its own bounds: two directories watched
-    // (the root and sub), two rows, neither cap hit.
-    if (rows.watches != 2) fail("live query reported the wrong watch count");
-    if (rows.truncated or rows.watch_limit) fail("live query claimed a bound it never hit");
-    if (!rows.has(alpha) or !rows.has(beta)) fail("live query missed an initial match");
-    if (rows.has(std.fmt.bufPrint(&pb[5], "{s}/ignore.log", .{dir}) catch unreachable))
-        fail("live query matched a non-matching name");
+        expectLive(&rows, &fs, Want.ready, "initial scan complete");
+        // The status event reports its own bounds: two directories watched
+        // (the root and sub), two rows, neither cap hit.
+        if (rows.watches != 2) fail("live query reported the wrong watch count");
+        if (rows.truncated or rows.watch_limit) fail("live query claimed a bound it never hit");
+        if (!rows.has(alpha) or !rows.has(beta)) fail("live query missed an initial match");
+        if (rows.has(std.fmt.bufPrint(&pb[5], "{s}/ignore.log", .{dir}) catch unreachable))
+            fail("live query matched a non-matching name");
 
-    // A file created externally appears with no request from anyone.
-    touch(dir, "gamma.txt", "g\n");
-    Want.path = gamma;
-    expectLive(&rows, &fs, Want.present, "externally created file appears");
+        // A file created externally appears with no request from anyone.
+        touch(dir, "gamma.txt", "g\n");
+        Want.path = gamma;
+        expectLive(&rows, &fs, Want.present, "externally created file appears");
 
-    // ...and a deleted one leaves.
-    var z: [4096]u8 = undefined;
-    _ = c.unlink(pathz.pathZ(&z, alpha) catch unreachable);
-    Want.path = alpha;
-    expectLive(&rows, &fs, Want.absent, "deleted file disappears");
+        // ...and a deleted one leaves.
+        var z: [4096]u8 = undefined;
+        _ = c.unlink(pathz.pathZ(&z, alpha) catch unreachable);
+        Want.path = alpha;
+        expectLive(&rows, &fs, Want.absent, "deleted file disappears");
 
-    // A whole directory MOVED out of the tree delivers no per-child
-    // event; its rows have to go anyway (this regressed once).
-    if (c.rename(
-        pathz.pathZ(&z, sub) catch unreachable,
-        pathz.pathZ(&pb[6], moved) catch unreachable,
-    ) != 0) fail("rename subdir");
-    Want.path = beta;
-    expectLive(&rows, &fs, Want.absent, "rows under a moved-away directory disappear");
+        // A whole directory MOVED out of the tree delivers no per-child
+        // event; its rows have to go anyway (this regressed once).
+        if (c.rename(
+            pathz.pathZ(&z, sub) catch unreachable,
+            pathz.pathZ(&pb[6], moved) catch unreachable,
+        ) != 0) fail("rename subdir");
+        Want.path = beta;
+        expectLive(&rows, &fs, Want.absent, "rows under a moved-away directory disappear");
 
-    fs.jobCancel(job) catch failErr("cancel live_find", fs.lastErr());
+        fs.jobCancel(job) catch failErr("cancel live_find", fs.lastErr());
 
-    // ── relative-time predicate that keeps being re-evaluated ──
-    var tdir_buf: [64]u8 = undefined;
-    const tdir = mkTmpDir(&tdir_buf, tag ++ "-age");
-    const fresh = std.fmt.bufPrint(&pb[0], "{s}/fresh.txt", .{tdir}) catch unreachable;
-    const old = std.fmt.bufPrint(&pb[1], "{s}/old.txt", .{tdir}) catch unreachable;
-    const later = std.fmt.bufPrint(&pb[2], "{s}/later.txt", .{tdir}) catch unreachable;
-    touch(tdir, "fresh.txt", "f\n");
-    touch(tdir, "old.txt", "o\n");
-    // Aged with a backdated mtime rather than by waiting: the daemon
-    // compares mtimes, so this is the same code path as real ageing.
-    setMtime(old, @as(i64, c.time(null)) - 7200);
+        // ── relative-time predicate that keeps being re-evaluated ──
+        var tdir_buf: [64]u8 = undefined;
+        const tdir = mkTmpDir(&tdir_buf, tag ++ "-age");
+        const fresh = std.fmt.bufPrint(&pb[0], "{s}/fresh.txt", .{tdir}) catch unreachable;
+        const old = std.fmt.bufPrint(&pb[1], "{s}/old.txt", .{tdir}) catch unreachable;
+        const later = std.fmt.bufPrint(&pb[2], "{s}/later.txt", .{tdir}) catch unreachable;
+        touch(tdir, "fresh.txt", "f\n");
+        touch(tdir, "old.txt", "o\n");
+        // Aged with a backdated mtime rather than by waiting: the daemon
+        // compares mtimes, so this is the same code path as real ageing.
+        setMtime(old, @as(i64, c.time(null)) - 7200);
 
-    const tjob = fs.startLiveFindOpts(tdir, "*.txt", .{ .within_ms = 3000 }) catch
-        failErr("start timed live_find", fs.lastErr());
-    var trows = LiveRows{ .allocator = allocator, .job = tjob };
-    defer trows.deinit();
-    expectLive(&trows, &fs, Want.ready, "timed query initial scan");
-    if (!trows.has(fresh)) fail("timed query dropped a file inside its window");
-    if (trows.has(old)) fail("timed query matched a file outside its window");
+        const tjob = fs.startLiveFindOpts(tdir, "*.txt", .{ .within_ms = 3000 }) catch
+            failErr("start timed live_find", fs.lastErr());
+        var trows = LiveRows{ .allocator = allocator, .job = tjob };
+        defer trows.deinit();
+        expectLive(&trows, &fs, Want.ready, "timed query initial scan");
+        if (!trows.has(fresh)) fail("timed query dropped a file inside its window");
+        if (trows.has(old)) fail("timed query matched a file outside its window");
 
-    // A file created inside the window matches...
-    touch(tdir, "later.txt", "l\n");
-    Want.path = later;
-    expectLive(&trows, &fs, Want.present, "new file inside the time window matches");
-    // ...and stops matching the moment its mtime is pushed out of it.
-    setMtime(later, @as(i64, c.time(null)) - 3600);
-    expectLive(&trows, &fs, Want.absent, "backdated file leaves the time window");
-    // ...and everything left ages out on its own deadline, with no
-    // filesystem event and nothing asked of the client.
-    expectLive(&trows, &fs, Want.empty, "matches age out on their own deadline");
-    fs.jobCancel(tjob) catch failErr("cancel timed live_find", fs.lastErr());
+        // A file created inside the window matches...
+        touch(tdir, "later.txt", "l\n");
+        Want.path = later;
+        expectLive(&trows, &fs, Want.present, "new file inside the time window matches");
+        // ...and stops matching the moment its mtime is pushed out of it.
+        setMtime(later, @as(i64, c.time(null)) - 3600);
+        expectLive(&trows, &fs, Want.absent, "backdated file leaves the time window");
+        // ...and everything left ages out on its own deadline, with no
+        // filesystem event and nothing asked of the client.
+        expectLive(&trows, &fs, Want.empty, "matches age out on their own deadline");
+        fs.jobCancel(tjob) catch failErr("cancel timed live_find", fs.lastErr());
+    } else {
+        // Panelize below resolves a gamma.txt row; on a watcher host the
+        // block above creates it as its external-create probe.
+        touch(dir, "gamma.txt", "g\n");
+    }
 
     // ── panelize: rows, rejects and the command's exit status ──
     var cmd_buf: [512]u8 = undefined;
@@ -2971,7 +3026,7 @@ fn bumpMtime(path: []const u8) void {
     const p = pathz.pathZ(&z, path) catch fail("bump path");
     var st: c.struct_stat = undefined;
     if (c.lstat(p, &st) != 0) fail("bump lstat");
-    const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+    const mts = mtime(st);
     var times = [_]c.struct_timespec{
         .{ .tv_sec = mts.tv_sec, .tv_nsec = 0 },
         .{ .tv_sec = mts.tv_sec + 2, .tv_nsec = 0 },
