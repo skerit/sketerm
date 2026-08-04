@@ -108,6 +108,18 @@ it is loaded, because breaking one is how each was learned:
   - Content mutations outside the delta path MUST call `tab.noteChangedFull`,
     or rows show stale cells.
 
+- **`src/lsp/CLAUDE.md`** (+ `docs/lsp.md` for the full reference) — the
+  editor's Language Server Protocol client.
+  - Everything under `src/lsp/` is GTK-free and in BOTH test roots; the only
+    GTK is `src/ui/editorlsp.zig`. `config.zig` imports `lsp/servers.zig` and
+    `config.zig` is compiled into `sketerm-mux`.
+  - LSP `character` is UTF-16 code units by default — never index a rope with
+    one; go through `lsp/position.zig`.
+  - `didChange` ranges are captured in `Document` observer slot 2 (PRE-edit)
+    and queued DESCENDING by offset.
+  - Responses are revision-stamped and dropped when stale; a missing server
+    degrades silently.
+
 ## Memory ownership
 
 - All long-lived state via the app `GeneralPurposeAllocator`.
