@@ -479,12 +479,12 @@ fn sigNoop(_: c_int) callconv(.c) void {}
 /// experiences as a forever-hanging tool call.
 fn installQuitSignals() void {
     var sa: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
-    sa.__sigaction_handler.sa_handler = onQuitSignal;
+    platform.setSigHandler(&sa, onQuitSignal);
     sa.sa_flags = 0;
     _ = c.sigaction(c.SIGTERM, &sa, null);
     _ = c.sigaction(c.SIGINT, &sa, null);
     var sp: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
-    sp.__sigaction_handler.sa_handler = sigNoop;
+    platform.setSigHandler(&sp, sigNoop);
     _ = c.sigaction(c.SIGPIPE, &sp, null);
 }
 
@@ -3775,6 +3775,15 @@ test "app_click reports a crash during its held click" {
     app_state.ready = true;
     try app_state.apps.put(t.allocator, 1, fixture.app);
     defer {
+        // Driving a real app tool records into the PROCESS-GLOBAL
+        // journal (and its nudge/log-delta siblings), which only the
+        // server's own shutdown normally clears — so without this the
+        // entries outlive the test and are reported against
+        // t.allocator. It leaked only on some orderings, because a
+        // later test reusing these globals could happen to free them.
+        Journal.deinitAll();
+        LogDelta.deinitAll();
+        MacroNudge.deinitAll();
         _ = app_state.apps.fetchSwapRemove(1);
         app_state.apps.deinit(t.allocator);
         app_state.apps = .empty;

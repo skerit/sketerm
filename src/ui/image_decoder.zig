@@ -472,12 +472,22 @@ test "image decoder produces normalized RGBA through the available backend" {
 
 test "image decoder preserves common animated image frames" {
     const allocator = std.testing.allocator;
-    const fixtures = [_][]const u8{
-        "R0lGODlhAgABAPAAAP8AAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAAAAAACwAAAAAAgABAAACAgQKACH5BAAKAAAALAAAAAACAAEAgAAA/wAAAAICBAoAOw==",
-        "UklGRsAAAABXRUJQVlA4WAoAAAACAAAAAQAAAAAAQU5JTQYAAAD/////AABBTk1GSAAAAAAAAAAAAAEAAAAAAGQAAAJWUDggMAAAANABAJ0BKgIAAQACADQloAJ0ugH4AAOwAP7wxAv/ILlhdcjX/yA/5Af8gP/48gAAAEFOTUZEAAAAAAAAAAAAAQAAAAAAZAAAAFZQOCAsAAAAlAEAnQEqAgABAAAANCWgAnS6AAOYAP75k2//kB//kB//kB//ID/iF3sgMAA=",
-        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAACXBIWXMAAAAAAAAAAQCEeRdzAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAACAAAAAQAAAAAAAAAAAAEAGQAA50mrUAAAAA9JREFUeJxj/MvAyMDAAAAGAAEAuVLGwQAAABpmY1RMAAAAAQAAAAIAAAABAAAAAAAAAAAAAQAZAAB8OkGEAAAAE2ZkQVQAAAACeJxjZGT4y8DAAAAECAEAmCREywAAAABJRU5ErkJggg==",
+    // Which backend answers decides which of these can animate at all.
+    // glycin decodes all three; the gdk-pixbuf fallback (the macOS path —
+    // glycin has no Homebrew formula) animates GIF only: it ships no WebP
+    // loader, and its PNG loader has no APNG support, so that fixture
+    // comes back as a single static frame. Those two are therefore
+    // asserted only where a backend claims to support them — the frame
+    // preservation this test guards is sketerm's, not the loaders'.
+    const have_glycin = glycinAvailable();
+    const fixtures = [_]struct { b64: []const u8, needs_glycin: bool }{
+        .{ .b64 = "R0lGODlhAgABAPAAAP8AAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAAAAAACwAAAAAAgABAAACAgQKACH5BAAKAAAALAAAAAACAAEAgAAA/wAAAAICBAoAOw==", .needs_glycin = false },
+        .{ .b64 = "UklGRsAAAABXRUJQVlA4WAoAAAACAAAAAQAAAAAAQU5JTQYAAAD/////AABBTk1GSAAAAAAAAAAAAAEAAAAAAGQAAAJWUDggMAAAANABAJ0BKgIAAQACADQloAJ0ugH4AAOwAP7wxAv/ILlhdcjX/yA/5Af8gP/48gAAAEFOTUZEAAAAAAAAAAAAAQAAAAAAZAAAAFZQOCAsAAAAlAEAnQEqAgABAAAANCWgAnS6AAOYAP75k2//kB//kB//kB//ID/iF3sgMAA=", .needs_glycin = true },
+        .{ .b64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAACXBIWXMAAAAAAAAAAQCEeRdzAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAACAAAAAQAAAAAAAAAAAAEAGQAA50mrUAAAAA9JREFUeJxj/MvAyMDAAAAGAAEAuVLGwQAAABpmY1RMAAAAAQAAAAIAAAABAAAAAAAAAAAAAQAZAAB8OkGEAAAAE2ZkQVQAAAACeJxjZGT4y8DAAAAECAEAmCREywAAAABJRU5ErkJggg==", .needs_glycin = true },
     };
-    for (fixtures, 0..) |encoded, fixture_index| {
+    for (fixtures, 0..) |fixture, fixture_index| {
+        if (fixture.needs_glycin and !have_glycin) continue;
+        const encoded = fixture.b64;
         const decoder64 = std.base64.standard.Decoder;
         const bytes = try allocator.alloc(u8, try decoder64.calcSizeForSlice(encoded));
         defer allocator.free(bytes);
