@@ -69,12 +69,7 @@ fn loadApi() ?Api {
         "libopus.0.dylib",
         "libopus.dylib",
     };
-    var handle: ?*anyopaque = null;
-    for (names) |name| {
-        handle = dlopen(name, RTLD_LAZY);
-        if (handle != null) break;
-    }
-    const h = handle orelse return null;
+    const h = @import("../util/platform.zig").dlopenAny(&names) orelse return null;
     const encoder_create = sym(EncoderCreate, h, "opus_encoder_create") orelse {
         _ = dlclose(h);
         return null;
