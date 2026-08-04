@@ -8,6 +8,34 @@
 //! with a Result on accept, with null on cancel/close/parent
 //! teardown -- and the window then destroys itself. Result slices
 //! are only valid during the callback.
+//!
+//! The name/location entry is present in EVERY mode, not just
+//! save_file. Non-empty text always wins over the listing selection:
+//! it is resolved (bare name, relative path, absolute path, `~`)
+//! against the shown directory by fpicker.resolveTyped, its kind is
+//! answered by the loaded listing when possible and by a daemon
+//! `stat` probe otherwise (the GUI never touches the disk, so remote
+//! hosts resolve exactly the same way), and fpicker.typedAction
+//! decides between browsing into it, accepting it and refusing it.
+//! A refusal is stated in the browser's status line and marks the
+//! entry with the "error" style, the same channel the location bar
+//! uses for a bad path.
+//!
+//! Selection -> entry rule: a selection of exactly ONE row writes
+//! that row's name into the entry (save_file only adopts files, so
+//! browsing does not clobber a typed save name); a MULTI selection
+//! clears the entry, because in open_files the whole selection is
+//! the answer and an entry naming one of its members would be a
+//! lie; an EMPTY selection leaves the entry alone. Browsing to
+//! another directory clears the entry (a bare name only meant
+//! something where it came from); save_file is exempt, since its
+//! name belongs to the document, not to the folder.
+//!
+//! Focus policy: save_file focuses the entry (the name is the point
+//! of the dialog), every other mode focuses the listing so arrow
+//! navigation and type-ahead work the moment the picker opens. The
+//! entry lives OUTSIDE BrowserView.root_box, so the browser's key
+//! controllers never see typing that is meant for it.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -16,6 +44,7 @@ const fpicker = @import("../filebrowser/picker.zig");
 const paths = @import("../filebrowser/paths.zig");
 const BrowserView = @import("browser/view.zig").BrowserView;
 const PickerHooks = @import("browser/view.zig").PickerHooks;
+const BTab = @import("browser/types.zig").BTab;
 const nav = @import("browser/nav.zig");
 
 pub const ResultCb = *const fn (ctx: ?*anyopaque, result: ?fpicker.Result) void;
@@ -72,6 +101,21 @@ pub const PickerWindow = struct {
     built: bool = false,
     name_entry: ?*c.GtkEntry = null,
     primary: *c.GtkWidget = undefined,
+    /// The one in-flight typed-name stat probe (a newer submit
+    /// replaces it, so a slow host cannot answer for stale text).
+    probe: ?*Probe = null,
+    /// The directory the entry's text was last valid for: browsing
+    /// away invalidates a name that names something here. save_file
+    /// is exempt -- its name is the document's, not the folder's.
+    last_dir: [4096]u8 = undefined,
+    last_dir_len: usize = 0,
+
+    /// A typed path whose kind only the host that owns it can tell.
+    const Probe = struct {
+        req: u32,
+        path: []u8,
+        trailing_slash: bool,
+    };
 
     /// Open a picker over `parent`. Returns after presenting; the
     /// result arrives through `cb`. All request slices are copied.
@@ -95,6 +139,7 @@ pub const PickerWindow = struct {
             .ctx = @ptrCast(self),
             .on_activate_file = &onActivateFile,
             .on_selection_changed = &onSelectionChanged,
+            .on_reply = &onProbeReply,
             .visible = &visibleCb,
             .suppress_ops = true,
         };
@@ -103,8 +148,10 @@ pub const PickerWindow = struct {
         self.built = true;
         self.syncFromSelection();
         c.gtk_window_present(self.window);
-        if (self.name_entry) |entry| {
-            _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(entry)));
+        // Save mode is about the name; every other mode is about
+        // browsing, and the listing needs the arrow keys.
+        if (self.mode == .save_file and self.name_entry != null) {
+            _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.name_entry.?)));
         } else {
             self.view.focusListing();
         }
@@ -145,6 +192,7 @@ pub const PickerWindow = struct {
     }
 
     fn freeOwned(self: *PickerWindow) void {
+        self.clearProbe();
         if (self.filters.len > 0) self.freeFilterSlice(self.filters, self.filters.len);
         self.filters = &.{};
         if (self.suggested_name) |sn| self.allocator.free(sn);
@@ -208,28 +256,22 @@ pub const PickerWindow = struct {
         c.gtk_widget_set_margin_top(footer, 6);
         c.gtk_widget_set_margin_bottom(footer, 8);
 
-        if (fpicker.needsNameEntry(self.mode)) {
-            const label = c.gtk_label_new("Name:");
-            c.gtk_widget_add_css_class(label, "dim-label");
-            c.gtk_box_append(@ptrCast(footer), label);
-            const entry = c.gtk_entry_new();
-            c.gtk_widget_set_hexpand(entry, 1);
-            if (self.suggested_name) |sn| {
-                var z: [512:0]u8 = undefined;
-                const n = @min(sn.len, z.len - 1);
-                @memcpy(z[0..n], sn[0..n]);
-                z[n] = 0;
-                c.gtk_editable_set_text(@ptrCast(entry), &z);
-            }
-            _ = c.g_signal_connect_data(entry, "changed", @ptrCast(&onNameChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-            _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPrimaryClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-            c.gtk_box_append(@ptrCast(footer), entry);
-            self.name_entry = @ptrCast(@alignCast(entry));
-        } else {
-            const spacer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
-            c.gtk_widget_set_hexpand(spacer, 1);
-            c.gtk_box_append(@ptrCast(footer), spacer);
-        }
+        // Present in every mode: a name to save under, the selected
+        // entry's name, or a path typed straight in.
+        const label = c.gtk_label_new("Name:");
+        c.gtk_widget_add_css_class(label, "dim-label");
+        c.gtk_box_append(@ptrCast(footer), label);
+        const entry = c.gtk_entry_new();
+        c.gtk_widget_set_hexpand(entry, 1);
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), switch (self.mode) {
+            .select_dir, .select_destination => "folder name or path",
+            else => "file name or path",
+        });
+        if (self.suggested_name) |sn| self.setEntryText(@ptrCast(@alignCast(entry)), sn);
+        _ = c.g_signal_connect_data(entry, "changed", @ptrCast(&onNameChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPrimaryClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(footer), entry);
+        self.name_entry = @ptrCast(@alignCast(entry));
 
         if (self.filters.len > 0) self.buildFilterDropdown(footer.?);
 
@@ -329,22 +371,49 @@ pub const PickerWindow = struct {
         return out;
     }
 
-    /// Selection -> footer: save-name adoption plus primary-button
-    /// sensitivity. The single sync point, also run once at build.
+    /// Selection -> footer: the entry follows a single selected row,
+    /// a multi selection empties it (the selection itself is then the
+    /// answer), an empty selection leaves typed text alone. Plus
+    /// primary-button sensitivity. The single sync point, also run
+    /// once at build.
     fn syncFromSelection(self: *PickerWindow) void {
+        self.noteDirectory();
         const sel = self.currentSelection();
-        if (self.mode == .save_file and sel.files == 1 and sel.dirs == 0) {
+        if (sel.files + sel.dirs > 1) {
+            self.setNameEntry("");
+        } else if (sel.files == 1 and sel.dirs == 0) {
             if (sel.first_file) |p| self.setNameEntry(std.fs.path.basename(p));
+        } else if (sel.dirs == 1 and sel.files == 0 and self.mode != .save_file) {
+            // A save name must survive browsing; every other mode can
+            // show the highlighted folder.
+            if (sel.first_dir) |p| self.setNameEntry(std.fs.path.basename(p));
         }
         self.updatePrimary(sel);
     }
 
+    /// Browsing elsewhere drops a name that only meant something in
+    /// the directory it came from ("sub" after entering sub/ would
+    /// otherwise resolve to sub/sub).
+    fn noteDirectory(self: *PickerWindow) void {
+        const tab = self.view.currentTab() orelse return;
+        const p = tab.root.path;
+        if (p.len >= self.last_dir.len) return;
+        if (std.mem.eql(u8, p, self.last_dir[0..self.last_dir_len])) return;
+        @memcpy(self.last_dir[0..p.len], p);
+        self.last_dir_len = p.len;
+        if (self.mode != .save_file) self.setNameEntry("");
+    }
+
+    /// The primary is live whenever SOMETHING would be picked: typed
+    /// text always counts (its validity is decided on submit, where
+    /// the failure can be explained), otherwise the selection rule of
+    /// the mode applies.
     fn updatePrimary(self: *PickerWindow, sel: Selection) void {
-        const on = switch (self.mode) {
+        const on = self.nameText().len > 0 or switch (self.mode) {
             .open_file => sel.files == 1 and sel.dirs == 0,
             .open_files => sel.files >= 1 and sel.dirs == 0,
             .select_dir, .select_destination => true,
-            .save_file => fpicker.validSaveName(self.nameText()),
+            .save_file => false,
         };
         c.gtk_widget_set_sensitive(self.primary, @intFromBool(on));
     }
@@ -354,20 +423,31 @@ pub const PickerWindow = struct {
         return std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(@alignCast(entry))))));
     }
 
-    fn setNameEntry(self: *PickerWindow, name: []const u8) void {
-        const entry = self.name_entry orelse return;
-        var z: [512:0]u8 = undefined;
-        const n = @min(name.len, z.len - 1);
-        @memcpy(z[0..n], name[0..n]);
+    fn setEntryText(_: *PickerWindow, entry: *c.GtkEntry, text: []const u8) void {
+        var z: [4096:0]u8 = undefined;
+        const n = @min(text.len, z.len - 1);
+        @memcpy(z[0..n], text[0..n]);
         z[n] = 0;
         c.gtk_editable_set_text(@ptrCast(@alignCast(entry)), &z);
+    }
+
+    fn setNameEntry(self: *PickerWindow, name: []const u8) void {
+        const entry = self.name_entry orelse return;
+        self.setEntryText(entry, name);
+    }
+
+    fn markEntryError(self: *PickerWindow, bad: bool) void {
+        const entry = self.name_entry orelse return;
+        const w: *c.GtkWidget = @ptrCast(@alignCast(entry));
+        if (bad) c.gtk_widget_add_css_class(w, "error") else c.gtk_widget_remove_css_class(w, "error");
     }
 
     // -- signal handlers -----------------------------------------
 
     fn onNameChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(PickerWindow, user);
-        if (!self.built) return;
+        if (!self.built or self.view.widgets_dead) return;
+        self.markEntryError(false);
         self.updatePrimary(self.currentSelection());
     }
 
@@ -467,8 +547,11 @@ pub const PickerWindow = struct {
 
     fn onPrimaryClicked(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(PickerWindow, user);
-        if (self.delivered) return;
+        if (self.delivered or self.view.widgets_dead) return;
         const tab = self.view.currentTab() orelse return;
+        // Typed text always wins: it is what the user last said.
+        const typed = self.nameText();
+        if (typed.len > 0) return self.submitTyped(tab, typed);
         const sel = self.currentSelection();
         switch (self.mode) {
             .open_file => {
@@ -502,25 +585,112 @@ pub const PickerWindow = struct {
                 var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
                 self.deliver(&.{paths.formatSpec(&buf, tab.hc.host, p)}, null);
             },
-            .save_file => self.primarySave(tab),
+            // Nothing typed and nothing to adopt from the listing.
+            .save_file => {},
         }
     }
 
-    fn primarySave(self: *PickerWindow, tab: *@import("browser/types.zig").BTab) void {
-        const name = self.nameText();
-        if (!fpicker.validSaveName(name)) return;
-        var pbuf: [4096]u8 = undefined;
-        const dir = tab.root.path;
-        const full = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{
-            if (std.mem.eql(u8, dir, "/")) "" else dir,
-            name,
-        }) catch return;
-        if (nav.entryForPath(tab, full) != null) {
-            self.confirmOverwrite(full, name);
+    // -- typed name/location -------------------------------------
+
+    /// Submit the entry's text: resolve it against the shown
+    /// directory, then answer its kind from the loaded listing when
+    /// we can and from the daemon when we cannot.
+    fn submitTyped(self: *PickerWindow, tab: *BTab, text: []const u8) void {
+        var buf: [4096]u8 = undefined;
+        const typed = fpicker.resolveTyped(&buf, tab.root.path, tab.hc.home_dir, text) orelse {
+            self.rejectTyped(text, "cannot be resolved to a path");
             return;
+        };
+        if (std.mem.eql(u8, typed.path, tab.root.path))
+            return self.applyTyped(tab, typed.path, .dir, typed.trailing_slash);
+        if (nav.entryForPath(tab, typed.path)) |e|
+            return self.applyTyped(tab, typed.path, if (e.tdir) .dir else .file, typed.trailing_slash);
+        self.startProbe(tab, typed);
+    }
+
+    /// Ask the host that owns the path what it is. One probe at a
+    /// time; the reply lands in onProbeReply.
+    fn startProbe(self: *PickerWindow, tab: *BTab, typed: fpicker.Typed) void {
+        self.clearProbe();
+        const owned = self.allocator.dupe(u8, typed.path) catch return;
+        const p = self.allocator.create(Probe) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        p.* = .{ .req = self.view.nextReq(), .path = owned, .trailing_slash = typed.trailing_slash };
+        self.probe = p;
+        self.view.sendOp(tab.hc, .{ .req = p.req, .op = "stat", .path = typed.path });
+    }
+
+    fn clearProbe(self: *PickerWindow) void {
+        const p = self.probe orelse return;
+        self.probe = null;
+        self.allocator.free(p.path);
+        self.allocator.destroy(p);
+    }
+
+    fn onProbeReply(ctx: *anyopaque, req: u32, ok: bool, is_dir: ?bool) bool {
+        const self: *PickerWindow = @ptrCast(@alignCast(ctx));
+        const p = self.probe orelse return false;
+        if (p.req != req) return false;
+        var pbuf: [4096]u8 = undefined;
+        if (p.path.len >= pbuf.len) {
+            self.clearProbe();
+            return true;
         }
-        var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
-        self.deliver(&.{paths.formatSpec(&buf, tab.hc.host, full)}, name);
+        @memcpy(pbuf[0..p.path.len], p.path);
+        const path = pbuf[0..p.path.len];
+        const trailing = p.trailing_slash;
+        self.clearProbe();
+        if (self.delivered or !self.built or self.view.widgets_dead) return true;
+        const tab = self.view.currentTab() orelse return true;
+        const kind: fpicker.TypedKind = if (!ok or is_dir == null)
+            .missing
+        else if (is_dir.?) .dir else .file;
+        self.applyTyped(tab, path, kind, trailing);
+        return true;
+    }
+
+    /// The verdict, acted on: browse into it, pick it, or say why not.
+    fn applyTyped(self: *PickerWindow, tab: *BTab, path: []const u8, kind: fpicker.TypedKind, trailing: bool) void {
+        switch (fpicker.typedAction(self.mode, kind, trailing)) {
+            .navigate => {
+                // navigate() may free storage `path` aliases.
+                var pbuf: [4096]u8 = undefined;
+                if (path.len >= pbuf.len) return;
+                @memcpy(pbuf[0..path.len], path);
+                self.setNameEntry("");
+                self.markEntryError(false);
+                self.view.navigate(tab, tab.hc.host, pbuf[0..path.len]);
+            },
+            .accept => {
+                self.markEntryError(false);
+                if (self.mode == .save_file) {
+                    const leaf = std.fs.path.basename(path);
+                    if (kind == .file) return self.confirmOverwrite(path, leaf);
+                    var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+                    self.deliver(&.{paths.formatSpec(&buf, tab.hc.host, path)}, leaf);
+                    return;
+                }
+                var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+                self.deliver(&.{paths.formatSpec(&buf, tab.hc.host, path)}, null);
+            },
+            .reject => {
+                const name = std.fs.path.basename(path);
+                self.rejectTyped(name, switch (kind) {
+                    .missing => "does not exist",
+                    .file => if (trailing) "is not a folder" else "is a file, and this dialog needs a folder",
+                    .dir => "is a folder",
+                });
+            },
+        }
+    }
+
+    /// State a refusal where the browser states its other path
+    /// failures, and mark the entry so the eye lands on it.
+    fn rejectTyped(self: *PickerWindow, name: []const u8, why: []const u8) void {
+        self.markEntryError(true);
+        self.view.setStatusFmt("\"{s}\" {s}", .{ name, why });
     }
 
     const OverwriteCtx = struct {

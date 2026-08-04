@@ -847,6 +847,10 @@ fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
     var xfer_touched = false;
     var over_budget = false;
     while (true) {
+        // A reply can end the view mid-drain: the picker's typed-name
+        // probe accepts a path, which delivers and destroys the
+        // picker window. Nothing after that fence may be fed.
+        if (self.widgets_dead) break;
         if (c.g_get_monotonic_time() > deadline) {
             // Possibly nothing left; the idle drains once for free.
             over_budget = true;
@@ -995,6 +999,13 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         }
     }
 
+    // The file picker's typed-name stat probe?
+    if (self.picker) |pk| {
+        if (pk.on_reply) |claim| {
+            const is_dir: ?bool = if (rep.entry) |e| e.tdir else null;
+            if (claim(pk.ctx, rep.req, rep.ok, is_dir)) return false;
+        }
+    }
     // A breadcrumb segment's sibling listing?
     if (self.feedSiblings(hc, rep)) return false;
     // A parked paste collision waiting on its two stat replies?
