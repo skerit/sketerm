@@ -286,6 +286,13 @@ pub fn main() u8 {
         // after every split/close — divergence aborts the app, which
         // fails this harness.
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        // Hermeticity: on a dev box with at-spi running, the GUI child
+        // would otherwise register its accessibles on the USER'S real
+        // a11y bus. This harness isolates every other resource, so it
+        // must isolate that too. Nothing here asserts a11y behaviour —
+        // if that is ever wanted it needs its own test with its own
+        // private bus (src/mux/a11yhub.zig spawns one per app session).
+        _ = c.setenv("GTK_A11Y", "none", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -813,6 +820,8 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
         // GtkIMContextSimple and compose/dead keys are live.
         _ = c.unsetenv("GTK_IM_MODULE");
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        // Same hermeticity rule as the primary GUI child above.
+        _ = c.setenv("GTK_A11Y", "none", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
