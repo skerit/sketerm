@@ -246,6 +246,14 @@ fn runNativeApp(
     if (ipc_client.resolveSocket(allocator, null)) |gui_sock| {
         allocator.free(gui_sock);
     } else {
+        // Same distinction as after a failed attach: with no window to
+        // render into the session normally keeps running, but if the
+        // command died on arrival there is nothing to attach to later
+        // and saying otherwise just sends the user chasing a ghost.
+        if (sessionGone(allocator, name, host_spec)) {
+            exitedNotice(name, host_spec, wayland);
+            return 1;
+        }
         headlessNotice(name, host_spec, wayland);
         return 0;
     }
