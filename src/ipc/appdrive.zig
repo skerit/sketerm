@@ -399,6 +399,11 @@ pub const App = struct {
     /// command spawns via `/bin/sh -c`, so this is the shell; argv-array
     /// launches exec directly and the pid IS the app.
     pid: i32 = 0,
+    /// Virtual output size the daemon confirmed at spawn (0 = the
+    /// daemon predates the field): what the compositor advertises as
+    /// the screen, distinct from any window's size.
+    output_width: u32 = 0,
+    output_height: u32 = 0,
     /// Toplevel the keyboard was last aimed at (0 = none yet).
     kbd_focus: u32 = 0, // public window id
     /// Tracked pointer: last surface-local position injected on the
@@ -496,6 +501,12 @@ pub const App = struct {
         cwd: ?[]const u8 = null,
         /// "KEY=VALUE" strings for the child environment.
         env: []const []const u8 = &.{},
+        /// Virtual output mode in pixels — what the session compositor
+        /// advertises as the screen (DPI/layout tests). The daemon
+        /// defaults omitted/zero to 1920x1080; an older daemon ignores
+        /// the field (compare App.output_width after launch).
+        output_width: u32 = 0,
+        output_height: u32 = 0,
         /// Per-step handshake deadline; a stalled daemon surfaces as a
         /// described SpawnFailed instead of a hung tool call.
         step_timeout_ms: i64 = 15_000,
@@ -556,19 +567,27 @@ pub const App = struct {
             .audio_capture = opts.audio_capture orelse "",
             .cwd = opts.cwd,
             .env = opts.env,
+            // 0 = "daemon default", but the wire field must be a valid
+            // mode (an explicit 0 is rejected), so resolve it here.
+            .output_width = if (opts.output_width != 0) opts.output_width else wlcomp.DEFAULT_OUTPUT_WIDTH,
+            .output_height = if (opts.output_height != 0) opts.output_height else wlcomp.DEFAULT_OUTPUT_HEIGHT,
         }) catch return Error.SpawnFailed;
         var spawn_pid: i32 = 0;
+        var spawn_ow: u32 = 0;
+        var spawn_oh: u32 = 0;
         {
             const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
                 setStepErr("spawn", &conn, err);
                 return Error.SpawnFailed;
             };
             defer ok.deinit(allocator);
-            const OkReply = struct { pid: i32 = 0 };
+            const OkReply = struct { pid: i32 = 0, output_width: u32 = 0, output_height: u32 = 0 };
             if (std.json.parseFromSlice(OkReply, allocator, ok.payload, .{
                 .ignore_unknown_fields = true,
             })) |p| {
                 spawn_pid = p.value.pid;
+                spawn_ow = p.value.output_width;
+                spawn_oh = p.value.output_height;
                 p.deinit();
             } else |_| {}
         }
@@ -588,6 +607,8 @@ pub const App = struct {
             .name = name,
             .layout = layout,
             .pid = spawn_pid,
+            .output_width = spawn_ow,
+            .output_height = spawn_oh,
             .local_sock = if (opts.host == null) (if (opts.local_sock) |p| allocator.dupe(u8, p) catch null else null) else null,
             .ssh_host = if (opts.host) |h| allocator.dupe(u8, h) catch null else null,
         };
