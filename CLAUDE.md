@@ -146,7 +146,14 @@ Design documents are never committed — proposals stay untracked in the working
 
 ## Packaging
 
-`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages both binaries. Run `cd dist && ./install.sh` (= `makepkg -sif`). **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. The perpetually dirty `pkgver=` line in `git status` is makepkg's own rewrite, not a local edit.
+`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages both binaries. Run `cd dist && ./install.sh` (= `makepkg -sif`). **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. makepkg rewrites the `pkgver=` line on every build; a **clean filter keeps that out of git** so it no longer shows as a permanent local edit (which made `git pull` complain). `.gitattributes` marks `dist/PKGBUILD filter=pkgver`, and the driver lives in local git config — **a fresh clone must set it up or the dirt comes back**:
+
+```bash
+git config filter.pkgver.clean  "sed -E 's/^pkgver=.*/pkgver=0.0.0/'"
+git config filter.pkgver.smudge cat
+```
+
+The stored `pkgver=0.0.0` is a deliberate placeholder: `pkgver()` derives the real version from `build.zig.zon` at build time, so the committed value is never read for anything. The filter masks ONLY that one assignment line — every other edit to PKGBUILD still diffs normally, and a clone without the driver configured degrades gracefully (git no-ops on an undefined filter).
 
 **The semver has exactly one source of truth: `.version` in `build.zig.zon`.** `build.zig` imports the zon and hands the string to every target as `build_options.version`; `src/version.zig` re-exports it (with the `:0` sentinel re-attached, since callers pass it to `fprintf`) for the GUI, the daemon and the MCP server, which is how `sketerm doctor` detects binary skew. `pkgver()` greps the same line and appends `.r<commit-count>.g<sha>`. Bump that one line and everything moves together — never hardcode a version anywhere else. Consequence: **any module importing `src/version.zig` must be in a target that has a `build_options` module**, and a new option set (alongside `glib_opts`/`noglib_opts`/`portable_opts`) must add `version` or that target won't compile.
 
