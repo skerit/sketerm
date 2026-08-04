@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// Single source of truth for the semver: `build.zig.zon`'s `.version`,
+/// handed to every target as `build_options.version` and re-exported by
+/// `src/version.zig`. `dist/PKGBUILD`'s `pkgver()` greps the same line.
+const semver = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
@@ -80,6 +85,7 @@ pub fn build(b: *std.Build) void {
 
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
+    glib_opts.addOption([]const u8, "version", semver);
     glib_opts.addOption([]const u8, "commit", git_commit);
     glib_opts.addOption([]const u8, "commit_date", git_date);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
@@ -90,6 +96,7 @@ pub fn build(b: *std.Build) void {
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
+    noglib_opts.addOption([]const u8, "version", semver);
     noglib_opts.addOption([]const u8, "commit", git_commit);
     noglib_opts.addOption([]const u8, "commit_date", git_date);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
@@ -218,6 +225,7 @@ pub fn build(b: *std.Build) void {
     // mux`; portable stays the lowest-common-denominator artifact.
     const portable_opts = b.addOptions();
     portable_opts.addOption(bool, "glib", false);
+    portable_opts.addOption([]const u8, "version", semver);
     portable_opts.addOption([]const u8, "commit", git_commit);
     portable_opts.addOption([]const u8, "commit_date", git_date);
     portable_opts.addOption(bool, "winstream_sck", false);
