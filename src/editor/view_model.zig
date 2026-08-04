@@ -22,6 +22,8 @@ const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
 const unicode = @import("unicode.zig");
 
+/// Fallback tab width for callers with no config (tests). The GTK face
+/// passes `Config.editor_tab_width`.
 pub const TAB_WIDTH: usize = 4;
 
 pub const LineBounds = struct {
@@ -192,11 +194,14 @@ pub fn insertNewlineIndent(alloc: Allocator, doc: *Document, sels: *SelectionSet
     try replaceSelections(alloc, doc, sels, texts.items);
 }
 
-/// Tab: spaces to the next TAB_WIDTH stop, counted in bytes from the
-/// line start (naive — a config-driven, column-aware version comes
-/// later).
-pub fn insertTabStop(alloc: Allocator, doc: *Document, sels: *SelectionSet) !void {
+/// Tab: with `spaces`, pad to the next `width` stop counted in BYTES
+/// from the line start (naive: a line already containing tabs or wide
+/// characters pads by byte column, not by rendered column); otherwise
+/// insert one literal tab.
+pub fn insertTabStop(alloc: Allocator, doc: *Document, sels: *SelectionSet, width: usize, spaces: bool) !void {
     if (sels.sels.items.len == 0) return;
+    if (!spaces) return insertText(alloc, doc, sels, "\t");
+    const w = @max(1, width);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -204,7 +209,7 @@ pub fn insertTabStop(alloc: Allocator, doc: *Document, sels: *SelectionSet) !voi
     for (sels.sels.items) |s| {
         const lb = lineBoundsAt(doc, s.start());
         const col = s.start() - lb.start;
-        const n = TAB_WIDTH - (col % TAB_WIDTH);
+        const n = w - (col % w);
         const t = try a.alloc(u8, n);
         @memset(t, ' ');
         try texts.append(a, t);
@@ -463,10 +468,23 @@ test "view_model tab stops pad to the next multiple" {
     defer doc.deinit();
     var sels = try SelectionSet.initSingle(a, Selection.caret(2));
     defer sels.deinit(a);
-    try insertTabStop(a, &doc, &sels);
+    try insertTabStop(a, &doc, &sels, TAB_WIDTH, true);
     try expectText(&doc, "ab  ");
-    try insertTabStop(a, &doc, &sels);
+    try insertTabStop(a, &doc, &sels, TAB_WIDTH, true);
     try expectText(&doc, "ab      ");
+}
+
+test "view_model tab honours width and literal-tab mode" {
+    const a = testing.allocator;
+    var doc = try docOf("ab");
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, Selection.caret(2));
+    defer sels.deinit(a);
+    try insertTabStop(a, &doc, &sels, 8, true);
+    try expectText(&doc, "ab      "); // 6 spaces to column 8
+    try insertTabStop(a, &doc, &sels, 8, false);
+    try expectText(&doc, "ab      \t");
+    try testing.expectEqual(@as(usize, 9), sels.primary().head);
 }
 
 test "view_model select all, collapse, clamp" {

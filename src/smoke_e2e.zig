@@ -251,6 +251,49 @@ pub fn main() u8 {
         }
         if (!saved) return fail("editor save never produced the expected file content");
 
+        // Editor V2 chords that ARE drivable over IPC: newline, soft
+        // wrap toggle (Alt+Z), and the document-edge jumps that go
+        // through the anchored scroll path. Ctrl+F opens a GTK entry
+        // and is not scriptable here — the Xvfb session covers it.
+        {
+            const chords = [_][]const u8{ "enter", "alt+z", "ctrl+home", "ctrl+end" };
+            for (chords) |ch| {
+                if (std.mem.eql(u8, ch, "enter")) {
+                    const r0 = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"enter\"}}\n", .{epane}) catch return fail("fmt");
+                    const p0 = roundtrip(allocator, sock_path, r0) orelse return fail("editor enter roundtrip");
+                    defer allocator.free(p0);
+                    if (std.mem.indexOf(u8, p0, "\"ok\":true") == null) return fail("editor enter not ok");
+                    const r1 = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"second line\"}}\n", .{epane}) catch return fail("fmt");
+                    const p1 = roundtrip(allocator, sock_path, r1) orelse return fail("editor second-line roundtrip");
+                    defer allocator.free(p1);
+                    if (std.mem.indexOf(u8, p1, "\"ok\":true") == null) return fail("editor second-line not ok");
+                    continue;
+                }
+                var cbuf: [256]u8 = undefined;
+                const rq = std.fmt.bufPrint(&cbuf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ epane, ch }) catch return fail("fmt");
+                const rp = roundtrip(allocator, sock_path, rq) orelse return fail("editor chord roundtrip");
+                defer allocator.free(rp);
+                if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return fail("editor chord not ok");
+            }
+            const kreq2 = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return fail("fmt");
+            const kresp2 = roundtrip(allocator, sock_path, kreq2) orelse return fail("editor second save roundtrip");
+            defer allocator.free(kresp2);
+            var saved2 = false;
+            var t2: u32 = 0;
+            while (t2 < 50) : (t2 += 1) {
+                _ = c.usleep(200_000);
+                const f = c.fopen(efile.ptr, "rb") orelse continue;
+                var content: [64]u8 = undefined;
+                const n = c.fread(&content, 1, content.len, f);
+                _ = c.fclose(f);
+                if (std.mem.eql(u8, content[0..n], "hello editor\nsecond line")) {
+                    saved2 = true;
+                    break;
+                }
+            }
+            if (!saved2) return fail("editor wrap/edge chord sequence did not round-trip through a save");
+        }
+
         const creq = std.fmt.bufPrint(&treq_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{epane}) catch return fail("fmt");
         const cresp = roundtrip(allocator, sock_path, creq) orelse return fail("editor close roundtrip");
         defer allocator.free(cresp);

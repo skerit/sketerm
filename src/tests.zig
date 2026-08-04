@@ -199,8 +199,10 @@ comptime {
     _ = @import("editor/unicode.zig");
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
+    _ = @import("editor/search.zig");
     _ = @import("render/editor_font.zig");
     _ = @import("render/editor_layout.zig");
+    _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
 }
 

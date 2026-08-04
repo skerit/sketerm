@@ -22,6 +22,7 @@ comptime {
     _ = @import("editor/unicode.zig");
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
+    _ = @import("editor/search.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");

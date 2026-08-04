@@ -17,6 +17,8 @@ const layout_mod = @import("render/editor_layout.zig");
 const Layout = layout_mod.Layout;
 const editor_pass = @import("render/editor_pass.zig");
 const EditorPass = editor_pass.EditorPass;
+const viewport_mod = @import("render/editor_viewport.zig");
+const search = @import("editor/search.zig");
 const Document = @import("editor/document.zig").Document;
 const tr = @import("editor/transaction.zig");
 const sel_mod = @import("editor/selection.zig");
@@ -329,10 +331,32 @@ pub fn main() !u8 {
     defer pass.releaseGL();
 
     const colors = editor_pass.Colors{};
-    const view = editor_pass.View{ .width_px = @floatFromInt(W), .height_px = @floatFromInt(H) };
+    const view = editor_pass.View{
+        .width_px = @floatFromInt(W),
+        .height_px = @floatFromInt(H),
+        .highlight_current_line = true,
+    };
+    // Find-bar matches: highlighted through the pass's bg kind, the
+    // current one emphasized.
+    const matches = try search.findAll(allocator, &doc, "the", .{});
+    defer allocator.free(matches);
+    std.debug.print("smoke-editor: literal search \"the\" matches={d}\n", .{matches.len});
+    if (matches.len < 3) {
+        std.debug.print("smoke-editor: FAIL — search found too few matches\n", .{});
+        return 8;
+    }
+    const frame = editor_pass.Frame{
+        .layout = &layout,
+        .doc = &doc,
+        .sels = &sels,
+        .colors = colors,
+        .view = view,
+        .matches = matches,
+        .current_match = 0,
+    };
 
     const t_build0 = nowNs();
-    try pass.buildFrame(&layout, &doc, &sels, colors, view);
+    try pass.buildFrame(frame);
     const t_build1 = nowNs();
     const n_instances = pass.instances.items.len;
 
@@ -343,7 +367,7 @@ pub fn main() !u8 {
     // Steady-state: second build+draw with hot caches.
     const t_draw2a = nowNs();
     c.glClear(c.GL_COLOR_BUFFER_BIT);
-    try pass.buildFrame(&layout, &doc, &sels, colors, view);
+    try pass.buildFrame(frame);
     pass.draw(atlas, W, H);
     c.glFinish();
     const t_draw2b = nowNs();
@@ -356,6 +380,7 @@ pub fn main() !u8 {
     var lit: usize = 0;
     var sel_px: usize = 0;
     var caret_px: usize = 0;
+    var match_px: usize = 0;
     {
         var i: usize = 0;
         while (i < fb_bytes) : (i += 4) {
@@ -365,14 +390,21 @@ pub fn main() !u8 {
             if (r > 0x40 and g > 0x40) lit += 1;
             // Selection blue (0.20,0.35,0.60 over dark bg) — blue-dominant.
             if (b > 0x60 and b > r + 0x20 and b > g + 0x18) sel_px += 1;
-            // Caret red (0.95,0.35,0.25) — red-dominant.
-            if (r > 0xB0 and r > b + 0x50 and g < 0x90) caret_px += 1;
+            // Caret red (0.95,0.35,0.25) — red-dominant, green close to blue.
+            if (r > 0xB0 and r > b + 0x50 and g < 0x90 and g < b + 0x28) caret_px += 1;
+            // Match amber (0.85,0.72,0.25 blended) — green clearly
+            // above blue, which no other element does.
+            if (r > 0x50 and g > b + 0x28 and r > b + 0x40) match_px += 1;
         }
     }
     std.debug.print(
-        "smoke-editor: instances={d} lit_pixels={d} selection_pixels={d} caret_pixels={d}\n",
-        .{ n_instances, lit, sel_px, caret_px },
+        "smoke-editor: instances={d} lit_pixels={d} selection_pixels={d} caret_pixels={d} match_pixels={d}\n",
+        .{ n_instances, lit, sel_px, caret_px, match_px },
     );
+    if (match_px < 100) {
+        std.debug.print("smoke-editor: FAIL — find-match highlights not rendered\n", .{});
+        return 8;
+    }
     if (lit < 2000) {
         std.debug.print("smoke-editor: FAIL — too few lit pixels, text not rendered\n", .{});
         return 6;
@@ -404,6 +436,112 @@ pub fn main() !u8 {
         return 7;
     }
     std.debug.print("smoke-editor: wrote {s}\n", .{png_path});
+
+    // --- Viewport anchoring on a ~200k-line document -------------------
+    // The V1 renderer laid out every line from 0 to the viewport
+    // bottom; jumping to the end therefore cost O(document). Assert the
+    // frame is O(viewport) both with wrap off (arithmetic anchor) and
+    // wrap on (estimated row index).
+    {
+        var big_text: std.ArrayList(u8) = .empty;
+        defer big_text.deinit(allocator);
+        const BIG_LINES: usize = 200_000;
+        var lbuf: [96]u8 = undefined;
+        var li: usize = 0;
+        while (li < BIG_LINES) : (li += 1) {
+            const s = try std.fmt.bufPrint(
+                &lbuf,
+                "line {d}: the quick brown fox jumps over the lazy dog\n",
+                .{li},
+            );
+            try big_text.appendSlice(allocator, s);
+        }
+        var big = try Document.initFromBytes(allocator, big_text.items);
+        defer big.deinit();
+        const big_lines = big.rope.lineCount();
+        std.debug.print(
+            "smoke-editor: big document lines={d} bytes={d}\n",
+            .{ big_lines, big_text.items.len },
+        );
+
+        var big_sels = try SelectionSet.initSingle(allocator, Selection.caret(0));
+        defer big_sels.deinit(allocator);
+        var rows = viewport_mod.RowIndex.init(allocator);
+        defer rows.deinit();
+
+        const line_h: f32 = @floatFromInt(atlas.cell_h);
+        const viewport_rows: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(H)) / line_h));
+        // Generous ceiling: the visible rows plus the partially
+        // scrolled one. Anything O(document) blows past it by 4 orders.
+        const budget = viewport_rows + 4;
+
+        inline for (.{ false, true }) |wrap| {
+            var blayout = Layout.init(allocator, &book);
+            defer blayout.deinit();
+            if (wrap) blayout.wrap_width = 300;
+            rows.reset(wrap, big_lines);
+
+            var bview = editor_pass.View{
+                .width_px = @floatFromInt(W),
+                .height_px = @floatFromInt(H),
+            };
+            // Top of the document: cheap either way.
+            var t0 = nowNs();
+            try pass.buildFrame(.{
+                .layout = &blayout,
+                .doc = &big,
+                .sels = &big_sels,
+                .view = bview,
+                .rows = &rows,
+            });
+            var t1 = nowNs();
+            const top_lines = pass.lines_laid_out;
+            const top_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+
+            // Jump to the very end — the case that used to be O(n).
+            const total_rows = rows.totalRows(big_lines);
+            bview.anchor = rows.anchorAtRow(big_lines, total_rows -| viewport_rows);
+            t0 = nowNs();
+            try pass.buildFrame(.{
+                .layout = &blayout,
+                .doc = &big,
+                .sels = &big_sels,
+                .view = bview,
+                .rows = &rows,
+            });
+            t1 = nowNs();
+            const end_lines = pass.lines_laid_out;
+            const end_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+            std.debug.print(
+                "smoke-editor: anchored frame wrap={} top(lines={d} {d:.2}ms) end(lines={d} {d:.2}ms) budget={d}\n",
+                .{ wrap, top_lines, top_ms, end_lines, end_ms, budget },
+            );
+            if (top_lines > budget or end_lines > budget) {
+                std.debug.print("smoke-editor: FAIL — frame laid out more lines than the viewport holds\n", .{});
+                return 9;
+            }
+            if (bview.anchor.line < big_lines / 2) {
+                std.debug.print("smoke-editor: FAIL — end anchor did not reach the document tail\n", .{});
+                return 9;
+            }
+
+            // The V1 cost, for the record: laying out every line above
+            // the anchor is what the absolute-scroll_y renderer did on
+            // this exact jump. Off by default — it takes seconds.
+            if (c.getenv("SKETERM_EDITOR_BASELINE") != null) {
+                blayout.invalidateAll();
+                const b0 = nowNs();
+                var k: usize = 0;
+                while (k <= bview.anchor.line) : (k += 1) _ = try blayout.line(&big, k);
+                const b1 = nowNs();
+                std.debug.print(
+                    "smoke-editor: BASELINE wrap={} prefix layout of {d} lines = {d:.1}ms\n",
+                    .{ wrap, bview.anchor.line + 1, @as(f64, @floatFromInt(b1 - b0)) / 1e6 },
+                );
+                blayout.invalidateAll();
+            }
+        }
+    }
 
     std.debug.print(
         "smoke-editor: timing layout(cold)={d:.2}ms layout(cached)={d:.3}ms build={d:.2}ms draw(first)={d:.2}ms frame(steady)={d:.2}ms for {d} glyphs / {d} lines\n",
