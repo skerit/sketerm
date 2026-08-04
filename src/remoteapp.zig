@@ -125,13 +125,29 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
 /// The session runs whether or not a viewer renders it; say so
 /// plainly instead of letting "no window here" read as "it failed".
-fn headlessNotice(name: []const u8, host: []const u8) void {
+///
+/// `wayland` distinguishes the two host kinds: a Linux daemon forwards
+/// surfaces from the session's own Wayland display, a macOS one has no
+/// Wayland at all and streams captured window pixels. Claiming the
+/// Wayland one unconditionally describes an architecture the Mac host
+/// does not have.
+fn headlessNotice(name: []const u8, host: []const u8, wayland: bool) void {
+    const backend = if (wayland)
+        "against its own Wayland display"
+    else
+        "and its windows stream as captured pixels (this host has no Wayland)";
     std.debug.print(
-        "sketerm app: '{s}' is running HEADLESS on {s} against its own Wayland display (no sketerm window here to render into).\n" ++
+        "sketerm app: '{s}' is running HEADLESS on {s} {s} (no sketerm window here to render into).\n" ++
             "  Attach later:   sketerm mux {s} attach {s}\n" ++
             "  Still running?  sketerm mux {s} list   (an instant exit usually means the command failed on the host — cwd is the daemon's own, normally $HOME, and the env is minimal there, so use host-absolute paths)\n",
-        .{ name, host, host, name, host },
+        .{ name, host, backend, host, name, host },
     );
+    if (!wayland) {
+        std.debug.print(
+            "  On a Mac host:  Apple's OWN apps (Calculator, TextEdit, Safari, …) are SIGKILLed the instant they are started this way — macOS launch constraints refuse to let them be an ordinary child process. Use a third-party or self-built binary as the capture target.\n",
+            .{},
+        );
+    }
 }
 
 /// Spawn an app session over the chosen transport, then have the
@@ -178,6 +194,15 @@ fn runNativeApp(
         errMsg("daemon on {s} refused the app session", .{remote.host});
         return 1;
     };
+    // Which backend will render this session? The spawn reply carries
+    // the session's Wayland display path; a macOS daemon has none and
+    // captures window pixels instead. Read it before the frame dies.
+    const Spawned = struct { wl_display: []const u8 = "" };
+    var wayland = true;
+    if (std.json.parseFromSlice(Spawned, allocator, ok.payload, .{ .ignore_unknown_fields = true })) |sp| {
+        defer sp.deinit();
+        wayland = sp.value.wl_display.len > 0 and !std.mem.eql(u8, sp.value.wl_display, "-");
+    } else |_| {}
     ok.deinit(allocator);
 
     if (headless) {
@@ -191,7 +216,7 @@ fn runNativeApp(
     if (ipc_client.resolveSocket(allocator, null)) |gui_sock| {
         allocator.free(gui_sock);
     } else {
-        headlessNotice(name, host_spec);
+        headlessNotice(name, host_spec, wayland);
         return 0;
     }
 
@@ -203,7 +228,7 @@ fn runNativeApp(
         // running sketerm window found", or "attach failed: no such
         // session"); the session itself is unaffected by a failed
         // viewer attach.
-        headlessNotice(name, attach_host);
+        headlessNotice(name, attach_host, wayland);
         return 0;
     }
     std.debug.print("sketerm: app session '{s}' on {s} over {s} — windows render via the sketerm GUI\n", .{ name, remote.host, @tagName(conn.transport) });
