@@ -288,6 +288,20 @@ pub const Conn = struct {
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
+            // Detach stdio before exec. The daemon outlives the client
+            // that autostarted it, so inheriting its stdout/stderr wedges
+            // any pipeline or $(...) that client sits in: the shell waits
+            // for EVERY writer to close the pipe and the daemon never
+            // does, so `sketerm mux spawn x | cat` hangs forever the one
+            // time it also has to start the daemon. Nothing is lost —
+            // lifecycle and warnings go to mux.log either way.
+            const devnull = c.open("/dev/null", c.O_RDWR);
+            if (devnull >= 0) {
+                _ = c.dup2(devnull, 0);
+                _ = c.dup2(devnull, 1);
+                _ = c.dup2(devnull, 2);
+                if (devnull > 2) _ = c.close(devnull);
+            }
             var bin_buf: [4096:0]u8 = undefined;
             const bin = findMuxBinary(&bin_buf);
             var argv: [5:null]?[*:0]const u8 = .{ bin, null, null, null, null };
