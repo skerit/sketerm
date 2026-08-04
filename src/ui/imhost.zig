@@ -5,8 +5,9 @@
 //! sequence — create context, set_client_widget, connect commit +
 //! preedit-*, hand it to the GtkEventControllerKey, drive focus_in/out
 //! from a focus controller, debounce set_cursor_location, and sever the
-//! whole thing while the client widget is still alive — and they had
-//! drifted apart in exactly the ways that break input.
+//! whole thing without tripping over GTK's dangling client-widget
+//! pointer — and they had drifted apart in exactly the ways that break
+//! input.
 //!
 //! GUI-only: register in `src/tests.zig`, never `tests_core.zig`.
 
@@ -188,6 +189,9 @@ pub const ImHost = struct {
     cbs: Callbacks = .{},
     /// The widget the IM context reports as its client. Kept so the
     /// probe hook can find the ImHost of the focused face.
+    ///
+    /// STRONGLY REFERENCED for the whole life of the host — see
+    /// `attach`/`detach`. This is what makes a late `detach` safe.
     client_widget: ?*c.GtkWidget = null,
     ctrls: [MAX_CTRLS]?*c.GtkEventControllerKey = @splat(null),
     n_ctrls: usize = 0,
@@ -208,6 +212,9 @@ pub const ImHost = struct {
     /// own GtkEventControllerFocus — GtkEventControllerKey does NOT
     /// drive them, and without focus_in Wayland text-input-v3 never
     /// enables, so no IME ever composes.
+    ///
+    /// Takes a STRONG reference on `widget`, released by `detach` —
+    /// see the ownership note there.
     pub fn attach(
         allocator: std.mem.Allocator,
         widget: ?*c.GtkWidget,
@@ -231,7 +238,10 @@ pub const ImHost = struct {
             .multi => c.gtk_im_multicontext_new(),
         });
         self.im = im;
-        if (widget) |w| c.gtk_im_context_set_client_widget(im, w);
+        if (widget) |w| {
+            _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(w)));
+            c.gtk_im_context_set_client_widget(im, w);
+        }
 
         // All three preedit signals, deliberately: connecting only
         // `preedit-changed` (as the terminal used to) leaves stale
@@ -301,18 +311,36 @@ pub const ImHost = struct {
         c.gtk_im_context_set_cursor_location(im, &r);
     }
 
-    /// Sever the IM context from its client widget and drop our ref.
+    /// Sever the IM context from its client widget and drop both refs.
     /// Idempotent.
     ///
-    /// MUST run while the client widget is still a live GObject —
-    /// from the face's prepare-destroy / the GL area's ::destroy, and
-    /// never as late as `deinit`. A multicontext's
-    /// `set_client_widget(NULL)` reaches into the widget's GtkSettings,
-    /// which criticals (or worse) against a finalized widget. The IM
-    /// context is not owned by the widget tree, so it can also still
-    /// emit `commit`/`preedit-changed` (fcitx5/ibus route
+    /// `set_client_widget(NULL)` on a GtkIMMulticontext walks the OLD
+    /// client widget (`gtk_widget_get_settings`, then a handler
+    /// disconnect on those settings) — so the widget has to be a live
+    /// GObject at that instant or GTK criticals against a dangling
+    /// pointer. That used to be a rule every face had to honour by
+    /// calling `detach` early enough, and it was unkeepable: the
+    /// Wayland IM module `g_set_object`s the client widget, so the IM
+    /// itself frequently holds the LAST reference to it. The widget's
+    /// ::destroy — the very hook a face uses to sever in time — then
+    /// cannot fire until the IM lets go, and the sever always happened
+    /// too late by construction.
+    ///
+    /// So the ImHost OWNS a reference to its client widget instead
+    /// (taken in `attach`) and releases it here, AFTER the sever. The
+    /// widget is therefore alive for every `detach`, whenever it runs
+    /// and from whichever teardown path — no ordering rule left to get
+    /// wrong.
+    ///
+    /// The IM context is not owned by the widget tree, so it can also
+    /// still emit `commit`/`preedit-changed` (fcitx5/ibus route
     /// asynchronously through D-Bus) after the widget dies — which is
     /// why the signal handlers go first.
+    ///
+    /// Dropping our widget reference is the LAST thing done: it can
+    /// finalize the widget, which re-enters the face's ::destroy
+    /// handler, and that handler routinely calls back into `detach`.
+    /// `self.im` is already null by then, so the re-entry is a no-op.
     pub fn detach(self: *ImHost) void {
         const im = self.im orelse return;
         self.im = null;
@@ -335,13 +363,16 @@ pub const ImHost = struct {
         );
         c.gtk_im_context_set_client_widget(im, null);
         c.g_object_unref(im_obj);
+        const widget = self.client_widget;
         self.client_widget = null;
+        if (widget) |w| c.g_object_unref(@as(?*anyopaque, @ptrCast(w)));
     }
 
     /// Detach (if the owner has not already) and free. The owning face
-    /// must have severed callbacks first — an ImHost holds a raw ctx
-    /// pointer into its face, exactly the deferred-callback holder the
-    /// clearSinks discipline exists for.
+    /// must null its own pointer to this host BEFORE calling — an
+    /// ImHost holds a raw ctx pointer into its face, exactly the
+    /// deferred-callback holder the clearSinks discipline exists for,
+    /// and `detach` can re-enter the face's ::destroy handler.
     pub fn deinit(self: *ImHost) void {
         self.detach();
         unregister(self);

@@ -553,6 +553,18 @@ const PasteCtx = struct {
     fence: *Fence,
 };
 
+/// One frame's worth of scrollbar geometry. Vertical values are in
+/// ESTIMATED rows, horizontal ones in pixels.
+const ScrollGeom = struct {
+    v_value: f64,
+    v_upper: f64,
+    v_page: f64,
+    h_value: f64,
+    h_upper: f64,
+    h_page: f64,
+    want_h: bool,
+};
+
 pub const EditorView = struct {
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
@@ -562,8 +574,10 @@ pub const EditorView = struct {
     tabhost: TabHost = undefined,
     area: *c.GtkGLArea = undefined,
     status_label: *c.GtkLabel = undefined,
-    /// Shared IM plumbing (compose / dead keys / IME). Severed in
-    /// prepareDestroy / the area's ::destroy — see ImHost.detach.
+    /// Shared IM plumbing (compose / dead keys / IME). Severed at the
+    /// first sign of teardown, and unconditionally by `deinit` — the
+    /// host keeps its client widget alive on its own (ImHost.detach),
+    /// so no call site owns an ordering rule.
     im: ?*imhost.ImHost = null,
     widgets_dead: bool = false,
 
@@ -575,6 +589,13 @@ pub const EditorView = struct {
     /// True while WE are writing an adjustment — its value-changed
     /// handler must not treat that as a user drag.
     sb_guard: bool = false,
+    /// Scrollbar geometry queued by the render pass, applied from an
+    /// idle (see syncScrollbars). `sb_applied` is the last state
+    /// actually pushed into the adjustments, so an unchanged frame
+    /// queues nothing.
+    sb_pending: ?ScrollGeom = null,
+    sb_applied: ?ScrollGeom = null,
+    sb_source: c_uint = 0,
 
     // Find/replace bar.
     find_bar: *c.GtkWidget = undefined,
@@ -970,26 +991,37 @@ pub const EditorView = struct {
         self.deinit();
     }
 
-    fn prepareDestroyCb(ctx: *anyopaque) void {
+    /// Phase 1 of the pane's two-phase teardown (`Pane.severFaces`).
+    ///
+    /// `widgets_dead` is the pane telling us whether our widget subtree
+    /// is still up. It is TRUE only on the last-resort sever from the
+    /// deferred `Pane.deinit`; the ordinary paths sever while the tree
+    /// is alive, which is the only time the AdwTabView shortcut restore
+    /// below can (or may) run — `ownerWindow()` walks `root_box`.
+    fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
-        // Before widgets_dead: ownerWindow() stops resolving after it.
+        self.widgets_dead = self.widgets_dead or widgets_dead;
+        // No-ops itself (through ownerWindow) once widgets_dead is set,
+        // which is why the pane's verdict has to be folded in first and
+        // our own unconditional `= true` comes after.
         self.suppressTabViewEdgeKeys(false);
         self.widgets_dead = true;
         self.stopBlink();
-        // Sever the IM context here, not in deinit: a multicontext's
-        // set_client_widget(NULL) reaches into the client widget's
-        // settings, and by deinit the GLArea can already be finalized
-        // (GTK criticals, then a NULL instance in the disconnect).
+        self.stopScrollbarSync();
         self.detachIm();
     }
 
     /// The GLArea can die without detachEditor running (whole-window
-    /// teardown); its destroy is the last moment the IM context's
-    /// client widget is still a live GObject.
+    /// teardown). Nothing here has to beat the widget's finalize any
+    /// more — ImHost owns a reference to its client widget, so a
+    /// detach from `deinit` is just as safe — but severing at the
+    /// first sign of teardown still keeps the IM from delivering
+    /// commits into a face that is on its way out.
     fn onAreaDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
         self.widgets_dead = true;
         self.stopBlink();
+        self.stopScrollbarSync();
         self.detachIm();
     }
 
@@ -1010,6 +1042,7 @@ pub const EditorView = struct {
     pub fn deinit(self: *EditorView) void {
         self.fence.close();
         self.stopBlink();
+        self.stopScrollbarSync();
         self.clearPreedit();
         self.detachIm();
         for (self.tabs.items) |t| t.destroy();
@@ -1879,6 +1912,18 @@ pub const EditorView = struct {
 
     // ---- scrollbars ---------------------------------------------------
 
+    /// Compute the scrollbar geometry for the frame being rendered and
+    /// queue it for application OUTSIDE the frame.
+    ///
+    /// The caller is the GtkGLArea ::render handler, i.e. we are inside
+    /// GTK's snapshot pass. Touching the adjustments there is illegal:
+    /// `gtk_adjustment_configure` makes GtkRange invalidate its slider's
+    /// allocation, and the same snapshot then walks into a slider gizmo
+    /// that has no allocation any more ("Trying to snapshot GtkGizmo
+    /// without a current allocation" — and a frame of missing
+    /// scrollbar). Same reason the horizontal scrollbar's `set_visible`
+    /// was already change-guarded; the adjustments need the same care,
+    /// which they can only get by moving off the render pass entirely.
     fn syncScrollbars(self: *EditorView, tab: *ETab, view_w: f32, view_h: f32) void {
         if (self.widgets_dead) return;
         const line_h = self.lineHeight();
@@ -1887,18 +1932,49 @@ pub const EditorView = struct {
         const total: f64 = @floatFromInt(tab.rows.totalRows(n_lines));
         const page: f64 = @max(1.0, @as(f64, view_h / line_h));
         const value: f64 = @floatFromInt(viewport_mod.anchorRow(&tab.rows, tab.anchor));
-        self.sb_guard = true;
-        c.gtk_adjustment_configure(self.vadj, value, 0, @max(total, page), 1, @max(1.0, page - 1), page);
         // Horizontal: only meaningful with wrap off.
         const text_w: f64 = @max(1.0, view_w - self.pass.text_origin_x - tab.scroll_x);
         const hupper: f64 = @max(@as(f64, tab.max_width + 40), text_w);
-        c.gtk_adjustment_configure(self.hadj, tab.scroll_x, 0, hupper, 20, text_w * 0.9, text_w);
+        const geom: ScrollGeom = .{
+            .v_value = value,
+            .v_upper = @max(total, page),
+            .v_page = page,
+            .h_value = tab.scroll_x,
+            .h_upper = hupper,
+            .h_page = text_w,
+            .want_h = !tab.wrap and hupper > text_w + 1,
+        };
+        if (self.sb_applied) |old| {
+            if (std.meta.eql(old, geom)) return;
+        }
+        self.sb_pending = geom;
+        if (self.sb_source == 0)
+            self.sb_source = c.g_idle_add(@ptrCast(&applyScrollbars), @ptrCast(self));
+    }
+
+    fn applyScrollbars(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(EditorView, user);
+        self.sb_source = 0;
+        const geom = self.sb_pending orelse return 0;
+        self.sb_pending = null;
+        if (self.widgets_dead) return 0;
+        self.sb_guard = true;
+        c.gtk_adjustment_configure(self.vadj, geom.v_value, 0, geom.v_upper, 1, @max(1.0, geom.v_page - 1), geom.v_page);
+        c.gtk_adjustment_configure(self.hadj, geom.h_value, 0, geom.h_upper, 20, geom.h_page * 0.9, geom.h_page);
         self.sb_guard = false;
-        // Only when it CHANGES: this runs inside the render handler, and
-        // an unconditional set_visible queues a resize every frame.
-        const want_h = !tab.wrap and hupper > text_w + 1;
-        if ((c.gtk_widget_get_visible(self.hscroll) != 0) != want_h)
-            c.gtk_widget_set_visible(self.hscroll, if (want_h) 1 else 0);
+        if ((c.gtk_widget_get_visible(self.hscroll) != 0) != geom.want_h)
+            c.gtk_widget_set_visible(self.hscroll, if (geom.want_h) 1 else 0);
+        self.sb_applied = geom;
+        return 0;
+    }
+
+    /// Drop the queued scrollbar update — it carries a raw *EditorView.
+    fn stopScrollbarSync(self: *EditorView) void {
+        if (self.sb_source != 0) {
+            _ = c.g_source_remove(self.sb_source);
+            self.sb_source = 0;
+        }
+        self.sb_pending = null;
     }
 
     fn onVAdjChanged(adj: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {

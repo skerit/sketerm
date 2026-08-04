@@ -12286,3 +12286,51 @@ that walks a real daemon through atomic rewrite / in-place rewrite /
 chmod / symlink / delete / recreate, and a `smoke-e2e` stage asserting
 the clean-buffer auto-reload after an external `rename()` over the
 open file.
+
+## Shared IM host: one input-method path, configurable strategy
+
+**The bug.** On any Wayland display advertising
+`zwp_text_input_manager_v3`, GTK resolves a `GtkIMMulticontext` to its
+`wayland` module — which derives from `GtkIMContext`, not
+`GtkIMContextSimple`, carries no compose engine, and only commits
+`gdk_keyval_to_unicode(keyval)` (0 for every dead keysym). The editor
+canvas and the forwarded-app host IM were both unconditional
+multicontexts, so `^`+`e` produced `e` there while the terminal (a
+`GtkIMContextSimple`) composed `ê` correctly. The editor's original
+verification was a false green: it ran under Xvfb, where a
+multicontext falls back to Simple. GtkGraphicsOffload, blamed in an
+earlier comment, has nothing to do with it.
+
+**`src/ui/imhost.zig`** is now the single implementation: create the
+context, `set_client_widget`, connect commit + all three preedit
+signals, install on the `GtkEventControllerKey`, `focusIn`/`focusOut`
+for the owner's focus controller to call, a DEBOUNCED
+`setCursorLocation`, and an idempotent `detach()` that must run while
+the client widget is still alive. It owns the
+`get_preedit_string`/`g_free`/`pango_attr_list_unref` dance once and
+hands consumers a borrowed slice plus a CHARACTER cursor.
+
+**`input_method = auto | simple | multi`** picks the strategy. There is
+no value that gives both dead keys and CJK input methods, so the key
+documents the trade. `auto` resolves to `multi` only where the session
+declares an input method (`$GTK_IM_MODULE` / the `gtk-im-module`
+GtkSettings property naming something other than none/simple).
+Deliberate asymmetry: the TERMINAL always resolves to `simple` under
+`auto` (its dead-key behaviour is load-bearing), while the editor and
+the app-host IM follow the heuristic. Explicit values override every
+face.
+
+**Behaviour gained.** The terminal connects `preedit-start`/`-end` for
+the first time (a cancelled composition no longer leaves stale text);
+the editor gains the cursor-location debounce (that call can be a
+D-Bus round trip); the forwarded-app host gains `focus_in`/`focus_out`
+and composes dead keys itself instead of depending on the host
+compositor's IME.
+
+**Testable forever.** `sketerm cli im-probe <hwcodes>` feeds hardware
+keycodes through the FOCUSED face's IM (`gtk_im_context_filter_key`,
+the way `GtkEventControllerKey` does) and reports what it committed —
+`send-text`/`send-keys` bypass the IM entirely, so this was previously
+unmeasurable without a human at a keyboard. Verified inside a sketerm
+display session (`sketerm-mux display create --kb-layout be`, which is
+a real text-input-v3 Wayland display), NOT under Xvfb.

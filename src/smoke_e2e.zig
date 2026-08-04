@@ -36,6 +36,11 @@ const KEY_MARKER = "sketerm-e2e-keyed-9317";
 
 /// The display session the GUI renders into.
 const DISPLAY_SESSION = "e2e-display";
+/// A SECOND display session, on a Belgian (AZERTY) keymap, for the
+/// dead-key stage. It needs its own session because a session's keymap
+/// is fixed at creation, and its own GUI instance because that one must
+/// run WITHOUT `GTK_IM_MODULE=wayland` — see `deadKeyStage`.
+const DEADKEY_SESSION = "e2e-deadkey";
 /// Backstop against orphans: even a SIGKILLed harness leaves nothing
 /// behind past this, because the daemon reaps a session with no
 /// attached viewer.
@@ -47,6 +52,10 @@ var daemon_pid: c.pid_t = 0;
 /// GUI renders into. null on macOS (no hub) — see the module docs.
 var drive: ?*appdrive.App = null;
 var display_ready = false;
+/// Same three, for the Belgian-layout dead-key session.
+var dk_pid: c.pid_t = 0;
+var dk_drive: ?*appdrive.App = null;
+var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
 var g_mux_sock: []const u8 = "";
 
@@ -54,6 +63,7 @@ var g_mux_sock: []const u8 = "";
 /// by exact pid — never by name. Idempotent: the success path and
 /// every `fail` go through it.
 fn teardown() void {
+    dkTeardown();
     if (drive) |app| {
         // detach, not kill: the session is destroyed by name below, so
         // a half-torn-down client never decides that for us.
@@ -77,6 +87,27 @@ fn teardown() void {
         var status: c_int = 0;
         _ = c.waitpid(daemon_pid, &status, 0);
         daemon_pid = 0;
+    }
+}
+
+/// Tear down only the dead-key stage's GUI, viewer and session — by
+/// exact pid and by name, like `teardown` itself. Idempotent, so the
+/// stage's own early returns and the global teardown share it.
+fn dkTeardown() void {
+    if (dk_drive) |app| {
+        app.detach();
+        dk_drive = null;
+    }
+    if (dk_pid > 0) {
+        _ = c.kill(dk_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(dk_pid, &status, 0);
+        dk_pid = 0;
+    }
+    if (dk_ready and g_mux_sock.len > 0) {
+        const r = runDisplayCli(g_alloc, &.{ "destroy", DEADKEY_SESSION, "--socket", g_mux_sock });
+        g_alloc.free(r.out);
+        dk_ready = false;
     }
 }
 
@@ -503,6 +534,14 @@ pub fn main() u8 {
         if (std.mem.indexOf(u8, after_editor, "\"ok\":true") == null) return fail("GUI unhealthy after editor close");
     }
 
+    // 6d. Dead keys, composed by a real seat on a Belgian keymap, in
+    // the terminal AND in the editor. Its own session + GUI — see
+    // deadKeyStage for why neither can be shared with the stages above.
+    if (!platform.is_macos) {
+        if (deadKeyStage(allocator, rt, mux_sock)) |why| return failMsg(why);
+        say("dead keys composed on a Belgian seat: '^'+'e' -> 'e-circumflex' in both the terminal and the editor");
+    }
+
     // 7. A stale SKETERM_PANE_ID (the GUI restarted since the pane's
     // shell was spawned, so its baked-in id no longer matches a live
     // pane) must NOT fail an attach with "no such pane" — the takeover
@@ -710,6 +749,150 @@ fn editorInputStage(allocator: std.mem.Allocator, app: *appdrive.App) ?[]const u
     if (!app.waitChangeSince(win_id, &ref2, 15_000, 0.02, null))
         return "escape did not close the editor's search bar";
     return null;
+}
+
+/// Dead-key composition end to end, on a Belgian (AZERTY) seat.
+///
+/// The one input behaviour that no codepoint-based injection can reach:
+/// `ipc/xkblayout.zig` skips every dead keysym, so `typeText("^")` is
+/// impossible by construction. This stage injects raw evdev HARDWARE
+/// keycodes instead (`App.tapKeyCodes`) — keymap-independent, exactly
+/// what a physical keyboard puts on the wire — and lets the session's
+/// Belgian keymap turn code 26 into `dead_circumflex` and code 18 into
+/// `e`. What must come out is one composed `ê`.
+///
+/// Its own display session, because a session's keymap is fixed at
+/// creation. Its own GUI instance, because that instance must run
+/// WITHOUT `GTK_IM_MODULE=wayland`: that variable is what makes the
+/// main instance's editor face take a GtkIMMulticontext, and a
+/// multicontext on Wayland resolves to GTK's `wayland` IM module, which
+/// carries no compose engine at all (see ui/imhost.zig). Composition is
+/// GtkIMContextSimple's job, and `auto` picks it only when the session
+/// declares no real input method. So both instances are needed: the
+/// main one proves the IME/text-input-v3 path exists, this one proves
+/// the compose path works — in BOTH faces.
+fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const u8) ?[]const u8 {
+    // ── a Belgian display session ─────────────────────────────────
+    var wl_z: [4096:0]u8 = undefined;
+    {
+        const r = runDisplayCli(allocator, &.{
+            "create",      "--name", DEADKEY_SESSION, "--kb-layout", "be",
+            "--ttl",       DISPLAY_TTL,               "--json",      "--socket",
+            mux_sock,
+        });
+        defer allocator.free(r.out);
+        if (r.code != 0) return "could not create a Belgian-layout display session";
+        dk_ready = true;
+        var parsed = std.json.parseFromSlice(CreateReply, allocator, r.out, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return "the Belgian display create did not answer the documented JSON";
+        defer parsed.deinit();
+        const wl = parsed.value.environment.WAYLAND_DISPLAY;
+        if (wl.len == 0 or wl[0] != '/') return "the Belgian display returned no absolute WAYLAND_DISPLAY";
+        _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return "WAYLAND_DISPLAY too long";
+    }
+
+    // Attach before the GUI starts — the compositor brain is
+    // client-side, so an unattended hub configures no toplevel.
+    dk_drive = appdrive.App.attachExisting(allocator, DEADKEY_SESSION, "be", mux_sock) catch
+        return "could not attach a viewer to the Belgian display session";
+    const app = dk_drive.?;
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for the Belgian GUI failed";
+    if (pid == 0) {
+        dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.deadkey", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        // The whole point of a second instance: no declared input
+        // method, so `input_method = auto` resolves BOTH faces to
+        // GtkIMContextSimple and compose/dead keys are live.
+        _ = c.unsetenv("GTK_IM_MODULE");
+        _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    dk_pid = pid;
+
+    const sock = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, pid }, 0) catch
+        return "alloc";
+    defer allocator.free(sock);
+    var waited: u32 = 0;
+    while (c.access(sock.ptr, c.F_OK) != 0) {
+        _ = c.usleep(100_000);
+        waited += 1;
+        if (waited > 150) return "the Belgian GUI never opened its control socket";
+    }
+    if (!app.waitFirstWindow(60_000)) return "the Belgian GUI never committed a window";
+    _ = c.usleep(1_200_000); // first pane's shell
+
+    if (app.windows.items.len == 0) return "the Belgian display session lost its window";
+    const win_id = app.windows.items[0].id;
+    const cx = @as(f64, @floatFromInt(app.windows.items[0].w)) / 2;
+    const cy = @as(f64, @floatFromInt(app.windows.items[0].h)) / 2;
+
+    // ── face 1: the terminal pane ─────────────────────────────────
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the Belgian GUI's pane failed";
+    _ = app.waitIdle(300, 5_000);
+    // 26 = dead_circumflex, 18 = e (BE keymap; xkb <AD11>/<AD03> minus
+    // the constant 8 offset between xkb and evdev keycodes).
+    app.tapKeyCodes(null, &.{ 26, 18 }) catch return "injecting the dead-key sequence failed";
+    if (!waitPaneText(allocator, sock, 1, "\u{ea}", 15_000))
+        return "the terminal pane never showed a composed 'e-circumflex' from a real dead-key sequence";
+
+    // ── face 2: an editor tab ─────────────────────────────────────
+    var path_buf: [512]u8 = undefined;
+    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/e2e-deadkey.txt", .{rt}) catch return "editor path";
+    var req_buf: [700]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch
+        return "editor req fmt";
+    const resp = roundtrip(allocator, sock, req) orelse return "Belgian new-editor-tab roundtrip";
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return "Belgian new-editor-tab not ok";
+    const epane = parseNumAfter(resp, "\"pane\":") orelse return "Belgian new-editor-tab reply has no pane id";
+    _ = c.usleep(1_200_000); // tab spawn + async load of a missing file
+
+    var freq_buf: [128]u8 = undefined;
+    const freq = std.fmt.bufPrint(&freq_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{epane}) catch return "fmt";
+    const fresp = roundtrip(allocator, sock, freq) orelse return "Belgian editor focus roundtrip";
+    allocator.free(fresp);
+    // ...and a real click on the canvas, so the seat's keyboard focus
+    // is genuinely there and not merely GTK's idea of it.
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the Belgian editor canvas failed";
+    _ = app.waitIdle(300, 5_000);
+
+    app.tapKeyCodes(null, &.{ 26, 18 }) catch return "injecting the editor dead-key sequence failed";
+    if (!waitPaneText(allocator, sock, epane, "\u{ea}", 15_000))
+        return "the editor buffer never showed a composed 'e-circumflex' from a real dead-key sequence";
+
+    dkTeardown();
+    return null;
+}
+
+/// Poll `get-text` on one pane until its reply contains `needle`.
+fn waitPaneText(
+    allocator: std.mem.Allocator,
+    sock: [:0]const u8,
+    pane: u32,
+    needle: []const u8,
+    ms: u32,
+) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        var buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return false;
+        if (roundtrip(allocator, sock, req)) |resp| {
+            defer allocator.free(resp);
+            if (std.mem.indexOf(u8, resp, needle) != null) return true;
+        }
+        _ = c.usleep(200_000);
+    }
+    return false;
 }
 
 /// First unsigned integer following `key` in `text` (JSON scraping).
