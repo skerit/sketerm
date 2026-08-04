@@ -17,6 +17,9 @@ comptime {
     _ = @import("config.zig");
     _ = @import("editor/document.zig");
     _ = @import("editor/rope.zig");
+    _ = @import("editor/fuzz.zig");
+    _ = @import("editor/stress.zig");
+    _ = @import("editor/journal.zig");
     _ = @import("editor/selection.zig");
     _ = @import("editor/reload.zig");
     _ = @import("editor/transaction.zig");
