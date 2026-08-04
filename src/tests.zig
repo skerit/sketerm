@@ -64,6 +64,7 @@ comptime {
     _ = @import("ui/image_canvas.zig");
     _ = @import("ui/viewer.zig");
     _ = @import("ui/app_switcher.zig");
+    _ = @import("ui/editorlsp.zig");
     // The browser facade only re-exports a few decls, which is NOT
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced
@@ -209,6 +210,14 @@ comptime {
     _ = @import("editor/structure.zig");
     _ = @import("editor/syntax.zig");
     _ = @import("editor/theme.zig");
+    _ = @import("lsp/rpc.zig");
+    _ = @import("lsp/position.zig");
+    _ = @import("lsp/servers.zig");
+    _ = @import("lsp/session.zig");
+    _ = @import("lsp/session_test.zig");
+    _ = @import("lsp/diagnostics.zig");
+    _ = @import("lsp/docsync.zig");
+    _ = @import("lsp/proc.zig");
     _ = @import("render/editor_font.zig");
     _ = @import("render/editor_layout.zig");
     _ = @import("render/editor_viewport.zig");
