@@ -87,15 +87,10 @@ pub const Layout = struct {
     tabs: []const TabSpec,
 };
 
-/// Working directory of a live process, owned by the caller. The
-/// Linux-vs-macOS split lives in the platform layer — see
-/// `platform.cwdOfPid`.
-pub fn cwdOfPid(pid: c.pid_t, allocator: std.mem.Allocator) ![]u8 {
-    var buf: [4096]u8 = undefined;
-    const cwd = @import("util/platform.zig").cwdOfPid(pid, &buf) orelse
-        return error.ReadlinkFailed;
-    return try allocator.dupe(u8, cwd);
-}
+// NOTE: a `cwdOfPid` used to live here as well as in the daemon, and the
+// two drifted — the daemon's copy never grew a macOS branch, which broke
+// every file transfer there. There is now exactly one, in
+// `util/platform.zig`. Do not reintroduce a local variant.
 
 pub fn save(layout: Layout, path: []const u8) !void {
     try makeParentDirs(path);
