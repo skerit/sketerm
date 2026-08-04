@@ -62,7 +62,7 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 **Shaders carry NO `#version`/`precision` lines.** `gl.zig compileShader` injects a per-API header (`300 es` on Linux/GLES, `330 core` on macOS desktop GL) — adding a version line to a shader source breaks one of the two platforms. `zig build smoke-gl-core` compiles every shader under desktop GL 3.3 core (the macOS path) via Mesa. Never call `gtk_gl_area_set_use_es` directly; use `gl.requestArea` + `gl.adoptAreaApi`.
 
-**Platform layer.** Linux-vs-macOS primitives live ONLY in `src/util/platform.zig` (exe path, eventfd-vs-pipe wakeup, runtime dir, cloexec sockets), keyed on comptime `builtin.os.tag`. OS-specific headers are `#ifdef __linux__`-gated in `vendor/cimport_*.h`. `zig build mux-portable -Dportable-target=aarch64-macos` is the cross-compile check — keep it green. See `docs/macos.md`.
+**Platform layer.** Linux-vs-macOS primitives live ONLY in `src/util/platform.zig` (exe path, eventfd-vs-pipe wakeup, runtime dir, cloexec sockets), keyed on comptime `builtin.os.tag`. OS-specific headers are `#ifdef __linux__`-gated in `vendor/cimport_*.h`. `zig build mux-portable -Dportable-target=aarch64-macos` is the cross-compile check — keep it green. See `docs/macos.md`. **A green macOS build is not a working macOS build**: the 2026-08 re-verification found five bugs that all compiled fine and then failed at runtime (no session could spawn, no file could transfer) — run the smoke rigs, not just the compiler.
 
 **Tab/pane tree is plain Zig data; GTK widgets are the view.** The model is `src/ui/tree.zig` (`Window.PaneTree`), one per tab, attached to the AdwTabPage as qdata (`sketerm-tree`) so it travels with cross-window tab drags. **Every widget-tree mutation (split / pane close / mux takeover / restore-build) must update the model in the same function** — `splitLeaf`/`removeLeaf`/`replaceLeaf`. Queries (`tabPageForPane`, layout collection, duplicate-tab) read the model, which stays correct while a pane is zoomed (zoom only reparents widgets). `SKETERM_VERIFY_TREE=1` cross-checks model vs widgets after each mutation and aborts on divergence — smoke-e2e runs with it set. Layout persistence (`layout.zig`) serializes the model to JSON; widgets+model rebuild from the tree on load. Saved at shutdown to `$XDG_STATE_HOME/sketerm/last.json`; restored via `--restore` or `--layout <path>`. This is step 1 of de-GTK-ing `src/ui` (goal: a future native AppKit frontend reusing core + model).
 
@@ -99,6 +99,10 @@ it is loaded, because breaking one is how each was learned:
     or the exit poller reaps arbitrary GUI children.
   - Any process hosting a `Daemon` must answer `--keep` (display keepers are
     spawned as the daemon's own `/proc/self/exe`).
+  - The broker↔worker control channel is `platform.controlSocketpair`, NOT a
+    raw `socketpair` — Darwin has no AF_UNIX SEQPACKET at all, and its
+    datagram size cap is a socket-buffer setting. A closed peer there is
+    `recv() == -1`/ECONNRESET, so "channel gone" is `n <= 0`, never `n == 0`.
 
 - **`src/ui/browser/CLAUDE.md`** (+ pointer in `src/filebrowser/`) — the file
   browser.
