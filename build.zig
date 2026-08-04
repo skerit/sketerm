@@ -467,6 +467,28 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-parser", "Parser microbenchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // Editor text-core benchmark — `zig build bench-editor [-- --quick]`.
+    // Core dependency set only: the rope/document/unicode core is GTK-free
+    // and must stay that way, so this target links what `sketerm-mux` does.
+    const bench_ed_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_editor.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, bench_ed_mod, core_cbindings_mod);
+    bench_ed_mod.addImport("build_options", noglib_opts_mod);
+    const bench_ed = b.addExecutable(.{
+        .name = "sketerm-bench-editor",
+        .root_module = bench_ed_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(bench_ed);
+    const bench_ed_run = b.addRunArtifact(bench_ed);
+    if (b.args) |args| bench_ed_run.addArgs(args);
+    const bench_ed_step = b.step("bench-editor", "Editor rope/document large-file benchmark");
+    bench_ed_step.dependOn(&bench_ed_run.step);
+
     // The headless GL harnesses below (smoke-image, smoke-cell,
     // bench-cell-upload, smoke-transparency, smoke-gl-core) drive GL
     // through EGL surfaceless contexts — there is no EGL on macOS, so
