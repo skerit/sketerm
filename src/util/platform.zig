@@ -102,6 +102,142 @@ pub fn socketpairCloexec(pair: *[2]c_int) c_int {
     return r;
 }
 
+/// The handler slot of `struct sigaction` is a union whose name AND
+/// member spellings differ: glibc calls it `__sigaction_handler` with
+/// `.sa_handler`/`.sa_sigaction`, Darwin calls it `__sigaction_u` with
+/// `.__sa_handler`/`.__sa_sigaction`. These two setters are the only
+/// place either spelling appears — callers just pass the function.
+pub fn setSigHandler(sa: *c.struct_sigaction, handler: *const fn (c_int) callconv(.c) void) void {
+    if (is_macos) {
+        sa.__sigaction_u = .{ .__sa_handler = handler };
+    } else {
+        sa.__sigaction_handler = .{ .sa_handler = handler };
+    }
+}
+
+/// SA_SIGINFO form of `setSigHandler` (three-argument handler).
+pub fn setSigAction(
+    sa: *c.struct_sigaction,
+    handler: *const fn (c_int, [*c]c.siginfo_t, ?*anyopaque) callconv(.c) void,
+) void {
+    if (is_macos) {
+        sa.__sigaction_u = .{ .__sa_sigaction = handler };
+    } else {
+        sa.__sigaction_handler = .{ .sa_sigaction = handler };
+    }
+}
+
+/// Control socketpair for the broker↔worker channel: every control
+/// message is ONE message carrying at most one SCM_RIGHTS fd, and
+/// messages as large as `capacity` bytes have to survive the trip.
+///
+/// Linux uses SOCK_SEQPACKET. Darwin's AF_UNIX has no SEQPACKET at all —
+/// socketpair() fails outright with EPROTONOSUPPORT — so it uses
+/// SOCK_DGRAM, which preserves the same message boundaries. Two Darwin
+/// consequences, both of which callers must handle:
+///   * a closed peer surfaces as recv() == -1/ECONNRESET, NOT 0, so
+///     "channel gone" has to be tested as `n <= 0`, never `n == 0`;
+///   * the per-message size limit comes from the SOCKET BUFFER, and
+///     net.local.dgram.maxdgram is only 2048 — well under one worker
+///     metadata push. The buffers are raised here to fit `capacity`,
+///     because a message over the limit is refused with EMSGSIZE and
+///     the sender's change-hash has already moved on, so it is never
+///     resent (the same permanent-staleness trap the truncation note
+///     on WORKER_META_BUF describes).
+/// Returns 0 on success (libc convention).
+pub fn controlSocketpair(pair: *[2]c_int, capacity: usize) c_int {
+    if (is_linux) return c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, pair);
+    const r = c.socketpair(c.AF_UNIX, c.SOCK_DGRAM, 0, pair);
+    if (r != 0) return r;
+    // Ask for headroom over the payload: the buffer also has to cover
+    // per-message bookkeeping, so an exactly-sized one can still refuse
+    // a full-capacity message. Capped well under kern.ipc.maxsockbuf.
+    const want: c_int = @intCast(@min(capacity *| 2, 4 << 20));
+    for (pair) |fd| {
+        for ([_]c_int{ c.SO_SNDBUF, c.SO_RCVBUF }) |opt| {
+            _ = c.setsockopt(fd, c.SOL_SOCKET, opt, &want, @sizeOf(c_int));
+        }
+    }
+    return 0;
+}
+
+// ── extended attributes ─────────────────────────────────────────
+//
+// All four act on the LINK itself, never following a symlink. Linux
+// spells that with an `l` prefix; Darwin has no such variants and takes
+// XATTR_NOFOLLOW as an options flag, plus a `position` argument that is
+// only meaningful for resource forks (always 0 here). Both platforms
+// return the name list as NUL-separated strings.
+//
+// The `user.` namespace the callers require is a Linux rule (only that
+// namespace is writable unprivileged). It is not required on Darwin but
+// is kept there anyway: it keeps the browser away from `com.apple.*`
+// attributes like quarantine and FinderInfo, and keeps one tag spelling
+// across both platforms.
+
+pub fn lgetxattr(path: [*:0]const u8, name: [*:0]const u8, buf: []u8) isize {
+    if (is_linux) return c.lgetxattr(path, name, buf.ptr, buf.len);
+    return c.getxattr(path, name, buf.ptr, buf.len, 0, c.XATTR_NOFOLLOW);
+}
+
+pub fn lsetxattr(path: [*:0]const u8, name: [*:0]const u8, value: []const u8) bool {
+    if (is_linux) return c.lsetxattr(path, name, value.ptr, value.len, 0) == 0;
+    return c.setxattr(path, name, value.ptr, value.len, 0, c.XATTR_NOFOLLOW) == 0;
+}
+
+pub fn lremovexattr(path: [*:0]const u8, name: [*:0]const u8) void {
+    if (is_linux) {
+        _ = c.lremovexattr(path, name);
+        return;
+    }
+    _ = c.removexattr(path, name, c.XATTR_NOFOLLOW);
+}
+
+pub fn llistxattr(path: [*:0]const u8, buf: []u8) isize {
+    if (is_linux) return c.llistxattr(path, buf.ptr, buf.len);
+    return c.listxattr(path, buf.ptr, buf.len, c.XATTR_NOFOLLOW);
+}
+
+/// macOS: query a process's vnode paths (cwd + root) via libproc.
+extern fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+
+/// Working directory of a live process, written into `buf`; null when
+/// it cannot be determined (dead pid, permission, no answer).
+///
+/// Linux reads the /proc/<pid>/cwd symlink. macOS has no /proc at all —
+/// libproc's PROC_PIDVNODEPATHINFO carries the same answer. Layout of
+/// `struct proc_vnodepathinfo`: two `vnode_info_path` entries, each
+/// { struct vnode_info (152 bytes), char vip_path[MAXPATHLEN] }, so
+/// pvi_cdir.vip_path sits at offset 152. VERIFIED on hardware (arm64,
+/// macOS 26 SDK): sizeof(vnode_info)=152, offsetof(vip_path)=152,
+/// flavor 9, live call matches getcwd().
+///
+/// This is the ONE implementation: the daemon resolves an upload's
+/// destination directory through it, and a /proc-only version there is
+/// what made every file transfer on macOS fail with "cannot determine
+/// session directory".
+pub fn cwdOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
+    if (pid <= 0) return null;
+    if (is_macos) {
+        const VNODE_INFO_SIZE = 152;
+        const MAXPATHLEN = 1024;
+        const PROC_PIDVNODEPATHINFO: c_int = 9;
+        var info: [2 * (VNODE_INFO_SIZE + MAXPATHLEN)]u8 align(8) = undefined;
+        const n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, info.len);
+        if (n <= VNODE_INFO_SIZE) return null;
+        const path_bytes = info[VNODE_INFO_SIZE .. VNODE_INFO_SIZE + MAXPATHLEN];
+        const len = std.mem.indexOfScalar(u8, path_bytes, 0) orelse MAXPATHLEN;
+        if (len == 0 or len > buf.len) return null;
+        @memcpy(buf[0..len], path_bytes[0..len]);
+        return buf[0..len];
+    }
+    var path_buf: [64]u8 = undefined;
+    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+    const n = c.readlink(link.ptr, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    return buf[0..@intCast(n)];
+}
+
 /// memfd_create is in both glibc and musl libc but its declaration
 /// hides behind _GNU_SOURCE, which the translate-c pass doesn't
 /// define — declare it ourselves (Linux-only; resolved at link).
