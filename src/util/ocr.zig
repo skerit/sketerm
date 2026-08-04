@@ -96,11 +96,7 @@ fn loadApi() ?Api {
         "libtesseract.5.dylib",
         "libtesseract.dylib",
     };
-    var handle: ?*anyopaque = null;
-    for (names) |name| {
-        handle = dlopen(name, RTLD_LAZY);
-        if (handle != null) break;
-    }
+    const handle: ?*anyopaque = @import("platform.zig").dlopenAny(&names);
     const h = handle orelse return null;
     const api = Api{
         .create = sym(Create, h, "TessBaseAPICreate") orelse return bail(h),
