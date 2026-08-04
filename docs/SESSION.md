@@ -12114,3 +12114,36 @@ smoke-mux and smoke-broker PASS with the real-xterm stage; normal build,
 static-musl mux, and aarch64-macOS portable mux build; `sketerm-mux` retains
 only libc/libm runtime dependencies. Cross-protocol drag and drop remains
 toolkit/upstream-dependent and is not part of the compatibility contract.
+
+## 2026-08-04: assistant-feedback fixes for headless GUI ergonomics
+
+An external AI assistant used the MCP + CLI as an Xvfb replacement and filed
+detailed feedback; this session lands the fixes.
+
+MCP: `capabilities` now reports `headless_gui` (what launch_app actually
+depends on) with explicit hints on it and on `gui_socket`, plus a
+`mode_hint` for non-shared modes explaining the private-daemon split — a
+bare `gui_socket:false` had been read as "no GUI capability at all".
+`launch_app` gained `size:"WxH"` (virtual output mode, rides
+SpawnReq.output_width/height through appdrive; the spawn ok confirms it and
+the reply WARNs when an older daemon ignored it) and `stable_ms` (default
+500): the inline launch screenshot now waits for painting to quiesce so it
+lands past the blank pre-paint frame, with honest caption notes for
+still-repainting and first-frame captures. The schema also states the
+daemon-side environment (cwd = daemon's own, minimal env, absolute paths).
+
+CLI: `sketerm run <command...>` is the new xvfb-run-shaped alias for
+`sketerm-mux display run -- <command...>` (inserts the `--` itself,
+`display.runCommandStart`); top-level and mux help point at it. `sketerm
+app` no longer prints a hard failure when no GUI window is present: the
+session runs headless by design, the notice says so with attach/list hints
+and exits 0, and `--headless` skips the viewer attach on purpose. `sketerm
+mux <cmd> --help` prints help instead of creating a session named
+"--help". `sketerm doctor` now unlinks the stale GUI sockets it used to
+only count.
+
+Verified: full suite 1177 pass / 5 skip; smoke-mux and smoke-mcp PASS;
+`sketerm run --size 3840x2160` shows the requested wl_output mode via
+wayland-info and forwards the command's exit status; a driven MCP session
+confirmed the new capabilities fields and a settled gnome-calculator
+launch screenshot; mux-portable stays libc-only.
