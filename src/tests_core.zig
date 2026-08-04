@@ -30,6 +30,14 @@ comptime {
     _ = @import("editor/structure.zig");
     _ = @import("editor/syntax.zig");
     _ = @import("editor/theme.zig");
+    _ = @import("lsp/rpc.zig");
+    _ = @import("lsp/position.zig");
+    _ = @import("lsp/servers.zig");
+    _ = @import("lsp/session.zig");
+    _ = @import("lsp/session_test.zig");
+    _ = @import("lsp/diagnostics.zig");
+    _ = @import("lsp/docsync.zig");
+    _ = @import("lsp/proc.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");

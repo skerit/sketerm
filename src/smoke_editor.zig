@@ -28,6 +28,8 @@ const unicode = @import("editor/unicode.zig");
 const syntax = @import("editor/syntax.zig");
 const structure = @import("editor/structure.zig");
 const theme_mod = @import("editor/theme.zig");
+const lsp_smoke = @import("smoke_editor_lsp.zig");
+const lspStage = lsp_smoke.stage;
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -912,6 +914,9 @@ pub fn main() !u8 {
             n_lines,
         },
     );
+    // ---- LSP against a REAL stub server process ----------------------
+    if (try lspStage(allocator)) |code| return code;
+
     std.debug.print("smoke-editor: PASS\n", .{});
     return 0;
 }

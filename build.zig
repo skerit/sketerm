@@ -696,6 +696,28 @@ pub fn build(b: *std.Build) void {
     spike_editor_step.dependOn(&spike_editor_run.step);
     }
 
+    // Scripted stub language server — `sketerm-lsp-stub`. A REAL
+    // process speaking the LSP base protocol over stdio, so the smoke
+    // rig exercises spawn + pipes + framing without depending on zls or
+    // clangd being installed on the build host. Core dependency set:
+    // it must stay as GTK-free as the protocol code it tests.
+    const lsp_stub_mod = b.createModule(.{
+        .root_source_file = b.path("src/lsp_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, lsp_stub_mod, core_cbindings_mod);
+    lsp_stub_mod.addImport("build_options", noglib_opts_mod);
+    const lsp_stub = b.addExecutable(.{
+        .name = "sketerm-lsp-stub",
+        .root_module = lsp_stub_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(lsp_stub);
+    const lsp_stub_step = b.step("lsp-stub", "Build the scripted stub language server used by the tests");
+    lsp_stub_step.dependOn(&b.addInstallArtifact(lsp_stub, .{}).step);
+
     // Headless editor-pipeline smoke — `zig build smoke-editor`.
     // Renders a real Document through editor_font itemization +
     // editor_layout + EditorPass (EGL surfaceless, same as smoke-cell),
@@ -719,6 +741,9 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(smoke_editor);
     const smoke_editor_run = b.addRunArtifact(smoke_editor);
+    // The LSP stage spawns the stub server by path; building it first
+    // is what makes `zig build smoke-editor` self-contained.
+    smoke_editor_run.step.dependOn(&b.addInstallArtifact(lsp_stub, .{}).step);
     const smoke_editor_step = b.step("smoke-editor", "Headless editor text pipeline render check");
     smoke_editor_step.dependOn(&smoke_editor_run.step);
     }
