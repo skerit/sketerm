@@ -1,9 +1,12 @@
 //! Document: rope + revision counter + line-ending style + undo history.
 //!
 //! CRLF handling: `initFromBytes` detects the dominant line-ending
-//! style, normalizes the in-memory text to LF, and `materialize`
-//! re-applies CRLF on the way out when that was the loaded style.
-//! All offsets in the public API are therefore LF-normalized bytes.
+//! style; a CRLF document is normalized to LF in memory and
+//! `materialize` re-applies CRLF on the way out. An LF document is
+//! loaded byte for byte — stray \r bytes are NOT stripped, because
+//! materialize would not put them back and saving would silently
+//! rewrite the file. All offsets in the public API are LF-normalized
+//! bytes for a CRLF document and raw file bytes for an LF one.
 //!
 //! Undo grouping: consecutive single-codepoint pure insertions typed at
 //! the end of the previous one coalesce into one undo unit; the group
@@ -130,8 +133,9 @@ pub const Document = struct {
         };
     }
 
-    /// Detects the line-ending style and loads an LF-normalized copy.
-    /// Lone \r bytes are left untouched — only \r\n pairs normalize.
+    /// Detects the line-ending style; a CRLF document is loaded as an
+    /// LF-normalized copy, an LF one byte for byte (see the file
+    /// header). Lone \r bytes are always left untouched.
     pub fn initFromBytes(alloc: Allocator, bytes: []const u8) !Document {
         var crlf: usize = 0;
         var lone_lf: usize = 0;
@@ -146,7 +150,12 @@ pub const Document = struct {
         var doc = initEmpty(alloc);
         errdefer doc.deinit();
         doc.line_ending = style;
-        if (crlf == 0) {
+        // Only a CRLF document is normalized. Stripping \r out of a file
+        // whose style is LF would be silent data loss: `materialize`
+        // re-applies CR only for the .crlf style, so a mostly-LF file
+        // with a few CRLF lines (or binary content that happens to hold
+        // \r\n pairs) would come back from a save with those bytes gone.
+        if (style == .lf) {
             doc.rope = try Rope.initFromBytes(alloc, bytes);
         } else {
             const norm = try alloc.alloc(u8, bytes.len - crlf);
@@ -499,6 +508,19 @@ test "document LF input stays LF" {
     const out = try doc.materialize(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a\nb\n", out);
+}
+
+test "document LF-majority file keeps its stray CRLF bytes" {
+    // Two LF lines against one CRLF line: the style is LF, so the file
+    // must survive a load/save round trip unchanged.
+    const src = "a\nb\r\nc\nd\n";
+    var doc = try Document.initFromBytes(testing.allocator, src);
+    defer doc.deinit();
+    try testing.expectEqual(LineEnding.lf, doc.line_ending);
+    try expectText(&doc, src);
+    const out = try doc.materialize(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
 }
 
 test "document mixed endings pick the majority, lone CR preserved" {
