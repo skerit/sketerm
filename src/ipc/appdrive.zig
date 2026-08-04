@@ -2952,6 +2952,17 @@ test "post-mortem log push + exit are peeled when EOF lands in the same read" {
     const a = t.allocator;
     var fds: [2]c_int = undefined;
     try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    // The whole 16 KiB stream is written below in ONE blocking write,
+    // before anything reads — so it has to fit in the socket buffers.
+    // Linux's default unix-socket buffer (~208 KiB) swallows it; Darwin's
+    // is 8 KiB, which deadlocks the write against a reader that only runs
+    // afterwards. Ask for room on both ends and on both directions.
+    const bufsize: c_int = 256 * 1024;
+    for (fds) |fd| {
+        for ([_]c_int{ c.SO_SNDBUF, c.SO_RCVBUF }) |opt| {
+            _ = c.setsockopt(fd, c.SOL_SOCKET, opt, &bufsize, @sizeOf(c_int));
+        }
+    }
     var app = App{
         .allocator = a,
         .conn = .{ .allocator = a, .fd = fds[0] },
