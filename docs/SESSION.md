@@ -12147,3 +12147,47 @@ Verified: full suite 1177 pass / 5 skip; smoke-mux and smoke-mcp PASS;
 wayland-info and forwards the command's exit status; a driven MCP session
 confirmed the new capabilities fields and a settled gnome-calculator
 launch screenshot; mux-portable stays libc-only.
+## Text editor foundations, native file picker, portal backend
+
+The editor is a new pane face on the terminal's GPU stack. A headless
+spike (spike-editor-text) first proved the existing atlas, HarfBuzz
+shapeRun and gl.zig render proportional shaped text with cluster-exact
+hit testing unchanged; the productionized stack adds FontBook font
+itemization (script/coverage run splitting with per-fallback-face
+hb_fonts), bidi-aware line layout with grapheme cluster maps, soft wrap
+and revision/generation caching, and EditorPass on the CellPass
+template (selections, carets, gutter). smoke-editor renders the whole
+pipeline offscreen with round-trip asserts.
+
+The GTK-free document core (src/editor/) is an AVL rope with line
+index, revisioned atomic multi-edit transactions, undo grouping with
+word-boundary breaks, first-class multi-selection with edit mapping,
+and UAX #29 grapheme plus word boundaries, fuzz-tested against a naive
+oracle and registered in both test roots.
+
+EditorView hosts document tabs on the new shared TabHost (the browser's
+inner-tab notebook mechanics extracted and adopted by both consumers),
+one GL canvas for the active document, IME-based input, multi-caret
+editing, clipboard, mouse selection, undo/redo, and daemon-backed
+open/save: reads remember mtime_ns, saves go through the daemon's new
+atomic install op (fsync-staged rename preserving mode/owner) with an
+expected-mtime conflict guard surfaced as Overwrite/Reload/Cancel.
+Layouts persist open editor files per pane; new-editor-tab rides the
+CLI/IPC surface and smoke-e2e types into a real editor and asserts the
+saved bytes.
+
+The native file picker presents a constrained paneless BrowserView
+(activation/selection funnels, visibility filter, file-ops suppressed)
+in a modal Viewer-styled window: modes for open/multi/dir/save/
+destination, glob filters, overwrite confirmation, remote hosts via the
+usual host connections. The prefs font chooser is the first consumer.
+`sketerm portal` exposes the same picker to any portal-using app as an
+opt-in org.freedesktop.impl.portal.FileChooser backend (OpenFile/
+SaveFile/SaveFiles plus Request.Close, file:// results, packaging files
+and docs/portal.md; nothing enabled without portals.conf).
+
+Verified: full suite 1253 pass / 6 skip; core suite 1044 pass / 5 skip;
+mux-portable still builds and sketerm-mux links only libc/libm;
+smoke-editor, spike-editor-text, smoke-fs (atomic save, monolith and
+broker), smoke-gl-core and xvfb smoke-e2e (with the new editor stage)
+all green; portal driven end to end over an isolated session bus.
