@@ -87,6 +87,11 @@ pub const PickerHooks = struct {
     /// Selection or location changed; the picker re-reads the
     /// current tab's selection.
     on_selection_changed: *const fn (ctx: *anyopaque) void,
+    /// A daemon fs_reply whose request the PICKER issued itself (the
+    /// typed-name stat probe). Returns true when the picker owned
+    /// `req`, which ends the dispatch. `is_dir` is null when the
+    /// reply carried no entry.
+    on_reply: ?*const fn (ctx: *anyopaque, req: u32, ok: bool, is_dir: ?bool) bool = null,
     /// Extra visibility predicate composed with views.entryVisible
     /// (the mode's file/dir rule plus the active name filter).
     visible: ?*const fn (ctx: *anyopaque, name: []const u8, is_dir: bool) bool = null,

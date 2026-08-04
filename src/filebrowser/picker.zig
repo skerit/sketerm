@@ -51,10 +51,6 @@ pub const Result = struct {
 
 // -- mode predicates ---------------------------------------------
 
-pub fn needsNameEntry(mode: Mode) bool {
-    return mode == .save_file;
-}
-
 pub fn allowsMulti(mode: Mode) bool {
     return mode == .open_files;
 }
@@ -97,6 +93,85 @@ pub fn validSaveName(name: []const u8) bool {
     if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
     return true;
+}
+
+// -- typed name/location resolution -------------------------------
+
+/// What the typed path turned out to BE on the host that owns it.
+pub const TypedKind = enum { dir, file, missing };
+
+/// What the picker does with a typed path of that kind.
+pub const TypedAction = enum { navigate, accept, reject };
+
+pub const Typed = struct {
+    /// Absolute, normalized path ("." / ".." / repeated and trailing
+    /// slashes resolved away; "/" stays "/").
+    path: []const u8,
+    /// The user wrote a trailing '/', i.e. "this is a folder".
+    trailing_slash: bool,
+};
+
+/// Append one path segment run to `buf`, resolving "." and ".."
+/// against what is already there. Returns the new write offset, or
+/// null when the result would not fit.
+fn pushSegments(buf: []u8, start: usize, src: []const u8) ?usize {
+    var w = start;
+    var it = std.mem.splitScalar(u8, src, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            while (w > 0 and buf[w - 1] != '/') w -= 1;
+            if (w > 0) w -= 1;
+            continue;
+        }
+        if (w + 1 + seg.len > buf.len) return null;
+        buf[w] = '/';
+        @memcpy(buf[w + 1 ..][0..seg.len], seg);
+        w += 1 + seg.len;
+    }
+    return w;
+}
+
+/// Resolve what the user typed in the picker's name/location entry to
+/// an absolute path on the CURRENT host. `cwd` is the directory on
+/// show, `home` that host's home directory (null disables `~`).
+/// Returns null for empty text, embedded NULs, or a result too long
+/// for `buf`. Host-qualified specs are deliberately NOT parsed here:
+/// a ':' is a literal filename byte, so changing host stays the
+/// location bar's job.
+pub fn resolveTyped(buf: []u8, cwd: []const u8, home: ?[]const u8, text: []const u8) ?Typed {
+    if (text.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return null;
+    var w: usize = 0;
+    var rest = text;
+    if (text[0] == '/') {
+        // Absolute: cwd plays no part.
+    } else if (text[0] == '~' and (text.len == 1 or text[1] == '/')) {
+        const h = home orelse return null;
+        w = pushSegments(buf, 0, h) orelse return null;
+        rest = text[1..];
+    } else {
+        w = pushSegments(buf, 0, cwd) orelse return null;
+    }
+    w = pushSegments(buf, w, rest) orelse return null;
+    return .{
+        .path = if (w == 0) "/" else buf[0..w],
+        .trailing_slash = text[text.len - 1] == '/',
+    };
+}
+
+/// The picker's verdict on a resolved typed path. A directory is
+/// browsed into unless the mode PICKS directories (or the user asked
+/// for one with a trailing slash, which always browses); a file is
+/// accepted by every file mode, including save_file, whose caller
+/// then runs the overwrite confirmation; a name that does not exist
+/// is only meaningful in save_file.
+pub fn typedAction(mode: Mode, kind: TypedKind, trailing_slash: bool) TypedAction {
+    return switch (kind) {
+        .dir => if (trailing_slash) .navigate else if (acceptsDirs(mode)) .accept else .navigate,
+        .file => if (trailing_slash or acceptsDirs(mode)) .reject else .accept,
+        .missing => if (mode == .save_file and !trailing_slash) .accept else .reject,
+    };
 }
 
 // -- filter matching ---------------------------------------------
@@ -144,9 +219,6 @@ pub fn filterMatches(filter: Filter, name: []const u8) bool {
 
 test "mode predicates" {
     const t = std.testing;
-    try t.expect(needsNameEntry(.save_file));
-    try t.expect(!needsNameEntry(.open_file));
-    try t.expect(!needsNameEntry(.select_dir));
     try t.expect(allowsMulti(.open_files));
     try t.expect(!allowsMulti(.open_file));
     try t.expect(!allowsMulti(.save_file));
@@ -177,6 +249,96 @@ test "validSaveName rejects empties, separators and dot names" {
     try t.expect(!validSaveName("."));
     try t.expect(!validSaveName(".."));
     try t.expect(!validSaveName("a\x00b"));
+}
+
+test "resolveTyped joins bare names against the shown directory" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const r = resolveTyped(&buf, "/home/j/docs", null, "notes.txt") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/docs/notes.txt", r.path);
+    try t.expect(!r.trailing_slash);
+
+    const sub = resolveTyped(&buf, "/home/j", null, "docs/notes.txt") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/docs/notes.txt", sub.path);
+
+    const root = resolveTyped(&buf, "/", null, "etc") orelse return error.Unresolved;
+    try t.expectEqualStrings("/etc", root.path);
+}
+
+test "resolveTyped keeps absolute paths and normalizes them" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const abs = resolveTyped(&buf, "/home/j", null, "/etc/fstab") orelse return error.Unresolved;
+    try t.expectEqualStrings("/etc/fstab", abs.path);
+
+    const messy = resolveTyped(&buf, "/home/j", null, "//usr//./local///bin") orelse return error.Unresolved;
+    try t.expectEqualStrings("/usr/local/bin", messy.path);
+
+    const up = resolveTyped(&buf, "/home/j/docs", null, "../pics/cat.png") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/pics/cat.png", up.path);
+
+    // Walking past the root clamps there rather than underflowing.
+    const past = resolveTyped(&buf, "/home", null, "../../../..") orelse return error.Unresolved;
+    try t.expectEqualStrings("/", past.path);
+
+    const dot = resolveTyped(&buf, "/home/j", null, ".") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j", dot.path);
+}
+
+test "resolveTyped reports the trailing slash and expands ~" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const slash = resolveTyped(&buf, "/home/j", null, "docs/") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/docs", slash.path);
+    try t.expect(slash.trailing_slash);
+
+    const home = resolveTyped(&buf, "/etc", "/home/j", "~/docs") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/docs", home.path);
+    const bare = resolveTyped(&buf, "/etc", "/home/j", "~") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j", bare.path);
+    // No home known: `~` is not silently treated as a filename.
+    try t.expect(resolveTyped(&buf, "/etc", null, "~/docs") == null);
+    // A '~' that does not start a home reference is a plain name.
+    const literal = resolveTyped(&buf, "/etc", "/home/j", "~file") orelse return error.Unresolved;
+    try t.expectEqualStrings("/etc/~file", literal.path);
+}
+
+test "resolveTyped refuses empty, NUL-bearing and oversized input" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    try t.expect(resolveTyped(&buf, "/home/j", null, "") == null);
+    try t.expect(resolveTyped(&buf, "/home/j", null, "a\x00b") == null);
+    var tiny: [8]u8 = undefined;
+    try t.expect(resolveTyped(&tiny, "/home/j", null, "some/long/name") == null);
+    // A colon stays a filename byte: host switching is the location
+    // bar's job, not this entry's.
+    const colon = resolveTyped(&buf, "/home/j", null, "box:/etc") orelse return error.Unresolved;
+    try t.expectEqualStrings("/home/j/box:/etc", colon.path);
+}
+
+test "typedAction routes directories, files and new names per mode" {
+    const t = std.testing;
+    // Directories: browsed into, except where the mode picks them.
+    try t.expectEqual(TypedAction.navigate, typedAction(.open_file, .dir, false));
+    try t.expectEqual(TypedAction.navigate, typedAction(.save_file, .dir, false));
+    try t.expectEqual(TypedAction.accept, typedAction(.select_dir, .dir, false));
+    try t.expectEqual(TypedAction.accept, typedAction(.select_destination, .dir, false));
+    // A trailing slash always means "browse", never "pick".
+    try t.expectEqual(TypedAction.navigate, typedAction(.select_dir, .dir, true));
+
+    // Files: every file mode takes them, directory modes cannot.
+    try t.expectEqual(TypedAction.accept, typedAction(.open_file, .file, false));
+    try t.expectEqual(TypedAction.accept, typedAction(.open_files, .file, false));
+    try t.expectEqual(TypedAction.accept, typedAction(.save_file, .file, false));
+    try t.expectEqual(TypedAction.reject, typedAction(.select_dir, .file, false));
+    try t.expectEqual(TypedAction.reject, typedAction(.open_file, .file, true));
+
+    // A name that does not exist is only a save target.
+    try t.expectEqual(TypedAction.accept, typedAction(.save_file, .missing, false));
+    try t.expectEqual(TypedAction.reject, typedAction(.save_file, .missing, true));
+    try t.expectEqual(TypedAction.reject, typedAction(.open_file, .missing, false));
+    try t.expectEqual(TypedAction.reject, typedAction(.open_files, .missing, false));
+    try t.expectEqual(TypedAction.reject, typedAction(.select_dir, .missing, false));
 }
 
 test "globMatch literals and case folding" {
