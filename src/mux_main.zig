@@ -4,8 +4,10 @@
 // servers standalone; the GUI spawns it on demand locally.
 
 const std = @import("std");
+const c = @import("c.zig").c;
 const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
+const VERSION = @import("version.zig").string;
 
 /// SIGPIPE "ignore" via a no-op handler. The libc `SIG_IGN` macro
 /// fails translate-c (function-pointer cast) and its raw value (1)
@@ -22,6 +24,7 @@ const HELP =
     \\       sketerm-mux --proxy
     \\       sketerm-mux --udp-listen [--udp-port LO:HI]
     \\       sketerm-mux display <create|run|inspect|list|destroy> ...
+    \\       sketerm-mux --version
     \\
     \\Runs in the foreground, listening on PATH (default
     \\$XDG_RUNTIME_DIR/sketerm/mux.sock). Clients (the sketerm GUI or
@@ -136,6 +139,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             );
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP});
+            return 0;
+        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            // stdout, not std.debug.print's stderr: this is the scriptable
+            // skew check, and `sketerm --version` prints to stdout too.
+            _ = c.fprintf(platform.stdout(), "sketerm-mux %s\n", @as([*:0]const u8, VERSION));
             return 0;
         } else {
             std.debug.print("sketerm-mux: unknown argument: {s}\n", .{a});
