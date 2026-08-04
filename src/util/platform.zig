@@ -161,6 +161,55 @@ pub fn controlSocketpair(pair: *[2]c_int, capacity: usize) c_int {
     return 0;
 }
 
+// ── runtime library probing ─────────────────────────────────────
+
+extern fn dlopen(filename: [*:0]const u8, flags: c_int) ?*anyopaque;
+const RTLD_LAZY: c_int = 0x1;
+
+/// Prefixes to try in front of a bare soname on Darwin, in order.
+/// Empty string first = the plain soname (system libraries, and any
+/// DYLD_LIBRARY_PATH the user set).
+const dl_prefixes = [_][]const u8{
+    "",
+    "/opt/homebrew/lib/", // Homebrew, Apple Silicon
+    "/usr/local/lib/", // Homebrew, Intel
+    "/opt/local/lib/", // MacPorts
+};
+
+/// dlopen the first of `names` that resolves, trying the prefixes a
+/// package manager may have installed it under.
+///
+/// On Linux a bare soname is enough: ld.so's cache covers every
+/// library directory the distro configured. **dyld has no equivalent
+/// for third-party prefixes** — it searches `/usr/lib` and the shared
+/// cache only — so a Homebrew library is invisible by soname alone.
+/// Every runtime-probed optional feature then reports itself absent on
+/// a Mac that has the library installed: no WebP/JXL preview codecs
+/// (remote thumbnails degrade), no Opus compression, no OCR.
+/// `$SKETERM_LIB_DIR` is honoured first for unusual prefixes.
+pub fn dlopenAny(names: []const [*:0]const u8) ?*anyopaque {
+    for (names) |name| {
+        if (dlopen(name, RTLD_LAZY)) |h| return h;
+        if (!is_macos) continue;
+        const soname = std.mem.span(name);
+        // A .so name on Darwin is a Linux entry in the same list; skip
+        // the prefix expansion rather than build paths that cannot exist.
+        if (std.mem.indexOf(u8, soname, ".dylib") == null) continue;
+        var buf: [512]u8 = undefined;
+        if (c.getenv("SKETERM_LIB_DIR")) |dir| {
+            const d = std.mem.span(@as([*:0]const u8, @ptrCast(dir)));
+            if (std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), soname })) |p| {
+                if (dlopen(p.ptr, RTLD_LAZY)) |h| return h;
+            } else |_| {}
+        }
+        for (dl_prefixes[1..]) |prefix| {
+            const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ prefix, soname }) catch continue;
+            if (dlopen(p.ptr, RTLD_LAZY)) |h| return h;
+        }
+    }
+    return null;
+}
+
 // ── extended attributes ─────────────────────────────────────────
 //
 // All four act on the LINK itself, never following a symlink. Linux

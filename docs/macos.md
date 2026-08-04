@@ -107,6 +107,20 @@ the wrong thing at runtime — the reason the smoke rigs exist.
    launch-constraints trap below) was dropped silently instead of
    materializing the log tab that explains the exit.
 
+6. **Every `dlopen`'d optional library was invisible under Homebrew.**
+   The runtime probes passed a bare soname (`libwebp.dylib`,
+   `libopus.dylib`, `libtesseract.dylib`), which is enough on Linux
+   because ld.so's cache covers the distro's library dirs — **dyld has
+   no equivalent for third-party prefixes**, searching only `/usr/lib`
+   and the shared cache. So every optional feature reported itself
+   absent on a Mac that had the library installed: no WebP/JXL preview
+   codecs (`smoke-fs` skipped both wire-thumb stages, i.e. remote
+   thumbnails silently degraded), no Opus compression, no OCR.
+   `platform.dlopenAny` now also tries the Homebrew/MacPorts prefixes
+   (and `$SKETERM_LIB_DIR`). Confirmed: `dlopen("libwebp.dylib")` fails
+   while `dlopen("/opt/homebrew/lib/libwebp.dylib")` succeeds; the two
+   imagecodec tests and the wire-thumb stages went from SKIP to PASS.
+
 Smaller: `SIGBUS` is 7 on Linux and 10 on Darwin, which overflowed
 crashlog's fixed truncating fallback into returning the empty string;
 `tic` writes `~/.terminfo/73/…` (hex bucket) on a case-insensitive
@@ -118,6 +132,14 @@ missing.
 ```bash
 brew install zig pkgconf gtk4 libadwaita adwaita-icon-theme \
              freetype harfbuzz libepoxy fribidi fontconfig libvpx
+
+# Optional, all probed at RUNTIME (no rebuild needed to pick them up):
+#   opus       Opus compression for remote audio  (doctor: opus:on)
+#   webp       WebP preview codec — remote thumbnails; installed
+#              already as a gtk4 dependency
+#   jpeg-xl    preferred over WebP when present
+#   tesseract  OCR
+brew install opus jpeg-xl tesseract
 
 zig build            # GUI → zig-out/bin/sketerm
 zig build mux        # session daemon
