@@ -68,6 +68,34 @@ int setxattr(const char *path, const char *name, const void *value,
              size_t size, sketerm_xattr_pos_t position, int options);
 int removexattr(const char *path, const char *name, int options);
 #define XATTR_NOFOLLOW 0x0001
+/* kqueue: the directory watcher backing live views/queries where there
+ * is no inotify (fsserve.Watcher). <sys/event.h> is another SDK-only
+ * header, so the ABI is declared here — verified against the macOS 26
+ * SDK: sizeof(struct kevent)=32, offsets 0/8/10/12/16/24. */
+struct kevent {
+    unsigned long  ident;
+    short          filter;
+    unsigned short flags;
+    unsigned int   fflags;
+    long           data;
+    void          *udata;
+};
+int kqueue(void);
+int kevent(int kq, const struct kevent *changelist, int nchanges,
+           struct kevent *eventlist, int nevents,
+           const struct timespec *timeout);
+#define EVFILT_VNODE  (-4)
+#define EV_ADD        0x0001
+#define EV_DELETE     0x0002
+#define EV_CLEAR      0x0020
+#define NOTE_DELETE   0x00000001
+#define NOTE_WRITE    0x00000002
+#define NOTE_EXTEND   0x00000004
+#define NOTE_ATTRIB   0x00000008
+#define NOTE_LINK     0x00000010
+#define NOTE_RENAME   0x00000020
+#define NOTE_REVOKE   0x00000040
+#define O_EVTONLY     0x8000
 #endif
 #include <termios.h>
 #include <unistd.h>

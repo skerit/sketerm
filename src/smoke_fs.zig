@@ -227,14 +227,8 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     if (!dlog.expectChildren(&fs, 1, "sub", 1)) fail("async child-count delta never arrived");
 
     // ── live deltas: external create / write / delete ──────────
-    // Deltas are inotify-backed, so a view elsewhere serves its initial
-    // listing and nothing more (fsserve.live_deltas). The filesystem
-    // work and the mutation VERBS below still run on every platform —
-    // only the delta OBSERVATIONS are gated, and where they are absent
-    // a fresh listing checks the same end state instead.
-    const deltas = fsserve.live_deltas;
     touch(dir, "c.txt", "x");
-    if (deltas and !dlog.expectSized(&fs, 1, "c.txt", 1)) fail("create delta never reached final size");
+    if (!dlog.expectSized(&fs, 1, "c.txt", 1)) fail("create delta never reached final size");
 
     {
         var z2: [4096]u8 = undefined;
@@ -243,13 +237,18 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         _ = c.fwrite("more!", 1, 5, f);
         _ = c.fclose(f);
     }
-    if (deltas and !dlog.expectSized(&fs, 1, "a.txt", 13)) fail("write delta never reached final size");
+    // Appending to an EXISTING file is the one event a kqueue directory
+    // watch cannot see (fsserve.watch_sees_child_writes) — the write
+    // never touches the directory. Everything else in this stage is
+    // exact on both backends.
+    if (fsserve.watch_sees_child_writes and !dlog.expectSized(&fs, 1, "a.txt", 13))
+        fail("write delta never reached final size");
 
     {
         var z2: [4096]u8 = undefined;
         _ = c.unlink(fsserve.joinZ(&z2, dir, "c.txt") catch fail("del path"));
     }
-    if (deltas) _ = dlog.expect(&fs, 1, "del", "c.txt") orelse fail("delete delta never arrived");
+    _ = dlog.expect(&fs, 1, "del", "c.txt") orelse fail("delete delta never arrived");
 
     // ── mutation verbs, observed through the same view ─────────
     var pbuf: [4096]u8 = undefined;
@@ -257,10 +256,8 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     w.print("{s}/made", .{dir}) catch fail("fmt");
     const made_path = w.buffered();
     fs.mkdir(made_path) catch failErr("mkdir", fs.lastErr());
-    if (deltas) {
-        const made = dlog.expect(&fs, 1, "upsert", "made") orelse fail("mkdir delta");
-        if (!made.tdir) fail("mkdir delta not dir");
-    }
+    const made = dlog.expect(&fs, 1, "upsert", "made") orelse fail("mkdir delta");
+    if (!made.tdir) fail("mkdir delta not dir");
 
     var p2buf: [4096]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&p2buf);
@@ -270,26 +267,11 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     var w3 = std.Io.Writer.fixed(&p3buf);
     w3.print("{s}/a.txt", .{dir}) catch fail("fmt3");
     fs.rename(w3.buffered(), renamed_path) catch failErr("rename", fs.lastErr());
-    if (deltas) {
-        _ = dlog.expect(&fs, 1, "del", "a.txt") orelse fail("rename del delta");
-        if (!dlog.expectSized(&fs, 1, "renamed.txt", 13)) fail("rename upsert delta");
-    }
+    _ = dlog.expect(&fs, 1, "del", "a.txt") orelse fail("rename del delta");
+    if (!dlog.expectSized(&fs, 1, "renamed.txt", 13)) fail("rename upsert delta");
 
     fs.deletePath(renamed_path) catch failErr("delete", fs.lastErr());
-    if (deltas) {
-        _ = dlog.expect(&fs, 1, "del", "renamed.txt") orelse fail("verb delete delta");
-    } else {
-        // No watcher: prove the same end state through a fresh listing,
-        // so the verbs above stay under test where deltas cannot be.
-        var l2 = fs.openView(2, dir) catch fail("re-list after verbs");
-        defer l2.deinit();
-        defer fs.closeView(2) catch {};
-        const made2 = findEntry(&l2, "made") orelse fail("mkdir verb had no effect");
-        if (!made2.tdir) fail("mkdir verb did not make a dir");
-        if (findEntry(&l2, "a.txt") != null) fail("rename verb left the source behind");
-        if (findEntry(&l2, "renamed.txt") != null) fail("delete verb had no effect");
-        if (findEntry(&l2, "c.txt") != null) fail("external delete not reflected in a re-list");
-    }
+    _ = dlog.expect(&fs, 1, "del", "renamed.txt") orelse fail("verb delete delta");
 
     // ── ranged write + read + stat + symlink ───────────────────
     var wbin: [4096]u8 = undefined;
@@ -355,9 +337,7 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         var z2: [4096]u8 = undefined;
         _ = c.rmdir(pathz.pathZ(&z2, gone_dir) catch fail("gone path"));
     }
-    // Self-destruction of the watched dir also arrives via the watcher
-    // (IN_DELETE_SELF / IN_MOVE_SELF), so it is gated with the rest.
-    if (deltas and !dlog.expectGone(&fs, 2)) fail("gone delta never arrived");
+    if (!dlog.expectGone(&fs, 2)) fail("gone delta never arrived");
     fs.closeView(2) catch failErr("close gone view", fs.lastErr());
 
     // ── close_view stops the stream ────────────────────────────
@@ -1943,101 +1923,89 @@ fn queryStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag:
     const gamma = std.fmt.bufPrint(&pb[3], "{s}/gamma.txt", .{dir}) catch unreachable;
     const moved = std.fmt.bufPrint(&pb[4], "{s}/moved-away", .{dir}) catch unreachable;
 
-    // Live queries are a recursive-WATCHER feature: where no watcher
-    // backend exists the daemon answers "live queries need the platform
-    // watcher backend" instead of silently degrading to polling, so the
-    // streamed-contract assertions below only apply where one does
-    // (fsserve.live_deltas). Panelize after this block is watcher-free
-    // and stays under test everywhere.
-    if (fsserve.live_deltas) {
-        // ── live filename query ────────────────────────────────────
-        const job = fs.startLiveFind(dir, "*.txt") catch failErr("start live_find", fs.lastErr());
-        var rows = LiveRows{ .allocator = allocator, .job = job };
-        defer rows.deinit();
+    // ── live filename query ────────────────────────────────────
+    const job = fs.startLiveFind(dir, "*.txt") catch failErr("start live_find", fs.lastErr());
+    var rows = LiveRows{ .allocator = allocator, .job = job };
+    defer rows.deinit();
 
-        const Want = struct {
-            var path: []const u8 = "";
-            fn ready(r: *const LiveRows) bool {
-                return r.ready;
-            }
-            fn present(r: *const LiveRows) bool {
-                return r.has(path);
-            }
-            fn absent(r: *const LiveRows) bool {
-                return !r.has(path);
-            }
-            fn empty(r: *const LiveRows) bool {
-                return r.paths.items.len == 0;
-            }
-        };
+    const Want = struct {
+        var path: []const u8 = "";
+        fn ready(r: *const LiveRows) bool {
+            return r.ready;
+        }
+        fn present(r: *const LiveRows) bool {
+            return r.has(path);
+        }
+        fn absent(r: *const LiveRows) bool {
+            return !r.has(path);
+        }
+        fn empty(r: *const LiveRows) bool {
+            return r.paths.items.len == 0;
+        }
+    };
 
-        expectLive(&rows, &fs, Want.ready, "initial scan complete");
-        // The status event reports its own bounds: two directories watched
-        // (the root and sub), two rows, neither cap hit.
-        if (rows.watches != 2) fail("live query reported the wrong watch count");
-        if (rows.truncated or rows.watch_limit) fail("live query claimed a bound it never hit");
-        if (!rows.has(alpha) or !rows.has(beta)) fail("live query missed an initial match");
-        if (rows.has(std.fmt.bufPrint(&pb[5], "{s}/ignore.log", .{dir}) catch unreachable))
-            fail("live query matched a non-matching name");
+    expectLive(&rows, &fs, Want.ready, "initial scan complete");
+    // The status event reports its own bounds: two directories watched
+    // (the root and sub), two rows, neither cap hit.
+    if (rows.watches != 2) fail("live query reported the wrong watch count");
+    if (rows.truncated or rows.watch_limit) fail("live query claimed a bound it never hit");
+    if (!rows.has(alpha) or !rows.has(beta)) fail("live query missed an initial match");
+    if (rows.has(std.fmt.bufPrint(&pb[5], "{s}/ignore.log", .{dir}) catch unreachable))
+        fail("live query matched a non-matching name");
 
-        // A file created externally appears with no request from anyone.
-        touch(dir, "gamma.txt", "g\n");
-        Want.path = gamma;
-        expectLive(&rows, &fs, Want.present, "externally created file appears");
+    // A file created externally appears with no request from anyone.
+    touch(dir, "gamma.txt", "g\n");
+    Want.path = gamma;
+    expectLive(&rows, &fs, Want.present, "externally created file appears");
 
-        // ...and a deleted one leaves.
-        var z: [4096]u8 = undefined;
-        _ = c.unlink(pathz.pathZ(&z, alpha) catch unreachable);
-        Want.path = alpha;
-        expectLive(&rows, &fs, Want.absent, "deleted file disappears");
+    // ...and a deleted one leaves.
+    var z: [4096]u8 = undefined;
+    _ = c.unlink(pathz.pathZ(&z, alpha) catch unreachable);
+    Want.path = alpha;
+    expectLive(&rows, &fs, Want.absent, "deleted file disappears");
 
-        // A whole directory MOVED out of the tree delivers no per-child
-        // event; its rows have to go anyway (this regressed once).
-        if (c.rename(
-            pathz.pathZ(&z, sub) catch unreachable,
-            pathz.pathZ(&pb[6], moved) catch unreachable,
-        ) != 0) fail("rename subdir");
-        Want.path = beta;
-        expectLive(&rows, &fs, Want.absent, "rows under a moved-away directory disappear");
+    // A whole directory MOVED out of the tree delivers no per-child
+    // event; its rows have to go anyway (this regressed once).
+    if (c.rename(
+        pathz.pathZ(&z, sub) catch unreachable,
+        pathz.pathZ(&pb[6], moved) catch unreachable,
+    ) != 0) fail("rename subdir");
+    Want.path = beta;
+    expectLive(&rows, &fs, Want.absent, "rows under a moved-away directory disappear");
 
-        fs.jobCancel(job) catch failErr("cancel live_find", fs.lastErr());
+    fs.jobCancel(job) catch failErr("cancel live_find", fs.lastErr());
 
-        // ── relative-time predicate that keeps being re-evaluated ──
-        var tdir_buf: [64]u8 = undefined;
-        const tdir = mkTmpDir(&tdir_buf, tag ++ "-age");
-        const fresh = std.fmt.bufPrint(&pb[0], "{s}/fresh.txt", .{tdir}) catch unreachable;
-        const old = std.fmt.bufPrint(&pb[1], "{s}/old.txt", .{tdir}) catch unreachable;
-        const later = std.fmt.bufPrint(&pb[2], "{s}/later.txt", .{tdir}) catch unreachable;
-        touch(tdir, "fresh.txt", "f\n");
-        touch(tdir, "old.txt", "o\n");
-        // Aged with a backdated mtime rather than by waiting: the daemon
-        // compares mtimes, so this is the same code path as real ageing.
-        setMtime(old, @as(i64, c.time(null)) - 7200);
+    // ── relative-time predicate that keeps being re-evaluated ──
+    var tdir_buf: [64]u8 = undefined;
+    const tdir = mkTmpDir(&tdir_buf, tag ++ "-age");
+    const fresh = std.fmt.bufPrint(&pb[0], "{s}/fresh.txt", .{tdir}) catch unreachable;
+    const old = std.fmt.bufPrint(&pb[1], "{s}/old.txt", .{tdir}) catch unreachable;
+    const later = std.fmt.bufPrint(&pb[2], "{s}/later.txt", .{tdir}) catch unreachable;
+    touch(tdir, "fresh.txt", "f\n");
+    touch(tdir, "old.txt", "o\n");
+    // Aged with a backdated mtime rather than by waiting: the daemon
+    // compares mtimes, so this is the same code path as real ageing.
+    setMtime(old, @as(i64, c.time(null)) - 7200);
 
-        const tjob = fs.startLiveFindOpts(tdir, "*.txt", .{ .within_ms = 3000 }) catch
-            failErr("start timed live_find", fs.lastErr());
-        var trows = LiveRows{ .allocator = allocator, .job = tjob };
-        defer trows.deinit();
-        expectLive(&trows, &fs, Want.ready, "timed query initial scan");
-        if (!trows.has(fresh)) fail("timed query dropped a file inside its window");
-        if (trows.has(old)) fail("timed query matched a file outside its window");
+    const tjob = fs.startLiveFindOpts(tdir, "*.txt", .{ .within_ms = 3000 }) catch
+        failErr("start timed live_find", fs.lastErr());
+    var trows = LiveRows{ .allocator = allocator, .job = tjob };
+    defer trows.deinit();
+    expectLive(&trows, &fs, Want.ready, "timed query initial scan");
+    if (!trows.has(fresh)) fail("timed query dropped a file inside its window");
+    if (trows.has(old)) fail("timed query matched a file outside its window");
 
-        // A file created inside the window matches...
-        touch(tdir, "later.txt", "l\n");
-        Want.path = later;
-        expectLive(&trows, &fs, Want.present, "new file inside the time window matches");
-        // ...and stops matching the moment its mtime is pushed out of it.
-        setMtime(later, @as(i64, c.time(null)) - 3600);
-        expectLive(&trows, &fs, Want.absent, "backdated file leaves the time window");
-        // ...and everything left ages out on its own deadline, with no
-        // filesystem event and nothing asked of the client.
-        expectLive(&trows, &fs, Want.empty, "matches age out on their own deadline");
-        fs.jobCancel(tjob) catch failErr("cancel timed live_find", fs.lastErr());
-    } else {
-        // Panelize below resolves a gamma.txt row; on a watcher host the
-        // block above creates it as its external-create probe.
-        touch(dir, "gamma.txt", "g\n");
-    }
+    // A file created inside the window matches...
+    touch(tdir, "later.txt", "l\n");
+    Want.path = later;
+    expectLive(&trows, &fs, Want.present, "new file inside the time window matches");
+    // ...and stops matching the moment its mtime is pushed out of it.
+    setMtime(later, @as(i64, c.time(null)) - 3600);
+    expectLive(&trows, &fs, Want.absent, "backdated file leaves the time window");
+    // ...and everything left ages out on its own deadline, with no
+    // filesystem event and nothing asked of the client.
+    expectLive(&trows, &fs, Want.empty, "matches age out on their own deadline");
+    fs.jobCancel(tjob) catch failErr("cancel timed live_find", fs.lastErr());
 
     // ── panelize: rows, rejects and the command's exit status ──
     var cmd_buf: [512]u8 = undefined;

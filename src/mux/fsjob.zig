@@ -3771,7 +3771,6 @@ fn liveScanDir(st: *LiveState, path: []const u8) void {
 /// other hosts report the missing watcher honestly instead of polling.
 fn runLiveFind(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.pattern.len == 0) return emitError("live_find needs pattern");
-    if (comptime builtin.os.tag != .linux) return emitError("live queries need the platform watcher backend");
     var watcher: fsserve.Watcher = .{};
     defer watcher.deinit();
     if (!watcher.ensure()) return emitError("cannot create filesystem watcher");
@@ -3802,7 +3801,7 @@ fn runLiveFind(allocator: std.mem.Allocator, spec: Spec) u8 {
         }
         if (pfds[1].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0) return 0;
         if (pfds[0].revents != 0) {
-            const n = c.read(watcher.fd, &buf, buf.len);
+            const n = watcher.readInto(&buf);
             if (n < 0 and std.posix.errno(n) == .INTR) continue;
             if (n <= 0) return emitError("watcher read failed");
             var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
