@@ -30,6 +30,9 @@ const vcodec = @import("vcodec.zig");
 const build_options = @import("build_options");
 const native_endian = @import("builtin").cpu.arch.endian();
 
+pub const DEFAULT_OUTPUT_WIDTH: u32 = 1920;
+pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1080;
+
 /// Default pc105/us xkb keymap; alternatives in keymaps.zig, chosen
 /// per session via the spawn `kb_layout` option (Compositor.keymap).
 pub const us_keymap = @import("keymaps.zig").us;
@@ -442,6 +445,10 @@ const Positioner = struct {
 pub const Compositor = struct {
     allocator: std.mem.Allocator,
     view: View,
+    /// Virtual output mode in physical pixels. Display sessions may
+    /// override this; ordinary forwarded sessions keep the defaults.
+    output_width: u32 = DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = DEFAULT_OUTPUT_HEIGHT,
     /// Integer output scale advertised to clients (HiDPI). The view
     /// sets this from the local display before the first feed; apps
     /// render buffers at this scale and tag them with set_buffer_scale.
@@ -1390,6 +1397,13 @@ pub const Compositor = struct {
         try self.send(try b.finish());
     }
 
+    /// Reports whether this client currently owns any xdg toplevels.
+    pub fn hasToplevels(self: *const Compositor) bool {
+        var it = self.surfaces.valueIterator();
+        while (it.next()) |surface| if (surface.toplevel != 0) return true;
+        return false;
+    }
+
     /// The accumulated outgoing unit stream; caller ships it (as
     /// chan_data, or decoded onto a test socket) and then clears.
     pub fn takeOut(self: *Compositor) []const u8 {
@@ -1550,7 +1564,6 @@ pub const Compositor = struct {
     const toplevelRequest = requests_mod.toplevelRequest;
     const commit = requests_mod.commit;
     const pushFrame = requests_mod.pushFrame;
-
 
     // ── surface-tree queries (renderer-facing) ──────────────────
     // A window is a TREE: the root surface's own buffer plus every
@@ -1729,6 +1742,15 @@ pub const Compositor = struct {
         return @intCast(self.output_scale * 120);
     }
 
+    /// Virtual output dimensions in logical coordinates at the current scale.
+    pub fn logicalOutputSize(self: *const Compositor) [2]i32 {
+        const s120 = @max(120, self.effScale120());
+        return .{
+            @intCast(@max(1, @as(u64, self.output_width) * 120 / s120)),
+            @intCast(@max(1, @as(u64, self.output_height) * 120 / s120)),
+        };
+    }
+
     /// The viewer told us its true display scale (set_scale intent):
     /// re-announce every scale channel so a mid-session change (or
     /// the app having connected before the viewer attached) converges.
@@ -1770,13 +1792,9 @@ pub const Compositor = struct {
         }
     }
 
-    /// Announce an xdg_output's logical geometry. The fixed 1920x1080
-    /// mode divided by the effective scale — matches what fractional-
-    /// scale clients will render at.
+    /// Announce an xdg_output's logical geometry at the effective scale.
     pub fn sendXdgOutputState(self: *Compositor, id: u32) Error!void {
-        const s120 = self.effScale120();
-        const lw: i32 = @intCast(@as(u64, 1920) * 120 / @max(120, s120));
-        const lh: i32 = @intCast(@as(u64, 1080) * 120 / @max(120, s120));
+        const logical = self.logicalOutputSize();
         var pbuf: [24]u8 = undefined;
         var pb = wire.Builder.init(&pbuf, id, 0); // logical_position
         pb.putInt(0);
@@ -1784,8 +1802,8 @@ pub const Compositor = struct {
         try self.send(try pb.finish());
         var sbuf: [24]u8 = undefined;
         var sb = wire.Builder.init(&sbuf, id, 1); // logical_size
-        sb.putInt(lw);
-        sb.putInt(lh);
+        sb.putInt(logical[0]);
+        sb.putInt(logical[1]);
         try self.send(try sb.finish());
         if (self.xdg_output_ver >= 2) {
             var nbuf: [32]u8 = undefined;
@@ -1961,8 +1979,8 @@ pub const Compositor = struct {
             var mbuf: [32]u8 = undefined;
             var m = wire.Builder.init(&mbuf, id, 1); // mode
             m.putUint(0x3); // current | preferred
-            m.putInt(1920);
-            m.putInt(1080);
+            m.putInt(@intCast(self.output_width));
+            m.putInt(@intCast(self.output_height));
             m.putInt(60000);
             try self.send(try m.finish());
             var sbuf: [16]u8 = undefined;
@@ -3068,6 +3086,26 @@ fn drainEvents(comp: *Compositor, list: *std.ArrayList([2]u32)) !void {
         pos += p.consumed;
     }
     comp.clearOut();
+}
+
+/// Assert the raw 32-bit body words of one queued Wayland event.
+fn expectEventWords(comp: *Compositor, object: u32, opcode: u16, expected: []const u32) !void {
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        if (p.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(p.unit.payload)).?;
+            if (hdr.object == object and hdr.opcode == opcode) {
+                const body = p.unit.payload[wire.header_size..hdr.size];
+                try t.expectEqual(expected.len * 4, body.len);
+                for (expected, 0..) |word, i|
+                    try t.expectEqual(word, std.mem.readInt(u32, body[i * 4 ..][0..4], native_endian));
+                return;
+            }
+        }
+        pos += p.consumed;
+    }
+    try t.expect(false);
 }
 
 test "registry dance announces our globals" {
@@ -4605,6 +4643,8 @@ test "v6 compositor / v6 wm_base / v4 output obligations" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
+    comp.output_width = 1234;
+    comp.output_height = 777;
     var buf: [64]u8 = undefined;
 
     try getRegistry(&comp);
@@ -4613,6 +4653,7 @@ test "v6 compositor / v6 wm_base / v4 output obligations" {
     comp.clearOut();
 
     try bindGlobal(&comp, 4, "wl_output", 4, 5);
+    try expectEventWords(&comp, 5, 1, &.{ 3, 1234, 777, 60000 });
     var evs: std.ArrayList([2]u32) = .empty;
     defer evs.deinit(t.allocator);
     try drainEvents(&comp, &evs);
@@ -4646,6 +4687,7 @@ test "v6 compositor / v6 wm_base / v4 output obligations" {
         var b = wire.Builder.init(&buf, 6, 6);
         try req(&comp, try b.finish());
     }
+    try expectEventWords(&comp, 8, 2, &.{ 1234, 777 });
     evs.clearRetainingCapacity();
     try drainEvents(&comp, &evs);
     const cfg_expect = [_][2]u32{
@@ -6731,6 +6773,9 @@ test "zxdg_output v3: logical geometry then wl_output.done" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
+    comp.output_width = 1024;
+    comp.output_height = 768;
+    comp.scale120 = 180;
     var buf: [96]u8 = undefined;
 
     try getRegistry(&comp);
@@ -6744,6 +6789,7 @@ test "zxdg_output v3: logical geometry then wl_output.done" {
         b.putObject(4);
         try req(&comp, try b.finish());
     }
+    try expectEventWords(&comp, 5, 1, &.{ 682, 512 });
     var evs: std.ArrayList([2]u32) = .empty;
     defer evs.deinit(t.allocator);
     try drainEvents(&comp, &evs);
@@ -6756,4 +6802,14 @@ test "zxdg_output v3: logical geometry then wl_output.done" {
         .{ 4, 2 }, // wl_output.done (xdg done is deprecated at v3)
     }, evs.items);
     try t.expect(!comp.dead);
+}
+
+test "virtual output size follows configured pixels and fractional scale" {
+    var comp = try Compositor.init(t.allocator, .{});
+    defer comp.deinit();
+    comp.output_width = 1024;
+    comp.output_height = 768;
+    try t.expectEqual([2]i32{ 1024, 768 }, comp.logicalOutputSize());
+    comp.scale120 = 180;
+    try t.expectEqual([2]i32{ 682, 512 }, comp.logicalOutputSize());
 }

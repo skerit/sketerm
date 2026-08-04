@@ -6,11 +6,13 @@
 //! in exactly that hop have shipped before while monolith smokes stayed
 //! green, so both is not redundancy — it is the point.
 //!
-//! Covered: `display create` returns a usable environment as JSON; the
+//! Covered: `display create` returns a usable environment and output mode;
+//! `display run` owns command status + cleanup; the
 //! returned Wayland socket accepts an EXTERNAL client (a stock
 //! weston-terminal sketerm never spawned); duplicate names are refused;
-//! `inspect`/`list` report the session; the no-viewer TTL kills an
-//! abandoned session; `destroy` closes the listener; and the controller
+//! `inspect`/`list` report the session; TTL pauses for a live external
+//! client then kills an abandoned session; `destroy` closes the listener;
+//! display-only destruction cannot kill a shell session; and the controller
 //! lease actually gates input — a non-controller's `request_close` does
 //! nothing, the controller's closes the app.
 
@@ -39,41 +41,70 @@ fn failf(comptime fmt: []const u8, args: anytype) noreturn {
 const CliResult = struct {
     code: u8,
     out: []u8,
+    err: []u8,
 
     fn deinit(self: CliResult, allocator: std.mem.Allocator) void {
         allocator.free(self.out);
+        allocator.free(self.err);
     }
 };
 
 fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) fail("pipe");
-    const saved = c.dup(1);
-    if (saved < 0) fail("dup stdout");
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
+    var out_fds: [2]c_int = undefined;
+    var err_fds: [2]c_int = undefined;
+    if (c.pipe(&out_fds) != 0 or c.pipe(&err_fds) != 0) fail("pipe");
+    const saved_out = c.dup(1);
+    const saved_err = c.dup(2);
+    if (saved_out < 0 or saved_err < 0) fail("dup output");
+    _ = c.dup2(out_fds[1], 1);
+    _ = c.dup2(err_fds[1], 2);
+    _ = c.close(out_fds[1]);
+    _ = c.close(err_fds[1]);
     const code = display_cli.run(allocator, argv);
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
+    _ = c.dup2(saved_out, 1);
+    _ = c.dup2(saved_err, 2);
+    _ = c.close(saved_out);
+    _ = c.close(saved_err);
 
     var out: std.ArrayList(u8) = .empty;
     while (true) {
         var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
+        const n = c.read(out_fds[0], &buf, buf.len);
         if (n <= 0) break;
         out.appendSlice(allocator, buf[0..@intCast(n)]) catch fail("oom");
     }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch fail("oom") };
+    _ = c.close(out_fds[0]);
+    var err: std.ArrayList(u8) = .empty;
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = c.read(err_fds[0], &buf, buf.len);
+        if (n <= 0) break;
+        err.appendSlice(allocator, buf[0..@intCast(n)]) catch fail("oom");
+    }
+    _ = c.close(err_fds[0]);
+    return .{
+        .code = code,
+        .out = out.toOwnedSlice(allocator) catch fail("oom"),
+        .err = err.toOwnedSlice(allocator) catch fail("oom"),
+    };
 }
 
 const CreateReply = struct {
     session: []const u8 = "",
+    pid: i32 = 0,
+    output: struct {
+        width: u32 = 0,
+        height: u32 = 0,
+    } = .{},
+    gpu: bool = false,
+    xwayland: bool = false,
     environment: struct {
         WAYLAND_DISPLAY: []const u8 = "",
         XDG_RUNTIME_DIR: []const u8 = "",
         PULSE_SERVER: []const u8 = "",
         LIBGL_ALWAYS_SOFTWARE: []const u8 = "",
+        DISPLAY: []const u8 = "",
+        XAUTHORITY: []const u8 = "",
     } = .{},
 };
 
@@ -84,6 +115,21 @@ fn socketAccepts(path: []const u8) bool {
     var addr: c.struct_sockaddr_un = undefined;
     @import("mux/daemon.zig").fillSockaddrUn(&addr, path) catch return false;
     return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0;
+}
+
+fn connectSocket(path: []const u8) c_int {
+    const fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    var addr: c.struct_sockaddr_un = undefined;
+    @import("mux/daemon.zig").fillSockaddrUn(&addr, path) catch {
+        _ = c.close(fd);
+        return -1;
+    };
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
+        _ = c.close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 // ── audio-flag stage ─────────────────────────────────────────────
@@ -582,6 +628,34 @@ fn spawnExternalApp(wl_path: []const u8) c.pid_t {
     return pid;
 }
 
+fn spawnExternalX11(display: []const u8, authority: []const u8) c.pid_t {
+    var display_buf: [64:0]u8 = undefined;
+    const display_z = std.fmt.bufPrintZ(&display_buf, "{s}", .{display}) catch fail("X11 display too long");
+    var auth_buf: [4096:0]u8 = undefined;
+    const auth_z = std.fmt.bufPrintZ(&auth_buf, "{s}", .{authority}) catch fail("Xauthority path too long");
+    const pid = c.fork();
+    if (pid < 0) fail("fork X11 app");
+    if (pid == 0) {
+        const null_fd = c.open("/dev/null", c.O_RDWR | c.O_CLOEXEC);
+        if (null_fd >= 0) {
+            _ = c.dup2(null_fd, 0);
+            _ = c.dup2(null_fd, 1);
+            _ = c.dup2(null_fd, 2);
+            if (null_fd > 2) _ = c.close(null_fd);
+        }
+        _ = c.setenv("DISPLAY", display_z.ptr, 1);
+        _ = c.setenv("XAUTHORITY", auth_z.ptr, 1);
+        _ = c.unsetenv("WAYLAND_DISPLAY");
+        _ = c.unsetenv("WAYLAND_SOCKET");
+        const argv = [_:null]?[*:0]const u8{
+            "/usr/bin/xterm", "-geometry", "40x10", "-title", "sketerm-x11-smoke", null,
+        };
+        _ = c.execv("/usr/bin/xterm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    return pid;
+}
+
 fn listJson(allocator: std.mem.Allocator, sock_path: []const u8) CliResult {
     return runCli(allocator, &.{ "list", "--json", "--socket", sock_path });
 }
@@ -601,8 +675,9 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     var wl_path_len: usize = 0;
     var pa_buf: [4096]u8 = undefined;
     var pa_len: usize = 0;
+    var dsp1_pid: i32 = 0;
     {
-        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--json", "--socket", sock_path });
+        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--size", "1024x768", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
         if (r.code != 0) failf("create failed (exit {d}): {s}", .{ r.code, r.out });
         var parsed = std.json.parseFromSlice(CreateReply, allocator, r.out, .{
@@ -612,6 +687,10 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         defer parsed.deinit();
         const env = parsed.value.environment;
         if (!std.mem.eql(u8, parsed.value.session, "dsp1")) fail("create: wrong session name in reply");
+        dsp1_pid = parsed.value.pid;
+        if (dsp1_pid <= 0) fail("create: no keeper pid in reply");
+        if (parsed.value.output.width != 1024 or parsed.value.output.height != 768)
+            fail("create: requested output size missing from reply");
         if (env.WAYLAND_DISPLAY.len == 0 or env.WAYLAND_DISPLAY[0] != '/')
             failf("create: WAYLAND_DISPLAY must be an absolute path, got '{s}'", .{env.WAYLAND_DISPLAY});
         if (env.XDG_RUNTIME_DIR.len == 0) fail("create: no XDG_RUNTIME_DIR");
@@ -636,18 +715,33 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
 
     // ── duplicate names are refused, not silently reused ──────────
     {
-        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--json", "--socket", sock_path });
+        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
         if (r.code == 0) fail("create: duplicate name was accepted");
+        if (std.mem.indexOf(u8, r.err, "session 'dsp1' already exists") == null)
+            failf("create: duplicate diagnostic omitted the session name: {s}", .{r.err});
+    }
+
+    // Help is command-local and must not contact the daemon.
+    {
+        const r = runCli(allocator, &.{ "create", "--help", "--socket", "/definitely/not/a/socket" });
+        defer r.deinit(allocator);
+        if (r.code != 0 or std.mem.indexOf(u8, r.out, "--size WxH") == null)
+            fail("create --help was not available without a daemon");
     }
 
     // ── --gpu drops the software-GL force ─────────────────────────
     {
-        const r = runCli(allocator, &.{ "create", "--name", "dspgpu", "--gpu", "--json", "--socket", sock_path });
+        const r = runCli(allocator, &.{ "create", "--name", "dspgpu", "--gpu", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
         if (r.code != 0) failf("create --gpu failed: {s}", .{r.out});
-        if (std.mem.indexOf(u8, r.out, "LIBGL_ALWAYS_SOFTWARE") != null)
+        if (std.mem.indexOf(u8, r.out, "\"LIBGL_ALWAYS_SOFTWARE\":\"1\"") != null)
             fail("create --gpu must not export LIBGL_ALWAYS_SOFTWARE");
+        const inspect_gpu = runCli(allocator, &.{ "inspect", "dspgpu", "--json", "--socket", sock_path });
+        defer inspect_gpu.deinit(allocator);
+        if (inspect_gpu.code != 0 or std.mem.indexOf(u8, inspect_gpu.out, "\"gpu\":true") == null or
+            std.mem.indexOf(u8, inspect_gpu.out, "\"LIBGL_ALWAYS_SOFTWARE\":\"1\"") != null)
+            fail("inspect did not preserve the display's GPU policy");
         const d = runCli(allocator, &.{ "destroy", "dspgpu", "--socket", sock_path });
         defer d.deinit(allocator);
         if (d.code != 0) fail("destroy dspgpu failed");
@@ -665,6 +759,8 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
             if (r.code != 0) failf("inspect failed: {s}", .{r.out});
             const ok = std.mem.indexOf(u8, r.out, "\"display\":true") != null and
                 std.mem.indexOf(u8, r.out, wl_path) != null and
+                std.mem.indexOf(u8, r.out, "\"width\":1024") != null and
+                std.mem.indexOf(u8, r.out, "\"height\":768") != null and
                 std.mem.indexOf(u8, r.out, "\"controller\":null") != null;
             if (ok) break;
             if (tries == 99) failf("inspect fields never became right: {s}", .{r.out});
@@ -672,7 +768,135 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         }
     }
     if (!hasDisplay(allocator, sock_path, "dsp1")) fail("list: dsp1 missing");
+    {
+        var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("identity guard: connect");
+        defer conn.deinit();
+        conn.sendJson(.kill, .{
+            .name = "dsp1",
+            .require_display = true,
+            .expected_pid = dsp1_pid + 1,
+            .expected_wl_display = wl_path,
+        }) catch fail("identity guard: send");
+        if (conn.recvExpectFor(&.{.ok}, 15_000)) |frame| {
+            frame.deinit(allocator);
+            fail("identity guard: stale identity was accepted");
+        } else |err| if (err != error.DaemonError) {
+            fail("identity guard: unexpected reply error");
+        }
+        if (!hasDisplay(allocator, sock_path, "dsp1")) fail("identity guard killed the wrong display incarnation");
+    }
     std.debug.print("smoke-display: inspect + list ok\n", .{});
+
+    // `run` is the xvfb-run-shaped path: environment is applied without
+    // eval/jq, command status is preserved, and both success/failure clean up.
+    {
+        const r = runCli(allocator, &.{
+            "run",     "--name", "dsprun",                                                                                                                                              "--size", "320x200", "--no-xwayland", "--socket", sock_path, "--",
+            "/bin/sh", "-c",     "test \"$XDG_SESSION_TYPE\" = wayland && test -z \"$DISPLAY\" && test -z \"$WAYLAND_SOCKET\" && test \"$LIBGL_ALWAYS_SOFTWARE\" = 1 && printf run-ok",
+        });
+        defer r.deinit(allocator);
+        if (r.code != 0 or !std.mem.eql(u8, r.out, "run-ok"))
+            failf("display run environment/status failed ({d}): out={s} err={s}", .{ r.code, r.out, r.err });
+        if (hasDisplay(allocator, sock_path, "dsprun")) fail("display run leaked its successful session");
+    }
+    {
+        const r = runCli(allocator, &.{ "run", "--name", "dsprun-fail", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "exit 23" });
+        defer r.deinit(allocator);
+        if (r.code != 23) failf("display run returned {d}, want command status 23", .{r.code});
+        if (hasDisplay(allocator, sock_path, "dsprun-fail")) fail("display run leaked its failed session");
+    }
+    { // The runner lease, not an app connection, keeps a short TTL paused.
+        const r = runCli(allocator, &.{ "run", "--name", "dsprun-ttl", "--ttl", "1", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "sleep 2" });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("display run was reaped by its own TTL: {s}", .{r.err});
+        if (hasDisplay(allocator, sock_path, "dsprun-ttl")) fail("TTL runner lease test leaked its display");
+    }
+    { // --gpu must remove, not merely decline to add, a software override.
+        const prior = if (c.getenv("LIBGL_ALWAYS_SOFTWARE")) |p| allocator.dupe(u8, std.mem.span(p)) catch fail("oom") else null;
+        defer {
+            if (prior) |p| allocator.free(p);
+        }
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        defer {
+            if (prior) |p| {
+                var zbuf: [128:0]u8 = undefined;
+                const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{p}) catch fail("prior LIBGL value too long");
+                _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", z.ptr, 1);
+            } else _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+        }
+        const r = runCli(allocator, &.{ "run", "--name", "dsprun-gpu", "--gpu", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "test -z \"$LIBGL_ALWAYS_SOFTWARE\" && printf gpu-ok" });
+        defer r.deinit(allocator);
+        if (r.code != 0 or !std.mem.eql(u8, r.out, "gpu-ok"))
+            failf("display run --gpu inherited software GL: out={s} err={s}", .{ r.out, r.err });
+    }
+    { // Signals reach the command group, its status wins, then cleanup runs.
+        const runner_pid = c.fork();
+        if (runner_pid < 0) fail("signal run: fork");
+        if (runner_pid == 0) {
+            const code = display_cli.run(allocator, &.{ "run", "--name", "dsprun-signal", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "trap 'exit 42' TERM; while :; do sleep 1; done" });
+            c._exit(code);
+        }
+        var appeared = false;
+        var tries: usize = 0;
+        while (tries < 100) : (tries += 1) {
+            if (hasDisplay(allocator, sock_path, "dsprun-signal")) {
+                appeared = true;
+                break;
+            }
+            _ = c.usleep(50_000);
+        }
+        if (!appeared) fail("signal run: display never appeared");
+        _ = c.usleep(250_000);
+        _ = c.kill(runner_pid, c.SIGTERM);
+        var status: c_int = 0;
+        _ = c.waitpid(runner_pid, &status, 0);
+        if (!c.WIFEXITED(status) or c.WEXITSTATUS(status) != 42)
+            failf("signal run: wrapper status was {d}, want 42", .{status});
+        if (hasDisplay(allocator, sock_path, "dsprun-signal")) fail("signal run leaked its display");
+    }
+    { // A SIGKILLed runner drops its lease; TTL then cleans the orphaned hub.
+        const runner_pid = c.fork();
+        if (runner_pid < 0) fail("killed run: fork");
+        if (runner_pid == 0) {
+            const code = display_cli.run(allocator, &.{ "run", "--name", "dsprun-killed", "--ttl", "1", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "sleep 3" });
+            c._exit(code);
+        }
+        var appeared = false;
+        var tries: usize = 0;
+        while (tries < 100) : (tries += 1) {
+            if (hasDisplay(allocator, sock_path, "dsprun-killed")) {
+                appeared = true;
+                break;
+            }
+            _ = c.usleep(50_000);
+        }
+        if (!appeared) fail("killed run: display never appeared");
+        _ = c.usleep(250_000);
+        _ = c.kill(runner_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(runner_pid, &status, 0);
+        tries = 0;
+        while (tries < 100 and hasDisplay(allocator, sock_path, "dsprun-killed")) : (tries += 1)
+            _ = c.usleep(50_000);
+        if (hasDisplay(allocator, sock_path, "dsprun-killed")) fail("killed run: lease stayed alive after runner death");
+    }
+    std.debug.print("smoke-display: scoped run environment + status + cleanup ok\n", .{});
+
+    // The display namespace shares ordinary mux session names. Guarded kill
+    // must reject a shell rather than turning a typo into data loss.
+    {
+        var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("guard: connect");
+        defer conn.deinit();
+        conn.sendJson(.spawn, .{ .name = "ordinary", .argv = &.{ "/bin/sh", "-c", "sleep 30" } }) catch fail("guard: spawn send");
+        (conn.recvExpectFor(&.{.ok}, 15_000) catch fail("guard: spawn reply")).deinit(allocator);
+        const d = runCli(allocator, &.{ "destroy", "ordinary", "--socket", sock_path });
+        defer d.deinit(allocator);
+        if (d.code == 0 or std.mem.indexOf(u8, d.err, "not a display session") == null)
+            fail("display destroy did not reject an ordinary mux session");
+        conn.sendJson(.kill, .{ .name = "ordinary" }) catch fail("guard: cleanup send");
+        (conn.recvExpectFor(&.{.ok}, 15_000) catch fail("guard: cleanup reply")).deinit(allocator);
+    }
+    std.debug.print("smoke-display: display-only destroy guard ok\n", .{});
 
     // ── an uncorked stream flips list's audio flag (and back) ─────
     audioStage(allocator, sock_path, "dsp1", pulse_server);
@@ -682,6 +906,14 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         leaseStage(allocator, sock_path, wl_path)
     else
         std.debug.print("smoke-display: lease stage SKIPPED (no weston-terminal)\n", .{});
+
+    // ── rootless X11 windows traverse satellite -> xdg-shell ──────
+    if (c.access("/usr/bin/Xwayland", c.X_OK) == 0 and
+        c.access("/usr/bin/xwayland-satellite", c.X_OK) == 0 and
+        c.access("/usr/bin/xterm", c.X_OK) == 0)
+        xwaylandStage(allocator, sock_path)
+    else
+        std.debug.print("smoke-display: rootless Xwayland stage SKIPPED (runtime tools missing)\n", .{});
 
     // ── controller death hands the lease to the oldest viewer ─────
     handoverStage(allocator, sock_path);
@@ -700,16 +932,36 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (hasDisplay(allocator, sock_path, "dsp1")) fail("destroy: dsp1 still listed");
     std.debug.print("smoke-display: destroy closes the listener ok\n", .{});
 
-    // ── TTL: an abandoned session must not leak a hub forever ─────
+    // ── TTL: a live renderer pauses it; disconnect starts it ──────
+    var ttl_path_buf: [4096]u8 = undefined;
+    var ttl_path_len: usize = 0;
     {
-        const r = runCli(allocator, &.{ "create", "--name", "dspttl", "--ttl", "1", "--json", "--socket", sock_path });
+        const r = runCli(allocator, &.{ "create", "--name", "dspttl", "--ttl", "1", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
         if (r.code != 0) failf("create --ttl failed: {s}", .{r.out});
+        var parsed = std.json.parseFromSlice(CreateReply, allocator, r.out, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch fail("ttl: create reply parse");
+        defer parsed.deinit();
+        ttl_path_len = parsed.value.environment.WAYLAND_DISPLAY.len;
+        @memcpy(ttl_path_buf[0..ttl_path_len], parsed.value.environment.WAYLAND_DISPLAY);
     }
     if (!hasDisplay(allocator, sock_path, "dspttl")) fail("ttl: session missing right after create");
+    const held_client = connectSocket(ttl_path_buf[0..ttl_path_len]);
+    if (held_client < 0) fail("ttl: could not connect external Wayland client");
     {
-        // 1s TTL, checked on the daemon's reap; a worker additionally
-        // has to exit and be reaped by the broker.
+        var tries: usize = 0;
+        while (tries < 25) : (tries += 1) {
+            _ = c.usleep(100_000);
+            if (!hasDisplay(allocator, sock_path, "dspttl"))
+                fail("ttl: reaped a display while an external Wayland client was connected");
+        }
+    }
+    _ = c.close(held_client);
+    {
+        // The complete TTL starts at disconnect; a worker additionally has
+        // to exit and be reaped by the broker.
         var tries: usize = 0;
         while (tries < 120) : (tries += 1) {
             if (!hasDisplay(allocator, sock_path, "dspttl")) break;
@@ -717,7 +969,125 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         }
         if (hasDisplay(allocator, sock_path, "dspttl")) fail("ttl: never-attached session outlived its ttl");
     }
-    std.debug.print("smoke-display: ttl expiry ok\n", .{});
+    std.debug.print("smoke-display: ttl active-client pause + expiry ok\n", .{});
+}
+
+/// A real X11-only xterm must authenticate, become a normal forwarded
+/// toplevel, obey the controller close, and not let satellite defeat TTL.
+fn xwaylandStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    if (c.access("/usr/bin/xprop", c.X_OK) == 0) {
+        const run_result = runCli(allocator, &.{
+            "run", "--name", "dspx11-run", "--xwayland", "--socket", sock_path, "--",
+            "/bin/sh", "-c", "test -n \"$DISPLAY\" && test -r \"$XAUTHORITY\" && /usr/bin/xprop -root >/dev/null && printf x11-run-ok",
+        });
+        defer run_result.deinit(allocator);
+        if (run_result.code != 0 or !std.mem.eql(u8, run_result.out, "x11-run-ok"))
+            failf("Xwayland run environment/auth failed: out={s} err={s}", .{ run_result.out, run_result.err });
+        if (hasDisplay(allocator, sock_path, "dspx11-run")) fail("Xwayland run leaked its display");
+    }
+    var display_buf: [64]u8 = undefined;
+    var display_len: usize = 0;
+    var auth_buf: [4096]u8 = undefined;
+    var auth_len: usize = 0;
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dspx11", "--xwayland", "--ttl", "1", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("Xwayland create failed: out={s} err={s}", .{ r.out, r.err });
+        var parsed = std.json.parseFromSlice(CreateReply, allocator, r.out, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch failf("Xwayland create output is not isolated JSON: {s}", .{r.out});
+        defer parsed.deinit();
+        if (!parsed.value.xwayland) fail("required Xwayland was not reported active");
+        const env = parsed.value.environment;
+        if (env.DISPLAY.len < 2 or env.DISPLAY[0] != ':') fail("Xwayland create omitted DISPLAY");
+        if (env.XAUTHORITY.len == 0) fail("Xwayland create omitted XAUTHORITY");
+        var zbuf: [4096:0]u8 = undefined;
+        const auth_z = std.fmt.bufPrintZ(&zbuf, "{s}", .{env.XAUTHORITY}) catch fail("Xauthority path too long");
+        var st: c.struct_stat = undefined;
+        if (c.stat(auth_z.ptr, &st) != 0 or st.st_mode & 0o777 != 0o600)
+            fail("Xauthority is missing or not mode 0600");
+        display_len = env.DISPLAY.len;
+        auth_len = env.XAUTHORITY.len;
+        @memcpy(display_buf[0..display_len], env.DISPLAY);
+        @memcpy(auth_buf[0..auth_len], env.XAUTHORITY);
+    }
+    const display = display_buf[0..display_len];
+    const authority = auth_buf[0..auth_len];
+    if (!listContains(allocator, sock_path, "\"xwayland\":true"))
+        fail("Xwayland state did not cross the worker/broker metadata path");
+
+    g_frames = 0;
+    g_sid = 0;
+    g_gone = 0;
+    const app_pid = spawnExternalX11(display, authority);
+    var app_reaped = false;
+    defer if (!app_reaped) {
+        _ = c.kill(app_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(app_pid, &status, 0);
+    };
+    {
+        var viewer = Viewer.attach(allocator, sock_path, "dspx11", .{ .replica = true });
+        defer viewer.deinit();
+        const deadline = nowMs() + 30_000;
+        while (g_frames == 0 and nowMs() < deadline) {
+            _ = viewer.pump();
+            if (!childAlive(app_pid)) fail("xterm died before committing a rootless window");
+            _ = c.usleep(20_000);
+        }
+        if (g_frames == 0 or g_sid == 0) fail("xterm never became a forwarded rootless toplevel");
+    }
+
+    // No viewer is attached now. The X11 toplevel itself must pause TTL even
+    // though every X window is multiplexed through satellite's auxiliary
+    // host-Wayland connection.
+    var live_tries: usize = 0;
+    while (live_tries < 25) : (live_tries += 1) {
+        _ = c.usleep(100_000);
+        if (!hasDisplay(allocator, sock_path, "dspx11"))
+            fail("TTL reaped a display while an X11 toplevel was active");
+        if (!childAlive(app_pid)) fail("xterm died during the no-viewer TTL check");
+    }
+
+    {
+        var viewer = Viewer.attach(allocator, sock_path, "dspx11", .{});
+        defer viewer.deinit();
+        const replay_deadline = nowMs() + 10_000;
+        while (viewer.chan == 0 and nowMs() < replay_deadline) {
+            _ = viewer.pump();
+            _ = c.usleep(20_000);
+        }
+        if (viewer.chan == 0) fail("X11 channel did not replay after a viewerless interval");
+        viewer.requestClose(g_sid);
+        const close_deadline = nowMs() + 10_000;
+        while (nowMs() < close_deadline) {
+            _ = viewer.pump();
+            if (!childAlive(app_pid)) {
+                app_reaped = true;
+                break;
+            }
+            _ = c.usleep(20_000);
+        }
+        if (!app_reaped) fail("controller close did not reach the X11 client");
+    }
+
+    // With the last X11 toplevel gone, satellite itself is not occupancy.
+    var tries: usize = 0;
+    while (tries < 150 and hasDisplay(allocator, sock_path, "dspx11")) : (tries += 1)
+        _ = c.usleep(100_000);
+    if (hasDisplay(allocator, sock_path, "dspx11"))
+        fail("xwayland-satellite kept an otherwise abandoned display alive past TTL");
+    var auth_zbuf: [4096:0]u8 = undefined;
+    const auth_z = std.fmt.bufPrintZ(&auth_zbuf, "{s}", .{authority}) catch fail("Xauthority path too long");
+    if (c.access(auth_z.ptr, c.F_OK) == 0) fail("Xauthority survived display teardown");
+    var x_socket_buf: [128:0]u8 = undefined;
+    const x_socket = std.fmt.bufPrintZ(&x_socket_buf, "/tmp/.X11-unix/X{s}", .{display[1..]}) catch fail("X socket path too long");
+    if (c.access(x_socket.ptr, c.F_OK) == 0) fail("X11 listener survived display teardown");
+    var x_lock_buf: [128:0]u8 = undefined;
+    const x_lock = std.fmt.bufPrintZ(&x_lock_buf, "/tmp/.X{s}-lock", .{display[1..]}) catch fail("X lock path too long");
+    if (c.access(x_lock.ptr, c.F_OK) == 0) fail("X11 lock survived display teardown");
+    std.debug.print("smoke-display: authenticated rootless X11 frame + close + auxiliary TTL ok\n", .{});
 }
 
 /// Two viewers on one display session with a real external app: only
@@ -808,7 +1178,7 @@ fn leaseStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_path: []co
 /// can drive. Read-only viewers are skipped by that handover.
 fn handoverStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     {
-        const r = runCli(allocator, &.{ "create", "--name", "dsphand", "--json", "--socket", sock_path });
+        const r = runCli(allocator, &.{ "create", "--name", "dsphand", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
         if (r.code != 0) failf("handover: create failed: {s}", .{r.out});
     }

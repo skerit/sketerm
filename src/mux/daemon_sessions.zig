@@ -15,6 +15,7 @@ const Session = dmod.Session;
 const Worker = dmod.Worker;
 const SpawnReq = dmod.SpawnReq;
 const AttachReq = dmod.AttachReq;
+const KillReq = dmod.KillReq;
 const wlkeymaps = @import("../wlhost/keymaps.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const logring = @import("logring.zig");
@@ -37,12 +38,25 @@ const Pool = @import("../grid/style_pool.zig").Pool;
 const Screen = @import("../grid/screen.zig").Screen;
 const Parser = @import("../parser/vt.zig").Parser;
 const build_options = @import("build_options");
+const xwayland = @import("xwayland.zig");
 
 pub fn findSession(self: *Daemon, name: []const u8) ?*Session {
     for (self.sessions.items) |s| {
         if (std.mem.eql(u8, s.name, name)) return s;
     }
     return null;
+}
+
+fn validOutputSize(req: SpawnReq) bool {
+    if (req.output_width == 0 or req.output_height == 0) return false;
+    if (req.output_width > 16_384 or req.output_height > 16_384) return false;
+    return @as(u64, req.output_width) * req.output_height <= 64 * 1024 * 1024;
+}
+
+fn queueNameExists(cl: *Client, name: []const u8) void {
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "session '{s}' already exists (use a different name or destroy it)", .{name}) catch "session name already exists";
+    cl.queueErr(msg);
 }
 
 pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
@@ -67,6 +81,10 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("spawn needs a name");
         return;
     }
+    if (!validOutputSize(req)) {
+        cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
+        return;
+    }
     // Empty argv = "the daemon host's login shell" — remote
     // clients can't know what's installed here. A display session
     // is exempt: spawnSession substitutes the keeper argv.
@@ -76,7 +94,7 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         req.login_shell = true;
     }
     if (findSession(self, req.name) != null) {
-        cl.queueErr("session name already exists");
+        queueNameExists(cl, req.name);
         return;
     }
     const s = spawnSession(self, req) catch |err| {
@@ -99,6 +117,12 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         .wl_display = if (s.wl_display_path) |p| p else "",
         .pulse_server = if (s.pa_socket_path) |p| p else "",
         .runtime_dir = if (s.runtime_dir_path) |p| p else "",
+        .xwayland = s.xwayland != null,
+        .x_display = if (s.xwayland) |*xwl| xwl.display_name else "",
+        .xauthority = if (s.xwayland) |*xwl| xwl.auth_path else "",
+        .gpu = s.gpu,
+        .output_width = s.output_width,
+        .output_height = s.output_height,
     });
 }
 
@@ -145,13 +169,17 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("spawn needs a name");
         return;
     }
+    if (!validOutputSize(req)) {
+        cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
+        return;
+    }
     const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
     if (req.argv.len == 0 and !req.display) {
         req.argv = default_shell;
         req.login_shell = true;
     }
     if (brokerFindWorker(self, req.name) != null) {
-        cl.queueErr("session name already exists");
+        queueNameExists(cl, req.name);
         return;
     }
 
@@ -211,6 +239,9 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         // Seeded from the request so `list` is right before the
         // worker's first 'M' push lands.
         .display = req.display,
+        .gpu = req.gpu,
+        .output_width = req.output_width,
+        .output_height = req.output_height,
         .ttl_secs = req.ttl_secs,
         .pending_client = cl,
     };
@@ -300,6 +331,12 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .audio = w.audio,
             .audio_streams = w.audio_streams,
             .display = w.display,
+            .xwayland = w.xwayland,
+            .x_display = if (w.x_display) |p| p else "",
+            .xauthority = if (w.xauthority) |p| p else "",
+            .gpu = w.gpu,
+            .output_width = w.output_width,
+            .output_height = w.output_height,
             .wl_display = if (w.wl_display) |p| p else "",
             .pulse_server = if (w.pulse_server) |p| p else "",
             .runtime_dir = if (w.runtime_dir) |p| p else "",
@@ -316,7 +353,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
 /// The buffered 'K' datagram is delivered to the worker even though reap
 /// closes the broker's control end this tick.
 pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
-    var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
+    var parsed = std.json.parseFromSlice(KillReq, self.allocator, payload, .{
         .ignore_unknown_fields = true,
     }) catch {
         cl.queueErr("bad kill request");
@@ -327,6 +364,20 @@ pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no such session");
         return;
     };
+    if (parsed.value.require_display and !w.display) {
+        cl.queueErr("session is not a display session");
+        return;
+    }
+    if (parsed.value.expected_pid != 0 and parsed.value.expected_pid != w.child_pid) {
+        cl.queueErr("display session identity changed");
+        return;
+    }
+    if (parsed.value.expected_wl_display.len > 0 and
+        (w.wl_display == null or !std.mem.eql(u8, parsed.value.expected_wl_display, w.wl_display.?)))
+    {
+        cl.queueErr("display session identity changed");
+        return;
+    }
     controlSend(w.control_fd, "K", -1);
     w.dead = true;
     cl.queueJson(.ok, .{ .ok = true });
@@ -523,6 +574,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         _ = c.close(h.fd);
         allocator.free(h.display_path);
     };
+    if (req.display and hub == null) return error.WaylandDisplayUnavailable;
 
     // Remote audio rides the same gate: the daemon IS the
     // session's PulseAudio server (SKETERM_MUX_NO_AUDIO=1 opts out).
@@ -589,6 +641,19 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         var z_buf: [4096]u8 = undefined;
         _ = c.mkdir(try pathZ(&z_buf, p), 0o700);
         rt_dir_z = try allocator.dupeZ(u8, p);
+    }
+
+    var xwl: ?xwayland.Instance = null;
+    errdefer if (xwl) |*instance| instance.deinit();
+    if (req.display and req.xwayland and hub != null) {
+        const base = runtimeBaseDir(self) orelse platform.runtimeDir();
+        const runtime = if (rt_dir_owned) |p| p else platform.runtimeDir();
+        xwl = xwayland.Instance.setup(allocator, base, hub.?.display_path, runtime, req.gpu) catch |err| blk: {
+            if (req.require_xwayland) return err;
+            log.warn("rootless Xwayland setup failed for '{s}': {s}; continuing Wayland-only", .{ req.name, @errorName(err) });
+            break :blk null;
+        };
+        if (xwl == null and req.require_xwayland) return error.XwaylandUnavailable;
     }
 
     // Forwarded-app sessions get a private D-Bus session bus so
@@ -706,6 +771,9 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         .screen = screen,
         .app = req.app,
         .display = req.display,
+        .xwayland = null,
+        .output_width = req.output_width,
+        .output_height = req.output_height,
         .ttl_ms = @as(i64, req.ttl_secs) * 1000,
         // A session nobody ever attaches to must still expire, so
         // the no-viewer clock starts now rather than at first detach.
@@ -722,6 +790,10 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         s.wl_hub_fd = h.fd;
         s.wl_display_path = h.display_path;
         hub = null; // ownership moved to the session
+    }
+    if (xwl) |instance| {
+        s.xwayland = instance;
+        xwl = null;
     }
     if (audio_hub) |h| {
         s.pa_hub_fd = h.fd;

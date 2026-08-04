@@ -22,6 +22,7 @@ const dmabuf_egl = @import("dmabuf_egl.zig");
 const pulse = @import("pulse.zig");
 const opuscodec = @import("opuscodec.zig");
 const wavcap = @import("wavcap.zig");
+const xwayland = @import("xwayland.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const icons = @import("icons.zig");
@@ -158,9 +159,18 @@ pub const SpawnReq = struct {
     /// daemon host's binary path, and a version mismatch would be a
     /// silent instant exit. Any argv the client sent is ignored.
     display: bool = false,
-    /// Seconds with NO attached viewer after which the daemon kills
-    /// this session (counted from creation while it has never been
-    /// attached). 0 = live forever, the historical behaviour.
+    /// Rootless X11 compatibility for an external display session.
+    xwayland: bool = false,
+    /// Fail session creation instead of degrading to Wayland-only when the
+    /// optional Xwayland runtime is unavailable or cannot start.
+    require_xwayland: bool = false,
+    /// Virtual Wayland output mode in physical pixels. These are separate
+    /// from the keeper PTY's rows/cols and do not force a window size.
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// Seconds with no attached viewer or external Wayland client after
+    /// which the daemon kills this session. Counted from creation when it
+    /// has never been occupied. 0 = live forever.
     ttl_secs: u32 = 0,
 };
 
@@ -182,6 +192,18 @@ pub const AttachReq = struct {
     /// Force the controller lease on attach, evicting whoever holds it.
     /// Without this an attach only acquires a FREE lease.
     control: bool = false,
+};
+
+pub const KillReq = struct {
+    name: []const u8 = "",
+    /// Display CLI safety fence: never let `display destroy` kill a shell
+    /// session that happens to share the requested name.
+    require_display: bool = false,
+    /// Optional identity fence used by display teardown. A name can be
+    /// destroyed and reused between list/create and kill; never kill the
+    /// replacement when either expected value no longer matches.
+    expected_pid: i32 = 0,
+    expected_wl_display: []const u8 = "",
 };
 
 /// `control_req` payload. Unknown ops are ignored (append-only).
@@ -238,6 +260,12 @@ pub const SessionInfo = struct {
     /// keeper, so the "terminal" is meaningless; what matters is the
     /// environment below.
     display: bool = false,
+    xwayland: bool = false,
+    x_display: []const u8 = "",
+    xauthority: []const u8 = "",
+    gpu: bool = false,
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
     /// Absolute path of the session's Wayland display socket, its
     /// PULSE_SERVER value and its private runtime dir (empty = none).
     /// An external renderer needs these and must never guess them.
@@ -275,10 +303,14 @@ pub const Session = struct {
     /// the session exists to own the Wayland/audio hubs for a process
     /// sketerm never spawned.
     display: bool = false,
-    /// No-viewer TTL (ms, 0 = none) and the monotonic stamp since when
-    /// this session has had no attached viewer (0 = one is attached
-    /// right now). Seeded at spawn so a session nobody ever attaches to
-    /// still expires.
+    /// Optional rootless X11 server attached to this Wayland compositor.
+    xwayland: ?xwayland.Instance = null,
+    /// Virtual output mode advertised to applications in this session.
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// Unoccupied TTL (ms, 0 = none) and the monotonic stamp since the
+    /// session last had neither a viewer nor a live external Wayland client.
+    /// Zero means occupied. Seeded at spawn so an abandoned session expires.
     ttl_ms: i64 = 0,
     no_viewer_since_ms: i64 = 0,
     /// The attached client currently allowed to drive this session's
@@ -334,6 +366,7 @@ pub const Session = struct {
     /// app_log): one monotonically-increasing id per line, bounded.
     log: logring.LogRing,
     pub fn deinit(self: *Session) void {
+        if (self.xwayland) |*xwl| xwl.deinit();
         self.log.deinit();
         if (self.cast) |*rec| rec.finish();
         if (self.winstream) |ws| {
@@ -404,6 +437,10 @@ pub const Worker = struct {
     /// carried in the 'Y' ready datagram so the spawn `.ok` can ship it.
     child_pid: i32 = 0,
     display: bool = false,
+    xwayland: bool = false,
+    gpu: bool = false,
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
     ttl_secs: u32 = 0,
     viewers: u32 = 0,
     /// Last-pushed audio-playing state (see SessionInfo.audio).
@@ -418,6 +455,8 @@ pub const Worker = struct {
     wl_display: ?[]u8 = null,
     pulse_server: ?[]u8 = null,
     runtime_dir: ?[]u8 = null,
+    x_display: ?[]u8 = null,
+    xauthority: ?[]u8 = null,
     /// Controller label pushed by the worker ("" / null = nobody).
     controller: ?[]u8 = null,
     /// The worker's reported spawn-failure reason ('E' control datagram,
@@ -433,6 +472,8 @@ pub const Worker = struct {
         if (self.wl_display) |p| self.allocator.free(p);
         if (self.pulse_server) |p| self.allocator.free(p);
         if (self.runtime_dir) |p| self.allocator.free(p);
+        if (self.x_display) |p| self.allocator.free(p);
+        if (self.xauthority) |p| self.allocator.free(p);
         if (self.controller) |p| self.allocator.free(p);
         self.freeAudioInfos(self.audio_streams);
         self.allocator.destroy(self);
@@ -503,6 +544,12 @@ pub const WorkerReady = struct {
     wl: []const u8 = "",
     pa: []const u8 = "",
     rt: []const u8 = "",
+    x: []const u8 = "",
+    xa: []const u8 = "",
+    xwayland: bool = false,
+    gpu: bool = false,
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).
@@ -523,6 +570,10 @@ pub const WorkerMeta = struct {
     /// with. Paths repeat on every push — cheap, and it keeps the
     /// broker correct after a restart-free worker re-setup.
     display: bool = false,
+    xwayland: bool = false,
+    gpu: bool = false,
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
     ttl_secs: u32 = 0,
     viewers: u32 = 0,
     controller: []const u8 = "",
@@ -532,6 +583,8 @@ pub const WorkerMeta = struct {
     wl: []const u8 = "",
     pa: []const u8 = "",
     rt: []const u8 = "",
+    x: []const u8 = "",
+    xa: []const u8 = "",
 };
 
 /// Worker-side throttle state for metadata pushes. Structural changes (client
@@ -789,6 +842,10 @@ pub const Channel = struct {
     /// Raw TCP forward (kind tcp_forward): chan_data is unframed
     /// socket bytes, strictly 1:1 with `client`.
     tcp: bool = false,
+    /// Infrastructure client (currently xwayland-satellite): its surfaces
+    /// are forwarded normally, but its persistent connection does not keep
+    /// an external display's no-viewer TTL occupied.
+    auxiliary: bool = false,
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
@@ -2060,6 +2117,21 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        // X11 listeners stay daemon-owned across satellite restarts. A
+        // pending X client wakes a dead satellite without polling or sleeps.
+        const x11_base = fds.items.len;
+        for (self.sessions.items) |s| {
+            try fds.append(self.allocator, .{
+                .fd = if (s.xwayland) |*xwl| xwl.unix_fd else -1,
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+            try fds.append(self.allocator, .{
+                .fd = if (s.xwayland) |*xwl| xwl.abstract_fd else -1,
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
         // Window-stream wakeup pipes: SCK delivers frames on its own
         // dispatch queues — a readable byte here just ends the poll
         // wait early so pumpWinstreams() drains with low latency.
@@ -2178,6 +2250,12 @@ pub const Daemon = struct {
             const s = self.sessions.items[i];
             if (fds.items[hub_base + i].revents & c.POLLIN != 0) self.acceptWaylandApp(s);
             if (fds.items[pa_base + i].revents & c.POLLIN != 0) self.acceptAudioApp(s);
+            if (s.xwayland) |*xwl| {
+                xwl.reap();
+                const x_re = fds.items[x11_base + i * 2].revents |
+                    fds.items[x11_base + i * 2 + 1].revents;
+                if (x_re & c.POLLIN != 0) xwl.maybeStart();
+            }
         }
 
         i = 0;
@@ -2389,10 +2467,11 @@ pub const Daemon = struct {
     fn acceptWaylandApp(self: *Daemon, s: *Session) void {
         const fd = c.accept(s.wl_hub_fd, null, null);
         if (fd < 0) return;
+        const auxiliary = if (s.xwayland) |*xwl| xwl.ownsPeer(fd) else false;
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
-        self.openAppChannel(s, fd);
+        self.openAppChannel(s, fd, auxiliary);
     }
 
     fn acceptAudioApp(self: *Daemon, s: *Session) void {
@@ -2793,7 +2872,7 @@ pub const Daemon = struct {
     }
 
     /// Bridge one accepted app connection as a session-owned channel.
-    fn openAppChannel(self: *Daemon, s: *Session, fd: c_int) void {
+    fn openAppChannel(self: *Daemon, s: *Session, fd: c_int, auxiliary: bool) void {
         const native = self.allocator.create(Native) catch {
             _ = c.close(fd);
             return;
@@ -2818,6 +2897,8 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
+        brain.output_width = s.output_width;
+        brain.output_height = s.output_height;
         brain.keymap = s.kb_keymap;
         brain.materialize_dmabuf_pools = false;
         // Opt-in (see get_registry); the softgl force in pty.zig is
@@ -2854,6 +2935,7 @@ pub const Daemon = struct {
             .fd = fd,
             .session = s,
             .client = null,
+            .auxiliary = auxiliary,
             .native = native,
         };
         native.wants_video = self.videoOk(s);
@@ -3545,6 +3627,12 @@ pub const Daemon = struct {
                 .audio = self.sessionAudioRunning(s, null),
                 .audio_streams = audio_streams,
                 .display = s.display,
+                .xwayland = s.xwayland != null,
+                .x_display = if (s.xwayland) |*xwl| xwl.display_name else "",
+                .xauthority = if (s.xwayland) |*xwl| xwl.auth_path else "",
+                .gpu = s.gpu,
+                .output_width = s.output_width,
+                .output_height = s.output_height,
                 .wl_display = if (s.wl_display_path) |p| p else "",
                 .pulse_server = if (s.pa_socket_path) |p| p else "",
                 .runtime_dir = if (s.runtime_dir_path) |p| p else "",
@@ -3679,7 +3767,7 @@ pub const Daemon = struct {
 
     pub fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {
         if (self.is_broker) return self.brokerKill(cl, payload);
-        var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
+        var parsed = std.json.parseFromSlice(KillReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
             cl.queueErr("bad kill request");
@@ -3690,6 +3778,20 @@ pub const Daemon = struct {
             cl.queueErr("no such session");
             return;
         };
+        if (parsed.value.require_display and !s.display) {
+            cl.queueErr("session is not a display session");
+            return;
+        }
+        if (parsed.value.expected_pid != 0 and parsed.value.expected_pid != s.pty.child_pid) {
+            cl.queueErr("display session identity changed");
+            return;
+        }
+        if (parsed.value.expected_wl_display.len > 0 and
+            (s.wl_display_path == null or !std.mem.eql(u8, parsed.value.expected_wl_display, s.wl_display_path.?)))
+        {
+            cl.queueErr("display session identity changed");
+            return;
+        }
         self.removeSession(s);
         cl.queueJson(.ok, .{ .ok = true });
     }
@@ -3892,24 +3994,33 @@ pub const Daemon = struct {
         }
     }
 
-    /// Kill sessions whose no-viewer TTL has run out. A session with an
-    /// attached viewer keeps resetting the clock; one that has NEVER
-    /// been attached counts from spawn (see no_viewer_since_ms), so an
-    /// abandoned `display create` cannot leak a Wayland hub forever.
+    /// Kill sessions whose idle TTL has run out. An attached mux viewer or
+    /// live external Wayland client resets the clock; a session that has
+    /// never had either counts from spawn.
     /// In broker mode this runs in the WORKER (which owns the session
     /// and knows its viewers); its exit is what retires the record.
     fn ttlSweep(self: *Daemon) void {
         const now = nowMs();
         for (self.sessions.items) |s| {
             if (s.ttl_ms == 0 or s.exited) continue;
-            var attached = false;
+            var occupied = false;
             for (self.clients.items) |cl| {
                 if (!cl.dead and cl.attached == s) {
-                    attached = true;
+                    occupied = true;
                     break;
                 }
             }
-            if (attached) {
+            if (!occupied and s.display) {
+                for (self.channels.items) |ch| {
+                    if (!ch.dead and ch.session == s and ch.native != null and
+                        (!ch.auxiliary or ch.native.?.brain.hasToplevels()))
+                    {
+                        occupied = true;
+                        break;
+                    }
+                }
+            }
+            if (occupied) {
                 s.no_viewer_since_ms = 0;
                 continue;
             }
@@ -3918,7 +4029,7 @@ pub const Daemon = struct {
                 continue;
             }
             if (now - s.no_viewer_since_ms < s.ttl_ms) continue;
-            log.info("session '{s}': ttl expired ({d}s with no viewer)", .{ s.name, @divTrunc(s.ttl_ms, 1000) });
+            log.info("session '{s}': ttl expired ({d}s unoccupied)", .{ s.name, @divTrunc(s.ttl_ms, 1000) });
             self.removeSession(s);
         }
     }

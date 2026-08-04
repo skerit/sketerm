@@ -1329,10 +1329,11 @@ pub fn commit(self: *Compositor, sid: u32, surf: *Surface) Error!void {
         surf.configured = true;
         if (surf.toplevel != 0) {
             if (self.wm_base_version >= 4) {
+                const logical = self.logicalOutputSize();
                 var bbuf: [24]u8 = undefined;
                 var bb = wire.Builder.init(&bbuf, surf.toplevel, 2); // configure_bounds
-                bb.putInt(1920);
-                bb.putInt(1080);
+                bb.putInt(logical[0]);
+                bb.putInt(logical[1]);
                 try self.send(try bb.finish());
             }
             if (self.wm_base_version >= 5) {

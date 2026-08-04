@@ -42,6 +42,10 @@ depends=(
     'glycin'   # sandboxed runtime-loaded image decoding for Viewer
     'libheif'  # Glycin AVIF/HEIF loader runtime
 )
+optdepends=(
+    'xorg-xwayland: X11 application support in external displays'
+    'xwayland-satellite>=0.8.1: rootless X window management in external displays'
+)
 makedepends=(
     'zig'
     'ncurses'  # provides tic, the terminfo compiler
