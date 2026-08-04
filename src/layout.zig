@@ -87,39 +87,14 @@ pub const Layout = struct {
     tabs: []const TabSpec,
 };
 
-/// macOS: query a process's vnode paths (cwd + root) via libproc.
-/// Layout of struct proc_vnodepathinfo: two vnode_info_path entries,
-/// each { struct vnode_info (152 bytes), char vip_path[MAXPATHLEN] }
-/// — pvi_cdir.vip_path therefore sits at offset 152. VERIFIED on
-/// hardware (arm64, macOS 26.4 SDK): sizeof(vnode_info)=152,
-/// offsetof(vip_path)=152, flavor 9, live call matches getcwd().
-extern fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
-
-/// Working directory of a live process. Linux: /proc/<pid>/cwd
-/// symlink. macOS: proc_pidinfo(PROC_PIDVNODEPATHINFO).
+/// Working directory of a live process, owned by the caller. The
+/// Linux-vs-macOS split lives in the platform layer — see
+/// `platform.cwdOfPid`.
 pub fn cwdOfPid(pid: c.pid_t, allocator: std.mem.Allocator) ![]u8 {
-    if (@import("util/platform.zig").is_macos) {
-        const VNODE_INFO_SIZE = 152;
-        const MAXPATHLEN = 1024;
-        const PROC_PIDVNODEPATHINFO: c_int = 9;
-        var buf: [2 * (VNODE_INFO_SIZE + MAXPATHLEN)]u8 align(8) = undefined;
-        const n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &buf, buf.len);
-        if (n <= VNODE_INFO_SIZE) return error.ReadlinkFailed;
-        const path_bytes = buf[VNODE_INFO_SIZE .. VNODE_INFO_SIZE + MAXPATHLEN];
-        const len = std.mem.indexOfScalar(u8, path_bytes, 0) orelse MAXPATHLEN;
-        if (len == 0) return error.ReadlinkFailed;
-        return try allocator.dupe(u8, path_bytes[0..len]);
-    }
-    var path_buf: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid});
-    var path_z: [128]u8 = undefined;
-    if (path.len >= path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    var read_buf: [4096]u8 = undefined;
-    const n = c.readlink(@ptrCast(&path_z), &read_buf, read_buf.len);
-    if (n < 0) return error.ReadlinkFailed;
-    return try allocator.dupe(u8, read_buf[0..@intCast(n)]);
+    var buf: [4096]u8 = undefined;
+    const cwd = @import("util/platform.zig").cwdOfPid(pid, &buf) orelse
+        return error.ReadlinkFailed;
+    return try allocator.dupe(u8, cwd);
 }
 
 pub fn save(layout: Layout, path: []const u8) !void {
