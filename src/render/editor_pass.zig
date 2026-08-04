@@ -1,18 +1,36 @@
 //! Editor pass — instanced GPU rendering for proportional document
-//! text, copied from CellPass's template (rotating triple VBO, three
-//! u_kind draws, forgetGL/releaseGL/realize/deinit contract) but fed
-//! from editor_layout.LaidLine instead of the cell grid.
+//! text, copied from CellPass's template (rotating triple VBO, one
+//! draw per u_kind, forgetGL/releaseGL/realize/deinit contract) but
+//! fed from editor_layout.LaidLine instead of the cell grid.
 //!
-//! One Instance per quad, tagged with a per-instance kind; each of the
-//! three draw calls sets u_kind and the vertex shader collapses
-//! non-matching instances to a degenerate position, so ordering is
-//! bg rects (selections, gutter) -> glyphs -> decorations (caret bars).
+//! One Instance per quad, tagged with a per-instance kind; each draw
+//! call sets u_kind and the vertex shader collapses non-matching
+//! instances to a degenerate position, so painter ordering is
+//! backgrounds (current line, match highlights, selections) ->
+//! document glyphs -> gutter -> preedit background -> preedit glyphs
+//! -> decorations (caret bars, preedit underline). Two orderings there
+//! are load-bearing: the GUTTER is above the document because it does
+//! not scroll horizontally and text passes under it, and the PREEDIT
+//! pair is above the document glyphs because an IME composition is
+//! drawn over the text it will displace and its opaque backing rect
+//! has to mask those glyphs.
 //!
 //! The instance list is rebuilt every buildFrame (no per-row dirty
 //! tracking — an editor viewport is a few thousand quads, far below
 //! the terminal grid's cost). Atlas eviction safety comes from the
 //! Layout's per-line generation check: stale lines re-shape before
 //! this pass ever sees their glyphs.
+//!
+//! ## Viewport anchoring (performance contract)
+//!
+//! `View.anchor` is a `(line, row, offset)` triple, not an absolute
+//! pixel — see editor_viewport.zig for why. buildFrame therefore
+//! starts laying out AT the anchor line and stops at the first line
+//! below the viewport, so the cost of a frame is O(visible rows)
+//! whatever the document size. `lines_laid_out` counts the
+//! `Layout.line` calls of the last frame; the smoke rig asserts it
+//! stays proportional to the viewport after a jump to the end of a
+//! 200k-line document.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -22,8 +40,24 @@ const Atlas = atlas_mod.Atlas;
 const layout_mod = @import("editor_layout.zig");
 const Layout = layout_mod.Layout;
 const LaidLine = layout_mod.LaidLine;
+const viewport_mod = @import("editor_viewport.zig");
+const Anchor = viewport_mod.Anchor;
+const RowIndex = viewport_mod.RowIndex;
 const Document = @import("../editor/document.zig").Document;
 const SelectionSet = @import("../editor/selection.zig").SelectionSet;
+const search = @import("../editor/search.zig");
+
+pub const KIND_BG: f32 = 0;
+pub const KIND_GLYPH: f32 = 1;
+/// The gutter paints ABOVE the document: with wrap off and the view
+/// scrolled right, text passes UNDER it (the gutter itself never
+/// scrolls), and everything document-side is clipped at `clip_x0`.
+pub const KIND_GUTTER_BG: f32 = 2;
+pub const KIND_GUTTER_GLYPH: f32 = 3;
+pub const KIND_PREEDIT_BG: f32 = 4;
+pub const KIND_PREEDIT_GLYPH: f32 = 5;
+pub const KIND_DECOR: f32 = 6;
+const KIND_COUNT: c_int = 7;
 
 /// One quad instance. Layout matches bindVertexAttribs. 64 bytes.
 pub const Instance = extern struct {
@@ -33,7 +67,7 @@ pub const Instance = extern struct {
     uv0: [2]f32 = .{ 0, 0 },
     uv1: [2]f32 = .{ 0, 0 },
     layer: f32 = 0,
-    /// 0 = bg rect, 1 = glyph, 2 = decoration (caret bar).
+    /// KIND_* above.
     kind: f32 = 0,
     /// 1 = colour (emoji) glyph — sample straight RGBA, no fg tint.
     colored: f32 = 0,
@@ -67,7 +101,7 @@ pub const VERT_SRC =
     \\    vec2 corner = corners[gl_VertexID];
     \\    v_color = a_color;
     \\    v_colored = a_colored;
-    \\    v_is_glyph = (u_kind == 1) ? 1.0 : 0.0;
+    \\    v_is_glyph = (u_kind == 1 || u_kind == 3 || u_kind == 5) ? 1.0 : 0.0;
     \\    v_uvw = vec3(mix(a_uv0, a_uv1, corner), a_layer);
     \\    vec2 pos = a_xy + corner * a_size;
     \\    bool emit = int(a_kind + 0.5) == u_kind
@@ -110,15 +144,58 @@ pub const Colors = struct {
     caret: [4]f32 = .{ 0.95, 0.35, 0.25, 1.0 },
     gutter_bg: [4]f32 = .{ 0.13, 0.13, 0.16, 1.0 },
     gutter_fg: [4]f32 = .{ 0.50, 0.52, 0.55, 1.0 },
+    /// Subtle band behind the caret's visual row.
+    current_line: [4]f32 = .{ 1.0, 1.0, 1.0, 0.045 },
+    /// Every find-bar match…
+    match: [4]f32 = .{ 0.85, 0.72, 0.25, 0.32 },
+    /// …and the one Enter would step off.
+    match_current: [4]f32 = .{ 0.95, 0.72, 0.20, 0.65 },
+    /// Opaque backing behind an IME composition (masks the document
+    /// glyphs the composition is drawn over).
+    preedit_bg: [4]f32 = .{ 0.09, 0.09, 0.12, 1.0 },
 };
 
 pub const View = struct {
     width_px: f32,
     height_px: f32,
-    /// Vertical scroll offset in px (0 = document top at viewport top).
-    scroll_y: f32 = 0,
+    /// First visible (line, wrapped row, px into that row).
+    anchor: Anchor = .{},
+    /// Horizontal scroll offset in px (wrap-off only; the gutter never
+    /// scrolls).
+    scroll_x: f32 = 0,
     /// Horizontal padding between gutter and text.
     margin_x: f32 = 8,
+    /// Draw the line-number gutter.
+    show_line_numbers: bool = true,
+    /// Band behind the caret row (single collapsed caret only).
+    highlight_current_line: bool = false,
+    /// Blink phase — false hides the document carets (never the
+    /// preedit caret, which must stay visible while composing).
+    caret_on: bool = true,
+};
+
+/// An in-flight IME composition, laid out by the caller into its own
+/// throwaway Document/Layout so it shapes exactly like real text.
+pub const Preedit = struct {
+    line: *const LaidLine,
+    /// Document offset the composition is anchored at (the primary
+    /// caret).
+    at: usize,
+    /// Caret position WITHIN the composition, in bytes.
+    cursor: usize,
+};
+
+pub const Frame = struct {
+    layout: *Layout,
+    doc: *const Document,
+    sels: *const SelectionSet,
+    colors: Colors = .{},
+    view: View,
+    /// Estimated row index; refined in place as lines are laid out.
+    rows: ?*RowIndex = null,
+    matches: []const search.Match = &.{},
+    current_match: ?usize = null,
+    preedit: ?Preedit = null,
 };
 
 pub const EditorPass = struct {
@@ -133,6 +210,19 @@ pub const EditorPass = struct {
 
     instances: std.ArrayList(Instance) = .empty,
     allocator: std.mem.Allocator,
+
+    /// Lines `Layout.line` was called for during the last buildFrame —
+    /// the viewport-anchoring proof (see the module header).
+    lines_laid_out: usize = 0,
+    /// Widest laid-out row of the last frame, px (horizontal scrollbar
+    /// range; only the visible lines contribute, so it grows as the
+    /// user scrolls, exactly like the vertical estimate).
+    max_row_width: f32 = 0,
+    /// x where document text starts (gutter + margin) in the last
+    /// frame — the hit-test mirror.
+    text_origin_x: f32 = 0,
+    /// Left clip edge for document-side quads (the gutter's width).
+    clip_x0: f32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) EditorPass {
         return .{ .allocator = allocator };
@@ -206,7 +296,7 @@ pub const EditorPass = struct {
 
     // ---- frame building ----------------------------------------------
 
-    fn addRect(self: *EditorPass, kind: f32, x: f32, y: f32, w: f32, h: f32, color: [4]f32) !void {
+    fn addRectRaw(self: *EditorPass, kind: f32, x: f32, y: f32, w: f32, h: f32, color: [4]f32) !void {
         try self.instances.append(self.allocator, .{
             .xy = .{ x, y },
             .size = .{ w, h },
@@ -215,7 +305,35 @@ pub const EditorPass = struct {
         });
     }
 
+    /// Document-side rect, clipped at the gutter's right edge.
+    fn addRect(self: *EditorPass, kind: f32, x: f32, y: f32, w: f32, h: f32, color: [4]f32) !void {
+        var cx = x;
+        var cw = w;
+        if (cx < self.clip_x0) {
+            cw -= self.clip_x0 - cx;
+            cx = self.clip_x0;
+        }
+        if (cw <= 0) return;
+        try self.addRectRaw(kind, cx, y, cw, h, color);
+    }
+
     fn addGlyph(self: *EditorPass, g: atlas_mod.Glyph, x: f32, baseline_y: f32, y_off: f32, color: [4]f32) !void {
+        // Wholly under the gutter: drop it. A glyph straddling the edge
+        // is drawn whole and the gutter (a later kind) covers the part
+        // that overhangs — clamping the quad would shear its UVs.
+        if (x + @as(f32, @floatFromInt(g.w)) <= self.clip_x0) return;
+        return self.addGlyphRaw(g, x, baseline_y, y_off, color, KIND_GLYPH);
+    }
+
+    fn addGlyphRaw(
+        self: *EditorPass,
+        g: atlas_mod.Glyph,
+        x: f32,
+        baseline_y: f32,
+        y_off: f32,
+        color: [4]f32,
+        kind: f32,
+    ) !void {
         if (g.w == 0 or g.h == 0) return;
         try self.instances.append(self.allocator, .{
             .xy = .{
@@ -227,54 +345,113 @@ pub const EditorPass = struct {
             .uv0 = .{ g.u0, g.v0 },
             .uv1 = .{ g.u1, g.v1 },
             .layer = @floatFromInt(g.layer),
-            .kind = 1,
+            .kind = kind,
             .colored = if (g.colored) 1.0 else 0.0,
         });
     }
 
+    /// Gutter width for a document of `n_lines` (0 when line numbers
+    /// are off). Shared with the caller's hit testing.
+    pub fn gutterWidth(atlas: *Atlas, n_lines: usize, show: bool) !f32 {
+        if (!show) return 0;
+        var digits: usize = 1;
+        var v = n_lines;
+        while (v >= 10) : (v /= 10) digits += 1;
+        const digit_g = try atlas.lookupOrLoad('0', false, false);
+        return @as(f32, @floatFromInt(digits)) * digit_g.advance + GUTTER_PAD * 2;
+    }
+
+    const GUTTER_PAD: f32 = 6;
+
     /// Rebuild the instance list for the current document/selection
-    /// state: gutter with right-aligned line numbers, selection rects,
-    /// glyphs, caret bars. Only lines whose visual rows intersect the
-    /// viewport EMIT instances (every line up to the viewport bottom is
-    /// still laid out — row heights aren't known without layout).
-    pub fn buildFrame(
-        self: *EditorPass,
-        layout: *Layout,
-        doc: *const Document,
-        sels: *const SelectionSet,
-        colors: Colors,
-        view: View,
-    ) !void {
+    /// state: current-line band, match highlights, selection rects,
+    /// gutter with right-aligned line numbers, glyphs, IME preedit and
+    /// caret bars.
+    ///
+    /// Layout starts at `view.anchor` and stops at the first line below
+    /// the viewport — never at line 0 (see the module header). Lines it
+    /// touches refine `frame.rows`.
+    pub fn buildFrame(self: *EditorPass, frame: Frame) !void {
+        const layout = frame.layout;
+        const doc = frame.doc;
+        const sels = frame.sels;
+        const colors = frame.colors;
+        const view = frame.view;
+
         self.instances.clearRetainingCapacity();
+        self.lines_laid_out = 0;
+        self.max_row_width = 0;
         const atlas = layout.book.atlas;
         atlas.markFrame();
         const line_h = layout.lineHeight();
         const asc = layout.ascent();
         const n_lines = doc.rope.lineCount();
 
-        // Gutter width: digits of the last line number, right-aligned.
-        var digits: usize = 1;
-        {
-            var v = n_lines;
-            while (v >= 10) : (v /= 10) digits += 1;
-        }
-        const digit_g = try atlas.lookupOrLoad('0', false, false);
-        const gutter_pad: f32 = 6;
-        const gutter_w = @as(f32, @floatFromInt(digits)) * digit_g.advance + gutter_pad * 2;
-        const text_x0 = gutter_w + view.margin_x;
-        try self.addRect(0, 0, 0, gutter_w, view.height_px, colors.gutter_bg);
+        const gutter_w = try gutterWidth(atlas, n_lines, view.show_line_numbers);
+        const text_x0 = gutter_w + view.margin_x - view.scroll_x;
+        self.text_origin_x = text_x0;
+        // Document-side geometry is clipped here; the gutter itself
+        // goes through the Raw helpers.
+        self.clip_x0 = gutter_w;
+        if (gutter_w > 0)
+            try self.addRectRaw(KIND_GUTTER_BG, 0, 0, gutter_w, view.height_px, colors.gutter_bg);
 
-        var y: f32 = -view.scroll_y;
-        var li: usize = 0;
+        // The caret row the current-line band belongs to, resolved
+        // while walking (a single collapsed caret only — with a
+        // selection or several carets the band is noise).
+        const band_head: ?usize = blk: {
+            if (!view.highlight_current_line) break :blk null;
+            if (sels.count() != 1) break :blk null;
+            const p = sels.primary();
+            if (!p.isCaret()) break :blk null;
+            break :blk p.head;
+        };
+
+        // First visible line's top, in viewport pixels: the anchor row
+        // sits `offset` px above the top edge, and the rows of the
+        // anchor line ABOVE it are off-screen.
+        var li: usize = @min(view.anchor.line, n_lines -| 1);
+        var y: f32 = -view.anchor.offset - @as(f32, @floatFromInt(view.anchor.row)) * line_h;
+
         while (li < n_lines and y < view.height_px) : (li += 1) {
             const ll = try layout.line(doc, li);
+            self.lines_laid_out += 1;
+            if (frame.rows) |ri| ri.note(li, @intCast(ll.rows.len));
             const n_rows: f32 = @floatFromInt(ll.rows.len);
             const line_bottom = y + n_rows * line_h;
             defer y = line_bottom;
             if (line_bottom < 0) continue;
+            self.max_row_width = @max(self.max_row_width, ll.width);
+
+            // Current-line band, full viewport width behind everything.
+            if (band_head) |head| {
+                if (head >= ll.byte_start and head <= ll.byte_end) {
+                    const cp = Layout.caretPos(ll, head - ll.byte_start);
+                    const row_y = y + @as(f32, @floatFromInt(cp.row)) * line_h;
+                    try self.addRect(
+                        KIND_BG,
+                        gutter_w,
+                        row_y,
+                        view.width_px - gutter_w,
+                        line_h,
+                        colors.current_line,
+                    );
+                }
+            }
+
+            // Find-bar match highlights (same per-cluster rule as
+            // selections, so they are correct across RTL and wraps).
+            for (frame.matches, 0..) |m, mi| {
+                if (m.end <= ll.byte_start or m.start > ll.byte_end) continue;
+                const col = if (frame.current_match != null and frame.current_match.? == mi)
+                    colors.match_current
+                else
+                    colors.match;
+                try self.addRangeRects(ll, m.start, m.end, text_x0, y, line_h, col);
+            }
 
             // Line number, right-aligned in the gutter, on the first row.
-            {
+            if (gutter_w > 0) {
                 var buf: [20]u8 = undefined;
                 const s = std.fmt.bufPrint(&buf, "{d}", .{li + 1}) catch unreachable;
                 var w: f32 = 0;
@@ -282,10 +459,10 @@ pub const EditorPass = struct {
                     const g = try atlas.lookupOrLoad(ch, false, false);
                     w += g.advance;
                 }
-                var gx = gutter_w - gutter_pad - w;
+                var gx = gutter_w - GUTTER_PAD - w;
                 for (s) |ch| {
                     const g = try atlas.lookupOrLoad(ch, false, false);
-                    try self.addGlyph(g, gx, y + asc, 0, colors.gutter_fg);
+                    try self.addGlyphRaw(g, gx, y + asc, 0, colors.gutter_fg, KIND_GUTTER_GLYPH);
                     gx += g.advance;
                 }
             }
@@ -295,23 +472,7 @@ pub const EditorPass = struct {
             // of clusters, not one x span).
             for (sels.sels.items) |sel| {
                 if (sel.isCaret()) continue;
-                const s = sel.start();
-                const e = sel.end();
-                if (e <= ll.byte_start or s >= ll.byte_end + 1) continue;
-                const ls = if (s > ll.byte_start) s - ll.byte_start else 0;
-                const le = if (e < ll.byte_end) e - ll.byte_start else ll.text.len;
-                for (ll.clusters) |cl| {
-                    if (cl.byte_start >= le or cl.byte_end <= ls) continue;
-                    const row_y = y + @as(f32, @floatFromInt(cl.row)) * line_h;
-                    try self.addRect(
-                        0,
-                        text_x0 + cl.x0 - ll.rows[cl.row].x0,
-                        row_y,
-                        cl.x1 - cl.x0,
-                        line_h,
-                        colors.selection,
-                    );
-                }
+                try self.addRangeRects(ll, sel.start(), sel.end(), text_x0, y, line_h, colors.selection);
             }
 
             // Glyphs.
@@ -326,16 +487,91 @@ pub const EditorPass = struct {
                 );
             }
 
-            // Caret bars (kind 2, drawn last). A caret at the line's
-            // trailing edge (byte == byte_end) also renders here.
-            for (sels.sels.items) |sel| {
+            // Caret bars. A caret at the line's trailing edge
+            // (byte == byte_end) also renders here.
+            for (sels.sels.items, 0..) |sel, si| {
                 if (!sel.isCaret()) continue;
                 if (sel.head < ll.byte_start or sel.head > ll.byte_end) continue;
+                // The preedit draws its own caret and replaces the
+                // primary one while composing.
+                if (frame.preedit != null and si == sels.primary_index) continue;
+                if (!view.caret_on) continue;
                 const cp = Layout.caretPos(ll, sel.head - ll.byte_start);
                 const row_y = y + @as(f32, @floatFromInt(cp.row)) * line_h;
-                try self.addRect(2, text_x0 + cp.x, row_y, 2, line_h, colors.caret);
+                try self.addRect(KIND_DECOR, text_x0 + cp.x, row_y, 2, line_h, colors.caret);
+            }
+
+            // IME preedit, inline at the primary caret on this line.
+            if (frame.preedit) |pe| {
+                if (pe.at >= ll.byte_start and pe.at <= ll.byte_end) {
+                    const cp = Layout.caretPos(ll, pe.at - ll.byte_start);
+                    const row_y = y + @as(f32, @floatFromInt(cp.row)) * line_h;
+                    try self.addPreedit(pe, text_x0 + cp.x, row_y, line_h, asc, colors);
+                }
             }
         }
+    }
+
+    /// Per-cluster rects for the document byte range [s,e) on `ll`.
+    fn addRangeRects(
+        self: *EditorPass,
+        ll: *const LaidLine,
+        s: usize,
+        e: usize,
+        text_x0: f32,
+        y: f32,
+        line_h: f32,
+        color: [4]f32,
+    ) !void {
+        if (e <= ll.byte_start or s >= ll.byte_end + 1) return;
+        const ls = if (s > ll.byte_start) s - ll.byte_start else 0;
+        const le = if (e < ll.byte_end) e - ll.byte_start else ll.text.len;
+        for (ll.clusters) |cl| {
+            if (cl.byte_start >= le or cl.byte_end <= ls) continue;
+            const row_y = y + @as(f32, @floatFromInt(cl.row)) * line_h;
+            try self.addRect(
+                KIND_BG,
+                text_x0 + cl.x0 - ll.rows[cl.row].x0,
+                row_y,
+                cl.x1 - cl.x0,
+                line_h,
+                color,
+            );
+        }
+    }
+
+    /// The composition run: opaque backing (so it masks the document
+    /// text it overlays), glyphs, a full-width underline, and the
+    /// caret at the IME's cursor position INSIDE the composition.
+    fn addPreedit(
+        self: *EditorPass,
+        pe: Preedit,
+        x0: f32,
+        row_y: f32,
+        line_h: f32,
+        asc: f32,
+        colors: Colors,
+    ) !void {
+        const pl = pe.line;
+        const w = @max(pl.width, 1.0);
+        try self.addRect(KIND_PREEDIT_BG, x0, row_y, w, line_h, colors.preedit_bg);
+        for (pl.glyphs) |pg| {
+            // A composition never soft-wraps: it renders as one run.
+            if (x0 + pg.x + @as(f32, @floatFromInt(pg.glyph.w)) <= self.clip_x0) continue;
+            try self.addGlyphRaw(
+                pg.glyph,
+                x0 + pg.x,
+                row_y + asc,
+                pg.y_offset,
+                colors.text,
+                KIND_PREEDIT_GLYPH,
+            );
+        }
+        // Underline the whole composition (the conventional "not
+        // committed yet" affordance).
+        try self.addRect(KIND_DECOR, x0, row_y + line_h - 2, w, 1.5, colors.text);
+        const cp = Layout.caretPos(pl, @min(pe.cursor, pl.text.len));
+        try self.addRect(KIND_DECOR, x0 + cp.x, row_y, 2, line_h, colors.caret);
     }
 
     // ---- upload + draw ------------------------------------------------
@@ -382,12 +618,11 @@ pub const EditorPass = struct {
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
         const n: c_int = @intCast(self.instances.items.len);
-        c.glUniform1i(self.u_kind, 0);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, n);
-        c.glUniform1i(self.u_kind, 1);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, n);
-        c.glUniform1i(self.u_kind, 2);
-        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, n);
+        var kind: c_int = 0;
+        while (kind < KIND_COUNT) : (kind += 1) {
+            c.glUniform1i(self.u_kind, kind);
+            c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, n);
+        }
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
     }

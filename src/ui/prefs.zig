@@ -149,6 +149,7 @@ fn openForProfile(
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &colorsPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &behaviorPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &filesPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &editorPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &renderingPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &windowPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &keybindsPage);
@@ -1223,6 +1224,56 @@ fn filesViewSelected(ctx: *Ctx, idx: c_uint) void {
         3 => .miller,
         else => .details,
     };
+    ctx.ev();
+}
+
+// ── Editor page (the text-editor face on a pane) ───────────────
+
+fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Editor");
+    c.adw_preferences_page_set_icon_name(page, "text-editor-symbolic");
+
+    // Indentation and view flags are APP-level: the same person wants
+    // the same indentation in every window, and a file opened from the
+    // browser must not indent differently because of the pane's
+    // profile.
+    const indent_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(indent_group)), "Indentation");
+    addSpinRowU16(@ptrCast(@alignCast(indent_group)), ctx, "Tab width", "Columns one Tab advances.", 1, 16, &ctx.cfg.editor_tab_width, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(indent_group)), ctx, "Insert spaces", "Tab inserts spaces to the next stop. Off inserts a literal tab character.", &ctx.cfg.editor_insert_spaces, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(indent_group)));
+
+    const view_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(view_group)), "View");
+    addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Soft wrap by default", "New editor tabs start wrapped. Alt+Z toggles it per tab.", &ctx.cfg.editor_soft_wrap, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Line numbers", "Show the line-number gutter.", &ctx.cfg.editor_line_numbers, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Highlight current line", "A subtle band behind the caret's row. Hidden while a selection or several carets are active.", &ctx.cfg.editor_highlight_current_line, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(view_group)));
+
+    // Font is PER-PROFILE, like the terminal font it falls back to.
+    const font_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(font_group)), "Part of the profile selected on the Profiles page — the editor is a face on a pane, so its font follows that pane's profile. Left unset, it follows the profile's terminal font.");
+    addEditorFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
+    addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Editor font size", "0 = follow the profile's terminal font size.", 0, 96, &ctx.edit.editor_font_size, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
+}
+
+fn addEditorFontFamilyRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Editor font family (empty = the profile's terminal font)");
+    if (ctx.edit.editor_font_family.len > 0) {
+        var z = cast.sliceToZ(256, ctx.edit.editor_font_family);
+        c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    }
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&editorFontFamilyChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn editorFontFamilyChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const slice = cast.editableText(row);
+    ctx.edit.editor_font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 

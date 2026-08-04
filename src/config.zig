@@ -109,11 +109,23 @@ pub const ProfileSettings = struct {
     /// off. Compile errors disable the pass, never blank the pane.
     custom_shader: []const u8 = "",
 
+    // Text editor (the editor face rides a pane, so its FONT is a
+    // pane-level choice like the terminal font — and its fallback,
+    // `font_family`/`font_size`, is itself per-profile, so a fallback
+    // could not cross the profile boundary even if we wanted it to).
+    /// Proportional font family for the editor face, via fontconfig.
+    /// Empty = fall back to this profile's terminal `font_family`
+    /// (and from there to the built-in candidates).
+    editor_font_family: []const u8 = "",
+    /// Editor point size. 0 = follow this profile's `font_size`.
+    editor_font_size: u16 = 0,
+
     /// Deep-copy every heap-backed field into `arena`.
     pub fn cloneInto(self: *const ProfileSettings, arena: std.mem.Allocator) error{OutOfMemory}!ProfileSettings {
         var out = self.*;
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
         out.font_family = try arena.dupe(u8, self.font_family);
+        out.editor_font_family = try arena.dupe(u8, self.editor_font_family);
         out.font_features = try arena.dupe(u8, self.font_features);
         out.scheme = try arena.dupe(u8, self.scheme);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
@@ -306,6 +318,24 @@ pub const Config = struct {
     /// Hash-compare every copied file against its source before the
     /// copy installs (same-host daemon copy jobs).
     files_verify_copy: bool = false,
+
+    // Text editor. These are EDITING BEHAVIOUR, not pane appearance:
+    // the same person wants the same indentation and the same wrap
+    // default in every window, and a document opened from the browser
+    // must not indent differently because the pane it landed in wears
+    // another profile. (The editor FONT is per-profile — see
+    // ProfileSettings.editor_font_*.)
+    /// Columns one Tab advances (and one Backspace-over-indent
+    /// retreats).
+    editor_tab_width: u16 = 4,
+    /// Tab inserts spaces to the next stop. False inserts a real \t.
+    editor_insert_spaces: bool = true,
+    /// New editor tabs start with soft wrap on (per-tab from there).
+    editor_soft_wrap: bool = false,
+    /// Show the line-number gutter.
+    editor_line_numbers: bool = true,
+    /// Subtle band behind the caret's visual row (single caret only).
+    editor_highlight_current_line: bool = true,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -657,6 +687,10 @@ pub const Config = struct {
         if (!std.mem.eql(u8, s.font_features, base.font_features))
             try w.print("font_features = {s}\n", .{s.font_features});
         if (s.font_size != base.font_size) try w.print("font_size = {d}\n", .{s.font_size});
+        if (!std.mem.eql(u8, s.editor_font_family, base.editor_font_family))
+            try w.print("editor_font_family = {s}\n", .{s.editor_font_family});
+        if (s.editor_font_size != base.editor_font_size)
+            try w.print("editor_font_size = {d}\n", .{s.editor_font_size});
         if (s.line_pad_px != base.line_pad_px) try w.print("line_pad_px = {d}\n", .{s.line_pad_px});
         if (s.padding != base.padding) try w.print("padding = {d:.2}\n", .{s.padding});
 
@@ -761,6 +795,14 @@ pub const Config = struct {
         if (self.files_show_hidden) try w.writeAll("files_show_hidden = true\n");
         if (!self.files_confirm_delete) try w.writeAll("files_confirm_delete = false\n");
         if (self.files_verify_copy) try w.writeAll("files_verify_copy = true\n");
+
+        // Text editor.
+        if (self.editor_tab_width != 4) try w.print("editor_tab_width = {d}\n", .{self.editor_tab_width});
+        if (!self.editor_insert_spaces) try w.writeAll("editor_insert_spaces = false\n");
+        if (self.editor_soft_wrap) try w.writeAll("editor_soft_wrap = true\n");
+        if (!self.editor_line_numbers) try w.writeAll("editor_line_numbers = false\n");
+        if (!self.editor_highlight_current_line)
+            try w.writeAll("editor_highlight_current_line = false\n");
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -1099,6 +1141,10 @@ fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u
         s.font_features = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         s.font_size = try parseU16(value);
+    } else if (std.mem.eql(u8, key, "editor_font_family")) {
+        s.editor_font_family = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "editor_font_size")) {
+        s.editor_font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
         s.line_pad_px = try parseI16(value);
     } else if (std.mem.eql(u8, key, "padding")) {
@@ -1278,6 +1324,18 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.files_confirm_delete = try parseBool(value);
     } else if (std.mem.eql(u8, key, "files_verify_copy")) {
         cfg.files_verify_copy = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_tab_width")) {
+        const w = try parseU16(value);
+        if (w == 0 or w > 16) return error.BadEditorTabWidth;
+        cfg.editor_tab_width = w;
+    } else if (std.mem.eql(u8, key, "editor_insert_spaces")) {
+        cfg.editor_insert_spaces = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_soft_wrap")) {
+        cfg.editor_soft_wrap = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_line_numbers")) {
+        cfg.editor_line_numbers = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_highlight_current_line")) {
+        cfg.editor_highlight_current_line = try parseBool(value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {
