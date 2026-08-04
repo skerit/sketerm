@@ -1,0 +1,55 @@
+<!-- Loads when working in src/lsp/. The full architecture, the feature
+     list and the config surface live in docs/lsp.md — read that first.
+     What follows is only the set of invariants that were expensive to
+     learn and are cheap to break. -->
+
+# LSP client
+
+`docs/lsp.md` is the reference. These are the rules:
+
+- **Everything here is GTK-free and lives in BOTH test roots.** The only
+  GTK in the client is `src/ui/editorlsp.zig`. `config.zig` imports
+  `servers.zig`, and `config.zig` is compiled into `sketerm-mux` — so a
+  GLib or GTK import in this directory breaks the daemon's dependency
+  invariant. `zig build mux-portable` + `ldd zig-out/bin/sketerm-mux`
+  (libc/libm only) after touching anything reachable from `servers.zig`.
+
+- **`session.zig` never touches a file descriptor.** Bytes in through
+  `feed()`, bytes out into `out`. That is what makes the whole protocol
+  testable without a process; do not "simplify" it by giving it the pipe.
+
+- **`character` is UTF-16 code units by default.** An emoji is 4 bytes,
+  1 codepoint, **2** characters. Every conversion goes through
+  `position.zig` — never index a rope with an LSP `character`.
+
+- **didChange ranges are captured PRE-edit**, in `Document`'s observer
+  slot 2, and queued **descending** by offset. Ascending would need each
+  range adjusted for its predecessors, because LSP applies
+  `contentChanges` in array order. Losing a capture sets `needs_full`;
+  never drop one silently, or the server is wrong for the rest of the
+  session.
+
+- **Every response is revision-stamped and dropped when stale**, exactly
+  as `editor/syntax.zig` does. Diagnostics are the one exception: they
+  are anchored byte ranges carried through edits by `mapThrough`.
+
+- **Server-to-client requests must always be answered** (null, or a real
+  MethodNotFound). A server waiting on us stops serving the user.
+
+- **A missing or unsupported server is SILENT.** It may only surface
+  where the user explicitly asked for a feature, as a status-line line.
+  No dialogs, no gutter noise, no startup errors.
+
+- **Never block the GLib main loop.** stdout is `g_unix_fd_add`-watched;
+  stdin gets a `G_IO_OUT` watch only while a write is short; stderr must
+  be drained or the server stalls when its pipe fills.
+
+- **Remote documents are refused, deliberately.** A server must run near
+  the files; `Manager.attachTab` returns early for a host-qualified spec
+  rather than resolving imports against the wrong filesystem. The daemon
+  side is a documented follow-up (docs/lsp.md).
+
+- `sketerm-lsp-stub` (`src/lsp_stub.zig`) is a REAL scripted server
+  process used by `zig build smoke-editor`. It keeps its own copy of the
+  document built from the `contentChanges` it receives, which is what
+  makes the stage a true test of incremental sync — keep it that way.
