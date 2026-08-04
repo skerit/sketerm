@@ -20,7 +20,7 @@ over both SSH and UDP. Remaining gaps are listed at the bottom.
   linker does not drop the unused fribidi dep the way `--as-needed`
   does on Linux; harmless, but the native build is not
   single-file-portable — use `mux-portable` for that).
-- **`cwdOfPid` offsets** (`layout.zig`): confirmed against the real
+- **`cwdOfPid` offsets** (now `util/platform.zig`): confirmed against the real
   SDK and a live call — sizeof(struct vnode_info)=152, vip_path at
   offset 152, MAXPATHLEN=1024, flavor 9, result matches getcwd().
 - **GUI**: builds, opens a window, panes realize (GL via GDK's
@@ -163,6 +163,27 @@ was needed — pkgconf's defaults cover the brew prefix.
   networks).
 - `udp:localhost` v4/v6 resolution bug still applies — use a real IP
   or hostname.
+- **`smoke-e2e` is FLAKY on macOS — the top open bug.** It fails part
+  of the time at the browser-split stage with
+  `{"ok":false,"error":"internal error: Disconnected"}`: the GUI's mux
+  connection to its private daemon drops while that split is asking for
+  the new pane's session. Measured 2026-08-04: 4/4 failures at
+  `d00438d`, roughly 4-in-10 passes at the branch tip, so it is NOT a
+  regression from the winstream/split work landed above — the split fix
+  made it better without curing it.
+  What is already ruled out: 40/40 bare `mux spawn` calls against a
+  broker daemon succeed, and 25/25 `cli split` + `close-pane` cycles
+  against a plain GUI succeed. So it needs the rig's fuller daemon
+  state to show up, and the prime suspect is the winstream stage —
+  the smoke's daemon has no Screen Recording grant (it runs from
+  `.zig-cache`, which is a different code identity), so that stage
+  hammers the capture-denied path. Whether the Darwin datagram control
+  channel contributes cannot be A/B tested, because without it macOS
+  spawns no sessions at all.
+  Next step for whoever picks this up: preserve the rig's runtime dir
+  (it is `removeTreeBestEffort`'d on exit) so its `mux.log` survives a
+  failing run, and check for fd exhaustion across repeated denied
+  captures.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
 - **No filesystem watcher backend — the one real feature gap.**
