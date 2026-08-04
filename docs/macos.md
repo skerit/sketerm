@@ -1,10 +1,17 @@
 # macOS support
 
-Status: **verified on real hardware** (Apple Silicon M2, macOS 26.4,
-Homebrew GTK 4.22, Zig 0.16.0). The GUI builds and runs natively, the
-full unit-test suite passes (500/507, 7 skipped), `smoke-mux` and
-`smoke-e2e` PASS, and mux interop with a Linux daemon works over both
-SSH and UDP transports. Remaining gaps are listed at the bottom.
+Status: **verified on real hardware** (Apple Silicon, macOS 26.5.1,
+Homebrew GTK 4.22.4, Zig 0.16.0). The GUI builds and runs natively,
+`zig build test` passes (1299/1319, 20 skipped), `test-core`,
+`smoke-mux`, `smoke-e2e` and `smoke-a11y` PASS, remote macOS app
+windows stream to a client, and mux interop with a Linux daemon works
+over both SSH and UDP. Remaining gaps are listed at the bottom.
+
+> **Re-verified 2026-08-04** after ~450 commits of drift. Four compile
+> breaks and, more importantly, **five behavioural bugs that a build
+> alone would never surface** — the daemon could not spawn a single
+> session, and every file transfer failed. Building is not the same as
+> working here; run the smoke rigs.
 
 ## Verified on hardware (2026-06)
 
@@ -29,8 +36,11 @@ SSH and UDP transports. Remaining gaps are listed at the bottom.
   (`udp:<ip>`) verified Darwin↔Darwin and Darwin↔Linux (ChaCha20
   datagrams, SSH bootstrap on Darwin, getentropy/clock paths in
   rudp.zig all exercised on hardware).
-- **`sketerm app`** correctly refuses on macOS (no Wayland session) —
-  Linux-only by design.
+- **`sketerm app`** — superseded: a macOS host now streams its app
+  windows to a client via the ScreenCaptureKit `winstream` backend
+  (kind 3), so `sketerm app <mac-host> <binary>` works. It is only
+  Wayland *forwarding* that a Mac cannot do; the session carries
+  `wl_display = "-"` there and the client renders captured pixels.
 
 ## Real-hardware friction found (and fixed)
 
@@ -61,18 +71,69 @@ SSH and UDP transports. Remaining gaps are listed at the bottom.
    the daemon can't be built from source (cross-compile mux-portable
    from elsewhere instead). Known wart, not yet fixed.
 
+## Behavioural bugs found on the 2026-08 re-verification
+
+None of these were build failures. Each compiled cleanly and then did
+the wrong thing at runtime — the reason the smoke rigs exist.
+
+1. **No AF_UNIX SOCK_SEQPACKET on Darwin.** `socketpair()` fails with
+   EPROTONOSUPPORT, so the broker↔worker control channel could never
+   open and **every session spawn failed** ("spawn failed (name
+   taken?)" — a guess, not the cause). Now `platform.controlSocketpair`,
+   using SOCK_DGRAM there. Two consequences it has to absorb: a closed
+   peer reports `-1`/ECONNRESET rather than `0` (so "channel gone" must
+   test `n <= 0`), and a datagram is capped at `net.local.dgram.maxdgram`
+   = **2048** unless SO_SNDBUF/SO_RCVBUF are raised — far under one
+   worker metadata push, and an over-limit datagram is refused with
+   EMSGSIZE and never retried, so the daemon would go permanently stale.
+2. **`cwdOfPid` had no macOS branch in the daemon.** There were two
+   copies: `layout.zig` had the libproc one, `daemon.zig` a bare
+   `/proc/<pid>/cwd` readlink. So the daemon could not resolve any
+   session's directory and **every file upload/download failed** with
+   "cannot determine session directory". Both now share
+   `platform.cwdOfPid`.
+3. **The autostarted daemon inherited the client's stdio.** Not
+   macOS-specific, but found here: the daemon outlives its client, so
+   `sketerm mux spawn x | cat` hangs FOREVER the one time it also has
+   to start the daemon — the shell waits for every pipe writer.
+4. **fcntl and flock share one lock space on Darwin.** XNU keeps one
+   advisory-lock list per vnode with the two kinds as distinct owners,
+   so they conflict *with each other in the same process*. The transfer
+   ledger's migration lock took both on one fd and could therefore never
+   be acquired. Verified both directions cross-process, which is also
+   why the fcntl lock alone suffices there.
+5. **winstream counted a window at channel open**, not at the first
+   frame — so an app that died before presenting anything (see the
+   launch-constraints trap below) was dropped silently instead of
+   materializing the log tab that explains the exit.
+
+Smaller: `SIGBUS` is 7 on Linux and 10 on Darwin, which overflowed
+crashlog's fixed truncating fallback into returning the empty string;
+`tic` writes `~/.terminfo/73/…` (hex bucket) on a case-insensitive
+filesystem, not `s/`, so `doctor` reported an installed terminfo as
+missing.
+
 ## Building on a Mac (verified recipe)
 
 ```bash
 brew install zig pkgconf gtk4 libadwaita adwaita-icon-theme \
-             freetype harfbuzz libepoxy fribidi fontconfig
+             freetype harfbuzz libepoxy fribidi fontconfig libvpx
 
 zig build            # GUI → zig-out/bin/sketerm
 zig build mux        # session daemon
-zig build test       # 500/507 (7 skipped)
+zig build test       # 1299/1319 (20 skipped)
+zig build test-core  # GTK-free subset
 zig build smoke-mux  # daemon end-to-end
+zig build smoke-fs   # file service end-to-end
 zig build smoke-e2e  # GUI end-to-end (opens a real window)
+zig build smoke-a11y # NSAccessibility / VoiceOver bridge
 ```
+
+**`libvpx` is not optional** — `configureSysDeps` links it
+unconditionally for the VP9/WebM app-window recorder. It is missing
+from every older copy of this recipe, and pkg-config resolves eagerly
+at configure time, so its absence fails the build before anything
+compiles.
 
 On Linux `smoke-e2e` hosts its own display (a `sketerm-mux display`
 session); macOS has no Wayland hub, so the GUI talks to the WindowServer
@@ -104,6 +165,39 @@ was needed — pkgconf's defaults cover the brew prefix.
   or hostname.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
+- **No filesystem watcher backend — the one real feature gap.**
+  `fsserve.Watcher` is inotify-backed and inert elsewhere
+  (`fsserve.live_deltas` is the predicate), so on macOS:
+  * a directory VIEW serves its initial listing and never updates —
+    including for changes the daemon itself makes through the mutation
+    verbs, since those are observed through the same watch rather than
+    synthesised. A browser listing goes stale until re-listed.
+  * live queries (`live_find`) refuse honestly: "live queries need the
+    platform watcher backend".
+
+  The `smoke-fs` stages asserting either are gated on that predicate;
+  the mutation verbs stay under test there via a re-list. **This gate
+  is a placeholder for the backend, not the intended end state.**
+
+  Design notes for whoever lands it — the choice is not obvious:
+  * **kqueue** (`EVFILT_VNODE` on a directory fd) is the natural fit
+    for a poll loop, but reports only *that* a directory changed, not
+    which entry, so it needs a per-watch snapshot and a readdir+diff to
+    synthesise per-name events. Worse, a child's *content* change does
+    not fire the directory's event at all, so `IN_CLOSE_WRITE`
+    equivalence needs one fd per FILE — an fd-budget problem on large
+    trees (macOS ships a 256 soft `RLIMIT_NOFILE`).
+  * **FSEvents** gives recursive path notifications including content
+    changes, but wants a CFRunLoop, so it needs a dedicated thread
+    feeding the poll loop through a pipe — which cuts against the
+    daemon's single-threaded design, though CoreServices itself is
+    fine (the daemon already links AppKit/ScreenCaptureKit here).
+
+  Whichever lands must keep the inotify bit vocabulary as the neutral
+  event encoding (`EventIter` decodes it, and both consumers —
+  `daemon_serve.fsWatchReadable` and `fsjob.runLiveFind` — read the
+  watcher fd directly, so they need a `Watcher.readInto`-shaped seam
+  rather than a raw `read()`).
 
 ## Window-streaming agent friction (2026-06, hardware)
 

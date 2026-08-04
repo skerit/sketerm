@@ -79,14 +79,30 @@ authorization to trust a new signing cert). It takes 30 seconds.
    - **Certificate Type:** **Code Signing**
 4. Click **Create**, accept the defaults, **Done**.
 
-A self-signed root you create is automatically trusted for your own
-user, so `codesign -s sketerm-dev` will work. Verify:
+Verify:
 
 ```bash
 security find-identity -v -p codesigning | grep sketerm-dev
 ```
 
 You should see one line with a 40-hex SHA-1 and `"sketerm-dev"`.
+
+> **On macOS 26 the new root is NOT automatically trusted**, so that
+> command can print `0 valid identities found` even though the
+> certificate exists. Check with `security find-identity` (no `-v`):
+> a line ending `(CSSMERR_TP_NOT_TRUSTED)` means the identity is there
+> but untrusted. **This does not block signing** — `codesign` resolves
+> the identity anyway; only the `-v` listing filters on the X.509 Basic
+> policy. Trust it from Keychain Access (double-click → Trust → Code
+> Signing → Always Trust) if you want the clean listing.
+
+> **Part 2 cannot be run over SSH — not just for the audit-session
+> reason in Why #1/#2, but because `codesign` cannot reach your login
+> keychain there.** An SSH session is not allowed to prompt for the
+> unlock, so `security` reports `User interaction is not allowed.` and
+> codesign fails with the unhelpful `errSecInternalComponent`. That
+> error means "cannot get at the private key", not "bad certificate".
+> Run the deploy from a Terminal on the Mac's own desktop.
 
 ---
 
@@ -174,11 +190,19 @@ tail -f /tmp/sketerm-mux.log
 # "CGS_REQUIRE_INIT" abort = not in the GUI session (see Why #1).
 ```
 
-> Note: **system apps** (Calculator, TextEdit, …) carry launch
+> Note: **system apps** (Calculator, TextEdit, Safari, …) carry launch
 > constraints on modern macOS and exit instantly when spawned as a
 > PTY child. Test with a third-party app or your own binary, launched
 > from the session shell (not via `open`, which re-parents to
 > launchd and escapes window tracking).
+>
+> Confirmed on macOS 26.5: running
+> `/System/Applications/Calculator.app/Contents/MacOS/Calculator`
+> from a shell exits **137** (SIGKILL) with no output whatsoever. The
+> session is therefore gone before any viewer can attach, which
+> surfaces as `attach failed: no such session` — `sketerm app` now
+> detects that case and says the app exited rather than claiming it
+> is running headless.
 
 ---
 
