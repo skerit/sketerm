@@ -19,12 +19,16 @@ pub const Mode = enum {
     select_destination,
 };
 
-/// One selectable name filter ("Images" -> "*.png", "*.jpg").
-/// Matching is case-insensitive on the basename; an empty pattern
-/// list matches everything.
+/// One selectable name filter ("Images" -> "*.png", "*.jpg", or
+/// "image/*"). Glob patterns match the basename case-insensitively;
+/// mimetypes match the type GIO guesses from that basename. A filter
+/// with neither matches everything.
 pub const Filter = struct {
     label: []const u8,
-    patterns: []const []const u8,
+    patterns: []const []const u8 = &.{},
+    /// Mimetype patterns ("image/png", "image/*"); the portal
+    /// backend's type-1 filter entries land here.
+    mimes: []const []const u8 = &.{},
 };
 
 pub const Request = struct {
@@ -32,6 +36,8 @@ pub const Request = struct {
     /// Starting location: a path or host-qualified spec (null = $HOME).
     initial_spec: ?[]const u8 = null,
     filters: []const Filter = &.{},
+    /// Filter selected on open; >= filters.len means "All files".
+    active_filter: usize = 0,
     /// Prefill for the save_file name entry.
     suggested_name: ?[]const u8 = null,
     /// Window title override (null = a mode-derived default).
@@ -39,6 +45,15 @@ pub const Request = struct {
     /// Primary-button label override (null = primaryLabel(mode));
     /// used by the portal backend's accept_label option.
     accept_label: ?[]const u8 = null,
+    /// The active filter also governs TYPED names, not just the
+    /// listing (see typedNameAllowed) -- the portal backend's rule.
+    enforce_filter: bool = false,
+    /// The consumer can only use paths on THIS machine: picks on a
+    /// remote host are refused in the dialog instead of delivered.
+    local_only: bool = false,
+    /// xdg-foreign / X11 parent handle from a portal caller
+    /// ("wayland:<handle>" / "x11:<hex xid>"); null = free-standing.
+    foreign_parent: ?[]const u8 = null,
 };
 
 /// Host-qualified specs chosen by the user. `name` repeats the leaf
@@ -47,6 +62,9 @@ pub const Request = struct {
 pub const Result = struct {
     specs: []const []const u8,
     name: ?[]const u8 = null,
+    /// Index into Request.filters of the filter that was active when
+    /// the user accepted; null for "All files".
+    filter_index: ?usize = null,
 };
 
 // -- mode predicates ---------------------------------------------
@@ -207,12 +225,53 @@ pub fn globMatch(pattern: []const u8, name: []const u8) bool {
     return p == pattern.len;
 }
 
-/// Whether `name` (a basename) passes `filter`. An empty pattern
-/// list is "All files".
-pub fn filterMatches(filter: Filter, name: []const u8) bool {
-    if (filter.patterns.len == 0) return true;
+/// Whether `name` (a basename), whose guessed mimetype is `mime`
+/// ("" when unknown), passes `filter`. Globs and mimetypes are OR'd:
+/// a portal filter that lists both means either may match. A filter
+/// with no patterns at all is "All files".
+pub fn filterMatches(filter: Filter, name: []const u8, mime: []const u8) bool {
+    if (filter.patterns.len == 0 and filter.mimes.len == 0) return true;
     for (filter.patterns) |pat| if (globMatch(pat, name)) return true;
+    if (mime.len > 0) for (filter.mimes) |m| if (globMatch(m, mime)) return true;
     return false;
+}
+
+/// Whether a TYPED name may be accepted under the active filter.
+/// `enforce` is the portal rule: an application that asked for *.png
+/// must not be handed notes.txt just because the user typed it. The
+/// "All files" entry (active >= filters.len) always passes, so the
+/// rule is an extra confirmation step, never a dead end.
+pub fn typedNameAllowed(
+    filters: []const Filter,
+    active: usize,
+    name: []const u8,
+    mime: []const u8,
+    enforce: bool,
+) bool {
+    if (!enforce) return true;
+    if (active >= filters.len) return true;
+    return filterMatches(filters[active], name, mime);
+}
+
+// -- save-target pre-flight --------------------------------------
+
+/// The directory part of an absolute normalized path ("/a/b" -> "/a",
+/// "/a" -> "/"). Null when there is no parent to speak of (the root
+/// itself, or a path that is not absolute).
+pub fn parentDir(path: []const u8) ?[]const u8 {
+    if (path.len < 2 or path[0] != '/') return null;
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+    if (slash == 0) return "/";
+    return path[0..slash];
+}
+
+/// Whether accepting this typed path still needs the PARENT directory
+/// probed. Only a save target that does not exist can name a folder
+/// that does not exist either; every other accepted kind was proven
+/// to exist by the probe that classified it.
+pub fn needsParentProbe(mode: Mode, kind: TypedKind, trailing_slash: bool) bool {
+    if (typedAction(mode, kind, trailing_slash) != .accept) return false;
+    return kind == .missing;
 }
 
 // -- tests -------------------------------------------------------
@@ -380,10 +439,69 @@ test "globMatch question mark" {
 test "filterMatches any-pattern semantics and the all-files filter" {
     const t = std.testing;
     const images = Filter{ .label = "Images", .patterns = &.{ "*.png", "*.jpg" } };
-    try t.expect(filterMatches(images, "cat.png"));
-    try t.expect(filterMatches(images, "CAT.JPG"));
-    try t.expect(!filterMatches(images, "cat.gif"));
-    const all = Filter{ .label = "All files", .patterns = &.{} };
-    try t.expect(filterMatches(all, "anything.xyz"));
-    try t.expect(filterMatches(all, ""));
+    try t.expect(filterMatches(images, "cat.png", ""));
+    try t.expect(filterMatches(images, "CAT.JPG", ""));
+    try t.expect(!filterMatches(images, "cat.gif", ""));
+    const all = Filter{ .label = "All files" };
+    try t.expect(filterMatches(all, "anything.xyz", ""));
+    try t.expect(filterMatches(all, "", ""));
+}
+
+test "filterMatches mimetypes, wildcards and glob/mime OR" {
+    const t = std.testing;
+    const any_image = Filter{ .label = "Images", .mimes = &.{"image/*"} };
+    try t.expect(filterMatches(any_image, "cat.png", "image/png"));
+    try t.expect(filterMatches(any_image, "cat.tiff", "IMAGE/TIFF"));
+    try t.expect(!filterMatches(any_image, "notes.txt", "text/plain"));
+    // No mime known: a mimetype-only filter cannot say yes.
+    try t.expect(!filterMatches(any_image, "cat.png", ""));
+
+    const exact = Filter{ .label = "PNG", .mimes = &.{"image/png"} };
+    try t.expect(filterMatches(exact, "cat.png", "image/png"));
+    try t.expect(!filterMatches(exact, "cat.jpg", "image/jpeg"));
+
+    // Globs and mimes are OR'd, not AND'd.
+    const both = Filter{ .label = "Pictures", .patterns = &.{"*.xcf"}, .mimes = &.{"image/*"} };
+    try t.expect(filterMatches(both, "art.xcf", ""));
+    try t.expect(filterMatches(both, "cat.png", "image/png"));
+    try t.expect(!filterMatches(both, "notes.txt", "text/plain"));
+}
+
+test "typedNameAllowed only bites when enforcement is on" {
+    const t = std.testing;
+    const filters = [_]Filter{
+        .{ .label = "PNG", .patterns = &.{"*.png"} },
+        .{ .label = "Images", .mimes = &.{"image/*"} },
+    };
+    // Plain picker: the filter governs the listing only.
+    try t.expect(typedNameAllowed(&filters, 0, "notes.txt", "text/plain", false));
+    // Portal mode: a *.png request refuses a typed notes.txt.
+    try t.expect(!typedNameAllowed(&filters, 0, "notes.txt", "text/plain", true));
+    try t.expect(typedNameAllowed(&filters, 0, "shot.PNG", "image/png", true));
+    try t.expect(typedNameAllowed(&filters, 1, "shot.tiff", "image/tiff", true));
+    try t.expect(!typedNameAllowed(&filters, 1, "notes.txt", "text/plain", true));
+    // "All files" is always the escape hatch.
+    try t.expect(typedNameAllowed(&filters, filters.len, "notes.txt", "text/plain", true));
+    try t.expect(typedNameAllowed(&.{}, 0, "notes.txt", "text/plain", true));
+}
+
+test "parentDir" {
+    const t = std.testing;
+    try t.expectEqualStrings("/home/j", parentDir("/home/j/notes.txt").?);
+    try t.expectEqualStrings("/", parentDir("/etc").?);
+    try t.expectEqualStrings("/a/b", parentDir("/a/b/c").?);
+    try t.expect(parentDir("/") == null);
+    try t.expect(parentDir("") == null);
+    try t.expect(parentDir("relative/x") == null);
+}
+
+test "needsParentProbe fires only for a missing save target" {
+    const t = std.testing;
+    try t.expect(needsParentProbe(.save_file, .missing, false));
+    // Rejected outright, so nothing to pre-flight.
+    try t.expect(!needsParentProbe(.save_file, .missing, true));
+    try t.expect(!needsParentProbe(.open_file, .missing, false));
+    // Existing things proved their own parent exists.
+    try t.expect(!needsParentProbe(.save_file, .file, false));
+    try t.expect(!needsParentProbe(.select_dir, .dir, false));
 }

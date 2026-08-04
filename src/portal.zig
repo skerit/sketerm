@@ -53,30 +53,108 @@ pub const RawFilter = struct {
     entries: []const RawEntry,
 };
 
-/// Map portal filters onto picker filters: glob entries pass through,
-/// mimetype entries are dropped. A filter left with NO globs is
-/// dropped entirely -- an empty pattern list means "all files" to the
-/// picker, which would invert a mimetype-only filter's meaning.
-/// Output slices alias the input; allocate from an arena.
-pub fn mapFilters(allocator: std.mem.Allocator, raw: []const RawFilter) ![]fpicker.Filter {
-    var out: std.ArrayList(fpicker.Filter) = .empty;
-    for (raw) |rf| {
+/// A mapped filter plus the index it came from in the caller's
+/// filter list, so the reply's `current_filter` can echo the ORIGINAL
+/// variant rather than a reconstruction.
+pub const MappedFilter = struct {
+    filter: fpicker.Filter,
+    src: usize,
+};
+
+/// Map portal filters onto picker filters: glob entries become name
+/// patterns, mimetype entries become mime patterns (the picker asks
+/// GIO for the name's type and matches those). A filter left with NO
+/// usable entries at all is dropped entirely -- an empty pattern list
+/// means "all files" to the picker, which would invert the filter's
+/// meaning. Output slices alias the input; allocate from an arena.
+pub fn mapFilters(allocator: std.mem.Allocator, raw: []const RawFilter) ![]MappedFilter {
+    var out: std.ArrayList(MappedFilter) = .empty;
+    for (raw, 0..) |rf, i| {
         var pats: std.ArrayList([]const u8) = .empty;
+        var mimes: std.ArrayList([]const u8) = .empty;
         for (rf.entries) |e| {
-            if (e.kind != ENTRY_GLOB) continue;
             if (e.pattern.len == 0) continue;
-            try pats.append(allocator, e.pattern);
+            switch (e.kind) {
+                ENTRY_GLOB => try pats.append(allocator, e.pattern),
+                ENTRY_MIME => try mimes.append(allocator, e.pattern),
+                else => {},
+            }
         }
-        if (pats.items.len == 0) {
+        if (pats.items.len == 0 and mimes.items.len == 0) {
             pats.deinit(allocator);
+            mimes.deinit(allocator);
             continue;
         }
         try out.append(allocator, .{
-            .label = rf.label,
-            .patterns = try pats.toOwnedSlice(allocator),
+            .src = i,
+            .filter = .{
+                .label = rf.label,
+                .patterns = try pats.toOwnedSlice(allocator),
+                .mimes = try mimes.toOwnedSlice(allocator),
+            },
         });
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Just the picker-facing halves of a mapped list.
+pub fn pickerFilters(allocator: std.mem.Allocator, mapped: []const MappedFilter) ![]fpicker.Filter {
+    const out = try allocator.alloc(fpicker.Filter, mapped.len);
+    for (mapped, 0..) |m, i| out[i] = m.filter;
+    return out;
+}
+
+fn rawEntryEql(a: RawEntry, b: RawEntry) bool {
+    return a.kind == b.kind and std.mem.eql(u8, a.pattern, b.pattern);
+}
+
+/// Whether two wire filters are the same filter (label + entries in
+/// order), which is how `current_filter` is matched to `filters`.
+pub fn rawFilterEql(a: RawFilter, b: RawFilter) bool {
+    if (!std.mem.eql(u8, a.label, b.label)) return false;
+    if (a.entries.len != b.entries.len) return false;
+    for (a.entries, b.entries) |x, y| if (!rawEntryEql(x, y)) return false;
+    return true;
+}
+
+/// Index of `target` in `raw`, for honouring `current_filter`.
+pub fn findRawFilter(raw: []const RawFilter, target: RawFilter) ?usize {
+    for (raw, 0..) |rf, i| if (rawFilterEql(rf, target)) return i;
+    return null;
+}
+
+/// The mapped-list index whose source is `src` (a caller filter that
+/// mapped to nothing has no index).
+pub fn mappedIndexOfSrc(mapped: []const MappedFilter, src: usize) ?usize {
+    for (mapped, 0..) |m, i| if (m.src == src) return i;
+    return null;
+}
+
+// -- parent_window handles ---------------------------------------
+
+/// A portal caller's `parent_window` handle: "wayland:<xdg_foreign
+/// exported handle>" or "x11:<hex window id>". Anything else (empty,
+/// unknown prefix, unparsable id) is `none`.
+pub const ParentHandle = union(enum) {
+    none,
+    wayland: []const u8,
+    x11: u64,
+};
+
+pub fn parseParentHandle(s: []const u8) ParentHandle {
+    if (std.mem.startsWith(u8, s, "wayland:")) {
+        const h = s["wayland:".len..];
+        return if (h.len == 0) .none else .{ .wayland = h };
+    }
+    if (std.mem.startsWith(u8, s, "x11:")) {
+        var hex = s["x11:".len..];
+        if (std.mem.startsWith(u8, hex, "0x") or std.mem.startsWith(u8, hex, "0X"))
+            hex = hex[2..];
+        if (hex.len == 0) return .none;
+        const xid = std.fmt.parseInt(u64, hex, 16) catch return .none;
+        return if (xid == 0) .none else .{ .x11 = xid };
+    }
+    return .none;
 }
 
 /// Portal accept_label values carry GTK mnemonics ("_Open"); the
@@ -171,7 +249,7 @@ test "modeFor matrix" {
     try t.expectEqual(fpicker.Mode.select_destination, modeFor(.save_files, true, false));
 }
 
-test "mapFilters keeps globs, drops mimetypes and empty filters" {
+test "mapFilters keeps globs and mimetypes, drops empty filters" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -187,19 +265,73 @@ test "mapFilters keeps globs, drops mimetypes and empty filters" {
         } },
         .{ .label = "Weird", .entries = &.{
             .{ .kind = ENTRY_GLOB, .pattern = "" },
+            .{ .kind = 7, .pattern = "unknown-entry-kind" },
         } },
         .{ .label = "Text", .entries = &.{
             .{ .kind = ENTRY_GLOB, .pattern = "*.txt" },
         } },
     };
     const mapped = try mapFilters(a, &raw);
-    try t.expectEqual(@as(usize, 2), mapped.len);
-    try t.expectEqualStrings("Images", mapped[0].label);
-    try t.expectEqual(@as(usize, 2), mapped[0].patterns.len);
-    try t.expectEqualStrings("*.png", mapped[0].patterns[0]);
-    try t.expectEqualStrings("*.jpg", mapped[0].patterns[1]);
-    try t.expectEqualStrings("Text", mapped[1].label);
-    try t.expectEqualStrings("*.txt", mapped[1].patterns[0]);
+    try t.expectEqual(@as(usize, 3), mapped.len);
+    try t.expectEqualStrings("Images", mapped[0].filter.label);
+    try t.expectEqual(@as(usize, 0), mapped[0].src);
+    try t.expectEqual(@as(usize, 2), mapped[0].filter.patterns.len);
+    try t.expectEqualStrings("*.png", mapped[0].filter.patterns[0]);
+    try t.expectEqualStrings("*.jpg", mapped[0].filter.patterns[1]);
+    try t.expectEqualStrings("image/jpeg", mapped[0].filter.mimes[0]);
+    // A mimetype-only filter is now a real filter, not a dropped one.
+    try t.expectEqualStrings("Any image", mapped[1].filter.label);
+    try t.expectEqual(@as(usize, 1), mapped[1].src);
+    try t.expectEqual(@as(usize, 0), mapped[1].filter.patterns.len);
+    try t.expectEqualStrings("image/*", mapped[1].filter.mimes[0]);
+    // "Weird" had nothing usable; "Text" keeps its original index.
+    try t.expectEqualStrings("Text", mapped[2].filter.label);
+    try t.expectEqual(@as(usize, 3), mapped[2].src);
+    try t.expectEqual(@as(?usize, 2), mappedIndexOfSrc(mapped, 3));
+    try t.expectEqual(@as(?usize, null), mappedIndexOfSrc(mapped, 2));
+
+    const plain = try pickerFilters(a, mapped);
+    try t.expectEqual(@as(usize, 3), plain.len);
+    try t.expectEqualStrings("Any image", plain[1].label);
+}
+
+test "rawFilterEql and findRawFilter locate current_filter" {
+    const t = std.testing;
+    const raw = [_]RawFilter{
+        .{ .label = "Images", .entries = &.{.{ .kind = ENTRY_MIME, .pattern = "image/*" }} },
+        .{ .label = "Text", .entries = &.{.{ .kind = ENTRY_GLOB, .pattern = "*.txt" }} },
+    };
+    try t.expectEqual(@as(?usize, 1), findRawFilter(&raw, raw[1]));
+    // Same label, different entries: not the same filter.
+    try t.expectEqual(@as(?usize, null), findRawFilter(&raw, .{
+        .label = "Text",
+        .entries = &.{.{ .kind = ENTRY_GLOB, .pattern = "*.md" }},
+    }));
+    try t.expectEqual(@as(?usize, null), findRawFilter(&raw, .{ .label = "Nope", .entries = &.{} }));
+    try t.expect(!rawFilterEql(raw[0], raw[1]));
+}
+
+test "parseParentHandle" {
+    const t = std.testing;
+    switch (parseParentHandle("wayland:handle-42")) {
+        .wayland => |h| try t.expectEqualStrings("handle-42", h),
+        else => return error.WrongVariant,
+    }
+    switch (parseParentHandle("x11:0x1a00003")) {
+        .x11 => |x| try t.expectEqual(@as(u64, 0x1a00003), x),
+        else => return error.WrongVariant,
+    }
+    // Bare hex (no 0x) is what some callers send.
+    switch (parseParentHandle("x11:1A00003")) {
+        .x11 => |x| try t.expectEqual(@as(u64, 0x1a00003), x),
+        else => return error.WrongVariant,
+    }
+    try t.expectEqual(ParentHandle.none, parseParentHandle(""));
+    try t.expectEqual(ParentHandle.none, parseParentHandle("wayland:"));
+    try t.expectEqual(ParentHandle.none, parseParentHandle("x11:"));
+    try t.expectEqual(ParentHandle.none, parseParentHandle("x11:0x0"));
+    try t.expectEqual(ParentHandle.none, parseParentHandle("x11:zzz"));
+    try t.expectEqual(ParentHandle.none, parseParentHandle("mir:3"));
 }
 
 test "mapFilters empty input" {
