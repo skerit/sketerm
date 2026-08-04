@@ -3152,6 +3152,185 @@ fn saveStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: 
     std.debug.print("smoke-fs: atomic save (" ++ tag ++ ") OK\n", .{});
 }
 
+/// Outcome of a job whose payload is a stream of non-progress events
+/// (git_status "match", diff "line"), which JobOutcome ignores.
+const StreamOutcome = struct {
+    outcome: JobOutcome,
+    matches: usize = 0,
+    lines: usize = 0,
+    /// Whether any "match" event named this path (git_status) — set by
+    /// collectStream's caller-supplied name.
+    saw_name: bool = false,
+    /// First diff line whose text starts with '+' (content, not the
+    /// +++ header) — proof diff actually ran rather than silently
+    /// producing nothing.
+    saw_added_line: bool = false,
+};
+
+fn collectStream(fs: *fsdrive.Fs, job: u64, want_name: []const u8, timeout_ms: i64) StreamOutcome {
+    var out = StreamOutcome{ .outcome = .{} };
+    var waited: i64 = 0;
+    while (waited < timeout_ms) {
+        while (fs.takeJobEvent()) |e0| {
+            var e = e0;
+            defer e.deinit();
+            if (e.job != job) continue;
+            if (std.mem.eql(u8, e.ev, "match")) {
+                out.matches += 1;
+                if (want_name.len > 0 and std.mem.eql(u8, e.path, want_name)) out.saw_name = true;
+                continue;
+            }
+            if (std.mem.eql(u8, e.ev, "line")) {
+                out.lines += 1;
+                if (e.text.len > 1 and e.text[0] == '+' and e.text[1] != '+') out.saw_added_line = true;
+                continue;
+            }
+            if (e.terminal()) {
+                const n = @min(e.ev.len, out.outcome.ev.len);
+                @memcpy(out.outcome.ev[0..n], e.ev[0..n]);
+                out.outcome.ev_len = n;
+                out.outcome.done = e.done;
+                out.outcome.message_len = @min(e.message.len, out.outcome.message.len);
+                @memcpy(out.outcome.message[0..out.outcome.message_len], e.message[0..out.outcome.message_len]);
+                return out;
+            }
+        }
+        _ = c.usleep(5_000);
+        waited += 5;
+    }
+    fail("streamed job never reached a terminal event");
+}
+
+/// Is `name` runnable on this host? The two shell-out jobs below
+/// (git_status, diff) legitimately produce nothing without their
+/// binary, so their CONTENT assertions are conditional — the routing
+/// assertion never is.
+fn haveTool(name: []const u8) bool {
+    var cmd: [128:0]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&cmd, "command -v {s} >/dev/null 2>&1", .{name}) catch return false;
+    const fp = c.popen(z.ptr, "r") orelse return false;
+    return c.pclose(fp) == 0;
+}
+
+fn runIn(dir: []const u8, command: []const u8) void {
+    var cmd: [1024:0]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&cmd, "cd '{s}' && {s} >/dev/null 2>&1", .{ dir, command }) catch fail("shell cmd too long");
+    const fp = c.popen(z.ptr, "r") orelse fail("popen");
+    _ = c.pclose(fp);
+}
+
+fn fileSize(path: []const u8) u64 {
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(pathz.pathZ(&z, path) catch return 0, &st) != 0) return 0;
+    return @intCast(st.st_size);
+}
+
+/// The job verbs the GUI sends that the daemon's routing used to drop
+/// into "unknown fs op": git_status, diff, split, combine,
+/// secure_delete. `startX` failing at all IS the regression — the
+/// routing gap made every one of these an error reply.
+fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-verbs");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("verbs fs connect");
+    defer fs.deinit();
+    var pb: [6][4096]u8 = undefined;
+
+    // ── git_status ────────────────────────────────────────────
+    {
+        const repo = std.fmt.bufPrint(&pb[0], "{s}/repo", .{dir}) catch unreachable;
+        mkdirAt(repo);
+        const have_git = haveTool("git");
+        if (have_git) {
+            runIn(repo, "git init -q .");
+            touch(repo, "tracked.txt", "one\n");
+            runIn(repo, "git add tracked.txt && git -c user.email=s@x -c user.name=s commit -qm init");
+            touch(repo, "untracked.txt", "new\n");
+        }
+        const job = fs.startGitStatus(repo) catch failErr("git_status refused", fs.lastErr());
+        const out = collectStream(&fs, job, "untracked.txt", 20_000);
+        if (!out.outcome.is("done")) fail("git_status outcome");
+        if (have_git) {
+            if (out.matches == 0) fail("git_status reported no changes in a dirty repo");
+            if (!out.saw_name) fail("git_status did not name the untracked file");
+        }
+    }
+
+    // ── diff ──────────────────────────────────────────────────
+    {
+        const a = std.fmt.bufPrint(&pb[0], "{s}/a.txt", .{dir}) catch unreachable;
+        const b = std.fmt.bufPrint(&pb[1], "{s}/b.txt", .{dir}) catch unreachable;
+        const same = std.fmt.bufPrint(&pb[2], "{s}/same.txt", .{dir}) catch unreachable;
+        touch(dir, "a.txt", "alpha\nbeta\n");
+        touch(dir, "b.txt", "alpha\ngamma\n");
+        touch(dir, "same.txt", "alpha\nbeta\n");
+        const have_diff = haveTool("diff");
+        const job = fs.startDiff(a, b) catch failErr("diff refused", fs.lastErr());
+        const out = collectStream(&fs, job, "", 20_000);
+        if (!out.outcome.is("done")) fail("diff outcome");
+        if (have_diff) {
+            if (out.lines == 0) fail("diff of differing files produced no lines");
+            if (!out.saw_added_line) fail("diff never emitted an added line");
+            // Identical files: a clean, EMPTY diff (not an error).
+            const same_job = fs.startDiff(a, same) catch failErr("diff (identical) refused", fs.lastErr());
+            const same_out = collectStream(&fs, same_job, "", 20_000);
+            if (!same_out.outcome.is("done")) fail("identical diff outcome");
+            if (same_out.lines != 0) fail("identical files produced diff lines");
+        }
+    }
+
+    // ── split + combine round-trip ────────────────────────────
+    {
+        const src = std.fmt.bufPrint(&pb[0], "{s}/blob.bin", .{dir}) catch unreachable;
+        writePattern(src, 1000, 11);
+        const src_hash = fileSha(src) orelse fail("split src hash");
+        const job = fs.startSplit(src, "400") catch failErr("split refused", fs.lastErr());
+        const out = collectJob(&fs, job, 20_000);
+        if (!out.is("done")) failErr("split outcome", out.messageText());
+        if (out.done != 1000) fail("split done bytes");
+        const p1 = std.fmt.bufPrint(&pb[1], "{s}.001", .{src}) catch unreachable;
+        const p2 = std.fmt.bufPrint(&pb[2], "{s}.002", .{src}) catch unreachable;
+        const p3 = std.fmt.bufPrint(&pb[3], "{s}.003", .{src}) catch unreachable;
+        const p4 = std.fmt.bufPrint(&pb[4], "{s}.004", .{src}) catch unreachable;
+        if (fileSize(p1) != 400 or fileSize(p2) != 400 or fileSize(p3) != 200) fail("split part sizes");
+        if (exists(p4)) fail("split made a spurious fourth part");
+
+        // Combine needs its destination free — the parts rebuild it.
+        {
+            var z: [4096]u8 = undefined;
+            _ = c.unlink(pathz.pathZ(&z, src) catch unreachable);
+        }
+        const cjob = fs.startCombine(p1) catch failErr("combine refused", fs.lastErr());
+        const cout = collectJob(&fs, cjob, 20_000);
+        if (!cout.is("done")) failErr("combine outcome", cout.messageText());
+        if (cout.done != 1000) fail("combine done bytes");
+        const back = fileSha(src) orelse fail("combined file missing");
+        if (!std.mem.eql(u8, &back, &src_hash)) fail("combine content mismatch");
+    }
+
+    // ── secure_delete ─────────────────────────────────────────
+    {
+        const victim = std.fmt.bufPrint(&pb[0], "{s}/secret.bin", .{dir}) catch unreachable;
+        writePattern(victim, 4096, 23);
+        const job = fs.startSecureDelete(victim) catch failErr("secure_delete refused", fs.lastErr());
+        const out = collectJob(&fs, job, 20_000);
+        if (!out.is("done")) failErr("secure_delete outcome", out.messageText());
+        if (out.done != 4096) fail("secure_delete done bytes");
+        if (exists(victim)) fail("secure_delete left the file behind");
+
+        // A directory is not shreddable — an honest error, not a hang.
+        const subdir = std.fmt.bufPrint(&pb[1], "{s}/adir", .{dir}) catch unreachable;
+        mkdirAt(subdir);
+        const djob = fs.startSecureDelete(subdir) catch failErr("secure_delete (dir) refused", fs.lastErr());
+        const dout = collectJob(&fs, djob, 20_000);
+        if (!dout.is("error")) fail("secure_delete accepted a directory");
+        if (!exists(subdir)) fail("secure_delete removed a directory it refused");
+    }
+
+    std.debug.print("smoke-fs: job verbs (" ++ tag ++ ") OK\n", .{});
+}
+
 fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -3206,6 +3385,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mediaStage(allocator, sock_path, "mono");
     queryStage(allocator, sock_path, "mono");
     saveStage(allocator, sock_path, "mono");
+    jobVerbStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -3267,6 +3447,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mediaStage(allocator, bsock, "broker");
     queryStage(allocator, bsock, "broker");
     saveStage(allocator, bsock, "broker");
+    jobVerbStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
         defer conn.deinit();

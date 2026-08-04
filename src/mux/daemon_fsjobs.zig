@@ -29,57 +29,15 @@ pub const MAX_MEDIA_BATCH_BYTES = 16 * 1024;
 pub const MAX_TOKEN_JOBS = 1024;
 const PREVIEW_ASSET_TTL_MS: i64 = 300_000;
 
+/// Wire verb -> job op. The wire names ARE the FsJob.Op tag names, so
+/// this is the single source of truth for "is this verb a job?" --
+/// daemon_serve's routing asks here rather than keeping its own list.
+pub fn jobOpFor(op: []const u8) ?FsJob.Op {
+    return std.meta.stringToEnum(FsJob.Op, op);
+}
+
 pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
-    const op: FsJob.Op = if (std.mem.eql(u8, r.op, "copy"))
-        .copy
-    else if (std.mem.eql(u8, r.op, "delete_tree"))
-        .delete_tree
-    else if (std.mem.eql(u8, r.op, "find"))
-        .find
-    else if (std.mem.eql(u8, r.op, "grep"))
-        .grep
-    else if (std.mem.eql(u8, r.op, "extract"))
-        .extract
-    else if (std.mem.eql(u8, r.op, "archive_create"))
-        .archive_create
-    else if (std.mem.eql(u8, r.op, "archive_list"))
-        .archive_list
-    else if (std.mem.eql(u8, r.op, "archive_extract"))
-        .archive_extract
-    else if (std.mem.eql(u8, r.op, "trash"))
-        .trash
-    else if (std.mem.eql(u8, r.op, "trash_restore"))
-        .trash_restore
-    else if (std.mem.eql(u8, r.op, "cross_copy"))
-        .cross_copy
-    else if (std.mem.eql(u8, r.op, "panelize"))
-        .panelize
-    else if (std.mem.eql(u8, r.op, "live_find"))
-        .live_find
-    else if (std.mem.eql(u8, r.op, "thumbnail"))
-        .thumbnail
-    else if (std.mem.eql(u8, r.op, "preview"))
-        .preview
-    else if (std.mem.eql(u8, r.op, "preview_transport"))
-        .preview_transport
-    else if (std.mem.eql(u8, r.op, "dir_size"))
-        .dir_size
-    else if (std.mem.eql(u8, r.op, "perm_tree"))
-        .perm_tree
-    else if (std.mem.eql(u8, r.op, "media_meta"))
-        .media_meta
-    else if (std.mem.eql(u8, r.op, "git_status"))
-        .git_status
-    else if (std.mem.eql(u8, r.op, "diff"))
-        .diff
-    else if (std.mem.eql(u8, r.op, "split"))
-        .split
-    else if (std.mem.eql(u8, r.op, "combine"))
-        .combine
-    else if (std.mem.eql(u8, r.op, "secure_delete"))
-        .secure_delete
-    else
-        .hash;
+    const op: FsJob.Op = jobOpFor(r.op) orelse return fsReplyErr(cl, r.req, "unknown fs job op");
     if (r.no_replace and std.mem.eql(u8, r.dir_mode, "replace"))
         return fsReplyErr(cl, r.req, "no_replace conflicts with dir_mode=replace");
     if ((op == .copy or op == .extract or op == .archive_create) and
@@ -981,13 +939,15 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     }
     if (std.mem.eql(u8, e.ev, "match") or std.mem.eql(u8, e.ev, "unmatch") or
         std.mem.eql(u8, e.ev, "resync") or std.mem.eql(u8, e.ev, "ready") or
-        std.mem.eql(u8, e.ev, "reject"))
+        std.mem.eql(u8, e.ev, "reject") or std.mem.eql(u8, e.ev, "line"))
     {
         // Streaming query events: forwarded verbatim toward the
         // owner (never stored -- the stream IS the result). `ready`
         // is a live query's status line and repeats whenever one of
         // its bounds is newly hit; `reject` is one output line a
-        // panelize command produced that was not a usable path.
+        // panelize command produced that was not a usable path;
+        // `line` is one diff line (the diff viewer's whole payload —
+        // swallowing it here left the verb silently empty).
         if (std.mem.eql(u8, e.ev, "match")) job.matches += 1;
         if (job.owner) |owner| {
             if (!owner.dead) owner.queueJson(.fs_job, .{

@@ -20,6 +20,34 @@ const nav = @import("browser/nav.zig");
 
 pub const ResultCb = *const fn (ctx: ?*anyopaque, result: ?fpicker.Result) void;
 
+/// Resolve a picked spec to a path this process can open itself, or
+/// explain why it cannot. Consumers that hand the path to a LOCAL
+/// reader/writer (FreeType, the layout JSON loader, GIO byte writes)
+/// have no way to honour a `host:/path` pick, and silently doing
+/// nothing reads as a broken dialog — so say it. `detail` is the
+/// second sentence, explaining why this particular action is local.
+/// The returned slice borrows from `spec` (callback lifetime only).
+pub fn localPathOrRefuse(
+    parent: ?*c.GtkWindow,
+    spec: []const u8,
+    comptime detail: []const u8,
+) ?[]const u8 {
+    const loc = paths.parseSpec(spec);
+    const host = loc.host orelse return loc.path;
+    var body: [640:0]u8 = undefined;
+    const b = std.fmt.bufPrintZ(
+        &body,
+        "\"{s}\" lives on {s}. " ++ detail,
+        .{ loc.path, host },
+    ) catch std.fmt.bufPrintZ(&body, detail, .{}) catch unreachable;
+    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Remote file", b.ptr)));
+    c.adw_alert_dialog_add_response(dialog, "ok", "OK");
+    c.adw_alert_dialog_set_default_response(dialog, "ok");
+    c.adw_alert_dialog_set_close_response(dialog, "ok");
+    c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(@alignCast(parent)));
+    return null;
+}
+
 pub const PickerWindow = struct {
     allocator: std.mem.Allocator,
     window: *c.GtkWindow = undefined,
