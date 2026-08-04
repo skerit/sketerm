@@ -18,6 +18,8 @@ const Allocator = std.mem.Allocator;
 const rope_mod = @import("rope.zig");
 const Rope = rope_mod.Rope;
 const tr = @import("transaction.zig");
+const sel_mod = @import("selection.zig");
+const Selection = sel_mod.Selection;
 
 pub const LineEnding = enum { lf, crlf };
 
@@ -31,13 +33,43 @@ const OwnedEdit = struct {
     inserted: []u8,
 };
 
+/// The selection state a transaction was applied FROM, recorded so undo
+/// can put the carets back where the user had them (what every editor
+/// does) instead of guessing from the reverse edits.
+pub const SelSnapshot = struct {
+    sels: []const Selection,
+    primary: usize = 0,
+};
+
 const HistEntry = struct {
     edits: std.ArrayList(OwnedEdit),
+    /// Owned copy of the pre-transaction selection, when the caller
+    /// supplied one.
+    before: ?[]Selection = null,
+    before_primary: usize = 0,
 
     fn deinitFree(self: *HistEntry, alloc: Allocator) void {
         for (self.edits.items) |e| alloc.free(e.inserted);
         self.edits.deinit(alloc);
+        if (self.before) |b| alloc.free(b);
+        self.before = null;
     }
+};
+
+/// What an undo/redo actually did, so the caller can move its own
+/// state (selections, scroll) through the same change.
+///
+/// `edits` are in the coordinates of the document as it was BEFORE this
+/// undo/redo (sorted, non-overlapping) — exactly what
+/// SelectionSet.mapThrough consumes. Both slices are owned by the
+/// document and stay valid until the next mutation.
+pub const Change = struct {
+    revision: u64,
+    edits: []const tr.Edit,
+    /// The selection recorded before the transaction this undo just
+    /// reversed. Null for a redo, and for transactions applied without
+    /// a snapshot.
+    restore: ?SelSnapshot = null,
 };
 
 const Typing = struct {
@@ -71,6 +103,13 @@ pub const Document = struct {
     typing: ?Typing,
     /// Optional pre-edit hook; see `EditObserver`. Not owned.
     observer: ?EditObserver = null,
+    /// The history entry the last undo/redo consumed, kept alive only
+    /// so the `Change` handed back can point at its buffers. Freed at
+    /// the next mutation.
+    consumed: ?HistEntry = null,
+    /// Borrowed views of `consumed`'s edits, in the coordinates the
+    /// undo/redo was applied in.
+    consumed_view: std.ArrayList(tr.Edit) = .empty,
 
     pub fn initEmpty(alloc: Allocator) Document {
         return .{
@@ -125,6 +164,15 @@ pub const Document = struct {
         self.undo_stack.deinit(self.alloc);
         for (self.redo_stack.items) |*e| e.deinitFree(self.alloc);
         self.redo_stack.deinit(self.alloc);
+        self.dropConsumed();
+        self.consumed_view.deinit(self.alloc);
+    }
+
+    /// Release the history entry the previous undo/redo handed out.
+    fn dropConsumed(self: *Document) void {
+        if (self.consumed) |*e| e.deinitFree(self.alloc);
+        self.consumed = null;
+        self.consumed_view.clearRetainingCapacity();
     }
 
     pub fn isDirty(self: *const Document) bool {
@@ -171,8 +219,17 @@ pub const Document = struct {
     /// Applies `tx` atomically and returns the new revision. Edits are
     /// pre-transaction coordinates, applied back-to-front internally.
     pub fn applyTransaction(self: *Document, tx: *const tr.Transaction) Error!u64 {
+        return self.applyTransactionSel(tx, null);
+    }
+
+    /// applyTransaction, recording the selection the edit was made
+    /// from so a later undo can restore it. A coalesced keystroke does
+    /// NOT overwrite the group's snapshot: undoing a typed word puts
+    /// the caret where the word STARTED.
+    pub fn applyTransactionSel(self: *Document, tx: *const tr.Transaction, before: ?SelSnapshot) Error!u64 {
         if (tx.base_revision != self.revision) return Error.RevisionMismatch;
         try tx.validate(self.rope.len());
+        self.dropConsumed();
 
         const typing_cp = self.typingCandidate(tx);
         if (typing_cp == null) self.typing = null;
@@ -201,33 +258,87 @@ pub const Document = struct {
             self.typing = .{ .end = new_end, .last_cp = cp };
         }
 
-        try self.undo_stack.append(self.alloc, .{ .edits = inverse });
+        const kept: ?[]Selection = if (before) |b|
+            self.alloc.dupe(Selection, b.sels) catch null
+        else
+            null;
+        try self.undo_stack.append(self.alloc, .{
+            .edits = inverse,
+            .before = kept,
+            .before_primary = if (before) |b| b.primary else 0,
+        });
         return self.revision;
     }
 
     /// Undoes the top history entry; error.NothingToUndo when empty.
-    pub fn undo(self: *Document) Error!u64 {
+    /// The returned `Change` borrows document-owned memory that the
+    /// next mutation frees.
+    pub fn undo(self: *Document) Error!Change {
         if (self.undo_stack.items.len == 0) return Error.NothingToUndo;
         self.typing = null;
+        self.dropConsumed();
         var entry = self.undo_stack.pop().?;
-        defer entry.deinitFree(self.alloc);
-        var redo_entry = try self.applyOwned(entry.edits.items);
+        var redo_entry = self.applyOwned(entry.edits.items) catch |err| {
+            entry.deinitFree(self.alloc);
+            return err;
+        };
         errdefer freeEntryList(self.alloc, &redo_entry);
-        try self.redo_stack.append(self.alloc, .{ .edits = redo_entry });
+        // The snapshot rides along so a redo→undo round trip still
+        // restores it; the consumed entry keeps its own copy.
+        try self.redo_stack.append(self.alloc, .{
+            .edits = redo_entry,
+            .before = self.dupeSels(entry.before),
+            .before_primary = entry.before_primary,
+        });
         self.revision += 1;
-        return self.revision;
+        return self.keepConsumed(entry, true);
     }
 
-    pub fn redo(self: *Document) Error!u64 {
+    pub fn redo(self: *Document) Error!Change {
         if (self.redo_stack.items.len == 0) return Error.NothingToUndo;
         self.typing = null;
+        self.dropConsumed();
         var entry = self.redo_stack.pop().?;
-        defer entry.deinitFree(self.alloc);
-        var undo_entry = try self.applyOwned(entry.edits.items);
+        var undo_entry = self.applyOwned(entry.edits.items) catch |err| {
+            entry.deinitFree(self.alloc);
+            return err;
+        };
         errdefer freeEntryList(self.alloc, &undo_entry);
-        try self.undo_stack.append(self.alloc, .{ .edits = undo_entry });
+        try self.undo_stack.append(self.alloc, .{
+            .edits = undo_entry,
+            .before = self.dupeSels(entry.before),
+            .before_primary = entry.before_primary,
+        });
         self.revision += 1;
-        return self.revision;
+        return self.keepConsumed(entry, false);
+    }
+
+    fn dupeSels(self: *Document, sels: ?[]Selection) ?[]Selection {
+        const s = sels orelse return null;
+        return self.alloc.dupe(Selection, s) catch null;
+    }
+
+    /// Park the just-applied history entry so the returned Change can
+    /// borrow its edit buffers, and build the borrowed edit view.
+    fn keepConsumed(self: *Document, entry: HistEntry, with_restore: bool) Error!Change {
+        self.consumed = entry;
+        const held = &self.consumed.?;
+        self.consumed_view.clearRetainingCapacity();
+        for (held.edits.items) |e| {
+            try self.consumed_view.append(self.alloc, .{
+                .offset = e.offset,
+                .deleted_len = e.deleted_len,
+                .inserted = e.inserted,
+            });
+        }
+        return .{
+            .revision = self.revision,
+            .edits = self.consumed_view.items,
+            .restore = if (with_restore and held.before != null)
+                .{ .sels = held.before.?, .primary = held.before_primary }
+            else
+                null,
+        };
     }
 
     pub fn canUndo(self: *const Document) bool {
@@ -499,6 +610,70 @@ test "document applyTransaction clears redo and typing continues correctly after
     // The pre-undo group must not have been extended.
     _ = try doc.undo();
     try expectText(&doc, "");
+}
+
+test "document undo hands back the edits it applied" {
+    var doc = try Document.initFromBytes(testing.allocator, "hello world");
+    defer doc.deinit();
+    var tx = tr.Transaction.init(0);
+    defer tx.deinit(testing.allocator);
+    try tx.addReplace(testing.allocator, 0, 5, "goodbye");
+    _ = try doc.applyTransaction(&tx);
+    try expectText(&doc, "goodbye world");
+
+    const change = try doc.undo();
+    try testing.expectEqual(@as(usize, 1), change.edits.len);
+    // Inverse of "replace [0,5) with 7 bytes" is "replace [0,7) with
+    // hello", in the coordinates the undo was applied in.
+    try testing.expectEqual(@as(usize, 0), change.edits[0].offset);
+    try testing.expectEqual(@as(usize, 7), change.edits[0].deleted_len);
+    try testing.expectEqualStrings("hello", change.edits[0].inserted);
+    // A position after the edit maps back correctly.
+    try testing.expectEqual(@as(usize, 10), tr.mapOffset(change.edits, 12, .other));
+
+    const rechange = try doc.redo();
+    try testing.expectEqual(@as(usize, 5), rechange.edits[0].deleted_len);
+    try testing.expectEqualStrings("goodbye", rechange.edits[0].inserted);
+    try testing.expect(rechange.restore == null);
+}
+
+test "document undo restores the recorded pre-edit selection" {
+    var doc = try Document.initFromBytes(testing.allocator, "abcdef");
+    defer doc.deinit();
+    var tx = tr.Transaction.init(0);
+    defer tx.deinit(testing.allocator);
+    try tx.addReplace(testing.allocator, 1, 3, "X");
+    const before = [_]Selection{.{ .anchor = 1, .head = 4 }};
+    _ = try doc.applyTransactionSel(&tx, .{ .sels = &before, .primary = 0 });
+    try expectText(&doc, "aXef");
+
+    const change = try doc.undo();
+    const restore = change.restore orelse return error.TestExpectedRestore;
+    try testing.expectEqual(@as(usize, 1), restore.sels.len);
+    try testing.expectEqual(@as(usize, 1), restore.sels[0].anchor);
+    try testing.expectEqual(@as(usize, 4), restore.sels[0].head);
+
+    // The snapshot survives a redo → undo round trip.
+    _ = try doc.redo();
+    const again = try doc.undo();
+    const restore2 = again.restore orelse return error.TestExpectedRestore;
+    try testing.expectEqual(@as(usize, 4), restore2.sels[0].head);
+}
+
+test "document coalesced typing keeps the group's FIRST selection" {
+    var doc = Document.initEmpty(testing.allocator);
+    defer doc.deinit();
+    for ("abc", 0..) |_, i| {
+        var tx = tr.Transaction.init(doc.revision);
+        defer tx.deinit(testing.allocator);
+        try tx.addInsert(testing.allocator, i, "abc"[i .. i + 1]);
+        const before = [_]Selection{Selection.caret(i)};
+        _ = try doc.applyTransactionSel(&tx, .{ .sels = &before, .primary = 0 });
+    }
+    try testing.expectEqual(@as(usize, 1), doc.undo_stack.items.len);
+    const change = try doc.undo();
+    const restore = change.restore orelse return error.TestExpectedRestore;
+    try testing.expectEqual(@as(usize, 0), restore.sels[0].head);
 }
 
 test "document markSaved clears dirty" {

@@ -536,6 +536,16 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         try ipc_protocol.writeOk(out, allocator, "record", .{ .recording = false });
     } else if (eql(u8, req.cmd, "get-text")) {
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        // An editor-visible pane answers with its DOCUMENT: the shell
+        // grid underneath is not what the caller is looking at.
+        if (pane.editorFaceVisible()) {
+            if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
+                const doc_text = ev.ipcGetText(allocator) orelse
+                    return ipc_protocol.writeErr(out, allocator, "editor has no open document");
+                defer allocator.free(doc_text);
+                return ipc_protocol.writeOk(out, allocator, "text", doc_text);
+            }
+        }
         const screen = pane.terminal.screen;
         if (req.last_command) {
             // A completed zone with no output (e.g. `true`) is
@@ -673,7 +683,13 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             const win = ownerWindow(self, pane);
             if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
             c.gtk_window_present(@ptrCast(win.app_window));
-            _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+            // Focusing an editor-visible pane must land on the document
+            // canvas, not on the hidden shell's GLArea.
+            if (pane.editorFaceVisible()) {
+                if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
+                    ev.focusFace();
+                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+            } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (req.tab != null) {
             const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");

@@ -720,6 +720,43 @@ pub const Fs = struct {
         return rep.entry orelse Error.BadReply;
     }
 
+    /// statPath, following symlinks to the file a read/write would
+    /// actually land on. The daemon's `stat` is an LSTAT, so a
+    /// symlinked document otherwise reports the LINK's identity —
+    /// which never moves when the target is rewritten, and is exactly
+    /// what an external-modification check must not compare against.
+    /// Bounded hop count: symlink loops exist.
+    pub fn statFollow(self: *Fs, arena: std.mem.Allocator, path: []const u8) Error!Entry {
+        var cur_buf: [4096]u8 = undefined;
+        if (path.len == 0 or path.len >= cur_buf.len) return Error.BadRequest;
+        @memcpy(cur_buf[0..path.len], path);
+        var cur_len = path.len;
+
+        var hops: usize = 0;
+        while (hops < 8) : (hops += 1) {
+            const e = try self.statPath(arena, cur_buf[0..cur_len]);
+            if (!std.mem.eql(u8, e.kind, "link")) return e;
+            const target = e.target orelse return Error.FsOpFailed;
+            if (target.len == 0) return Error.FsOpFailed;
+            var next_buf: [4096]u8 = undefined;
+            const next: []const u8 = if (target[0] == '/')
+                target
+            else blk: {
+                const dir = std.fs.path.dirname(cur_buf[0..cur_len]) orelse "/";
+                break :blk std.fmt.bufPrint(&next_buf, "{s}/{s}", .{ dir, target }) catch
+                    return Error.BadRequest;
+            };
+            if (next.len >= cur_buf.len) return Error.BadRequest;
+            // `next` may alias arena memory or next_buf: copy through a
+            // scratch buffer before overwriting cur_buf.
+            var tmp: [4096]u8 = undefined;
+            @memcpy(tmp[0..next.len], next);
+            @memcpy(cur_buf[0..next.len], tmp[0..next.len]);
+            cur_len = next.len;
+        }
+        return Error.FsOpFailed;
+    }
+
     pub fn mkdir(self: *Fs, path: []const u8) Error!void {
         try self.simpleOp("mkdir", .{ .path = path });
     }

@@ -24,16 +24,28 @@
 //!   `sb_guard` flag stops its value-changed handler from fighting the
 //!   value we push into it.
 //!
+//! ## External changes
+//!
+//! Every open document's file is stat-probed when the user returns to
+//! the editor (focus, tab switch, click); a clean buffer reloads
+//! itself, a dirty one raises the inline banner. See the
+//! "external-change detection" section below for why this is a poll
+//! and not a daemon directory watch, and `editor/reload.zig` for the
+//! predicate.
+//!
 //! Deliberate simplifications (documented, not accidental):
 //! - Soft wrap breaks at cluster boundaries, not word boundaries
 //!   (editor_layout's greedy wrap).
 //! - Find is LITERAL only — no regex (editor/search.zig).
+//! - Undo/redo is not a per-keystroke journal of the FILE: an external
+//!   reload replaces the document and its history with it.
 //! - The IME preedit is laid out in its own throwaway Document, drawn
 //!   OVER the text it will displace behind an opaque backing rect
 //!   rather than reflowing the line; with several carets it shows at
 //!   the primary caret only and commits to all of them.
-//! - Undo restores selections by clamping (Document does not expose
-//!   its inverse edits).
+//! - Undo/redo restore selections properly: Document hands back the
+//!   edits it applied plus the pre-edit selection, so view_model
+//!   restores or MAPS rather than clamping.
 //! - Ctrl+Shift+S / Ctrl+Shift+Z are claimed by the editor face
 //!   (Save As / Redo), shadowing the global save_layout /
 //!   restore_closed_tab while the editor has focus.
@@ -55,6 +67,7 @@ const Anchor = viewport_mod.Anchor;
 const RowIndex = viewport_mod.RowIndex;
 const search = @import("../editor/search.zig");
 const Document = @import("../editor/document.zig").Document;
+const reload = @import("../editor/reload.zig");
 const sel_mod = @import("../editor/selection.zig");
 const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
@@ -162,7 +175,12 @@ const IoJob = struct {
     err_buf: [96]u8 = undefined,
     err_len: usize = 0,
     bytes: []u8 = &.{},
-    mtime_ns: i64 = 0,
+    /// Post-op identity of the file: the new conflict baseline after a
+    /// load/save, and the OTHER file's identity after a conflict.
+    disk: reload.DiskState = .{},
+    /// Reload that must land on the current cursor/scroll, not at the
+    /// top of the document.
+    keep_position: bool = false,
 
     fn setErr(self: *IoJob, text: []const u8) void {
         self.err_len = @min(text.len, self.err_buf.len);
@@ -193,11 +211,39 @@ fn connectFs(host: ?[]const u8) !fsdrive.Fs {
     return fsdrive.Fs.initConn(allocator, conn);
 }
 
-fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), mtime_out: *i64) !void {
+/// Observe one path's identity, following symlinks (fsdrive.statFollow
+/// explains why the follow is mandatory).
+///
+/// A missing path answers `present = false`; a TRANSPORT failure
+/// returns false, so a dead link can never be mistaken for a deleted
+/// file.
+fn probePath(fs: *fsdrive.Fs, path: []const u8, out: *reload.DiskState) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const e = fs.statFollow(arena.allocator(), path) catch |err| {
+        if (err == fsdrive.Error.FsOpFailed or err == fsdrive.Error.BadRequest) {
+            out.* = .{ .known = true, .present = false };
+            return true;
+        }
+        return false;
+    };
+    out.* = .{
+        .known = true,
+        .present = true,
+        .mtime_ns = e.mtime_ns,
+        .mtime_ms = e.mtime_ms,
+        .size = e.size,
+        .ino = e.ino,
+        .mode = e.mode,
+    };
+    return true;
+}
+
+fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), info_out: *fsdrive.ReadInfo) !void {
     const allocator = std.heap.c_allocator;
     const probe = try fs.read(path, 0, 0, out);
     if (probe.size > MAX_FILE_BYTES) return error.SourceTooLarge;
-    mtime_out.* = probe.mtime_ns;
+    info_out.* = probe;
     try out.ensureTotalCapacity(allocator, @intCast(probe.size));
     var offset: u64 = 0;
     while (offset < probe.size) {
@@ -226,8 +272,8 @@ fn ioThread(job: *IoJob) void {
         switch (job.kind) {
             .load => {
                 var out: std.ArrayList(u8) = .empty;
-                var mtime: i64 = 0;
-                readAllCapped(&fs, loc.path, &out, &mtime) catch |err| {
+                var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
+                readAllCapped(&fs, loc.path, &out, &info) catch |err| {
                     out.deinit(allocator);
                     if (err == error.SourceTooLarge or err == error.ShortRead) {
                         job.setErr(@errorName(err));
@@ -251,26 +297,104 @@ fn ioThread(job: *IoJob) void {
                     job.setErr("OutOfMemory");
                     break :run;
                 };
-                job.mtime_ns = mtime;
+                // Identity from the FD the bytes came through (never a
+                // separate stat, which could see a newer file than the
+                // one just read) — with the permission bits filled in
+                // from a follow-stat, since a read cannot report them.
+                job.disk = .{
+                    .known = true,
+                    .present = true,
+                    .mtime_ns = info.mtime_ns,
+                    .size = info.size,
+                    .ino = info.ino,
+                };
+                var st: reload.DiskState = .{};
+                if (probePath(&fs, loc.path, &st) and st.present) {
+                    job.disk.mode = st.mode;
+                    if (job.disk.mtime_ns == 0) job.disk.mtime_ns = st.mtime_ns;
+                    job.disk.mtime_ms = st.mtime_ms;
+                }
                 job.ok = true;
             },
             .save => {
                 const res = fs.writeFileAtomic(loc.path, job.save_bytes, job.expected_mtime) catch |err| {
                     if (err == fsdrive.Error.Conflict) {
                         job.conflict = true;
-                        if (fs.lastConflict()) |ci| job.mtime_ns = ci.mtime_ns;
+                        if (fs.lastConflict()) |ci| job.disk = .{
+                            .known = true,
+                            .present = true,
+                            .mtime_ns = ci.mtime_ns,
+                            .mtime_ms = ci.mtime_ms,
+                            .size = ci.size,
+                            .ino = ci.ino,
+                            .mode = ci.mode,
+                        };
                     } else {
                         const detail = fs.lastErr();
                         if (detail.len > 0) job.setErr(detail) else job.setErr(@errorName(err));
                     }
                     break :run;
                 };
-                job.mtime_ns = res.mtime_ns;
+                job.disk = .{
+                    .known = true,
+                    .present = true,
+                    .mtime_ns = res.mtime_ns,
+                    .mtime_ms = res.mtime_ms,
+                    .size = res.size,
+                    .ino = res.ino,
+                    .mode = res.mode,
+                };
                 job.ok = true;
             },
         }
     }
     _ = c.g_idle_add(@ptrCast(&ioIdle), @ptrCast(job));
+}
+
+/// One batched disk-identity probe: every open document on ONE host,
+/// statted through ONE connection. This is the whole external-change
+/// detector (see `EditorView.checkDisk` for why it is a poll and not a
+/// daemon watch).
+const ProbeItem = struct {
+    tab_id: u64,
+    path: []u8,
+    state: reload.DiskState = .{},
+    /// False when the probe could not be taken (transport failure) —
+    /// which must never be reported as "the file is gone".
+    ok: bool = false,
+};
+
+const ProbeJob = struct {
+    fence: *Fence,
+    /// Owned copy of the host part of the specs ("" = local).
+    host: []u8,
+    items: []ProbeItem,
+
+    fn destroy(self: *ProbeJob) void {
+        const a = std.heap.c_allocator;
+        for (self.items) |it| a.free(it.path);
+        a.free(self.items);
+        a.free(self.host);
+        self.fence.unref();
+        a.destroy(self);
+    }
+};
+
+fn probeThread(job: *ProbeJob) void {
+    const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
+    if (connectFs(host)) |fs_val| {
+        var fs = fs_val;
+        defer fs.deinit();
+        for (job.items) |*it| it.ok = probePath(&fs, it.path, &it.state);
+    } else |_| {}
+    _ = c.g_idle_add(@ptrCast(&probeIdle), @ptrCast(job));
+}
+
+fn probeIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const job: *ProbeJob = @ptrCast(@alignCast(user.?));
+    if (job.fence.viewIfAlive()) |view| view.onProbeDone(job);
+    job.destroy();
+    return 0;
 }
 
 fn ioIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -316,8 +440,28 @@ pub const ETab = struct {
     needle: []u8 = &.{},
     /// Host-qualified spec; null = unsaved Untitled buffer.
     spec: ?[]u8 = null,
-    /// Conflict baseline from the last load/save (0 = none).
-    mtime_ns: i64 = 0,
+    /// Identity of the file as of the last load/save: the save
+    /// conflict baseline AND the reference every disk probe compares
+    /// against.
+    disk: reload.DiskState = .{},
+    /// The most recent probe result, whatever the verdict.
+    seen: reload.DiskState = .{},
+    /// Probe result the user dismissed the banner for; the banner stays
+    /// down until the file moves on from it.
+    dismissed: ?reload.DiskState = null,
+    /// Which inline banner this tab wants (per tab: switching tabs
+    /// switches the banner).
+    alert: Alert = .none,
+    /// The banner was raised by a REFUSED SAVE rather than by a probe —
+    /// same state, different wording.
+    alert_from_save: bool = false,
+    /// Cursor/scroll to restore when the in-flight load is a
+    /// position-preserving reload. Owned.
+    keep_sels: []Selection = &.{},
+    keep_primary: usize = 0,
+    keep_anchor: Anchor = .{},
+    keep_scroll_x: f32 = 0,
+    keep_active: bool = false,
     loading: bool = false,
     /// Generation for in-flight IO; 0 = idle.
     io_gen: u64 = 0,
@@ -349,6 +493,7 @@ pub const ETab = struct {
         self.clearMatches();
         if (self.needle.len > 0) a.free(self.needle);
         if (self.spec) |s| a.free(s);
+        if (self.keep_sels.len > 0) a.free(self.keep_sels);
         a.destroy(self);
     }
 
@@ -368,6 +513,16 @@ pub const ETab = struct {
         const base = std.fs.path.basename(loc.path);
         return if (base.len == 0) s else base;
     }
+};
+
+/// The inline banner's state for one document.
+pub const Alert = enum {
+    none,
+    /// The file changed on disk under a DIRTY buffer (a clean one is
+    /// reloaded silently instead), or a save was refused.
+    changed,
+    /// The file is not on disk any more.
+    deleted,
 };
 
 const DlgCtx = struct {
@@ -427,6 +582,18 @@ pub const EditorView = struct {
     find_case: *c.GtkWidget = undefined,
     find_word: *c.GtkWidget = undefined,
     find_open: bool = false,
+
+    // External-change banner (inline, above the canvas — never a
+    // modal: it fires while the user is typing).
+    banner_box: *c.GtkWidget = undefined,
+    banner_label: *c.GtkLabel = undefined,
+    banner_reload: *c.GtkWidget = undefined,
+    banner_save: *c.GtkWidget = undefined,
+
+    /// Monotonic ms of the last disk probe (rate limit) and how many
+    /// probe jobs are in flight (never stack them).
+    last_probe_ms: i64 = 0,
+    probes_in_flight: u32 = 0,
 
     // Caret blink. A g_timeout, never a frame-clock tick: a tick
     // callback on a GtkGLArea leaks on Wayland (same reason Pane uses
@@ -825,8 +992,16 @@ pub const EditorView = struct {
 
     fn focusCb(ctx: *anyopaque) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
-        if (!self.widgets_dead)
-            _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        self.focusFace();
+    }
+
+    /// Focus the document canvas (pane focus, IPC `focus`). Probes the
+    /// disk directly rather than waiting for the GTK focus signal,
+    /// which a headless/unfocused toplevel may never deliver.
+    pub fn focusFace(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        self.checkDisk();
     }
 
     pub fn deinit(self: *EditorView) void {
@@ -938,6 +1113,12 @@ pub const EditorView = struct {
         c.gtk_overlay_set_child(@ptrCast(overlay), area_widget);
         self.buildFindBar();
         c.gtk_overlay_add_overlay(@ptrCast(overlay), self.find_bar);
+
+        // The external-change banner sits between the tab strip and
+        // the canvas (a real child, not an overlay: it must not cover
+        // the find bar, and it must not steal a click from the text).
+        self.buildBanner();
+        c.gtk_box_append(@ptrCast(vbox), self.banner_box);
 
         const grid = c.gtk_grid_new();
         c.gtk_widget_set_hexpand(grid, 1);
@@ -1079,6 +1260,51 @@ pub const EditorView = struct {
         self.find_bar = outer.?;
     }
 
+    /// Full-width inline banner for external file changes. Same
+    /// Adwaita vocabulary as the find bar ("toolbar" styling), hidden
+    /// until a document needs it.
+    fn buildBanner(self: *EditorView) void {
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_add_css_class(row, "toolbar");
+        c.gtk_widget_add_css_class(row, "warning");
+        c.gtk_widget_set_margin_start(row, 6);
+        c.gtk_widget_set_margin_end(row, 6);
+        c.gtk_widget_set_margin_top(row, 2);
+        c.gtk_widget_set_margin_bottom(row, 2);
+        c.gtk_widget_set_visible(row, 0);
+
+        const icon = c.gtk_image_new_from_icon_name("dialog-warning-symbolic");
+        c.gtk_box_append(@ptrCast(row), icon);
+
+        const label = c.gtk_label_new("");
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_label_set_wrap(@ptrCast(label), 1);
+        c.gtk_widget_set_hexpand(label, 1);
+        c.gtk_box_append(@ptrCast(row), label);
+        self.banner_label = @ptrCast(@alignCast(label));
+
+        const reload_btn = c.gtk_button_new_with_label("Reload");
+        c.gtk_widget_set_tooltip_text(reload_btn, "Replace the buffer with the version on disk");
+        _ = c.g_signal_connect_data(reload_btn, "clicked", @ptrCast(&onBannerReload), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), reload_btn);
+        self.banner_reload = reload_btn.?;
+
+        const save_btn = c.gtk_button_new_with_label("Save Anyway");
+        c.gtk_widget_add_css_class(save_btn, "destructive-action");
+        c.gtk_widget_set_tooltip_text(save_btn, "Write this buffer over the version on disk");
+        _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onBannerSave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), save_btn);
+        self.banner_save = save_btn.?;
+
+        const dismiss = c.gtk_button_new_from_icon_name("window-close-symbolic");
+        c.gtk_button_set_has_frame(@ptrCast(dismiss), 0);
+        c.gtk_widget_set_tooltip_text(dismiss, "Dismiss");
+        _ = c.g_signal_connect_data(dismiss, "clicked", @ptrCast(&onBannerDismiss), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), dismiss);
+
+        self.banner_box = row.?;
+    }
+
     fn toggleButton(self: *EditorView, box: ?*c.GtkWidget, label: [*:0]const u8, tooltip: [*:0]const u8) *c.GtkWidget {
         const btn = c.gtk_toggle_button_new_with_label(label);
         c.gtk_button_set_has_frame(@ptrCast(btn), 0);
@@ -1181,8 +1407,10 @@ pub const EditorView = struct {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         if (self.widgets_dead) return;
         self.active = self.findTabByPage(page);
+        self.updateBanner();
         self.updateStatus();
         self.queueRender();
+        self.checkDisk();
     }
 
     /// Close with the dirty confirmation.
@@ -1819,6 +2047,11 @@ pub const EditorView = struct {
         const self = cast.userData(EditorView, user);
         if (self.im_ctx) |im| c.gtk_im_context_focus_in(im);
         self.suppressTabViewEdgeKeys(true);
+        // Coming back to the editor is exactly when a stale buffer
+        // starts to matter (this also covers the toplevel regaining
+        // activation: GTK drops widget focus while the window is not
+        // active).
+        self.checkDisk();
         self.noteActivity();
         self.queueRender();
     }
@@ -1983,7 +2216,7 @@ pub const EditorView = struct {
             prev_end = m.end;
             applied += 1;
         }
-        _ = tab.doc.applyTransaction(&tx) catch return;
+        _ = tab.doc.applyTransactionSel(&tx, vm.snapshotOf(&tab.sels)) catch return;
         tab.sels.mapThrough(tx.edits.items, .editor);
         vm.clampSelections(&tab.doc, &tab.sels);
         var buf: [64:0]u8 = undefined;
@@ -2139,6 +2372,10 @@ pub const EditorView = struct {
     // ---- IO -----------------------------------------------------------
 
     fn startLoad(self: *EditorView, tab: *ETab) void {
+        self.startLoadEx(tab, false);
+    }
+
+    fn startLoadEx(self: *EditorView, tab: *ETab, keep_position: bool) void {
         const spec = tab.spec orelse return;
         const a = std.heap.c_allocator;
         const job = a.create(IoJob) catch return;
@@ -2149,7 +2386,13 @@ pub const EditorView = struct {
         self.fence.ref();
         tab.io_gen = self.next_io_gen;
         self.next_io_gen += 1;
-        job.* = .{ .fence = self.fence, .gen = tab.io_gen, .kind = .load, .spec = owned };
+        job.* = .{
+            .fence = self.fence,
+            .gen = tab.io_gen,
+            .kind = .load,
+            .spec = owned,
+            .keep_position = keep_position,
+        };
         tab.loading = true;
         self.updateStatus();
         const thread = std.Thread.spawn(.{}, ioThread, .{job}) catch {
@@ -2174,7 +2417,11 @@ pub const EditorView = struct {
             self.saveTabAs(tab);
             return;
         }
-        self.startSave(tab, if (tab.mtime_ns != 0) tab.mtime_ns else null);
+        // The guarded save IS the before-save disk check: the daemon
+        // compares the baseline against the destination inside the
+        // install, which no client-side poll can do race-free.
+        const guard: ?i64 = if (tab.disk.present and tab.disk.mtime_ns != 0) tab.disk.mtime_ns else null;
+        self.startSave(tab, guard);
     }
 
     fn startSave(self: *EditorView, tab: *ETab, expected_mtime: ?i64) void {
@@ -2228,8 +2475,12 @@ pub const EditorView = struct {
                     return;
                 }
                 if (job.not_found) {
-                    // New file: keep the empty document, no baseline.
-                    tab.mtime_ns = 0;
+                    // New file (or an unreadable one): keep the empty
+                    // document and record NO baseline, so the disk
+                    // probe stays silent about a file we never read.
+                    tab.disk = .{};
+                    tab.keep_active = false;
+                    self.clearAlert(tab);
                     self.setStatus("New file.");
                     self.refresh(tab);
                     return;
@@ -2252,18 +2503,36 @@ pub const EditorView = struct {
                 tab.scroll_x = 0;
                 tab.max_width = 0;
                 self.applyWrapWidth(tab);
-                tab.mtime_ns = job.mtime_ns;
-                const caret = @min(tab.want_cursor orelse 0, tab.doc.rope.len());
-                tab.want_cursor = null;
-                tab.sels.keepPrimaryOnly();
-                tab.sels.sels.items[0] = Selection.caret(caret);
+                tab.disk = job.disk;
+                tab.seen = job.disk;
+                self.clearAlert(tab);
+                if (job.keep_position and tab.keep_active) {
+                    self.restoreKeptPosition(tab);
+                } else {
+                    const caret = @min(tab.want_cursor orelse 0, tab.doc.rope.len());
+                    tab.want_cursor = null;
+                    tab.sels.keepPrimaryOnly();
+                    tab.sels.sels.items[0] = Selection.caret(caret);
+                }
+                const was_reload = job.keep_position and tab.keep_active;
+                tab.keep_active = false;
                 self.refresh(tab);
+                // AFTER refresh: updateStatus paints Ln/Col over
+                // anything set before it.
+                if (was_reload) self.setStatus("Reloaded: the file changed on disk.");
             },
             .save => {
                 if (job.conflict) {
                     tab.close_after_save = false;
-                    self.conflictDialog(tab, job.mtime_ns);
-                    self.updateStatus();
+                    // NOT a modal: the same inline banner the probe
+                    // raises, so a refused save and an observed change
+                    // can never produce two competing prompts.
+                    tab.seen = job.disk;
+                    tab.dismissed = null;
+                    tab.alert = .changed;
+                    tab.alert_from_save = true;
+                    self.updateBanner();
+                    self.setStatus("Save refused: the file changed on disk.");
                     return;
                 }
                 if (!job.ok) {
@@ -2272,7 +2541,9 @@ pub const EditorView = struct {
                     self.updateStatus();
                     return;
                 }
-                tab.mtime_ns = job.mtime_ns;
+                tab.disk = job.disk;
+                tab.seen = job.disk;
+                self.clearAlert(tab);
                 if (tab.doc.revision == job.revision) tab.doc.markSaved();
                 if (tab.close_after_save) {
                     tab.close_after_save = false;
@@ -2281,8 +2552,8 @@ pub const EditorView = struct {
                         return;
                     }
                 }
-                self.setStatus("Saved.");
                 self.refresh(tab);
+                self.setStatus("Saved.");
             },
         }
     }
@@ -2297,38 +2568,267 @@ pub const EditorView = struct {
         c.adw_dialog_present(@ptrCast(dialog), self.dialogParent());
     }
 
-    /// The file on disk changed since load/last save.
-    fn conflictDialog(self: *EditorView, tab: *ETab, disk_mtime: i64) void {
-        _ = disk_mtime;
-        const ctx = DlgCtx.create(self, tab) orelse return;
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(
-            "File changed on disk",
-            "The file was modified outside this editor since it was loaded. Overwrite the on-disk version, or reload it (discarding your changes)?",
-        )));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "reload", "Reload");
-        c.adw_alert_dialog_add_response(dialog, "overwrite", "Overwrite");
-        c.adw_alert_dialog_set_response_appearance(dialog, "overwrite", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_default_response(dialog, "cancel");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onConflictResponse, @ptrCast(ctx));
+    // ---- external-change detection -------------------------------------
+    //
+    // Detection is a BATCHED STAT POLL, not a daemon directory watch.
+    // The daemon's live views (`open_view`) are directory-scoped: they
+    // cost a full stat-per-entry listing of the containing directory
+    // (opening one file in a huge tree would list thousands of
+    // siblings), they need a persistent connection parked on the GLib
+    // loop (which for a remote host cannot be established without a
+    // worker thread — the thing the GUI must not grow), and their
+    // inotify backend is Linux-only, so a remote macOS/BSD host would
+    // behave DIFFERENTLY. They also carry no IN_MODIFY, so a writer
+    // holding the fd open produces nothing until close — a poll is
+    // needed as a backstop regardless.
+    //
+    // A stat probe has none of that: one connection per HOST carries
+    // every open document's stat (so twenty tabs in one directory —
+    // or twenty directories — are one round trip, strictly stronger
+    // than per-(host, dir) dedupe), it is identical local and remote,
+    // and it runs on the same detached-thread + g_idle_add path the
+    // loads and saves already use. It fires when the user comes back
+    // to the editor (canvas focus, pane focus, tab switch), which is
+    // exactly when a stale buffer starts to matter, and the save path
+    // is guarded by the daemon-side mtime check, which is race-free in
+    // a way no poll can be.
+
+    /// Rate limit: focus-in storms (click, alt-tab, tab switch) must
+    /// not turn into a round trip each.
+    const PROBE_MIN_INTERVAL_MS: i64 = 400;
+
+    /// Probe every open document's file for external changes. Cheap,
+    /// idempotent and safe to call from any user-facing event.
+    pub fn checkDisk(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        if (self.probes_in_flight > 0) return;
+        const now = @import("../util/clock.zig").nowMs();
+        if (now - self.last_probe_ms < PROBE_MIN_INTERVAL_MS) return;
+        self.last_probe_ms = now;
+
+        const a = std.heap.c_allocator;
+        var hosts: std.ArrayList([]const u8) = .empty;
+        defer hosts.deinit(a);
+        for (self.tabs.items) |t| {
+            const spec = t.spec orelse continue;
+            if (t.io_gen != 0 or t.loading) continue;
+            const host = paths.parseSpec(spec).host orelse "";
+            var seen = false;
+            for (hosts.items) |h| {
+                if (std.mem.eql(u8, h, host)) seen = true;
+            }
+            if (!seen) hosts.append(a, host) catch return;
+        }
+        for (hosts.items) |host| self.probeHost(host);
     }
 
-    fn onConflictResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
-        defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
-        const r = ctx.resolve() orelse return;
-        if (std.mem.eql(u8, resp, "overwrite")) {
-            r.view.startSave(r.tab, null);
-        } else if (std.mem.eql(u8, resp, "reload")) {
-            if (r.tab.isDirty()) {
-                r.view.confirmReloadDirty(r.tab);
-            } else {
-                r.view.startLoad(r.tab);
-            }
+    /// One probe job for every document on `host` — one connection,
+    /// one thread, N stats.
+    fn probeHost(self: *EditorView, host: []const u8) void {
+        const a = std.heap.c_allocator;
+        var items: std.ArrayList(ProbeItem) = .empty;
+        defer items.deinit(a);
+        for (self.tabs.items) |t| {
+            const spec = t.spec orelse continue;
+            if (t.io_gen != 0 or t.loading) continue;
+            const loc = paths.parseSpec(spec);
+            if (!std.mem.eql(u8, loc.host orelse "", host)) continue;
+            const path = a.dupe(u8, loc.path) catch continue;
+            items.append(a, .{ .tab_id = t.id, .path = path }) catch {
+                a.free(path);
+                continue;
+            };
         }
+        if (items.items.len == 0) return;
+        const owned_items = items.toOwnedSlice(a) catch return;
+        const owned_host = a.dupe(u8, host) catch {
+            for (owned_items) |it| a.free(it.path);
+            a.free(owned_items);
+            return;
+        };
+        const job = a.create(ProbeJob) catch {
+            for (owned_items) |it| a.free(it.path);
+            a.free(owned_items);
+            a.free(owned_host);
+            return;
+        };
+        self.fence.ref();
+        job.* = .{ .fence = self.fence, .host = owned_host, .items = owned_items };
+        self.probes_in_flight += 1;
+        const thread = std.Thread.spawn(.{}, probeThread, .{job}) catch {
+            self.probes_in_flight -= 1;
+            job.destroy();
+            return;
+        };
+        thread.detach();
+    }
+
+    fn onProbeDone(self: *EditorView, job: *ProbeJob) void {
+        if (self.probes_in_flight > 0) self.probes_in_flight -= 1;
+        if (self.widgets_dead) return;
+        for (job.items) |it| {
+            // A probe that could not be TAKEN (dead link, unreachable
+            // host) says nothing — it must never read as "deleted".
+            if (!it.ok) continue;
+            const tab = self.findTabById(it.tab_id) orelse continue;
+            // A load/save started after the probe owns the baseline.
+            if (tab.io_gen != 0 or tab.loading) continue;
+            self.applyDiskState(tab, it.state);
+        }
+        self.updateBanner();
+    }
+
+    /// The whole external-change state machine for one document.
+    fn applyDiskState(self: *EditorView, tab: *ETab, obs: reload.DiskState) void {
+        tab.seen = obs;
+        switch (reload.compare(tab.disk, obs)) {
+            .unchanged => {
+                // Reverted underneath us: a banner about a change that
+                // is no longer there is noise.
+                if (tab.alert != .none) self.clearAlert(tab);
+                tab.dismissed = null;
+            },
+            .permissions => {
+                // Content is identical; only the bits moved. Re-baseline
+                // silently so the next save is not refused for it.
+                tab.disk.mode = obs.mode;
+                self.setStatus("Permissions changed on disk.");
+            },
+            .deleted => {
+                if (tab.dismissed) |d| {
+                    if (reload.sameState(d, obs)) return;
+                }
+                // Keep the content; the buffer is simply no longer
+                // backed by a file, and Save recreates it (the absent
+                // baseline drops the conflict guard).
+                tab.disk = obs;
+                tab.dismissed = null;
+                tab.alert = .deleted;
+                tab.alert_from_save = false;
+            },
+            .modified, .replaced, .reappeared => {
+                if (tab.dismissed) |d| {
+                    if (reload.sameState(d, obs)) return;
+                }
+                tab.dismissed = null;
+                if (!tab.isDirty()) {
+                    // Clean buffer: reload quietly, keeping the caret
+                    // and the scroll position. No prompt — that is what
+                    // good editors do.
+                    self.reloadKeepingPosition(tab);
+                    return;
+                }
+                tab.alert = .changed;
+                tab.alert_from_save = false;
+            },
+        }
+    }
+
+    fn reloadKeepingPosition(self: *EditorView, tab: *ETab) void {
+        const a = self.allocator;
+        if (tab.keep_sels.len > 0) a.free(tab.keep_sels);
+        tab.keep_sels = a.dupe(Selection, tab.sels.sels.items) catch &.{};
+        tab.keep_primary = tab.sels.primary_index;
+        tab.keep_anchor = tab.anchor;
+        tab.keep_scroll_x = tab.scroll_x;
+        tab.keep_active = true;
+        self.startLoadEx(tab, true);
+    }
+
+    /// Put the caret/selection and the scroll anchor back after a
+    /// reload, clamped into the document that actually arrived.
+    fn restoreKeptPosition(self: *EditorView, tab: *ETab) void {
+        const a = self.allocator;
+        const len = tab.doc.rope.len();
+        const lines = tab.doc.rope.lineCount();
+        tab.sels.sels.clearRetainingCapacity();
+        for (tab.keep_sels) |s| tab.sels.sels.append(a, s) catch {};
+        if (tab.sels.sels.items.len == 0)
+            tab.sels.sels.append(a, Selection.caret(0)) catch return;
+        tab.sels.primary_index = @min(tab.keep_primary, tab.sels.sels.items.len - 1);
+        reload.clampSet(&tab.sels, len);
+        tab.want_cursor = null;
+
+        const line = reload.clampLine(tab.keep_anchor.line, lines);
+        const rows = self.rowsOfLine(tab, line);
+        tab.anchor = .{
+            .line = line,
+            .row = @min(tab.keep_anchor.row, rows -| 1),
+            .offset = tab.keep_anchor.offset,
+        };
+        tab.scroll_x = if (tab.wrap) 0 else tab.keep_scroll_x;
+        self.clampAnchor(tab, self.viewportHeightPx());
+    }
+
+    // ---- the inline banner ----------------------------------------------
+
+    fn clearAlert(self: *EditorView, tab: *ETab) void {
+        tab.alert = .none;
+        tab.alert_from_save = false;
+        tab.dismissed = null;
+        self.updateBanner();
+    }
+
+    /// Render the ACTIVE tab's alert (each document carries its own).
+    fn updateBanner(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse {
+            c.gtk_widget_set_visible(self.banner_box, 0);
+            return;
+        };
+        if (tab.alert == .none) {
+            c.gtk_widget_set_visible(self.banner_box, 0);
+            return;
+        }
+        var buf: [320:0]u8 = undefined;
+        const text: [:0]const u8 = switch (tab.alert) {
+            .none => unreachable,
+            .changed => if (tab.alert_from_save)
+                std.fmt.bufPrintZ(&buf, "Save refused: \"{s}\" changed on disk since you opened it.", .{tab.title()}) catch "The file changed on disk."
+            else
+                std.fmt.bufPrintZ(&buf, "\"{s}\" changed on disk.", .{tab.title()}) catch "The file changed on disk.",
+            .deleted => std.fmt.bufPrintZ(&buf, "\"{s}\" no longer exists on disk.", .{tab.title()}) catch "The file no longer exists on disk.",
+        };
+        c.gtk_label_set_text(self.banner_label, text.ptr);
+        c.gtk_widget_set_visible(self.banner_reload, if (tab.alert == .changed) 1 else 0);
+        c.gtk_button_set_label(
+            @ptrCast(self.banner_save),
+            if (tab.alert == .deleted) "Save" else "Save Anyway",
+        );
+        c.gtk_widget_set_visible(self.banner_box, 1);
+    }
+
+    fn onBannerReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        const tab = self.active orelse return;
+        if (tab.isDirty()) {
+            // Losing unsaved work is the one thing that still deserves
+            // a confirmation — and it follows a deliberate click.
+            self.confirmReloadDirty(tab);
+            return;
+        }
+        self.clearAlert(tab);
+        self.reloadKeepingPosition(tab);
+    }
+
+    fn onBannerSave(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        const tab = self.active orelse return;
+        self.clearAlert(tab);
+        // Deliberate overwrite (or re-create): no conflict guard.
+        self.startSave(tab, null);
+    }
+
+    fn onBannerDismiss(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        const tab = self.active orelse return;
+        // Stay quiet for THIS on-disk state only: a further change
+        // raises the banner again, and the save baseline is untouched,
+        // so Ctrl+S is still refused.
+        tab.dismissed = tab.seen;
+        tab.alert = .none;
+        tab.alert_from_save = false;
+        self.updateBanner();
     }
 
     fn confirmReloadDirty(self: *EditorView, tab: *ETab) void {
@@ -2351,7 +2851,10 @@ pub const EditorView = struct {
         const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
         const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const r = ctx.resolve() orelse return;
-        if (std.mem.eql(u8, resp, "reload")) r.view.startLoad(r.tab);
+        if (std.mem.eql(u8, resp, "reload")) {
+            r.view.clearAlert(r.tab);
+            r.view.reloadKeepingPosition(r.tab);
+        }
     }
 
     // ---- Save As / Open pickers ---------------------------------------
@@ -2389,7 +2892,9 @@ pub const EditorView = struct {
         const owned = r.view.allocator.dupe(u8, res.specs[0]) catch return;
         if (r.tab.spec) |old| r.view.allocator.free(old);
         r.tab.spec = owned;
-        r.tab.mtime_ns = 0;
+        r.tab.disk = .{};
+        r.tab.seen = .{};
+        r.view.clearAlert(r.tab);
         // "Save As untitled.zig" is the moment the language becomes
         // knowable for a buffer that never had a filename.
         r.view.ensureHighlighter(r.tab);
@@ -2638,12 +3143,12 @@ pub const EditorView = struct {
                             return 1;
                         },
                         c.GDK_KEY_z => {
-                            vm.undo(&tab.doc, &tab.sels) catch {};
+                            vm.undo(self.allocator, &tab.doc, &tab.sels) catch {};
                             self.afterDocEdit(tab);
                             return 1;
                         },
                         c.GDK_KEY_y => {
-                            vm.redo(&tab.doc, &tab.sels) catch {};
+                            vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
                             self.afterDocEdit(tab);
                             return 1;
                         },
@@ -2673,7 +3178,7 @@ pub const EditorView = struct {
                 if (ctrl and shift) {
                     switch (lower) {
                         c.GDK_KEY_z => {
-                            vm.redo(&tab.doc, &tab.sels) catch {};
+                            vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
                             self.afterDocEdit(tab);
                             return 1;
                         },
@@ -2801,6 +3306,10 @@ pub const EditorView = struct {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         const tab = self.active orelse return;
         _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        // Clicking into an ALREADY focused canvas raises no focus
+        // event, and is just as much a "I am back at this document"
+        // signal (rate-limited like every other trigger).
+        self.checkDisk();
         const state = c.gtk_event_controller_get_current_event_state(@ptrCast(gesture));
         const mods = state & input.SIGNIFICANT_MODS;
         const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
@@ -2897,6 +3406,13 @@ pub const EditorView = struct {
         return .{ .files = files.items, .active = active_idx };
     }
 
+    /// IPC get-text on an editor-visible pane: the active document's
+    /// text, in its on-disk line-ending style. Caller frees.
+    pub fn ipcGetText(self: *EditorView, alloc: std.mem.Allocator) ?[]u8 {
+        const tab = self.active orelse return null;
+        return tab.doc.materialize(alloc) catch null;
+    }
+
     /// IPC send-text routed at an editor-visible pane: insert at all
     /// carets of the active tab.
     pub fn ipcInsertText(self: *EditorView, text: []const u8) bool {
@@ -2930,10 +3446,10 @@ pub const EditorView = struct {
             } else if (std.mem.eql(u8, chord, "ctrl+s")) {
                 self.saveTab(tab);
             } else if (std.mem.eql(u8, chord, "ctrl+z")) {
-                vm.undo(&tab.doc, &tab.sels) catch {};
+                vm.undo(self.allocator, &tab.doc, &tab.sels) catch {};
                 self.afterDocEdit(tab);
             } else if (std.mem.eql(u8, chord, "ctrl+y")) {
-                vm.redo(&tab.doc, &tab.sels) catch {};
+                vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
                 self.afterDocEdit(tab);
             } else if (std.mem.eql(u8, chord, "alt+z")) {
                 self.toggleWrap(tab);
