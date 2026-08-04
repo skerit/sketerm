@@ -47,6 +47,19 @@ const Typing = struct {
     last_cp: u21,
 };
 
+/// Notified just BEFORE any edit list touches the rope, in
+/// pre-transaction coordinates and with the old text still intact.
+///
+/// It exists for the incremental syntax highlighter, which cannot
+/// compute Tree-sitter's `old_end_point` after the fact (the deleted
+/// bytes are gone). Hooking `applyEdits` rather than
+/// `applyTransaction` means undo and redo feed the observer too, so an
+/// undo is as incremental as the edit it reverses.
+pub const EditObserver = struct {
+    ctx: *anyopaque,
+    before_apply: *const fn (ctx: *anyopaque, doc: *const Document, edits: []const tr.Edit) void,
+};
+
 pub const Document = struct {
     alloc: Allocator,
     rope: Rope,
@@ -56,6 +69,8 @@ pub const Document = struct {
     undo_stack: std.ArrayList(HistEntry),
     redo_stack: std.ArrayList(HistEntry),
     typing: ?Typing,
+    /// Optional pre-edit hook; see `EditObserver`. Not owned.
+    observer: ?EditObserver = null,
 
     pub fn initEmpty(alloc: Allocator) Document {
         return .{
@@ -267,6 +282,10 @@ pub const Document = struct {
     /// Applies sorted non-overlapping edits back-to-front and returns
     /// the inverse edit list in post-apply coordinates.
     fn applyEdits(self: *Document, edits: []const tr.Edit) Allocator.Error!std.ArrayList(OwnedEdit) {
+        // Before ANY mutation, while the old text and its line
+        // structure are still readable.
+        if (self.observer) |ob| ob.before_apply(ob.ctx, self, edits);
+
         var inverse: std.ArrayList(OwnedEdit) = .empty;
         errdefer freeEntryList(self.alloc, &inverse);
 

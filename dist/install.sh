@@ -172,6 +172,7 @@ stage() {
         install -Dm755 zig-out/bin/sketerm "$dest/usr/bin/sketerm"
         ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-files"
         ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-viewer"
+        ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-editor"
 
         install -Dm644 data/dev.sker.sketerm.desktop \
             "$dest/usr/share/applications/dev.sker.sketerm.desktop"
@@ -179,9 +180,12 @@ stage() {
             "$dest/usr/share/applications/dev.sker.sketerm.files.desktop"
         install -Dm644 data/dev.sker.sketerm.viewer.desktop \
             "$dest/usr/share/applications/dev.sker.sketerm.viewer.desktop"
+        install -Dm644 data/dev.sker.sketerm.editor.desktop \
+            "$dest/usr/share/applications/dev.sker.sketerm.editor.desktop"
 
         local i
-        for i in dev.sker.sketerm dev.sker.sketerm.files dev.sker.sketerm.viewer; do
+        for i in dev.sker.sketerm dev.sker.sketerm.files dev.sker.sketerm.viewer \
+                 dev.sker.sketerm.editor; do
             install -Dm644 "data/icons/hicolor/scalable/apps/$i.svg" \
                 "$dest/usr/share/icons/hicolor/scalable/apps/$i.svg"
         done

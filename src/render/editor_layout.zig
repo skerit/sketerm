@@ -17,6 +17,22 @@
 //! - Clusters whose start is not a grapheme boundary merge into their
 //!   visually-previous cluster so a caret can never land inside a
 //!   grapheme.
+//!
+//! ## Syntax highlighting
+//!
+//! When a `Highlighter` and a `Theme` are attached, each line asks the
+//! highlighter for one `syntax.Kind` byte per line byte. Those kinds do
+//! two things: the theme's per-kind bold/italic becomes the
+//! `StyleSpan` list handed to itemization (so a bold keyword shapes
+//! with the bold FACE, not a synthesized smear), and every
+//! `PlacedGlyph` carries its kind so editor_pass can colour it.
+//!
+//! The per-line cache therefore keys on the highlighter's `gen` as well
+//! as the document revision: a debounced re-parse lands at the SAME
+//! revision the lines were laid out at, and without that key the
+//! viewport would keep painting the pre-parse colours.
+//! A stale highlighter is not an error here — the line simply lays out
+//! unhighlighted and re-lays out when the parse catches up.
 
 const std = @import("std");
 const atlas_mod = @import("atlas.zig");
@@ -28,6 +44,8 @@ const StyleSpan = font_mod.StyleSpan;
 const bidi = @import("../grid/bidi.zig");
 const unicode = @import("../editor/unicode.zig");
 const Document = @import("../editor/document.zig").Document;
+const syntax = @import("../editor/syntax.zig");
+const theme_mod = @import("../editor/theme.zig");
 
 /// One positioned glyph. `x` is the UNWRAPPED visual pen position of
 /// the glyph (hb x_offset applied); the renderer adds bearings and
@@ -42,6 +60,9 @@ pub const PlacedGlyph = struct {
     advance: f32,
     /// Soft-wrap row index (0 when not wrapping).
     row: u32,
+    /// `@intFromEnum(syntax.Kind)` of the glyph's cluster; 0 (`.none`)
+    /// when the line is unhighlighted.
+    kind: u8 = 0,
 };
 
 /// One hit-testing cluster: byte range + unwrapped x range, in VISUAL
@@ -77,6 +98,8 @@ pub const LaidLine = struct {
     n_notdef: usize,
     revision: u64,
     atlas_gens: [atlas_mod.PAGE_COUNT]u32,
+    /// Highlighter generation the kinds came from (0 = unhighlighted).
+    hl_gen: u64 = 0,
 
     fn free(self: *LaidLine, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
@@ -94,6 +117,12 @@ pub const Layout = struct {
     tab_cols: u16 = 4,
     /// Soft wrap width in px (null = no wrap).
     wrap_width: ?f32 = null,
+    /// Syntax highlighter for this document (null = plain text). Owned
+    /// by the caller and allowed to lag the document — a stale one is
+    /// simply not consulted.
+    hl: ?*syntax.Highlighter = null,
+    /// Colour + face source for highlight kinds.
+    theme: *const theme_mod.Theme = &theme_mod.dark,
     cache: std.AutoHashMap(usize, *LaidLine),
 
     pub fn init(alloc: std.mem.Allocator, book: *FontBook) Layout {
@@ -132,10 +161,21 @@ pub const Layout = struct {
 
     /// Lay out (or fetch cached) line `idx`. The returned pointer stays
     /// valid until this line is re-laid-out or the Layout is deinit-ed.
+    /// Highlighter generation usable for `doc` right now — 0 when there
+    /// is no highlighter or it has not caught up (revision-stamped
+    /// results are rejected rather than painted onto moved bytes).
+    fn liveHlGen(self: *Layout, doc: *const Document) u64 {
+        const hl = self.hl orelse return 0;
+        if (hl.isStale(doc)) return 0;
+        return hl.gen;
+    }
+
     pub fn line(self: *Layout, doc: *const Document, idx: usize) !*const LaidLine {
         const gens = self.atlasGens();
+        const hl_gen = self.liveHlGen(doc);
         if (self.cache.get(idx)) |cached| {
             if (cached.revision == doc.revision and
+                cached.hl_gen == hl_gen and
                 std.mem.eql(u32, &cached.atlas_gens, &gens))
                 return cached;
             cached.free(self.alloc);
@@ -149,7 +189,21 @@ pub const Layout = struct {
         const text = try doc.rope.sliceAlloc(self.alloc, start, end);
         errdefer self.alloc.free(text);
 
-        const built = try self.buildLine(text);
+        // One highlight kind per line byte. A highlighter that errors
+        // (stale, or a window it cannot serve) degrades to plain text
+        // rather than failing the frame.
+        var kinds: ?[]u8 = null;
+        defer if (kinds) |k| self.alloc.free(k);
+        if (hl_gen != 0 and text.len > 0) {
+            const buf = try self.alloc.alloc(u8, text.len);
+            if (self.hl.?.fillKinds(doc, start, end, buf)) |_| {
+                kinds = buf;
+            } else |_| {
+                self.alloc.free(buf);
+            }
+        }
+
+        const built = try self.buildLine(text, kinds);
         const ll = try self.alloc.create(LaidLine);
         errdefer self.alloc.destroy(ll);
         ll.* = .{
@@ -165,6 +219,7 @@ pub const Layout = struct {
             .n_notdef = built.n_notdef,
             .revision = doc.revision,
             .atlas_gens = gens,
+            .hl_gen = if (kinds != null) hl_gen else 0,
         };
         try self.cache.put(idx, ll);
         return ll;
@@ -179,7 +234,7 @@ pub const Layout = struct {
         n_notdef: usize,
     };
 
-    fn buildLine(self: *Layout, text: []const u8) !Built {
+    fn buildLine(self: *Layout, text: []const u8, kinds: ?[]const u8) !Built {
         const alloc = self.alloc;
         var glyphs: std.ArrayList(PlacedGlyph) = .empty;
         errdefer glyphs.deinit(alloc);
@@ -254,6 +309,7 @@ pub const Layout = struct {
                         if (i > seg_start) {
                             const stats = try self.emitPiece(
                                 text,
+                                kinds,
                                 @intCast(seg_start),
                                 @intCast(i),
                                 rtl,
@@ -363,9 +419,36 @@ pub const Layout = struct {
     const PieceStats = struct { runs: usize, notdef: usize };
 
     /// Itemize + shape + place one tab-free slice of a bidi run.
+    /// Coalesce the piece's highlight kinds into itemization style
+    /// spans (bold/italic runs). Caller frees.
+    fn styleSpansFor(
+        self: *Layout,
+        kinds: []const u8,
+    ) ![]StyleSpan {
+        var spans: std.ArrayList(StyleSpan) = .empty;
+        errdefer spans.deinit(self.alloc);
+        var i: usize = 0;
+        while (i < kinds.len) {
+            const st = self.theme.style(@enumFromInt(kinds[i]));
+            var j = i + 1;
+            while (j < kinds.len) : (j += 1) {
+                const s2 = self.theme.style(@enumFromInt(kinds[j]));
+                if (s2.bold != st.bold or s2.italic != st.italic) break;
+            }
+            try spans.append(self.alloc, .{
+                .end = @intCast(j),
+                .bold = st.bold,
+                .italic = st.italic,
+            });
+            i = j;
+        }
+        return spans.toOwnedSlice(self.alloc);
+    }
+
     fn emitPiece(
         self: *Layout,
         text: []const u8,
+        kinds: ?[]const u8,
         piece_start: u32,
         piece_end: u32,
         rtl: bool,
@@ -375,7 +458,12 @@ pub const Layout = struct {
     ) !PieceStats {
         const alloc = self.alloc;
         const piece = text[piece_start..piece_end];
-        const runs = try self.book.itemize(alloc, piece, &.{}, rtl);
+        const spans: []StyleSpan = if (kinds) |k|
+            try self.styleSpansFor(k[piece_start..piece_end])
+        else
+            &.{};
+        defer if (spans.len > 0) alloc.free(spans);
+        const runs = try self.book.itemize(alloc, piece, spans, rtl);
         defer alloc.free(runs);
         var notdef: usize = 0;
 
@@ -391,6 +479,11 @@ pub const Layout = struct {
                 const cluster = shaped[i].cluster;
                 const seg_x0 = pen.*;
                 const temp_cluster_idx: u32 = @intCast(clusters.items.len);
+                const cluster_byte = piece_start + run.start + cluster;
+                const cluster_kind: u8 = if (kinds) |kk|
+                    (if (cluster_byte < kk.len) kk[cluster_byte] else 0)
+                else
+                    0;
                 while (i < shaped.len and shaped[i].cluster == cluster) : (i += 1) {
                     const sg = shaped[i];
                     if (sg.glyph_id == 0) notdef += 1;
@@ -405,14 +498,15 @@ pub const Layout = struct {
                         .x = pen.* + @as(f32, @floatFromInt(sg.x_offset)) / 64.0,
                         .y_offset = @as(f32, @floatFromInt(sg.y_offset)) / 64.0,
                         .glyph = g,
-                        .cluster_byte = piece_start + run.start + cluster,
+                        .cluster_byte = cluster_byte,
                         .advance = adv,
                         .row = temp_cluster_idx,
+                        .kind = cluster_kind,
                     });
                     pen.* += adv;
                 }
                 try clusters.append(alloc, .{
-                    .byte_start = piece_start + run.start + cluster,
+                    .byte_start = cluster_byte,
                     .byte_end = 0,
                     .x0 = seg_x0,
                     .x1 = pen.*,
@@ -647,6 +741,68 @@ test "layout: wrap segmentation covers the line and fits the width" {
     for (ll.glyphs) |g| {
         try testing.expect(g.row < ll.rows.len);
     }
+}
+
+test "layout: highlighted glyphs carry kinds and re-lay out on parse" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    const src = "const x = 42;\n";
+    var doc = try Document.initFromBytes(a, src);
+    defer doc.deinit();
+    var hl = try syntax.Highlighter.init(a, .zig);
+    defer hl.deinit();
+
+    // Attached but NOT yet parsed: the line lays out unhighlighted
+    // rather than being blocked or mispainted.
+    rig.layout.hl = &hl;
+    const plain = try rig.layout.line(&doc, 0);
+    try testing.expectEqual(@as(u64, 0), plain.hl_gen);
+    for (plain.glyphs) |g| try testing.expectEqual(@as(u8, 0), g.kind);
+
+    // The parse lands at the SAME revision — only the hl_gen key can
+    // invalidate the cached line.
+    try hl.parse(&doc);
+    const lit = try rig.layout.line(&doc, 0);
+    try testing.expect(lit.hl_gen != 0);
+    try testing.expectEqual(doc.revision, lit.revision);
+
+    var kw: usize = 0;
+    var num: usize = 0;
+    for (lit.glyphs) |g| {
+        const kind: syntax.Kind = @enumFromInt(g.kind);
+        if (g.cluster_byte < 5 and kind == .keyword) kw += 1;
+        if (g.cluster_byte >= 10 and g.cluster_byte < 12 and kind == .number) num += 1;
+    }
+    try testing.expect(kw > 0);
+    try testing.expect(num > 0);
+}
+
+test "layout: theme faces become itemization style spans" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    // `const` is bold in the theme, the identifier after it is not, so
+    // the piece must split into at least two shaping runs.
+    const kinds = [_]u8{@intFromEnum(syntax.Kind.keyword)} ** 5 ++
+        [_]u8{@intFromEnum(syntax.Kind.none)} ** 5;
+    const spans = try rig.layout.styleSpansFor(&kinds);
+    defer a.free(spans);
+    try testing.expectEqual(@as(usize, 2), spans.len);
+    try testing.expectEqual(@as(u32, 5), spans[0].end);
+    try testing.expect(spans[0].bold);
+    try testing.expectEqual(@as(u32, 10), spans[1].end);
+    try testing.expect(!spans[1].bold);
+    try testing.expect(!spans[1].italic);
+
+    // Comments are italic in both built-in themes.
+    const cm = [_]u8{@intFromEnum(syntax.Kind.comment)} ** 4;
+    const cspans = try rig.layout.styleSpansFor(&cm);
+    defer a.free(cspans);
+    try testing.expectEqual(@as(usize, 1), cspans.len);
+    try testing.expect(cspans[0].italic);
 }
 
 test "layout: empty line yields one empty row and caret at 0" {

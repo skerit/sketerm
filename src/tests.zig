@@ -47,6 +47,7 @@ comptime {
     _ = @import("grid/word_motion.zig");
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
+    _ = @import("editor_app.zig");
     _ = @import("shader_preset.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");
@@ -200,6 +201,8 @@ comptime {
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
     _ = @import("editor/search.zig");
+    _ = @import("editor/syntax.zig");
+    _ = @import("editor/theme.zig");
     _ = @import("render/editor_font.zig");
     _ = @import("render/editor_layout.zig");
     _ = @import("render/editor_viewport.zig");

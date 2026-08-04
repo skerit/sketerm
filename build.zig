@@ -99,6 +99,11 @@ pub fn build(b: *std.Build) void {
     noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
     const noglib_opts_mod = noglib_opts.createModule();
 
+    // Vendored Tree-sitter runtime + grammars for the editor's syntax
+    // highlighting. Built once and linked into the GUI-side artifacts
+    // only — see `buildTreeSitter`/`addTreeSitter`.
+    const tree_sitter = buildTreeSitter(b, target, optimize, use_lld);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -115,6 +120,7 @@ pub fn build(b: *std.Build) void {
     if (native_macos) addNsaxBridge(b, exe_mod);
     if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
     if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)
+    addTreeSitter(b, exe_mod, tree_sitter); // editor syntax highlighting (GUI only)
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
@@ -132,6 +138,9 @@ pub fn build(b: *std.Build) void {
     );
     b.getInstallStep().dependOn(
         &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-viewer" }).step,
+    );
+    b.getInstallStep().dependOn(
+        &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-editor" }).step,
     );
 
     const run_cmd = b.addRunArtifact(exe);
@@ -669,6 +678,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_editor_mod, cbindings_mod);
     smoke_editor_mod.addImport("build_options", glib_opts_mod);
     smoke_editor_mod.linkSystemLibrary("EGL", .{});
+    addTreeSitter(b, smoke_editor_mod, tree_sitter);
     const smoke_editor = b.addExecutable(.{
         .name = "sketerm-smoke-editor",
         .root_module = smoke_editor_mod,
@@ -723,6 +733,7 @@ pub fn build(b: *std.Build) void {
     // vcodec x264 backend wherever x264 is installed.
     if (have_x264) addVideo(b, tests_mod);
     if (have_vtenc) addVtEnc(b, tests_mod);
+    addTreeSitter(b, tests_mod, tree_sitter);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = use_lld,
@@ -748,6 +759,11 @@ pub fn build(b: *std.Build) void {
     if (native_sck) addSckBackend(b, coretests_mod);
     if (have_x264) addVideo(b, coretests_mod);
     if (have_vtenc) addVtEnc(b, coretests_mod);
+    // test-core covers src/editor/syntax.zig, which is GTK-free but
+    // tree-sitter-backed. This is the ONLY non-GUI module that gets the
+    // C runtime — `mux`/`mux-portable` use configureCoreDeps WITHOUT it,
+    // which is what keeps the daemon's link graph clean.
+    addTreeSitter(b, coretests_mod, tree_sitter);
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
         .use_lld = use_lld,
@@ -908,6 +924,120 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
         .file = b.path("vendor/zstd/zstd.c"),
         .flags = &.{ "-O3", "-Wno-unused-function", "-Wno-unused-but-set-variable", "-Wno-unused-parameter" },
     });
+}
+
+/// Vendored Tree-sitter runtime + the generated grammars behind the
+/// editor's syntax highlighting (src/editor/syntax.zig). See
+/// vendor/tree-sitter/PROVENANCE.txt for commits and licenses.
+///
+/// GUI-side artifacts ONLY. `configureCoreDeps` deliberately does not
+/// call this: `sketerm-mux` must keep its libc-only link graph, and
+/// `mux-portable` must keep building against static musl. The one
+/// non-GUI exception is `test-core`, which exercises syntax.zig.
+///
+/// Everything here is generated or hand-written C — no node/JS
+/// toolchain runs at build time. `lib/src/lib.c` is upstream's
+/// amalgamation (it `#include`s every other runtime .c), so exactly one
+/// translation unit compiles the runtime. Each grammar gets ITS OWN
+/// include path because its `tree_sitter/parser.h` pins the language
+/// ABI its table was generated against.
+const TS_GRAMMARS = [_]struct { dir: []const u8, scanner: bool }{
+    .{ .dir = "zig", .scanner = false },
+    .{ .dir = "c", .scanner = false },
+    .{ .dir = "json", .scanner = false },
+    .{ .dir = "markdown", .scanner = true },
+    .{ .dir = "markdown_inline", .scanner = true },
+};
+
+const TS_CFLAGS = [_][]const u8{
+    // gnu11, not c11: the runtime calls fdopen() and the byte-order
+    // macros (be16toh), which strict ISO mode hides behind feature-test
+    // macros. This is upstream's own dialect.
+    "-std=gnu11",
+    "-O2",
+    "-Wno-unused-but-set-variable",
+    "-Wno-unused-parameter",
+    "-Wno-unused-function",
+};
+
+/// The runtime + one static lib per grammar. Each is a SEPARATE
+/// compilation because `tree_sitter/parser.h` is a different file for
+/// each of them: the runtime has its own internal `lib/src/parser.h`,
+/// and a grammar's copy pins the language ABI its tables were generated
+/// against (json is v14, the rest v15). Merging the include paths into
+/// one module would let whichever `-I` came first silently shadow the
+/// others.
+const TreeSitter = struct {
+    libs: [1 + TS_GRAMMARS.len]*std.Build.Step.Compile,
+};
+
+fn buildTreeSitter(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    use_lld: bool,
+) TreeSitter {
+    var out: TreeSitter = undefined;
+
+    const rt_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    rt_mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    rt_mod.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    // Upstream's amalgamation: lib.c `#include`s every other runtime
+    // .c, so the whole runtime is one translation unit.
+    rt_mod.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &TS_CFLAGS,
+    });
+    out.libs[0] = b.addLibrary(.{
+        .name = "tree-sitter",
+        .root_module = rt_mod,
+        .linkage = .static,
+        .use_lld = use_lld,
+    });
+
+    for (TS_GRAMMARS, 0..) |g, i| {
+        const dir = b.fmt("vendor/tree-sitter/grammars/{s}", .{g.dir});
+        const g_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        g_mod.addIncludePath(b.path(dir));
+        g_mod.addCSourceFile(.{
+            .file = b.path(b.fmt("{s}/parser.c", .{dir})),
+            .flags = &TS_CFLAGS,
+        });
+        if (g.scanner) {
+            g_mod.addCSourceFile(.{
+                .file = b.path(b.fmt("{s}/scanner.c", .{dir})),
+                .flags = &TS_CFLAGS,
+            });
+        }
+        out.libs[1 + i] = b.addLibrary(.{
+            .name = b.fmt("tree-sitter-{s}", .{g.dir}),
+            .root_module = g_mod,
+            .linkage = .static,
+            .use_lld = use_lld,
+        });
+    }
+    return out;
+}
+
+fn addTreeSitter(b: *std.Build, mod: *std.Build.Module, ts: TreeSitter) void {
+    mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    for (ts.libs) |lib| mod.linkLibrary(lib);
+    // The highlight queries ride along as embedded assets — vendor/ is
+    // outside the source module root, so @embedFile needs an anonymous
+    // import (same trick as the CRT shaders in smoke-cell).
+    for (TS_GRAMMARS) |g| {
+        mod.addAnonymousImport(b.fmt("ts_query_{s}", .{g.dir}), .{
+            .root_source_file = b.path(b.fmt("vendor/tree-sitter/queries/{s}.scm", .{g.dir})),
+        });
+    }
 }
 
 /// libx264 + the C shim (vendor/x264_shim.c) for the lossy video path.

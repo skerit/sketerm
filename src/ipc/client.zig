@@ -219,6 +219,37 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 /// RUNNING terminal instance's control socket. Never registers a
 /// GApplication: the browser face belongs to an existing pane, and a
 /// second app identity would open a window of its own instead.
+/// `sketerm edit --here` / `--tab`: put an editor face on the invoking
+/// pane, or an editor tab in that pane's window. Same addressing and
+/// same failure messages as `browserInPane` — the two subcommands are
+/// deliberately one mechanism.
+pub fn editorInPane(allocator: std.mem.Allocator, here: bool, spec: ?[]const u8) u8 {
+    const flag: [*:0]const u8 = if (here) "--here" else "--tab";
+    var req: protocol.Request = .{
+        .cmd = if (here) "editor-here" else "new-editor-tab",
+        .data = spec,
+    };
+    if (c.getenv("SKETERM_SESSION")) |env| req.session = std.mem.span(env);
+    if (c.getenv("SKETERM_PANE_ID")) |env| req.pane = std.fmt.parseInt(u32, std.mem.span(env), 10) catch null;
+    if (req.session == null and req.pane == null) {
+        _ = c.fprintf(
+            platform.stderr(),
+            "sketerm edit %s: not inside a sketerm pane ($SKETERM_PANE_ID unset) - run plain `sketerm edit` for an editor window\n",
+            flag,
+        );
+        return 2;
+    }
+    const sock_path = resolveSocket(allocator, null) orelse {
+        _ = c.fprintf(
+            platform.stderr(),
+            "sketerm edit %s: cannot reach the sketerm instance owning this pane ($SKETERM_SOCKET unset and no single instance found)\n",
+            flag,
+        );
+        return 1;
+    };
+    return talk(allocator, sock_path, req, true);
+}
+
 pub fn browserInPane(allocator: std.mem.Allocator, here: bool, spec: ?[]const u8) u8 {
     const flag: [*:0]const u8 = if (here) "--here" else "--tab";
     var req: protocol.Request = .{

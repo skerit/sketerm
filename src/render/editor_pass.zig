@@ -46,6 +46,7 @@ const RowIndex = viewport_mod.RowIndex;
 const Document = @import("../editor/document.zig").Document;
 const SelectionSet = @import("../editor/selection.zig").SelectionSet;
 const search = @import("../editor/search.zig");
+const theme_mod = @import("../editor/theme.zig");
 
 pub const KIND_BG: f32 = 0;
 pub const KIND_GLYPH: f32 = 1;
@@ -196,6 +197,12 @@ pub const Frame = struct {
     matches: []const search.Match = &.{},
     current_match: ?usize = null,
     preedit: ?Preedit = null,
+    /// Per-highlight-kind glyph colours. Null = every glyph paints in
+    /// `colors.text` (plain text, or syntax highlighting switched off).
+    /// The layout tags each glyph with its kind; `Kind.none` resolves
+    /// to the theme's own foreground, so an unhighlighted region inside
+    /// a highlighted document looks identical either way.
+    theme: ?*const theme_mod.Theme = null,
 };
 
 pub const EditorPass = struct {
@@ -478,12 +485,16 @@ pub const EditorPass = struct {
             // Glyphs.
             for (ll.glyphs) |pg| {
                 const row_y = y + @as(f32, @floatFromInt(pg.row)) * line_h;
+                const fg = if (frame.theme) |th|
+                    th.colorOf(@enumFromInt(pg.kind))
+                else
+                    colors.text;
                 try self.addGlyph(
                     pg.glyph,
                     text_x0 + pg.x - ll.rows[pg.row].x0,
                     row_y + asc,
                     pg.y_offset,
-                    colors.text,
+                    fg,
                 );
             }
 

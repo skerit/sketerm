@@ -90,6 +90,7 @@ package() {
     install -Dm755 zig-out/bin/sketerm "$pkgdir/usr/bin/sketerm"
     ln "$pkgdir/usr/bin/sketerm" "$pkgdir/usr/bin/sketerm-files"
     ln "$pkgdir/usr/bin/sketerm" "$pkgdir/usr/bin/sketerm-viewer"
+    ln "$pkgdir/usr/bin/sketerm" "$pkgdir/usr/bin/sketerm-editor"
 
     # Session daemon (durable panes; links libc only)
     install -Dm755 zig-out/bin/sketerm-mux "$pkgdir/usr/bin/sketerm-mux"
@@ -107,6 +108,8 @@ package() {
         "$pkgdir/usr/share/applications/dev.sker.sketerm.files.desktop"
     install -Dm644 data/dev.sker.sketerm.viewer.desktop \
         "$pkgdir/usr/share/applications/dev.sker.sketerm.viewer.desktop"
+    install -Dm644 data/dev.sker.sketerm.editor.desktop \
+        "$pkgdir/usr/share/applications/dev.sker.sketerm.editor.desktop"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
 
@@ -116,6 +119,8 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.files.svg"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.viewer.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.viewer.svg"
+    install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.editor.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.editor.svg"
 
     # Bundled symbolic action icons (split left/right + top/bottom for
     # the context menu; rendering for the prefs page; terminal for the

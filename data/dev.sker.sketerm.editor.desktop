@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Sketerm Editor
+GenericName=Text Editor
+Comment=Edit local and remote text files through the sketerm file service
+TryExec=sketerm-editor
+Exec=sketerm-editor %U
+Icon=dev.sker.sketerm.editor
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/markdown;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-python;text/x-shellscript;text/x-zig;text/css;text/html;text/xml;text/csv;application/json;application/xml;application/x-yaml;application/toml;application/x-shellscript;application/javascript;
+StartupNotify=true
+StartupWMClass=dev.sker.sketerm.editor
+Terminal=false
+Keywords=text;editor;code;write;remote;ssh;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=sketerm-editor

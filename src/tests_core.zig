@@ -23,6 +23,8 @@ comptime {
     _ = @import("editor/model.zig");
     _ = @import("editor/view_model.zig");
     _ = @import("editor/search.zig");
+    _ = @import("editor/syntax.zig");
+    _ = @import("editor/theme.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");
@@ -77,6 +79,7 @@ comptime {
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
     _ = @import("viewer.zig");
+    _ = @import("editor_app.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
     _ = @import("mux/dbus.zig");
