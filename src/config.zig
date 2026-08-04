@@ -9,6 +9,12 @@
 //! restart (no live reload v1).
 
 const std = @import("std");
+const lsp_servers = @import("lsp/servers.zig");
+
+/// One `[lsp.<name>]` section. The record lives in src/lsp/servers.zig
+/// (with the built-in table and the matching rules) so the LSP client
+/// does not have to import the config layer to know what a server is.
+pub const LspServer = lsp_servers.Server;
 
 /// Single-line config-load warning to stderr. Centralised so the
 /// "sketerm: config: ..." prefix stays consistent across the parser.
@@ -378,6 +384,23 @@ pub const Config = struct {
     /// Colour theme name — see `editor/theme.zig`'s `byName`, which
     /// falls back to "dark" for anything it does not know.
     editor_theme: []const u8 = "dark",
+    /// Master switch for the editor's language-server client
+    /// (src/lsp/). Off means no server is ever spawned; every LSP
+    /// feature reports "no language server" when asked for explicitly
+    /// and is otherwise invisible.
+    ///
+    /// App level rather than per-profile: a language server serves a
+    /// LANGUAGE, and which pane profile the document happens to be open
+    /// under says nothing about that.
+    editor_lsp: bool = true,
+    /// Squiggles + gutter markers for server diagnostics. Off keeps
+    /// the rest of LSP (completion, hover, navigation) working.
+    editor_lsp_diagnostics: bool = true,
+    /// How long the editor waits after the last keystroke before
+    /// flushing `textDocument/didChange`. A feature request (completion,
+    /// hover, go-to-definition) always flushes FIRST regardless, so this
+    /// only trades server CPU against how fresh diagnostics feel.
+    editor_lsp_debounce_ms: u16 = 250,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -508,6 +531,14 @@ pub const Config = struct {
     /// preserved for round-trip serialisation + UI listing.
     domains: std.ArrayList(Domain) = .empty,
 
+    /// Language servers from `[lsp.<name>]` sections. A section whose
+    /// name matches a built-in (src/lsp/servers.zig) REPLACES it
+    /// wholesale — it is seeded from the built-in at parse time, so a
+    /// section carrying only `enabled = false` still knows the command
+    /// it is switching off, and one carrying only `args` keeps the
+    /// built-in's languages and root markers.
+    lsp_servers: std.ArrayList(LspServer) = .empty,
+
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
     /// the OSC 0/1/2 terminal title. Off by default — many users
@@ -592,6 +623,18 @@ pub const Config = struct {
             cd.name = try arena.dupe(u8, d.name);
             cd.host = try arena.dupe(u8, d.host);
             out.domains.appendAssumeCapacity(cd);
+        }
+        out.lsp_servers = .empty;
+        try out.lsp_servers.ensureTotalCapacity(arena, self.lsp_servers.items.len);
+        for (self.lsp_servers.items) |s| {
+            out.lsp_servers.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, s.name),
+                .languages = try arena.dupe(u8, s.languages),
+                .command = try arena.dupe(u8, s.command),
+                .args = try arena.dupe(u8, s.args),
+                .root_files = try arena.dupe(u8, s.root_files),
+                .enabled = s.enabled,
+            });
         }
         return out;
     }
@@ -853,6 +896,10 @@ pub const Config = struct {
         if (!self.editor_folding) try w.writeAll("editor_folding = false\n");
         if (!self.editor_fold_indent_fallback)
             try w.writeAll("editor_fold_indent_fallback = false\n");
+        if (!self.editor_lsp) try w.writeAll("editor_lsp = false\n");
+        if (!self.editor_lsp_diagnostics) try w.writeAll("editor_lsp_diagnostics = false\n");
+        if (self.editor_lsp_debounce_ms != 250)
+            try w.print("editor_lsp_debounce_ms = {d}\n", .{self.editor_lsp_debounce_ms});
         if (!std.mem.eql(u8, self.editor_theme, "dark"))
             try w.print("editor_theme = {s}\n", .{self.editor_theme});
 
@@ -967,6 +1014,93 @@ pub const Config = struct {
             if (dom.host.len > 0) try w.print("host = {s}\n", .{dom.host});
             if (dom.transport != .auto) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
         }
+
+        // Every key is written for an LSP section rather than diffed
+        // against the built-in: a section that silently inherited half
+        // its fields from a built-in that later CHANGES would quietly
+        // change behaviour on upgrade, which is exactly what a written
+        // config is meant to prevent.
+        for (self.lsp_servers.items) |srv| {
+            try w.print("\n[lsp.{s}]\n", .{srv.name});
+            if (srv.command.len > 0) try w.print("command = {s}\n", .{srv.command});
+            if (srv.args.len > 0) try w.print("args = {s}\n", .{srv.args});
+            if (srv.languages.len > 0) try w.print("languages = {s}\n", .{srv.languages});
+            if (srv.root_files.len > 0) try w.print("root_files = {s}\n", .{srv.root_files});
+            if (!srv.enabled) try w.writeAll("enabled = false\n");
+        }
+    }
+
+    /// The server that should handle `language_id`: a `[lsp.<name>]`
+    /// section first (it replaces a built-in of the same name at parse
+    /// time, so the list is already merged), then the built-in table.
+    /// Null when nothing claims the language.
+    pub fn lspServerFor(self: *const Config, language_id: []const u8) ?*const LspServer {
+        return self.lspServerForInstalled(language_id, null, null);
+    }
+
+    /// Same, but skipping servers whose command is not actually present
+    /// — so configuring `zls` AND a fallback for Zig does the obvious
+    /// thing on a machine that only has one of them. `installed` is a
+    /// callback so this module stays free of any filesystem or PATH
+    /// dependency (it is compiled into `sketerm-mux`); null means "do
+    /// not check", which is what the config tests want.
+    pub fn lspServerForInstalled(
+        self: *const Config,
+        language_id: []const u8,
+        ctx: ?*anyopaque,
+        installed: ?*const fn (ctx: ?*anyopaque, command: []const u8) bool,
+    ) ?*const LspServer {
+        if (!self.editor_lsp) return null;
+        for (self.lsp_servers.items) |*s| {
+            if (!s.handles(language_id)) continue;
+            if (installed) |f| {
+                if (!f(ctx, s.command)) continue;
+            }
+            return s;
+        }
+        for (&lsp_servers.builtins) |*b| {
+            // A user section with this name has already been consulted
+            // above; consulting the built-in too would resurrect a
+            // server the user switched off.
+            if (self.hasLspSection(b.name)) continue;
+            if (!b.handles(language_id)) continue;
+            if (installed) |f| {
+                if (!f(ctx, b.command)) continue;
+            }
+            return b;
+        }
+        return null;
+    }
+
+    /// Editable record for `name`, materializing a `[lsp.<name>]`
+    /// section (seeded from the built-in) the first time the UI writes
+    /// to it. `arena` must be the one backing this Config.
+    ///
+    /// Materializing on WRITE rather than on read is deliberate: a user
+    /// who never touches a server keeps a config file with no section
+    /// for it, and so keeps following the built-in as it evolves.
+    pub fn lspServerMut(self: *Config, arena: std.mem.Allocator, name: []const u8) ?*LspServer {
+        return findOrCreateLspServer(self, arena, name) catch null;
+    }
+
+    pub fn hasLspSection(self: *const Config, name: []const u8) bool {
+        for (self.lsp_servers.items) |*s| {
+            if (std.mem.eql(u8, s.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Every server the UI should list: user sections, then the
+    /// built-ins they did not override. The slice is caller-owned.
+    pub fn lspServerList(self: *const Config, alloc: std.mem.Allocator) error{OutOfMemory}![]const LspServer {
+        var out: std.ArrayList(LspServer) = .empty;
+        errdefer out.deinit(alloc);
+        for (self.lsp_servers.items) |s| try out.append(alloc, s);
+        for (lsp_servers.builtins) |b| {
+            if (self.hasLspSection(b.name)) continue;
+            try out.append(alloc, b);
+        }
+        return out.toOwnedSlice(alloc);
     }
 
     /// Resolve a profile name to its settings. Empty name, the
@@ -1056,6 +1190,7 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     var current_settings: ?*ProfileSettings = null;
     var current_profile_name: []const u8 = "";
     var current_domain: ?*Domain = null;
+    var current_lsp: ?*LspServer = null;
     while (lines.next()) |raw| {
         lineno += 1;
         const line = trim(stripComment(raw));
@@ -1069,6 +1204,7 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             current_settings = null;
             current_profile_name = "";
             current_domain = null;
+            current_lsp = null;
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
                 if (name.len == 0) {
@@ -1086,6 +1222,18 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
                 };
                 current_settings = &prof.settings;
                 current_profile_name = prof.name;
+                continue;
+            }
+            if (std.mem.startsWith(u8, inside, "lsp.")) {
+                const name = inside["lsp.".len..];
+                if (name.len == 0) {
+                    warnConfigAt(lineno, "empty lsp server name", .{});
+                    continue;
+                }
+                current_lsp = findOrCreateLspServer(cfg, arena, name) catch {
+                    warnConfigAt(lineno, "out of memory creating lsp server", .{});
+                    continue;
+                };
                 continue;
             }
             if (std.mem.startsWith(u8, inside, "domain.")) {
@@ -1110,7 +1258,11 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         };
         const key = trim(line[0..eq]);
         const value = trim(line[eq + 1 ..]);
-        if (current_domain) |dom| {
+        if (current_lsp) |srv| {
+            applyLspKv(srv, arena, key, value) catch |err| {
+                warnConfigAt(lineno, "lsp '{s}': bad value for '{s}' ({s})", .{ srv.name, key, @errorName(err) });
+            };
+        } else if (current_domain) |dom| {
             applyDomainKv(dom, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "domain '{s}': bad value for '{s}' ({s})", .{ dom.name, key, @errorName(err) });
             };
@@ -1136,6 +1288,38 @@ fn findOrCreateDomain(cfg: *Config, arena: std.mem.Allocator, name: []const u8) 
     const dup = try arena.dupe(u8, name);
     try cfg.domains.append(arena, .{ .name = dup });
     return &cfg.domains.items[cfg.domains.items.len - 1];
+}
+
+/// Find (or create) an `[lsp.<name>]` record. A new record is SEEDED
+/// from the built-in of the same name, so a section only has to carry
+/// what it changes.
+fn findOrCreateLspServer(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*LspServer {
+    for (cfg.lsp_servers.items) |*s| {
+        if (std.mem.eql(u8, s.name, name)) return s;
+    }
+    var seed = LspServer{ .name = try arena.dupe(u8, name) };
+    for (lsp_servers.builtins) |b| {
+        if (!std.mem.eql(u8, b.name, name)) continue;
+        seed = b;
+        seed.name = try arena.dupe(u8, name);
+        break;
+    }
+    try cfg.lsp_servers.append(arena, seed);
+    return &cfg.lsp_servers.items[cfg.lsp_servers.items.len - 1];
+}
+
+fn applyLspKv(srv: *LspServer, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "command")) {
+        srv.command = try expandTilde(arena, value);
+    } else if (std.mem.eql(u8, key, "args")) {
+        srv.args = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "languages")) {
+        srv.languages = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "root_files")) {
+        srv.root_files = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "enabled")) {
+        srv.enabled = try parseBool(value);
+    } else return error.UnknownKey;
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -1401,6 +1585,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_folding = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_fold_indent_fallback")) {
         cfg.editor_fold_indent_fallback = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp")) {
+        cfg.editor_lsp = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_diagnostics")) {
+        cfg.editor_lsp_diagnostics = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_debounce_ms")) {
+        cfg.editor_lsp_debounce_ms = try parseU16(value);
     } else if (std.mem.eql(u8, key, "editor_theme")) {
         cfg.editor_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
@@ -1975,6 +2165,70 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     try std.testing.expectEqual(.auto, cfg2.domains.items[1].transport);
     try std.testing.expectEqual(.ssh, cfg2.domains.items[2].transport);
     try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
+}
+
+test "config: [lsp.name] sections parse, seed from builtins and round-trip" {
+    const body =
+        \\editor_lsp_debounce_ms = 400
+        \\
+        \\[lsp.zls]
+        \\args = --enable-debug-log
+        \\
+        \\[lsp.clangd]
+        \\enabled = false
+        \\
+        \\[lsp.pylsp]
+        \\command = pylsp
+        \\languages = python
+        \\root_files = pyproject.toml,setup.py
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 400), cfg.editor_lsp_debounce_ms);
+    try std.testing.expectEqual(@as(usize, 3), cfg.lsp_servers.items.len);
+
+    // Seeded from the built-in: the section only set `args`, but the
+    // command and languages came along.
+    const zls = cfg.lspServerFor("zig").?;
+    try std.testing.expectEqualStrings("zls", zls.command);
+    try std.testing.expectEqualStrings("--enable-debug-log", zls.args);
+    try std.testing.expectEqualStrings("build.zig,build.zig.zon,.git", zls.root_files);
+
+    // A disabled section must not fall through to the built-in.
+    try std.testing.expect(cfg.lspServerFor("c") == null);
+    // A wholly new server works with no built-in behind it.
+    try std.testing.expectEqualStrings("pylsp", cfg.lspServerFor("python").?.command);
+    // Untouched built-ins still resolve.
+    try std.testing.expectEqualStrings("rust-analyzer", cfg.lspServerFor("rust").?.command);
+    try std.testing.expect(cfg.lspServerFor("cobol") == null);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer cfg2.deinit();
+    try std.testing.expectEqual(@as(u16, 400), cfg2.editor_lsp_debounce_ms);
+    try std.testing.expectEqualStrings("--enable-debug-log", cfg2.lspServerFor("zig").?.args);
+    try std.testing.expect(cfg2.lspServerFor("c") == null);
+    try std.testing.expectEqualStrings("pylsp", cfg2.lspServerFor("python").?.command);
+}
+
+test "config: editor_lsp = false disables every server" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "editor_lsp = false\n");
+    defer cfg.deinit();
+    try std.testing.expect(cfg.lspServerFor("zig") == null);
+}
+
+test "config: lspServerList merges user sections over builtins" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "[lsp.zls]\ncommand = /opt/zls\n");
+    defer cfg.deinit();
+    const list = try cfg.lspServerList(std.testing.allocator);
+    defer std.testing.allocator.free(list);
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqualStrings("zls", list[0].name);
+    try std.testing.expectEqualStrings("/opt/zls", list[0].command);
+    try std.testing.expectEqualStrings("clangd", list[1].name);
 }
 
 test "config: [profile.name] sections round-trip" {
