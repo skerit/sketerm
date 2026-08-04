@@ -506,14 +506,26 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     ctx.* = .{ .widget = widget, .terminal = terminal };
 
     // GtkIMContextSimple: in-process compose-table handling. Picked
-    // over GtkIMMulticontext because the latter on Wayland routes to
-    // the wayland-im module, which delegates dead-key composition to
-    // the compositor. Compositors only compose for surfaces they
-    // recognize as text inputs — and our GLArea sits inside a
-    // GtkGraphicsOffload subsurface, which the compositor's text-
-    // input plumbing does not engage. Result with multicontext: dead
-    // keys (^, ¨, AltGr+= → ~, ` → grave, etc.) silently drop.
-    // Simple handles them via the same Compose tables xkbcommon uses.
+    // over GtkIMMulticontext because on any Wayland display advertising
+    // zwp_text_input_manager_v3, GTK resolves a multicontext to its
+    // `wayland` module (gtkimmodule.c keys on a display-level registry
+    // query). That module derives from GtkIMContext, NOT from
+    // GtkIMContextSimple, and its filter_keypress only commits
+    // gdk_keyval_to_unicode(keyval) -- which is 0 for every dead
+    // keysym. It has no compose engine and no dead-key state, so dead
+    // keys (^, ", AltGr+= -> ~, ` -> grave) fall through unconsumed and
+    // the next letter commits bare. Composition then only happens if
+    // the compositor's own IME does it (ibus under GNOME does; a bare
+    // KWin/sway session does not; sketerm's wlhost relays only what its
+    // host GUI composes). Simple always composes, via the same Compose
+    // tables xkbcommon uses, at the cost of real IME support (CJK).
+    //
+    // NOTE: an earlier version of this comment blamed GtkGraphicsOffload
+    // for the failure. That was wrong -- measured both ways in a 2x2
+    // probe (Simple/Multi x offload/no-offload), offload has zero effect
+    // on IM behaviour. The conclusion (use Simple) was right anyway, but
+    // the false reason led to the editor face adopting a multicontext on
+    // the assumption that not being offloaded made it safe. It does not.
     const im = c.gtk_im_context_simple_new();
     c.gtk_im_context_set_client_widget(@ptrCast(im), widget);
     _ = c.g_signal_connect_data(
