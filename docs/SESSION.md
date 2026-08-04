@@ -12480,3 +12480,78 @@ an unparented dialog instead of a binary that will not link.
 Also: a frontend that vanishes from the bus mid-call now takes its
 dialog with it, and `choices` defaults are echoed in the results even
 though the widgets are not drawn yet.
+
+## LSP: the editor speaks Language Server Protocol
+
+The editor is a language-server client. Everything protocol-shaped
+lives in `src/lsp/` and is GTK-free (both test roots); the only GTK is
+`src/ui/editorlsp.zig`. `docs/lsp.md` is the reference.
+
+**Transport.** JSON-RPC over the server's stdio with Content-Length
+framing. `src/lsp/proc.zig` forks with three non-blocking pipes;
+stdout is watched with `g_unix_fd_add` exactly like the mux socket,
+stdin gets a `G_IO_OUT` watch only while a write comes up short, and
+stderr is drained (a server whose stderr fills stops serving). No
+worker thread, no blocking read — the GUI is single-threaded.
+`session.zig` itself never touches an fd: bytes in through `feed`,
+bytes out into `out`, which is what lets the whole lifecycle be
+unit-tested against a scripted in-process server.
+
+**Remote is a documented follow-up, not a gap left open.** A server
+must run near the files, so a remote document needs the daemon to spawn
+it and tunnel its stdio over the existing byte channels. `attachTab`
+therefore REFUSES a host-qualified spec outright rather than resolving
+imports against the wrong filesystem; only `pumpWrite`/`onReadable`
+know the transport is a local pipe.
+
+**Positions.** LSP `character` is UTF-16 code units by default — an
+emoji is 4 bytes, 1 codepoint, 2 characters. `position.zig` converts
+both ways for utf-8/16/32, clamps past-the-line positions and resolves
+a `character` inside a surrogate pair to the codepoint start. We
+advertise both encodings and honour the server's choice. The tests
+round-trip every codepoint boundary of a mixed-script document in all
+three encodings.
+
+**Sync.** didChange ranges are captured in `Document`'s THIRD observer
+slot (pre-edit, like the highlighter's) and queued DESCENDING by
+offset, which reproduces the document's own back-to-front application
+so no range needs adjusting for its predecessors. Debounced 250 ms,
+always flushed before a feature request.
+
+**Staleness.** Every request carries its document revision; a stale
+completion/hover/formatting answer is dropped. Diagnostics are the
+exception: they are converted once to byte offsets and then carried
+through edits by `mapThrough`, the same primitive selections and fold
+anchors use.
+
+**Features.** Diagnostics (squiggles through the existing per-cluster
+decoration path plus a gutter stripe inside the existing gutter width,
+so publishing never shifts the text), F8 navigation, Ctrl+Space
+completion with lazy `completionItem/resolve`, Ctrl+I hover, the F12
+family, Ctrl+Shift+O / Ctrl+T symbols, F2 rename and Ctrl+Shift+I
+formatting. One popup widget serves completion, results and symbols;
+it does not take focus, so the editor's own key handler drives it and
+typing keeps flowing into the document. Rename and formatting each fold
+into ONE transaction per document. Results open through the ordinary
+tab machinery.
+
+**Config.** App-level `[lsp.<name>]` sections (command, args,
+languages, root markers, init_options, enabled) seeded from the
+built-ins for zls / clangd / rust-analyzer, plus `editor_lsp`,
+`editor_lsp_diagnostics` and `editor_lsp_debounce_ms`. Resolution picks
+the first server that both claims the language AND is installed. The
+Editor prefs page carries all of it and reports whether each command is
+on PATH. A missing server is silent — visible only where the user asked
+for a feature.
+
+**Verification.** `sketerm-lsp-stub` is a REAL scripted server process:
+`zig build smoke-editor` drives diagnostics, incremental sync, hover,
+definition, references, symbols, completion+resolve, rename and
+formatting through it over real pipes, twice, once per position
+encoding. Because the stub rebuilds its own copy of the document from
+the contentChanges it receives, an off-by-one range fails the run.
+`zig build smoke-lsp-gui` then drives the REAL editor GUI on sketerm's
+own compositor against `typescript-language-server` when it is
+installed (the stub otherwise), asserting the diagnostic stripe renders
+and that the hover and completion popups actually open, with
+screenshots in `zig-out/`.

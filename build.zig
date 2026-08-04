@@ -549,6 +549,34 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
 
+    // LSP GUI smoke — `zig build smoke-lsp-gui`. Same rig as smoke-e2e
+    // (private daemon, display session, viewer attached first), running
+    // the real editor against a real language server:
+    // typescript-language-server when it is on PATH, else the scripted
+    // sketerm-lsp-stub. Asserts diagnostics render and that the
+    // completion / hover popups actually open, with screenshots.
+    const smoke_lsp_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_lsp_gui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_lsp_mod, cbindings_mod);
+    smoke_lsp_mod.addImport("build_options", glib_opts_mod);
+    const smoke_lsp = b.addExecutable(.{
+        .name = "sketerm-smoke-lsp-gui",
+        .root_module = smoke_lsp_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(smoke_lsp);
+    const smoke_lsp_run = b.addRunArtifact(smoke_lsp);
+    // getInstallStep covers sketerm, sketerm-mux AND sketerm-lsp-stub
+    // (all three are b.installArtifact'ed).
+    smoke_lsp_run.step.dependOn(b.getInstallStep());
+    smoke_lsp_run.setCwd(b.path("."));
+    const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
+    smoke_lsp_step.dependOn(&smoke_lsp_run.step);
+
     // macOS NSAccessibility smoke — `zig build smoke-a11y`. Drives a
     // real SketermTermView through the AX selectors VoiceOver uses and
     // asserts they match a known screen (incl. an astral char, so the
