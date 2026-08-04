@@ -1031,6 +1031,34 @@ pub const Fs = struct {
         return self.startJob("hash", .{ .path = path });
     }
 
+    /// `git status` overlay for `root`; one "match" event per changed
+    /// path (`text` = the single-letter status). A non-repo (or a host
+    /// without git) completes with zero matches, not an error.
+    pub fn startGitStatus(self: *Fs, root: []const u8) Error!u64 {
+        return self.startJob("git_status", .{ .path = root });
+    }
+
+    /// Unified diff of two host-side files; one "line" event per line.
+    pub fn startDiff(self: *Fs, a: []const u8, b: []const u8) Error!u64 {
+        return self.startJob("diff", .{ .path = a, .to = b });
+    }
+
+    /// Split `path` into `<path>.001`, `.002`, … of `part_size` each
+    /// ("10M"/"512k"/plain bytes). Existing parts refuse the job.
+    pub fn startSplit(self: *Fs, path: []const u8, part_size: []const u8) Error!u64 {
+        return self.startJob("split", .{ .path = path, .pattern = part_size });
+    }
+
+    /// Rebuild the base file from a `.NNN` part series (any part path).
+    pub fn startCombine(self: *Fs, part_path: []const u8) Error!u64 {
+        return self.startJob("combine", .{ .path = part_path });
+    }
+
+    /// Best-effort shred: one random overwrite pass, then unlink.
+    pub fn startSecureDelete(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("secure_delete", .{ .path = path });
+    }
+
     /// Recursive name search under `root` (ci substring, or glob when
     /// the pattern has wildcards). Matches arrive as job events with
     /// ev == "match".

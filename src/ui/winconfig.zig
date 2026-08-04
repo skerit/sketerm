@@ -39,9 +39,13 @@ const PresetButtonCtx = struct {
     /// focusedPane() then returns null). Null = delete-only ctx.
     pane: ?*Pane = null,
 };
+/// Carries its own allocator: the picker's cancel callback can fire
+/// while the parent window is being torn down, and freeing the ctx
+/// must not dereference `win` then.
 const ShaderPickCtx = struct {
     win: *Window,
     pane: *Pane,
+    allocator: std.mem.Allocator,
 };
 
 
@@ -59,25 +63,33 @@ pub fn findProfile(self: *const Window, name: []const u8) ?*const @import("../co
 /// The pick is sticky across config reloads (custom_shader_user).
 pub fn pickPaneShader(self: *Window) void {
     const pane = self.focusedPane() orelse return;
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Choose Pane Shader (GLSL, shadertoy mainImage)");
-    // Start where the user will actually find shaders: the
-    // pane's current pick, else the shipped presets directory.
-    if (pane.custom_shader_path) |cur| {
-        var buf: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&buf, "{s}", .{cur})) |z| {
-            const gf = c.g_file_new_for_path(z.ptr);
-            c.gtk_file_dialog_set_initial_file(dialog, gf);
-            c.g_object_unref(gf);
-        } else |_| {}
-    } else if (shaderPresetDirZ()) |dir| {
-        const gf = c.g_file_new_for_path(dir);
-        c.gtk_file_dialog_set_initial_folder(dialog, gf);
-        c.g_object_unref(gf);
-    }
+    // Start where the user will actually find shaders: the folder of
+    // the pane's current pick, else the shipped presets directory.
+    const start: ?[]const u8 = if (pane.custom_shader_path) |cur|
+        std.fs.path.dirname(cur)
+    else if (shaderPresetDirZ()) |dir|
+        std.mem.span(dir)
+    else
+        null;
     const ctx = self.allocator.create(ShaderPickCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane };
-    c.gtk_file_dialog_open(dialog, @ptrCast(self.app_window), null, @ptrCast(&onShaderPicked), @ptrCast(ctx));
+    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
+    _ = @import("picker.zig").PickerWindow.open(
+        self.allocator,
+        @ptrCast(self.app_window),
+        .{
+            .mode = .open_file,
+            .title = "Choose Pane Shader (GLSL, shadertoy mainImage)",
+            .initial_spec = start,
+            .filters = &.{
+                .{ .label = "Shaders", .patterns = &.{ "*.glsl", "*.frag", "*.fs", "*.shader" } },
+            },
+        },
+        &onShaderPicked,
+        @ptrCast(ctx),
+    ) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
 }
 
 /// Directory holding the shipped CRT shader presets, or null.
@@ -1101,14 +1113,13 @@ pub fn reloadConfigFromDisk(self: *Window) void {
     std.debug.print("sketerm: config reloaded\n", .{});
 }
 
-pub fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {
     const ctx = cast.userData(ShaderPickCtx, user);
-    defer ctx.win.allocator.destroy(ctx);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
+    // Fires exactly once, cancel included — so the ctx is freed here
+    // on every path, through its OWN allocator (win may be gone).
+    defer ctx.allocator.destroy(ctx);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
 
     // The pane may have closed while the dialog was up — only act if
     // it's still listed (the pointer would be dangling otherwise).
@@ -1120,7 +1131,13 @@ pub fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
         }
     }
     if (!alive) return;
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    // The GL shader compiler reads the file with local libc; a remote
+    // pick has no local path, so refuse it out loud.
+    const path = @import("picker.zig").localPathOrRefuse(
+        @ptrCast(ctx.win.app_window),
+        res.specs[0],
+        "The GL shader compiler reads the file locally — pick a shader on this machine.",
+    ) orelse return;
     // Strictly per-pane: the pick lands on the clicked pane only. A
     // manual file pick replaces any bound preset.
     ctx.pane.dropShaderPreset(ctx.win.config.shader_params.items);

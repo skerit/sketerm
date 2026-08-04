@@ -20,6 +20,84 @@ const cast = @import("util/cast.zig");
 const rw = @import("remote_window.zig");
 const Compositor = @import("wlhost/compositor.zig").Compositor;
 const wlpipe = @import("wlhost/pipe.zig");
+const picker = @import("ui/picker.zig");
+const fpicker = @import("filebrowser/picker.zig");
+const pathZ = @import("util/pathz.zig").pathZ;
+
+/// Pending "where do I put this blob?" pick. The encoded bytes are
+/// captured before the picker opens, so they outlive the app window.
+const SaveBytesCtx = struct {
+    allocator: std.mem.Allocator,
+    bytes: *c.GBytes,
+    parent: ?*c.GtkWindow,
+};
+
+/// Ask for a destination and write `bytes` there. Takes ownership of
+/// the GBytes reference on every path, including failure to open.
+fn askSaveBytes(
+    allocator: std.mem.Allocator,
+    parent: ?*c.GtkWindow,
+    bytes: *c.GBytes,
+    title: []const u8,
+    suggested: []const u8,
+    filters: []const fpicker.Filter,
+) void {
+    const ctx = allocator.create(SaveBytesCtx) catch {
+        c.g_bytes_unref(bytes);
+        return;
+    };
+    ctx.* = .{ .allocator = allocator, .bytes = bytes, .parent = parent };
+    _ = picker.PickerWindow.open(allocator, parent, .{
+        .mode = .save_file,
+        .title = title,
+        .suggested_name = suggested,
+        .filters = filters,
+    }, &onShotPicked, @ptrCast(ctx)) catch {
+        c.g_bytes_unref(bytes);
+        allocator.destroy(ctx);
+        return;
+    };
+}
+
+/// Fires exactly once (cancel included), so the blob and the ctx are
+/// released here on every path.
+fn onShotPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
+    const ctx = cast.userData(SaveBytesCtx, user);
+    defer {
+        c.g_bytes_unref(ctx.bytes);
+        ctx.allocator.destroy(ctx);
+    }
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
+    // This process holds the encoded bytes and writes them itself —
+    // there is no path on another host it could write to.
+    const path = picker.localPathOrRefuse(
+        ctx.parent,
+        res.specs[0],
+        "Sketerm writes the file itself — pick a location on this machine.",
+    ) orelse return;
+    var pz: [4096]u8 = undefined;
+    const path_z = pathZ(&pz, path) catch return;
+    const file = c.g_file_new_for_path(path_z) orelse return;
+    defer c.g_object_unref(file);
+    var sz: usize = 0;
+    const data = c.g_bytes_get_data(ctx.bytes, &sz) orelse return;
+    _ = c.g_file_replace_contents(
+        file,
+        @ptrCast(data),
+        sz,
+        null,
+        0,
+        c.G_FILE_CREATE_REPLACE_DESTINATION,
+        null,
+        null,
+        null,
+    );
+}
+
+const PNG_FILTERS = [_]fpicker.Filter{.{ .label = "PNG images", .patterns = &.{"*.png"} }};
+const GIF_FILTERS = [_]fpicker.Filter{.{ .label = "GIF animations", .patterns = &.{"*.gif"} }};
+const WEBM_FILTERS = [_]fpicker.Filter{.{ .label = "WebM videos", .patterns = &.{"*.webm"} }};
 
 pub const AppHost = struct {
     allocator: std.mem.Allocator,
@@ -371,31 +449,7 @@ pub const AppHost = struct {
             const paintable = c.gtk_picture_get_paintable(@ptrCast(win.picture)) orelse return;
             if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(paintable)), c.gdk_texture_get_type()) == 0) return;
             const bytes = c.gdk_texture_save_to_png_bytes(@ptrCast(paintable)) orelse return;
-            const dialog = c.gtk_file_dialog_new();
-            c.gtk_file_dialog_set_title(dialog, "Save App Screenshot");
-            c.gtk_file_dialog_set_initial_name(dialog, "sketerm-app.png");
-            c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
-        }
-
-        fn onShotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-            const bytes: *c.GBytes = @ptrCast(@alignCast(user.?));
-            defer c.g_bytes_unref(bytes);
-            const dialog: *c.GtkFileDialog = @ptrCast(source);
-            const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
-            defer c.g_object_unref(file);
-            var sz: usize = 0;
-            const data = c.g_bytes_get_data(bytes, &sz) orelse return;
-            _ = c.g_file_replace_contents(
-                file,
-                @ptrCast(data),
-                sz,
-                null,
-                0,
-                c.G_FILE_CREATE_REPLACE_DESTINATION,
-                null,
-                null,
-                null,
-            );
+            askSaveBytes(win.host.allocator, win.window, bytes, "Save App Screenshot", "sketerm-app.png", &PNG_FILTERS);
         }
 
         fn recNowMs() i64 {
@@ -415,10 +469,7 @@ pub const AppHost = struct {
                 win.rec = null;
                 const bytes = c.g_bytes_new(gif.ptr, gif.len);
                 win.host.allocator.free(gif);
-                const dialog = c.gtk_file_dialog_new();
-                c.gtk_file_dialog_set_title(dialog, "Save Recording");
-                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.gif");
-                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.gif", &GIF_FILTERS);
                 return;
             }
             win.rec = gifrec.Rec.init(win.host.allocator, 0);
@@ -438,10 +489,7 @@ pub const AppHost = struct {
                 win.rec = null;
                 const bytes = c.g_bytes_new(gif.ptr, gif.len);
                 win.host.allocator.free(gif);
-                const dialog = c.gtk_file_dialog_new();
-                c.gtk_file_dialog_set_title(dialog, "Save Recording");
-                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.gif");
-                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.gif", &GIF_FILTERS);
                 return;
             }
             if (win.vrec) |*r| {
@@ -452,10 +500,7 @@ pub const AppHost = struct {
                 win.vrec = null;
                 const bytes = c.g_bytes_new(webm.ptr, webm.len);
                 win.host.allocator.free(webm);
-                const dialog = c.gtk_file_dialog_new();
-                c.gtk_file_dialog_set_title(dialog, "Save Recording");
-                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.webm");
-                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.webm", &WEBM_FILTERS);
                 return;
             }
             win.vrec = videorec.Rec.init(win.host.allocator, 0);

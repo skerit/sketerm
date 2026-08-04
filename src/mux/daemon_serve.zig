@@ -1626,16 +1626,11 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     // Every other verb takes an absolute path — the client resolves
     // ~ and relative input; the daemon never guesses a cwd here.
     if (r.path.len == 0 or r.path[0] != '/') return fsReplyErr(cl, r.req, "path must be absolute");
-    if (std.mem.eql(u8, r.op, "copy") or std.mem.eql(u8, r.op, "delete_tree") or
-        std.mem.eql(u8, r.op, "hash") or std.mem.eql(u8, r.op, "find") or
-        std.mem.eql(u8, r.op, "grep") or std.mem.eql(u8, r.op, "extract") or
-        std.mem.eql(u8, r.op, "archive_create") or std.mem.eql(u8, r.op, "trash") or
-        std.mem.eql(u8, r.op, "trash_restore") or std.mem.eql(u8, r.op, "cross_copy") or
-        std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
-        std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract") or
-        std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview") or std.mem.eql(u8, r.op, "preview_transport") or
-        std.mem.eql(u8, r.op, "dir_size") or std.mem.eql(u8, r.op, "perm_tree") or
-        std.mem.eql(u8, r.op, "media_meta"))
+    // Job verbs are recognised straight off FsJob.Op's tag names, so
+    // routing here and the dispatch in fsStartJob cannot drift apart
+    // (a hand-maintained duplicate list silently dropped git_status /
+    // diff / split / combine / secure_delete into "unknown fs op").
+    if (@import("daemon_fsjobs.zig").jobOpFor(r.op) != null)
         return self.fsStartJob(cl, r);
 
     if (std.mem.eql(u8, r.op, "open_view")) {

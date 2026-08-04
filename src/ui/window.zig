@@ -39,6 +39,8 @@ pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
+const picker = @import("picker.zig");
+const fpicker = @import("../filebrowser/picker.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 
 /// One-shot hint. Reset to false at startup; flipped on first
@@ -846,7 +848,15 @@ pub const Window = struct {
     pub const openApplyProfilePicker = winconfig.openApplyProfilePicker;
     pub const applyProfileToPane = winconfig.applyProfileToPane;
     pub const openShaderPresetPicker = winconfig.openShaderPresetPicker;
-    pub const applyConfigChange = winconfig.applyConfigChange;
+    /// winconfig's pane push, then the faces that keep their own
+    /// resolved copies. Editor faces MUST re-read here: their settings
+    /// came out of the config arena winconfig just freed.
+    pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
+        winconfig.applyConfigChange(self, new_cfg);
+        for (self.panes.items) |p| {
+            if (@import("editorview.zig").EditorView.fromPane(p)) |ev| ev.syncConfig();
+        }
+    }
     pub const refreshBindings = winconfig.refreshBindings;
     pub const reloadConfigFromDisk = winconfig.reloadConfigFromDisk;
     const pickPaneShader = winconfig.pickPaneShader;
@@ -3138,9 +3148,12 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     }
 }
 
+/// Carries its own allocator: the picker's cancel callback can fire
+/// during window teardown, and freeing must not go through `win`.
 const ScreenshotCtx = struct {
     win: *Window,
     pane: *Pane,
+    allocator: std.mem.Allocator,
 };
 
 /// "Record Session (asciicast)…" — pick a .cast destination, then ask
@@ -3151,21 +3164,29 @@ fn recordFocusedSession(self: *Window) void {
     const pane = self.focusedPane() orelse return;
     if (pane.terminal.remote == null) return;
     const ctx = self.allocator.create(ScreenshotCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane };
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Record Session As");
-    c.gtk_file_dialog_set_initial_name(dialog, "session.cast");
-    c.gtk_file_dialog_save(dialog, @ptrCast(self.app_window), null, @ptrCast(&onRecordPicked), @ptrCast(ctx));
+    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
+    _ = picker.PickerWindow.open(
+        self.allocator,
+        @ptrCast(self.app_window),
+        .{
+            .mode = .save_file,
+            .title = "Record Session As",
+            .suggested_name = "session.cast",
+            .filters = &.{.{ .label = "Asciicasts", .patterns = &.{"*.cast"} }},
+        },
+        &onRecordPicked,
+        @ptrCast(ctx),
+    ) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
 }
 
-fn onRecordPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onRecordPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
     const ctx = cast.userData(ScreenshotCtx, user);
-    defer ctx.win.allocator.destroy(ctx);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
+    defer ctx.allocator.destroy(ctx);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
 
     // The pane may have closed while the dialog was up.
     var alive = false;
@@ -3176,7 +3197,16 @@ fn onRecordPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque
         }
     }
     if (!alive) return;
-    ctx.pane.terminal.requestRecordStart(std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr))));
+    // The wire carries a BARE path the session's own daemon resolves,
+    // with no way to say "on host X" — so a pick from some third host
+    // has no meaning here and is refused rather than silently written
+    // somewhere else. A plain path keeps the pre-picker behaviour.
+    const path = picker.localPathOrRefuse(
+        @ptrCast(ctx.win.app_window),
+        res.specs[0],
+        "A recording path is resolved by the session's own host — pick a plain path instead.",
+    ) orelse return;
+    ctx.pane.terminal.requestRecordStart(path);
 }
 
 /// "Screenshot Pane…" — render the focused pane to a PNG the user
@@ -3184,21 +3214,29 @@ fn onRecordPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque
 fn screenshotFocusedPane(self: *Window) void {
     const pane = self.focusedPane() orelse return;
     const ctx = self.allocator.create(ScreenshotCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane };
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Save Pane Screenshot");
-    c.gtk_file_dialog_set_initial_name(dialog, "sketerm.png");
-    c.gtk_file_dialog_save(dialog, @ptrCast(self.app_window), null, @ptrCast(&onScreenshotPicked), @ptrCast(ctx));
+    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
+    _ = picker.PickerWindow.open(
+        self.allocator,
+        @ptrCast(self.app_window),
+        .{
+            .mode = .save_file,
+            .title = "Save Pane Screenshot",
+            .suggested_name = "sketerm.png",
+            .filters = &.{.{ .label = "PNG images", .patterns = &.{"*.png"} }},
+        },
+        &onScreenshotPicked,
+        @ptrCast(ctx),
+    ) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
 }
 
-fn onScreenshotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onScreenshotPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
     const ctx = cast.userData(ScreenshotCtx, user);
-    defer ctx.win.allocator.destroy(ctx);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
+    defer ctx.allocator.destroy(ctx);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
 
     // The pane may have closed while the dialog was up.
     var alive = false;
@@ -3209,8 +3247,19 @@ fn onScreenshotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
         }
     }
     if (!alive) return;
+    // The PNG bytes are written by this process — a remote pick has
+    // no local file to write to.
+    const path = picker.localPathOrRefuse(
+        @ptrCast(ctx.win.app_window),
+        res.specs[0],
+        "Sketerm writes the screenshot itself — pick a location on this machine.",
+    ) orelse return;
     const bytes = ctx.pane.screenshotPng() orelse return;
     defer c.g_bytes_unref(bytes);
+    var pz: [4096]u8 = undefined;
+    const path_z = pathZ(&pz, path) catch return;
+    const file = c.g_file_new_for_path(path_z) orelse return;
+    defer c.g_object_unref(file);
     var gerr: [*c]c.GError = null;
     // g_file_replace_contents wants the raw buffer; pull it from GBytes.
     var sz: c.gsize = 0;
@@ -3219,9 +3268,11 @@ fn onScreenshotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
     if (gerr != null) c.g_error_free(gerr);
 }
 
+/// Carries its own allocator for the same reason ScreenshotCtx does.
 const UploadPickCtx = struct {
     win: *Window,
     pane: *Pane,
+    allocator: std.mem.Allocator,
 };
 
 /// "Upload File…" — pick a local file, then stream it to the focused
@@ -3230,20 +3281,28 @@ fn openUploadDialog(self: *Window) void {
     const pane = self.focusedPane() orelse return;
     if (pane.terminal.remote == null) return; // remote panes only
     const ctx = self.allocator.create(UploadPickCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane };
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Upload File to Remote");
-    c.gtk_file_dialog_open(dialog, @ptrCast(self.app_window), null, @ptrCast(&onUploadFilePicked), @ptrCast(ctx));
+    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
+    _ = picker.PickerWindow.open(
+        self.allocator,
+        @ptrCast(self.app_window),
+        .{
+            .mode = .open_file,
+            .title = "Upload File to Remote",
+            .accept_label = "Upload",
+        },
+        &onUploadFilePicked,
+        @ptrCast(ctx),
+    ) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
 }
 
-fn onUploadFilePicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onUploadFilePicked(user: ?*anyopaque, result: ?fpicker.Result) void {
     const ctx = cast.userData(UploadPickCtx, user);
-    defer ctx.win.allocator.destroy(ctx);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
+    defer ctx.allocator.destroy(ctx);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
 
     // The pane may have closed while the dialog was up.
     var alive = false;
@@ -3254,7 +3313,13 @@ fn onUploadFilePicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
         }
     }
     if (!alive) return;
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    // startUpload reads the bytes HERE and streams them to the pane's
+    // session; there is no local file behind a remote pick.
+    const path = picker.localPathOrRefuse(
+        @ptrCast(ctx.win.app_window),
+        res.specs[0],
+        "The upload reads the file from this machine — pick a local file.",
+    ) orelse return;
     ctx.pane.terminal.startUpload(&[_][]const u8{path});
 }
 

@@ -701,11 +701,21 @@ pub const ViewerWindow = struct {
     }
 
     fn replaceWithLocal(self: *ViewerWindow, path: []const u8) void {
-        if (paths.isSketermMount(path)) {
+        var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+        self.replaceWithSpec(paths.formatSpec(&buf, null, path));
+    }
+
+    /// Show a host-qualified spec as the whole batch. The viewer is
+    /// remote-capable end to end (`showCurrent` dispatches on
+    /// `resource.host`), so a picked `user@box:/path` needs no local
+    /// copy up front.
+    fn replaceWithSpec(self: *ViewerWindow, spec_in: []const u8) void {
+        const loc = paths.parseSpec(spec_in);
+        if (loc.host == null and paths.isSketermMount(loc.path)) {
             c.gtk_label_set_text(self.status, "Sketerm mount paths are refused; open the original host:/path resource instead");
             return;
         }
-        const spec = paths.formatSpecAlloc(self.allocator, null, path) catch return;
+        const spec = self.allocator.dupe(u8, spec_in) catch return;
         const one = self.allocator.alloc([]u8, 1) catch {
             self.allocator.free(spec);
             return;
@@ -969,24 +979,40 @@ fn toggleFullscreen(self: *ViewerWindow) void {
 
 fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Open Image");
+    // The ref keeps the window (and the qdata that resolves back to
+    // `self`) alive until the one-shot callback runs.
     _ = c.g_object_ref(@ptrCast(self.window));
-    c.gtk_file_dialog_open(dialog, @ptrCast(self.window), null, @ptrCast(&onOpenDone), @ptrCast(self.window));
-    c.g_object_unref(@ptrCast(dialog));
+    _ = @import("picker.zig").PickerWindow.open(
+        self.allocator,
+        @ptrCast(@alignCast(self.window)),
+        .{
+            .mode = .open_file,
+            .title = "Open Image",
+            .filters = &.{.{ .label = "Images", .patterns = &.{
+                "*.png",   "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
+                "*.jxl",   "*.bmp",  "*.svg",  "*.ico",  "*.tif",
+                "*.tiff",  "*.avif", "*.heic", "*.heif",
+            } }},
+        },
+        &onOpenDone,
+        @ptrCast(self.window),
+    ) catch {
+        c.g_object_unref(@ptrCast(self.window));
+        return;
+    };
 }
 
-fn onOpenDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onOpenDone(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {
     const window: *c.GtkWidget = @ptrCast(@alignCast(user.?));
     defer c.g_object_unref(@ptrCast(window));
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const raw = c.g_file_get_path(file) orelse return;
-    defer c.g_free(raw);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
     const data = c.g_object_get_data(@ptrCast(window), VIEWER_QDATA) orelse return;
     const self: *ViewerWindow = @ptrCast(@alignCast(data));
-    self.replaceWithLocal(std.mem.span(@as([*:0]const u8, @ptrCast(raw))));
+    // Remote picks are PASSED THROUGH: the viewer loads `host:/path`
+    // resources natively (daemon-backed), so refusing them here would
+    // remove a capability it already has.
+    self.replaceWithSpec(res.specs[0]);
 }
 
 fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {

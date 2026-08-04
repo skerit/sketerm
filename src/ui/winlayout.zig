@@ -15,6 +15,8 @@ const Window = winmod.Window;
 const PaneTree = winmod.PaneTree;
 const tab_effects = @import("tab_effects.zig");
 const muxtabs = @import("muxtabs.zig");
+const picker = @import("picker.zig");
+const fpicker = @import("../filebrowser/picker.zig");
 
 /// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
 /// `freePanedRatio`. Carries its own allocator so the GTK destroy-notify
@@ -666,36 +668,40 @@ pub fn widgetMatchesNode(self: *Window, w: *c.GtkWidget, node: PaneTree.Node) bo
     }
 }
 
-/// Open a GtkFileChooserNative for save-as; user picks a path,
-/// we serialize the current layout to it. Defaults to .json (the
-/// authoritative format) — pick `.layout` if you want the simple
-/// DSL but only JSON is implemented for save right now.
+/// Sketerm's own picker for save-as; user picks a path, we serialize
+/// the current layout to it. Defaults to .json (the authoritative
+/// format) — pick `.layout` if you want the simple DSL but only JSON
+/// is implemented for save right now.
 pub fn saveLayoutAs(self: *Window) void {
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Save Layout");
-    c.gtk_file_dialog_set_initial_name(dialog, "layout.json");
-    c.gtk_file_dialog_save(
-        dialog,
+    _ = picker.PickerWindow.open(
+        self.allocator,
         @ptrCast(self.app_window),
-        null,
-        @ptrCast(&onSaveLayoutAsDone),
+        .{
+            .mode = .save_file,
+            .title = "Save Layout",
+            .suggested_name = "layout.json",
+            .filters = &.{.{ .label = "Layouts", .patterns = &.{"*.json"} }},
+        },
+        &onSaveLayoutAsDone,
         @ptrCast(self),
-    );
+    ) catch return;
 }
 
-/// Open a GtkFileDialog to pick a saved layout (.json/.layout)
-/// and append its tabs to the current window — same semantics as
-/// the `--layout` CLI flag (existing tabs are kept).
+/// Pick a saved layout (.json/.layout) and append its tabs to the
+/// current window — same semantics as the `--layout` CLI flag
+/// (existing tabs are kept).
 pub fn loadLayoutAs(self: *Window) void {
-    const dialog = c.gtk_file_dialog_new();
-    c.gtk_file_dialog_set_title(dialog, "Load Layout");
-    c.gtk_file_dialog_open(
-        dialog,
+    _ = picker.PickerWindow.open(
+        self.allocator,
         @ptrCast(self.app_window),
-        null,
-        @ptrCast(&onLoadLayoutDone),
+        .{
+            .mode = .open_file,
+            .title = "Load Layout",
+            .filters = &.{.{ .label = "Layouts", .patterns = &.{ "*.json", "*.layout" } }},
+        },
+        &onLoadLayoutDone,
         @ptrCast(self),
-    );
+    ) catch return;
 }
 
 /// Save current state to the default path.
@@ -834,14 +840,15 @@ pub fn loadDefaultLayoutIfPresent(self: *Window) !bool {
     return true;
 }
 
-pub fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+/// A null result (cancel, or the parent window tearing the picker
+/// down) must not touch `self` — the Window may already be gone.
+pub fn onSaveLayoutAsDone(user: ?*anyopaque, result: ?fpicker.Result) void {
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
     const self = cast.userData(Window, user);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    // layout_mod.save writes with local libc; a remote pick cannot be
+    // honoured, and silence would read as a broken dialog.
+    const path = picker.localPathOrRefuse(@ptrCast(self.app_window), res.specs[0], "Sketerm writes layout files with local file access — pick a location on this machine.") orelse return;
 
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
@@ -850,14 +857,12 @@ pub fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*a
     layout_mod.save(layout, path) catch return;
 }
 
-pub fn onLoadLayoutDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+pub fn onLoadLayoutDone(user: ?*anyopaque, result: ?fpicker.Result) void {
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
     const self = cast.userData(Window, user);
-    const dialog: *c.GtkFileDialog = @ptrCast(source);
-    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
-    defer c.g_object_unref(file);
-    const path_cstr = c.g_file_get_path(file) orelse return;
-    defer c.g_free(path_cstr);
-    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    // layout_mod.load reads with local libc — remote picks are refused.
+    const path = picker.localPathOrRefuse(@ptrCast(self.app_window), res.specs[0], "Sketerm reads layout files with local file access — pick a file on this machine.") orelse return;
     // Load into a fresh window so the current window's tabs are left intact
     // (and the restored tabs keep their saved order). Fall back to this
     // window if spawning one fails.
