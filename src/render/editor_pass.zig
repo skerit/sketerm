@@ -48,6 +48,7 @@ const SelectionSet = @import("../editor/selection.zig").SelectionSet;
 const search = @import("../editor/search.zig");
 const theme_mod = @import("../editor/theme.zig");
 const structure = @import("../editor/structure.zig");
+const lsp_diag = @import("../lsp/diagnostics.zig");
 
 pub const KIND_BG: f32 = 0;
 pub const KIND_GLYPH: f32 = 1;
@@ -161,6 +162,21 @@ pub const Colors = struct {
     fold_badge: [4]f32 = .{ 0.50, 0.53, 0.57, 0.25 },
     /// Gutter chevron + the badge's dots.
     fold_fg: [4]f32 = .{ 0.60, 0.64, 0.68, 1.0 },
+    /// Language-server diagnostic squiggles + gutter stripes, one
+    /// colour per LSP severity.
+    diag_error: [4]f32 = .{ 0.90, 0.30, 0.28, 1.0 },
+    diag_warning: [4]f32 = .{ 0.92, 0.70, 0.20, 1.0 },
+    diag_info: [4]f32 = .{ 0.35, 0.65, 0.92, 1.0 },
+    diag_hint: [4]f32 = .{ 0.45, 0.75, 0.55, 1.0 },
+
+    pub fn diagColor(self: *const Colors, sev: lsp_diag.Severity) [4]f32 {
+        return switch (sev) {
+            .err => self.diag_error,
+            .warning => self.diag_warning,
+            .information => self.diag_info,
+            .hint => self.diag_hint,
+        };
+    }
 };
 
 /// One gutter fold affordance. `folded` picks the glyph direction and
@@ -225,6 +241,14 @@ pub const Frame = struct {
     /// Byte ranges to box as the caret's bracket pair (0, 1 or 2 per
     /// caret).
     brackets: []const structure.Range = &.{},
+    /// Language-server diagnostics for the WHOLE document, sorted by
+    /// start offset (lsp/diagnostics.zig keeps them that way). Drawn as
+    /// squiggles under the offending clusters plus a gutter stripe on
+    /// the affected lines — deliberately the same decoration path as
+    /// selections and bracket boxes rather than a second overlay: a
+    /// squiggle is a per-cluster range rect like any other, and giving
+    /// it its own pass would double the atlas/clip bookkeeping.
+    diagnostics: []const lsp_diag.Diagnostic = &.{},
     /// Per-highlight-kind glyph colours. Null = every glyph paints in
     /// `colors.text` (plain text, or syntax highlighting switched off).
     /// The layout tags each glyph with its kind; `Kind.none` resolves
@@ -559,6 +583,45 @@ pub const EditorPass = struct {
                 try self.addRangeRects(ll, br.start, br.end, text_x0, y, line_h, colors.bracket);
             }
 
+            // Diagnostics: a squiggle per overlapped cluster, and one
+            // gutter stripe for the worst severity on the line. The
+            // stripe rides KIND_GUTTER_BG (appended after the gutter
+            // background, so it lands on top within that kind's draw)
+            // and does NOT widen the gutter — the text must not shift
+            // sideways when a server publishes.
+            if (frame.diagnostics.len > 0) {
+                var worst: ?lsp_diag.Severity = null;
+                for (frame.diagnostics) |d| {
+                    // Sorted by start: everything past this line's end
+                    // is past every later line too.
+                    if (d.start > ll.byte_end) break;
+                    const d_end = @max(d.end, d.start);
+                    if (d_end < ll.byte_start) continue;
+                    if (worst == null or @intFromEnum(d.severity) < @intFromEnum(worst.?)) worst = d.severity;
+                    try self.addRangeSquiggles(
+                        ll,
+                        d.start,
+                        // A zero-width diagnostic ("expected ;") still
+                        // has to be visible, so it claims one cluster.
+                        if (d.end > d.start) d.end else d.start + 1,
+                        text_x0,
+                        y,
+                        line_h,
+                        colors.diagColor(d.severity),
+                    );
+                }
+                if (worst) |sev| {
+                    if (gutter_w > 0) try self.addRectRaw(
+                        KIND_GUTTER_BG,
+                        0,
+                        y,
+                        DIAG_STRIPE_W,
+                        n_rows * line_h,
+                        colors.diagColor(sev),
+                    );
+                }
+            }
+
             // Folded-region badge, at the end of the header line's last
             // row: the affordance that says "content is hidden here".
             if (frame.folds) |f| {
@@ -665,6 +728,82 @@ pub const EditorPass = struct {
         while (i < 3) : (i += 1) {
             try self.addGlyph(dot, gx, row_y + asc, 0, colors.fold_fg);
             gx += dot.advance;
+        }
+    }
+
+    /// Width of the diagnostic stripe painted at the gutter's left
+    /// edge. Inside the existing gutter, so publishing diagnostics
+    /// never re-lays-out the text.
+    pub const DIAG_STRIPE_W: f32 = 3;
+
+    /// One period of the squiggle, in px. Two rects per period (up,
+    /// down) is the cheapest zigzag that still reads as "wavy" at every
+    /// font size we support.
+    const SQUIGGLE_PERIOD: f32 = 4;
+
+    /// A wavy underline along [x, x+w) sitting on `bottom_y`.
+    fn addSquiggle(self: *EditorPass, x: f32, bottom_y: f32, w: f32, color: [4]f32) !void {
+        if (w <= 0) return;
+        const half = SQUIGGLE_PERIOD / 2;
+        var cx = x;
+        var up = true;
+        // Bound the loop: a pathological wide range must not emit tens
+        // of thousands of quads for one line.
+        var guard: usize = 0;
+        while (cx < x + w and guard < 4096) : (guard += 1) {
+            const seg = @min(half, x + w - cx);
+            try self.addRect(
+                KIND_DECOR,
+                cx,
+                if (up) bottom_y - 2 else bottom_y - 1,
+                seg,
+                1.5,
+                color,
+            );
+            cx += half;
+            up = !up;
+        }
+    }
+
+    /// Squiggles for the document byte range [s,e) on `ll`, following
+    /// the same per-cluster rule selections use (so a squiggle is
+    /// correct across RTL runs and soft wraps).
+    fn addRangeSquiggles(
+        self: *EditorPass,
+        ll: *const LaidLine,
+        s: usize,
+        e: usize,
+        text_x0: f32,
+        y: f32,
+        line_h: f32,
+        color: [4]f32,
+    ) !void {
+        if (e <= ll.byte_start or s >= ll.byte_end + 1) return;
+        const ls = if (s > ll.byte_start) s - ll.byte_start else 0;
+        const le = if (e < ll.byte_end) e - ll.byte_start else ll.text.len;
+        var drew = false;
+        for (ll.clusters) |cl| {
+            if (cl.byte_start >= le or cl.byte_end <= ls) continue;
+            const row_y = y + @as(f32, @floatFromInt(cl.row)) * line_h;
+            try self.addSquiggle(
+                text_x0 + cl.x0 - ll.rows[cl.row].x0,
+                row_y + line_h - 1,
+                cl.x1 - cl.x0,
+                color,
+            );
+            drew = true;
+        }
+        // A diagnostic pointing past the last character of a line (a
+        // missing token) covers no cluster; mark the line's end anyway.
+        if (!drew and ls >= ll.text.len and ll.rows.len > 0) {
+            const last = ll.rows[ll.rows.len - 1];
+            const last_row: f32 = @floatFromInt(ll.rows.len - 1);
+            try self.addSquiggle(
+                text_x0 + (last.x1 - last.x0),
+                y + last_row * line_h + line_h - 1,
+                SQUIGGLE_PERIOD * 2,
+                color,
+            );
         }
     }
 
