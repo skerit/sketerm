@@ -134,8 +134,10 @@ fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
 }
 
 fn loadOne(names: []const [*:0]const u8) ?*anyopaque {
-    for (names) |name| if (dlopen(name, RTLD_LAZY)) |handle| return handle;
-    return null;
+    // Via the platform layer: a bare soname does not resolve under a
+    // Homebrew prefix on Darwin, which silently disabled every preview
+    // codec on macOS. See platform.dlopenAny.
+    return @import("platform.zig").dlopenAny(names);
 }
 
 fn loadJxl() ?JxlApi {
