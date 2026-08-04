@@ -107,6 +107,14 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
         const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
+        var out_w: u32 = 0;
+        var out_h: u32 = 0;
+        if (argStr(args, "size")) |sz| {
+            const dims = @import("../mux/display.zig").parseSize(sz) orelse
+                return appErr(arena, "'size' must be \"WxH\" pixels (1..16384 per side, at most 64 megapixels), e.g. \"3840x2160\"");
+            out_w = dims[0];
+            out_h = dims[1];
+        }
         var env_list: std.ArrayList([]const u8) = .empty;
         defer env_list.deinit(arena);
         var user_set_ozone_hint = false;
@@ -137,6 +145,8 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             .audio_capture = audio_path,
             .cwd = argStr(args, "cwd"),
             .env = env_list.items,
+            .output_width = out_w,
+            .output_height = out_h,
         }) catch |err|
             return appErr(arena, switch (err) {
                 appdrive.Error.SpawnFailed => blk: {
@@ -162,7 +172,28 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         } else {
             _ = app.waitFirstWindow(wait_ms);
         }
+        // Launch-and-look must not return the pre-paint frame: "window
+        // exists" is earlier than "window has content" for most apps,
+        // and a black frame-1 screenshot reads as a broken app. Let
+        // painting quiesce briefly before capturing (0 disables).
+        const stable_ms: i64 = std.math.clamp(argInt(args, "stable_ms") orelse 500, 0, 10_000);
+        var shot_win: u32 = 0;
+        for (app.windows.items) |win| {
+            if (!win.popup and win.frames > 0) {
+                shot_win = win.id;
+                break;
+            }
+        }
+        var settled = true;
+        if (shot_win != 0 and stable_ms > 0 and !app.exited)
+            settled = app.waitVisualSettle(shot_win, stable_ms, @max(stable_ms * 4, 2000), 0, null);
         var summary = try appSummary(arena, app);
+        if (out_w != 0 and (app.output_width != out_w or app.output_height != out_h)) {
+            summary = if (app.output_width == 0)
+                try std.fmt.allocPrint(arena, "{s}\nWARNING: the daemon did not confirm the requested {d}x{d} output (older daemon — 'size' was likely ignored, the screen stays 1920x1080)", .{ summary, out_w, out_h })
+            else
+                try std.fmt.allocPrint(arena, "{s}\nWARNING: requested {d}x{d} output but the daemon applied {d}x{d}", .{ summary, out_w, out_h, app.output_width, app.output_height });
+        }
         if (browser_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, browser_note });
         if (debug_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, debug_note });
         if (audio_path) |ap| {
@@ -171,14 +202,15 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         }
         // Launch-and-look is THE common case: when a window rendered,
         // fold the first screenshot into the launch reply.
-        var shot_win: u32 = 0;
-        for (app.windows.items) |win| {
-            if (!win.popup and win.frames > 0) {
-                shot_win = win.id;
-                break;
+        if (shot_win != 0 and !app.exited) {
+            var shot_frames: u64 = 0;
+            for (app.windows.items) |win| {
+                if (win.id == shot_win) shot_frames = win.frames;
             }
-        }
-        if (shot_win != 0) {
+            if (!settled)
+                summary = try std.fmt.allocPrint(arena, "{s}\n(inline screenshot: window was STILL REPAINTING after the {d}ms settle wait — it may be mid-paint or the app animates continuously; screenshot_app with stable_ms/min_frame gets settled pixels)", .{ summary, stable_ms })
+            else if (shot_frames <= 1)
+                summary = try std.fmt.allocPrint(arena, "{s}\n(inline screenshot is the window's FIRST committed frame and may precede the app's real paint — screenshot_app with stable_ms gets settled content)", .{summary});
             if (app.screenshotPng(shot_win, 1568, null, 1)) |shot| {
                 defer mcp.app_state.allocator.free(shot.png);
                 const caption = try screenshotCaption(arena, app, shot_win, shot, summary);
