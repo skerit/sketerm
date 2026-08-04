@@ -275,7 +275,14 @@ pub const Pane = struct {
     /// and two-phase teardown as the browser face above.
     editor_widget: ?*c.GtkWidget = null,
     editor_ctx: ?*anyopaque = null,
-    editor_prepare_destroy: ?*const fn (*anyopaque) void = null,
+    /// `widgets_dead` tells the face whether its widget subtree is
+    /// still alive: the ordinary path (severFaces) calls it with the
+    /// widgets up, the last-resort path from `Pane.deinit` calls it
+    /// after GTK has already finalized them. Passing it is not
+    /// optional — the editor face restores window-level shortcuts
+    /// through its root widget, which is a use-after-free on the late
+    /// path.
+    editor_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     editor_deinit: ?*const fn (*anyopaque) void = null,
     editor_focus: ?*const fn (*anyopaque) void = null,
     /// "File browser hidden - click to show it" strip, shown on the
@@ -799,15 +806,10 @@ pub const Pane = struct {
         // Defensive: unmap normally detaches first, but a pane torn down
         // while still mapped must not leave a dangling AX child.
         detachA11y(self);
-        // Same for the app host: an embedded overlay inside our widget
-        // tree must be returned to its (hidden) window before GTK
-        // destroys the tree under it. Normally done in unlistPane.
-        self.detachAppHost();
-        // Browser face: its fd watch + connection must not outlive
-        // the pane (the callback holds a raw *BrowserView).
-        self.detachBrowser();
-        // Editor face: in-flight IO jobs must see the fence die.
-        self.detachEditor();
+        // Last-resort sever for a teardown path that never called
+        // severFaces() while the widgets were alive. Idempotent, so it
+        // is a no-op on every ordinary path.
+        self.severFaces();
         // A pane deinited while its widgets still exist (window
         // teardown order varies) must not leave the destroy fence
         // pointing at freed memory.
@@ -834,10 +836,6 @@ pub const Pane = struct {
         self.freePresetData();
         self.preset_params.deinit(self.allocator);
         if (self.atlas) |a| a.deinit();
-        // Fallback for teardown paths that never ran detachIm() —
-        // the pane-close/swap paths sever the IM context BEFORE the
-        // widget surgery destroys the GtkGLArea.
-        self.detachIm();
         if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
@@ -846,15 +844,25 @@ pub const Pane = struct {
         self.allocator.destroy(self);
     }
 
-    /// Sever the standalone IM context from the pane NOW. Must run
-    /// before the GtkGLArea is destroyed: the IM context is not owned
-    /// by the widget tree, so GTK can still emit `commit` /
-    /// `preedit-changed` (fcitx5/ibus route asynchronously through
-    /// D-Bus) between the widget surgery and the deferred Pane.deinit,
-    /// and those handlers dereference the dangling GLArea
-    /// (Gtk-CRITICAL in gtk_gl_area_queue_render). Idempotent.
-    /// Dropping the ref here also plugs the one-IM-context-per-closed-
-    /// pane leak (and its inner D-Bus name watch).
+    /// Sever every face that outlives the pane's widget subtree — IM
+    /// context, browser, editor, forwarded-app embed — while that
+    /// subtree is still alive. Idempotent.
+    ///
+    /// THE single teardown entry point: every path that is about to
+    /// destroy a pane's widgets (close, split-collapse, mux takeover,
+    /// tab-close sweep, `Window.unlistPane`) calls this and nothing
+    /// else. It used to be a hand-copied list of `detachIm();
+    /// detachBrowser();` at four call sites, and the editor face —
+    /// added later — was never added to any of them, so it was severed
+    /// only from the deferred `Pane.deinit`, i.e. against widgets GTK
+    /// had already finalized.
+    pub fn severFaces(self: *Pane) void {
+        self.detachIm();
+        self.detachBrowser();
+        self.detachEditor();
+        self.detachAppHost();
+    }
+
     /// Adopt an existing AppHost (a tabless session materialized
     /// into this pane): wire the pane callbacks and embed its
     /// primary window.
@@ -982,7 +990,7 @@ pub const Pane = struct {
         self: *Pane,
         face: *c.GtkWidget,
         ctx: *anyopaque,
-        prepare_destroy_cb: *const fn (*anyopaque) void,
+        prepare_destroy_cb: *const fn (*anyopaque, widgets_dead: bool) void,
         deinit_cb: *const fn (*anyopaque) void,
         focus_cb: *const fn (*anyopaque) void,
     ) void {
@@ -1046,7 +1054,7 @@ pub const Pane = struct {
         self.editor_focus = null;
         self.editor_widget = null;
         if (ctx) |editor_ctx| {
-            if (prepare_destroy_cb) |cb| cb(editor_ctx);
+            if (prepare_destroy_cb) |cb| cb(editor_ctx, self.widgets_dead);
         }
         if (face) |ew| {
             if (!self.widgets_dead) {
@@ -1078,6 +1086,15 @@ pub const Pane = struct {
         self.app_embed_active = false;
     }
 
+    /// Sever the terminal face's IM context NOW. Prefer `severFaces`;
+    /// this is the per-face half of it. The IM context is not owned by
+    /// the widget tree, so GTK can still emit `commit` /
+    /// `preedit-changed` (fcitx5/ibus route asynchronously through
+    /// D-Bus) between the widget surgery and the deferred `Pane.deinit`,
+    /// and those handlers dereference the dangling GLArea (Gtk-CRITICAL
+    /// in gtk_gl_area_queue_render). Idempotent. Dropping the ref here
+    /// also plugs the one-IM-context-per-closed-pane leak (and its
+    /// inner D-Bus name watch).
     pub fn detachIm(self: *Pane) void {
         const ictx = self.input_ctx orelse return;
         const im = ictx.im orelse return;

@@ -2010,6 +2010,28 @@ pub const App = struct {
         try self.sendIntents(win.chan, units.items);
     }
 
+    /// Tap raw evdev HARDWARE keycodes on the seat, in order, each as a
+    /// press+release with no modifiers.
+    ///
+    /// The only injection path that can express a key with no codepoint
+    /// of its own: `typeText`/`pressKey` map CHARACTERS through
+    /// `xkblayout`, which skips every dead keysym, so a dead key is
+    /// literally untypable through them. Evdev codes are
+    /// keymap-independent — the session keymap decides what each one
+    /// means — so `{ 26, 18 }` is `^` then `e` on a Belgian session and
+    /// `[` then `e` on a US one.
+    pub fn tapKeyCodes(self: *App, win_id: ?u32, codes: []const u32) Error!void {
+        const win = try self.resolveKbd(win_id);
+        const a = self.allocator;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
+        for (codes) |code| {
+            wlpipe.appendSeatKey(&units, a, code, true) catch return Error.OutOfMemory;
+            wlpipe.appendSeatKey(&units, a, code, false) catch return Error.OutOfMemory;
+        }
+        try self.sendIntents(win.chan, units.items);
+    }
+
     pub fn pressKey(self: *App, win_id: ?u32, spec: []const u8) Error!void {
         return self.pressKeyHold(win_id, spec, 0);
     }
