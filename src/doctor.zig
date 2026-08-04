@@ -174,7 +174,10 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
     return warns;
 }
 
-/// Count live GUI instance sockets (reaps nothing; read-only probe).
+/// Count live GUI instance sockets and unlink stale ones — the same
+/// self-heal `sketerm cli` auto-discovery does, so leftovers can't
+/// accumulate on machines where discovery never runs (SKETERM_SOCKET
+/// set, or an explicit --socket everywhere).
 fn checkGui(allocator: std.mem.Allocator) u32 {
     const rt = platform.runtimeDir();
     const dir_z = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm", .{rt}, 0) catch return 1;
@@ -189,11 +192,14 @@ fn checkGui(allocator: std.mem.Allocator) u32 {
             if (std.mem.eql(u8, name, "mux.sock")) continue;
             const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch continue;
             defer allocator.free(path);
-            if (ipc_client.socketAlive(path)) live += 1 else stale += 1;
+            if (ipc_client.socketAlive(path)) live += 1 else {
+                _ = c.unlink(path.ptr);
+                stale += 1;
+            }
         }
     }
     if (stale > 0) {
-        _ = c.printf("gui       %u live instance(s), %u stale socket(s) (crash leftovers; the CLI self-heals them)\n", @as(c_uint, live), @as(c_uint, stale));
+        _ = c.printf("gui       %u live instance(s); removed %u stale socket(s) (crash leftovers)\n", @as(c_uint, live), @as(c_uint, stale));
     } else {
         _ = c.printf("gui       %u live instance(s)\n", @as(c_uint, live));
     }

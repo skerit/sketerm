@@ -20,6 +20,13 @@ maps to:
 sketerm-mux display run --size 1024x768 -- ./run-render-test
 ```
 
+The GUI binary ships the same thing as `sketerm run`, which inserts the `--`
+itself when absent:
+
+```sh
+sketerm run --size 1024x768 ./run-render-test
+```
+
 `display run`:
 
 - Generates a collision-resistant session name unless `--name` is given.

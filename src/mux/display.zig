@@ -135,7 +135,9 @@ fn outPrint(bytes: []const u8) !void {
     }
 }
 
-fn parseSize(text: []const u8) ?[2]u32 {
+/// Shared "WxH" parser (also used by MCP launch_app's `size`); caps
+/// match the daemon's validOutputSize so a bad value fails client-side.
+pub fn parseSize(text: []const u8) ?[2]u32 {
     const split = std.mem.indexOfScalar(u8, text, 'x') orelse
         std.mem.indexOfScalar(u8, text, 'X') orelse return null;
     if (split == 0 or split + 1 >= text.len) return null;
@@ -144,6 +146,33 @@ fn parseSize(text: []const u8) ?[2]u32 {
     if (width == 0 or height == 0 or width > 16_384 or height > 16_384) return null;
     if (@as(u64, width) * height > 64 * 1024 * 1024) return null;
     return .{ width, height };
+}
+
+/// Where the COMMAND begins in `sketerm run` argv (no explicit `--`):
+/// skips leading display-run flags plus their values so the alias can
+/// insert the `--` itself. Null = argv already has a `--` before any
+/// command word, or contains no command at all.
+pub fn runCommandStart(args: []const []const u8) ?usize {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const s = args[i];
+        if (std.mem.eql(u8, s, "--")) return null;
+        if (!std.mem.startsWith(u8, s, "-")) return i;
+        const takes_value = std.mem.eql(u8, s, "--name") or std.mem.eql(u8, s, "--socket") or
+            std.mem.eql(u8, s, "--ttl") or std.mem.eql(u8, s, "--size");
+        if (takes_value) i += 1;
+    }
+    return null;
+}
+
+test "display: runCommandStart finds the command past valued flags" {
+    const t = std.testing;
+    try t.expectEqual(@as(?usize, 0), runCommandStart(&.{ "xterm", "-e", "top" }));
+    try t.expectEqual(@as(?usize, 2), runCommandStart(&.{ "--size", "800x600", "game", "--level" }));
+    try t.expectEqual(@as(?usize, 3), runCommandStart(&.{ "--gpu", "--ttl", "60", "cmd" }));
+    try t.expectEqual(@as(?usize, null), runCommandStart(&.{ "--size", "800x600", "--", "cmd" }));
+    try t.expectEqual(@as(?usize, null), runCommandStart(&.{ "--help" }));
+    try t.expectEqual(@as(?usize, null), runCommandStart(&.{}));
 }
 
 fn parseArgs(argv: []const []const u8) ?Args {
