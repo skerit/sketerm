@@ -12334,3 +12334,47 @@ the way `GtkEventControllerKey` does) and reports what it committed —
 unmeasurable without a human at a keyboard. Verified inside a sketerm
 display session (`sketerm-mux display create --kb-layout be`, which is
 a real text-input-v3 Wayland display), NOT under Xvfb.
+
+### Testing moved off X entirely
+
+`smoke-e2e` no longer needs a display server: it creates its own
+session (`sketerm-mux display create --json`, environment used
+verbatim), attaches a viewer BEFORE starting the GUI (the compositor
+brain is client-side, so an unattended hub never configures the
+toplevel and nothing paints), drives the real seat, and tears session
+and daemon down by exact pid/name on every exit path.
+
+This was a correctness fix, not housekeeping. The old harness forced
+`GDK_BACKEND=x11` whenever `DISPLAY` was set, so the whole suite ran on
+X whenever Xvfb was present -- and on X a `GtkIMMulticontext` falls
+back to `GtkIMContextSimple`, which is exactly why the editor's IME
+verification passed while dead keys were broken on every Wayland
+compositor advertising text-input-v3. The suite also never checked that
+the GUI painted at all, since IPC `send-text` bypasses input and the
+daemon holds the screen state.
+
+New coverage: real pointer and evdev-keycode input reaching the shell
+with an asserted repaint; a real Ctrl+F opening the editor search bar;
+the existence of a `zwp_text_input_v3` object on the seat (impossible
+under X11), with a comptime guard so the compositor cannot silently
+stop advertising it; and dead-key composition end to end on a
+`--kb-layout be` session, asserted in both a terminal pane and an
+editor tab. The GUI children run with `GTK_A11Y=none` so a dev box's
+real accessibility bus is never touched.
+
+### IM teardown: the IM held the last widget reference
+
+GTK's Wayland IM module `g_set_object`s its client widget, so the IM
+owned the LAST reference to the `GtkGLArea`. The widget's `::destroy`
+-- the hook used to sever the IM in time -- could not fire until the IM
+let go, and `set_client_widget(NULL)` then finalized the widget mid-call
+and walked its own dangling pointer. No ordering rule could fix that,
+so `ImHost` now holds a strong reference for its whole lifetime and
+releases it last; every detach path is valid at any time.
+
+Found alongside it: `Window.unlistPane` severed the IM, browser and
+app-host faces but never the editor face, so the editor was only
+severed from the deferred `Pane.deinit`. The four hand-copied detach
+lists are now one `Pane.severFaces`, and `editor_prepare_destroy` takes
+a `widgets_dead` flag so the compiler forces each caller to state
+whether the widgets are still alive.
