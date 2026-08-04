@@ -23,6 +23,7 @@ const browser_model = @import("../../filebrowser/model.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
+const gitstatus = @import("../../filebrowser/gitstatus.zig");
 const iconload = @import("iconload.zig");
 const dnd = @import("dnd.zig");
 const profile = @import("../../util/profile.zig");
@@ -1044,21 +1045,9 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
         c.gtk_label_set_text(@ptrCast(nc.label), &name_buf);
     }
 
-    // Git status badge (local current dir only).
-    var git_shown = false;
-    if (tab.hc.host == null and dir == tab.root) {
-        if (self.git_map.get(e.name)) |st| {
-            var gz: [8:0]u8 = undefined;
-            const gtxt = std.fmt.bufPrintZ(&gz, "[{c}]", .{st}) catch "";
-            c.gtk_label_set_text(@ptrCast(nc.git), gtxt.ptr);
-            c.gtk_widget_remove_css_class(nc.git, "dim-label");
-            c.gtk_widget_remove_css_class(nc.git, "warning");
-            c.gtk_widget_add_css_class(nc.git, if (st == '?') "dim-label" else "warning");
-            c.gtk_widget_set_visible(nc.git, 1);
-            git_shown = true;
-        }
-    }
-    if (!git_shown) c.gtk_widget_set_visible(nc.git, 0);
+    // Version-control chip. The state travels the same daemon job on
+    // every host, so a remote repository marks its rows identically.
+    applyGitBadge(nc, self.gitBadgeFor(tab, dir, e.*));
 
     if (e.tags.len > 0) {
         var tag_z: [128:0]u8 = undefined;
@@ -1085,6 +1074,29 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
     // Live lookup for thumbnails and inline rename.
     tab.name_cells.put(self.allocator, d.path, root) catch {};
 }
+
+/// Paint (or clear) the version-control chip of a name cell.
+///
+/// Colour comes from libadwaita's status classes, never a hardcoded
+/// hex, so light and dark themes both stay readable. Ignored entries
+/// get no chip at all -- their NAME fades instead, which says
+/// "deliberately not tracked" without competing with real changes.
+fn applyGitBadge(nc: *const NameCell, badge: ?gitstatus.Badge) void {
+    for (GIT_CSS_CLASSES) |cls| c.gtk_widget_remove_css_class(nc.git, cls.ptr);
+    c.gtk_widget_remove_css_class(nc.label, "dim-label");
+    const b = badge orelse return c.gtk_widget_set_visible(nc.git, 0);
+    if (b.dim_name) c.gtk_widget_add_css_class(nc.label, "dim-label");
+    if (b.letter == 0) return c.gtk_widget_set_visible(nc.git, 0);
+    var gz: [8:0]u8 = undefined;
+    const gtxt = std.fmt.bufPrintZ(&gz, "{c}", .{b.letter}) catch "";
+    c.gtk_label_set_text(@ptrCast(nc.git), gtxt.ptr);
+    c.gtk_widget_add_css_class(nc.git, b.css.ptr);
+    c.gtk_widget_set_visible(nc.git, 1);
+}
+
+/// Every class applyGitBadge can add, so a recycled cell is stripped
+/// clean before the next one is applied.
+const GIT_CSS_CLASSES = [_][:0]const u8{ "dim-label", "warning", "success", "error", "accent" };
 
 fn onNameUnbind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
     const ctx: *ColCtx = @ptrCast(@alignCast(user.?));

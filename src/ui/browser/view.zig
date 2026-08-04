@@ -22,6 +22,7 @@ const browser_model = @import("../../filebrowser/model.zig");
 const clipboard_mod = @import("../../filebrowser/clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const emblems_mod = @import("../../filebrowser/emblems.zig");
+const gitstatus = @import("../../filebrowser/gitstatus.zig");
 const iconload = @import("iconload.zig");
 const Pane = @import("../pane.zig").Pane;
 const file_transfers = @import("../file_transfers.zig");
@@ -41,7 +42,6 @@ const DupState = @import("search.zig").DupState;
 const EditWatch = @import("types.zig").EditWatch;
 const EditorRename = @import("ops.zig").EditorRename;
 const FileColor = @import("types.zig").FileColor;
-const GitCtx = @import("gitstat.zig").GitCtx;
 const HostAction = @import("types.zig").HostAction;
 const HostConn = @import("types.zig").HostConn;
 const JobPanel = @import("jobpanel.zig").Panel;
@@ -331,14 +331,24 @@ pub const BrowserView = struct {
     search_max_matches: u64 = 0,
     /// User file-coloring rules (~/.config/sketerm/filecolors.conf).
     file_colors: std.ArrayList(FileColor) = .empty,
-    /// Git status overlay for the current LOCAL root: child name ->
-    /// porcelain status char. Rebuilt by a worker thread per navigate.
-    git_map: std.StringHashMap(u8) = undefined,
+    /// Version-control overlay for the browsed root: path relative to
+    /// that root -> folded state, ancestors included so a directory
+    /// row can show that something inside it changed. Filled by the
+    /// daemon's `git_status` job (gitstat.zig) for local and remote
+    /// roots alike -- the GUI never runs git itself.
+    git: gitstatus.Overlay = undefined,
+    /// Which (host, root) the overlay describes. Both are compared
+    /// before a badge is drawn: a same-named folder on another host
+    /// is another repository.
     git_root: []u8 = &.{},
-    git_gen: u64 = 0,
-    git_inflight: ?*GitCtx = null,
-    /// Remote-root overlay: the in-flight `git_status` daemon job
-    /// (gitstat.zig feedGit). req 0 + job 0 = idle.
+    git_host: []u8 = &.{},
+    /// Roots asked recently, so navigating back and forth (or sitting
+    /// outside any repository) does not respawn git per step.
+    git_cache: gitstatus.Cache = undefined,
+    /// Trailing debounce for change-driven refreshes (0 = none).
+    git_delta_src: c.guint = 0,
+    /// The in-flight `git_status` daemon job (gitstat.zig feedGit).
+    /// req 0 + job 0 = idle.
     git_rhc: ?*HostConn = null,
     git_rreq: u32 = 0,
     git_rjob: u64 = 0,
@@ -840,15 +850,15 @@ pub const BrowserView = struct {
     pub const onMenuSyncHere = @import("compare.zig").onMenuSyncHere;
     pub const startCompare = @import("compare.zig").startCompare;
 
-    // gitstat.zig -- the git status overlay
-    pub const clearGitMap = @import("gitstat.zig").clearGitMap;
+    // gitstat.zig -- the version-control overlay
     pub const refreshGitOverlay = @import("gitstat.zig").refreshGitOverlay;
+    pub const refreshGitForced = @import("gitstat.zig").refreshGitForced;
+    pub const scheduleGitRefresh = @import("gitstat.zig").scheduleGitRefresh;
+    pub const gitBadgeFor = @import("gitstat.zig").badgeFor;
+    pub const gitSummaryNote = @import("gitstat.zig").summaryNote;
     pub const feedGit = @import("gitstat.zig").feedGit;
     pub const feedDiff = @import("diffview.zig").feedDiff;
     pub const compareSelected = @import("diffview.zig").compareSelected;
-    pub const gitThreadMain = @import("gitstat.zig").gitThreadMain;
-    pub const finishGit = @import("gitstat.zig").finishGit;
-    pub const onGitIdle = @import("gitstat.zig").onGitIdle;
 
     /// Create a browser face on `pane`, starting at `start_spec`
     /// (a path or host-qualified spec; null/relative = $HOME).
@@ -917,7 +927,8 @@ pub const BrowserView = struct {
         self.media.init(allocator);
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
         self.thumb_failed = std.StringHashMap(void).init(allocator);
-        self.git_map = std.StringHashMap(u8).init(allocator);
+        self.git = gitstatus.Overlay.init(allocator);
+        self.git_cache = gitstatus.Cache.init(allocator);
         if (places_mod.load(allocator)) |parsed| {
             defer parsed.deinit();
             for (parsed.value.bookmarks, 0..) |b, i| {
@@ -1354,6 +1365,7 @@ pub const BrowserView = struct {
         if (self.editor_rename) |er| er.destroy(self.allocator);
         if (self.thumb_render_src != 0) _ = c.g_source_remove(self.thumb_render_src);
         if (self.listing_render_src != 0) _ = c.g_source_remove(self.listing_render_src);
+        if (self.git_delta_src != 0) _ = c.g_source_remove(self.git_delta_src);
         if (self.thumb_ctx) |tc| {
             tc.lock();
             tc.orphaned = true;
@@ -1397,10 +1409,10 @@ pub const BrowserView = struct {
         if (self.last_search) |ls| ls.deinitOwned(self.allocator);
         for (self.file_colors.items) |fc| self.allocator.free(fc.glob);
         self.file_colors.deinit(self.allocator);
-        if (self.git_inflight) |g| g.orphaned = true;
-        self.clearGitMap();
-        self.git_map.deinit();
+        self.git.deinit();
+        self.git_cache.deinit();
         if (self.git_root.len > 0) self.allocator.free(self.git_root);
+        if (self.git_host.len > 0) self.allocator.free(self.git_host);
         self.clearThumbCache();
         self.thumbs.deinit();
         var fit = self.thumb_failed.iterator();
@@ -1505,6 +1517,13 @@ pub const BrowserView = struct {
             \\.sketerm-fb-toolbar button:checked:hover {
             \\  background: alpha(currentColor, 0.26);
             \\}
+            \\.sketerm-fb-gitchip {
+            \\  font-size: 0.72em;
+            \\  font-weight: bold;
+            \\  padding: 0 3px;
+            \\  border-radius: 4px;
+            \\  background: alpha(@theme_bg_color, 0.85);
+            \\}
         ;
         const provider = c.gtk_css_provider_new();
         c.gtk_css_provider_load_from_string(provider, css);
@@ -1521,6 +1540,9 @@ pub const BrowserView = struct {
         self.clearFailureCaches();
         self.refreshDir(tab, tab.root);
         for (tab.subdirs.items) |d| self.refreshDir(tab, d);
+        // An explicit reload always re-asks git: the recency cache is
+        // exactly what the user is overriding by pressing this.
+        self.refreshGitForced(tab);
     }
 
     /// Split into a second browser pane. The pane binding table owns

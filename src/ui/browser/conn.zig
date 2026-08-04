@@ -328,6 +328,11 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         }
     }
     self.clearReconnect(hc.host);
+    // The overlay for the visible tab was skipped while this host was
+    // still connecting (nothing to send it to); ask now that there is.
+    if (self.currentTab()) |tab| {
+        if (tab.hc == hc) self.refreshGitForced(tab);
+    }
     self.requestHostDirs(hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
@@ -1405,7 +1410,13 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 dir.del(ch.name);
             }
         }
-        if (structural) self.requestFreeSpace(tab);
+        if (structural) {
+            self.requestFreeSpace(tab);
+            // The watch is the browser's only change notification, and
+            // it is what a completed file operation shows up as. One
+            // debounced git job per burst, never a poll.
+            self.scheduleGitRefresh();
+        }
         return structural;
     }
     return false;

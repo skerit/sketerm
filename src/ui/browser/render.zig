@@ -167,11 +167,18 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch ""
     else
         std.fmt.bufPrint(&count_buf, "{d} items{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch "";
-    var status_buf: [700]u8 = undefined;
+    // Repository awareness, unobtrusively: the browsed root's change
+    // summary rides the count phrase. The daemon's `git_status` verb
+    // reports records only, so there is no branch name to show.
+    var git_buf: [200]u8 = undefined;
+    const gnote = self.gitSummaryNote(tab, &git_buf);
+    var status_buf: [960]u8 = undefined;
     const cmsg: []const u8 = if (tab.nav_error) |refused|
-        std.fmt.bufPrint(&status_buf, "{s} -- still showing {s} ({s})", .{
-            refused, tab.root.path, counted,
+        std.fmt.bufPrint(&status_buf, "{s} -- still showing {s} ({s}{s})", .{
+            refused, tab.root.path, counted, gnote,
         }) catch refused
+    else if (gnote.len > 0)
+        std.fmt.bufPrint(&status_buf, "{s}{s}", .{ counted, gnote }) catch counted
     else
         counted;
     self.setStatus(cmsg);
@@ -897,6 +904,34 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         thumb_pending = std.mem.eql(u8, e.kind, "file") and isPreviewMediaName(e.name);
     }
     if (icon == null) icon = entryIconImage(@ptrCast(@alignCast(fb)), e, step.tile_icon_px);
+    // The version-control chip rides an overlay ON the icon: the icons
+    // view has no columns to spare, and an extra row under some tiles
+    // would make the grid ragged.
+    const git_badge = self.gitBadgeFor(tab, tab.root, e);
+    // The async thumbnail replaces the IMAGE, never the overlay that
+    // may now wrap it.
+    const icon_img = icon;
+    if (git_badge) |b| {
+        if (b.letter != 0) {
+            const ov = c.gtk_overlay_new();
+            // Shrink-wrap the icon: a FILL overlay would stretch to the
+            // tile width and park the chip against the tile's edge,
+            // which also widens the tile.
+            c.gtk_widget_set_halign(ov, c.GTK_ALIGN_CENTER);
+            c.gtk_widget_set_valign(ov, c.GTK_ALIGN_CENTER);
+            c.gtk_overlay_set_child(@ptrCast(ov), icon);
+            var gz: [8:0]u8 = undefined;
+            const chip = c.gtk_label_new(std.fmt.bufPrintZ(&gz, "{c}", .{b.letter}) catch "");
+            c.gtk_widget_add_css_class(chip, b.css.ptr);
+            c.gtk_widget_add_css_class(chip, "sketerm-fb-gitchip");
+            c.gtk_widget_set_halign(chip, c.GTK_ALIGN_END);
+            c.gtk_widget_set_valign(chip, c.GTK_ALIGN_END);
+            c.gtk_overlay_add_overlay(@ptrCast(ov), chip);
+            // The chip must never grow the overlay past the icon.
+            c.gtk_overlay_set_measure_overlay(@ptrCast(ov), chip, 0);
+            icon = ov;
+        }
+    }
     c.gtk_box_append(@ptrCast(tile), icon);
 
     var name_z: [256:0]u8 = undefined;
@@ -906,6 +941,9 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
     const lab = c.gtk_label_new(&name_z);
     c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_label_set_max_width_chars(@ptrCast(lab), 12);
+    if (git_badge) |b| {
+        if (b.dim_name) c.gtk_widget_add_css_class(lab, "dim-label");
+    }
     c.gtk_box_append(@ptrCast(tile), lab);
 
     const child = c.gtk_flow_box_child_new();
@@ -921,7 +959,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         .is_dir = e.tdir,
     };
     c.g_object_set_data_full(@ptrCast(child), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
-    if (thumb_pending) if (icon) |ic| {
+    if (thumb_pending) if (icon_img) |ic| {
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-img", @ptrCast(ic));
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-px", @ptrFromInt(@as(usize, @intCast(step.tile_icon_px))));
     };

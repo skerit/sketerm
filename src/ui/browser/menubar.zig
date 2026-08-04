@@ -431,6 +431,7 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
                 v.clearFailureCaches();
                 v.refreshDir(tab, tab.root);
                 for (tab.subdirs.items) |d| v.refreshDir(tab, d);
+                v.refreshGitForced(tab);
             }
         },
         .toggle_hidden => if (bv) |v| {
