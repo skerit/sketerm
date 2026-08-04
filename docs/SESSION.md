@@ -12042,3 +12042,75 @@ smoke-mux, smoke-broker, smoke-e2e; portable mux build; mux binary
 still links only libc/libm. Isolated GUI runs proved stable
 connection counts across polls, kill and attach flows, live
 thumbnails, and search filtering.
+
+## 2026-08-03: display sessions as an xvfb-run replacement
+
+`sketerm-mux display run [--size WxH] -- COMMAND...` now owns the complete
+headless-test lifecycle: collision-resistant generated names, environment
+application without shell evaluation, software GL by default, inherited X11
+display removal, direct argv execution, command exit-status propagation,
+process-group signal forwarding, and guarded teardown. Persistent `create`
+also generates a name when omitted. Parent and subcommand help are wired.
+
+Output geometry is daemon state, not keeper PTY geometry. It travels through
+spawn/list and broker ready/metadata JSON, initializes each authoritative
+compositor brain, and drives wl_output mode, scale-adjusted xdg-output logical
+size, and configure_bounds. Inspect/create JSON reports the effective mode and
+GPU policy. `display_v2` prevents a new CLI from trusting old daemons that
+would silently ignore geometry or the display-only kill fence.
+
+Collisions now name the occupied session and remediation. Inspect/destroy
+reject ordinary terminal sessions, destroy waits for the Wayland socket to
+vanish, and failed create output is rolled back. TTL occupancy now includes
+live external Wayland channels, so a long unattended render is not reaped;
+the complete TTL starts after its client disconnects.
+
+Coverage in both smoke-mux and smoke-broker exercises custom size metadata,
+help without a daemon, exact collision diagnostics, GPU inspect fidelity,
+scoped-run environment/status/cleanup, guarded shell-session destruction,
+and active-renderer TTL pause followed by expiry. `docs/display.md` records
+the Xvfb mapping and native-Wayland limitations.
+
+Verified: full suite 1173 pass / 5 skip; core suite 972 pass / 5 skip;
+smoke-mux and smoke-broker PASS with the shared display stage; normal build,
+static-musl mux, and aarch64-macOS portable mux build; `sketerm-mux` retains
+only libc/libm runtime dependencies.
+
+## 2026-08-04: rootless Xwayland display compatibility
+
+External displays now auto-enable rootless X11 when Xwayland and
+xwayland-satellite 0.8.1+ are available. `--xwayland` makes compatibility a
+hard requirement and `--no-xwayland` keeps a display Wayland-only. Successful
+create/list/inspect replies report `xwayland`, `DISPLAY`, and `XAUTHORITY`;
+`display run` applies them directly, including Java's non-reparenting hint.
+The CLI proves readiness with an authenticated X11 setup handshake. A broken
+automatic runtime is destroyed and recreated Wayland-only rather than taking
+the requested display down; required mode fails honestly.
+
+`src/mux/xwayland.zig` owns display-number allocation, pre-populated atomic
+lock publication, stale-owner reclamation, filesystem and Linux abstract X11
+listeners, a random mode-0600 MIT-MAGIC-COOKIE-1 record, process-group
+supervision, parent-death handling, and exact normal teardown. `/tmp/.X11-unix`
+is accepted only as a sticky world-writable directory owned by root or this
+uid. Existing lock nodes are inspected nonblocking under `flock`, and socket
+probes are bounded, so hostile FIFOs or listeners cannot wedge the daemon.
+Satellite stdout/stderr is detached from the creating CLI and the broker
+control descriptor is close-on-exec. TCP listening is disabled.
+
+Satellite remains the XWM and maps X windows into the existing xdg-shell
+pipeline; the mux daemon gained no XCB dependency. Its host Wayland connection
+is marked auxiliary: it forwards frames and input normally, but only a live X
+toplevel (not idle infrastructure) pauses display TTL. X11 metadata crosses
+both worker ready and ongoing broker metadata messages.
+
+The shared display smoke now runs a real X11-only xterm in monolith and broker
+modes. It validates authenticated `display run`, mode-0600 authority, frame
+forwarding, viewerless active-window TTL retention, controller close,
+post-window TTL expiry, and lock/socket/authority cleanup. Unit coverage also
+checks dead/live lock handling and nonblocking rejection of a FIFO lock node.
+
+Verified: full suite 1175 pass / 5 skip; core suite 972 pass / 5 skip;
+smoke-mux and smoke-broker PASS with the real-xterm stage; normal build,
+static-musl mux, and aarch64-macOS portable mux build; `sketerm-mux` retains
+only libc/libm runtime dependencies. Cross-protocol drag and drop remains
+toolkit/upstream-dependent and is not part of the compatibility contract.
