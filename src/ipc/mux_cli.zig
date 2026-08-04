@@ -52,6 +52,11 @@ const MUX_HELP =
     \\      127.0.0.1:<remote> on the daemon's host over the mux
     \\      connection (SSH/UDP transports included); runs until killed
     \\
+    \\Headless GUI apps (no screen needed): `sketerm run <command...>`
+    \\runs a command against a private Wayland display and exits with
+    \\its status (the Xvfb/xvfb-run replacement); `sketerm-mux display
+    \\<create|run|inspect|list|destroy>` manages persistent ones.
+    \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
     \\Bare hosts select transport automatically; udp:<host> and
@@ -138,6 +143,13 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     if (args.len == 0) return tui(allocator, host);
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+        _ = c.fputs(MUX_HELP, platform.stdout());
+        return 0;
+    }
+    // `mux spawn --help` (any subcommand): the word after the
+    // subcommand is normally a session NAME, so without this a help
+    // request would create a session literally named "--help".
+    if (args.len >= 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
         _ = c.fputs(MUX_HELP, platform.stdout());
         return 0;
     }

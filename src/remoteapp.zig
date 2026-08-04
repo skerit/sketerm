@@ -22,15 +22,27 @@ fn errMsg(comptime fmt: []const u8, args: anytype) void {
 }
 
 const USAGE =
-    \\Usage: sketerm app [-u] [-i] [--gpu] [user@]<host|domain> <command...>
+    \\Usage: sketerm app [-u] [-i] [--headless] [--gpu] [user@]<host|domain> <command...>
     \\
-    \\Run a graphical application on a remote host with its windows on
-    \\this desktop. A sketerm window must already be open here — it
-    \\renders the forwarded windows. The remote needs key/agent SSH
-    \\auth and `sketerm-mux` installed.
+    \\Run a graphical application on <host> (localhost works) with its
+    \\windows on this desktop: the host's sketerm-mux daemon is the
+    \\app's Wayland display, and an open sketerm window here renders
+    \\the forwarded windows. Without a sketerm window the app still
+    \\runs, headlessly, against that display — attach a viewer later
+    \\with `sketerm mux <host> attach <session>`. Remote hosts need
+    \\key/agent SSH auth and `sketerm-mux` installed.
+    \\
+    \\The command runs ON THE HOST'S DAEMON: cwd defaults to the
+    \\daemon's own working directory (normally $HOME) and the
+    \\environment is minimal, so pass absolute paths. For a synchronous headless run that
+    \\inherits stdio and exits with the command's status (the
+    \\xvfb-run replacement), use `sketerm run <command...>` /
+    \\`sketerm-mux display run -- <command...>` instead.
     \\
     \\  -u    force mosh-style encrypted UDP. Without it, sketerm
     \\        probes UDP automatically and falls back to SSH.
+    \\  --headless  don't look for a sketerm window at all: spawn the
+    \\        app session, print its name + attach hint, exit 0.
     \\  -i    isolate: run under a private runtime dir + no shared D-Bus
     \\        bus, so single-instance apps (pcmanfm, GApplication) open
     \\        here instead of handing off to a copy already rendering on
@@ -56,16 +68,18 @@ pub const Parsed = struct {
     udp: bool = false,
     isolated: bool = false,
     gpu: bool = false,
+    headless: bool = false,
 };
 
-/// Pure argv split: leading -u/-i/--gpu flags (any order), then host,
-/// rest = remote command (so the app's own flags pass through). Null =
-/// show usage (missing host/command, or -h/--help).
+/// Pure argv split: leading -u/-i/--headless/--gpu flags (any order),
+/// then host, rest = remote command (so the app's own flags pass
+/// through). Null = show usage (missing host/command, or -h/--help).
 pub fn parseArgs(args_in: []const []const u8) ?Parsed {
     var args = args_in;
     var udp = false;
     var isolated = false;
     var gpu = false;
+    var headless = false;
     while (args.len > 0) {
         if (std.mem.eql(u8, args[0], "-u")) {
             udp = true;
@@ -73,13 +87,15 @@ pub fn parseArgs(args_in: []const []const u8) ?Parsed {
             isolated = true;
         } else if (std.mem.eql(u8, args[0], "--gpu")) {
             gpu = true;
+        } else if (std.mem.eql(u8, args[0], "--headless")) {
+            headless = true;
         } else break;
         args = args[1..];
     }
     if (args.len < 2) return null;
     if (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) return null;
     if (args[0].len == 0) return null;
-    return .{ .host = args[0], .command = args[1..], .udp = udp, .isolated = isolated, .gpu = gpu };
+    return .{ .host = args[0], .command = args[1..], .udp = udp, .isolated = isolated, .gpu = gpu, .headless = headless };
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
@@ -104,17 +120,25 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
-    // Null = no GUI to render into.
-    if (runNativeApp(allocator, host_spec, parsed.command, cfg.udpRange(), parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
-    errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
-    return 1;
+    return runNativeApp(allocator, host_spec, parsed.command, cfg.udpRange(), parsed.isolated, parsed.gpu, parsed.headless, cfg.app_keyboard_layout);
+}
+
+/// The session runs whether or not a viewer renders it; say so
+/// plainly instead of letting "no window here" read as "it failed".
+fn headlessNotice(name: []const u8, host: []const u8) void {
+    std.debug.print(
+        "sketerm app: '{s}' is running HEADLESS on {s} against its own Wayland display (no sketerm window here to render into).\n" ++
+            "  Attach later:   sketerm mux {s} attach {s}\n" ++
+            "  Still running?  sketerm mux {s} list   (an instant exit usually means the command failed on the host — cwd is the daemon's own, normally $HOME, and the env is minimal there, so use host-absolute paths)\n",
+        .{ name, host, host, name, host },
+    );
 }
 
 /// Spawn an app session over the chosen transport, then have the
 /// running GUI attach and render it. Inside a sketerm pane THIS pane
 /// becomes the session view (like `sketerm mux attach`); outside, a
-/// new tab. Null = no running GUI (caller reports it); any other
-/// failure returns a status with its own message.
+/// new tab. No GUI (or --headless) is NOT a failure: the session
+/// keeps running headlessly and the notice says how to attach.
 fn runNativeApp(
     allocator: std.mem.Allocator,
     host_spec: []const u8,
@@ -122,12 +146,9 @@ fn runNativeApp(
     port_range: ?[]const u8,
     isolated: bool,
     gpu: bool,
+    headless: bool,
     kb_layout: []const u8,
-) ?u8 {
-    const ipc_client = @import("ipc/client.zig");
-    const gui_sock = ipc_client.resolveSocket(allocator, null) orelse return null;
-    allocator.free(gui_sock);
-
+) u8 {
     const remote = mux_client.RemoteSpec.parse(host_spec);
     var conn = mux_client.Conn.connectRemote(allocator, host_spec, port_range) catch {
         errMsg("could not reach {s} using {s} transport policy (key/agent auth + sketerm-mux required there)", .{ remote.host, @tagName(remote.mode) });
@@ -159,18 +180,31 @@ fn runNativeApp(
     };
     ok.deinit(allocator);
 
+    if (headless) {
+        std.debug.print("sketerm app: '{s}' running headless on {s} over {s} — attach with: sketerm mux {s} attach {s}\n", .{ name, remote.host, @tagName(conn.transport), host_spec, name });
+        return 0;
+    }
+
+    // A viewer needs a running GUI. None here = the app simply stays
+    // headless (the spawn above already succeeded).
+    const ipc_client = @import("ipc/client.zig");
+    if (ipc_client.resolveSocket(allocator, null)) |gui_sock| {
+        allocator.free(gui_sock);
+    } else {
+        headlessNotice(name, host_spec);
+        return 0;
+    }
+
     // The GUI attaches with its own connection and owns the session
     // from here — over the same transport, so UDP sessions roam.
     const attach_host = host_spec;
     if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, attach_host, true)) {
         // guiCommand already printed the specific reason (e.g. "no
         // running sketerm window found", or "attach failed: no such
-        // session"). Add the likely cause + the manual fallback.
-        errMsg(
-            "couldn't display '{s}' on {s} (reason above). A 'no such session' right after spawn usually means the command exited on the host — the command + paths run THERE, so use host-absolute paths (no client-side ~). Manual attach: sketerm mux {s} attach {s}",
-            .{ name, attach_host, attach_host, name },
-        );
-        return 1;
+        // session"); the session itself is unaffected by a failed
+        // viewer attach.
+        headlessNotice(name, attach_host);
+        return 0;
     }
     std.debug.print("sketerm: app session '{s}' on {s} over {s} — windows render via the sketerm GUI\n", .{ name, remote.host, @tagName(conn.transport) });
     return 0;
@@ -228,6 +262,19 @@ test "remoteapp: parseArgs handles --gpu (any order, pass-through after host)" {
     const r = parseArgs(&trailing).?;
     try std.testing.expect(!r.gpu);
     try std.testing.expectEqualStrings("--gpu", r.command[1]);
+}
+
+test "remoteapp: parseArgs handles --headless (any order, pass-through after host)" {
+    const h = [_][]const u8{ "--headless", "box", "app" };
+    const p = parseArgs(&h).?;
+    try std.testing.expect(p.headless and !p.udp);
+    const mixed = [_][]const u8{ "-u", "--headless", "--gpu", "box", "app" };
+    const q = parseArgs(&mixed).?;
+    try std.testing.expect(q.headless and q.udp and q.gpu);
+    const trailing = [_][]const u8{ "box", "app", "--headless" };
+    const r = parseArgs(&trailing).?;
+    try std.testing.expect(!r.headless);
+    try std.testing.expectEqualStrings("--headless", r.command[1]);
 }
 
 test "remoteapp: parseArgs rejects missing command / help" {

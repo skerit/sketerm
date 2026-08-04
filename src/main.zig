@@ -88,11 +88,25 @@ const HELP_TEXT =
     \\                         Needs key auth + sketerm-mux on the
     \\                         host; survives disconnects (reattach
     \\                         with `sketerm mux <host>`).
+    \\  sketerm run [--size WxH] <command...>
+    \\                         Run a GUI app headlessly against a
+    \\                         private Wayland display (no screen
+    \\                         needed) — the Xvfb/xvfb-run
+    \\                         replacement. Inherits stdio, waits,
+    \\                         exits with the command's status;
+    \\                         rootless X11 via Xwayland when
+    \\                         installed. Sugar for `sketerm-mux
+    \\                         display run -- <command...>`; see
+    \\                         `sketerm-mux display --help` for
+    \\                         persistent displays.
     \\  sketerm app [-u] <host> <command...>
-    \\                         Run a remote GUI app with its windows
-    \\                         on this desktop (this sketerm window
-    \\                         renders them). Needs key auth and
-    \\                         sketerm-mux on the remote.
+    \\                         Run a GUI app on <host> (localhost
+    \\                         works) with its windows on this
+    \\                         desktop (this sketerm window renders
+    \\                         them); with no window open it keeps
+    \\                         running headlessly for a later attach.
+    \\                         Needs key auth and sketerm-mux on the
+    \\                         remote.
     \\                         -u: force encrypted roaming UDP instead
     \\                         of automatic UDP/SSH selection.
     \\  sketerm files [spec]   File browser as its OWN application
@@ -304,6 +318,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(m_args);
         for (argv[2..], 0..) |a, n| m_args[n] = std.mem.span(a);
         return @import("fsmount.zig").run(allocator, m_args);
+    }
+
+    // `sketerm run [opts] <command...>` — xvfb-run-shaped synchronous
+    // headless GUI run: sugar for `sketerm-mux display run [opts] --
+    // <command...>` (the `--` is inserted when absent). No
+    // GApplication; exits with the command's status.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "run")) {
+        const rest = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(rest);
+        for (argv[2..], 0..) |a, n| rest[n] = std.mem.span(a);
+        const display = @import("mux/display.zig");
+        var full: std.ArrayList([]const u8) = .empty;
+        defer full.deinit(allocator);
+        full.append(allocator, "run") catch return 1;
+        if (display.runCommandStart(rest)) |start| {
+            full.appendSlice(allocator, rest[0..start]) catch return 1;
+            full.append(allocator, "--") catch return 1;
+            full.appendSlice(allocator, rest[start..]) catch return 1;
+        } else {
+            full.appendSlice(allocator, rest) catch return 1;
+        }
+        return display.run(allocator, full.items);
     }
 
     // `sketerm doctor [host]` — health check; socket-only, no
