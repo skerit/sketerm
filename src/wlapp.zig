@@ -23,6 +23,7 @@ const wlpipe = @import("wlhost/pipe.zig");
 const picker = @import("ui/picker.zig");
 const fpicker = @import("filebrowser/picker.zig");
 const pathZ = @import("util/pathz.zig").pathZ;
+const imhost = @import("ui/imhost.zig");
 
 /// Pending "where do I put this blob?" pick. The encoded bytes are
 /// captured before the picker opens, so they outlive the app window.
@@ -358,9 +359,11 @@ pub const AppHost = struct {
         /// so the IM context can be attached when text-input activates.
         key_ctl: ?*c.GtkEventControllerKey = null,
         embed_key_ctl: ?*c.GtkEventControllerKey = null,
-        /// Host IM context; its "commit" ships text_commit intents
-        /// while the app has an enabled text input.
-        im: ?*c.GtkIMContext = null,
+        /// Host IM (imhost.zig); its commit callback ships
+        /// text_commit intents while the app has an enabled text
+        /// input. Created lazily on the first enable, then kept and
+        /// merely routed/unrouted (see applyImRouting).
+        im: ?*imhost.ImHost = null,
 
         /// Store the icon texture and apply it (needs the surface;
         /// onWinRealize re-applies). Takes ownership of one ref.
@@ -744,7 +747,9 @@ pub const AppHost = struct {
             w.*.cancelOpaqueResize();
             if (w.*.app_id) |aid| self.allocator.free(aid);
             if (w.*.icon_tex) |tex| c.g_object_unref(tex);
-            if (w.*.im) |im| c.g_object_unref(im);
+            // Before gtk_window_destroy below: severing the IM
+            // reaches into the client widget's settings.
+            if (w.*.im) |im| im.deinit();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -2004,6 +2009,10 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         win.host.seatKbdEnter(win.surface);
+        // Without focus_in the IM never enables (Wayland
+        // text-input-v3) and GtkIMContextSimple keeps no dead-key
+        // state — GtkEventControllerKey does not drive this.
+        if (win.im) |im| im.focusIn();
         // Fresh offer per focus: the host clipboard may have changed
         // while the app was unfocused. Empty clipboards just paste
         // empty (the async read answers honestly either way).
@@ -2017,6 +2026,7 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         win.host.seatKbdLeave();
+        if (win.im) |im| im.focusOut();
         win.host.flushHost();
     }
 
@@ -2385,22 +2395,34 @@ pub const AppHost = struct {
     /// and on state flips).
     fn applyImRouting(self: *AppHost, win: *Win) void {
         if (self.text_active and win.im == null) {
-            const im = c.gtk_im_multicontext_new();
-            _ = c.g_signal_connect_data(@ptrCast(im), "commit", @ptrCast(&onImCommit), win, null, 0);
-            win.im = im;
+            // `.app_host` under `input_method = auto` resolves to
+            // GtkIMContextSimple unless the session declares a real
+            // input method: this used to be an unconditional
+            // multicontext, so a forwarded app lost every dead key
+            // unless the HOST compositor's IME composed for it.
+            win.im = imhost.ImHost.attach(
+                self.allocator,
+                @ptrCast(win.window),
+                null,
+                .app_host,
+                .{ .ctx = @ptrCast(win), .on_commit = onImCommit },
+            ) catch null;
         }
-        const im: ?*c.GtkIMContext = if (self.text_active) win.im else null;
-        if (win.key_ctl) |k| c.gtk_event_controller_key_set_im_context(k, im);
-        if (win.embed_key_ctl) |k| c.gtk_event_controller_key_set_im_context(k, im);
+        const im = win.im orelse return;
+        // Idempotent (addController de-dups) — this runs on every
+        // controller creation as well as on state flips.
+        if (win.key_ctl) |k| im.addController(k);
+        if (win.embed_key_ctl) |k| im.addController(k);
+        im.setEnabled(self.text_active);
     }
 
     /// Host IM committed text (IME result, compose, dead keys) —
     /// deliver it via zwp_text_input_v3.commit_string.
-    fn onImCommit(_: ?*c.GtkIMContext, str: ?[*:0]const u8, user: ?*anyopaque) callconv(.c) void {
+    fn onImCommit(user: ?*anyopaque, text: []const u8) void {
         const win = cast.userData(Win, user);
-        const text = str orelse return;
+        if (text.len == 0) return;
         win.host.stampNow();
-        win.host.textCommitIntent(std.mem.span(text));
+        win.host.textCommitIntent(text);
         win.host.flushHost();
     }
 

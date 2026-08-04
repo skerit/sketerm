@@ -1014,6 +1014,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(input_group)), "Input");
     addSwitchRow(@ptrCast(@alignCast(input_group)), ctx, "Bracketed paste", "Wrap pasted text in DECSET 2004 markers.", &ctx.cfg.bracketed_paste, applyOnly);
     addModifyOtherKeysRow(@ptrCast(@alignCast(input_group)), ctx);
+    addInputMethodRow(@ptrCast(@alignCast(input_group)), ctx);
     addEntryRowString(@ptrCast(@alignCast(input_group)), ctx, "Word characters", "Chars considered part of a word for double-click selection.", &ctx.cfg.word_chars, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(input_group)), ctx, "Smart copy", "Ctrl+Shift+C with no selection forwards Ctrl+C.", &ctx.cfg.smart_copy, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(input_group)));
@@ -1129,6 +1130,43 @@ fn addModifyOtherKeysRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 
 fn modifyOtherKeysSelected(ctx: *Ctx, idx: c_uint) void {
     ctx.cfg.modify_other_keys = @intCast(@min(idx, 2));
+    ctx.ev();
+}
+
+/// `input_method`: no value gives both dead keys and CJK input
+/// methods, so the row says which one it trades away.
+fn addInputMethodRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{
+        "Automatic",
+        "Compose / dead keys (no IME)",
+        "System input method (IME; dead keys need compositor support)",
+    });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Input method");
+    c.adw_action_row_set_subtitle(
+        @ptrCast(@alignCast(row)),
+        "Automatic: terminal always composes; editor and forwarded apps use your IME when one is configured",
+    );
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    const initial: c_uint = switch (ctx.cfg.input_method) {
+        .auto => 0,
+        .simple => 1,
+        .multi => 2,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = inputMethodSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn inputMethodSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.input_method = switch (idx) {
+        1 => .simple,
+        2 => .multi,
+        else => .auto,
+    };
     ctx.ev();
 }
 

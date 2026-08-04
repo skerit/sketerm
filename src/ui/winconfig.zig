@@ -629,6 +629,12 @@ pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
     var old_cfg = self.config;
     defer old_cfg.deinit();
     self.config = cloned;
+    // IM strategy is app-level; faces read it at construction time.
+    @import("imhost.zig").setPreference(switch (self.config.input_method) {
+        .auto => .auto,
+        .simple => .simple,
+        .multi => .multi,
+    });
 
     // Background layer: only re-decode when one of its keys
     // actually moved (image decode is not keystroke-cheap).

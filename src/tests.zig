@@ -54,6 +54,7 @@ comptime {
     _ = @import("parser/iterm_image.zig");
     _ = @import("parser/kitty_image.zig");
     _ = @import("ui/input.zig");
+    _ = @import("ui/imhost.zig");
     _ = @import("ui/tree.zig");
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
