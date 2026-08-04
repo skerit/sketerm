@@ -36,7 +36,6 @@ struct timespec { long tv_sec; long tv_nsec; };
 #include <sys/prctl.h>    /* satellite dies with its owning daemon */
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <sys/inotify.h> /* fsserve: live directory-view deltas */
-#include <sys/xattr.h>   /* fsserve: user.sketerm.tags file tags */
 #include <linux/fuse.h>  /* fsmount: pure-Zig /dev/fuse client */
 #include <sys/uio.h>     /* fsmount: writev for big read replies */
 #include <pty.h>         /* openpty/forkpty live here on glibc/musl */
@@ -54,6 +53,10 @@ int forkpty(int *amaster, char *name,
 int login_tty(int fd);
 #include <sys/random.h>  /* macOS: getentropy lives here */
 #endif
+/* Extended attributes (fsserve: user.sketerm.tags file tags).
+ * Both glibc/musl and Darwin ship <sys/xattr.h>; the FUNCTIONS
+ * differ (l*xattr vs an options flag), which platform.zig hides. */
+#include <sys/xattr.h>
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
