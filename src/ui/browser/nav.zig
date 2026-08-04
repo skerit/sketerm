@@ -1417,6 +1417,10 @@ pub fn idleAfterSwitch(user: ?*anyopaque) callconv(.c) c.gboolean {
     if (self.currentTab()) |t| {
         c.gtk_toggle_button_set_active(self.hidden_toggle, @intFromBool(t.show_hidden));
         self.syncPathEntry(t);
+        // The overlay is per VIEW, not per tab: the newly selected tab
+        // shows another root, so its own status has to be asked for
+        // (the recency cache makes a flip back to a just-left tab free).
+        self.refreshGitOverlay(t);
         self.renderTab(t);
     }
     self.updatePreview();
