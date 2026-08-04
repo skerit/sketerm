@@ -106,12 +106,21 @@ pub const Document = struct {
     typing: ?Typing,
     /// Pre-edit hooks; see `EditObserver`. Not owned.
     ///
-    /// A fixed pair rather than a list: the subscriber set is static
-    /// (the incremental highlighter, and the editor's position anchors
-    /// for code folding) and this fires on every keystroke, so an
-    /// allocation here would be a hot-path cost for no flexibility
-    /// anyone needs.
-    observers: [2]?EditObserver = .{ null, null },
+    /// A fixed array rather than a list: the subscriber set is static
+    /// and this fires on every keystroke, so an allocation here would
+    /// be a hot-path cost for no flexibility anyone needs. Three slots,
+    /// one per subscriber that genuinely needs PRE-edit coordinates:
+    ///
+    ///   0. the incremental syntax highlighter (Tree-sitter's
+    ///      `old_end_point` is unrecoverable after the fact),
+    ///   1. the editor's fold anchors,
+    ///   2. the LSP client, which needs the `didChange` range in the
+    ///      coordinates the server still holds, and carries the
+    ///      diagnostics' anchors through the same edit.
+    ///
+    /// Growing this is the supported way to add a subscriber; a
+    /// fourth one bumps the array, it does not fork the mechanism.
+    observers: [3]?EditObserver = .{ null, null, null },
     /// The history entry the last undo/redo consumed, kept alive only
     /// so the `Change` handed back can point at its buffers. Freed at
     /// the next mutation.
@@ -213,7 +222,7 @@ pub const Document = struct {
     }
 
     pub fn clearObservers(self: *Document) void {
-        self.observers = .{ null, null };
+        self.observers = .{ null, null, null };
     }
 
     pub fn isDirty(self: *const Document) bool {
