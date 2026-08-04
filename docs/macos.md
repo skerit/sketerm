@@ -189,7 +189,10 @@ was needed — pkgconf's defaults cover the brew prefix.
   `connectLocalAutostart` because the rig's own daemon was not
   listening yet. Two daemons racing for one isolated socket is a very
   plausible source of a dropped client connection, and it is a leak
-  regardless: nothing may orphan daemons by design.
+  regardless: nothing may orphan daemons by design. They also ignored
+  SIGTERM and needed SIGKILL, so they are WEDGED rather than merely
+  unparented — a daemon stuck somewhere that never reaches its signal
+  handling is itself a good candidate for whatever drops the client.
   Next steps: have the rig record and reap any daemon the GUI
   autostarts (or wait for its own socket before launching the GUI), and
   preserve the runtime dir (it is `removeTreeBestEffort`'d on exit) so
