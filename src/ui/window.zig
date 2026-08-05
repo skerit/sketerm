@@ -3151,6 +3151,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
         .launch_remote_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .prefs_open => self.openPrefs(),
+        .search => self.openSearch(),
         else => {},
     }
 }

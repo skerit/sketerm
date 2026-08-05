@@ -528,6 +528,7 @@ pub const Pane = struct {
             ictx.autohide_set = setCursorHiddenSink;
             ictx.browser_toggle = toggleBrowserFaceSink;
             ictx.editor_toggle = toggleEditorFaceSink;
+            ictx.context_menu = contextMenuAtCursorSink;
         }
 
         // Resize → TIOCSWINSZ → SIGWINCH child.
@@ -670,8 +671,60 @@ pub const Pane = struct {
                 launchUri(uri);
                 return true;
             },
+            // These three already exist as keybind actions. Delegating
+            // keeps ONE implementation each: a menu row and its chord
+            // can never drift apart.
+            .select_all => {
+                const ictx = self.input_ctx orelse return true;
+                _ = input.runAction(ictx, .select_all);
+                self.a11yNudge();
+                return true;
+            },
+            .select_output => {
+                const ictx = self.input_ctx orelse return true;
+                _ = input.runAction(ictx, .select_command_output);
+                self.a11yNudge();
+                return true;
+            },
+            .clear_scrollback => {
+                const ictx = self.input_ctx orelse return true;
+                _ = input.runAction(ictx, .clear_scrollback);
+                return true;
+            },
             else => return false,
         }
+    }
+
+    /// Widget-local pixel position of the text cursor's BOTTOM-left
+    /// corner — the anchor a keyboard-opened context menu points at,
+    /// chosen so the popover hangs below the caret instead of over it.
+    ///
+    /// Inverse of `cellAt`: the grid and `pad` are in physical
+    /// framebuffer pixels, GTK coordinates are logical, so divide the
+    /// scale factor back out.
+    fn cursorAnchor(self: *Pane) struct { x: f64, y: f64 } {
+        const atlas = self.atlas orelse return .{ .x = 0, .y = 0 };
+        const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (scale == 0) return .{ .x = 0, .y = 0 };
+        const pad: f64 = @floatCast(self.grid_pass.pad);
+        const screen = self.terminal.screen;
+        // The cursor is addressed against the LIVE screen; scrolled
+        // back, its on-screen row shifts down by the view offset.
+        const visible_row: f64 =
+            @as(f64, @floatFromInt(screen.row)) + @as(f64, @floatFromInt(screen.view_offset));
+        const px = pad + @as(f64, @floatFromInt(screen.col)) * @as(f64, @floatFromInt(atlas.cell_w));
+        const py = pad + (visible_row + 1.0) * @as(f64, @floatFromInt(atlas.cell_h));
+        return .{ .x = px / scale, .y = py / scale };
+    }
+
+    /// Wired into input.zig's `context_menu`: the Menu key / Shift+F10
+    /// path. Pops the SAME popover a right-click does, anchored at the
+    /// caret, and runs the same pre-popup hook — so link rows, session
+    /// rows and every sensitivity below reflect current state.
+    fn contextMenuAtCursorSink(ctx: ?*anyopaque) bool {
+        const self = cast.userData(Pane, ctx);
+        const at = self.cursorAnchor();
+        return menu.popupAt(@ptrCast(self.area), at.x, at.y);
     }
 
     /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
@@ -2642,11 +2695,25 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     // row against A.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
 
-    // "Copy Command Output" greys out until a completed OSC 133
-    // command zone is reachable.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-output")) |act| {
-        const avail = self.terminal.screen.lastCommandOutputAvailable();
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(avail));
+    // "Copy" and "Select Command Output" / "Copy Command Output" grey
+    // out rather than silently doing nothing. Copy reads the SAME
+    // selection model the mouse drives (word / line / rectangular all
+    // set `selection.mode`), so there is no second notion of "what is
+    // selected" here.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "copy")) |act| {
+        const has_sel = screen.selection.isActive();
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(has_sel));
+    }
+    const output_avail = screen.lastCommandOutputAvailable();
+    for ([_][*:0]const u8{ "copy-output", "select-output" }) |name| {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(output_avail));
+        }
+    }
+    // Nothing in the ring → nothing to clear, and Select All would
+    // produce the same selection as selecting the screen.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "clear-scrollback")) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(screen.scrollbackCount() > 0));
     }
 
     // The Session submenu splits into two independent conditions:

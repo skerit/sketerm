@@ -25,6 +25,10 @@ pub const Ctx = struct {
     /// Swap the pane's editor and terminal faces. @return false when
     /// the pane has no editor face, so the key falls through.
     editor_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Pop the pane's context menu at the text cursor (keyboard path:
+    /// Menu / Shift+F10). @return false when the pane has no menu
+    /// attached yet, so the key falls through to the child.
+    context_menu: ?*const fn (ctx: ?*anyopaque) bool = null,
     /// Optional shortcut sink for tab/split/etc actions. May be null
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
@@ -214,6 +218,14 @@ pub const Action = enum {
     copy_mode,
     /// Toggle zooming the focused pane to fill its tab (tmux z).
     zoom_pane,
+    /// Select the whole buffer (scrollback ring + visible screen) in
+    /// the terminal's own line-select mode, so Copy / the selection
+    /// highlight behave exactly as they do for a mouse drag.
+    select_all,
+    /// Open the pane's right-click context menu from the keyboard,
+    /// anchored at the text cursor. Bound to the Menu key and
+    /// Shift+F10 (the two cross-desktop conventions).
+    context_menu,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -293,6 +305,13 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_down },
     .{ .keyval = c.GDK_KEY_Home, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .scrollback_top },
     .{ .keyval = c.GDK_KEY_End, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .scrollback_bottom },
+    // Keyboard access to the context menu. Both conventions are bound:
+    // the dedicated Menu key (which has no terminal encoding of its
+    // own, so nothing is lost) and Shift+F10 (which DOES have one —
+    // CSI 21;2~ — and is shadowed here; rebind or clear
+    // `keybind.context_menu` if an app needs it).
+    .{ .keyval = c.GDK_KEY_Menu, .mods = 0, .action = .context_menu },
+    .{ .keyval = c.GDK_KEY_F10, .mods = c.GDK_SHIFT_MASK, .action = .context_menu },
 };
 
 /// Match a (keyval, modifier_state) against the binding table. Returns
@@ -388,6 +407,8 @@ pub fn actionName(a: Action) []const u8 {
         .hints_open => "hints_open",
         .copy_mode => "copy_mode",
         .zoom_pane => "zoom_pane",
+        .select_all => "select_all",
+        .context_menu => "context_menu",
     };
 }
 
@@ -471,6 +492,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .hints_open => "Keyboard hints (open/copy URLs, paths, hashes)",
         .copy_mode => "Copy mode (keyboard selection)",
         .zoom_pane => "Zoom pane (fill the tab; toggle)",
+        .select_all => "Select all (scrollback + screen)",
+        .context_menu => "Open the context menu at the cursor",
     };
 }
 
@@ -731,6 +754,23 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         .toggle_editor_face => {
             const flip = ctx.editor_toggle orelse return 0;
             return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
+        .context_menu => {
+            const show = ctx.context_menu orelse return 0;
+            return if (show(ctx.pane_ctx)) 1 else 0;
+        },
+        .select_all => {
+            const screen = ctx.terminal.screen;
+            // line_select over [-scrollbackCount .. rows-1] is exactly
+            // what a full-height mouse drag in line mode produces, so
+            // extractSelection / the highlight need no special case.
+            const back: i32 = @intCast(screen.scrollbackCount());
+            const last_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
+            screen.selection.start(-back, 0, .line_select);
+            screen.selection.extend(last_row, @intCast(screen.cols));
+            screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
+            return 1;
         },
         .paste_clipboard => {
             clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
