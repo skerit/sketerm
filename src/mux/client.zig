@@ -225,6 +225,10 @@ pub const Conn = struct {
     udp_tickets: bool = false,
     /// Display output geometry and guarded display-only kill requests.
     display_v2: bool = false,
+    /// Daemon answers `lsp_open` (welcome capability): it can spawn a
+    /// language server near the files and bridge its stdio as a byte
+    /// channel. Absent = degrade silently, like a missing server.
+    lsp_support: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -358,6 +362,7 @@ pub const Conn = struct {
         self.durable_copy = false;
         self.copy_no_replace = false;
         self.display_v2 = false;
+        self.lsp_support = false;
         self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
@@ -369,6 +374,7 @@ pub const Conn = struct {
             durable_copy: bool = false,
             copy_no_replace: bool = false,
             display_v2: bool = false,
+            lsp: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -386,6 +392,7 @@ pub const Conn = struct {
             self.durable_copy = parsed.value.durable_copy;
             self.copy_no_replace = parsed.value.copy_no_replace;
             self.display_v2 = parsed.value.display_v2;
+            self.lsp_support = parsed.value.lsp;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
