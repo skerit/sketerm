@@ -12,8 +12,13 @@
 //!   visual LEFT edge of its cluster; no split-caret at bidi
 //!   boundaries.
 //! - Tabs inside RTL bidi runs advance in visual order like LTR tabs.
-//! - Soft wrap breaks at grapheme-cluster boundaries in VISUAL order
-//!   (no word wrap, and a bidi line wraps by visual runs).
+//! - Soft wrap walks clusters in VISUAL order (a bidi line wraps by
+//!   visual runs). With `wrap_words` it breaks at the last UAX #14
+//!   opportunity on the row (editor/linebreak.zig) and falls back to
+//!   the overflowing cluster only when one unbreakable token exceeds
+//!   the width; whitespace clusters hang past the wrap column. For an
+//!   RTL run the opportunity is tested at the LOGICAL seam between the
+//!   visually adjacent clusters, which is the cluster's byte_end.
 //! - Clusters whose start is not a grapheme boundary merge into their
 //!   visually-previous cluster so a caret can never land inside a
 //!   grapheme.
@@ -68,6 +73,7 @@ const FontBook = font_mod.FontBook;
 const StyleSpan = font_mod.StyleSpan;
 const bidi = @import("../grid/bidi.zig");
 const unicode = @import("../editor/unicode.zig");
+const linebreak = @import("../editor/linebreak.zig");
 const Document = @import("../editor/document.zig").Document;
 const syntax = @import("../editor/syntax.zig");
 const theme_mod = @import("../editor/theme.zig");
@@ -166,6 +172,11 @@ pub const Layout = struct {
     tab_cols: u16 = 4,
     /// Soft wrap width in px (null = no wrap).
     wrap_width: ?f32 = null,
+    /// Prefer UAX #14 break opportunities (editor/linebreak.zig) over
+    /// raw cluster boundaries; a token wider than the wrap width still
+    /// falls back to a mid-token cluster break. Changing it needs
+    /// `invalidateAll`, same contract as `wrap_width`.
+    wrap_words: bool = true,
     /// Syntax highlighter for this document (null = plain text). Owned
     /// by the caller and allowed to lag the document — a stale one is
     /// simply not consulted.
@@ -509,19 +520,45 @@ pub const Layout = struct {
             }
         }
 
-        // Soft wrap: greedy walk in visual order, breaking before the
-        // cluster that would overflow (unless it is the row's first).
+        // Soft wrap: greedy walk in visual order. With `wrap_words` on,
+        // prefer the last UAX #14 break opportunity seen on the row and
+        // fall back to a cluster boundary only when a single unbreakable
+        // token exceeds the width. Whitespace clusters never trigger a
+        // wrap — trailing spaces hang past the wrap column.
         var rows: std.ArrayList(WrapRow) = .empty;
         errdefer rows.deinit(alloc);
         {
             var row_x0: f32 = 0;
             var row_idx: u32 = 0;
-            for (merged.items) |*cl| {
+            var row_start: usize = 0; // first cluster index of the row
+            var last_opp: ?usize = null; // break opportunity within this row
+            for (merged.items, 0..) |*cl, i| {
                 if (self.wrap_width) |ww| {
-                    if (cl.x1 - row_x0 > ww and cl.x0 > row_x0) {
-                        try rows.append(alloc, .{ .x0 = row_x0, .x1 = cl.x0 });
-                        row_x0 = cl.x0;
+                    if (self.wrap_words and i > row_start and
+                        breakAllowedBefore(text, merged.items, i))
+                        last_opp = i;
+                    const is_ws = clusterIsWhitespace(text, cl.*);
+                    while (!is_ws and cl.x1 - row_x0 > ww and cl.x0 > row_x0) {
+                        var brk = i;
+                        if (last_opp) |o| {
+                            if (o > row_start) brk = o;
+                        }
+                        if (brk <= row_start) break;
+                        try rows.append(alloc, .{ .x0 = row_x0, .x1 = merged.items[brk].x0 });
+                        row_x0 = merged.items[brk].x0;
                         row_idx += 1;
+                        for (merged.items[brk..i]) |*moved| moved.row = row_idx;
+                        row_start = brk;
+                        // Re-derive the opportunity set for the clusters
+                        // now on the fresh row (the still-overflowing
+                        // token may contain one, e.g. after a hyphen).
+                        last_opp = null;
+                        if (self.wrap_words) {
+                            var j = brk + 1;
+                            while (j <= i) : (j += 1) {
+                                if (breakAllowedBefore(text, merged.items, j)) last_opp = j;
+                            }
+                        }
                     }
                 }
                 cl.row = row_idx;
@@ -559,6 +596,28 @@ pub const Layout = struct {
             .n_runs = n_runs,
             .n_notdef = n_notdef,
         };
+    }
+
+    /// True when every byte of the cluster is a space or tab — those
+    /// hang past the wrap column instead of forcing a wrap.
+    fn clusterIsWhitespace(text: []const u8, cl: Cluster) bool {
+        if (cl.byte_start >= cl.byte_end or cl.byte_end > text.len) return false;
+        for (text[cl.byte_start..cl.byte_end]) |b| {
+            if (b != ' ' and b != '\t') return false;
+        }
+        return true;
+    }
+
+    /// UAX #14 permission to start a row at visual cluster `i`. The
+    /// seam between a cluster and its visually-previous one is the
+    /// cluster's byte_start in forward (LTR) flow and its byte_end in
+    /// reverse (RTL) flow, where the visual-left neighbour is the
+    /// logically-NEXT text.
+    fn breakAllowedBefore(text: []const u8, clusters: []const Cluster, i: usize) bool {
+        const cl = clusters[i];
+        const prev = clusters[i - 1];
+        const seam: usize = if (prev.byte_start <= cl.byte_start) cl.byte_start else cl.byte_end;
+        return linebreak.isBreakOpportunity(text, seam);
     }
 
     const PieceStats = struct { runs: usize, notdef: usize };
@@ -928,7 +987,8 @@ test "layout: wrap segmentation covers the line and fits the width" {
         try testing.expectApproxEqAbs(prev_x1, r.x0, 0.01);
         prev_x1 = r.x1;
     }
-    // Cluster rows are non-decreasing and match their row's x range.
+    // Cluster rows are non-decreasing and match their row's x range
+    // (whitespace clusters may hang past the width; none exist here).
     var prev_row: u32 = 0;
     for (ll.clusters) |cl| {
         try testing.expect(cl.row >= prev_row);
@@ -940,6 +1000,194 @@ test "layout: wrap segmentation covers the line and fits the width" {
     for (ll.glyphs) |g| {
         try testing.expect(g.row < ll.rows.len);
     }
+}
+
+/// First cluster (in visual order) of wrap row `row`, or null.
+fn firstClusterOfRow(ll: *const LaidLine, row: u32) ?Cluster {
+    for (ll.clusters) |cl| {
+        if (cl.row == row) return cl;
+    }
+    return null;
+}
+
+test "layout: word wrap breaks after spaces, not mid-word" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var probe = try Document.initFromBytes(a, "alpha beta");
+    defer probe.deinit();
+    const w2 = (try rig.layout.line(&probe, 0)).width;
+
+    var doc = try Document.initFromBytes(a, "alpha beta gamma delta epsilon zeta");
+    defer doc.deinit();
+    rig.layout.wrap_width = w2 + 1.0; // two words per row
+    rig.layout.invalidateAll();
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expect(ll.rows.len >= 2);
+    // Every continuation row starts right after a space — a permitted
+    // break — never inside a word.
+    var r: u32 = 1;
+    while (r < ll.rows.len) : (r += 1) {
+        const first = firstClusterOfRow(ll, r).?;
+        try testing.expect(first.byte_start > 0);
+        try testing.expectEqual(@as(u8, ' '), ll.text[first.byte_start - 1]);
+        try testing.expect(ll.text[first.byte_start] != ' ');
+    }
+}
+
+test "layout: anywhere-wrap mode restores the cluster-boundary break" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var probe = try Document.initFromBytes(a, "alpha beta");
+    defer probe.deinit();
+    const w2 = (try rig.layout.line(&probe, 0)).width;
+
+    var doc = try Document.initFromBytes(a, "alpha beta gamma delta epsilon zeta");
+    defer doc.deinit();
+    rig.layout.wrap_width = w2 + 1.0;
+    rig.layout.wrap_words = false;
+    rig.layout.invalidateAll();
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expect(ll.rows.len >= 2);
+    // Anywhere-wrap fills every row to the width: no non-space cluster
+    // may overflow, and at least one continuation row starts mid-word.
+    var mid_word = false;
+    var r: u32 = 1;
+    while (r < ll.rows.len) : (r += 1) {
+        const first = firstClusterOfRow(ll, r).?;
+        if (first.byte_start > 0 and ll.text[first.byte_start - 1] != ' ') mid_word = true;
+    }
+    try testing.expect(mid_word);
+}
+
+test "layout: trailing spaces hang past the wrap column" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var bare = try Document.initFromBytes(a, "abcd");
+    defer bare.deinit();
+    const w_bare = (try rig.layout.line(&bare, 0)).width;
+
+    rig.layout.wrap_width = w_bare + 2.0;
+    rig.layout.invalidateAll();
+    var doc = try Document.initFromBytes(a, "abcd        ");
+    defer doc.deinit();
+    const ll = try rig.layout.line(&doc, 0);
+    // The spaces extend far past the wrap width yet force no wrap.
+    try testing.expectEqual(@as(usize, 1), ll.rows.len);
+    try testing.expect(ll.clusters[ll.clusters.len - 1].x1 > rig.layout.wrap_width.?);
+
+    // A word AFTER those spaces still wraps (spaces hang, text does not).
+    rig.layout.invalidateAll();
+    var doc2 = try Document.initFromBytes(a, "abcd        xy");
+    defer doc2.deinit();
+    const ll2 = try rig.layout.line(&doc2, 0);
+    try testing.expectEqual(@as(usize, 2), ll2.rows.len);
+    const cont = firstClusterOfRow(ll2, 1).?;
+    try testing.expectEqual(@as(u32, 12), cont.byte_start); // the 'x'
+}
+
+test "layout: a break is taken after a hyphen" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "aaaaaa-bbbbbb");
+    defer doc.deinit();
+    // Wide enough for "aaaaaa-" but not the whole token.
+    var probe = try Document.initFromBytes(a, "aaaaaa-b");
+    defer probe.deinit();
+    const w_probe = (try rig.layout.line(&probe, 0)).width;
+    rig.layout.wrap_width = w_probe;
+    rig.layout.invalidateAll();
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expectEqual(@as(usize, 2), ll.rows.len);
+    // The second row starts at the 'b' after the hyphen, not mid-run.
+    try testing.expectEqual(@as(u32, 7), firstClusterOfRow(ll, 1).?.byte_start);
+}
+
+test "layout: an unbreakable token falls back to a cluster break" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "ab supercalifragilisticexpialidocious");
+    defer doc.deinit();
+    rig.layout.wrap_width = 70;
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expect(ll.rows.len >= 3);
+    // Row 1 starts at the word (the permitted break)…
+    try testing.expectEqual(@as(u32, 3), firstClusterOfRow(ll, 1).?.byte_start);
+    // …and later rows are mid-word fallbacks that still fit the width.
+    var r: u32 = 2;
+    while (r < ll.rows.len) : (r += 1) {
+        const first = firstClusterOfRow(ll, r).?;
+        try testing.expect(ll.text[first.byte_start - 1] != ' ');
+    }
+    for (ll.clusters) |cl| {
+        try testing.expect(cl.x1 - ll.rows[cl.row].x0 <= 70.0 + 0.01);
+    }
+}
+
+test "layout: CJK wraps between ideographs and fills the width" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    // 12 ideographs, no spaces anywhere.
+    var doc = try Document.initFromBytes(a, "\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{6587}\u{7AE0}\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{6587}\u{7AE0}");
+    defer doc.deinit();
+    const one = try rig.layout.line(&doc, 0);
+    const cjk_w = one.clusters[0].x1 - one.clusters[0].x0;
+    if (cjk_w <= 0.5) return error.SkipZigTest; // no CJK-capable font
+    // Room for 4 characters per row.
+    rig.layout.wrap_width = cjk_w * 4.0 + 1.0;
+    rig.layout.invalidateAll();
+    const ll = try rig.layout.line(&doc, 0);
+    // Neither one character per row nor a line that never wraps: the
+    // scriptless text still fills each row.
+    try testing.expectEqual(@as(usize, 3), ll.rows.len);
+    var counts = [_]usize{0} ** 3;
+    for (ll.clusters) |cl| {
+        counts[cl.row] += 1;
+        try testing.expect(cl.x1 - ll.rows[cl.row].x0 <= rig.layout.wrap_width.? + 0.01);
+    }
+    try testing.expectEqualSlices(usize, &.{ 4, 4, 4 }, &counts);
+}
+
+test "layout: an inlay hint moves the wrap break" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "alpha beta gamma delta");
+    defer doc.deinit();
+    rig.layout.wrap_width = 110;
+    const plain = try rig.layout.line(&doc, 0);
+    const plain_rows = plain.rows.len;
+    const plain_break = if (plain_rows > 1) firstClusterOfRow(plain, 1).?.byte_start else 0;
+
+    // A fat hint before "beta" pushes everything after it right, so
+    // the same width must now break earlier (or make more rows).
+    const hints = [_]InlayHint{.{ .offset = 6, .text = "wwwwwwwwww" }};
+    rig.layout.hints = &hints;
+    rig.layout.hints_gen = 9;
+    defer {
+        rig.layout.hints = &.{};
+        rig.layout.hints_gen = 0;
+    }
+    const hinted = try rig.layout.line(&doc, 0);
+    try testing.expect(hinted.rows.len >= plain_rows);
+    const hinted_break = firstClusterOfRow(hinted, 1).?.byte_start;
+    try testing.expect(hinted.rows.len > plain_rows or hinted_break < plain_break);
+    // Break positions remain permitted opportunities (after a space).
+    try testing.expectEqual(@as(u8, ' '), hinted.text[hinted_break - 1]);
+    // The document byte space is untouched by the hint.
+    try testing.expectEqual(plain.clusters.len, hinted.clusters.len);
 }
 
 test "layout: highlighted glyphs carry kinds and re-lay out on parse" {
