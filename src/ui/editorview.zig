@@ -36,7 +36,10 @@
 //! Deliberate simplifications (documented, not accidental):
 //! - Soft wrap breaks at cluster boundaries, not word boundaries
 //!   (editor_layout's greedy wrap).
-//! - Find is LITERAL only — no regex (editor/search.zig).
+//! - Find is literal by default; the `.*` toggle switches the bar to
+//!   regular expressions (editor/search.zig + editor/regex.zig, which
+//!   lists the syntax and what it deliberately leaves out).
+//!   Replacements then expand `$1`..`$9` capture references.
 //! - Undo/redo is not a per-keystroke journal of the FILE: an external
 //!   reload replaces the document and its history with it.
 //! - The IME preedit is laid out in its own throwaway Document, drawn
@@ -720,7 +723,11 @@ pub const EditorView = struct {
     find_count: *c.GtkLabel = undefined,
     find_case: *c.GtkWidget = undefined,
     find_word: *c.GtkWidget = undefined,
+    find_regex: *c.GtkWidget = undefined,
     find_open: bool = false,
+    /// The needle is regex mode and did not compile; the count label
+    /// says so instead of reporting an honest-looking "No results".
+    find_bad_pattern: bool = false,
 
     // External-change banner (inline, above the canvas — never a
     // modal: it fires while the user is typing).
@@ -1862,6 +1869,11 @@ pub const EditorView = struct {
 
         self.find_case = self.toggleButton(row, "Aa", "Match case");
         self.find_word = self.toggleButton(row, "\u{2423}W", "Whole word only");
+        self.find_regex = self.toggleButton(
+            row,
+            ".*",
+            "Regular expression. Replacements expand $1..$9 (and $0 for the whole match).",
+        );
         _ = self.barButton(row, "go-up-symbolic", "Previous match (Shift+Enter)", &onFindPrevClicked);
         _ = self.barButton(row, "go-down-symbolic", "Next match (Enter)", &onFindNextClicked);
         _ = self.barButton(row, "window-close-symbolic", "Close (Escape)", &onFindCloseClicked);
@@ -2945,6 +2957,7 @@ pub const EditorView = struct {
         return .{
             .case_sensitive = c.gtk_toggle_button_get_active(@ptrCast(self.find_case)) != 0,
             .whole_word = c.gtk_toggle_button_get_active(@ptrCast(self.find_word)) != 0,
+            .regex = c.gtk_toggle_button_get_active(@ptrCast(self.find_regex)) != 0,
         };
     }
 
@@ -3005,8 +3018,14 @@ pub const EditorView = struct {
         if (tab.needle.len > 0) self.allocator.free(tab.needle);
         tab.needle = self.allocator.dupe(u8, needle) catch &.{};
         tab.clearMatches();
+        self.find_bad_pattern = false;
         if (needle.len > 0) {
-            tab.matches = search.findAll(self.allocator, &tab.doc, needle, self.findOptions()) catch &.{};
+            tab.matches = search.findAll(self.allocator, &tab.doc, needle, self.findOptions()) catch |e| blk: {
+                // A pattern the user is still typing is invalid most of
+                // the time; that is a label, not an error dialog.
+                self.find_bad_pattern = e != error.OutOfMemory;
+                break :blk &.{};
+            };
         }
         if (select and tab.matches.len > 0) {
             tab.current_match = search.pick(tab.matches, tab.sels.primary().start(), true);
@@ -3017,7 +3036,9 @@ pub const EditorView = struct {
 
     fn updateFindCount(self: *EditorView, tab: *ETab) void {
         var buf: [40:0]u8 = undefined;
-        const txt: [:0]const u8 = if (tab.matches.len == 0)
+        const txt: [:0]const u8 = if (self.find_bad_pattern)
+            "Bad pattern"
+        else if (tab.matches.len == 0)
             (if (entryText(self.find_entry).len == 0) "" else "No results")
         else if (tab.current_match) |i|
             std.fmt.bufPrintZ(&buf, "{d} of {d}", .{ i + 1, tab.matches.len }) catch ""
@@ -3060,6 +3081,15 @@ pub const EditorView = struct {
         self.queueRender();
     }
 
+    /// Compiled needle for the replace paths, or null in literal mode
+    /// (and when the pattern does not compile, which the count label
+    /// has already reported).
+    fn replaceRegex(self: *EditorView, tab: *ETab) ?search.Regex {
+        const opts = self.findOptions();
+        if (!opts.regex) return null;
+        return search.Regex.init(self.allocator, tab.needle, opts) catch null;
+    }
+
     fn replaceCurrent(self: *EditorView) void {
         const tab = self.active orelse return;
         const idx = tab.current_match orelse {
@@ -3068,7 +3098,21 @@ pub const EditorView = struct {
         };
         if (idx >= tab.matches.len) return;
         const m = tab.matches[idx];
-        const with = entryText(self.replace_entry);
+        const template = entryText(self.replace_entry);
+
+        // In regex mode the replacement is the template EXPANDED against
+        // this match's captures, so it differs per match.
+        var expanded: std.ArrayList(u8) = .empty;
+        defer expanded.deinit(self.allocator);
+        var with = template;
+        if (self.replaceRegex(tab)) |re_val| {
+            var re = re_val;
+            defer re.deinit();
+            const caps = (re.capturesAt(&tab.doc, m.start) catch null) orelse return;
+            re.expand(&tab.doc, caps, template, &expanded) catch return;
+            with = expanded.items;
+        } else if (self.findOptions().regex) return;
+
         tab.sels.keepPrimaryOnly();
         tab.sels.sels.items[0] = .{ .anchor = m.start, .head = m.end };
         vm.insertText(self.allocator, &tab.doc, &tab.sels, with) catch return;
@@ -3081,13 +3125,32 @@ pub const EditorView = struct {
         const tab = self.active orelse return;
         self.recomputeMatches(tab, false);
         if (tab.matches.len == 0) return;
-        const with = entryText(self.replace_entry);
+        const template = entryText(self.replace_entry);
         var tx = tr.Transaction.init(tab.doc.revision);
         defer tx.deinit(self.allocator);
+
+        // The transaction BORROWS its inserted slices, so every expanded
+        // replacement has to outlive the apply — hence the arena.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var re_opt = self.replaceRegex(tab);
+        defer if (re_opt) |*r| r.deinit();
+        if (re_opt == null and self.findOptions().regex) return;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
         var prev_end: usize = 0;
         var applied: usize = 0;
         for (tab.matches) |m| {
             if (m.start < prev_end) continue; // overlapping (can't happen, defensive)
+            var with = template;
+            if (re_opt) |*re| {
+                buf.clearRetainingCapacity();
+                const caps = (re.capturesAt(&tab.doc, m.start) catch null) orelse continue;
+                re.expand(&tab.doc, caps, template, &buf) catch continue;
+                with = arena.dupe(u8, buf.items) catch continue;
+            }
             tx.addReplace(self.allocator, m.start, m.end - m.start, with) catch return;
             prev_end = m.end;
             applied += 1;
@@ -3095,8 +3158,8 @@ pub const EditorView = struct {
         _ = tab.doc.applyTransactionSel(&tx, vm.snapshotOf(&tab.sels)) catch return;
         tab.sels.mapThrough(tx.edits.items, .editor);
         vm.clampSelections(&tab.doc, &tab.sels);
-        var buf: [64:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "Replaced {d} occurrence(s).", .{applied}) catch "Replaced.";
+        var msg_buf: [64:0]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&msg_buf, "Replaced {d} occurrence(s).", .{applied}) catch "Replaced.";
         self.afterDocEdit(tab);
         self.setStatus(msg.ptr);
     }

@@ -109,6 +109,82 @@ fn checkRtlLine(
     return null;
 }
 
+/// Regex search + capture-group Replace All, exactly as the find bar
+/// drives them: matches from `search.findAll`, replacements expanded
+/// per match, all of it in ONE transaction so a single undo reverts it.
+fn regexStage(allocator: std.mem.Allocator) !?u8 {
+    const SRC =
+        \\const a = call(one, two);
+        \\const b = call(three, four);
+        \\// call(x, y) in a comment too
+    ;
+    var doc = try Document.initFromBytes(allocator, SRC);
+    defer doc.deinit();
+
+    var re = search.Regex.init(allocator, "call\\((\\w+), (\\w+)\\)", .{ .case_sensitive = true }) catch |e| {
+        std.debug.print("smoke-editor: FAIL - regex compile: {s}\n", .{@errorName(e)});
+        return 12;
+    };
+    defer re.deinit();
+    const matches = try re.findAll(&doc);
+    defer allocator.free(matches);
+    if (matches.len != 3) {
+        std.debug.print("smoke-editor: FAIL - regex found {d} matches, want 3\n", .{matches.len});
+        return 12;
+    }
+
+    // A pattern that cannot compile must be an error, not silence.
+    if (search.findAll(allocator, &doc, "(unclosed", .{ .regex = true })) |m| {
+        allocator.free(m);
+        std.debug.print("smoke-editor: FAIL - invalid pattern compiled\n", .{});
+        return 12;
+    } else |_| {}
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(allocator);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (matches) |m| {
+        buf.clearRetainingCapacity();
+        const caps = (try re.capturesAt(&doc, m.start)) orelse {
+            std.debug.print("smoke-editor: FAIL - no captures at a reported match\n", .{});
+            return 12;
+        };
+        try re.expand(&doc, caps, "call($2, $1)", &buf);
+        try tx.addReplace(allocator, m.start, m.end - m.start, try arena.dupe(u8, buf.items));
+    }
+    const before = try doc.textAlloc(allocator);
+    defer allocator.free(before);
+    _ = try doc.applyTransaction(&tx);
+    const after = try doc.textAlloc(allocator);
+    defer allocator.free(after);
+    if (std.mem.indexOf(u8, after, "call(two, one)") == null or
+        std.mem.indexOf(u8, after, "call(four, three)") == null or
+        std.mem.indexOf(u8, after, "call(y, x)") == null)
+    {
+        std.debug.print("smoke-editor: FAIL - capture-group replace produced: {s}\n", .{after});
+        return 12;
+    }
+
+    // ONE undo unit: a single undo has to restore the whole document.
+    _ = try doc.undo();
+    const undone = try doc.textAlloc(allocator);
+    defer allocator.free(undone);
+    if (!std.mem.eql(u8, undone, before)) {
+        std.debug.print("smoke-editor: FAIL - replace-all was not one undo step\n", .{});
+        return 12;
+    }
+    if (doc.canUndo()) {
+        std.debug.print("smoke-editor: FAIL - replace-all left extra undo history\n", .{});
+        return 12;
+    }
+    std.debug.print("smoke-editor: PASS regex replace-all ({d} matches, one undo step)\n", .{matches.len});
+    return null;
+}
+
 fn ns2ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
@@ -914,6 +990,9 @@ pub fn main() !u8 {
             n_lines,
         },
     );
+    // ---- regex find/replace ------------------------------------------
+    if (try regexStage(allocator)) |code| return code;
+
     // ---- LSP against a REAL stub server process ----------------------
     if (try lspStage(allocator)) |code| return code;
 
