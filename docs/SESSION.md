@@ -12610,3 +12610,66 @@ tell a clean repository from a directory that is not in one (both
 answer `done` with zero records). The browser therefore shows the
 change summary it can compute and no branch. Widening that is a daemon
 change, not a browser one.
+
+## Version-control decoration, part 2: the daemon actually answers
+
+The previous entry ended by listing what `git_status` could not tell a
+browser. All of it is now on the wire.
+
+**The verb.** `runGitStatus` runs `git status --porcelain=v2 --branch
+--ignored -z` and scans it with `gitstatus.Scanner` -- the SAME parser
+the browser folds records with, so producer and consumer cannot drift
+(`src/filebrowser/gitstatus.zig`, GTK-free, in both test roots). Per
+record it emits `path` + `text` (the pre-v2 collapsed character,
+byte-identical to what the old verb produced) + `xy` (both porcelain
+columns) + `orig` (rename/copy source) + `kind:"submodule"`. After the
+records comes one `repo` event: `repo` (is this a repository at all),
+`branch`, `upstream`, `ahead`/`behind`, `detached`, `initial`, `root`
+(the browsed dir IS the repo root) and `truncated`.
+
+**Skew, both directions.** No FrameType or EventTag byte changed; the
+whole enrichment is JSON fields on the existing `fs_job` frame, and
+every parser on the path uses `ignore_unknown_fields`. A NEW browser
+against an OLD daemon sees no `repo` event -- which is exactly the
+signal it keys on (`Repo.known`), so it keeps the old branch-less
+phrasing instead of claiming "not a repository", and renders the
+collapsed `text` character as the single letter it always did. An OLD
+browser against a NEW daemon reads `path`+`text` and ignores the rest;
+the only difference in that stream is that a rename now arrives as one
+`R` record instead of a delete plus an add, and ignored entries arrive
+as `!` -- both of which the old `fromChar` already maps. Verified for
+real over `ssh localhost`, where the installed daemon predates this
+work.
+
+**`--ignored` is unconditional, and that is affordable.** Its default
+`traditional` mode collapses a wholly ignored DIRECTORY into ONE
+record, so the record count tracks the number of ignore rules that
+match, not the tree they hide. Measured on a synthetic 50k-tracked /
+50k-ignored-file repository: 0.08s and 92 records without `--ignored`,
+0.11s and 293 with (200 individually-ignored files plus one collapsed
+`build/`). The pathological shape -- 20k files ignored one by one --
+costs 0.13s and 412 KB, which the caps absorb: 4096 CHANGE records,
+8192 total, ignored emitted in a SECOND pass so truncation always
+sacrifices ignored decoration before a real change. The read cap rose
+to 1 MiB and a mid-record cut is trimmed to the last NUL and reported
+as `truncated`.
+
+**What the browser now shows.** The chip prints git's own column pair
+for a row a record named -- `M.` staged, `.M` unstaged, `MM` both,
+`??`, `UU`/`AA` for conflicts, `R.` for a rename -- with a tooltip that
+spells it out in words and names the rename source. Ignored entries
+fade (they arrive now, so that path stopped being dead code). The
+status line gained the branch: `, on main +2 -1, 3 modified`, `,
+detached at 2b4d84f8, 1 modified`, `, on main (no commits yet)`, and --
+the case that used to be invisible -- `, clean` for a clean repository,
+`, no changes here` below its root, and nothing at all outside a
+repository.
+
+**Two staleness holes closed.** A clean repository used to make the
+whole summary disappear, indistinguishable from a non-repo; it now says
+so. And a change DEEPER than the watched views raises no delta at all,
+so `gitstat.ensurePoll` re-polls a repository root on a timer paced at
+40x the last job's measured cost (20s floor, 5min ceiling), skipping a
+face that is not mapped. Focus is deliberately NOT part of that gate: a
+wrong badge in a visible unfocused window is still wrong, and window
+activation is not a state the GUI can rely on resolving.
