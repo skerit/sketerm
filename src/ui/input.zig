@@ -4,6 +4,7 @@
 //! and CSI u progressive enhancement come later.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const Terminal = @import("../terminal.zig").Terminal;
@@ -575,58 +576,112 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     return ctx;
 }
 
-/// Key-released handler. No-op unless kitty kbd report-events flag
-/// (0x02) is enabled — most apps don't want release noise polluting
-/// their PTY. When enabled, emits `CSI <kc>;<mods>:3 u`.
-fn onKeyReleased(
-    _: *c.GtkEventControllerKey,
+/// Assemble the encoder's view of a key event: the modifier set, plus
+/// the layout-derived facts only GDK can answer — what this physical
+/// key produces unmodified and with Shift, and the true lock states
+/// (GdkModifierType has a bit for Caps Lock but none for Num Lock).
+fn keyInputFor(
+    ctx: *Ctx,
+    kctrl: *c.GtkEventControllerKey,
     keyval: c_uint,
-    _: c_uint,
+    keycode: c_uint,
+    state: c.GdkModifierType,
+    event: KeyEventType,
+) KeyInput {
+    const screen = ctx.terminal.screen;
+    var in = KeyInput{
+        .keyval = keyval,
+        .keycode = keycode,
+        .mods = Mods.fromState(state),
+        .event = event,
+        .app_cursor = screen.app_cursor_keys,
+        .app_keypad = screen.app_keypad,
+        .modify_other_keys = screen.modify_other_keys,
+        .kitty_flags = screen.kitty_kbd_flags,
+    };
+
+    var group: c_int = 0;
+    if (c.gtk_event_controller_get_current_event(@ptrCast(kctrl))) |ev| {
+        group = @intCast(c.gdk_key_event_get_layout(ev));
+        if (c.gdk_event_get_device(ev)) |dev| {
+            in.mods.caps_lock = c.gdk_device_get_caps_lock_state(dev) != 0;
+            in.mods.num_lock = c.gdk_device_get_num_lock_state(dev) != 0;
+        }
+    }
+    if (keycode != 0) {
+        const display = c.gtk_widget_get_display(ctx.widget);
+        var kv: c_uint = 0;
+        var eff_group: c_int = 0;
+        var level: c_int = 0;
+        var consumed: c.GdkModifierType = 0;
+        if (c.gdk_display_translate_key(display, keycode, 0, group, &kv, &eff_group, &level, &consumed) != 0)
+            in.base_keyval = kv;
+        if (c.gdk_display_translate_key(display, keycode, c.GDK_SHIFT_MASK, group, &kv, &eff_group, &level, &consumed) != 0)
+            in.shifted_keyval = kv;
+    }
+    return in;
+}
+
+/// Key-released handler. Silent unless the application enabled kitty
+/// keyboard event reporting (flag 0x02) — and even then `encode` drops
+/// releases of keys whose press is a plain control byte, which have no
+/// release encoding.
+fn onKeyReleased(
+    kctrl: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    keycode: c_uint,
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     // Clear the repeat-detection memory so the next press is treated
-    // as fresh (event=1). We track this regardless of whether kitty
-    // reports are enabled so a later toggle gets clean state.
+    // as fresh. Tracked regardless of whether kitty reports are on so
+    // a later toggle starts from clean state.
     if (ctx.last_press_keyval == keyval) {
         ctx.last_press_keyval = 0;
         ctx.last_press_time_us = 0;
     }
 
-    const screen = ctx.terminal.screen;
-    if ((screen.kitty_kbd_flags & 0x02) == 0) return;
-
-    const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
-    const alt = (state & c.GDK_ALT_MASK) != 0;
-    const shift = (state & c.GDK_SHIFT_MASK) != 0;
-
-    // Map to the same canonical lowercase code point we use on press.
-    var cp: u32 = 0;
-    switch (keyval) {
-        c.GDK_KEY_Escape => cp = 27,
-        c.GDK_KEY_Return => cp = 13,
-        c.GDK_KEY_KP_Enter => cp = 57414,
-        c.GDK_KEY_BackSpace => cp = 127,
-        c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => cp = 9,
-        else => {
-            const u = c.gdk_keyval_to_unicode(keyval);
-            if (u == 0 or u >= 0x110000) return;
-            cp = u;
-            if (cp >= 'A' and cp <= 'Z') cp += 0x20;
-        },
-    }
-    var buf: [32]u8 = undefined;
-    const n = kittyKeyEvent(&buf, cp, shift, alt, ctrl, 3);
+    var buf: [64]u8 = undefined;
+    const n = encode(&buf, keyInputFor(ctx, kctrl, keyval, keycode, state, .release));
     if (n > 0) ctx.terminal.writeUserInput(buf[0..n]);
 }
 
 fn onImCommit(user: ?*anyopaque, text: []const u8) void {
     const ctx = cast.userData(Ctx, user);
-    if (text.len > 0) ctx.terminal.writeUserInput(text);
+    if (text.len > 0) {
+        if (!commitAsKeyReport(ctx, text)) ctx.terminal.writeUserInput(text);
+    }
     // Clear any preedit on commit (preedit-end also fires, but not
     // every IM emits it before the commit).
     setPreedit(ctx, "");
+}
+
+/// Report an input-method commit as the protocol's text-only key
+/// event, `CSI 0 ; ; <codepoints> u`. Only applies when the
+/// application asked for every key as an escape code AND for the text
+/// alongside it; with report-all alone we still send the raw bytes
+/// rather than let a composed character vanish. @return false when the
+/// caller should write the text itself.
+fn commitAsKeyReport(ctx: *Ctx, text: []const u8) bool {
+    const flags = ctx.terminal.screen.kitty_kbd_flags;
+    if ((flags & FLAG_REPORT_ALL) == 0 or (flags & FLAG_ASSOCIATED_TEXT) == 0) return false;
+
+    var cps: [16]u32 = undefined;
+    var n: usize = 0;
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+    while (it.nextCodepoint()) |cp| {
+        if (n == cps.len) return false;
+        cps[n] = cp;
+        n += 1;
+    }
+    if (n == 0) return false;
+
+    var buf: [256]u8 = undefined;
+    const len = emitCsi(&buf, .{ .num = 0, .text = cps[0..n] });
+    if (len == 0) return false;
+    ctx.terminal.writeUserInput(buf[0..len]);
+    return true;
 }
 
 /// Composition text is rendered as grid cells by GridPass — the
@@ -650,9 +705,9 @@ fn setPreedit(ctx: *Ctx, text: []const u8) void {
 }
 
 fn onKeyPressed(
-    _: *c.GtkEventControllerKey,
+    kctrl: *c.GtkEventControllerKey,
     keyval: c_uint,
-    _: c_uint,
+    keycode: c_uint,
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
@@ -719,10 +774,18 @@ fn onKeyPressed(
         return runAction(ctx, action);
     }
 
-    var buf: [16]u8 = undefined;
+    var buf: [64]u8 = undefined;
     const screen = ctx.terminal.screen;
-    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags, is_repeat, screen.app_keypad);
+    const event: KeyEventType = if (is_repeat) .repeat else .press;
+    const n = encode(&buf, keyInputFor(ctx, kctrl, keyval, keycode, state, event));
     if (n == 0) return 0;
+    // A bare modifier is reported (under flag 0x08) but never
+    // consumed, and never counts as typing: GTK's own modifier
+    // bookkeeping runs off these same events.
+    if (isModifierKey(keyval)) {
+        ctx.terminal.writeUserInput(buf[0..n]);
+        return 0;
+    }
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
     if (screen.view_offset != 0) {
         screen.view_offset = 0;
@@ -970,90 +1033,402 @@ pub fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
     return out.len;
 }
 
-/// Kitty progressive-enhancement keyboard CSI u emit.
-/// Format: `CSI <unicode-code-point> [; <mods>] u`. Mods follow the
-/// xterm encoding (1 + shift+alt*2+ctrl*4) — same as modCode(). When
-/// only Shift is "held", we still emit mods=2 here per kitty spec
-/// (callers handle whether Shift suppresses CSI u for printable keys).
-pub fn kittyKey(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool) usize {
-    return kittyKeyEvent(buf, code_point, shift, alt, ctrl, 1);
+// ── Kitty keyboard protocol ──────────────────────────────────────
+//
+// https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+// Progressive-enhancement flags, all independently settable:
+
+pub const FLAG_DISAMBIGUATE: u8 = 0x01;
+pub const FLAG_EVENT_TYPES: u8 = 0x02;
+pub const FLAG_ALTERNATE_KEYS: u8 = 0x04;
+pub const FLAG_REPORT_ALL: u8 = 0x08;
+pub const FLAG_ASSOCIATED_TEXT: u8 = 0x10;
+
+/// Modifier set in the protocol's own bit order, so `bits()` is the
+/// value the wire format wants minus its +1 bias.
+pub const Mods = packed struct(u8) {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    hyper: bool = false,
+    meta: bool = false,
+    caps_lock: bool = false,
+    num_lock: bool = false,
+
+    pub fn bits(self: Mods) u8 {
+        return @bitCast(self);
+    }
+
+    /// Kitty's modifier parameter: 1 + the whole bit field, lock keys
+    /// included.
+    pub fn kittyParam(self: Mods) u32 {
+        return 1 + @as(u32, self.bits());
+    }
+
+    /// xterm's modifier parameter. Deliberately narrower than
+    /// `kittyParam`: only Shift/Alt/Ctrl exist in the legacy encoding,
+    /// so holding Super or turning Caps Lock on must not perturb a
+    /// sequence a non-kitty application is reading.
+    pub fn legacyParam(self: Mods) u8 {
+        return modCode(self.shift, self.alt, self.ctrl);
+    }
+
+    pub fn fromState(state: c.GdkModifierType) Mods {
+        return .{
+            .shift = (state & c.GDK_SHIFT_MASK) != 0,
+            .alt = (state & c.GDK_ALT_MASK) != 0,
+            .ctrl = (state & c.GDK_CONTROL_MASK) != 0,
+            .super = (state & c.GDK_SUPER_MASK) != 0,
+            .hyper = (state & c.GDK_HYPER_MASK) != 0,
+            .meta = (state & c.GDK_META_MASK) != 0,
+            .caps_lock = (state & c.GDK_LOCK_MASK) != 0,
+        };
+    }
+
+    /// Any modifier that changes which bytes a key produces. Caps and
+    /// Num Lock are excluded: they change the keyval, not the encoding.
+    pub fn anyEncoding(self: Mods) bool {
+        return self.shift or self.alt or self.ctrl or self.super or self.hyper or self.meta;
+    }
+
+    /// Any modifier other than Shift. Shift is excluded because on a
+    /// text key it only selects a different glyph, which the legacy
+    /// encoding already expresses by sending that glyph.
+    pub fn beyondShift(self: Mods) bool {
+        return self.alt or self.ctrl or self.super or self.hyper or self.meta;
+    }
+};
+
+pub const KeyEventType = enum(u8) { press = 1, repeat = 2, release = 3 };
+
+/// One key report. Field order and every omission rule below mirror
+/// kitty's reference encoder:
+///   `CSI <num>[:<shifted>[:<base>]][;<mods>[:<event>]][;<text>] <trailer>`
+pub const CsiKey = struct {
+    num: u32 = 1,
+    /// Shifted variant of `num`; only ever set when Shift is held.
+    shifted: u32 = 0,
+    /// The same physical key on a US PC-101 layout, when it differs
+    /// from `num` — this is what lets an application's Ctrl+C binding
+    /// keep working on a Cyrillic or Greek layout.
+    base_layout: u32 = 0,
+    mods: Mods = .{},
+    /// Override for the modifier parameter. The legacy VT encodings
+    /// use a narrower set than the protocol's, so the caller supplies
+    /// the value rather than the emitter assuming kitty's.
+    mods_param: ?u32 = null,
+    event: KeyEventType = .press,
+    /// Codepoints the keystroke produces as text (flag 0x10).
+    text: []const u32 = &.{},
+    /// Final byte: 'u' for CSI-u keys, '~' or a letter for the
+    /// functional keys that have a legacy encoding.
+    trailer: u8 = 'u',
+};
+
+fn appendf(buf: []u8, w: *usize, comptime fmt: []const u8, args: anytype) bool {
+    const out = std.fmt.bufPrint(buf[w.*..], fmt, args) catch return false;
+    w.* += out.len;
+    return true;
 }
 
-/// Variant that also encodes the event type per kitty kbd flag 0x02:
-///   1 = press, 2 = repeat, 3 = release.
-/// Press emits the same shape as `kittyKey`; repeat/release add the
-/// `:<event>` sub-parameter. Apps that haven't enabled flag 0x02
-/// should use the default `event = 1` form.
-pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
-    return kittyKeyEventFull(buf, code_point, 0, shift, alt, ctrl, event);
+/// Emit a key report. Returns 0 if it does not fit in `buf` (64 bytes
+/// is always enough).
+pub fn emitCsi(buf: []u8, k: CsiKey) usize {
+    var w: usize = 0;
+    if (!appendf(buf, &w, "\x1b[", .{})) return 0;
+
+    const param: u32 = k.mods_param orelse k.mods.kittyParam();
+    const has_alts = k.shifted != 0 or k.base_layout != 0;
+    // `num` is omitted only in the shortest possible form, where the
+    // default of 1 is unambiguous — `CSI A` for a bare Up arrow. We
+    // also spell it out whenever an event type follows, so nothing
+    // has to parse `CSI ;1:3A` with an empty leading parameter.
+    if (k.num != 1 or param != 1 or has_alts or k.text.len > 0 or k.event != .press) {
+        if (!appendf(buf, &w, "{d}", .{k.num})) return 0;
+    }
+    if (has_alts) {
+        if (!appendf(buf, &w, ":", .{})) return 0;
+        if (k.shifted != 0 and !appendf(buf, &w, "{d}", .{k.shifted})) return 0;
+        if (k.base_layout != 0 and !appendf(buf, &w, ":{d}", .{k.base_layout})) return 0;
+    }
+    if (param != 1 or k.event != .press) {
+        if (!appendf(buf, &w, ";{d}", .{param})) return 0;
+        if (k.event != .press and !appendf(buf, &w, ":{d}", .{@intFromEnum(k.event)})) return 0;
+    } else if (k.text.len > 0) {
+        // The text section is positional, so an absent mods section
+        // still needs its separator.
+        if (!appendf(buf, &w, ";", .{})) return 0;
+    }
+    for (k.text, 0..) |cp, i| {
+        if (!appendf(buf, &w, "{c}{d}", .{ @as(u8, if (i == 0) ';' else ':'), cp })) return 0;
+    }
+    if (!appendf(buf, &w, "{c}", .{k.trailer})) return 0;
+    return w;
 }
 
-/// Full kitty CSI u emitter with optional alt-shifted codepoint
-/// (kitty flag 0x04). When `alt_shifted == 0` the sub-parameter is
-/// omitted and output matches `kittyKeyEvent`. Otherwise format is
-/// `CSI <code>:<alt-shifted> [; <mods> [: <event>]] u`.
-pub fn kittyKeyEventFull(buf: []u8, code_point: u32, alt_shifted: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
-    return kittyKeyEventComplete(buf, code_point, alt_shifted, 0, shift, alt, ctrl, event);
-}
+/// A key's protocol encoding: the CSI parameter and final byte kitty
+/// assigns it. Keys with a legacy VT sequence keep it (`Up` stays
+/// `CSI A`); only keys that never had one use a Private Use Area
+/// codepoint with a `u` final.
+pub const Functional = struct {
+    num: u32,
+    trailer: u8,
+    /// Cursor keys swap `CSI` for `SS3` under DECCKM.
+    cursor: bool = false,
+    /// F1-F4 emit SS3 in their unmodified form.
+    ss3: bool = false,
+};
 
-/// Most general kitty CSI u emitter with optional associated-text
-/// codepoint (kitty flag 0x10). Format:
-///   `CSI <code>[:<alt>][;<mods>[:<event>]][;<text>] u`
-/// When text is set the mods section is always emitted (possibly
-/// empty `;;` when default mods=1), per kitty spec — apps parsing
-/// the text section count semicolons.
-pub fn kittyKeyEventComplete(
-    buf: []u8,
-    code_point: u32,
-    alt_shifted: u32,
-    associated_text: u32,
-    shift: bool,
-    alt: bool,
-    ctrl: bool,
-    event: u8,
-) usize {
-    const m = modCode(shift, alt, ctrl);
-    const has_alt = alt_shifted != 0 and alt_shifted != code_point;
-    const has_text = associated_text != 0;
-
-    // Build the code section: <code>[:<alt>]
-    var code_buf: [32]u8 = undefined;
-    const code_part = if (has_alt)
-        std.fmt.bufPrint(&code_buf, "{d}:{d}", .{ code_point, alt_shifted }) catch return 0
-    else
-        std.fmt.bufPrint(&code_buf, "{d}", .{code_point}) catch return 0;
-
-    // Build the mods section: <mods>[:<event>], or empty when both
-    // default (m=1, event=1) AND no text follows.
-    var mods_buf: [16]u8 = undefined;
-    const mods_part: []const u8 = blk: {
-        if (m == 1 and event == 1) break :blk if (has_text) "" else "";
-        if (event == 1) break :blk std.fmt.bufPrint(&mods_buf, "{d}", .{m}) catch return 0;
-        break :blk std.fmt.bufPrint(&mods_buf, "{d}:{d}", .{ m, event }) catch return 0;
+pub fn functionalKey(keyval: c_uint) ?Functional {
+    return switch (keyval) {
+        // Keys with a legacy control byte.
+        c.GDK_KEY_Escape => .{ .num = 27, .trailer = 'u' },
+        c.GDK_KEY_Return => .{ .num = 13, .trailer = 'u' },
+        c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => .{ .num = 9, .trailer = 'u' },
+        c.GDK_KEY_BackSpace => .{ .num = 127, .trailer = 'u' },
+        // Editing / navigation.
+        c.GDK_KEY_Insert => .{ .num = 2, .trailer = '~' },
+        c.GDK_KEY_Delete => .{ .num = 3, .trailer = '~' },
+        c.GDK_KEY_Page_Up => .{ .num = 5, .trailer = '~' },
+        c.GDK_KEY_Page_Down => .{ .num = 6, .trailer = '~' },
+        c.GDK_KEY_Up => .{ .num = 1, .trailer = 'A', .cursor = true },
+        c.GDK_KEY_Down => .{ .num = 1, .trailer = 'B', .cursor = true },
+        c.GDK_KEY_Right => .{ .num = 1, .trailer = 'C', .cursor = true },
+        c.GDK_KEY_Left => .{ .num = 1, .trailer = 'D', .cursor = true },
+        c.GDK_KEY_Begin => .{ .num = 1, .trailer = 'E', .cursor = true },
+        c.GDK_KEY_End => .{ .num = 1, .trailer = 'F', .cursor = true },
+        c.GDK_KEY_Home => .{ .num = 1, .trailer = 'H', .cursor = true },
+        // Lock and system keys — no legacy encoding.
+        c.GDK_KEY_Caps_Lock => .{ .num = 57358, .trailer = 'u' },
+        c.GDK_KEY_Scroll_Lock => .{ .num = 57359, .trailer = 'u' },
+        c.GDK_KEY_Num_Lock => .{ .num = 57360, .trailer = 'u' },
+        c.GDK_KEY_Print => .{ .num = 57361, .trailer = 'u' },
+        c.GDK_KEY_Pause => .{ .num = 57362, .trailer = 'u' },
+        c.GDK_KEY_Menu => .{ .num = 57363, .trailer = 'u' },
+        // Function keys. F1-F12 keep their VT encodings.
+        c.GDK_KEY_F1 => .{ .num = 1, .trailer = 'P', .ss3 = true },
+        c.GDK_KEY_F2 => .{ .num = 1, .trailer = 'Q', .ss3 = true },
+        c.GDK_KEY_F3 => .{ .num = 13, .trailer = '~' },
+        c.GDK_KEY_F4 => .{ .num = 1, .trailer = 'S', .ss3 = true },
+        c.GDK_KEY_F5 => .{ .num = 15, .trailer = '~' },
+        c.GDK_KEY_F6 => .{ .num = 17, .trailer = '~' },
+        c.GDK_KEY_F7 => .{ .num = 18, .trailer = '~' },
+        c.GDK_KEY_F8 => .{ .num = 19, .trailer = '~' },
+        c.GDK_KEY_F9 => .{ .num = 20, .trailer = '~' },
+        c.GDK_KEY_F10 => .{ .num = 21, .trailer = '~' },
+        c.GDK_KEY_F11 => .{ .num = 23, .trailer = '~' },
+        c.GDK_KEY_F12 => .{ .num = 24, .trailer = '~' },
+        c.GDK_KEY_F13 => .{ .num = 57376, .trailer = 'u' },
+        c.GDK_KEY_F14 => .{ .num = 57377, .trailer = 'u' },
+        c.GDK_KEY_F15 => .{ .num = 57378, .trailer = 'u' },
+        c.GDK_KEY_F16 => .{ .num = 57379, .trailer = 'u' },
+        c.GDK_KEY_F17 => .{ .num = 57380, .trailer = 'u' },
+        c.GDK_KEY_F18 => .{ .num = 57381, .trailer = 'u' },
+        c.GDK_KEY_F19 => .{ .num = 57382, .trailer = 'u' },
+        c.GDK_KEY_F20 => .{ .num = 57383, .trailer = 'u' },
+        c.GDK_KEY_F21 => .{ .num = 57384, .trailer = 'u' },
+        c.GDK_KEY_F22 => .{ .num = 57385, .trailer = 'u' },
+        c.GDK_KEY_F23 => .{ .num = 57386, .trailer = 'u' },
+        c.GDK_KEY_F24 => .{ .num = 57387, .trailer = 'u' },
+        c.GDK_KEY_F25 => .{ .num = 57388, .trailer = 'u' },
+        c.GDK_KEY_F26 => .{ .num = 57389, .trailer = 'u' },
+        c.GDK_KEY_F27 => .{ .num = 57390, .trailer = 'u' },
+        c.GDK_KEY_F28 => .{ .num = 57391, .trailer = 'u' },
+        c.GDK_KEY_F29 => .{ .num = 57392, .trailer = 'u' },
+        c.GDK_KEY_F30 => .{ .num = 57393, .trailer = 'u' },
+        c.GDK_KEY_F31 => .{ .num = 57394, .trailer = 'u' },
+        c.GDK_KEY_F32 => .{ .num = 57395, .trailer = 'u' },
+        c.GDK_KEY_F33 => .{ .num = 57396, .trailer = 'u' },
+        c.GDK_KEY_F34 => .{ .num = 57397, .trailer = 'u' },
+        c.GDK_KEY_F35 => .{ .num = 57398, .trailer = 'u' },
+        // Keypad. GTK reports the digit keysyms only while Num Lock
+        // is on and the navigation ones while it is off, so both
+        // halves of the table are reachable.
+        c.GDK_KEY_KP_0 => .{ .num = 57399, .trailer = 'u' },
+        c.GDK_KEY_KP_1 => .{ .num = 57400, .trailer = 'u' },
+        c.GDK_KEY_KP_2 => .{ .num = 57401, .trailer = 'u' },
+        c.GDK_KEY_KP_3 => .{ .num = 57402, .trailer = 'u' },
+        c.GDK_KEY_KP_4 => .{ .num = 57403, .trailer = 'u' },
+        c.GDK_KEY_KP_5 => .{ .num = 57404, .trailer = 'u' },
+        c.GDK_KEY_KP_6 => .{ .num = 57405, .trailer = 'u' },
+        c.GDK_KEY_KP_7 => .{ .num = 57406, .trailer = 'u' },
+        c.GDK_KEY_KP_8 => .{ .num = 57407, .trailer = 'u' },
+        c.GDK_KEY_KP_9 => .{ .num = 57408, .trailer = 'u' },
+        c.GDK_KEY_KP_Decimal => .{ .num = 57409, .trailer = 'u' },
+        c.GDK_KEY_KP_Divide => .{ .num = 57410, .trailer = 'u' },
+        c.GDK_KEY_KP_Multiply => .{ .num = 57411, .trailer = 'u' },
+        c.GDK_KEY_KP_Subtract => .{ .num = 57412, .trailer = 'u' },
+        c.GDK_KEY_KP_Add => .{ .num = 57413, .trailer = 'u' },
+        c.GDK_KEY_KP_Enter => .{ .num = 57414, .trailer = 'u' },
+        c.GDK_KEY_KP_Equal => .{ .num = 57415, .trailer = 'u' },
+        c.GDK_KEY_KP_Separator => .{ .num = 57416, .trailer = 'u' },
+        c.GDK_KEY_KP_Left => .{ .num = 57417, .trailer = 'u' },
+        c.GDK_KEY_KP_Right => .{ .num = 57418, .trailer = 'u' },
+        c.GDK_KEY_KP_Up => .{ .num = 57419, .trailer = 'u' },
+        c.GDK_KEY_KP_Down => .{ .num = 57420, .trailer = 'u' },
+        c.GDK_KEY_KP_Page_Up => .{ .num = 57421, .trailer = 'u' },
+        c.GDK_KEY_KP_Page_Down => .{ .num = 57422, .trailer = 'u' },
+        c.GDK_KEY_KP_Home => .{ .num = 57423, .trailer = 'u' },
+        c.GDK_KEY_KP_End => .{ .num = 57424, .trailer = 'u' },
+        c.GDK_KEY_KP_Insert => .{ .num = 57425, .trailer = 'u' },
+        c.GDK_KEY_KP_Delete => .{ .num = 57426, .trailer = 'u' },
+        c.GDK_KEY_KP_Begin => .{ .num = 1, .trailer = 'E', .cursor = true },
+        // Media keys.
+        c.GDK_KEY_AudioPlay => .{ .num = 57428, .trailer = 'u' },
+        c.GDK_KEY_AudioPause => .{ .num = 57429, .trailer = 'u' },
+        c.GDK_KEY_AudioStop => .{ .num = 57432, .trailer = 'u' },
+        c.GDK_KEY_AudioForward => .{ .num = 57433, .trailer = 'u' },
+        c.GDK_KEY_AudioRewind => .{ .num = 57434, .trailer = 'u' },
+        c.GDK_KEY_AudioNext => .{ .num = 57435, .trailer = 'u' },
+        c.GDK_KEY_AudioPrev => .{ .num = 57436, .trailer = 'u' },
+        c.GDK_KEY_AudioRecord => .{ .num = 57437, .trailer = 'u' },
+        c.GDK_KEY_AudioLowerVolume => .{ .num = 57438, .trailer = 'u' },
+        c.GDK_KEY_AudioRaiseVolume => .{ .num = 57439, .trailer = 'u' },
+        c.GDK_KEY_AudioMute => .{ .num = 57440, .trailer = 'u' },
+        // The modifier keys themselves — reported only under 0x08.
+        c.GDK_KEY_Shift_L => .{ .num = 57441, .trailer = 'u' },
+        c.GDK_KEY_Control_L => .{ .num = 57442, .trailer = 'u' },
+        c.GDK_KEY_Alt_L => .{ .num = 57443, .trailer = 'u' },
+        c.GDK_KEY_Super_L => .{ .num = 57444, .trailer = 'u' },
+        c.GDK_KEY_Hyper_L => .{ .num = 57445, .trailer = 'u' },
+        c.GDK_KEY_Meta_L => .{ .num = 57446, .trailer = 'u' },
+        c.GDK_KEY_Shift_R => .{ .num = 57447, .trailer = 'u' },
+        c.GDK_KEY_Control_R => .{ .num = 57448, .trailer = 'u' },
+        c.GDK_KEY_Alt_R => .{ .num = 57449, .trailer = 'u' },
+        c.GDK_KEY_Super_R => .{ .num = 57450, .trailer = 'u' },
+        c.GDK_KEY_Hyper_R => .{ .num = 57451, .trailer = 'u' },
+        c.GDK_KEY_Meta_R => .{ .num = 57452, .trailer = 'u' },
+        c.GDK_KEY_ISO_Level3_Shift => .{ .num = 57453, .trailer = 'u' },
+        c.GDK_KEY_ISO_Level5_Shift => .{ .num = 57454, .trailer = 'u' },
+        else => null,
     };
-
-    if (has_text) {
-        const out = std.fmt.bufPrint(buf, "\x1b[{s};{s};{d}u", .{ code_part, mods_part, associated_text }) catch return 0;
-        return out.len;
-    }
-    if (mods_part.len == 0) {
-        const out = std.fmt.bufPrint(buf, "\x1b[{s}u", .{code_part}) catch return 0;
-        return out.len;
-    }
-    const out = std.fmt.bufPrint(buf, "\x1b[{s};{s}u", .{ code_part, mods_part }) catch return 0;
-    return out.len;
 }
 
-pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool, app_keypad: bool) usize {
-    const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
-    const alt = (mods & c.GDK_ALT_MASK) != 0;
-    const shift = (mods & c.GDK_SHIFT_MASK) != 0;
+/// True for keys that only ever act as modifiers. They are silent
+/// unless the application asked for every key (0x08), and even then
+/// the event is not consumed — GTK's own modifier bookkeeping runs on
+/// the same events.
+pub fn isModifierKey(keyval: c_uint) bool {
+    return switch (keyval) {
+        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+        c.GDK_KEY_ISO_Level3_Shift, c.GDK_KEY_ISO_Level5_Shift,
+        c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock, c.GDK_KEY_Scroll_Lock,
+        => true,
+        else => false,
+    };
+}
 
+/// Codepoint of the key at this hardware position on a US PC-101
+/// layout, for the protocol's base-layout alternate (flag 0x04).
+/// Only the alphanumeric block is mapped — those are the keys whose
+/// application shortcuts break under a non-Latin layout. 0 = unknown.
+///
+/// GDK hardware keycodes are evdev codes + 8 on both X11 and Wayland;
+/// on any other platform the caller gets 0 and the field is omitted.
+pub fn baseLayoutCodepoint(keycode: c_uint) u32 {
+    if (builtin.os.tag != .linux) return 0;
+    return switch (keycode) {
+        49 => '`',
+        10 => '1', 11 => '2', 12 => '3', 13 => '4', 14 => '5', 15 => '6',
+        16 => '7', 17 => '8', 18 => '9', 19 => '0', 20 => '-', 21 => '=',
+        24 => 'q', 25 => 'w', 26 => 'e', 27 => 'r', 28 => 't', 29 => 'y',
+        30 => 'u', 31 => 'i', 32 => 'o', 33 => 'p', 34 => '[', 35 => ']',
+        38 => 'a', 39 => 's', 40 => 'd', 41 => 'f', 42 => 'g', 43 => 'h',
+        44 => 'j', 45 => 'k', 46 => 'l', 47 => ';', 48 => '\'',
+        51 => '\\',
+        52 => 'z', 53 => 'x', 54 => 'c', 55 => 'v', 56 => 'b', 57 => 'n',
+        58 => 'm', 59 => ',', 60 => '.', 61 => '/',
+        65 => ' ',
+        else => 0,
+    };
+}
+
+/// Everything the encoder needs about one key event. The GTK layer
+/// fills the layout-derived fields; a test can leave them at zero and
+/// the encoder falls back to case-folding the keyval.
+pub const KeyInput = struct {
+    keyval: c_uint,
+    mods: Mods = .{},
+    event: KeyEventType = .press,
+    /// Hardware keycode, for the base-layout alternate key. 0 = unknown.
+    keycode: c_uint = 0,
+    /// The keyval this physical key produces with no modifiers, and
+    /// with Shift, in the active group. 0 = unknown.
+    base_keyval: c_uint = 0,
+    shifted_keyval: c_uint = 0,
+    // Terminal modes.
+    app_cursor: bool = false,
+    app_keypad: bool = false,
+    modify_other_keys: u8 = 0,
+    kitty_flags: u8 = 0,
+};
+
+const Flags = struct {
+    disamb: bool,
+    events: bool,
+    alt_keys: bool,
+    report_all: bool,
+    assoc: bool,
+
+    fn from(bits: u8) Flags {
+        return .{
+            // Reporting every key as an escape code implies
+            // disambiguating them.
+            .disamb = (bits & (FLAG_DISAMBIGUATE | FLAG_REPORT_ALL)) != 0,
+            .events = (bits & FLAG_EVENT_TYPES) != 0,
+            .alt_keys = (bits & FLAG_ALTERNATE_KEYS) != 0,
+            .report_all = (bits & FLAG_REPORT_ALL) != 0,
+            .assoc = (bits & FLAG_ASSOCIATED_TEXT) != 0,
+        };
+    }
+
+    /// True once the application has opted into the protocol at all,
+    /// which is what licenses the wider modifier encoding.
+    fn any(self: Flags) bool {
+        return self.disamb or self.events or self.alt_keys or self.report_all or self.assoc;
+    }
+};
+
+pub fn encode(buf: []u8, input: KeyInput) usize {
+    var in = input;
+    // ISO_Left_Tab is what X11 calls Shift+Tab; every layer below is
+    // simpler if it never has to know that.
+    if (in.keyval == c.GDK_KEY_ISO_Left_Tab) {
+        in.keyval = c.GDK_KEY_Tab;
+        in.mods.shift = true;
+    }
+    const fl = Flags.from(in.kitty_flags);
+    // Without the event-types flag there is nowhere to put the event
+    // type, so only presses (and auto-repeats, which look like
+    // presses) produce anything at all.
+    if (in.event == .release and !fl.events) return 0;
+    const evt: KeyEventType = if (fl.events) in.event else .press;
+
+    // Modifier keys report only when the application asked for every
+    // key; otherwise they are silent, as they have been since VT100.
+    if (isModifierKey(in.keyval)) {
+        if (!fl.report_all) return 0;
+        const f = functionalKey(in.keyval) orelse return 0;
+        return emitCsi(buf, .{ .num = f.num, .mods = in.mods, .event = evt });
+    }
+
+    if (functionalKey(in.keyval)) |f| return encodeFunctional(buf, in, fl, evt, f);
+    return encodeText(buf, in, fl, evt);
+}
+
+/// Keys that have a name in the protocol's functional table.
+fn encodeFunctional(buf: []u8, in: KeyInput, fl: Flags, evt: KeyEventType, f: Functional) usize {
     // Application keypad mode (DECPAM): numpad keys emit `ESC O X`
-    // sequences instead of plain digits / operators. xterm uses these
-    // VT220 codes, which vim, less, etc. read for navigation.
-    if (app_keypad) {
-        const final: u8 = switch (keyval) {
+    // sequences instead of plain digits / operators. Superseded by
+    // report-all, which gives every keypad key its own codepoint.
+    if (in.app_keypad and !fl.report_all) {
+        const final: u8 = switch (in.keyval) {
             c.GDK_KEY_KP_0 => 'p',
             c.GDK_KEY_KP_1 => 'q',
             c.GDK_KEY_KP_2 => 'r',
@@ -1081,145 +1456,128 @@ pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bo
             return 3;
         }
     }
-    // DECCKM swap: arrows/home/end use ESC O X instead of ESC [ X.
-    const ck: u8 = if (app_cursor) 'O' else '[';
-
-    // Event type for kitty kbd encoder: 1 = press, 2 = repeat.
-    // Repeats only emit when flag 0x02 (events) is enabled — outside
-    // that flag, repeats look identical to fresh presses.
-    const kitty_event: u8 = if ((kitty_flags & 0x02) != 0 and is_repeat) 2 else 1;
-
-    // Kitty progressive-enhancement keyboard — disambiguate flag
-    // (0x01) reroutes Tab/Enter/Esc/BS and modified keys through
-    // CSI u. Report-all-keys (0x08) implies disambiguate AND also
-    // routes UNMODIFIED printables through CSI u (per kitty spec).
-    const kitty_disamb = (kitty_flags & 0x01) != 0;
-    const kitty_report_all = (kitty_flags & 0x08) != 0;
-    if (kitty_disamb or kitty_report_all) {
-        switch (keyval) {
-            c.GDK_KEY_Escape => return kittyKeyEvent(buf, 27, shift, alt, ctrl, kitty_event),
-            c.GDK_KEY_Return => return kittyKeyEvent(buf, 13, shift, alt, ctrl, kitty_event),
-            // Keypad Enter has its own functional codepoint so apps
-            // can bind it separately from Return (kitty spec table).
-            c.GDK_KEY_KP_Enter => return kittyKeyEvent(buf, 57414, shift, alt, ctrl, kitty_event),
-            c.GDK_KEY_BackSpace => return kittyKeyEvent(buf, 127, shift, alt, ctrl, kitty_event),
-            c.GDK_KEY_Tab => return kittyKeyEvent(buf, 9, shift, alt, ctrl, kitty_event),
-            c.GDK_KEY_ISO_Left_Tab => return kittyKeyEvent(buf, 9, true, alt, ctrl, kitty_event),
-            else => {},
+    // Escape, Enter, Tab and Backspace are the four keys whose
+    // "functional" encoding is a plain control byte. They keep it
+    // unless the application has asked to have them disambiguated
+    // (and then only when a modifier is involved, except for Escape,
+    // which is ambiguous with the start of every other sequence) or
+    // has asked for every key as an escape code.
+    const legacy_byte: u8 = switch (in.keyval) {
+        c.GDK_KEY_Escape => 0x1B,
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => '\r',
+        c.GDK_KEY_BackSpace => 0x7F,
+        c.GDK_KEY_Tab => '\t',
+        else => 0,
+    };
+    if (legacy_byte != 0) {
+        const force_csi = fl.report_all or
+            (fl.disamb and (in.keyval == c.GDK_KEY_Escape or in.mods.anyEncoding()));
+        if (force_csi) {
+            return emitCsi(buf, .{ .num = f.num, .mods = in.mods, .event = evt });
         }
-
-        // With report-all (0x08), functional keys switch to the
-        // kitty Unicode-private-use codepoint table. Apps opting in
-        // get a uniform CSI u stream; apps using only 0x01 keep the
-        // legacy CSI A / SS3 P / CSI 5~ shapes.
-        if (kitty_report_all) {
-            const pua_cp: u32 = switch (keyval) {
-                c.GDK_KEY_Up => 57352,
-                c.GDK_KEY_Down => 57353,
-                c.GDK_KEY_Right => 57351,
-                c.GDK_KEY_Left => 57350,
-                c.GDK_KEY_Home => 57356,
-                c.GDK_KEY_End => 57357,
-                c.GDK_KEY_Insert => 57348,
-                c.GDK_KEY_Delete => 57349,
-                c.GDK_KEY_Page_Up => 57354,
-                c.GDK_KEY_Page_Down => 57355,
-                c.GDK_KEY_F1 => 57364,
-                c.GDK_KEY_F2 => 57365,
-                c.GDK_KEY_F3 => 57366,
-                c.GDK_KEY_F4 => 57367,
-                c.GDK_KEY_F5 => 57368,
-                c.GDK_KEY_F6 => 57369,
-                c.GDK_KEY_F7 => 57370,
-                c.GDK_KEY_F8 => 57371,
-                c.GDK_KEY_F9 => 57372,
-                c.GDK_KEY_F10 => 57373,
-                c.GDK_KEY_F11 => 57374,
-                c.GDK_KEY_F12 => 57375,
-                else => 0,
-            };
-            if (pua_cp != 0) return kittyKeyEvent(buf, pua_cp, shift, alt, ctrl, kitty_event);
+        // A control byte has nowhere to carry an event type, so a
+        // release of one of these keys is simply not reportable —
+        // kitty drops it too rather than inventing an encoding.
+        if (evt == .release) return 0;
+        if (in.keyval == c.GDK_KEY_Tab and in.mods.shift) {
+            @memcpy(buf[0..3], "\x1b[Z");
+            return 3;
         }
-        // Printable codepoints. Without report-all (0x08), only
-        // modified keys get CSI u so plain typing stays as raw
-        // bytes. With 0x08, every printable goes through CSI u
-        // even unmodified — apps using the report-all level want
-        // every keystroke as an escape so they can build full
-        // keymap UIs (e.g. neovim with kitty-keyboard support).
-        if (ctrl or alt or kitty_report_all) {
-            const cp_pre = c.gdk_keyval_to_unicode(keyval);
-            if (cp_pre != 0 and cp_pre < 0x110000) {
-                // Use the lowercase code point so 'A' and 'a' both
-                // map to 'a' = 0x61, with Shift signalled via mods.
-                var canon: u32 = cp_pre;
-                if (canon >= 'A' and canon <= 'Z') canon += 0x20;
-                // Kitty flag 0x04 — alt-shifted as sub-parameter.
-                // Conservative: only emit for ASCII letters where
-                // shift→uppercase is layout-independent. Digits +
-                // punctuation skipped (US-only assumption would
-                // mislead non-US-layout users).
-                const kitty_alt_keys = (kitty_flags & 0x04) != 0;
-                const alt_shifted: u32 = if (kitty_alt_keys and canon >= 'a' and canon <= 'z')
-                    canon - 0x20
-                else
-                    0;
-                // Kitty flag 0x10 — associated text. Only emit when
-                // the keystroke would produce text in normal mode:
-                // unmodified printables (and Shift+letter for the
-                // shifted glyph). Ctrl/Alt-modified keys produce
-                // control bytes / nothing — emit no text.
-                const kitty_assoc = (kitty_flags & 0x10) != 0;
-                var assoc_text: u32 = 0;
-                if (kitty_assoc and !ctrl and !alt) {
-                    assoc_text = if (shift and canon >= 'a' and canon <= 'z')
-                        canon - 0x20
-                    else
-                        cp_pre;
-                }
-                return kittyKeyEventComplete(buf, canon, alt_shifted, assoc_text, shift, alt, ctrl, kitty_event);
-            }
+        // Ctrl+Backspace is ^H, the one legacy modifier combination
+        // these keys encode themselves.
+        const byte: u8 = if (in.keyval == c.GDK_KEY_BackSpace and in.mods.ctrl) 0x08 else legacy_byte;
+        if (in.mods.alt) {
+            buf[0] = 0x1B;
+            buf[1] = byte;
+            return 2;
         }
+        buf[0] = byte;
+        return 1;
     }
 
-    // Special keys (return early).
-    switch (keyval) {
-        c.GDK_KEY_Return => { buf[0] = '\r'; return 1; },
-        c.GDK_KEY_BackSpace => { buf[0] = 0x7F; return 1; },
-        c.GDK_KEY_Tab => {
-            if (shift) { @memcpy(buf[0..3], "\x1b[Z"); return 3; }
-            buf[0] = '\t';
-            return 1;
-        },
-        c.GDK_KEY_ISO_Left_Tab => { @memcpy(buf[0..3], "\x1b[Z"); return 3; },
-        c.GDK_KEY_Escape => { buf[0] = 0x1B; return 1; },
-        c.GDK_KEY_Up => return cursorKey(buf, ck, 'A', shift, alt, ctrl),
-        c.GDK_KEY_Down => return cursorKey(buf, ck, 'B', shift, alt, ctrl),
-        c.GDK_KEY_Right => return cursorKey(buf, ck, 'C', shift, alt, ctrl),
-        c.GDK_KEY_Left => return cursorKey(buf, ck, 'D', shift, alt, ctrl),
-        c.GDK_KEY_Home => return cursorKey(buf, ck, 'H', shift, alt, ctrl),
-        c.GDK_KEY_End => return cursorKey(buf, ck, 'F', shift, alt, ctrl),
-        c.GDK_KEY_Page_Up => return tildeKey(buf, 5, shift, alt, ctrl),
-        c.GDK_KEY_Page_Down => return tildeKey(buf, 6, shift, alt, ctrl),
-        c.GDK_KEY_Insert => return tildeKey(buf, 2, shift, alt, ctrl),
-        c.GDK_KEY_Delete => return tildeKey(buf, 3, shift, alt, ctrl),
-        c.GDK_KEY_F1 => return ssoKey(buf, 'P', shift, alt, ctrl),
-        c.GDK_KEY_F2 => return ssoKey(buf, 'Q', shift, alt, ctrl),
-        c.GDK_KEY_F3 => return ssoKey(buf, 'R', shift, alt, ctrl),
-        c.GDK_KEY_F4 => return ssoKey(buf, 'S', shift, alt, ctrl),
-        c.GDK_KEY_F5 => return tildeKey(buf, 15, shift, alt, ctrl),
-        c.GDK_KEY_F6 => return tildeKey(buf, 17, shift, alt, ctrl),
-        c.GDK_KEY_F7 => return tildeKey(buf, 18, shift, alt, ctrl),
-        c.GDK_KEY_F8 => return tildeKey(buf, 19, shift, alt, ctrl),
-        c.GDK_KEY_F9 => return tildeKey(buf, 20, shift, alt, ctrl),
-        c.GDK_KEY_F10 => return tildeKey(buf, 21, shift, alt, ctrl),
-        c.GDK_KEY_F11 => return tildeKey(buf, 23, shift, alt, ctrl),
-        c.GDK_KEY_F12 => return tildeKey(buf, 24, shift, alt, ctrl),
-        else => {},
+    // Everything else in the functional table: arrows, editing keys,
+    // F-keys, keypad, media. The modifier parameter widens to the
+    // protocol's only once the application has opted in, so a plain
+    // VT app never sees a Super or lock bit it cannot interpret.
+    const param: u32 = if (fl.any()) in.mods.kittyParam() else in.mods.legacyParam();
+    if (param == 1 and evt == .press) {
+        if (f.trailer == '~' or f.trailer == 'u') {
+            const out = std.fmt.bufPrint(buf, "\x1b[{d}{c}", .{ f.num, f.trailer }) catch return 0;
+            return out.len;
+        }
+        // Letter finals: SS3 for F1-F4 always, and for the cursor
+        // keys under DECCKM.
+        buf[0] = 0x1B;
+        buf[1] = if (f.ss3 or (f.cursor and in.app_cursor)) 'O' else '[';
+        buf[2] = f.trailer;
+        return 3;
     }
+    return emitCsi(buf, .{
+        .num = f.num,
+        .mods = in.mods,
+        .mods_param = param,
+        .event = evt,
+        .trailer = f.trailer,
+    });
+}
+
+/// Keys that produce text. `num` is always the key as it is with no
+/// modifiers at all, with the shifted and base-layout variants
+/// carried alongside it, so an application can bind the physical key
+/// rather than whatever glyph the layout puts on it.
+fn encodeText(buf: []u8, in: KeyInput, fl: Flags, evt: KeyEventType) usize {
+    const ctrl = in.mods.ctrl;
+    const alt = in.mods.alt;
+    const shift = in.mods.shift;
+    const mok = in.modify_other_keys;
 
     // Printable codepoint via gdk's keyval-to-unicode.
-    const cp = c.gdk_keyval_to_unicode(keyval);
-    if (cp == 0) return 0;
+    const cp = c.gdk_keyval_to_unicode(in.keyval);
+    if (cp == 0 or cp >= 0x110000) return 0;
+
+    // The unmodified form of the same physical key. Falling back to
+    // case-folding the keyval is only right for Latin letters, which
+    // is why the GTK layer translates the keycode when it can.
+    var base: u32 = if (in.base_keyval != 0) c.gdk_keyval_to_unicode(in.base_keyval) else 0;
+    if (base == 0 or base >= 0x110000) {
+        base = cp;
+        if (base >= 'A' and base <= 'Z') base += 0x20;
+    }
+
+    const csi_form = fl.report_all or
+        (fl.disamb and in.mods.beyondShift()) or
+        (fl.events and evt != .press);
+    if (csi_form) {
+        var shifted: u32 = 0;
+        var base_layout: u32 = 0;
+        if (fl.alt_keys) {
+            if (shift) {
+                const s = if (in.shifted_keyval != 0) c.gdk_keyval_to_unicode(in.shifted_keyval) else cp;
+                if (s != 0 and s < 0x110000 and s != base) shifted = s;
+            }
+            const bl = baseLayoutCodepoint(in.keycode);
+            if (bl != 0 and bl != base) base_layout = bl;
+        }
+        // Associated text is what the keystroke would have produced
+        // had it not been reported as an escape code; a control
+        // modifier means it would have produced none.
+        var text_storage: [1]u32 = .{0};
+        var text: []const u32 = &.{};
+        if (fl.assoc and evt != .release and !ctrl and !alt and !in.mods.super and !in.mods.hyper and !in.mods.meta) {
+            text_storage[0] = cp;
+            text = text_storage[0..1];
+        }
+        return emitCsi(buf, .{
+            .num = base,
+            .shifted = shifted,
+            .base_layout = base_layout,
+            .mods = in.mods,
+            .event = evt,
+            .text = text,
+        });
+    }
+    // Legacy text encoding below — no way to express a release.
+    if (evt == .release) return 0;
 
     // Ctrl + 0x40..0x7E → C0 control (Ctrl-A = 0x01, etc).
     if (ctrl and cp >= 0x40 and cp <= 0x7E) {
