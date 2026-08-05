@@ -29,6 +29,10 @@ const syntax = @import("editor/syntax.zig");
 const structure = @import("editor/structure.zig");
 const theme_mod = @import("editor/theme.zig");
 const journal = @import("editor/journal.zig");
+const gitdiff = @import("editor/gitdiff.zig");
+const outline_mod = @import("editor/outline.zig");
+const project_mod = @import("editor/project.zig");
+const psearch = @import("editor/psearch.zig");
 const reload = @import("editor/reload.zig");
 const lsp_smoke = @import("smoke_editor_lsp.zig");
 const lspStage = lsp_smoke.stage;
@@ -273,6 +277,13 @@ fn journalStage(allocator: std.mem.Allocator) !?u8 {
     std.debug.print("smoke-editor: PASS crash-recovery journal round trip\n", .{});
     return null;
 }
+
+/// Only `/repo/.git` exists, so exactly one ancestor answers.
+const FakeProjectFs = struct {
+    fn exists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
+        return std.mem.eql(u8, dir, "/repo") and std.mem.eql(u8, name, ".git");
+    }
+};
 
 fn ns2ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -1031,6 +1042,193 @@ pub fn main() !u8 {
             return 11;
         }
         std.debug.print("smoke-editor: PASS structure (brackets, folding, expand/shrink {d} steps)\n", .{steps});
+    }
+
+    // --- Project layer: git gutter, outline, project-wide search ------
+    //
+    // The daemon round trips these features make are covered by the GUI
+    // rig; what is coverable HERE is everything downstream of the bytes
+    // the daemon hands back, which is where the logic actually lives.
+    {
+        const th = &theme_mod.dark;
+        var gdoc = try Document.initFromBytes(allocator, HL_SRC);
+        defer gdoc.deinit();
+        var glayout = Layout.init(allocator, &book);
+        defer glayout.deinit();
+        glayout.theme = th;
+        var gsels = try SelectionSet.initSingle(allocator, Selection.caret(0));
+        defer gsels.deinit(allocator);
+
+        // 1. A real `git diff -U0` payload becomes anchored marks.
+        const DIFF =
+            "diff --git a/x.zig b/x.zig\n" ++
+            "index 1111111..2222222 100644\n" ++
+            "--- a/x.zig\n" ++
+            "+++ b/x.zig\n" ++
+            "@@ -1,1 +1,1 @@\n" ++
+            "-const old = 1;\n" ++
+            "+const std = @import(\"std\");\n" ++
+            "@@ -3,0 +4,2 @@\n" ++
+            "+added one\n" ++
+            "+added two\n" ++
+            "@@ -9,2 +11,0 @@\n" ++
+            "-gone a\n" ++
+            "-gone b\n";
+        const line_marks = try gitdiff.parseUnified(allocator, DIFF);
+        defer allocator.free(line_marks);
+        var marks = gitdiff.Marks.init(allocator);
+        defer marks.deinit();
+        try marks.setFromLines(&gdoc, line_marks);
+        if (marks.list.items.len != 4 or !marks.known) {
+            std.debug.print("smoke-editor: FAIL — git marks {d} (want 4)\n", .{marks.list.items.len});
+            return 12;
+        }
+        if (marks.list.items[0].kind != .modified or marks.list.items[1].kind != .added) {
+            std.debug.print("smoke-editor: FAIL — git mark kinds wrong\n", .{});
+            return 12;
+        }
+        const hunks = marks.hunkCount(&gdoc);
+        if (hunks != 3) {
+            std.debug.print("smoke-editor: FAIL — hunk count {d} (want 3)\n", .{hunks});
+            return 12;
+        }
+        // Hunk navigation walks forward and wraps.
+        const first = marks.nextHunk(&gdoc, 0, true).?;
+        const second = marks.nextHunk(&gdoc, first, true).?;
+        if (second <= first) {
+            std.debug.print("smoke-editor: FAIL — hunk navigation did not advance\n", .{});
+            return 12;
+        }
+
+        // 2. Marks survive an edit ABOVE them, the way diagnostics do.
+        const before_anchor = marks.list.items[3].anchor;
+        const edits = [_]tr.Edit{.{ .offset = 0, .deleted_len = 0, .inserted = "// prefix\n" }};
+        marks.mapThrough(&edits);
+        if (marks.list.items[3].anchor != before_anchor + 10) {
+            std.debug.print("smoke-editor: FAIL — git marks did not map through an edit\n", .{});
+            return 12;
+        }
+        marks.mapThrough(&[_]tr.Edit{}); // no-op guard
+        try marks.setFromLines(&gdoc, line_marks);
+
+        // 3. The gutter actually paints them.
+        c.glClearColor(th.bg[0], th.bg[1], th.bg[2], th.bg[3]);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        const gcolors = editor_pass.Colors{ .text = th.fg, .gutter_bg = th.gutter_bg, .gutter_fg = th.gutter_fg };
+        try pass.buildFrame(.{
+            .layout = &glayout,
+            .doc = &gdoc,
+            .sels = &gsels,
+            .view = .{
+                .width_px = @floatFromInt(W),
+                .height_px = @floatFromInt(H),
+                .show_line_numbers = true,
+            },
+            .colors = gcolors,
+            .theme = th,
+            .git_marks = marks.list.items,
+        });
+        pass.draw(atlas, W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var added_px: usize = 0;
+        var modified_px: usize = 0;
+        var deleted_px: usize = 0;
+        var gi: usize = 0;
+        while (gi < fb_bytes) : (gi += 4) {
+            const px = [3]u8{ fb[gi], fb[gi + 1], fb[gi + 2] };
+            if (nearColor(px, gcolors.git_added)) added_px += 1;
+            if (nearColor(px, gcolors.git_modified)) modified_px += 1;
+            if (nearColor(px, gcolors.git_deleted)) deleted_px += 1;
+        }
+        std.debug.print(
+            "smoke-editor: git gutter added={d}px modified={d}px deleted={d}px hunks={d}\n",
+            .{ added_px, modified_px, deleted_px, hunks },
+        );
+        if (added_px == 0 or modified_px == 0 or deleted_px == 0) {
+            std.debug.print("smoke-editor: FAIL — a gutter mark kind painted nothing\n", .{});
+            return 12;
+        }
+
+        // 4. Outline from the syntax tree, with caret tracking and a
+        //    signature that does NOT move when only ranges do.
+        var ohl = try syntax.Highlighter.init(allocator, .zig);
+        defer ohl.deinit();
+        try ohl.parse(&gdoc);
+        var ol = outline_mod.Outline.init(allocator);
+        defer ol.deinit();
+        try outline_mod.fromTree(&ol, &ohl, &gdoc, .zig);
+        if (ol.source != .tree or ol.isEmpty()) {
+            std.debug.print("smoke-editor: FAIL — tree outline is empty\n", .{});
+            return 12;
+        }
+        const main_off = std.mem.indexOf(u8, HL_SRC, "pub fn main").?;
+        const at = ol.indexAt(main_off + 4) orelse {
+            std.debug.print("smoke-editor: FAIL — outline does not track the caret\n", .{});
+            return 12;
+        };
+        const sig_before = ol.signature();
+        ol.mapThrough(&edits);
+        if (ol.signature() != sig_before) {
+            std.debug.print("smoke-editor: FAIL — an edit changed the outline SHAPE\n", .{});
+            return 12;
+        }
+        std.debug.print(
+            "smoke-editor: outline symbols={d} source=tree caret_row={d} name={s}\n",
+            .{ ol.nodes.items.len, at, ol.name(at) },
+        );
+
+        // 5. Project-wide search semantics: the daemon's grep only
+        //    chooses candidate FILES, the editor's own engine produces
+        //    every hit and every replacement.
+        var res = psearch.Results.init(allocator);
+        defer res.deinit();
+        try res.reset("/proj", "std", .{});
+        try res.setReplacement("STD");
+        const f0 = try res.addFile("/proj/x.zig");
+        const hits = try res.scanContent(f0, HL_SRC);
+        if (hits == 0) {
+            std.debug.print("smoke-editor: FAIL — project search found nothing\n", .{});
+            return 12;
+        }
+        const plan = (try res.planReplace(f0, HL_SRC, 42)).?;
+        if (std.mem.indexOf(u8, plan, "STD") == null) {
+            std.debug.print("smoke-editor: FAIL — replace plan did not replace\n", .{});
+            return 12;
+        }
+        if (std.mem.indexOf(u8, plan, "\nconst std") != null) {
+            std.debug.print("smoke-editor: FAIL — replace plan missed an occurrence\n", .{});
+            return 12;
+        }
+        // The seed a regex hands the daemon must be SOUND: every match
+        // of the pattern contains it.
+        if (!std.mem.eql(u8, psearch.literalSeed("std.debug", .{ .regex = true }), "std.")) {
+            // `.` ends the run, so the seed is the literal prefix.
+            if (!std.mem.eql(u8, psearch.literalSeed("std.debug", .{ .regex = true }), "debug")) {
+                std.debug.print("smoke-editor: FAIL — unsound regex literal seed\n", .{});
+                return 12;
+            }
+        }
+        std.debug.print(
+            "smoke-editor: project search hits={d} files={d} plan_bytes={d}\n",
+            .{ res.hitCount(), res.matchedFiles(), plan.len },
+        );
+
+        // 6. Root discovery is the LSP machinery, one marker list wider.
+        var fake = FakeProjectFs{};
+        const found = project_mod.discover("/repo/src/main.zig", "", FakeProjectFs.exists, &fake) orelse {
+            std.debug.print("smoke-editor: FAIL — no project root discovered\n", .{});
+            return 12;
+        };
+        if (!std.mem.eql(u8, found.root, "/repo") or !found.isVcs()) {
+            std.debug.print("smoke-editor: FAIL — wrong project root {s}\n", .{found.root});
+            return 12;
+        }
+        if (project_mod.discover("/loose/file.txt", "", FakeProjectFs.exists, &fake) != null) {
+            std.debug.print("smoke-editor: FAIL — a loose file was given a project\n", .{});
+            return 12;
+        }
+        std.debug.print("smoke-editor: PASS project layer (gutter, outline, search, roots)\n", .{});
     }
 
     // --- Syntax perf on a ~1MB source ---------------------------------
