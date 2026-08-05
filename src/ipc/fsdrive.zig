@@ -17,6 +17,10 @@ const c = @import("../c.zig").c;
 const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 pub const fsserve = @import("../mux/fsserve.zig");
+/// The gutter's model, shared with the daemon that fills it: the
+/// `git_diff` job parses on the host and ships `gitdiff.Run`s, so
+/// producer and consumer cannot drift.
+pub const gitdiff = @import("../editor/gitdiff.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -282,7 +286,12 @@ pub const JobEvent = struct {
     orig: []const u8 = "",
     /// git_status `repo` event: the branch header of the browsed
     /// root. Absent entirely from a daemon too old to report it.
+    /// git_diff sends the same event for its own three states, of
+    /// which only `repo`, `tracked`, `initial` and `truncated` mean
+    /// anything.
     repo: bool = false,
+    /// git_diff `repo` event: git tracks the file.
+    tracked: bool = false,
     branch: []const u8 = "",
     upstream: []const u8 = "",
     ahead: i64 = 0,
@@ -442,6 +451,7 @@ pub const Fs = struct {
             xy: []const u8 = "",
             orig: []const u8 = "",
             repo: bool = false,
+            tracked: bool = false,
             branch: []const u8 = "",
             upstream: []const u8 = "",
             ahead: i64 = 0,
@@ -489,6 +499,7 @@ pub const Fs = struct {
             .xy = parsed.xy,
             .orig = parsed.orig,
             .repo = parsed.repo,
+            .tracked = parsed.tracked,
             .branch = parsed.branch,
             .upstream = parsed.upstream,
             .ahead = parsed.ahead,
@@ -1117,6 +1128,107 @@ pub const Fs = struct {
     /// Unified diff of two host-side files; one "line" event per line.
     pub fn startDiff(self: *Fs, a: []const u8, b: []const u8) Error!u64 {
         return self.startJob("diff", .{ .path = a, .to = b });
+    }
+
+    /// Per-line change marks for ONE file against HEAD, computed on
+    /// the file's own host. One "line" event per RUN of consecutive
+    /// same-kind lines (`line` = 0-based start, `size` = count,
+    /// `kind` = added/modified/deleted), then a "repo" event carrying
+    /// repo / tracked / initial. `gitDiff` below is the collected
+    /// form; this is for a caller that wants the stream.
+    ///
+    /// Refused against a daemon that predates the verb — the caller
+    /// must say it does not know rather than draw a clean gutter.
+    pub fn startGitDiff(self: *Fs, path: []const u8) Error!u64 {
+        if (!self.conn.git_diff) return Error.BadRequest;
+        return self.startJob("git_diff", .{ .path = path });
+    }
+
+    /// Everything a gutter needs about one file. `repo == false` means
+    /// UNKNOWN (no repository, or no git on that host) — not "clean".
+    pub const GitDiffResult = struct {
+        /// The file lives inside a git repository.
+        repo: bool = false,
+        /// git tracks the file. An untracked file inside a repo has
+        /// no diff at all; every one of its lines is new.
+        tracked: bool = false,
+        /// The repository has no HEAD commit yet, so nothing is
+        /// committed to compare against.
+        initial: bool = false,
+        /// The diff (or the run list) hit a cap; what came back is a
+        /// prefix, not the whole answer.
+        truncated: bool = false,
+        /// Caller-allocated; free with the same allocator.
+        runs: []gitdiff.Run = &.{},
+    };
+
+    /// Run one `git_diff` to completion (bounded) and collect it.
+    /// Runs are allocated from `alloc`; nothing else is owned.
+    pub fn gitDiff(self: *Fs, alloc: std.mem.Allocator, path: []const u8, timeout_ms: i64) Error!GitDiffResult {
+        const job = try self.startGitDiff(path);
+        var out = GitDiffResult{};
+        var runs: std.ArrayList(gitdiff.Run) = .empty;
+        errdefer runs.deinit(alloc);
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            var i: usize = 0;
+            var terminal: ?[]const u8 = null;
+            while (i < self.job_events.items.len) {
+                const e = &self.job_events.items[i];
+                if (e.job != job) {
+                    i += 1;
+                    continue;
+                }
+                var ev = self.job_events.orderedRemove(i);
+                defer ev.deinit();
+                if (std.mem.eql(u8, ev.ev, "line")) {
+                    const kind = gitdiff.kindFromName(ev.kind) orelse continue;
+                    if (ev.size == 0) continue;
+                    runs.append(alloc, .{
+                        .line = std.math.cast(u32, ev.line) orelse continue,
+                        .count = std.math.cast(u32, ev.size) orelse continue,
+                        .kind = kind,
+                    }) catch return Error.OutOfMemory;
+                    continue;
+                }
+                if (std.mem.eql(u8, ev.ev, "repo")) {
+                    out.repo = ev.repo;
+                    out.tracked = ev.tracked;
+                    out.initial = ev.initial;
+                    if (ev.truncated) out.truncated = true;
+                    continue;
+                }
+                if (ev.terminal()) {
+                    terminal = if (std.mem.eql(u8, ev.ev, "done")) "done" else "";
+                    break;
+                }
+            }
+            if (terminal) |t| {
+                if (t.len == 0) {
+                    runs.deinit(alloc);
+                    return Error.FsOpFailed;
+                }
+                out.runs = runs.toOwnedSlice(alloc) catch return Error.OutOfMemory;
+                return out;
+            }
+            const remain = deadline - nowMs();
+            if (remain <= 0) {
+                runs.deinit(alloc);
+                return Error.Timeout;
+            }
+            const f = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+                error.Timeout => {
+                    runs.deinit(alloc);
+                    return Error.Timeout;
+                },
+                else => {
+                    runs.deinit(alloc);
+                    return Error.NotConnected;
+                },
+            };
+            defer f.deinit(self.allocator);
+            self.stashPush(f.ftype, f.payload);
+        }
     }
 
     /// Split `path` into `<path>.001`, `.002`, … of `part_size` each
