@@ -2716,9 +2716,11 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     // selection model the mouse drives (word / line / rectangular all
     // set `selection.mode`), so there is no second notion of "what is
     // selected" here.
+    // hasContent, not isActive: a bare left click leaves an active
+    // but empty selection, which would keep Copy sensitive and
+    // copying nothing.
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy")) |act| {
-        const has_sel = screen.selection.isActive();
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(has_sel));
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(screen.selection.hasContent()));
     }
     const output_avail = screen.lastCommandOutputAvailable();
     for ([_][*:0]const u8{ "copy-output", "select-output" }) |name| {
