@@ -63,6 +63,28 @@ pub const Command = struct {
     /// `U=1`: this is a Unicode-placeholder (virtual) placement — the
     /// image is positioned later by U+10EEEE cells, not at the cursor.
     unicode_placement: u8 = 0,
+    /// Image NUMBER (`I=`) — a client-chosen tag the terminal maps to
+    /// an id it assigns itself. Distinct from `image_id`; `d=n/N`
+    /// deletes by it.
+    image_number: u32 = 0,
+    /// `S=` size in bytes and `O=` offset, for the file and shared
+    /// memory transfer media.
+    data_size: u32 = 0,
+    data_offset: u32 = 0,
+    /// Pixel offset within the starting cell (`X=`, `Y=`), so an image
+    /// can be positioned off the cell grid. For `a=f` these two mean
+    /// the frame composition mode and background colour instead.
+    cell_x_offset: u32 = 0,
+    cell_y_offset: u32 = 0,
+    /// Relative placement (`P=` parent image, `Q=` parent placement)
+    /// with its offset in cells (`H=`, `V=`).
+    parent_image_id: u32 = 0,
+    parent_placement_id: u32 = 0,
+    parent_dx: i32 = 0,
+    parent_dy: i32 = 0,
+    /// `N=1`: the client says this image is transient and need not be
+    /// kept once its placements are gone.
+    transient: u8 = 0,
     /// Raw payload after the ';'. May be empty.
     payload: []const u8 = &.{},
 };
@@ -146,6 +168,16 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
         'd' => if (val.len > 0) {
             cmd.delete_what = val[0];
         },
+        'I' => cmd.image_number = parseUint(val),
+        'S' => cmd.data_size = parseUint(val),
+        'O' => cmd.data_offset = parseUint(val),
+        'X' => cmd.cell_x_offset = parseUint(val),
+        'Y' => cmd.cell_y_offset = parseUint(val),
+        'P' => cmd.parent_image_id = parseUint(val),
+        'Q' => cmd.parent_placement_id = parseUint(val),
+        'H' => cmd.parent_dx = parseInt(val),
+        'V' => cmd.parent_dy = parseInt(val),
+        'N' => cmd.transient = if (val.len > 0) val[0] -% '0' else 0,
         else => {},
     }
 }
