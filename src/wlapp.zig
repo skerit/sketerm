@@ -100,6 +100,134 @@ const PNG_FILTERS = [_]fpicker.Filter{.{ .label = "PNG images", .patterns = &.{"
 const GIF_FILTERS = [_]fpicker.Filter{.{ .label = "GIF animations", .patterns = &.{"*.gif"} }};
 const WEBM_FILTERS = [_]fpicker.Filter{.{ .label = "WebM videos", .patterns = &.{"*.webm"} }};
 
+// ---- forwarded-window host menu (shared with winapp.zig) ----------
+//
+// Both app-forwarding backends put the same host-side chrome on a
+// remote window: screenshot, record, close. The rows below are the
+// mechanism (popover, row buttons, teardown); each backend passes its
+// own row list, because only the Wayland side has embedding
+// (pop-out / show-in-tab) to offer.
+
+/// One host-menu row: a label and the handler the button drives.
+pub const HostMenuRow = struct {
+    label: [*:0]const u8,
+    cb: *const fn (?*c.GtkButton, ?*anyopaque) callconv(.c) void,
+    ctx: ?*anyopaque,
+};
+
+/// Pop a host menu of `rows`, parented to `parent` at (x, y) in its
+/// coordinates. Handlers call `popdownHostMenu` on their button.
+pub fn popupHostMenu(parent: *c.GtkWidget, x: f64, y: f64, rows: []const HostMenuRow) void {
+    const pop = c.gtk_popover_new();
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    for (rows) |row| {
+        const btn = c.gtk_button_new_with_label(row.label);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        _ = c.g_signal_connect_data(@ptrCast(btn), "clicked", @ptrCast(row.cb), row.ctx, null, 0);
+        c.gtk_box_append(@ptrCast(box), btn);
+    }
+    c.gtk_popover_set_child(@ptrCast(pop), box);
+    c.gtk_widget_set_parent(pop, parent);
+    var rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+    c.gtk_popover_set_pointing_to(@ptrCast(pop), &rect);
+    _ = c.g_signal_connect_data(@ptrCast(pop), "closed", @ptrCast(&onHostMenuClosed), null, null, 0);
+    c.gtk_popover_popup(@ptrCast(pop));
+}
+
+/// Dismiss the host menu a row button belongs to.
+pub fn popdownHostMenu(btn: ?*c.GtkButton) void {
+    const pop = c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type()) orelse return;
+    c.gtk_popover_popdown(@ptrCast(pop));
+}
+
+fn onHostMenuClosed(pop: ?*c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
+    // Unparent OUTSIDE the closed emission; ref-held so a window
+    // teardown racing the idle can't leave a dangler.
+    _ = c.g_object_ref(@ptrCast(pop));
+    _ = c.g_idle_add(@ptrCast(&idleUnparentPopover), pop);
+}
+
+fn idleUnparentPopover(user: ?*anyopaque) callconv(.c) c_int {
+    const w: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    if (c.gtk_widget_get_parent(w) != null) c.gtk_widget_unparent(w);
+    c.g_object_unref(@ptrCast(w));
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Save a GtkPicture's CURRENT frame as a PNG. The texture's bytes are
+/// taken immediately (they outlive the window), then a save location
+/// is asked for.
+pub fn screenshotPicture(allocator: std.mem.Allocator, parent: ?*c.GtkWindow, picture: *c.GtkWidget) void {
+    const paintable = c.gtk_picture_get_paintable(@ptrCast(picture)) orelse return;
+    if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(paintable)), c.gdk_texture_get_type()) == 0) return;
+    const bytes = c.gdk_texture_save_to_png_bytes(@ptrCast(paintable)) orelse return;
+    askSaveBytes(allocator, parent, bytes, "Save App Screenshot", "sketerm-app.png", &PNG_FILTERS);
+}
+
+/// GIF/WebM recording of one forwarded window's frames — the state
+/// behind the host menu's Record rows, shared by both backends so the
+/// start/stop/save rules cannot drift apart.
+pub const WindowRec = struct {
+    pub const Kind = enum { gif, webm };
+
+    gif: ?@import("util/gifrec.zig").Rec = null,
+    webm: ?@import("util/videorec.zig").Rec = null,
+
+    pub fn active(self: *const WindowRec) bool {
+        return self.gif != null or self.webm != null;
+    }
+
+    pub fn nowMs() i64 {
+        return @divTrunc(c.g_get_monotonic_time(), 1000);
+    }
+
+    /// Feed one presented frame (wl_shm-style format code: 0 =
+    /// premultiplied BGRA, 1 = BGRX). No-op when not recording.
+    pub fn addFrame(self: *WindowRec, pixels: []const u8, w: u32, h: u32, format: u32) void {
+        if (self.gif) |*r| r.addShmFrame(pixels, w, h, format, nowMs()) catch {};
+        if (self.webm) |*r| r.addShmFrame(pixels, w, h, format, nowMs()) catch {};
+    }
+
+    /// Toggle: a running recording of EITHER kind stops and offers to
+    /// save; otherwise `kind` starts.
+    pub fn toggle(self: *WindowRec, allocator: std.mem.Allocator, parent: ?*c.GtkWindow, kind: Kind) void {
+        if (self.gif) |*r| {
+            const blob = r.finish(nowMs()) catch {
+                self.gif = null;
+                return;
+            };
+            self.gif = null;
+            const bytes = c.g_bytes_new(blob.ptr, blob.len);
+            allocator.free(blob);
+            askSaveBytes(allocator, parent, bytes.?, "Save Recording", "sketerm-recording.gif", &GIF_FILTERS);
+            return;
+        }
+        if (self.webm) |*r| {
+            const blob = r.finish(nowMs()) catch {
+                self.webm = null;
+                return;
+            };
+            self.webm = null;
+            const bytes = c.g_bytes_new(blob.ptr, blob.len);
+            allocator.free(blob);
+            askSaveBytes(allocator, parent, bytes.?, "Save Recording", "sketerm-recording.webm", &WEBM_FILTERS);
+            return;
+        }
+        switch (kind) {
+            .gif => self.gif = @import("util/gifrec.zig").Rec.init(allocator, 0),
+            .webm => self.webm = @import("util/videorec.zig").Rec.init(allocator, 0),
+        }
+    }
+
+    /// Drop a recording without saving (the window died under it).
+    pub fn abort(self: *WindowRec) void {
+        if (self.gif) |*r| r.abort();
+        if (self.webm) |*r| r.abort();
+        self.gif = null;
+        self.webm = null;
+    }
+};
+
 /// A window named across app connections: the connection's session id
 /// plus a surface id in THAT connection's space. Neither half is
 /// unique on its own.
@@ -346,8 +474,7 @@ pub const AppHost = struct {
         /// attached to the session (assistant-is-driving indicator).
         badge: ?*c.GtkWidget = null,
         /// Active recording of this window (host menu): GIF or WebM.
-        rec: ?@import("util/gifrec.zig").Rec = null,
-        vrec: ?@import("util/videorec.zig").Rec = null,
+        rec: WindowRec = .{},
         /// Last host-edge band the pointer was in (Wayland edge mask,
         /// 0 = interior). Drives the resize cursor and gates whether a
         /// press starts a host-window resize vs. goes to the app.
@@ -428,115 +555,59 @@ pub const AppHost = struct {
 
         /// Ctrl+right-click host menu: the only host-side chrome a
         /// forwarded window has (everything else goes to the app).
+        /// Rows and the popover itself are the shared host-menu
+        /// mechanism (`popupHostMenu`), which winapp.zig uses too; the
+        /// embedding rows are this backend's alone.
         fn showHostMenu(self: *Win, x: f64, y: f64) void {
-            const pop = c.gtk_popover_new();
-            const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-            const shot = c.gtk_button_new_with_label("Screenshot Window…");
-            c.gtk_button_set_has_frame(@ptrCast(shot), 0);
-            _ = c.g_signal_connect_data(@ptrCast(shot), "clicked", @ptrCast(&onMenuScreenshot), self, null, 0);
-            c.gtk_box_append(@ptrCast(box), shot);
-            const recording = self.rec != null or self.vrec != null;
-            const rec_btn = c.gtk_button_new_with_label(if (recording) "Stop Recording…" else "Record Window (WebM)");
-            c.gtk_button_set_has_frame(@ptrCast(rec_btn), 0);
-            _ = c.g_signal_connect_data(@ptrCast(rec_btn), "clicked", @ptrCast(&onMenuRecordWebm), self, null, 0);
-            c.gtk_box_append(@ptrCast(box), rec_btn);
+            var rows: [5]HostMenuRow = undefined;
+            var n: usize = 0;
+            rows[n] = .{ .label = "Screenshot Window\u{2026}", .cb = &onMenuScreenshot, .ctx = self };
+            n += 1;
+            const recording = self.rec.active();
+            rows[n] = .{
+                .label = if (recording) "Stop Recording\u{2026}" else "Record Window (WebM)",
+                .cb = &onMenuRecordWebm,
+                .ctx = self,
+            };
+            n += 1;
             if (!recording) {
-                const gif_btn = c.gtk_button_new_with_label("Record Window (GIF)");
-                c.gtk_button_set_has_frame(@ptrCast(gif_btn), 0);
-                _ = c.g_signal_connect_data(@ptrCast(gif_btn), "clicked", @ptrCast(&onMenuRecord), self, null, 0);
-                c.gtk_box_append(@ptrCast(box), gif_btn);
+                rows[n] = .{ .label = "Record Window (GIF)", .cb = &onMenuRecord, .ctx = self };
+                n += 1;
             }
             if (self.embedded) {
-                const out_btn = c.gtk_button_new_with_label("Pop Out Window");
-                c.gtk_button_set_has_frame(@ptrCast(out_btn), 0);
-                _ = c.g_signal_connect_data(@ptrCast(out_btn), "clicked", @ptrCast(&onMenuPopOut), self, null, 0);
-                c.gtk_box_append(@ptrCast(box), out_btn);
+                rows[n] = .{ .label = "Pop Out Window", .cb = &onMenuPopOut, .ctx = self };
+                n += 1;
             } else if (self.host.on_request_embed != null and self.host.embed_surface == 0) {
-                const in_btn = c.gtk_button_new_with_label("Show in Tab");
-                c.gtk_button_set_has_frame(@ptrCast(in_btn), 0);
-                _ = c.g_signal_connect_data(@ptrCast(in_btn), "clicked", @ptrCast(&onMenuShowInTab), self, null, 0);
-                c.gtk_box_append(@ptrCast(box), in_btn);
+                rows[n] = .{ .label = "Show in Tab", .cb = &onMenuShowInTab, .ctx = self };
+                n += 1;
             }
-            const close_btn = c.gtk_button_new_with_label("Close Window");
-            c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
-            _ = c.g_signal_connect_data(@ptrCast(close_btn), "clicked", @ptrCast(&onMenuClose), self, null, 0);
-            c.gtk_box_append(@ptrCast(box), close_btn);
-            c.gtk_popover_set_child(@ptrCast(pop), box);
-            c.gtk_widget_set_parent(pop, self.picture);
-            var rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
-            c.gtk_popover_set_pointing_to(@ptrCast(pop), &rect);
-            _ = c.g_signal_connect_data(@ptrCast(pop), "closed", @ptrCast(&onHostMenuClosed), null, null, 0);
-            c.gtk_popover_popup(@ptrCast(pop));
+            rows[n] = .{ .label = "Close Window", .cb = &onMenuClose, .ctx = self };
+            n += 1;
+            popupHostMenu(self.picture, x, y, rows[0..n]);
         }
 
         fn popdownFrom(btn: ?*c.GtkButton) void {
-            const pop = c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type()) orelse return;
-            c.gtk_popover_popdown(@ptrCast(pop));
+            popdownHostMenu(btn);
         }
 
-        /// Snapshot the CURRENT frame texture immediately (its GBytes
-        /// outlives the window), then ask where to save it.
         fn onMenuScreenshot(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
             popdownFrom(btn);
-            const paintable = c.gtk_picture_get_paintable(@ptrCast(win.picture)) orelse return;
-            if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(paintable)), c.gdk_texture_get_type()) == 0) return;
-            const bytes = c.gdk_texture_save_to_png_bytes(@ptrCast(paintable)) orelse return;
-            askSaveBytes(win.host.allocator, win.window, bytes, "Save App Screenshot", "sketerm-app.png", &PNG_FILTERS);
-        }
-
-        fn recNowMs() i64 {
-            return @divTrunc(c.g_get_monotonic_time(), 1000);
+            screenshotPicture(win.host.allocator, win.window, win.picture);
         }
 
         /// Toggle GIF recording of this window's committed frames.
         fn onMenuRecord(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
             popdownFrom(btn);
-            const gifrec = @import("util/gifrec.zig");
-            if (win.rec) |*r| {
-                const gif = r.finish(recNowMs()) catch {
-                    win.rec = null;
-                    return;
-                };
-                win.rec = null;
-                const bytes = c.g_bytes_new(gif.ptr, gif.len);
-                win.host.allocator.free(gif);
-                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.gif", &GIF_FILTERS);
-                return;
-            }
-            win.rec = gifrec.Rec.init(win.host.allocator, 0);
+            win.rec.toggle(win.host.allocator, win.window, .gif);
         }
 
         /// Toggle WebM/VP9 recording of this window's committed frames.
         fn onMenuRecordWebm(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
             popdownFrom(btn);
-            const videorec = @import("util/videorec.zig");
-            // Stop whichever recording is active (WebM or GIF).
-            if (win.rec) |*r| {
-                const gif = r.finish(recNowMs()) catch {
-                    win.rec = null;
-                    return;
-                };
-                win.rec = null;
-                const bytes = c.g_bytes_new(gif.ptr, gif.len);
-                win.host.allocator.free(gif);
-                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.gif", &GIF_FILTERS);
-                return;
-            }
-            if (win.vrec) |*r| {
-                const webm = r.finish(recNowMs()) catch {
-                    win.vrec = null;
-                    return;
-                };
-                win.vrec = null;
-                const bytes = c.g_bytes_new(webm.ptr, webm.len);
-                win.host.allocator.free(webm);
-                askSaveBytes(win.host.allocator, win.window, bytes.?, "Save Recording", "sketerm-recording.webm", &WEBM_FILTERS);
-                return;
-            }
-            win.vrec = videorec.Rec.init(win.host.allocator, 0);
+            win.rec.toggle(win.host.allocator, win.window, .webm);
         }
 
         fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -562,20 +633,6 @@ pub const AppHost = struct {
             const win = cast.userData(Win, user);
             popdownFrom(btn);
             if (win.host.on_request_embed) |f| f(win.host.embed_ctx);
-        }
-
-        fn onHostMenuClosed(pop: ?*c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
-            // Unparent OUTSIDE the closed emission; ref-held so a
-            // window teardown racing the idle can't leave a dangler.
-            _ = c.g_object_ref(@ptrCast(pop));
-            _ = c.g_idle_add(@ptrCast(&idleUnparentPopover), pop);
-        }
-
-        fn idleUnparentPopover(user: ?*anyopaque) callconv(.c) c_int {
-            const w: *c.GtkWidget = @ptrCast(@alignCast(user.?));
-            if (c.gtk_widget_get_parent(w) != null) c.gtk_widget_unparent(w);
-            c.g_object_unref(@ptrCast(w));
-            return 0; // G_SOURCE_REMOVE
         }
 
         /// Host-window resize edge under (x, y) in picture coords, or 0
@@ -1079,12 +1136,7 @@ pub const AppHost = struct {
             rw.newTexture(w, h, format, pixels)) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
-        if (win.rec) |*r| {
-            r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
-        }
-        if (win.vrec) |*r| {
-            r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
-        }
+        win.rec.addFrame(pixels, @intCast(w), @intCast(h), format);
     }
 
     /// Number of live windows (embedded or floating).
@@ -1578,8 +1630,7 @@ pub const AppHost = struct {
             if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), win.overlay);
             if (self.on_embed) |f| f(self.embed_ctx, false);
         }
-        if (win.rec) |*r| r.abort();
-        if (win.vrec) |*r| r.abort();
+        win.rec.abort();
         if (win.app_id) |aid| self.allocator.free(aid);
         if (win.icon_tex) |tex| c.g_object_unref(tex);
         win.cancelOpaqueResize();

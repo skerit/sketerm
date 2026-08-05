@@ -14,6 +14,7 @@ const proto = @import("winstream/proto.zig");
 const rw = @import("remote_window.zig");
 const vcodec = @import("wlhost/vcodec.zig");
 const build_options = @import("build_options");
+const wlapp = @import("wlapp.zig");
 
 pub const WsHost = struct {
     allocator: std.mem.Allocator,
@@ -78,6 +79,10 @@ pub const WsHost = struct {
         /// present re-wraps it as a texture — so a damaged-rect source
         /// only has to ship the rect, not the whole window.
         backing: std.ArrayList(u8) = .empty,
+        /// Active recording of this window (host menu): GIF or WebM.
+        /// Same state and same start/stop/save rules as the Wayland
+        /// backend — wlapp.WindowRec is shared, not copied.
+        rec: wlapp.WindowRec = .{},
         /// Lazily-created video decoder for win_vtile updates, recreated
         /// on a dimension/codec change (build_options.video).
         vdec: ?vcodec.Decoder = null,
@@ -143,6 +148,59 @@ pub const WsHost = struct {
             const tex = rw.newTexture(win.w, win.h, 0, win.backing.items[0..need]) orelse return;
             defer c.g_object_unref(tex);
             c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+            // 0 = premultiplied BGRA, the format the backing holds.
+            win.rec.addFrame(win.backing.items[0..need], @intCast(win.w), @intCast(win.h), 0);
+        }
+
+        /// Ctrl+right-click host menu: the winstream backend's half of
+        /// the shared host-menu contract (wlapp.popupHostMenu). No
+        /// pop-out / show-in-tab rows: a streamed window is always a
+        /// floating toplevel, there is no embedded mode to leave.
+        fn showHostMenu(win: *Win, x: f64, y: f64) void {
+            var rows: [4]wlapp.HostMenuRow = undefined;
+            var n: usize = 0;
+            rows[n] = .{ .label = "Screenshot Window\u{2026}", .cb = &onMenuScreenshot, .ctx = win };
+            n += 1;
+            const recording = win.rec.active();
+            rows[n] = .{
+                .label = if (recording) "Stop Recording\u{2026}" else "Record Window (WebM)",
+                .cb = &onMenuRecordWebm,
+                .ctx = win,
+            };
+            n += 1;
+            if (!recording) {
+                rows[n] = .{ .label = "Record Window (GIF)", .cb = &onMenuRecordGif, .ctx = win };
+                n += 1;
+            }
+            rows[n] = .{ .label = "Close Window", .cb = &onMenuClose, .ctx = win };
+            n += 1;
+            wlapp.popupHostMenu(win.picture, x, y, rows[0..n]);
+        }
+
+        fn onMenuScreenshot(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            wlapp.popdownHostMenu(btn);
+            wlapp.screenshotPicture(win.host.allocator, win.window, win.picture);
+        }
+
+        fn onMenuRecordGif(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            wlapp.popdownHostMenu(btn);
+            win.rec.toggle(win.host.allocator, win.window, .gif);
+        }
+
+        fn onMenuRecordWebm(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            wlapp.popdownHostMenu(btn);
+            win.rec.toggle(win.host.allocator, win.window, .webm);
+        }
+
+        /// Ask the remote app to close, the same request the window
+        /// manager's close button sends (onCloseRequest).
+        fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            wlapp.popdownHostMenu(btn);
+            c.gtk_window_close(win.window);
         }
     };
 
@@ -156,6 +214,7 @@ pub const WsHost = struct {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
             w.*.cancelOpaqueResize();
+            w.*.rec.abort();
             self.allocator.free(w.*.drag_rects);
             w.*.backing.deinit(self.allocator);
             if (w.*.vdec) |*d| d.deinit();
@@ -295,6 +354,7 @@ pub const WsHost = struct {
                 const win = self.windows.get(id) orelse return;
                 _ = self.windows.remove(id);
                 win.cancelOpaqueResize();
+                win.rec.abort();
                 self.allocator.free(win.drag_rects);
                 win.backing.deinit(self.allocator);
                 if (win.vdec) |*d| d.deinit();
@@ -443,6 +503,16 @@ pub const WsHost = struct {
     fn onPress(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
+        // Ctrl+right-click is the HOST menu (screenshot / record /
+        // close) — the same chord and the same rows the Wayland
+        // backend answers with; every other press goes to the app.
+        const state = c.gtk_event_controller_get_current_event_state(@ptrCast(g));
+        if (btn == 3 and (state & c.GDK_CONTROL_MASK) != 0) {
+            _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
+            win.fwd_press = false;
+            win.showHostMenu(x, y);
+            return;
+        }
         // A primary press on a title-bar region MIGHT start a local
         // window-move — but defer that until the pointer actually moves
         // (see onMotion). A press+release with no movement is a real click
