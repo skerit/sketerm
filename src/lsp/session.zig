@@ -26,6 +26,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rpc = @import("rpc.zig");
 const pos = @import("position.zig");
+const semantic = @import("semantic.zig");
 
 pub const Encoding = pos.Encoding;
 
@@ -61,6 +62,13 @@ pub const Kind = enum {
     rename,
     formatting,
     range_formatting,
+    signature_help,
+    code_action,
+    code_action_resolve,
+    execute_command,
+    inlay_hint,
+    semantic_tokens_full,
+    semantic_tokens_delta,
 };
 
 pub const Request = struct {
@@ -99,16 +107,45 @@ pub const Caps = struct {
     rename: bool = false,
     formatting: bool = false,
     range_formatting: bool = false,
+    signature_help: bool = false,
+    code_action: bool = false,
+    code_action_resolve: bool = false,
+    inlay_hint: bool = false,
+    /// `semanticTokensProvider.full` — the whole-document request.
+    semantic_tokens: bool = false,
+    /// …and whether it also answers `semanticTokens/full/delta`.
+    semantic_tokens_delta: bool = false,
     /// Characters that should pop the completion list open. Owned.
     completion_triggers: []u8 = &.{},
+    /// Characters that open signature help, and the (usually smaller)
+    /// set that updates an already-open one. Owned.
+    signature_triggers: []u8 = &.{},
+    signature_retriggers: []u8 = &.{},
+    /// `tokenTypes` from the semantic-tokens legend. Owned.
+    token_types: semantic.Legend = .{},
 
     pub fn deinit(self: *Caps, alloc: Allocator) void {
-        if (self.completion_triggers.len > 0) alloc.free(self.completion_triggers);
-        self.completion_triggers = &.{};
+        for ([_]*[]u8{
+            &self.completion_triggers,
+            &self.signature_triggers,
+            &self.signature_retriggers,
+        }) |slot| {
+            if (slot.len > 0) alloc.free(slot.*);
+            slot.* = &.{};
+        }
+        self.token_types.deinit(alloc);
     }
 
     pub fn isTrigger(self: *const Caps, ch: u8) bool {
         return std.mem.indexOfScalar(u8, self.completion_triggers, ch) != null;
+    }
+
+    pub fn isSignatureTrigger(self: *const Caps, ch: u8) bool {
+        return std.mem.indexOfScalar(u8, self.signature_triggers, ch) != null;
+    }
+
+    pub fn isSignatureRetrigger(self: *const Caps, ch: u8) bool {
+        return std.mem.indexOfScalar(u8, self.signature_retriggers, ch) != null;
     }
 };
 
@@ -128,6 +165,12 @@ pub const Handler = struct {
     on_notification: *const fn (ctx: *anyopaque, method: []const u8, params: std.json.Value) void,
     /// State transitions, including the move to `.dead`.
     on_state: *const fn (ctx: *anyopaque, state: State) void,
+    /// `workspace/applyEdit`: the server asks US to write a
+    /// `WorkspaceEdit`. This is how a code action that carries a
+    /// `command` (rather than an inline edit) actually changes
+    /// anything, so it cannot be answered generically here. @return
+    /// what goes into the reply's `applied` field.
+    on_apply_edit: *const fn (ctx: *anyopaque, params: std.json.Value) bool,
 };
 
 pub const Session = struct {
@@ -252,7 +295,14 @@ pub const Session = struct {
             std.mem.eql(u8, env.method, "workspace/configuration");
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.alloc);
-        if (nullable) {
+        if (std.mem.eql(u8, env.method, "workspace/applyEdit")) {
+            const applied = self.handler.on_apply_edit(self.handler.ctx, env.params);
+            buf.print(
+                self.alloc,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"applied\":{s}}}}}",
+                .{ id_tok.items, if (applied) "true" else "false" },
+            ) catch return;
+        } else if (nullable) {
             // workspace/configuration wants an ARRAY (one entry per
             // requested section); the others want a bare null.
             var result: std.ArrayList(u8) = .empty;
@@ -323,6 +373,7 @@ pub const Session = struct {
             self.markDead();
             return;
         }
+        self.caps.deinit(self.alloc);
         self.caps = parseCaps(self.alloc, env.result);
         self.sendNotification("initialized", "{}");
         self.setState(.ready);
@@ -541,7 +592,7 @@ pub const CLIENT_CAPS =
     \\"clientInfo":{"name":"sketerm"},
     \\"capabilities":{
     \\"general":{"positionEncodings":["utf-8","utf-16"]},
-    \\"workspace":{"applyEdit":false,"workspaceEdit":{"documentChanges":true},"symbol":{"dynamicRegistration":false},"configuration":true},
+    \\"workspace":{"applyEdit":true,"workspaceEdit":{"documentChanges":true},"symbol":{"dynamicRegistration":false},"configuration":true,"executeCommand":{"dynamicRegistration":false}},
     \\"textDocument":{
     \\"synchronization":{"dynamicRegistration":false,"willSave":false,"didSave":true},
     \\"publishDiagnostics":{"relatedInformation":true,"versionSupport":true},
@@ -554,7 +605,11 @@ pub const CLIENT_CAPS =
     \\"documentSymbol":{"dynamicRegistration":false,"hierarchicalDocumentSymbolSupport":true},
     \\"rename":{"dynamicRegistration":false,"prepareSupport":false},
     \\"formatting":{"dynamicRegistration":false},
-    \\"rangeFormatting":{"dynamicRegistration":false}
+    \\"rangeFormatting":{"dynamicRegistration":false},
+    \\"signatureHelp":{"dynamicRegistration":false,"contextSupport":true,"signatureInformation":{"documentationFormat":["plaintext","markdown"],"parameterInformation":{"labelOffsetSupport":true},"activeParameterSupport":true}},
+    \\"codeAction":{"dynamicRegistration":false,"isPreferredSupport":true,"dataSupport":true,"resolveSupport":{"properties":["edit"]},"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["","quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source","source.organizeImports","source.fixAll"]}}},
+    \\"inlayHint":{"dynamicRegistration":false,"resolveSupport":{"properties":[]}},
+    \\"semanticTokens":{"dynamicRegistration":false,"requests":{"range":false,"full":{"delta":true}},"tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],"tokenModifiers":["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"],"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":true,"augmentsSyntaxTokens":true}
     \\}}
 ;
 
@@ -604,15 +659,40 @@ pub fn parseCaps(alloc: Allocator, result: std.json.Value) Caps {
         if (cp == .object) {
             caps.completion = true;
             caps.completion_resolve = boolOf(cp.object.get("resolveProvider"), false);
-            if (cp.object.get("triggerCharacters")) |tc| {
-                if (tc == .array) {
-                    var buf: std.ArrayList(u8) = .empty;
-                    for (tc.array.items) |t| {
-                        if (t == .string and t.string.len > 0) buf.append(alloc, t.string[0]) catch break;
-                    }
-                    caps.completion_triggers = buf.toOwnedSlice(alloc) catch &.{};
+            caps.completion_triggers = firstCharsOf(alloc, cp.object.get("triggerCharacters"));
+        }
+    }
+
+    if (sc.get("signatureHelpProvider")) |sp| {
+        if (sp == .object) {
+            caps.signature_help = true;
+            caps.signature_triggers = firstCharsOf(alloc, sp.object.get("triggerCharacters"));
+            caps.signature_retriggers = firstCharsOf(alloc, sp.object.get("retriggerCharacters"));
+        }
+    }
+
+    if (sc.get("codeActionProvider")) |ca| {
+        caps.code_action = providerOn(ca);
+        if (ca == .object) caps.code_action_resolve = boolOf(ca.object.get("resolveProvider"), false);
+    }
+    caps.inlay_hint = providerOn(sc.get("inlayHintProvider"));
+
+    // `semanticTokensProvider.full` is `true` or `{delta}`; a provider
+    // that offers only `range` is treated as offering nothing, because
+    // the client asks for the whole document first (docs/lsp.md).
+    if (sc.get("semanticTokensProvider")) |sp| {
+        if (sp == .object) {
+            if (sp.object.get("full")) |full| {
+                switch (full) {
+                    .bool => |b| caps.semantic_tokens = b,
+                    .object => |fo| {
+                        caps.semantic_tokens = true;
+                        caps.semantic_tokens_delta = boolOf(fo.get("delta"), false);
+                    },
+                    else => {},
                 }
             }
+            if (caps.semantic_tokens) caps.token_types.absorb(alloc, sp);
         }
     }
     caps.hover = providerOn(sc.get("hoverProvider"));
@@ -626,6 +706,20 @@ pub fn parseCaps(alloc: Allocator, result: std.json.Value) Caps {
     caps.formatting = providerOn(sc.get("documentFormattingProvider"));
     caps.range_formatting = providerOn(sc.get("documentRangeFormattingProvider"));
     return caps;
+}
+
+/// The FIRST byte of each string in a `triggerCharacters`-shaped array.
+/// A trigger is matched against one committed byte, so a multi-byte
+/// trigger would never fire anyway; taking the lead byte at least makes
+/// an ASCII trigger in a list containing one work.
+fn firstCharsOf(alloc: Allocator, v: ?std.json.Value) []u8 {
+    const val = v orelse return &.{};
+    if (val != .array) return &.{};
+    var buf: std.ArrayList(u8) = .empty;
+    for (val.array.items) |t| {
+        if (t == .string and t.string.len > 0) buf.append(alloc, t.string[0]) catch break;
+    }
+    return buf.toOwnedSlice(alloc) catch &.{};
 }
 
 fn syncFromInt(i: i64) SyncKind {

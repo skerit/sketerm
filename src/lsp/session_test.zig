@@ -18,12 +18,16 @@ const Recorder = struct {
     responses: std.ArrayList(struct { req: session.Request, ok: bool, text: []u8 }) = .empty,
     notifications: std.ArrayList([]u8) = .empty,
     states: std.ArrayList(session.State) = .empty,
+    /// `workspace/applyEdit` payloads the server pushed at us.
+    applied: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *Recorder) void {
         for (self.responses.items) |r| self.alloc.free(r.text);
         self.responses.deinit(self.alloc);
         for (self.notifications.items) |n| self.alloc.free(n);
         self.notifications.deinit(self.alloc);
+        for (self.applied.items) |a| self.alloc.free(a);
+        self.applied.deinit(self.alloc);
         self.states.deinit(self.alloc);
     }
 
@@ -33,7 +37,21 @@ const Recorder = struct {
             .on_response = onResponse,
             .on_notification = onNotification,
             .on_state = onState,
+            .on_apply_edit = onApplyEdit,
         };
+    }
+
+    fn onApplyEdit(ctx: *anyopaque, params: std.json.Value) bool {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        var w: std.Io.Writer.Allocating = .init(self.alloc);
+        defer w.deinit();
+        std.json.Stringify.value(params, .{}, &w.writer) catch return false;
+        const txt = self.alloc.dupe(u8, w.written()) catch return false;
+        self.applied.append(self.alloc, txt) catch {
+            self.alloc.free(txt);
+            return false;
+        };
+        return true;
     }
 
     fn onResponse(ctx: *anyopaque, req: session.Request, env: rpc.Envelope) void {
@@ -121,7 +139,11 @@ const FULL_CAPS =
     \\"typeDefinitionProvider":true,"referencesProvider":true,
     \\"documentSymbolProvider":true,"workspaceSymbolProvider":true,
     \\"renameProvider":{"prepareProvider":false},
-    \\"documentFormattingProvider":true,"documentRangeFormattingProvider":true}}
+    \\"documentFormattingProvider":true,"documentRangeFormattingProvider":true,
+    \\"signatureHelpProvider":{"triggerCharacters":["(","<"],"retriggerCharacters":[","]},
+    \\"codeActionProvider":{"resolveProvider":true},
+    \\"inlayHintProvider":{"resolveProvider":false},
+    \\"semanticTokensProvider":{"legend":{"tokenTypes":["namespace","type","function"],"tokenModifiers":["static"]},"full":{"delta":true},"range":true}}}
 ;
 
 /// Bring a session all the way to `.ready` with the full capability set.
@@ -175,6 +197,81 @@ test "session: capabilities are absorbed exactly" {
     try testing.expect(s.caps.type_definition and s.caps.references);
     try testing.expect(s.caps.document_symbol and s.caps.workspace_symbol);
     try testing.expect(s.caps.rename and s.caps.formatting and s.caps.range_formatting);
+    try testing.expect(s.caps.signature_help);
+    try testing.expect(s.caps.isSignatureTrigger('(') and s.caps.isSignatureTrigger('<'));
+    try testing.expect(!s.caps.isSignatureTrigger(','));
+    try testing.expect(s.caps.isSignatureRetrigger(','));
+    try testing.expect(s.caps.code_action and s.caps.code_action_resolve);
+    try testing.expect(s.caps.inlay_hint);
+    try testing.expect(s.caps.semantic_tokens and s.caps.semantic_tokens_delta);
+    try testing.expectEqualStrings("type", s.caps.token_types.name(1));
+    try testing.expectEqualStrings("", s.caps.token_types.name(7));
+}
+
+test "session: a semanticTokens provider offering only range is not a provider" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    s.start("", 1, "");
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try feedJson(&s, alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"semanticTokensProvider":{"legend":{"tokenTypes":["type"]},"range":true}}}}
+    );
+    // The client asks for the whole document first, so a range-only
+    // provider offers it nothing it can use.
+    try testing.expect(!s.caps.semantic_tokens);
+    try testing.expect(!s.caps.semantic_tokens_delta);
+}
+
+test "session: the new capabilities default to off" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    s.start("", 1, "");
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try feedJson(&s, alloc, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}");
+    try testing.expect(!s.caps.signature_help);
+    try testing.expect(!s.caps.code_action);
+    try testing.expect(!s.caps.inlay_hint);
+    try testing.expect(!s.caps.semantic_tokens);
+    try testing.expectEqual(@as(usize, 0), s.caps.signature_triggers.len);
+}
+
+test "session: workspace/applyEdit is answered with the handler's verdict" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    try readySession(alloc, &s);
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent); // "initialized"
+
+    // A command-carrying code action ends here: the SERVER asks US to
+    // write. It is a request, so it must be answered or the server
+    // blocks forever.
+    try feedJson(&s, alloc,
+        \\{"jsonrpc":"2.0","id":88,"method":"workspace/applyEdit","params":{"edit":{"changes":{"file:///a.zig":[]}}}}
+    );
+    var reply: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &reply);
+    try drain(alloc, &s, &reply);
+    try testing.expectEqual(@as(usize, 1), reply.items.len);
+    try testing.expectEqual(@as(i64, 88), reply.items[0].id().?);
+    const result = reply.items[0].parsed.value.object.get("result").?;
+    try testing.expect(result.object.get("applied").?.bool);
+    // The handler saw the params, edit included.
+    try testing.expectEqual(@as(usize, 1), rec.applied.items.len);
+    try testing.expect(std.mem.indexOf(u8, rec.applied.items[0], "file:///a.zig") != null);
 }
 
 test "session: an empty capability set disables every feature" {
@@ -403,8 +500,10 @@ test "session: server-to-client requests are always answered" {
     try feedJson(&s, alloc,
         \\{"jsonrpc":"2.0","id":89,"method":"workspace/configuration","params":{"items":[{"section":"a"},{"section":"b"}]}}
     );
+    // Not `workspace/applyEdit` any more: that one IS implemented now
+    // (it is how a command-carrying code action does its work).
     try feedJson(&s, alloc,
-        \\{"jsonrpc":"2.0","id":90,"method":"workspace/applyEdit","params":{}}
+        \\{"jsonrpc":"2.0","id":90,"method":"workspace/codeLens/refresh","params":{}}
     );
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);

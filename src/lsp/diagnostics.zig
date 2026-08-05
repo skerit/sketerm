@@ -55,6 +55,15 @@ pub const Diagnostic = struct {
     message: []u8,
     /// Owned; empty when the server did not say ("zls", "clang", …).
     source: []u8,
+    /// The diagnostic's ORIGINAL JSON, verbatim and owned. Empty when
+    /// the producer did not keep it.
+    ///
+    /// This exists for `textDocument/codeAction`: its `context.
+    /// diagnostics` must be the server's own objects, `data` field and
+    /// all, or a server that keys its fixits off them (clangd does)
+    /// answers with nothing. Round-tripping the text is the only way to
+    /// promise that, since the store's own fields are lossy by design.
+    raw: []u8 = &.{},
 };
 
 pub const Store = struct {
@@ -79,6 +88,7 @@ pub const Store = struct {
         for (self.items.items) |d| {
             self.alloc.free(d.message);
             self.alloc.free(d.source);
+            if (d.raw.len > 0) self.alloc.free(d.raw);
         }
         self.items.clearRetainingCapacity();
     }
@@ -96,6 +106,7 @@ pub const Store = struct {
                 .severity = d.severity,
                 .message = try self.alloc.dupe(u8, d.message),
                 .source = try self.alloc.dupe(u8, d.source),
+                .raw = if (d.raw.len > 0) try self.alloc.dupe(u8, d.raw) else &.{},
             });
         }
         std.mem.sort(Diagnostic, self.items.items, {}, lessByStart);
@@ -273,6 +284,18 @@ test "diagnostics: mapThrough carries anchors across an edit" {
     try testing.expectEqual(@as(usize, 4), s.items.items[0].start);
     try testing.expectEqual(@as(usize, 23), s.items.items[1].start);
     try testing.expectEqual(@as(usize, 28), s.items.items[1].end);
+}
+
+test "diagnostics: the original JSON round-trips through the store" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    var d = mk(0, 3, .err, "boom");
+    d.raw = @constCast(@as([]const u8, "{\"message\":\"boom\",\"data\":{\"fixit\":1}}"));
+    try s.replace(1, &.{d});
+    try testing.expectEqualStrings("{\"message\":\"boom\",\"data\":{\"fixit\":1}}", s.items.items[0].raw);
+    // Replacing frees it (leak-checked by the testing allocator).
+    try s.replace(2, &.{mk(0, 1, .err, "x")});
+    try testing.expectEqual(@as(usize, 0), s.items.items[0].raw.len);
 }
 
 test "diagnostics: a deletion swallowing a range collapses it, never inverts it" {

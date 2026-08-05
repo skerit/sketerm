@@ -219,6 +219,8 @@ comptime {
     _ = @import("editor/outline.zig");
     _ = @import("editor/theme.zig");
     _ = @import("lsp/rpc.zig");
+    _ = @import("lsp/semantic.zig");
+    _ = @import("lsp/inlay.zig");
     _ = @import("lsp/position.zig");
     _ = @import("lsp/servers.zig");
     _ = @import("lsp/session.zig");
