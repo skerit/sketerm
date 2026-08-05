@@ -270,6 +270,9 @@ pub const Window = struct {
     /// Config so a SIGUSR1 config reload can't clear it.
     hold_override: bool = false,
     config: Config = .{},
+    /// GFileMonitor on config.conf (`config_auto_reload`). Null when
+    /// the key is off or no monitor could be created.
+    config_watch: ?*@import("configwatch.zig").Watcher = null,
     /// Scrollback search (Ctrl+F).
     search_bar: ?*c.GtkWidget = null,
     search_entry: ?*c.GtkWidget = null,
@@ -730,6 +733,12 @@ pub const Window = struct {
         // Resolve keybinds from defaults + Config overrides.
         self.refreshBindings();
 
+        // Translate `symbol_map.*` into the atlas's own type. Must run
+        // before the first pane: applyPaneConfig hands the pane a slice
+        // of this list, and an empty one meant a configured symbol map
+        // did nothing at all until the first config reload.
+        winconfig_mod.rebuildSymbolSpecs(self);
+
         // Background image / gradient layer.
         self.refreshBgSource();
 
@@ -738,6 +747,9 @@ pub const Window = struct {
 
         // Auto shell-integration script discovery.
         self.resolveShellIntegration();
+
+        // Live config reload: watch the file this process reads.
+        @import("configwatch.zig").install(self);
 
         // Remote-control socket (sketerm cli). Failure is non-fatal:
         // the terminal works fine without scripting. Primary only —
@@ -794,6 +806,9 @@ pub const Window = struct {
             _ = c.g_source_remove(self.ack_timer_id);
             self.ack_timer_id = 0;
         }
+        // Before anything else: a pending debounce timer would fire
+        // into a half-torn-down window.
+        @import("configwatch.zig").uninstall(self);
         for (self.panes.items) |p| p.detachAppHost();
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
@@ -880,7 +895,10 @@ pub const Window = struct {
     /// resolved copies. Editor faces MUST re-read here: their settings
     /// came out of the config arena winconfig just freed.
     pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
-        winconfig.applyConfigChange(self, new_cfg);
+        self.applyConfigChangeOpts(new_cfg, .{});
+    }
+    pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: winconfig.ApplyOpts) void {
+        winconfig.applyConfigChangeOpts(self, new_cfg, opts);
         for (self.panes.items) |p| {
             if (@import("editorview.zig").EditorView.fromPane(p)) |ev| ev.syncConfig();
         }

@@ -13214,3 +13214,53 @@ multi-select and Enter copies everything collected.
 Not covered: the prefs UI has no rows for the new hint keys (rules
 need a list editor); `docs/config.md` still documents a ZON format
 that never shipped and is unrelated drift.
+
+## Automatic config reload
+
+**config.conf is watched, and saving it applies the new settings with
+no keystroke.** A `GFileMonitor` per window (`src/ui/configwatch.zig`),
+debounced 200 ms, gated on the new app-level key `config_auto_reload`
+(default on; the prefs Behavior page has a switch for it). Rename-over
+— how editors actually save — re-arms the monitor before the reload, so
+the feature does not work exactly once and then stop.
+
+Three things make it safe to run on every save rather than on a
+keybind. An automatic reload does NOT write the file back
+(`ApplyOpts.persist = false`): the serialiser emits non-default keys
+only, so persisting would strip the comments and ordering of the file
+being edited, and would feed our own write back in forever. Every
+in-app write (`persistConfig`, sliders included) stamps the file's
+content hash, and an event whose content hashes the same is dropped —
+that is what keeps the prefs dialog, which persists on every tick,
+from bouncing off the watcher. And `Config.loadFromPath` is a new
+entry point that ERRORS on an unreadable file instead of returning
+defaults the way startup's `loadWithOverride` does: a reload that
+raced a rename must leave the running config alone, not reset every
+setting the user has.
+
+`reload_config` / SIGUSR1 changed with it: they now honour a `--config
+<path>` override (they silently reloaded the XDG file before, i.e. a
+different file from the one the process was started with) and no
+longer rewrite the file either. `persistConfig` writes to the override
+path too.
+
+Two dangling-pointer bugs came out of auditing `applyConfigChange`
+against the current field set, both from the per-style font work:
+
+- **`Pane.font_opts` was never re-pointed.** It holds five slices out
+  of the config arena — `font_family_bold` / `_italic` /
+  `_bold_italic`, plus the symbol-map list whose backing array
+  `rebuildSymbolSpecs` reallocates — and only `applyPaneConfig` (a
+  pane-creation path) ever set it. Every config reload freed the arena
+  underneath it. Now rebuilt in the pane loop through the shared
+  `fontOptsFor`, and `fontOptsDiffer` puts styled families, weights and
+  `builtin_box_drawing` into the "needs a font rebuild" test they were
+  missing from.
+- **`rebuildSymbolSpecs` was never called at startup**, only from
+  `applyConfigChange` — so a configured `symbol_map.*` did nothing at
+  all until the first reload.
+
+Covered by a smoke-e2e stage (in-place write, then a temp-file rename
+over the target, asserting the grid re-flows and flows back through
+`screen-info`), verified non-vacuous by disabling the watcher and
+watching the stage fail.
