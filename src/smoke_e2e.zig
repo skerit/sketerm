@@ -49,6 +49,9 @@ const DISPLAY_TTL = "900";
 
 var child_pid: c.pid_t = 0;
 var daemon_pid: c.pid_t = 0;
+/// The SECOND private daemon acting as the "remote host" behind the
+/// fake ssh (remoteProjectStage). Killed by exact pid, like the rest.
+var remote_mux_pid: c.pid_t = 0;
 /// Seat/pixel side of the harness: a viewer of the display session the
 /// GUI renders into. null on macOS (no hub) — see the module docs.
 var drive: ?*appdrive.App = null;
@@ -85,6 +88,12 @@ fn teardown() void {
         var status: c_int = 0;
         _ = c.waitpid(child_pid, &status, 0);
         child_pid = 0;
+    }
+    if (remote_mux_pid > 0) {
+        _ = c.kill(remote_mux_pid, c.SIGTERM);
+        var status: c_int = 0;
+        _ = c.waitpid(remote_mux_pid, &status, 0);
+        remote_mux_pid = 0;
     }
     if (display_ready and g_mux_sock.len > 0) {
         const r = runDisplayCli(g_alloc, &.{ "destroy", DISPLAY_SESSION, "--socket", g_mux_sock });
@@ -266,6 +275,67 @@ pub fn main() u8 {
             _ = c.fprintf(platform.stderr(), "smoke-e2e: attach said: %s\n", appdrive.lastLaunchErr().ptr);
             return fail("could not attach a viewer to the display session");
         };
+    }
+
+    // ── a hermetic "remote" host: fake ssh + a second daemon ──────
+    // remoteProjectStage used to run over REAL `ssh localhost`, which
+    // reaches whatever daemon the target user happens to be running —
+    // a daemon predating a capability (git_diff, say) draws an empty
+    // gutter BY DESIGN, so the assertion was about the host machine's
+    // installed daemon, not about this build. The remote is now the
+    // freshly built sketerm-mux: $SKETERM_SSH points at a script that
+    // execs `sketerm-mux --proxy` against a SECOND private daemon
+    // under <rt>/r, pre-started here so its pid is owned (an
+    // autostarted daemon detaches and could not be killed by exact
+    // pid). Setting SKETERM_SSH also disables the deploy/multiplex
+    // legs by design (deploy.prepare returns null under it).
+    var rrt_buf: [256]u8 = undefined;
+    const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return fail("remote rt path");
+    _ = c.mkdir(rrt.ptr, 0o700);
+    {
+        var mux_abs_buf: [4096]u8 = undefined;
+        const mux_abs_raw = c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return fail("realpath sketerm-mux");
+        const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(mux_abs_raw)));
+        const rmt_pid = c.fork();
+        if (rmt_pid < 0) return fail("remote mux fork");
+        if (rmt_pid == 0) {
+            dieWithParent();
+            _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
+            _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
+            _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
+            _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        remote_mux_pid = rmt_pid;
+        var rsock_buf: [512]u8 = undefined;
+        const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return fail("remote sock path");
+        var rwaited: u32 = 0;
+        while (c.access(rsock.ptr, c.F_OK) != 0) {
+            _ = c.usleep(50_000);
+            rwaited += 1;
+            if (rwaited > 100) return fail("private remote mux socket never appeared (5s)");
+        }
+
+        var ssh_path_buf: [300:0]u8 = undefined;
+        const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path");
+        var script_buf: [2048]u8 = undefined;
+        const body = std.fmt.bufPrint(&script_buf,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\export XDG_RUNTIME_DIR='{s}'
+            \\export XDG_STATE_HOME='{s}'
+            \\export XDG_CONFIG_HOME='{s}'
+            \\export SKETERM_MUX_BIN='{s}'
+            \\exec '{s}' --proxy
+            \\
+        , .{ rrt, rrt, rrt, mux_abs, mux_abs }) catch return fail("fake ssh body");
+        const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
+        const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
+        _ = c.fclose(fp);
+        if (!wrote) return fail("fake ssh write");
+        if (c.chmod(ssh_path.ptr, 0o755) != 0) return fail("fake ssh chmod");
+        _ = c.setenv("SKETERM_SSH", ssh_path.ptr, 1);
     }
 
     // Spawn the freshly-built binary with its own app id so it
@@ -1024,16 +1094,36 @@ fn writePng(path: [*:0]const u8, bytes: []const u8) void {
 /// Skipped (loudly) when passwordless ssh to localhost is not
 /// available; a rig that cannot reach the transport must not turn that
 /// into a product failure.
+/// True when a `list` reply shows pane `pane` inside a tab with
+/// "selected":true — i.e. the pane's tab is what its window is
+/// actually showing. With several windows this accepts any window's
+/// selected tab; the e2e runs a single window at this stage.
+fn selectedTabHasPane(resp: []const u8, pane: u32) bool {
+    var needle_buf: [48]u8 = undefined;
+    // PaneInfo serializes as {"id":N,"title":...} — anchor on the pair
+    // so a tab id or a stray number in a title cannot match.
+    const needle = std.fmt.bufPrint(&needle_buf, "\"id\":{d},\"title\"", .{pane}) catch return false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, "\"selected\":true")) |at| {
+        const panes_at = std.mem.indexOfPos(u8, resp, at, "\"panes\":[") orelse return false;
+        const end = std.mem.indexOfScalarPos(u8, resp, panes_at, ']') orelse return false;
+        if (std.mem.indexOf(u8, resp[panes_at..end], needle) != null) return true;
+        from = end;
+    }
+    return false;
+}
+
 fn remoteProjectStage(
     allocator: std.mem.Allocator,
     maybe_app: ?*appdrive.App,
     sock_path: [:0]const u8,
     rt: []const u8,
 ) ?[]const u8 {
-    if (sh("ssh -T -o BatchMode=yes -o ConnectTimeout=5 localhost true >/dev/null 2>&1") != 0) {
-        say("remote project stage SKIPPED (no passwordless ssh to localhost)");
-        return null;
-    }
+    // "localhost" resolves through $SKETERM_SSH (set at GUI launch) to
+    // the harness's second private daemon — the freshly built
+    // sketerm-mux, not whatever the machine's installed one is. No
+    // passwordless ssh needed, and the gutter assertion below is about
+    // THIS build's remote project layer.
     const app = maybe_app orelse return null;
 
     var req_buf: [900]u8 = undefined;
@@ -1061,12 +1151,34 @@ fn remoteProjectStage(
 
     const freq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{rpane}) catch return "fmt";
     const fresp = roundtrip(allocator, sock_path, freq) orelse return "remote focus roundtrip";
-    allocator.free(fresp);
+    defer allocator.free(fresp);
+    if (std.mem.indexOf(u8, fresp, "\"ok\":true") == null) return "remote focus was refused";
+
+    // The gutter scan below reads WINDOW pixels, so it is evidence
+    // about the remote document only while the remote tab is the one
+    // on screen — the LOCAL editor tab from the previous stage is
+    // still open with its own marks, and a run once went green off
+    // those. Assert the selected tab actually holds the remote pane,
+    // and fail the stage if the focus never took.
+    const win_id = app.windows.items[0].id;
+    {
+        var selected = false;
+        var st: u32 = 0;
+        while (st < 40 and !selected) : (st += 1) {
+            _ = c.usleep(250_000);
+            const lresp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse continue;
+            defer allocator.free(lresp);
+            selected = selectedTabHasPane(lresp, rpane);
+        }
+        if (!selected) return "focus did not take: the remote editor tab never became the selected tab";
+        // Flush any frame committed before the tab switch, so the scan
+        // cannot count the local tab's final frame.
+        _ = app.waitVisualSettle(win_id, 600, 10_000, 0.003, null);
+    }
 
     // The gutter is the whole layer in one assertion: it needs the
     // project resolved (directory listings on the remote), the diff
     // produced by a remote `git`, and the result read back.
-    const win_id = app.windows.items[0].id;
     var marks: usize = 0;
     var g: u32 = 0;
     while (g < 80) : (g += 1) {
@@ -1074,7 +1186,16 @@ fn remoteProjectStage(
         marks = gutterMarkPixels(allocator, app, win_id);
         if (marks > 8) break;
     }
-    if (marks <= 8) return "the git gutter never painted for a document served over ssh";
+    if (marks <= 8) {
+        // Evidence for the postmortem: what the (confirmed-selected)
+        // remote tab actually shows.
+        dumpLeftStrip(allocator, app, win_id);
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-remote-gutter-FAIL.png", shot.png);
+        } else |_| {}
+        return "the git gutter never painted for a document served over ssh";
+    }
     if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
         defer allocator.free(shot.png);
         writePng("zig-out/smoke-e2e-remote-gutter.png", shot.png);
