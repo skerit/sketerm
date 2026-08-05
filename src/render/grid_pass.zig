@@ -22,6 +22,7 @@ const Color = @import("../grid/style_pool.zig").Color;
 const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
+pub const scrollbar = @import("scrollbar.zig");
 
 pub const VERT_SRC =
     \\in vec2 a_pos;
@@ -192,6 +193,15 @@ const Snapshot = struct {
     allow_bold: bool = true,
     bold_is_bright: bool = true,
     min_contrast: f32 = 1.0,
+
+    border_width: f32 = 0,
+    border_color_active: [4]f32 = .{ 0, 0, 0, 0 },
+    border_color: [4]f32 = .{ 0, 0, 0, 0 },
+    scrollbar_mode: u8 = 0,
+    scrollbar_width: f32 = 0,
+    scrollbar_trough_color: [4]f32 = .{ 0, 0, 0, 0 },
+    scrollbar_thumb_color: [4]f32 = .{ 0, 0, 0, 0 },
+    scrollbar_thumb_active_color: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 pub const GridPass = struct {
@@ -228,6 +238,18 @@ pub const GridPass = struct {
     /// Minimum WCAG contrast ratio enforced on overlay-row glyph fg
     /// vs the cell's effective bg. <= 1.0 disables.
     min_contrast: f32 = 1.0,
+    /// Pane border, in framebuffer pixels. Drawn inside the pane's
+    /// own rectangle; an alpha-0 colour draws nothing.
+    border_width: f32 = 2.0,
+    border_color_active: [4]f32 = .{ 0.40, 0.55, 0.85, 0.75 },
+    border_color: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Overlay scrollbar. Geometry comes from `render/scrollbar.zig`
+    /// so `Pane`'s hit-testing sees the same rectangles.
+    scrollbar_mode: scrollbar.Mode = .auto,
+    scrollbar_width: f32 = 4.0,
+    scrollbar_trough_color: [4]f32 = .{ 0.5, 0.5, 0.5, 0.18 },
+    scrollbar_thumb_color: [4]f32 = .{ 0.5, 0.5, 0.5, 0.30 },
+    scrollbar_thumb_active_color: [4]f32 = .{ 0.40, 0.55, 0.85, 0.70 },
     allocator: std.mem.Allocator,
     /// Scratch buffers for bidi resolution + visual ordering. Grow
     /// to cols on first use; subsequent frames reuse them. Avoids
@@ -899,33 +921,24 @@ pub const GridPass = struct {
 
         const w_full: f32 = if (self.canvas_w > 0) self.canvas_w else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
         const h_full: f32 = if (self.canvas_h > 0) self.canvas_h else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
-        if (focused) {
-            const border: f32 = 2.0;
-            const accent = .{ 0.40, 0.55, 0.85, 0.75 };
-            try self.pushQuad(.{ 0, 0 }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, h_full - border }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ w_full - border, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+        const border: f32 = self.border_width;
+        const border_color = if (focused) self.border_color_active else self.border_color;
+        if (border > 0 and border_color[3] > 0) {
+            try self.pushQuad(.{ 0, 0 }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, border_color, 0.0);
+            try self.pushQuad(.{ 0, h_full - border }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, border_color, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, border_color, 0.0);
+            try self.pushQuad(.{ w_full - border, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, border_color, 0.0);
         }
 
-        if (sb_count > 0) {
-            const total_lines: u32 = sb_count + screen.rows;
-            const view_top: u32 = sb_count - view_off;
-            const visible: u32 = screen.rows;
-            const track_w: f32 = 4.0;
-            const track_x: f32 = w_full - track_w;
-            const track_h: f32 = h_full;
-            const track_color = .{ 0.5, 0.5, 0.5, 0.18 };
-            try self.pushQuad(.{ track_x, 0 }, .{ track_w, track_h }, .{ 0, 0 }, .{ 0, 0 }, track_color, 0.0);
-            const thumb_top_f: f32 = @as(f32, @floatFromInt(view_top)) / @as(f32, @floatFromInt(total_lines));
-            const thumb_h_f: f32 = @as(f32, @floatFromInt(visible)) / @as(f32, @floatFromInt(total_lines));
-            const thumb_y: f32 = thumb_top_f * track_h;
-            const thumb_h: f32 = @max(8.0, thumb_h_f * track_h);
-            const thumb_color: [4]f32 = if (view_off == 0)
-                .{ 0.5, 0.5, 0.5, 0.30 }
-            else
-                .{ 0.40, 0.55, 0.85, 0.70 };
-            try self.pushQuad(.{ track_x, thumb_y }, .{ track_w, thumb_h }, .{ 0, 0 }, .{ 0, 0 }, thumb_color, 0.0);
+        if (self.scrollbarView(screen, w_full, h_full)) |sv| {
+            if (scrollbar.layout(sv)) |l| {
+                try self.pushQuad(.{ l.x, 0 }, .{ l.w, l.h }, .{ 0, 0 }, .{ 0, 0 }, self.scrollbar_trough_color, 0.0);
+                const thumb_color: [4]f32 = if (view_off == 0)
+                    self.scrollbar_thumb_color
+                else
+                    self.scrollbar_thumb_active_color;
+                try self.pushQuad(.{ l.x, l.thumb_y }, .{ l.w, l.thumb_h }, .{ 0, 0 }, .{ 0, 0 }, thumb_color, 0.0);
+            }
         }
 
         // Per-row caches are now consistent with what we emitted —
@@ -934,6 +947,28 @@ pub const GridPass = struct {
         for (self.row_caches_valid.items) |*v| v.* = true;
         self.last_snapshot = snap;
         self.vbuf_valid = true;
+    }
+
+    /// Scrollbar geometry inputs for `screen` at a pane of
+    /// `w_full` x `h_full` framebuffer pixels, or null when the
+    /// scrollbar is off. `Pane` calls this for hit-testing so the
+    /// thumb it grabs is the thumb `buildVertices` drew.
+    pub fn scrollbarView(
+        self: *const GridPass,
+        screen: *const Screen,
+        w_full: f32,
+        h_full: f32,
+    ) ?scrollbar.View {
+        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
+        if (!scrollbar.visible(self.scrollbar_mode, self.scrollbar_width, sb_count)) return null;
+        return .{
+            .canvas_w = w_full,
+            .canvas_h = h_full,
+            .width = self.scrollbar_width,
+            .sb_count = sb_count,
+            .rows = screen.rows,
+            .view_off = @min(screen.view_offset, sb_count),
+        };
     }
 
     fn ensureRowCaches(self: *GridPass, rows: u16) !void {
@@ -1013,6 +1048,15 @@ pub const GridPass = struct {
             .allow_bold = self.allow_bold,
             .bold_is_bright = self.bold_is_bright,
             .min_contrast = self.min_contrast,
+
+            .border_width = self.border_width,
+            .border_color_active = self.border_color_active,
+            .border_color = self.border_color,
+            .scrollbar_mode = @intFromEnum(self.scrollbar_mode),
+            .scrollbar_width = self.scrollbar_width,
+            .scrollbar_trough_color = self.scrollbar_trough_color,
+            .scrollbar_thumb_color = self.scrollbar_thumb_color,
+            .scrollbar_thumb_active_color = self.scrollbar_thumb_active_color,
         };
         if (screen.preedit_text) |t| {
             s.preedit_hash = std.hash.Wyhash.hash(0, t);

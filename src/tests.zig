@@ -49,6 +49,7 @@ comptime {
     _ = @import("grid/word_motion.zig");
     _ = @import("grid/bracket.zig");
     _ = @import("render/boxdraw.zig");
+    _ = @import("render/scrollbar.zig");
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
     _ = @import("editor_app.zig");
@@ -60,6 +61,7 @@ comptime {
     _ = @import("ui/input.zig");
     _ = @import("ui/imhost.zig");
     _ = @import("ui/tree.zig");
+    _ = @import("ui/quake.zig");
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
     _ = @import("ui/tab_effects.zig");

@@ -300,6 +300,22 @@ pub const ProfileSettings = struct {
     /// Editor point size. 0 = follow this profile's `font_size`.
     editor_font_size: u16 = 0,
 
+    // Pane presentation. Per-profile (not window-level) so a profile
+    // can mark its panes visually — a red border on the `root` or
+    // `prod` profile is the point. All lengths are framebuffer
+    // pixels, the same unit as `padding`.
+    /// Border drawn just inside the pane's own rectangle. 0 = none.
+    pane_border_width: f32 = 2.0,
+    /// Border colour while the pane has focus.
+    pane_border_color_active: [4]f32 = .{ 0.40, 0.55, 0.85, 0.75 },
+    /// Border colour while it does not. Alpha 0 (the default) draws
+    /// nothing, which is what sketerm has always done.
+    pane_border_color: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Corner rounding, applied as an alpha cut on the composited
+    /// pane, so it reveals whatever is behind the GL area. Forces the
+    /// post-process pass on when non-zero. 0 = square corners.
+    pane_corner_radius: f32 = 0,
+
     /// The colour set that is in force for `scheme`, as a copy of
     /// these settings with the flat colour fields swapped out. Null
     /// scheme (= `auto_theme` off) returns the settings untouched, so
@@ -383,6 +399,13 @@ pub const Domain = struct {
 ///   multiple — only ask when there's >1 pane in the closing target
 ///   always   — ask on every close
 pub const ConfirmClose = enum { never, multiple, always };
+
+/// Overlay-scrollbar visibility. `auto` is "only when there is
+/// scrollback to reach"; there is no timed fade.
+pub const ScrollbarMode = enum { never, auto, always };
+
+/// Monitor edge a quake window is meant to drop from.
+pub const QuakeEdge = enum { top, bottom, left, right };
 
 /// File-browser listing view modes (mirrors filebrowser/model.zig's
 /// ViewMode; config keeps its own enum so the parser has no UI dep).
@@ -743,6 +766,53 @@ pub const Config = struct {
     /// `inactive_darken`.
     inactive_desaturate: f32 = 0.0,
 
+    // Overlay scrollbar (drawn by GridPass inside the pane, not a
+    // widget). Window-level: it is chrome, and a pane whose scrollbar
+    // came and went with its profile would be a usability trap.
+    /// never = not drawn and not interactive; auto = drawn once the
+    /// pane has scrollback; always = drawn even with none (the thumb
+    /// then fills the track). There is no timed fade-out.
+    scrollbar: ScrollbarMode = .auto,
+    /// Track/thumb width in framebuffer pixels. 0 also disables it.
+    scrollbar_width: f32 = 4.0,
+    scrollbar_trough_color: [4]f32 = .{ 0.5, 0.5, 0.5, 0.18 },
+    /// Thumb while the view sits at the live bottom.
+    scrollbar_thumb_color: [4]f32 = .{ 0.5, 0.5, 0.5, 0.30 },
+    /// Thumb while scrolled back.
+    scrollbar_thumb_active_color: [4]f32 = .{ 0.40, 0.55, 0.85, 0.70 },
+
+    // Split separators. Window-level: one CSS provider styles every
+    // GtkPaned in the window, and a gap is a property of the space
+    // BETWEEN two panes, which no single profile owns.
+    /// Thickness of the GtkPaned separator in logical pixels — the
+    /// visible gap between two panes. Keep it a multiple of 4: at
+    /// fractional surface scales an odd separator pushes one pane off
+    /// the device-pixel grid and GtkGraphicsOffload rejects every
+    /// frame. Clamped to 1..64 (0 would make the divider undraggable).
+    pane_gap: f32 = 4.0,
+    /// Separator colour — what shows through the gap.
+    pane_gap_color: [4]f32 = .{ 0x35.0 / 255.0, 0x35.0 / 255.0, 0x35.0 / 255.0, 1.0 },
+
+    // Quake mode (`sketerm --toggle`). Off by default: with it on,
+    // the primary window is sized from the monitor instead of the
+    // 1000x700 default.
+    /// Apply the quake geometry below to the primary window.
+    quake_enabled: bool = false,
+    /// Which monitor to drop onto: "active" (the one the window is
+    /// on), "primary", a 0-based index, or a connector name ("DP-1").
+    /// Empty = "active". GTK4 has no primary-monitor concept, so
+    /// "primary" resolves to the display's first monitor.
+    quake_monitor: []const u8 = "",
+    /// Which edge the window drops from. ADVISORY ONLY: GTK4 removed
+    /// toplevel positioning on every backend and Wayland forbids it
+    /// outright, so nothing sketerm can call moves the window to an
+    /// edge. Recorded so a compositor window rule (or a future
+    /// layer-shell backend) can consume it; it moves nothing itself.
+    quake_edge: QuakeEdge = .top,
+    /// Coverage of the target monitor, in percent (1..100).
+    quake_width_percent: f32 = 100.0,
+    quake_height_percent: f32 = 50.0,
+
     /// Minimum WCAG contrast ratio between text and its cell
     /// background, 1.0 (off) .. 21.0. Text falling below the
     /// threshold snaps to white or black, whichever reads better.
@@ -848,6 +918,7 @@ pub const Config = struct {
         out.arena = null;
         out.settings = try self.settings.cloneInto(arena);
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
+        out.quake_monitor = try arena.dupe(u8, self.quake_monitor);
         out.hint_alphabet = try arena.dupe(u8, self.hint_alphabet);
         out.hint_rules = .empty;
         try out.hint_rules.ensureTotalCapacity(arena, self.hint_rules.items.len);
@@ -1096,6 +1167,16 @@ pub const Config = struct {
         if (s.line_pad_px != base.line_pad_px) try w.print("line_pad_px = {d}\n", .{s.line_pad_px});
         if (s.padding != base.padding) try w.print("padding = {d:.2}\n", .{s.padding});
 
+        // Pane presentation.
+        if (s.pane_border_width != base.pane_border_width)
+            try w.print("pane_border_width = {d:.2}\n", .{s.pane_border_width});
+        if (!eqColor(s.pane_border_color_active, base.pane_border_color_active))
+            try writeColorA(w, "pane_border_color_active", s.pane_border_color_active);
+        if (!eqColor(s.pane_border_color, base.pane_border_color))
+            try writeColorA(w, "pane_border_color", s.pane_border_color);
+        if (s.pane_corner_radius != base.pane_corner_radius)
+            try w.print("pane_corner_radius = {d:.2}\n", .{s.pane_corner_radius});
+
         // Colors.
         if (!eqColor(s.default_fg, base.default_fg)) try writeColor(w, "default_fg", s.default_fg);
         if (!eqColor(s.default_bg, base.default_bg)) try writeColor(w, "default_bg", s.default_bg);
@@ -1340,6 +1421,32 @@ pub const Config = struct {
         if (self.background_opacity != 1.0)
             try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
 
+        // Overlay scrollbar.
+        if (self.scrollbar != .auto) try w.print("scrollbar = {s}\n", .{@tagName(self.scrollbar)});
+        if (self.scrollbar_width != 4.0)
+            try w.print("scrollbar_width = {d:.2}\n", .{self.scrollbar_width});
+        if (!eqColor(self.scrollbar_trough_color, .{ 0.5, 0.5, 0.5, 0.18 }))
+            try writeColorA(w, "scrollbar_trough_color", self.scrollbar_trough_color);
+        if (!eqColor(self.scrollbar_thumb_color, .{ 0.5, 0.5, 0.5, 0.30 }))
+            try writeColorA(w, "scrollbar_thumb_color", self.scrollbar_thumb_color);
+        if (!eqColor(self.scrollbar_thumb_active_color, .{ 0.40, 0.55, 0.85, 0.70 }))
+            try writeColorA(w, "scrollbar_thumb_active_color", self.scrollbar_thumb_active_color);
+
+        // Split separators.
+        if (self.pane_gap != 4.0) try w.print("pane_gap = {d:.2}\n", .{self.pane_gap});
+        if (!eqColor(self.pane_gap_color, .{ 0x35.0 / 255.0, 0x35.0 / 255.0, 0x35.0 / 255.0, 1.0 }))
+            try writeColorA(w, "pane_gap_color", self.pane_gap_color);
+
+        // Quake mode.
+        if (self.quake_enabled) try w.writeAll("quake_enabled = true\n");
+        if (self.quake_monitor.len > 0)
+            try w.print("quake_monitor = {s}\n", .{self.quake_monitor});
+        if (self.quake_edge != .top) try w.print("quake_edge = {s}\n", .{@tagName(self.quake_edge)});
+        if (self.quake_width_percent != 100.0)
+            try w.print("quake_width_percent = {d:.2}\n", .{self.quake_width_percent});
+        if (self.quake_height_percent != 50.0)
+            try w.print("quake_height_percent = {d:.2}\n", .{self.quake_height_percent});
+
         // Inactive pane dimming.
         if (self.inactive_darken != 0.2)
             try w.print("inactive_darken = {d:.2}\n", .{self.inactive_darken});
@@ -1571,6 +1678,19 @@ fn writeColor(w: *std.Io.Writer, key: []const u8, c: [4]f32) !void {
     const g: u8 = @intFromFloat(@round(c[1] * 255.0));
     const b: u8 = @intFromFloat(@round(c[2] * 255.0));
     try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ key, r, g, b });
+}
+
+/// Like `writeColor` but keeps the alpha channel (`#rrggbbaa`). Used
+/// by the keys whose colour is meaningfully translucent — plain
+/// `writeColor` drops alpha, which would silently turn an overlay
+/// solid on the next save.
+fn writeColorA(w: *std.Io.Writer, key: []const u8, c: [4]f32) !void {
+    const q = struct {
+        fn f(v: f32) u8 {
+            return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
+        }
+    }.f;
+    try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ key, q(c[0]), q(c[1]), q(c[2]), q(c[3]) });
 }
 
 fn writePalette16(w: *std.Io.Writer, key: []const u8, pal: [16][3]u8) !void {
@@ -1823,6 +1943,14 @@ fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u
         s.line_pad_px = try parseI16(value);
     } else if (std.mem.eql(u8, key, "padding")) {
         s.padding = try parseFloat(value);
+    } else if (std.mem.eql(u8, key, "pane_border_width")) {
+        s.pane_border_width = std.math.clamp(try parseFloat(value), 0.0, 32.0);
+    } else if (std.mem.eql(u8, key, "pane_border_color_active")) {
+        s.pane_border_color_active = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "pane_border_color")) {
+        s.pane_border_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "pane_corner_radius")) {
+        s.pane_corner_radius = std.math.clamp(try parseFloat(value), 0.0, 64.0);
     } else if (std.mem.eql(u8, key, "default_fg")) {
         s.default_fg = try parseColor(value);
     } else if (std.mem.eql(u8, key, "default_bg")) {
@@ -2199,6 +2327,30 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_gradient_to = try parseColor(value);
     } else if (std.mem.eql(u8, key, "background_gradient_angle")) {
         cfg.background_gradient_angle = try parseFloat(value);
+    } else if (std.mem.eql(u8, key, "scrollbar")) {
+        cfg.scrollbar = std.meta.stringToEnum(ScrollbarMode, value) orelse return error.BadScrollbarMode;
+    } else if (std.mem.eql(u8, key, "scrollbar_width")) {
+        cfg.scrollbar_width = std.math.clamp(try parseFloat(value), 0.0, 64.0);
+    } else if (std.mem.eql(u8, key, "scrollbar_trough_color")) {
+        cfg.scrollbar_trough_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "scrollbar_thumb_color")) {
+        cfg.scrollbar_thumb_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "scrollbar_thumb_active_color")) {
+        cfg.scrollbar_thumb_active_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "pane_gap")) {
+        cfg.pane_gap = std.math.clamp(try parseFloat(value), 1.0, 64.0);
+    } else if (std.mem.eql(u8, key, "pane_gap_color")) {
+        cfg.pane_gap_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "quake_enabled")) {
+        cfg.quake_enabled = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "quake_monitor")) {
+        cfg.quake_monitor = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "quake_edge")) {
+        cfg.quake_edge = std.meta.stringToEnum(QuakeEdge, value) orelse return error.BadQuakeEdge;
+    } else if (std.mem.eql(u8, key, "quake_width_percent")) {
+        cfg.quake_width_percent = std.math.clamp(try parseFloat(value), 1.0, 100.0);
+    } else if (std.mem.eql(u8, key, "quake_height_percent")) {
+        cfg.quake_height_percent = std.math.clamp(try parseFloat(value), 1.0, 100.0);
     } else if (std.mem.eql(u8, key, "inactive_darken")) {
         cfg.inactive_darken = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_desaturate")) {
@@ -3219,4 +3371,139 @@ test "config: gpu_apps parses and appWantsGpu matches name or exec basename" {
     // Args never match; empty list never matches.
     try std.testing.expect(!cfg.appWantsGpu("X", "foo mpv"));
     try std.testing.expect(!gpuAppsMatch("", "Blender", "blender"));
+}
+
+test "config: overlay scrollbar keys parse and round-trip" {
+    const body =
+        \\scrollbar = always
+        \\scrollbar_width = 10
+        \\scrollbar_trough_color = #10203040
+        \\scrollbar_thumb_color = #405060
+        \\scrollbar_thumb_active_color = #a0b0c0d0
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(ScrollbarMode.always, cfg.scrollbar);
+    try std.testing.expectEqual(@as(f32, 10), cfg.scrollbar_width);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x40) / 255.0, cfg.scrollbar_trough_color[3], 0.001);
+    // A 6-digit colour is opaque; the alpha-preserving serialiser
+    // must not turn that into a translucent value on the way back.
+    try std.testing.expectEqual(@as(f32, 1.0), cfg.scrollbar_thumb_color[3]);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "scrollbar = always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "scrollbar_trough_color = #10203040") != null);
+
+    var again = try Config.loadFromBytes(std.testing.allocator, out);
+    defer again.deinit();
+    try std.testing.expectEqual(cfg.scrollbar, again.scrollbar);
+    try std.testing.expectEqual(cfg.scrollbar_width, again.scrollbar_width);
+    try std.testing.expectEqual(cfg.scrollbar_trough_color, again.scrollbar_trough_color);
+    try std.testing.expectEqual(cfg.scrollbar_thumb_color, again.scrollbar_thumb_color);
+    try std.testing.expectEqual(cfg.scrollbar_thumb_active_color, again.scrollbar_thumb_active_color);
+}
+
+test "config: scrollbar_width clamps and a bad mode is rejected" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "scrollbar_width = 999\n");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(f32, 64), cfg.scrollbar_width);
+    // A bad value warns on the line and leaves the default standing,
+    // like every other key — a typo must not cost the whole file.
+    var bad = try Config.loadFromBytes(std.testing.allocator, "scrollbar = sometimes\n");
+    defer bad.deinit();
+    try std.testing.expectEqual(ScrollbarMode.auto, bad.scrollbar);
+}
+
+test "config: pane presentation keys round-trip, per profile" {
+    const body =
+        \\pane_border_width = 3
+        \\pane_corner_radius = 8
+        \\pane_gap = 8
+        \\pane_gap_color = #112233
+        \\
+        \\[profile.prod]
+        \\pane_border_color_active = #ff000080
+        \\pane_border_color = #ff0000ff
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(f32, 3), cfg.settings.pane_border_width);
+    try std.testing.expectEqual(@as(f32, 8), cfg.settings.pane_corner_radius);
+    try std.testing.expectEqual(@as(f32, 8), cfg.pane_gap);
+    // The profile section is seeded from Default, so it keeps the
+    // width set above and overrides only the two colours.
+    const prod = cfg.profileSettings("prod").*;
+    try std.testing.expectEqual(@as(f32, 3), prod.pane_border_width);
+    try std.testing.expectEqual(@as(f32, 1.0), prod.pane_border_color[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x80) / 255.0, prod.pane_border_color_active[3], 0.001);
+    // The Default profile keeps the schema default (invisible).
+    try std.testing.expectEqual(@as(f32, 0), cfg.settings.pane_border_color[3]);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    var again = try Config.loadFromBytes(std.testing.allocator, out);
+    defer again.deinit();
+    try std.testing.expectEqual(cfg.settings.pane_border_width, again.settings.pane_border_width);
+    try std.testing.expectEqual(cfg.settings.pane_corner_radius, again.settings.pane_corner_radius);
+    try std.testing.expectEqual(cfg.pane_gap, again.pane_gap);
+    try std.testing.expectEqual(cfg.pane_gap_color, again.pane_gap_color);
+    try std.testing.expectEqual(prod.pane_border_color, again.profileSettings("prod").pane_border_color);
+    try std.testing.expectEqual(prod.pane_border_color_active, again.profileSettings("prod").pane_border_color_active);
+}
+
+test "config: quake keys parse, clamp and round-trip" {
+    const body =
+        \\quake_enabled = true
+        \\quake_monitor = DP-1
+        \\quake_edge = bottom
+        \\quake_width_percent = 80
+        \\quake_height_percent = 400
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.quake_enabled);
+    try std.testing.expectEqualStrings("DP-1", cfg.quake_monitor);
+    try std.testing.expectEqual(QuakeEdge.bottom, cfg.quake_edge);
+    try std.testing.expectEqual(@as(f32, 80), cfg.quake_width_percent);
+    try std.testing.expectEqual(@as(f32, 100), cfg.quake_height_percent);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    var again = try Config.loadFromBytes(std.testing.allocator, out);
+    defer again.deinit();
+    try std.testing.expectEqual(cfg.quake_enabled, again.quake_enabled);
+    try std.testing.expectEqualStrings(cfg.quake_monitor, again.quake_monitor);
+    try std.testing.expectEqual(cfg.quake_edge, again.quake_edge);
+    try std.testing.expectEqual(cfg.quake_width_percent, again.quake_width_percent);
+    try std.testing.expectEqual(cfg.quake_height_percent, again.quake_height_percent);
+
+    // The string field is arena-backed: cloneInto must deep-copy it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const clone = try cfg.cloneInto(arena.allocator());
+    try std.testing.expectEqualStrings("DP-1", clone.quake_monitor);
+    try std.testing.expect(clone.quake_monitor.ptr != cfg.quake_monitor.ptr);
+}
+
+test "config: the new defaults stay out of the serialised file" {
+    var cfg = Config{};
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "quake_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "scrollbar") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pane_gap") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pane_border") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pane_corner") == null);
 }
