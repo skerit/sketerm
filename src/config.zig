@@ -156,6 +156,62 @@ pub const HintRule = struct {
     command: []const u8 = "",
 };
 
+/// Which half of a light/dark pair is in force.
+pub const ColorScheme = enum { light, dark };
+
+/// A partial override of a `ProfileSettings` colour set, parsed from
+/// the `light.<key>` / `dark.<key>` families. Null means "inherit the
+/// profile's flat value", which is what makes a config written before
+/// variants existed behave exactly as it did.
+pub const ColorSet = struct {
+    default_fg: ?[4]f32 = null,
+    default_bg: ?[4]f32 = null,
+    cursor_color: ?[4]f32 = null,
+    cursor_color_default: ?bool = null,
+    palette: ?[16][3]u8 = null,
+    /// Null = inherit; `""` = "no scheme" (cancels an inherited one).
+    scheme: ?[]const u8 = null,
+
+    pub fn isEmpty(self: ColorSet) bool {
+        return std.meta.eql(self, ColorSet{});
+    }
+
+    /// Field-wise override: every non-null field of `over` wins.
+    pub fn overlay(self: ColorSet, over: ColorSet) ColorSet {
+        var out = self;
+        if (over.default_fg) |v| out.default_fg = v;
+        if (over.default_bg) |v| out.default_bg = v;
+        if (over.cursor_color) |v| out.cursor_color = v;
+        if (over.cursor_color_default) |v| out.cursor_color_default = v;
+        if (over.palette) |v| out.palette = v;
+        if (over.scheme) |v| out.scheme = v;
+        return out;
+    }
+
+    /// Deep-copy the one heap-backed field into `arena`.
+    pub fn cloneInto(self: *const ColorSet, arena: std.mem.Allocator) error{OutOfMemory}!ColorSet {
+        var out = self.*;
+        if (self.scheme) |s| out.scheme = try arena.dupe(u8, s);
+        return out;
+    }
+};
+
+/// The fg/bg sketerm has always substituted under `auto_theme`, now
+/// expressed as the lowest layer of the light variant. A user
+/// `light.*` key overrides it; anything it leaves null (palette,
+/// cursor, scheme) keeps falling through to the flat values, which
+/// is how auto_theme behaved before variants existed.
+pub const builtin_light: ColorSet = .{
+    .default_fg = .{ 0.10, 0.10, 0.10, 1.0 },
+    .default_bg = .{ 0.97, 0.97, 0.97, 1.0 },
+};
+
+/// Dark counterpart of `builtin_light`.
+pub const builtin_dark: ColorSet = .{
+    .default_fg = .{ 0.92, 0.92, 0.92, 1.0 },
+    .default_bg = .{ 0.10, 0.10, 0.10, 1.0 },
+};
+
 /// The pane-level settings bundle — everything that can sensibly
 /// differ between two panes. The Default profile is the embedded
 /// `Config.settings`; named profiles ([profile.<name>] sections) are
@@ -212,6 +268,12 @@ pub const ProfileSettings = struct {
     /// Built-in scheme name (tango / linux / xterm / solarized_dark /
     /// …). Empty string = "no scheme; use defaults or `palette`".
     scheme: []const u8 = "",
+    /// Colours to swap in while the system is in light mode
+    /// (`light.<key> = …`). Only meaningful with `auto_theme`.
+    light: ColorSet = .{},
+    /// Colours to swap in while the system is in dark mode
+    /// (`dark.<key> = …`). Only meaningful with `auto_theme`.
+    dark: ColorSet = .{},
 
     // Shell + child env.
     shell: ?[]const u8 = null,
@@ -238,6 +300,31 @@ pub const ProfileSettings = struct {
     /// Editor point size. 0 = follow this profile's `font_size`.
     editor_font_size: u16 = 0,
 
+    /// The colour set that is in force for `scheme`, as a copy of
+    /// these settings with the flat colour fields swapped out. Null
+    /// scheme (= `auto_theme` off) returns the settings untouched, so
+    /// a manual theme always renders exactly what the user wrote.
+    ///
+    /// Pure by design: the flat fields stay the configured base, so
+    /// the serialiser and the prefs dialog keep reading and writing
+    /// what the user actually put in the file rather than whatever
+    /// half of the pair happened to be showing.
+    pub fn forScheme(self: *const ProfileSettings, scheme: ?ColorScheme) ProfileSettings {
+        const which = scheme orelse return self.*;
+        const set = switch (which) {
+            .light => builtin_light.overlay(self.light),
+            .dark => builtin_dark.overlay(self.dark),
+        };
+        var out = self.*;
+        if (set.default_fg) |v| out.default_fg = v;
+        if (set.default_bg) |v| out.default_bg = v;
+        if (set.cursor_color) |v| out.cursor_color = v;
+        if (set.cursor_color_default) |v| out.cursor_color_default = v;
+        if (set.palette) |v| out.palette = v;
+        if (set.scheme) |v| out.scheme = v;
+        return out;
+    }
+
     /// Deep-copy every heap-backed field into `arena`.
     pub fn cloneInto(self: *const ProfileSettings, arena: std.mem.Allocator) error{OutOfMemory}!ProfileSettings {
         var out = self.*;
@@ -249,6 +336,8 @@ pub const ProfileSettings = struct {
         out.editor_font_family = try arena.dupe(u8, self.editor_font_family);
         out.font_features = try arena.dupe(u8, self.font_features);
         out.scheme = try arena.dupe(u8, self.scheme);
+        out.light = try self.light.cloneInto(arena);
+        out.dark = try self.dark.cloneInto(arena);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.term_env = try arena.dupe(u8, self.term_env);
         out.color_term_env = try arena.dupe(u8, self.color_term_env);
@@ -1020,17 +1109,12 @@ pub const Config = struct {
             break :blk !std.meta.eql(s.palette.?, base.palette.?);
         };
         if (pal_differs) {
-            if (s.palette) |pal| {
-                try w.writeAll("palette = ");
-                for (pal, 0..) |rgb, i| {
-                    if (i != 0) try w.writeAll(":");
-                    try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
-                }
-                try w.writeAll("\n");
-            }
+            if (s.palette) |pal| try writePalette16(w, "palette", pal);
             // null-while-base-set isn't expressible in the format;
             // the parse-time seed keeps base's palette in that case.
         }
+        try serialiseColorSet(&s.light, &base.light, "light", w);
+        try serialiseColorSet(&s.dark, &base.dark, "dark", w);
 
         // Shell + env.
         if (!eqOptStr(s.shell, base.shell)) {
@@ -1047,6 +1131,43 @@ pub const Config = struct {
 
         if (!std.mem.eql(u8, s.custom_shader, base.custom_shader))
             try w.print("custom_shader = {s}\n", .{s.custom_shader});
+    }
+
+    /// Emit the `<prefix>.<key>` lines of a light/dark variant whose
+    /// value differs from `base`'s same-prefix variant. Clearing a
+    /// field back to null is not expressible, same as `palette`.
+    fn serialiseColorSet(set: *const ColorSet, base: *const ColorSet, prefix: []const u8, w: *std.Io.Writer) !void {
+        var key_buf: [64]u8 = undefined;
+        const K = struct {
+            fn f(buf: []u8, pfx: []const u8, name: []const u8) []const u8 {
+                return std.fmt.bufPrint(buf, "{s}.{s}", .{ pfx, name }) catch unreachable;
+            }
+        };
+        if (set.default_fg) |v| {
+            if (!eqOptColor(base.default_fg, v)) try writeColor(w, K.f(&key_buf, prefix, "default_fg"), v);
+        }
+        if (set.default_bg) |v| {
+            if (!eqOptColor(base.default_bg, v)) try writeColor(w, K.f(&key_buf, prefix, "default_bg"), v);
+        }
+        if (set.cursor_color) |v| {
+            if (!eqOptColor(base.cursor_color, v)) try writeColor(w, K.f(&key_buf, prefix, "cursor_color"), v);
+        }
+        if (set.cursor_color_default) |v| {
+            if (base.cursor_color_default == null or base.cursor_color_default.? != v)
+                try w.print("{s} = {s}\n", .{ K.f(&key_buf, prefix, "cursor_color_default"), if (v) "true" else "false" });
+        }
+        if (set.scheme) |v| {
+            if (base.scheme == null or !std.mem.eql(u8, base.scheme.?, v))
+                try w.print("{s} = {s}\n", .{ K.f(&key_buf, prefix, "scheme"), v });
+        }
+        if (set.palette) |v| {
+            if (base.palette == null or !std.meta.eql(base.palette.?, v))
+                try writePalette16(w, K.f(&key_buf, prefix, "palette"), v);
+        }
+    }
+
+    fn eqOptColor(a: ?[4]f32, b: [4]f32) bool {
+        return a != null and eqColor(a.?, b);
     }
 
     fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
@@ -1452,6 +1573,15 @@ fn writeColor(w: *std.Io.Writer, key: []const u8, c: [4]f32) !void {
     try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ key, r, g, b });
 }
 
+fn writePalette16(w: *std.Io.Writer, key: []const u8, pal: [16][3]u8) !void {
+    try w.print("{s} = ", .{key});
+    for (pal, 0..) |rgb, i| {
+        if (i != 0) try w.writeAll(":");
+        try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
+    }
+    try w.writeAll("\n");
+}
+
 const makeParentDirs = @import("util/pathz.zig").makeParentDirs;
 
 /// Allocates the path; caller frees.
@@ -1656,6 +1786,13 @@ fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
 /// not a pane-level key (the caller decides whether that's an
 /// app-level key or an unknown one).
 fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
+    // `light.<key>` / `dark.<key>` are prefix-keyed families like
+    // `keybind.<action>`, and work identically at top level and
+    // inside a [profile.<name>] section.
+    if (std.mem.startsWith(u8, key, "light."))
+        return applyColorSetKv(&s.light, arena, key["light.".len..], value);
+    if (std.mem.startsWith(u8, key, "dark."))
+        return applyColorSetKv(&s.dark, arena, key["dark.".len..], value);
     if (std.mem.eql(u8, key, "shell")) {
         s.shell = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
@@ -1708,6 +1845,28 @@ fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u
         s.login_shell = try parseBool(value);
     } else if (std.mem.eql(u8, key, "custom_shader")) {
         s.custom_shader = try expandTilde(arena, value);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// Apply one `light.`/`dark.`-stripped key to a variant. Returns
+/// false for a sub-key that is not a colour key, which the caller
+/// reports as unknown.
+fn applyColorSetKv(set: *ColorSet, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, key, "default_fg")) {
+        set.default_fg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "default_bg")) {
+        set.default_bg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "cursor_color")) {
+        set.cursor_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
+        set.cursor_color_default = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "scheme")) {
+        set.scheme = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "palette")) {
+        set.palette = try parsePalette16(value);
     } else {
         return false;
     }
@@ -2244,6 +2403,141 @@ test "config: serialise omits defaults" {
     try std.testing.expect(std.mem.startsWith(u8, out, "# sketerm config"));
     try std.testing.expect(std.mem.indexOf(u8, out, "font_size") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ligatures") == null);
+}
+
+test "config: light/dark variants parse and fall back to flat values" {
+    const body =
+        \\default_fg = #cccccc
+        \\default_bg = #111111
+        \\cursor_color = #ff0000
+        \\scheme = tango
+        \\light.default_fg = #202020
+        \\light.default_bg = #fafafa
+        \\light.scheme = solarized_light
+        \\dark.default_bg = #000000
+        \\dark.cursor_color_default = false
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    const s = &cfg.settings;
+
+    // Flat values are untouched by the variants: they stay the base
+    // AND the "auto_theme off" answer.
+    try std.testing.expectApproxEqAbs(@as(f32, 0xcc) / 255.0, s.default_fg[0], 0.005);
+    try std.testing.expectEqualStrings("tango", s.scheme);
+    try std.testing.expect(std.meta.eql(s.*, s.forScheme(null)));
+
+    // Light: fully specified fg/bg/scheme; cursor falls back to flat.
+    const lt = s.forScheme(.light);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x20) / 255.0, lt.default_fg[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0xfa) / 255.0, lt.default_bg[0], 0.005);
+    try std.testing.expectEqualStrings("solarized_light", lt.scheme);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), lt.cursor_color[0], 0.005);
+    try std.testing.expectEqual(true, lt.cursor_color_default);
+
+    // Dark: only bg + cursor_color_default set. fg falls through to
+    // the BUILT-IN dark fg (what auto_theme has always substituted),
+    // and scheme falls back to the flat one.
+    const dk = s.forScheme(.dark);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), dk.default_bg[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.92), dk.default_fg[0], 0.005);
+    try std.testing.expectEqualStrings("tango", dk.scheme);
+    try std.testing.expectEqual(false, dk.cursor_color_default);
+}
+
+test "config: no variants keeps the pre-variant auto_theme behaviour" {
+    const body =
+        \\default_fg = #cccccc
+        \\default_bg = #111111
+        \\scheme = tango
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    const s = &cfg.settings;
+    // The built-in pair is exactly what resolveColorsFor hardcoded
+    // before variants existed; palette/scheme/cursor still come from
+    // the flat fields under both halves.
+    inline for (.{ .{ ColorScheme.light, builtin_light }, .{ ColorScheme.dark, builtin_dark } }) |pair| {
+        const eff = s.forScheme(pair[0]);
+        try std.testing.expect(eqColor(eff.default_fg, pair[1].default_fg.?));
+        try std.testing.expect(eqColor(eff.default_bg, pair[1].default_bg.?));
+        try std.testing.expectEqualStrings("tango", eff.scheme);
+        try std.testing.expectEqual(true, eff.cursor_color_default);
+        try std.testing.expect(eff.palette == null);
+    }
+}
+
+test "config: light/dark variants round-trip through serialise + clone" {
+    var cfg = Config{};
+    cfg.settings.light = .{
+        .default_fg = .{ 0.0, 0.0, 0.0, 1.0 },
+        .default_bg = .{ 1.0, 1.0, 1.0, 1.0 },
+        .scheme = "solarized_light",
+    };
+    cfg.settings.dark = .{
+        .cursor_color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .cursor_color_default = false,
+        .palette = .{
+            .{ 0x07, 0x36, 0x42 }, .{ 0xdc, 0x32, 0x2f }, .{ 0x85, 0x99, 0x00 }, .{ 0xb5, 0x89, 0x00 },
+            .{ 0x26, 0x8b, 0xd2 }, .{ 0xd3, 0x36, 0x82 }, .{ 0x2a, 0xa1, 0x98 }, .{ 0xee, 0xe8, 0xd5 },
+            .{ 0x00, 0x2b, 0x36 }, .{ 0xcb, 0x4b, 0x16 }, .{ 0x58, 0x6e, 0x75 }, .{ 0x65, 0x7b, 0x83 },
+            .{ 0x83, 0x94, 0x96 }, .{ 0x6c, 0x71, 0xc4 }, .{ 0x93, 0xa1, 0xa1 }, .{ 0xfd, 0xf6, 0xe3 },
+        },
+    };
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "light.scheme = solarized_light") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "dark.cursor_color_default = false") != null);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("solarized_light", parsed.settings.light.scheme.?);
+    try std.testing.expect(parsed.settings.light.default_bg != null);
+    try std.testing.expect(parsed.settings.light.cursor_color == null);
+    try std.testing.expectEqual(false, parsed.settings.dark.cursor_color_default.?);
+    try std.testing.expectEqual(@as(u8, 0xfd), parsed.settings.dark.palette.?[15][0]);
+    try std.testing.expect(parsed.settings.dark.default_fg == null);
+
+    // Clone into a fresh arena, then free the source: the variant
+    // scheme string must be a copy, not a slice into the dead arena.
+    var cloned = try parsed.clone(std.testing.allocator);
+    defer cloned.deinit();
+    parsed.deinit();
+    try std.testing.expectEqualStrings("solarized_light", cloned.settings.light.scheme.?);
+    try std.testing.expectEqual(@as(u8, 0xfd), cloned.settings.dark.palette.?[15][0]);
+}
+
+test "config: profile sections carry their own light/dark variants" {
+    const body =
+        \\dark.default_bg = #101010
+        \\
+        \\[profile.paper]
+        \\light.default_bg = #fffff0
+        \\dark.default_bg = #202020
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    // Default profile: only the top-level dark override.
+    try std.testing.expect(cfg.settings.light.default_bg == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x10) / 255.0, cfg.settings.dark.default_bg.?[0], 0.005);
+
+    // The named profile was seeded from Default, then overrode both.
+    const paper = cfg.profileSettings("paper");
+    try std.testing.expectApproxEqAbs(@as(f32, 0xff) / 255.0, paper.light.default_bg.?[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x20) / 255.0, paper.dark.default_bg.?[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x20) / 255.0, paper.forScheme(.dark).default_bg[0], 0.005);
+
+    // A profile-only override serialises inside its section, and the
+    // Default's dark bg it inherited unchanged does not repeat.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const sec = std.mem.indexOf(u8, w.buffered(), "[profile.paper]").?;
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered()[sec..], "light.default_bg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered()[sec..], "dark.default_bg") != null);
 }
 
 test "config: palette + scheme + new keys round-trip" {
