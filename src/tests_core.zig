@@ -29,7 +29,11 @@ comptime {
     _ = @import("editor/search.zig");
     _ = @import("editor/regex.zig");
     _ = @import("editor/structure.zig");
+    _ = @import("editor/project.zig");
+    _ = @import("editor/gitdiff.zig");
+    _ = @import("editor/psearch.zig");
     _ = @import("editor/syntax.zig");
+    _ = @import("editor/outline.zig");
     _ = @import("editor/theme.zig");
     _ = @import("lsp/rpc.zig");
     _ = @import("lsp/position.zig");
