@@ -99,6 +99,7 @@ comptime {
     _ = @import("ui/browser/dnd.zig");
     _ = @import("ui/file_transfers.zig");
     _ = @import("a11y/view.zig");
+    _ = @import("a11y/docview.zig");
     _ = @import("a11y/nsax.zig");
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/mux_cli.zig");
