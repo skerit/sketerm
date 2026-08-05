@@ -20,6 +20,19 @@ pub const Selection = struct {
         return self.mode != .none;
     }
 
+    /// True when the selection actually covers at least one cell.
+    ///
+    /// `isActive` is not that test: a bare left click calls `start`
+    /// and leaves mode = .normal with anchor == end, so the selection
+    /// is active but extracts to "". UI that offers a Copy affordance
+    /// must gate on this, or the row is sensitive and does nothing.
+    /// A line_select of one row is a whole line, so it always counts.
+    pub fn hasContent(self: *const Selection) bool {
+        if (!self.isActive()) return false;
+        if (self.mode == .line_select) return true;
+        return self.anchor_row != self.end_row or self.anchor_col != self.end_col;
+    }
+
     pub fn start(self: *Selection, row: i32, col: i32, mode: Mode) void {
         self.mode = mode;
         self.anchor_row = row;
@@ -123,4 +136,32 @@ test "selection contains normal" {
     try std.testing.expect(!s.contains(2, 5)); // exclusive end col
     try std.testing.expect(!s.contains(2, 6)); // after end
     try std.testing.expect(!s.contains(1, 1)); // before start col on top row
+}
+
+test "hasContent separates a bare click from a real selection" {
+    var s = Selection{};
+    try std.testing.expect(!s.hasContent()); // never started
+
+    // A bare left click: start() with no drag. Active, but empty —
+    // this is the case that used to leave a Copy row sensitive.
+    s.start(3, 7, .normal);
+    try std.testing.expect(s.isActive());
+    try std.testing.expect(!s.hasContent());
+
+    // One cell to the right is a real selection.
+    s.extend(3, 8);
+    try std.testing.expect(s.hasContent());
+
+    // Same for a rectangular selection collapsed to a point.
+    s.start(1, 1, .rectangular);
+    try std.testing.expect(!s.hasContent());
+    s.extend(4, 1);
+    try std.testing.expect(s.hasContent());
+
+    // A line selection of a single row still covers that whole line.
+    s.start(2, 0, .line_select);
+    try std.testing.expect(s.hasContent());
+
+    s.clear();
+    try std.testing.expect(!s.hasContent());
 }
