@@ -225,11 +225,6 @@ pub const Conn = struct {
     udp_tickets: bool = false,
     /// Display output geometry and guarded display-only kill requests.
     display_v2: bool = false,
-    /// Daemon serves the `git_diff` fs job (welcome capability). An
-    /// older daemon answers that verb "unknown fs job op", so the
-    /// editor gutter asks only when this is set and otherwise reports
-    /// no VCS information rather than a bogus clean file.
-    git_diff: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -363,7 +358,6 @@ pub const Conn = struct {
         self.durable_copy = false;
         self.copy_no_replace = false;
         self.display_v2 = false;
-        self.git_diff = false;
         self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
@@ -375,7 +369,6 @@ pub const Conn = struct {
             durable_copy: bool = false,
             copy_no_replace: bool = false,
             display_v2: bool = false,
-            git_diff: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -393,7 +386,6 @@ pub const Conn = struct {
             self.durable_copy = parsed.value.durable_copy;
             self.copy_no_replace = parsed.value.copy_no_replace;
             self.display_v2 = parsed.value.display_v2;
-            self.git_diff = parsed.value.git_diff;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
@@ -1601,14 +1593,6 @@ test "welcome records older and future daemon profiles without rejecting either"
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true}");
     try std.testing.expect(conn.durable_copy);
     try std.testing.expect(conn.copy_no_replace);
-    // A daemon that predates git_diff simply omits the flag; one that
-    // has the verb says so. Both directions of the skew are decided
-    // here and nowhere else.
-    try std.testing.expect(!conn.git_diff);
-    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"git_diff\":true}");
-    try std.testing.expect(conn.git_diff);
-    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1}");
-    try std.testing.expect(!conn.git_diff);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     conn.applyWelcome(a, "{\"proto\":9}");

@@ -3626,20 +3626,6 @@ fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime ta
             if (have_git and lr.repo) fail("git_diff called a plain directory a repository");
             if (lr.runs.len != 0) fail("git_diff produced runs outside a repository");
         }
-
-        // Old-daemon direction: without the welcome capability the
-        // client refuses to ask instead of eating "unknown fs job op".
-        {
-            const had = fs.conn.git_diff;
-            fs.conn.git_diff = false;
-            if (fs.startGitDiff(tracked)) |_| {
-                fail("git_diff asked a daemon that never announced the verb");
-            } else |err| {
-                if (err != fsdrive.Error.BadRequest) fail("git_diff gate wrong error");
-            }
-            fs.conn.git_diff = had;
-            if (!had) fail("daemon did not announce the git_diff capability");
-        }
     }
 
     // ── diff ──────────────────────────────────────────────────

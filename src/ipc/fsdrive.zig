@@ -1136,11 +1136,7 @@ pub const Fs = struct {
     /// `kind` = added/modified/deleted), then a "repo" event carrying
     /// repo / tracked / initial. `gitDiff` below is the collected
     /// form; this is for a caller that wants the stream.
-    ///
-    /// Refused against a daemon that predates the verb — the caller
-    /// must say it does not know rather than draw a clean gutter.
     pub fn startGitDiff(self: *Fs, path: []const u8) Error!u64 {
-        if (!self.conn.git_diff) return Error.BadRequest;
         return self.startJob("git_diff", .{ .path = path });
     }
 
