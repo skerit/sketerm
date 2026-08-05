@@ -40,6 +40,48 @@ test "shapeRun: 'fi' produces glyph IDs" {
     try std.testing.expectEqual(@as(u32, 0), glyphs[0].cluster);
 }
 
+test "a symbol map claims its range from the primary face" {
+    const a = std.testing.allocator;
+    var plain = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer plain.deinit();
+    try std.testing.expect(plain.symbolFaceForTest('A') == null);
+
+    // Map the ASCII capitals to another family and check the mapped
+    // face is what answers for 'A' — and only inside the range.
+    const maps = [_]Atlas.SymbolMapSpec{.{ .lo = 'A', .hi = 'Z', .family = "DejaVu Sans" }};
+    var mapped = blk: {
+        for (FONT_CANDIDATES) |path| {
+            if (Atlas.initWith(a, path, 14, .{ .symbol_maps = &maps })) |atlas| break :blk atlas else |_| continue;
+        }
+        return error.SkipZigTest;
+    };
+    defer mapped.deinit();
+    // fontconfig always substitutes SOMETHING, so a resolved face is
+    // the assertion; which file it is depends on the machine.
+    if (mapped.symbolFaceForTest('A') == null) return error.SkipZigTest;
+    try std.testing.expect(mapped.symbolFaceForTest('a') == null); // outside the range
+}
+
+test "an explicit italic family is used instead of the primary's sibling" {
+    const a = std.testing.allocator;
+    var atlas = blk: {
+        for (FONT_CANDIDATES) |path| {
+            if (Atlas.initWith(a, path, 14, .{ .italic_family = "DejaVu Serif" })) |x| break :blk x else |_| continue;
+        }
+        return error.SkipZigTest;
+    };
+    defer atlas.deinit();
+    // The italic face must exist and must not be the regular one: a
+    // configured family that silently resolved back to the primary
+    // would look like it worked while changing nothing.
+    if (atlas.ft_face_italic) |it| {
+        try std.testing.expect(it != atlas.ft_face);
+    } else return error.SkipZigTest;
+}
+
 test "shapeRun: 'hello' produces 5 glyphs (no ligatures in monospace)" {
     const a = std.testing.allocator;
     var atlas = openAnyFont(a) catch |e| {

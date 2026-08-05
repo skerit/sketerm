@@ -48,6 +48,7 @@ comptime {
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
     _ = @import("grid/bracket.zig");
+    _ = @import("render/boxdraw.zig");
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
     _ = @import("editor_app.zig");
