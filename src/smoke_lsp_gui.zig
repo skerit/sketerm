@@ -191,8 +191,46 @@ fn tsInitOptions(allocator: std.mem.Allocator) []const u8 {
     return std.fmt.bufPrint(&ts_init_buf, "{{\"tsserver\":{{\"path\":\"{s}\"}}}}", .{ts}) catch "";
 }
 
+const C_BODY =
+    \\static int add_two(int x) { return x + 2; }
+    \\static int add_three(int x) { return x + 3; }
+    \\
+    \\int wrong = "type mismatch";
+    \\
+    \\int use(void) {
+    \\    return
+;
+
+const ZLS_BODY =
+    \\const std = @import("std");
+    \\
+    \\fn alpha(x: i32) i32 {
+    \\    var unused: i32 = 0;
+    \\    return x + 1;
+    \\}
+    \\
+    \\pub fn main() void {
+    \\    _ = alpha(1);
+    \\}
+    \\
+    \\const probe = std.
+;
+
+/// Which server the rig drives: `SKETERM_SMOKE_LSP` forces one
+/// (ts|clangd|zls|stub); otherwise the first installed real server
+/// wins, the scripted stub last.
 fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
-    if (proc.onPath(allocator, "typescript-language-server")) {
+    const forced: []const u8 = if (c.getenv("SKETERM_SMOKE_LSP")) |v| std.mem.span(v) else "";
+    const want = struct {
+        forced: []const u8,
+        fn is(self: @This(), name: []const u8) bool {
+            return std.mem.eql(u8, self.forced, name);
+        }
+        fn auto(self: @This()) bool {
+            return self.forced.len == 0;
+        }
+    }{ .forced = forced };
+    if (want.is("ts") or (want.auto() and proc.onPath(allocator, "typescript-language-server"))) {
         return .{
             .name = "tsserver",
             .command = "typescript-language-server",
@@ -205,6 +243,41 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .marker_body = "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\"},\"include\":[\"*.ts\"]}\n",
             .body = TS_BODY,
             .completion_prefix = "gre",
+            .real_server = true,
+        };
+    }
+    if (want.is("clangd") or (want.auto() and proc.onPath(allocator, "clangd"))) {
+        // Same command/args/root_files as the servers.zig BUILT-IN
+        // definition, so a drift there fails here.
+        return .{
+            .name = "clangd",
+            .command = "clangd",
+            .args = "--background-index",
+            .languages = "c,cpp,objective-c,objective-cpp,cuda",
+            .root_files = "compile_commands.json,compile_flags.txt,.clangd,CMakeLists.txt,Makefile,.git",
+            .file = "main.c",
+            .marker = "compile_flags.txt",
+            .marker_body = "-Wall\n",
+            .body = C_BODY,
+            // Typed at Ctrl+End — inside `use()`'s unterminated body, an
+            // expression position where clangd offers both `add_` fns.
+            .completion_prefix = " add_t",
+            .real_server = true,
+        };
+    }
+    if (want.is("zls") or (want.auto() and proc.onPath(allocator, "zls"))) {
+        return .{
+            .name = "zls",
+            .command = "zls",
+            .args = "",
+            .languages = "zig",
+            .root_files = "build.zig,build.zig.zon,.git",
+            .file = "main.zig",
+            .marker = "build.zig",
+            .marker_body = "// workspace root marker\n",
+            .body = ZLS_BODY,
+            // After the trailing `std.` — member completion.
+            .completion_prefix = "deb",
             .real_server = true,
         };
     }
@@ -548,7 +621,15 @@ pub fn main() u8 {
         savePng(app, win_id, "zig-out/smoke-lsp-gui-nocompletion.png");
         return fail("Ctrl+Space opened no completion popup", .{});
     }
-    pumpFor(app, 600);
+    // The popup must SURVIVE, not just flash into one frame: a
+    // mid-flight minimum-size change once made GTK popdown it right
+    // after the first commit, and a 200ms poll happily "passed" on
+    // that single frame while the user saw nothing.
+    pumpFor(app, 1500);
+    if (popupCount(app) <= popups_before_completion) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-nocompletion.png");
+        return fail("completion popup closed itself right after opening", .{});
+    }
     savePng(app, win_id, "zig-out/smoke-lsp-gui-completion.png");
     savePopupPng(app, "zig-out/smoke-lsp-gui-completion-popup.png");
     say("PASS completion popup -> zig-out/smoke-lsp-gui-completion.png", .{});
@@ -559,8 +640,15 @@ pub fn main() u8 {
     defer allocator.free(before.px);
     app.pressKey(win_id, "Down") catch {};
     pumpFor(app, 300);
+    if (popupCount(app) <= popups_before_completion)
+        return fail("completion popup vanished before the accept", .{});
     app.pressKey(win_id, "Return") catch {};
     pumpFor(app, 1200);
+    // Accepting must CLOSE the list — a Return that fell through to
+    // the document (popup already dead) also changes pixels, so the
+    // diff below alone is not proof of an accepted completion.
+    if (popupCount(app) > popups_before_completion)
+        return fail("completion popup still open after accepting", .{});
     const after = app.snapshotRgba(win_id, null) catch return fail("snapshot", .{});
     defer allocator.free(after.px);
     var changed: usize = 0;
