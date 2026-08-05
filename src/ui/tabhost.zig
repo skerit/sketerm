@@ -125,6 +125,12 @@ pub const TabHost = struct {
     /// Per-tab context menu. Null = no per-tab menu at all (the
     /// right-click and the Menu key then do nothing).
     tab_menu: ?TabMenu = null,
+    /// Event time of the press a TAB's menu just answered. The strip
+    /// gesture (on the notebook) can still see that press — its
+    /// empty-area hit test picks the tab area's gizmo rather than the
+    /// label box when the press lands on a tab's very edge — and would
+    /// pop the strip menu ON TOP of the tab menu. Same press, one menu.
+    tab_press_time: u32 = 0,
 
     /// Build the notebook (scrollable strip, expand both ways). The
     /// caller appends `notebook` to its layout and connects any
@@ -368,8 +374,11 @@ pub const TabHost = struct {
     }
 
     /// Close every page the predicate selects. The page list is
-    /// snapshotted FIRST: `on_close` destroys widgets (and may show a
-    /// dialog), so walking the live notebook mid-close is not safe.
+    /// snapshotted FIRST: `on_close` destroys that page's widget tree
+    /// (and may raise a dialog), so walking the live notebook while it
+    /// is being torn down is not safe. The pages that are NOT being
+    /// closed keep their pointers, which is what makes the snapshot
+    /// valid for the whole loop.
     fn closeMatching(
         self: *TabHost,
         keep: *c.GtkWidget,
@@ -408,6 +417,7 @@ pub const TabHost = struct {
         // Claim before popping up: an unclaimed release dismisses the
         // popover the frame it maps (ui/menu.zig documents the race).
         _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+        host.tab_press_time = c.gtk_event_controller_get_current_event_time(@ptrCast(gesture));
         _ = host.showTabMenu(handle.page, handle.box, x, y);
     }
 
@@ -496,6 +506,9 @@ pub const TabHost = struct {
 
     fn onStripRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const self: *TabHost = @ptrCast(@alignCast(user.?));
+        // A tab's own menu already answered this press.
+        const when = c.gtk_event_controller_get_current_event_time(@ptrCast(gesture));
+        if (when != 0 and when == self.tab_press_time) return;
         if (!self.onStripEmpty(x, y)) return;
         const cb = self.on_strip_menu orelse return;
         _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
