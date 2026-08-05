@@ -29,28 +29,33 @@ pub const Token = struct {
     modifiers: u32,
 };
 
-/// The server's `tokenTypes` list, owned. Index into it is what a
-/// token's `tokenType` field means; an empty legend makes every token
-/// untyped, which the caller renders as "leave the Tree-sitter colour".
-/// Deliberately allocator-free (the allocator is passed in), so it can
-/// be a plain field of `session.Caps`, which is default-constructed
-/// before any allocator is in scope.
+/// The server's `tokenTypes` and `tokenModifiers` lists, owned. A
+/// token's `tokenType` field indexes the first; its `tokenModifiers`
+/// field is a BITSET whose bit N means `modifiers[N]`. An empty legend
+/// makes every token untyped, which the caller renders as "leave the
+/// Tree-sitter colour". Deliberately allocator-free (the allocator is
+/// passed in), so it can be a plain field of `session.Caps`, which is
+/// default-constructed before any allocator is in scope.
 pub const Legend = struct {
     types: std.ArrayList([]u8) = .empty,
+    modifiers: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *Legend, alloc: Allocator) void {
         self.clear(alloc);
         self.types.deinit(alloc);
+        self.modifiers.deinit(alloc);
     }
 
     pub fn clear(self: *Legend, alloc: Allocator) void {
         for (self.types.items) |t| alloc.free(t);
         self.types.clearRetainingCapacity();
+        for (self.modifiers.items) |m| alloc.free(m);
+        self.modifiers.clearRetainingCapacity();
     }
 
-    /// Read `legend.tokenTypes` out of a `semanticTokensProvider`
-    /// options object. Anything malformed leaves the legend empty
-    /// rather than failing the session.
+    /// Read `legend.tokenTypes` / `legend.tokenModifiers` out of a
+    /// `semanticTokensProvider` options object. Anything malformed
+    /// leaves that list empty rather than failing the session.
     pub fn absorb(self: *Legend, alloc: Allocator, provider: std.json.Value) void {
         self.clear(alloc);
         const po = switch (provider) {
@@ -61,14 +66,19 @@ pub const Legend = struct {
             .object => |o| o,
             else => return,
         };
-        const types = switch (legend.get("tokenTypes") orelse std.json.Value.null) {
+        absorbList(alloc, &self.types, legend.get("tokenTypes") orelse .null);
+        absorbList(alloc, &self.modifiers, legend.get("tokenModifiers") orelse .null);
+    }
+
+    fn absorbList(alloc: Allocator, out: *std.ArrayList([]u8), v: std.json.Value) void {
+        const arr = switch (v) {
             .array => |a| a,
             else => return,
         };
-        for (types.items) |t| {
+        for (arr.items) |t| {
             if (t != .string) continue;
             const dup = alloc.dupe(u8, t.string) catch return;
-            self.types.append(alloc, dup) catch {
+            out.append(alloc, dup) catch {
                 alloc.free(dup);
                 return;
             };
@@ -81,6 +91,32 @@ pub const Legend = struct {
     pub fn name(self: *const Legend, idx: u32) []const u8 {
         if (idx >= self.types.items.len) return "";
         return self.types.items[idx];
+    }
+
+    /// Name of modifier BIT `idx`, or "" when out of range.
+    pub fn modName(self: *const Legend, idx: u32) []const u8 {
+        if (idx >= self.modifiers.items.len) return "";
+        return self.modifiers.items[idx];
+    }
+
+    /// Fold a token's `tokenModifiers` bitset into whatever `map` makes
+    /// of each set bit's NAME, OR-ed together. Keeps the wire-order
+    /// bit -> name resolution in one place: the same bit means different
+    /// things to different servers, so a numeric shortcut is always a
+    /// bug waiting for the next server.
+    pub fn foldMods(
+        self: *const Legend,
+        bits: u32,
+        comptime T: type,
+        map: *const fn ([]const u8) T,
+    ) T {
+        var out: T = 0;
+        var i: u5 = 0;
+        while (true) : (i += 1) {
+            if (bits & (@as(u32, 1) << i) != 0) out |= map(self.modName(i));
+            if (i == 31) break;
+        }
+        return out;
     }
 };
 
@@ -249,6 +285,34 @@ test "semantic: legend absorbs tokenTypes and clamps unknown indices" {
     try testing.expectEqual(@as(usize, 3), legend.types.items.len);
     try testing.expectEqualStrings("type", legend.name(1));
     try testing.expectEqualStrings("", legend.name(99));
+}
+
+test "semantic: legend absorbs tokenModifiers and folds a bitset by NAME" {
+    var p = try parse(
+        \\{"legend":{"tokenTypes":["variable"],
+        \\           "tokenModifiers":["declaration","readonly","static","deprecated"]},"full":true}
+    );
+    defer p.deinit();
+    var legend = Legend{};
+    defer legend.deinit(testing.allocator);
+    legend.absorb(testing.allocator, p.value);
+    try testing.expectEqual(@as(usize, 4), legend.modifiers.items.len);
+    try testing.expectEqualStrings("readonly", legend.modName(1));
+    try testing.expectEqualStrings("", legend.modName(9));
+
+    const map = struct {
+        fn f(name: []const u8) u8 {
+            if (std.mem.eql(u8, name, "readonly")) return 1;
+            if (std.mem.eql(u8, name, "deprecated")) return 2;
+            return 0;
+        }
+    }.f;
+    // bit 1 = readonly, bit 3 = deprecated; bits 0 and 2 map to nothing.
+    try testing.expectEqual(@as(u8, 3), legend.foldMods(0b1111, u8, &map));
+    try testing.expectEqual(@as(u8, 1), legend.foldMods(0b0010, u8, &map));
+    try testing.expectEqual(@as(u8, 0), legend.foldMods(0b0101, u8, &map));
+    // A bit past the legend names nothing and folds to nothing.
+    try testing.expectEqual(@as(u8, 0), legend.foldMods(1 << 31, u8, &map));
 }
 
 test "semantic: legend survives a provider with no legend at all" {

@@ -152,6 +152,20 @@ pub const TabState = struct {
     /// A semantic-token request is worth making again (the document
     /// changed since the last answer).
     sem_stale: bool = true,
+    /// Line window `sem_spans` covers when the server answers only
+    /// `semanticTokens/range`. `sem_ranged` says which regime we are in;
+    /// in FULL regime the spans cover the document and the window is
+    /// meaningless. Scrolling out of the window is what re-asks, exactly
+    /// as it is for inlay hints.
+    sem_ranged: bool = false,
+    sem_from: u32 = 0,
+    sem_to: u32 = 0,
+
+    /// True when the current range-mode spans already cover
+    /// `[from_line, to_line]`, so a scroll inside them costs no request.
+    pub fn semRangeCovers(self: *const TabState, from_line: u32, to_line: u32) bool {
+        return self.sem_ranged and from_line >= self.sem_from and to_line <= self.sem_to;
+    }
 
     pub fn create(alloc: std.mem.Allocator, tab: *ETab) ?*TabState {
         const self = alloc.create(TabState) catch return null;
@@ -197,6 +211,9 @@ pub const TabState = struct {
         self.sem_generation +%= 1;
         self.sem_revision = 0;
         self.sem_stale = true;
+        self.sem_ranged = false;
+        self.sem_from = 0;
+        self.sem_to = 0;
     }
 
     /// Document observer slot 2: queue the change for didChange AND
@@ -265,7 +282,11 @@ pub const Conn = struct {
             else => std.json.Value.null,
         };
         const r = self.mgr.applyWorkspaceEdit(self, edit);
-        return r.touched > 0;
+        self.mgr.reportEditOutcome(r);
+        // An edit whose files all had to be OPENED has applied nothing
+        // yet but is not a refusal — `applied:false` would make the
+        // server think its command failed.
+        return r.touched + r.opened > 0;
     }
 
     fn onResponse(ctx: *anyopaque, req: session.Request, env: rpc.Envelope) void {
@@ -905,6 +926,19 @@ const SigPopup = struct {
 // Manager: one per EditorView
 // ======================================================================
 
+/// A `WorkspaceEdit` entry for a file that was not open. The tab is
+/// opened and the edits ride here until its bytes arrive; the encoding
+/// is captured now because the connection that produced them may be
+/// gone by then, and it is the only thing `applyTextEdits` needs from it.
+const PendingEdit = struct {
+    /// Tab spec (`local:/path` or `host:/path`), owned.
+    spec: []u8,
+    /// The `TextEdit[]` re-serialized, owned — a `std.json.Value`
+    /// borrows its parse arena, which dies with the response.
+    edits: []u8,
+    enc: pos.Encoding,
+};
+
 pub const Manager = struct {
     view: *EditorView,
     alloc: std.mem.Allocator,
@@ -933,6 +967,14 @@ pub const Manager = struct {
     /// Byte offset the last dwell request was made for — a pointer
     /// wandering within one word must not re-ask.
     dwell_offset: usize = std.math.maxInt(usize),
+    /// `TextEdit[]`s from a `WorkspaceEdit` whose file had no tab yet.
+    /// The tab has been asked to open; the edits apply when its async
+    /// load lands (`onDocumentReplaced`). See `applyWorkspaceEdit`.
+    pending_edits: std.ArrayList(PendingEdit) = .empty,
+    /// How many of the current WorkspaceEdit's files have been written
+    /// so far, for the "…and here is the final count" status line the
+    /// deferred half owes the user.
+    pending_touched: usize = 0,
 
     pub fn create(view: *EditorView) ?*Manager {
         const self = view.allocator.create(Manager) catch return null;
@@ -957,6 +999,8 @@ pub const Manager = struct {
         while (self.links.pop()) |link| link.destroyLink();
         self.links.deinit(self.alloc);
         self.list.deinit();
+        self.dropPendingEdits();
+        self.pending_edits.deinit(self.alloc);
         self.hint_view.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -1573,6 +1617,15 @@ pub const Manager = struct {
     /// observer died with it and the server must be told the content
     /// changed wholesale.
     pub fn onDocumentReplaced(self: *Manager, tab: *ETab) void {
+        // A WorkspaceEdit for a file that had no tab opened one; its
+        // bytes have just arrived, so its edits apply now. Done BEFORE
+        // the sync bookkeeping below so the server is told about the
+        // final text in one didChange rather than two.
+        const drained = self.drainPendingEdits(tab);
+        if (drained > 0) {
+            self.pending_touched += drained;
+            self.reportDeferredEdits();
+        }
         const st = tab.lsp orelse {
             self.attachTab(tab);
             return;
@@ -1691,7 +1744,11 @@ pub const Manager = struct {
             .code_action_resolve => self.onCodeActionResolved(cn, req, env),
             .execute_command => self.onCommandDone(env),
             .inlay_hint => self.onInlayHints(cn, req, env, tab),
-            .semantic_tokens_full, .semantic_tokens_delta => self.onSemanticTokens(cn, req, env, tab),
+            .inlay_hint_resolve => self.onInlayHintResolved(req, env, tab),
+            .semantic_tokens_full,
+            .semantic_tokens_delta,
+            .semantic_tokens_range,
+            => self.onSemanticTokens(cn, req, env, tab),
             else => {},
         }
     }
@@ -2295,27 +2352,47 @@ pub const Manager = struct {
             self.view.setStatusText("Rename produced no changes.");
             return;
         }
-        const r = self.applyWorkspaceEdit(cn, env.result);
-        var buf: [200:0]u8 = undefined;
-        const msg = if (r.skipped > 0)
-            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s); {d} not open (open them and retry).", .{ r.touched, r.skipped }) catch "Renamed."
-        else
-            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s).", .{r.touched}) catch "Renamed.";
-        self.view.setStatusText(msg);
+        self.reportOutcome("Renamed", self.applyWorkspaceEdit(cn, env.result));
     }
 
-    pub const EditOutcome = struct { touched: usize = 0, skipped: usize = 0 };
+    pub const EditOutcome = struct {
+        /// Files edited synchronously, because they already had a tab.
+        touched: usize = 0,
+        /// Files that had no tab: opened, edits queued, applied when the
+        /// async load lands.
+        opened: usize = 0,
+        /// `create` / `rename` / `delete` file operations, counted and
+        /// reported but deliberately NOT performed (see the doc comment
+        /// on `applyWorkspaceEdit`).
+        file_ops: usize = 0,
+        /// Entries that could not be applied at all (malformed, or the
+        /// tab could not be opened).
+        skipped: usize = 0,
+    };
 
     /// Apply a `WorkspaceEdit`. THE cross-file applier: rename, code
     /// actions and the server-initiated `workspace/applyEdit` all come
     /// through here, so the one-transaction-per-document rule (and its
     /// documented one-undo-unit-per-FILE consequence) holds for every
     /// one of them rather than being re-derived per feature.
+    ///
+    /// Two things it deliberately does NOT do, both reported rather than
+    /// silent (see `reportEditOutcome`):
+    ///
+    /// * a single cross-DOCUMENT undo unit — the editor's history lives
+    ///   on `Document` and the group would be silently invalidated by a
+    ///   reload, a tab close, or the user simply typing in one of the
+    ///   files afterwards (docs/lsp.md records the full argument);
+    /// * `create` / `rename` / `delete` file operations — a filesystem
+    ///   mutation has no `Document` to hang an undo entry off, so
+    ///   performing one would produce a change Ctrl+Z genuinely cannot
+    ///   reach. Counted and named instead.
     fn applyWorkspaceEdit(self: *Manager, cn: *Conn, edit: std.json.Value) EditOutcome {
         const obj = switch (edit) {
             .object => |o| o,
             else => return .{},
         };
+        self.pending_touched = 0;
         var out = EditOutcome{};
         // `documentChanges` (ordered, versioned) wins over `changes`
         // when both are present, per the spec.
@@ -2324,43 +2401,115 @@ pub const Manager = struct {
                 for (dc.array.items) |entry| {
                     if (entry != .object) continue;
                     // create/rename/delete file operations carry a
-                    // `kind` instead of edits. The editor never writes
-                    // files behind the user's back (the file browser is
-                    // the daemon's job), so they are counted as skipped
-                    // rather than silently ignored.
+                    // `kind` instead of edits.
                     if (entry.object.get("kind") != null) {
-                        out.skipped += 1;
+                        out.file_ops += 1;
                         continue;
                     }
                     const td = entry.object.get("textDocument") orelse continue;
                     const uri = strOf(if (td == .object) td.object.get("uri") else null) orelse continue;
                     const edits = entry.object.get("edits") orelse continue;
-                    if (self.applyEditsToUri(cn, uri, edits)) out.touched += 1 else out.skipped += 1;
+                    self.applyEditsToUri(cn, uri, edits, &out);
                 }
             }
         } else if (obj.get("changes")) |ch| {
             if (ch == .object) {
                 var it = ch.object.iterator();
                 while (it.next()) |kv| {
-                    if (self.applyEditsToUri(cn, kv.key_ptr.*, kv.value_ptr.*)) out.touched += 1 else out.skipped += 1;
+                    self.applyEditsToUri(cn, kv.key_ptr.*, kv.value_ptr.*, &out);
                 }
             }
         }
+        self.pending_touched = out.touched;
         return out;
     }
 
     /// Apply a `TextEdit[]` to the tab holding `uri`, as ONE
     /// transaction — one undo unit per document.
     ///
+    /// A file with NO tab is opened rather than reported as skipped:
+    /// leaving three of a rename's four files untouched is the surprise
+    /// this used to be, and the editor already opens files on its own
+    /// for every navigation result. The load is async, so the edits are
+    /// queued against the tab's spec and drained by
+    /// `onDocumentReplaced`.
+    ///
     /// Limitation, deliberate and documented: the editor's history is
     /// per Document, so a rename touching three files is three undo
-    /// units, one per file. Making it a single unit would need a
-    /// cross-document history object that nothing else in the editor
-    /// wants. Files that are NOT open are reported rather than edited
-    /// behind the user's back.
-    fn applyEditsToUri(self: *Manager, cn: *Conn, uri: []const u8, edits: std.json.Value) bool {
-        const tab = self.tabForUri(cn, uri) orelse return false;
-        return self.applyTextEdits(tab, edits, cn.sess.caps.encoding);
+    /// units, one per file — and `reportEditOutcome` says so out loud.
+    fn applyEditsToUri(self: *Manager, cn: *Conn, uri: []const u8, edits: std.json.Value, out: *EditOutcome) void {
+        if (self.tabForUri(cn, uri)) |tab| {
+            if (self.applyTextEdits(tab, edits, cn.sess.caps.encoding)) out.touched += 1 else out.skipped += 1;
+            return;
+        }
+        const path = (servers.uriToPath(self.alloc, uri) catch null) orelse {
+            out.skipped += 1;
+            return;
+        };
+        defer self.alloc.free(path);
+        const spec = self.specForConnPath(cn, path) orelse {
+            out.skipped += 1;
+            return;
+        };
+        // The file may already be open under a differently-spelled spec
+        // (`local:/x` vs `/x`) or attached to another connection —
+        // tabForSpec normalizes, tabForUri does not.
+        if (self.view.tabForSpec(spec)) |tab| {
+            defer self.alloc.free(spec);
+            if (self.applyTextEdits(tab, edits, cn.sess.caps.encoding)) out.touched += 1 else out.skipped += 1;
+            return;
+        }
+        const blob = serializeValue(self.alloc, edits) catch {
+            self.alloc.free(spec);
+            out.skipped += 1;
+            return;
+        };
+        self.pending_edits.append(self.alloc, .{
+            .spec = spec,
+            .edits = blob,
+            .enc = cn.sess.caps.encoding,
+        }) catch {
+            self.alloc.free(spec);
+            self.alloc.free(blob);
+            out.skipped += 1;
+            return;
+        };
+        self.view.openSpecAtLineCol(spec, 0, 0);
+        out.opened += 1;
+    }
+
+    /// Apply (and drop) every queued edit for `tab`, now that it has its
+    /// bytes. @return how many were applied.
+    fn drainPendingEdits(self: *Manager, tab: *ETab) usize {
+        if (self.pending_edits.items.len == 0) return 0;
+        var applied: usize = 0;
+        var i: usize = 0;
+        while (i < self.pending_edits.items.len) {
+            const p = self.pending_edits.items[i];
+            // tabForSpec normalizes the spelling (`local:/x` vs `/x`),
+            // which a byte compare against `tab.spec` would not.
+            if (self.view.tabForSpec(p.spec) != tab) {
+                i += 1;
+                continue;
+            }
+            _ = self.pending_edits.orderedRemove(i);
+            defer {
+                self.alloc.free(p.spec);
+                self.alloc.free(p.edits);
+            }
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, p.edits, .{}) catch continue;
+            defer parsed.deinit();
+            if (self.applyTextEdits(tab, parsed.value, p.enc)) applied += 1;
+        }
+        return applied;
+    }
+
+    fn dropPendingEdits(self: *Manager) void {
+        for (self.pending_edits.items) |p| {
+            self.alloc.free(p.spec);
+            self.alloc.free(p.edits);
+        }
+        self.pending_edits.clearRetainingCapacity();
     }
 
     fn applyTextEdits(self: *Manager, tab: *ETab, edits_val: std.json.Value, enc: pos.Encoding) bool {
@@ -2795,15 +2944,63 @@ pub const Manager = struct {
     }
 
     fn reportEditOutcome(self: *Manager, r: EditOutcome) void {
+        self.reportOutcome("Applied", r);
+    }
+
+    /// Say exactly what a WorkspaceEdit did — including the two things
+    /// it did NOT do, which is the point of the wording.
+    ///
+    /// The undo sentence is not decoration. The editor's history lives
+    /// on `Document`, so an action touching N files leaves N separate
+    /// undo entries, and a user who presses Ctrl+Z once after a
+    /// three-file rename gets one third of it back. Reporting the file
+    /// count without reporting the undo shape is what made that a
+    /// surprise; saying it in the same breath is the whole fix.
+    fn reportOutcome(self: *Manager, comptime verb: []const u8, r: EditOutcome) void {
+        var buf: [320:0]u8 = undefined;
+        var w: std.ArrayList(u8) = .empty;
+        defer w.deinit(self.alloc);
+        const total = r.touched + r.opened;
+        w.print(self.alloc, verb ++ " in {d} file(s)", .{total}) catch return self.view.setStatusText(verb ++ ".");
+        if (total > 1) {
+            w.print(self.alloc, " — {d} separate undo steps, one per file", .{total}) catch {};
+        }
+        if (r.opened > 0) {
+            w.print(self.alloc, "; {d} opened for it", .{r.opened}) catch {};
+        }
+        if (r.file_ops > 0) {
+            w.print(
+                self.alloc,
+                "; {d} file create/rename/delete NOT performed (no undo for those)",
+                .{r.file_ops},
+            ) catch {};
+        }
+        if (r.skipped > 0) {
+            w.print(self.alloc, "; {d} could not be applied", .{r.skipped}) catch {};
+        }
+        w.append(self.alloc, '.') catch {};
+        const msg = std.fmt.bufPrintZ(&buf, "{s}", .{w.items}) catch return self.view.setStatusText(verb ++ ".");
+        self.view.setStatusText(msg);
+    }
+
+    /// The deferred half of a WorkspaceEdit landed (a file that had to
+    /// be opened first). Restates the running total so the user is not
+    /// left with a count that was only a promise.
+    fn reportDeferredEdits(self: *Manager) void {
         var buf: [200:0]u8 = undefined;
-        const msg = if (r.skipped > 0)
+        const remaining = self.pending_edits.items.len;
+        const msg = if (remaining > 0)
             std.fmt.bufPrintZ(
                 &buf,
-                "Applied in {d} file(s); {d} skipped (not open, or a file operation).",
-                .{ r.touched, r.skipped },
-            ) catch "Applied."
+                "Edited {d} file(s) so far; {d} still opening.",
+                .{ self.pending_touched, remaining },
+            ) catch "Edited."
         else
-            std.fmt.bufPrintZ(&buf, "Applied in {d} file(s).", .{r.touched}) catch "Applied.";
+            std.fmt.bufPrintZ(
+                &buf,
+                "Edited {d} file(s) — {d} separate undo steps, one per file.",
+                .{ self.pending_touched, self.pending_touched },
+            ) catch "Edited.";
         self.view.setStatusText(msg);
     }
 
@@ -2832,16 +3029,33 @@ pub const Manager = struct {
     }
 
     /// The viewport moved. Only re-asks when the visible lines have left
-    /// the window the current hints were fetched for.
+    /// the window a viewport-scoped decoration was fetched for — which
+    /// is inlay hints always, and semantic tokens when the server offers
+    /// `range` but not `full`.
     pub fn onViewportMoved(self: *Manager) void {
         const tab = self.view.activeTab() orelse return;
         const st = tab.lsp orelse return;
-        if (st.conn == null) return;
-        if (!self.hintsEnabled()) return;
+        const cn = st.conn orelse return;
         const span = self.view.visibleLineSpanPublic(tab);
-        if (st.hints.valid and st.hints.revision == tab.doc.revision and
-            st.hints.covers(@intCast(span.from), @intCast(span.to))) return;
-        self.armDecorations(tab);
+        const from: u32 = @intCast(span.from);
+        const to: u32 = @intCast(span.to);
+
+        if (self.hintsEnabled() and cn.sess.caps.inlay_hint) {
+            const covered = st.hints.valid and st.hints.revision == tab.doc.revision and
+                st.hints.covers(from, to);
+            if (!covered) return self.armDecorations(tab);
+        }
+        if (self.semanticRangeOnly(cn)) {
+            const covered = st.sem_revision == tab.doc.revision and st.semRangeCovers(from, to);
+            if (!covered) return self.armDecorations(tab);
+        }
+    }
+
+    /// The server answers `semanticTokens/range` and NOT
+    /// `semanticTokens/full`, so every request is viewport-scoped.
+    fn semanticRangeOnly(self: *Manager, cn: *Conn) bool {
+        return self.semanticEnabled() and cn.sess.caps.semantic_tokens_range and
+            !cn.sess.caps.semantic_tokens;
     }
 
     fn hintsEnabled(self: *Manager) bool {
@@ -2854,6 +3068,22 @@ pub const Manager = struct {
         return conf.editor_lsp_semantic_tokens;
     }
 
+    /// Build `{textDocument:{uri}, range:{start,end}}` into `scratch`
+    /// for a whole-line window. Shared by `inlayHint` and
+    /// `semanticTokens/range`, which take the identical param shape.
+    /// @return false when the buffer could not be built (out of memory).
+    fn rangeParams(self: *Manager, uri: []const u8, from: u32, to: u32) bool {
+        self.scratch.clearRetainingCapacity();
+        self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return false;
+        session.appendJsonString(self.alloc, &self.scratch, uri) catch return false;
+        self.scratch.print(
+            self.alloc,
+            "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":0}}}}}}",
+            .{ from, to },
+        ) catch return false;
+        return true;
+    }
+
     fn refreshDecorations(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
@@ -2861,22 +3091,47 @@ pub const Manager = struct {
         self.flushChanges(tab);
         const r = Ready{ .tab = tab, .st = st, .cn = cn };
 
+        // The window both viewport-scoped requests use: the visible
+        // lines widened by HINT_MARGIN_LINES, so scrolling a few rows
+        // costs no round trip at all.
+        const span = self.view.visibleLineSpanPublic(tab);
+        const n_lines: u32 = @intCast(tab.doc.rope.lineCount());
+        const win_from: u32 = @as(u32, @intCast(span.from)) -| HINT_MARGIN_LINES;
+        const win_to: u32 = @min(n_lines, @as(u32, @intCast(span.to)) +| HINT_MARGIN_LINES);
+
         if (self.hintsEnabled() and cn.sess.caps.inlay_hint) {
-            const span = self.view.visibleLineSpanPublic(tab);
-            const n_lines: u32 = @intCast(tab.doc.rope.lineCount());
-            const from: u32 = @as(u32, @intCast(span.from)) -| HINT_MARGIN_LINES;
-            const to: u32 = @min(n_lines, @as(u32, @intCast(span.to)) +| HINT_MARGIN_LINES);
-            self.scratch.clearRetainingCapacity();
-            self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-            session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return;
-            self.scratch.print(
-                self.alloc,
-                "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":0}}}}}}",
-                .{ from, to },
-            ) catch return;
-            // aux carries the window back so the answer can record what
-            // it covers without a second lookup.
-            self.issue(r, .inlay_hint, "textDocument/inlayHint", self.scratch.items, packWindow(from, to));
+            if (self.rangeParams(st.sync.uri, win_from, win_to)) {
+                // aux carries the window back so the answer can record
+                // what it covers without a second lookup.
+                self.issue(
+                    r,
+                    .inlay_hint,
+                    "textDocument/inlayHint",
+                    self.scratch.items,
+                    packWindow(win_from, win_to),
+                );
+            }
+        }
+
+        // Range-only servers: the same viewport-scoped shape as inlay
+        // hints, deliberately — `range` exists precisely so a client can
+        // colour what is on screen without paying for the document, and
+        // inventing a second scoping rule for it would give two answers
+        // to "why did this re-ask?".
+        if (self.semanticRangeOnly(cn)) {
+            const covered = st.sem_revision == tab.doc.revision and
+                st.semRangeCovers(@intCast(span.from), @intCast(span.to));
+            if ((st.sem_stale or !covered) and self.rangeParams(st.sync.uri, win_from, win_to)) {
+                st.sem_stale = false;
+                self.issue(
+                    r,
+                    .semantic_tokens_range,
+                    "textDocument/semanticTokens/range",
+                    self.scratch.items,
+                    packWindow(win_from, win_to),
+                );
+            }
+            return;
         }
 
         if (self.semanticEnabled() and cn.sess.caps.semantic_tokens and st.sem_stale) {
@@ -2924,6 +3179,57 @@ pub const Manager = struct {
         self.view.queueRenderExternal();
     }
 
+    /// Show hint `idx`'s tooltip at the pointer, resolving it first when
+    /// the server offers `inlayHint/resolve` and has not told us yet.
+    /// @return whether the dwell was consumed (so no `textDocument/hover`
+    /// goes out for the same pointer rest).
+    fn dwellOnHint(self: *Manager, r: Ready, idx: usize) bool {
+        const st = r.st;
+        const h = &st.hints.items.items[idx];
+        if (h.tooltip.len > 0) {
+            self.hover.at = self.view.pointRectPx(self.dwell_x, self.dwell_y);
+            self.showHover(h.tooltip);
+            return true;
+        }
+        if (!r.cn.sess.caps.inlay_hint_resolve) return false;
+        if (h.resolve_asked or h.raw.len == 0) return false;
+        h.resolve_asked = true;
+        // aux ties the answer to the exact set it was asked against: a
+        // set is REPLACED wholesale on every refresh, so an index alone
+        // would let a late answer write a tooltip onto a different hint.
+        self.issue(
+            r,
+            .inlay_hint_resolve,
+            "inlayHint/resolve",
+            h.raw,
+            packHintRef(st.hints.generation, idx),
+        );
+        // The answer re-anchors the popup itself; nothing to show yet,
+        // and nothing else should claim this dwell either.
+        return true;
+    }
+
+    fn onInlayHintResolved(self: *Manager, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const tab = maybe_tab orelse return;
+        const st = tab.lsp orelse return;
+        if (env.has_error) return;
+        if (tab.doc.revision != req.revision) return;
+        const ref = unpackHintRef(req.aux);
+        // The set was replaced (scroll, edit) while the answer was in
+        // flight: the index means nothing now. Silently drop it, the
+        // same rule every other stale answer follows.
+        if (@as(u32, @truncate(st.hints.generation)) != ref.generation) return;
+        if (!st.hints.absorbResolved(ref.index, env.result)) return;
+        // Only pop the tooltip if the pointer is still resting where it
+        // was asked from — a resolve that lands after the user moved on
+        // must not throw a popup at them.
+        if (self.dwell_timer != 0 or self.list.open) return;
+        const off = self.view.offsetAtPointPublic(tab, self.dwell_x, self.dwell_y) orelse return;
+        if (st.hints.items.items[ref.index].offset != off) return;
+        self.hover.at = self.view.pointRectPx(self.dwell_x, self.dwell_y);
+        self.showHover(st.hints.items.items[ref.index].tooltip);
+    }
+
     // ---- semantic tokens -------------------------------------------------------
 
     fn onSemanticTokens(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
@@ -2953,6 +3259,20 @@ pub const Manager = struct {
             st.sem_data.reset();
             return;
         }
+        if (req.kind == .semantic_tokens_range) {
+            // A range answer describes ONLY the window it was asked
+            // for, and its resultId (if any) refers to that window, so
+            // it must never seed a `full/delta` splice. `refreshDecorations`
+            // never asks for a delta in this regime, and dropping the id
+            // here keeps that true even if a server volunteers one.
+            const win = unpackWindow(req.aux);
+            st.sem_ranged = true;
+            st.sem_from = win.from;
+            st.sem_to = win.to;
+            dbg("semanticTokens/range: lines {d}..{d}", .{ win.from, win.to });
+        } else {
+            st.sem_ranged = false;
+        }
         self.rebuildSemanticSpans(tab, st, cn);
         self.view.queueRenderExternal();
     }
@@ -2980,10 +3300,15 @@ pub const Manager = struct {
                 enc,
             );
             if (end <= start) continue;
+            // The modifier bits ride in the SAME byte as the kind (see
+            // the band in syntax.zig): `editor_layout` memsets that byte
+            // across the span and `theme.style` splits it again, so no
+            // second channel has to be threaded through the renderer.
+            const mods = legend.foldMods(t.modifiers, u8, &semanticModBit);
             st.sem_spans.append(self.alloc, .{
                 .start = start,
                 .end = end,
-                .kind = @intFromEnum(kind),
+                .kind = @intFromEnum(syntax.withMods(kind, mods)),
             }) catch break;
         }
         // The layout binary-searches these, and a server is free to send
@@ -3045,7 +3370,11 @@ pub const Manager = struct {
         const tab = self.view.activeTab() orelse return;
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
-        if (cn.sess.state != .ready or !cn.sess.caps.hover) return;
+        if (cn.sess.state != .ready) return;
+        // Hover is the usual answer, but a dwell can also land on an
+        // inlay hint's tooltip, so a server with hints and no hover
+        // still gets a timer.
+        if (!cn.sess.caps.hover and !(cn.sess.caps.inlay_hint and self.hintsEnabled())) return;
         self.dwell_timer = c.g_timeout_add(ms, @ptrCast(&onDwellTimer), @ptrCast(self));
     }
 
@@ -3074,10 +3403,24 @@ pub const Manager = struct {
         if (self.list.open) return 0;
         const tab = self.view.activeTab() orelse return 0;
         const r = self.quietReady() orelse return 0;
-        if (!r.cn.sess.caps.hover) return 0;
         const off = self.view.offsetAtPointPublic(tab, self.dwell_x, self.dwell_y) orelse return 0;
         if (off == self.dwell_offset) return 0;
         self.dwell_offset = off;
+
+        // An inlay hint anchored exactly here wins the dwell. A hint has
+        // no clusters — that is the invariant keeping the caret out of
+        // text the document does not contain — so it has no hit region
+        // of its own either, and the pointer resolving to the hint's
+        // ANCHOR byte is the whole hit test there is. Good enough:
+        // a hint is drawn immediately before that byte, so resting on
+        // the hint or on the token it annotates both land here.
+        if (self.hintsEnabled() and r.st.hints.valid and r.st.hints.revision == tab.doc.revision) {
+            if (r.st.hints.indexAtOffset(off)) |idx| {
+                if (self.dwellOnHint(r, idx)) return 0;
+            }
+        }
+
+        if (!r.cn.sess.caps.hover) return 0;
         const params = self.docPosParams(r, off, "") orelse return 0;
         self.hover.at = self.view.pointRectPx(self.dwell_x, self.dwell_y);
         self.issue(r, .hover, "textDocument/hover", params, HOVER_DWELL_AUX);
@@ -3671,6 +4014,17 @@ fn unpackWindow(v: u64) struct { from: u32, to: u32 } {
     return .{ .from = @intCast(v >> 32), .to = @truncate(v) };
 }
 
+/// `Request.aux` for an `inlayHint/resolve`: which hint, in which
+/// generation of the tab's hint set. The generation half is what makes a
+/// late answer safe — the set is replaced wholesale on every refresh.
+fn packHintRef(generation: u64, index: usize) u64 {
+    return (@as(u64, @as(u32, @truncate(generation))) << 32) | @as(u64, @as(u32, @truncate(index)));
+}
+
+fn unpackHintRef(v: u64) struct { generation: u32, index: usize } {
+    return .{ .generation = @intCast(v >> 32), .index = @as(u32, @truncate(v)) };
+}
+
 /// LSP semantic token type name -> the editor's highlight kind.
 ///
 /// `.none` means "we have no colour for this", and the caller DROPS
@@ -3712,6 +4066,23 @@ fn semanticKind(name: []const u8) syntax.Kind {
         if (std.mem.eql(u8, name, row[0])) return row[1];
     }
     return .none;
+}
+
+/// One LSP token-modifier NAME -> the `syntax.MOD_*` bit it renders as,
+/// or 0 for one this editor's themes cannot say anything about.
+///
+/// The band is three bits wide (syntax.zig), so this is a deliberate
+/// short list rather than a complete one. The seven standard modifiers
+/// that map to 0 — `declaration`, `definition`, `static`, `abstract`,
+/// `async`, `modification`, `documentation` — plus every vendor
+/// extension are parsed off the wire and then dropped, exactly as an
+/// unmapped token TYPE is: a modifier with no rendering is not a reason
+/// to change how the token is coloured.
+fn semanticModBit(name: []const u8) u8 {
+    if (std.mem.eql(u8, name, "readonly")) return syntax.MOD_READONLY;
+    if (std.mem.eql(u8, name, "deprecated")) return syntax.MOD_DEPRECATED;
+    if (std.mem.eql(u8, name, "defaultLibrary")) return syntax.MOD_DEFAULT_LIBRARY;
+    return 0;
 }
 
 /// A `ParameterInformation.label`: a string, or a `[start, end]` pair of
