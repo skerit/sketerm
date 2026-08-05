@@ -9,6 +9,9 @@ const clipboard = @import("clipboard.zig");
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
+const wm = @import("../grid/word_motion.zig");
+const bracket = @import("../grid/bracket.zig");
+const Screen = @import("../grid/screen.zig").Screen;
 
 // ── Keyboard hints (quick-select) ───────────────────────────
 
@@ -36,6 +39,7 @@ pub fn openHints(self: *Window) void {
         ictx.hint_sink = onHintKey;
         ictx.hint_ctx = @ptrCast(self);
     }
+    imBypass(pane, true);
     refreshHintOverlay(self);
 }
 
@@ -46,6 +50,7 @@ pub fn exitHints(self: *Window) void {
         ictx.hint_sink = null;
         ictx.hint_ctx = null;
     }
+    imBypass(pane, false);
     pane.terminal.screen.hints_overlay = &.{};
     pane.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(pane.area));
@@ -296,6 +301,22 @@ pub fn prevMatch(self: *Window) void {
     applyCurrentMatch(self);
 }
 
+/// Route a pane's keys around its input method for the duration of an
+/// overlay mode, and back through it afterwards.
+///
+/// A mode's key sink lives in `key-pressed`, which GTK only emits for
+/// keys the IM did not claim first — and an IM claims exactly the
+/// plain printable keys the vi-style motions and the hint labels are
+/// made of. Without this, every `w`, `y` or hint letter is committed
+/// as text and typed into the shell instead of driving the mode. The
+/// context itself stays alive, so a half-finished compose sequence is
+/// still there when the mode exits.
+fn imBypass(pane: *Pane, active: bool) void {
+    const ictx = pane.input_ctx orelse return;
+    const im = ictx.im orelse return;
+    im.setEnabled(!active);
+}
+
 // ── Copy mode (keyboard-driven selection) ─────────────────────
 
 /// Enter copy mode on the focused pane. The copy cursor starts at
@@ -310,10 +331,13 @@ pub fn openCopyMode(self: *Window) void {
     const screen = pane.terminal.screen;
     self.copymode_pane = pane;
     self.copymode_sel = .none;
+    self.copymode_find_pending = 0;
+    self.copymode_find_kind = 0;
     self.copymode_row = @intCast(@min(screen.row, screen.rows -| 1));
     self.copymode_col = @min(screen.col, screen.cols -| 1);
     ictx.copymode_sink = onCopyModeKey;
     ictx.copymode_ctx = @ptrCast(self);
+    imBypass(pane, true);
     copyModeRefresh(self);
 }
 
@@ -323,10 +347,12 @@ pub fn exitCopyMode(self: *Window) void {
     const pane = self.copymode_pane orelse return;
     self.copymode_pane = null;
     self.copymode_sel = .none;
+    self.copymode_find_pending = 0;
     if (pane.input_ctx) |ictx| {
         ictx.copymode_sink = null;
         ictx.copymode_ctx = null;
     }
+    imBypass(pane, false);
     const screen = pane.terminal.screen;
     screen.copy_cursor = null;
     screen.selection.clear();
@@ -359,6 +385,23 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
         c.GDK_KEY_Caps_Lock,
         c.GDK_KEY_Num_Lock,
         => return false,
+        else => {},
+    }
+
+    // f/F/t/T ate the previous key and this one names the target.
+    if (self.copymode_find_pending != 0) {
+        const kind = self.copymode_find_pending;
+        self.copymode_find_pending = 0;
+        if (keyval == c.GDK_KEY_Escape) return true;
+        const ch = c.gdk_keyval_to_unicode(keyval);
+        if (ch == 0) return true;
+        self.copymode_find_kind = kind;
+        self.copymode_find_char = ch;
+        copyModeFind(self, kind, ch);
+        return true;
+    }
+
+    switch (keyval) {
         c.GDK_KEY_Escape, c.GDK_KEY_q => self.exitCopyMode(),
         c.GDK_KEY_y, c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => copyModeYank(self),
         c.GDK_KEY_h, c.GDK_KEY_Left => copyModeMoveTo(self, row, col - 1),
@@ -367,6 +410,8 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
         c.GDK_KEY_j, c.GDK_KEY_Down => copyModeMoveTo(self, row + 1, col),
         c.GDK_KEY_0, c.GDK_KEY_Home => copyModeMoveTo(self, row, 0),
         c.GDK_KEY_dollar, c.GDK_KEY_End => copyModeMoveTo(self, row, copyModeLineEnd(screen, row)),
+        // ^ and _ — first non-blank cell on the line.
+        c.GDK_KEY_asciicircum, c.GDK_KEY_underscore => copyModeMoveTo(self, row, copyModeLineStart(screen, row)),
         // g / G — scrollback top / live bottom (cursor keeps its
         // column, mirroring scrollback_top/bottom actions).
         c.GDK_KEY_g => {
@@ -374,8 +419,60 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
             copyModeMoveTo(self, -sb, col);
         },
         c.GDK_KEY_G => copyModeMoveTo(self, @as(i32, @intCast(screen.rows)) - 1, col),
-        c.GDK_KEY_w => copyModeWord(self, .next),
-        c.GDK_KEY_b => copyModeWord(self, .prev),
+        // H / M / L — high, middle and low row of what is on screen,
+        // which is not the same as the buffer once scrolled back.
+        c.GDK_KEY_H => copyModeMoveTo(self, copyModeViewTop(self), col),
+        c.GDK_KEY_M => copyModeMoveTo(self, copyModeViewTop(self) + @divTrunc(@as(i32, @intCast(screen.rows)) - 1, 2), col),
+        c.GDK_KEY_L => copyModeMoveTo(self, copyModeViewTop(self) + @as(i32, @intCast(screen.rows)) - 1, col),
+        // Page and half-page scrolling.
+        c.GDK_KEY_Page_Down => copyModeMoveTo(self, row + @as(i32, @intCast(screen.rows)), col),
+        c.GDK_KEY_Page_Up => copyModeMoveTo(self, row - @as(i32, @intCast(screen.rows)), col),
+        c.GDK_KEY_f => {
+            if (ctrl) {
+                copyModeMoveTo(self, row + @as(i32, @intCast(screen.rows)), col);
+            } else {
+                self.copymode_find_pending = 'f';
+            }
+        },
+        c.GDK_KEY_b => {
+            if (ctrl) {
+                copyModeMoveTo(self, row - @as(i32, @intCast(screen.rows)), col);
+            } else {
+                copyModeWord(self, .prev, .word);
+            }
+        },
+        c.GDK_KEY_d => {
+            if (ctrl) copyModeMoveTo(self, row + @divTrunc(@as(i32, @intCast(screen.rows)), 2), col);
+        },
+        c.GDK_KEY_u => {
+            if (ctrl) copyModeMoveTo(self, row - @divTrunc(@as(i32, @intCast(screen.rows)), 2), col);
+        },
+        // Word motions. Lower case respects the word_chars set; upper
+        // case is vim's WORD, delimited by blanks alone.
+        c.GDK_KEY_w => copyModeWord(self, .next, .word),
+        c.GDK_KEY_W => copyModeWord(self, .next, .big),
+        c.GDK_KEY_B => copyModeWord(self, .prev, .big),
+        c.GDK_KEY_e => copyModeWord(self, .next_end, .word),
+        c.GDK_KEY_E => copyModeWord(self, .next_end, .big),
+        // { / } — paragraph motion, i.e. the next blank line.
+        c.GDK_KEY_braceright => copyModeParagraph(self, 1),
+        c.GDK_KEY_braceleft => copyModeParagraph(self, -1),
+        // % — the bracket matching the one under the cursor.
+        c.GDK_KEY_percent => copyModeMatchBracket(self),
+        // F / T and their repeats.
+        c.GDK_KEY_F => self.copymode_find_pending = 'F',
+        c.GDK_KEY_t => self.copymode_find_pending = 't',
+        c.GDK_KEY_T => self.copymode_find_pending = 'T',
+        c.GDK_KEY_semicolon => {
+            if (self.copymode_find_kind != 0) copyModeFind(self, self.copymode_find_kind, self.copymode_find_char);
+        },
+        c.GDK_KEY_comma => {
+            if (self.copymode_find_kind != 0) copyModeFind(self, findReverse(self.copymode_find_kind), self.copymode_find_char);
+        },
+        // n / N — walk the search bar's matches without leaving copy
+        // mode, so a search can be refined into a selection.
+        c.GDK_KEY_n => copyModeSearchStep(self, 1),
+        c.GDK_KEY_N => copyModeSearchStep(self, -1),
         // v = cell-wise anchor toggle; Ctrl+v (or r) = rectangular;
         // V = line-wise.
         c.GDK_KEY_v => copyModeToggleSel(self, if (ctrl) .rect else .cell),
@@ -385,6 +482,115 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
         else => {},
     }
     return true;
+}
+
+/// Display row of the topmost line currently on screen.
+fn copyModeViewTop(self: *Window) i32 {
+    const pane = self.copymode_pane orelse return 0;
+    const screen = pane.terminal.screen;
+    return -@as(i32, @intCast(@min(screen.view_offset, screen.scrollbackCount())));
+}
+
+fn findReverse(kind: u8) u8 {
+    return switch (kind) {
+        'f' => 'F',
+        'F' => 'f',
+        't' => 'T',
+        'T' => 't',
+        else => kind,
+    };
+}
+
+/// f/F/t/T — jump to `ch` on the cursor's own line. Line-local, like
+/// vim: running off the end is a no-op rather than a wrap.
+pub fn copyModeFind(self: *Window, kind: u8, ch: u32) void {
+    const pane = self.copymode_pane orelse return;
+    const screen = pane.terminal.screen;
+    const cells = screen.lineCellsAtPub(self.copymode_row) orelse return;
+    const col: usize = self.copymode_col;
+    const hit = switch (kind) {
+        'f' => wm.findForward(cells, col, ch, false),
+        't' => wm.findForward(cells, col, ch, true),
+        'F' => wm.findBackward(cells, col, ch, false),
+        'T' => wm.findBackward(cells, col, ch, true),
+        else => null,
+    };
+    if (hit) |c2| copyModeMoveTo(self, self.copymode_row, @intCast(c2));
+}
+
+/// { / } — the next blank line in `dir`, or the buffer edge.
+pub fn copyModeParagraph(self: *Window, dir: i32) void {
+    const pane = self.copymode_pane orelse return;
+    const screen = pane.terminal.screen;
+    const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
+    const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
+    var r = self.copymode_row;
+    var last = r;
+    while (true) {
+        r += dir;
+        if (r < -sb or r > max_row) break;
+        last = r;
+        if (copyModeRowBlank(screen, r)) break;
+    }
+    copyModeMoveTo(self, last, 0);
+}
+
+fn copyModeRowBlank(screen: *const Screen, row: i32) bool {
+    const cells = screen.lineCellsAtPub(row) orelse return true;
+    for (cells) |cell| {
+        if (cell.rune != 0 and cell.rune != ' ') return false;
+    }
+    return true;
+}
+
+/// The bracket pairing with the one under the cursor. The row budget
+/// is a screenful in each direction, so a stray bracket in a long
+/// scrollback cannot turn one keystroke into a full-buffer scan on
+/// the main loop.
+pub fn copyModeMatchBracket(self: *Window) void {
+    const pane = self.copymode_pane orelse return;
+    const screen = pane.terminal.screen;
+    const hit = bracket.matchAt(screen, self.copymode_row, self.copymode_col, @intCast(screen.rows)) orelse return;
+    copyModeMoveTo(self, hit.row, hit.col);
+}
+
+/// n / N — move the copy cursor onto the next search match. Needs the
+/// search bar to have been used; without matches it does nothing.
+pub fn copyModeSearchStep(self: *Window, dir: i32) void {
+    const pane = self.copymode_pane orelse return;
+    if (self.search_pane != pane) return;
+    const matches = self.search_matches.items;
+    if (matches.len == 0) return;
+
+    const row = self.copymode_row;
+    const col: i32 = self.copymode_col;
+    // Nearest match strictly after (or before) the cursor, in reading
+    // order. The list is already ordered oldest row first.
+    if (dir > 0) {
+        for (matches, 0..) |m, i| {
+            if (m.row > row or (m.row == row and @as(i32, @intCast(m.col)) > col)) {
+                self.search_idx = i;
+                copyModeMoveTo(self, m.row, @intCast(m.col));
+                return;
+            }
+        }
+        self.search_idx = 0;
+        copyModeMoveTo(self, matches[0].row, @intCast(matches[0].col));
+    } else {
+        var i = matches.len;
+        while (i > 0) {
+            i -= 1;
+            const m = matches[i];
+            if (m.row < row or (m.row == row and @as(i32, @intCast(m.col)) < col)) {
+                self.search_idx = i;
+                copyModeMoveTo(self, m.row, @intCast(m.col));
+                return;
+            }
+        }
+        self.search_idx = matches.len - 1;
+        const m = matches[matches.len - 1];
+        copyModeMoveTo(self, m.row, @intCast(m.col));
+    }
 }
 
 /// Toggle the selection anchor. Re-pressing the active kind drops
@@ -424,34 +630,41 @@ pub fn copyModeMoveTo(self: *Window, row: i32, col: i32) void {
     copyModeRefresh(self);
 }
 
-pub const WordDir = enum { next, prev };
+pub const WordDir = enum { next, prev, next_end, prev_end };
 
-/// w / b — jump to the next / previous word start, wrapping to
-/// adjacent lines when the current one runs out of words.
-pub fn copyModeWord(self: *Window, dir: WordDir) void {
+/// w / b / e — jump to the next or previous word boundary, wrapping to
+/// adjacent lines when the current one runs out of words. `kind`
+/// picks the alphabet: the word_chars set, or vim's blank-delimited
+/// WORD for the upper-case motions.
+pub fn copyModeWord(self: *Window, dir: WordDir, kind: wm.Kind) void {
     const pane = self.copymode_pane orelse return;
     const screen = pane.terminal.screen;
-    const wm = @import("../grid/word_motion.zig");
+    const chars = screen.word_chars;
     if (screen.lineCellsAtPub(self.copymode_row)) |cells| {
         const hit = switch (dir) {
-            .next => wm.nextWordStart(cells, screen.word_chars, self.copymode_col),
-            .prev => wm.prevWordStart(cells, screen.word_chars, self.copymode_col),
+            .next => wm.nextStart(cells, chars, self.copymode_col, kind),
+            .prev => wm.prevStart(cells, chars, self.copymode_col, kind),
+            .next_end => wm.nextEnd(cells, chars, self.copymode_col, kind),
+            .prev_end => wm.prevEnd(cells, chars, self.copymode_col, kind),
         };
         if (hit) |c2| {
             copyModeMoveTo(self, self.copymode_row, @intCast(c2));
             return;
         }
     }
+    const forward = dir == .next or dir == .next_end;
     const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
     const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
     var row = self.copymode_row;
     while (true) {
-        row = if (dir == .next) row + 1 else row - 1;
+        row = if (forward) row + 1 else row - 1;
         if (row < -sb or row > max_row) return; // buffer edge — stay put
         const cells = screen.lineCellsAtPub(row) orelse continue;
         const hit = switch (dir) {
-            .next => wm.firstWordStart(cells, screen.word_chars),
-            .prev => wm.lastWordStart(cells, screen.word_chars),
+            .next => wm.firstStart(cells, chars, kind),
+            .prev => wm.lastStart(cells, chars, kind),
+            .next_end => wm.firstEnd(cells, chars, kind),
+            .prev_end => wm.lastEnd(cells, chars, kind),
         };
         if (hit) |c2| {
             copyModeMoveTo(self, row, @intCast(c2));
@@ -525,12 +738,21 @@ pub fn onCopyModeKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType)
 
 /// Column of the last non-blank cell on a display row ($ motion).
 /// Blank line → column 0.
-pub fn copyModeLineEnd(screen: *const @import("../grid/screen.zig").Screen, row: i32) i32 {
+pub fn copyModeLineEnd(screen: *const Screen, row: i32) i32 {
     const cells = screen.lineCellsAtPub(row) orelse return 0;
     var i: usize = cells.len;
     while (i > 0 and cells[i - 1].rune == 0) i -= 1;
     if (i == 0) return 0;
     return @intCast(i - 1);
+}
+
+/// Column of the first non-blank cell on a display row (^ motion).
+pub fn copyModeLineStart(screen: *const Screen, row: i32) i32 {
+    const cells = screen.lineCellsAtPub(row) orelse return 0;
+    for (cells, 0..) |cell, i| {
+        if (cell.rune != 0 and cell.rune != ' ') return @intCast(i);
+    }
+    return 0;
 }
 
 
