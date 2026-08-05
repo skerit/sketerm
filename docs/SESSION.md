@@ -13234,3 +13234,51 @@ Known limitation: app_hover_map only finds controls that draw hover
 feedback, so an app with none yields an empty map — that is reported,
 not implied. Clicking every cell would find more but is destructive, so
 it is deliberately not offered.
+
+## Editor: word wrap (UAX #14), reloads that keep undo history, exact a11y ranges
+
+Two V1 limits a person actually feels while editing are gone. Soft
+wrap no longer breaks mid-word: `src/editor/linebreak.zig` is a UAX
+#14 rule engine in `unicode.zig`'s idiom (complete engine, compact
+class table) covering LB7-LB31's load-bearing subset — break after
+spaces/hyphens/ZWSP, never before closers/nonstarters/quotes, numeric
+runs like "3.14"/"-5"/"1,234" hold together, NBSP/WJ glue — and the
+CJK/kana/Hangul/emoji planes resolve to ID so ideographic text breaks
+between characters and fills each row (no spaces required). The
+layout's greedy wrap takes the last opportunity on the row, testing
+the LOGICAL seam (byte_end for RTL flow), and falls back to the old
+cluster break only when a single unbreakable token exceeds the width.
+Whitespace clusters never trigger a wrap, so trailing spaces hang
+past the column like every editor. Hint-shifted x positions flow into
+the same overflow test, so an inlay hint moves breaks correctly.
+`editor_wrap_words` (default true, prefs row) restores anywhere-wrap
+— a real preference for logs/minified text, and an escape hatch for
+the compact class table. Thai/Lao/Khmer classify as AL (no dictionary
+breaking): long SA runs glue like Latin words until the fallback.
+
+An external reload no longer throws away undo history.
+`editor/diff.zig` diffs the disk bytes onto the LIVE document —
+common prefix/suffix trim snapped to codepoint boundaries, then
+line-granularity Myers, O((N+M)*D) time and O(D^2) space with N+M
+capped at 50k lines and D at 512, past which the middle collapses to
+one replace — and applies the hunks as ONE transaction. Undo restores
+the pre-reload text (and the pre-reload carets, via the selection
+snapshot), redo returns to the disk content, and the highlighter,
+fold/git/outline anchors and LSP didChange all ride the ordinary
+edit-observer path, so `onDocumentReplaced` and the kept-position
+clamp machinery are gone from the reload. Line-ending style is
+re-detected but is metadata: undo does not put a CRLF flag back.
+
+The a11y hole ("an edit outside the caret's 32-line block goes
+unannounced") now has its missing half: `Document` grew the fourth
+edit-observer slot, and `docview.ChangeLog` records each
+transaction's REAL remove/insert ranges (deleted-char counts taken
+pre-edit, byte→char conversion deferred to `take()` so a burst with
+no reader attached costs almost nothing), surfaced through
+`DocSource.takeChanges`. Honesty rule: one transaction per take — a
+second one marks the log stale and the consumer must fall back to the
+region diff rather than compose coordinates. The final wire into
+`atspi.zig`'s `emitNow` (prefer exact changes over the region diff)
+is deliberately not in this change: that file was concurrently owned;
+the proposed shape is an optional `changes` vtable entry the bridge
+consults first.
