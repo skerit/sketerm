@@ -229,6 +229,15 @@ pub fn main() u8 {
     _ = c.unsetenv("SKETERM_SOCKET");
     defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
 
+    // A fresh XDG_CONFIG_HOME changes fontconfig's cache key, so every
+    // isolated GUI launch below would otherwise rebuild the font caches
+    // on concurrent threads and race pango into heap corruption (SEGV in
+    // pango_glyph_string_extents_range, or "malloc(): unaligned tcache
+    // chunk", with no sketerm frame in the faulting stack). Warming it
+    // ONCE, single-threaded, before anything else starts is the fix —
+    // same as smoke-atspi and smoke-lsp-gui.
+    _ = c.system("fc-cache >/dev/null 2>&1");
+
     const mux_pid = c.fork();
     if (mux_pid < 0) return fail("mux fork");
     if (mux_pid == 0) {
