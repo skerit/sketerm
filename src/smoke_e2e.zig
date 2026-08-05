@@ -462,6 +462,8 @@ pub fn main() u8 {
         say("kitty keyboard protocol encodes real key events correctly");
         if (copyModeStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("copy mode selected a word with vi motions and yanked it to the clipboard");
+        if (hintsStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("hint labels typed on the real seat, with the copy override");
 
         // 3c. The pane's context menu, driven by a real right-click and
         // by the keyboard. Contents and per-row sensitivity are
@@ -1734,6 +1736,40 @@ fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
         return "the copy-mode selection overshot the word it was on";
 
     // Clear the pasted line so the pane is left at a clean prompt.
+    app.pressKey(null, "ctrl+u") catch return "clearing the pasted line failed";
+    _ = app.waitIdle(300, 5_000);
+    return null;
+}
+
+/// Hint mode from the seat. The label keys are plain letters, which
+/// is exactly what an input method claims first — the same trap copy
+/// mode fell into — so this stage is here to keep them typeable.
+/// Shift+label is the copy override, checked through a paste back.
+fn hintsStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    // `clear` first: labels are handed out in reading order, so a
+    // clean screen makes the first label deterministic.
+    // `clear` wipes the echoed command line too, so exactly one
+    // occurrence is left on screen — and exactly one hint to label.
+    app.typeText(null, "clear; echo /tmp/zh-hint-file\n") catch return "injecting the hint sample failed";
+    if (!waitMarkerCount(allocator, sock_path, "/tmp/zh-hint-file", 1, 15_000))
+        return "the hint sample never reached the shell";
+    _ = app.waitIdle(300, 5_000);
+
+    app.pressKey(null, "ctrl+shift+e") catch return "entering hint mode failed";
+    _ = app.waitIdle(300, 5_000);
+    // Shift+label: copy whatever the match is, instead of its own
+    // action (a path would otherwise try to open in an editor).
+    app.pressKey(null, "shift+a") catch return "picking a hint label failed";
+    _ = app.waitIdle(300, 5_000);
+
+    app.pressKey(null, "ctrl+shift+v") catch return "pasting the hinted text failed";
+    if (!waitMarkerCount(allocator, sock_path, "/tmp/zh-hint-file", 2, 10_000)) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n")) |resp| {
+            defer allocator.free(resp);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: hints pane text: %.*s\n", @as(c_int, @intCast(@min(resp.len, 2000))), resp.ptr);
+        }
+        return "the hint label never copied its match";
+    }
     app.pressKey(null, "ctrl+u") catch return "clearing the pasted line failed";
     _ = app.waitIdle(300, 5_000);
     return null;

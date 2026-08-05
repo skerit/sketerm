@@ -48,9 +48,9 @@ const ENTRIES = [_]Entry{
     .{ .icon = "utilities-terminal-symbolic", .title = "Copy Command Output",
        .desc = "Copy the output of the last command (needs OSC 133 shell integration).", .action = .copy_command_output },
     .{ .icon = "find-location-symbolic", .title = "Keyboard Hints",
-       .desc = "Label URLs, paths, and hashes on screen; type a label to open or copy.", .action = .hints_open },
+       .desc = "Label matches on screen; type a label to act on one. Shift copies, Alt pastes, Tab collects several.", .action = .hints_open },
     .{ .icon = "edit-select-all-symbolic", .title = "Copy Mode",
-       .desc = "Keyboard-driven selection: move with h/j/k/l, select with v, copy with y.", .action = .copy_mode },
+       .desc = "Keyboard-driven selection: vi motions (w/e/b, H/M/L, %, f), select with v, copy with y.", .action = .copy_mode },
     .{ .icon = "view-fullscreen-symbolic", .title = "Zoom Pane",
        .desc = "Toggle the focused pane to fill the whole tab (tmux z).", .action = .zoom_pane },
 
