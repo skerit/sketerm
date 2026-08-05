@@ -87,6 +87,23 @@ pub const KeybindEntry = struct {
     accel: []const u8,
 };
 
+/// What activating a hint does. `open` hands URLs to the desktop and
+/// existing files to the editor; `command` runs `HintRule.command`
+/// with {match} substituted.
+pub const HintAction = enum { open, copy, paste, select, command };
+
+/// One user-defined hint rule, from `hint.<name>.*` lines. The
+/// pattern is a POSIX extended regular expression matched against
+/// each visible row's text; an invalid one disables just that rule.
+pub const HintRule = struct {
+    name: []const u8,
+    pattern: []const u8 = "",
+    action: HintAction = .copy,
+    /// Shell command for `action = command`. `{match}` is replaced
+    /// with the matched text, shell-quoted.
+    command: []const u8 = "",
+};
+
 /// The pane-level settings bundle — everything that can sensibly
 /// differ between two panes. The Default profile is the embedded
 /// `Config.settings`; named profiles ([profile.<name>] sections) are
@@ -499,6 +516,18 @@ pub const Config = struct {
     /// `+line file` ("nvim"). Empty = $EDITOR/$VISUAL, falling back
     /// to copy-to-clipboard when neither is set.
     hint_editor: []const u8 = "",
+    /// Label alphabet for hint mode, in the order labels are handed
+    /// out. Empty = the built-in home-row-first set. Duplicate or
+    /// non-printable characters make the setting be ignored.
+    hint_alphabet: []const u8 = "",
+    /// Start hint mode in multi-select: each label appends its match
+    /// instead of activating and closing. Toggleable in-mode with Tab
+    /// either way.
+    hint_multiple: bool = false,
+    /// User-defined hint rules from `hint.<name>.*` lines, in file
+    /// order. They are scanned BEFORE the built-in URL/path/hash
+    /// scanners, so a rule can claim text those would have taken.
+    hint_rules: std.ArrayList(HintRule) = .empty,
 
     // Search
     /// Default state for the search box's case sensitivity. The
@@ -647,6 +676,17 @@ pub const Config = struct {
         out.arena = null;
         out.settings = try self.settings.cloneInto(arena);
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
+        out.hint_alphabet = try arena.dupe(u8, self.hint_alphabet);
+        out.hint_rules = .empty;
+        try out.hint_rules.ensureTotalCapacity(arena, self.hint_rules.items.len);
+        for (self.hint_rules.items) |hr| {
+            out.hint_rules.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, hr.name),
+                .pattern = try arena.dupe(u8, hr.pattern),
+                .action = hr.action,
+                .command = try arena.dupe(u8, hr.command),
+            });
+        }
         out.background_image = try arena.dupe(u8, self.background_image);
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
@@ -1008,6 +1048,13 @@ pub const Config = struct {
         if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
         if (self.clipboard_read) try w.writeAll("clipboard_read = allow\n");
         if (self.hint_editor.len > 0) try w.print("hint_editor = {s}\n", .{self.hint_editor});
+        if (self.hint_alphabet.len > 0) try w.print("hint_alphabet = {s}\n", .{self.hint_alphabet});
+        if (self.hint_multiple) try w.writeAll("hint_multiple = true\n");
+        for (self.hint_rules.items) |hr| {
+            if (hr.pattern.len > 0) try w.print("hint.{s}.regex = {s}\n", .{ hr.name, hr.pattern });
+            try w.print("hint.{s}.action = {s}\n", .{ hr.name, @tagName(hr.action) });
+            if (hr.command.len > 0) try w.print("hint.{s}.command = {s}\n", .{ hr.name, hr.command });
+        }
         if (self.mouse_middle_click != .paste_primary)
             try w.print("mouse_middle_click = {s}\n", .{@tagName(self.mouse_middle_click)});
         if (self.mouse_right_click != .menu)
@@ -1571,6 +1618,35 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         try cfg.editor_keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
         return;
     }
+    // `hint.<name>.<field> = <value>` — user-defined hint rules. The
+    // fields of one rule can appear in any order and on any line; the
+    // rule is created by whichever mentions it first, which is also
+    // the order rules are scanned in.
+    if (std.mem.startsWith(u8, key, "hint.")) {
+        const rest = key["hint.".len..];
+        const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return error.BadHintRule;
+        const name = rest[0..dot];
+        const field = rest[dot + 1 ..];
+        if (name.len == 0 or field.len == 0) return error.BadHintRule;
+
+        var rule: *HintRule = blk: {
+            for (cfg.hint_rules.items) |*entry| {
+                if (std.mem.eql(u8, entry.name, name)) break :blk entry;
+            }
+            try cfg.hint_rules.append(arena, .{ .name = try arena.dupe(u8, name) });
+            break :blk &cfg.hint_rules.items[cfg.hint_rules.items.len - 1];
+        };
+        if (std.mem.eql(u8, field, "regex") or std.mem.eql(u8, field, "pattern")) {
+            rule.pattern = try arena.dupe(u8, value);
+        } else if (std.mem.eql(u8, field, "action")) {
+            rule.action = std.meta.stringToEnum(HintAction, value) orelse return error.BadHintAction;
+        } else if (std.mem.eql(u8, field, "command")) {
+            rule.command = try arena.dupe(u8, value);
+        } else {
+            return error.BadHintRule;
+        }
+        return;
+    }
     // `shader_param.<name> = <float | #rrggbb>` — tunable shader
     // uniforms (floats and vec3 colors).
     if (std.mem.startsWith(u8, key, "shader_param.")) {
@@ -1770,6 +1846,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.mouse_right_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
     } else if (std.mem.eql(u8, key, "hint_editor")) {
         cfg.hint_editor = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "hint_alphabet")) {
+        cfg.hint_alphabet = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "hint_multiple")) {
+        cfg.hint_multiple = try parseBool(value);
     } else if (std.mem.eql(u8, key, "clipboard_read")) {
         if (std.mem.eql(u8, value, "allow")) {
             cfg.clipboard_read = true;
@@ -2242,6 +2322,47 @@ test "config: visibility defaults are NOT emitted (terse output)" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_bar") == null);
+}
+
+test "config: hint rules parse, keep file order and round-trip" {
+    const src =
+        \\hint_alphabet = qwerty
+        \\hint_multiple = true
+        \\hint.ticket.regex = [A-Z]+-[0-9]+
+        \\hint.ticket.action = command
+        \\hint.ticket.command = xdg-open https://tracker/{match}
+        \\hint.ip.regex = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+
+        \\hint.ip.action = paste
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("qwerty", cfg.hint_alphabet);
+    try std.testing.expect(cfg.hint_multiple);
+    try std.testing.expectEqual(@as(usize, 2), cfg.hint_rules.items.len);
+    // Order matters: rules are scanned in the order they appear.
+    try std.testing.expectEqualStrings("ticket", cfg.hint_rules.items[0].name);
+    try std.testing.expectEqual(HintAction.command, cfg.hint_rules.items[0].action);
+    try std.testing.expectEqualStrings("xdg-open https://tracker/{match}", cfg.hint_rules.items[0].command);
+    try std.testing.expectEqualStrings("ip", cfg.hint_rules.items[1].name);
+    try std.testing.expectEqual(HintAction.paste, cfg.hint_rules.items[1].action);
+    try std.testing.expectEqualStrings("[A-Z]+-[0-9]+", cfg.hint_rules.items[0].pattern);
+}
+
+test "config: an unknown hint action leaves the rule on its safe default" {
+    const src =
+        \\hint.x.regex = foo
+        \\hint.x.action = rm -rf
+        \\
+    ;
+    // A bad line is warned about and skipped, like every other config
+    // error — the rule must not end up doing something else instead.
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cfg.hint_rules.items.len);
+    try std.testing.expectEqual(HintAction.copy, cfg.hint_rules.items[0].action);
+    try std.testing.expectEqualStrings("foo", cfg.hint_rules.items[0].pattern);
 }
 
 test "config: keybind.<action> entries round-trip" {

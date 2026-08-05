@@ -9,11 +9,27 @@
 //! draws the overlays from `Screen.hints_overlay`.
 
 const std = @import("std");
+const c = @import("../c.zig").c;
 const Screen = @import("../grid/screen.zig").Screen;
 const Cell = @import("../grid/cell.zig").Cell;
 const url_scan = @import("../grid/url_scan.zig");
 
-pub const Kind = enum { url, path, hash };
+pub const Kind = enum { url, path, hash, custom };
+
+/// What activating a match does. Mirrors `config.HintAction`; kept
+/// separate so this module stays independent of the config type.
+pub const Action = enum { open, copy, paste, select, command };
+
+/// A user-defined rule: a POSIX extended regular expression plus what
+/// to do with what it matches. Scanned before the built-in scanners,
+/// in the order the config file lists them.
+pub const Rule = struct {
+    pattern: []const u8,
+    action: Action = .copy,
+    /// Shell command for `action = .command`, with `{match}` replaced
+    /// by the matched text, shell-quoted.
+    command: []const u8 = "",
+};
 
 pub const Match = struct {
     /// Display row (0..rows-1) at collect time.
@@ -25,6 +41,12 @@ pub const Match = struct {
     /// Extracted text, owned by the caller's allocator. Captured at
     /// collect time so scrolling can't change what gets activated.
     text: []u8,
+    /// What this match does when picked.
+    action: Action = .copy,
+    /// Command template for `.command` matches. Owned like `text`,
+    /// because the config arena it came from can be replaced while
+    /// the mode is open.
+    command: []u8 = &.{},
     /// Assigned label ("a", "fj", ...). All labels in one batch share
     /// the same length, so no label is a prefix of another.
     label: [2]u8 = .{ 0, 0 },
@@ -34,35 +56,179 @@ pub const Match = struct {
 /// Home-row-first label alphabet.
 pub const ALPHABET = "asdfghjklqwertyuiopzxcvbnm";
 
+/// A configured alphabet is only used when it can actually label
+/// things: at least two distinct printable ASCII characters, no
+/// duplicates (a repeated character would give two matches the same
+/// label). Anything else falls back to the built-in set.
+pub fn validAlphabet(alphabet: []const u8) ?[]const u8 {
+    if (alphabet.len < 2 or alphabet.len > 64) return null;
+    for (alphabet, 0..) |ch, i| {
+        if (ch <= ' ' or ch > '~') return null;
+        for (alphabet[i + 1 ..]) |other| {
+            if (other == ch) return null;
+        }
+    }
+    return alphabet;
+}
+
 /// Hard cap: 26 single-char + first rows of 2-char labels is far more
 /// than ever fits on screen anyway.
 pub const MAX_MATCHES = 26 * 26;
 
 pub fn freeMatches(allocator: std.mem.Allocator, matches: []Match) void {
-    for (matches) |m| allocator.free(m.text);
+    for (matches) |m| {
+        allocator.free(m.text);
+        if (m.command.len > 0) allocator.free(m.command);
+    }
 }
 
 /// Scan the visible rows of `screen` for hintable items, in reading
 /// order. Caller owns the returned slice AND each match's `text`
 /// (use `freeMatches`). Labels are already assigned.
 pub fn collectVisible(allocator: std.mem.Allocator, screen: *const Screen) ![]Match {
+    return collectVisibleWith(allocator, screen, &.{}, ALPHABET);
+}
+
+/// `collectVisible` with user-defined rules and a label alphabet.
+/// Rules are tried first on every row, so one can claim text a
+/// built-in scanner would otherwise have taken.
+pub fn collectVisibleWith(
+    allocator: std.mem.Allocator,
+    screen: *const Screen,
+    rules: []const Rule,
+    alphabet: []const u8,
+) ![]Match {
     var out: std.ArrayList(Match) = .empty;
     errdefer {
         freeMatches(allocator, out.items);
         out.deinit(allocator);
     }
 
+    var compiled = try CompiledRules.init(allocator, rules);
+    defer compiled.deinit(allocator);
+
     const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
     var d: u16 = 0;
     while (d < screen.rows) : (d += 1) {
         const buf_row: i32 = @as(i32, d) - view_off;
         const cells = screen.lineCellsAtPub(buf_row) orelse continue;
-        try scanRowAll(allocator, screen, cells, d, &out);
+        // Both scanners dedupe against everything already found on
+        // THIS row, rules included — a rule that claimed a path must
+        // stop the built-in path scanner finding it again.
+        const row_first = out.items.len;
+        try scanRowRules(allocator, cells, d, compiled, row_first, &out);
+        try scanRowAll(allocator, screen, cells, d, row_first, &out);
         if (out.items.len >= MAX_MATCHES) break;
     }
 
-    assignLabels(out.items);
+    assignLabels2(out.items, alphabet);
     return try out.toOwnedSlice(allocator);
+}
+
+/// Rule patterns compiled once per hint-mode entry rather than once
+/// per row. A pattern that does not compile is dropped with its rule,
+/// so one bad line in the config cannot disable the others.
+const CompiledRules = struct {
+    res: []?*c.regex_t = &.{},
+    rules: []const Rule = &.{},
+
+    fn init(allocator: std.mem.Allocator, rules: []const Rule) !CompiledRules {
+        if (rules.len == 0) return .{};
+        const res = try allocator.alloc(?*c.regex_t, rules.len);
+        errdefer allocator.free(res);
+        for (res, rules) |*slot, rule| {
+            slot.* = null;
+            if (rule.pattern.len == 0) continue;
+            const pat_z = allocator.allocSentinel(u8, rule.pattern.len, 0) catch continue;
+            defer allocator.free(pat_z);
+            @memcpy(pat_z, rule.pattern);
+            // glibc's regex_t has bitfields translate-c cannot model,
+            // so it is opaque to Zig and cannot live on the stack.
+            const buf = std.c.malloc(256) orelse continue;
+            const re: *c.regex_t = @ptrCast(@alignCast(buf));
+            if (c.regcomp(re, pat_z.ptr, c.REG_EXTENDED) != 0) {
+                std.c.free(buf);
+                continue;
+            }
+            slot.* = re;
+        }
+        return .{ .res = res, .rules = rules };
+    }
+
+    fn deinit(self: *CompiledRules, allocator: std.mem.Allocator) void {
+        for (self.res) |maybe| {
+            if (maybe) |re| {
+                c.regfree(re);
+                std.c.free(@ptrCast(re));
+            }
+        }
+        if (self.res.len > 0) allocator.free(self.res);
+    }
+};
+
+/// Run every compiled rule over one row's text. Column mapping is by
+/// cell index, so a row containing wide or combining characters maps
+/// back through the same byte→column table the extractor builds.
+fn scanRowRules(
+    allocator: std.mem.Allocator,
+    cells: []const Cell,
+    row: u16,
+    compiled: CompiledRules,
+    row_first: usize,
+    out: *std.ArrayList(Match),
+) !void {
+    if (compiled.rules.len == 0) return;
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    var col_of: std.ArrayList(u16) = .empty;
+    defer col_of.deinit(allocator);
+    for (cells, 0..) |cl, i| {
+        if (cl.flags & 0b0000_0010 != 0) continue; // wide continuation
+        const cp: u32 = if (cl.rune == 0) ' ' else cl.rune;
+        var ub: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+        for (ub[0..n]) |b| {
+            try line.append(allocator, b);
+            try col_of.append(allocator, @intCast(i));
+        }
+    }
+    if (line.items.len == 0) return;
+    const line_z = try allocator.allocSentinel(u8, line.items.len, 0);
+    defer allocator.free(line_z);
+    @memcpy(line_z, line.items);
+
+    for (compiled.res, compiled.rules) |maybe, rule| {
+        const re = maybe orelse continue;
+        var pos: usize = 0;
+        while (pos < line_z.len) {
+            var m: c.regmatch_t = undefined;
+            // REG_NOTBOL past the start: `^` must anchor to the row,
+            // not to wherever the previous match ended.
+            const flags: c_int = if (pos == 0) 0 else c.REG_NOTBOL;
+            if (c.regexec(re, line_z.ptr + pos, 1, &m, flags) != 0) break;
+            const so: usize = pos + @as(usize, @intCast(m.rm_so));
+            const eo: usize = pos + @as(usize, @intCast(m.rm_eo));
+            if (eo == so) {
+                pos = so + 1;
+                continue;
+            }
+            const col_start = col_of.items[so];
+            const col_end: u16 = if (eo < col_of.items.len) col_of.items[eo] else @intCast(cells.len);
+            if (!overlaps(out.items[row_first..], col_start, col_end)) {
+                try out.append(allocator, .{
+                    .row = row,
+                    .col_start = col_start,
+                    .col_end = col_end,
+                    .kind = .custom,
+                    .text = try allocator.dupe(u8, line_z[so..eo]),
+                    .action = rule.action,
+                    .command = if (rule.command.len > 0) try allocator.dupe(u8, rule.command) else &.{},
+                });
+            }
+            pos = eo;
+        }
+    }
 }
 
 /// All scanners for one row, deduplicated: OSC 8 link runs win over
@@ -73,9 +239,9 @@ fn scanRowAll(
     screen: *const Screen,
     cells: []const Cell,
     row: u16,
+    row_first: usize,
     out: *std.ArrayList(Match),
 ) !void {
-    const row_first = out.items.len;
 
     // 1. OSC 8 hyperlink runs (consecutive cells with the link flag
     //    and the same link id).
@@ -95,6 +261,7 @@ fn scanRowAll(
                     .col_start = @intCast(start),
                     .col_end = @intCast(col),
                     .kind = .url,
+                    .action = .open,
                     .text = try allocator.dupe(u8, uri),
                 });
             }
@@ -112,6 +279,7 @@ fn scanRowAll(
                 .col_start = m.col_start,
                 .col_end = m.col_end,
                 .kind = .url,
+                .action = .open,
                 .text = try extractCells(allocator, cells[m.col_start..m.col_end]),
             });
         }
@@ -148,6 +316,7 @@ fn scanRowAll(
                 .col_start = @intCast(start),
                 .col_end = @intCast(end),
                 .kind = .path,
+                .action = .open,
                 .text = try extractCells(allocator, cells[start..end]),
             });
         }
@@ -182,6 +351,7 @@ fn scanRowAll(
                 .col_start = @intCast(start),
                 .col_end = @intCast(end),
                 .kind = .hash,
+                .action = .copy,
                 .text = try extractCells(allocator, cells[start..end]),
             });
         }
@@ -212,15 +382,20 @@ fn extractCells(allocator: std.mem.Allocator, cells: []const Cell) ![]u8 {
 /// labels; more get uniform two-char labels (uniform length keeps the
 /// set prefix-free).
 pub fn assignLabels(matches: []Match) void {
-    if (matches.len <= ALPHABET.len) {
+    assignLabels2(matches, ALPHABET);
+}
+
+pub fn assignLabels2(matches: []Match, alphabet_in: []const u8) void {
+    const alphabet = validAlphabet(alphabet_in) orelse ALPHABET;
+    if (matches.len <= alphabet.len) {
         for (matches, 0..) |*m, i| {
-            m.label[0] = ALPHABET[i];
+            m.label[0] = alphabet[i];
             m.label_len = 1;
         }
     } else {
         for (matches, 0..) |*m, i| {
-            m.label[0] = ALPHABET[(i / ALPHABET.len) % ALPHABET.len];
-            m.label[1] = ALPHABET[i % ALPHABET.len];
+            m.label[0] = alphabet[(i / alphabet.len) % alphabet.len];
+            m.label[1] = alphabet[i % alphabet.len];
             m.label_len = 2;
         }
     }
@@ -439,6 +614,110 @@ test "buildEditorCommand: bare editor, +line, template" {
     const c4 = try buildEditorCommand(a, "hx {file}:{line}", "/a/b", null, null);
     defer a.free(c4);
     try std.testing.expectEqualStrings("hx /a/b:1", c4);
+}
+
+fn collectRules(s: *Screen, rules: []const Rule) ![]Match {
+    return collectVisibleWith(std.testing.allocator, s, rules, ALPHABET);
+}
+
+test "a custom rule matches, carries its action, and wins over the built-ins" {
+    var pool = try StylePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 4);
+    defer s.deinit();
+    feedStr(s, "fix PROJ-1234 in /etc/hosts");
+
+    const rules = [_]Rule{.{ .pattern = "[A-Z]+-[0-9]+", .action = .command, .command = "open {match}" }};
+    const matches = try collectRules(s, &rules);
+    defer {
+        freeMatches(std.testing.allocator, matches);
+        std.testing.allocator.free(matches);
+    }
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(Kind.custom, matches[0].kind);
+    try std.testing.expectEqualStrings("PROJ-1234", matches[0].text);
+    try std.testing.expectEqual(Action.command, matches[0].action);
+    try std.testing.expectEqualStrings("open {match}", matches[0].command);
+    // The built-in path scanner still runs for what the rule left.
+    try std.testing.expectEqual(Kind.path, matches[1].kind);
+    try std.testing.expectEqualStrings("/etc/hosts", matches[1].text);
+}
+
+test "a rule claims text a built-in scanner would have taken" {
+    var pool = try StylePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 4);
+    defer s.deinit();
+    feedStr(s, "see /etc/hosts now");
+
+    const rules = [_]Rule{.{ .pattern = "/etc/[a-z]+", .action = .paste }};
+    const matches = try collectRules(s, &rules);
+    defer {
+        freeMatches(std.testing.allocator, matches);
+        std.testing.allocator.free(matches);
+    }
+    // One match, not two: the path scanner sees the columns taken.
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(Kind.custom, matches[0].kind);
+    try std.testing.expectEqual(Action.paste, matches[0].action);
+}
+
+test "a rule matches repeatedly on one row without looping forever" {
+    var pool = try StylePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 4);
+    defer s.deinit();
+    feedStr(s, "10.0.0.1 10.0.0.2 10.0.0.3");
+
+    // A pattern that can also match empty would spin on a naive
+    // advance; the scanner steps past a zero-length match.
+    const rules = [_]Rule{.{ .pattern = "[0-9.]*", .action = .copy }};
+    const matches = try collectRules(s, &rules);
+    defer {
+        freeMatches(std.testing.allocator, matches);
+        std.testing.allocator.free(matches);
+    }
+    try std.testing.expectEqual(@as(usize, 3), matches.len);
+    try std.testing.expectEqualStrings("10.0.0.1", matches[0].text);
+    try std.testing.expectEqualStrings("10.0.0.3", matches[2].text);
+}
+
+test "an uncompilable pattern disables only its own rule" {
+    var pool = try StylePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 4);
+    defer s.deinit();
+    feedStr(s, "abc 42");
+
+    const rules = [_]Rule{
+        .{ .pattern = "[unterminated", .action = .copy },
+        .{ .pattern = "[0-9]+", .action = .select },
+    };
+    const matches = try collectRules(s, &rules);
+    defer {
+        freeMatches(std.testing.allocator, matches);
+        std.testing.allocator.free(matches);
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("42", matches[0].text);
+    try std.testing.expectEqual(Action.select, matches[0].action);
+}
+
+test "custom label alphabet is used, and a broken one falls back" {
+    var ms: [3]Match = undefined;
+    for (&ms) |*m| m.* = .{ .row = 0, .col_start = 0, .col_end = 1, .kind = .hash, .text = &.{} };
+
+    assignLabels2(&ms, "xyz");
+    try std.testing.expectEqual(@as(u8, 'x'), ms[0].label[0]);
+    try std.testing.expectEqual(@as(u8, 'z'), ms[2].label[0]);
+
+    // A repeated character would give two matches the same label.
+    assignLabels2(&ms, "xxz");
+    try std.testing.expectEqual(@as(u8, 'a'), ms[0].label[0]);
+    // As would one character, or whitespace in the set.
+    try std.testing.expectEqual(@as(?[]const u8, null), validAlphabet("a"));
+    try std.testing.expectEqual(@as(?[]const u8, null), validAlphabet("a b"));
+    try std.testing.expect(validAlphabet("asdf") != null);
 }
 
 test "two-char labels are uniform when >26 matches" {

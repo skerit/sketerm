@@ -27,7 +27,34 @@ pub fn openHints(self: *Window) void {
     if (self.copymode_pane != null) self.exitCopyMode();
     const pane = self.focusedPane() orelse return;
     const hints_mod = @import("hints.zig");
-    const matches = hints_mod.collectVisible(self.allocator, pane.terminal.screen) catch return;
+
+    // Translate the config's rules into the scanner's own type. The
+    // strings are borrowed for the length of the scan only; matches
+    // keep their own copies, so replacing the config arena while hint
+    // mode is open cannot dangle them.
+    var rules: std.ArrayList(hints_mod.Rule) = .empty;
+    defer rules.deinit(self.allocator);
+    for (self.config.hint_rules.items) |hr| {
+        if (hr.pattern.len == 0) continue;
+        rules.append(self.allocator, .{
+            .pattern = hr.pattern,
+            .action = switch (hr.action) {
+                .open => .open,
+                .copy => .copy,
+                .paste => .paste,
+                .select => .select,
+                .command => .command,
+            },
+            .command = hr.command,
+        }) catch return;
+    }
+
+    const matches = hints_mod.collectVisibleWith(
+        self.allocator,
+        pane.terminal.screen,
+        rules.items,
+        self.config.hint_alphabet,
+    ) catch return;
     if (matches.len == 0) {
         self.allocator.free(matches);
         return;
@@ -35,6 +62,8 @@ pub fn openHints(self: *Window) void {
     self.hint_matches = matches;
     self.hints_pane = pane;
     self.hints_typed_len = 0;
+    self.hints_multi = self.config.hint_multiple;
+    self.hints_collected.clearRetainingCapacity();
     if (pane.input_ctx) |ictx| {
         ictx.hint_sink = onHintKey;
         ictx.hint_ctx = @ptrCast(self);
@@ -85,35 +114,100 @@ pub fn refreshHintOverlay(self: *Window) void {
 /// A label was completed: open URLs with the default handler;
 /// copy paths / hashes to both clipboards.
 pub fn activateHint(self: *Window, m: @import("hints.zig").Match) void {
+    activateHintAs(self, m, m.action);
+}
+
+/// Run one hint match under an explicit action, which is how the
+/// modifier overrides reach the same code path as the default.
+pub fn activateHintAs(self: *Window, m: @import("hints.zig").Match, action: @import("hints.zig").Action) void {
     const pane = self.hints_pane orelse return;
     if (m.text.len == 0) return;
-    switch (m.kind) {
-        .url => {
-            var buf: [4096]u8 = undefined;
-            const n = @min(m.text.len, buf.len - 1);
-            @memcpy(buf[0..n], m.text[0..n]);
-            buf[n] = 0;
-            _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+    switch (action) {
+        .open => switch (m.kind) {
+            .path => {
+                // A path hint whose file exists locally opens in the
+                // editor; anything else (remote pane paths, deleted
+                // files, no editor configured) copies as before.
+                if (openPathInEditor(self, pane, m.text)) return;
+                copyHintText(self, pane, m.text);
+            },
+            else => {
+                // Anything else opens as a URI. A custom rule that
+                // matched a bare path gets the same editor treatment
+                // first, so `open` means the same thing everywhere.
+                if (std.mem.indexOf(u8, m.text, "://") == null and openPathInEditor(self, pane, m.text)) return;
+                var buf: [4096]u8 = undefined;
+                const n = @min(m.text.len, buf.len - 1);
+                @memcpy(buf[0..n], m.text[0..n]);
+                buf[n] = 0;
+                _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+            },
         },
-        .path => {
-            // A path hint whose file exists locally opens in the
-            // editor; anything else (remote pane paths, deleted
-            // files, no editor configured) copies as before.
-            if (openPathInEditor(self, pane, m.text)) return;
-            const z = self.allocator.allocSentinel(u8, m.text.len, 0) catch return;
-            defer self.allocator.free(z);
-            @memcpy(z, m.text);
-            clipboard.copyToClipboard(@ptrCast(pane.area), z);
-            clipboard.copyToPrimary(@ptrCast(pane.area), z);
+        .copy => copyHintText(self, pane, m.text),
+        .paste => pane.terminal.writeUserInput(m.text),
+        .select => {
+            const screen = pane.terminal.screen;
+            const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+            const row: i32 = @as(i32, m.row) - view_off;
+            screen.selection.start(row, m.col_start, .normal);
+            screen.selection.extend(row, m.col_end);
+            screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(pane.area));
         },
-        .hash => {
-            const z = self.allocator.allocSentinel(u8, m.text.len, 0) catch return;
-            defer self.allocator.free(z);
-            @memcpy(z, m.text);
-            clipboard.copyToClipboard(@ptrCast(pane.area), z);
-            clipboard.copyToPrimary(@ptrCast(pane.area), z);
-        },
+        .command => runHintCommand(self, pane, m),
     }
+}
+
+fn copyHintText(self: *Window, pane: *Pane, text: []const u8) void {
+    const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+    defer self.allocator.free(z);
+    @memcpy(z, text);
+    clipboard.copyToClipboard(@ptrCast(pane.area), z);
+    clipboard.copyToPrimary(@ptrCast(pane.area), z);
+}
+
+/// `action = command`: run the rule's command line with `{match}`
+/// replaced by the shell-quoted matched text. Spawned detached
+/// through `sh -c` in the pane's cwd, so a command can be a one-liner
+/// with pipes; its output goes nowhere, like any launcher.
+fn runHintCommand(self: *Window, pane: *Pane, m: @import("hints.zig").Match) void {
+    if (m.command.len == 0) return;
+    const shellquote = @import("../util/shellquote.zig");
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(self.allocator);
+
+    var i: usize = 0;
+    while (i < m.command.len) {
+        if (std.mem.startsWith(u8, m.command[i..], "{match}")) {
+            shellquote.appendQuoted(&line, self.allocator, m.text) catch return;
+            i += "{match}".len;
+        } else {
+            line.append(self.allocator, m.command[i]) catch return;
+            i += 1;
+        }
+    }
+    const line_z = self.allocator.allocSentinel(u8, line.items.len, 0) catch return;
+    defer self.allocator.free(line_z);
+    @memcpy(line_z, line.items);
+
+    const pid = c.fork();
+    if (pid != 0) {
+        // Reap immediately: the intermediate child exits at once and
+        // its own child is reparented to init.
+        if (pid > 0) _ = c.waitpid(pid, null, 0);
+        return;
+    }
+    // Double-fork so nothing is left for the GUI to reap.
+    if (c.fork() != 0) c._exit(0);
+    if (pane.terminal.cwd) |dir| {
+        var dz: [4096]u8 = undefined;
+        if (std.fmt.bufPrintZ(&dz, "{s}", .{dir})) |z| {
+            _ = c.chdir(z.ptr);
+        } else |_| {}
+    }
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", line_z.ptr, null };
+    _ = c.execvp("sh", @ptrCast(@constCast(&argv)));
+    c._exit(127);
 }
 
 /// Try to open a path-hint's target in the configured editor, in
@@ -851,11 +945,24 @@ pub fn onSearchKeyPressed(
 /// Ctx while hint mode is active. Returns true when the key was
 /// consumed; bare modifiers fall through so autohide/IM bookkeeping
 /// stays sane.
-pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
+pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) bool {
     const self = cast.userData(Window, ctx);
     if (self.hints_pane == null) return false;
+    const hints_mod = @import("hints.zig");
+    const shift = (state & c.GDK_SHIFT_MASK) != 0;
+    const alt = (state & c.GDK_ALT_MASK) != 0;
     switch (keyval) {
         c.GDK_KEY_Escape => {
+            self.exitHints();
+            return true;
+        },
+        // Tab toggles multi-select; Enter finishes it.
+        c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => {
+            self.hints_multi = !self.hints_multi;
+            return true;
+        },
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
+            finishHintCollection(self);
             self.exitHints();
             return true;
         },
@@ -879,14 +986,18 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
         => return false,
         else => {},
     }
-    const u = c.gdk_keyval_to_unicode(keyval);
-    if (u >= 'a' and u <= 'z' and self.hints_typed_len < 2) {
+    // Labels are matched case-insensitively so a Shift-held pick
+    // (which asks for "copy instead") still finds its label.
+    var u = c.gdk_keyval_to_unicode(keyval);
+    if (u >= 'A' and u <= 'Z') u += 0x20;
+    const alphabet = hints_mod.validAlphabet(self.config.hint_alphabet) orelse hints_mod.ALPHABET;
+    if (u != 0 and u < 128 and std.mem.indexOfScalar(u8, alphabet, @intCast(u)) != null and self.hints_typed_len < 2) {
         const candidate_len = self.hints_typed_len + 1;
         self.hints_typed[self.hints_typed_len] = @intCast(u);
         // Count matches under the new prefix; activate on a unique
         // FULL match, revert the keystroke when nothing matches.
         var matching: usize = 0;
-        var full: ?@import("hints.zig").Match = null;
+        var full: ?hints_mod.Match = null;
         for (self.hint_matches) |m| {
             if (!std.mem.startsWith(u8, m.label[0..m.label_len], self.hints_typed[0..candidate_len])) continue;
             matching += 1;
@@ -894,7 +1005,17 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
         }
         if (matching == 0) return true; // ignore stray key
         if (full) |m| {
-            activateHint(self, m);
+            if (self.hints_multi) {
+                collectHint(self, m);
+                self.hints_typed_len = 0;
+                refreshHintOverlay(self);
+                return true;
+            }
+            // Modifier overrides: Shift picks copy, Alt picks paste,
+            // whatever the rule's own action is. Both are reachable
+            // for every match, including the built-in kinds.
+            const action: hints_mod.Action = if (shift) .copy else if (alt) .paste else m.action;
+            activateHintAs(self, m, action);
             self.exitHints();
             return true;
         }
@@ -904,4 +1025,20 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
     }
     // Swallow everything else — hint mode owns the keyboard.
     return true;
+}
+
+/// Multi-select: append a picked match to the collection instead of
+/// acting on it.
+fn collectHint(self: *Window, m: @import("hints.zig").Match) void {
+    if (self.hints_collected.items.len > 0)
+        self.hints_collected.append(self.allocator, '\n') catch return;
+    self.hints_collected.appendSlice(self.allocator, m.text) catch return;
+}
+
+/// Enter in multi-select mode: copy everything collected, as one
+/// newline-separated block. Nothing collected = nothing copied.
+fn finishHintCollection(self: *Window) void {
+    const pane = self.hints_pane orelse return;
+    if (self.hints_collected.items.len == 0) return;
+    copyHintText(self, pane, self.hints_collected.items);
 }
