@@ -47,6 +47,7 @@ comptime {
     _ = @import("grid/reflow_screen_test.zig");
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
+    _ = @import("grid/bracket.zig");
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
     _ = @import("editor_app.zig");

@@ -344,6 +344,12 @@ pub const Window = struct {
     copymode_sel: CopyModeSel = .none,
     copymode_anchor_row: i32 = 0,
     copymode_anchor_col: u16 = 0,
+    /// f/F/t/T have eaten their key and are waiting for the character
+    /// to search for. 0 when no motion is pending.
+    copymode_find_pending: u8 = 0,
+    /// The last f/F/t/T, for `;` and `,` to repeat and reverse.
+    copymode_find_kind: u8 = 0,
+    copymode_find_char: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null, true);
