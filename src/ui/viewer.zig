@@ -474,6 +474,9 @@ pub const ViewerWindow = struct {
     next_button: *c.GtkWidget,
     fullscreen: bool = false,
     pending_mount: ?*MountOpen = null,
+    /// Image-canvas context menu. Borrowed: the click gesture on the
+    /// canvas owns it and frees it when the canvas dies.
+    canvas_menu: ?*CanvasMenu = null,
 
     pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, batch: model.Batch) !*ViewerWindow {
         const self = try allocator.create(ViewerWindow);
@@ -633,6 +636,32 @@ pub const ViewerWindow = struct {
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(window, @ptrCast(keys));
 
+        // Right-click / Menu key on the image itself. Every row
+        // forwards to the header or hamburger button that already
+        // implements it, so the menu adds no second copy of any
+        // action and inherits each button's sensitivity.
+        self.canvas_menu = try attachCanvasMenu(allocator, self.canvas.widget(), &.{
+            .{ .row = .{ .label = "Copy Image", .icon = "edit-copy-symbolic", .source = copy_button } },
+            .{ .row = .{ .label = "Open With…", .icon = "document-open-symbolic", .source = open_with_button } },
+            .{ .row = .{ .label = "Show in Sketerm Files", .icon = "folder-open-symbolic", .source = reveal_button } },
+            .{ .row = .{ .label = "Reload", .icon = "view-refresh-symbolic", .source = reload_button } },
+            .separator,
+            .{ .row = .{ .label = "Fit to Window", .icon = "zoom-fit-best-symbolic", .source = fit_button } },
+            .{ .row = .{ .label = "Actual Size", .icon = "zoom-original-symbolic", .source = actual_button } },
+            .{ .row = .{ .label = "Fill Window", .icon = "view-fullscreen-symbolic", .source = fill_button } },
+            .{ .row = .{ .label = "Zoom In", .icon = "zoom-in-symbolic", .source = zoom_in } },
+            .{ .row = .{ .label = "Zoom Out", .icon = "zoom-out-symbolic", .source = zoom_out } },
+            .separator,
+            .{ .row = .{ .label = "Rotate Left", .icon = "object-rotate-left-symbolic", .source = rotate_left } },
+            .{ .row = .{ .label = "Rotate Right", .icon = "object-rotate-right-symbolic", .source = rotate_right } },
+            .{ .row = .{ .label = "Pause / Resume Animation", .icon = "media-playback-pause-symbolic", .source = play_button } },
+            .separator,
+            .{ .row = .{ .label = "Previous Image", .icon = "go-previous-symbolic", .source = prev_button } },
+            .{ .row = .{ .label = "Next Image", .icon = "go-next-symbolic", .source = next_button } },
+            .{ .row = .{ .label = "View Full Resolution", .icon = "zoom-in-symbolic", .source = original } },
+            .{ .row = .{ .label = "Fullscreen", .icon = "view-fullscreen-symbolic", .source = fullscreen_button } },
+        });
+
         self.showCurrent();
         c.gtk_window_present(@ptrCast(window));
         return self;
@@ -753,6 +782,179 @@ pub const ViewerWindow = struct {
         self.canvas.setAccessible(resource.name(), text, false);
     }
 };
+
+/// One image-canvas context-menu entry: either a separator, or a row
+/// that MIRRORS an existing toolbar / hamburger button. Mirroring
+/// rather than re-implementing is deliberate — the row activates the
+/// source button, so the action, its handler and its sensitivity all
+/// stay single-sourced.
+pub const CanvasMenuItem = union(enum) {
+    separator,
+    row: struct {
+        label: [*:0]const u8,
+        icon: [*:0]const u8,
+        source: *c.GtkWidget,
+    },
+};
+
+const MAX_CANVAS_MENU_ROWS = 24;
+
+/// Owns the canvas popover and the row→source mapping. Freed by the
+/// click gesture's GDestroyNotify, which fires when the controller is
+/// removed from the canvas — i.e. when the canvas widget dies.
+const CanvasMenu = struct {
+    allocator: std.mem.Allocator,
+    host: *c.GtkWidget,
+    popover: *c.GtkWidget,
+    rows: [MAX_CANVAS_MENU_ROWS]?*c.GtkWidget = @splat(null),
+    sources: [MAX_CANVAS_MENU_ROWS]?*c.GtkWidget = @splat(null),
+    n: usize = 0,
+};
+
+/// Per-row signal context. Heap-allocated, so it carries its own
+/// allocator and is released through `freeCanvasRow`.
+const CanvasRowCtx = struct {
+    allocator: std.mem.Allocator,
+    menu: *CanvasMenu,
+    source: *c.GtkWidget,
+};
+
+/// Give `host` a right-click (and Menu-key) context menu built from
+/// `items`. Rows past MAX_CANVAS_MENU_ROWS are ignored rather than
+/// overflowing; the compile-time assert keeps that from going unseen.
+fn attachCanvasMenu(
+    allocator: std.mem.Allocator,
+    host: *c.GtkWidget,
+    items: []const CanvasMenuItem,
+) !*CanvasMenu {
+    const popover = c.gtk_popover_new().?;
+    c.gtk_widget_set_parent(popover, host);
+    c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
+
+    const menu = try allocator.create(CanvasMenu);
+    errdefer allocator.destroy(menu);
+    menu.* = .{ .allocator = allocator, .host = host, .popover = popover };
+
+    const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+    for (items) |item| switch (item) {
+        .separator => c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?),
+        .row => |r| {
+            if (menu.n >= MAX_CANVAS_MENU_ROWS) continue;
+            const btn = actionButton(list, r.label, r.icon);
+            const rctx = try allocator.create(CanvasRowCtx);
+            rctx.* = .{ .allocator = allocator, .menu = menu, .source = r.source };
+            _ = c.g_signal_connect_data(
+                btn,
+                "clicked",
+                @ptrCast(&onCanvasRowClicked),
+                @ptrCast(rctx),
+                @ptrCast(&freeCanvasRow),
+                c.G_CONNECT_DEFAULT,
+            );
+            menu.rows[menu.n] = btn;
+            menu.sources[menu.n] = r.source;
+            menu.n += 1;
+        },
+    };
+    // Same GTK4 popover-sizing trap menu.zig documents: a bare box's
+    // MINIMUM height is the whole list, and a popover whose minimum
+    // does not fit the granted space is silently popped down.
+    const scroller = c.gtk_scrolled_window_new().?;
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
+    c.gtk_popover_set_child(@ptrCast(popover), scroller);
+
+    const click = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(click), 3);
+    _ = c.g_signal_connect_data(
+        click,
+        "pressed",
+        @ptrCast(&onCanvasRightClick),
+        @ptrCast(menu),
+        @ptrCast(&freeCanvasMenu),
+        c.G_CONNECT_DEFAULT,
+    );
+    c.gtk_widget_add_controller(host, @ptrCast(click));
+    // Dismissing without picking anything (Escape, click-away) must
+    // not strand focus in the dead popover.
+    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onCanvasMenuClosed), @ptrCast(menu), null, c.G_CONNECT_DEFAULT);
+    return menu;
+}
+
+fn onCanvasMenuClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    const menu: *CanvasMenu = @ptrCast(@alignCast(user.?));
+    const root = c.gtk_widget_get_root(menu.host) orelse return;
+    const focus = c.gtk_root_get_focus(@ptrCast(root));
+    // Only reclaim focus that is still inside the popover — a row
+    // that opened a dialog has already moved it somewhere better.
+    const inside = focus == null or
+        focus == menu.popover or
+        c.gtk_widget_is_ancestor(focus, menu.popover) != 0;
+    if (inside) _ = c.gtk_widget_grab_focus(menu.host);
+}
+
+/// Refresh every row's sensitivity from its source button, then pop
+/// up at (x, y). Reading the source each time is what keeps the menu
+/// honest: "Next Image" greys out on the last image, "Pause" while no
+/// animation is loaded, exactly as the toolbar does.
+fn showCanvasMenu(menu: *CanvasMenu, x: f64, y: f64) void {
+    for (menu.rows[0..menu.n], menu.sources[0..menu.n]) |maybe_row, maybe_src| {
+        const row = maybe_row orelse continue;
+        const src = maybe_src orelse continue;
+        const usable = c.gtk_widget_get_sensitive(src) != 0 and c.gtk_widget_get_visible(src) != 0;
+        c.gtk_widget_set_sensitive(row, @intFromBool(usable));
+    }
+    var rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+    c.gtk_popover_set_pointing_to(@ptrCast(menu.popover), &rect);
+    c.gtk_popover_popup(@ptrCast(menu.popover));
+}
+
+fn onCanvasRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const menu: *CanvasMenu = @ptrCast(@alignCast(user.?));
+    // Claim before popup — an unclaimed RELEASE reads as a click
+    // outside the fresh popover and dismisses it (see menu.zig).
+    _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    showCanvasMenu(menu, x, y);
+}
+
+/// Keyboard path: the viewer's window-level key handler routes Menu /
+/// Shift+F10 here. An image has no caret, so the popover is anchored
+/// at the centre of the canvas.
+fn showCanvasMenuCentred(menu: *CanvasMenu) void {
+    const w: f64 = @floatFromInt(c.gtk_widget_get_width(menu.host));
+    const h: f64 = @floatFromInt(c.gtk_widget_get_height(menu.host));
+    showCanvasMenu(menu, w / 2.0, h / 2.0);
+}
+
+fn onCanvasRowClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const rctx: *CanvasRowCtx = @ptrCast(@alignCast(user.?));
+    c.gtk_popover_popdown(@ptrCast(rctx.menu.popover));
+    // Focus goes back to the canvas before the action runs, so a
+    // dismissed menu never leaves the keyboard stranded in a dead
+    // popover. An action that opens its own dialog takes focus after.
+    _ = c.gtk_widget_grab_focus(rctx.menu.host);
+    _ = c.gtk_widget_activate(rctx.source);
+}
+
+fn freeCanvasRow(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const rctx: *CanvasRowCtx = @ptrCast(@alignCast(u));
+        rctx.allocator.destroy(rctx);
+    }
+}
+
+fn freeCanvasMenu(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const menu: *CanvasMenu = @ptrCast(@alignCast(u));
+        // A popover added with gtk_widget_set_parent must be
+        // unparented before the host finalizes, or GTK warns about
+        // leftover children (same rule as menu.zig's freeClickCtx).
+        if (c.gtk_widget_get_parent(menu.popover) != null) c.gtk_widget_unparent(menu.popover);
+        menu.allocator.destroy(menu);
+    }
+}
 
 fn actionButton(box: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8) *c.GtkWidget {
     const button = c.gtk_button_new().?;
@@ -1015,8 +1217,18 @@ fn onOpenDone(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").R
     self.replaceWithSpec(res.specs[0]);
 }
 
-fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
+fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    // Keyboard access to the canvas context menu. Handled here rather
+    // than on the canvas because this controller runs in CAPTURE
+    // phase on the window and would otherwise swallow the keys first.
+    if (keyval == c.GDK_KEY_Menu or
+        (keyval == c.GDK_KEY_F10 and (state & c.GDK_SHIFT_MASK) != 0))
+    {
+        const menu = self.canvas_menu orelse return 0;
+        showCanvasMenuCentred(menu);
+        return 1;
+    }
     switch (keyval) {
         c.GDK_KEY_Left => self.move(-1),
         c.GDK_KEY_Right => self.move(1),
