@@ -235,7 +235,17 @@ pub const Session = struct {
     /// get MethodNotFound rather than silence, because a server that
     /// waits on us stops serving the user.
     fn answerServerRequest(self: *Session, env: rpc.Envelope) void {
-        const id = env.id orelse return;
+        // The reply must echo the request's id VERBATIM — including a
+        // server-minted STRING id (zls's workspace/configuration).
+        // Dropping those once turned the request into a "notification"
+        // nobody answered, and zls quietly stopped serving completions.
+        var id_tok: std.ArrayList(u8) = .empty;
+        defer id_tok.deinit(self.alloc);
+        if (env.id) |i| {
+            id_tok.print(self.alloc, "{d}", .{i}) catch return;
+        } else if (env.id_str.len > 0) {
+            appendJsonString(self.alloc, &id_tok, env.id_str) catch return;
+        } else return;
         const nullable = std.mem.eql(u8, env.method, "window/workDoneProgress/create") or
             std.mem.eql(u8, env.method, "client/registerCapability") or
             std.mem.eql(u8, env.method, "client/unregisterCapability") or
@@ -252,12 +262,12 @@ pub const Session = struct {
             } else {
                 result.appendSlice(self.alloc, "null") catch return;
             }
-            buf.print(self.alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ id, result.items }) catch return;
+            buf.print(self.alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}", .{ id_tok.items, result.items }) catch return;
         } else {
             buf.print(
                 self.alloc,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32601,\"message\":\"unsupported\"}}}}",
-                .{id},
+                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"unsupported\"}}}}",
+                .{id_tok.items},
             ) catch return;
         }
         rpc.frameInto(self.alloc, &self.out, buf.items) catch {};

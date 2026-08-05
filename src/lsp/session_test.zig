@@ -418,6 +418,31 @@ test "session: server-to-client requests are always answered" {
     try testing.expect(sent.items[2].parsed.value.object.get("error") != null);
 }
 
+test "session: a string request id is echoed back verbatim" {
+    // zls sends workspace/configuration with id "i_haz_configuration"
+    // and matches the answer by that exact id. Dropping or rewriting
+    // it leaves zls waiting forever — it then returns null for every
+    // completion request.
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    try readySession(alloc, &s);
+    s.out.clearRetainingCapacity();
+
+    try feedJson(&s, alloc,
+        \\{"jsonrpc":"2.0","id":"i_haz_configuration","method":"workspace/configuration","params":{"items":[{"section":"zls"}]}}
+    );
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try testing.expectEqual(@as(usize, 1), sent.items.len);
+    const reply = sent.items[0].parsed.value.object;
+    try testing.expectEqualStrings("i_haz_configuration", reply.get("id").?.string);
+    try testing.expectEqual(@as(usize, 1), reply.get("result").?.array.items.len);
+}
+
 test "session: notifications reach the handler" {
     const alloc = testing.allocator;
     var rec = Recorder{ .alloc = alloc };
