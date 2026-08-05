@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const boxdraw = @import("boxdraw.zig");
 
 /// Pixels per page side. Cap at 2048 — cross-vendor safe.
 pub const PAGE_SIZE: u32 = 2048;
@@ -94,6 +95,33 @@ fn styleKey(base: u32, bold: bool, italic: bool) u32 {
 /// frees. Note fontconfig substitutes rather than failing: an unknown
 /// family resolves to the system default monospace-ish match.
 pub fn resolveFamilyPath(allocator: std.mem.Allocator, family: []const u8) ?[:0]u8 {
+    return resolveFamilyStyled(allocator, family, c.FC_WEIGHT_REGULAR, c.FC_SLANT_ROMAN);
+}
+
+/// fontconfig's weight scale is not CSS's. 0 = leave it to the caller
+/// (regular), otherwise map 100..900 onto the FC_WEIGHT_* ladder.
+pub fn fcWeightFor(css_weight: u16) c_int {
+    if (css_weight == 0) return c.FC_WEIGHT_REGULAR;
+    return switch (css_weight) {
+        0...149 => c.FC_WEIGHT_THIN,
+        150...249 => c.FC_WEIGHT_EXTRALIGHT,
+        250...349 => c.FC_WEIGHT_LIGHT,
+        350...399 => c.FC_WEIGHT_DEMILIGHT,
+        400...449 => c.FC_WEIGHT_REGULAR,
+        450...549 => c.FC_WEIGHT_MEDIUM,
+        550...649 => c.FC_WEIGHT_DEMIBOLD,
+        650...749 => c.FC_WEIGHT_BOLD,
+        750...849 => c.FC_WEIGHT_EXTRABOLD,
+        else => c.FC_WEIGHT_BLACK,
+    };
+}
+
+pub fn resolveFamilyStyled(
+    allocator: std.mem.Allocator,
+    family: []const u8,
+    weight: c_int,
+    slant: c_int,
+) ?[:0]u8 {
     if (family.len == 0) return null;
     if (c.FcInit() == 0) return null;
     const fam_z = allocator.allocSentinel(u8, family.len, 0) catch return null;
@@ -103,8 +131,8 @@ pub fn resolveFamilyPath(allocator: std.mem.Allocator, family: []const u8) ?[:0]
     const pattern = c.FcPatternCreate() orelse return null;
     defer c.FcPatternDestroy(pattern);
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, @ptrCast(fam_z.ptr));
-    _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, c.FC_WEIGHT_REGULAR);
-    _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, c.FC_SLANT_ROMAN);
+    _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
+    _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, slant);
     _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
     _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
     c.FcDefaultSubstitute(pattern);
@@ -209,6 +237,47 @@ pub const Atlas = struct {
     /// bits (0x4000_0000 / 0x2000_0000) burned into the high range.
     face_gid_cache: std.AutoHashMap(u64, Glyph) = undefined,
 
+    /// Codepoint ranges pinned to fonts of their own, ahead of the
+    /// primary face and the fallback machinery.
+    symbol_faces: std.ArrayList(SymbolFace) = .empty,
+    /// Draw box/block/Powerline characters from the cell rectangle
+    /// instead of the font. On by default: a font's own outlines are
+    /// hinted per glyph and rarely tile without seams.
+    builtin_box: bool = true,
+
+    /// One such range.
+    pub const SymbolFace = struct {
+        lo: u32,
+        hi: u32,
+        face: c.FT_Face,
+    };
+
+    /// Everything about a font beyond its file and size. All of it is
+    /// optional: an empty Options behaves exactly as `init` did.
+    pub const Options = struct {
+        line_pad_px: i16 = 0,
+        /// Explicit families for the styled faces. Empty = resolve the
+        /// style from the primary face's own family, as before.
+        bold_family: []const u8 = "",
+        italic_family: []const u8 = "",
+        bold_italic_family: []const u8 = "",
+        /// CSS weights (100..900), 0 = the font's default. Applied to
+        /// family resolution and to a variable font's `wght` axis.
+        weight: u16 = 0,
+        bold_weight: u16 = 0,
+        /// Codepoint ranges routed to another family, in priority
+        /// order. Ranges may overlap; the first match wins.
+        symbol_maps: []const SymbolMapSpec = &.{},
+        /// Draw box/block/Powerline characters procedurally.
+        builtin_box: bool = true,
+    };
+
+    pub const SymbolMapSpec = struct {
+        lo: u32,
+        hi: u32,
+        family: []const u8,
+    };
+
     pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, size_px: u16) !*Atlas {
         return initOpts(allocator, font_path, size_px, 0);
     }
@@ -222,6 +291,16 @@ pub const Atlas = struct {
         size_px: u16,
         line_pad_px: i16,
     ) !*Atlas {
+        return initWith(allocator, font_path, size_px, .{ .line_pad_px = line_pad_px });
+    }
+
+    pub fn initWith(
+        allocator: std.mem.Allocator,
+        font_path: [*:0]const u8,
+        size_px: u16,
+        opts: Options,
+    ) !*Atlas {
+        const line_pad_px = opts.line_pad_px;
         var lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&lib) != 0) return error.FreeTypeInit;
         errdefer _ = c.FT_Done_FreeType(lib);
@@ -231,6 +310,9 @@ pub const Atlas = struct {
         errdefer _ = c.FT_Done_Face(face);
 
         if (c.FT_Set_Pixel_Sizes(face, 0, size_px) != 0) return error.SetSize;
+        // A variable font can be any weight; a static one ignores this
+        // and keeps whatever fontconfig already picked by file.
+        if (opts.weight != 0) setVariableWeight(face, opts.weight);
 
         const m = face.*.size.*.metrics;
         const cell_w: u16 = @intCast(@as(c_long, m.max_advance) >> 6);
@@ -252,9 +334,28 @@ pub const Atlas = struct {
         // Resolve real bold / italic / bold-italic faces up front
         // (best quality). Missing variants degrade to synthesis:
         // outline-embolden for bold, shader shear for italic.
-        const bold_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_BOLD, c.FC_SLANT_ROMAN) else null;
-        const italic_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_REGULAR, c.FC_SLANT_ITALIC) else null;
-        const bold_italic_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_BOLD, c.FC_SLANT_ITALIC) else null;
+        // An explicitly configured family for a style bypasses the
+        // sibling search entirely — that is the whole point of naming
+        // one, and the search would refuse a different family anyway.
+        const bold_weight_fc = fcWeightFor(if (opts.bold_weight != 0) opts.bold_weight else 700);
+        const bold_face = if (opts.bold_family.len > 0)
+            loadNamedFace(allocator, lib, opts.bold_family, size_px, bold_weight_fc, c.FC_SLANT_ROMAN, opts.bold_weight)
+        else if (fc_ok)
+            loadVariantFace(lib, face, font_path, size_px, bold_weight_fc, c.FC_SLANT_ROMAN)
+        else
+            null;
+        const italic_face = if (opts.italic_family.len > 0)
+            loadNamedFace(allocator, lib, opts.italic_family, size_px, fcWeightFor(opts.weight), c.FC_SLANT_ITALIC, opts.weight)
+        else if (fc_ok)
+            loadVariantFace(lib, face, font_path, size_px, fcWeightFor(opts.weight), c.FC_SLANT_ITALIC)
+        else
+            null;
+        const bold_italic_face = if (opts.bold_italic_family.len > 0)
+            loadNamedFace(allocator, lib, opts.bold_italic_family, size_px, bold_weight_fc, c.FC_SLANT_ITALIC, opts.bold_weight)
+        else if (fc_ok)
+            loadVariantFace(lib, face, font_path, size_px, bold_weight_fc, c.FC_SLANT_ITALIC)
+        else
+            null;
         const hb_font_bold = if (bold_face) |bf| c.hb_ft_font_create_referenced(bf) else null;
         const hb_font_italic = if (italic_face) |f| c.hb_ft_font_create_referenced(f) else null;
         const hb_font_bold_italic = if (bold_italic_face) |f| c.hb_ft_font_create_referenced(f) else null;
@@ -287,11 +388,107 @@ pub const Atlas = struct {
             .cp_to_shape_fallback = std.AutoHashMap(u32, ?u16).init(allocator),
             .face_gid_cache = std.AutoHashMap(u64, Glyph).init(allocator),
         };
+        self.builtin_box = opts.builtin_box;
+        // Symbol maps load eagerly: there are a handful at most, and a
+        // lazy load would put an FcFontMatch in the glyph path.
+        for (opts.symbol_maps) |spec| {
+            const sface = loadNamedFace(allocator, lib, spec.family, size_px, fcWeightFor(opts.weight), c.FC_SLANT_ROMAN, opts.weight) orelse continue;
+            self.symbol_faces.append(allocator, .{ .lo = spec.lo, .hi = spec.hi, .face = sface }) catch {
+                _ = c.FT_Done_Face(sface);
+            };
+        }
         // Pre-grow caches so ASCII pre-warm + first session content
         // don't pay 4-5 rehashes climbing from default capacity.
         try self.cache.ensureTotalCapacity(256);
         try self.glyph_cache.ensureTotalCapacity(256);
         return self;
+    }
+
+    /// Set a variable font's `wght` axis, clamped to what the face
+    /// actually offers. A static face has no axes and is left alone.
+    fn setVariableWeight(face: c.FT_Face, css_weight: u16) void {
+        if ((face.*.face_flags & c.FT_FACE_FLAG_MULTIPLE_MASTERS) == 0) return;
+        var mm: [*c]c.FT_MM_Var = null;
+        if (c.FT_Get_MM_Var(face, &mm) != 0 or mm == null) return;
+        defer _ = c.FT_Done_MM_Var(face.*.glyph.*.library, mm);
+
+        const n = mm.*.num_axis;
+        if (n == 0 or n > 16) return;
+        var coords: [16]c.FT_Fixed = undefined;
+        var touched = false;
+        var i: c_uint = 0;
+        while (i < n) : (i += 1) {
+            const axis = mm.*.axis[i];
+            coords[i] = axis.def;
+            // 'wght' as a big-endian tag, the way FreeType reports it.
+            if (axis.tag == (@as(c_ulong, 'w') << 24 | @as(c_ulong, 'g') << 16 | @as(c_ulong, 'h') << 8 | @as(c_ulong, 't'))) {
+                const want: c.FT_Fixed = @as(c.FT_Fixed, css_weight) << 16;
+                coords[i] = std.math.clamp(want, axis.minimum, axis.maximum);
+                touched = true;
+            }
+        }
+        if (!touched) return;
+        _ = c.FT_Set_Var_Design_Coordinates(face, n, &coords);
+    }
+
+    /// Resolve a family name to a face at a given style. Used for the
+    /// explicitly configured style families and for symbol maps.
+    fn loadNamedFace(
+        allocator: std.mem.Allocator,
+        lib: c.FT_Library,
+        family: []const u8,
+        size_px: u16,
+        weight: c_int,
+        slant: c_int,
+        css_weight: u16,
+    ) ?c.FT_Face {
+        const path = resolveFamilyStyled(allocator, family, weight, slant) orelse return null;
+        defer allocator.free(path);
+        var face: c.FT_Face = undefined;
+        if (c.FT_New_Face(lib, path.ptr, 0, &face) != 0) return null;
+        if (!setFaceSize(face, size_px)) {
+            _ = c.FT_Done_Face(face);
+            return null;
+        }
+        if (css_weight != 0) setVariableWeight(face, css_weight);
+        return face;
+    }
+
+    /// Rasterize a built-in box/block/Powerline glyph into the atlas.
+    /// The result covers the cell exactly: full advance, no bearing,
+    /// which is what makes adjacent cells' lines meet.
+    fn drawBuiltin(self: *Atlas, cp: u32) ?Glyph {
+        const w: u32 = self.cell_w;
+        const h: u32 = self.cell_h;
+        if (w == 0 or h == 0) return null;
+        const cov = self.allocator.alloc(u8, w * h) catch return null;
+        defer self.allocator.free(cov);
+        @memset(cov, 0);
+        if (!boxdraw.draw(cp, cov, w, h)) return null;
+
+        const rgba = self.allocator.alloc(u8, w * h * 4) catch return null;
+        defer self.allocator.free(rgba);
+        for (cov, 0..) |a, i| {
+            rgba[i * 4 + 0] = 255;
+            rgba[i * 4 + 1] = 255;
+            rgba[i * 4 + 2] = 255;
+            rgba[i * 4 + 3] = a;
+        }
+        return self.packRgba(rgba, w, h, 0, @intCast(self.ascent), @floatFromInt(w), false) catch null;
+    }
+
+    /// Test hook for `symbolFace`, which is otherwise only reachable
+    /// from the glyph path.
+    pub fn symbolFaceForTest(self: *Atlas, cp: u32) ?c.FT_Face {
+        return self.symbolFace(cp);
+    }
+
+    /// The face a symbol map pins this codepoint to, if any.
+    fn symbolFace(self: *Atlas, cp: u32) ?c.FT_Face {
+        for (self.symbol_faces.items) |sf| {
+            if (cp >= sf.lo and cp <= sf.hi) return sf.face;
+        }
+        return null;
     }
 
     /// Call with a current GL context. Idempotent.
@@ -383,6 +580,8 @@ pub const Atlas = struct {
         if (self.hb_font_bold_italic) |f| c.hb_font_destroy(f);
         for (self.fallback_faces.items) |fb| _ = c.FT_Done_Face(fb);
         self.fallback_faces.deinit(self.allocator);
+        for (self.symbol_faces.items) |sf| _ = c.FT_Done_Face(sf.face);
+        self.symbol_faces.deinit(self.allocator);
         self.cp_to_fallback.deinit();
         for (self.shape_fallbacks.items) |sf| {
             if (sf.hb) |f| c.hb_font_destroy(f);
@@ -525,6 +724,42 @@ pub const Atlas = struct {
         if (self.cache.get(key)) |g| {
             self.touchPage(g.layer);
             return g;
+        }
+        // Box drawing, blocks and Powerline separators are drawn from
+        // the cell rectangle rather than the font, because they have
+        // to tile exactly and hinted outlines do not. Outranks even a
+        // symbol map: a user pinning a Nerd Font for its icons is not
+        // asking for its box characters.
+        if (self.builtin_box and boxdraw.covers(codepoint)) {
+            if (self.drawBuiltin(codepoint)) |g| {
+                try self.cache.put(key, g);
+                self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                    .key = key,
+                    .kind = .codepoint,
+                }) catch |err| {
+                    _ = self.cache.remove(key);
+                    return err;
+                };
+                return g;
+            }
+        }
+        // A symbol map outranks the primary face: the user pinned this
+        // range to a font precisely because they did not want whatever
+        // the main font has there.
+        if (self.symbolFace(codepoint)) |sym_face| {
+            const sym_gid = c.FT_Get_Char_Index(sym_face, codepoint);
+            if (sym_gid != 0) {
+                const g = self.loadGlyphFromFace(sym_face, sym_gid, bold) catch return self.cacheEmpty(key);
+                try self.cache.put(key, g);
+                self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                    .key = key,
+                    .kind = .codepoint,
+                }) catch |err| {
+                    _ = self.cache.remove(key);
+                    return err;
+                };
+                return g;
+            }
         }
         const sf = self.styledFace(bold, italic);
         const gid = c.FT_Get_Char_Index(sf.face, codepoint);
@@ -1040,6 +1275,23 @@ pub const Atlas = struct {
             }
         }
 
+        return self.packRgba(rgba, w, h, bearing_x, bearing_y, advance, colored);
+    }
+
+    /// Shelf-pack an RGBA bitmap into a page, upload it, and return the
+    /// Glyph describing where it landed. `rgba` may be null for an
+    /// empty glyph (space), which still gets a slot so its metrics are
+    /// cached.
+    fn packRgba(
+        self: *Atlas,
+        rgba: ?[]const u8,
+        w: u32,
+        h: u32,
+        bearing_x: i16,
+        bearing_y: i16,
+        advance: f32,
+        colored: bool,
+    ) !Glyph {
         // Find a page that fits, optionally evicting LRU.
         const page_idx = self.findOrEvictPage(w, h) orelse return error.PageFull;
         const page = &self.pages[page_idx];

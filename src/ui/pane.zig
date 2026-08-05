@@ -220,6 +220,10 @@ pub const Pane = struct {
     /// OpenType feature spec for shaping. Owned by the Config arena
     /// like `font_family`; applied to every atlas this pane creates.
     font_features: ?[]const u8 = null,
+    /// Per-style families, weights and symbol maps. All borrowed from
+    /// the Config arena, and re-pointed by `applyPaneConfig` on every
+    /// config change, like the rest of the font settings.
+    font_opts: Atlas.Options = .{},
     /// Cursor blink half-cycle interval in microseconds. 500_000
     /// (= 500 ms) is the xterm default.
     cursor_blink_us: i64 = 500_000,
@@ -1262,33 +1266,46 @@ pub const Pane = struct {
 
     fn createAtlasInner(self: *Pane) ?*Atlas {
         const size: u16 = self.physicalFontSize();
+        const atlas_mod = @import("../render/atlas.zig");
+        var opts = self.font_opts;
+        opts.line_pad_px = self.line_pad_px;
+
         if (self.font_path) |fp| {
-            if (self.tryAtlasPath(fp, size)) |a| return a;
+            if (self.tryAtlasPath(fp, size, opts)) |a| return a;
         }
         if (self.font_family) |fam| {
-            if (@import("../render/atlas.zig").resolveFamilyPath(self.allocator, fam)) |path| {
-                defer self.allocator.free(path);
-                if (Atlas.initOpts(self.allocator, path.ptr, size, self.line_pad_px)) |a| {
+            // The regular face follows the configured weight too, so a
+            // `font_weight = 300` family resolves to its Light file
+            // rather than being emboldened at render time.
+            const path = atlas_mod.resolveFamilyStyled(
+                self.allocator,
+                fam,
+                atlas_mod.fcWeightFor(opts.weight),
+                @import("../c.zig").c.FC_SLANT_ROMAN,
+            );
+            if (path) |p| {
+                defer self.allocator.free(p);
+                if (Atlas.initWith(self.allocator, p.ptr, size, opts)) |a| {
                     return a;
                 } else |_| {}
             }
         }
         if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
-            if (self.tryAtlasPath(env_path, size)) |a| return a;
+            if (self.tryAtlasPath(env_path, size, opts)) |a| return a;
         }
         for (FONT_CANDIDATES) |path| {
-            if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
+            if (Atlas.initWith(self.allocator, path, size, opts)) |a| {
                 return a;
             } else |_| continue;
         }
         return null;
     }
 
-    fn tryAtlasPath(self: *Pane, fp: []const u8, size: u16) ?*Atlas {
+    fn tryAtlasPath(self: *Pane, fp: []const u8, size: u16, opts: Atlas.Options) ?*Atlas {
         const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return null;
         defer self.allocator.free(z);
         @memcpy(z, fp);
-        return Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px) catch null;
+        return Atlas.initWith(self.allocator, z.ptr, size, opts) catch null;
     }
 
     /// Install the frame-clock tick callback if it isn't already

@@ -77,6 +77,8 @@
 #include <ft2build.h>
 #include <freetype/freetype.h>
 #include <freetype/ftoutln.h>
+/* Variable-font axes, for font_weight on a variable family. */
+#include <freetype/ftmm.h>
 #include <hb.h>
 #include <hb-ft.h>
 #include <fribidi.h>

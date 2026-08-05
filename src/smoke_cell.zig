@@ -150,7 +150,12 @@ pub fn main() !u8 {
         // OSC 133 command zone — exercises the command-block gutter
         // bar (red, leftmost ~3px of the row). CUP (not LF) moves to
         // the D row so nothing scrolls.
-        "\x1b[4;1H\x1b]133;C\x07command output\x1b[5;1H\x1b]133;D;2\x07";
+        "\x1b[4;1H\x1b]133;C\x07command output\x1b[5;1H\x1b]133;D;2\x07" ++
+        // Two vertically adjacent box-drawing verticals, away from
+        // everything else. The built-in drawing exists so these join:
+        // the assertion below reads the pixel column back and refuses
+        // a gap at the cell boundary.
+        "\x1b[1;30H│\x1b[2;30H│";
     parser.advance(greeting, Emit.cb, @ptrCast(&ec));
 
     // Cell pass.
@@ -239,6 +244,51 @@ pub fn main() !u8 {
     if (gutter_red < 3) {
         std.debug.print("smoke-cell: FAIL — command-zone gutter bar not drawn\n", .{});
         return 6;
+    }
+
+    // Box-drawing continuity. Two stacked U+2502 must read back as ONE
+    // unbroken run of lit pixel rows: a gap there is exactly the seam
+    // the built-in drawing exists to remove, and it is invisible to
+    // every other assertion in this file. The line is found by
+    // scanning for the tallest lit column rather than by computing
+    // where it should be, so grid padding cannot make this pass or
+    // fail for the wrong reason.
+    {
+        const ch: usize = atlas.?.cell_h;
+        const wu: usize = @intCast(W);
+        const hu: usize = @intCast(H);
+        // The focus border runs along all four edges.
+        const border: usize = 3;
+        var best_rows: usize = 0;
+        var best_span: usize = 0;
+        var x: usize = border;
+        while (x < wu - border) : (x += 1) {
+            var rows: usize = 0;
+            var first: ?usize = null;
+            var last: usize = 0;
+            var y: usize = border;
+            while (y < hu - border) : (y += 1) {
+                const o = (y * wu + x) * 4;
+                const sum: u32 = @as(u32, fb[o]) + fb[o + 1] + fb[o + 2];
+                if (sum <= 260) continue; // background is ~0.05,0.05,0.10
+                rows += 1;
+                if (first == null) first = y;
+                last = y;
+            }
+            if (rows > best_rows) {
+                best_rows = rows;
+                best_span = if (first) |f| last - f + 1 else 0;
+            }
+        }
+        std.debug.print("smoke-cell: tallest lit column rows={d} span={d} (2 cells = {d}px)\n", .{ best_rows, best_span, ch * 2 });
+        if (best_rows + 2 < ch * 2) {
+            std.debug.print("smoke-cell: FAIL — the stacked box-drawing verticals do not span both cells\n", .{});
+            return 27;
+        }
+        if (best_span != best_rows) {
+            std.debug.print("smoke-cell: FAIL — the box-drawing vertical has a gap at the cell boundary\n", .{});
+            return 28;
+        }
     }
 
     // Custom-shader pass: re-render the scene through a channel-
