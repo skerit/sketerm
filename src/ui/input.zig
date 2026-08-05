@@ -119,8 +119,8 @@ pub const Action = enum {
     /// single-tab mode where the bar is wasted vertical space.
     toggle_tab_bar,
     /// Re-load config.conf from disk + apply live (no restart).
-    /// Honours XDG search path; --config override paths are not
-    /// re-honoured (user would need to restart).
+    /// Re-reads the file the process started from: an active
+    /// `--config <path>` override, else the XDG search path.
     reload_config,
     /// Open the app launcher (installed GUI apps on the focused
     /// pane's host — local daemon or SSH remote).
