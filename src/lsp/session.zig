@@ -67,8 +67,10 @@ pub const Kind = enum {
     code_action_resolve,
     execute_command,
     inlay_hint,
+    inlay_hint_resolve,
     semantic_tokens_full,
     semantic_tokens_delta,
+    semantic_tokens_range,
 };
 
 pub const Request = struct {
@@ -111,10 +113,18 @@ pub const Caps = struct {
     code_action: bool = false,
     code_action_resolve: bool = false,
     inlay_hint: bool = false,
+    /// `inlayHintProvider.resolveProvider` — the server can fill in a
+    /// hint's `tooltip` (and its label parts' details) on demand.
+    inlay_hint_resolve: bool = false,
     /// `semanticTokensProvider.full` — the whole-document request.
     semantic_tokens: bool = false,
     /// …and whether it also answers `semanticTokens/full/delta`.
     semantic_tokens_delta: bool = false,
+    /// `semanticTokensProvider.range` — tokens for a RANGE only. Some
+    /// servers offer this and nothing else; the client then scopes its
+    /// requests to the viewport rather than treating the server as
+    /// offering no semantic tokens at all.
+    semantic_tokens_range: bool = false,
     /// Characters that should pop the completion list open. Owned.
     completion_triggers: []u8 = &.{},
     /// Characters that open signature help, and the (usually smaller)
@@ -614,8 +624,8 @@ pub const CLIENT_CAPS =
     \\"rangeFormatting":{"dynamicRegistration":false},
     \\"signatureHelp":{"dynamicRegistration":false,"contextSupport":true,"signatureInformation":{"documentationFormat":["plaintext","markdown"],"parameterInformation":{"labelOffsetSupport":true},"activeParameterSupport":true}},
     \\"codeAction":{"dynamicRegistration":false,"isPreferredSupport":true,"dataSupport":true,"resolveSupport":{"properties":["edit"]},"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["","quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source","source.organizeImports","source.fixAll"]}}},
-    \\"inlayHint":{"dynamicRegistration":false,"resolveSupport":{"properties":[]}},
-    \\"semanticTokens":{"dynamicRegistration":false,"requests":{"range":false,"full":{"delta":true}},"tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],"tokenModifiers":["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"],"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":true,"augmentsSyntaxTokens":true}
+    \\"inlayHint":{"dynamicRegistration":false,"resolveSupport":{"properties":["tooltip","label.tooltip","label.location","label.command"]}},
+    \\"semanticTokens":{"dynamicRegistration":false,"requests":{"range":true,"full":{"delta":true}},"tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],"tokenModifiers":["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"],"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":true,"augmentsSyntaxTokens":true}
     \\}}
 ;
 
@@ -681,11 +691,15 @@ pub fn parseCaps(alloc: Allocator, result: std.json.Value) Caps {
         caps.code_action = providerOn(ca);
         if (ca == .object) caps.code_action_resolve = boolOf(ca.object.get("resolveProvider"), false);
     }
-    caps.inlay_hint = providerOn(sc.get("inlayHintProvider"));
+    if (sc.get("inlayHintProvider")) |ip| {
+        caps.inlay_hint = providerOn(ip);
+        if (ip == .object) caps.inlay_hint_resolve = boolOf(ip.object.get("resolveProvider"), false);
+    }
 
-    // `semanticTokensProvider.full` is `true` or `{delta}`; a provider
-    // that offers only `range` is treated as offering nothing, because
-    // the client asks for the whole document first (docs/lsp.md).
+    // `semanticTokensProvider.full` is `true` or `{delta}`, and `range`
+    // is `true` or an (empty) options object. A server offering only
+    // `range` is fully usable — the client scopes those requests to the
+    // viewport, which is what `range` exists for (docs/lsp.md).
     if (sc.get("semanticTokensProvider")) |sp| {
         if (sp == .object) {
             if (sp.object.get("full")) |full| {
@@ -698,7 +712,8 @@ pub fn parseCaps(alloc: Allocator, result: std.json.Value) Caps {
                     else => {},
                 }
             }
-            if (caps.semantic_tokens) caps.token_types.absorb(alloc, sp);
+            caps.semantic_tokens_range = providerOn(sp.object.get("range"));
+            if (caps.semantic_tokens or caps.semantic_tokens_range) caps.token_types.absorb(alloc, sp);
         }
     }
     caps.hover = providerOn(sc.get("hoverProvider"));
