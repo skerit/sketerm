@@ -366,6 +366,11 @@ pub const Config = struct {
     editor_insert_spaces: bool = true,
     /// New editor tabs start with soft wrap on (per-tab from there).
     editor_soft_wrap: bool = false,
+    /// Soft wrap prefers UAX #14 word/line-break opportunities; false
+    /// wraps at any grapheme (denser, useful for logs/minified text).
+    /// An unbreakable token wider than the view wraps mid-token either
+    /// way.
+    editor_wrap_words: bool = true,
     /// Show the line-number gutter.
     editor_line_numbers: bool = true,
     /// Subtle band behind the caret's visual row (single caret only).
@@ -957,6 +962,7 @@ pub const Config = struct {
         if (self.editor_tab_width != 4) try w.print("editor_tab_width = {d}\n", .{self.editor_tab_width});
         if (!self.editor_insert_spaces) try w.writeAll("editor_insert_spaces = false\n");
         if (self.editor_soft_wrap) try w.writeAll("editor_soft_wrap = true\n");
+        if (!self.editor_wrap_words) try w.writeAll("editor_wrap_words = false\n");
         if (!self.editor_line_numbers) try w.writeAll("editor_line_numbers = false\n");
         if (!self.editor_highlight_current_line)
             try w.writeAll("editor_highlight_current_line = false\n");
@@ -1704,6 +1710,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_insert_spaces = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_soft_wrap")) {
         cfg.editor_soft_wrap = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_wrap_words")) {
+        cfg.editor_wrap_words = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_line_numbers")) {
         cfg.editor_line_numbers = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_highlight_current_line")) {

@@ -34,14 +34,18 @@
 //! predicate.
 //!
 //! Deliberate simplifications (documented, not accidental):
-//! - Soft wrap breaks at cluster boundaries, not word boundaries
-//!   (editor_layout's greedy wrap).
+//! - Soft wrap breaks at UAX #14 opportunities (editor/linebreak.zig;
+//!   CJK breaks between ideographs, trailing spaces hang) and falls
+//!   back to a cluster boundary only for a token wider than the view;
+//!   `editor_wrap_words = false` restores the anywhere-wrap.
 //! - Find is literal by default; the `.*` toggle switches the bar to
 //!   regular expressions (editor/search.zig + editor/regex.zig, which
 //!   lists the syntax and what it deliberately leaves out).
 //!   Replacements then expand `$1`..`$9` capture references.
-//! - Undo/redo is not a per-keystroke journal of the FILE: an external
-//!   reload replaces the document and its history with it.
+//! - An external reload is applied as ONE transaction against the live
+//!   document (editor/diff.zig), so undo history survives it and
+//!   undoing past a reload restores the pre-reload text; only a FIRST
+//!   load builds a fresh document.
 //! - The IME preedit is laid out in its own throwaway Document, drawn
 //!   OVER the text it will displace behind an opaque backing rect
 //!   rather than reflowing the line; with several carets it shows at
@@ -114,6 +118,7 @@ const gitdiff = @import("../editor/gitdiff.zig");
 const outline_mod = @import("../editor/outline.zig");
 const psearch = @import("../editor/psearch.zig");
 const tr = @import("../editor/transaction.zig");
+const ediff = @import("../editor/diff.zig");
 const theme_mod = @import("../editor/theme.zig");
 const tabhost_mod = @import("tabhost.zig");
 const TabHost = tabhost_mod.TabHost;
@@ -536,12 +541,10 @@ pub const ETab = struct {
     /// The banner was raised by a REFUSED SAVE rather than by a probe —
     /// same state, different wording.
     alert_from_save: bool = false,
-    /// Cursor/scroll to restore when the in-flight load is a
-    /// position-preserving reload. Owned.
-    keep_sels: []Selection = &.{},
-    keep_primary: usize = 0,
-    keep_anchor: Anchor = .{},
-    keep_scroll_x: f32 = 0,
+    /// The in-flight load is a history-preserving reload: the arriving
+    /// bytes are DIFFED onto the live document as one transaction
+    /// (editor/diff.zig) instead of replacing it, so carets/scroll map
+    /// through and undo walks back through the reload.
     keep_active: bool = false,
     loading: bool = false,
     /// Generation for in-flight IO; 0 = idle.
@@ -705,7 +708,6 @@ pub const ETab = struct {
         self.clearMatches();
         if (self.needle.len > 0) a.free(self.needle);
         if (self.spec) |s| a.free(s);
-        if (self.keep_sels.len > 0) a.free(self.keep_sels);
         a.destroy(self);
     }
 
@@ -911,6 +913,9 @@ pub const EditorView = struct {
     tab_width: u16 = 4,
     insert_spaces: bool = true,
     soft_wrap_default: bool = false,
+    /// Soft wrap prefers UAX #14 break opportunities (config
+    /// `editor_wrap_words`); false = anywhere-wrap.
+    wrap_words: bool = true,
     line_numbers: bool = true,
     highlight_current_line: bool = true,
     syntax_on: bool = true,
@@ -1068,6 +1073,17 @@ pub const EditorView = struct {
         self.tab_width = @max(1, cfg.editor_tab_width);
         self.insert_spaces = cfg.editor_insert_spaces;
         self.soft_wrap_default = cfg.editor_soft_wrap;
+        if (self.wrap_words != cfg.editor_wrap_words) {
+            self.wrap_words = cfg.editor_wrap_words;
+            // Break positions move: every cached layout and row
+            // estimate is stale (same contract as a wrap-width change).
+            for (self.tabs.items) |t| {
+                t.layout.wrap_words = self.wrap_words;
+                t.layout.invalidateAll();
+                t.rows_lines = 0;
+            }
+            if (self.tabs.items.len > 0) self.queueRender();
+        }
         self.line_numbers = cfg.editor_line_numbers;
         self.highlight_current_line = cfg.editor_highlight_current_line;
         self.syntax_on = cfg.editor_syntax;
@@ -2346,7 +2362,9 @@ pub const EditorView = struct {
             .outline = outline_mod.Outline.init(self.allocator),
         };
         tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
+        tab.doc.addObserver(self.a11y_src.editObserver());
         tab.layout.tab_cols = self.tab_width;
+        tab.layout.wrap_words = self.wrap_words;
         self.next_tab_id += 1;
         if (spec) |s| tab.spec = self.allocator.dupe(u8, s) catch null;
         const handle = self.tabhost.addPage(page.?, tab.title()) orelse {
@@ -3916,6 +3934,10 @@ pub const EditorView = struct {
                     self.refresh(tab);
                     return;
                 }
+                if (job.keep_position and tab.keep_active) {
+                    self.finishReloadInPlace(tab, job);
+                    return;
+                }
                 var new_doc = Document.initFromBytes(self.allocator, job.bytes) catch {
                     self.errorDialog("Could not open file", "OutOfMemory");
                     self.closeTabForce(tab);
@@ -3937,6 +3959,7 @@ pub const EditorView = struct {
                 tab.br_valid = false;
                 tab.sel_stack.clear();
                 tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
+        tab.doc.addObserver(self.a11y_src.editObserver());
                 // The observer the swap dropped has to be re-installed
                 // and the server told the content changed wholesale;
                 // a first-time load is where the server is attached.
@@ -3950,9 +3973,7 @@ pub const EditorView = struct {
                 tab.disk = job.disk;
                 tab.seen = job.disk;
                 self.clearAlert(tab);
-                if (job.keep_position and tab.keep_active) {
-                    self.restoreKeptPosition(tab);
-                } else {
+                {
                     const caret = @min(tab.want_cursor orelse 0, tab.doc.rope.len());
                     tab.want_cursor = null;
                     tab.sels.keepPrimaryOnly();
@@ -3970,7 +3991,6 @@ pub const EditorView = struct {
                     tab.anchor = .{ .line = @min(top, lines -| 1), .row = 0, .offset = 0 };
                 }
                 self.noteSavedHash(tab);
-                const was_reload = job.keep_position and tab.keep_active;
                 tab.keep_active = false;
                 // The document is new: its project may be too, and the
                 // gutter marks anchored into the old byte space are gone.
@@ -3981,9 +4001,6 @@ pub const EditorView = struct {
                 editorproj.refreshGit(self, tab);
                 editoroutline.refresh(self, tab, true);
                 self.refresh(tab);
-                // AFTER refresh: updateStatus paints Ln/Col over
-                // anything set before it.
-                if (was_reload) self.setStatus("Reloaded: the file changed on disk.");
             },
             .save => {
                 if (job.conflict) {
@@ -4027,6 +4044,52 @@ pub const EditorView = struct {
                 self.setStatus("Saved.");
             },
         }
+    }
+
+    /// A reload that KEEPS the document: the arriving bytes are diffed
+    /// onto the live buffer as ONE transaction (editor/diff.zig), so
+    /// undo restores the pre-reload text, every edit observer
+    /// (highlighter, folds/git/outline anchors, LSP didChange, a11y
+    /// change log) sees ordinary edits, and carets/selections map
+    /// through instead of clamping.
+    fn finishReloadInPlace(self: *EditorView, tab: *ETab, job: *IoJob) void {
+        tab.keep_active = false;
+        const changed = ediff.reloadFromBytes(self.allocator, &tab.doc, job.bytes, &tab.sels) catch {
+            // Out of memory mid-diff: the transaction applied atomically
+            // or not at all, so the buffer is intact — just stale.
+            self.setStatus("Reload failed: out of memory.");
+            return;
+        };
+        tab.disk = job.disk;
+        tab.seen = job.disk;
+        self.clearAlert(tab);
+        self.noteSavedHash(tab);
+        // Contract step 3 (same as a save): clean buffer, record goes.
+        if (!tab.isDirty()) {
+            if (tab.journal) |*h| h.clear();
+        }
+        if (!changed) {
+            self.refresh(tab);
+            return;
+        }
+        // A changed line count moves the whole row estimate.
+        tab.rows_lines = 0;
+        // A reload only changes the language via a new shebang. The
+        // same language keeps the incrementally-updated tree (the
+        // highlighter observer already saw the edits) and just needs
+        // the debounced re-parse; a different one swaps grammars.
+        if (!std.meta.eql(self.detectLang(tab), tab.hl_lang)) {
+            self.ensureHighlighter(tab);
+        } else {
+            self.scheduleParse(tab);
+        }
+        self.clampAnchor(tab, self.viewportHeightPx());
+        editorproj.refreshGit(self, tab);
+        editoroutline.refresh(self, tab, true);
+        self.refresh(tab);
+        // AFTER refresh: updateStatus paints Ln/Col over anything set
+        // before it.
+        self.setStatus("Reloaded: the file changed on disk.");
     }
 
     fn errorDialog(self: *EditorView, heading: [*:0]const u8, detail: []const u8) void {
@@ -4196,39 +4259,8 @@ pub const EditorView = struct {
     }
 
     fn reloadKeepingPosition(self: *EditorView, tab: *ETab) void {
-        const a = self.allocator;
-        if (tab.keep_sels.len > 0) a.free(tab.keep_sels);
-        tab.keep_sels = a.dupe(Selection, tab.sels.sels.items) catch &.{};
-        tab.keep_primary = tab.sels.primary_index;
-        tab.keep_anchor = tab.anchor;
-        tab.keep_scroll_x = tab.scroll_x;
         tab.keep_active = true;
         self.startLoadEx(tab, true);
-    }
-
-    /// Put the caret/selection and the scroll anchor back after a
-    /// reload, clamped into the document that actually arrived.
-    fn restoreKeptPosition(self: *EditorView, tab: *ETab) void {
-        const a = self.allocator;
-        const len = tab.doc.rope.len();
-        const lines = tab.doc.rope.lineCount();
-        tab.sels.sels.clearRetainingCapacity();
-        for (tab.keep_sels) |s| tab.sels.sels.append(a, s) catch {};
-        if (tab.sels.sels.items.len == 0)
-            tab.sels.sels.append(a, Selection.caret(0)) catch return;
-        tab.sels.primary_index = @min(tab.keep_primary, tab.sels.sels.items.len - 1);
-        reload.clampSet(&tab.sels, len);
-        tab.want_cursor = null;
-
-        const line = reload.clampLine(tab.keep_anchor.line, lines);
-        const rows = self.rowsOfLine(tab, line);
-        tab.anchor = .{
-            .line = line,
-            .row = @min(tab.keep_anchor.row, rows -| 1),
-            .offset = tab.keep_anchor.offset,
-        };
-        tab.scroll_x = if (tab.wrap) 0 else tab.keep_scroll_x;
-        self.clampAnchor(tab, self.viewportHeightPx());
     }
 
     // ---- the inline banner ----------------------------------------------
@@ -4575,6 +4607,7 @@ pub const EditorView = struct {
         tab.doc = new_doc;
         tab.doc.markUnsaved();
         tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
+        tab.doc.addObserver(self.a11y_src.editObserver());
         self.ensureHighlighter(tab);
         if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
         tab.layout.invalidateAll();
