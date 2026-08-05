@@ -233,6 +233,7 @@ comptime {
     _ = @import("render/editor_layout.zig");
     _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
+    _ = @import("ui/menu.zig");
 }
 
 test {

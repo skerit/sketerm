@@ -481,6 +481,65 @@ pub fn popupAt(widget: *c.GtkWidget, x: f64, y: f64) bool {
     return showAt(ctx, x, y);
 }
 
+test "menu: every row's detailed action name matches its bare name" {
+    // A typo here produces a row that LOOKS enabled and does nothing
+    // when clicked: gtk_actionable_set_action_name silently accepts an
+    // action that the group does not contain. The action-group
+    // registration below uses `name`, the button uses `detailed`, so
+    // the two must agree or the row is dead.
+    for (BINDS) |b| {
+        const bare = std.mem.span(b.name);
+        const detailed = std.mem.span(b.detailed);
+        try std.testing.expect(std.mem.startsWith(u8, detailed, "term."));
+        try std.testing.expectEqualStrings(bare, detailed["term.".len..]);
+    }
+}
+
+test "menu: row names are unique" {
+    // Duplicates would make g_action_map_add_action overwrite the
+    // first registration, so one of the two rows would drive the
+    // other's Action.
+    for (BINDS, 0..) |a, i| {
+        for (BINDS[i + 1 ..]) |b| {
+            try std.testing.expect(!std.mem.eql(u8, std.mem.span(a.name), std.mem.span(b.name)));
+        }
+    }
+}
+
+test "menu: every Action has exactly one row" {
+    // Adding an Action without a row (or two rows for one Action)
+    // is otherwise invisible until someone hunts for a missing item.
+    inline for (@typeInfo(Action).@"enum".fields) |field| {
+        const want: Action = @enumFromInt(field.value);
+        var seen: usize = 0;
+        for (BINDS) |b| {
+            if (b.action == want) seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), seen);
+    }
+}
+
+test "menu: conditional-row buckets are sized for the rows that use them" {
+    // These counts drive fixed-size arrays in ClickCtx; an off-by-one
+    // would silently drop a row from show/hide handling, leaving it
+    // visible on a session it cannot act on.
+    var link: usize = 0;
+    var host: usize = 0;
+    var rec_start: usize = 0;
+    var rec_stop: usize = 0;
+    for (BINDS) |b| {
+        if (b.link_only) link += 1;
+        if (b.host_only) host += 1;
+        if (b.rec_row == 1) rec_start += 1;
+        if (b.rec_row == 2) rec_stop += 1;
+    }
+    // Link bucket also holds the separator trailing the link rows.
+    try std.testing.expectEqual(link + 1, N_LINK_WIDGETS);
+    try std.testing.expectEqual(host, N_HOST_WIDGETS);
+    try std.testing.expectEqual(@as(usize, 1), rec_start);
+    try std.testing.expectEqual(@as(usize, 1), rec_stop);
+}
+
 /// Build one flat icon+label menu-row button. `arrow` appends the
 /// submenu chevron at the trailing edge.
 fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWidget {
