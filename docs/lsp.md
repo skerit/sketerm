@@ -13,6 +13,8 @@ src/lsp/servers.zig      server registry data, languageId table, root resolution
 src/lsp/session.zig      lifecycle, capabilities, document sync, request bookkeeping, cancellation
 src/lsp/docsync.zig      per-document version counter + the didChange queue
 src/lsp/diagnostics.zig  diagnostics as anchored byte ranges
+src/lsp/semantic.zig     the token legend, the packed data array, delta splicing
+src/lsp/inlay.zig        inlay hints as (byte offset, text) pairs
 src/lsp/proc.zig         fork/exec with non-blocking stdio pipes (libc only)
 src/ui/editorlsp.zig     the ONLY GTK part: fd watches, popups, every feature
 ```
@@ -87,6 +89,24 @@ mixing ASCII, Latin-1, CJK and emoji through all three encodings, and the
 smoke rig runs its whole end-to-end stage twice, once per encoding.
 
 ## Document sync
+
+`didOpen` is sent when the document HAS its content, which is not the
+same moment the tab is attached to a server. A tab is created (and
+attached) the instant the user asks for a file; its bytes arrive on the
+async load. `Manager.openDocument` therefore returns early while
+`ETab.loading` is set and the load's own `onDocumentReplaced` opens the
+document — with the "new file" branch, which has no document replace to
+ride on, calling `ensureOpen` instead.
+
+That ordering is load-bearing and used to be wrong: the client opened
+every document with **zero bytes** and sent the content as a
+full-replace `didChange` immediately afterwards. Sync ended up correct
+either way, which is why it survived so long, but `languageId` plus the
+first text is what a server does its one-time indexing from, and handing
+it an empty file is a bad way to start. `sketerm-lsp-stub` writes the
+size of the `didOpen` payload it received to `$SKETERM_LSP_STUB_REPORT`
+and `smoke-lsp-gui` asserts it equals the document — the only place that
+number is observable at all.
 
 `textDocument/didOpen` on load, `didChange` incrementally when the server
 asks for it (`textDocumentSync.change == 2`), full text otherwise,
@@ -170,6 +190,9 @@ in the standalone editor window, because both are one `EditorView`.
 | `Ctrl+T` | workspace symbols (query = the word at the caret or the selection) |
 | `F2` | rename |
 | `Ctrl+Shift+I` | format document, or the selection when there is one |
+| `Ctrl+Shift+Space` | signature help (also opens on the server's trigger characters) |
+| `Ctrl+.` | code actions for the selection, or for the caret |
+| — | **Inlay hints** in the visible lines, **semantic highlighting** on top of Tree-sitter, and a **hover on mouse dwell** |
 
 **Popup behaviour.** One widget serves completion, results and symbols.
 It is a `GtkPopover` with `autohide = false` pointed at the caret using
@@ -198,6 +221,103 @@ reported ("N not open") rather than edited behind the user's back.
 **Formatting** folds the returned `TextEdit[]` into one transaction, so a
 whole-file reformat is a single undo.
 
+**Signature help** opens on the server's own `triggerCharacters`
+(typically `(`), refreshes on its `retriggerCharacters` (typically `,`),
+and can always be asked for with Ctrl+Shift+Space. It is its own
+popover, not a mode of the list, because VS Code-style behaviour has it
+open at the same time as the completion list — so it points UP from the
+caret while the list points down.
+
+Following the active parameter as the caret moves is the re-entrant
+part, and it is handled with exactly the machinery completion already
+uses: the re-request is debounced by 120 ms, a new request supersedes
+the in-flight one with `$/cancelRequest`, and an answer whose revision
+no longer matches the document is dropped rather than shown. The popup
+closes outright once the caret walks back past the offset the current
+help was requested at — that call is gone.
+
+**Code actions** ask for the selection, or for the caret when there is
+none, and carry back the diagnostics OVERLAPPING that range as the
+server's own objects. That is why `diagnostics.Diagnostic` keeps the
+`raw` JSON of every published diagnostic: a fixit provider (clangd is
+one) matches on its own `data` field, and a re-serialised approximation
+of it produces no actions at all.
+
+All three shapes a server can answer with are handled: an inline `edit`
+is applied; a `command` goes to `workspace/executeCommand` and the
+server's follow-up `workspace/applyEdit` is answered (this is why the
+client advertises `workspace.applyEdit: true` and `Session.Handler` has
+an `on_apply_edit` slot); an action carrying neither is resolved with
+`codeAction/resolve` first.
+
+Every one of those paths — rename included — applies through the SAME
+`applyWorkspaceEdit`, so the one-transaction-per-document rule holds
+once rather than three times. The consequence rename documents applies
+unchanged and is not papered over: **history is per `Document`, so an
+action touching three files is three undo units**. `create`/`rename`/
+`delete` file operations inside a `WorkspaceEdit` are counted as skipped
+and reported, never performed — the editor does not write files the user
+did not open.
+
+**Inlay hints** are requested for the visible line span widened by 80
+lines, never for the whole document, and re-requested only when the
+viewport leaves that window or the document changes (debounced 220 ms).
+
+They are display-only, and the way that is guaranteed is worth stating
+precisely, because "just draw them" is where editors get this wrong:
+a hint reaches the renderer as `(byte offset, text)` on
+`Layout.hints`, and `editor_layout` emits its glyphs with `hint = true`
+and **appends no `Cluster`**. Clusters are the entire hit-testing and
+caret currency (`caretPos`, `byteToX`, `xToByte` walk nothing else), so
+the document's byte space is bit-for-bit what it was without hints: the
+caret cannot enter a hint, a click inside one resolves to the nearest
+real grapheme boundary, and no offset anywhere shifts. What hints DO
+change is x — everything after one on the line moves right, which can
+change that line's wrapped row count. That needs no new invalidation
+rule: `RowIndex` is an estimate that `note()` refines for every line the
+renderer lays out, so the scrollbar follows on the next frame exactly as
+it does after any other content change. The per-line layout cache gains
+`hints_gen` alongside `hl_gen` for the same reason `hl_gen` exists.
+
+Hints are dropped, never carried, on an edit: a decoration anchored to
+moved bytes is worse than no decoration, and the refresh is one round
+trip.
+
+**Semantic tokens** are requested for the whole document
+(`semanticTokens/full`), with `full/delta` used whenever the server both
+offers it and has given us a `resultId` for the array we still hold;
+`semantic.Data` keeps that packed array verbatim so a delta can splice
+into it (back-to-front, so one splice cannot move the next one's
+offset). A delta that does not fit the array we hold is refused
+WHOLESALE and the cached array dropped, so the next request is a full
+one — half-applying a splice would mis-colour the rest of the session.
+The `range` request is not used.
+
+**Precedence, decided and fixed: Tree-sitter is the base layer and a
+semantic token overrides it for the bytes it covers.** The server knows
+things the grammar cannot (whether `foo` is a type, a macro or a local),
+so where it speaks it wins. But servers routinely classify only
+identifiers — punctuation, and often comments and strings, come back
+untyped — so the grammar keeps everything the server did not claim. The
+same reasoning decides what happens to a token type this editor has no
+colour for (`concept`, a vendor extension, anything new): it is
+**dropped**, not painted as `Kind.none`, because `.none` would blank out
+the grammar's answer and lose information. This is exactly the contract
+`semanticTokens.augmentsSyntaxTokens: true` in the client capabilities
+describes. Token MODIFIERS are parsed off the wire but not used — a
+`readonly` variable is coloured as a variable.
+
+**Mouse-dwell hover** is a motion controller feeding a timer, and the
+distinction that matters is that the motion handler only ever RESTARTS
+the timer: the request is issued from the timer callback, so a pointer
+crossing the window produces zero requests. The dwell is cancelled by
+any key, any scroll, any click, and by the pointer moving again; a
+second dwell landing on the same byte offset does not re-ask. The popup
+is anchored at the POINTER (not the caret) and reports the diagnostic
+under the pointer, and a dwell that finds nothing says nothing at all —
+the user did not ask for it. `editor_lsp_hover_delay_ms = 0` turns it
+off; Ctrl+I is unaffected.
+
 ## Configuration
 
 App-level, not per-profile: a language server serves a **language**, and
@@ -205,9 +325,13 @@ which pane profile a document happens to be open under says nothing about
 that (the split CLAUDE.md describes for `ProfileSettings`).
 
 ```ini
-editor_lsp = true              # master switch
-editor_lsp_diagnostics = true  # squiggles + gutter stripe
+editor_lsp = true                   # master switch
+editor_lsp_diagnostics = true       # squiggles + gutter stripe
 editor_lsp_debounce_ms = 250
+editor_lsp_inlay_hints = true       # inline type / parameter annotations
+editor_lsp_semantic_tokens = true   # server colours on top of Tree-sitter
+editor_lsp_signature_help = true    # parameter list while typing a call
+editor_lsp_hover_delay_ms = 500     # mouse dwell; 0 = off (Ctrl+I unaffected)
 
 [lsp.zls]
 args = --enable-debug-log
@@ -252,7 +376,7 @@ directory. One server process is shared per (server, root) pair, and the
 last tab out shuts it down (`shutdown`, then `exit`, then SIGKILL after
 1.5 s).
 
-The Editor page in Preferences carries the three switches plus one group
+The Editor page in Preferences carries these switches plus one group
 per server (enabled / command / arguments / languages / root markers) and
 reports whether each command is on `PATH`. Editing a server there
 materializes its `[lsp.<name>]` section; a server the user never touches
@@ -271,13 +395,22 @@ that dies takes its diagnostics down with it and the editor keeps working.
 * `zig build test-core` / `zig build test` — framing (including
   byte-at-a-time delivery and lost framing), position mapping in all
   three encodings, the registry and URI handling, the diagnostics store,
-  the didChange queue, process spawn, and the whole session lifecycle
-  against a scripted in-process server (`src/lsp/session_test.zig`).
+  the didChange queue, process spawn, the semantic-token legend / decode
+  / delta splice, inlay-hint parsing (label parts, padding, the emoji
+  line), and the whole session lifecycle against a scripted in-process
+  server (`src/lsp/session_test.zig`). `zig build test` additionally
+  covers the RENDER side in `render/editor_layout.zig`: that a hint
+  shifts glyphs without adding a cluster or moving a byte, and that a
+  semantic token overrides the Tree-sitter kind only where it lands.
 * `zig build smoke-editor` — the LSP stage spawns
   **`sketerm-lsp-stub`**, a real child process speaking the base protocol
   over real pipes, and drives diagnostics, incremental sync, hover,
   definition, references, symbols, completion + resolve, rename and
-  formatting through the production client. The stub maintains its **own**
+  formatting through the production client — plus signature help (the
+  active parameter must move with the caret), all three code-action
+  shapes including `codeAction/resolve`, range-honouring inlay hints,
+  and `semanticTokens/full` followed by a `full/delta` that has to
+  decode to the same token set. The stub maintains its **own**
   copy of the document from the `contentChanges` it receives and publishes
   diagnostics against it, so an off-by-one range makes the two copies
   diverge and the stage fail. The whole stage runs twice, once per
@@ -286,11 +419,26 @@ that dies takes its diagnostics down with it and the editor keeps working.
   Wayland compositor (private daemon on a short socket, display session,
   viewer attached before the GUI — never Xvfb), driving
   `typescript-language-server` when it is on PATH and the stub
-  otherwise. Asserts the diagnostic stripe renders, that Ctrl+I and
-  Ctrl+Space actually open popups (a GtkPopover is its own xdg_popup, so
-  this is observable rather than inferred), that accepting an item
-  changes the document, and that F12 moves the caret. One screenshot per
-  claim lands in `zig-out/`.
+  otherwise; `SKETERM_SMOKE_LSP=ts|clangd|zls|stub` forces one, and it
+  is meant to be run against a real server AND the stub, because the
+  stub answers in the same tick and is the only thing that exposes
+  race-shaped bugs (a fast `completionItem/resolve` growing a popover's
+  minimum size once popped the completion list down; see the invariant
+  on `ensurePopup`).
+
+  Asserts the diagnostic stripe renders, that Ctrl+I, Ctrl+Space,
+  Ctrl+. and a typed `(` each open a popup (a GtkPopover is its own
+  xdg_popup, so this is observable rather than inferred), that the
+  signature popup SURVIVES the caret moving to the next parameter, that
+  accepting a completion and applying a code action each change the
+  document and close the list, that a pointer resting on a symbol opens
+  a hover with no key pressed, and that F12 moves the caret. Inlay
+  hints are asserted by their own colour appearing to the right of the
+  gutter (nothing else uses it). Against the stub it additionally
+  asserts that `didOpen` carried the whole document, and that the
+  `SEM` marker is painted in the `property` colour — which no grammar
+  gives that identifier, so it can only come from the semantic tokens.
+  One screenshot per claim lands in `zig-out/`.
 
 `SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
 published diagnostics to stderr — the client is silent by design, so
