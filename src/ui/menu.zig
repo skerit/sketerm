@@ -616,13 +616,21 @@ fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
 /// grabbing it back unconditionally would steal focus from that
 /// dialog the frame it appeared.
 fn returnFocus(ctx: *ClickCtx) void {
-    const root = c.gtk_widget_get_root(ctx.widget) orelse return;
+    returnFocusTo(ctx.widget, ctx.popover);
+}
+
+/// The widget-level half of `returnFocus`, for menus built elsewhere
+/// (the shared tab-strip menu in ui/tabhost.zig) that need the same
+/// rule without this module's ClickCtx. Same condition, same reason:
+/// only take focus back when it is still stranded in the popover.
+pub fn returnFocusTo(widget: *c.GtkWidget, popover: *c.GtkWidget) void {
+    const root = c.gtk_widget_get_root(widget) orelse return;
     const focus = c.gtk_root_get_focus(@ptrCast(root));
     const inside = focus == null or
-        focus == ctx.popover or
-        c.gtk_widget_is_ancestor(focus, ctx.popover) != 0;
+        focus == popover or
+        c.gtk_widget_is_ancestor(focus, popover) != 0;
     if (!inside) return;
-    _ = c.gtk_widget_grab_focus(ctx.widget);
+    _ = c.gtk_widget_grab_focus(widget);
 }
 
 fn freeHoverCtx(user: ?*anyopaque) callconv(.c) void {

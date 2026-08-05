@@ -363,7 +363,17 @@ pub const Menu = struct {
 
     /// A row with an icon in its slot (themed name or app GIcon).
     pub fn itemIcon(self: Menu, label: [*:0]const u8, icon: Icon, cb: anytype, ctx: ?*anyopaque) void {
+        self.itemIconEnabled(label, icon, true, cb, ctx);
+    }
+
+    /// A row that may be present but unable to act: `enabled = false`
+    /// greys it out instead of hiding it, so a menu still shows what
+    /// this surface CAN do while making clear that this verb has
+    /// nothing to act on right now. The handler is connected either
+    /// way — an insensitive GtkButton never emits `clicked`.
+    pub fn itemIconEnabled(self: Menu, label: [*:0]const u8, icon: Icon, enabled: bool, cb: anytype, ctx: ?*anyopaque) void {
         const row = self.makeRow(label, icon, false);
+        if (!enabled) c.gtk_widget_set_sensitive(row, 0);
         self.connectActivate(row, cb, ctx);
     }
 
