@@ -5,8 +5,9 @@
 //! Missing keys fall back to defaults. Unknown keys are ignored
 //! (with a stderr warning) so newer configs work on older binaries.
 //!
-//! Loaded once at app start via `Config.load`. Mutations require a
-//! restart (no live reload v1).
+//! Loaded at app start via `Config.load` and re-loaded live — on the
+//! `reload_config` action, on SIGUSR1, and (unless `config_auto_reload`
+//! is off) whenever the file changes on disk (`ui/configwatch.zig`).
 
 const std = @import("std");
 const lsp_servers = @import("lsp/servers.zig");
@@ -387,6 +388,11 @@ pub const Config = struct {
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
+    /// Watch config.conf and apply it the moment it changes on disk,
+    /// without the `reload_config` keybind. Off falls back to the
+    /// keybind and SIGUSR1. An auto reload never writes the file back,
+    /// so hand-written comments and ordering survive.
+    config_auto_reload: bool = true,
 
     // Rendering
     ligatures: bool = true,
@@ -860,49 +866,58 @@ pub const Config = struct {
     /// Load with an optional explicit path that overrides the default
     /// XDG / ~/.config search. Used by --config <path>.
     pub fn loadWithOverride(allocator: std.mem.Allocator, override_path: ?[]const u8) Config {
-        var cfg = Config{};
         const resolved: ?[]u8 = if (override_path) |p|
             allocator.dupe(u8, p) catch null
         else
             resolveConfigPath(allocator);
         if (resolved) |path| {
             defer allocator.free(path);
-            // Zig 0.16's `std.fs` requires an `Io` instance we don't
-            // thread through here. Just use libc — we link it anyway.
-            const c = @import("c.zig").c;
-            // path is allocator-owned and not necessarily NUL-terminated;
-            // copy onto a stack buffer with a trailing 0.
-            var path_z: [4096]u8 = undefined;
-            if (path.len >= path_z.len) {
-                warnConfig("config path too long: {s}", .{path});
-            } else {
-                @memcpy(path_z[0..path.len], path);
-                path_z[path.len] = 0;
-                const fp = c.fopen(@ptrCast(&path_z), "rb");
-                if (fp == null) {
-                    if (override_path != null) {
-                        warnConfig("--config path {s} not readable, using defaults", .{path});
-                    }
-                } else {
-                    defer _ = c.fclose(fp);
-                    const max_bytes: usize = 64 * 1024;
-                    var buf: [max_bytes]u8 = undefined;
-                    const n = c.fread(&buf, 1, buf.len, fp);
-                    if (n == buf.len and c.feof(fp) == 0) {
-                        warnConfig("{s} larger than 64 KiB; trailing settings ignored", .{path});
-                    }
-                    cfg.arena = std.heap.ArenaAllocator.init(allocator);
-                    parseInto(&cfg, buf[0..n]) catch {
-                        warnConfig("parse error in {s}, using defaults", .{path});
-                        cfg.deinit();
-                        cfg = Config{};
-                    };
-                }
+            if (loadFromPath(allocator, path)) |cfg| {
+                return cfg;
+            } else |err| switch (err) {
+                error.PathTooLong => warnConfig("config path too long: {s}", .{path}),
+                error.NotReadable => if (override_path != null) {
+                    warnConfig("--config path {s} not readable, using defaults", .{path});
+                },
             }
         }
+        var cfg = Config{};
+        applyEnvOverrides(&cfg, allocator);
+        return cfg;
+    }
 
-        // Env overrides — highest priority. Applied to the Default
-        // settings only; named profiles keep their own values.
+    /// Read and parse one config file, env overrides included.
+    ///
+    /// Unlike `loadWithOverride` an unreadable file is an ERROR, not
+    /// "use defaults": a LIVE reload (the `reload_config` action, the
+    /// file watcher) that raced an editor's rename would otherwise
+    /// silently reset every setting the user has.
+    pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !Config {
+        // Zig 0.16's `std.fs` requires an `Io` instance we don't
+        // thread through here. Just use libc — we link it anyway.
+        const c = @import("c.zig").c;
+        // path is caller-owned and not necessarily NUL-terminated;
+        // copy onto a stack buffer with a trailing 0.
+        var path_z: [4096]u8 = undefined;
+        if (path.len >= path_z.len) return error.PathTooLong;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.NotReadable;
+        defer _ = c.fclose(fp);
+        const max_bytes: usize = 64 * 1024;
+        var buf: [max_bytes]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, fp);
+        if (n == buf.len and c.feof(fp) == 0) {
+            warnConfig("{s} larger than 64 KiB; trailing settings ignored", .{path});
+        }
+        var cfg = try loadFromBytes(allocator, buf[0..n]);
+        applyEnvOverrides(&cfg, allocator);
+        return cfg;
+    }
+
+    /// Env overrides — highest priority, beating the file. Applied to
+    /// the Default settings only; named profiles keep their own values.
+    fn applyEnvOverrides(cfg: *Config, allocator: std.mem.Allocator) void {
         if (@import("util/profile.zig").getenv("SKETERM_SCROLLBACK")) |env| {
             if (std.fmt.parseInt(u32, env, 10)) |n| cfg.settings.scrollback = n else |_| {}
         }
@@ -911,11 +926,11 @@ pub const Config = struct {
             const arena = cfg.arena.?.allocator();
             cfg.settings.font_path = arena.dupe(u8, env_path) catch cfg.settings.font_path;
         }
-        return cfg;
     }
 
     pub fn loadFromBytes(allocator: std.mem.Allocator, body: []const u8) !Config {
         var cfg = Config{ .arena = std.heap.ArenaAllocator.init(allocator) };
+        errdefer cfg.deinit();
         try parseInto(&cfg, body);
         return cfg;
     }
@@ -1077,6 +1092,7 @@ pub const Config = struct {
         if (self.tab_ack_delay_secs != 1.0) try w.print("tab_ack_delay_secs = {d:.2}\n", .{self.tab_ack_delay_secs});
         if (self.image_memory_mb != 320) try w.print("image_memory_mb = {d}\n", .{self.image_memory_mb});
         if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
+        if (!self.config_auto_reload) try w.writeAll("config_auto_reload = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
         if (self.gtk_theme.len > 0) try w.print("gtk_theme = {s}\n", .{self.gtk_theme});
@@ -1860,6 +1876,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.image_memory_mb = try parseU32(value);
     } else if (std.mem.eql(u8, key, "smart_copy")) {
         cfg.smart_copy = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "config_auto_reload")) {
+        cfg.config_auto_reload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "close_button_on_tab")) {
         cfg.close_button_on_tab = try parseBool(value);
     } else if (std.mem.eql(u8, key, "word_chars")) {
@@ -2277,6 +2295,68 @@ test "config: palette + scheme + new keys round-trip" {
     try std.testing.expectEqual(false, parsed.bell_urgent);
     try std.testing.expectEqualStrings("abc", parsed.word_chars);
     try std.testing.expectApproxEqAbs(@as(f32, 3.5), parsed.minimum_contrast, 1e-6);
+}
+
+test "config: loadFromPath refuses an unreadable file instead of returning defaults" {
+    // The whole point of the separate entry point: a live reload that
+    // raced an editor's rename must not silently reset every setting.
+    try std.testing.expectError(
+        error.NotReadable,
+        Config.loadFromPath(std.testing.allocator, "/nonexistent/sketerm-test/config.conf"),
+    );
+
+    const c = @import("c.zig").c;
+    var tmpl = "/tmp/sketerm-cfgpath-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    defer _ = c.unlink(path.ptr);
+    defer _ = c.rmdir(dir);
+    {
+        const fp = c.fopen(path.ptr, "wb") orelse return error.SkipZigTest;
+        defer _ = c.fclose(fp);
+        const body = "# hand written\nfont_size = 21\nconfig_auto_reload = false\n";
+        _ = c.fwrite(body.ptr, 1, body.len, fp);
+    }
+    var cfg = try Config.loadFromPath(std.testing.allocator, path);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 21), cfg.settings.font_size);
+    try std.testing.expectEqual(false, cfg.config_auto_reload);
+}
+
+test "config: config_auto_reload defaults on, round-trips and clones" {
+    try std.testing.expectEqual(true, (Config{}).config_auto_reload);
+
+    // Default value writes no line (the serialiser is minimal).
+    {
+        var cfg = Config{};
+        var buf: [2048]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try cfg.serialise(&w);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "config_auto_reload") == null);
+    }
+
+    var cfg = Config{};
+    cfg.config_auto_reload = false;
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "config_auto_reload = false") != null);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqual(false, parsed.config_auto_reload);
+
+    // The clone every apply path goes through must carry it.
+    var cloned = try parsed.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(false, cloned.config_auto_reload);
+
+    // The other spellings parseBool accepts.
+    var off = try Config.loadFromBytes(std.testing.allocator, "config_auto_reload = off\n");
+    defer off.deinit();
+    try std.testing.expectEqual(false, off.config_auto_reload);
 }
 
 test "config: serialise round-trips through loadFromBytes" {
