@@ -652,6 +652,12 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_CONTROL_MASK, .what = "bookmark current folder", .run = &chordBookmark },
     .{ .keyval = c.GDK_KEY_j, .mods = c.GDK_CONTROL_MASK, .what = "frecency jump", .run = &chordJump },
     .{
+        .keyval = c.GDK_KEY_j,
+        .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
+        .what = "toggle the transfer center",
+        .run = &chordTransfers,
+    },
+    .{
         .keyval = c.GDK_KEY_x,
         .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
         .what = "visual select mode",
@@ -691,6 +697,11 @@ pub const browser_chords = [_]Chord{
 
 fn chordUndo(self: *BrowserView) bool {
     self.performUndo();
+    return true;
+}
+
+fn chordTransfers(self: *BrowserView) bool {
+    @import("jobpanel.zig").toggleTransferCenter(self);
     return true;
 }
 

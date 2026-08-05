@@ -13015,3 +13015,61 @@ Verification: smoke-fs (mono + broker incl. all new stages), smoke-mux,
 smoke-broker, mux-portable, `zig build`, full unit suite 1623 pass /
 0 fail (test-core 1385; the build-step exit flake is the known
 tesseract ObjectCache leak noise).
+
+## Transfers UI: the two-tier redesign (ambient strip + Transfer Center)
+
+The per-pane jobs strip was replaced with the two tiers proposed in the
+transfer-UI review:
+
+- Tier 1, the ambient strip: ONE line at the bottom of the browser face
+  -- progress ring (cairo), "Copying 2 items to mercer -- file.bin",
+  and percent/rate/ETA. Green summary with a clear button when
+  everything finished, red with the failure sentence when something
+  failed, dim while only queued. Clicking it (or Ctrl+Shift+J, or its
+  Details button) toggles tier 2.
+- Tier 2, the Transfer Center: header ("Transfers -- 1 active - 2
+  queued - 6.1 MB/s total" + Clear finished), then one CARD per
+  operation: name-first head line (destination as host:parent/, host
+  prefix stripped), right-aligned mono stats ("434 / 700 MB - 6.0 MB/s
+  - 2:41 left"), a custom-drawn byte bar whose RESUMED prefix renders
+  dimmer, a "resumed at N MB" chip, the in-flight file line, and an
+  area-filled sparkline. Failed cards get a red edge and the full
+  failure sentence, selectable. Cards keep their position for their
+  lifetime (stable meter-order sort); full endpoints live in the
+  tooltip and a right-click "Copy Source/Destination Path" menu
+  (classicmenu). Batch bars blend finished members with the running
+  member's byte fraction, so one big file no longer parks at 0%.
+
+Chasing the "duplicate identical rows" complaint live (headless rig,
+fake-ssh throttled through pv) surfaced three deeper defects, all
+fixed:
+
+- Restarted jobs SUMMED the dead attempt's journaled progress with the
+  fresh run's counting (done reached 1.66x the file size) -- the
+  progress seed now applies only when the copy step is skipped
+  (resume_phase > 0). Reproduced and pinned in the retry-resume smoke
+  stage (max_done <= total asserts there and in the flaky stage).
+- A re-paste of endpoints an older intent still holds now ADOPTS that
+  intent (same ledger token => daemon restarts the old job, staged
+  data and all -- verified live: "resumed at 92.0 MB" after killing
+  GUI + helper mid-transfer and pasting again), and other stale
+  duplicates are retired as superseded, at materialization and again
+  when the same endpoints complete.
+- A restarted no_replace job whose destination already carries EXACTLY
+  the source content (shape + hashes) now reports success instead of
+  "destination exists" -- but only with a journaled prior attempt
+  (stage/phase/progress); a fresh job still refuses, preserving the
+  collision smoke's "identical bytes are not proof this job installed
+  them" invariant for moves.
+
+Known limitation: a crashed session's unclaimed recovered intent can
+sit as one dormant "queued -- waiting to start" card until dispatched
+or canceled; it no longer races or duplicates anything.
+
+Verification: full suite 1626/0 (3 new jobpanel tests: strip aggregate,
+failure/done lines, batch fraction hint), test-core 1386/0, smoke-fs
+(mono+broker) incl. the hardened kill-window stages, mux-portable +
+aarch64-macos cross, and the live rig end to end: paste -> SIGKILL
+helper mid-flight -> auto-retry resumes in place -> kill GUI+helper ->
+relaunch + re-paste -> adoption resumes at 92 MB -> both files land
+sha256-identical.

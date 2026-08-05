@@ -1964,6 +1964,37 @@ pub const Service = struct {
         return self.materializeUserBatchItemState(batch_token, index, coordinator_host, dst_override, no_replace, owner, false);
     }
 
+    /// A NEW copy command for endpoints an older, never-started intent
+    /// still holds is a supersession, not a second transfer: retire
+    /// the stale one so the panel shows ONE row per logical copy (the
+    /// duplicated "Copy N items" rows were exactly this — resurrected
+    /// queued intents from an earlier session stacking behind a fresh
+    /// paste of the same files). An intent that already runs, or
+    /// failed with a daemon job behind it, is left alone: it owns
+    /// resumable staged state.
+    fn retireSupersededDuplicates(self: *Service, kind: store.Kind, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, keep_batch: u64, include_settled: bool) void {
+        for (self.intents.items) |it| {
+            if (it.retired or it.kind != kind) continue;
+            if (keep_batch != 0 and it.batch_id == keep_batch) continue;
+            const stale_queued = it.job == 0 and (it.state == .queued or it.state == .waiting_retry);
+            // Once the same endpoints have SUCCEEDED, any sibling still
+            // pending or claiming failure for them is stale bookkeeping,
+            // not a transfer (only a genuinely RUNNING one is left to
+            // finish on its own terms).
+            const moot = include_settled and
+                (it.state == .failed or it.state == .waiting_retry or it.state == .queued);
+            if (!stale_queued and !moot) continue;
+            if (!std.mem.eql(u8, it.src_host, src_host) or !std.mem.eql(u8, it.src_path, src_path)) continue;
+            if (!std.mem.eql(u8, it.dst_host, dst_host) or !std.mem.eql(u8, it.dst_path, dst_path)) continue;
+            it.cancel_requested = true;
+            it.state = .canceled;
+            it.retired = true;
+            it.claimed = false;
+            self.replaceMessage(it, "superseded by a newer copy of the same files");
+            self.writeIntent(it);
+        }
+    }
+
     fn materializeUserBatchItemState(
         self: *Service,
         batch_token: []const u8,
@@ -2019,6 +2050,53 @@ pub const Service = struct {
             };
             if (skipped and !self.writeIntentOk(existing)) return null;
             return existing.token;
+        }
+        if (!skipped) {
+            // ADOPTION: a re-paste of the same endpoints is the same
+            // logical transfer. Reusing the existing intent keeps its
+            // token — which is the transfer_token the daemon restarts
+            // the old job by, staged data and all — instead of minting
+            // a sibling that races it to the same destination.
+            const dst_path = dst_override orelse item.dst_path;
+            for (self.intents.items) |existing| {
+                if (existing.retired or existing.kind != .download) continue;
+                if (existing.state == .running or existing.state == .submitting or existing.state == .done) continue;
+                if (existing.cancel_requested or existing.ack_job != 0) continue;
+                if (!std.mem.eql(u8, existing.src_host, batch.src_host) or
+                    !std.mem.eql(u8, existing.src_path, item.src_path)) continue;
+                if (!std.mem.eql(u8, existing.dst_host, batch.dst_host) or
+                    !std.mem.eql(u8, existing.dst_path, dst_path)) continue;
+                if (!self.replaceIntentString(&existing.batch_token, batch.token)) break;
+                handle.release();
+                // A fresh attempt identity: the daemon then RESTARTS
+                // the failed job by transfer_token instead of replaying
+                // the spent attempt's terminal state.
+                if (self.newToken()) |fresh| {
+                    self.allocator.free(existing.client_token);
+                    existing.client_token = fresh;
+                } else |_| {}
+                existing.batch_id = batch.batch_id;
+                existing.batch_total = batch.batch_total;
+                existing.order = self.nextOrder();
+                existing.state = .queued;
+                existing.attempts = 0;
+                existing.job = 0;
+                existing.mediated = true;
+                existing.user_copy = true;
+                existing.claimed = true;
+                existing.paused = false;
+                existing.delete_src_after = batch.move;
+                existing.no_replace = no_replace orelse batch.no_replace;
+                existing.coordinator_set = coordinator_host != null;
+                if (!self.replaceIntentString(&existing.coordinator_host, coordinator_host orelse ""))
+                    existing.coordinator_set = false;
+                self.replaceMessage(existing, "");
+                self.writeIntent(existing);
+                return existing.token;
+            }
+            // Anything not adopted (a second stale duplicate) is
+            // superseded rather than left to race the new transfer.
+            self.retireSupersededDuplicates(.download, batch.src_host, item.src_path, batch.dst_host, dst_path, batch.batch_id, false);
         }
         const it = self.dupIntent(handle, .{
             .token = item.token,
@@ -2304,6 +2382,10 @@ pub const Service = struct {
             it.claimed = false;
             return false;
         }
+        // This exact copy just succeeded: siblings still claiming these
+        // endpoints failed (a crashed session's leftovers) are moot.
+        if (it.state == .done)
+            self.retireSupersededDuplicates(it.kind, it.src_host, it.src_path, it.dst_host, it.dst_path, it.batch_id, true);
         return true;
     }
 
@@ -2454,6 +2536,10 @@ pub const Service = struct {
         it.retired = true;
         it.state = if (it.cancel_requested) .canceled else .done;
         if (!self.writeIntentOk(it)) return false;
+        // This exact copy just succeeded: siblings still claiming these
+        // endpoints failed (a crashed session's leftovers) are moot.
+        if (it.state == .done)
+            self.retireSupersededDuplicates(it.kind, it.src_host, it.src_path, it.dst_host, it.dst_path, it.batch_id, true);
         return self.retire(it);
     }
 
