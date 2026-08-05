@@ -1,10 +1,13 @@
-//! Version-control overlay state for the file browser: porcelain
+//! Version-control overlay state for the file browser: porcelain-v2
 //! record parsing, directory rollup, the display decision and the
 //! per-root refresh cache.
 //!
-//! GTK-free on purpose — the UI side (`src/ui/browser/gitstat.zig`)
-//! only ships records in and reads badges out, so every rule here is
-//! unit-testable from both test roots.
+//! GTK-free on purpose — the daemon's `git_status` job (`mux/fsjob.zig`)
+//! scans `git status --porcelain=v2 --branch --ignored -z` with the
+//! `Scanner` below, and the UI side (`src/ui/browser/gitstat.zig`) only
+//! ships records in and reads badges out. Every rule is therefore
+//! unit-testable from both test roots, and producer and consumer agree
+//! on the record shape by construction.
 
 const std = @import("std");
 
@@ -209,7 +212,6 @@ fn parseEntry(tok: []const u8, kind: Kind, path_field: usize) ?Record {
     };
 }
 
-
 /// One entry's version-control state, ordered by PRECEDENCE: a higher
 /// tag wins when several records fold onto the same path (a directory
 /// rollup, or an index record plus a worktree record).
@@ -288,7 +290,6 @@ pub fn sidesFor(r: Record) struct { index: State, work: State } {
     };
 }
 
-
 /// What a child state contributes to its ANCESTOR directories.
 ///
 /// Ignored content never propagates: a directory full of build output
@@ -298,48 +299,89 @@ pub fn propagates(self: State) State {
     return if (self == .ignored) .none else self;
 }
 
-/// How one row is drawn. `letter` is the porcelain character (or `*`
-/// for "something inside changed"); `css` is a libadwaita status class
-/// so both themes stay readable without hardcoded colours; `dim_name`
-/// fades the whole name instead of adding a chip.
-pub const Badge = struct {
-    letter: u8,
-    /// NUL-terminated so the UI can hand it straight to GTK.
-    css: [:0]const u8,
-    dim_name: bool = false,
-};
-
-/// The chip for a state, or null when the row must stay unmarked.
-///
-/// `rollup` = the state came from something BELOW this row, never
-/// from a record naming it: those get one neutral `*` so a directory
-/// cannot be mistaken for a changed file.
-pub fn badgeFor(state: State, rollup: bool) ?Badge {
-    if (state == .none) return null;
-    if (state == .ignored) {
-        // Ignored is information, not an alarm: no chip at all, just
-        // a faded name. Nothing propagates it, so a rollup cannot be
-        // ignored in the first place.
-        return if (rollup) null else Badge{ .letter = 0, .css = "dim-label", .dim_name = true };
-    }
-    const css: [:0]const u8 = switch (state) {
-        .untracked, .added => "success",
-        .modified, .typechange => "warning",
-        .renamed => "accent",
-        .deleted, .conflicted => "error",
-        else => "dim-label",
-    };
-    const letter: u8 = if (rollup) '*' else switch (state) {
+/// The chip letter of a state, for rows whose two columns are not
+/// known (a pre-v2 daemon reported one collapsed character).
+pub fn letterFor(state: State) u8 {
+    return switch (state) {
         .untracked => '?',
+        .ignored => '!',
         .added => 'A',
         .typechange => 'T',
         .modified => 'M',
         .renamed => 'R',
         .deleted => 'D',
         .conflicted => 'U',
-        else => ' ',
+        .none => ' ',
     };
-    return .{ .letter = letter, .css = css };
+}
+
+/// How one row is drawn.
+///
+/// `code` is what the chip prints: git's own two-column pair for an
+/// exact row whose columns are known (`M.` staged, `.M` unstaged,
+/// `MM` both, `??`, `UU`), a single letter when only a collapsed
+/// character arrived, and `*` for "something inside changed". `css` is
+/// a libadwaita status class so both themes stay readable without
+/// hardcoded colours; `dim_name` fades the whole name instead of
+/// adding a chip.
+pub const Badge = struct {
+    code: [2]u8 = .{ 0, 0 },
+    code_len: u8 = 0,
+    /// NUL-terminated so the UI can hand it straight to GTK.
+    css: [:0]const u8,
+    dim_name: bool = false,
+    /// The index side carries a change (the row is at least partly
+    /// staged) / the worktree side does.
+    staged: bool = false,
+    unstaged: bool = false,
+    rollup: bool = false,
+
+    pub fn text(self: *const Badge) []const u8 {
+        return self.code[0..self.code_len];
+    }
+};
+
+fn cssFor(state: State) [:0]const u8 {
+    return switch (state) {
+        .untracked, .added => "success",
+        .modified, .typechange => "warning",
+        .renamed => "accent",
+        .deleted, .conflicted => "error",
+        else => "dim-label",
+    };
+}
+
+/// The chip for a folded row, or null when it must stay unmarked.
+///
+/// A rollup (`!row.exact`) means the state came from something BELOW
+/// this row, never from a record naming it: those get one neutral `*`
+/// so a directory cannot be mistaken for a changed file.
+pub fn badgeForRow(row: Row) ?Badge {
+    if (row.state == .none) return null;
+    if (row.state == .ignored) {
+        // Ignored is information, not an alarm: no chip at all, just
+        // a faded name. Nothing propagates it, so a rollup cannot be
+        // ignored in the first place.
+        return if (!row.exact) null else Badge{ .css = "dim-label", .dim_name = true };
+    }
+    const css = cssFor(row.state);
+    if (!row.exact) return .{ .code = .{ '*', 0 }, .code_len = 1, .css = css, .rollup = true };
+    if (row.x == 0) {
+        // Pre-v2 daemon: one collapsed character is all there is.
+        return .{ .code = .{ letterFor(row.state), 0 }, .code_len = 1, .css = css };
+    }
+    return .{
+        .code = .{ row.x, row.y },
+        .code_len = 2,
+        .css = css,
+        .staged = row.index != .none,
+        .unstaged = row.work != .none,
+    };
+}
+
+/// Legacy entry point kept for callers that only have a merged state.
+pub fn badgeFor(state: State, rollup: bool) ?Badge {
+    return badgeForRow(.{ .state = state, .exact = !rollup });
 }
 
 /// Human word for a state, for tooltips and the status summary.
@@ -360,15 +402,55 @@ pub fn label(state: State) []const u8 {
 /// Folded state of one path in the overlay.
 pub const Row = struct {
     state: State = .none,
+    /// The porcelain columns of the record that produced `state`, or
+    /// 0 when only a collapsed character arrived (an old daemon).
+    x: u8 = 0,
+    y: u8 = 0,
+    index: State = .none,
+    work: State = .none,
     /// A record named this exact path (as opposed to something under
     /// it): decides letter-vs-rollup rendering.
     exact: bool = false,
+    submodule: bool = false,
+    /// Rename/copy source, owned by the overlay; empty when none.
+    orig: []const u8 = &.{},
+
+    /// One line of prose for a tooltip.
+    pub fn describe(self: Row, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        if (!self.exact) {
+            w.writeAll("contains changes") catch {};
+            return w.buffered();
+        }
+        if (self.state == .ignored) {
+            w.writeAll("ignored by git") catch {};
+            return w.buffered();
+        }
+        if (self.index == .conflicted and self.work == .conflicted) {
+            w.print("conflicted ({c}{c})", .{ self.x, self.y }) catch {};
+        } else if (self.x == 0) {
+            w.writeAll(label(self.state)) catch {};
+        } else {
+            var wrote = false;
+            if (self.index != .none) {
+                w.print("staged {s}", .{label(self.index)}) catch {};
+                wrote = true;
+            }
+            if (self.work != .none) {
+                if (wrote) w.writeAll(", ") catch {};
+                w.print("unstaged {s}", .{label(self.work)}) catch {};
+            }
+        }
+        if (self.orig.len > 0) w.print(" (from {s})", .{self.orig}) catch {};
+        if (self.submodule) w.writeAll(" [submodule]") catch {};
+        return w.buffered();
+    }
 };
 
 /// Hard ceiling on folded entries. The daemon caps its record stream
-/// at 4096; times a path depth this is the memory the overlay can
-/// ever hold, and a pathological tree stops growing it rather than
-/// the browser growing without bound.
+/// (see `mux/fsjob.zig`); times a path depth this is the memory the
+/// overlay can ever hold, and a pathological tree stops growing it
+/// rather than the browser growing without bound.
 pub const MAX_ENTRIES: usize = 20000;
 
 /// Every changed path under one browsed directory, folded so that a
@@ -398,7 +480,10 @@ pub const Overlay = struct {
 
     pub fn clear(self: *Overlay) void {
         var it = self.map.iterator();
-        while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        while (it.next()) |kv| {
+            self.allocator.free(kv.key_ptr.*);
+            if (kv.value_ptr.orig.len > 0) self.allocator.free(kv.value_ptr.orig);
+        }
         self.map.clearRetainingCapacity();
         self.counts = @splat(0);
         self.truncated = false;
@@ -417,30 +502,82 @@ pub const Overlay = struct {
         return n;
     }
 
-    /// Fold one porcelain record. `path` is relative to the browsed
-    /// directory; a trailing slash (git's collapsed untracked/ignored
-    /// directory form) is tolerated.
+    /// One record as it arrives from the daemon, already relative to
+    /// the browsed directory.
+    ///
+    /// `x`/`y` are the porcelain-v2 columns; a pre-v2 daemon sends
+    /// neither and `legacy` (the single collapsed character) is then
+    /// the only information there is.
+    pub const Input = struct {
+        path: []const u8,
+        x: u8 = 0,
+        y: u8 = 0,
+        legacy: u8 = 0,
+        orig: []const u8 = "",
+        submodule: bool = false,
+    };
+
+    /// Fold one collapsed-character record (the pre-v2 wire shape).
     pub fn apply(self: *Overlay, path: []const u8, ch: u8) void {
-        const st = fromChar(ch);
-        if (st == .none) return;
-        const rel = std.mem.trim(u8, path, "/");
+        self.applyInput(.{ .path = path, .legacy = ch });
+    }
+
+    /// Fold one record. A trailing slash (git's collapsed untracked or
+    /// ignored directory form) is tolerated.
+    pub fn applyInput(self: *Overlay, in: Input) void {
+        var row = Row{ .exact = true, .submodule = in.submodule };
+        if (in.x != 0) {
+            row.x = in.x;
+            row.y = in.y;
+            if (in.x == '?' or in.x == '!') {
+                // Untracked and ignored records have no index side at
+                // all; their doubled column is git's own placeholder.
+                row.work = sideState(in.x);
+            } else if (isUnmergedPair(in.x, in.y)) {
+                // A `u` record's columns are one conflict PAIR, not
+                // two independent sides: `AA` is "both added", not a
+                // staged-plus-unstaged add.
+                row.index = .conflicted;
+                row.work = .conflicted;
+            } else {
+                row.index = sideState(in.x);
+                row.work = sideState(in.y);
+            }
+            row.state = merge(row.index, row.work);
+        } else {
+            row.state = fromChar(in.legacy);
+        }
+        if (row.state == .none) return;
+        const rel = std.mem.trim(u8, in.path, "/");
         if (rel.len == 0) return;
-        self.put(rel, st, true);
-        const up = propagates(st);
+        self.put(rel, row, in.orig);
+        const up = propagates(row.state);
         if (up == .none) return;
         // Every ancestor segment carries the rollup.
         var i: usize = 0;
         while (std.mem.indexOfScalarPos(u8, rel, i, '/')) |slash| {
-            self.put(rel[0..slash], up, false);
+            self.put(rel[0..slash], .{ .state = up }, "");
             i = slash + 1;
         }
     }
 
-    fn put(self: *Overlay, key: []const u8, st: State, exact: bool) void {
-        if (exact) self.counts[@intFromEnum(st)] +|= 1;
+    fn put(self: *Overlay, key: []const u8, new: Row, orig: []const u8) void {
+        if (new.exact) self.counts[@intFromEnum(new.state)] +|= 1;
         if (self.map.getPtr(key)) |row| {
-            row.state = merge(row.state, st);
-            if (exact) row.exact = true;
+            // Strongest wins, and its columns travel with it: a weaker
+            // record must not repaint a stronger one's chip.
+            if (new.state.rank() > row.state.rank()) {
+                const keep_exact = row.exact or new.exact;
+                const keep_orig = row.orig;
+                row.* = new;
+                row.exact = keep_exact;
+                row.orig = keep_orig;
+            } else if (new.exact) {
+                row.exact = true;
+                row.submodule = row.submodule or new.submodule;
+            }
+            if (orig.len > 0 and row.orig.len == 0)
+                row.orig = self.allocator.dupe(u8, orig) catch &.{};
             return;
         }
         if (self.map.count() >= MAX_ENTRIES) {
@@ -451,8 +588,11 @@ pub const Overlay = struct {
             self.truncated = true;
             return;
         };
-        self.map.put(self.allocator, owned, .{ .state = st, .exact = exact }) catch {
+        var stored = new;
+        if (orig.len > 0) stored.orig = self.allocator.dupe(u8, orig) catch &.{};
+        self.map.put(self.allocator, owned, stored) catch {
             self.allocator.free(owned);
+            if (stored.orig.len > 0) self.allocator.free(stored.orig);
             self.truncated = true;
         };
     }
@@ -464,17 +604,36 @@ pub const Overlay = struct {
     /// The chip for a row, given its path relative to the browsed dir.
     pub fn badge(self: *const Overlay, rel: []const u8) ?Badge {
         const row = self.map.get(rel) orelse return null;
-        return badgeFor(row.state, !row.exact);
+        return badgeForRow(row);
+    }
+
+    /// How many records carry a staged side, and how many an unstaged
+    /// one. Rollups are excluded; a row changed on both sides counts
+    /// in both.
+    pub fn stagedSplit(self: *const Overlay) struct { staged: u32, unstaged: u32 } {
+        var staged: u32 = 0;
+        var unstaged: u32 = 0;
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            const row = kv.value_ptr.*;
+            if (!row.exact or row.state == .ignored) continue;
+            if (row.index != .none) staged += 1;
+            if (row.work != .none) unstaged += 1;
+        }
+        return .{ .staged = staged, .unstaged = unstaged };
     }
 
     /// A short ", 3 modified, 1 untracked" phrase for the status line,
     /// or an empty slice when there is nothing to say.
-    ///
-    /// This is deliberately everything the daemon's `git_status` verb
-    /// gives us: it reports records, not a branch, so no branch name
-    /// is invented here.
     pub fn summary(self: *const Overlay, buf: []u8) []const u8 {
         var w = std.Io.Writer.fixed(buf);
+        if (!self.writeSummary(&w)) return buf[0..0];
+        if (self.truncated) w.writeAll(", partial") catch {};
+        return w.buffered();
+    }
+
+    /// @return whether anything was written.
+    fn writeSummary(self: *const Overlay, w: *std.Io.Writer) bool {
         var wrote = false;
         // Loudest first: a conflict is what the user must see.
         const order = [_]State{ .conflicted, .deleted, .renamed, .modified, .typechange, .added, .untracked };
@@ -484,11 +643,121 @@ pub const Overlay = struct {
             w.print(", {d} {s}", .{ n, label(st) }) catch break;
             wrote = true;
         }
-        if (!wrote) return buf[0..0];
-        if (self.truncated) w.writeAll(", partial") catch {};
-        return w.buffered();
+        return wrote;
     }
 };
+
+/// Repository-level answer for the browsed root.
+///
+/// `known` is the SKEW flag and the reason this type exists: a daemon
+/// too old to answer the repository question sends no repo event at
+/// all, and the browser must then keep its pre-branch behaviour rather
+/// than claim "not a repository". `known and !is_repo` is a real
+/// negative; `known and is_repo` with an empty overlay is a clean
+/// repository, which used to be indistinguishable from a non-repo.
+pub const Repo = struct {
+    allocator: std.mem.Allocator,
+    known: bool = false,
+    is_repo: bool = false,
+    detached: bool = false,
+    /// No commit yet: there is a branch name but nothing to be ahead
+    /// or behind of.
+    initial: bool = false,
+    /// The browsed directory IS the repository root, so an empty
+    /// overlay means the whole repository is clean.
+    at_root: bool = false,
+    /// The daemon hit its record cap; counts are a floor.
+    truncated: bool = false,
+    branch: []u8 = &.{},
+    upstream: []u8 = &.{},
+    /// Abbreviated commit, for a detached HEAD.
+    oid: []u8 = &.{},
+    ahead: i64 = 0,
+    behind: i64 = 0,
+    have_ab: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) Repo {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Repo) void {
+        self.clear();
+    }
+
+    pub fn clear(self: *Repo) void {
+        const a = self.allocator;
+        if (self.branch.len > 0) a.free(self.branch);
+        if (self.upstream.len > 0) a.free(self.upstream);
+        if (self.oid.len > 0) a.free(self.oid);
+        self.* = .{ .allocator = a };
+    }
+
+    /// Adopt one repo answer. Strings are copied; a failed copy leaves
+    /// the field empty rather than failing the whole answer.
+    pub fn set(self: *Repo, in: struct {
+        is_repo: bool,
+        detached: bool = false,
+        initial: bool = false,
+        at_root: bool = false,
+        truncated: bool = false,
+        branch: []const u8 = "",
+        upstream: []const u8 = "",
+        oid: []const u8 = "",
+        ahead: i64 = 0,
+        behind: i64 = 0,
+        have_ab: bool = false,
+    }) void {
+        const a = self.allocator;
+        self.clear();
+        self.known = true;
+        self.is_repo = in.is_repo;
+        self.detached = in.detached;
+        self.initial = in.initial;
+        self.at_root = in.at_root;
+        self.truncated = in.truncated;
+        self.ahead = in.ahead;
+        self.behind = in.behind;
+        self.have_ab = in.have_ab;
+        if (in.branch.len > 0) self.branch = a.dupe(u8, in.branch) catch &.{};
+        if (in.upstream.len > 0) self.upstream = a.dupe(u8, in.upstream) catch &.{};
+        if (in.oid.len > 0) self.oid = a.dupe(u8, in.oid) catch &.{};
+    }
+};
+
+/// The version-control phrase appended to the browser's status line.
+///
+/// Three cases, in the order they matter:
+/// - the daemon never answered the repository question (old build):
+///   the pre-branch phrase, empty when nothing changed;
+/// - a real "not a repository": nothing at all;
+/// - a repository: `, on main +2 -1, 3 modified` — and `, clean` (or
+///   `, no changes here` below the root) when there is nothing, which
+///   is what makes a clean repository visible at all.
+pub fn statusNote(repo: *const Repo, ov: *const Overlay, buf: []u8) []const u8 {
+    if (!repo.known) return ov.summary(buf);
+    if (!repo.is_repo) return buf[0..0];
+    var w = std.Io.Writer.fixed(buf);
+    if (repo.detached) {
+        if (repo.oid.len > 0)
+            w.print(", detached at {s}", .{repo.oid}) catch return w.buffered()
+        else
+            w.writeAll(", detached HEAD") catch return w.buffered();
+    } else if (repo.branch.len > 0) {
+        w.print(", on {s}", .{repo.branch}) catch return w.buffered();
+    } else {
+        w.writeAll(", git") catch return w.buffered();
+    }
+    if (repo.initial) {
+        w.writeAll(" (no commits yet)") catch {};
+    } else if (repo.have_ab and (repo.ahead != 0 or repo.behind != 0)) {
+        if (repo.ahead != 0) w.print(" +{d}", .{repo.ahead}) catch {};
+        if (repo.behind != 0) w.print(" -{d}", .{repo.behind}) catch {};
+    }
+    if (!ov.writeSummary(&w))
+        w.writeAll(if (repo.at_root) ", clean" else ", no changes here") catch {};
+    if (repo.truncated or ov.truncated) w.writeAll(", partial") catch {};
+    return w.buffered();
+}
 
 /// Remembers which (host, root) pairs were asked recently, so that
 /// walking back and forth between two folders does not respawn a
@@ -621,23 +890,84 @@ test "ignored never propagates to a parent directory" {
 test "badges: letters for exact records, a neutral star for rollups" {
     try std.testing.expectEqual(@as(?Badge, null), badgeFor(.none, false));
     const m = badgeFor(.modified, false).?;
-    try std.testing.expectEqual(@as(u8, 'M'), m.letter);
+    try std.testing.expectEqualStrings("M", m.text());
     try std.testing.expectEqualStrings("warning", m.css);
     try std.testing.expect(!m.dim_name);
 
     const roll = badgeFor(.modified, true).?;
-    try std.testing.expectEqual(@as(u8, '*'), roll.letter);
+    try std.testing.expectEqualStrings("*", roll.text());
+    try std.testing.expect(roll.rollup);
     try std.testing.expectEqualStrings("warning", roll.css);
 
     // Ignored is a faded name, never a chip, and never a rollup.
     const ig = badgeFor(.ignored, false).?;
     try std.testing.expect(ig.dim_name);
-    try std.testing.expectEqual(@as(u8, 0), ig.letter);
+    try std.testing.expectEqual(@as(u8, 0), ig.code_len);
     try std.testing.expectEqual(@as(?Badge, null), badgeFor(.ignored, true));
 
     try std.testing.expectEqualStrings("error", badgeFor(.conflicted, false).?.css);
     try std.testing.expectEqualStrings("success", badgeFor(.untracked, false).?.css);
     try std.testing.expectEqualStrings("accent", badgeFor(.renamed, false).?.css);
+}
+
+test "badges print both porcelain columns when the daemon reported them" {
+    var ov = Overlay.init(std.testing.allocator);
+    defer ov.deinit();
+    ov.applyInput(.{ .path = "staged.txt", .x = 'M', .y = '.' });
+    ov.applyInput(.{ .path = "dirty.txt", .x = '.', .y = 'M' });
+    ov.applyInput(.{ .path = "both.txt", .x = 'M', .y = 'M' });
+    ov.applyInput(.{ .path = "new.txt", .x = '?', .y = '?' });
+    ov.applyInput(.{ .path = "clash.txt", .x = 'A', .y = 'A' });
+    ov.applyInput(.{ .path = "moved.txt", .x = 'R', .y = '.', .orig = "old.txt" });
+
+    const staged = ov.badge("staged.txt").?;
+    try std.testing.expectEqualStrings("M.", staged.text());
+    try std.testing.expect(staged.staged and !staged.unstaged);
+
+    const dirty = ov.badge("dirty.txt").?;
+    try std.testing.expectEqualStrings(".M", dirty.text());
+    try std.testing.expect(!dirty.staged and dirty.unstaged);
+
+    const both = ov.badge("both.txt").?;
+    try std.testing.expectEqualStrings("MM", both.text());
+    try std.testing.expect(both.staged and both.unstaged);
+
+    try std.testing.expectEqualStrings("??", ov.badge("new.txt").?.text());
+    // AA is a conflict pair, not a double add.
+    try std.testing.expectEqualStrings("AA", ov.badge("clash.txt").?.text());
+    try std.testing.expectEqual(State.conflicted, ov.get("clash.txt").?.state);
+    try std.testing.expectEqualStrings("error", ov.badge("clash.txt").?.css);
+
+    const moved = ov.get("moved.txt").?;
+    try std.testing.expectEqual(State.renamed, moved.state);
+    try std.testing.expectEqualStrings("old.txt", moved.orig);
+    try std.testing.expectEqualStrings("R.", ov.badge("moved.txt").?.text());
+
+    const split = ov.stagedSplit();
+    try std.testing.expectEqual(@as(u32, 4), split.staged);
+    try std.testing.expectEqual(@as(u32, 4), split.unstaged);
+}
+
+test "row descriptions name the side, the rename source and the submodule" {
+    var buf: [160]u8 = undefined;
+    var ov = Overlay.init(std.testing.allocator);
+    defer ov.deinit();
+    ov.applyInput(.{ .path = "a/b.txt", .x = 'M', .y = 'M' });
+    ov.applyInput(.{ .path = "moved.txt", .x = 'R', .y = 'M', .orig = "old.txt" });
+    ov.applyInput(.{ .path = "conf.txt", .x = 'U', .y = 'D' });
+    ov.applyInput(.{ .path = "vendor/lib", .x = '.', .y = 'M', .submodule = true });
+    ov.applyInput(.{ .path = "build/x.o", .x = '!', .y = '!' });
+
+    try std.testing.expectEqualStrings("staged modified, unstaged modified", ov.get("a/b.txt").?.describe(&buf));
+    try std.testing.expectEqualStrings("contains changes", ov.get("a").?.describe(&buf));
+    try std.testing.expectEqualStrings("staged renamed, unstaged modified (from old.txt)", ov.get("moved.txt").?.describe(&buf));
+    try std.testing.expectEqualStrings("conflicted (UD)", ov.get("conf.txt").?.describe(&buf));
+    try std.testing.expectEqualStrings("unstaged modified [submodule]", ov.get("vendor/lib").?.describe(&buf));
+    try std.testing.expectEqualStrings("ignored by git", ov.get("build/x.o").?.describe(&buf));
+    // A legacy collapsed record has no sides to name.
+    ov.apply("legacy.txt", 'M');
+    try std.testing.expectEqualStrings("modified", ov.get("legacy.txt").?.describe(&buf));
+    try std.testing.expectEqualStrings("M", ov.badge("legacy.txt").?.text());
 }
 
 test "overlay folds records into ancestor rollups" {
@@ -658,9 +988,9 @@ test "overlay folds records into ancestor rollups" {
     try std.testing.expectEqual(State.modified, top.state);
     try std.testing.expect(!top.exact);
 
-    try std.testing.expectEqual(@as(u8, '*'), ov.badge("src").?.letter);
-    try std.testing.expectEqual(@as(u8, 'M'), ov.badge("src/ui/main.zig").?.letter);
-    try std.testing.expectEqual(@as(u8, '?'), ov.badge("README.md").?.letter);
+    try std.testing.expectEqualStrings("*", ov.badge("src").?.text());
+    try std.testing.expectEqualStrings("M", ov.badge("src/ui/main.zig").?.text());
+    try std.testing.expectEqualStrings("?", ov.badge("README.md").?.text());
     try std.testing.expectEqual(@as(?Badge, null), ov.badge("nothing"));
 }
 
@@ -928,6 +1258,80 @@ test "unmerged pairs are exactly git's seven" {
         try std.testing.expect(isUnmergedPair(p[0], p[1]));
     for ([_][2]u8{ .{ 'M', 'M' }, .{ 'A', 'D' }, .{ 'A', '.' }, .{ 'R', 'M' }, .{ '?', '?' } }) |p|
         try std.testing.expect(!isUnmergedPair(p[0], p[1]));
+}
+
+test "status note distinguishes an old daemon, a non-repo and a clean repo" {
+    var buf: [200]u8 = undefined;
+    var ov = Overlay.init(std.testing.allocator);
+    defer ov.deinit();
+    var repo = Repo.init(std.testing.allocator);
+    defer repo.deinit();
+
+    // Old daemon: no repo answer at all, so the pre-branch phrase.
+    try std.testing.expectEqualStrings("", statusNote(&repo, &ov, &buf));
+    ov.applyInput(.{ .path = "a.txt", .x = '.', .y = 'M' });
+    try std.testing.expectEqualStrings(", 1 modified", statusNote(&repo, &ov, &buf));
+
+    // A real "not a repository" says nothing at all.
+    repo.set(.{ .is_repo = false });
+    try std.testing.expectEqualStrings("", statusNote(&repo, &ov, &buf));
+
+    repo.set(.{ .is_repo = true, .at_root = true, .branch = "main" });
+    try std.testing.expectEqualStrings(", on main, 1 modified", statusNote(&repo, &ov, &buf));
+
+    // A clean repository is now visible, which it never used to be.
+    ov.clear();
+    try std.testing.expectEqualStrings(", on main, clean", statusNote(&repo, &ov, &buf));
+    repo.set(.{ .is_repo = true, .at_root = false, .branch = "main" });
+    try std.testing.expectEqualStrings(", on main, no changes here", statusNote(&repo, &ov, &buf));
+
+    repo.set(.{ .is_repo = true, .at_root = true, .branch = "main", .upstream = "origin/main", .ahead = 2, .behind = 3, .have_ab = true });
+    try std.testing.expectEqualStrings(", on main +2 -3, clean", statusNote(&repo, &ov, &buf));
+
+    repo.set(.{ .is_repo = true, .at_root = true, .detached = true, .oid = "abc1234" });
+    try std.testing.expectEqualStrings(", detached at abc1234, clean", statusNote(&repo, &ov, &buf));
+
+    repo.set(.{ .is_repo = true, .at_root = true, .initial = true, .branch = "main" });
+    try std.testing.expectEqualStrings(", on main (no commits yet), clean", statusNote(&repo, &ov, &buf));
+
+    repo.set(.{ .is_repo = true, .at_root = true, .branch = "main", .truncated = true });
+    try std.testing.expectEqualStrings(", on main, clean, partial", statusNote(&repo, &ov, &buf));
+}
+
+test "a scanned tree folds into the overlay the browser renders" {
+    var ov = Overlay.init(std.testing.allocator);
+    defer ov.deinit();
+    var s = Scanner.init(z(.{
+        "# branch.oid " ++ OID,
+        "# branch.head main",
+        "2 R. N... 100644 100644 100644 " ++ H1 ++ " " ++ H1 ++ " R100 src/new.zig",
+        "src/old.zig",
+        "1 MM N... 100644 100644 100644 " ++ H1 ++ " " ++ H1 ++ " src/edit.zig",
+        "! zig-out/",
+        "? notes.md",
+    }));
+    while (s.next()) |rec| {
+        ov.applyInput(.{
+            .path = rec.path,
+            .x = rec.x,
+            .y = rec.y,
+            .legacy = rec.legacyChar(),
+            .orig = rec.orig,
+            .submodule = rec.submodule,
+        });
+    }
+    try std.testing.expectEqualStrings("R.", ov.badge("src/new.zig").?.text());
+    try std.testing.expectEqualStrings("src/old.zig", ov.get("src/new.zig").?.orig);
+    try std.testing.expectEqualStrings("MM", ov.badge("src/edit.zig").?.text());
+    // The rename outranks the modification on the parent rollup.
+    try std.testing.expectEqual(State.renamed, ov.get("src").?.state);
+    try std.testing.expectEqualStrings("*", ov.badge("src").?.text());
+    // The ignored build tree fades its own row and marks nothing else.
+    try std.testing.expect(ov.badge("zig-out").?.dim_name);
+    try std.testing.expectEqualStrings("??", ov.badge("notes.md").?.text());
+
+    var buf: [200]u8 = undefined;
+    try std.testing.expectEqualStrings(", 1 renamed, 1 modified, 1 untracked", ov.summary(&buf));
 }
 
 test "relativeKey resolves rows in the root and in expanded subdirs" {

@@ -167,10 +167,11 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch ""
     else
         std.fmt.bufPrint(&count_buf, "{d} items{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch "";
-    // Repository awareness, unobtrusively: the browsed root's change
-    // summary rides the count phrase. The daemon's `git_status` verb
-    // reports records only, so there is no branch name to show.
-    var git_buf: [200]u8 = undefined;
+    // Repository awareness, unobtrusively: the browsed root's branch,
+    // its ahead/behind and its change summary ride the count phrase.
+    // A clean repository says so; a directory outside one says
+    // nothing at all.
+    var git_buf: [240]u8 = undefined;
     const gnote = self.gitSummaryNote(tab, &git_buf);
     var status_buf: [960]u8 = undefined;
     const cmsg: []const u8 = if (tab.nav_error) |refused|
@@ -912,7 +913,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
     // may now wrap it.
     const icon_img = icon;
     if (git_badge) |b| {
-        if (b.letter != 0) {
+        if (b.code_len != 0) {
             const ov = c.gtk_overlay_new();
             // Shrink-wrap the icon: a FILL overlay would stretch to the
             // tile width and park the chip against the tile's edge,
@@ -921,7 +922,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
             c.gtk_widget_set_valign(ov, c.GTK_ALIGN_CENTER);
             c.gtk_overlay_set_child(@ptrCast(ov), icon);
             var gz: [8:0]u8 = undefined;
-            const chip = c.gtk_label_new(std.fmt.bufPrintZ(&gz, "{c}", .{b.letter}) catch "");
+            const chip = c.gtk_label_new(std.fmt.bufPrintZ(&gz, "{s}", .{b.text()}) catch "");
             c.gtk_widget_add_css_class(chip, b.css.ptr);
             c.gtk_widget_add_css_class(chip, "sketerm-fb-gitchip");
             c.gtk_widget_set_halign(chip, c.GTK_ALIGN_END);
