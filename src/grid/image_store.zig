@@ -44,6 +44,9 @@ pub const Image = struct {
     /// cell_w x cells_high * cell_h pixels.
     cells_wide: u32 = 0,
     cells_high: u32 = 0,
+    /// Pixel offset inside the top-left cell (kitty `X=`/`Y=`).
+    cell_x_offset: u32 = 0,
+    cell_y_offset: u32 = 0,
     /// Source-rect crop (image-pixel coords). When src_w/src_h are
     /// 0, the whole image is rendered.
     src_x: u32 = 0,
@@ -178,6 +181,9 @@ pub const Store = struct {
         src_y: u32 = 0,
         src_w: u32 = 0,
         src_h: u32 = 0,
+        /// Pixel offset inside the top-left cell (kitty `X=`/`Y=`).
+        cell_x_offset: u32 = 0,
+        cell_y_offset: u32 = 0,
         /// Stable line id of the placement's top row (0 = pin to `row`).
         anchor_id: u64 = 0,
     };
@@ -219,6 +225,8 @@ pub const Store = struct {
             .src_y = o.src_y,
             .src_w = o.src_w,
             .src_h = o.src_h,
+            .cell_x_offset = o.cell_x_offset,
+            .cell_y_offset = o.cell_y_offset,
         });
     }
 
@@ -235,6 +243,32 @@ pub const Store = struct {
 
     /// Mark all images for deletion. Real teardown happens in
     /// flushUploads when the GL context is current.
+    /// Mark every placement a kitty `a=d` request selects. Positional
+    /// selectors use the placement's live cell rectangle, so an image
+    /// that has scrolled is judged where it is NOW — which is what the
+    /// application sees.
+    pub fn markSelectedForDelete(
+        self: *Store,
+        ev: @import("screen.zig").Screen.ImageDeleteEvent,
+        numberOf: *const fn (ctx: ?*anyopaque, image_id: u32) u32,
+        ctx: ?*anyopaque,
+    ) void {
+        for (self.images.items) |*img| {
+            const cols: i32 = if (img.cells_wide > 0) @intCast(img.cells_wide) else 1;
+            const rows: i32 = if (img.cells_high > 0) @intCast(img.cells_high) else 1;
+            if (ev.selects(
+                img.image_id,
+                img.placement_id,
+                numberOf(ctx, img.image_id),
+                img.z_index,
+                @intCast(img.cell_col),
+                img.draw_row,
+                cols,
+                rows,
+            )) img.deleting = true;
+        }
+    }
+
     pub fn markAllForDelete(self: *Store) void {
         for (self.images.items) |*img| img.deleting = true;
     }

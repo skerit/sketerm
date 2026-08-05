@@ -157,3 +157,132 @@ test "graphics: ImageStore.markByPlacementForDelete + flush teardown" {
     }
     try std.testing.expectEqual(@as(usize, 2), deleting_count);
 }
+
+// ── Control keys the protocol defines that we used to drop ────────
+
+test "graphics: the whole documented key set parses" {
+    const cmd = try kitty.parse("Ga=T,I=7,S=1024,O=16,X=3,Y=4,P=9,Q=2,H=-1,V=5,N=1;AA");
+    try std.testing.expectEqual(@as(u32, 7), cmd.image_number);
+    try std.testing.expectEqual(@as(u32, 1024), cmd.data_size);
+    try std.testing.expectEqual(@as(u32, 16), cmd.data_offset);
+    try std.testing.expectEqual(@as(u32, 3), cmd.cell_x_offset);
+    try std.testing.expectEqual(@as(u32, 4), cmd.cell_y_offset);
+    try std.testing.expectEqual(@as(u32, 9), cmd.parent_image_id);
+    try std.testing.expectEqual(@as(u32, 2), cmd.parent_placement_id);
+    try std.testing.expectEqual(@as(i32, -1), cmd.parent_dx);
+    try std.testing.expectEqual(@as(i32, 5), cmd.parent_dy);
+    try std.testing.expectEqual(@as(u8, 1), cmd.transient);
+}
+
+// ── Delete selectors ──────────────────────────────────────────────
+
+const ScreenM = @import("../grid/screen.zig").Screen;
+const DelEv = ScreenM.ImageDeleteEvent;
+
+/// One placement to judge selectors against: image 5 / placement 9 /
+/// number 3 / z 2, occupying cells (10,4)..(13,6).
+fn selectsSample(ev: DelEv) bool {
+    return ev.selects(5, 9, 3, 2, 10, 4, 4, 3);
+}
+
+test "graphics: id, number and range selectors" {
+    try std.testing.expect(selectsSample(.{ .what = 'i', .image_id = 5 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'i', .image_id = 6 }));
+    // With a placement id, only that placement.
+    try std.testing.expect(selectsSample(.{ .what = 'i', .image_id = 5, .placement_id = 9 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'i', .image_id = 5, .placement_id = 8 }));
+    // By image NUMBER, which is not the id.
+    try std.testing.expect(selectsSample(.{ .what = 'n', .image_number = 3 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'n', .image_number = 5 }));
+    // Inclusive id range.
+    try std.testing.expect(selectsSample(.{ .what = 'r', .id_lo = 4, .id_hi = 6 }));
+    try std.testing.expect(selectsSample(.{ .what = 'r', .id_lo = 5, .id_hi = 5 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'r', .id_lo = 6, .id_hi = 9 }));
+}
+
+test "graphics: positional selectors use the placement's cell extent" {
+    // A cell inside the placement, and one outside it.
+    try std.testing.expect(selectsSample(.{ .what = 'p', .x = 11, .y = 5 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'p', .x = 14, .y = 5 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'p', .x = 11, .y = 7 }));
+    // Same cell, plus a z-index that has to match.
+    try std.testing.expect(selectsSample(.{ .what = 'q', .x = 11, .y = 5, .z = 2 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'q', .x = 11, .y = 5, .z = 3 }));
+    // Whole column, whole row.
+    try std.testing.expect(selectsSample(.{ .what = 'x', .x = 12 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'x', .x = 20 }));
+    try std.testing.expect(selectsSample(.{ .what = 'y', .y = 6 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'y', .y = 3 }));
+    // By z-index alone.
+    try std.testing.expect(selectsSample(.{ .what = 'z', .z = 2 }));
+    try std.testing.expect(!selectsSample(.{ .what = 'z', .z = 0 }));
+}
+
+test "graphics: case selects the same placements either way" {
+    // Upper case only means "free the source data too"; both cases
+    // must pick out the same placements, or a `d=I` would leave the
+    // image on screen with its pixels gone.
+    for ([_][2]u8{ .{ 'i', 'I' }, .{ 'n', 'N' }, .{ 'p', 'P' }, .{ 'x', 'X' }, .{ 'y', 'Y' }, .{ 'z', 'Z' }, .{ 'r', 'R' } }) |pair| {
+        const lo = DelEv{ .what = pair[0], .image_id = 5, .image_number = 3, .x = 11, .y = 5, .z = 2, .id_lo = 4, .id_hi = 6 };
+        var hi = lo;
+        hi.what = pair[1];
+        try std.testing.expectEqual(selectsSample(lo), selectsSample(hi));
+    }
+}
+
+test "graphics: a delete request carries its coordinates off the wire" {
+    const Pool = @import("../grid/style_pool.zig").Pool;
+    const allocator = std.testing.allocator;
+    var pool = try Pool.init(allocator);
+    defer pool.deinit();
+    var screen = try ScreenM.init(allocator, &pool, 20, 5);
+    defer screen.deinit();
+
+    const Capture = struct {
+        var got: ?DelEv = null;
+        fn sink(_: ?*anyopaque, ev: DelEv) void {
+            got = ev;
+        }
+    };
+    Capture.got = null;
+    screen.sink = .{ .ctx = null, .on_image_delete_full = Capture.sink };
+
+    // `d=p` selects by cell, and the protocol's coordinates are
+    // 1-based while everything inside is 0-based.
+    screen.onApc("Ga=d,d=p,x=4,y=2");
+    try std.testing.expect(Capture.got != null);
+    try std.testing.expectEqual(@as(u32, 3), Capture.got.?.x);
+    try std.testing.expectEqual(@as(u32, 1), Capture.got.?.y);
+
+    // `d=c` means "wherever the cursor is" — no coordinates given.
+    screen.row = 2;
+    screen.col = 7;
+    Capture.got = null;
+    screen.onApc("Ga=d,d=c");
+    try std.testing.expectEqual(@as(u32, 7), Capture.got.?.x);
+    try std.testing.expectEqual(@as(u32, 2), Capture.got.?.y);
+}
+
+test "graphics: sub-cell offsets reach the placement" {
+    const Pool = @import("../grid/style_pool.zig").Pool;
+    const allocator = std.testing.allocator;
+    var pool = try Pool.init(allocator);
+    defer pool.deinit();
+    var screen = try ScreenM.init(allocator, &pool, 20, 5);
+    defer screen.deinit();
+
+    const Capture = struct {
+        var got: ?ScreenM.ImageEvent = null;
+        fn sink(_: ?*anyopaque, ev: ScreenM.ImageEvent) void {
+            got = ev;
+        }
+    };
+    Capture.got = null;
+    screen.sink = .{ .ctx = null, .on_image = Capture.sink };
+
+    // 2x2 RGBA, placed with a 3,5 pixel offset inside its cell.
+    screen.onApc("Ga=T,f=32,s=2,v=2,i=1,X=3,Y=5;AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    try std.testing.expect(Capture.got != null);
+    try std.testing.expectEqual(@as(u32, 3), Capture.got.?.cell_x_offset);
+    try std.testing.expectEqual(@as(u32, 5), Capture.got.?.cell_y_offset);
+}

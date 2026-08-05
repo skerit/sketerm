@@ -619,15 +619,71 @@ pub const Screen = struct {
         return out[0..n];
     }
 
+    /// One `a=d` request, with everything the protocol's selectors
+    /// can key on. `what` is the `d=` letter; its case decides only
+    /// whether the source data is freed as well, so both cases select
+    /// the same placements.
+    ///
+    /// The selectors are: a/A all, i/I by image id, n/N by image
+    /// number, c/C intersecting the cursor, p/P intersecting a cell,
+    /// q/Q that cell at one z, x/X a column, y/Y a row, z/Z a
+    /// z-index, r/R an id range, f/F animation frames.
     pub const ImageDeleteEvent = struct {
         /// 0 = delete-all-images. Otherwise the specific image.
         image_id: u32 = 0,
         /// 0 = any placement of the image. Otherwise specific.
         placement_id: u32 = 0,
-        /// 'a'=all, 'i'=intersect cursor, 'p'=specific placement,
-        /// 'r'=z-range. Lowercase = leave data on disk; uppercase
-        /// = also free data. We don't distinguish on free behaviour.
         what: u8 = 'a',
+        /// Image number for n/N.
+        image_number: u32 = 0,
+        /// Cell coordinates for c/C, p/P, q/Q, x/X, y/Y — already
+        /// resolved to 0-based screen coordinates (the protocol's are
+        /// 1-based, and c/C uses the cursor's).
+        x: u32 = 0,
+        y: u32 = 0,
+        /// z-index for q/Q and z/Z.
+        z: i32 = 0,
+        /// Inclusive image-id range for r/R.
+        id_lo: u32 = 0,
+        id_hi: u32 = 0,
+
+        /// Does this request select a placement of `image_id` at the
+        /// given cell rectangle? The rectangle is in screen cells;
+        /// callers that do not track one pass a zero-size rect and get
+        /// the id-based selectors only.
+        pub fn selects(
+            self: ImageDeleteEvent,
+            img_id: u32,
+            place_id: u32,
+            img_number: u32,
+            z_index: i32,
+            col: i32,
+            row: i32,
+            cols: i32,
+            rows: i32,
+        ) bool {
+            const covers_cell = struct {
+                fn f(cx: i64, cy: i64, c0: i32, r0: i32, cw: i32, rh: i32) bool {
+                    if (cw <= 0 or rh <= 0) return false;
+                    return cx >= c0 and cx < @as(i64, c0) + cw and
+                        cy >= r0 and cy < @as(i64, r0) + rh;
+                }
+            }.f;
+            const matches_placement = self.placement_id == 0 or place_id == self.placement_id;
+            return switch (self.what) {
+                'a', 'A' => true,
+                'i', 'I' => img_id == self.image_id and matches_placement,
+                'n', 'N' => img_number != 0 and img_number == self.image_number and matches_placement,
+                'c', 'C', 'p', 'P' => covers_cell(self.x, self.y, col, row, cols, rows),
+                'q', 'Q' => z_index == self.z and covers_cell(self.x, self.y, col, row, cols, rows),
+                'x', 'X' => cols > 0 and @as(i64, self.x) >= col and @as(i64, self.x) < @as(i64, col) + cols,
+                'y', 'Y' => rows > 0 and @as(i64, self.y) >= row and @as(i64, self.y) < @as(i64, row) + rows,
+                'z', 'Z' => z_index == self.z,
+                'r', 'R' => img_id >= self.id_lo and img_id <= self.id_hi,
+                // f/F deletes animation frames, not placements.
+                else => false,
+            };
+        }
     };
 
     pub const ImageEvent = struct {
@@ -654,6 +710,11 @@ pub const Screen = struct {
         src_y: u32 = 0,
         src_w: u32 = 0,
         src_h: u32 = 0,
+        /// Pixel offset inside the starting cell (Kitty `X=`, `Y=`),
+        /// so an image can sit off the cell grid. Clamped to the cell
+        /// by the sender; the renderer just adds them.
+        cell_x_offset: u32 = 0,
+        cell_y_offset: u32 = 0,
         /// Stable line id of the placement's top row. The renderer
         /// resolves this to a live display row every frame so the image
         /// scrolls with its content (and into scrollback). 0 = no
@@ -708,13 +769,25 @@ pub const Screen = struct {
         var i: usize = 0;
         while (i < self.retained_images.items.len) {
             const ri = self.retained_images.items[i].ev;
-            const hit = switch (ev.what) {
-                'a', 'A' => ev.image_id == 0 or ri.image_id == ev.image_id,
-                'p', 'P' => ri.image_id == ev.image_id and
-                    (ev.placement_id == 0 or ri.placement_id == ev.placement_id),
-                'i', 'I' => ri.image_id == ev.image_id,
-                else => false,
-            };
+            // Retained images know where they were placed, so every
+            // positional selector can be answered here. Cell extent is
+            // whatever the placement asked for; a native-size image
+            // (cells 0) still occupies its top-left cell.
+            const cols: i32 = if (ri.cells_wide > 0) @intCast(ri.cells_wide) else 1;
+            const rows: i32 = if (ri.cells_high > 0) @intCast(ri.cells_high) else 1;
+            const hit = if (ev.what == 'a' or ev.what == 'A')
+                (ev.image_id == 0 or ri.image_id == ev.image_id)
+            else
+                ev.selects(
+                    ri.image_id,
+                    ri.placement_id,
+                    self.kitty_images.numberOf(ri.image_id),
+                    ri.z_index,
+                    @intCast(ri.col),
+                    @intCast(ri.row),
+                    cols,
+                    rows,
+                );
             if (hit) {
                 const old = self.retained_images.orderedRemove(i);
                 self.retained_image_bytes -= old.owned.len;
@@ -2531,6 +2604,18 @@ pub const Screen = struct {
             const decoded = iterm.decodePayload(self.allocator, rest) catch return;
             defer self.allocator.free(decoded.rgba);
             if (decoded.format != .png or decoded.rgba.len == 0) return;
+            // `inline=0` (the protocol's default) means "transfer this
+            // file, don't show it". We have no download side, so those
+            // are dropped rather than drawn where the app expects
+            // nothing.
+            if (!decoded.inline_display) return;
+            // The requested box is in cells, pixels, percent or auto;
+            // resolve it against this pane's real metrics. Zero cell
+            // pixels means Pane.onResize hasn't reported yet — use the
+            // CSI 14t fallback, same as ReportCellSize.
+            const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+            const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+            const cells = iterm.resolveCells(decoded, cw, ch, self.cols, self.rows);
             self.emitImage(.{
                 .width = decoded.width,
                 .height = decoded.height,
@@ -2539,6 +2624,8 @@ pub const Screen = struct {
                 .col = self.col,
                 .placement_id = 0,
                 .z_index = 0,
+                .cells_wide = cells[0],
+                .cells_high = cells[1],
             });
             return;
         }
@@ -2893,21 +2980,48 @@ pub const Screen = struct {
         // around — so dropping it here was the cause of the
         // "images don't render in real apps" report.
         if (cmd.action == .delete) {
-            switch (cmd.delete_what) {
-                // Uppercase: free source image data too.
-                'A' => self.kitty_images.dropAll(),
-                'I' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
-                'P' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
-                // Lowercase: leave source data alone — placements only.
-                else => {},
-            }
             const del_ev = ImageDeleteEvent{
                 .image_id = cmd.image_id,
                 .placement_id = cmd.placement_id,
                 .what = cmd.delete_what,
+                .image_number = cmd.image_number,
+                // The protocol's cell coordinates are 1-based, and
+                // `c/C` means "wherever the cursor is" instead.
+                .x = switch (cmd.delete_what) {
+                    'c', 'C' => self.col,
+                    else => if (cmd.src_x > 0) cmd.src_x - 1 else 0,
+                },
+                .y = switch (cmd.delete_what) {
+                    'c', 'C' => self.row,
+                    else => if (cmd.src_y > 0) cmd.src_y - 1 else 0,
+                },
+                .z = cmd.z,
+                // r/R reuses x and y as an inclusive id range.
+                .id_lo = cmd.src_x,
+                .id_hi = if (cmd.src_y == 0) std.math.maxInt(u32) else cmd.src_y,
             };
+            // Placements first, source data second: the `n/N`
+            // selector resolves an image's NUMBER through
+            // `kitty_images`, so dropping the source first would make
+            // every retained placement look like number 0 and survive.
             self.pruneRetainedImages(del_ev);
             if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, del_ev);
+            // Uppercase also frees the source data. Which images that
+            // covers depends on the selector: only the ones whose
+            // placements this request could possibly name.
+            if (cmd.delete_what >= 'A' and cmd.delete_what <= 'Z') {
+                switch (cmd.delete_what) {
+                    'A' => self.kitty_images.dropAll(),
+                    'I', 'P', 'Q' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
+                    'N' => if (cmd.image_number != 0) self.kitty_images.dropByNumber(cmd.image_number),
+                    'R' => self.kitty_images.dropRange(del_ev.id_lo, del_ev.id_hi),
+                    // C/X/Y/Z select by position, which the image
+                    // store does not track — the placements go, the
+                    // source data stays. Freeing everything instead
+                    // would be worse than keeping too much.
+                    else => {},
+                }
+            }
             self.dirty = true;
             return;
         }
@@ -2950,6 +3064,8 @@ pub const Screen = struct {
             .src_y = outcome.src_y,
             .src_w = outcome.src_w,
             .src_h = outcome.src_h,
+            .cell_x_offset = cmd.cell_x_offset,
+            .cell_y_offset = cmd.cell_y_offset,
         });
         self.dirty = true;
     }

@@ -386,6 +386,93 @@ test "iterm2 OSC 1337 PNG fires sink" {
     try std.testing.expectEqual(@as(u32, 1), h.capture.height);
 }
 
+/// A 4x2 truecolour PNG — a 2:1 aspect, so a sizing request that keeps
+/// the aspect is visible in the resulting cell counts.
+const png_4x2 = [_]u8{
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0xF0, 0xCA, 0xEA, 0x34, 0x00, 0x00, 0x00,
+    0x18, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60, 0xB0, 0xA9, 0xD8,
+    0xF2, 0x41, 0x27, 0x63, 0xC9, 0x03, 0x99, 0x88, 0x29, 0x0C, 0xC8, 0x1C,
+    0x00, 0x89, 0x42, 0x0A, 0xF1, 0x52, 0x5E, 0x60, 0x67, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+};
+
+/// Feed `png_4x2` through OSC 1337 with the given `File=` attributes on
+/// an 80x24 grid of 8x16 pixel cells (a 640x384 window).
+fn feedIterm(h: *Harness, attrs: []const u8) !void {
+    h.screen.cell_pixel_w = 8;
+    h.screen.cell_pixel_h = 16;
+    h.capture.fired = false;
+    var b64_buf: [256]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &png_4x2);
+    var seq_buf: [512]u8 = undefined;
+    const seq = try std.fmt.bufPrint(&seq_buf, "\x1b]1337;File={s}:{s}\x1b\\", .{ attrs, b64 });
+    h.feed(seq);
+}
+
+test "iterm2 sizing: every unit form reaches the placement as cells" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // Bare number = cells. 4 cells = 32px wide, so 16px = 1 cell high.
+    try feedIterm(&h, "inline=1;width=4");
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 4), h.capture.width); // intrinsic
+    try std.testing.expectEqual(@as(u32, 4), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 1), h.capture.cells_high);
+
+    // Pixels: 64px = 8 cells, 32px = 2 cells.
+    try feedIterm(&h, "inline=1;width=64px");
+    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+
+    // Percent of the window: 50% of 640px = 320px = 40 cells.
+    try feedIterm(&h, "inline=1;width=50%");
+    try std.testing.expectEqual(@as(u32, 40), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 10), h.capture.cells_high);
+
+    // Explicit auto on both axes is native size — no scaling at all.
+    try feedIterm(&h, "inline=1;width=auto;height=auto");
+    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_high);
+}
+
+test "iterm2 sizing: preserveAspectRatio decides fit vs stretch" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // Box 8x8 cells = 64x128px. The 2:1 image fits as 64x32px = 8x2.
+    try feedIterm(&h, "inline=1;width=8;height=8");
+    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+
+    // Same box, aspect waived: it fills the box exactly.
+    try feedIterm(&h, "inline=1;width=8;height=8;preserveAspectRatio=0");
+    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_high);
+}
+
+test "iterm2 sizing: no size attributes still means native pixels" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+    try feedIterm(&h, "inline=1;name=dC5wbmc=");
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_high);
+}
+
+test "iterm2: inline=0 is a file transfer, not a placement" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+    // The protocol's default is inline=0, so an omitted key must be
+    // dropped just the same as an explicit one.
+    try feedIterm(&h, "inline=0;width=4");
+    try std.testing.expect(!h.capture.fired);
+    try feedIterm(&h, "name=dC5wbmc=;size=81");
+    try std.testing.expect(!h.capture.fired);
+}
+
 // Append a codepoint's UTF-8 to an ArrayList — placeholder + diacritic
 // helper for the Unicode-placeholder tests.
 fn appendCp(list: *std.ArrayList(u8), a: std.mem.Allocator, cp: u21) !void {
