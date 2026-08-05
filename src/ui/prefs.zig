@@ -1294,6 +1294,7 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const view_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(view_group)), "View");
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Soft wrap by default", "New editor tabs start wrapped. Alt+Z toggles it per tab.", &ctx.cfg.editor_soft_wrap, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Wrap at word boundaries", "Soft wrap breaks between words (UAX #14). Off wraps at any character.", &ctx.cfg.editor_wrap_words, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Line numbers", "Show the line-number gutter.", &ctx.cfg.editor_line_numbers, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Crash recovery", "Snapshot unsaved editor buffers while you type, and offer them back after a crash. Off writes nothing.", &ctx.cfg.editor_crash_recovery, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Highlight current line", "A subtle band behind the caret's row. Hidden while a selection or several carets are active.", &ctx.cfg.editor_highlight_current_line, applyOnly);
