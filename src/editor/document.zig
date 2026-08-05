@@ -233,6 +233,16 @@ pub const Document = struct {
         self.saved_revision = self.revision;
     }
 
+    /// Declare the content different from disk without an edit having
+    /// produced it — a buffer restored from the crash journal, whose
+    /// bytes ARE unsaved work but whose undo history was not recovered.
+    /// The revision moves so every revision-keyed cache re-derives.
+    pub fn markUnsaved(self: *Document) void {
+        self.saved_revision = self.revision;
+        self.revision += 1;
+        self.typing = null;
+    }
+
     /// Caller-owned bytes in the document's on-disk line-ending style.
     pub fn materialize(self: *const Document, alloc: Allocator) ![]u8 {
         const n = self.rope.len();
@@ -746,6 +756,19 @@ test "document markSaved clears dirty" {
     defer doc.deinit();
     try testing.expect(!doc.isDirty());
     try typeChar(&doc, 1, "y");
+    try testing.expect(doc.isDirty());
+    doc.markSaved();
+    try testing.expect(!doc.isDirty());
+}
+
+test "document markUnsaved makes a freshly built buffer dirty" {
+    var doc = try Document.initFromBytes(testing.allocator, "recovered text");
+    defer doc.deinit();
+    try testing.expect(!doc.isDirty());
+    doc.markUnsaved();
+    try testing.expect(doc.isDirty());
+    // Still editable, and a save afterwards clears it again.
+    try typeChar(&doc, doc.revision, "!");
     try testing.expect(doc.isDirty());
     doc.markSaved();
     try testing.expect(!doc.isDirty());

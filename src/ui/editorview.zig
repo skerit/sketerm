@@ -99,6 +99,7 @@ const RowIndex = viewport_mod.RowIndex;
 const search = @import("../editor/search.zig");
 const Document = @import("../editor/document.zig").Document;
 const reload = @import("../editor/reload.zig");
+const journal = @import("../editor/journal.zig");
 const sel_mod = @import("../editor/selection.zig");
 const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
@@ -137,6 +138,27 @@ const PARSE_DEBOUNCE_MS: c_uint = 40;
 /// Bytes of the first line inspected for a shebang when the filename
 /// carries no usable extension.
 const SHEBANG_PROBE: usize = 256;
+
+// ---- crash recovery ---------------------------------------------------
+//
+// See editor/journal.zig for the record format and the flock-based
+// crash predicate. The five steps of its UI contract land here:
+// `armJournal`/`journalTick` (open + debounced write), `onIoDone`
+// (clear after save), `ETab.destroy` (discard on close), `offerRecovery`
+// (the startup offer) and the `prune` inside it.
+
+/// Debounce between snapshots of a dirty buffer. Long enough that
+/// typing never pays for it, short enough that a crash costs a second.
+const JOURNAL_DEBOUNCE_MS: c_uint = 1500;
+/// Records nobody claimed in a week are dropped (contract step 5).
+const JOURNAL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Seed for the "is the buffer identical to what was saved" hash. See
+/// `journalTick` for why a revision comparison is not enough.
+const SAVED_HASH_SEED: u64 = 0x5a7ed;
+
+/// The recovery offer is per PROCESS, not per face: several editor
+/// faces must not each open the same records.
+var recovery_offered: bool = false;
 
 /// Refcounted liveness fence shared by IO worker threads, GLib idle
 /// deliveries, clipboard reads and dialog callbacks. The mutex only
@@ -572,8 +594,28 @@ pub const ETab = struct {
     /// had to open the file first.
     want_pos: ?lsp_pos.Position = null,
 
+    /// Crash-recovery slot: opened on the first edit that dirties this
+    /// buffer and held (lock included) for the tab's lifetime, so no
+    /// other process offers OUR record while we are alive.
+    journal: ?journal.Handle = null,
+    /// Hash of the buffer as of the last load/save. `Document.isDirty`
+    /// compares REVISIONS, so undoing back to the saved state still
+    /// reads dirty; this is what keeps a record for a buffer identical
+    /// to disk from being offered as recovered work.
+    saved_hash: u64 = 0,
+    saved_hash_valid: bool = false,
+    /// Journaling gave up on this buffer (over `journal.MAX_CONTENT`).
+    /// Reported once; never retried.
+    journal_off: bool = false,
+
     fn destroy(self: *ETab) void {
         const a = self.view.allocator;
+        // Closing a tab (or a clean quit, which destroys every tab) is
+        // exactly the "no crash happened" case: drop the record.
+        if (self.journal) |*h| {
+            h.discard();
+            self.journal = null;
+        }
         // Normally `Manager.detachTab` has already run (closeTabForce);
         // this is the last-resort free for a tab destroyed on an error
         // path before it was ever listed.
@@ -736,6 +778,21 @@ pub const EditorView = struct {
     banner_reload: *c.GtkWidget = undefined,
     banner_save: *c.GtkWidget = undefined,
 
+    // Crash-recovery offer: the SAME inline vocabulary as the
+    // external-change banner, deliberately not a modal — it appears
+    // while the user is starting to work, may list several buffers, and
+    // declining it must cost one click and lose nothing.
+    recover_box: *c.GtkWidget = undefined,
+    recover_label: *c.GtkLabel = undefined,
+    /// Recoverable records this face is offering. Owned; entries are
+    /// consumed by Recover and Discard, and merely dropped (records
+    /// left ON DISK) by Dismiss.
+    recovery: []journal.Entry = &.{},
+    /// Debounced journal writer while any tab is dirty; 0 = disarmed.
+    journal_timer: c_uint = 0,
+    /// `editor_crash_recovery`, re-read by syncConfig.
+    crash_recovery: bool = true,
+
     /// Monotonic ms of the last disk probe (rate limit) and how many
     /// probe jobs are in flight (never stack them).
     last_probe_ms: i64 = 0,
@@ -847,6 +904,7 @@ pub const EditorView = struct {
         self.syncConfig();
         self.startBlink();
         if (spec) |s| self.openSpec(s, null) else _ = self.newTab(null);
+        self.offerRecovery();
         return self;
     }
 
@@ -868,6 +926,7 @@ pub const EditorView = struct {
         self.bracket_match = cfg.editor_bracket_match;
         self.folding = cfg.editor_folding;
         self.fold_indent_fallback = cfg.editor_fold_indent_fallback;
+        self.crash_recovery = cfg.editor_crash_recovery;
         self.theme = theme_mod.byName(cfg.editor_theme);
         self.applyThemeColors();
 
@@ -1550,6 +1609,7 @@ pub const EditorView = struct {
         if (self.toolbar_box) |bar| c.gtk_widget_set_visible(bar, 0);
         self.syncConfig();
         self.startBlink();
+        self.offerRecovery();
         return self;
     }
 
@@ -1604,6 +1664,7 @@ pub const EditorView = struct {
         self.widgets_dead = true;
         self.stopBlink();
         self.stopScrollbarSync();
+        self.stopJournalTimer();
         self.detachIm();
         // LSP popovers are parented to the GLArea with
         // gtk_widget_set_parent and MUST be unparented before it
@@ -1622,6 +1683,7 @@ pub const EditorView = struct {
         self.widgets_dead = true;
         self.stopBlink();
         self.stopScrollbarSync();
+        self.stopJournalTimer();
         self.detachIm();
     }
 
@@ -1643,6 +1705,8 @@ pub const EditorView = struct {
         self.fence.close();
         self.stopBlink();
         self.stopScrollbarSync();
+        self.stopJournalTimer();
+        self.dropRecovery();
         self.clearPreedit();
         self.detachIm();
         // Before the tabs: the manager owns each tab's TabState and
@@ -1749,6 +1813,10 @@ pub const EditorView = struct {
         // the canvas (a real child, not an overlay: it must not cover
         // the find bar, and it must not steal a click from the text).
         self.buildBanner();
+        self.buildRecoverBanner();
+        // Above the change banner: it is about work that predates this
+        // session, so it reads first.
+        c.gtk_box_append(@ptrCast(vbox), self.recover_box);
         c.gtk_box_append(@ptrCast(vbox), self.banner_box);
 
         const grid = c.gtk_grid_new();
@@ -1949,6 +2017,51 @@ pub const EditorView = struct {
         c.gtk_box_append(@ptrCast(row), dismiss);
 
         self.banner_box = row.?;
+    }
+
+    /// The crash-recovery offer. Same shape as the external-change
+    /// banner (inline, dismissible, never modal) because it is the same
+    /// kind of news: something happened to your files while you were
+    /// not looking, and only you can decide what to do about it.
+    fn buildRecoverBanner(self: *EditorView) void {
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_add_css_class(row, "toolbar");
+        c.gtk_widget_add_css_class(row, "accent");
+        c.gtk_widget_set_margin_start(row, 6);
+        c.gtk_widget_set_margin_end(row, 6);
+        c.gtk_widget_set_margin_top(row, 2);
+        c.gtk_widget_set_margin_bottom(row, 2);
+        c.gtk_widget_set_visible(row, 0);
+
+        const icon = c.gtk_image_new_from_icon_name("document-revert-symbolic");
+        c.gtk_box_append(@ptrCast(row), icon);
+
+        const label = c.gtk_label_new("");
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_label_set_wrap(@ptrCast(label), 1);
+        c.gtk_widget_set_hexpand(label, 1);
+        c.gtk_box_append(@ptrCast(row), label);
+        self.recover_label = @ptrCast(@alignCast(label));
+
+        const recover_btn = c.gtk_button_new_with_label("Recover");
+        c.gtk_widget_add_css_class(recover_btn, "suggested-action");
+        c.gtk_widget_set_tooltip_text(recover_btn, "Open each unsaved buffer in a tab, still unsaved");
+        _ = c.g_signal_connect_data(recover_btn, "clicked", @ptrCast(&onRecoverClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), recover_btn);
+
+        const discard_btn = c.gtk_button_new_with_label("Discard");
+        c.gtk_widget_add_css_class(discard_btn, "destructive-action");
+        c.gtk_widget_set_tooltip_text(discard_btn, "Delete these snapshots for good");
+        _ = c.g_signal_connect_data(discard_btn, "clicked", @ptrCast(&onRecoverDiscardClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), discard_btn);
+
+        const later = c.gtk_button_new_from_icon_name("window-close-symbolic");
+        c.gtk_button_set_has_frame(@ptrCast(later), 0);
+        c.gtk_widget_set_tooltip_text(later, "Not now — the snapshots are kept");
+        _ = c.g_signal_connect_data(later, "clicked", @ptrCast(&onRecoverLaterClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(row), later);
+
+        self.recover_box = row.?;
     }
 
     fn toggleButton(self: *EditorView, box: ?*c.GtkWidget, label: [*:0]const u8, tooltip: [*:0]const u8) *c.GtkWidget {
@@ -3188,6 +3301,9 @@ pub const EditorView = struct {
             m.onEdited(tab);
             m.onCaretMoved();
         }
+        // Crash recovery: the first edit that dirties a buffer opens its
+        // journal slot on the next tick (editor/journal.zig).
+        self.armJournal();
         self.refresh(tab);
     }
 
@@ -3487,6 +3603,7 @@ pub const EditorView = struct {
                     tab.want_pos = null;
                     self.applyWantPos(tab, p);
                 }
+                self.noteSavedHash(tab);
                 const was_reload = job.keep_position and tab.keep_active;
                 tab.keep_active = false;
                 self.refresh(tab);
@@ -3518,6 +3635,11 @@ pub const EditorView = struct {
                 tab.seen = job.disk;
                 self.clearAlert(tab);
                 if (tab.doc.revision == job.revision) tab.doc.markSaved();
+                // Contract step 3: the record goes, the lock stays.
+                if (!tab.isDirty()) {
+                    if (tab.journal) |*h| h.clear();
+                }
+                self.noteSavedHash(tab);
                 if (self.lsp) |m| m.onSaved(tab);
                 if (tab.close_after_save) {
                     tab.close_after_save = false;
@@ -3829,6 +3951,304 @@ pub const EditorView = struct {
             r.view.clearAlert(r.tab);
             r.view.reloadKeepingPosition(r.tab);
         }
+    }
+
+    // ---- crash recovery -------------------------------------------------
+    //
+    // Journal writes are DEBOUNCED off one timer for the whole face
+    // rather than one per tab: the tick is a cheap walk over the tabs,
+    // and a single source is a single thing to disarm at teardown
+    // (`stopJournalTimer`, called from every path that kills the
+    // widgets, exactly like the blink timer).
+
+    /// Arm the debounce after any edit. No-op when it is already
+    /// running or the feature is off.
+    fn armJournal(self: *EditorView) void {
+        if (!self.crash_recovery or self.journal_timer != 0) return;
+        self.journal_timer = c.g_timeout_add(JOURNAL_DEBOUNCE_MS, @ptrCast(&onJournalTimer), @ptrCast(self));
+    }
+
+    fn stopJournalTimer(self: *EditorView) void {
+        if (self.journal_timer != 0) {
+            _ = c.g_source_remove(self.journal_timer);
+            self.journal_timer = 0;
+        }
+    }
+
+    fn onJournalTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(EditorView, user);
+        var any = false;
+        for (self.tabs.items) |t| {
+            if (self.journalTick(t)) any = true;
+        }
+        if (!any) {
+            self.journal_timer = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    /// One tab's snapshot decision. True while the tab still wants the
+    /// timer running.
+    fn journalTick(self: *EditorView, tab: *ETab) bool {
+        if (!self.crash_recovery) {
+            if (tab.journal) |*h| {
+                h.discard();
+                tab.journal = null;
+            }
+            return false;
+        }
+        if (!tab.isDirty()) {
+            // Clean: drop the snapshot but KEEP the lock, so the slot is
+            // still ours when the buffer goes dirty again.
+            if (tab.journal) |*h| h.clear();
+            return false;
+        }
+        // Given up on (too large): nothing more to do for this tab, so
+        // it must not keep the timer spinning either.
+        if (tab.journal_off) return false;
+        if (tab.loading) return true;
+        if (tab.journal == null) {
+            tab.journal = journal.open(self.allocator, tab.spec orelse "") catch {
+                tab.journal_off = true;
+                return false;
+            };
+        }
+        const h = &tab.journal.?;
+        if (!h.shouldWrite(tab.doc.revision)) return true;
+
+        const text = tab.doc.textAlloc(self.allocator) catch return true;
+        defer self.allocator.free(text);
+        // `isDirty` is a revision comparison, so undoing back to the
+        // saved state still reads dirty. Keeping a record for a buffer
+        // that is byte-identical to disk would offer the user their own
+        // unchanged file as "unsaved work" after a crash, so compare
+        // the CONTENT here — the bytes are in hand anyway, which is why
+        // this is cheaper than teaching Document a second dirty rule.
+        if (tab.saved_hash_valid and std.hash.Wyhash.hash(SAVED_HASH_SEED, text) == tab.saved_hash) {
+            h.clear();
+            return true;
+        }
+        var hdr = journal.Header{
+            .spec = tab.spec orelse "",
+            .remote = if (tab.spec) |s| paths.parseSpec(s).host != null else false,
+            .crlf = tab.doc.line_ending == .crlf,
+            .revision = tab.doc.revision,
+            .saved_revision = tab.doc.saved_revision,
+            .cursor = @intCast(tab.sels.primary().head),
+        };
+        hdr.setBaseline(tab.disk);
+        h.write(hdr, text) catch |e| {
+            if (e == journal.Error.BufferTooLarge) {
+                tab.journal_off = true;
+                self.setStatus("Buffer too large for crash recovery — save often.");
+            }
+            return true;
+        };
+        return true;
+    }
+
+    /// Record the content hash of the buffer as it now sits on disk.
+    fn noteSavedHash(self: *EditorView, tab: *ETab) void {
+        const text = tab.doc.textAlloc(self.allocator) catch {
+            tab.saved_hash_valid = false;
+            return;
+        };
+        defer self.allocator.free(text);
+        tab.saved_hash = std.hash.Wyhash.hash(SAVED_HASH_SEED, text);
+        tab.saved_hash_valid = true;
+    }
+
+    /// Prune stale records and offer whatever a previous run left
+    /// behind. Runs ONCE per process, from the first editor face.
+    fn offerRecovery(self: *EditorView) void {
+        if (recovery_offered or !self.crash_recovery) return;
+        recovery_offered = true;
+        _ = journal.prune(self.allocator, JOURNAL_MAX_AGE_MS) catch {};
+        const entries = journal.list(self.allocator) catch return;
+        if (entries.len == 0) {
+            journal.freeEntries(self.allocator, entries);
+            return;
+        }
+        self.recovery = entries;
+        self.updateRecoverBanner();
+    }
+
+    fn dropRecovery(self: *EditorView) void {
+        if (self.recovery.len == 0) return;
+        journal.freeEntries(self.allocator, self.recovery);
+        self.recovery = &.{};
+    }
+
+    fn updateRecoverBanner(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        if (self.recovery.len == 0) {
+            c.gtk_widget_set_visible(self.recover_box, 0);
+            return;
+        }
+        var names: [180]u8 = undefined;
+        var n: usize = 0;
+        for (self.recovery, 0..) |e, i| {
+            const name = recoveryName(e.header.spec);
+            const sep: []const u8 = if (i == 0) "" else ", ";
+            if (n + sep.len + name.len + 4 > names.len) {
+                const more = std.fmt.bufPrint(names[n..], ", ...", .{}) catch break;
+                n += more.len;
+                break;
+            }
+            @memcpy(names[n .. n + sep.len], sep);
+            n += sep.len;
+            @memcpy(names[n .. n + name.len], name);
+            n += name.len;
+        }
+        var buf: [320:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(
+            &buf,
+            "{d} unsaved buffer(s) from a previous session ({s}), last changed {s}: {s}",
+            .{
+                self.recovery.len,
+                if (self.recovery.len == 1) "one editor" else "earlier editors",
+                agoText(self.recovery[0].header.updated_ms),
+                names[0..n],
+            },
+        ) catch "Unsaved buffers from a previous session are recoverable.";
+        c.gtk_label_set_text(self.recover_label, text.ptr);
+        c.gtk_widget_set_visible(self.recover_box, 1);
+    }
+
+    fn recoveryName(spec: []const u8) []const u8 {
+        if (spec.len == 0) return "Untitled";
+        const loc = paths.parseSpec(spec);
+        const base = std.fs.path.basename(loc.path);
+        return if (base.len == 0) spec else base;
+    }
+
+    /// "4 minutes ago" for the banner. Wall clock, because that is what
+    /// the record carries and what the user recognises.
+    fn agoText(updated_ms: i64) []const u8 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts);
+        const now: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+        const delta = @max(0, now - updated_ms);
+        const mins = @divTrunc(delta, 60_000);
+        if (mins < 1) return "moments ago";
+        if (mins < 60) return "in the last hour";
+        const hours = @divTrunc(mins, 60);
+        if (hours < 24) return "earlier today";
+        return "over a day ago";
+    }
+
+    fn onRecoverClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        const entries = self.recovery;
+        self.recovery = &.{};
+        defer journal.freeEntries(self.allocator, entries);
+        var opened: usize = 0;
+        for (entries) |e| {
+            if (self.recoverOne(e)) opened += 1;
+            // Consumed either way: a record we could not read is
+            // corrupt, and one we opened now lives in a tab with its
+            // own (fresh) slot.
+            journal.remove(self.allocator, e.key) catch {};
+        }
+        self.updateRecoverBanner();
+        var buf: [80:0]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "Recovered {d} unsaved buffer(s).", .{opened}) catch "Recovered.";
+        self.setStatus(msg.ptr);
+        // Show whether each file moved on since the crash, rather than
+        // writing anything back: the ordinary probe compares the
+        // recovered baseline and raises the ordinary banner.
+        self.last_probe_ms = 0;
+        self.checkDisk();
+    }
+
+    /// Build one tab from a record: the snapshot's bytes, its caret,
+    /// its line-ending style, still DIRTY, and the disk identity it was
+    /// taken against as the buffer's baseline.
+    fn recoverOne(self: *EditorView, entry: journal.Entry) bool {
+        var rec = journal.read(self.allocator, entry.key) catch return false;
+        defer rec.deinit(self.allocator);
+
+        const tab = self.newTab(null) orelse return false;
+        if (rec.header.spec.len > 0) {
+            if (self.allocator.dupe(u8, rec.header.spec)) |s| {
+                if (tab.spec) |old| self.allocator.free(old);
+                tab.spec = s;
+            } else |_| {}
+        }
+        var new_doc = Document.initFromBytes(self.allocator, rec.content) catch return false;
+        // The snapshot is LF-normalized in-memory text, so the style
+        // comes from the header, not from sniffing the content.
+        new_doc.line_ending = if (rec.header.crlf) .crlf else .lf;
+        tab.doc.deinit();
+        tab.doc = new_doc;
+        tab.doc.markUnsaved();
+        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
+        self.ensureHighlighter(tab);
+        if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
+        tab.layout.invalidateAll();
+        tab.rows_lines = 0;
+        tab.anchor = .{};
+        self.applyWrapWidth(tab);
+        tab.disk = rec.header.baseline();
+        tab.seen = tab.disk;
+        // The recovered bytes are NOT what is on disk, so the saved
+        // hash must stay unknown or journalTick would drop the record.
+        tab.saved_hash_valid = false;
+        const caret = @min(@as(usize, @intCast(rec.header.cursor)), tab.doc.rope.len());
+        tab.sels.keepPrimaryOnly();
+        tab.sels.sels.items[0] = Selection.caret(caret);
+        self.refresh(tab);
+        self.ensureCaretVisible(tab);
+        // Immediately re-journal: a recovered buffer that is never
+        // touched must survive a SECOND crash.
+        _ = self.journalTick(tab);
+        self.armJournal();
+        return true;
+    }
+
+    fn onRecoverLaterClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        // Only the offer goes away. The records stay on disk and are
+        // offered again next launch — declining must never destroy work.
+        self.dropRecovery();
+        self.updateRecoverBanner();
+    }
+
+    fn onRecoverDiscardClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        if (self.recovery.len == 0) return;
+        var body: [160:0]u8 = undefined;
+        const b = std.fmt.bufPrintZ(
+            &body,
+            "{d} unsaved buffer(s) from a previous session will be deleted. This cannot be undone.",
+            .{self.recovery.len},
+        ) catch "These unsaved buffers will be deleted.";
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Discard recovered work?", b.ptr)));
+        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+        c.adw_alert_dialog_add_response(dialog, "discard", "Discard");
+        c.adw_alert_dialog_set_response_appearance(dialog, "discard", c.ADW_RESPONSE_DESTRUCTIVE);
+        c.adw_alert_dialog_set_default_response(dialog, "cancel");
+        c.adw_alert_dialog_set_close_response(dialog, "cancel");
+        const ctx = std.heap.c_allocator.create(DlgCtx) catch return;
+        self.fence.ref();
+        ctx.* = .{ .fence = self.fence, .tab_id = 0 };
+        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onRecoverDiscardResponse, @ptrCast(ctx));
+    }
+
+    fn onRecoverDiscardResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
+        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
+        // tab_id 0 never resolves to a tab, so this one uses the fence
+        // directly: the records are the view's, not a tab's.
+        const view = ctx.fence.viewIfAlive() orelse return;
+        if (!std.mem.eql(u8, resp, "discard")) return;
+        for (view.recovery) |e| journal.remove(view.allocator, e.key) catch {};
+        view.dropRecovery();
+        view.updateRecoverBanner();
+        view.setStatus("Discarded the recovered snapshots.");
     }
 
     // ---- Save As / Open pickers ---------------------------------------
