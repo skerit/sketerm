@@ -17,6 +17,7 @@ const remotectl_mod = @import("remotectl.zig");
 const modes_mod = @import("modes.zig");
 const winlayout_mod = @import("winlayout.zig");
 const winconfig_mod = @import("winconfig.zig");
+const quake = @import("quake.zig");
 const termsinks_mod = @import("termsinks.zig");
 const tabchrome_mod = @import("tabchrome.zig");
 const Config = @import("../config.zig").Config;
@@ -782,6 +783,11 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Quake geometry replaces the 1000x700 default size. Primary
+        // only: `--toggle` drives the primary window, and a secondary
+        // is an ordinary window.
+        if (is_primary) self.applyQuakeGeometry();
+
         return self;
     }
 
@@ -980,6 +986,10 @@ pub const Window = struct {
     /// Wayland caveat: focus-stealing prevention may delay the raise.
     pub fn toggleQuake(self: *Window) void {
         const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
+        // Re-resolve the geometry on every reveal: with
+        // `quake_monitor = active` the target follows the pointer's
+        // monitor, and monitors come and go.
+        self.applyQuakeGeometry();
         // gtk_window_is_active reflects "this window has focus AND is
         // visible". Minimized windows return false; so do unfocused
         // ones. Combine with mapped-state to disambiguate.
@@ -991,6 +1001,84 @@ pub const Window = struct {
             c.gtk_window_unminimize(window);
             c.gtk_window_present(window);
         }
+    }
+
+    /// Size the window per the `quake_*` config against its target
+    /// monitor. No-op unless `quake_enabled`.
+    ///
+    /// What actually reaches the compositor: the SIZE (always) and
+    /// the MONITOR (only when the requested coverage is the whole
+    /// screen, since `gtk_window_fullscreen_on_monitor` is the sole
+    /// GTK4 call that names one). The EDGE cannot be applied at all —
+    /// GTK4 has no toplevel-positioning API on any backend and
+    /// Wayland forbids self-placement — so a partial-size quake
+    /// window lands wherever the compositor puts it. See
+    /// `ui/quake.zig`.
+    pub fn applyQuakeGeometry(self: *Window) void {
+        if (!self.config.quake_enabled) return;
+        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
+        const wp = self.config.quake_width_percent;
+        const hp = self.config.quake_height_percent;
+        const monitor = self.quakeMonitor();
+
+        if (quake.coversMonitor(wp, hp)) {
+            if (monitor) |m| {
+                c.gtk_window_fullscreen_on_monitor(window, m);
+                return;
+            }
+            c.gtk_window_fullscreen(window);
+            return;
+        }
+        c.gtk_window_unfullscreen(window);
+
+        var geo: c.GdkRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        if (monitor) |m| c.gdk_monitor_get_geometry(m, &geo);
+        if (geo.width <= 0 or geo.height <= 0) return;
+        const want = quake.geometry(
+            .{ .x = geo.x, .y = geo.y, .w = geo.width, .h = geo.height },
+            wp,
+            hp,
+            self.config.quake_edge,
+        );
+        c.gtk_window_set_default_size(window, want.w, want.h);
+    }
+
+    /// The `GdkMonitor` `quake_monitor` names, or null when the
+    /// display has none. Ownership: `g_list_model_get_item` returns a
+    /// ref we drop immediately — the display owns its monitors and
+    /// outlives any use here.
+    fn quakeMonitor(self: *Window) ?*c.GdkMonitor {
+        const display = c.gtk_widget_get_display(self.app_window) orelse return null;
+        const spec = quake.parseMonitor(self.config.quake_monitor);
+        if (spec == .active) {
+            if (c.gtk_native_get_surface(@ptrCast(@alignCast(self.app_window)))) |surface| {
+                if (c.gdk_display_get_monitor_at_surface(display, surface)) |m| return m;
+            }
+        }
+        const monitors = c.gdk_display_get_monitors(display) orelse return null;
+        const n = c.g_list_model_get_n_items(@ptrCast(@alignCast(monitors)));
+        if (n == 0) return null;
+        const wanted: u32 = switch (spec) {
+            .index => |i| i,
+            .connector => |name| blk: {
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const item = c.g_list_model_get_item(@ptrCast(@alignCast(monitors)), i) orelse continue;
+                    defer c.g_object_unref(item);
+                    const conn = c.gdk_monitor_get_connector(@ptrCast(@alignCast(item)));
+                    if (conn != null and std.mem.eql(u8, std.mem.span(conn), name)) break :blk i;
+                }
+                break :blk 0;
+            },
+            // `active` only lands here when the window has no surface
+            // yet (first show), where the first monitor is the best
+            // guess available.
+            .active, .primary => 0,
+        };
+        const idx = if (wanted < n) wanted else 0;
+        const item = c.g_list_model_get_item(@ptrCast(@alignCast(monitors)), idx) orelse return null;
+        c.g_object_unref(item);
+        return @ptrCast(@alignCast(item));
     }
 
     /// Spawn a new shell pane and add it as a tab.

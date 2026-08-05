@@ -464,6 +464,8 @@ pub fn main() u8 {
         say("copy mode selected a word with vi motions and yanked it to the clipboard");
         if (hintsStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("hint labels typed on the real seat, with the copy override");
+        if (scrollbarStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("overlay scrollbar dragged and paged on the real seat, mouse mode included");
 
         // 3c. The pane's context menu, driven by a real right-click and
         // by the keyboard. Contents and per-row sensitivity are
@@ -1778,6 +1780,139 @@ fn hintsStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]c
     app.pressKey(null, "ctrl+u") catch return "clearing the pasted line failed";
     _ = app.waitIdle(300, 5_000);
     return null;
+}
+
+/// The overlay scrollbar, driven by real pointer input. The geometry
+/// is unit-tested in `render/scrollbar.zig`; what only a live run can
+/// prove is the wiring — that a press on the track reaches the
+/// scrollbar BEFORE selection and before the app's mouse reporting,
+/// and that dragging it actually moves the view.
+///
+/// The mouse-mode half is the point of the stage: with DECSET 1000
+/// on, a pane that forwarded the press would both fail to scroll and
+/// leave an `^[[<` report in the grid (`cat -v` renders it), so one
+/// assertion catches either mistake.
+fn scrollbarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    if (app.windows.items.len == 0) return "the display session has no window to drive";
+    const win = app.windows.items[0];
+    const win_w: f64 = @floatFromInt(win.w);
+    const win_h: f64 = @floatFromInt(win.h);
+    if (win_w <= 0 or win_h <= 0) return "the GUI's window has no size";
+    // Enough scrollback that one screenful is a small part of it.
+    app.typeText(null, "clear; seq 1 400 | sed 's/.*/SBLINE&END/'\n") catch
+        return "injecting the scrollback filler failed";
+    if (!waitPaneText(allocator, sock_path, 1, "SBLINE400END", 25_000))
+        return "the scrollback filler never ran";
+    _ = app.waitIdle(300, 5_000);
+
+    // The track hugs the PANE's right edge, which is NOT the
+    // toplevel's: a client-side-decorated window carries a shadow
+    // margin whose width the compositor negotiates. Measure it off a
+    // real frame — the last fully opaque column is the pane's edge —
+    // rather than hard-coding a margin that would rot.
+    var track_x: f64 = 0;
+    var bottom_y: f64 = 0;
+    {
+        const shot = app.snapshotRgba(win.id, null) catch return "snapshotting the window failed";
+        defer allocator.free(shot.px);
+        if (shot.w < 16 or shot.h < 16) return "the window frame is too small to locate the scrollbar";
+        const mid_row = shot.h / 2;
+        var right: u32 = shot.w;
+        while (right > 0) : (right -= 1) {
+            if (shot.px[(mid_row * shot.w + right - 1) * 4 + 3] == 255) break;
+        }
+        if (right < 8) return "no opaque content found on the window's right edge";
+        // 3 px in: inside the 4 px track, clear of both the 2 px
+        // focus border and the toplevel's own resize edge.
+        const col = right - 3;
+        var bottom: u32 = shot.h;
+        while (bottom > 0) : (bottom -= 1) {
+            if (shot.px[((bottom - 1) * shot.w + col) * 4 + 3] == 255) break;
+        }
+        if (bottom < 16) return "no opaque content found on the window's bottom edge";
+        track_x = @floatFromInt(col);
+        bottom_y = @floatFromInt(bottom - 10);
+        _ = c.fprintf(
+            platform.stderr(),
+            "smoke-e2e: scrollbar track at x=%.0f, pane bottom at y=%.0f (surface %ux%u)\n",
+            track_x,
+            bottom_y,
+            shot.w,
+            shot.h,
+        );
+    }
+
+    // 1. Grab the thumb (parked at the bottom) and drag it upward.
+    //    The drag ENDS inside the window: a compositor that does not
+    //    implement the implicit pointer grab stops delivering motion
+    //    the moment the pointer leaves the surface.
+    app.drag(win.id, track_x, bottom_y, track_x, win_h * 0.25, 1) catch
+        return "dragging the scrollbar thumb failed";
+    if (!waitPaneTextAbsent(allocator, sock_path, 1, "SBLINE400END", 10_000))
+        return "dragging the scrollbar thumb did not scroll the view back";
+
+    // 2. A click in the trough BELOW the thumb pages toward the
+    //    click, the way every scrollbar does.
+    const before = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse
+        return "reading the pane text before the trough click failed";
+    defer allocator.free(before);
+    app.click(win.id, track_x, bottom_y, 1) catch return "clicking the scrollbar trough failed";
+    var waited: u32 = 0;
+    const paged = while (waited < 10_000) : (waited += 200) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n")) |now| {
+            defer allocator.free(now);
+            if (!std.mem.eql(u8, now, before)) break true;
+        }
+        _ = c.usleep(200_000);
+    } else false;
+    if (!paged) return "a click in the scrollbar trough did not page the view";
+
+    // 3. Same drag with the running app holding the mouse. `cat -v`
+    //    makes any leaked report visible as text.
+    app.typeText(null, "printf '\\033[?1000h'; echo MOUSEON; timeout 30 cat -v; printf '\\033[?1000l'; echo MOUSEOFF\n") catch
+        return "injecting the mouse-mode command failed";
+    if (!waitMarkerCount(allocator, sock_path, "MOUSEON", 2, 15_000))
+        return "the shell never enabled mouse reporting";
+    _ = app.waitIdle(300, 5_000);
+    app.drag(win.id, track_x, bottom_y, track_x, win_h * 0.25, 1) catch
+        return "dragging the scrollbar under mouse mode failed";
+    if (!waitPaneTextAbsent(allocator, sock_path, 1, "MOUSEON", 10_000))
+        return "the scrollbar stopped working once the app took the mouse";
+    // Ctrl+D ends `cat` — and, being a keystroke, snaps the view back
+    // to the live bottom so the tail markers are on screen again.
+    app.pressKey(null, "ctrl+d") catch return "ending the mouse-mode command failed";
+    if (!waitMarkerCount(allocator, sock_path, "MOUSEOFF", 2, 20_000))
+        return "the pane never returned to a plain shell";
+    // The whole session's text, so a report emitted while scrolled
+    // back is still caught.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1,\"scrollback\":1}\n")) |all| {
+        defer allocator.free(all);
+        if (std.mem.indexOf(u8, all, "^[[<") != null)
+            return "the scrollbar press was forwarded to the app as a mouse report";
+    }
+    app.typeText(null, "clear\n") catch return "clearing after the scrollbar stage failed";
+    return null;
+}
+
+/// Poll a pane's text until `needle` is NOT in it.
+fn waitPaneTextAbsent(
+    allocator: std.mem.Allocator,
+    sock: [:0]const u8,
+    pane: u32,
+    needle: []const u8,
+    ms: u32,
+) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        var buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return false;
+        if (roundtrip(allocator, sock, req)) |resp| {
+            defer allocator.free(resp);
+            if (std.mem.indexOf(u8, resp, needle) == null) return true;
+        }
+        _ = c.usleep(200_000);
+    }
+    return false;
 }
 
 /// Poll a pane's text until `needle` appears at least `want` times.
