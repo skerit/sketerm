@@ -13498,3 +13498,111 @@ ratio removed, and a junk P3. `zig build replay` now prints an
 `image WxH at (row,col) ... px0=(r,g,b,a)` line per image event, since
 images leave no cells behind and the grid dump alone could not show
 any of this.
+
+## Light and dark as colour variants, and prefs rows that edit what renders
+
+`auto_theme` followed the system, but it did it by substituting a fixed
+pair of colours, so "which profile is this pane" and "is the desktop in
+dark mode" were not independent axes. `ProfileSettings` now carries a
+`light` and a `dark` `ColorSet` (six optional fields), settable at top
+level and inside `[profile.<name>]` as `light.<key>` / `dark.<key>`, and
+`forScheme` overlays the variant - user's, else the built-in pair - over
+the flat base.
+
+`forScheme` returns a COPY rather than swapping in place, which was a
+deliberate reversal of the original brief. Two reasons, both load
+bearing: the serialiser emits the flat colour keys, so an in-place swap
+would let the next persist write the dark colours out as the user's
+`default_bg`, and one theme flip would silently rewrite the config; and
+prefs binds rows at those same flat fields, so it would edit whichever
+half happened to be showing.
+
+That second reason was already a live bug, and the variants only made it
+visible: with `auto_theme` on - the default - every colour row in
+Preferences edited a base that the variant then covered, so the swatches
+looked inert. The Colors page now shows Light and Dark groups whenever
+`auto_theme` is on, each row reading the effective value and writing into
+`light.*` / `dark.*`, and the toggle rebuilds the section in place. The
+resolve-and-write rule lives in `ProfileSettings` with every reader
+defined through `forScheme`, so "the row shows what renders" is true by
+construction rather than by two copies of the logic agreeing.
+
+Found on the way: `onThemeChanged` pushed the Default profile's fg/bg to
+every pane regardless of that pane's own profile, and never touched
+palette or cursor at all. Per-profile colours were already half-broken on
+every system theme change. One `pushPaneColors`, per pane, now.
+
+## The daemons the e2e rig never forked
+
+`smoke-e2e` was flaky in a way that cascaded: a failed run left around
+twenty processes alive under its isolated runtime dir, and the next run
+inherited them as "socket never appeared" or an unrelated stage failing.
+Green runs were getting hard to trust.
+
+The teardown was correct for the processes the rig forked. That was the
+wrong set. When the private daemon dies mid-run the GUI's reconnect path
+autostarts a REPLACEMENT, double-forked and detached, so it is neither a
+child (PDEATHSIG cannot reach it, and is cleared across `fork` anyway)
+nor the tracked `daemon_pid`. Every pane opened after that became a
+session worker of a daemon nobody owned, each dragging in Xwayland, dbus
+and the at-spi stack. The run then deleted its own tree while that daemon
+was still bound inside it, so a directory-based sweep would have found
+nothing - which is why both sweeps key on each process's own environ
+instead, at startup and at teardown.
+
+Proven on the failure path rather than the happy one: baseline success
+runs leaked nothing, forced stage failures leaked nothing, and only
+killing the broker mid-run reproduced it. One orphan before, zero after.
+
+The underlying behaviour is left alone on purpose. Any client whose
+daemon connection drops silently autostarts a detached replacement, which
+is exactly right for the GUI - it is what makes sessions durable - and
+exactly wrong for an isolated harness, which would rather fail loudly.
+`sketerm mcp` has the same exposure and defends the same way. Both sweeps
+are Linux-only (`/proc` environ); on macOS they no-op and the ordered
+teardown still runs.
+
+## config.conf, documented from the parser and editable from the dialog
+
+`docs/config.md` described a ZON format with a `version` field and nested
+`.font = .{ ... }` tables. That format never shipped. It has been
+rewritten from `src/config.zig` itself: every key table, the
+profile-level vs app-level split (an app-level key inside a profile
+section is rejected, not merged), the prefix families, precedence, and
+reload semantics. The key list was diffed both directions against the
+parser, so a documented key that does not parse and a parsed key that is
+not documented are both build-time findable by hand. Two keys are
+deliberately absent from the tables and explained in prose:
+`inactive_fg_dim` / `inactive_bg_dim` are retired no-ops, still accepted
+so old configs do not warn.
+
+One thing the doc had to say plainly rather than describe as intended
+behaviour: `quake_edge` parses, serialises and moves nothing. Wayland
+does not permit a client to position its own toplevel and GTK4 removed
+`gtk_window_move` on every backend. Real edge anchoring needs
+`zwlr_layer_shell_v1`, and the protocol is not the obstacle - the tables
+in `src/wlhost/protocol.zig` already cover all of xdg-shell and the wire
+codec is direction-agnostic. The obstacle is that GDK owns the GUI's
+Wayland connection, so we cannot mint object IDs on it, and a surface
+takes its role once and permanently, so switching it means interposing on
+libwayland's marshalling mid-realize. `gtk4-layer-shell` exists precisely
+to do that (it ships an LD_PRELOAD shim and its header requires being
+linked ahead of libwayland), which also means it cannot be taken as a
+lazily `dlopen`ed optional dependency. Tabled.
+
+The other half: everything added in this completion pass was file-only.
+Styled font families, weights, box drawing, symbol maps, hint rules and
+alphabet, the scrollbar set, quake geometry and pane presentation now
+have Preferences rows. The two list-shaped families get add/remove rows
+rather than a text box holding raw config syntax, and validation lives in
+`config.zig` so it matches the parser exactly rather than approximately:
+weights are a combo because `parseWeight` errors outside 100..900 instead
+of clamping (a spin row would let you stop on a value the next load would
+drop), clamped floats use spin rows bounded at the parser's own limits,
+and an uncompilable hint regex is flagged rather than refused, because
+the file accepts it and hint mode skips it. `ui/hints.zig:validAlphabet`
+now delegates to the config-side implementation so there is one.
+
+`quake_edge` kept its row, labelled as having no effect on this backend.
+A key that parses and serialises but that the dialog cannot see would be
+a worse trap than a row that explains itself.
