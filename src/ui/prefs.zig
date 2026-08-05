@@ -57,6 +57,14 @@ const Ctx = struct {
     /// The AdwPreferencesWindow (a real toplevel, not an attached
     /// sheet).
     dialog: ?*c.GtkWidget = null,
+    /// The Colors page, kept so its colour groups can be torn down
+    /// and rebuilt in place when `auto_theme` is toggled — the flat
+    /// and the light/dark presentations are different widget trees.
+    colors_page: ?*c.AdwPreferencesPage = null,
+    /// The rebuildable groups on that page (everything below the
+    /// "Theme" group). Three is the flat layout's count; the sizing
+    /// is asserted in `trackColorGroup`.
+    color_groups: [4]?*c.GtkWidget = .{null} ** 4,
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
@@ -814,46 +822,182 @@ fn onChooseFontPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker
 const schemes = @import("../grid/schemes.zig");
 const SCHEMES = schemes.all;
 
+const ColorScheme = config_mod.ColorScheme;
+
 const PaletteRowCtx = struct {
     allocator: std.mem.Allocator,
     parent: *Ctx,
     index: usize, // 0..15
+    /// Which colour layer the row edits. Null = the flat fields.
+    variant: ?ColorScheme,
 };
 
+/// A row bound to a plain `[4]f32` config field (title bar, gradient
+/// — the app-level colours, which have no light/dark variants).
 const ColorRowCtx = struct {
     allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *[4]f32,
 };
 
+const VariantColorCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    variant: ?ColorScheme,
+    field: ProfileSettings.VariantColor,
+};
+
+const VariantSwitchCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    variant: ?ColorScheme,
+};
+
+const SchemeRowCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    variant: ?ColorScheme,
+};
+
 fn colorsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_page_set_title(page, "Colors");
     c.adw_preferences_page_set_icon_name(page, "preferences-color-symbolic");
+    ctx.colors_page = page;
 
+    // The theme switch comes first and sits in a group of its own:
+    // it decides WHICH colour section is shown below it, and that
+    // section is torn down and rebuilt every time it flips.
+    const theme_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(theme_group)), "Theme");
+    addSwitchRow(
+        @ptrCast(@alignCast(theme_group)),
+        ctx,
+        "Auto theme",
+        "Follow Adwaita dark/light at runtime. On: the light and dark sets below are what render. Off: the single flat set is.",
+        &ctx.cfg.auto_theme,
+        autoThemeChanged,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(theme_group)));
+
+    buildColorGroups(page, ctx);
+}
+
+/// Rebuild the colour section in place. Removing a group drops the
+/// last reference to it, which finalizes its rows and runs every
+/// row context's GDestroyNotify — so a rebuild frees the old row
+/// contexts rather than stacking them up.
+fn autoThemeChanged(ctx: *Ctx) void {
+    ctx.ev();
+    const page = ctx.colors_page orelse return;
+    for (&ctx.color_groups) |*slot| {
+        if (slot.*) |w| c.adw_preferences_page_remove(page, @ptrCast(@alignCast(w)));
+        slot.* = null;
+    }
+    buildColorGroups(page, ctx);
+}
+
+fn trackColorGroup(ctx: *Ctx, group: *c.GtkWidget) void {
+    for (&ctx.color_groups) |*slot| {
+        if (slot.* == null) {
+            slot.* = group;
+            return;
+        }
+    }
+    unreachable; // color_groups is sized for the largest layout.
+}
+
+/// With `auto_theme` off there is one flat colour set, presented the
+/// way sketerm always has. With it on, the flat set is not what
+/// renders — `ProfileSettings.forScheme` overlays a variant over it —
+/// so we show the two variants instead, one group each. Two stacked
+/// groups (rather than a light/dark switcher over one set of rows)
+/// mirror the `light.` / `dark.` config sections one-to-one, show
+/// both halves at once so they can be compared, and need no
+/// remembered "which half am I editing" state.
+///
+/// Two known limits of the variant layout: the flat fg/bg cannot be
+/// reached from the dialog while auto_theme is on (the built-in
+/// variants always cover those two, so editing the base would be the
+/// inert row this replaced), and a colour meant for both halves has
+/// to be set twice. Both are the honest consequence of "the row
+/// shows what renders"; a "same in both" affordance would need its
+/// own tri-state and is not worth it until asked for.
+fn buildColorGroups(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    if (!ctx.cfg.auto_theme) {
+        addFlatColorGroups(page, ctx);
+        return;
+    }
+    addVariantGroup(page, ctx, .light);
+    addVariantGroup(page, ctx, .dark);
+}
+
+fn addFlatColorGroups(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Scheme picker.
     const scheme_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(scheme_group)), "Scheme");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(scheme_group)), "Picking a scheme overwrites the foreground / background / palette below.");
-    addSchemeRow(@ptrCast(@alignCast(scheme_group)), ctx);
+    addSchemeRow(@ptrCast(@alignCast(scheme_group)), ctx, null);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(scheme_group)));
+    trackColorGroup(ctx, @ptrCast(@alignCast(scheme_group)));
 
-    // Defaults (fg / bg / cursor + auto-theme + cursor_color_default).
+    // Defaults (fg / bg / cursor + cursor_color_default).
     const defaults_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(defaults_group)), "Defaults");
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Foreground", &ctx.edit.default_fg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Background", &ctx.edit.default_bg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor", &ctx.edit.cursor_color);
-    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor uses foreground", "Override the explicit cursor colour with the foreground.", &ctx.edit.cursor_color_default, applyOnly);
-    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Auto theme", "Follow Adwaita dark/light at runtime.", &ctx.cfg.auto_theme, applyOnly);
+    addColorSetRows(@ptrCast(@alignCast(defaults_group)), ctx, null);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(defaults_group)));
+    trackColorGroup(ctx, @ptrCast(@alignCast(defaults_group)));
 
-    // 16-colour palette in an expander row.
+    // 16-colour palette, one row per index.
     const palette_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(palette_group)), "ANSI palette (16 colours)");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(palette_group)), "Per-index colours used by SGR 30-37 / 40-47 (and bright 90-97). Editing here unsets `scheme` so your tweaks stick.");
     var i: usize = 0;
-    while (i < 16) : (i += 1) addPaletteRow(@ptrCast(@alignCast(palette_group)), ctx, i);
+    while (i < 16) : (i += 1) {
+        const row = paletteRow(ctx, i, null) orelse continue;
+        c.adw_preferences_group_add(@ptrCast(@alignCast(palette_group)), row);
+    }
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(palette_group)));
+    trackColorGroup(ctx, @ptrCast(@alignCast(palette_group)));
+}
+
+/// One variant's complete colour set: scheme, fg/bg/cursor, and the
+/// palette folded into an expander so two of these groups still fit
+/// on a scannable page.
+fn addVariantGroup(page: *c.AdwPreferencesPage, ctx: *Ctx, variant: ColorScheme) void {
+    const group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(
+        @ptrCast(@alignCast(group)),
+        if (variant == .light) "Light" else "Dark",
+    );
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)), if (variant == .light)
+        "What renders while the system theme is light. These rows write `light.*`; anything you don't set here falls back to the built-in light pair, then to the flat colours in the config file."
+    else
+        "What renders while the system theme is dark. These rows write `dark.*`; anything you don't set here falls back to the built-in dark pair, then to the flat colours in the config file.");
+
+    addSchemeRow(@ptrCast(@alignCast(group)), ctx, variant);
+    addColorSetRows(@ptrCast(@alignCast(group)), ctx, variant);
+
+    const exp = c.adw_expander_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), "ANSI palette (16 colours)");
+    c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), "SGR 30-37 / 40-47 and bright 90-97. Editing one unsets this variant's scheme.");
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const row = paletteRow(ctx, i, variant) orelse continue;
+        c.adw_expander_row_add_row(@ptrCast(@alignCast(exp)), row);
+    }
+    c.adw_preferences_group_add(@ptrCast(@alignCast(group)), exp);
+
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
+    trackColorGroup(ctx, @ptrCast(@alignCast(group)));
+}
+
+/// fg / bg / cursor / cursor-uses-fg for one layer. `variant` null =
+/// the flat fields (auto_theme off).
+fn addColorSetRows(group: *c.AdwPreferencesGroup, ctx: *Ctx, variant: ?ColorScheme) void {
+    addVariantColorRow(group, ctx, "Foreground", variant, .default_fg);
+    addVariantColorRow(group, ctx, "Background", variant, .default_bg);
+    addVariantColorRow(group, ctx, "Cursor", variant, .cursor_color);
+    addCursorDefaultRow(group, ctx, variant);
 }
 
 fn addColorRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, field: *[4]f32) void {
@@ -880,23 +1024,85 @@ fn colorRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyop
     cctx.parent.ev();
 }
 
-fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
+/// A pane colour bound to a LAYER rather than a struct field: it
+/// shows the effective value (variant override → built-in variant →
+/// flat base) and writes into the layer it was built for, so the
+/// swatch always matches what renders.
+fn addVariantColorRow(
+    group: *c.AdwPreferencesGroup,
+    ctx: *Ctx,
+    title: [*:0]const u8,
+    variant: ?ColorScheme,
+    field: ProfileSettings.VariantColor,
+) void {
+    const row = c.adw_action_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+
+    const cur = ctx.edit.variantColor(variant, field);
+    const dlg = c.gtk_color_dialog_new();
+    const btn = c.gtk_color_dialog_button_new(dlg);
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    var rgba: c.GdkRGBA = .{ .red = cur[0], .green = cur[1], .blue = cur[2], .alpha = cur[3] };
+    c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
+
+    const vctx = ctx.allocator.create(VariantColorCtx) catch return;
+    vctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .variant = variant, .field = field };
+    _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&variantColorChanged), @ptrCast(vctx), @ptrCast(cast.destroyCtx(VariantColorCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn variantColorChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const vctx = cast.userData(VariantColorCtx, user);
+    const rgba = c.gtk_color_dialog_button_get_rgba(btn);
+    vctx.parent.edit.setVariantColor(
+        vctx.variant,
+        vctx.field,
+        .{ rgba.*.red, rgba.*.green, rgba.*.blue, rgba.*.alpha },
+    );
+    vctx.parent.ev();
+}
+
+fn addCursorDefaultRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, variant: ?ColorScheme) void {
+    const row = c.adw_switch_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Cursor uses foreground");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Override the explicit cursor colour with the foreground.");
+    c.adw_switch_row_set_active(@ptrCast(@alignCast(row)), if (ctx.edit.variantCursorDefault(variant)) 1 else 0);
+    const vctx = ctx.allocator.create(VariantSwitchCtx) catch return;
+    vctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .variant = variant };
+    _ = c.g_signal_connect_data(row, "notify::active", @ptrCast(&cursorDefaultChanged), @ptrCast(vctx), @ptrCast(cast.destroyCtx(VariantSwitchCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn cursorDefaultChanged(row: *c.AdwSwitchRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const vctx = cast.userData(VariantSwitchCtx, user);
+    vctx.parent.edit.setVariantCursorDefault(vctx.variant, c.adw_switch_row_get_active(row) != 0);
+    vctx.parent.ev();
+}
+
+/// The 16 palette entries a layer resolves to: its own override,
+/// else its scheme preset, else the built-in 256-table's first 16.
+/// Both the swatch and the promote-on-write path go through this, so
+/// editing one entry cannot silently move the other fifteen.
+fn effectivePalette(ctx: *Ctx, variant: ?ColorScheme) [16][3]u8 {
+    if (ctx.edit.variantPalette(variant)) |p| return p;
+    if (schemes.lookup(ctx.edit.variantSchemeName(variant))) |sch| return sch.palette;
+    const default_pal = @import("../grid/palette.zig").default_256;
+    var pal: [16][3]u8 = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) pal[i] = default_pal[i];
+    return pal;
+}
+
+/// One palette entry's row. Returns it unparented so the caller can
+/// put it in a group (flat layout) or an expander (variant layout).
+fn paletteRow(ctx: *Ctx, idx: usize, variant: ?ColorScheme) ?*c.GtkWidget {
     const row = c.adw_action_row_new();
     var title_buf: [32:0]u8 = undefined;
     const title = std.fmt.bufPrintZ(&title_buf, "Color {d}", .{idx}) catch "Color";
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title.ptr);
 
-    // Pull current value: prefer cfg.palette override; else scheme;
-    // else built-in default 256-table first 16. Must match the seed in
-    // paletteRowChanged or editing preserves colors the dialog never showed.
-    const default_pal = @import("../grid/palette.zig").default_256;
-    const cur: [3]u8 = if (ctx.edit.palette) |p|
-        p[idx]
-    else if (@import("../grid/schemes.zig").lookup(ctx.edit.scheme)) |scheme|
-        scheme.palette[idx]
-    else
-        default_pal[idx];
-
+    const cur = effectivePalette(ctx, variant)[idx];
     const dlg = c.gtk_color_dialog_new();
     const btn = c.gtk_color_dialog_button_new(dlg);
     c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
@@ -908,42 +1114,29 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
     };
     c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
 
-    const pctx = ctx.allocator.create(PaletteRowCtx) catch return;
-    pctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .index = idx };
+    const pctx = ctx.allocator.create(PaletteRowCtx) catch return null;
+    pctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .index = idx, .variant = variant };
     _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&paletteRowChanged), @ptrCast(pctx), @ptrCast(cast.destroyCtx(PaletteRowCtx)), c.G_CONNECT_DEFAULT);
     c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
-    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+    return row;
 }
 
 fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const pctx = cast.userData(PaletteRowCtx, user);
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
-    // Promote palette to override mode if needed (copying from
-    // current effective palette).
-    if (pctx.parent.edit.palette == null) {
-        const default_pal = @import("../grid/palette.zig").default_256;
-        var pal: [16][3]u8 = undefined;
-        if (@import("../grid/schemes.zig").lookup(pctx.parent.edit.scheme)) |scheme| {
-            pal = scheme.palette;
-        } else {
-            var i: usize = 0;
-            while (i < 16) : (i += 1) pal[i] = default_pal[i];
-        }
-        pctx.parent.edit.palette = pal;
-    }
-    var pal = pctx.parent.edit.palette.?;
+    var pal = effectivePalette(pctx.parent, pctx.variant);
     pal[pctx.index] = .{
         @intFromFloat(@round(rgba.*.red * 255.0)),
         @intFromFloat(@round(rgba.*.green * 255.0)),
         @intFromFloat(@round(rgba.*.blue * 255.0)),
     };
-    pctx.parent.edit.palette = pal;
-    // Editing the palette unsets `scheme` — the user has overridden.
-    pctx.parent.edit.scheme = "";
+    // Pins the palette on this layer and unsets its `scheme` — the
+    // user has overridden.
+    pctx.parent.edit.setVariantPalette(pctx.variant, pal);
     pctx.parent.ev();
 }
 
-fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, variant: ?ColorScheme) void {
     const items_array = blk: {
         // null-terminated [*:0]?[*:0]const u8 list.
         var arr: [SCHEMES.len + 1]?[*:0]const u8 = undefined;
@@ -958,37 +1151,37 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
     c.g_object_unref(items);
     var sel: c_uint = 0;
+    const cur_scheme = ctx.edit.variantSchemeName(variant);
     for (SCHEMES, 0..) |sch, i| {
-        if (std.mem.eql(u8, sch.key, ctx.edit.scheme)) {
+        if (std.mem.eql(u8, sch.key, cur_scheme)) {
             sel = @intCast(i);
             break;
         }
     }
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), sel);
-    const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = schemeSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    const sctx = ctx.allocator.create(SchemeRowCtx) catch return;
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .variant = variant };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&schemeSelected), @ptrCast(sctx), @ptrCast(cast.destroyCtx(SchemeRowCtx)), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
-fn schemeSelected(ctx: *Ctx, idx: c_uint) void {
+fn schemeSelected(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const sctx = cast.userData(SchemeRowCtx, user);
+    const idx = c.adw_combo_row_get_selected(row);
     if (idx >= SCHEMES.len) return;
     const sch = SCHEMES[idx];
-    ctx.edit.scheme = sch.key;
-    ctx.edit.default_fg = .{
-        @as(f32, @floatFromInt(sch.fg[0])) / 255.0,
-        @as(f32, @floatFromInt(sch.fg[1])) / 255.0,
-        @as(f32, @floatFromInt(sch.fg[2])) / 255.0,
-        1.0,
-    };
-    ctx.edit.default_bg = .{
-        @as(f32, @floatFromInt(sch.bg[0])) / 255.0,
-        @as(f32, @floatFromInt(sch.bg[1])) / 255.0,
-        @as(f32, @floatFromInt(sch.bg[2])) / 255.0,
-        1.0,
-    };
-    ctx.edit.palette = sch.palette;
-    ctx.ev();
+    const to_f = struct {
+        fn f(rgb: [3]u8) [4]f32 {
+            return .{
+                @as(f32, @floatFromInt(rgb[0])) / 255.0,
+                @as(f32, @floatFromInt(rgb[1])) / 255.0,
+                @as(f32, @floatFromInt(rgb[2])) / 255.0,
+                1.0,
+            };
+        }
+    }.f;
+    sctx.parent.edit.setVariantScheme(sctx.variant, sch.key, to_f(sch.fg), to_f(sch.bg), sch.palette);
+    sctx.parent.ev();
     // Note: the open color buttons in the dialog don't auto-refresh
     // their preview swatches. The next reopen will reflect the new
     // values. Live-applying a re-paint to the preview swatches would

@@ -341,6 +341,118 @@ pub const ProfileSettings = struct {
         return out;
     }
 
+    /// The variant a `light.`/`dark.` write lands in.
+    pub fn variantSet(self: *ProfileSettings, scheme: ColorScheme) *ColorSet {
+        return switch (scheme) {
+            .light => &self.light,
+            .dark => &self.dark,
+        };
+    }
+
+    /// The flat colour fields an editor (the prefs dialog) can bind a
+    /// row to. Every one of them has a `ColorSet` counterpart.
+    pub const VariantColor = enum { default_fg, default_bg, cursor_color };
+
+    /// What a colour editor must DISPLAY for `field` under `scheme`:
+    /// the variant's own override, else the built-in variant, else
+    /// the flat base. Defined through `forScheme`, so the swatch can
+    /// never show something other than what renders.
+    pub fn variantColor(self: *const ProfileSettings, scheme: ?ColorScheme, field: VariantColor) [4]f32 {
+        const eff = self.forScheme(scheme);
+        return switch (field) {
+            .default_fg => eff.default_fg,
+            .default_bg => eff.default_bg,
+            .cursor_color => eff.cursor_color,
+        };
+    }
+
+    /// Where a colour editor WRITES: the variant under `scheme`, or
+    /// the flat base when `scheme` is null (`auto_theme` off). Never
+    /// the base while a variant is in force — the base is what the
+    /// serialiser emits as the plain `default_bg`-style keys.
+    pub fn setVariantColor(self: *ProfileSettings, scheme: ?ColorScheme, field: VariantColor, v: [4]f32) void {
+        if (scheme) |sc| {
+            const set = self.variantSet(sc);
+            switch (field) {
+                .default_fg => set.default_fg = v,
+                .default_bg => set.default_bg = v,
+                .cursor_color => set.cursor_color = v,
+            }
+            return;
+        }
+        switch (field) {
+            .default_fg => self.default_fg = v,
+            .default_bg => self.default_bg = v,
+            .cursor_color => self.cursor_color = v,
+        }
+    }
+
+    /// Effective `cursor_color_default` under `scheme`.
+    pub fn variantCursorDefault(self: *const ProfileSettings, scheme: ?ColorScheme) bool {
+        return self.forScheme(scheme).cursor_color_default;
+    }
+
+    pub fn setVariantCursorDefault(self: *ProfileSettings, scheme: ?ColorScheme, v: bool) void {
+        if (scheme) |sc| {
+            self.variantSet(sc).cursor_color_default = v;
+        } else {
+            self.cursor_color_default = v;
+        }
+    }
+
+    /// Effective built-in scheme name under `scheme` ("" = none).
+    pub fn variantSchemeName(self: *const ProfileSettings, scheme: ?ColorScheme) []const u8 {
+        return self.forScheme(scheme).scheme;
+    }
+
+    /// Effective palette override under `scheme`. Null means no layer
+    /// pins one, so the reader falls back to the scheme preset or the
+    /// built-in 256-table.
+    pub fn variantPalette(self: *const ProfileSettings, scheme: ?ColorScheme) ?[16][3]u8 {
+        return self.forScheme(scheme).palette;
+    }
+
+    /// Pin an explicit palette in the `scheme` layer, cancelling that
+    /// layer's built-in scheme so the hand-picked colours stick (the
+    /// palette wins over `scheme` when both are set, but leaving a
+    /// stale name behind would misreport what is in force).
+    pub fn setVariantPalette(self: *ProfileSettings, scheme: ?ColorScheme, pal: [16][3]u8) void {
+        if (scheme) |sc| {
+            const set = self.variantSet(sc);
+            set.palette = pal;
+            set.scheme = "";
+            return;
+        }
+        self.palette = pal;
+        self.scheme = "";
+    }
+
+    /// Point the `scheme` layer at built-in scheme `key`, whose fg /
+    /// bg / palette the caller has already looked up (the scheme
+    /// table lives in `grid/schemes.zig`, which the daemon-side
+    /// config must not depend on).
+    pub fn setVariantScheme(
+        self: *ProfileSettings,
+        scheme: ?ColorScheme,
+        key: []const u8,
+        fg: [4]f32,
+        bg: [4]f32,
+        pal: [16][3]u8,
+    ) void {
+        if (scheme) |sc| {
+            const set = self.variantSet(sc);
+            set.scheme = key;
+            set.default_fg = fg;
+            set.default_bg = bg;
+            set.palette = pal;
+            return;
+        }
+        self.scheme = key;
+        self.default_fg = fg;
+        self.default_bg = bg;
+        self.palette = pal;
+    }
+
     /// Deep-copy every heap-backed field into `arena`.
     pub fn cloneInto(self: *const ProfileSettings, arena: std.mem.Allocator) error{OutOfMemory}!ProfileSettings {
         var out = self.*;
@@ -2690,6 +2802,114 @@ test "config: profile sections carry their own light/dark variants" {
     const sec = std.mem.indexOf(u8, w.buffered(), "[profile.paper]").?;
     try std.testing.expect(std.mem.indexOf(u8, w.buffered()[sec..], "light.default_bg") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered()[sec..], "dark.default_bg") != null);
+}
+
+test "config: variant colour rows show the effective value" {
+    var s = ProfileSettings{};
+    s.default_fg = .{ 0.5, 0.5, 0.5, 1.0 };
+    s.cursor_color = .{ 1.0, 0.0, 0.0, 1.0 };
+    s.light.default_bg = .{ 0.9, 0.8, 0.7, 1.0 };
+
+    // auto_theme off: the row shows the flat base, unchanged.
+    try std.testing.expect(eqColor(s.variantColor(null, .default_fg), s.default_fg));
+    try std.testing.expect(eqColor(s.variantColor(null, .cursor_color), s.cursor_color));
+
+    // Variant field set -> the variant wins.
+    try std.testing.expect(eqColor(s.variantColor(.light, .default_bg), .{ 0.9, 0.8, 0.7, 1.0 }));
+    // Unset but covered by the built-in variant -> the built-in.
+    try std.testing.expect(eqColor(s.variantColor(.light, .default_fg), builtin_light.default_fg.?));
+    try std.testing.expect(eqColor(s.variantColor(.dark, .default_bg), builtin_dark.default_bg.?));
+    // Unset and not covered by the built-in -> the flat base.
+    try std.testing.expect(eqColor(s.variantColor(.dark, .cursor_color), s.cursor_color));
+
+    // Whatever a row shows is what forScheme renders.
+    inline for (.{ ColorScheme.light, ColorScheme.dark }) |sc| {
+        const eff = s.forScheme(sc);
+        try std.testing.expect(eqColor(s.variantColor(sc, .default_fg), eff.default_fg));
+        try std.testing.expect(eqColor(s.variantColor(sc, .default_bg), eff.default_bg));
+        try std.testing.expect(eqColor(s.variantColor(sc, .cursor_color), eff.cursor_color));
+    }
+
+    // cursor_color_default / scheme / palette resolve the same way.
+    s.cursor_color_default = false;
+    s.scheme = "tango";
+    s.dark.cursor_color_default = true;
+    s.dark.scheme = "";
+    try std.testing.expectEqual(false, s.variantCursorDefault(null));
+    try std.testing.expectEqual(false, s.variantCursorDefault(.light));
+    try std.testing.expectEqual(true, s.variantCursorDefault(.dark));
+    try std.testing.expectEqualStrings("tango", s.variantSchemeName(.light));
+    try std.testing.expectEqualStrings("", s.variantSchemeName(.dark));
+    try std.testing.expect(s.variantPalette(.light) == null);
+}
+
+test "config: variant colour writes land in the variant, never the base" {
+    var s = ProfileSettings{};
+    const base_fg = s.default_fg;
+    const base_bg = s.default_bg;
+
+    s.setVariantColor(.dark, .default_bg, .{ 0.1, 0.2, 0.3, 1.0 });
+    try std.testing.expect(eqColor(s.default_bg, base_bg));
+    try std.testing.expect(eqColor(s.dark.default_bg.?, .{ 0.1, 0.2, 0.3, 1.0 }));
+    try std.testing.expect(s.light.default_bg == null);
+
+    s.setVariantCursorDefault(.light, false);
+    try std.testing.expectEqual(true, s.cursor_color_default);
+    try std.testing.expectEqual(false, s.light.cursor_color_default.?);
+
+    // Null scheme (auto_theme off) writes the base and nothing else.
+    s.setVariantColor(null, .default_fg, .{ 0.4, 0.4, 0.4, 1.0 });
+    try std.testing.expect(eqColor(s.default_fg, .{ 0.4, 0.4, 0.4, 1.0 }));
+    try std.testing.expect(!eqColor(s.default_fg, base_fg));
+    try std.testing.expect(s.light.default_fg == null and s.dark.default_fg == null);
+
+    // A palette write pins the layer's palette and cancels its scheme.
+    s.scheme = "tango";
+    var pal: [16][3]u8 = undefined;
+    for (&pal, 0..) |*e, i| e.* = .{ @intCast(i), 0, 0 };
+    s.setVariantPalette(.light, pal);
+    try std.testing.expect(s.palette == null);
+    try std.testing.expectEqualStrings("tango", s.scheme);
+    try std.testing.expectEqualStrings("", s.light.scheme.?);
+    try std.testing.expectEqual(@as(u8, 15), s.variantPalette(.light).?[15][0]);
+    // The other half is untouched and still sees the flat scheme.
+    try std.testing.expectEqualStrings("tango", s.variantSchemeName(.dark));
+
+    // Picking a built-in scheme fills the whole layer.
+    s.setVariantScheme(.dark, "solarized_dark", .{ 0.5, 0, 0, 1 }, .{ 0, 0.5, 0, 1 }, pal);
+    try std.testing.expectEqualStrings("solarized_dark", s.variantSchemeName(.dark));
+    try std.testing.expect(eqColor(s.variantColor(.dark, .default_fg), .{ 0.5, 0, 0, 1 }));
+    try std.testing.expect(eqColor(s.default_fg, .{ 0.4, 0.4, 0.4, 1.0 }));
+    try std.testing.expectEqualStrings("tango", s.scheme);
+}
+
+test "config: variants written by the prefs helpers survive a save/load round-trip" {
+    var cfg = Config{};
+    cfg.settings.setVariantColor(.light, .default_bg, .{ 1.0, 1.0, 1.0, 1.0 });
+    cfg.settings.setVariantColor(.dark, .default_bg, .{ 0.0, 0.0, 0.0, 1.0 });
+    cfg.settings.setVariantCursorDefault(.dark, false);
+    cfg.settings.setVariantColor(.dark, .cursor_color, .{ 1.0, 0.0, 0.0, 1.0 });
+    // The flat base the user configured must come back untouched.
+    cfg.settings.default_bg = .{
+        @as(f32, 0x11) / 255.0,
+        @as(f32, 0x22) / 255.0,
+        @as(f32, 0x33) / 255.0,
+        1.0,
+    };
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+    const s = &parsed.settings;
+    try std.testing.expectApproxEqAbs(@as(f32, 0x11) / 255.0, s.default_bg[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.variantColor(.light, .default_bg)[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s.variantColor(.dark, .default_bg)[0], 0.005);
+    try std.testing.expectEqual(false, s.variantCursorDefault(.dark));
+    try std.testing.expectEqual(true, s.variantCursorDefault(.light));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.variantColor(.dark, .cursor_color)[0], 0.005);
 }
 
 test "config: palette + scheme + new keys round-trip" {
