@@ -479,6 +479,11 @@ pub fn main() u8 {
         }
     }
 
+    // 3c. The config file, edited underneath the running GUI, applies
+    // itself — including the rename-over that every editor save is.
+    if (configReloadStage(allocator, sock_path, rt)) |why| return failMsg(why);
+    say("config.conf edited on disk applied live, in-place AND rename-over");
+
     // 4. split, then list must show two panes.
     const split_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return fail("split roundtrip");
     defer allocator.free(split_resp);
@@ -1977,6 +1982,129 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
 }
 
 /// Poll `get-text` on one pane until its reply contains `needle`.
+/// Automatic config reload (`config_auto_reload`): the GUI watches
+/// config.conf and applies it with no keystroke.
+///
+/// Seven steps, each a way this feature is shipped broken:
+///
+///  1. A plain in-place write, into a directory that has no
+///     config.conf yet — the CREATE path, and the one a `cat >` or a
+///     `sed -i` on some filesystems produces.
+///  2. A temp file renamed over the target — how every editor
+///     actually saves. It swaps the inode out from under the monitor,
+///     which is why watching is so often shipped working exactly once.
+///  3. `config_auto_reload = false` arriving IN the watched file: the
+///     apply frees the watcher from inside the watcher's own callback.
+///  4. With it off, a further save must change nothing.
+///  5. `reload_config` puts the defaults back — and re-installs the
+///     watcher, because the reloaded config has the key back on.
+///  6. That re-installed watcher still sees a save.
+///  7. Deleting config.conf keeps the running config (see the step).
+///
+/// `font_size` is the observable: applyConfigChange rebuilds the pane's
+/// atlas, which recomputes the grid, so `screen-info`'s `cols` moves
+/// and moves back. No pixels involved, so the assertion cannot be
+/// fooled by a repaint that came from somewhere else.
+fn configReloadStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    var path_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    var tmp_buf: [512:0]u8 = undefined;
+    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/sketerm/config.conf.editor-tmp", .{rt}) catch return "temp path";
+
+    const base_cols = paneCols(allocator, sock_path) orelse return "screen-info reported no cols";
+
+    // 1. In-place write of a bigger font: fewer columns.
+    if (!writeFile(cfg_path, "# smoke\nfont_size = 24\n")) return "could not write config.conf";
+    const grew = waitCols(allocator, sock_path, base_cols, false, 15_000);
+    if (grew == null) return "config.conf was written but the GUI never reloaded it";
+
+    // 2. Rename-over, the editor save. If the monitor is left pointing
+    //    at the replaced inode this is the write that goes unnoticed.
+    if (!writeFile(tmp_path, "# smoke\nfont_size = 14\n")) return "could not write the temp config";
+    if (c.rename(tmp_path.ptr, cfg_path.ptr) != 0) return "could not rename the temp config over config.conf";
+    if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
+        return "a rename-over save was not picked up (the monitor died with the old inode)";
+
+    // 3. The key switching ITSELF off. The apply tears the watcher
+    //    down from inside the watcher's own callback, so this is the
+    //    use-after-free shape as much as it is the feature.
+    if (!writeFile(cfg_path, "# smoke\nconfig_auto_reload = false\nfont_size = 24\n"))
+        return "could not write the auto-reload-off config";
+    const off_cols = waitCols(allocator, sock_path, base_cols, false, 15_000) orelse
+        return "the config that turns auto-reload off was itself never applied";
+
+    // 4. ...and with it off, a further save must do nothing.
+    if (!writeFile(cfg_path, "# smoke\nconfig_auto_reload = false\nfont_size = 30\n"))
+        return "could not write the ignored config";
+    _ = c.usleep(3_000_000);
+    if (paneCols(allocator, sock_path) != off_cols)
+        return "config_auto_reload = false still reloaded on a file change";
+
+    // 5. Back to defaults on demand — which re-installs the watcher,
+    //    since the reloaded config has the key at its default (on).
+    _ = c.unlink(cfg_path.ptr);
+    const rl = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"reload_config\"}\n") orelse
+        return "reload_config roundtrip";
+    allocator.free(rl);
+    if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
+        return "an on-demand reload did not restore the default font";
+
+    // 6. The re-installed watcher still works.
+    if (!writeFile(cfg_path, "# smoke\nfont_size = 24\n")) return "could not write the final config";
+    if (waitCols(allocator, sock_path, base_cols, false, 15_000) == null)
+        return "the watcher was not re-installed when auto-reload came back on";
+
+    // 7. A vanished file keeps the running config. Deliberate: an
+    //    editor that saves by unlink-then-create makes the file
+    //    briefly absent, and "reset every setting" is the wrong way to
+    //    resolve that ambiguity. Wanting the defaults back is what
+    //    reload_config is for.
+    const big_cols = paneCols(allocator, sock_path) orelse return "screen-info stopped answering";
+    _ = c.unlink(cfg_path.ptr);
+    _ = c.usleep(2_000_000);
+    if (paneCols(allocator, sock_path) != big_cols)
+        return "deleting config.conf wiped the running config";
+
+    const rl2 = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"reload_config\"}\n") orelse
+        return "final reload_config roundtrip";
+    allocator.free(rl2);
+    if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
+        return "the stage could not put the defaults back for the stages after it";
+    return null;
+}
+
+/// `cols` of pane 1, via the GUI's own screen-info command.
+fn paneCols(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse return null;
+    defer allocator.free(resp);
+    return parseNumAfter(resp, "\"cols\":");
+}
+
+/// Poll until pane 1's column count equals (`want_equal`) or differs
+/// from (`!want_equal`) `reference`. Returns the observed value.
+fn waitCols(
+    allocator: std.mem.Allocator,
+    sock_path: [:0]const u8,
+    reference: u32,
+    want_equal: bool,
+    ms: u32,
+) ?u32 {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 250) {
+        if (paneCols(allocator, sock_path)) |cols| {
+            if ((cols == reference) == want_equal) return cols;
+        }
+        _ = c.usleep(250_000);
+    }
+    return null;
+}
+
+fn writeFile(path: [:0]const u8, body: []const u8) bool {
+    const fp = c.fopen(path.ptr, "wb") orelse return false;
+    defer _ = c.fclose(fp);
+    return c.fwrite(body.ptr, 1, body.len, fp) == body.len;
+}
+
 fn waitPaneText(
     allocator: std.mem.Allocator,
     sock: [:0]const u8,
