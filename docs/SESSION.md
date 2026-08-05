@@ -12756,3 +12756,108 @@ reattach replay alone. `set_parent`/`set_modal`/`xdg-foreign parent`
 are now `SKETERM_MUX_LOG=debug` lines for exactly this reason: window
 parenting is the one relation with no visible trace when it silently
 fails.
+
+---
+
+# The editor's project layer (roadmap phase 7)
+
+The editor stops being a file editor and becomes a project editor:
+root discovery, project-wide search and replace, a symbol outline, a
+per-line VCS gutter, and a session that survives a restart. All of it
+works for REMOTE documents, because all of it is a job the daemon runs
+on the file's own host -- the GUI still never touches a disk and never
+runs a process. `docs/project.md` is the reference; this is the
+argument.
+
+**The model is one paragraph, and the interesting half is what it
+refuses.** A project is a `(host, root)` pair found by walking up to
+the nearest ancestor holding a marker, reusing `lsp/servers.zig`'s
+`findRoot` machinery rather than a second discovery scheme. Two
+differences: the marker list is a superset (every VCS directory plus
+the language markers the built-in servers already name), and a MISS
+answers `null` instead of falling back to the document's directory. So
+a loose file has NO project and every project-scoped feature is off for
+it -- no jobs started, no panels changed, nothing resolved. That is
+what keeps opening one file exactly as cheap as it was. A face holds a
+refcounted `project.Set`, so a window showing three repositories has
+three projects; each TAB has at most one, and anything needing a single
+root uses the ACTIVE tab's. The LSP root stays separate on purpose: a
+server's workspace is narrower and server-specific (clangd wants the
+directory with `compile_commands.json`), so the project is the user's
+unit and the LSP root is the server's, and `Project.lspRootHint` exists
+only so a UI can say which is which.
+
+**grep and the editor's regex engine are different engines, so only one
+of them decides anything.** The daemon's grep is a case-insensitive
+literal substring scan with per-file and per-line caps; the find bar is
+literal-or-regex with match-case and whole-word. Pretending they agree
+would make replace unsafe. So grep chooses which FILES to read and
+nothing else: every hit shown and every byte written comes from running
+`editor/search.zig` over the file's real content, which is why a
+project search means precisely what the same query means in the open
+buffer. `psearch.literalSeed` extracts the literal every match must
+contain (conservative: depth-zero runs only, a run loses its last
+character to a following `?`/`*`/`{`, any alternation disqualifies the
+pattern) and hands THAT to grep; with no seed the `find` verb
+enumerates instead, bounded by `editor_project_search_max_files`. The
+divergence that remains is the daemon's own caps hiding a candidate
+FILE, and that is reported as truncated, not swallowed. Replace is
+previewed (per file, the full rewritten content plus its mtime), then
+applied: an open buffer through its Document as ONE transaction and
+then saved, everything else through the same atomic install an ordinary
+Ctrl+S uses, so a file that changed since the preview is REFUSED.
+
+**The gutter needed a verb that does not exist, and the workaround is
+named rather than hidden.** `git_status` reports per-FILE letters with
+no line information; `diff` diffs two files that both exist. Neither
+can materialize a committed blob. So the editor asks the `panelize`
+verb -- a host-side `/bin/sh -lc` -- to run `git diff -U0 HEAD -- <rel>`
+into a temp file and reads that back through the ordinary `read` verb.
+It runs on the file's own host, so a remote document gets a remote
+gutter, and the GUI still runs nothing. A dedicated `git_diff` job verb
+would remove the temp-file dance; it is a tidiness win, not a
+correctness one, which is why it was reported and not done. Marks are
+BYTE ANCHORS carried through every edit by `transaction.mapOffset` --
+through the same single ETab observer folds already used, which now
+carries the gutter and the outline too -- so a refresh in flight never
+fights the typing that continues during it. Known limitation, written
+down rather than discovered later: the gutter compares HEAD against the
+file ON DISK, so it refreshes on load, on save and on tab activation,
+not on every keystroke.
+
+**The outline has two sources and no third.** LSP `documentSymbol`
+where a server answers, the tree-sitter tree where none does, tree
+first so the panel is never blank while a request is in flight. Rows
+are rebuilt only when a hash of names, kinds and depths changes -- not
+of ranges -- so typing inside a function moves the ranges (mapped
+through the edit) and not the list, and caret tracking only moves the
+selection. Ctrl+Shift+O took the chord from the transient
+document-symbol popup, which was a strictly worse version of the same
+thing; the popup path now serves workspace symbols only.
+
+**Restore vs recover has a rule, and it is one sentence.** The layout
+decides WHICH files are open; the crash journal decides their CONTENT.
+Recovery runs from `attach`, before the restore opens anything, so a
+recovered buffer already occupies its spec's tab and `openSpec`'s
+dedupe makes the restore focus it -- and `recoverOne` now ADOPTS an
+existing tab for its spec rather than opening a second one, so the two
+cannot duplicate whichever order they run in. `PaneSpec.editor` gained
+`top_line` (a LINE, because the editor's wrapped-row anchor is
+meaningless in a pane of a different width) and `project`; both default,
+so an old layout file restores.
+
+**Verification.** `zig build test` (1530 tests), `test-core`,
+`mux-portable` with `ldd` showing libc/libm only, and `smoke-editor`
+with a new stage covering diff parsing, anchored marks through an edit,
+hunk navigation, the gutter actually painting all three mark kinds,
+the tree outline with caret tracking, and the search/replace model.
+`smoke-e2e` gained the real thing: a scratch git repository, the gutter
+painting after a save, F7 landing on the hunk (proved by typing a
+marker and reading the document back), Ctrl+Shift+F finding a token and
+a hit row opening the file it names, a previewed replace that writes
+nothing until Ctrl+Enter, the same layer over `ssh localhost`, and a
+second GUI started with `--restore` bringing the session back with its
+active tab. `smoke-lsp-gui` proves the outline is fed by a live server
+process ("2 symbol(s) -- language server"). Its completion-popup stage
+fails, and a worktree at the commit before this work fails identically:
+pre-existing, not a regression.
