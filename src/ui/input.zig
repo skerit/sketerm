@@ -60,7 +60,7 @@ pub const Ctx = struct {
     /// here FIRST; a true return consumes the event. Window installs
     /// it on the focused pane when hint mode opens and clears it on
     /// exit.
-    hint_sink: ?*const fn (ctx: ?*anyopaque, keyval: c_uint) bool = null,
+    hint_sink: ?*const fn (ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) bool = null,
     hint_ctx: ?*anyopaque = null,
     /// Copy-mode key sink. While set, every key press is routed here
     /// before bindings / PTY encoding. Returns true = consumed; false
@@ -717,7 +717,7 @@ fn onKeyPressed(
     // before shortcuts / PTY encoding. A false return (unconsumed)
     // only happens for keys hint mode ignores, e.g. bare modifiers.
     if (ctx.hint_sink) |hs| {
-        if (hs(ctx.hint_ctx, keyval)) return 1;
+        if (hs(ctx.hint_ctx, keyval, state)) return 1;
     }
 
     // Copy mode owns the keyboard while active — nothing below

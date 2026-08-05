@@ -344,6 +344,13 @@ pub const Window = struct {
     copymode_sel: CopyModeSel = .none,
     copymode_anchor_row: i32 = 0,
     copymode_anchor_col: u16 = 0,
+    /// Hint mode keeps going after each pick, collecting matches
+    /// instead of activating them; Enter copies the lot. Seeded from
+    /// `Config.hint_multiple`, toggled in-mode with Tab.
+    hints_multi: bool = false,
+    /// Newline-joined text collected in multi-select mode.
+    hints_collected: std.ArrayList(u8) = .empty,
+
     /// f/F/t/T have eaten their key and are waiting for the character
     /// to search for. 0 when no motion is pending.
     copymode_find_pending: u8 = 0,
@@ -811,6 +818,7 @@ pub const Window = struct {
         @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
         self.allocator.free(self.hint_matches);
         self.hints_overlay_buf.deinit(self.allocator);
+        self.hints_collected.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
         if (self.closed_arena) |*a| a.deinit();
