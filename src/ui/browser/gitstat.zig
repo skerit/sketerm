@@ -25,6 +25,19 @@ const WireReply = @import("types.zig").WireReply;
 /// is the whole point of the timer.
 const DELTA_DEBOUNCE_MS: c.guint = 750;
 
+/// Floor for the deep-change re-poll (below). Watches cover the
+/// browsed directory and whatever subdirectories are expanded, so a
+/// commit or an edit ANYWHERE ELSE under the root produces no delta
+/// at all; without a poll its badge stays wrong until the next
+/// navigation.
+const POLL_MIN_MS: i64 = 20_000;
+/// ...and its ceiling, and the multiple of the last job's duration
+/// that sets the interval between them. A repository where git status
+/// costs a second is re-polled every 40s, not every 20 — the poll
+/// paces itself off the cost it measured rather than a guess.
+const POLL_MAX_MS: i64 = 300_000;
+const POLL_COST_FACTOR: i64 = 40;
+
 /// Kick a `git_status` job for the tab root on the host that owns it.
 ///
 /// Skipped when the same root was asked recently (`git_cache`) and the
@@ -60,6 +73,9 @@ fn refreshGit(self: *BrowserView, tab: *BTab, force: bool) void {
     // there is nothing to mark.
     if (same_root) noteOverlayRows(self, tab);
     self.git.clear();
+    // The repository answer belongs to the OLD root; keeping it would
+    // make a non-repo inherit the previous folder's branch.
+    if (!same_root) self.git_repo.clear();
     setRootKey(self, tab.root.path, host);
 
     // A previous job's events would carry another root's records.
@@ -72,10 +88,14 @@ fn refreshGit(self: *BrowserView, tab: *BTab, force: bool) void {
     self.git_rjob = 0;
     self.git_rreq = 0;
     self.git_rhc = null;
-    if (tab.hc.state != .ready) return;
+    if (tab.hc.state != .ready) {
+        self.git_repo.clear();
+        return;
+    }
     self.git_cache.note(host, tab.root.path, now);
     self.git_rhc = tab.hc;
     self.git_rreq = self.nextReq();
+    self.git_started_ms = now;
     self.sendOp(tab.hc, .{ .req = self.git_rreq, .op = "git_status", .path = tab.root.path });
 }
 
@@ -113,6 +133,44 @@ fn noteOverlayRows(self: *BrowserView, tab: *BTab) void {
         };
         tab.noteChangedFull(full);
     }
+}
+
+/// Remember what the job just cost, which is what paces the re-poll.
+fn notePollCost(self: *BrowserView) void {
+    if (self.git_started_ms == 0) return;
+    const took = clock.nowMs() -% self.git_started_ms;
+    self.git_started_ms = 0;
+    self.git_poll_ms = std.math.clamp(took * POLL_COST_FACTOR, POLL_MIN_MS, POLL_MAX_MS);
+}
+
+/// Arm (or leave armed) the deep-change re-poll for a repository root.
+///
+/// Only a repository is polled, and the tick itself skips a face that
+/// is not on screen. Window FOCUS is deliberately not part of the
+/// gate: it is not a state the GUI can rely on resolving (a headless
+/// compositor focuses nothing), and a wrong badge in a visible
+/// background window is still a wrong badge.
+fn ensurePoll(self: *BrowserView) void {
+    if (self.widgets_dead or self.git_poll_src != 0) return;
+    if (!self.git_repo.known or !self.git_repo.is_repo) return;
+    const ms = @max(POLL_MIN_MS, self.git_poll_ms);
+    self.git_poll_src = c.g_timeout_add(@intCast(ms), @ptrCast(&onGitPollTick), @ptrCast(self));
+}
+
+fn onGitPollTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.git_poll_src = 0;
+    if (self.widgets_dead) return 0;
+    const tab = gitTab(self) orelse return 0;
+    if (!self.git_repo.is_repo) return 0;
+    if (c.gtk_widget_get_mapped(self.root_box) == 0) {
+        // The face is not on screen at all (another tab, or a hidden
+        // window): nothing to repaint, but stay armed.
+        ensurePoll(self);
+        return 0;
+    }
+    refreshGit(self, tab, true);
+    return 0; // one-shot; the reply re-arms with a fresh interval
 }
 
 /// Schedule a debounced forced refresh after a change notification.
@@ -158,16 +216,48 @@ pub fn feedGit(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload
             }) catch return false;
             if (ev.job != self.git_rjob) return false;
             if (std.mem.eql(u8, ev.ev, "match")) {
-                if (ev.path.len > 0 and ev.text.len > 0) self.git.apply(ev.path, ev.text[0]);
+                if (ev.path.len == 0) return true;
+                // `xy` is the porcelain-v2 pair; a daemon too old to
+                // send it leaves the collapsed `text` character as the
+                // only information, and the overlay renders that as
+                // the single letter it always did.
+                self.git.applyInput(.{
+                    .path = ev.path,
+                    .x = if (ev.xy.len == 2) ev.xy[0] else 0,
+                    .y = if (ev.xy.len == 2) ev.xy[1] else 0,
+                    .legacy = if (ev.text.len > 0) ev.text[0] else 0,
+                    .orig = ev.orig,
+                    .submodule = std.mem.eql(u8, ev.kind, "submodule"),
+                });
+                return true;
+            }
+            if (std.mem.eql(u8, ev.ev, "repo")) {
+                self.git_repo.set(.{
+                    .is_repo = ev.repo,
+                    .detached = ev.detached,
+                    .initial = ev.initial,
+                    .at_root = ev.root,
+                    .truncated = ev.truncated,
+                    .branch = ev.branch,
+                    .upstream = ev.upstream,
+                    .oid = ev.text,
+                    .ahead = ev.ahead,
+                    .behind = ev.behind,
+                    .have_ab = ev.have_ab,
+                });
                 return true;
             }
             if (ev.terminalEv()) {
                 self.git_rjob = 0;
                 self.git_rhc = null;
-                if (!self.git.isEmpty()) {
-                    if (gitTab(self)) |tab| noteOverlayRows(self, tab);
-                    self.renderCurrent();
-                }
+                notePollCost(self);
+                // Always render: a repository that went CLEAN has an
+                // empty overlay and still has a status line to change,
+                // and the rows that carried the old badges must lose
+                // them.
+                if (gitTab(self)) |tab| noteOverlayRows(self, tab);
+                self.renderCurrent();
+                ensurePoll(self);
             }
             return true;
         },
@@ -189,12 +279,23 @@ pub fn badgeFor(self: *BrowserView, tab: *BTab, dir: *const Dir, e: Entry) ?gits
     return self.git.badge(rel);
 }
 
-/// ", 3 modified, 1 untracked" for the status line, or empty.
+/// ", on main +2 -1, 3 modified" for the status line, or empty.
 ///
-/// The daemon's `git_status` reports records only — no branch, no
-/// ahead/behind — so this is everything there is to say.
+/// Everything about WHAT to say lives in `filebrowser/gitstatus.zig`;
+/// this only decides that the overlay still describes this tab.
 pub fn summaryNote(self: *BrowserView, tab: *BTab, buf: []u8) []const u8 {
     if (!std.mem.eql(u8, self.git_root, tab.root.path)) return buf[0..0];
     if (!std.mem.eql(u8, self.git_host, tab.hc.host orelse "")) return buf[0..0];
-    return self.git.summary(buf);
+    return gitstatus.statusNote(&self.git_repo, &self.git, buf);
+}
+
+/// The tooltip for one row's chip, or empty when it carries none.
+pub fn tooltipFor(self: *BrowserView, tab: *BTab, dir: *const Dir, e: Entry, buf: []u8) []const u8 {
+    if (self.git.isEmpty()) return buf[0..0];
+    if (!std.mem.eql(u8, self.git_root, tab.root.path)) return buf[0..0];
+    if (!std.mem.eql(u8, self.git_host, tab.hc.host orelse "")) return buf[0..0];
+    var key: [4096]u8 = undefined;
+    const rel = gitstatus.relativeKey(tab.root.path, dir.path, e.name, &key) orelse return buf[0..0];
+    const row = self.git.get(rel) orelse return buf[0..0];
+    return row.describe(buf);
 }

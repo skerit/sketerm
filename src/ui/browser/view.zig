@@ -345,8 +345,16 @@ pub const BrowserView = struct {
     /// Roots asked recently, so navigating back and forth (or sitting
     /// outside any repository) does not respawn git per step.
     git_cache: gitstatus.Cache = undefined,
+    /// Branch header of the overlay's root: the answer to "is this a
+    /// repository at all", which a pre-v2 daemon cannot give.
+    git_repo: gitstatus.Repo = undefined,
     /// Trailing debounce for change-driven refreshes (0 = none).
     git_delta_src: c.guint = 0,
+    /// Re-poll timer for changes DEEPER than the watched views (0 =
+    /// none), and how long the last git job took, which paces it.
+    git_poll_src: c.guint = 0,
+    git_poll_ms: i64 = 0,
+    git_started_ms: i64 = 0,
     /// The in-flight `git_status` daemon job (gitstat.zig feedGit).
     /// req 0 + job 0 = idle.
     git_rhc: ?*HostConn = null,
@@ -856,6 +864,7 @@ pub const BrowserView = struct {
     pub const scheduleGitRefresh = @import("gitstat.zig").scheduleGitRefresh;
     pub const gitBadgeFor = @import("gitstat.zig").badgeFor;
     pub const gitSummaryNote = @import("gitstat.zig").summaryNote;
+    pub const gitTooltipFor = @import("gitstat.zig").tooltipFor;
     pub const feedGit = @import("gitstat.zig").feedGit;
     pub const feedDiff = @import("diffview.zig").feedDiff;
     pub const compareSelected = @import("diffview.zig").compareSelected;
@@ -929,6 +938,7 @@ pub const BrowserView = struct {
         self.thumb_failed = std.StringHashMap(void).init(allocator);
         self.git = gitstatus.Overlay.init(allocator);
         self.git_cache = gitstatus.Cache.init(allocator);
+        self.git_repo = gitstatus.Repo.init(allocator);
         if (places_mod.load(allocator)) |parsed| {
             defer parsed.deinit();
             for (parsed.value.bookmarks, 0..) |b, i| {
@@ -1366,6 +1376,7 @@ pub const BrowserView = struct {
         if (self.thumb_render_src != 0) _ = c.g_source_remove(self.thumb_render_src);
         if (self.listing_render_src != 0) _ = c.g_source_remove(self.listing_render_src);
         if (self.git_delta_src != 0) _ = c.g_source_remove(self.git_delta_src);
+        if (self.git_poll_src != 0) _ = c.g_source_remove(self.git_poll_src);
         if (self.thumb_ctx) |tc| {
             tc.lock();
             tc.orphaned = true;
@@ -1411,6 +1422,7 @@ pub const BrowserView = struct {
         self.file_colors.deinit(self.allocator);
         self.git.deinit();
         self.git_cache.deinit();
+        self.git_repo.deinit();
         if (self.git_root.len > 0) self.allocator.free(self.git_root);
         if (self.git_host.len > 0) self.allocator.free(self.git_host);
         self.clearThumbCache();

@@ -1047,7 +1047,8 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
 
     // Version-control chip. The state travels the same daemon job on
     // every host, so a remote repository marks its rows identically.
-    applyGitBadge(nc, self.gitBadgeFor(tab, dir, e.*));
+    var git_tip: [512]u8 = undefined;
+    applyGitBadge(nc, self.gitBadgeFor(tab, dir, e.*), self.gitTooltipFor(tab, dir, e.*, &git_tip));
 
     if (e.tags.len > 0) {
         var tag_z: [128:0]u8 = undefined;
@@ -1081,16 +1082,26 @@ fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque
 /// hex, so light and dark themes both stay readable. Ignored entries
 /// get no chip at all -- their NAME fades instead, which says
 /// "deliberately not tracked" without competing with real changes.
-fn applyGitBadge(nc: *const NameCell, badge: ?gitstatus.Badge) void {
+/// The chip text is git's own column pair (`M.` staged, `.M` unstaged,
+/// `MM` both), so staged and unstaged are distinguishable at a glance
+/// and the tooltip spells the same thing out in words.
+fn applyGitBadge(nc: *const NameCell, badge: ?gitstatus.Badge, tip: []const u8) void {
     for (GIT_CSS_CLASSES) |cls| c.gtk_widget_remove_css_class(nc.git, cls.ptr);
     c.gtk_widget_remove_css_class(nc.label, "dim-label");
     const b = badge orelse return c.gtk_widget_set_visible(nc.git, 0);
     if (b.dim_name) c.gtk_widget_add_css_class(nc.label, "dim-label");
-    if (b.letter == 0) return c.gtk_widget_set_visible(nc.git, 0);
+    if (b.code_len == 0) return c.gtk_widget_set_visible(nc.git, 0);
     var gz: [8:0]u8 = undefined;
-    const gtxt = std.fmt.bufPrintZ(&gz, "{c}", .{b.letter}) catch "";
+    const gtxt = std.fmt.bufPrintZ(&gz, "{s}", .{b.text()}) catch "";
     c.gtk_label_set_text(@ptrCast(nc.git), gtxt.ptr);
     c.gtk_widget_add_css_class(nc.git, b.css.ptr);
+    if (tip.len > 0) {
+        var tz: [576:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&tz, "{s}", .{tip})) |t|
+            c.gtk_widget_set_tooltip_text(nc.git, t.ptr)
+        else |_|
+            c.gtk_widget_set_tooltip_text(nc.git, null);
+    } else c.gtk_widget_set_tooltip_text(nc.git, null);
     c.gtk_widget_set_visible(nc.git, 1);
 }
 

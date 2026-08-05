@@ -185,6 +185,23 @@ pub const WireJobEv = struct {
     file: []const u8 = "",
     files_done: u64 = 0,
     files_total: u64 = 0,
+    /// git_status match detail: the two porcelain-v2 columns and a
+    /// rename/copy source. Empty from a daemon too old to send them,
+    /// which is exactly what makes `text` still load-bearing.
+    xy: []const u8 = "",
+    orig: []const u8 = "",
+    /// git_status `repo` event: the branch header of the browsed root.
+    /// The event itself is absent from a pre-v2 daemon, which is how
+    /// the browser tells "no answer" from "not a repository".
+    repo: bool = false,
+    branch: []const u8 = "",
+    upstream: []const u8 = "",
+    ahead: i64 = 0,
+    behind: i64 = 0,
+    have_ab: bool = false,
+    detached: bool = false,
+    initial: bool = false,
+    root: bool = false,
 
     /// True for the events that end a job.
     pub fn terminalEv(self: WireJobEv) bool {
