@@ -119,6 +119,11 @@ pub const Envelope = struct {
     kind: MessageKind,
     /// Present on responses and server->client requests.
     id: ?i64 = null,
+    /// String request id, when the server minted one (zls's
+    /// `workspace/configuration` uses "i_haz_configuration"). Only ever
+    /// set on server->client REQUESTS — responses match our own ids,
+    /// which are always integers. Borrows from the parsed document.
+    id_str: []const u8 = "",
     /// Present on notifications and requests.
     method: []const u8 = "",
     params: std.json.Value = .null,
@@ -138,12 +143,18 @@ pub fn classify(v: std.json.Value) Envelope {
         .object => |o| o,
         else => return .{ .kind = .invalid },
     };
-    const id: ?i64 = switch (obj.get("id") orelse std.json.Value.null) {
+    const raw_id = obj.get("id") orelse std.json.Value.null;
+    const id: ?i64 = switch (raw_id) {
         .integer => |i| i,
-        // String ids are legal JSON-RPC; we never mint them, and a
-        // server echoing one back is answering a request we did not
-        // send, so treat it as id-less.
         else => null,
+    };
+    // String ids are legal JSON-RPC. We never mint them, so a RESPONSE
+    // carrying one answers a request we did not send — but a
+    // server->client REQUEST may use any id it likes (zls does) and
+    // must be answered with that id echoed back verbatim.
+    const id_str: []const u8 = switch (raw_id) {
+        .string => |s| s,
+        else => "",
     };
     const method: []const u8 = switch (obj.get("method") orelse std.json.Value.null) {
         .string => |s| s,
@@ -151,8 +162,9 @@ pub fn classify(v: std.json.Value) Envelope {
     };
     if (method.len > 0) {
         return .{
-            .kind = if (obj.get("id") != null and id != null) .request else .notification,
+            .kind = if (id != null or id_str.len > 0) .request else .notification,
             .id = id,
+            .id_str = id_str,
             .method = method,
             .params = obj.get("params") orelse .null,
         };
@@ -294,4 +306,31 @@ test "rpc classify: response, notification, request, error" {
     try testing.expect(env.has_error);
     try testing.expectEqual(REQUEST_CANCELLED, env.err_code);
     try testing.expectEqualStrings("cancelled", env.err_message);
+}
+
+test "rpc classify: a string-id server request is a request, not a notification" {
+    // zls mints "i_haz_configuration" for workspace/configuration; a
+    // client that drops the id treats it as a notification, never
+    // answers, and zls silently stops serving completions.
+    var p = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":\"i_haz_configuration\",\"method\":\"workspace/configuration\",\"params\":{\"items\":[{}]}}",
+        .{},
+    );
+    defer p.deinit();
+    const env = classify(p.value);
+    try testing.expectEqual(MessageKind.request, env.kind);
+    try testing.expect(env.id == null);
+    try testing.expectEqualStrings("i_haz_configuration", env.id_str);
+
+    // A RESPONSE with a string id answers nothing we sent: invalid.
+    var p2 = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"result\":null}",
+        .{},
+    );
+    defer p2.deinit();
+    try testing.expectEqual(MessageKind.invalid, classify(p2.value).kind);
 }
