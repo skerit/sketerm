@@ -575,6 +575,11 @@ fn onCopyRelativePath(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 /// null when the file is not under that root at all.
 fn relativeTo(root: []const u8, path: []const u8) ?[]const u8 {
     const trimmed = if (root.len > 1 and root[root.len - 1] == '/') root[0 .. root.len - 1] else root;
+    // A root of "/" has no trailing component to strip; everything
+    // absolute is under it.
+    if (std.mem.eql(u8, trimmed, "/")) {
+        return if (path.len > 1 and path[0] == '/') path[1..] else null;
+    }
     if (!std.mem.startsWith(u8, path, trimmed)) return null;
     const rest = path[trimmed.len..];
     if (rest.len == 0) return null;
