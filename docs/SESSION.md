@@ -13073,3 +13073,83 @@ aarch64-macos cross, and the live rig end to end: paste -> SIGKILL
 helper mid-flight -> auto-retry resumes in place -> kill GUI+helper ->
 relaunch + re-paste -> adoption resumes at 92 MB -> both files land
 sha256-identical.
+
+## Inner document tabs: a shared per-tab context menu (and winapp's host menu)
+
+The inner tab strip that the file browser and the editor share
+(`src/ui/tabhost.zig`) had a menu hook for the strip's EMPTY area and
+none at all for a tab. The browser carried its own right-click gesture
+and its own three-row popover; right-clicking an editor document tab
+did nothing.
+
+`TabHost` now owns the per-tab menu. The mechanical rows are the same
+verbs in any tabbed host, so it builds them itself — Close Tab, Close
+Other Tabs, Close Tabs to the Right, Close Unmodified Tabs, Duplicate
+Tab, Open in New Window — driving them through the existing `on_close`
+callback and a `TabMenu` struct of optional hooks. A null hook removes
+its row (the browser has no `modified` predicate, so it has no Close
+Unmodified row; the editor has no `duplicate`, because opening the
+same file twice is refused by design), and every predicate is asked at
+POPUP time, so a row that cannot act is built insensitive rather than
+present and inert. Consumers add only their domain rows through
+`TabMenu.extra`: the editor's Save / Save As… / Revert / Copy Full
+Path / Copy Relative Path / Reveal in File Browser, the browser's
+Reopen Closed Tab. Rows are `browser/classicmenu.zig`, which grew an
+`itemIconEnabled` for the insensitive case.
+
+Keyboard parity comes from a key controller on the notebook (a tab's
+label box never sees the key: GtkNotebook focuses its own per-tab
+gizmo, which is the label's PARENT) that answers Menu / Shift+F10
+while focus is in the strip, and `menu.returnFocusTo` is factored out
+of the pane menu's focus-return so a keyboard-opened menu cannot
+strand focus in a dead popover. The editor also gained the strip menu
+it never had (New Document / Open File…).
+
+`Revert` is `EditorView.revertTab`, the external-change banner's
+Reload path given a name so any tab can reach it; Copy Relative Path
+is insensitive when the document has no project, which is the normal
+answer for a loose file (`editor/project.zig` returns null on a marker
+miss). Nothing new was invented: Reveal opens a browser tab with the
+file revealed (`newBrowserTabFromReveal`) or, with no window to host
+one, the Sketerm Files identity — exactly what the standalone editor
+window's own Reveal button does.
+
+`winapp.zig` (the winstream backend) had no host menu at all while
+`wlapp.zig` had one on Ctrl+right-click. wlapp's construction is now
+shared rather than copied: `popupHostMenu` (rows + popover + deferred
+unparent), `screenshotPicture` and `WindowRec` (the GIF/WebM
+start/stop/save state) are public, wlapp uses them for its own menu,
+and winapp answers Ctrl+right-click with Screenshot / Record (WebM) /
+Record (GIF) / Close. The embedding rows stay wlapp's: a streamed
+window is always a floating toplevel.
+
+Splitter handles were left alone deliberately. A useful row there
+("equalize this split") does not exist as behaviour anywhere:
+`winlayout.zig`'s `PanedRatioCtx` only tracks and re-applies a ratio
+across remaps and layout saves, there is no `input.Action` for
+resizing or resetting a split and no palette entry, so the row would
+have meant writing new window management to fill a menu.
+
+Two GTK bugs surfaced on the way and are fixed with it: closing ANY
+file-browser tab aborted GTK in `gtk_column_view_sorter_dispose` (the
+tab's extra reference on the column view's sorter outlived the view,
+which is what empties that sorter's sequence) and ran
+`invalidateBackingRefs` after the list model it reads was gone; and a
+press on a tab's very top edge popped the strip menu on top of the tab
+menu (the strip's empty-area hit test picks the notebook's own tab
+gizmo there), so the tab gesture now stamps the press's event time and
+the strip gesture skips a press already answered.
+
+Verification: 1624 unit tests / 6 skipped (one new: the relative-path
+helper), test-core 1386/5, smoke-e2e, smoke-editor, smoke-atspi,
+mux-portable (ldd: libc/libm only) and the aarch64-macos cross all
+green. smoke-atspi gained a stage that drives BOTH consumers on the
+real seat: the tab strip is located by clicking down a column until
+the accessibility tree reports that tab selected (GTK4 on Wayland
+reports every accessible rect at 0,0, so extents cannot aim a click),
+the menu is then counted as its own popup SURFACE, its rows are read
+off the a11y bus with their sensitivity, Copy Full Path is activated
+and the clipboard checked, Shift+F10 opens the same menu, and Close
+Other Tabs really closes the others. Reverting either consumer's
+`tab_menu` assignment, or the strip key controller, fails exactly the
+matching assertion.
