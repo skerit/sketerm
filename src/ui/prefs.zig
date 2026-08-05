@@ -65,6 +65,16 @@ const Ctx = struct {
     /// "Theme" group). Three is the flat layout's count; the sizing
     /// is asserted in `trackColorGroup`.
     color_groups: [4]?*c.GtkWidget = .{null} ** 4,
+    /// The two list-shaped families (`symbol_map.<name>`,
+    /// `hint.<name>.*`) each own one group that is destroyed and
+    /// rebuilt whenever an entry is added or removed — which is also
+    /// what runs the removed rows' GDestroyNotify. Both groups are
+    /// built LAST on their page so a rebuild's append lands them back
+    /// where they were.
+    appearance_page: ?*c.AdwPreferencesPage = null,
+    symbol_group: ?*c.GtkWidget = null,
+    behavior_page: ?*c.AdwPreferencesPage = null,
+    hint_group: ?*c.GtkWidget = null,
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
@@ -397,11 +407,18 @@ fn defaultProfileSelected(ctx: *Ctx, idx: c_uint) void {
 fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_page_set_title(page, "Appearance");
     c.adw_preferences_page_set_icon_name(page, "preferences-desktop-font-symbolic");
+    ctx.appearance_page = page;
 
     const font_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
     addFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontPathRow(@ptrCast(@alignCast(font_group)), ctx);
+    addEntryRowString(@ptrCast(@alignCast(font_group)), ctx, "Bold family", "", &ctx.edit.font_family_bold, applyOnly);
+    addEntryRowString(@ptrCast(@alignCast(font_group)), ctx, "Italic family", "", &ctx.edit.font_family_italic, applyOnly);
+    addEntryRowString(@ptrCast(@alignCast(font_group)), ctx, "Bold italic family", "", &ctx.edit.font_family_bold_italic, applyOnly);
+    addFontWeightRow(@ptrCast(@alignCast(font_group)), ctx, "Weight", "Weight for the regular face. Also drives a variable font's wght axis.", &ctx.edit.font_weight);
+    addFontWeightRow(@ptrCast(@alignCast(font_group)), ctx, "Bold weight", "Weight for the bold face.", &ctx.edit.font_weight_bold);
+    addSwitchRow(@ptrCast(@alignCast(font_group)), ctx, "Built-in box drawing", "Draw box, block and Powerline characters from the cell rectangle instead of the font — they tile without seams. Off gives the font's own shapes back.", &ctx.edit.builtin_box_drawing, applyOnly);
     addFontFeaturesRow(@ptrCast(@alignCast(font_group)), ctx);
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.edit.font_size, applyOnly);
     addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.edit.line_pad_px, applyOnly);
@@ -473,6 +490,21 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.edit.custom_shader, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances.", &ctx.cfg.custom_shader_animation, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shader_group)));
+
+    // Overlay scrollbar. App-level (see the comment on Config.scrollbar):
+    // it is chrome, not a per-pane look.
+    const sbar_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(sbar_group)), "Overlay scrollbar");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(sbar_group)), "Drawn inside the pane by the renderer, not a widget. Applies to every pane in the window.");
+    addScrollbarModeRow(@ptrCast(@alignCast(sbar_group)), ctx);
+    addSpinRowF32Step(@ptrCast(@alignCast(sbar_group)), ctx, "Width", "Track/thumb width in pixels. 0 also disables it.", 0.0, 64.0, 1.0, 0, &ctx.cfg.scrollbar_width, applyOnly);
+    addColorRow(@ptrCast(@alignCast(sbar_group)), ctx, "Trough", &ctx.cfg.scrollbar_trough_color);
+    addColorRow(@ptrCast(@alignCast(sbar_group)), ctx, "Thumb", &ctx.cfg.scrollbar_thumb_color);
+    addColorRow(@ptrCast(@alignCast(sbar_group)), ctx, "Thumb while scrolled back", &ctx.cfg.scrollbar_thumb_active_color);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(sbar_group)));
+
+    // LAST on this page: a rebuild re-appends it (see Ctx.symbol_group).
+    buildSymbolMapGroup(page, ctx);
 }
 
 // ── Generic row helpers ─────────────────────────────────────────
@@ -1199,6 +1231,7 @@ fn applyOnly(ctx: *Ctx) void {
 fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_page_set_title(page, "Behavior");
     c.adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
+    ctx.behavior_page = page;
 
     // Shell — note: applies to NEW panes, not running shells.
     const shell_group = c.adw_preferences_group_new();
@@ -1278,6 +1311,9 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(comp_group)), "Compositing");
     addSwitchRow(@ptrCast(@alignCast(comp_group)), ctx, "Graphics offload", "Wayland subsurface scanout fast path. Turn off if your compositor misbehaves with subsurfaces.", &ctx.cfg.graphics_offload, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(comp_group)));
+
+    // LAST on this page: a rebuild re-appends it (see Ctx.hint_group).
+    buildHintGroup(page, ctx);
 }
 
 const StringFieldCtx = struct {
@@ -1811,6 +1847,78 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(close_group)), "Closing");
     addConfirmCloseRow(@ptrCast(@alignCast(close_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(close_group)));
+
+    // Pane presentation. The borders and the corner radius are
+    // pane-level (they belong to the profile being edited); the gap is
+    // the space BETWEEN two panes, which no single profile owns, so it
+    // is app-level. Both live here because a user thinking about "how
+    // my splits look" is thinking about one thing.
+    const pres_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(pres_group)), "Pane presentation");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(pres_group)), "Borders and the corner radius follow the profile being edited; the gap and its colour are window-wide.");
+    addSpinRowF32Step(@ptrCast(@alignCast(pres_group)), ctx, "Border width", "Border drawn inside a pane's edge. 0 = none.", 0.0, 32.0, 1.0, 0, &ctx.edit.pane_border_width, applyOnly);
+    addColorRow(@ptrCast(@alignCast(pres_group)), ctx, "Border (focused pane)", &ctx.edit.pane_border_color_active);
+    addColorRow(@ptrCast(@alignCast(pres_group)), ctx, "Border (unfocused pane)", &ctx.edit.pane_border_color);
+    addSpinRowF32Step(@ptrCast(@alignCast(pres_group)), ctx, "Corner radius", "Round a pane's corners. 0 = square.", 0.0, 64.0, 1.0, 0, &ctx.edit.pane_corner_radius, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(pres_group)), ctx, "Gap between panes", "Thickness of the split separator. Keep it a multiple of 4 — an odd separator can push a pane off the device-pixel grid at fractional scales and lose graphics offload.", 1.0, 64.0, 1.0, 0, &ctx.cfg.pane_gap, applyOnly);
+    addColorRow(@ptrCast(@alignCast(pres_group)), ctx, "Gap colour", &ctx.cfg.pane_gap_color);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(pres_group)));
+
+    // Quake mode.
+    const quake_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(quake_group)), "Quake mode");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(quake_group)), "Size the primary window from a monitor instead of the 1000x700 default, for a drop-down terminal toggled with `sketerm --toggle`.");
+    addSwitchRow(@ptrCast(@alignCast(quake_group)), ctx, "Enabled", "Apply the geometry below to the primary window.", &ctx.cfg.quake_enabled, applyOnly);
+    addEntryRowString(@ptrCast(@alignCast(quake_group)), ctx, "Monitor (active / primary / index / connector)", "", &ctx.cfg.quake_monitor, applyOnly);
+    addQuakeEdgeRow(@ptrCast(@alignCast(quake_group)), ctx);
+    addSpinRowF32Step(@ptrCast(@alignCast(quake_group)), ctx, "Width (% of monitor)", "", 1.0, 100.0, 5.0, 0, &ctx.cfg.quake_width_percent, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(quake_group)), ctx, "Height (% of monitor)", "", 1.0, 100.0, 5.0, 0, &ctx.cfg.quake_height_percent, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(quake_group)));
+}
+
+/// `scrollbar` — never / auto / always, in the enum's own order.
+fn addScrollbarModeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Never", "When there is scrollback", "Always" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Show");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "There is no timed fade-out — the bar is either drawn or it is not.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(ctx.cfg.scrollbar));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = scrollbarModeSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn scrollbarModeSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.scrollbar = std.enums.fromInt(config_mod.ScrollbarMode, idx) orelse .auto;
+    ctx.ev();
+}
+
+/// `quake_edge`. Kept in the dialog even though it moves nothing: the
+/// key parses and serialises, so a config that already sets it must
+/// survive a dialog round-trip, and a row that says why it is inert is
+/// more honest than a key the UI silently cannot see. GTK4 removed
+/// toplevel positioning on every backend and Wayland forbids a client
+/// placing its own surface, so no code path can act on this.
+fn addQuakeEdgeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Top", "Bottom", "Left", "Right" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Edge (no effect on this backend)");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Recorded only. Wayland forbids a client from positioning its own window and GTK4 dropped window moving everywhere, so nothing sketerm can call honours this — use a compositor window rule to place the window.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(ctx.cfg.quake_edge));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = quakeEdgeSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn quakeEdgeSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.quake_edge = std.enums.fromInt(config_mod.QuakeEdge, idx) orelse .top;
+    ctx.ev();
 }
 
 fn addConfirmCloseRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
@@ -2100,4 +2208,516 @@ fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
         .accel = accel_dup,
     }) catch return;
     rctx.parent.ev();
+}
+
+// ── Font weight ────────────────────────────────────────────────
+//
+// `font_weight` / `font_weight_bold` are 0 (the font's own default)
+// or a CSS weight 100..900 — anything else is a config ERROR, not a
+// clamp (see config.parseWeight). A spin row cannot express that
+// without letting the user stop on a value the parser would reject
+// and lose on the next load, so this is a combo: every item it can
+// select is a value the parser accepts.
+
+const WeightCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    field: *u16,
+    /// A weight already in the config that is not a multiple of 100
+    /// (the parser accepts e.g. 350). Offered as an extra last item so
+    /// opening the dialog cannot silently round it. 0 = none.
+    extra: u16,
+};
+
+fn addFontWeightRow(
+    group: *c.AdwPreferencesGroup,
+    ctx: *Ctx,
+    title: [*:0]const u8,
+    subtitle: [*:0]const u8,
+    field: *u16,
+) void {
+    const cur = field.*;
+    const extra: u16 = if (cur != 0 and cur % 100 != 0) cur else 0;
+
+    var labels: [12]?[*:0]const u8 = undefined;
+    var bufs: [12][16:0]u8 = undefined;
+    labels[0] = "Font default";
+    var i: usize = 1;
+    while (i <= 9) : (i += 1) {
+        const w: u16 = @intCast(i * 100);
+        _ = std.fmt.bufPrintZ(&bufs[i], "{d}", .{w}) catch continue;
+        labels[i] = &bufs[i];
+    }
+    var count: usize = 10;
+    if (extra != 0) {
+        _ = std.fmt.bufPrintZ(&bufs[10], "{d}", .{extra}) catch {};
+        labels[10] = &bufs[10];
+        count = 11;
+    }
+    labels[count] = null;
+
+    const items = c.gtk_string_list_new(@ptrCast(&labels));
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    const sel: c_uint = if (cur == 0) 0 else if (extra != 0) 10 else @intCast(cur / 100);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), sel);
+
+    const wctx = ctx.allocator.create(WeightCtx) catch return;
+    wctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .extra = extra };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&weightSelected), @ptrCast(wctx), @ptrCast(cast.destroyCtx(WeightCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn weightSelected(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const wctx = cast.userData(WeightCtx, user);
+    const idx = c.adw_combo_row_get_selected(row);
+    wctx.field.* = if (idx == 0)
+        0
+    else if (idx <= 9)
+        @intCast(idx * 100)
+    else
+        wctx.extra;
+    wctx.parent.ev();
+}
+
+// ── Inline validation ──────────────────────────────────────────
+//
+// A rejected value stays out of the working config and the row says
+// why, rather than being written and then silently dropped by the
+// parser on the next load.
+
+fn markRowError(row: anytype, msg: [*:0]const u8) void {
+    const w: *c.GtkWidget = @ptrCast(@alignCast(row));
+    c.gtk_widget_add_css_class(w, "error");
+    c.gtk_widget_set_tooltip_text(w, msg);
+}
+
+fn clearRowError(row: anytype) void {
+    const w: *c.GtkWidget = @ptrCast(@alignCast(row));
+    c.gtk_widget_remove_css_class(w, "error");
+    c.gtk_widget_set_tooltip_text(w, null);
+}
+
+/// `markRowError` with a runtime string (validator messages are Zig
+/// slices, GTK wants NUL-terminated).
+fn markRowErrorSlice(row: anytype, msg: []const u8) void {
+    var z = cast.sliceToZ(192, msg);
+    markRowError(row, &z);
+}
+
+// ── Symbol maps (symbol_map.<name>) ────────────────────────────
+//
+// App-level: this is about glyph COVERAGE, which does not sensibly
+// differ between two panes of the same session.
+//
+// An entry's name is its config key and is fixed at creation — a
+// live-renaming entry row would rewrite a key on every keystroke and
+// could collide mid-word. Delete and re-add to rename.
+
+const SymbolField = enum { range, family };
+
+const SymbolRowCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    /// Entry name; lives in the dialog arena, which outlives the row.
+    name: []const u8,
+    field: SymbolField,
+};
+
+/// Which list an add/remove button acts on.
+const ListKind = enum { symbol_map, hint_rule };
+
+const ListRemoveCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    name: []const u8,
+    kind: ListKind,
+};
+
+const AddEntryCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    kind: ListKind,
+    /// The rows the Add button reads. For a hint rule only `name` is
+    /// used; a rule with no pattern is inert but round-trips, whereas a
+    /// symbol map with no family or range does not.
+    name_row: *c.GtkWidget,
+    range_row: ?*c.GtkWidget = null,
+    family_row: ?*c.GtkWidget = null,
+};
+
+fn buildSymbolMapGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    const group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Symbol maps");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)), "Route a Unicode range to a specific font family \xe2\x80\x94 Powerline glyphs from a Nerd Font, say. Consulted before the primary face, so the mapped font wins even where the main font has glyphs of its own. Applies to every pane.");
+
+    for (ctx.cfg.symbol_maps.items) |sm| {
+        const name = ctx.dupe(sm.name) catch continue;
+        const exp = c.adw_expander_row_new();
+        var title_z = cast.sliceToZ(96, name);
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), &title_z);
+        var range_buf: [32]u8 = undefined;
+        const range = config_mod.formatCodepointRange(&range_buf, sm.lo, sm.hi);
+        var sub_buf: [192:0]u8 = undefined;
+        const sub = std.fmt.bufPrintZ(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
+            range,
+            if (sm.family.len > 0) sm.family else "(no family \xe2\x80\x94 not saved)",
+        }) catch "";
+        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), sub.ptr);
+
+        addSymbolFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .range, "Range", range);
+        addSymbolFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .family, "Font family", sm.family);
+        addRemoveRow(@ptrCast(@alignCast(exp)), ctx, name, .symbol_map, "Remove this symbol map");
+        c.adw_preferences_group_add(@ptrCast(@alignCast(group)), @ptrCast(@alignCast(exp)));
+    }
+
+    addSymbolMapAddRow(@ptrCast(@alignCast(group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
+    ctx.symbol_group = @ptrCast(@alignCast(group));
+}
+
+fn addSymbolFieldRow(
+    exp: *c.AdwExpanderRow,
+    ctx: *Ctx,
+    name: []const u8,
+    field: SymbolField,
+    title: [*:0]const u8,
+    value: []const u8,
+) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    var z = cast.sliceToZ(256, value);
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    if (field == .family and value.len == 0)
+        markRowError(row, "A symbol map with no family does nothing and is not written to the config file.");
+    const rctx = ctx.allocator.create(SymbolRowCtx) catch return;
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name, .field = field };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&symbolFieldChanged), @ptrCast(rctx), @ptrCast(cast.destroyCtx(SymbolRowCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_expander_row_add_row(exp, @ptrCast(@alignCast(row)));
+}
+
+fn symbolFieldChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const rctx = cast.userData(SymbolRowCtx, user);
+    const text = cast.editableText(row);
+    const sm = rctx.parent.cfg.findSymbolMap(rctx.name) orelse return;
+    switch (rctx.field) {
+        .range => {
+            const r = config_mod.parseCodepointRange(text) catch {
+                markRowError(row, "Expected a hex codepoint or range: U+E0A0 or U+E0A0-U+E0A3 (the high end may not be below the low one, and neither may exceed U+10FFFF).");
+                return;
+            };
+            clearRowError(row);
+            sm.lo = r.lo;
+            sm.hi = r.hi;
+        },
+        .family => {
+            if (text.len == 0) {
+                markRowError(row, "A symbol map with no family does nothing and is not written to the config file.");
+            } else {
+                clearRowError(row);
+            }
+            sm.family = rctx.parent.dupe(text) catch return;
+        },
+    }
+    rctx.parent.ev();
+}
+
+/// Name + range + family, validated together: a half-filled symbol map
+/// is not representable in the config file, so the entry is only
+/// created once all three are good.
+fn addSymbolMapAddRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const exp = c.adw_expander_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), "Add a symbol map");
+
+    const name_row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(name_row)), "Name (the config key)");
+    c.adw_expander_row_add_row(@ptrCast(@alignCast(exp)), @ptrCast(@alignCast(name_row)));
+
+    const range_row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(range_row)), "Range (U+E0A0-U+E0A3)");
+    c.adw_expander_row_add_row(@ptrCast(@alignCast(exp)), @ptrCast(@alignCast(range_row)));
+
+    const family_row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(family_row)), "Font family");
+    c.adw_expander_row_add_row(@ptrCast(@alignCast(exp)), @ptrCast(@alignCast(family_row)));
+
+    const btn_row = c.adw_action_row_new();
+    const btn = c.gtk_button_new_with_label("Add");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(btn, "suggested-action");
+    const actx = ctx.allocator.create(AddEntryCtx) catch return;
+    actx.* = .{
+        .allocator = ctx.allocator,
+        .parent = ctx,
+        .kind = .symbol_map,
+        .name_row = @ptrCast(@alignCast(name_row)),
+        .range_row = @ptrCast(@alignCast(range_row)),
+        .family_row = @ptrCast(@alignCast(family_row)),
+    };
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAddListEntry), @ptrCast(actx), @ptrCast(cast.destroyCtx(AddEntryCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_action_row_add_suffix(@ptrCast(@alignCast(btn_row)), btn);
+    c.adw_expander_row_add_row(@ptrCast(@alignCast(exp)), @ptrCast(@alignCast(btn_row)));
+
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(exp)));
+}
+
+// ── Hint rules (hint.<name>.{regex,action,command}) ────────────
+
+const HintField = enum { regex, command };
+
+const HintRowCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    name: []const u8,
+    field: HintField,
+};
+
+const HintActionCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    name: []const u8,
+};
+
+fn buildHintGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    const group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Hints");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)), "Hint mode labels every match on screen so it can be picked from the keyboard. Your rules are scanned BEFORE the built-in URL / path / hash scanners, so a rule can claim text those would have taken.");
+
+    addHintAlphabetRow(@ptrCast(@alignCast(group)), ctx);
+    addSwitchRow(@ptrCast(@alignCast(group)), ctx, "Start in multi-select", "Each label appends its match instead of activating and closing. Tab toggles it in-mode either way.", &ctx.cfg.hint_multiple, applyOnly);
+
+    for (ctx.cfg.hint_rules.items) |hr| {
+        const name = ctx.dupe(hr.name) catch continue;
+        const exp = c.adw_expander_row_new();
+        var title_z = cast.sliceToZ(96, name);
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), &title_z);
+        var sub_buf: [256:0]u8 = undefined;
+        const sub = std.fmt.bufPrintZ(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
+            if (hr.pattern.len > 0) hr.pattern else "(no pattern \xe2\x80\x94 matches nothing)",
+            @tagName(hr.action),
+        }) catch "";
+        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), sub.ptr);
+
+        addHintFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .regex, "Pattern (POSIX extended regex)", hr.pattern);
+        addHintActionRow(@ptrCast(@alignCast(exp)), ctx, name, hr.action);
+        addHintFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .command, "Command ({match} is substituted)", hr.command);
+        addRemoveRow(@ptrCast(@alignCast(exp)), ctx, name, .hint_rule, "Remove this rule");
+        c.adw_preferences_group_add(@ptrCast(@alignCast(group)), @ptrCast(@alignCast(exp)));
+    }
+
+    addHintRuleAddRow(@ptrCast(@alignCast(group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
+    ctx.hint_group = @ptrCast(@alignCast(group));
+}
+
+fn addHintAlphabetRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Label alphabet (empty = built-in home-row set)");
+    var z = cast.sliceToZ(128, ctx.cfg.hint_alphabet);
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    // User-data is the dialog's main Ctx (freed by onClosed) — no
+    // destroy-notify, same as the shell row.
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&hintAlphabetChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn hintAlphabetChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const text = cast.editableText(row);
+    if (text.len > 0) {
+        config_mod.checkHintAlphabet(text) catch |err| {
+            markRowErrorSlice(row, config_mod.alphabetErrorText(err));
+            return;
+        };
+    }
+    clearRowError(row);
+    ctx.cfg.hint_alphabet = ctx.dupe(text) catch return;
+    ctx.ev();
+}
+
+fn addHintFieldRow(
+    exp: *c.AdwExpanderRow,
+    ctx: *Ctx,
+    name: []const u8,
+    field: HintField,
+    title: [*:0]const u8,
+    value: []const u8,
+) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    var z = cast.sliceToZ(512, value);
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    if (field == .regex and value.len > 0 and !config_mod.hintPatternCompiles(value))
+        markRowError(row, "This is not a valid POSIX extended regex \xe2\x80\x94 the rule is skipped while it does not compile.");
+    const rctx = ctx.allocator.create(HintRowCtx) catch return;
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name, .field = field };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&hintFieldChanged), @ptrCast(rctx), @ptrCast(cast.destroyCtx(HintRowCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_expander_row_add_row(exp, @ptrCast(@alignCast(row)));
+}
+
+fn hintFieldChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const rctx = cast.userData(HintRowCtx, user);
+    const text = cast.editableText(row);
+    const dup = rctx.parent.dupe(text) catch return;
+    const rule = rctx.parent.cfg.findHintRule(rctx.name) orelse return;
+    switch (rctx.field) {
+        // The parser stores any pattern and hint mode drops the rule if
+        // it fails to compile, so an uncompilable regex is FLAGGED, not
+        // rejected — refusing it here would be stricter than the file.
+        .regex => {
+            if (text.len > 0 and !config_mod.hintPatternCompiles(text)) {
+                markRowError(row, "This is not a valid POSIX extended regex \xe2\x80\x94 the rule is skipped while it does not compile.");
+            } else {
+                clearRowError(row);
+            }
+            rule.pattern = dup;
+        },
+        .command => rule.command = dup,
+    }
+    rctx.parent.ev();
+}
+
+fn addHintActionRow(exp: *c.AdwExpanderRow, ctx: *Ctx, name: []const u8, action: config_mod.HintAction) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{
+        "Open (URL to the desktop, file to the editor)",
+        "Copy to clipboard",
+        "Paste into the pane",
+        "Select",
+        "Run the command below",
+    });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Action");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(action));
+    const actx = ctx.allocator.create(HintActionCtx) catch return;
+    actx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&hintActionSelected), @ptrCast(actx), @ptrCast(cast.destroyCtx(HintActionCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_expander_row_add_row(exp, @ptrCast(@alignCast(row)));
+}
+
+fn hintActionSelected(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const actx = cast.userData(HintActionCtx, user);
+    const rule = actx.parent.cfg.findHintRule(actx.name) orelse return;
+    rule.action = std.enums.fromInt(config_mod.HintAction, c.adw_combo_row_get_selected(row)) orelse return;
+    actx.parent.ev();
+}
+
+fn addHintRuleAddRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "New rule (name)");
+    const btn = c.gtk_button_new_with_label("Add");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(btn, "suggested-action");
+    const actx = ctx.allocator.create(AddEntryCtx) catch return;
+    actx.* = .{
+        .allocator = ctx.allocator,
+        .parent = ctx,
+        .kind = .hint_rule,
+        .name_row = @ptrCast(@alignCast(row)),
+    };
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAddListEntry), @ptrCast(actx), @ptrCast(cast.destroyCtx(AddEntryCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_entry_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+// ── Shared add / remove plumbing ───────────────────────────────
+
+fn addRemoveRow(exp: *c.AdwExpanderRow, ctx: *Ctx, name: []const u8, kind: ListKind, title: [*:0]const u8) void {
+    const row = c.adw_action_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    const btn = c.gtk_button_new_with_label("Remove");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(btn, "destructive-action");
+    const rctx = ctx.allocator.create(ListRemoveCtx) catch return;
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .name = name, .kind = kind };
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRemoveListEntry), @ptrCast(rctx), @ptrCast(cast.destroyCtx(ListRemoveCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+    c.adw_expander_row_add_row(exp, @ptrCast(@alignCast(row)));
+}
+
+fn onRemoveListEntry(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const rctx = cast.userData(ListRemoveCtx, user);
+    // Read everything BEFORE the rebuild: it destroys this button,
+    // which runs this context's GDestroyNotify.
+    const ctx = rctx.parent;
+    const kind = rctx.kind;
+    switch (kind) {
+        .symbol_map => _ = ctx.cfg.removeSymbolMap(rctx.name),
+        .hint_rule => _ = ctx.cfg.removeHintRule(rctx.name),
+    }
+    ctx.ev();
+    rebuildListGroup(ctx, kind);
+}
+
+fn onAddListEntry(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const actx = cast.userData(AddEntryCtx, user);
+    const ctx = actx.parent;
+    const kind = actx.kind;
+    const arena = ctx.arena.allocator();
+    const name = std.mem.trim(u8, cast.editableText(actx.name_row), &std.ascii.whitespace);
+
+    config_mod.checkEntryName(name) catch |err| {
+        markRowErrorSlice(actx.name_row, config_mod.nameErrorText(err));
+        return;
+    };
+    switch (kind) {
+        .symbol_map => {
+            if (ctx.cfg.findSymbolMap(name) != null) {
+                markRowErrorSlice(actx.name_row, config_mod.nameErrorText(error.DuplicateName));
+                return;
+            }
+            const range_row = actx.range_row orelse return;
+            const family_row = actx.family_row orelse return;
+            const range = cast.editableText(range_row);
+            const family = std.mem.trim(u8, cast.editableText(family_row), &std.ascii.whitespace);
+            _ = config_mod.parseCodepointRange(range) catch {
+                markRowError(range_row, "Expected a hex codepoint or range: U+E0A0 or U+E0A0-U+E0A3.");
+                return;
+            };
+            if (family.len == 0) {
+                markRowError(family_row, "A symbol map needs a font family \xe2\x80\x94 without one it is not written to the config file.");
+                return;
+            }
+            clearRowError(actx.name_row);
+            clearRowError(range_row);
+            clearRowError(family_row);
+            _ = ctx.cfg.addSymbolMap(arena, name, range, family) catch return;
+        },
+        .hint_rule => {
+            if (ctx.cfg.findHintRule(name) != null) {
+                markRowErrorSlice(actx.name_row, config_mod.nameErrorText(error.DuplicateName));
+                return;
+            }
+            clearRowError(actx.name_row);
+            _ = ctx.cfg.addHintRule(arena, name) catch return;
+        },
+    }
+    ctx.ev();
+    rebuildListGroup(ctx, kind);
+}
+
+/// Tear the list's group down and build it again. Dropping the group
+/// finalizes its rows, which runs every row context's GDestroyNotify —
+/// so add/remove cycles free their contexts instead of stacking them.
+/// Both groups are the LAST on their page, so re-adding restores the
+/// original order.
+fn rebuildListGroup(ctx: *Ctx, kind: ListKind) void {
+    switch (kind) {
+        .symbol_map => {
+            const page = ctx.appearance_page orelse return;
+            if (ctx.symbol_group) |g| c.adw_preferences_page_remove(page, @ptrCast(@alignCast(g)));
+            ctx.symbol_group = null;
+            buildSymbolMapGroup(page, ctx);
+        },
+        .hint_rule => {
+            const page = ctx.behavior_page orelse return;
+            if (ctx.hint_group) |g| c.adw_preferences_page_remove(page, @ptrCast(@alignCast(g)));
+            ctx.hint_group = null;
+            buildHintGroup(page, ctx);
+        },
+    }
 }

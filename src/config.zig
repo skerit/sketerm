@@ -108,16 +108,35 @@ pub fn parseSymbolMap(name: []const u8, value: []const u8) !SymbolMap {
     const family = std.mem.trim(u8, trimmed[sp + 1 ..], " \t");
     if (family.len == 0) return error.BadSymbolMap;
 
-    var lo_s = range;
-    var hi_s = range;
-    if (std.mem.indexOfScalar(u8, range, '-')) |dash| {
-        lo_s = range[0..dash];
-        hi_s = range[dash + 1 ..];
+    const r = try parseCodepointRange(range);
+    return .{ .name = name, .lo = r.lo, .hi = r.hi, .family = family };
+}
+
+pub const CodepointRange = struct { lo: u32, hi: u32 };
+
+/// The range half of a `symbol_map` value: `U+E0A0-U+E0A3`, `E0A0-E0A3`
+/// or a single codepoint. Split out from `parseSymbolMap` so the
+/// Preferences dialog can validate the range field on its own with
+/// exactly the parser's rules.
+pub fn parseCodepointRange(range: []const u8) !CodepointRange {
+    const t = std.mem.trim(u8, range, " \t");
+    var lo_s = t;
+    var hi_s = t;
+    if (std.mem.indexOfScalar(u8, t, '-')) |dash| {
+        lo_s = t[0..dash];
+        hi_s = t[dash + 1 ..];
     }
     const lo = try parseCodepoint(lo_s);
     const hi = try parseCodepoint(hi_s);
     if (hi < lo) return error.BadSymbolMap;
-    return .{ .name = name, .lo = lo, .hi = hi, .family = family };
+    return .{ .lo = lo, .hi = hi };
+}
+
+/// Render a range back in the form the serialiser writes, so a UI can
+/// show what will land in the file. Needs 32 bytes.
+pub fn formatCodepointRange(buf: []u8, lo: u32, hi: u32) []const u8 {
+    if (lo == hi) return std.fmt.bufPrint(buf, "U+{X}", .{lo}) catch "";
+    return std.fmt.bufPrint(buf, "U+{X}-U+{X}", .{ lo, hi }) catch "";
 }
 
 fn parseCodepoint(text: []const u8) !u32 {
@@ -155,6 +174,94 @@ pub const HintRule = struct {
     /// with the matched text, shell-quoted.
     command: []const u8 = "",
 };
+
+/// Why a `symbol_map.<name>` / `hint.<name>` entry name was rejected.
+pub const NameError = error{ EmptyName, NameTooLong, NameBadChar, DuplicateName };
+
+/// A name usable as the `<name>` of a prefix-keyed family. The parser
+/// splits a line at the first `=` and trims, so a name may not carry
+/// `=`, whitespace or a control byte; `#`, `[` and `]` are refused
+/// because they start a comment or a section header; `.` because
+/// `hint.<name>.<field>` splits on the LAST dot and a name ending in
+/// a field name would be unreadable. Non-ASCII is allowed — a family
+/// nickname is the user's business.
+pub fn checkEntryName(name: []const u8) NameError!void {
+    if (name.len == 0) return error.EmptyName;
+    if (name.len > 64) return error.NameTooLong;
+    for (name) |ch| {
+        if (ch < 0x21 or ch == 0x7f) return error.NameBadChar;
+        switch (ch) {
+            '=', '#', '[', ']', '.' => return error.NameBadChar,
+            else => {},
+        }
+    }
+}
+
+/// One-line reason for a `NameError`, for a dialog to show verbatim.
+pub fn nameErrorText(err: NameError) []const u8 {
+    return switch (err) {
+        error.EmptyName => "Name cannot be empty.",
+        error.NameTooLong => "Name is longer than 64 characters.",
+        error.NameBadChar => "Name may not contain spaces or any of = # [ ] .",
+        error.DuplicateName => "An entry with that name already exists.",
+    };
+}
+
+/// Why a `hint_alphabet` was rejected. Mirrors the runtime rule in
+/// `ui/hints.zig`: an alphabet that cannot label things is ignored.
+pub const AlphabetError = error{ AlphabetTooShort, AlphabetTooLong, AlphabetNotPrintable, AlphabetDuplicate };
+
+pub fn checkHintAlphabet(alphabet: []const u8) AlphabetError!void {
+    if (alphabet.len < 2) return error.AlphabetTooShort;
+    if (alphabet.len > 64) return error.AlphabetTooLong;
+    for (alphabet, 0..) |ch, i| {
+        if (ch <= ' ' or ch > '~') return error.AlphabetNotPrintable;
+        for (alphabet[i + 1 ..]) |other| {
+            if (other == ch) return error.AlphabetDuplicate;
+        }
+    }
+}
+
+/// The alphabet if it can label matches, else null (caller falls back
+/// to the built-in set). The single implementation behind both the
+/// hint-mode runtime and the Preferences validation.
+pub fn validHintAlphabet(alphabet: []const u8) ?[]const u8 {
+    checkHintAlphabet(alphabet) catch return null;
+    return alphabet;
+}
+
+pub fn alphabetErrorText(err: AlphabetError) []const u8 {
+    return switch (err) {
+        error.AlphabetTooShort => "Needs at least two characters.",
+        error.AlphabetTooLong => "At most 64 characters.",
+        error.AlphabetNotPrintable => "Printable ASCII only, no spaces.",
+        error.AlphabetDuplicate => "A character is repeated — two matches would get the same label.",
+    };
+}
+
+/// Whether a hint rule's pattern compiles as a POSIX extended regex.
+/// NOT a parse rule: the config parser stores any pattern and
+/// `ui/hints.zig` silently drops the rule if it fails to compile, so
+/// this exists only so a dialog can warn instead of the rule dying
+/// invisibly. An over-long pattern is reported as fine rather than
+/// broken — refusing to check is not evidence of a fault.
+pub fn hintPatternCompiles(pattern: []const u8) bool {
+    if (pattern.len == 0) return false;
+    if (pattern.len >= 1024) return true;
+    const c = @import("c.zig").c;
+    var pat_z: [1024]u8 = undefined;
+    @memcpy(pat_z[0..pattern.len], pattern);
+    pat_z[pattern.len] = 0;
+    // glibc's regex_t carries bitfields translate-c cannot model, so
+    // it is opaque to Zig and cannot be a stack local (same dance as
+    // ui/hints.zig).
+    const buf = std.c.malloc(256) orelse return true;
+    defer std.c.free(buf);
+    const re: *c.regex_t = @ptrCast(@alignCast(buf));
+    if (c.regcomp(re, @ptrCast(&pat_z), c.REG_EXTENDED) != 0) return false;
+    c.regfree(re);
+    return true;
+}
 
 /// Which half of a light/dark pair is in force.
 pub const ColorScheme = enum { light, dark };
@@ -1479,6 +1586,11 @@ pub const Config = struct {
         if (self.hint_alphabet.len > 0) try w.print("hint_alphabet = {s}\n", .{self.hint_alphabet});
         if (self.hint_multiple) try w.writeAll("hint_multiple = true\n");
         for (self.symbol_maps.items) |sm| {
+            // A map with no family routes nothing (the atlas skips it)
+            // and would serialise as a trailing-space line the parser
+            // then rejects on the next load. Skipping it keeps the file
+            // reloadable; the Preferences dialog flags such an entry.
+            if (sm.family.len == 0) continue;
             if (sm.lo == sm.hi) {
                 try w.print("symbol_map.{s} = U+{X} {s}\n", .{ sm.name, sm.lo, sm.family });
             } else {
@@ -1708,6 +1820,81 @@ pub const Config = struct {
     /// for it, and so keeps following the built-in as it evolves.
     pub fn lspServerMut(self: *Config, arena: std.mem.Allocator, name: []const u8) ?*LspServer {
         return findOrCreateLspServer(self, arena, name) catch null;
+    }
+
+    // ── symbol_map.<name> / hint.<name> list editing ─────────────
+    //
+    // The two prefix-keyed families the Preferences dialog can add to
+    // and remove from. Both live on the config arena: a removed entry's
+    // strings are not freed (the arena outlives the edit and is thrown
+    // away whole), and a name is fixed at creation — renaming would
+    // mean rewriting a config key on every keystroke.
+
+    pub fn findSymbolMap(self: *Config, name: []const u8) ?*SymbolMap {
+        for (self.symbol_maps.items) |*sm| {
+            if (std.mem.eql(u8, sm.name, name)) return sm;
+        }
+        return null;
+    }
+
+    /// Append a symbol map. `range` uses the config syntax
+    /// (`U+E0A0-U+E0A3`); an empty family is allowed here and simply
+    /// skipped by the renderer, matching a config line the user has
+    /// half-filled.
+    pub fn addSymbolMap(
+        self: *Config,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        range: []const u8,
+        family: []const u8,
+    ) !*SymbolMap {
+        try checkEntryName(name);
+        if (self.findSymbolMap(name) != null) return error.DuplicateName;
+        const r = try parseCodepointRange(range);
+        try self.symbol_maps.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .lo = r.lo,
+            .hi = r.hi,
+            .family = try arena.dupe(u8, family),
+        });
+        return &self.symbol_maps.items[self.symbol_maps.items.len - 1];
+    }
+
+    pub fn removeSymbolMap(self: *Config, name: []const u8) bool {
+        for (self.symbol_maps.items, 0..) |sm, i| {
+            if (std.mem.eql(u8, sm.name, name)) {
+                _ = self.symbol_maps.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn findHintRule(self: *Config, name: []const u8) ?*HintRule {
+        for (self.hint_rules.items) |*hr| {
+            if (std.mem.eql(u8, hr.name, name)) return hr;
+        }
+        return null;
+    }
+
+    /// Append a hint rule with the parser's own defaults (empty
+    /// pattern, `copy`). A rule with no pattern matches nothing, so a
+    /// freshly added one is inert until its regex is filled in.
+    pub fn addHintRule(self: *Config, arena: std.mem.Allocator, name: []const u8) !*HintRule {
+        try checkEntryName(name);
+        if (self.findHintRule(name) != null) return error.DuplicateName;
+        try self.hint_rules.append(arena, .{ .name = try arena.dupe(u8, name) });
+        return &self.hint_rules.items[self.hint_rules.items.len - 1];
+    }
+
+    pub fn removeHintRule(self: *Config, name: []const u8) bool {
+        for (self.hint_rules.items, 0..) |hr, i| {
+            if (std.mem.eql(u8, hr.name, name)) {
+                _ = self.hint_rules.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn hasLspSection(self: *const Config, name: []const u8) bool {
@@ -3726,4 +3913,229 @@ test "config: the new defaults stay out of the serialised file" {
     try std.testing.expect(std.mem.indexOf(u8, out, "pane_gap") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "pane_border") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "pane_corner") == null);
+}
+
+// ── Preferences-side validation + list editing ─────────────────
+
+test "config: entry names for the prefix-keyed families" {
+    try checkEntryName("powerline");
+    try checkEntryName("nerd-font_2");
+    try checkEntryName("caf\xc3\xa9"); // non-ASCII is the user's business
+    try std.testing.expectError(error.EmptyName, checkEntryName(""));
+    try std.testing.expectError(error.NameBadChar, checkEntryName("two words"));
+    try std.testing.expectError(error.NameBadChar, checkEntryName("a=b"));
+    try std.testing.expectError(error.NameBadChar, checkEntryName("a.b"));
+    try std.testing.expectError(error.NameBadChar, checkEntryName("[sec]"));
+    try std.testing.expectError(error.NameBadChar, checkEntryName("a#b"));
+    try std.testing.expectError(error.NameTooLong, checkEntryName("x" ** 65));
+}
+
+test "config: hint alphabet validation matches the hint-mode rule" {
+    try checkHintAlphabet("asdf");
+    try std.testing.expectError(error.AlphabetTooShort, checkHintAlphabet("a"));
+    try std.testing.expectError(error.AlphabetTooLong, checkHintAlphabet("x" ** 65));
+    try std.testing.expectError(error.AlphabetNotPrintable, checkHintAlphabet("a b"));
+    try std.testing.expectError(error.AlphabetDuplicate, checkHintAlphabet("aba"));
+    try std.testing.expectEqual(@as(?[]const u8, null), validHintAlphabet("a"));
+    try std.testing.expect(validHintAlphabet("qwerty") != null);
+    // Every error has a message; none is empty.
+    for ([_]AlphabetError{
+        error.AlphabetTooShort,
+        error.AlphabetTooLong,
+        error.AlphabetNotPrintable,
+        error.AlphabetDuplicate,
+    }) |e| try std.testing.expect(alphabetErrorText(e).len > 0);
+    for ([_]NameError{
+        error.EmptyName,
+        error.NameTooLong,
+        error.NameBadChar,
+        error.DuplicateName,
+    }) |e| try std.testing.expect(nameErrorText(e).len > 0);
+}
+
+test "config: codepoint ranges parse and format back" {
+    const one = try parseCodepointRange("U+2603");
+    try std.testing.expectEqual(@as(u32, 0x2603), one.lo);
+    try std.testing.expectEqual(@as(u32, 0x2603), one.hi);
+    const many = try parseCodepointRange("e0a0-U+E0A3");
+    try std.testing.expectEqual(@as(u32, 0xE0A0), many.lo);
+    try std.testing.expectEqual(@as(u32, 0xE0A3), many.hi);
+    try std.testing.expectError(error.BadSymbolMap, parseCodepointRange("U+E0A3-U+E0A0"));
+    try std.testing.expectError(error.BadSymbolMap, parseCodepointRange("zz"));
+    try std.testing.expectError(error.BadSymbolMap, parseCodepointRange("U+110000"));
+
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("U+2603", formatCodepointRange(&buf, 0x2603, 0x2603));
+    try std.testing.expectEqualStrings("U+E0A0-U+E0A3", formatCodepointRange(&buf, 0xE0A0, 0xE0A3));
+    // What the dialog shows is what parses back.
+    const again = try parseCodepointRange(formatCodepointRange(&buf, 0xE0A0, 0xE0A3));
+    try std.testing.expectEqual(@as(u32, 0xE0A0), again.lo);
+    try std.testing.expectEqual(@as(u32, 0xE0A3), again.hi);
+}
+
+test "config: hint patterns are checked for compilability" {
+    try std.testing.expect(hintPatternCompiles("[A-Z]+-[0-9]+"));
+    try std.testing.expect(!hintPatternCompiles("[unterminated"));
+    try std.testing.expect(!hintPatternCompiles("*bad"));
+    // An empty pattern matches nothing; the rule is inert, not broken.
+    try std.testing.expect(!hintPatternCompiles(""));
+}
+
+test "config: symbol maps add and remove, and round-trip through the file" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font\n");
+    defer cfg.deinit();
+    const arena = cfg.arena.?.allocator();
+
+    try std.testing.expectError(error.DuplicateName, cfg.addSymbolMap(arena, "powerline", "U+1", "X"));
+    try std.testing.expectError(error.NameBadChar, cfg.addSymbolMap(arena, "bad name", "U+1", "X"));
+    try std.testing.expectError(error.BadSymbolMap, cfg.addSymbolMap(arena, "snow", "U+ZZ", "X"));
+    try std.testing.expectEqual(@as(usize, 1), cfg.symbol_maps.items.len);
+
+    _ = try cfg.addSymbolMap(arena, "snow", "U+2603", "DejaVu Sans");
+    try std.testing.expectEqual(@as(usize, 2), cfg.symbol_maps.items.len);
+    try std.testing.expect(cfg.findSymbolMap("snow") != null);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "symbol_map.snow = U+2603 DejaVu Sans") != null);
+
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 2), re.symbol_maps.items.len);
+    try std.testing.expectEqualStrings("DejaVu Sans", re.findSymbolMap("snow").?.family);
+
+    // Remove one, then the last — an empty list IS expressible (unlike
+    // clearing `palette`), so both survive a save/load.
+    try std.testing.expect(cfg.removeSymbolMap("snow"));
+    try std.testing.expect(!cfg.removeSymbolMap("snow"));
+    try std.testing.expect(cfg.removeSymbolMap("powerline"));
+    try std.testing.expectEqual(@as(usize, 0), cfg.symbol_maps.items.len);
+
+    var w2 = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w2);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "symbol_map.") == null);
+    var empty = try Config.loadFromBytes(std.testing.allocator, w2.buffered());
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.symbol_maps.items.len);
+}
+
+test "config: a symbol map with no family is not serialised" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "symbol_map.a = U+2603 DejaVu Sans\n");
+    defer cfg.deinit();
+    cfg.findSymbolMap("a").?.family = "";
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    // Written with an empty family it would be `= U+2603 `, which the
+    // parser rejects on the next load.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "symbol_map.a") == null);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 0), re.symbol_maps.items.len);
+}
+
+test "config: hint rules add and remove, and round-trip through the file" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator,
+        \\hint.ticket.regex = [A-Z]+-[0-9]+
+        \\hint.ticket.action = command
+        \\hint.ticket.command = xdg-open https://tracker/{match}
+        \\
+    );
+    defer cfg.deinit();
+    const arena = cfg.arena.?.allocator();
+
+    try std.testing.expectError(error.DuplicateName, cfg.addHintRule(arena, "ticket"));
+    try std.testing.expectError(error.NameBadChar, cfg.addHintRule(arena, "a.b"));
+
+    const rule = try cfg.addHintRule(arena, "ip");
+    // A fresh rule carries the parser's own defaults.
+    try std.testing.expectEqual(HintAction.copy, rule.action);
+    try std.testing.expectEqualStrings("", rule.pattern);
+    rule.pattern = "[0-9]+\\.[0-9]+";
+    rule.action = .paste;
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 2), re.hint_rules.items.len);
+    try std.testing.expectEqual(HintAction.command, re.findHintRule("ticket").?.action);
+    try std.testing.expectEqualStrings("xdg-open https://tracker/{match}", re.findHintRule("ticket").?.command);
+    try std.testing.expectEqual(HintAction.paste, re.findHintRule("ip").?.action);
+    try std.testing.expectEqualStrings("[0-9]+\\.[0-9]+", re.findHintRule("ip").?.pattern);
+
+    // A rule with no pattern still round-trips: the action line names it.
+    const inert = try cfg.addHintRule(arena, "inert");
+    _ = inert;
+    var w2 = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w2);
+    var re2 = try Config.loadFromBytes(std.testing.allocator, w2.buffered());
+    defer re2.deinit();
+    try std.testing.expect(re2.findHintRule("inert") != null);
+
+    // Removing the last rule is expressible too.
+    try std.testing.expect(cfg.removeHintRule("inert"));
+    try std.testing.expect(cfg.removeHintRule("ip"));
+    try std.testing.expect(cfg.removeHintRule("ticket"));
+    try std.testing.expect(!cfg.removeHintRule("ticket"));
+    var w3 = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w3);
+    try std.testing.expect(std.mem.indexOf(u8, w3.buffered(), "hint.") == null);
+    var empty = try Config.loadFromBytes(std.testing.allocator, w3.buffered());
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.hint_rules.items.len);
+}
+
+test "config: the hint alphabet and multi-select round-trip" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "hint_alphabet = qwerty\nhint_multiple = true\n");
+    defer cfg.deinit();
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqualStrings("qwerty", re.hint_alphabet);
+    try std.testing.expect(re.hint_multiple);
+    try std.testing.expect(validHintAlphabet(re.hint_alphabet) != null);
+}
+
+test "config: every font weight the dialog can select round-trips" {
+    // The Preferences combo offers 0 (font default) and 100..900; a
+    // weight already in the file that is not a multiple of 100 is
+    // offered back unchanged. All of them must survive a save/load.
+    for ([_]u16{ 0, 100, 350, 400, 900 }) |wt| {
+        var cfg = Config{};
+        cfg.settings.font_weight = wt;
+        cfg.settings.font_weight_bold = wt;
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try cfg.serialise(&w);
+        if (wt == 0) try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "font_weight") == null);
+        var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+        defer re.deinit();
+        try std.testing.expectEqual(wt, re.settings.font_weight);
+        try std.testing.expectEqual(wt, re.settings.font_weight_bold);
+    }
+}
+
+test "config: the styled font families and box drawing round-trip" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator,
+        \\font_family_bold = Iosevka Bold
+        \\font_family_italic = Cascadia Italic
+        \\font_family_bold_italic = Cascadia Bold Italic
+        \\builtin_box_drawing = false
+        \\
+    );
+    defer cfg.deinit();
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqualStrings("Iosevka Bold", re.settings.font_family_bold);
+    try std.testing.expectEqualStrings("Cascadia Italic", re.settings.font_family_italic);
+    try std.testing.expectEqualStrings("Cascadia Bold Italic", re.settings.font_family_bold_italic);
+    try std.testing.expect(!re.settings.builtin_box_drawing);
 }

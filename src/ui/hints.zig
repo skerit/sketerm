@@ -61,14 +61,7 @@ pub const ALPHABET = "asdfghjklqwertyuiopzxcvbnm";
 /// duplicates (a repeated character would give two matches the same
 /// label). Anything else falls back to the built-in set.
 pub fn validAlphabet(alphabet: []const u8) ?[]const u8 {
-    if (alphabet.len < 2 or alphabet.len > 64) return null;
-    for (alphabet, 0..) |ch, i| {
-        if (ch <= ' ' or ch > '~') return null;
-        for (alphabet[i + 1 ..]) |other| {
-            if (other == ch) return null;
-        }
-    }
-    return alphabet;
+    return @import("../config.zig").validHintAlphabet(alphabet);
 }
 
 /// Hard cap: 26 single-char + first rows of 2-char labels is far more
