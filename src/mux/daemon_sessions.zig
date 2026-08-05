@@ -150,8 +150,16 @@ pub fn applyWorkerLimits() void {
     };
     if (mb == 0) return;
     const bytes = mb * 1024 * 1024;
-    const rl = c.struct_rlimit{ .rlim_cur = @intCast(bytes), .rlim_max = @intCast(bytes) };
-    _ = c.setrlimit(c.RLIMIT_AS, &rl);
+    // Hand-declared instead of the translate-c types: <sys/resource.h>
+    // is only in the CORE cimport set, and this function is reachable
+    // from code the GUI test root compiles too (Daemon.tick).
+    const RLimit = extern struct { rlim_cur: u64, rlim_max: u64 };
+    const S = struct {
+        extern "c" fn setrlimit(resource: c_int, rlim: *const RLimit) c_int;
+    };
+    const RLIMIT_AS: c_int = if (@import("builtin").os.tag == .macos) 5 else 9;
+    const rl = RLimit{ .rlim_cur = bytes, .rlim_max = bytes };
+    _ = S.setrlimit(RLIMIT_AS, &rl);
 }
 
 /// Broker side of spawn: fork a worker process that owns this session.
