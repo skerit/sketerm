@@ -739,8 +739,19 @@ pub const Pane = struct {
     /// rows and every sensitivity below reflect current state.
     fn contextMenuAtCursorSink(ctx: ?*anyopaque) bool {
         const self = cast.userData(Pane, ctx);
+        if (self.nonTerminalFaceVisible()) return false;
         const at = self.cursorAnchor();
         return menu.popupAt(@ptrCast(self.area), at.x, at.y);
+    }
+
+    /// True while a face (editor/browser) covers the grid. The pane
+    /// menu's gesture lives on the GLArea, which is UNMAPPED then, so
+    /// the only paths that can still reach it are the titlebar and the
+    /// keyboard sink — and neither is about the terminal any more.
+    /// Popping it would offer Reset Terminal over an editor, against a
+    /// widget that is not on screen.
+    pub fn nonTerminalFaceVisible(self: *Pane) bool {
+        return self.editorFaceVisible() or self.browserFaceVisible();
     }
 
     /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
@@ -2893,6 +2904,7 @@ fn onTitlebarClicked(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user
 /// exactly what tells `paneMenuPrePopup` not to probe for a link.
 fn onTitlebarRightClicked(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+    if (self.nonTerminalFaceVisible()) return;
     const widget = c.gtk_event_controller_get_widget(@ptrCast(@alignCast(g))) orelse return;
     var out: c.graphene_point_t = undefined;
     const from = c.graphene_point_t{ .x = @floatCast(x), .y = @floatCast(y) };
