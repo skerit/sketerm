@@ -134,17 +134,23 @@ rather than on a re-guessed offset.
    each has. Nothing has been written.
 3. **Apply**:
    * a file OPEN in a tab is replaced through its Document as ONE
-     transaction, so `Ctrl+Z` undoes that file's whole replacement and
-     the highlighter, the folds, the outline and the language server
-     all see the edit;
+     transaction and then SAVED, so `Ctrl+Z` undoes that file's whole
+     replacement (re-dirtying the buffer, which the user then saves
+     again) and the highlighter, the folds, the outline and the
+     language server all see the edit;
    * every other file is written by the same atomic path an ordinary
      `Ctrl+S` uses (temp file + `install` with the expected mtime), so
      a file that changed since the preview is REFUSED, not clobbered.
      The panel says how many were refused.
 4. The search re-runs, so the list reflects what is on disk now.
 
-Undo is therefore **per file**, and only for files that were open. That
-asymmetry is the reason the preview exists and is not optional.
+Undo is therefore **per file**, and only for files that were open when
+the replace ran. That asymmetry is the reason the preview exists and is
+not optional.
+
+`Enter` in the replacement entry previews; `Ctrl+Enter` applies. The
+destructive half needs the modifier, and it is the one action with no
+other keyboard route.
 
 ---
 
