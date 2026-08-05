@@ -278,11 +278,10 @@ file that still has to load gets its caret placed once the async load
 lands. A single result jumps straight there; several open the list.
 
 **Rename** applies the server's `WorkspaceEdit` as **one transaction per
-document** — one undo unit per file. Known limitation: the editor's
-history is per `Document`, so a rename touching three files is three undo
-units, one per file; a single cross-document unit would need a history
-object nothing else in the editor wants. Files that are **not open** are
-reported ("N not open") rather than edited behind the user's back.
+document** — one undo unit per file — and a file with no tab is
+**opened** so it gets edited like the rest (below). The status line
+states the undo shape out loud: *"Renamed in 3 file(s) — 3 separate undo
+steps, one per file"*.
 
 **Formatting** folds the returned `TextEdit[]` into one transaction, so a
 whole-file reformat is a single undo.
@@ -318,16 +317,83 @@ an `on_apply_edit` slot); an action carrying neither is resolved with
 
 Every one of those paths — rename included — applies through the SAME
 `applyWorkspaceEdit`, so the one-transaction-per-document rule holds
-once rather than three times. The consequence rename documents applies
-unchanged and is not papered over: **history is per `Document`, so an
-action touching three files is three undo units**. `create`/`rename`/
-`delete` file operations inside a `WorkspaceEdit` are counted as skipped
-and reported, never performed — the editor does not write files the user
-did not open.
+once rather than three times.
+
+**Cross-file undo: not built, and said out loud instead.** History is
+per `Document`, so an action touching three files leaves three undo
+entries. A single cross-document unit was costed and refused, and the
+reasons are worth recording because they are not "it is a lot of work":
+
+* `Document.undo()` unconditionally pops the top of its stack. The
+  moment the user types in one of the N files after the rename — the
+  overwhelmingly likely next thing they do — the group's entry is no
+  longer on top, and a group undo would pop the wrong one. A correct
+  coordinator therefore needs a new `Document` primitive
+  (`undoIfTop(token)`) plus a decided refuse-or-degrade policy, i.e. a
+  contract change in the editor's most safety-critical structure.
+* A reload replaces a `Document` **and its history** (that is a stated
+  invariant of the editor, not an accident), so any member file being
+  reloaded silently invalidates the group. Closing a tab frees the
+  stacks outright. Both are routine.
+* `Change.edits` borrows document-owned memory that the next mutation on
+  that document frees, so undoing N documents is not a loop: each needs
+  its own refresh, selection restore, banner/status and focus handling,
+  in order.
+
+Against that, the failure it prevents is "one Ctrl+Z reverted only part
+of my rename", whose recovery is pressing Ctrl+Z again in each file. So
+the **behaviour is made honest** rather than the mechanism made clever:
+every WorkspaceEdit reports its file count together with its undo shape,
+and never reports a count alone.
+
+**Files with no tab are opened, not skipped.** A `WorkspaceEdit` naming
+a file the user has not opened used to be counted as skipped and left
+alone, which is how a rename silently missed most of its own work. The
+tab is now opened through the ordinary machinery, and — because the load
+is async — the `TextEdit[]` is queued against the tab's spec and applied
+by `onDocumentReplaced` when the bytes land, then reported again with
+the final count. Applying through the daemon's atomic install path
+instead was rejected: a file written that way has no `Document`, hence no
+undo entry at all, which is strictly worse than the per-file undo this
+section is about.
+
+**`create` / `rename` / `delete` file operations are still NOT
+performed** — counted, named in the status line ("2 file
+create/rename/delete NOT performed (no undo for those)"), and left to
+the user. Same reasoning as above taken to its end: a filesystem
+mutation has no `Document` to hang an undo entry off, so performing one
+would produce a change Ctrl+Z genuinely cannot reach. Reporting it is
+the honest half; doing it is not.
 
 **Inlay hints** are requested for the visible line span widened by 80
 lines, never for the whole document, and re-requested only when the
 viewport leaves that window or the document changes (debounced 220 ms).
+
+`inlayHint/resolve` is implemented, lazily and for one hint at a time —
+the same discipline `completionItem/resolve` follows for the selected
+completion row. Resting the pointer on a hint (or on the token it
+annotates) shows its **tooltip**; if the server offers `resolveProvider`
+and has not sent one, the hint's own JSON goes back out as
+`inlayHint/resolve` and the answer pops the tooltip, provided the
+pointer is still there. Each hint keeps that raw JSON verbatim, because
+a server round-trips a private `data` field through it and a
+reconstruction resolves to nothing. The answer's `aux` carries the hint
+INDEX plus the hint set's GENERATION, and a set is replaced wholesale on
+every refresh, so a late answer for a set that has been replaced is
+dropped rather than written onto a different hint.
+
+**Where that stops: no click-to-navigate on a label part.** An
+`InlayHintLabelPart` may carry a `location` or a `command`, and honouring
+either needs a per-part hit region inside the hint. Hints deliberately
+append **no `Cluster`** — that is the invariant keeping the caret and
+every byte offset out of text the document does not contain — so there
+is no hit-testing currency for a part, and building a parallel one in
+`editor_layout` for this is out of proportion to the feature. Part
+tooltips are not lost, though: they are joined with newlines and shown
+as the hint's tooltip when the hint itself has none. Hit testing for the
+hint as a whole is likewise the pointer resolving to the hint's ANCHOR
+byte, which is exact enough because a hint is drawn immediately before
+that byte.
 
 They are display-only, and the way that is guaranteed is worth stating
 precisely, because "just draw them" is where editors get this wrong:
@@ -357,7 +423,19 @@ into it (back-to-front, so one splice cannot move the next one's
 offset). A delta that does not fit the array we hold is refused
 WHOLESALE and the cached array dropped, so the next request is a full
 one — half-applying a splice would mis-colour the rest of the session.
-The `range` request is not used.
+
+**A server offering only `range` is served, not ignored.**
+`semanticTokens/range` is asked for the VISIBLE line span widened by the
+same 80 lines inlay hints use, and it is invalidated by the same two
+things: the document moving (revision stamp) and the viewport leaving
+the window (`TabState.semRangeCovers`). Deliberately the identical
+scoping rule rather than a second one — `range` exists precisely so a
+client can colour what is on screen, and two answers to "why did this
+re-ask?" would be one too many. A range answer never seeds a
+`full/delta`: its `resultId` describes the window, not the document, so
+the delta path is unreachable in that regime by construction. Outside
+the window the grammar's own colours stand, which is the ordinary
+augment contract, not a degradation.
 
 **Precedence, decided and fixed: Tree-sitter is the base layer and a
 semantic token overrides it for the bytes it covers.** The server knows
@@ -370,8 +448,45 @@ colour for (`concept`, a vendor extension, anything new): it is
 **dropped**, not painted as `Kind.none`, because `.none` would blank out
 the grammar's answer and lose information. This is exactly the contract
 `semanticTokens.augmentsSyntaxTokens: true` in the client capabilities
-describes. Token MODIFIERS are parsed off the wire but not used — a
-`readonly` variable is coloured as a variable.
+describes.
+
+**Token MODIFIERS reach the renderer, through the kind byte.** The only
+channel from `editorlsp` through `editor_layout` to `editor_pass` is one
+`syntax.Kind` byte per document byte, so that byte is split: low five
+bits are the kind, the top three are a modifier bitset
+(`syntax.KIND_MASK` / `MOD_*`). `editor_layout` memsets the whole byte
+across a span exactly as before and knows nothing about the split;
+`theme.style` masks it apart again. Tree-sitter never sets a modifier
+bit.
+
+Three bits is the budget, and the choice of which three is the design
+decision:
+
+| bit | LSP modifier | what a theme says about it |
+| --- | --- | --- |
+| 0x20 | `readonly` | blend toward the constant colour — a readonly binding *is* a constant |
+| 0x40 | `deprecated` | **strikethrough** + blend toward the comment grey |
+| 0x80 | `defaultLibrary` | blend toward the type/namespace colour — the grammar can never know a name is not this project's |
+
+A theme expresses each as a `ModStyle`: a colour `blend` toward a
+`toward` colour, an optional bold/italic override, and `strike`. They
+compose — a symbol can carry all three, folded readonly → defaultLibrary
+→ deprecated so the deprecated dimming survives.
+
+Deliberately **not** expressible, and these are the tradeoffs the
+three-bit band buys:
+
+* the other seven standard modifiers (`declaration`, `definition`,
+  `static`, `abstract`, `async`, `modification`, `documentation`) and
+  every vendor extension: parsed off the wire, mapped to no bit, and
+  dropped — exactly as an unmapped token TYPE is;
+* per-(kind × modifier) styling: a readonly *variable* and a readonly
+  *property* get the same blend. Twenty kinds × eight combinations of
+  colours per theme is a palette nobody would maintain for a
+  distinction users read as a shade;
+* background colours, underlines, or any decoration other than the one
+  strikethrough `editor_pass` draws for `deprecated`;
+* modifiers on Tree-sitter kinds — only semantic tokens carry them.
 
 **Mouse-dwell hover** is a motion controller feeding a timer, and the
 distinction that matters is that the motion handler only ever RESTARTS
