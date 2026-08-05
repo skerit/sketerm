@@ -784,6 +784,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .file_list => handleFileList(self, cl, frame.payload),
         .app_list => handleAppList(self, cl),
         .app_a11y => handleAppA11y(self, cl, frame.payload),
+        .app_debug => self.handleAppDebug(cl, frame.payload),
         .rec_start => handleRecStart(self, cl, frame.payload),
         .search => self.handleSearch(cl, frame.payload),
         .log_get => self.handleLogGet(cl, frame.payload),

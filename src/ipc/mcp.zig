@@ -972,6 +972,9 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps). screenshot=true returns the post-scroll frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the input -> look -> app_log -> diff loop into one call."}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Or — pass min_frames — wait until the window has COMMITTED that many new frames, which is the only meaningful liveness check for an app that never quiesces. Every verdict reports the frame delta actually observed, so 'settled' on a static splash screen is distinguishable from 'settled' on a wedged app. Never quiescing is reported as a normal ALIVE AND ANIMATING state, not as a failure.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window whose frames are counted / diffed (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"quiet_ms":{"type":"integer"},"min_frames":{"type":"integer","description":"Wait until the window commits this many NEW frames, then return. Liveness for continuously-animating apps: succeeds only if the app is really painting."},"timeout_ms":{"type":"integer","description":"Max wait (default 10000, max 120000)"},"change_pct":{"type":"number","description":"Settle when frames change less than this % of pixels (e.g. 2). Omit = strict no-new-frames quiescence"},"region":{"type":"object","description":"Scope change_pct's pixel diffing to this rect (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}},
+    \\{"name":"app_watch","description":"Watch a window for a while and report WHEN it changed, as a timeline. Use this whenever the question is 'did anything happen?' rather than 'what is on screen now'. A screenshot samples one instant: an action with a multi-second pre-roll, or one whose visible result is a short clip, is routinely missed by every capture you think to take, and the resulting silence is indistinguishable from a dead control. This samples continuously instead, so it can answer 'nothing changed' as a MEASUREMENT. Zero changes while the window kept committing frames is reported as exactly that (the app is painting, the content did not change) and is different from zero frames, which is a hung app. Thumbnails of the first few change points come back inline.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window to watch (omit = the PRIMARY toplevel)"},"duration_ms":{"type":"integer","description":"How long to watch (default 10000, max 120000). Make this longer than the latency you suspect."},"min_change_pct":{"type":"number","description":"A commit counts as a change when it differs from the previously recorded one by at least this % of pixels (default 2). Lower it to catch small updates; raise it above a game's idle animation."},"max_events":{"type":"integer","description":"Cap on timeline entries (default 16, max 64). Overflow is reported, never silently dropped."},"thumbnails":{"type":"integer","description":"Inline a PNG of the first N change points (default 3, max 8)"},"max_px":{"type":"integer","description":"Longest side of each thumbnail (default 640)"},"region":{"type":"object","description":"Gauge change inside this rect only (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}},
+    \\{"name":"app_hover_map","description":"Sweep the pointer over a grid and report which cells made the window repaint — empirical discovery of interactive regions for an app with no accessibility tree (games, raw framebuffer UIs), where the only alternative is guessing coordinates. Needs no cooperation from the app. Returns an ASCII map plus the surface-coordinate centre of every responding cell, so a promising area can be re-swept with a region and a finer grid. Two honest limits, both reported: an app that repaints by ITSELF cannot be mapped this way (detected up front with control samples, and refused rather than answered with a map of noise), and an app that draws no hover feedback at all yields an empty map, which does NOT mean nothing there is clickable. Nothing is clicked; only the pointer moves, and it is returned to where it was.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"cols":{"type":"integer","description":"Grid columns (default 12, max 40)"},"rows":{"type":"integer","description":"Grid rows (default 9, max 40)"},"settle_ms":{"type":"integer","description":"How long to wait for a repaint after each move (default 120). Total time is roughly cols*rows*settle_ms."},"min_change_pct":{"type":"number","description":"Pixels that must differ for a cell to count as responding (default 0.05 — hover highlights are small)"},"region":{"type":"object","description":"Sweep only this rect (surface pixels); omit = the whole window","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}},
+    \\{"name":"app_backtrace","description":"Attach a debugger to the app on the daemon host and return every thread's backtrace. This is the tool for a HANG — the one failure class that otherwise gives nothing, since a crash dumps its report into app_log and a freeze does not. It works from here and nowhere else: Linux Yama only lets an ancestor trace a process, and the app's ancestor is the sketerm daemon, so 'gdb -p' run from your own shell answers 'Operation not permitted'. Only sessions launched through these app tools are debuggable; the app is STOPPED while the trace is taken and resumed afterwards, so timings across this call mean nothing. Requires gdb (or lldb) on the daemon host.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer","description":"How long the debugger may take (default 20000, max 100000). A big process with many threads needs longer; a partial dump is returned rather than nothing if it overruns."}}}},
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle. Desktop app identities come from the rendered windows' Wayland app_id instead. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps. When NOTHING published a tree (raw SDL/OpenGL/framebuffer apps and games have no toolkit to do so) the reply says exactly that, so an empty tree is never confused with having asked too early — in that case drive the app with screenshot_app + app_click coordinates and app_template_save/app_find_image, and do not expect app_perform_action/app_set_value to work.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"},"fps":{"type":"integer","description":"Cap the capture rate (frames/second, 1-60; default = every committed frame)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save it (WebM or GIF per app_record_start). Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}},
@@ -2226,6 +2229,7 @@ pub fn needsLiveApp(name: []const u8) bool {
         "app_a11y_tree",      "app_record_start",  "close_app_window",
         "app_read_text",      "app_wait_text",     "app_find_image",
         "app_wait_image",     "app_macro_run",
+        "app_hover_map",      "app_backtrace",     "app_watch",
     };
     for (live) |l| {
         if (std.mem.eql(u8, name, l)) return true;
@@ -2267,6 +2271,12 @@ pub fn clickTuned(app: *appdrive.App, win_id: u32, x: f64, y: f64, button: u32) 
 /// screen predates the input" — the old idle-only wait returned
 /// instantly-quiet on an app that takes a moment to react, so a
 /// post-click screenshot was frequently the PRE-click frame.
+/// A window silent for this long at the moment an input is injected was
+/// not made silent BY that input. Well past any ordinary idle gap (an
+/// unfocused static UI commits nothing), so it only fires when the app
+/// really has stopped drawing.
+pub const APP_QUIET_HANG_MS: i64 = 3_000;
+
 pub const PostInputWait = struct {
     ref: ?appdrive.App.FrameRef,
     wait: bool,
@@ -2289,6 +2299,15 @@ pub const PostInputWait = struct {
     /// than hoped to be — the fix for captures silently lagging whole
     /// screens behind the drive.
     frame_at_input: u64 = 0,
+    /// Monotonic ms of the window's last commit BEFORE the input, and
+    /// the moment the input was injected. Together they answer a
+    /// question the old single no-repaint message collapsed: was the
+    /// window painting when the input arrived? If it had already gone
+    /// quiet for seconds, the input did not kill it — the app was
+    /// ALREADY not painting, and reading that as "the click missed"
+    /// costs the entire diagnosis of a hang.
+    last_commit_before: i64 = 0,
+    injected_at: i64 = 0,
 
     /// `want_shot` = a post-input screenshot was requested; wait_change
     /// then defaults ON (pass wait_change:false to capture immediately).
@@ -2326,7 +2345,17 @@ pub const PostInputWait = struct {
             .region = regionFrom(args),
             .t0 = monoMs(),
             .frame_at_input = app.frameCount(win_id),
+            .last_commit_before = app.lastCommitMs(win_id),
+            .injected_at = monoMs(),
         };
+    }
+
+    /// How long the window had ALREADY been silent when the input was
+    /// injected (-1 = unknown: it has never painted, or no baseline was
+    /// taken because no wait was requested).
+    pub fn quietBeforeMs(self: *const PostInputWait) i64 {
+        if (!self.wait or self.last_commit_before == 0) return -1;
+        return self.injected_at - self.last_commit_before;
     }
 
     /// " [frame N at input, M now]" — the handle a caller passes back
@@ -2390,10 +2419,31 @@ pub const PostInputWait = struct {
             const detail = try appStopText(arena, stop, "the post-input wait");
             return try std.fmt.allocPrint(arena, " - {s}", .{detail});
         }
+        const scoped: []const u8 = if (self.region != null and self.min_pct > 0) " in the given region" else "";
+        // The daemon's commit counter already knew whether this window
+        // was painting BEFORE the input, so say which failure this is
+        // rather than leading with the input caveat. An app that had
+        // gone silent seconds earlier was not killed by this click, and
+        // the first evidence of a hang must not read as a dead click.
+        const quiet = self.quietBeforeMs();
+        if (quiet >= APP_QUIET_HANG_MS) {
+            return try std.fmt.allocPrint(
+                arena,
+                " — APP LIVENESS WARNING, not an input problem: window {d} had ALREADY not painted for {d}ms when the input was injected, and it has not painted since. The input was delivered; the app is not drawing. Take a backtrace (app_backtrace) before assuming the coordinates were wrong",
+                .{ win_id, quiet },
+            );
+        }
+        if (quiet >= 0) {
+            return try std.fmt.allocPrint(
+                arena,
+                " — NO repaint{s} within {d}ms after the input, although the window WAS painting {d}ms earlier: the input may have hit a dead area, or the app reacts without redrawing (any frame shown predates the input)",
+                .{ scoped, self.timeout_ms, quiet },
+            );
+        }
         return try std.fmt.allocPrint(
             arena,
             " — NO repaint{s} within {d}ms after the input: it may have hit a dead area, or the app reacts without redrawing (any frame shown predates the input)",
-            .{ if (self.region != null and self.min_pct > 0) " in the given region" else "", self.timeout_ms },
+            .{ scoped, self.timeout_ms },
         );
     }
 };
@@ -3761,6 +3811,59 @@ test "PostInputWait reports a click-triggered process crash" {
     try t.expectEqual(@as(?i32, 11), wait.stop.?.signal);
     try t.expect(std.mem.indexOf(u8, note, "app EXITED") != null);
     try t.expect(std.mem.indexOf(u8, note, "SIGSEGV") != null);
+}
+
+test "a no-repaint verdict names the app when it had already stopped painting" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    const args = try parseTestValue(arena, "{\"wait_change\":true,\"timeout_ms\":150,\"settle_ms\":0}");
+
+    // The window was painting a moment before the input: a dry wait is
+    // genuinely ambiguous (dead area vs an app that reacts silently),
+    // and must still say so.
+    fixture.app.windows.items[0].last_commit_ms = monoMs() - 100;
+    var live = PostInputWait.begin(args, fixture.app, 1, false);
+    const live_note = try live.finish(arena, fixture.app, 1);
+    try t.expect(std.mem.indexOf(u8, live_note, "dead area") != null);
+    try t.expect(std.mem.indexOf(u8, live_note, "WAS painting") != null);
+    try t.expect(std.mem.indexOf(u8, live_note, "LIVENESS") == null);
+
+    // The window had been silent for 10s BEFORE the input. This input
+    // cannot have caused that, and the first evidence of a hang must
+    // not read as a click that missed.
+    fixture.app.windows.items[0].last_commit_ms = monoMs() - 10_000;
+    var hung = PostInputWait.begin(args, fixture.app, 1, false);
+    try t.expect(hung.quietBeforeMs() >= APP_QUIET_HANG_MS);
+    const hung_note = try hung.finish(arena, fixture.app, 1);
+    try t.expect(std.mem.indexOf(u8, hung_note, "APP LIVENESS WARNING") != null);
+    try t.expect(std.mem.indexOf(u8, hung_note, "app_backtrace") != null);
+    try t.expect(std.mem.indexOf(u8, hung_note, "dead area") == null);
+}
+
+test "watchChanges reports a still window as measured, not as an empty sample" {
+    const t = std.testing;
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+
+    var res = try fixture.app.watchChanges(1, 250, 2.0, null, 8, 2);
+    defer res.deinit(t.allocator);
+    // Nothing commits on this fixture: no events, and — the load-bearing
+    // part — a frame total of zero, which is what separates "the app is
+    // painting and the content did not change" from "the app is dead".
+    try t.expectEqual(@as(usize, 0), res.events.len);
+    try t.expectEqual(@as(u64, 0), res.frames);
+    try t.expectEqual(@as(u64, 1), res.frame_first);
+    try t.expect(!res.truncated);
+    try t.expect(res.elapsed_ms >= 200);
+
+    // No such window is an error, never a silent empty timeline.
+    try t.expectError(appdrive.Error.NoSuchWindow, fixture.app.watchChanges(99, 50, 2.0, null, 4, 0));
 }
 
 test "app_click reports a crash during its held click" {

@@ -892,6 +892,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             // that visibly landed must never get a second press, and
             // without a wait there is no verdict to retry on.
             if (repainted or !piw.wait or attempts > retries or stopped != null) break;
+            // Nothing to retry against: the window had already stopped
+            // painting before the first press, so more presses only
+            // burn the timeout and bury the liveness verdict.
+            if (piw.quietBeforeMs() >= mcp.APP_QUIET_HANG_MS) break;
         }
         journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d},\"hold_ms\":{d},\"count\":{d}}}", .{ x, y, button, win_id, hold_ms, count });
         if (stopped != null) {
@@ -1757,10 +1761,19 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             // honest opposite of settling on a static frame.
             const want: u64 = @intCast(@max(mf, 1));
             if (wid == 0) return appErr(arena, "no rendered window yet (min_frames needs one)");
-            outcome = if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms))
-                try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, monoMs() - t0 })
-            else
-                try std.fmt.allocPrint(arena, "NOT LIVE: window {d} committed only {d} of the {d} requested frame(s) in {d}ms — it is not painting (frozen, minimised, or rendering into another window)", .{ wid, app.frameCount(wid) - frames_before, want, timeout_ms });
+            if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms)) {
+                outcome = try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, monoMs() - t0 });
+            } else {
+                // Falling short is USUALLY arithmetic, not a fault: an
+                // app at 12fps cannot deliver 1400 frames in 115s no
+                // matter how healthy it is. Reporting that as "it is
+                // not painting" was a false alarm frequent enough to
+                // train callers to ignore the message — which is the
+                // worst possible reflex, because the same message is
+                // how a real freeze announces itself. Only ZERO frames
+                // is a liveness claim now.
+                outcome = try shortFramesVerdict(arena, wid, app.frameCount(wid) - frames_before, want, monoMs() - t0, timeout_ms);
+            }
         } else if (argFloat(args, "change_pct")) |pct| {
             // Visual quiescence: frames may keep committing (a game
             // always renders) — settle when they stop CHANGING much.
@@ -1793,6 +1806,9 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
+    if (eql(u8, name, "app_watch")) return appWatch(arena, app, args);
+    if (eql(u8, name, "app_hover_map")) return hoverMap(arena, app, args);
+    if (eql(u8, name, "app_backtrace")) return appBacktrace(arena, app, args);
     if (eql(u8, name, "app_a11y_tree")) {
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 5_000, 0, mcp.WAIT_CAP_MS);
         const tree = app.a11yTree(timeout_ms) catch |err| return appErr(arena, switch (err) {
@@ -2064,4 +2080,329 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         return toolResult(arena, msg, outcome == .unconfirmed) orelse error.OutOfMemory;
     }
     return appErr(arena, "unknown tool");
+}
+
+// ── observation tools (app_watch / app_hover_map / app_backtrace) ──
+
+/// app_watch: sample a window continuously and report WHEN it changed.
+///
+/// A screenshot answers "what is on screen now"; nothing answered "did
+/// anything happen in the next N seconds". For an action with unknown
+/// latency the two are not the same question, and a capture that lands
+/// in a pre-roll — or after a short clip has already ended — reads
+/// exactly like a dead control. This turns that guess into a
+/// measurement.
+fn appWatch(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
+    const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+    if (wid == 0) return appErr(arena, "no rendered window yet — nothing to watch");
+    const duration_ms: i64 = std.math.clamp(argInt(args, "duration_ms") orelse 10_000, 200, mcp.WAIT_CAP_MS);
+    const min_pct = argFloat(args, "min_change_pct") orelse 2.0;
+    const max_events: usize = @intCast(std.math.clamp(argInt(args, "max_events") orelse 16, 1, 64));
+    const thumbs: usize = @intCast(std.math.clamp(argInt(args, "thumbnails") orelse 3, 0, 8));
+    const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 640, 64, 2048));
+    const region = regionFrom(args);
+
+    // Start from the LIVE frame: a queued backlog would otherwise
+    // replay as a burst of "changes" that happened before the watch.
+    _ = app.drainLive(CATCHUP_MS);
+    const frame_at_start = app.frameCount(wid);
+    var res = app.watchChanges(wid, duration_ms, min_pct, region, max_events, thumbs) catch |err|
+        return appErr(arena, switch (err) {
+            appdrive.Error.NoSuchWindow => "no such window (or it has not painted a frame yet)",
+            else => "watch failed",
+        });
+    defer res.deinit(mcp.app_state.allocator);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("watched window {d} for {d}ms{s} — it committed {d} frame(s) (frame {d} -> {d})\n", .{
+        wid,
+        res.elapsed_ms,
+        if (region != null) ", change gauged inside the given region" else "",
+        res.frames,
+        res.frame_first,
+        res.frame_last,
+    });
+    if (res.events.len == 0) {
+        if (res.frames == 0) {
+            try w.print(
+                "NO frames at all: the window did not paint once in {d}ms. For an idle event-driven app that is normal (nothing asked it to redraw); for one that should be animating, or one you just sent input to, it is the signature of a hang — app_backtrace shows where the process is.\n",
+                .{res.elapsed_ms},
+            );
+        } else {
+            try w.print(
+                "NO change of {d:.1}% or more happened at any point. The window IS painting, so this is a real observation and not a missed sample: the content simply never changed materially. Lower min_change_pct to catch smaller updates.\n",
+                .{min_pct},
+            );
+        }
+    } else {
+        try w.print("timeline (each entry is measured against the previous one, threshold {d:.1}%):\n", .{min_pct});
+        for (res.events, 0..) |e, i| {
+            try w.print("  [{d}] t={d}ms  changed {d:.1}% of pixels  (frame {d})\n", .{ i + 1, e.at_ms, e.pct, e.frame });
+        }
+        if (res.truncated)
+            try w.print("(timeline capped at {d} entries — more changes occurred; raise max_events or raise min_change_pct)\n", .{max_events});
+        if (res.events.len == 1) {
+            try w.print(
+                "ONE change, at t={d}ms. A screenshot taken before that moment would have shown nothing happening — that delay is the action's real latency.\n",
+                .{res.events[0].at_ms},
+            );
+        }
+    }
+    if (res.exited) try w.writeAll("the app EXITED during the watch (details below)\n");
+    try w.print("pass min_frame:{d} to screenshot_app for a capture provably newer than the start of this watch\n", .{frame_at_start});
+    try w.writeAll(try appSummary(arena, app));
+
+    // Thumbnails: encoded AFTER the watch, from stashed pixels, so PNG
+    // encoding never perturbs the sampling it is describing.
+    var pngs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (pngs.items) |p| mcp.app_state.allocator.free(p);
+        pngs.deinit(arena);
+    }
+    for (res.events) |e| {
+        if (e.px.len == 0) continue;
+        const shot = app.encodePixelsPng(e.px, e.w, e.h, e.format, e.frame, max_px, region, 1, &.{}) catch continue;
+        try pngs.append(arena, shot.png);
+    }
+    if (pngs.items.len == 0)
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    try w.print("({d} thumbnail(s) below, in timeline order)", .{pngs.items.len});
+    return imagesResult(arena, aw.written(), pngs.items) orelse error.OutOfMemory;
+}
+
+/// app_hover_map: sweep the pointer over a grid and report which cells
+/// made the window repaint.
+///
+/// For an app with no accessibility tree there is otherwise no way to
+/// find what is clickable except guessing coordinates, and a piece of
+/// background art that happens to be a door is unguessable. This needs
+/// no cooperation from the target: it is the same pixel diff every
+/// other verdict here is built on, applied to hover.
+fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
+    const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+    if (wid == 0) return appErr(arena, "no rendered window yet");
+    const dims = app.windowSize(wid) orelse return appErr(arena, "no such window (or it has not painted yet)");
+    const region: appdrive.App.Region = regionFrom(args) orelse .{
+        .x = 0,
+        .y = 0,
+        .w = @intCast(@max(dims.w, 0)),
+        .h = @intCast(@max(dims.h, 0)),
+    };
+    if (region.w == 0 or region.h == 0) return appErr(arena, "empty region");
+    const cols: usize = @intCast(std.math.clamp(argInt(args, "cols") orelse 12, 2, 40));
+    const rows: usize = @intCast(std.math.clamp(argInt(args, "rows") orelse 9, 2, 40));
+    const probes = cols * rows;
+    const MAX_PROBES = 600;
+    if (probes > MAX_PROBES)
+        return appErr(arena, "cols*rows exceeds 600 probes — narrow the region or use a coarser grid, then re-sweep the interesting part");
+    const settle_ms: i64 = std.math.clamp(argInt(args, "settle_ms") orelse 120, 20, 2_000);
+    const min_pct = argFloat(args, "min_change_pct") orelse 0.05;
+    // Every probe can burn its full settle, so the worst case is the
+    // budget. Refuse with the arithmetic rather than start a sweep the
+    // call watchdog will cut off half-finished.
+    const worst_ms = @as(i64, @intCast(probes)) * settle_ms;
+    if (worst_ms > mcp.WAIT_CAP_MS) {
+        return appErr(arena, try std.fmt.allocPrint(
+            arena,
+            "{d} probes at {d}ms each is up to {d}ms, over the {d}ms cap on a single call. Use a coarser grid, a smaller settle_ms, or sweep a region at a time.",
+            .{ probes, settle_ms, worst_ms, mcp.WAIT_CAP_MS },
+        ));
+    }
+
+    // A continuously-animating app repaints regardless of the pointer,
+    // which would mark every cell as interactive. Establish that BEFORE
+    // sweeping: a map that cannot mean anything must not be produced.
+    _ = app.drainLive(CATCHUP_MS);
+    var self_changes: usize = 0;
+    var control: usize = 0;
+    while (control < 3) : (control += 1) {
+        var ref = app.frameRef(wid, true) orelse return appErr(arena, "no such window");
+        defer ref.deinit(mcp.app_state.allocator);
+        if (app.waitChangeSince(wid, &ref, settle_ms, min_pct, null)) self_changes += 1;
+    }
+    if (self_changes >= 2) {
+        return appErr(arena, try std.fmt.allocPrint(
+            arena,
+            "this window repaints by itself ({d} of 3 control samples changed by {d:.2}% with the pointer held still), so a hover map cannot separate the app's own animation from a hover response. Raise min_change_pct above the animation's amplitude (measure it with app_watch) or scope the sweep to a still region.",
+            .{ self_changes, min_pct },
+        ));
+    }
+
+    const restore = app.pointerPos();
+    const cell_w = @as(f64, @floatFromInt(region.w)) / @as(f64, @floatFromInt(cols));
+    const cell_h = @as(f64, @floatFromInt(region.h)) / @as(f64, @floatFromInt(rows));
+    const map = try arena.alloc(f64, probes);
+    @memset(map, 0);
+    var hits: usize = 0;
+    const t0 = monoMs();
+    var stopped = false;
+    var r: usize = 0;
+    outer: while (r < rows) : (r += 1) {
+        var col: usize = 0;
+        while (col < cols) : (col += 1) {
+            if (app.exited) {
+                stopped = true;
+                break :outer;
+            }
+            const px = @as(f64, @floatFromInt(region.x)) + (@as(f64, @floatFromInt(col)) + 0.5) * cell_w;
+            const py = @as(f64, @floatFromInt(region.y)) + (@as(f64, @floatFromInt(r)) + 0.5) * cell_h;
+            var ref = app.frameRef(wid, true) orelse {
+                stopped = true;
+                break :outer;
+            };
+            defer ref.deinit(mcp.app_state.allocator);
+            _ = app.moveMouse(wid, px, py) catch continue;
+            if (app.waitChangeSince(wid, &ref, settle_ms, min_pct, null)) {
+                map[r * cols + col] = app.peekChangeVs(wid, &ref, null);
+                hits += 1;
+            }
+        }
+    }
+    if (restore) |p| _ = app.moveMouse(p.win, p.x, p.y) catch {};
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("hover map of window {d} over ({d},{d}) {d}x{d}: {d}x{d} grid, {d} probes in {d}ms ({d}ms settle, threshold {d:.2}%)\n", .{
+        wid, region.x, region.y, region.w, region.h, cols, rows, probes, monoMs() - t0, settle_ms, min_pct,
+    });
+    if (stopped) try w.writeAll("the sweep STOPPED EARLY (the app exited or the window vanished) — the map below is partial\n");
+    r = 0;
+    while (r < rows) : (r += 1) {
+        try w.writeAll("  ");
+        var col: usize = 0;
+        while (col < cols) : (col += 1) {
+            try w.writeByte(if (map[r * cols + col] > 0) '#' else '.');
+        }
+        try w.writeByte('\n');
+    }
+    if (hits == 0) {
+        try w.print(
+            "NO cell produced a repaint. This app may simply not draw hover feedback — that is common for framebuffer games, and it does NOT mean nothing there is clickable. Lower min_change_pct, or fall back to app_read_text / app_find_image.\n",
+            .{},
+        );
+    } else {
+        try w.print("{d} cell(s) responded to hover, click centres in surface coordinates:\n", .{hits});
+        r = 0;
+        while (r < rows) : (r += 1) {
+            var col: usize = 0;
+            while (col < cols) : (col += 1) {
+                const pct = map[r * cols + col];
+                if (pct <= 0) continue;
+                const px = @as(f64, @floatFromInt(region.x)) + (@as(f64, @floatFromInt(col)) + 0.5) * cell_w;
+                const py = @as(f64, @floatFromInt(region.y)) + (@as(f64, @floatFromInt(r)) + 0.5) * cell_h;
+                try w.print("  ({d},{d})  {d:.2}%\n", .{ @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct });
+            }
+        }
+        try w.writeAll("A cell is one grid step wide, so these are approximate centres — re-sweep a promising area with a region + finer grid to localise it.\n");
+    }
+    try w.writeAll(try appSummary(arena, app));
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+/// app_backtrace: what a crash gets for free and a hang never did.
+///
+/// A crashing app dumps a sanitizer/gdb report into the log ring. A
+/// HUNG one produces nothing, and `gdb -p` from the calling session
+/// fails: Linux Yama only lets an ancestor trace, and the app's
+/// ancestor is the daemon. So the daemon takes the backtrace.
+fn appBacktrace(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
+    const debugger_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 20_000, 2_000, 100_000);
+    // Outlast the daemon-side deadline: the reply to a timed-out
+    // debugger is still a reply, and giving up first would throw away
+    // the partial dump it carries.
+    const raw = app.debugBacktrace(debugger_ms, debugger_ms + 10_000) catch |err|
+        return appErr(arena, switch (err) {
+            appdrive.Error.Timeout => "the daemon did not answer the debug request in time",
+            else => "debug request failed (app gone?)",
+        });
+    defer mcp.app_state.allocator.free(raw);
+
+    const Reply = struct {
+        ok: bool = false,
+        pid: i32 = 0,
+        tool: []const u8 = "",
+        text: []const u8 = "",
+        truncated: bool = false,
+        timed_out: bool = false,
+        took_ms: i64 = 0,
+        @"error": []const u8 = "",
+    };
+    var parsed = std.json.parseFromSlice(Reply, arena, raw, .{ .ignore_unknown_fields = true }) catch
+        return appErr(arena, "malformed debug reply from the daemon");
+    defer parsed.deinit();
+    const rep = parsed.value;
+    if (rep.@"error".len > 0 and rep.text.len == 0)
+        return appErr(arena, try std.fmt.allocPrint(arena, "no backtrace: {s}", .{rep.@"error"}));
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    if (rep.timed_out) {
+        try w.print("PARTIAL: {s}\n", .{rep.@"error"});
+    } else {
+        try w.print("{s} attached to pid {d} on the daemon host and reported in {d}ms.\n", .{ rep.tool, rep.pid, rep.took_ms });
+    }
+    try w.writeAll("The app was STOPPED while this was taken and has been resumed; wall-clock timings across this call are not meaningful.\n");
+    if (rep.truncated) try w.writeAll("(output truncated at the daemon's cap — the head is retained)\n");
+    try w.writeAll("---\n");
+    try w.writeAll(rep.text);
+    if (!std.mem.endsWith(u8, rep.text, "\n")) try w.writeByte('\n');
+    try w.writeAll("---\n");
+    try w.writeAll(try appSummary(arena, app));
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+/// Verdict for a `min_frames` wait that fell short.
+///
+/// Falling short is USUALLY arithmetic, not a fault: an app painting at
+/// 12fps cannot deliver 1400 frames inside 115s no matter how healthy
+/// it is. Reporting that as "it is not painting (frozen…)" was a false
+/// alarm frequent enough to train callers into ignoring the message —
+/// the worst possible reflex, because the identical sentence is how a
+/// REAL freeze announces itself. Only zero frames makes a liveness
+/// claim now; anything else states the rate and the arithmetic.
+fn shortFramesVerdict(
+    arena: std.mem.Allocator,
+    wid: u32,
+    got: u64,
+    want: u64,
+    elapsed_ms: i64,
+    timeout_ms: i64,
+) ![]const u8 {
+    if (got == 0) {
+        return std.fmt.allocPrint(
+            arena,
+            "NOT LIVE: window {d} committed NO frames at all in {d}ms — it is not painting. That is frozen, minimised, or rendering into another window IF it was supposed to be drawing; an idle event-driven app legitimately commits nothing until something asks it to redraw. app_backtrace settles which one.",
+            .{ wid, timeout_ms },
+        );
+    }
+    const elapsed = @max(elapsed_ms, 1);
+    const fps = @as(f64, @floatFromInt(got)) * 1000.0 / @as(f64, @floatFromInt(elapsed));
+    const need_ms: i64 = @intFromFloat(@as(f64, @floatFromInt(want)) * 1000.0 / @max(fps, 0.001));
+    return std.fmt.allocPrint(
+        arena,
+        "the app IS painting, at about {d:.1} fps — but {d} frames at that rate needs roughly {d}ms and the timeout was {d}ms, so only {d} arrived. That is arithmetic, not a fault: raise timeout_ms, lower min_frames, or wait on something real (app_wait_log / app_watch).",
+        .{ fps, want, need_ms, timeout_ms, got },
+    );
+}
+
+test "a min_frames shortfall only claims NOT LIVE when nothing painted" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The field case: ~12fps, 1400 frames wanted, 115s timeout. The app
+    // was painting perfectly and the old wording called it frozen.
+    const slow = try shortFramesVerdict(arena, 1, 1243, 1400, 115_000, 115_000);
+    try t.expect(std.mem.indexOf(u8, slow, "IS painting") != null);
+    try t.expect(std.mem.indexOf(u8, slow, "NOT LIVE") == null);
+    try t.expect(std.mem.indexOf(u8, slow, "frozen") == null);
+    try t.expect(std.mem.indexOf(u8, slow, "10.8 fps") != null);
+
+    // A genuine freeze keeps the alarm — and points at the tool that
+    // can say where it is stuck.
+    const dead = try shortFramesVerdict(arena, 2, 0, 10, 5_000, 5_000);
+    try t.expect(std.mem.indexOf(u8, dead, "NOT LIVE") != null);
+    try t.expect(std.mem.indexOf(u8, dead, "app_backtrace") != null);
 }
