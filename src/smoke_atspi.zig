@@ -406,7 +406,14 @@ pub fn main() u8 {
         return 1;
     }
 
-    // ── 6-9. the editor canvas ───────────────────────────────────────
+    // ── 6. the shared per-tab menu on the editor's document tabs ────
+    if (tabMenuStage(allocator, rt, sock_path)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
+    // ── 7-10. the editor canvas ──────────────────────────────────────
     if (editorStage(allocator, rt, sock_path)) |msg| {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
         teardown();
@@ -649,6 +656,494 @@ fn paneIdCount(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
     defer allocator.free(resp);
     if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
     return std.mem.count(u8, resp, "\"id\":");
+}
+
+/// ATSPI_ROLE_PAGE_TAB — what GTK4 maps a GtkNotebook tab onto. The
+/// inner document tabs of the editor and the file browser are these.
+const ROLE_PAGE_TAB: u32 = 37;
+
+const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+const TabNode = struct { id: []u8, rect: Rect, states_lo: u32 };
+
+/// `"rect":[x,y,w,h]` starting at or after `from`, plus the offset
+/// just past it.
+fn parseRectAt(json: []const u8, from: usize) ?struct { rect: Rect, end: usize } {
+    const key = ",\"rect\":[";
+    const at = std.mem.indexOfPos(u8, json, from, key) orelse return null;
+    var i = at + key.len;
+    var vals: [4]i32 = undefined;
+    for (&vals) |*v| {
+        var neg = false;
+        if (i < json.len and json[i] == '-') {
+            neg = true;
+            i += 1;
+        }
+        var n: i32 = 0;
+        var any = false;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+            n = n * 10 + @as(i32, json[i] - '0');
+            any = true;
+        }
+        if (!any) return null;
+        v.* = if (neg) -n else n;
+        if (i < json.len and (json[i] == ',' or json[i] == ']')) i += 1;
+    }
+    return .{ .rect = .{ .x = vals[0], .y = vals[1], .w = vals[2], .h = vals[3] }, .end = i };
+}
+
+/// Width of the application's toplevel (role FRAME), which the
+/// driver's window box exceeds by the client-side-decoration margin.
+fn frameWidth(json: []const u8) f64 {
+    const key = "\"role\":23,";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, json, from, key)) |at| {
+        from = at + key.len;
+        const hit = parseRectAt(json, at) orelse continue;
+        if (hit.rect.w > 0) return @floatFromInt(hit.rect.w);
+    }
+    return 0;
+}
+
+/// A document tab in an inner tab strip, located by its label. The
+/// rect carries the tab's SIZE only (see locateTabStrip on why the
+/// position is unusable).
+fn findTabNode(allocator: std.mem.Allocator, name: []const u8, budget_ms: u32) ?TabNode {
+    var needle_buf: [256]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ",\"name\":\"{s}\"", .{name}) catch return null;
+    var waited: u32 = 0;
+    while (waited < budget_ms) : (waited += 500) {
+        if (drive) |app| app.drain();
+        if (hub.?.treeJson(allocator)) |json| {
+            defer allocator.free(json);
+            frame_w = frameWidth(json);
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, json, from, needle)) |at| {
+                from = at + needle.len;
+                const id_key = "{\"id\":\"";
+                const istart = std.mem.lastIndexOf(u8, json[0..at], id_key) orelse continue;
+                const vstart = istart + id_key.len;
+                const vend = std.mem.indexOfScalarPos(u8, json, vstart, '"') orelse continue;
+                const role_key = "\",\"role\":";
+                var role: u32 = 0;
+                if (std.mem.indexOfPos(u8, json, vend, role_key)) |rk| {
+                    var i = rk + role_key.len;
+                    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
+                        role = role * 10 + (json[i] - '0');
+                }
+                if (role != ROLE_PAGE_TAB) continue;
+                const st_key = ",\"states\":[";
+                var st_lo: u32 = 0;
+                const sk = std.mem.indexOfPos(u8, json, vend, st_key) orelse continue;
+                var i = sk + st_key.len;
+                while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
+                    st_lo = st_lo * 10 + (json[i] - '0');
+                const hit = parseRectAt(json, sk) orelse continue;
+                const id = allocator.dupe(u8, json[vstart..vend]) catch return null;
+                return .{ .id = id, .rect = hit.rect, .states_lo = st_lo };
+            }
+            dumpTree(json);
+        }
+        _ = c.usleep(500_000);
+    }
+    return null;
+}
+
+/// A PNG of an open popup surface, for a human to look at. Same
+/// artefact convention as smoke-e2e's menu shots.
+fn shotPopup(allocator: std.mem.Allocator, id: u32, path: [*:0]const u8) void {
+    const app = drive orelse return;
+    const shot = app.screenshotPng(id, 1024, null, 0) catch return;
+    defer allocator.free(shot.png);
+    const f = c.fopen(path, "wb") orelse return;
+    _ = c.fwrite(shot.png.ptr, 1, shot.png.len, f);
+    _ = c.fclose(f);
+}
+
+/// Last tree walked, for diagnosing a stage that cannot find its node.
+fn dumpTree(json: []const u8) void {
+    const f = c.fopen("/tmp/sketerm-atspi-tree.json", "wb") orelse return;
+    _ = c.fwrite(json.ptr, 1, json.len, f);
+    _ = c.fclose(f);
+}
+
+/// Right-click a point and wait for the menu's popup surface.
+///
+/// A GTK4 popover is its OWN xdg_popup surface, so "the menu opened"
+/// is counted on the compositor side; the a11y rows alone could come
+/// from a stale tree.
+fn rightClickAt(x: f64, y: f64, ms: u32) ?u32 {
+    const app = drive orelse return null;
+    _ = app.drainLive(500);
+    if (app.windows.items.len == 0) return null;
+    const win = app.windows.items[0];
+    app.clickEx(win.id, x, y, 3, 80, 1) catch return null;
+    return waitTabPopup(app, true, ms);
+}
+
+/// An open MENU popup surface. Size-filtered: GTK tooltips are
+/// xdg_popups too, and the toolbar above the tab strip has one on
+/// every button — an unfiltered "is a popup" test reports those.
+/// Every menu here is at least four rows tall.
+fn tabPopup(app: *appdrive.App) ?u32 {
+    _ = app.pumpOnce(120);
+    for (app.windows.items) |w| {
+        if (w.popup and w.frames > 0 and w.h >= 70 and w.w >= 120) return w.id;
+    }
+    return null;
+}
+
+fn waitTabPopup(app: *appdrive.App, want_open: bool, ms: u32) ?u32 {
+    var waited: u32 = 0;
+    while (true) {
+        const id = tabPopup(app);
+        if ((id != null) == want_open) return id orelse 0;
+        if (waited >= ms) return null;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+const Point = struct { x: f64, y: f64 };
+
+/// Toplevel width as the a11y tree measures it (role FRAME), so the
+/// driver's client-side-decoration margin can be subtracted. Filled
+/// by findTabNode on every tree walk.
+var frame_w: f64 = 0;
+
+/// ATSPI_STATE_SELECTED is bit 23 of the low state word — set on the
+/// tab a GtkNotebook currently shows.
+const STATE_SELECTED_BIT: u32 = 1 << 23;
+
+/// Window-local point on the tab strip's FIRST tab, found by probing
+/// down the column of a tab that is NOT currently selected with LEFT
+/// clicks until the a11y tree reports that tab selected.
+///
+/// Probing, not extents: GTK4 on Wayland reports every accessible rect
+/// at 0,0 (a client cannot know its own screen position), so the tree
+/// gives sizes and nothing to aim with. Left clicks, not right ones:
+/// a right click that misses opens some other surface's menu, and
+/// dismissing that eats the next press — the probe then chases its own
+/// wake instead of finding the strip. A left click that misses only
+/// moves a caret, and the hit is confirmed by an EFFECT (the tab it
+/// selects) rather than by a popup appearing. The probed column is an
+/// unselected tab because a tab that is already selected cannot
+/// confirm anything.
+fn locateTabStrip(allocator: std.mem.Allocator, names: []const []const u8, tab_w: i32, tab_h: i32) ?Point {
+    const app = drive orelse return null;
+    if (app.windows.items.len == 0) return null;
+    const win = app.windows.items[0];
+    // Client-side decorations: the driver's window box is bigger than
+    // the toplevel the a11y tree measures, by an even margin.
+    const margin: f64 = @max(0.0, (@as(f64, @floatFromInt(win.w)) - frame_w) / 2);
+    const w: f64 = @floatFromInt(tab_w);
+
+    var target: ?usize = null;
+    for (names, 0..) |name, i| {
+        const node = findTabNode(allocator, name, 2_000) orelse continue;
+        defer allocator.free(node.id);
+        if (node.states_lo & STATE_SELECTED_BIT == 0) target = i;
+    }
+    const idx = target orelse return null;
+    const x = margin + w * (@as(f64, @floatFromInt(idx)) + 0.5);
+    var y: f64 = margin;
+    const limit: f64 = margin + 420;
+    while (y < limit) : (y += 10) {
+        app.clickEx(win.id, x, y, 1, 60, 1) catch return null;
+        _ = app.waitIdle(200, 1_500);
+        const node = findTabNode(allocator, names[idx], 1) orelse continue;
+        defer allocator.free(node.id);
+        if (node.states_lo & STATE_SELECTED_BIT == 0) continue;
+        // A third of a tab down from the first row that works: the
+        // topmost such row is the notebook's own tab-area edge, where
+        // a press reaches the strip gesture but not the label box.
+        return .{ .x = margin + w * 0.5, .y = y + @as(f64, @floatFromInt(tab_h)) / 3 };
+    }
+    return null;
+}
+
+/// Close whatever menu is open (Escape, then an inside-the-content
+/// click — never near the window edge, which is a resize band).
+fn dismissPopup(app: *appdrive.App) void {
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        if (tabPopup(app) == null) return;
+        app.pressKey(null, "Escape") catch {};
+        if (waitTabPopup(app, false, 1_500) != null) return;
+        if (app.windows.items.len == 0) return;
+        const win = app.windows.items[0];
+        app.clickEx(win.id, @as(f64, @floatFromInt(win.w)) / 2, @as(f64, @floatFromInt(win.h)) - 60, 1, 60, 1) catch {};
+        if (waitTabPopup(app, false, 1_500) != null) return;
+    }
+}
+
+/// The per-tab context menu shared by the editor and the file browser
+/// (ui/tabhost.zig), asserted on the editor's document tabs: the menu
+/// opens as a real popup surface, its rows are accessible objects with
+/// the sensitivity the document under the pointer implies, a row that
+/// copies really writes the clipboard, the keyboard opens the same
+/// menu, and Close Other Tabs really closes the others.
+fn tabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
+    const app = drive orelse return "the display session has no driver";
+    // Three documents in ONE editor face, on the pane that is already
+    // in front: `editor-here` converts it, and every further call adds
+    // a document tab to that same face.
+    var path_buf: [3][512]u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    var specs: [3][:0]const u8 = undefined;
+    for (0..3) |i| {
+        specs[i] = std.fmt.bufPrintZ(&path_buf[i], "{s}/tabmenu-{c}.txt", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }) catch
+            return "tab menu path";
+        names[i] = std.fs.path.basename(std.mem.span(specs[i].ptr));
+        const f = c.fopen(specs[i].ptr, "wb") orelse return "creating a tab-menu document failed";
+        _ = c.fputs("hello\n", f);
+        _ = c.fclose(f);
+    }
+
+    var req_buf: [800]u8 = undefined;
+    const epane: u64 = 1;
+    for (specs) |spec| {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"editor-here\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ epane, spec }) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "editor-here roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "editor-here was refused";
+    }
+    var settle: u32 = 0;
+    while (settle < 15) : (settle += 1) {
+        app.drain();
+        _ = c.usleep(100_000);
+    }
+
+    // ── find the strip, then open the menu on the FIRST document ──
+    const tab_a = findTabNode(allocator, names[0], 30_000) orelse
+        return "no PAGE_TAB node named after the first document appeared (see /tmp/sketerm-atspi-tree.json)";
+    defer allocator.free(tab_a.id);
+    if (waitTabPopup(app, false, 3_000) == null) return "a popup was already open before the tab menu stage";
+    const first = locateTabStrip(allocator, &names, tab_a.rect.w, tab_a.rect.h) orelse
+        return "clicking down the document tab column never selected a document tab";
+    const menu_id = rightClickAt(first.x, first.y, 10_000) orelse
+        return "right-clicking the first document's tab opened no menu popup";
+    _ = app.waitVisualSettle(menu_id, 300, 5_000, 0.002, null);
+    shotPopup(allocator, menu_id, "/tmp/sketerm-atspi-editor-tab-menu.png");
+
+    // ── rows, and what their sensitivity says ───────────────────
+    // A freshly loaded document is clean, so Save has nothing to do;
+    // Save As always does. Both must be PRESENT — a row that vanishes
+    // teaches nothing about why it cannot act.
+    const save = findMenuRow(allocator, "Save", 10_000) orelse
+        return "the tab menu exposes no Save row";
+    defer allocator.free(save.id);
+    if (save.states_lo & STATE_SENSITIVE_BIT != 0)
+        return "Save is sensitive on a clean document — it must grey out";
+    const save_as = findMenuRow(allocator, "Save As\u{2026}", 5_000) orelse
+        return "the tab menu exposes no Save As row";
+    defer allocator.free(save_as.id);
+    if (save_as.states_lo & STATE_SENSITIVE_BIT == 0) return "Save As is greyed out";
+
+    // The documents live in the isolated runtime dir, which has no
+    // project marker above it — project.zig answers null, so there is
+    // nothing for a relative path to be relative TO.
+    const rel = findMenuRow(allocator, "Copy Relative Path", 5_000) orelse
+        return "the tab menu exposes no Copy Relative Path row";
+    defer allocator.free(rel.id);
+    if (rel.states_lo & STATE_SENSITIVE_BIT != 0)
+        return "Copy Relative Path is sensitive on a document with no project";
+
+    const others = findMenuRow(allocator, "Close Other Tabs", 5_000) orelse
+        return "the tab menu exposes no Close Other Tabs row";
+    defer allocator.free(others.id);
+    if (others.states_lo & STATE_SENSITIVE_BIT == 0)
+        return "Close Other Tabs is greyed out with three documents open";
+
+    // ── a row that really acts: Copy Full Path → the clipboard ──
+    const full = findMenuRow(allocator, "Copy Full Path", 5_000) orelse
+        return "the tab menu exposes no Copy Full Path row";
+    defer allocator.free(full.id);
+    if (full.states_lo & STATE_SENSITIVE_BIT == 0) return "Copy Full Path is greyed out on a saved document";
+    if (!hub.?.doAction(allocator, full.id, 0)) return "activating Copy Full Path over AT-SPI failed";
+    _ = waitTabPopup(app, false, 5_000);
+    var clip_ok = false;
+    var tries: u32 = 0;
+    while (tries < 40) : (tries += 1) {
+        app.drain();
+        if (app.getClipboard(3_000)) |text| {
+            defer allocator.free(text);
+            if (std.mem.eql(u8, std.mem.trim(u8, text, " \n\r\t"), std.mem.span(specs[0].ptr))) {
+                clip_ok = true;
+                break;
+            }
+        } else |_| {}
+        _ = c.usleep(250_000);
+    }
+    if (!clip_ok) return "Copy Full Path did not put the document's path on the clipboard";
+    say("editor tab menu: real popup surface, rows sensitive per document state, Copy Full Path really copied");
+
+    // ── the keyboard path opens the SAME menu ───────────────────
+    // Clicking a tab leaves focus on the notebook's tab gizmo, which
+    // is where Menu / Shift+F10 is answered.
+    app.clickEx(app.windows.items[0].id, first.x, first.y, 1, 60, 1) catch return "clicking the tab failed";
+    _ = app.waitIdle(200, 2_000);
+    app.pressKey(null, "shift+F10") catch return "injecting Shift+F10 failed";
+    if (waitTabPopup(app, true, 10_000) == null)
+        return "Shift+F10 on the tab strip opened no tab menu";
+    if (findMenuRow(allocator, "Close Other Tabs", 8_000)) |n| {
+        allocator.free(n.id);
+    } else return "the keyboard-opened tab menu has no rows";
+    app.pressKey(null, "Escape") catch return "injecting Escape failed";
+    if (waitTabPopup(app, false, 8_000) == null) return "the keyboard-opened tab menu never closed on Escape";
+    say("editor tab menu: Shift+F10 on the tab strip opened the same menu, Escape closed it");
+
+    // ── Close Other Tabs really closes the others ───────────────
+    if (rightClickAt(first.x, first.y, 10_000) == null)
+        return "reopening the tab menu on the first document failed";
+    const others2 = findMenuRow(allocator, "Close Other Tabs", 8_000) orelse
+        return "the reopened tab menu exposes no Close Other Tabs row";
+    defer allocator.free(others2.id);
+    if (!hub.?.doAction(allocator, others2.id, 0)) return "activating Close Other Tabs over AT-SPI failed";
+    tries = 0;
+    while (tries < 60) : (tries += 1) {
+        app.drain();
+        if (!hasTabNamed(allocator, names[1]) and !hasTabNamed(allocator, names[2])) break;
+        _ = c.usleep(250_000);
+    } else return "Close Other Tabs left the other documents open";
+    if (!hasTabNamed(allocator, names[0])) return "Close Other Tabs closed the tab it was invoked on";
+    say("editor tab menu: Close Other Tabs closed the other two documents and kept its own");
+    dismissPopup(app);
+
+    // ── the same mechanism on the file browser's tabs ───────────
+    if (browserTabMenuStage(allocator, rt, sock_path)) |why| return why;
+
+    // Hand the pane back to its shell for the editor stage, which
+    // opens its own editor pane from scratch.
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"keys\":\"ctrl+shift+e\"}}\n", .{epane}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "send-keys roundtrip";
+        allocator.free(rp);
+    }
+    var closed: u32 = 0;
+    while (closed < 20) : (closed += 1) {
+        app.drain();
+        _ = c.usleep(100_000);
+    }
+    return null;
+}
+
+/// The other consumer of the same TabHost mechanism: the file
+/// browser's tabs. The shared rows must be the same ones, minus the
+/// editor-only Close Unmodified Tabs, plus Duplicate Tab — which the
+/// browser has and the editor deliberately does not. Both a domain
+/// row (Duplicate) and a shared bulk-close row are activated.
+fn browserTabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
+    const app = drive orelse return "the display session has no driver";
+    var dir_buf: [3][512]u8 = undefined;
+    var dirs: [3][:0]const u8 = undefined;
+    var names: [3][]const u8 = undefined;
+    for (0..3) |i| {
+        dirs[i] = std.fmt.bufPrintZ(&dir_buf[i], "{s}/btab-{c}", .{ rt, @as(u8, 'a') + @as(u8, @intCast(i)) }) catch
+            return "browser tab path";
+        names[i] = std.fs.path.basename(std.mem.span(dirs[i].ptr));
+        _ = c.mkdir(dirs[i].ptr, 0o755);
+    }
+    var req_buf: [800]u8 = undefined;
+    for (dirs) |dir| {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"browser-here\",\"pane\":1,\"data\":\"{s}\"}}\n", .{dir}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "browser-here roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "browser-here was refused";
+    }
+    var settle: u32 = 0;
+    while (settle < 20) : (settle += 1) {
+        app.drain();
+        _ = c.usleep(100_000);
+    }
+
+    const tab_a = findTabNode(allocator, names[0], 30_000) orelse
+        return "no PAGE_TAB node named after the first browser tab appeared";
+    defer allocator.free(tab_a.id);
+    const first = locateTabStrip(allocator, &names, tab_a.rect.w, tab_a.rect.h) orelse
+        return "clicking down the browser tab column never selected a tab";
+    const menu_id = rightClickAt(first.x, first.y, 10_000) orelse
+        return "right-clicking a browser tab opened no menu popup";
+    _ = app.waitVisualSettle(menu_id, 300, 5_000, 0.002, null);
+    shotPopup(allocator, menu_id, "/tmp/sketerm-atspi-browser-tab-menu.png");
+
+    if (findMenuRow(allocator, "Close Unmodified Tabs", 1)) |n| {
+        allocator.free(n.id);
+        return "the browser tab menu has a Close Unmodified Tabs row, which means nothing for a listing";
+    }
+    const others = findMenuRow(allocator, "Close Other Tabs", 5_000) orelse
+        return "the browser tab menu exposes no Close Other Tabs row";
+    defer allocator.free(others.id);
+    if (others.states_lo & STATE_SENSITIVE_BIT == 0) return "Close Other Tabs is greyed out with three tabs open";
+    const right = findMenuRow(allocator, "Close Tabs to the Right", 5_000) orelse
+        return "the browser tab menu exposes no Close Tabs to the Right row";
+    defer allocator.free(right.id);
+    if (right.states_lo & STATE_SENSITIVE_BIT == 0)
+        return "Close Tabs to the Right is greyed out on the first of three tabs";
+
+    // ── a row that really acts: Duplicate Tab ───────────────────
+    const dup = findMenuRow(allocator, "Duplicate Tab", 10_000) orelse
+        return "the browser tab menu exposes no Duplicate Tab row";
+    defer allocator.free(dup.id);
+    if (dup.states_lo & STATE_SENSITIVE_BIT == 0) return "Duplicate Tab is greyed out on a directory tab";
+    const before = countTabsNamed(allocator, names[0]);
+    if (!hub.?.doAction(allocator, dup.id, 0)) return "activating Duplicate Tab over AT-SPI failed";
+    var tries: u32 = 0;
+    while (tries < 60) : (tries += 1) {
+        app.drain();
+        if (countTabsNamed(allocator, names[0]) > before) break;
+        _ = c.usleep(250_000);
+    } else return "Duplicate Tab did not open a second tab on the same directory";
+    say("browser tab menu: same close rows, no Close Unmodified row, Duplicate Tab really duplicated");
+
+    // ── and the shared bulk close, on this consumer too ─────────
+    if (rightClickAt(first.x, first.y, 10_000) == null)
+        return "reopening the browser tab menu failed";
+    const others2 = findMenuRow(allocator, "Close Other Tabs", 8_000) orelse
+        return "the reopened browser tab menu exposes no Close Other Tabs row";
+    defer allocator.free(others2.id);
+    if (!hub.?.doAction(allocator, others2.id, 0)) return "activating Close Other Tabs over AT-SPI failed";
+    tries = 0;
+    while (tries < 60) : (tries += 1) {
+        app.drain();
+        if (!hasTabNamed(allocator, names[1]) and !hasTabNamed(allocator, names[2])) break;
+        _ = c.usleep(250_000);
+    } else return "Close Other Tabs left the other browser tabs open";
+    if (!hasTabNamed(allocator, names[0])) return "Close Other Tabs closed the browser tab it was invoked on";
+    say("browser tab menu: Close Other Tabs closed the other browser tabs and kept its own");
+    dismissPopup(app);
+    return null;
+}
+
+/// How many document tabs currently carry this label.
+fn countTabsNamed(allocator: std.mem.Allocator, name: []const u8) usize {
+    var needle_buf: [256]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ",\"name\":\"{s}\"", .{name}) catch return 0;
+    const json = hub.?.treeJson(allocator) orelse return 0;
+    defer allocator.free(json);
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, json, from, needle)) |at| {
+        from = at + needle.len;
+        // Each node object opens with its id and then its role, both
+        // BEFORE the name this matched.
+        const obj = std.mem.lastIndexOf(u8, json[0..at], "{\"id\":\"") orelse continue;
+        const role_key = "\",\"role\":";
+        const rk = std.mem.indexOfPos(u8, json, obj, role_key) orelse continue;
+        var role: u32 = 0;
+        var i = rk + role_key.len;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
+            role = role * 10 + (json[i] - '0');
+        if (role == ROLE_PAGE_TAB) n += 1;
+    }
+    return n;
+}
+
+/// Is a document tab with this label in the tree right now?
+fn hasTabNamed(allocator: std.mem.Allocator, name: []const u8) bool {
+    const n = findTabNode(allocator, name, 1) orelse return false;
+    allocator.free(n.id);
+    return true;
 }
 
 /// The editor canvas over the same bridge: an editable TEXT_BOX node
