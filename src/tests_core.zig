@@ -90,6 +90,7 @@ comptime {
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
+    _ = @import("grid/bracket.zig");
     _ = @import("ipc/cdp.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/fsdrive.zig");

@@ -460,6 +460,8 @@ pub fn main() u8 {
         say("real seat input reached the shell and repainted the window");
         if (kittyKbdStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("kitty keyboard protocol encodes real key events correctly");
+        if (copyModeStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("copy mode selected a word with vi motions and yanked it to the clipboard");
 
         // 3c. The pane's context menu, driven by a real right-click and
         // by the keyboard. Contents and per-row sensitivity are
@@ -1687,6 +1689,53 @@ fn kittyKbdStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // is an ordinary shell for every stage after this one.
     if (!waitMarkerCount(allocator, sock_path, "KBDOFF", 2, 20_000))
         return "the pane never returned to a plain shell";
+    return null;
+}
+
+/// Copy mode, driven from the seat and closed through the real system
+/// clipboard: the yanked text is pasted back into the shell, so the
+/// assertion is on the pane's own grid and covers the whole loop
+/// (key sink → motions → selection → GTK clipboard → paste).
+///
+/// The word motions are what make this worth a live stage: `w` and
+/// `e` have to agree about where a word begins and ends, and only the
+/// round trip proves the selection they produced was the right one.
+fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    // Three words sharing a prefix, so a motion that stops one word
+    // early or late yanks something visibly different.
+    app.typeText(null, "echo ZQalpha ZQbeta ZQgamma\n") catch return "injecting the sample line failed";
+    // Twice: the echoed command line, and its output.
+    if (!waitMarkerCount(allocator, sock_path, "ZQbeta", 2, 15_000))
+        return "the sample line never reached the shell";
+    _ = app.waitIdle(300, 5_000);
+
+    app.pressKey(null, "ctrl+shift+x") catch return "entering copy mode failed";
+    _ = app.waitIdle(300, 5_000);
+    // Up onto the output line, to its start, then select the MIDDLE
+    // word: w to its first character, e to its last.
+    const motions = [_][]const u8{ "k", "0", "w", "v", "e", "y" };
+    for (motions) |key| {
+        app.pressKey(null, key) catch return "injecting a copy-mode motion failed";
+        _ = app.waitIdle(120, 2_000);
+    }
+
+    // Paste it back. A third occurrence can only come from the yank.
+    app.pressKey(null, "ctrl+shift+v") catch return "pasting the yanked text failed";
+    if (!waitMarkerCount(allocator, sock_path, "ZQbeta", 3, 10_000)) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n")) |resp| {
+            defer allocator.free(resp);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: copy-mode pane text: %.*s\n", @as(c_int, @intCast(@min(resp.len, 2000))), resp.ptr);
+        }
+        return "copy mode did not yank the word the motions selected";
+    }
+    // The word boundaries have to be exact: a selection that ran on
+    // into the next word would have brought ZQgamma with it.
+    if (waitMarkerCount(allocator, sock_path, "ZQgamma", 3, 1_000))
+        return "the copy-mode selection overshot the word it was on";
+
+    // Clear the pasted line so the pane is left at a clean prompt.
+    app.pressKey(null, "ctrl+u") catch return "clearing the pasted line failed";
+    _ = app.waitIdle(300, 5_000);
     return null;
 }
 
