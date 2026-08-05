@@ -14,6 +14,16 @@
 //!   4. a real pointer drag creates exactly one AT-SPI selection whose
 //!      range yields the dragged text, and a click clears it again.
 //!
+//! and that the EDITOR canvas — a second GtkGLArea, same bridge over
+//! the rope instead of the grid — is readable the same way:
+//!
+//!   5. an editable TEXT_BOX node named after the open file appears;
+//!   6. its Text contents are exactly what was typed (no inlay hints,
+//!      no gutter, no decorations — the document, not the rendering);
+//!   7. the caret advances by the number of characters typed, counting
+//!      a multi-byte character as ONE;
+//!   8. Shift+Home reports a selection whose range yields the line.
+//!
 //! Deliberately a separate target from smoke-e2e: that harness runs its
 //! GUI children with GTK_A11Y=none (correct isolation on a desktop with a
 //! live at-spi), so a11y coverage needs its own private bus — this one.
@@ -389,6 +399,13 @@ pub fn main() u8 {
         say("selection cleared on click");
     }
 
+    // ── 5-8. the editor canvas ───────────────────────────────────────
+    if (editorStage(allocator, rt, sock_path)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
     // Graceful GUI shutdown.
     _ = c.kill(pid, c.SIGTERM);
     var status: c_int = 0;
@@ -435,6 +452,228 @@ fn findTerminalNode(allocator: std.mem.Allocator, budget_ms: u32) ?[]u8 {
         _ = c.usleep(500_000);
     }
     return null;
+}
+
+/// First integer following `key` in `json`, or null.
+fn parseNumAfter(json: []const u8, key: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, json, key) orelse return null;
+    var i = at + key.len;
+    var v: u64 = 0;
+    var any = false;
+    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) {
+        v = v * 10 + (json[i] - '0');
+        any = true;
+    }
+    return if (any) v else null;
+}
+
+/// AT-SPI role GTK 4 maps `GTK_ACCESSIBLE_ROLE_TEXT_BOX` onto:
+/// ATSPI_ROLE_TEXT (61), which is what GtkTextView reports too — NOT
+/// ATSPI_ROLE_ENTRY (79), and emphatically not the terminal's
+/// ATSPI_ROLE_TERMINAL (60).
+const ROLE_TEXT_BOX: u32 = 61;
+
+/// Typed into the editor tab. The `é` is deliberate: it is two BYTES
+/// and one CHARACTER, so a caret that advances by 2 for "é!" proves the
+/// bridge reports character offsets and not rope byte offsets.
+const ED_HEAD = "edmark1";
+const ED_TAIL = "\u{e9}!";
+
+const NodeRef = struct { id: []u8, role: u32, states_lo: u32 };
+
+/// ATSPI_STATE_EDITABLE is bit 7 of the low state word.
+const STATE_EDITABLE_BIT: u32 = 1 << 7;
+
+/// Find the tree node whose accessible Name is exactly `name` AND
+/// whose role is `want_role`, and return its id (caller frees).
+///
+/// The name has to be matched together with the role because the tab
+/// STRIP also names its page after the open file: several nodes carry
+/// the same name and only one of them is the canvas. Roles that were
+/// seen under that name but rejected are reported on failure, so a GTK
+/// that maps `GTK_ACCESSIBLE_ROLE_TEXT_BOX` somewhere else says so
+/// instead of just timing out.
+fn findNamedNode(allocator: std.mem.Allocator, name: []const u8, want_role: u32, budget_ms: u32) ?NodeRef {
+    var needle_buf: [256]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ",\"name\":\"{s}\"", .{name}) catch return null;
+    var seen: [8]u32 = undefined;
+    var n_seen: usize = 0;
+    var waited: u32 = 0;
+    while (waited < budget_ms) : (waited += 500) {
+        if (drive) |app| app.drain();
+        if (hub.?.treeJson(allocator)) |json| {
+            defer allocator.free(json);
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, json, from, needle)) |at| {
+                from = at + needle.len;
+                const id_key = "{\"id\":\"";
+                const istart = std.mem.lastIndexOf(u8, json[0..at], id_key) orelse continue;
+                const vstart = istart + id_key.len;
+                const vend = std.mem.indexOfScalarPos(u8, json, vstart, '"') orelse continue;
+                const role_key = "\",\"role\":";
+                var role: u32 = 0;
+                if (std.mem.indexOfPos(u8, json, vend, role_key)) |rk| {
+                    var i = rk + role_key.len;
+                    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
+                        role = role * 10 + (json[i] - '0');
+                }
+                if (role == want_role) {
+                    const st_key = ",\"states\":[";
+                    var st_lo: u32 = 0;
+                    if (std.mem.indexOfPos(u8, json, vend, st_key)) |sk| {
+                        var i = sk + st_key.len;
+                        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
+                            st_lo = st_lo * 10 + (json[i] - '0');
+                    }
+                    const id = allocator.dupe(u8, json[vstart..vend]) catch return null;
+                    return .{ .id = id, .role = role, .states_lo = st_lo };
+                }
+                if (n_seen < seen.len) {
+                    seen[n_seen] = role;
+                    n_seen += 1;
+                }
+            }
+        }
+        _ = c.usleep(500_000);
+    }
+    for (seen[0..n_seen]) |r|
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: node named '%.*s' had role %u\n", @as(c_int, @intCast(name.len)), name.ptr, r);
+    return null;
+}
+
+/// The editor canvas over the same bridge: an editable TEXT_BOX node
+/// named after the open file, whose Text is the document (and only the
+/// document), whose caret counts characters, and whose selection is
+/// readable. Returns an error message, or null on pass.
+fn editorStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
+    var path_buf: [512]u8 = undefined;
+    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/a11y-editor.txt", .{rt}) catch return "editor path";
+    const base = std.fs.path.basename(std.mem.span(efile.ptr));
+
+    var req_buf: [700]u8 = undefined;
+    var epane: u64 = 0;
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return "editor req fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "new-editor-tab roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "new-editor-tab not ok";
+        epane = parseNumAfter(rp, "\"pane\":") orelse return "new-editor-tab reply has no pane id";
+    }
+    // An unaddressed `new-editor-tab` CREATES the tab without selecting
+    // it (remotectl only selects when a pane was addressed), and an
+    // unselected AdwTabView page contributes nothing to the AT-SPI
+    // tree. A screen reader reads the tab in front, so select it.
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{epane}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "editor focus roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "focusing the editor tab was refused";
+    }
+    // The tab spawns and its (missing-file) load resolves asynchronously.
+    var settle: u32 = 0;
+    while (settle < 10) : (settle += 1) {
+        if (drive) |app| app.drain();
+        _ = c.usleep(100_000);
+    }
+
+    // ── 5. an editable TEXT_BOX named after the document ─────────────
+    const node = findNamedNode(allocator, base, ROLE_TEXT_BOX, 30_000) orelse
+        return "no editable TEXT_BOX node named after the open document appeared";
+    defer allocator.free(node.id);
+    if (node.states_lo & STATE_EDITABLE_BIT == 0) {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: editor node states_lo=%u (no EDITABLE bit)\n", node.states_lo);
+        return "the editor canvas is not exposed as EDITABLE";
+    }
+    say("editor node found in the AT-SPI tree (editable TEXT_BOX, named after the file)");
+
+    // ── 6. the Text IS the document ──────────────────────────────────
+    if (typeInto(allocator, sock_path, epane, ED_HEAD)) |m| return m;
+    if (awaitText(allocator, node.id, ED_HEAD, ED_HEAD.len)) |m| return m;
+    say("editor text readable and exactly the document");
+
+    // ── 7. the caret counts characters, not bytes ────────────────────
+    if (typeInto(allocator, sock_path, epane, ED_TAIL)) |m| return m;
+    // "é!" is 3 bytes and 2 characters: the caret must land on 9.
+    if (awaitText(allocator, node.id, ED_HEAD ++ ED_TAIL, ED_HEAD.len + 2)) |m| return m;
+    say("editor caret advanced in characters (not rope bytes)");
+
+    // ── 8. a selection is reported ───────────────────────────────────
+    // Shift+Home over the REAL seat: `send-keys` on an editor face
+    // speaks a small fixed chord set that has no selection chords, and
+    // a selection is exactly the thing worth driving through actual
+    // input anyway.
+    {
+        const app = drive orelse return "the display viewer went away";
+        _ = app.drainLive(2_000);
+        if (app.windows.items.len == 0) return "display session lost its window";
+        app.pressKey(app.windows.items[0].id, "shift+home") catch return "injecting Shift+Home failed";
+    }
+    var tries: u32 = 0;
+    var sel_ok = false;
+    while (tries < 100) : (tries += 1) {
+        if (drive) |app| app.drain();
+        if ((hub.?.textNSelections(allocator, node.id) orelse -1) == 1) {
+            if (hub.?.textSelection(allocator, node.id)) |range| {
+                const ts = hub.?.textState(allocator, node.id) orelse continue;
+                defer allocator.free(ts.text);
+                const b0 = charToByte(ts.text, range[0]);
+                const b1 = charToByte(ts.text, range[1]);
+                if (std.mem.eql(u8, ts.text[b0..b1], ED_HEAD ++ ED_TAIL)) {
+                    sel_ok = true;
+                    break;
+                }
+            }
+        }
+        _ = c.usleep(200_000);
+    }
+    if (!sel_ok) return "Shift+Home never became an AT-SPI selection covering the typed line";
+    say("editor selection readable over Text.GetSelection");
+
+    // Save, so the GUI's SIGTERM is not met by a dirty-buffer prompt.
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "editor ctrl+s roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "editor ctrl+s not ok";
+    }
+    tries = 0;
+    while (tries < 50) : (tries += 1) {
+        if (drive) |app| app.drain();
+        _ = c.usleep(200_000);
+        const f = c.fopen(efile.ptr, "rb") orelse continue;
+        var content: [64]u8 = undefined;
+        const n = c.fread(&content, 1, content.len, f);
+        _ = c.fclose(f);
+        if (std.mem.eql(u8, content[0..n], ED_HEAD ++ ED_TAIL)) break;
+    } else return "the editor buffer never saved (a dirty prompt would block shutdown)";
+    return null;
+}
+
+/// Type `text` into the focused pane (the editor tab just opened).
+fn typeInto(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u64, text: []const u8) ?[]const u8 {
+    var buf: [512]u8 = undefined;
+    const rq = std.fmt.bufPrint(&buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ pane, text }) catch return "fmt";
+    const rp = roundtrip(allocator, sock_path, rq) orelse return "editor send-text roundtrip";
+    defer allocator.free(rp);
+    if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "editor send-text not ok";
+    return null;
+}
+
+/// Poll until node `id`'s Text is EXACTLY `want` with the caret at
+/// `caret` characters. Exact, not "contains": a gutter, an inlay hint
+/// or any other decoration leaking into the accessible text would fail
+/// here.
+fn awaitText(allocator: std.mem.Allocator, id: []const u8, want: []const u8, caret: usize) ?[]const u8 {
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        if (drive) |app| app.drain();
+        if (hub.?.textState(allocator, id)) |ts| {
+            defer allocator.free(ts.text);
+            if (std.mem.eql(u8, ts.text, want) and ts.caret == @as(i32, @intCast(caret))) return null;
+        }
+        _ = c.usleep(200_000);
+    }
+    return "the editor's Text/CaretOffset never matched what was typed";
 }
 
 /// One connect → one request line → one response line on the GUI's
