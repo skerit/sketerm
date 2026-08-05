@@ -238,6 +238,12 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     while (i < self.pending.items.len) {
         if (self.pending.items[i].tab == tab) self.dropPending(i) else i += 1;
     }
+    // Both of these must run while the page's widgets are still
+    // alive: the tab's extra reference on the column view's sorter
+    // must not outlive the view (BTab.releaseSorter), and fencing the
+    // recycled cells reads the view's list model.
+    tab.releaseSorter();
+    colview.invalidateBackingRefs(tab);
     const page_idx = c.gtk_notebook_page_num(self.notebook, tab.page);
     if (page_idx >= 0) c.gtk_notebook_remove_page(self.notebook, page_idx);
     for (self.tabs.items, 0..) |t, j| {
@@ -246,7 +252,6 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
             break;
         }
     }
-    colview.invalidateBackingRefs(tab);
     tab.deinit();
     if (self.currentTab()) |t| {
         self.syncPathEntry(t);

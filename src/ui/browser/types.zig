@@ -856,15 +856,27 @@ pub const BTab = struct {
         self.changed_all = false;
     }
 
+    /// Drop the extra reference this tab holds on its column view's
+    /// GtkColumnViewSorter, with its handler.
+    ///
+    /// MUST happen while the column view still exists. That sorter is
+    /// owned by the view and empties its per-column sequence as the
+    /// view disposes its columns; an outside reference that outlives
+    /// the view leaves the sequence non-empty at the sorter's own
+    /// dispose, and GTK aborts there
+    /// (gtk_column_view_sorter_dispose). Idempotent.
+    pub fn releaseSorter(self: *BTab) void {
+        const sorter = self.sorter orelse return;
+        if (self.sorter_handler != 0)
+            c.g_signal_handler_disconnect(@ptrCast(sorter), self.sorter_handler);
+        c.g_object_unref(sorter);
+        self.sorter = null;
+        self.sorter_handler = 0;
+    }
+
     pub fn deinit(self: *BTab) void {
         const a = self.view.allocator;
-        if (self.sorter) |sorter| {
-            if (self.sorter_handler != 0)
-                c.g_signal_handler_disconnect(@ptrCast(sorter), self.sorter_handler);
-            c.g_object_unref(sorter);
-            self.sorter = null;
-            self.sorter_handler = 0;
-        }
+        self.releaseSorter();
         // Before anything else: a running query holds a host-side
         // recursive watcher, which must not outlive this tab.
         self.view.queryForget(self);
