@@ -15,6 +15,15 @@ pub const Action = enum {
     copy_screen,
     copy_scrollback,
     copy_output,
+    /// Select the whole buffer (scrollback + screen) using the
+    /// terminal's own line-select mode.
+    select_all,
+    /// Line-select the last OSC 133 command output zone.
+    select_output,
+    /// Open the pane search bar (Ctrl+Shift+F's action).
+    search,
+    /// Wipe the scrollback ring; the visible screen stays.
+    clear_scrollback,
     paste,
     new_tab,
     new_tab_as_profile,
@@ -116,11 +125,14 @@ const MENU = [_]Item{
     .separator,
     .{ .bind = .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .icon = "edit-copy-symbolic", .action = .copy } },
     .{ .bind = .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .icon = "edit-paste-symbolic", .action = .paste } },
+    .{ .bind = .{ .name = "select-all", .label = "Select All", .detailed = "term.select-all", .icon = "edit-select-all-symbolic", .action = .select_all } },
     .{ .submenu = .{ .label = "Copy More", .icon = "edit-select-all-symbolic", .items = &.{
         .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .icon = "edit-select-all-symbolic", .action = .copy_screen },
         .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback },
         .{ .name = "copy-output", .label = "Copy Command Output", .detailed = "term.copy-output", .icon = "utilities-terminal-symbolic", .action = .copy_output },
+        .{ .name = "select-output", .label = "Select Command Output", .detailed = "term.select-output", .icon = "edit-select-all-symbolic", .action = .select_output },
     } } },
+    .{ .bind = .{ .name = "search", .label = "Find…", .detailed = "term.search", .icon = "edit-find-symbolic", .action = .search } },
     .separator,
     .{ .bind = .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h } },
     .{ .bind = .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v } },
@@ -164,6 +176,7 @@ const MENU = [_]Item{
         .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill },
     } } },
     .separator,
+    .{ .bind = .{ .name = "clear-scrollback", .label = "Clear Scrollback", .detailed = "term.clear-scrollback", .icon = "edit-clear-all-symbolic", .action = .clear_scrollback } },
     .{ .bind = .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal } },
     .{ .bind = .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open } },
 };
@@ -233,8 +246,18 @@ const N_HOST_WIDGETS = blk: {
     break :blk n;
 };
 
+/// Widget data key under which a menu-bearing widget publishes its
+/// ClickCtx, so `popupAt` can reach it from the keyboard path. The
+/// data is NOT owned here (no GDestroyNotify): the click gesture's
+/// `freeClickCtx` is the single owner, and the gesture dies with the
+/// widget, so the key can never outlive the pointer it holds.
+const CTX_KEY = "sketerm-term-menu";
+
 const ClickCtx = struct {
     allocator: std.mem.Allocator,
+    /// The widget the menu is attached to. Focus returns here when
+    /// the popover closes with focus still inside it.
+    widget: *c.GtkWidget,
     popover: *c.GtkWidget,
     group: *c.GSimpleActionGroup,
     pre_popup_fn: ?PrePopupFn = null,
@@ -328,6 +351,7 @@ pub fn attachWithPrePopup(
     const cctx = try allocator.create(ClickCtx);
     cctx.* = .{
         .allocator = allocator,
+        .widget = widget,
         .popover = popover,
         .group = @ptrCast(group),
         .pre_popup_fn = pre_popup_fn,
@@ -438,6 +462,23 @@ pub fn attachWithPrePopup(
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(widget, @ptrCast(click));
+    // Published last, once every field is filled: the keyboard path
+    // (`popupAt`) resolves the same context through this key.
+    c.g_object_set_data(@ptrCast(@alignCast(widget)), CTX_KEY, @ptrCast(cctx));
+}
+
+/// Pop the menu at widget-local (x, y) without a pointer event —
+/// the Menu-key / Shift+F10 path, where the caller passes the text
+/// cursor's rectangle instead of a click position. Runs the identical
+/// pre-popup + conditional-row refresh as a right-click, so a
+/// keyboard-opened menu reflects exactly the same state.
+///
+/// @return false when `widget` has no menu attached, or the pre-popup
+/// hook suppressed it (right-click rebound to paste).
+pub fn popupAt(widget: *c.GtkWidget, x: f64, y: f64) bool {
+    const data = c.g_object_get_data(@ptrCast(@alignCast(widget)), CTX_KEY) orelse return false;
+    const ctx: *ClickCtx = @ptrCast(@alignCast(data));
+    return showAt(ctx, x, y);
 }
 
 /// Build one flat icon+label menu-row button. `arrow` appends the
@@ -502,6 +543,27 @@ fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
         const sub = maybe_sub orelse continue;
         if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
     }
+    returnFocus(ctx);
+}
+
+/// Hand keyboard focus back to the menu's host widget when the
+/// popover closes — without this the keyboard path (Menu / Shift+F10)
+/// strands focus in a dead popover and the pane stops receiving keys,
+/// which also loses the AT-SPI focus target.
+///
+/// Only fires when focus is still INSIDE the popover. A row that
+/// opened a dialog (Set Pane Title…, Apply Profile…) has already
+/// moved focus into an AdwDialog living in the same window, and
+/// grabbing it back unconditionally would steal focus from that
+/// dialog the frame it appeared.
+fn returnFocus(ctx: *ClickCtx) void {
+    const root = c.gtk_widget_get_root(ctx.widget) orelse return;
+    const focus = c.gtk_root_get_focus(@ptrCast(root));
+    const inside = focus == null or
+        focus == ctx.popover or
+        c.gtk_widget_is_ancestor(focus, ctx.popover) != 0;
+    if (!inside) return;
+    _ = c.gtk_widget_grab_focus(ctx.widget);
 }
 
 fn freeHoverCtx(user: ?*anyopaque) callconv(.c) void {
@@ -582,6 +644,22 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     // the menu the instant it opened. Timing-dependent, so it
     // presented as "right-click often does nothing".
     _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    _ = showAtPrepared(ctx, x, y);
+}
+
+/// Pre-popup hook + row refresh + popup. Split out of `onRightClick`
+/// so the keyboard path runs byte-identical state resolution; the
+/// only thing it cannot share is the gesture-sequence claim, which
+/// has no meaning without a pointer event.
+fn showAt(ctx: *ClickCtx, x: f64, y: f64) bool {
+    if (ctx.pre_popup_fn) |f| {
+        if (!f(ctx.pre_popup_ctx, ctx.group, x, y)) return false;
+    }
+    return showAtPrepared(ctx, x, y);
+}
+
+/// The half of `showAt` that runs AFTER the pre-popup hook.
+fn showAtPrepared(ctx: *ClickCtx, x: f64, y: f64) bool {
     // Conditional rows: each group's visibility tracks a representative
     // action's enabled state, which the pre-popup hook set per-pane.
     //   - Session submenu (detach/rename/kill) → durable session.
@@ -605,4 +683,5 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     };
     c.gtk_popover_set_pointing_to(@ptrCast(ctx.popover), &rect);
     c.gtk_popover_popup(@ptrCast(ctx.popover));
+    return true;
 }
