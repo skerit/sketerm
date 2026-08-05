@@ -15,6 +15,8 @@ const std = @import("std");
 
 comptime {
     _ = @import("config.zig");
+    _ = @import("editor/linebreak.zig");
+    _ = @import("editor/diff.zig");
     _ = @import("editor/document.zig");
     _ = @import("editor/rope.zig");
     _ = @import("editor/fuzz.zig");

@@ -6,6 +6,8 @@
 const std = @import("std");
 
 comptime {
+    _ = @import("editor/linebreak.zig");
+    _ = @import("editor/diff.zig");
     _ = @import("util/utf8.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/pattern.zig");
