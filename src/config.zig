@@ -1130,6 +1130,31 @@ pub const Config = struct {
         return null;
     }
 
+    /// Every enabled server claiming `language_id`, in resolution
+    /// order (user sections, then non-overridden built-ins), WITHOUT
+    /// an installed check — for the remote-document path, where
+    /// "installed" can only be answered by the host that will run the
+    /// server (the daemon walks this list and picks the first present
+    /// on ITS PATH). Caller owns the slice; records borrow the config
+    /// arena, so use them before the next config swap.
+    pub fn lspServerCandidates(
+        self: *const Config,
+        language_id: []const u8,
+        alloc: std.mem.Allocator,
+    ) error{OutOfMemory}![]const LspServer {
+        var out: std.ArrayList(LspServer) = .empty;
+        errdefer out.deinit(alloc);
+        if (!self.editor_lsp) return out.toOwnedSlice(alloc);
+        for (self.lsp_servers.items) |*s| {
+            if (s.handles(language_id)) try out.append(alloc, s.*);
+        }
+        for (&lsp_servers.builtins) |*b| {
+            if (self.hasLspSection(b.name)) continue;
+            if (b.handles(language_id)) try out.append(alloc, b.*);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
     /// Editable record for `name`, materializing a `[lsp.<name>]`
     /// section (seeded from the built-in) the first time the UI writes
     /// to it. `arena` must be the one backing this Config.
@@ -2307,6 +2332,37 @@ test "config: lspServerList merges user sections over builtins" {
     try std.testing.expectEqualStrings("zls", list[0].name);
     try std.testing.expectEqualStrings("/opt/zls", list[0].command);
     try std.testing.expectEqualStrings("clangd", list[1].name);
+}
+
+test "config: lspServerCandidates keeps resolution order and skips disabled" {
+    const body =
+        \\[lsp.clangd]
+        \\enabled = false
+        \\
+        \\[lsp.fallback-zls]
+        \\command = /opt/other-zls
+        \\languages = zig
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    // User section first, then the untouched built-in — the order the
+    // daemon walks looking for an installed one.
+    const zig_list = try cfg.lspServerCandidates("zig", std.testing.allocator);
+    defer std.testing.allocator.free(zig_list);
+    try std.testing.expectEqual(@as(usize, 2), zig_list.len);
+    try std.testing.expectEqualStrings("/opt/other-zls", zig_list[0].command);
+    try std.testing.expectEqualStrings("zls", zig_list[1].command);
+    // The disabled clangd section suppresses its built-in wholesale.
+    const c_list = try cfg.lspServerCandidates("c", std.testing.allocator);
+    defer std.testing.allocator.free(c_list);
+    try std.testing.expectEqual(@as(usize, 0), c_list.len);
+    // Master switch off = no candidates at all.
+    var off = try Config.loadFromBytes(std.testing.allocator, "editor_lsp = false\n");
+    defer off.deinit();
+    const none = try off.lspServerCandidates("zig", std.testing.allocator);
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "config: [profile.name] sections round-trip" {
