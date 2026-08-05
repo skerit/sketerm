@@ -13282,3 +13282,64 @@ region diff rather than compose coordinates. The final wire into
 is deliberately not in this change: that file was concurrently owned;
 the proposed shape is an optional `changes` vtable entry the bridge
 consults first.
+## 2026-08-05 — feature completion pass 1: kitty keyboard, copy mode, hints
+
+Three of the "finish what we already started" items, each verified in
+`smoke-e2e` on a real seat as well as by unit tests.
+
+**Kitty keyboard protocol conformance.** The flag stack had the wrong
+shape: `CSI > flags u` SET the flags instead of pushing them (so a
+program enabling the protocol destroyed its caller's flags, and the
+matching `CSI < 1 u` restored zero), and `CSI = flags ; mode u` treated
+modes 2/3 as push/pop rather than or/clear. Both fixed, main and alt
+screens now keep separate stacks (`kitty_kbd_other_*`, swapped in
+`toggleAltScreen`), and a full stack drops its oldest entry instead of
+refusing the push. Encoding was rewritten around `KeyInput` +
+`emitCsi`: keys with a legacy VT sequence KEEP it under report-all
+(Up was being sent as `CSI 57352 u`, a Private Use Area alias only
+kitty's own decoder understands — arrows were effectively dead in
+report-all apps), Enter/Tab/Backspace stay control bytes under
+disambiguate unless modified, the modifier set widened to
+super/hyper/meta/caps/num, and the functional table gained F13-F35,
+the keypad, media keys, lock keys and the modifier keys themselves.
+Releases and repeats now work for every key class. Alternate keys are
+real: the hardware keycode is translated back through GDK for the
+unmodified and shifted key and mapped to a US PC-101 codepoint, so
+Ctrl+C bindings survive a Cyrillic layout. Behaviour was checked
+against the specification AND kitty's own `kitty_tests/keys.py`, which
+is the only authority on the cases the prose leaves implicit (e.g. a
+control-byte key has no release form, while a text key does).
+
+**Overlay modes were losing every plain printable key.** A mode's key
+sink lives in `key-pressed`, which GTK only emits for keys the input
+method did not claim — and an IM claims exactly the letters that hint
+labels and vi motions are made of. `w`, `y` and every hint letter was
+being committed as text into the shell. `modes.imBypass` now routes a
+pane's keys around its IM for the duration of hint and copy mode
+(`ImHost.setEnabled`, so the context and any half-finished compose
+survive). Found by the new smoke-e2e stage, not by reading.
+
+**Copy mode** gained H/M/L, page and half-page motions, word ends
+(e/E), WORD variants (W/B), `^`/`_`, paragraph `{`/`}`, `%` for the
+matching bracket, f/F/t/T with `;`/`,`, and n/N to walk the search
+bar's matches without leaving the mode. `grid/word_motion.zig` grew
+end-motions, a blank-delimited WORD alphabet and the find primitives;
+`grid/bracket.zig` is new and pure, with a row budget so one keystroke
+cannot scan a whole scrollback.
+
+**Hints are configurable.** New config keys: `hint_alphabet` (label
+characters, in order — ignored unless at least two distinct printable
+ASCII characters), `hint_multiple` (start in multi-select), and
+`hint.<name>.regex` / `.action` / `.command` for user rules. Actions
+are open/copy/paste/select/command; `{match}` in a command is replaced
+with the shell-quoted match and run detached via `sh -c` in the pane's
+cwd. Rules are POSIX EREs compiled once per mode entry (a pattern that
+does not compile disables only its own rule) and scanned BEFORE the
+built-in URL/path/hash scanners, sharing their per-row dedupe window,
+so a rule can claim text a built-in would have taken. In-mode:
+Shift+label forces copy, Alt+label forces paste, Tab toggles
+multi-select and Enter copies everything collected.
+
+Not covered: the prefs UI has no rows for the new hint keys (rules
+need a list editor); `docs/config.md` still documents a ZON format
+that never shipped and is unrelated drift.
