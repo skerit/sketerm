@@ -371,6 +371,85 @@ pub const Hub = struct {
         return true;
     }
 
+    /// org.a11y.atspi.Text state of node `id`: full text (owned by the
+    /// caller) + caret offset in characters. Null when the node has no
+    /// Text interface or the bus is down.
+    pub const TextState = struct { text: []u8, caret: i32 };
+
+    pub fn textState(self: *Hub, allocator: std.mem.Allocator, id: []const u8) ?TextState {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return null;
+        var bus = self.openA11yBus(allocator) orelse return null;
+        defer bus.deinit();
+        const count = textIntProp(allocator, &bus, ref, "CharacterCount") orelse return null;
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putI32(0) catch return null;
+        bw.putI32(count) catch return null;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Text",
+            .member = "GetText",
+            .destination = ref.dest,
+            .signature = "ii",
+            .body = bw.buf.items,
+        }) catch return null;
+        defer allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        const s = rd.string() catch return null;
+        const text = allocator.dupe(u8, s) catch return null;
+        const caret = textIntProp(allocator, &bus, ref, "CaretOffset") orelse {
+            allocator.free(text);
+            return null;
+        };
+        return .{ .text = text, .caret = caret };
+    }
+
+    /// org.a11y.atspi.Text.GetNSelections on node `id`. Null on failure.
+    pub fn textNSelections(self: *Hub, allocator: std.mem.Allocator, id: []const u8) ?i32 {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return null;
+        var bus = self.openA11yBus(allocator) orelse return null;
+        defer bus.deinit();
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Text",
+            .member = "GetNSelections",
+            .destination = ref.dest,
+        }) catch return null;
+        defer allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        return rd.i32v() catch null;
+    }
+
+    /// org.a11y.atspi.Text.GetSelection(0) on node `id` → [start, end)
+    /// character offsets. Null when there is no selection.
+    pub fn textSelection(self: *Hub, allocator: std.mem.Allocator, id: []const u8) ?[2]i32 {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return null;
+        var bus = self.openA11yBus(allocator) orelse return null;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putI32(0) catch return null;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Text",
+            .member = "GetSelection",
+            .destination = ref.dest,
+            .signature = "i",
+            .body = bw.buf.items,
+        }) catch return null;
+        defer allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        const a = rd.i32v() catch return null;
+        const b = rd.i32v() catch return null;
+        return .{ a, b };
+    }
+
     /// Set org.a11y.atspi.Value.CurrentValue (sliders, spinners,
     /// scrollbars) on node `id`. False on failure.
     pub fn setCurrentValue(self: *Hub, allocator: std.mem.Allocator, id: []const u8, value: f64) bool {
@@ -426,6 +505,29 @@ fn splitId(id: []const u8, path_buf: *[256]u8) ?IdRef {
     if (tail[0] == '/') return .{ .dest = dest, .path = tail };
     const p = std.fmt.bufPrint(path_buf, ATSPI_PATH_PREFIX ++ "{s}", .{tail}) catch return null;
     return .{ .dest = dest, .path = p };
+}
+
+/// Read an i32 org.a11y.atspi.Text property (CharacterCount,
+/// CaretOffset) off node `ref`. Null when absent or not an int.
+fn textIntProp(allocator: std.mem.Allocator, conn: *Conn, ref: IdRef, prop: []const u8) ?i32 {
+    var bw = dbus.Writer.init(allocator);
+    defer bw.deinit();
+    bw.putString("org.a11y.atspi.Text") catch return null;
+    bw.putString(prop) catch return null;
+    const r = conn.call(.{
+        .mtype = .method_call,
+        .path = ref.path,
+        .interface = "org.freedesktop.DBus.Properties",
+        .member = "Get",
+        .destination = ref.dest,
+        .signature = "ss",
+        .body = bw.buf.items,
+    }) catch return null;
+    defer allocator.free(r.body);
+    var rd = dbus.Reader.init(r.body);
+    const vsig = rd.sig() catch return null;
+    if (vsig.len != 1 or vsig[0] != 'i') return null;
+    return rd.i32v() catch null;
 }
 
 /// Set a boolean org.a11y.Status property on /org/a11y/bus (session

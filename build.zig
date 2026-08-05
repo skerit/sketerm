@@ -602,6 +602,37 @@ pub fn build(b: *std.Build) void {
     const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
     smoke_lsp_step.dependOn(&smoke_lsp_run.step);
 
+    // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).
+    // Same self-hosted rig as smoke-e2e, PLUS a private accessibility
+    // bus (dbus-daemon + at-spi2-registryd via mux/a11yhub.zig): the
+    // GUI runs with GTK_A11Y=atspi on that bus and the harness asserts
+    // real org.a11y.atspi.Text replies — terminal text, caret motion,
+    // drag selection. Separate from smoke-e2e on purpose: that harness
+    // pins GTK_A11Y=none so its GUI children can never register on the
+    // user's live a11y bus. SKIPs where the bus tooling is absent.
+    if (!native_macos) {
+        const smoke_atspi_mod = b.createModule(.{
+            .root_source_file = b.path("src/smoke_atspi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureSysDeps(b, smoke_atspi_mod, cbindings_mod);
+        smoke_atspi_mod.addImport("build_options", glib_opts_mod);
+        const smoke_atspi = b.addExecutable(.{
+            .name = "sketerm-smoke-atspi",
+            .root_module = smoke_atspi_mod,
+            .use_lld = use_lld,
+        });
+        const smoke_atspi_run = b.addRunArtifact(smoke_atspi);
+        // It execs zig-out/bin/sketerm + sketerm-mux, so install first;
+        // cwd must be the project root.
+        smoke_atspi_run.step.dependOn(b.getInstallStep());
+        smoke_atspi_run.setCwd(b.path("."));
+        const smoke_atspi_step = b.step("smoke-atspi", "Terminal-pane AT-SPI accessibility smoke on a private a11y bus (headless, no X)");
+        smoke_atspi_step.dependOn(&smoke_atspi_run.step);
+    }
+
     // macOS NSAccessibility smoke — `zig build smoke-a11y`. Drives a
     // real SketermTermView through the AX selectors VoiceOver uses and
     // asserts they match a known screen (incl. an astral char, so the
