@@ -400,6 +400,26 @@ pub const EditorPass = struct {
         try self.addRectRaw(kind, cx, y, cw, h, color);
     }
 
+    /// One run of consecutive struck-through glyphs on one visual row.
+    const StrikeRun = struct { row_y: f32, x0: f32, x1: f32, color: [4]f32 };
+
+    /// The bar for a strike run: KIND_DECOR, so it lands ON TOP of the
+    /// glyphs whatever order they were appended in, at roughly a third
+    /// of the ascent above the baseline (x-height) and never thinner
+    /// than one pixel.
+    fn addStrike(self: *EditorPass, run: StrikeRun, asc: f32, line_h: f32) !void {
+        if (run.x1 <= run.x0) return;
+        const thickness = @max(1.0, @round(line_h / 16.0));
+        try self.addRect(
+            KIND_DECOR,
+            run.x0,
+            run.row_y + asc - @round(asc * 0.30),
+            run.x1 - run.x0,
+            thickness,
+            run.color,
+        );
+    }
+
     fn addGlyph(self: *EditorPass, g: atlas_mod.Glyph, x: f32, baseline_y: f32, y_off: f32, color: [4]f32) !void {
         // Wholly under the gutter: drop it. A glyph straddling the edge
         // is drawn whole and the gutter (a later kind) covers the part
@@ -583,23 +603,49 @@ pub const EditorPass = struct {
                 try self.addRangeRects(ll, sel.start(), sel.end(), text_x0, y, line_h, colors.selection);
             }
 
-            // Glyphs.
+            // Glyphs. A semantic-token modifier can ask for a strike
+            // through the run it covers (deprecated); those glyphs are
+            // collected into contiguous runs here and drawn as ONE
+            // KIND_DECOR bar per run afterwards, so the line is unbroken
+            // rather than one quad per glyph with seams between them.
+            var strike: ?StrikeRun = null;
             for (ll.glyphs) |pg| {
                 const row_y = y + @as(f32, @floatFromInt(pg.row)) * line_h;
-                const fg = if (pg.hint)
-                    colors.inlay
-                else if (frame.theme) |th|
-                    th.colorOf(@enumFromInt(pg.kind))
-                else
-                    colors.text;
+                const gx = text_x0 + pg.x - ll.rows[pg.row].x0;
+                var fg = colors.text;
+                var struck = false;
+                if (pg.hint) {
+                    fg = colors.inlay;
+                } else if (frame.theme) |th| {
+                    const st = th.style(@enumFromInt(pg.kind));
+                    fg = st.rgba;
+                    struck = st.strike;
+                }
+                if (struck) {
+                    const x1 = gx + pg.glyph.advance;
+                    if (strike) |*run| {
+                        if (run.row_y == row_y and gx <= run.x1 + 1.0) {
+                            run.x1 = @max(run.x1, x1);
+                        } else {
+                            try self.addStrike(run.*, asc, line_h);
+                            strike = .{ .row_y = row_y, .x0 = gx, .x1 = x1, .color = fg };
+                        }
+                    } else {
+                        strike = .{ .row_y = row_y, .x0 = gx, .x1 = x1, .color = fg };
+                    }
+                } else if (strike) |run| {
+                    try self.addStrike(run, asc, line_h);
+                    strike = null;
+                }
                 try self.addGlyph(
                     pg.glyph,
-                    text_x0 + pg.x - ll.rows[pg.row].x0,
+                    gx,
                     row_y + asc,
                     pg.y_offset,
                     fg,
                 );
             }
+            if (strike) |run| try self.addStrike(run, asc, line_h);
 
             // Bracket-pair boxes. KIND_BG, so they paint UNDER the
             // glyphs whatever order they are appended in and the
