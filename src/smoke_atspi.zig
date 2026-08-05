@@ -399,7 +399,14 @@ pub fn main() u8 {
         say("selection cleared on click");
     }
 
-    // ── 5-8. the editor canvas ───────────────────────────────────────
+    // ── 5. the pane's context menu, over the same bridge ─────────────
+    if (contextMenuStage(allocator, sock_path)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
+    // ── 6-9. the editor canvas ───────────────────────────────────────
     if (editorStage(allocator, rt, sock_path)) |msg| {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
         teardown();
@@ -539,6 +546,109 @@ fn findNamedNode(allocator: std.mem.Allocator, name: []const u8, want_role: u32,
     for (seen[0..n_seen]) |r|
         _ = c.fprintf(platform.stderr(), "smoke-atspi: node named '%.*s' had role %u\n", @as(c_int, @intCast(name.len)), name.ptr, r);
     return null;
+}
+
+/// ATSPI_STATE_SENSITIVE is bit 24 of the low state word — what GTK
+/// clears for a button whose GAction is disabled. Reading it is how
+/// this rig tells "greyed out" from "absent", which is the difference
+/// between a menu row that explains itself and one that silently does
+/// nothing.
+const STATE_SENSITIVE_BIT: u32 = 1 << 24;
+
+/// ATSPI_ROLE_PUSH_BUTTON. The pane menu builds its rows as
+/// GtkButtons (GtkPopoverMenu cannot render per-item icons), so every
+/// row is a push button in the tree.
+const ROLE_PUSH_BUTTON: u32 = 43;
+
+/// A context-menu row, located by its visible label.
+fn findMenuRow(allocator: std.mem.Allocator, label: []const u8, budget_ms: u32) ?NodeRef {
+    return findNamedNode(allocator, label, ROLE_PUSH_BUTTON, budget_ms);
+}
+
+/// The terminal pane's right-click menu, asserted through AT-SPI.
+///
+/// This is the half `smoke_e2e` cannot do: it runs with GTK_A11Y=none,
+/// so it can only prove the popup surface appeared. Here the rows are
+/// real accessible objects, so their presence, their sensitivity and
+/// their activation are all checkable — and a menu invisible to a
+/// screen reader fails outright.
+fn contextMenuStage(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?[]const u8 {
+    const app = drive orelse return "the display session has no driver";
+    _ = app.drainLive(2_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win = app.windows.items[0];
+    const w: f64 = @floatFromInt(win.w);
+    const h: f64 = @floatFromInt(win.h);
+
+    // The preceding stage left a plain click in the middle of the
+    // pane, i.e. an ACTIVE BUT EMPTY selection. That is exactly the
+    // state in which Copy must be greyed out.
+    app.clickEx(win.id, w * 0.5, h * 0.5, 3, 80, 1) catch
+        return "injecting a right-click failed";
+
+    const paste = findMenuRow(allocator, "Paste", 10_000) orelse
+        return "no Paste row appeared in the AT-SPI tree after a right-click";
+    defer allocator.free(paste.id);
+    if (paste.states_lo & STATE_SENSITIVE_BIT == 0)
+        return "Paste is insensitive; it should always be available";
+
+    const copy = findMenuRow(allocator, "Copy", 5_000) orelse
+        return "the context menu exposes no Copy row";
+    defer allocator.free(copy.id);
+    if (copy.states_lo & STATE_SENSITIVE_BIT != 0)
+        return "Copy is sensitive with an empty selection — it must grey out, not copy nothing";
+
+    // Rows added alongside the keyboard path must be reachable too.
+    if (findMenuRow(allocator, "Select All", 5_000)) |n| {
+        allocator.free(n.id);
+    } else return "the context menu exposes no Select All row";
+    if (findMenuRow(allocator, "Find\u{2026}", 5_000)) |n| {
+        allocator.free(n.id);
+    } else return "the context menu exposes no Find row";
+
+    // ── a row that genuinely acts ───────────────────────────────
+    const split = findMenuRow(allocator, "Split Left / Right", 5_000) orelse
+        return "the context menu exposes no Split Left / Right row";
+    defer allocator.free(split.id);
+    if (split.states_lo & STATE_SENSITIVE_BIT == 0) return "Split Left / Right is greyed out";
+
+    const before = paneIdCount(allocator, sock_path) orelse
+        return "listing panes before the menu split failed";
+    if (!hub.?.doAction(allocator, split.id, 0))
+        return "activating the Split row over AT-SPI failed";
+
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        app.drain();
+        if (paneIdCount(allocator, sock_path)) |now| {
+            if (now > before) break;
+        }
+        _ = c.usleep(200_000);
+    } else return "the menu's Split row did not actually split the pane";
+    say("context menu: rows exposed to AT-SPI, Copy greyed out on an empty selection, Split really split");
+
+    // Put the layout back so the editor stage sees what it expects.
+    const closed = roundtrip(allocator, sock_path, "{\"cmd\":\"close-pane\",\"pane\":2}\n") orelse
+        return "closing the pane the menu split off failed";
+    allocator.free(closed);
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        app.drain();
+        if (paneIdCount(allocator, sock_path)) |now| {
+            if (now == before) break;
+        }
+        _ = c.usleep(200_000);
+    } else return "the pane split off by the menu never closed again";
+    return null;
+}
+
+/// Number of `"id":` fields the GUI's control socket reports (one tab
+/// id plus one per pane).
+fn paneIdCount(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
+    return std.mem.count(u8, resp, "\"id\":");
 }
 
 /// The editor canvas over the same bridge: an editable TEXT_BOX node
