@@ -68,10 +68,44 @@ var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
 var g_mux_sock: []const u8 = "";
+/// This run's isolated `XDG_RUNTIME_DIR`, in a global buffer so the
+/// signal handlers and the final sweep can still name it. Empty until
+/// `main` has built it.
+var g_rt_buf: [256]u8 = undefined;
+var g_rt: []const u8 = "";
+
+/// The prefix every run's isolated runtime dir is built from; the
+/// harness pid follows. Unique enough that a process whose environment
+/// contains it CANNOT be the user's real daemon — which is what makes
+/// the by-environ sweeps below safe.
+const RT_PREFIX = "/tmp/sketerm-smoke-e2e-";
+
+/// SIGTERM (or `sig`), wait up to `grace_ms`, then SIGKILL — a wedged
+/// child must never turn teardown into a hang, and a hung teardown is
+/// how a "failed" run used to leave its whole process fleet running.
+fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
+    if (pid <= 0) return;
+    _ = c.kill(pid, sig);
+    var status: c_int = 0;
+    var waited: u32 = 0;
+    while (waited < grace_ms) : (waited += 20) {
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) return;
+        _ = c.usleep(20_000);
+    }
+    _ = c.kill(pid, c.SIGKILL);
+    _ = c.waitpid(pid, &status, 0);
+}
 
 /// Tear down everything this process created, in dependency order and
 /// by exact pid — never by name. Idempotent: the success path and
 /// every `fail` go through it.
+///
+/// The ordered part below is not sufficient on its own: a GUI whose
+/// daemon connection drops AUTOSTARTS a replacement daemon, and that
+/// replacement is double-forked (no `PR_SET_PDEATHSIG`, not our child,
+/// not `daemon_pid`) — so it and every session worker it forks outlive
+/// the harness. `sweepRuntimeDir` is the fence that makes "everything
+/// this run started is gone" true regardless of who started it.
 fn teardown() void {
     dkTeardown();
     if (viewer_pid > 0) {
@@ -81,9 +115,7 @@ fn teardown() void {
         viewer_pid = -1;
     }
     if (restore_pid > 0) {
-        _ = c.kill(restore_pid, c.SIGKILL);
-        var rst: c_int = 0;
-        _ = c.waitpid(restore_pid, &rst, 0);
+        reap(restore_pid, c.SIGKILL, 0);
         restore_pid = -1;
     }
     if (drive) |app| {
@@ -93,15 +125,11 @@ fn teardown() void {
         drive = null;
     }
     if (child_pid > 0) {
-        _ = c.kill(child_pid, c.SIGKILL);
-        var status: c_int = 0;
-        _ = c.waitpid(child_pid, &status, 0);
+        reap(child_pid, c.SIGKILL, 0);
         child_pid = 0;
     }
     if (remote_mux_pid > 0) {
-        _ = c.kill(remote_mux_pid, c.SIGTERM);
-        var status: c_int = 0;
-        _ = c.waitpid(remote_mux_pid, &status, 0);
+        reap(remote_mux_pid, c.SIGTERM, 2000);
         remote_mux_pid = 0;
     }
     if (display_ready and g_mux_sock.len > 0) {
@@ -111,10 +139,182 @@ fn teardown() void {
     }
     if (daemon_pid > 0) {
         // Let the broker terminate and reap its exact worker children.
-        _ = c.kill(daemon_pid, c.SIGTERM);
-        var status: c_int = 0;
-        _ = c.waitpid(daemon_pid, &status, 0);
+        reap(daemon_pid, c.SIGTERM, 3000);
         daemon_pid = 0;
+    }
+    if (g_rt.len > 0) {
+        const left = sweepRuntimeDir(g_rt);
+        if (left > 0) {
+            _ = c.fprintf(
+                platform.stderr(),
+                "smoke-e2e: swept %d orphan process(es) still holding %.*s\n",
+                @as(c_int, @intCast(left)),
+                @as(c_int, @intCast(g_rt.len)),
+                g_rt.ptr,
+            );
+        }
+    }
+}
+
+/// True when `hay` contains `needle` as a whole path token: the byte
+/// after the match must not be a digit, so a sweep for
+/// `/tmp/sketerm-smoke-e2e-123` never matches `.../sketerm-smoke-e2e-1234`.
+fn hasPathToken(hay: []const u8, needle: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, from, needle)) |at| {
+        const end = at + needle.len;
+        if (end >= hay.len or !std.ascii.isDigit(hay[end])) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+/// True only when the pid is provably gone (ESRCH). EPERM — someone
+/// else's process wearing that number — reads as ALIVE, so a leftover
+/// whose ownership we cannot establish is left running.
+fn pidGone(pid: c.pid_t) bool {
+    const rc = c.kill(pid, 0);
+    if (rc == 0) return false;
+    return std.posix.errno(rc) == .SRCH;
+}
+
+/// Read `/proc/<pid>/environ` into `buf`. Null when it is unreadable —
+/// a process we cannot read cannot be ours, so it is never a target.
+fn readEnviron(pid: c.pid_t, buf: []u8) ?[]u8 {
+    var path_buf: [64:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/environ", .{pid}) catch return null;
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var used: usize = 0;
+    while (used < buf.len) {
+        const n = c.read(fd, buf.ptr + used, buf.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    if (used == 0) return null;
+    return buf[0..used];
+}
+
+/// Kill, BY EXACT PID, every live process whose environment names `dir`
+/// — the isolated runtime dir of one smoke-e2e run. Nothing is ever
+/// matched by process NAME: `dir` embeds the owning harness's pid, so a
+/// process carrying it in its environment was started by that run and
+/// by nothing else. The user's real daemon can never match.
+///
+/// Two rounds, because killing a broker can let a worker fork one more
+/// child before it dies. Returns how many processes were killed.
+fn sweepRuntimeDir(dir: []const u8) usize {
+    if (builtin.os.tag != .linux) return 0;
+    const self = c.getpid();
+    var killed: usize = 0;
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var hits: usize = 0;
+        const d = c.opendir("/proc") orelse return killed;
+        while (c.readdir(d)) |ent| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+            const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
+            if (pid == self) continue;
+            var env_buf: [64 * 1024]u8 = undefined;
+            const env = readEnviron(pid, &env_buf) orelse continue;
+            if (!hasPathToken(env, dir)) continue;
+            _ = c.kill(pid, c.SIGKILL);
+            hits += 1;
+        }
+        _ = c.closedir(d);
+        killed += hits;
+        if (hits == 0) break;
+        // Give the kernel a moment to deliver, then look again: a
+        // freshly forked grandchild inherits the same environment.
+        _ = c.usleep(150_000);
+    }
+    // Reap whatever of ours died along the way; orphans belong to init.
+    var st: c_int = 0;
+    while (c.waitpid(-1, &st, c.WNOHANG) > 0) {}
+    return killed;
+}
+
+/// Startup self-defence: clean up after a PREVIOUS run that never got
+/// to `teardown` (SIGKILL, a panic, a crashed harness). Modelled on
+/// `sweepStaleEphemeral` in `src/ipc/mcp.zig`.
+///
+/// Keyed on the process environment rather than on the leftover
+/// directory, because the worst orphan — an autostarted replacement
+/// daemon — outlives the directory: the previous run's `removeTreeBestEffort`
+/// deletes the tree while the daemon bound to a socket inside it keeps
+/// running. A leftover is only swept when its OWNING harness pid is
+/// gone, so two concurrent smoke-e2e runs never touch each other.
+fn sweepStaleRuns() void {
+    if (builtin.os.tag != .linux) return;
+    const self = c.getpid();
+    const d = c.opendir("/proc") orelse return;
+    defer _ = c.closedir(d);
+    var swept: usize = 0;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
+        if (pid == self) continue;
+        var env_buf: [64 * 1024]u8 = undefined;
+        const env = readEnviron(pid, &env_buf) orelse continue;
+        const at = std.mem.indexOf(u8, env, RT_PREFIX) orelse continue;
+        var end = at + RT_PREFIX.len;
+        while (end < env.len and std.ascii.isDigit(env[end])) end += 1;
+        const owner = std.fmt.parseInt(c.pid_t, env[at + RT_PREFIX.len .. end], 10) catch continue;
+        if (owner == self) continue;
+        // Owner still alive = a concurrent run; leave it strictly alone.
+        if (!pidGone(owner)) continue;
+        _ = c.kill(pid, c.SIGKILL);
+        swept += 1;
+    }
+    // Directories whose owner is gone: the tree the crashed run never removed.
+    const t = c.opendir("/tmp") orelse {
+        if (swept > 0) reportSwept(swept);
+        return;
+    };
+    defer _ = c.closedir(t);
+    const dir_prefix = "sketerm-smoke-e2e-";
+    while (c.readdir(t)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, dir_prefix)) continue;
+        const owner = std.fmt.parseInt(c.pid_t, name[dir_prefix.len..], 10) catch continue;
+        if (owner == self or !pidGone(owner)) continue;
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/tmp/{s}", .{name}) catch continue;
+        @import("mux/daemon.zig").removeTreeBestEffort(path);
+    }
+    if (swept > 0) reportSwept(swept);
+}
+
+fn reportSwept(n: usize) void {
+    _ = c.fprintf(
+        platform.stderr(),
+        "smoke-e2e: startup sweep killed %d orphan(s) from a previous run\n",
+        @as(c_int, @intCast(n)),
+    );
+}
+
+/// Teardown must also happen when the harness is interrupted or dies on
+/// a fault. `fail`/`failMsg` cover every ordinary exit; these cover the
+/// rest, because an un-torn-down run poisons the NEXT one (its GUI
+/// autostarts a daemon at a socket a leftover daemon already owns).
+/// The handler is not strictly async-signal-safe — it walks /proc — but
+/// it runs once, in a process that is exiting either way.
+fn onFatalSignal(sig: c_int) callconv(.c) void {
+    _ = c.signal(sig, c.SIG_DFL); // never re-enter on a fault inside teardown
+    teardown();
+    if (g_rt.len > 0) {
+        var z: [256:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z, "{s}", .{g_rt})) |p| {
+            @import("mux/daemon.zig").removeTreeBestEffort(p);
+        } else |_| {}
+    }
+    c._exit(1);
+}
+
+fn installTeardownSignals() void {
+    for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP, c.SIGQUIT, c.SIGABRT, c.SIGSEGV }) |sig| {
+        _ = c.signal(sig, onFatalSignal);
     }
 }
 
@@ -217,11 +417,18 @@ pub fn main() u8 {
     // has one (the GDK macOS backend talks to the WindowServer
     // directly; no env var advertises it).
 
+    // Leftovers from a run that never reached `teardown` poison this one:
+    // its GUI would autostart a daemon whose socket path a stale daemon
+    // still owns, and the failure surfaces stages later as an unrelated
+    // regression. Sweep before anything of ours exists.
+    sweepStaleRuns();
+    installTeardownSignals();
+
     // Every mutable path and the daemon itself are private to this smoke.
     // A protocol bump must never classify the user's live daemon as stale
     // and shut it down.
-    var rt_buf: [256]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-smoke-e2e-{d}", .{c.getpid()}) catch return fail("runtime path");
+    const rt = std.fmt.bufPrintZ(&g_rt_buf, RT_PREFIX ++ "{d}", .{c.getpid()}) catch return fail("runtime path");
+    g_rt = rt;
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
