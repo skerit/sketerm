@@ -1,240 +1,665 @@
 # Configuration
 
-User-level config via `$XDG_CONFIG_HOME/sketerm/config.zon`.
-Load at startup only in v1; hot reload is post-v1.
+Reference for `config.conf`, the file `src/config.zig` parses.
+`data/sample.conf` is a commented starting point; this document is
+the complete key list plus the structural rules a sample file cannot
+express (what is per-profile and what is not, how prefix families are
+keyed, precedence, reload semantics).
 
-## Resolution
+## Where the file lives
 
-1. `--config <path>` CLI flag — highest priority; error if missing.
-2. `$XDG_CONFIG_HOME/sketerm/config.zon` — default location.
-3. `$HOME/.config/sketerm/config.zon` — fallback if XDG unset.
-4. No file present → baked-in defaults, no error.
+1. `--config <path>` on the command line. Highest priority; if it is
+   unreadable a warning goes to stderr and the built-in defaults are
+   used. Recorded process-wide, so every later re-read goes to the
+   same file.
+2. `$XDG_CONFIG_HOME/sketerm/config.conf`.
+3. `$HOME/.config/sketerm/config.conf` when `XDG_CONFIG_HOME` is unset.
 
-`--no-config` flag bypasses file resolution entirely.
+A missing file is not an error: every key has a baked-in default.
+There is no `--no-config` flag.
 
-## Format
+The daemon (`sketerm-mux`) links the same parser, so keys that affect
+session spawning (`shell`, `term`, `login_shell`, `scrollback`, the
+`[lsp.*]` sections) are meaningful on the machine the session runs on.
 
-Zig Object Notation (ZON). Schema-versioned via a root `version`
-field.
-
-```zig
-.{
-    .version = 1,
-
-    .font = .{
-        .face = "Fira Code",
-        .size = 12,
-        .hinting = .slight,        // .none | .slight | .medium | .full
-        .antialias = .grayscale,   // .none | .grayscale | .lcd_rgb | .lcd_bgr
-    },
-
-    .colors = .{
-        .default_fg = .{ 0xEB, 0xEB, 0xEB },
-        .default_bg = .{ 0x1E, 0x1E, 0x1E },
-        .cursor     = .{ 0xEB, 0xEB, 0xEB },
-        .palette = .{
-            .{ 0x1E, 0x1E, 0x1E }, .{ 0xCC, 0x00, 0x00 },
-            .{ 0x4E, 0x9A, 0x06 }, .{ 0xC4, 0xA0, 0x00 },
-            .{ 0x34, 0x65, 0xA4 }, .{ 0x75, 0x50, 0x7B },
-            .{ 0x06, 0x98, 0x9A }, .{ 0xD3, 0xD7, 0xCF },
-            .{ 0x55, 0x57, 0x53 }, .{ 0xEF, 0x29, 0x29 },
-            .{ 0x8A, 0xE2, 0x34 }, .{ 0xFC, 0xE9, 0x4F },
-            .{ 0x72, 0x9F, 0xCF }, .{ 0xAD, 0x7F, 0xA8 },
-            .{ 0x34, 0xE2, 0xE2 }, .{ 0xEE, 0xEE, 0xEC },
-        },
-    },
-
-    .cursor = .{
-        .shape = .block,       // .block | .underline | .bar
-        .blink = true,
-    },
-
-    .scrollback = .{
-        .lines = 10_000,
-    },
-
-    .mouse = .{
-        .click_focus = true,
-        .hide_on_type = false,
-        .middle_click_paste = true,   // primary selection paste
-    },
-
-    .clipboard = .{
-        .osc52_read = .prompt,         // .prompt | .allow | .deny
-        .osc52_max_bytes = 1_048_576,
-        .bracketed_paste = true,
-    },
-
-    .input = .{
-        .modify_other_keys = 1,        // 0 = disable, 1 = v1 default
-    },
-
-    .term = .{
-        .value = .auto,                // .auto = sketerm-256color
-                                       //   with fallback probe
-                                       // .force_xterm = always
-                                       //   xterm-256color
-    },
-
-    .layout = .{
-        .auto_save = true,             // write last.zon on clean exit
-    },
-
-    .images = .{
-        .max_per_pane_bytes = 256 * 1024 * 1024,
-        .max_per_image_bytes = 64 * 1024 * 1024,
-        .max_per_window_bytes = 1024 * 1024 * 1024,
-    },
-
-    .hold_on_exit = true,
-
-    .bell = .{
-        .urgency_hint = true,
-        .audible = false,
-    },
-
-    .keybindings = &.{
-        .{ .keys = "<Ctrl><Shift>c",     .action = .copy },
-        .{ .keys = "<Ctrl><Shift>v",     .action = .paste },
-        .{ .keys = "<Ctrl><Shift>t",     .action = .new_tab },
-        .{ .keys = "<Ctrl><Shift>w",     .action = .close_tab },
-        .{ .keys = "<Ctrl><Shift>d",     .action = .split_horizontal },
-        .{ .keys = "<Ctrl><Shift>r",     .action = .split_vertical },
-        .{ .keys = "<Ctrl>Tab",          .action = .next_pane },
-        .{ .keys = "<Ctrl><Shift>Tab",   .action = .prev_pane },
-        .{ .keys = "<Ctrl><Shift>plus",  .action = .increase_font },
-        .{ .keys = "<Ctrl><Shift>minus", .action = .decrease_font },
-        .{ .keys = "<Ctrl><Shift>0",     .action = .reset_font },
-    },
-}
-```
-
-## Defaults philosophy
-
-Every field has a baked-in default in `src/config.zig`
-(`Config.default()`). Config overlays — any missing field keeps
-its default. Missing file → all defaults.
-
-## Schema versioning
-
-`version: u32 = 1`. Policy:
-
-- Equal → load directly.
-- Lower → run ordered migrations (documented in
-  `docs/MIGRATIONS.md` once we first bump).
-- Higher → error — *"config requires sketerm ≥ vX; upgrade"*.
-
-Additive optional fields with safe defaults do not require a bump.
-
-## Keybinding model
-
-### Actions (fixed enum, v1)
+## Syntax
 
 ```
-copy, paste, paste_primary, select_all, clear_scrollback,
-new_tab, close_tab, rename_tab,
-next_tab, prev_tab, tab_1 … tab_9,
-split_horizontal, split_vertical,
-close_pane, next_pane, prev_pane,
-increase_font, decrease_font, reset_font,
-scroll_up_line, scroll_down_line,
-scroll_up_page, scroll_down_page,
-scroll_to_top, scroll_to_bottom,
-reset_terminal, toggle_fullscreen,
-none,                    // explicitly unbind a default
+key = value
 ```
 
-Plugin-extensible post-v1.
+- One key per line. Whitespace around the key and the value is
+  trimmed.
+- `#` starts a comment **only when it is the first non-blank
+  character of the line**. There are no trailing comments, which is
+  what keeps `#rrggbb` usable as a value.
+- Blank lines are ignored.
+- `[section]` headers switch the meaning of the lines that follow
+  (see Sections).
+- Unknown keys and unknown sections produce a stderr warning and are
+  otherwise ignored, so a config written for a newer build still
+  loads on an older one.
+- A value that fails to parse warns with its line number and leaves
+  that key at its previous value.
+- Files larger than 64 KiB are truncated at that point with a
+  warning.
 
-### Key format
+### Value types
 
-Standard GTK accelerator syntax — same as `gtk_accelerator_parse`:
+| Type | Accepted forms |
+| --- | --- |
+| bool | `true` / `false`, `1` / `0`, `yes` / `no`, `on` / `off` (case-insensitive) |
+| int | decimal |
+| float | decimal, e.g. `0.25` |
+| string | unquoted, taken verbatim to end of line |
+| path | string; a leading `~` or `~/` expands to `$HOME` (`~user` is not supported) |
+| colour | `#RRGGBB`, `#RRGGBBAA`, `R,G,B` or `R,G,B,A` with components 0..255 |
+| palette | exactly 16 colon-separated `#RRGGBB` entries |
+| enum | one of the listed bare words |
 
-- `<Ctrl>`, `<Shift>`, `<Alt>`, `<Meta>`, `<Super>` prefixes
-- Named keys: `Tab`, `Return`, `Escape`, `F1`–`F20`, `Page_Up`,
-  `Home`, `End`, `plus`, `minus`, ...
-- Printable keys: lowercase letter for the key cap (`c`, `v`, ...).
+## The one structural rule: app-level vs profile-level
 
-Matched at runtime via `gtk_accelerator_match`.
+Keys fall into two disjoint sets.
 
-### Conflict resolution
+**Profile-level keys** are the pane-level settings bundle
+(`ProfileSettings`): font, colours, shell and child environment,
+scrollback, the pane's own shader, the pane border. They are valid
+at the top level of the file AND inside a `[profile.<name>]` section.
 
-- Config entry overrides default (same keys → user wins).
-- Duplicate keys within config → last-wins, warning on load.
-- Unknown action → warn on load, entry skipped.
-- Unparseable keys → warn on load, entry skipped.
+**App-level keys** are everything else: window and tab chrome, mouse
+behaviour, keybinds, rendering flags, bells, the file browser, editor
+editing behaviour, the background image/opacity, the scrollbar, the
+pane gap, quake geometry. They are valid **only at the top level**.
+Putting one inside a `[profile.<name>]` section prints
+`unknown profile key '<key>' (ignoring)` and does nothing. This is
+the single most common mistake with this format.
 
-### Unbinding a default
+`Config.settings` IS the Default profile: a profile-level key written
+at the top level edits the Default profile, not some separate global.
+`[profile.default]` is a legal alias for the top level and edits the
+same bundle.
 
-```zig
-.{ .keys = "<Ctrl><Shift>c", .action = .none },
+A named profile is a **complete copy**, not a patch. When the parser
+reaches `[profile.dev]` it seeds the new profile from the Default
+settings **as parsed so far** and then applies the section's keys on
+top. There are no inherit sentinels and no fallback chain at apply
+time. Two consequences:
+
+- Top-level (Default) keys must appear **before** the profile
+  sections that should inherit them. The serialiser always writes
+  them in that order.
+- Changing a Default key later does not change a profile that had
+  already been seeded from a different value.
+
+A pane resolves its bundle through `Config.profileSettings(name)`:
+an empty name, the reserved name `default`, and any unknown name all
+yield the Default settings, so a pane whose profile was deleted
+degrades instead of dangling.
+
+## Prefix-keyed families
+
+Some settings are lists rather than single values. They are written
+as a key prefix plus a name, and each family is described in full
+further down.
+
+| Family | Shape |
+| --- | --- |
+| `keybind.<action>` | `keybind.new_tab = <Control><Shift>t` |
+| `hint.<name>.<field>` | `hint.jira.regex = [A-Z]+-[0-9]+` |
+| `symbol_map.<name>` | `symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font` |
+| `shader_param.<name>` | `shader_param.glow = 0.55` |
+| `light.<key>` / `dark.<key>` | `light.default_bg = #fdf6e3` |
+
+`light.` / `dark.` are profile-level and therefore work both at the
+top level and inside a profile section. The other four are app-level
+and only work at the top level.
+
+Within a family, a later line for the same name replaces the earlier
+one (for `hint.<name>.*`, a later line for the same *field* replaces
+that field; the rule itself is created by whichever field mentions it
+first, and that is also the order rules are scanned in).
+
+## Sections
+
+| Header | Contents |
+| --- | --- |
+| `[profile.<name>]` | profile-level keys; `<name>` = `default` edits the Default bundle |
+| `[domain.<name>]` | `host`, `transport` |
+| `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `enabled` |
+
+A section header with an unrecognised prefix warns and leaves the
+following lines in the no-section (top level) state, so an unknown
+future section does not silently strip data.
+
+---
+
+## Profile-level keys
+
+Valid at the top level (= the Default profile) and inside
+`[profile.<name>]`.
+
+### Font
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `font` (alias `font_path`) | path | unset | Explicit font file. Wins over `font_family`. |
+| `font_family` | string | unset | Resolved via fontconfig, e.g. `JetBrains Mono`. |
+| `font_family_bold` | string | unset | Empty means "derive bold from `font_family`", which is wrong when you pair one family's regular with another's bold. |
+| `font_family_italic` | string | unset | as above |
+| `font_family_bold_italic` | string | unset | as above |
+| `font_weight` | int | `0` | CSS weight 100..900 for the regular face. `0` = the font's own default (400). Selects the family's weight file AND sets the `wght` axis on a variable font, which is the only way to reach intermediate weights. A value outside 100..900 is a parse error, not a clamp. |
+| `font_weight_bold` | int | `0` | Same, for the bold face (`0` = 700). |
+| `font_features` | string | unset | OpenType features for HarfBuzz, whitespace/comma separated, CSS/kitty syntax: `-calt +ss01 zero cv05=3`. |
+| `font_size` | int | `14` | Points. |
+| `line_pad_px` (alias `line_spacing`) | int | `0` | Extra pixels of cell height. Negative tightens, clamped so the glyph still fits. |
+| `padding` | float | `6.0` | Inner padding around the cell grid, in pixels. |
+| `builtin_box_drawing` | bool | `true` | Draw box-drawing, block and Powerline characters from the cell rectangle instead of taking them from the font, so they tile with no seams. **This is on by default and is a visible change from earlier versions**; set `false` to get the font's own glyphs back. |
+
+### Colours
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `default_fg` | colour | `#ebebeb` | |
+| `default_bg` | colour | `#1a1a1a` | |
+| `cursor_color` | colour | `#ffffff` | Ignored while `cursor_color_default` is on. |
+| `cursor_color_default` | bool | `true` | Cursor takes the foreground colour (xterm/Terminator behaviour). |
+| `scheme` | string | unset | Built-in preset: `sketerm`, `tango`, `solarized_dark`, `solarized_light`, `gruvbox_dark`, `gruvbox_light`, `nord`, `dracula`, `monokai`. Empty = no scheme. |
+| `palette` | palette | unset | 16 colon-separated `#RRGGBB` (ANSI 0..15), Terminator's format. Overrides the scheme's palette. |
+
+### Light / dark colour variants
+
+`light.<key>` and `dark.<key>` override the flat colour of the same
+name while the system colour scheme is in that state. They only take
+effect with `auto_theme = true` (app-level); with `auto_theme` off,
+the flat values are rendered exactly as written.
+
+Overridable sub-keys: `default_fg`, `default_bg`, `cursor_color`,
+`cursor_color_default`, `scheme`, `palette`. Anything left unset
+falls through to the flat value, which is why a config written before
+variants existed behaves identically.
+
+Under `light` / `dark` there is also a built-in bottom layer -- the
+`#1a1a1a` / `#ebebeb` pair `auto_theme` has always substituted -- so
+a variant that sets only, say, `dark.default_bg` still gets the
+built-in dark foreground rather than the flat one.
+
+Both variants live in every profile, so a per-pane profile survives a
+theme switch:
+
+```
+light.default_fg = #1a1a1a
+light.default_bg = #fdf6e3
+light.scheme     = solarized_light
+dark.default_bg  = #002b36
+dark.scheme      = solarized_dark
 ```
 
-Removes default binding without replacing.
+Note: clearing a variant field back to "inherit" is not expressible
+in the file format, and neither is clearing a `palette` back to none.
 
-## Font
+### Shell and child environment
 
-```zig
-.font = .{
-    .face = "Fira Code",     // Pango face descriptor
-    .size = 12,
-    .size_adjust = 0,        // pixel offset applied after raster
-    .hinting = .slight,      // .none | .slight | .medium | .full
-    .antialias = .grayscale, // .none | .grayscale | .lcd_rgb | .lcd_bgr
-},
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `shell` | path | unset | Empty = the user's login shell. |
+| `term` (alias `term_env`) | string | `xterm-256color` | Set to `xterm-kitty` to make tools that gate image preview on `$TERM` (yazi, lf, btop, chafa) use the Kitty graphics protocol, which sketerm implements. |
+| `color_term` (alias `color_term_env`) | string | `truecolor` | |
+| `login_shell` | bool | `false` | Prepends `-` to argv[0]. |
+| `scrollback` | int | `10000` | Lines retained per pane. |
+
+### Editor font
+
+The editor face rides a pane, so its font is a pane-level choice.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `editor_font_family` | string | unset | Proportional family via fontconfig. Empty = this profile's `font_family`, then built-in candidates. |
+| `editor_font_size` | int | `0` | `0` = follow this profile's `font_size`. |
+
+Editing *behaviour* (`editor_tab_width`, wrap, LSP, ...) is
+app-level -- see below.
+
+### Pane presentation
+
+Per-profile so a profile can mark its panes: a red border on a `root`
+or `prod` profile is the point. Lengths are framebuffer pixels, the
+same unit as `padding`.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `pane_border_width` | float | `2.0` | Clamped 0..32. 0 = no border. |
+| `pane_border_color_active` | colour | `#668cd9bf` | Focused pane. |
+| `pane_border_color` | colour | `#00000000` | Unfocused pane; alpha 0 draws nothing. |
+| `pane_corner_radius` | float | `0` | Clamped 0..64. An alpha cut on the composited pane, so the corners reveal what is behind. Non-zero forces the post-process pass on. |
+
+Note that the *gap between* panes (`pane_gap`, `pane_gap_color`) is
+app-level, not per-profile: one CSS provider styles every GtkPaned in
+the window and the gap belongs to no single profile.
+
+### Shader
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `custom_shader` | path | unset | Shadertoy-style fragment shader defining `mainImage`; `iChannel0` is the rendered frame. A compile error disables the pass, it never blanks the pane. |
+
+`custom_shader_animation` and the `shader_param.*` family are
+app-level.
+
+---
+
+## App-level keys
+
+Valid only at the top level.
+
+### Cursor
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `cursor_shape` | enum | `block` | `block`, `underline`, `bar` |
+| `cursor_blink` | bool | `true` | |
+| `cursor_blink_ms` | int | `500` | One half-cycle, so 500 = a full blink per second. |
+
+### Behaviour
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `bracketed_paste` | bool | `true` | |
+| `modify_other_keys` | int | `0` | `0` off, `1` basic, `2` full. Anything higher is a parse error. |
+| `word_chars` | string | `-_.,/?:@&=+%~` | Extra characters counted as part of a word for double-click selection, on top of alphanumerics. |
+| `smart_copy` | bool | `true` | With no selection, Ctrl+Shift+C forwards Ctrl+C instead of doing nothing. |
+| `scroll_on_output` | bool | `false` | Snap to the bottom on any output, not just on keystroke. |
+| `exit_action` | enum | `close` | `close`, `restart`, `hold` (keep the pane with an exit-status banner). |
+| `shell_integration` | bool/enum | `true` | Accepts `auto` (= true) and `off` (= false) as well as the bool forms. Injects the OSC 7/133 scripts into zsh/fish/bash at spawn. |
+| `notify_command_secs` | int | `15` | Desktop-notify when a command in a non-visible pane finishes after at least this many seconds. `0` = off. Needs OSC 133. |
+| `track_tab_activity` | bool | `true` | Per-tab activity indicator, computed in the event drain so it works for unfocused tabs. |
+| `inactive_warn_secs` | int | `60` | Silence before a tab's inactivity warning fires. The toggle itself is per-tab (right-click a tab); this is the shared threshold. |
+| `tab_ack_delay_secs` | float | `1.0` | Clamped 0..6. How long a tab must stay selected before viewing it clears its inactivity warning. |
+| `image_memory_mb` | int | `320` | Per-pane cap on retained decoded-image memory; past it the oldest images are evicted FIFO. `0` = unlimited. |
+| `config_auto_reload` | bool | `true` | See Reload semantics. |
+| `clipboard_read` | bool/enum | `false` | Accepts `allow` / `deny` as well as the bool forms. Allows apps to READ the clipboard via OSC 52 query. Off by default because anything on the PTY, including remote programs, could exfiltrate it. |
+| `search_case_sensitive` | bool | `false` | Default for the search box; the actual default is smart-case unless this or Ctrl+I overrides. |
+| `auto_url_detect` | bool | `true` | Underline and open plain http(s) URLs. OSC 8 hyperlinks win where both apply. |
+| `gtk_theme` | string | unset | Name of a GTK theme whose `gtk-4.0/gtk.css` is applied over libadwaita's stylesheet. Empty = honour the session theme. |
+
+### Rendering
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `ligatures` | bool | `true` | HarfBuzz shaping. |
+| `bidi` | bool | `true` | fribidi reorder; pure-ASCII lines skip it. |
+| `auto_theme` | bool | `true` | Follow AdwStyleManager light/dark. Off honours `default_fg` / `default_bg` exactly and disables the `light.` / `dark.` variants. |
+| `graphics_offload` | bool | `true` | GtkGraphicsOffload for pane GL content. Disable as an escape hatch for compositor/GTK subsurface bugs. |
+| `allow_bold` | bool | `true` | Whether the bold attribute affects rendering at all. |
+| `bold_is_bright` | bool | `true` | Bold also lifts palette 0..7 to 8..15 (xterm convention). |
+| `minimum_contrast` | float | `1.0` | Clamped 1..21. Minimum WCAG contrast between text and its cell background; text below it snaps to white or black. `1.0` = off. |
+| `inactive_darken` | float | `0.2` | Clamped 0..1. Uniform darken of an unfocused pane's final composited image, so colour relations are preserved. |
+| `inactive_desaturate` | float | `0.0` | Clamped 0..1. Blend an unfocused pane toward luma. |
+| `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances. Applies to whichever shader a pane resolves to. |
+
+`inactive_fg_dim` and `inactive_bg_dim` are retired per-cell dim keys.
+They are still accepted and ignored, so old files do not warn; use
+`inactive_darken`.
+
+### Bell
+
+| Key | Type | Default |
+| --- | --- | --- |
+| `bell_audible` | bool | `false` |
+| `bell_visible` | bool | `true` |
+| `bell_urgent` | bool | `true` |
+
+### Window and tabs
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `tab_position` | enum | `top` | `top`, `bottom` |
+| `close_button_on_tab` | bool | `true` | |
+| `show_tab_bar` | bool | `true` | Start with the AdwTabBar hidden by setting false; the `toggle_tab_bar` action flips it at runtime. |
+| `always_on_top` | bool | `false` | |
+| `new_tab_after_current` | bool | `false` | Insert new tabs after the focused one instead of appending. |
+| `confirm_close` | enum | `multiple` | `never`, `multiple` (only when more than one pane is being lost), `always` |
+| `show_titlebar` | bool | `false` | Per-pane title bar carrying the OSC 0/1/2 title. |
+| `title_active_fg` | colour | `#ffffff` | |
+| `title_active_bg` | colour | `#c80003` | |
+| `title_inactive_fg` | colour | `#000000` | |
+| `title_inactive_bg` | colour | `#c0bebf` | |
+
+### Split separators
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `pane_gap` | float | `4.0` | Clamped 1..64, logical pixels. Keep it a multiple of 4: at fractional surface scales an odd separator pushes a pane off the device-pixel grid and GtkGraphicsOffload then rejects every frame. |
+| `pane_gap_color` | colour | `#353535` | What shows through the gap. |
+
+### Overlay scrollbar
+
+Drawn by the renderer inside the pane, not a widget, so it steals no
+column. Window-level rather than per-profile: it is chrome, and a
+scrollbar that came and went with a pane's profile would be a trap.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `scrollbar` | enum | `auto` | `never` (not drawn, not interactive), `auto` (drawn once there is scrollback), `always`. There is no timed fade-out. |
+| `scrollbar_width` | float | `4.0` | Clamped 0..64 framebuffer pixels; `0` also disables it. |
+| `scrollbar_trough_color` | colour | `#8080802e` | |
+| `scrollbar_thumb_color` | colour | `#8080804d` | Thumb while the view sits at the live bottom. |
+| `scrollbar_thumb_active_color` | colour | `#668cd9b3` | Thumb while scrolled back. |
+
+### Mouse
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `mouse_autohide` | bool | `true` | Hide the pointer while typing. |
+| `copy_on_selection` | bool | `false` | Copy to PRIMARY on selection end. |
+| `clear_select_on_copy` | bool | `false` | Drop the selection after Ctrl+Shift+C. |
+| `disable_mouse_paste` | bool | `false` | Kill switch for middle-click PRIMARY paste; still wins over `mouse_middle_click`. |
+| `disable_mousewheel_zoom` | bool | `false` | Disable Ctrl+wheel font zoom. |
+| `link_single_click` | bool | `false` | Open OSC 8 links on a plain click instead of Ctrl+click. |
+| `mouse_middle_click` | enum | `paste_primary` | `menu`, `paste_primary`, `paste_clipboard`, `none`. `menu` is not meaningful here and behaves as `none`. |
+| `mouse_right_click` | enum | `menu` | Same set; PuTTY users want `paste_clipboard`. |
+
+Both click actions apply only while the running app is not in
+mouse-report mode.
+
+### Keyboard hints
+
+Hint mode (Ctrl+Shift+E by default) labels every match on screen and
+activates the one whose label you type.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `hint_editor` | string | unset | Command used when a path hint's file exists: either a template with `{file}` / `{line}` / `{col}` (`code -g {file}:{line}:{col}`) or a bare command taking `+line file` (`nvim`). Empty = `$EDITOR` / `$VISUAL`, and with neither set the match is copied to the clipboard. |
+| `hint_alphabet` | string | unset | Label characters, in the order labels are handed out. Empty = the built-in home-row-first set (`asdfghjklqwertyuiopzxcvbnm`). Ignored (with the built-in used instead) if it is shorter than 2 or longer than 64 characters, contains a duplicate, or contains anything outside printable ASCII. |
+| `hint_multiple` | bool | `false` | Start hint mode in multi-select, where each label appends its match instead of activating and closing. Tab toggles it in-mode either way. |
+
+#### `hint.<name>.<field>` rules
+
+User-defined rules are scanned **before** the built-in URL / path /
+hash scanners, so a rule can claim text those would have taken. Rules
+apply in the order their names first appear in the file.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `regex` (alias `pattern`) | string | POSIX extended regular expression, matched against each visible row's text. An invalid pattern disables just that rule. |
+| `action` | enum | `open`, `copy` (default), `paste`, `select`, `command`. `open` hands URLs to the desktop and existing files to the editor. |
+| `command` | string | Shell command for `action = command`. `{match}` is substituted with the matched text, shell-quoted. |
+
+```
+hint.ticket.regex   = [A-Z]{2,}-[0-9]+
+hint.ticket.action  = command
+hint.ticket.command = xdg-open https://jira.example.com/browse/{match}
 ```
 
-Face resolution via `pango_font_description_from_string` (wraps
-`fontconfig`).
+### `symbol_map.<name>`
 
-**Hinting modes** map to FreeType load flags:
-- `none` → `FT_LOAD_NO_HINTING`
-- `slight` → `FT_LOAD_TARGET_LIGHT` (default; matches most distros)
-- `medium` → `FT_LOAD_TARGET_NORMAL`
-- `full` → `FT_LOAD_FORCE_AUTOHINT` + `FT_LOAD_TARGET_NORMAL`
+Routes a codepoint range to a specific font family. Consulted before
+the primary face, so the mapped font wins even where the main font
+has glyphs of its own in that range. App-level rather than
+per-profile: this is glyph coverage, which does not sensibly differ
+between two panes of one session.
 
-**Antialias modes**:
-- `none` → `FT_LOAD_TARGET_MONO` (1-bit bitmap, aliased)
-- `grayscale` → 8-bit alpha atlas (default; our atlas is R8)
-- `lcd_rgb` / `lcd_bgr` → `FT_LOAD_TARGET_LCD` / LCD_V with RGBA
-  atlas; requires shader-side gamma-correct subpixel blend. Post-v1
-  (shader adds ~30 lines, correct subpixel is easy to get wrong).
+```
+symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font
+symbol_map.tick      = U+2713 DejaVu Sans
+```
 
-**v1 limitations**:
-- Single face, no fallback chain. Missing glyphs render as tofu
-  (⬜). Font fallback lands in M10.
-- LCD subpixel modes accepted in config but silently fall back to
-  grayscale in v1.
+The value is `<lo>[-<hi>] <family>`. The `U+` prefix is optional on
+either end (`0x` is also accepted), a single codepoint means a
+one-entry range, and `hi < lo` is an error. `<name>` is just a label
+so a later line can replace the entry.
 
-## Colors
+### `shader_param.<name>`
 
-- `palette`: 16 entries (ANSI 0..15), each `[3]u8` RGB.
-- 256-color mode extends with a baked-in xterm 6×6×6 + grayscale
-  ramp; not configurable in v1.
-- Truecolor (`38;2;r;g;b`) always passes through unchanged.
-- `default_fg`, `default_bg`, `cursor`: each `[3]u8` RGB.
+Overrides for the tunable uniforms a custom shader declares
+(RetroArch `#pragma parameter` lines plus sketerm's `//@color`). The
+value is a float, or `#RRGGBB` for a vec3 colour parameter. Names are
+capped at 31 characters. Uploaded every frame, so a reload re-tunes
+live without recompiling.
 
-## Error handling
+```
+shader_param.glow     = 0.55
+shader_param.phosphor = #ffb333
+```
 
-Parse errors are warnings, not fatal:
+### `keybind.<action>`
 
-- Single field invalid → warn; that field uses default.
-- Whole file unparseable → warn; all defaults.
-- All warnings → stderr + scratch log viewable via menu
-  *Help / Config diagnostics*.
+`<action>` is the action name; the value is a GTK accelerator string
+(`<Control><Shift>t`). An **empty value unbinds** that action. A
+missing entry keeps the default binding. Unknown action names and
+unparseable accelerators warn on load and are skipped; an accelerator
+that shadows another binding warns too.
 
-Never silently apply a partially-broken config without saying so.
+Action names (stable across versions, from `src/ui/input.zig`):
 
-## File-size cap
+```
+new_tab close_tab next_tab prev_tab copy paste split_h split_v
+font_inc font_dec font_reset search_open cross_search attach_all
+save_layout save_layout_as save_default_layout load_layout
+prompt_prev prompt_next pane_next pane_prev prefs_open
+broadcast_cycle restore_closed_tab toggle_pin_tab toggle_tab_bar
+reload_config launch_app app_windows
+goto_tab_1 goto_tab_2 goto_tab_3 goto_tab_4 goto_tab_5
+goto_tab_6 goto_tab_7 goto_tab_8 goto_tab_9
+duplicate_tab detach_tab configure_shader shader_preset_pick
+apply_profile show_scrollback new_durable_tab new_browser_tab
+new_browser_split close_pane toggle_browser_face new_editor_tab
+toggle_editor_face mux_detach paste_clipboard copy_selection
+copy_screen copy_scrollback copy_command_output
+select_command_output interrupt_or_copy clear_and_scrollback
+clear_scrollback scrollback_page_up scrollback_page_down
+scrollback_top scrollback_bottom command_palette hints_open
+copy_mode zoom_pane
+```
 
-Config file > 1 MB → reject with diagnostic. Legitimate configs
-are ~few KB; anything larger is a red flag.
+### File browser
 
-## Future extensions (post-v1, non-binding)
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `files_default_view` | enum | `details` | `details`, `compact`, `icons`, `miller`. Per-folder view memory still wins for folders the user has adjusted. |
+| `files_show_hidden` | bool | `false` | |
+| `files_confirm_delete` | bool | `true` | Ask before a permanent delete. |
+| `files_verify_copy` | bool | `false` | Hash-compare each copied file against its source before the copy installs. |
 
-- Hot reload via GIO file monitor.
-- Multiple profiles with per-profile overrides.
-- Per-pane overrides at layout level.
-- Environment-conditional overrides (dark/light based on time).
-- Import converters from Alacritty / Kitty / iTerm2 formats.
-- User-defined actions via Lua plugin hooks.
+### Text editor (behaviour)
+
+App-level on purpose: the same person wants the same indentation and
+wrap default in every window, and a document opened from the browser
+must not indent differently because of the pane it landed in. The
+editor *font* is per-profile.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `editor_tab_width` | int | `4` | 1..16. |
+| `editor_insert_spaces` | bool | `true` | False inserts a real tab. |
+| `editor_soft_wrap` | bool | `false` | Initial state for new editor tabs; per-tab from there. |
+| `editor_line_numbers` | bool | `true` | |
+| `editor_highlight_current_line` | bool | `true` | |
+| `editor_syntax` | bool | `true` | Tree-sitter highlighting. |
+| `editor_bracket_match` | bool | `true` | |
+| `editor_folding` | bool | `true` | |
+| `editor_fold_indent_fallback` | bool | `true` | Derive folds from indentation for files with no grammar. |
+| `editor_theme` | string | `dark` | `dark` or `light`; anything unknown falls back to `dark`. |
+| `editor_crash_recovery` | bool | `true` | Snapshot unsaved buffers to `$XDG_STATE_HOME/sketerm/editor-recovery.d`. |
+| `editor_git_gutter` | bool | `true` | Per-line change markers against HEAD, computed on the file's own host. |
+| `editor_outline` | bool | `false` | Open the symbol outline with every editor face; Ctrl+Shift+O still opens it per face. |
+| `editor_project_markers` | string | unset | Comma-separated marker filenames identifying a project root. Empty = the built-in list. |
+| `editor_project_search_max_files` | int | `4000` | Cap on files a project-wide search will read. |
+| `editor_lsp` | bool | `true` | Master switch for the language-server client. Off means no server is ever spawned. |
+| `editor_lsp_diagnostics` | bool | `true` | Squiggles and gutter markers; off keeps the rest of LSP working. |
+| `editor_lsp_debounce_ms` | int | `250` | Delay after the last keystroke before `textDocument/didChange` is flushed. A feature request always flushes first regardless. |
+
+### Forwarded apps and remote sessions
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `app_view` | enum | `window` | `window` (free-floating; the tab keeps the app log and a raise banner) or `tab` (embedded interactively). Pop-out is available either way. |
+| `app_keyboard_layout` | string | unset | xkb layout for forwarded-app session keyboards: `us`, `gb`, `fr`, `be`, `de`. Set it to YOUR physical layout -- keystrokes pass through as raw keycodes and the app decodes them with this keymap. Empty = `us`. |
+| `gpu_apps` | string | unset | Comma-separated app names always launched with GPU rendering (linux-dmabuf instead of software GL), matched case-insensitively against the .desktop `Name` or the `Exec` binary's basename: `Blender, mpv`. |
+| `mux_udp_port_range` | string | unset | `lo:hi` passed to the remote UDP bootstrap; pin it when a firewall sits in front of the host (`60000:61000`). Validated at load. Empty = ephemeral port. |
+| `input_method` | enum | `auto` | `simple` = GTK's in-process compose tables (dead keys always work, no IME); `multi` = the per-display IM module (ibus/fcitx, but on Wayland that module has no compose engine); `auto` picks `multi` only where an input method is visibly configured. Under `auto` the terminal always resolves to `simple`; the editor and the app host follow the heuristic. An explicit value applies to every face. Applies to faces created after the change. |
+
+### Background layer
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `background_opacity` | float | `1.0` | Clamped 0..1. Needs compositor support for per-window alpha. Blur is not reachable from GTK4; set it with a compositor window rule. |
+| `background_image` | path | unset | PNG/JPEG, drawn cover-cropped behind the cell grid. Wins over the gradient. |
+| `background_image_opacity` | float | `0.3` | Clamped 0..1. Keep it low: text on the default background sits directly on the image. |
+| `background_gradient_from` | colour | transparent | The gradient is active only when both colours have alpha > 0. |
+| `background_gradient_to` | colour | transparent | |
+| `background_gradient_angle` | float | `90` | Degrees; 0 = left to right, 90 = top to bottom. |
+
+### Quake mode
+
+Applied to the primary window when `quake_enabled` is on; `sketerm
+--toggle` raises or hides the running instance.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `quake_enabled` | bool | `false` | With it on, the primary window is sized from the monitor instead of the 1000x700 default. |
+| `quake_monitor` | string | `active` | `active` (the monitor the window is on), `primary`, a 0-based index, or a connector name such as `DP-1`. Anything unrecognised resolves to `active`. |
+| `quake_edge` | enum | `top` | `top`, `bottom`, `left`, `right`. **Parsed, serialised, and currently moves nothing** -- see below. |
+| `quake_width_percent` | float | `100.0` | Clamped 1..100, of the target monitor. |
+| `quake_height_percent` | float | `50.0` | Clamped 1..100. |
+
+Platform caveats, stated plainly because the intended behaviour and
+the actual behaviour differ:
+
+- **`quake_edge` does not move the window.** Wayland does not permit
+  a client to position its own toplevel, and GTK4 removed
+  `gtk_window_move` on every backend, so there is no call sketerm can
+  make to push the window against an edge. The key is recorded so a
+  compositor window rule (or a future layer-shell backend) can
+  consume it. Today, pin the window with a KWin or Mutter rule.
+- **Monitor targeting is exact only at 100% x 100%.** That is the one
+  case that goes through `gtk_window_fullscreen_on_monitor`, the only
+  GTK4 call that names a monitor. At any smaller size sketerm can
+  only set the window size and the compositor decides where it lands.
+- **Percentages are of the full monitor rectangle, not the work
+  area.** `gdk_monitor_get_workarea` is gone in GTK4, so panels and
+  docks are not subtracted.
+- **GTK4 has no primary-monitor concept**, so `quake_monitor =
+  primary` resolves to the display's first monitor.
+
+### Profile selection
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `default_profile` | string | unset | Profile new panes spawn with. Empty or `default` = the Default settings. |
+
+Splits inherit the focused pane's profile. "Apply Profile to Pane"
+(right-click or the palette, action `apply_profile`) restyles a live
+pane.
+
+---
+
+## `[domain.<name>]` -- named mux endpoints
+
+Each section names a remote `sketerm-mux` endpoint. The command
+palette gains a "New Tab on `<name>`" entry, and `sketerm mux <name>`
+/ `sketerm ssh <name>` resolve the name.
+
+| Key | Type | Default | Values |
+| --- | --- | --- | --- |
+| `host` | string | unset | `host` or `user@host`. Empty means the section is ignored. |
+| `transport` | enum | `auto` | `auto` probes roaming UDP and falls back to the SSH pipe; `ssh` and `udp` force one. |
+
+```
+[domain.devbox]
+host = skerit@192.168.1.2
+transport = udp
+```
+
+## `[lsp.<name>]` -- language servers
+
+A section whose name matches a built-in (`zls`, `clangd`,
+`rust-analyzer`) **replaces it wholesale**, but the record is seeded
+from the built-in at parse time. So a section carrying only
+`enabled = false` still knows the command it is switching off, and
+one carrying only `args` keeps the built-in's languages and root
+markers. A server you never write a section for keeps following the
+built-in as it evolves.
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `command` | path | Executable, looked up on `PATH`. Empty disables the entry. |
+| `args` | string | Whitespace-separated argv tail. |
+| `languages` | string | Comma-separated LSP languageIds this server handles. |
+| `root_files` | string | Comma-separated marker filenames; the nearest ancestor containing one becomes the workspace root. Empty = the document's own directory. |
+| `init_options` | string | Raw JSON object passed as `initialize.initializationOptions`. Malformed JSON is dropped rather than corrupting the request. |
+| `enabled` | bool | |
+
+Note that when the prefs dialog writes the file back, every field of
+an LSP section is written out rather than diffed against the
+built-in: a section that silently inherited half its fields from a
+built-in that later changed would quietly change behaviour on
+upgrade. See `docs/lsp.md` for the client itself.
+
+---
+
+## Precedence
+
+1. Built-in defaults (the field initialisers in `src/config.zig`).
+2. The config file, in file order -- a later line for the same key
+   wins.
+3. Environment overrides, which beat the file because an explicit
+   invocation beats persistent config. They apply to the **Default
+   profile only**; named profiles keep their own values.
+
+| Variable | Overrides |
+| --- | --- |
+| `SKETERM_FONT` | `font` (absolute path to a .ttf/.otf) |
+| `SKETERM_SCROLLBACK` | `scrollback` |
+
+## Reload semantics
+
+- **`config_auto_reload = true` (the default)** watches the config
+  file and applies changes as soon as they land. The watcher handles
+  editors that save by writing a temp file and renaming over the
+  target, not just in-place writes, by re-arming on
+  DELETED/RENAMED/MOVED_OUT. Events are debounced (200 ms), and an
+  event whose file content hashes the same as the last apply is
+  dropped, so the app's own writes do not loop.
+- **An automatic reload never persists the config.** Neither does the
+  `reload_config` action or `SIGUSR1`. The serialiser writes only
+  non-default keys, so writing back would destroy a hand-written
+  file's comments and ordering. Only the Preferences dialog persists.
+- **`reload_config` and `SIGUSR1` work regardless of the auto-reload
+  setting.** Bind the action (it has no default accelerator) or send
+  the signal:
+
+  ```
+  keybind.reload_config = <Control><Shift>F5
+  kill -USR1 $(pidof sketerm)
+  ```
+
+- **A reload honours an active `--config <path>` override**, re-reading
+  the same file the process was started with rather than the XDG path.
+- A reload that cannot read the file leaves the running config alone
+  and warns -- unlike startup, where a missing file means "use
+  defaults". An empty file is likewise refused, since it is nearly
+  always a truncate caught mid-write.
+- Auto-reload is suppressed while the Preferences dialog is open, so a
+  hand edit cannot be silently undone by the dialog's own copy.
+
+## What the Preferences dialog writes
+
+The dialog persists to the same file, atomically (write to `.tmp`,
+rename). It emits **only keys whose value differs from the default**,
+so the file stays minimal; profile sections diff against the Default
+settings, matching the parse-time seed, so the round-trip is exact.
+Editing the file by hand and using the dialog therefore mix, but a
+dialog save rewrites the file and loses hand-written comments.
+
+Two states are not expressible in the format and so survive a
+round-trip as the seeded value rather than as "unset": clearing a
+profile's `palette` back to none, and clearing a `light.` / `dark.`
+field back to inherit.
+
+## See also
+
+- `data/sample.conf` -- a commented file to copy to
+  `~/.config/sketerm/config.conf`.
+- `docs/lsp.md` -- the language-server client.
+- `docs/layout.md` -- layout files, which are separate from this
+  config.

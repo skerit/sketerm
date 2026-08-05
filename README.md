@@ -155,7 +155,8 @@ zig-out/bin/sketerm --help
   trust model
 - [Lifecycle](docs/lifecycle.md) — PTY spawn, workers, signals,
   teardown
-- [Config](docs/config.md) — config file schema, keybinding model
+- [Config](docs/config.md) — complete `config.conf` key reference:
+  profiles vs app-level keys, prefix families, reload semantics
 - [Testing](docs/testing.md) — parser fixtures, record/replay,
   differential diffing, fuzzing, benchmarks
 - [MCP tools](docs/mcp.md) — command completion vs output-idle waits
