@@ -18,6 +18,8 @@ const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
 const applyColumnWidths = @import("render.zig").applyColumnWidths;
 const classicmenu = @import("classicmenu.zig");
+const tabhost = @import("../tabhost.zig");
+const paths = @import("../../filebrowser/paths.zig");
 const dnd = @import("dnd.zig");
 const dropValueIntoAction = @import("ops.zig").dropValueIntoAction;
 
@@ -195,18 +197,13 @@ pub fn reopenClosedTab(self: *BrowserView) void {
 
 // -- mouse conveniences ------------------------------------------
 
-/// Wire the browser-specific per-tab gestures on the tab-host label
-/// box: the right-click tab menu and the file-drop target. The label
-/// itself, close button, middle-click close and scroll-to-switch are
-/// the shared tabhost.zig recipe.
+/// Wire the browser-specific per-tab gesture on the tab-host label
+/// box: the file-drop target. The label itself, close button,
+/// middle-click close, scroll-to-switch AND the right-click tab menu
+/// are the shared tabhost.zig recipe (see `tabMenuSpec`).
 pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkWidget) void {
     _ = self;
     // Middle-click-a-row lives on the column view (colview.zig).
-
-    const menu = c.gtk_gesture_click_new();
-    c.gtk_gesture_single_set_button(@ptrCast(menu), 3);
-    _ = c.g_signal_connect_data(menu, "pressed", @ptrCast(&onTabRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(label_box, @ptrCast(menu));
 
     // Dropping onto a tab targets THAT tab's directory, whichever
     // tab is currently shown.
@@ -267,70 +264,76 @@ pub fn onTabDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, use
     return @intFromBool(dropValueIntoAction(tab.view, tab, value, dbuf[0..tab.root.path.len], dnd.dropAction(target, tab)));
 }
 
-/// Heap context for the tab menu; owned by its popover.
-pub const TabMenuCtx = struct {
-    allocator: std.mem.Allocator,
-    view: *BrowserView,
-    tab: *BTab,
-    popover: *c.GtkWidget,
+// -- the per-tab menu (shared mechanism) ---------------------------
+//
+// Close / Close Others / Close to the Right / Duplicate come from
+// tabhost.zig, which drives them through `on_close` and the
+// predicates below. Only the browser-specific row (Reopen Closed
+// Tab) is built here.
 
-    pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
-        ctx.allocator.destroy(ctx);
-    }
-};
-
-pub fn onTabRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
-    tab.view.showTabMenu(tab, x, y);
-}
-
-pub fn showTabMenu(self: *BrowserView, tab: *BTab, x: f64, y: f64) void {
-    const label_box = c.gtk_notebook_get_tab_label(self.notebook, tab.page) orelse return;
-    const ctx = self.allocator.create(TabMenuCtx) catch return;
-    ctx.* = .{ .allocator = self.allocator, .view = self, .tab = tab, .popover = undefined };
-    const root = classicmenu.Root.create(self.allocator) orelse {
-        self.allocator.destroy(ctx);
-        return;
+/// The browser's half of the shared per-tab menu contract.
+pub fn tabMenuSpec() tabhost.TabMenu {
+    return .{
+        .extra = &menuExtra,
+        .duplicate = &menuDuplicate,
+        .can_duplicate = &menuCanDuplicate,
+        .new_window = &menuNewWindow,
+        .can_new_window = &menuCanNewWindow,
+        // No `modified`: a listing has no unsaved state, so there is
+        // no "Close Unmodified Tabs" row here.
     };
-    const m = root.top();
-    m.item("Duplicate Tab", &onTabMenuDuplicate, @ptrCast(ctx));
-    if (self.closed_tabs.closed.items.len > 0) {
-        var label: [96:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
-            self.closed_tabs.closed.items.len,
-        }) catch "Reopen Closed Tab";
-        m.item(text.ptr, &onTabMenuReopen, @ptrCast(ctx));
+}
+
+fn tabForPage(self: *BrowserView, page: *c.GtkWidget) ?*BTab {
+    for (self.tabs.items) |t| {
+        if (t.page == page) return t;
     }
-    m.item("Close Tab", &onTabMenuClose, @ptrCast(ctx));
-    const popover = root.popup(label_box, x, y);
-    ctx.popover = popover;
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-tabmenu", @ptrCast(ctx), @ptrCast(&TabMenuCtx.free));
+    return null;
 }
 
-pub fn onTabMenuDuplicate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
-    const view = ctx.view;
-    const tab = ctx.tab;
-    c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    view.duplicateTab(tab);
+fn menuExtra(ctx: ?*anyopaque, _: *c.GtkWidget, _: *classicmenu.Root, m: classicmenu.Menu) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    if (self.closed_tabs.closed.items.len == 0) return;
+    var label: [96:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+        self.closed_tabs.closed.items.len,
+    }) catch "Reopen Closed Tab";
+    m.itemIcon(text.ptr, .{ .name = "document-open-recent-symbolic" }, &onTabMenuReopen, ctx);
 }
 
-pub fn onTabMenuReopen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
-    const view = ctx.view;
-    c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    view.reopenClosedTab();
+fn menuDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(self, page) orelse return;
+    self.duplicateTab(tab);
 }
 
-pub fn onTabMenuClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
-    const view = ctx.view;
-    const tab = ctx.tab;
-    // The popover is parented to the tab label this is about to
-    // destroy; pop it down first.
-    c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    view.closeTab(tab);
+fn menuCanDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(self, page) orelse return false;
+    return snapshotable(tab);
+}
+
+/// This tab's location in a fresh sketerm window — `openFilesWindow`,
+/// the same call the menubar's File ▸ New Window makes, given this
+/// tab's directory instead of the default one.
+fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(self, page) orelse return;
+    const win = self.ownerWindow() orelse return;
+    var spec_buf: [4096]u8 = undefined;
+    const spec = paths.formatSpec(&spec_buf, tab.hc.host, tab.root.path);
+    _ = win.openFilesWindow(spec, null) catch {};
+}
+
+fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(self, page) orelse return false;
+    return self.ownerWindow() != null and snapshotable(tab);
+}
+
+fn onTabMenuReopen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.reopenClosedTab();
 }
 
 // -- the tab STRIP (empty area) ------------------------------------

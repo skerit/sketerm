@@ -525,7 +525,6 @@ pub const BrowserView = struct {
     pub const reopenClosedTab = @import("tabs.zig").reopenClosedTab;
     pub const installTabConveniences = @import("tabs.zig").installTabConveniences;
     pub const installGridMiddleClick = @import("tabs.zig").installGridMiddleClick;
-    pub const showTabMenu = @import("tabs.zig").showTabMenu;
 
     // render.zig -- listing rendering, columns, rows, emblems
     pub const renderCurrent = @import("render.zig").renderCurrent;
@@ -1699,6 +1698,7 @@ pub const BrowserView = struct {
         self.tabhost.on_close = &hostCloseCb;
         self.tabhost.on_new = &hostNewCb;
         self.tabhost.on_strip_menu = &hostStripMenuCb;
+        self.tabhost.tab_menu = tabsmod.tabMenuSpec();
         const notebook = self.tabhost.widget();
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
