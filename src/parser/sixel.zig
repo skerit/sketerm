@@ -5,8 +5,8 @@
 //! Output: RGBA8 pixel buffer + dimensions.
 //!
 //! Subset implemented (covers what chafa, img2sixel, yazi emit):
-//!   - `" Pan;Pad;Ph;Pv` raster attributes (parsed; Ph/Pv used as
-//!     hints for buffer sizing if present)
+//!   - `" Pan;Pad;Ph;Pv` raster attributes — Ph/Pv size the buffer,
+//!     Pan/Pad set the pixel aspect ratio (overriding DCS P1)
 //!   - `# Pc ; Pu ; Px ; Py ; Pz` color register definitions —
 //!     RGB (Pu=2) and HLS (Pu=1, converted in `hlsToRgb`)
 //!   - `# Pc` color register selection
@@ -15,11 +15,13 @@
 //!   - `$` carriage return (back to col 0 of current 6-row band)
 //!   - `-` line feed (next 6-row band)
 //!   - transparency: unpainted pixels stay alpha 0 so the cell
-//!     background shows through (the image pass blends them out)
+//!     background shows through (the image pass blends them out),
+//!     unless `Options.background` asks for a fill
 //!
-//! Not implemented: the DCS P1-P3 private params (aspect ratio /
-//! background-select / grid) — they ride on the DCS header, not this
-//! body, and every real emitter leaves unpainted pixels transparent.
+//! The DCS header params P1 (aspect ratio) and P2 (background select)
+//! arrive through `Options`; the caller resolves them with
+//! `aspectFromP1`. P3 (horizontal grid size) has no effect here or in
+//! any other implementation — see `Options.aspect_num`.
 
 const std = @import("std");
 
@@ -28,6 +30,45 @@ pub const Decoded = struct {
     width: u32,
     height: u32,
 };
+
+pub const Options = struct {
+    /// Pixel aspect ratio, vertical:horizontal, from DCS P1 via
+    /// `aspectFromP1`. A `"` raster attribute in the body overrides it:
+    /// P1 is a coarse macro selecting one of nine fixed ratios, while
+    /// Pan/Pad state the ratio outright, so the body is the more
+    /// specific (and later) statement of intent — which is also what
+    /// makes modern encoders' `P1 = 0` harmless, since they all emit
+    /// `"1;1;...`.
+    ///
+    /// DCS P3 (horizontal grid size) has no counterpart here: DEC
+    /// defined it for the VT240's device grid and xterm, libsixel and
+    /// every other implementation ignore it. We parse past it and drop
+    /// it rather than invent a meaning.
+    aspect_num: u32 = 1,
+    aspect_den: u32 = 1,
+    /// Colour for pixels the sixel data never paints (DCS P2 = 0 or 2,
+    /// "set to the current background colour"). null leaves them at
+    /// alpha 0, which is both P2 = 1 (transparent) and the right answer
+    /// for a default background, where "current background" is whatever
+    /// the pane paints under the image.
+    background: ?[4]u8 = null,
+};
+
+/// DCS P1 macro parameter -> pixel aspect ratio, vertical:horizontal.
+///
+/// Table from the VT330/VT340 Programmer Reference (chapter 14, Sixel
+/// Graphics); 0 is the omitted-parameter default and shares 1's row.
+/// Values above 9 are not in the table, so they get 1:1 rather than a
+/// guess.
+pub fn aspectFromP1(p1: u32) [2]u32 {
+    return switch (p1) {
+        0, 1, 5, 6 => .{ 2, 1 },
+        2 => .{ 5, 1 },
+        3, 4 => .{ 3, 1 },
+        7, 8, 9 => .{ 1, 1 },
+        else => .{ 1, 1 },
+    };
+}
 
 pub const Error = error{
     EmptyImage,
@@ -44,7 +85,7 @@ const PALETTE_SIZE = 256;
 /// u32 painting math safe: 10000*10000*4 ≈ 4e8 < 2^32.
 const MAX_DIM: u32 = 10000;
 
-pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
+pub fn decode(allocator: std.mem.Allocator, body: []const u8, opts: Options) Error!Decoded {
     // Pass 1: scan dimensions, clamped to MAX_DIM before any sizing/painting.
     const dims = scanDimensions(body);
     if (dims.width == 0 or dims.height == 0) return Error.EmptyImage;
@@ -58,7 +99,10 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
     // (belt-and-suspenders; scanDimensions already caps each dim to MAX_DIM).
     const size: usize = @as(usize, dims.width) * @as(usize, dims.height) * 4;
     const rgba = try allocator.alloc(u8, size);
-    @memset(rgba, 0);
+    if (opts.background) |bg| {
+        var p: usize = 0;
+        while (p < size) : (p += 4) rgba[p..][0..4].* = bg;
+    } else @memset(rgba, 0);
 
     var x: u32 = 0;
     var band: u32 = 0;
@@ -135,7 +179,55 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
         }
     }
 
-    return .{ .rgba = rgba, .width = dims.width, .height = dims.height };
+    // The raster attribute wins over P1 when it carries a ratio.
+    const num = if (dims.aspect_num > 0 and dims.aspect_den > 0) dims.aspect_num else opts.aspect_num;
+    const den = if (dims.aspect_num > 0 and dims.aspect_den > 0) dims.aspect_den else opts.aspect_den;
+    return applyAspect(allocator, rgba, dims.width, dims.height, num, den);
+}
+
+/// Stretch the painted buffer so one sixel pixel occupies `num`:`den`
+/// device pixels (vertical:horizontal), by whole-pixel replication —
+/// the same thing the VT240's scan converter did, and all a nearest
+/// neighbour blit would do anyway. Takes ownership of `rgba`.
+fn applyAspect(
+    allocator: std.mem.Allocator,
+    rgba: []u8,
+    width: u32,
+    height: u32,
+    num: u32,
+    den: u32,
+) Error!Decoded {
+    const sy = ratioScale(num, den);
+    const sx = ratioScale(den, num);
+    if (sx == 1 and sy == 1) return .{ .rgba = rgba, .width = width, .height = height };
+
+    const out_w = @min(width *| sx, MAX_DIM);
+    const out_h = @min(height *| sy, MAX_DIM);
+    const out = allocator.alloc(u8, @as(usize, out_w) * @as(usize, out_h) * 4) catch {
+        allocator.free(rgba);
+        return Error.OutOfMemory;
+    };
+    defer allocator.free(rgba);
+
+    var y: u32 = 0;
+    while (y < out_h) : (y += 1) {
+        const src_y = @min(y / sy, height - 1);
+        var x: u32 = 0;
+        while (x < out_w) : (x += 1) {
+            const src_x = @min(x / sx, width - 1);
+            const src = (@as(usize, src_y) * width + src_x) * 4;
+            const dst = (@as(usize, y) * out_w + x) * 4;
+            out[dst..][0..4].* = rgba[src..][0..4].*;
+        }
+    }
+    return .{ .rgba = out, .width = out_w, .height = out_h };
+}
+
+/// Whole-pixel replication factor for `a`:`b`, rounded to nearest and
+/// never below 1 (a ratio below 1:1 scales the other axis instead).
+fn ratioScale(a: u32, b: u32) u32 {
+    if (a == 0 or b == 0 or a <= b) return 1;
+    return @max(1, (a + b / 2) / b);
 }
 
 fn scaleColor(p: u32) u8 {
@@ -212,12 +304,20 @@ fn paintSixel(
     }
 }
 
-const Dims = struct { width: u32, height: u32 };
+const Dims = struct {
+    width: u32,
+    height: u32,
+    /// Raster attribute Pan/Pad. Both 0 = no ratio stated, use P1.
+    aspect_num: u32 = 0,
+    aspect_den: u32 = 0,
+};
 
 fn scanDimensions(body: []const u8) Dims {
     // Look for raster attrs first.
     var raster_w: u32 = 0;
     var raster_h: u32 = 0;
+    var raster_num: u32 = 0;
+    var raster_den: u32 = 0;
     if (std.mem.indexOfScalar(u8, body, '"')) |q_idx| {
         var i: usize = q_idx + 1;
         var params: [4]u32 = .{ 0, 0, 0, 0 };
@@ -244,7 +344,13 @@ fn scanDimensions(body: []const u8) Dims {
                 break;
             }
         }
-        // params: Pan, Pad, Ph, Pv
+        // params: Pan, Pad, Ph, Pv. Ph/Pv only count when both are
+        // there; Pan/Pad are usable on their own (a `"2;1` prefix with
+        // no size is legal and states nothing but the ratio).
+        if (n >= 2) {
+            raster_num = params[0];
+            raster_den = params[1];
+        }
         if (n >= 4) {
             raster_w = params[2];
             raster_h = params[3];
@@ -309,7 +415,12 @@ fn scanDimensions(body: []const u8) Dims {
     const h = if (raster_h > 0) raster_h else band *| 6;
     // Clamp to MAX_DIM so the allocation and paintSixel offset math
     // (computed in u32) cannot overflow on attacker-controlled input.
-    return .{ .width = @min(w, MAX_DIM), .height = @min(h, MAX_DIM) };
+    return .{
+        .width = @min(w, MAX_DIM),
+        .height = @min(h, MAX_DIM),
+        .aspect_num = raster_num,
+        .aspect_den = raster_den,
+    };
 }
 
 fn parseParams(body: []const u8, i: *usize) []u32 {
@@ -345,7 +456,7 @@ fn parseParams(body: []const u8, i: *usize) []u32 {
 test "decode all-on single column" {
     // Body: define color 1 as red, select it, '~' = all 6 pixels.
     const body = "#1;2;100;0;0#1~";
-    const out = try decode(std.testing.allocator, body);
+    const out = try decode(std.testing.allocator, body, .{});
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqual(@as(u32, 1), out.width);
     try std.testing.expectEqual(@as(u32, 6), out.height);
@@ -358,7 +469,7 @@ test "decode 4-wide red bar" {
     // Define color 2 = green; select; print 4 columns of 'O' = bits 5..0?
     // 'O' = 0x4F - 0x3F = 0x10 = 16 = bit 4 → only the 5th pixel (y=4).
     const body = "#2;2;0;100;0#2OOOO";
-    const out = try decode(std.testing.allocator, body);
+    const out = try decode(std.testing.allocator, body, .{});
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqual(@as(u32, 4), out.width);
     try std.testing.expectEqual(@as(u32, 6), out.height);
@@ -372,7 +483,7 @@ test "decode 4-wide red bar" {
 test "RLE expansion" {
     // Define green; select; !5~ should produce 5 columns all-on green.
     const body = "#2;2;0;100;0#2!5~";
-    const out = try decode(std.testing.allocator, body);
+    const out = try decode(std.testing.allocator, body, .{});
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqual(@as(u32, 5), out.width);
     try std.testing.expectEqual(@as(u32, 6), out.height);
@@ -389,8 +500,103 @@ test "oversized RLE and raster numbers saturate before dimension clamp" {
 
 test "raster attrs honored" {
     const body = "\"1;1;10;6#1;2;0;0;100#1~";
-    const out = try decode(std.testing.allocator, body);
+    const out = try decode(std.testing.allocator, body, .{});
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqual(@as(u32, 10), out.width);
     try std.testing.expectEqual(@as(u32, 6), out.height);
+}
+
+test "P1 macro parameter maps to the VT330 aspect table" {
+    try std.testing.expectEqual([2]u32{ 2, 1 }, aspectFromP1(0));
+    try std.testing.expectEqual([2]u32{ 2, 1 }, aspectFromP1(1));
+    try std.testing.expectEqual([2]u32{ 5, 1 }, aspectFromP1(2));
+    try std.testing.expectEqual([2]u32{ 3, 1 }, aspectFromP1(3));
+    try std.testing.expectEqual([2]u32{ 3, 1 }, aspectFromP1(4));
+    try std.testing.expectEqual([2]u32{ 2, 1 }, aspectFromP1(5));
+    try std.testing.expectEqual([2]u32{ 2, 1 }, aspectFromP1(6));
+    try std.testing.expectEqual([2]u32{ 1, 1 }, aspectFromP1(7));
+    try std.testing.expectEqual([2]u32{ 1, 1 }, aspectFromP1(8));
+    try std.testing.expectEqual([2]u32{ 1, 1 }, aspectFromP1(9));
+    // Off the end of the table: no invented ratio.
+    try std.testing.expectEqual([2]u32{ 1, 1 }, aspectFromP1(10));
+    try std.testing.expectEqual([2]u32{ 1, 1 }, aspectFromP1(65535));
+}
+
+test "P1 aspect ratio stretches the image vertically" {
+    // One all-on column, 1 x 6 sixel pixels, at 3:1 -> 1 x 18 device.
+    const body = "#1;2;100;0;0#1~";
+    const out = try decode(std.testing.allocator, body, .{ .aspect_num = 3, .aspect_den = 1 });
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(@as(u32, 1), out.width);
+    try std.testing.expectEqual(@as(u32, 18), out.height);
+    // Every replicated row carries the source pixel.
+    var y: u32 = 0;
+    while (y < 18) : (y += 1) {
+        try std.testing.expectEqual(@as(u8, 255), out.rgba[y * 4 + 0]);
+        try std.testing.expectEqual(@as(u8, 255), out.rgba[y * 4 + 3]);
+    }
+}
+
+test "a raster attribute ratio overrides P1" {
+    // P1 = 2 asks for 5:1; the body says 1:1 and wins.
+    const body = "\"1;1;1;6#1;2;100;0;0#1~";
+    const a = aspectFromP1(2);
+    const out = try decode(std.testing.allocator, body, .{ .aspect_num = a[0], .aspect_den = a[1] });
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(@as(u32, 6), out.height);
+
+    // And the reverse: a 2:1 raster attribute stretches even though
+    // P1 = 7 asks for 1:1.
+    const b = aspectFromP1(7);
+    const out2 = try decode(std.testing.allocator, "\"2;1;1;6#1;2;100;0;0#1~", .{ .aspect_num = b[0], .aspect_den = b[1] });
+    defer std.testing.allocator.free(out2.rgba);
+    try std.testing.expectEqual(@as(u32, 12), out2.height);
+}
+
+test "a raster attribute wider than tall stretches horizontally" {
+    const out = try decode(std.testing.allocator, "\"1;2;1;6#1;2;100;0;0#1~", .{});
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(@as(u32, 2), out.width);
+    try std.testing.expectEqual(@as(u32, 6), out.height);
+}
+
+test "aspect scaling stays inside MAX_DIM" {
+    // 6000 rows at 5:1 would be 30000 tall. Pan/Pad = 0 states no
+    // ratio, so P1 is the one in force.
+    const out = try decode(std.testing.allocator, "\"0;0;2;6000#1;2;100;0;0#1~", .{ .aspect_num = 5, .aspect_den = 1 });
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(MAX_DIM, out.height);
+}
+
+test "background select fills only the pixels the data misses" {
+    // 2x6 image, left column all-on red, right column never painted.
+    const body = "\"1;1;2;6#1;2;100;0;0#1~?";
+    const out = try decode(std.testing.allocator, body, .{ .background = .{ 0, 0, 255, 255 } });
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(@as(u32, 2), out.width);
+    // Painted pixel keeps its own colour, not the background.
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, out.rgba[0..4]);
+    // Untouched neighbour took the background, opaque.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, out.rgba[4..8]);
+}
+
+test "no background select leaves untouched pixels transparent" {
+    const body = "\"1;1;2;6#1;2;100;0;0#1~?";
+    const out = try decode(std.testing.allocator, body, .{});
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, out.rgba[0..4]);
+    try std.testing.expectEqual(@as(u8, 0), out.rgba[7]); // alpha
+}
+
+test "background fill survives aspect scaling" {
+    const out = try decode(std.testing.allocator, "#1;2;100;0;0#1~?", .{
+        .aspect_num = 2,
+        .aspect_den = 1,
+        .background = .{ 7, 8, 9, 255 },
+    });
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(@as(u32, 12), out.height);
+    // Row 11, column 1 is still background.
+    const off = (11 * 2 + 1) * 4;
+    try std.testing.expectEqualSlices(u8, &.{ 7, 8, 9, 255 }, out.rgba[off .. off + 4]);
 }

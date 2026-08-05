@@ -244,6 +244,88 @@ test "sixel DCS payload fires sink" {
     try std.testing.expect(h.capture.height >= 1);
 }
 
+// DCS P2 = 0 (and its omitted-parameter default) means "pixels the
+// data never paints take the current background colour"; P2 = 1 means
+// leave them alone. Inverting these is the classic sixel bug, so both
+// directions are pinned here with an explicit SGR background.
+test "sixel P2=0 paints the current background behind the image" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // SGR 48;2;0;0;255 = blue background, then a 2x6 sixel whose right
+    // column is never painted.
+    h.feed("\x1b[48;2;0;0;255m\x1bP0;0;0q#1;2;100;0;0#1~?\x1b\\");
+
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 2), h.capture.width);
+    const px = h.capture.rgba.?;
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, px[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[4..8]);
+}
+
+test "sixel P2=1 leaves unpainted pixels transparent" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    h.feed("\x1b[48;2;0;0;255m\x1bP0;1;0q#1;2;100;0;0#1~?\x1b\\");
+
+    try std.testing.expect(h.capture.fired);
+    const px = h.capture.rgba.?;
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, px[0..4]);
+    try std.testing.expectEqual(@as(u8, 0), px[7]); // alpha
+}
+
+test "sixel P2=2 behaves like P2=0" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    h.feed("\x1b[48;5;46m\x1bP0;2;0q#1;2;100;0;0#1~?\x1b\\");
+
+    try std.testing.expect(h.capture.fired);
+    const px = h.capture.rgba.?;
+    try std.testing.expectEqual(@as(u8, 255), px[7]); // opaque fill
+    // Palette index 46 resolved through the screen's 256-colour table.
+    try std.testing.expectEqualSlices(u8, px[4..7], &h.screen.palette[46]);
+}
+
+test "sixel background select with a default background stays transparent" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // No SGR background: the "current background" is whatever the pane
+    // paints, which alpha 0 reproduces exactly.
+    h.feed("\x1bP0;0;0q#1;2;100;0;0#1~?\x1b\\");
+
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u8, 0), h.capture.rgba.?[7]);
+}
+
+test "sixel P1 aspect ratio scales, and a raster attribute overrides it" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // P1 = 2 -> 5:1, no raster attribute: 6 sixel rows -> 30 pixels.
+    h.feed("\x1bP2;1;0q#1;2;100;0;0#1~\x1b\\");
+    try std.testing.expectEqual(@as(u32, 30), h.capture.height);
+
+    // Same P1, but the body states 1:1 — the raster attribute wins.
+    h.feed("\x1bP2;1;0q\"1;1;1;6#1;2;100;0;0#1~\x1b\\");
+    try std.testing.expectEqual(@as(u32, 6), h.capture.height);
+}
+
+test "sixel P3 is ignored" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    h.feed("\x1bP7;1;0q\"1;1;2;6#1;2;100;0;0#1~?\x1b\\");
+    const w = h.capture.width;
+    const height = h.capture.height;
+    // A wildly different P3 changes nothing about the decode.
+    h.feed("\x1bP7;1;9999q\"1;1;2;6#1;2;100;0;0#1~?\x1b\\");
+    try std.testing.expectEqual(w, h.capture.width);
+    try std.testing.expectEqual(height, h.capture.height);
+}
+
 // EmberGlyph pattern: multi-chunk transmit where continuation chunks
 // drop the `i=` field. The kitty spec allows this; we route to the
 // active in-progress transmit by id.
