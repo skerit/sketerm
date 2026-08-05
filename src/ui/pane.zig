@@ -23,6 +23,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const DrainHandle = @import("../terminal.zig").DrainHandle;
 const input = @import("input.zig");
 const a11y = @import("../a11y/atspi.zig");
+const termsource = @import("../a11y/termsource.zig");
 const platform = @import("../util/platform.zig");
 const render_kick = @import("../util/render_kick.zig");
 /// macOS NSAccessibility bridge. GTK4 has no NSAccessibility backend
@@ -351,7 +352,7 @@ pub const Pane = struct {
         // A SketermTermArea (GtkGLArea subclass) so the pane exposes its
         // text + caret to AT-SPI / Orca via GtkAccessibleText; otherwise a
         // bare GL area is an opaque box to a screen reader.
-        const area_widget = a11y.newArea(terminal);
+        const area_widget = termsource.newArea(terminal);
         gl_mod.requestArea(@ptrCast(area_widget));
         // auto_render=FALSE → GtkGLArea only invokes the render
         // signal on demand (queue_draw / queue_render). With TRUE,

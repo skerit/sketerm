@@ -1,28 +1,35 @@
-//! Linux/GTK accessibility bridge.
+//! Linux/GTK accessibility bridge for a GPU canvas.
 //!
-//! Exposes a terminal pane to AT-SPI (Orca, braille via BRLTTY) by giving
-//! the pane's `GtkGLArea` a subclass that implements `GtkAccessibleText`.
-//! A bare GtkGLArea is an opaque box to a screen reader; this makes its
-//! text + caret + selection readable. All the actual text model lives in
-//! the platform-neutral `view.zig` so the macOS NSAccessibility bridge
-//! reuses it unchanged.
+//! A bare `GtkGLArea` is an opaque box to a screen reader. This module
+//! gives one a subclass that implements `GtkAccessibleText`, so its
+//! text + caret + selection become readable by Orca (and braille via
+//! BRLTTY). It is deliberately content-agnostic: what the canvas is
+//! showing arrives through a `Source` vtable, so the terminal grid
+//! (`termsource.zig`, over the platform-neutral `view.zig`) and the
+//! editor's rope (`docsource.zig`, over `docview.zig`) share one
+//! GType-and-notification implementation rather than forking it.
 //!
-//! Notification policy: `notifyChanged` is called for every applied event
-//! batch (and selection mutation), but emission is coalesced to at most
-//! one per `INTERVAL_MS` with a trailing-edge timer, because a busy TUI
-//! rewrites the screen far faster than any reader can speak. Until an AT
-//! actually queries this pane (any vfunc firing flips `at_active`), an
-//! emission is a bare caret nudge — no snapshot is built, so a session
-//! without a screen reader pays nothing per batch.
+//! Notification policy: `notifyChanged` is called for every applied
+//! event batch, edit and selection mutation, but emission is coalesced
+//! to at most one per `INTERVAL_MS` with a trailing-edge timer, because
+//! a busy TUI rewrites the screen — and a held key rewrites a document
+//! line — far faster than any reader can speak. Until an AT actually
+//! queries this canvas (any vfunc firing flips `at_active`), an
+//! emission is a bare caret nudge: no source query, no rope walk, no
+//! snapshot, so a session without a screen reader pays nothing.
+//!
+//! Content-change notifications diff a REGION the source nominates —
+//! the whole screen for a terminal, a caret-anchored line block for a
+//! document. The region carries an identity `key` and its own starting
+//! character offset; a burst whose region key or origin moved since the
+//! last one emits NO text-changed event (only caret/selection), because
+//! a diff across two different regions would be a fabricated range.
+//! Emitting nothing is correct: readers re-read on the caret move.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
-const Terminal = @import("../terminal.zig").Terminal;
 const view = @import("view.zig");
 
-/// qdata key carrying the owning `*Terminal` (stable; `terminal.screen`
-/// itself is swapped wholesale on a remote snapshot, so we deref it live).
-const TERM_KEY = "sketerm-a11y-term";
 /// qdata key carrying the per-area `*State` (owned; freed on finalize).
 const STATE_KEY = "sketerm-a11y-state";
 
@@ -31,31 +38,102 @@ const STATE_KEY = "sketerm-a11y-state";
 /// instant to a human listener.
 const INTERVAL_MS: i64 = 75;
 
-var area_gtype: c.GType = 0;
+/// Text granularity an AT asked for, collapsed to the three units both
+/// backends can answer. SENTENCE/PARAGRAPH map onto LINE.
+pub const Gran = enum { character, word, line };
 
-/// Per-area notify state: the AT-activity gate, the coalescing timer,
-/// and the previously announced text/caret/selection for diffing.
+/// A character range [start, end) of the accessible text.
+pub const Range = struct { start: u32, end: u32 };
+
+/// Text for a granularity unit, plus the range it occupies.
+pub const Chunk = struct { text: []u8, start: u32, end: u32 };
+
+/// The slice of accessible text a source is willing to diff for
+/// change notifications, its character offset, and an identity key.
+/// Bursts only diff two regions with the same key AND the same
+/// `char0`; see the file header.
+pub const Region = struct { text: []u8, char0: u32, key: u64 };
+
+/// Everything the bridge needs to know about the canvas's content.
+/// All calls happen on the main thread, only while an AT is attached,
+/// and every returned allocation is freed by the bridge.
+pub const VTable = struct {
+    /// UTF-8 bytes of character range [c0, c1), clamped by the source.
+    contents: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, c0: u32, c1: u32) ?[]u8,
+    /// The granularity unit containing character offset `off`.
+    contentsAt: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, off: u32, gran: Gran) ?Chunk,
+    /// Character offset of the (primary) caret.
+    caret: *const fn (ctx: *anyopaque) u32,
+    /// Every non-empty selection, most significant first. Empty slice
+    /// = no selection (a bare caret is a position, not a selection).
+    selections: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) []Range,
+    /// The diff region for change notifications; null = this burst
+    /// cannot be localized, so no text-changed event is emitted.
+    region: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) ?Region,
+};
+
+pub const Source = struct { ctx: *anyopaque, vtable: *const VTable };
+
+/// Which accessible role (and therefore which GType) an area gets.
+pub const Role = enum {
+    /// A terminal emulator's screen: read-only, grid-shaped.
+    terminal,
+    /// An editable multi-line document canvas.
+    text_box,
+};
+
+var term_gtype: c.GType = 0;
+var edit_gtype: c.GType = 0;
+
+/// Per-area notify state: the source, the AT-activity gate, the
+/// coalescing timer, and the previously announced region/caret/
+/// selection for diffing.
 const State = struct {
     allocator: std.mem.Allocator,
-    /// An AT has queried this pane at least once (vfunc fired). Gates
-    /// the snapshot+diff work in `emitNow`.
+    /// Null once severed; every query and emission short-circuits.
+    source: ?Source = null,
+    /// An AT has queried this canvas at least once (vfunc fired).
+    /// Gates all the snapshot/diff work in `emitNow`.
     at_active: bool = false,
     timer: c.guint = 0,
     last_emit_ms: i64 = 0,
+    /// At least one burst has been emitted, so the prev_* fields are
+    /// meaningful (offset 0 / no selection are legitimate values).
+    have_prev: bool = false,
     prev_text: ?[]u8 = null,
+    prev_key: u64 = 0,
+    prev_char0: u32 = 0,
     prev_caret: u32 = 0,
-    prev_sel: ?[2]u32 = null,
+    prev_sel: []Range = &.{},
+
+    fn dropPrev(self: *State) void {
+        if (self.prev_text) |t| self.allocator.free(t);
+        self.prev_text = null;
+        if (self.prev_sel.len > 0) self.allocator.free(self.prev_sel);
+        self.prev_sel = &.{};
+        self.have_prev = false;
+    }
 };
 
-/// The `SketermTermArea` GType: a GtkGLArea that implements
-/// GtkAccessibleText and reports the TERMINAL role. Registered once.
-pub fn ensureType() c.GType {
-    if (area_gtype != 0) return area_gtype;
-    area_gtype = c.g_type_register_static_simple(
+/// The GType for `role`: a GtkGLArea subclass implementing
+/// GtkAccessibleText. Registered once per role.
+pub fn ensureType(role: Role) c.GType {
+    const slot = switch (role) {
+        .terminal => &term_gtype,
+        .text_box => &edit_gtype,
+    };
+    if (slot.* != 0) return slot.*;
+    slot.* = c.g_type_register_static_simple(
         c.gtk_gl_area_get_type(),
-        "SketermTermArea",
+        switch (role) {
+            .terminal => "SketermTermArea",
+            .text_box => "SketermEditArea",
+        },
         @sizeOf(c.GtkGLAreaClass),
-        classInit,
+        switch (role) {
+            .terminal => classInitTerm,
+            .text_box => classInitEdit,
+        },
         @sizeOf(c.GtkGLArea),
         null,
         c.G_TYPE_FLAG_NONE,
@@ -65,35 +143,56 @@ pub fn ensureType() c.GType {
         .interface_finalize = null,
         .interface_data = null,
     };
-    c.g_type_add_interface_static(area_gtype, c.gtk_accessible_text_get_type(), &info);
-    return area_gtype;
+    c.g_type_add_interface_static(slot.*, c.gtk_accessible_text_get_type(), &info);
+    return slot.*;
 }
 
-/// Create the pane's GL area as a SketermTermArea bound to `term`.
-pub fn newArea(term: *Terminal) *c.GtkWidget {
-    const w: *c.GtkWidget = @ptrCast(@alignCast(c.g_object_new(ensureType(), @as([*c]const u8, null))));
-    c.g_object_set_data(@ptrCast(@alignCast(w)), TERM_KEY, @ptrCast(term));
-    const st = term.allocator.create(State) catch null;
+/// Create a GL area of `role` bound to `source`, labelled `label`.
+pub fn newArea(
+    role: Role,
+    source: Source,
+    label: [*:0]const u8,
+    allocator: std.mem.Allocator,
+) *c.GtkWidget {
+    const w: *c.GtkWidget = @ptrCast(@alignCast(c.g_object_new(ensureType(role), @as([*c]const u8, null))));
+    const st = allocator.create(State) catch null;
     if (st) |s| {
-        s.* = .{ .allocator = term.allocator };
+        s.* = .{ .allocator = allocator, .source = source };
         c.g_object_set_data_full(@ptrCast(@alignCast(w)), STATE_KEY, @ptrCast(s), destroyState);
     }
     c.gtk_accessible_update_property(
         @ptrCast(@alignCast(w)),
         c.GTK_ACCESSIBLE_PROPERTY_LABEL,
-        @as([*c]const u8, "Terminal"),
+        label,
         @as(c_int, -1),
     );
+    if (role == .text_box) {
+        // An editable, multi-line text box: without these an AT-SPI
+        // ENTRY reads as a single-line read-only field and Orca refuses
+        // to run its caret-review commands over it.
+        c.gtk_accessible_update_property(
+            @ptrCast(@alignCast(w)),
+            c.GTK_ACCESSIBLE_PROPERTY_READ_ONLY,
+            @as(c_int, 0),
+            @as(c_int, -1),
+        );
+        c.gtk_accessible_update_property(
+            @ptrCast(@alignCast(w)),
+            c.GTK_ACCESSIBLE_PROPERTY_MULTI_LINE,
+            @as(c_int, 1),
+            @as(c_int, -1),
+        );
+    }
     // Widget destruction severs unconditionally: no pending timer (with
-    // its widget ref) and no Terminal back-pointer may outlive the
-    // widget tree, whichever teardown path got here.
+    // its widget ref) and no source back-pointer may outlive the widget
+    // tree, whichever teardown path got here.
     _ = c.g_signal_connect_data(w, "destroy", @ptrCast(&onAreaDestroy), null, null, c.G_CONNECT_DEFAULT);
     return w;
 }
 
-/// Screen-reader label. The pane calls this when its title changes, so
-/// "Terminal" becomes e.g. "vim src/main.zig" in a reader's focus
-/// announcement.
+/// Screen-reader label. Callers update it when their title changes, so
+/// "Terminal" becomes e.g. "vim src/main.zig", and an editor canvas
+/// names the document it is showing.
 pub fn setLabel(widget: *c.GtkWidget, title_z: [*:0]const u8) void {
     c.gtk_accessible_update_property(
         @ptrCast(@alignCast(widget)),
@@ -103,20 +202,17 @@ pub fn setLabel(widget: *c.GtkWidget, title_z: [*:0]const u8) void {
     );
 }
 
-/// Pre-teardown sever: drop the Terminal back-pointer, cancel the
+/// Pre-teardown sever: drop the source back-pointer, cancel the
 /// coalescing timer, forget the diff cache. Idempotent; called from
 /// `Pane.severFaces` (widgets alive) and from the area's own destroy.
 pub fn sever(widget: *c.GtkWidget) void {
-    c.g_object_set_data(@ptrCast(@alignCast(widget)), TERM_KEY, null);
     const st = stateOf(widget) orelse return;
+    st.source = null;
     if (st.timer != 0) {
         _ = c.g_source_remove(st.timer); // its destroy-notify drops the widget ref
         st.timer = 0;
     }
-    if (st.prev_text) |t| {
-        st.allocator.free(t);
-        st.prev_text = null;
-    }
+    st.dropPrev();
 }
 
 /// Tell AT clients the caret/contents/selection may have changed.
@@ -155,7 +251,7 @@ fn unrefWidget(user: c.gpointer) callconv(.c) void {
     c.g_object_unref(user);
 }
 
-/// Emit the actual AT-SPI notifications for the current screen state.
+/// Emit the actual AT-SPI notifications for the current content.
 fn emitNow(widget: *c.GtkWidget, st: *State) void {
     st.last_emit_ms = nowMs();
     const at: ?*c.GtkAccessibleText = @ptrCast(@alignCast(widget));
@@ -165,53 +261,71 @@ fn emitNow(widget: *c.GtkWidget, st: *State) void {
         c.gtk_accessible_text_update_caret_position(at);
         return;
     }
-    const term = termOf(at) orelse return; // severed
-    var s = view.build(term.screen, term.allocator) catch return;
-    defer s.deinit();
+    const src = st.source orelse return; // severed
 
-    if (st.prev_text) |old| {
-        if (view.diffChars(old, s.text)) |chg| {
-            // GTK re-queries get_contents for the announced string, so
-            // the REMOVE range's text reads from the NEW screen (the
-            // grid already changed) — same after-the-fact semantics as
-            // GTK's own text widgets; readers key on the range + the
-            // INSERT, which are exact.
-            if (chg.del_end > chg.del_start)
-                c.gtk_accessible_text_update_contents(at, c.GTK_ACCESSIBLE_TEXT_CONTENT_CHANGE_REMOVE, chg.del_start, chg.del_end);
-            if (chg.ins_end > chg.ins_start)
-                c.gtk_accessible_text_update_contents(at, c.GTK_ACCESSIBLE_TEXT_CONTENT_CHANGE_INSERT, chg.ins_start, chg.ins_end);
+    if (src.vtable.region(src.ctx, st.allocator)) |reg| {
+        if (st.prev_text) |old| {
+            if (st.prev_key == reg.key and st.prev_char0 == reg.char0) {
+                // GTK re-queries get_contents for the announced string,
+                // so the REMOVE range's text reads from the NEW content
+                // (it already changed) — same after-the-fact semantics
+                // as GTK's own text widgets; readers key on the range +
+                // the INSERT, which are exact.
+                if (view.diffChars(old, reg.text)) |chg| {
+                    if (chg.del_end > chg.del_start)
+                        c.gtk_accessible_text_update_contents(at, c.GTK_ACCESSIBLE_TEXT_CONTENT_CHANGE_REMOVE, reg.char0 + chg.del_start, reg.char0 + chg.del_end);
+                    if (chg.ins_end > chg.ins_start)
+                        c.gtk_accessible_text_update_contents(at, c.GTK_ACCESSIBLE_TEXT_CONTENT_CHANGE_INSERT, reg.char0 + chg.ins_start, reg.char0 + chg.ins_end);
+                }
+            }
+            st.allocator.free(old);
         }
+        st.prev_text = reg.text;
+        st.prev_key = reg.key;
+        st.prev_char0 = reg.char0;
+    } else if (st.prev_text) |old| {
+        st.allocator.free(old);
+        st.prev_text = null;
     }
-    const first = st.prev_text == null;
-    if (first or !std.mem.eql(u8, st.prev_text.?, s.text)) {
-        const copy = st.allocator.dupe(u8, s.text) catch null;
-        if (copy) |cp| {
-            if (st.prev_text) |old| st.allocator.free(old);
-            st.prev_text = cp;
-        }
-    }
-    if (first or st.prev_caret != s.caret) {
-        st.prev_caret = s.caret;
+
+    const caret = src.vtable.caret(src.ctx);
+    if (!st.have_prev or st.prev_caret != caret) {
+        st.prev_caret = caret;
         c.gtk_accessible_text_update_caret_position(at);
     }
-    const cur_sel: ?[2]u32 = if (s.sel_start) |a| .{ a, s.sel_end.? } else null;
-    const sel_changed = if (st.prev_sel) |p|
-        (if (cur_sel) |n| p[0] != n[0] or p[1] != n[1] else true)
-    else
-        cur_sel != null;
-    if (sel_changed) {
-        st.prev_sel = cur_sel;
+
+    // No `have_prev` guard here: an empty `prev_sel` already IS "no
+    // selection", so a first burst without one must not announce a
+    // selection change.
+    const sels = src.vtable.selections(src.ctx, st.allocator);
+    if (!rangesEql(st.prev_sel, sels)) {
+        if (st.prev_sel.len > 0) st.allocator.free(st.prev_sel);
+        st.prev_sel = sels;
         c.gtk_accessible_text_update_selection_bound(at);
+    } else if (sels.len > 0) {
+        st.allocator.free(sels);
     }
+    st.have_prev = true;
+}
+
+fn rangesEql(a: []const Range, b: []const Range) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x.start != y.start or x.end != y.end) return false;
+    return true;
 }
 
 fn nowMs() i64 {
     return @divTrunc(c.g_get_monotonic_time(), 1000);
 }
 
-fn classInit(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+fn classInitTerm(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const wc: *c.GtkWidgetClass = @ptrCast(@alignCast(klass));
     c.gtk_widget_class_set_accessible_role(wc, c.GTK_ACCESSIBLE_ROLE_TERMINAL);
+}
+
+fn classInitEdit(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const wc: *c.GtkWidgetClass = @ptrCast(@alignCast(klass));
+    c.gtk_widget_class_set_accessible_role(wc, c.GTK_ACCESSIBLE_ROLE_TEXT_BOX);
 }
 
 fn ifaceInit(iface: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
@@ -230,32 +344,24 @@ fn onAreaDestroy(widget: ?*c.GtkWidget, _: c.gpointer) callconv(.c) void {
 
 fn destroyState(p: ?*anyopaque) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(p.?));
-    if (st.prev_text) |t| st.allocator.free(t);
+    st.dropPrev();
     st.allocator.destroy(st);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
-
-fn termOf(self: ?*c.GtkAccessibleText) ?*Terminal {
-    const d = c.g_object_get_data(@ptrCast(@alignCast(self orelse return null)), TERM_KEY) orelse return null;
-    return @ptrCast(@alignCast(d));
-}
 
 fn stateOf(widget: anytype) ?*State {
     const d = c.g_object_get_data(@ptrCast(@alignCast(widget)), STATE_KEY) orelse return null;
     return @ptrCast(@alignCast(d));
 }
 
-/// A vfunc fired: a real AT is reading this pane. From here on,
-/// `emitNow` does the snapshot+diff work.
-fn markActive(self: ?*c.GtkAccessibleText) void {
-    const st = stateOf(self orelse return) orelse return;
+/// A vfunc fired: a real AT is reading this canvas. From here on,
+/// `emitNow` does the query+diff work.
+fn active(self: ?*c.GtkAccessibleText) ?*State {
+    const st = stateOf(self orelse return null) orelse return null;
     st.at_active = true;
-}
-
-fn snap(self: ?*c.GtkAccessibleText) ?view.Snapshot {
-    const term = termOf(self) orelse return null;
-    return view.build(term.screen, term.allocator) catch null;
+    if (st.source == null) return null;
+    return st;
 }
 
 fn bytesNew(b: []const u8) ?*c.GBytes {
@@ -266,10 +372,12 @@ fn bytesNew(b: []const u8) ?*c.GBytes {
 // ── GtkAccessibleText vfuncs ─────────────────────────────────────────
 
 fn getContents(self: ?*c.GtkAccessibleText, start: c_uint, end: c_uint) callconv(.c) ?*c.GBytes {
-    markActive(self);
-    var s = snap(self) orelse return c.g_bytes_new(null, 0);
-    defer s.deinit();
-    return bytesNew(s.byteRange(@intCast(start), @intCast(end)));
+    const st = active(self) orelse return c.g_bytes_new(null, 0);
+    const src = st.source.?;
+    const text = src.vtable.contents(src.ctx, st.allocator, @intCast(start), @intCast(end)) orelse
+        return c.g_bytes_new(null, 0);
+    defer st.allocator.free(text);
+    return bytesNew(text);
 }
 
 fn getContentsAt(
@@ -279,43 +387,28 @@ fn getContentsAt(
     start: [*c]c_uint,
     end: [*c]c_uint,
 ) callconv(.c) ?*c.GBytes {
-    markActive(self);
-    var s = snap(self) orelse {
-        start.* = 0;
-        end.* = 0;
-        return c.g_bytes_new(null, 0);
+    start.* = 0;
+    end.* = 0;
+    const st = active(self) orelse return c.g_bytes_new(null, 0);
+    const src = st.source.?;
+    const gran: Gran = switch (granularity) {
+        c.GTK_ACCESSIBLE_TEXT_GRANULARITY_CHARACTER => .character,
+        c.GTK_ACCESSIBLE_TEXT_GRANULARITY_WORD => .word,
+        // LINE / SENTENCE / PARAGRAPH all map to one line.
+        else => .line,
     };
-    defer s.deinit();
-    const off: u32 = @intCast(offset);
-    var rs: u32 = undefined;
-    var re: u32 = undefined;
-    switch (granularity) {
-        c.GTK_ACCESSIBLE_TEXT_GRANULARITY_CHARACTER => {
-            rs = @min(off, s.n_chars);
-            re = @min(off + 1, s.n_chars);
-        },
-        c.GTK_ACCESSIBLE_TEXT_GRANULARITY_WORD => {
-            const w = s.wordRange(off);
-            rs = w.start;
-            re = w.end;
-        },
-        // LINE / SENTENCE / PARAGRAPH all map to a grid row for a terminal.
-        else => {
-            const l = s.lineRange(off);
-            rs = l.start;
-            re = l.end;
-        },
-    }
-    start.* = rs;
-    end.* = re;
-    return bytesNew(s.byteRange(rs, re));
+    const chunk = src.vtable.contentsAt(src.ctx, st.allocator, @intCast(offset), gran) orelse
+        return c.g_bytes_new(null, 0);
+    defer st.allocator.free(chunk.text);
+    start.* = chunk.start;
+    end.* = chunk.end;
+    return bytesNew(chunk.text);
 }
 
 fn getCaretPosition(self: ?*c.GtkAccessibleText) callconv(.c) c_uint {
-    markActive(self);
-    var s = snap(self) orelse return 0;
-    defer s.deinit();
-    return s.caret;
+    const st = active(self) orelse return 0;
+    const src = st.source.?;
+    return src.vtable.caret(src.ctx);
 }
 
 fn getSelection(
@@ -323,16 +416,16 @@ fn getSelection(
     n_ranges: [*c]c.gsize,
     ranges: [*c][*c]c.GtkAccessibleTextRange,
 ) callconv(.c) c.gboolean {
-    markActive(self);
     n_ranges.* = 0;
-    var s = snap(self) orelse return 0;
-    defer s.deinit();
-    const a = s.sel_start orelse return 0;
-    const b = s.sel_end orelse return 0;
+    const st = active(self) orelse return 0;
+    const src = st.source.?;
+    const sels = src.vtable.selections(src.ctx, st.allocator);
+    defer if (sels.len > 0) st.allocator.free(sels);
+    if (sels.len == 0) return 0;
     // (transfer container): GTK g_free()s the array, not the contents.
-    const arr: [*c]c.GtkAccessibleTextRange = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(c.GtkAccessibleTextRange))));
-    arr[0] = .{ .start = a, .length = b - a };
-    n_ranges.* = 1;
+    const arr: [*c]c.GtkAccessibleTextRange = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(c.GtkAccessibleTextRange) * sels.len)));
+    for (sels, 0..) |r, i| arr[i] = .{ .start = r.start, .length = r.end - r.start };
+    n_ranges.* = sels.len;
     ranges.* = arr;
     return 1;
 }

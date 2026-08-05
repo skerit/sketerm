@@ -130,6 +130,9 @@ const lsp_pos = @import("../lsp/position.zig");
 const PickerWindow = @import("picker.zig").PickerWindow;
 const editorproj = @import("editorproj.zig");
 const editoroutline = @import("editoroutline.zig");
+const a11y = @import("../a11y/atspi.zig");
+const a11ydoc = @import("../a11y/docsource.zig");
+const docview = @import("../a11y/docview.zig");
 
 /// Open size cap: bigger files are refused with a clear error.
 pub const MAX_FILE_BYTES: usize = 64 << 20;
@@ -794,6 +797,13 @@ pub const EditorView = struct {
     root_box: *c.GtkWidget = undefined,
     tabhost: TabHost = undefined,
     area: *c.GtkGLArea = undefined,
+    /// AT-SPI document source for `area` (role TEXT_BOX). Holds the
+    /// byte<->character index; must outlive the GL area, which is why
+    /// it is a field rather than a local. Severed with the face.
+    a11y_src: a11ydoc.DocSource = .{},
+    /// Accessible label last pushed to the canvas, so a status refresh
+    /// that did not change the document name costs no GTK call.
+    a11y_label: [260]u8 = [_]u8{0} ** 260,
     status_label: *c.GtkLabel = undefined,
     /// Shared IM plumbing (compose / dead keys / IME). Severed at the
     /// first sign of teardown, and unconditionally by `deinit` — the
@@ -1799,6 +1809,11 @@ pub const EditorView = struct {
     /// below can (or may) run — `ownerWindow()` walks `root_box`.
     fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
+        // Before anything else: drop the AT-SPI bridge's back-pointer
+        // into this face and cancel its coalescing timer, while the
+        // GL area is still a live widget. Idempotent, and the area's
+        // own ::destroy severs again on the paths that skip this one.
+        if (!self.widgets_dead and !widgets_dead) a11y.sever(@ptrCast(self.area));
         self.widgets_dead = self.widgets_dead or widgets_dead;
         // No-ops itself (through ownerWindow) once widgets_dead is set,
         // which is why the pane's verdict has to be folded in first and
@@ -1846,6 +1861,12 @@ pub const EditorView = struct {
 
     pub fn deinit(self: *EditorView) void {
         self.fence.close();
+        // Last resort — every ordinary path severed already (either
+        // `prepareDestroyCb` or the area's ::destroy). Only safe while
+        // the widget is alive; once it is finalized its own destroy
+        // handler has run and `self.area` dangles.
+        if (!self.widgets_dead) a11y.sever(@ptrCast(self.area));
+        self.a11y_src.deinit();
         self.stopBlink();
         self.stopScrollbarSync();
         self.stopJournalTimer();
@@ -1936,7 +1957,12 @@ pub const EditorView = struct {
 
         // The document canvas, inside an overlay that carries the find
         // bar, in a grid that carries the two scrollbars.
-        const area_widget = c.gtk_gl_area_new();
+        // A SketermEditArea (GtkGLArea subclass) rather than a bare GL
+        // area, so the document's text, caret and selections reach a
+        // screen reader through GtkAccessibleText — the same bridge
+        // the terminal canvas uses, over the rope instead of the grid.
+        self.a11y_src = a11ydoc.DocSource.init(self.allocator, @ptrCast(self), &a11yTarget);
+        const area_widget = a11ydoc.newArea(&self.a11y_src, "Editor");
         gl_mod.requestArea(@ptrCast(area_widget));
         c.gtk_gl_area_set_auto_render(@ptrCast(area_widget), 0);
         c.gtk_widget_set_vexpand(area_widget, 1);
@@ -3665,8 +3691,40 @@ pub const EditorView = struct {
         self.queueRender();
     }
 
+    /// `docview.Target` resolver for the AT-SPI document source: the
+    /// ACTIVE tab's rope + selections. Null while a tab is still
+    /// loading — its `doc` is an empty placeholder that would be
+    /// announced as a wiped document.
+    fn a11yTarget(ctx: *anyopaque) ?docview.Target {
+        const self: *EditorView = @ptrCast(@alignCast(ctx));
+        if (self.widgets_dead) return null;
+        const tab = self.active orelse return null;
+        if (tab.loading) return null;
+        return .{ .doc = &tab.doc, .sels = &tab.sels };
+    }
+
+    /// Keep the canvas's accessible label on the active document's file
+    /// name (the reader announces "main.zig" on focus, not "Editor"),
+    /// and tell the bridge the text/caret/selection may have moved.
+    /// Coalesced and gated on an attached AT inside the bridge.
+    fn a11yRefresh(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        const name: []const u8 = if (self.active) |t| t.title() else "Editor";
+        const n = @min(name.len, self.a11y_label.len - 1);
+        if (!std.mem.eql(u8, self.a11y_label[0..n], name[0..n]) or self.a11y_label[n] != 0) {
+            @memcpy(self.a11y_label[0..n], name[0..n]);
+            self.a11y_label[n] = 0;
+            a11y.setLabel(@ptrCast(self.area), @ptrCast(&self.a11y_label));
+        }
+        a11y.notifyChanged(@ptrCast(self.area));
+    }
+
     fn updateStatus(self: *EditorView) void {
         if (self.widgets_dead) return;
+        // Every caret move, edit, tab switch and dirty-flag change
+        // funnels through here, so this is also where the screen
+        // reader's view of the canvas is refreshed.
+        self.a11yRefresh();
         // Every path that changes the caret, the active tab, the tab
         // set or a dirty flag funnels through here, so this is the one
         // place a standalone host has to watch to keep its window title
