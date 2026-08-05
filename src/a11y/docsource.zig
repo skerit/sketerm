@@ -16,7 +16,8 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atspi = @import("atspi.zig");
 const docview = @import("docview.zig");
-const Document = @import("../editor/document.zig").Document;
+const docmod = @import("../editor/document.zig");
+const Document = docmod.Document;
 const tr = @import("../editor/transaction.zig");
 
 /// Per-canvas document source. Lives as a field of the editor face
@@ -57,7 +58,7 @@ pub const DocSource = struct {
     /// The Document edit-observer hook feeding `log` (slot 3; see
     /// document.zig). Keyed on `ctx == self`, so re-attaching after a
     /// document swap replaces rather than double-registers.
-    pub fn editObserver(self: *DocSource) Document.EditObserver {
+    pub fn editObserver(self: *DocSource) docmod.EditObserver {
         return .{ .ctx = @ptrCast(self), .before_apply = onDocEdits };
     }
 
