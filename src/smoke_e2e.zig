@@ -61,6 +61,9 @@ var dk_pid: c.pid_t = 0;
 /// The second GUI started with --restore (restoreStage), killed by
 /// EXACT pid — never by name.
 var restore_pid: c.pid_t = -1;
+/// The standalone image viewer (`sketerm view`) spawned into the same
+/// display session by viewerMenuStage. Killed by EXACT pid.
+var viewer_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -71,6 +74,12 @@ var g_mux_sock: []const u8 = "";
 /// every `fail` go through it.
 fn teardown() void {
     dkTeardown();
+    if (viewer_pid > 0) {
+        _ = c.kill(viewer_pid, c.SIGKILL);
+        var vst: c_int = 0;
+        _ = c.waitpid(viewer_pid, &vst, 0);
+        viewer_pid = -1;
+    }
     if (restore_pid > 0) {
         _ = c.kill(restore_pid, c.SIGKILL);
         var rst: c_int = 0;
@@ -442,10 +451,17 @@ pub fn main() u8 {
         say("real seat input reached the shell and repainted the window");
 
         // 3c. The pane's context menu, driven by a real right-click and
-        // by the keyboard, and asserted through AT-SPI (so a menu that
-        // paints but is invisible to a screen reader fails here too).
+        // by the keyboard. Contents and per-row sensitivity are
+        // asserted in smoke_atspi (this rig runs GTK_A11Y=none).
         if (contextMenuStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("context menu: right-click and Shift+F10 both opened it, Escape closed it, focus returned to the pane");
+
+        // 3d. The standalone image viewer's canvas menu — a second
+        // application identity in the same display session.
+        if (have_wl) {
+            if (viewerMenuStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("image viewer: right-click and Shift+F10 opened the canvas menu, Escape closed it");
+        }
     }
 
     // 4. split, then list must show two panes.
@@ -1511,6 +1527,108 @@ fn contextMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         if (countMarker(allocator, resp, MENU_MARKER) >= 2) break;
         _ = app.pumpOnce(200);
     } else return "focus never returned to the pane after the context menu closed";
+    return null;
+}
+
+/// Ids of every non-popup surface currently known, so a newly mapped
+/// toplevel can be told from the ones already on screen.
+fn hasToplevelOtherThan(app: *appdrive.App, known: []const u32) ?u32 {
+    _ = app.pumpOnce(120);
+    outer: for (app.windows.items) |w| {
+        if (w.popup or w.frames == 0) continue;
+        for (known) |k| {
+            if (w.id == k) continue :outer;
+        }
+        return w.id;
+    }
+    return null;
+}
+
+/// The standalone image viewer's canvas context menu, in the same
+/// display session. `sketerm view` is its own application identity, so
+/// it is spawned as a second child and killed by exact pid.
+fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const u8, wl: [*:0]const u8) ?[]const u8 {
+    _ = app.drainLive(2_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const term_win = app.windows.items[0].id;
+
+    // An image to open: a PNG of the terminal window itself, which is
+    // guaranteed to exist and to decode.
+    const img_path = std.fmt.allocPrintSentinel(allocator, "{s}/viewer-sample.png", .{rt}, 0) catch
+        return "allocating the sample image path failed";
+    defer allocator.free(img_path);
+    if (app.screenshotPng(term_win, 512, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng(img_path, shot.png);
+    } else |_| return "could not produce a sample image for the viewer";
+
+    var known: [8]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for the viewer failed";
+    if (pid == 0) {
+        dieWithParent();
+        // Its own app id: `sketerm view` registers a viewer identity,
+        // and it must not join the terminal instance already running.
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eview", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    viewer_pid = pid;
+
+    var waited: u32 = 0;
+    const viewer_win = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "the image viewer never mapped a window";
+    _ = app.waitVisualSettle(viewer_win, 400, 10_000, 0.002, null);
+
+    const vw = app.winById(viewer_win) orelse return "the viewer window vanished";
+    const cx = @as(f64, @floatFromInt(vw.w)) / 2;
+    const cy = @as(f64, @floatFromInt(vw.h)) / 2;
+    if (openPopup(app) != null) return "a popup was already open before the viewer menu";
+
+    // Right-click on the image canvas.
+    app.clickEx(viewer_win, cx, cy, 3, 100, 1) catch return "right-clicking the viewer canvas failed";
+    const menu_id = waitPopup(app, true, 15_000) orelse
+        return "a right-click on the image canvas opened no menu";
+    _ = app.waitVisualSettle(menu_id, 300, 5_000, 0.002, null);
+    if (app.screenshotPng(menu_id, 1024, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-viewer-menu.png", shot.png);
+        if (shot.img_w < 40 or shot.img_h < 40) return "the viewer's menu popup has no real size";
+    } else |_| return "screenshotting the viewer's context menu failed";
+
+    app.pressKey(viewer_win, "Escape") catch return "injecting Escape failed";
+    if (waitPopup(app, false, 10_000) == null)
+        return "the viewer's context menu never closed on Escape";
+
+    // Keyboard path: the viewer routes Menu / Shift+F10 through its
+    // own window-level key handler.
+    app.pressKey(viewer_win, "shift+F10") catch return "injecting Shift+F10 failed";
+    if (waitPopup(app, true, 15_000) == null)
+        return "Shift+F10 did not open the viewer's context menu";
+    app.pressKey(viewer_win, "Escape") catch return "injecting Escape failed";
+    if (waitPopup(app, false, 10_000) == null)
+        return "the viewer's keyboard-opened menu never closed on Escape";
+
+    _ = c.kill(viewer_pid, c.SIGKILL);
+    var vst: c_int = 0;
+    _ = c.waitpid(viewer_pid, &vst, 0);
+    viewer_pid = -1;
+    _ = app.drainLive(2_000);
     return null;
 }
 
