@@ -1587,6 +1587,11 @@ pub const FsOpReq = struct {
     src_host: []const u8 = "",
     dst_host: []const u8 = "",
     client_token: []const u8 = "",
+    /// Stable logical-transfer identity kept across retry attempts:
+    /// lets a resubmission adopt (and restart) the failed job that
+    /// already owns staged data, instead of minting a fresh job whose
+    /// randomized stage can never see it. Old daemons ignore it.
+    transfer_token: []const u8 = "",
     /// Comma-separated extended-attribute names to include with
     /// every entry (listings, stat and deltas).
     attrs: []const u8 = "",

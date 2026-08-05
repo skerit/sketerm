@@ -12963,3 +12963,55 @@ mux-portable (ldd libc/libm only) + aarch64-macos cross all green;
 driven live on the mux display rig with screenshots (context menu,
 Ctrl+D multi-caret, Ctrl+/ on a real Zig file, auto-close + type-over
 + wrap-closer Enter, smart backspace, Ctrl+G line:col).
+
+## Cross-host transfers: real resume across retries, pipelined bytes, reboot-durable journals
+
+Root-caused the "move kept retrying, then left a 6+ GB
+`.sketerm-copy-47-*` orphan next to `-50-*`" report: the browser mints
+a fresh daemon idempotency token per attempt, the daemon then mints a
+fresh JOB, and a no-replace move's destination stage is named by the
+job id -- so no retry could ever adopt the previous attempt's staged
+bytes. Fixed structurally, not by widening a special case:
+
+- Two-tier retry identity. Every cross_copy now also carries the
+  ledger's stable `transfer_token` (client_token still rotates per
+  attempt). `fsStartJob` restarts a FAILED matching job from its own
+  journal under its own id -- same `.skpart`s, same destination stage,
+  same quarantine/phase -- and adopts a still-RUNNING one instead of
+  duplicating it. Old daemons ignore the unknown field and behave as
+  before; old clients simply never send it.
+- ALL no_replace cross copies stage (previously only moves), so an
+  interrupted no-replace tree copy resumes instead of failing against
+  its own partial root.
+- Fs-job journals moved from the runtime dir to
+  `$XDG_STATE_HOME/sketerm/fsjobs/<sock-hash>/` (`Daemon.fsJobsDirAlloc`,
+  one-time copy-based migration), so staged data and move-cleanup
+  state survive a reboot; created lazily so isolated test daemons
+  leave no litter.
+- Post-commit honesty: a move failing after the `copied` phase reports
+  "the copy is complete and installed; ..." -- the destination stays
+  under its final name and the retry redoes ONLY source cleanup
+  (proved by inode identity in the smoke).
+- Throughput: `CrossCopy.transferBytes` replaces the stop-and-wait
+  chunk loop with a bounded 4-deep read/write pipeline over new
+  fsdrive submit/await primitives (replies match by req nonce; blocking
+  ops route pipelined frames instead of dropping them). Reconnects
+  restart the window from the acknowledged contiguous prefix.
+- A per-run digest cache (`hashCached`, stat-identity keyed, rebound
+  across rename/utimens) collapses the move flow's four-to-six full
+  re-reads of both files into one hash per side; a lost rename ACK is
+  now disambiguated by claiming a destination that carries the
+  verified digest (`renameDstClaimed`).
+
+smoke-fs grew two stages: a mid-transfer SIGKILLed copy retried with a
+rotated client_token must return the SAME job id and a non-zero
+resumed_from; a move whose quarantine is blocked (read-only source
+parent) must fail with the installed-copy message and finish via a
+cleanup-only retry. Three existing kill-window stages were made
+structural (watch the growing `.skpart` / add a trailing tree file)
+because the digest cache shrank the windows they raced.
+
+Verification: smoke-fs (mono + broker incl. all new stages), smoke-mux,
+smoke-broker, mux-portable, `zig build`, full unit suite 1623 pass /
+0 fail (test-core 1385; the build-step exit flake is the known
+tesseract ObjectCache leak noise).

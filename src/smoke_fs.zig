@@ -669,6 +669,73 @@ fn replaceMoveSourceAfterQuarantine(ctx: *MoveReplacement) void {
     }
 }
 
+const CopyHelperKill = struct {
+    journal: []const u8,
+    part: []const u8,
+    min_bytes: u64 = 2 << 20,
+    killed: bool = false,
+};
+
+/// SIGKILL the copy helper once its staged partial has real bytes —
+/// the deterministic "attempt died mid-transfer" a retry must resume.
+fn killCopyHelperMidTransfer(ctx: *CopyHelperKill) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (c.stat(pathz.pathZ(&z, ctx.part) catch return, &st) == 0 and
+            st.st_size >= @as(c.off_t, @intCast(ctx.min_bytes)))
+        {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                if (parsed.value.pid > 0 and
+                    c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0)
+                {
+                    ctx.killed = true;
+                    return;
+                }
+            } else |_| {}
+        }
+        _ = c.usleep(1_000);
+    }
+}
+
+const QuarantineBlock = struct {
+    journal: []const u8,
+    parent: []const u8,
+    blocked: bool = false,
+};
+
+/// Make the move's source parent read-only as soon as staged bytes
+/// exist: the copy and install succeed, then the quarantine rename
+/// fails deterministically — the "copy complete, source retained"
+/// failure class.
+fn blockQuarantineDuringCopy(ctx: *QuarantineBlock) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            if (parsed.value.destination_stage.len > 0) {
+                var part_buf: [4096]u8 = undefined;
+                const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{parsed.value.destination_stage}) catch return;
+                if (exists(part) or exists(parsed.value.destination_stage)) {
+                    var z: [4096]u8 = undefined;
+                    if (c.chmod(pathz.pathZ(&z, ctx.parent) catch return, 0o555) == 0)
+                        ctx.blocked = true;
+                    return;
+                }
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
 const MoveHelperKill = struct {
     journal: []const u8,
     remove_after_kill: []const u8 = "",
@@ -718,9 +785,20 @@ fn killMoveHelperInDestinationStage(ctx: *MoveHelperKill) void {
                     ctx.stage_child,
                 }) catch return;
                 child_ready = exists(child);
+            } else if (parsed.value.destination_stage.len > 0) {
+                // Single-file stage: the bare staged file's lifetime is
+                // a handful of stats now that verified digests are
+                // cached, so the reliable kill window is the transfer
+                // itself — the growing `.skpart` under the stage name.
+                var part_buf: [4096]u8 = undefined;
+                const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{parsed.value.destination_stage}) catch return;
+                var z: [4096]u8 = undefined;
+                var st: c.struct_stat = undefined;
+                child_ready = c.stat(pathz.pathZ(&z, part) catch return, &st) == 0 and
+                    st.st_size >= (1 << 20);
             }
             if (std.mem.eql(u8, parsed.value.phase, "rename_planned") and
-                parsed.value.destination_stage.len > 0 and exists(parsed.value.destination_stage) and
+                parsed.value.destination_stage.len > 0 and
                 child_ready and
                 parsed.value.pid > 0)
             {
@@ -2472,6 +2550,15 @@ fn writeAll(fd: c_int, data: []const u8) bool {
     return true;
 }
 
+/// The daemon-side journal record path for one job — computed by the
+/// same rule the daemon uses (state dir keyed by socket hash), so the
+/// smoke's helper-kill probes watch the file the helper writes.
+fn journalPathOf(allocator: std.mem.Allocator, buf: []u8, sock_path: []const u8, job: u64) []const u8 {
+    const dir = daemon_mod.Daemon.fsJobsDirAlloc(allocator, sock_path) catch fail("smoke: journal dir");
+    defer allocator.free(dir);
+    return std.fmt.bufPrint(buf, "{s}/{d}.json", .{ dir, job }) catch fail("smoke: journal path");
+}
+
 fn writeScript(path: [:0]const u8, body: []const u8) void {
     const f = c.fopen(path.ptr, "wb") orelse fail("write fake-ssh");
     if (c.fwrite(body.ptr, 1, body.len, f) != body.len) fail("write fake-ssh body");
@@ -2598,10 +2685,8 @@ fn crossStage(
             defer _ = c.unlink(pathz.pathZ(&xz, xdst) catch unreachable);
             const job = fs.startCrossCopyOpts("", xsrc, "", xdst, true, .{ .delete_src = true, .no_replace = true }) catch
                 failErr("cross: start xdev move", fs.lastErr());
-            const xjob_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
             var xjournal_buf: [4096]u8 = undefined;
-            const xjournal = std.fmt.bufPrint(&xjournal_buf, "{s}/fsjobs/{d}.json", .{ xjob_parent, job }) catch
-                fail("cross: XDEV file journal path");
+            const xjournal = journalPathOf(allocator, &xjournal_buf, sock_dst, job);
             var xkiller_ctx = MoveHelperKill{ .journal = xjournal };
             const xkiller = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&xkiller_ctx}) catch
                 fail("cross: XDEV file helper killer");
@@ -2620,6 +2705,12 @@ fn crossStage(
             mkdirAt(tree_src);
             const tree_file = std.fmt.bufPrint(&tree_paths[1], "{s}/payload.bin", .{tree_src}) catch unreachable;
             writePattern(tree_file, 16 << 20, 0x6e);
+            // A file sorting AFTER the watched one keeps "payload.bin
+            // installed bare, tree not yet done" open for a whole
+            // file's transfer — the watcher's kill window.
+            var tree_tail_buf: [256]u8 = undefined;
+            const tree_tail = std.fmt.bufPrint(&tree_tail_buf, "{s}/zz-tail.bin", .{tree_src}) catch unreachable;
+            writePattern(tree_tail, 16 << 20, 0x6f);
             const tree_dst = std.fmt.bufPrint(&tree_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-tree-{d}", .{c.getpid()}) catch unreachable;
             daemon_mod.removeTreeBestEffort(tree_dst);
             defer daemon_mod.removeTreeBestEffort(tree_dst);
@@ -2628,9 +2719,7 @@ fn crossStage(
                 .no_replace = true,
             }) catch failErr("cross: start resumable XDEV tree move", fs.lastErr());
             var journal_buf: [4096]u8 = undefined;
-            const job_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
-            const journal = std.fmt.bufPrint(&journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, tree_job }) catch
-                fail("cross: XDEV tree journal path");
+            const journal = journalPathOf(allocator, &journal_buf, sock_dst, tree_job);
             var killer_ctx = MoveHelperKill{ .journal = journal, .stage_child = "payload.bin" };
             const killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&killer_ctx}) catch
                 fail("cross: XDEV tree helper killer");
@@ -2648,6 +2737,11 @@ fn crossStage(
             mkdirAt(stale_src);
             const stale_file = std.fmt.bufPrint(&stale_paths[1], "{s}/removed.bin", .{stale_src}) catch unreachable;
             writePattern(stale_file, 8 << 20, 0x71);
+            // Same trailing-file trick: keeps the bare removed.bin
+            // observable while the tree copy is still running.
+            var stale_tail_buf: [256]u8 = undefined;
+            const stale_tail = std.fmt.bufPrint(&stale_tail_buf, "{s}/zz-tail.bin", .{stale_src}) catch unreachable;
+            writePattern(stale_tail, 8 << 20, 0x72);
             const stale_dst = std.fmt.bufPrint(&stale_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-stale-{d}", .{c.getpid()}) catch unreachable;
             daemon_mod.removeTreeBestEffort(stale_dst);
             defer daemon_mod.removeTreeBestEffort(stale_dst);
@@ -2656,8 +2750,7 @@ fn crossStage(
                 .no_replace = true,
             }) catch failErr("cross: start stale-stage XDEV move", fs.lastErr());
             var stale_journal_buf: [4096]u8 = undefined;
-            const stale_journal = std.fmt.bufPrint(&stale_journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, stale_job }) catch
-                fail("cross: stale-stage journal path");
+            const stale_journal = journalPathOf(allocator, &stale_journal_buf, sock_dst, stale_job);
             var stale_killer_ctx = MoveHelperKill{
                 .journal = stale_journal,
                 .remove_after_kill = stale_file,
@@ -2844,18 +2937,30 @@ fn crossStage(
         // The copy boundary and quarantine identity are helper-owned
         // journal state. Killing that exact helper must respawn cleanup
         // without falling back to deleting the original pathname.
+        // A tree source keeps the post-quarantine window wide enough to
+        // land the kill: verified digests are cached per run, so a
+        // single file's cleanup tail became nearly instant.
         var src_buf: [256]u8 = undefined;
-        const src = std.fmt.bufPrint(&src_buf, "{s}/crash-recovery.bin", .{src_dir}) catch unreachable;
-        writePattern(src, 32 << 20, 0x39);
-        const want_crash = fileSha(src) orelse fail("cross: crash recovery source hash");
+        const src = std.fmt.bufPrint(&src_buf, "{s}/crash-recovery", .{src_dir}) catch unreachable;
+        mkdirAt(src);
+        var big_crash_buf: [256]u8 = undefined;
+        const big_crash = std.fmt.bufPrint(&big_crash_buf, "{s}/payload.bin", .{src}) catch unreachable;
+        writePattern(big_crash, 32 << 20, 0x39);
+        {
+            var i: usize = 0;
+            var name_buf: [64]u8 = undefined;
+            while (i < 64) : (i += 1) {
+                const name = std.fmt.bufPrint(&name_buf, "small-{d}.txt", .{i}) catch unreachable;
+                touch(src, name, "crash recovery payload");
+            }
+        }
+        const want_crash = fileSha(big_crash) orelse fail("cross: crash recovery source hash");
         var dst_buf: [256]u8 = undefined;
-        const dst = std.fmt.bufPrint(&dst_buf, "{s}/crash-recovery.bin", .{dst_dir}) catch unreachable;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/crash-recovery", .{dst_dir}) catch unreachable;
         const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{ .delete_src = true }) catch
             failErr("cross: start crash-recovery move", fs.lastErr());
         var journal_buf: [4096]u8 = undefined;
-        const job_parent = std.fs.path.dirname(sock_dst) orelse fail("cross: coordinator socket has no parent");
-        const journal = std.fmt.bufPrint(&journal_buf, "{s}/fsjobs/{d}.json", .{ job_parent, job }) catch
-            fail("cross: crash recovery journal path");
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
         var killer_ctx = MoveHelperKill{ .journal = journal };
         const killer = std.Thread.spawn(.{}, killMoveHelperAfterCopy, .{&killer_ctx}) catch
             fail("cross: helper killer thread");
@@ -2864,7 +2969,9 @@ fn crossStage(
         if (!killer_ctx.killed) fail("cross: move helper was not killed after its copy boundary");
         if (!res.is("done")) failErr("cross: killed move helper did not recover", res.messageText());
         if (exists(src)) fail("cross: recovered move left its source behind");
-        const got = fileSha(dst) orelse fail("cross: recovered move destination hash");
+        var moved_crash_buf: [256]u8 = undefined;
+        const moved_crash = std.fmt.bufPrint(&moved_crash_buf, "{s}/payload.bin", .{dst}) catch unreachable;
+        const got = fileSha(moved_crash) orelse fail("cross: recovered move destination hash");
         if (!std.mem.eql(u8, &got, &want_crash)) fail("cross: recovered move content mismatch");
     }
     {
@@ -2951,6 +3058,103 @@ fn crossStage(
         var bytes: [32]u8 = undefined;
         const copied = readSmall(copied_a, &bytes);
         if (!std.mem.eql(u8, copied, "original")) fail("cross: changed source overwrote its proven destination copy");
+    }
+
+    // ── retry with a rotated client_token adopts the failed job ──
+    // The browser mints a fresh idempotency token per attempt but keeps
+    // the transfer_token; the daemon must RESTART the failed job under
+    // its own id so the staged partial is resumed, never orphaned
+    // (the `.sketerm-copy-47` vs `-50` bug class).
+    {
+        var rs_buf: [256]u8 = undefined;
+        const rs_src = std.fmt.bufPrint(&rs_buf, "{s}/retry-resume.bin", .{src_dir}) catch unreachable;
+        writePattern(rs_src, 24 << 20, 0x53);
+        const want_rs = fileSha(rs_src) orelse fail("cross: retry-resume source hash");
+        var rd_buf: [256]u8 = undefined;
+        const rs_dst = std.fmt.bufPrint(&rd_buf, "{s}/retry-resume.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", rs_src, "", rs_dst, true, "attempt-1", .{
+            .transfer_token = "xfer-retry-resume",
+        }) catch failErr("cross: start retry-resume", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var part_buf: [256]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{rs_dst}) catch unreachable;
+        var killer_ctx = CopyHelperKill{ .journal = journal, .part = part };
+        const killer = std.Thread.spawn(.{}, killCopyHelperMidTransfer, .{&killer_ctx}) catch
+            fail("cross: retry-resume killer thread");
+        const first = collectJob(&fs, job, 120_000);
+        killer.join();
+        if (!killer_ctx.killed) fail("cross: retry-resume helper was not killed mid-transfer");
+        if (!first.is("error")) fail("cross: killed copy attempt did not report failure");
+        if (!exists(part)) fail("cross: killed copy attempt left no staged partial");
+        // The retry: NEW client_token, SAME transfer_token.
+        const retry_job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", rs_src, "", rs_dst, true, "attempt-2", .{
+            .transfer_token = "xfer-retry-resume",
+        }) catch failErr("cross: start retry-resume attempt 2", fs.lastErr());
+        if (retry_job != job)
+            fail("cross: the retry minted a fresh job instead of restarting the failed one");
+        const second = collectJob(&fs, retry_job, 120_000);
+        if (!second.is("done")) failErr("cross: retried copy did not finish", second.messageText());
+        if (second.resumed_from == 0)
+            fail("cross: the retry restarted from byte zero instead of resuming the staged partial");
+        const got_rs = fileSha(rs_dst) orelse fail("cross: retry-resume destination hash");
+        if (!std.mem.eql(u8, &got_rs, &want_rs)) fail("cross: retried copy content mismatch");
+    }
+
+    // ── move failing AFTER install: destination stays, retry only
+    // finishes cleanup ──
+    // Once the copy is verified and installed, a cleanup failure must
+    // (a) say the copy is intact, (b) leave it under its final name,
+    // and (c) let a retry redo ONLY the source cleanup.
+    {
+        var qdir_buf: [256]u8 = undefined;
+        const qdir = std.fmt.bufPrint(&qdir_buf, "{s}/quarantine-blocked", .{src_dir}) catch unreachable;
+        mkdirAt(qdir);
+        var qs_buf: [256]u8 = undefined;
+        const q_src = std.fmt.bufPrint(&qs_buf, "{s}/move-me.bin", .{qdir}) catch unreachable;
+        writePattern(q_src, 16 << 20, 0x47);
+        const want_q = fileSha(q_src) orelse fail("cross: blocked-move source hash");
+        var qd_buf: [256]u8 = undefined;
+        const q_dst = std.fmt.bufPrint(&qd_buf, "{s}/quarantine-blocked.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", q_src, "", q_dst, true, "qmove-1", .{
+            .delete_src = true,
+            .no_replace = true,
+            .transfer_token = "xfer-quarantine-blocked",
+        }) catch failErr("cross: start blocked move", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var blocker_ctx = QuarantineBlock{ .journal = journal, .parent = qdir };
+        const blocker = std.Thread.spawn(.{}, blockQuarantineDuringCopy, .{&blocker_ctx}) catch
+            fail("cross: quarantine blocker thread");
+        const first = collectJob(&fs, job, 120_000);
+        blocker.join();
+        var qz: [4096]u8 = undefined;
+        const restore_ok = c.chmod(pathz.pathZ(&qz, qdir) catch unreachable, 0o755) == 0;
+        if (!blocker_ctx.blocked) fail("cross: quarantine block did not land during the copy");
+        if (!restore_ok) fail("cross: could not restore blocked source parent");
+        if (!first.is("error")) fail("cross: blocked move reported success");
+        if (std.mem.indexOf(u8, first.messageText(), "complete and installed") == null)
+            failErr("cross: post-install failure did not say the copy is intact", first.messageText());
+        if (!exists(q_src)) fail("cross: blocked move lost its source");
+        const got_installed = fileSha(q_dst) orelse fail("cross: blocked move destination missing");
+        if (!std.mem.eql(u8, &got_installed, &want_q))
+            fail("cross: blocked move destination content mismatch");
+        const installed_ino = inodeOf(q_dst);
+        // The retry: cleanup only — same job, same installed inode.
+        const retry_job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", q_src, "", q_dst, true, "qmove-2", .{
+            .delete_src = true,
+            .no_replace = true,
+            .transfer_token = "xfer-quarantine-blocked",
+        }) catch failErr("cross: start blocked-move retry", fs.lastErr());
+        if (retry_job != job)
+            fail("cross: the cleanup retry minted a fresh job instead of restarting the failed one");
+        const second = collectJob(&fs, retry_job, 120_000);
+        if (!second.is("done")) failErr("cross: cleanup retry did not finish the move", second.messageText());
+        if (exists(q_src)) fail("cross: cleanup retry left the source behind");
+        if (inodeOf(q_dst) != installed_ino)
+            fail("cross: cleanup retry recopied the already-installed destination");
+        const got_final = fileSha(q_dst) orelse fail("cross: cleanup-retry destination hash");
+        if (!std.mem.eql(u8, &got_final, &want_q)) fail("cross: cleanup retry damaged the destination");
     }
     _ = c.unsetenv("SKETERM_SSH");
 
@@ -3738,6 +3942,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var thumb_cache_buf: [128:0]u8 = undefined;
     const thumb_cache = std.fmt.bufPrintZ(&thumb_cache_buf, "/tmp/sketerm-smoke-fs-cache-{d}", .{c.getpid()}) catch unreachable;
     _ = c.setenv("XDG_CACHE_HOME", thumb_cache.ptr, 1);
+    // Fs-job journals live under the STATE dir now (reboot-durable
+    // resume); isolate it or smoke daemons would journal into the real
+    // ~/.local/state and adopt each other's records across runs.
+    var state_buf: [128:0]u8 = undefined;
+    const state_dir = std.fmt.bufPrintZ(&state_buf, "/tmp/sketerm-smoke-fs-state-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.setenv("XDG_STATE_HOME", state_dir.ptr, 1);
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     defer if (gpa_state.deinit() == .leak) {
         std.debug.print("smoke-fs: FAIL — leaked memory (see GPA report above)\n", .{});

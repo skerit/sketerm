@@ -61,6 +61,11 @@ pub const Record = struct {
     /// Stable caller identity used to reconcile a submission whose
     /// reply was lost when the client disconnected.
     client_token: []const u8 = "",
+    /// Logical-transfer identity that survives attempt boundaries: the
+    /// client rotates `client_token` per attempt but keeps this one, so
+    /// a retry can adopt the failed job's journal (stage, quarantine,
+    /// phase) instead of orphaning the staged data under a fresh job.
+    transfer_token: []const u8 = "",
     /// The durable client ledger has recorded this terminal outcome.
     acknowledged: bool = false,
 };
@@ -163,6 +168,7 @@ test "job journal save/load is atomic and complete" {
         .files_done = 7,
         .files_total = 9,
         .client_token = "intent-42",
+        .transfer_token = "transfer-42",
         .conflict = "skip",
         .no_replace = true,
         .delete_src = true,
@@ -189,6 +195,7 @@ test "job journal save/load is atomic and complete" {
     try std.testing.expectEqual(@as(u64, 7), parsed.value.files_done);
     try std.testing.expectEqual(@as(u64, 9), parsed.value.files_total);
     try std.testing.expectEqualStrings("intent-42", parsed.value.client_token);
+    try std.testing.expectEqualStrings("transfer-42", parsed.value.transfer_token);
     try std.testing.expectEqualStrings("skip", parsed.value.conflict);
     try std.testing.expect(parsed.value.no_replace);
     try std.testing.expect(parsed.value.delete_src);

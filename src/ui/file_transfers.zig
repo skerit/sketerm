@@ -1436,6 +1436,9 @@ pub const Service = struct {
             .dst_host = it.dst_host,
             .@"resume" = true,
             .client_token = it.client_token,
+            // Stable across attempts: a capable daemon restarts the
+            // failed job (and its staged data) instead of duplicating.
+            .transfer_token = it.token,
         }) catch {
             _ = self.pending.pop();
             it.state = .queued;

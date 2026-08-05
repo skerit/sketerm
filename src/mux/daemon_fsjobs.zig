@@ -65,9 +65,36 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
     // Idempotent submission closes the crash window where the job
     // started but its reply never reached the caller. Claiming the
     // existing job also resumes its event stream after reconnect.
-    if (r.client_token.len > 0) {
-        for (self.fs_jobs.items) |existing| {
-            if (!std.mem.eql(u8, existing.client_token, r.client_token)) continue;
+    // A `transfer_token` match reaches further: the client rotates its
+    // per-attempt client_token, and without this a retry would mint a
+    // FRESH job whose randomized stage/quarantine can never adopt the
+    // failed attempt's staged data (the `.sketerm-copy-47` / `-50`
+    // orphan class). A failed transfer job is therefore RESTARTED from
+    // its own journal under its own id.
+    if (r.client_token.len > 0 or r.transfer_token.len > 0) {
+        const matched: ?*FsJob = for (self.fs_jobs.items) |existing| {
+            if (existing.ephemeral) continue;
+            if (r.client_token.len > 0 and std.mem.eql(u8, existing.client_token, r.client_token)) break existing;
+            if (r.transfer_token.len > 0 and existing.op == op and
+                std.mem.eql(u8, existing.transfer_token, r.transfer_token)) break existing;
+        } else null;
+        if (matched) |found| {
+            var existing = found;
+            const same_attempt = std.mem.eql(u8, existing.client_token, r.client_token);
+            if (!same_attempt and !existing.finished()) {
+                // A live job for this transfer: the "failure" the client
+                // retried on was its own view, not the job's. Adopt it.
+                if (self.allocator.dupe(u8, r.client_token)) |fresh| {
+                    self.allocator.free(existing.client_token);
+                    existing.client_token = fresh;
+                    journalFsJob(self, existing);
+                } else |_| {}
+            } else if (!same_attempt and existing.state == .failed and r.@"resume" and
+                (op == .cross_copy or op == .copy))
+            {
+                if (restartFsJobFromJournal(self, cl, existing, r.client_token)) |replacement|
+                    existing = replacement;
+            }
             if (existing.terminal_pending) {
                 saveFsJob(self, existing) catch return fsReplyErr(cl, r.req, "cannot persist terminal job state");
                 existing.terminal_pending = false;
@@ -116,6 +143,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .src_host = r.src_host,
         .dst_host = r.dst_host,
         .client_token = r.client_token,
+        .transfer_token = r.transfer_token,
         .resumable = r.@"resume",
         .within_ms = r.within_ms,
         .max_matches = r.max_matches,
@@ -136,6 +164,59 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
     }
     self.next_fs_job_id = job.id + 1;
     cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
+}
+
+/// Respawn a terminally-failed transfer job from its journal, keeping
+/// its id — and therefore its staged partials, destination stage,
+/// quarantine and durable move phase. The new attempt's client_token
+/// replaces the spent one. Returns null when the journal is gone or
+/// the respawn fails; the caller then replays the terminal state.
+fn restartFsJobFromJournal(self: *Daemon, cl: *Client, existing: *FsJob, client_token: []const u8) ?*FsJob {
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, existing.id }) catch return null;
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    const parsed = fsjournal.load(arena.allocator(), path) catch return null;
+    defer parsed.deinit();
+    const rec = parsed.value;
+    const op = fsOpFromName(rec.op) orelse return null;
+    const replacement = spawnFsJob(self, cl, op, rec.id, .{
+        .src = rec.src,
+        .dst = rec.dst,
+        .pattern = rec.pattern,
+        .src_host = rec.src_host,
+        .dst_host = rec.dst_host,
+        .client_token = client_token,
+        .transfer_token = rec.transfer_token,
+        .resumable = true,
+        .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
+        .delete_src = rec.delete_src,
+        .verify = rec.verify,
+        .phase = rec.phase,
+        .source_quarantine = rec.source_quarantine,
+        .destination_stage = rec.destination_stage,
+        .source_fingerprint = rec.source_fingerprint,
+        .source_kind = rec.source_kind,
+        .source_dev = rec.source_dev,
+        .source_ino = rec.source_ino,
+        .recovery_attempts = rec.recovery_attempts,
+        .done = rec.done,
+        .total = rec.total,
+        .resumed_from = rec.resumed_from,
+        .files_done = rec.files_done,
+        .files_total = rec.files_total,
+        .preserve_journal_on_failure = true,
+    }) catch return null;
+    // spawnFsJob appends; replace the spent job's slot so its id stays
+    // singular in the list and in job_list.
+    for (self.fs_jobs.items, 0..) |j, i| {
+        if (j != existing) continue;
+        self.fs_jobs.items[i] = replacement;
+        _ = self.fs_jobs.pop();
+        existing.deinit(false);
+        break;
+    }
+    return replacement;
 }
 
 /// Short-lived client-owned probes: no journal, no history, killed
@@ -161,6 +242,7 @@ pub const FsJobArgs = struct {
     src_host: []const u8 = "",
     dst_host: []const u8 = "",
     client_token: []const u8 = "",
+    transfer_token: []const u8 = "",
     resumable: bool = false,
     within_ms: u64 = 0,
     max_matches: u64 = 0,
@@ -225,6 +307,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .within_ms = within_ms,
         .max_matches = max_matches,
         .client_token = client_token,
+        .transfer_token = args.transfer_token,
         .mode = perm.mode,
         .uid = perm.uid,
         .gid = perm.gid,
@@ -269,6 +352,8 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
     errdefer if (!job_initialized) self.allocator.free(dst_host_owned);
     const client_token_owned = try self.allocator.dupe(u8, client_token);
     errdefer if (!job_initialized) self.allocator.free(client_token_owned);
+    const transfer_token_owned = try self.allocator.dupe(u8, args.transfer_token);
+    errdefer if (!job_initialized) self.allocator.free(transfer_token_owned);
     const conflict_owned = try self.allocator.dupe(u8, copy.conflict);
     errdefer if (!job_initialized) self.allocator.free(conflict_owned);
     const job = try self.allocator.create(FsJob);
@@ -318,6 +403,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .src_host = src_host_owned,
         .dst_host = dst_host_owned,
         .client_token = client_token_owned,
+        .transfer_token = transfer_token_owned,
         .conflict = conflict_owned,
         .no_replace = copy.no_replace,
         .resumable = resumable,
@@ -457,6 +543,7 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
         .files_total = job.files_total,
         .message = job.message[0..job.message_len],
         .client_token = job.client_token,
+        .transfer_token = job.transfer_token,
         .acknowledged = job.acknowledged,
     });
 }
@@ -480,6 +567,8 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
     errdefer self.allocator.free(dst_host);
     const client_token = self.allocator.dupe(u8, rec.client_token) catch return null;
     errdefer self.allocator.free(client_token);
+    const transfer_token = self.allocator.dupe(u8, rec.transfer_token) catch return null;
+    errdefer self.allocator.free(transfer_token);
     const conflict = self.allocator.dupe(u8, rec.conflict) catch return null;
     errdefer self.allocator.free(conflict);
     const job = self.allocator.create(FsJob) catch return null;
@@ -502,6 +591,7 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .src_host = src_host,
         .dst_host = dst_host,
         .client_token = client_token,
+        .transfer_token = transfer_token,
         .conflict = conflict,
         .no_replace = rec.no_replace,
         .acknowledged = rec.acknowledged,
@@ -582,6 +672,7 @@ pub fn restoreFsJobs(self: *Daemon) void {
                 .src_host = rec.src_host,
                 .dst_host = rec.dst_host,
                 .client_token = rec.client_token,
+                .transfer_token = rec.transfer_token,
                 .resumable = true,
                 .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
                 .delete_src = rec.delete_src,
@@ -711,6 +802,7 @@ pub fn restartCrashedFsJobs(self: *Daemon) void {
             .src_host = rec.src_host,
             .dst_host = rec.dst_host,
             .client_token = rec.client_token,
+            .transfer_token = rec.transfer_token,
             .resumable = true,
             .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
             .delete_src = true,
