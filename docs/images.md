@@ -73,6 +73,16 @@ API (main thread only — touches GL):
 ## Per-protocol semantics
 
 ### Sixel (DCS q)
+- `DCS P1 ; P2 ; P3 q` header params: P1 selects a pixel aspect ratio
+  from the VT330/VT340 macro table (0/1/5/6 = 2:1, 2 = 5:1, 3/4 = 3:1,
+  7/8/9 = 1:1), applied by whole-pixel replication; P2 = 0 or 2 fills
+  unpainted pixels with the current SGR background (a default
+  background stays transparent so a pane background image still shows),
+  P2 = 1 keeps them transparent; P3 (horizontal grid size) is ignored,
+  as it is everywhere else.
+- A `" Pan ; Pad ; Ph ; Pv` raster attribute overrides P1's ratio — it
+  states the ratio outright instead of selecting a macro — and sizes
+  the buffer via Ph/Pv.
 - One placement per received sixel stream.
 - Anchored at the cursor position at receive time.
 - `image_id` is synthetic (fresh, never reused).

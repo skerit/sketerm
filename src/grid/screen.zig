@@ -3070,6 +3070,19 @@ pub const Screen = struct {
         self.dirty = true;
     }
 
+    /// The fill colour for sixel background-select (DCS P2 = 0/2): the
+    /// current SGR background. `.default` returns null — an opaque box
+    /// in the default colour would hide a pane background image or
+    /// window transparency, whereas alpha 0 lets exactly the current
+    /// background through, which is what the parameter asks for.
+    fn sixelBackground(self: *Screen) ?[4]u8 {
+        return switch (self.pool.get(self.cur_style).bg) {
+            .default => null,
+            .palette => |p| .{ self.palette[p][0], self.palette[p][1], self.palette[p][2], 255 },
+            .rgb => |c| .{ c.r, c.g, c.b, 255 },
+        };
+    }
+
     fn onDcs(self: *Screen, d: Event.DcsFull) void {
         // DECRQSS: `DCS $ q <selector> ST` — request status string.
         if (d.proto.final == 'q' and d.proto.n_intermediates == 1 and d.proto.intermediates[0] == '$') {
@@ -3082,10 +3095,22 @@ pub const Screen = struct {
             self.handleXtgettcap(d.body);
             return;
         }
-        // Sixel: `DCS Pn ; Pn ; Pn q <body> ST`.
+        // Sixel: `DCS P1 ; P2 ; P3 q <body> ST`.
         if (d.proto.final == 'q' and d.proto.n_intermediates == 0) {
             const sixel = @import("../parser/sixel.zig");
-            const decoded = sixel.decode(self.allocator, d.body) catch return;
+            const p1: u32 = if (d.proto.n_params >= 1) d.proto.params[0] else 0;
+            const p2: u32 = if (d.proto.n_params >= 2) d.proto.params[1] else 0;
+            // P3 (horizontal grid size) is deliberately unread: DEC
+            // defined it for the VT240's device grid and no terminal
+            // since has acted on it.
+            const aspect = sixel.aspectFromP1(p1);
+            const decoded = sixel.decode(self.allocator, d.body, .{
+                .aspect_num = aspect[0],
+                .aspect_den = aspect[1],
+                // P2 = 1 keeps unpainted pixels transparent; 0 and 2
+                // both mean "current background colour".
+                .background = if (p2 == 1) null else self.sixelBackground(),
+            }) catch return;
             defer self.allocator.free(decoded.rgba);
             self.emitImage(.{
                 .width = decoded.width,
