@@ -12918,3 +12918,48 @@ same code emitting it. Attributes (colors/bold) still report empty.
 The macOS twin can adopt selection by reading the same snapshot
 fields. Verification: 1539 tests, test-core, mux-portable (ldd:
 libc/libm only), smoke-atspi PASS, smoke-e2e PASS.
+
+## Editor: editing verbs, multi-caret ergonomics, typing behaviour, canvas context menu
+
+The editor face grew the day-to-day editing verbs, all implemented
+GTK-free in `src/editor/commands.zig` over Document + SelectionSet:
+duplicate line/selection (up/down), move lines (blocks merge, edges
+no-op), join, sort, toggle line comment, indent/dedent, trim trailing
+whitespace, upper/lower/title case, go-to-line dialog, plus the
+multi-caret makers: select next/skip/all occurrences (Ctrl+D family),
+add caret above/below, split selection into line carets, and
+Shift+Alt+drag block selection (byte columns, no virtual space --
+documented in docs/editor-commands.md with the reasoning). Every
+command is ONE transaction through applyTransactionSel, so one undo
+step restores text AND selection across any caret count. Comment
+toggle resolves the prefix from the document's detected language
+(`Lang.lineComment`), never an extension table; JSON/Markdown report
+"no line-comment syntax" on the status line; mixed selections follow
+the all-commented-uncomments rule.
+
+Typing behaviour, each with an app-level config key defaulting on and
+a prefs row (Editor page, "Typing" group): `editor_auto_indent`
+(Enter deepens after an opening bracket, drops a pending closer onto
+its own line -- bracket adjacency only, no tree walk),
+`editor_auto_close_pairs` (pair insertion with type-over, surround-
+selection, backspace-pair; refuses before word chars, after word
+chars for quotes, and inside grammar-declared strings/comments; multi-
+caret is all-or-nothing), `editor_smart_backspace` (leading-space
+retreat to the previous tab stop).
+
+Bindings are a separate `editor_keybind.<command>` config namespace
+(never consulted by the terminal, so Ctrl+D can be Ctrl+D), resolved
+in syncConfig over defaults from commands.zig, editable on the prefs
+Keybindings page ("Editor Commands" group), and every command appears
+in the command palette (with its chord) when the focused pane wears
+an editor face. `src/ui/editormenu.zig` adds the canvas right-click
+menu (ui/menu.zig idiom): cut/copy/paste/select-all, the new
+commands, LSP rows shown only while a server is attached, folding,
+find/replace/goto-line; rows that cannot act are insensitive.
+
+Verification: 1618 unit tests (46 new in commands.zig + config
+round-trips), test-core 1385, smoke-editor, smoke-lsp-gui, smoke-e2e,
+mux-portable (ldd libc/libm only) + aarch64-macos cross all green;
+driven live on the mux display rig with screenshots (context menu,
+Ctrl+D multi-caret, Ctrl+/ on a real Zig file, auto-close + type-over
++ wrap-closer Enter, smart backspace, Ctrl+G line:col).
