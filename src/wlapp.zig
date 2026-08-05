@@ -100,6 +100,11 @@ const PNG_FILTERS = [_]fpicker.Filter{.{ .label = "PNG images", .patterns = &.{"
 const GIF_FILTERS = [_]fpicker.Filter{.{ .label = "GIF animations", .patterns = &.{"*.gif"} }};
 const WEBM_FILTERS = [_]fpicker.Filter{.{ .label = "WebM videos", .patterns = &.{"*.webm"} }};
 
+/// A window named across app connections: the connection's session id
+/// plus a surface id in THAT connection's space. Neither half is
+/// unique on its own.
+pub const ForeignRef = struct { conn: u32, surface: u32 };
+
 pub const AppHost = struct {
     allocator: std.mem.Allocator,
     comp: Compositor,
@@ -187,6 +192,31 @@ pub const AppHost = struct {
     /// parent. Also the live source of truth for re-parenting. 0 = the
     /// parent was unset.
     pending_parents: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Surface → the SESSION-WIDE identity of its xdg-foreign parent.
+    /// Same latch-then-apply story as `pending_parents`, except the
+    /// parent may belong to a DIFFERENT app connection of the same
+    /// session, hence a different AppHost — so resolving it goes
+    /// through `foreign_resolve`, not through `self.windows`. An entry
+    /// here outranks `pending_parents` for the same surface: a client
+    /// that used both meant the foreign one (the local set_parent is
+    /// its fallback for compositors without xdg-foreign).
+    foreign_parents: std.AutoHashMapUnmanaged(u32, ForeignRef) = .empty,
+    /// Surface → xdg-dialog modality, latched the same way.
+    pending_modals: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// This app connection's id inside its session (the mux channel
+    /// id). Half of the (connection, surface) window identity that
+    /// xdg-foreign relations are expressed in.
+    conn_id: u32 = 0,
+    /// Resolve a session-wide window identity to its host GtkWindow —
+    /// implemented by the Terminal, which owns every app channel of
+    /// the session. Null while unwired (a standalone AppHost then
+    /// simply resolves nothing cross-connection).
+    foreign_resolve: ?*const fn (ctx: ?*anyopaque, conn: u32, surface: u32) ?*c.GtkWindow = null,
+    /// One of THIS host's toplevels appeared (`gone` false) or is
+    /// about to be destroyed (`gone` true). Sibling hosts may have
+    /// children latched onto it and need to bind or release them.
+    foreign_changed: ?*const fn (ctx: ?*anyopaque, conn: u32, surface: u32, gone: bool) void = null,
+    foreign_ctx: ?*anyopaque = null,
     /// Icon textures that arrived BEFORE the first frame (the usual
     /// order — the daemon injects the icon right after the app_id,
     /// before any buffer commit). Owned refs; moved to the Win in
@@ -681,6 +711,8 @@ pub const AppHost = struct {
             .input_region = onInputRegion,
             .toplevel_geometry = onGeometry,
             .toplevel_parent = onParent,
+            .toplevel_foreign_parent = onForeignParent,
+            .toplevel_modal = onModal,
             .toplevel_min_size = onMinSize,
             .toplevel_state_request = onStateRequest,
             .clipboard_offer = onClipOffer,
@@ -784,6 +816,8 @@ pub const AppHost = struct {
         self.pending_icons.deinit(self.allocator);
         self.pending_ssd.deinit(self.allocator);
         self.pending_parents.deinit(self.allocator);
+        self.foreign_parents.deinit(self.allocator);
+        self.pending_modals.deinit(self.allocator);
         self.geos.deinit(self.allocator);
         self.fetch_kinds.deinit(self.allocator);
         if (self.pending_reads > 0) {
@@ -1525,6 +1559,14 @@ pub const AppHost = struct {
         while (pvit.next()) |v| {
             if (v.* == surface) v.* = 0;
         }
+        _ = self.foreign_parents.remove(surface);
+        _ = self.pending_modals.remove(surface);
+        // Release every child of this window before it is destroyed —
+        // a dead GtkWindow must not stay anyone's transient parent,
+        // here or in another connection's host.
+        const ref = ForeignRef{ .conn = self.conn_id, .surface = surface };
+        self.refreshForeignChildrenOf(ref, true);
+        if (self.foreign_changed) |f| f(self.foreign_ctx, ref.conn, ref.surface, true);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
         if (win.embedded) {
@@ -1637,8 +1679,15 @@ pub const AppHost = struct {
         // both as a child (our parent may already be up) and as a
         // parent (children that raced ahead of us can now bind).
         self.applyParent(surface);
+        self.applyModal(surface);
         var pit = self.pending_parents.iterator();
         while (pit.next()) |e| if (e.value_ptr.* == surface) self.applyParent(e.key_ptr.*);
+        // Children in OTHER connections of this session may have been
+        // waiting for exactly this window (the portal case: the dialog
+        // process imports the caller's toplevel long before the caller
+        // has painted anything).
+        self.refreshForeignChildrenOf(.{ .conn = self.conn_id, .surface = surface }, false);
+        if (self.foreign_changed) |f| f(self.foreign_ctx, self.conn_id, surface, false);
 
         // Only the FIRST toplevel embeds; dialogs and secondary
         // windows always float (transient over the embedded view).
@@ -2105,21 +2154,100 @@ pub const AppHost = struct {
         self.applyParent(surface);
     }
 
+    /// zxdg_imported_v2.set_parent_of, resolved by the daemon brain
+    /// into a session-wide window identity. Same latch-then-apply
+    /// shape as onParent — the child's window usually does not exist
+    /// yet, and neither may the parent's.
+    fn onForeignParent(ctx: ?*anyopaque, surface: u32, conn: u32, parent: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        if (conn == 0 or parent == 0) {
+            _ = self.foreign_parents.remove(surface);
+        } else {
+            self.foreign_parents.put(self.allocator, surface, .{ .conn = conn, .surface = parent }) catch {
+                std.debug.print("wlapp: OOM latching foreign parent for surface#{d} — dialog will open standalone\n", .{surface});
+                return;
+            };
+        }
+        self.applyParent(surface);
+    }
+
+    /// xdg_dialog_v1 set_modal/unset_modal.
+    fn onModal(ctx: ?*anyopaque, surface: u32, modal: bool) void {
+        const self = cast.userData(AppHost, ctx);
+        self.pending_modals.put(self.allocator, surface, modal) catch return;
+        self.applyModal(surface);
+    }
+
+    fn applyModal(self: *AppHost, surface: u32) void {
+        const win = self.windows.get(surface) orelse return;
+        const modal = self.pending_modals.get(surface) orelse return;
+        c.gtk_window_set_modal(win.window, @intFromBool(modal));
+    }
+
+    /// The GtkWindow hosting `surface`, for a sibling AppHost holding a
+    /// cross-connection relation onto it.
+    pub fn windowForSurface(self: *AppHost, surface: u32) ?*c.GtkWindow {
+        const win = self.windows.get(surface) orelse return null;
+        return win.window;
+    }
+
+    /// A window named by `ref` appeared or vanished somewhere in this
+    /// session: rebind (or release) every child of ours latched onto
+    /// it. Release is explicit because a destroyed GtkWindow must not
+    /// stay anyone's transient parent.
+    pub fn refreshForeignChildrenOf(self: *AppHost, ref: ForeignRef, gone: bool) void {
+        var it = self.foreign_parents.iterator();
+        while (it.next()) |e| {
+            const v = e.value_ptr.*;
+            if (v.conn != ref.conn or v.surface != ref.surface) continue;
+            const child = e.key_ptr.*;
+            if (!gone) {
+                self.applyParent(child);
+            } else if (self.windows.get(child)) |win| {
+                c.gtk_window_set_transient_for(win.window, null);
+            }
+        }
+    }
+
+    /// Resolve the effective parent GtkWindow for `surface`: the
+    /// xdg-foreign relation if there is one (it may name a window
+    /// owned by another connection's AppHost), else the plain
+    /// xdg_toplevel.set_parent latch. Null = no parent is known here.
+    fn parentWindowFor(self: *AppHost, surface: u32) ?*c.GtkWindow {
+        if (self.foreign_parents.get(surface)) |ref| {
+            if (ref.conn == self.conn_id) {
+                if (self.windowForSurface(ref.surface)) |w| return w;
+                // Same connection: fall through to the local latch
+                // rather than to another host's answer.
+                return null;
+            }
+            const resolve = self.foreign_resolve orelse return null;
+            return resolve(self.foreign_ctx, ref.conn, ref.surface);
+        }
+        const parent = self.pending_parents.get(surface) orelse return null;
+        if (parent == 0) return null;
+        const p = self.windows.get(parent) orelse return null;
+        return p.window;
+    }
+
     /// Set (or clear) a window's transient-for from the latched parent,
     /// once the child window exists. The parent window may still be
     /// absent (frames race) — leave it unset until its winFor sweep
     /// picks up this child.
     fn applyParent(self: *AppHost, surface: u32) void {
         const win = self.windows.get(surface) orelse return;
-        const parent = self.pending_parents.get(surface) orelse return;
-        if (parent == 0) {
+        const foreign = self.foreign_parents.get(surface);
+        const local = self.pending_parents.get(surface);
+        if (foreign == null and local == null) return;
+        // An explicit clear (set_parent(null), or a revoked export) is
+        // the only thing that unsets transient-for. An unresolvable
+        // parent means "not built yet": the parent's own arrival sweep
+        // applies this latch later.
+        if (self.parentWindowFor(surface)) |p| {
+            c.gtk_window_set_transient_for(win.window, p);
+        } else if (foreign == null and local.? == 0) {
             c.gtk_window_set_transient_for(win.window, null);
-            return;
         }
-        // Parent window not built yet: keep whatever transient-for the
-        // child has — the parent's winFor sweep applies this latch later.
-        const p = self.windows.get(parent) orelse return;
-        c.gtk_window_set_transient_for(win.window, p.window);
     }
 
     fn onMinSize(ctx: ?*anyopaque, surface: u32, mw: i32, mh: i32) void {

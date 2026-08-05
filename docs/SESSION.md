@@ -12673,3 +12673,86 @@ so `gitstat.ensurePoll` re-polls a repository root on a timer paced at
 face that is not mapped. Focus is deliberately NOT part of that gate: a
 wrong badge in a visible unfocused window is still wrong, and window
 activation is not a state the GUI can rely on resolving.
+
+## Cross-connection window parenting: xdg-foreign that reaches the GUI
+
+xdg-foreign already worked at the protocol level -- one client of a
+session exported a toplevel, another imported the handle, and
+`sketerm portal` stopped hearing "Server is missing xdg_foreign
+support". What it did NOT do was reach the window: the relation was
+recorded in compositor state and the view was told only when both ends
+happened to be the same client connection. The portal case is by
+construction two connections, so the dialog opened as an unparented
+taskbar window.
+
+**The identity problem.** `View.toplevel_parent` carries a surface id,
+and surface ids are per-connection: a compositor cannot name a surface
+owned by another connection. Three answers were considered. Minting a
+new session-wide window id was rejected -- a fresh id space needs an
+owner, a lifetime and a reconnect story, all of which already exist
+somewhere else. Keying on the xdg-foreign HANDLE was rejected for a
+sharper reason: a replica re-parsing `export_toplevel` mints its own
+handle from its own entropy, so the handle an app then imports never
+resolves on the viewer side; handles are brain-private by
+construction. What shipped reuses what both ends already agree on --
+the app channel's id. `Compositor.conn_id` is set to `Channel.id`, so
+`(conn_id, surface)` names a window session-wide with no new id space,
+no new lifetime, and no new failure mode: the channel closing IS the
+window going away.
+
+**Daemon-authoritative, like the icons.** The brain resolves the
+import and fires `View.toplevel_foreign_parent(child, conn, parent)`;
+the daemon turns that into a `foreign_parent` pipe unit toward the
+viewer (child sid, parent connection id, parent sid), injected exactly
+like `toplevel_icon` and replayed on reattach from
+`Native.foreign_parents`. The GUI latches it per surface and resolves
+the connection half through `Terminal` -- every app channel of a
+session rides one mux connection, so the sibling `AppHost` is always
+one list walk away -- then applies `gtk_window_set_transient_for`.
+Windows race in both directions (a dialog sets its parent before
+either window has painted), so both sides sweep: a new window rebinds
+children latched onto it, and a dying one releases them.
+
+**One mechanism, not two.** `importedSetParentOf` no longer writes
+`Surface.tl_parent` for a same-connection import. `tl_parent` is
+`xdg_toplevel.set_parent` and nothing else; every foreign relation,
+local or cross-connection, now travels the same path. The GUI resolves
+an effective parent per surface with the foreign latch outranking the
+local one, so a client that sends both gets the one it meant.
+
+**Modality, because nothing else could express it.** xdg-shell has no
+modality request at all -- `xdg_wm_dialog_v1` is it, and GTK4 binds it
+for every `gtk_window_set_modal` dialog. Withholding it does not make a
+dialog non-modal, it makes modality unannounceable, so it is now
+advertised: `set_modal`/`unset_modal` land as `View.toplevel_modal` and
+become `gtk_window_set_modal` on the host window.
+
+**Skew, both directions.** The bind latches `used_dialog` and raises
+`Session.native_state_min` to 11, so a v10 viewer stops receiving a
+session's app channels the moment an app binds xdg-dialog rather than
+dying on an interface its tables do not contain -- the same gate
+xdg-foreign got at v10 and dmabuf feedback at v8. State-sync v11 adds
+`Surface.modal` plus the live dialog objects and downgrades cleanly to
+v10 (one byte per surface and one table count shorter). In the other
+direction a new viewer against an old daemon simply never receives a
+`foreign_parent` unit and behaves as before; and an old viewer that
+does receive one skips the unknown tag, because pipe tags are
+append-only and unknown ones skip cleanly.
+
+**Proven end to end, not merely handshaken.** A GTK4 exporter and a
+separate GTK4 importer process (real GDK: `export_handle` /
+`set_transient_for_exported`, the portal's own code path) ran as one
+forwarded app session inside a sketerm GUI, which itself rendered into
+a sketerm display session. The daemon log shows the app session
+resolving `chan=4 surface=34 <- chan=1 surface=34`, and then the GUI's
+OWN connection to the outer display emitting
+`set_parent surface=91 parent=82` and `set_modal surface=91
+modal=true` -- i.e. a real transient-for and a real modal on the host
+windows, not just protocol bookkeeping. Killing the exporter produced
+the clear on both layers (`<- chan=0 surface=0`, then
+`set_parent parent=0`), leaving no stuck modal. A brand-new GUI
+process handed the already-parented session rebuilt both from the
+reattach replay alone. `set_parent`/`set_modal`/`xdg-foreign parent`
+are now `SKETERM_MUX_LOG=debug` lines for exactly this reason: window
+parenting is the one relation with no visible trace when it silently
+fails.

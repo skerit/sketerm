@@ -1157,6 +1157,13 @@ pub const Native = struct {
     skipped: std.AutoHashMapUnmanaged(u32, ?wltrack.RowRange) = .empty,
     /// Current surface id -> shipped icon bytes for durable reattach.
     surface_icons: SurfaceIconCache = .{},
+    /// Resolved xdg-foreign relations owned by THIS channel's surfaces:
+    /// child surface id -> (exporting channel id, exported surface id).
+    /// Daemon-side only (the brain's handle namespace never crosses the
+    /// wire), and replayed to every attaching viewer.
+    foreign_parents: std.AutoHashMapUnmanaged(u32, ForeignParent) = .empty,
+
+    pub const ForeignParent = struct { conn: u32, surface: u32 };
 
     const VideoSurface = struct {
         churn: churnmod.Tracker,
@@ -1339,6 +1346,7 @@ pub const Native = struct {
         self.vblob.deinit(self.allocator);
         self.pixscratch.deinit(self.allocator);
         self.surface_icons.deinit(self.allocator);
+        self.foreign_parents.deinit(self.allocator);
         self.tracker.deinit();
         self.allocator.destroy(self);
     }
@@ -2755,6 +2763,60 @@ pub const Daemon = struct {
     fn onBrainGone(ctx: ?*anyopaque, sid: u32) void {
         const nv: *Native = @ptrCast(@alignCast(ctx.?));
         nv.surface_icons.remove(nv.allocator, sid);
+        _ = nv.foreign_parents.remove(sid);
+    }
+
+    /// xdg_toplevel.set_parent, logged only. Window parenting is the
+    /// one relation with no visible trace when it silently fails ("my
+    /// dialog opened as its own taskbar window"), and this is where
+    /// both halves of it are observable: an app's own set_parent here,
+    /// and the GUI's resulting transient-for when the GUI is itself a
+    /// client of a sketerm display session.
+    fn onBrainParent(ctx: ?*anyopaque, sid: u32, parent: u32) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const ch = nv.chan orelse return;
+        log.debug("set_parent: chan={d} surface={d} parent={d} (session '{s}')", .{
+            ch.id, sid, parent, if (ch.session) |s| s.name else "?",
+        });
+    }
+
+    /// xdg-dialog modality, logged only — the twin of onBrainParent
+    /// and just as invisible when it silently does not happen.
+    fn onBrainModal(ctx: ?*anyopaque, sid: u32, modal: bool) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const ch = nv.chan orelse return;
+        log.debug("set_modal: chan={d} surface={d} modal={} (session '{s}')", .{
+            ch.id, sid, modal, if (ch.session) |s| s.name else "?",
+        });
+    }
+
+    /// The brain resolved (or dropped) an xdg-foreign parent for one of
+    /// this connection's toplevels. Handles never leave the daemon:
+    /// the viewer is told the session-wide identity of the parent
+    /// window instead — the EXPORTING channel's id plus its surface id,
+    /// which is exactly what the viewer knows that window by.
+    ///
+    /// This fires from inside another channel's feed whenever the
+    /// exporting client is the one that moved (a revoked export clears
+    /// every importer), so it must not assume `ch` is the channel
+    /// currently being served. Queuing toward the mux client is safe
+    /// there — unlike brain output, which needs `foreign_flush_pending`.
+    fn onBrainForeignParent(ctx: ?*anyopaque, sid: u32, conn: u32, parent: u32) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const self = nv.daemon orelse return;
+        const ch = nv.chan orelse return;
+        if (conn == 0 or parent == 0) {
+            if (nv.foreign_parents.fetchRemove(sid) == null) return;
+        } else {
+            nv.foreign_parents.put(self.allocator, sid, .{ .conn = conn, .surface = parent }) catch return;
+        }
+        log.debug("xdg-foreign parent: chan={d} surface={d} <- chan={d} surface={d} (session '{s}')", .{
+            ch.id, sid, conn, parent, if (ch.session) |s| s.name else "?",
+        });
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(self.allocator);
+        wlpipe.appendForeignParent(&unit, self.allocator, sid, conn, parent) catch return;
+        if (!ch.dead) self.queueUnits(ch, unit.items);
     }
 
     pub fn nativeViewer(cl: *const Client, s: *const Session) bool {
@@ -2970,10 +3032,14 @@ pub const Daemon = struct {
         // announces its app_id. Stable pointers (native/ch are heap).
         native.daemon = self;
         native.chan = ch;
+        brain.conn_id = ch.id;
         brain.view = .{
             .ctx = native,
             .toplevel_app_id = onBrainAppId,
             .toplevel_gone = onBrainGone,
+            .toplevel_parent = onBrainParent,
+            .toplevel_foreign_parent = onBrainForeignParent,
+            .toplevel_modal = onBrainModal,
         };
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
@@ -3414,6 +3480,26 @@ pub const Daemon = struct {
             if (ok) nv.surface_icons.appendReplay(&units, self.allocator) catch {
                 ok = false;
             };
+            // Neither are foreign parents: they resolve against the
+            // brain's handle namespace, which never crosses the wire.
+            // The parent may live on a channel this client has not been
+            // told about yet — the viewer latches unresolved relations
+            // and applies them when that window appears.
+            if (ok) {
+                var fit = nv.foreign_parents.iterator();
+                while (fit.next()) |e| {
+                    wlpipe.appendForeignParent(
+                        &units,
+                        self.allocator,
+                        e.key_ptr.*,
+                        e.value_ptr.conn,
+                        e.value_ptr.surface,
+                    ) catch {
+                        ok = false;
+                        break;
+                    };
+                }
+            }
             if (!ok) {
                 cl.dead = true;
                 return;

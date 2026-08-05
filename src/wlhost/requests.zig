@@ -105,6 +105,9 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
         // xdg-foreign interfaces at all, so even this bind is fatal.
         if (g.iface == &protocol.zxdg_exporter_v2 or g.iface == &protocol.zxdg_importer_v2)
             self.used_foreign = true;
+        // ... and one more, for xdg-dialog: a v10 replica has no
+        // xdg_wm_dialog_v1 in its tables either.
+        if (g.iface == &protocol.xdg_wm_dialog_v1) self.used_dialog = true;
         if (g.iface == &protocol.wl_seat) self.seat_version = ver;
         if (g.iface == &protocol.wl_compositor) self.compositor_version = ver;
         if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
@@ -583,6 +586,23 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
             const child = (try it.next()).?.object;
             try self.importedSetParentOf(hdr.object, child);
         },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.xdg_wm_dialog_v1) switch (hdr.opcode) {
+        0 => try self.destroyObject(hdr.object), // destroy
+        1 => { // get_xdg_dialog(id, toplevel)
+            const id = (try it.next()).?.new_id;
+            const toplevel = (try it.next()).?.object;
+            try self.register(id, &protocol.xdg_dialog_v1);
+            try self.dialogCreate(id, toplevel);
+        },
+        else => return Error.Protocol,
+    } else if (iface == &protocol.xdg_dialog_v1) switch (hdr.opcode) {
+        0 => { // destroy
+            self.dialogDrop(hdr.object);
+            try self.destroyObject(hdr.object);
+        },
+        1 => self.dialogSetModal(hdr.object, true), // set_modal
+        2 => self.dialogSetModal(hdr.object, false), // unset_modal
         else => return Error.Protocol,
     } else if (iface == &protocol.wl_data_device_manager) switch (hdr.opcode) {
         0 => { // create_data_source

@@ -171,6 +171,11 @@ pub fn nativeProcess(self: *Daemon, ch: *Channel) void {
             if (ch.session) |s|
                 s.native_state_min = @max(s.native_state_min, wire.FOREIGN_STATE_VERSION);
         }
+        // ... and for xdg-dialog, one version later again.
+        if (nv.brain.used_dialog) {
+            if (ch.session) |s|
+                s.native_state_min = @max(s.native_state_min, wire.DIALOG_STATE_VERSION);
+        }
         flushBrain(self, ch);
     }
     if (units.items.len > 0 and !ch.dead) queueUnits(self, ch, units.items);

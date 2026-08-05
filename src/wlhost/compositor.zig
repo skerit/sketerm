@@ -113,6 +113,21 @@ pub const View = struct {
     /// xdg_toplevel.set_parent — dialogs become transient for
     /// their parent's host window (0 clears).
     toplevel_parent: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32) void = null,
+    /// zxdg_imported_v2.set_parent_of — the SESSION-WIDE form of
+    /// set_parent: `conn` names the connection that exported the
+    /// parent toplevel (`Compositor.conn_id`; equal to this
+    /// compositor's own id when both ends are one client) and
+    /// `parent` is a surface id in THAT connection's space. Both zero
+    /// clears the relationship.
+    ///
+    /// Fired by the AUTHORITATIVE brain when it resolves the import,
+    /// and by a replica when the daemon replays the resolved relation
+    /// as a `foreign_parent` pipe unit — a replica cannot resolve the
+    /// handle itself, since handles are minted by the brain.
+    toplevel_foreign_parent: ?*const fn (ctx: ?*anyopaque, surface: u32, conn: u32, parent: u32) void = null,
+    /// xdg_dialog_v1 set_modal/unset_modal: the toplevel wants to
+    /// block input to the rest of its (foreign or local) parent chain.
+    toplevel_modal: ?*const fn (ctx: ?*anyopaque, surface: u32, modal: bool) void = null,
     /// xdg_toplevel.set_min_size (0 = unset).
     toplevel_min_size: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32) void = null,
     /// App-initiated window ops: 1 maximize, 2 unmaximize,
@@ -187,19 +202,19 @@ pub const ForeignImport = struct {
     child: u32 = 0,
     live: bool = true,
 
-    /// Undo whatever this import established on its child, telling the
-    /// child's own view when the relationship was one it could see.
+    /// Undo whatever this import established on its child. Always
+    /// reported to the owner's view: the relationship is one the view
+    /// acted on whether or not the parent was the same connection.
     fn clearParent(imp: *ForeignImport) void {
         if (imp.child == 0) return;
         const child = imp.child;
         imp.child = 0;
         const surf = imp.owner.surfaces.getPtr(child) orelse return;
+        if (surf.foreign_parent == 0 and surf.foreign_parent_conn == 0) return;
         surf.foreign_parent = 0;
         surf.foreign_parent_remote = false;
-        if (surf.tl_parent != 0) {
-            surf.tl_parent = 0;
-            if (imp.owner.view.toplevel_parent) |cb| cb(imp.owner.view.ctx, child, 0);
-        }
+        surf.foreign_parent_conn = 0;
+        imp.owner.emitForeignParent(child, 0, 0);
     }
 };
 
@@ -373,6 +388,10 @@ pub const globals = [_]Global{
     // v1-only (GTK3 has no xdg-foreign at all).
     .{ .name = 25, .iface = &protocol.zxdg_exporter_v2, .version = 1 },
     .{ .name = 26, .iface = &protocol.zxdg_importer_v2, .version = 1 },
+    // xdg-dialog: the only modality request in xdg-shell. Withholding
+    // it does not make a dialog non-modal, it makes it unannounceable
+    // — the app has no other way to say so.
+    .{ .name = 27, .iface = &protocol.xdg_wm_dialog_v1, .version = 1 },
 };
 
 const Pool = struct {
@@ -483,6 +502,10 @@ pub const Surface = struct {
     foreign_parent: u32 = 0,
     /// True when `foreign_parent` lives in another client connection.
     foreign_parent_remote: bool = false,
+    /// Connection that owns `foreign_parent` (`Compositor.conn_id`).
+    foreign_parent_conn: u32 = 0,
+    /// xdg_dialog_v1.set_modal is in effect for this toplevel.
+    modal: bool = false,
 
     pub fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
         self.frame_cbs.deinit(a);
@@ -708,6 +731,19 @@ pub const Compositor = struct {
     /// zxdg_exporter_v2 cannot even parse the bind, let alone restore
     /// a state blob naming the interface.
     used_foreign: bool = false,
+    /// The app bound xdg_wm_dialog_v1. Same viewer gate again, one
+    /// version later: a v10 replica's tables have neither
+    /// xdg_wm_dialog_v1 nor xdg_dialog_v1, so the bind alone is fatal
+    /// there and a state blob naming either interface is unrestorable.
+    used_dialog: bool = false,
+    /// Identifies this connection inside its session. The daemon sets
+    /// it to the app channel's id, which is the SAME number the viewer
+    /// knows the channel by — so it doubles as the connection half of
+    /// a session-wide window identity (conn_id, surface id). Zero on a
+    /// standalone compositor.
+    conn_id: u32 = 0,
+    /// Live xdg_dialog_v1 objects: object id -> the surface it wraps.
+    dialogs: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Handle namespace for xdg-foreign. Left null, every compositor
     /// exports into its own `foreign_local` and only its own client can
     /// import — pointing every connection of a session at one shared
@@ -805,6 +841,7 @@ pub const Compositor = struct {
         // sends below need this compositor's queue to still exist.
         self.foreignPurgeClient();
         self.foreign_local.deinit();
+        self.dialogs.deinit(a);
         self.out.deinit(a);
         self.inbuf.deinit(a);
         self.objects.deinit(a);
@@ -1667,6 +1704,23 @@ pub const Compositor = struct {
                     if (self.view.toplevel_icon) |cb| cb(self.view.ctx, sid, kind, payload[5..]);
                 }
             },
+            .foreign_parent => {
+                // The brain's resolved answer, which a replica cannot
+                // compute: record it on the surface (so a later
+                // serialize/inspect agrees) and hand the view the
+                // session-wide (connection, surface) identity.
+                if (payload.len >= 12) {
+                    const sid = std.mem.readInt(u32, payload[0..4], .little);
+                    const conn = std.mem.readInt(u32, payload[4..8], .little);
+                    const parent = std.mem.readInt(u32, payload[8..12], .little);
+                    if (self.surfaces.getPtr(sid)) |surf| {
+                        surf.foreign_parent = parent;
+                        surf.foreign_parent_conn = conn;
+                        surf.foreign_parent_remote = conn != self.conn_id;
+                    }
+                    if (self.view.toplevel_foreign_parent) |cb| cb(self.view.ctx, sid, conn, parent);
+                }
+            },
             else => {}, // forward compat
         }
     }
@@ -2143,6 +2197,7 @@ pub const Compositor = struct {
 
     pub fn notifyGone(self: *Compositor, sid: u32) void {
         self.foreignSurfaceGone(sid);
+        self.dialogSurfaceGone(sid);
         if (self.view.toplevel_gone) |cb| cb(self.view.ctx, sid);
     }
 
@@ -2244,11 +2299,23 @@ pub const Compositor = struct {
         try self.send(try b.finish());
     }
 
-    /// zxdg_imported_v2.set_parent_of. Realised through exactly the
-    /// same state as xdg_toplevel.set_parent when the exporter is this
-    /// client (`Surface.tl_parent` + the toplevel_parent View
-    /// callback). Across clients the parent surface has no id in this
-    /// compositor's space, so only `Surface.foreign_parent` records it.
+    /// Report a foreign parent relation to the view. Silent on a
+    /// replica: a replica cannot mint or resolve handles (they are the
+    /// brain's entropy), so its own import bookkeeping is meaningless
+    /// and the authoritative answer arrives as a `foreign_parent` pipe
+    /// unit instead, which lands in `feedUnit`.
+    fn emitForeignParent(self: *Compositor, child: u32, conn: u32, parent: u32) void {
+        if (self.lenient) return;
+        if (self.view.toplevel_foreign_parent) |cb| cb(self.view.ctx, child, conn, parent);
+    }
+
+    /// zxdg_imported_v2.set_parent_of. One path for both cases: the
+    /// relation is recorded as `Surface.foreign_parent` plus the
+    /// exporting connection's id and reported through
+    /// `toplevel_foreign_parent`, whether or not the exporter is this
+    /// same client. `Surface.tl_parent` stays reserved for
+    /// xdg_toplevel.set_parent, so the two mechanisms never fight over
+    /// one field.
     pub fn importedSetParentOf(self: *Compositor, imported: u32, child: u32) Error!void {
         const child_is_toplevel = if (self.surfaces.get(child)) |s| s.toplevel != 0 else false;
         if (!child_is_toplevel) {
@@ -2269,10 +2336,8 @@ pub const Compositor = struct {
         const surf = self.surfaces.getPtr(child) orelse return;
         surf.foreign_parent = exp.surface;
         surf.foreign_parent_remote = exp.owner != self;
-        if (exp.owner == self) {
-            surf.tl_parent = exp.surface;
-            if (self.view.toplevel_parent) |cb| cb(self.view.ctx, child, exp.surface);
-        }
+        surf.foreign_parent_conn = exp.owner.conn_id;
+        self.emitForeignParent(child, exp.owner.conn_id, exp.surface);
     }
 
     /// Revoke an export: every importer holding the handle is told
@@ -2354,6 +2419,52 @@ pub const Compositor = struct {
         }
     }
 
+    // ── xdg-dialog v1 ───────────────────────────────────────────
+
+    /// xdg_wm_dialog_v1.get_xdg_dialog. `toplevel` is an xdg_toplevel
+    /// object id; the dialog object is bound to the surface behind it.
+    pub fn dialogCreate(self: *Compositor, id: u32, toplevel: u32) Error!void {
+        const sid = self.xdg_map.get(toplevel) orelse {
+            // The toplevel must exist per spec; a replica re-parsing an
+            // authoritative stream still tracks the object so the id
+            // space stays in step.
+            if (self.lenient) return;
+            return Error.Protocol;
+        };
+        try self.dialogs.put(self.allocator, id, sid);
+    }
+
+    /// xdg_dialog_v1.set_modal / unset_modal.
+    pub fn dialogSetModal(self: *Compositor, id: u32, modal: bool) void {
+        const sid = self.dialogs.get(id) orelse return;
+        const surf = self.surfaces.getPtr(sid) orelse return;
+        if (surf.modal == modal) return;
+        surf.modal = modal;
+        if (self.view.toplevel_modal) |cb| cb(self.view.ctx, sid, modal);
+    }
+
+    /// xdg_dialog_v1.destroy — modality dies with the object.
+    pub fn dialogDrop(self: *Compositor, id: u32) void {
+        const entry = self.dialogs.fetchRemove(id) orelse return;
+        self.dialogSetModalSurface(entry.value, false);
+    }
+
+    /// A surface lost its dialog object (or its toplevel role).
+    fn dialogSetModalSurface(self: *Compositor, sid: u32, modal: bool) void {
+        const surf = self.surfaces.getPtr(sid) orelse return;
+        if (surf.modal == modal) return;
+        surf.modal = modal;
+        if (self.view.toplevel_modal) |cb| cb(self.view.ctx, sid, modal);
+    }
+
+    /// Drop any dialog object bound to a dying surface.
+    fn dialogSurfaceGone(self: *Compositor, sid: u32) void {
+        var it = self.dialogs.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* == sid) e.value_ptr.* = 0;
+        }
+    }
+
     pub fn nextSerial(self: *Compositor) u32 {
         self.serial +%= 1;
         return self.serial;
@@ -2403,7 +2514,11 @@ pub const Compositor = struct {
     // are fatal there. Foreign relations themselves are NOT serialized
     // — the brain is the authority for them and a replica only needs to
     // keep parsing.
-    const state_sync_version: u8 = 10;
+    // v11 adds the surface's xdg-dialog modality flag AND is the
+    // capability signal for xdg-dialog: a v10 replica has neither
+    // xdg_wm_dialog_v1 nor xdg_dialog_v1 in its tables, so the app's
+    // bind and an objects list naming either are fatal there.
+    const state_sync_version: u8 = 11;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -2558,6 +2673,7 @@ pub const Compositor = struct {
             try putI32(&out, a, s.min_w);
             try putI32(&out, a, s.min_h);
             try putU32(&out, a, s.tl_parent);
+            if (version >= 11) try putU8(&out, a, @intFromBool(s.modal));
             try putU32(&out, a, @intCast(s.frame_cbs.items.len));
             for (s.frame_cbs.items) |cb| try putU32(&out, a, cb);
             if (version >= 9) {
@@ -2577,6 +2693,17 @@ pub const Compositor = struct {
             try putU32(&out, a, map.count());
             var mit = map.iterator();
             while (mit.next()) |e| {
+                try putU32(&out, a, e.key_ptr.*);
+                try putU32(&out, a, e.value_ptr.*);
+            }
+        }
+
+        // v11: live xdg_dialog_v1 objects, so a reattached replica can
+        // keep parsing set_modal on dialogs created before it arrived.
+        if (version >= 11) {
+            try putU32(&out, a, self.dialogs.count());
+            var dit = self.dialogs.iterator();
+            while (dit.next()) |e| {
                 try putU32(&out, a, e.key_ptr.*);
                 try putU32(&out, a, e.value_ptr.*);
             }
@@ -2840,6 +2967,7 @@ pub const Compositor = struct {
             s.min_w = try r.i32v();
             s.min_h = try r.i32v();
             s.tl_parent = try r.u32v();
+            if (ver >= 11) s.modal = try r.u8v() != 0;
             const n_cbs = try r.u32v();
             for (0..n_cbs) |_| try s.frame_cbs.append(a, try r.u32v());
             if (ver >= 9) {
@@ -2861,6 +2989,14 @@ pub const Compositor = struct {
             for (0..n) |_| {
                 const k = try r.u32v();
                 try map.put(a, k, try r.u32v());
+            }
+        }
+
+        if (ver >= 11) {
+            const n_dlg = try r.u32v();
+            for (0..n_dlg) |_| {
+                const k = try r.u32v();
+                try self.dialogs.put(a, k, try r.u32v());
             }
         }
 
@@ -3039,6 +3175,10 @@ pub const Compositor = struct {
             if (s.app_id) |id| if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, id);
             if (s.deco != 0) if (self.view.toplevel_decoration) |cb| cb(self.view.ctx, sid, s.deco == 2);
             if (s.tl_parent != 0) if (self.view.toplevel_parent) |cb| cb(self.view.ctx, sid, s.tl_parent);
+            // Foreign parents are NOT in the blob: they resolve against
+            // the brain's handle namespace, and the daemon replays them
+            // as `foreign_parent` units right after this state_sync.
+            if (s.modal) if (self.view.toplevel_modal) |cb| cb(self.view.ctx, sid, true);
             if (s.min_w != 0 or s.min_h != 0) if (self.view.toplevel_min_size) |cb| cb(self.view.ctx, sid, s.min_w, s.min_h);
             if (s.geo.w != 0) if (self.view.toplevel_geometry) |cb| cb(self.view.ctx, sid, s.geo.x, s.geo.y, s.geo.w, s.geo.h);
             if (!s.input_whole) if (self.view.input_region) |cb| cb(self.view.ctx, sid, s.input_rects.items);
@@ -3217,6 +3357,14 @@ const TestView = struct {
     child_frames: usize = 0,
     child_parent: u32 = 0,
     child_parent_before_frame: ?bool = null,
+    // xdg-foreign / xdg-dialog: last relation and modality reported.
+    foreign_events: usize = 0,
+    foreign_child: u32 = 0,
+    foreign_conn: u32 = 0,
+    foreign_sid: u32 = 0,
+    modal_events: usize = 0,
+    modal_sid: u32 = 0,
+    modal: ?bool = null,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -3229,6 +3377,19 @@ const TestView = struct {
             self.child_parent = parent;
             self.child_parent_before_frame = (self.child_frames == 0);
         }
+    }
+    fn onForeignParent(ctx: ?*anyopaque, surface: u32, conn: u32, parent: u32) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.foreign_events += 1;
+        self.foreign_child = surface;
+        self.foreign_conn = conn;
+        self.foreign_sid = parent;
+    }
+    fn onModal(ctx: ?*anyopaque, surface: u32, modal: bool) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.modal_events += 1;
+        self.modal_sid = surface;
+        self.modal = modal;
     }
     fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
         _ = format;
@@ -3384,6 +3545,8 @@ const TestView = struct {
             .primary_read = onPrimaryRead,
             .toplevel_raise = onRaise,
             .toplevel_parent = onParent,
+            .toplevel_foreign_parent = onForeignParent,
+            .toplevel_modal = onModal,
         };
     }
 };
@@ -7300,10 +7463,11 @@ fn foreignExportRefused(comp: *Compositor, exported: u32, sid: u32) !void {
     try t.expect(comp.dead);
 }
 
-test "xdg-foreign: same-client import parents exactly like set_parent" {
+test "xdg-foreign: same-client import parents through the foreign path too" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
+    comp.conn_id = 7;
     try foreignSetup(&comp);
     try foreignToplevel(&comp, 10); // parent surface 10
     tv.child_sid = 40;
@@ -7320,17 +7484,26 @@ test "xdg-foreign: same-client import parents exactly like set_parent" {
     b.putObject(40);
     try req(&comp, try b.finish());
 
-    // Same state and the same View callback as xdg_toplevel.set_parent.
-    try t.expectEqual(@as(u32, 10), comp.surfaces.get(40).?.tl_parent);
+    // ONE mechanism for both cases: the relation is reported through
+    // toplevel_foreign_parent naming this connection, and tl_parent
+    // stays reserved for xdg_toplevel.set_parent.
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(40).?.tl_parent);
     try t.expectEqual(@as(u32, 10), comp.surfaces.get(40).?.foreign_parent);
+    try t.expectEqual(@as(u32, 7), comp.surfaces.get(40).?.foreign_parent_conn);
     try t.expect(!comp.surfaces.get(40).?.foreign_parent_remote);
-    try t.expectEqual(@as(u32, 10), tv.child_parent);
+    try t.expectEqual(@as(u32, 0), tv.child_parent);
+    try t.expectEqual(@as(usize, 1), tv.foreign_events);
+    try t.expectEqual(@as(u32, 40), tv.foreign_child);
+    try t.expectEqual(@as(u32, 7), tv.foreign_conn);
+    try t.expectEqual(@as(u32, 10), tv.foreign_sid);
 
     // Destroying the zxdg_imported_v2 invalidates the relationship.
     var db = wire.Builder.init(&buf, 21, 0);
     try req(&comp, try db.finish());
-    try t.expectEqual(@as(u32, 0), comp.surfaces.get(40).?.tl_parent);
-    try t.expectEqual(@as(u32, 0), tv.child_parent);
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(40).?.foreign_parent);
+    try t.expectEqual(@as(usize, 2), tv.foreign_events);
+    try t.expectEqual(@as(u32, 0), tv.foreign_conn);
+    try t.expectEqual(@as(u32, 0), tv.foreign_sid);
     try t.expectEqual(@as(usize, 0), comp.foreignReg().imports.items.len);
     try t.expect(!comp.dead);
 }
@@ -7374,11 +7547,13 @@ test "xdg-foreign: cross-client import resolves and the exporter's death notifie
     var app = try Compositor.init(t.allocator, atv.view());
     defer app.deinit();
     app.foreign_shared = &reg;
+    app.conn_id = 3;
 
     var dtv = TestView{};
     var dialog = try Compositor.init(t.allocator, dtv.view());
     defer dialog.deinit();
     dialog.foreign_shared = &reg;
+    dialog.conn_id = 4;
 
     try foreignSetup(&app);
     try foreignToplevel(&app, 10);
@@ -7399,11 +7574,20 @@ test "xdg-foreign: cross-client import resolves and the exporter's death notifie
 
     // The relation is recorded and flagged as pointing outside this
     // connection's id space; tl_parent stays clear because surface 10
-    // in THIS compositor is the child itself, not the parent.
+    // in THIS compositor is the child itself, not the parent. The view
+    // learns the parent by its SESSION-wide identity: the exporting
+    // connection's id plus the surface id in that connection's space.
     try t.expectEqual(@as(u32, 10), dialog.surfaces.get(10).?.foreign_parent);
     try t.expect(dialog.surfaces.get(10).?.foreign_parent_remote);
     try t.expectEqual(@as(u32, 0), dialog.surfaces.get(10).?.tl_parent);
     try t.expectEqual(@as(u32, 0), dtv.child_parent);
+    try t.expectEqual(@as(usize, 1), dtv.foreign_events);
+    try t.expectEqual(@as(u32, 10), dtv.foreign_child);
+    try t.expectEqual(@as(u32, 3), dtv.foreign_conn);
+    try t.expectEqual(@as(u32, 10), dtv.foreign_sid);
+    // The exporter's own view heard nothing: only the importing
+    // connection has a relation to act on.
+    try t.expectEqual(@as(usize, 0), atv.foreign_events);
 
     // The exporting toplevel goes away: the importer is told, its
     // relationship is dropped, and the handle stops resolving.
@@ -7412,6 +7596,13 @@ test "xdg-foreign: cross-client import resolves and the exporter's death notifie
     try t.expect(try sawImportDestroyed(&dialog, 21));
     try t.expectEqual(@as(usize, 0), reg.exports.items.len);
     try t.expectEqual(@as(u32, 0), dialog.surfaces.get(10).?.foreign_parent);
+    // A parent that dies while the child is showing must actively
+    // release the child, not leave a stale reference behind.
+    try t.expectEqual(@as(usize, 2), dtv.foreign_events);
+    try t.expectEqual(@as(u32, 10), dtv.foreign_child);
+    try t.expectEqual(@as(u32, 0), dtv.foreign_conn);
+    try t.expectEqual(@as(u32, 0), dtv.foreign_sid);
+    try t.expectEqual(@as(u32, 0), dialog.surfaces.get(10).?.foreign_parent_conn);
 
     // A re-import of the revoked handle is refused immediately.
     try foreignImport(&dialog, 22, &handle);
@@ -7510,4 +7701,216 @@ test "xdg-foreign: a replica never judges the authoritative stream" {
     sb.putObject(30);
     try req(&comp, try sb.finish());
     try t.expect(!comp.dead);
+}
+
+test "xdg-foreign: a replica learns cross-connection parents from the daemon's unit" {
+    // A replica mints its OWN handles while re-parsing export_toplevel,
+    // so the handle the app then imports never resolves there — which
+    // is exactly why the brain ships the resolved relation instead.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.lenient = true;
+    comp.conn_id = 4;
+    try foreignSetup(&comp);
+    tv.child_sid = 10;
+    try foreignToplevel(&comp, 10);
+    comp.clearOut();
+
+    // The replica's own bookkeeping says nothing.
+    const local = try foreignExport(&comp, 20, 10);
+    try foreignImport(&comp, 21, &local);
+    var buf: [32]u8 = undefined;
+    var b = wire.Builder.init(&buf, 21, 1);
+    b.putObject(10);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(usize, 0), tv.foreign_events);
+
+    // The daemon's answer does, and names a window in ANOTHER
+    // connection (conn 3, surface 10 — an id this compositor also
+    // uses, for a different window).
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(t.allocator);
+    try pipe.appendForeignParent(&units, t.allocator, 10, 3, 10);
+    try comp.feed(units.items);
+    try t.expectEqual(@as(usize, 1), tv.foreign_events);
+    try t.expectEqual(@as(u32, 10), tv.foreign_child);
+    try t.expectEqual(@as(u32, 3), tv.foreign_conn);
+    try t.expectEqual(@as(u32, 10), tv.foreign_sid);
+    try t.expectEqual(@as(u32, 10), comp.surfaces.get(10).?.foreign_parent);
+    try t.expectEqual(@as(u32, 3), comp.surfaces.get(10).?.foreign_parent_conn);
+    try t.expect(comp.surfaces.get(10).?.foreign_parent_remote);
+    // The local xdg_toplevel.set_parent path is untouched by all this.
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(10).?.tl_parent);
+    try t.expectEqual(@as(u32, 0), tv.child_parent);
+
+    // The parent dies: the clear arrives the same way.
+    units.clearRetainingCapacity();
+    try pipe.appendForeignParent(&units, t.allocator, 10, 0, 0);
+    try comp.feed(units.items);
+    try t.expectEqual(@as(usize, 2), tv.foreign_events);
+    try t.expectEqual(@as(u32, 0), comp.surfaces.get(10).?.foreign_parent);
+    try t.expect(!comp.dead);
+}
+
+test "xdg-foreign: an old replica skips the unit instead of dying" {
+    // The unit tag is append-only and unknown tags skip cleanly, so a
+    // viewer that predates it degrades to no cross-connection
+    // parenting rather than to a broken stream. (The state-sync gate
+    // is the belt: pre-v10 viewers stop receiving the channel at all
+    // the moment an app binds xdg-foreign.)
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.lenient = true;
+    try foreignSetup(&comp);
+    try foreignToplevel(&comp, 10);
+    comp.clearOut();
+
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(t.allocator);
+    // A tag from the future, then a normal one: the stream survives.
+    try pipe.appendUnit(&units, t.allocator, @enumFromInt(250), "junk");
+    try pipe.appendForeignParent(&units, t.allocator, 10, 3, 10);
+    try comp.feed(units.items);
+    try t.expect(!comp.dead);
+    try t.expectEqual(@as(usize, 1), tv.foreign_events);
+}
+
+// ─── xdg-dialog v1 tests ────────────────────────────────────────
+
+/// xdg_wm_dialog_v1.get_xdg_dialog(id, toplevel) on `manager`.
+fn dialogCreateReq(comp: *Compositor, manager: u32, id: u32, toplevel: u32) !void {
+    var buf: [32]u8 = undefined;
+    var b = wire.Builder.init(&buf, manager, 1);
+    b.putNewId(id);
+    b.putObject(toplevel);
+    try req(comp, try b.finish());
+}
+
+/// xdg_dialog_v1.set_modal / unset_modal.
+fn dialogModalReq(comp: *Compositor, id: u32, modal: bool) !void {
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, id, if (modal) 1 else 2);
+    try req(comp, try b.finish());
+}
+
+/// registry + wl_compositor(3) + xdg_wm_base(4) + xdg_wm_dialog_v1(7).
+fn dialogSetup(comp: *Compositor) !void {
+    try getRegistry(comp);
+    try bindGlobal(comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(comp, 5, "xdg_wm_base", 6, 4);
+    try bindGlobal(comp, 27, "xdg_wm_dialog_v1", 1, 7);
+}
+
+test "xdg-dialog: set_modal reaches the view and the gate latches at bind" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 4);
+    try t.expect(!comp.used_dialog);
+    try bindGlobal(&comp, 27, "xdg_wm_dialog_v1", 1, 7);
+    try t.expect(!comp.dead);
+    // A v10 replica has no xdg_wm_dialog_v1 at all, so the bind alone
+    // must raise the viewer floor.
+    try t.expect(comp.used_dialog);
+
+    try foreignToplevel(&comp, 10); // surface 10, xdg_toplevel 12
+    comp.clearOut();
+
+    try dialogCreateReq(&comp, 7, 30, 12);
+    try dialogModalReq(&comp, 30, true);
+    try t.expect(comp.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(usize, 1), tv.modal_events);
+    try t.expectEqual(@as(u32, 10), tv.modal_sid);
+    try t.expectEqual(@as(?bool, true), tv.modal);
+
+    // Repeats are idempotent; unset reports once.
+    try dialogModalReq(&comp, 30, true);
+    try t.expectEqual(@as(usize, 1), tv.modal_events);
+    try dialogModalReq(&comp, 30, false);
+    try t.expect(!comp.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(usize, 2), tv.modal_events);
+    try t.expectEqual(@as(?bool, false), tv.modal);
+
+    // Modality dies with the dialog object.
+    try dialogModalReq(&comp, 30, true);
+    try t.expect(comp.surfaces.get(10).?.modal);
+    var buf: [32]u8 = undefined;
+    var db = wire.Builder.init(&buf, 30, 0); // destroy
+    try req(&comp, try db.finish());
+    try t.expect(!comp.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(?bool, false), tv.modal);
+    try t.expect(!comp.dead);
+}
+
+test "xdg-dialog: modality survives a state_sync into a fresh replica" {
+    var btv = TestView{};
+    var brain = try Compositor.init(t.allocator, btv.view());
+    defer brain.deinit();
+    try dialogSetup(&brain);
+    try foreignToplevel(&brain, 10);
+    try dialogCreateReq(&brain, 7, 30, 12);
+    try dialogModalReq(&brain, 30, true);
+    brain.clearOut();
+
+    const blob = try brain.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    var rtv = TestView{};
+    var replica = try Compositor.init(t.allocator, rtv.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(t.allocator);
+    try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+    try replica.feed(units.items);
+    try t.expect(replica.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(?bool, true), rtv.modal);
+    replica.clearOut();
+
+    // The dialog object came across too, so a later unset still lands.
+    try dialogModalReq(&replica, 30, false);
+    try t.expect(!replica.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(?bool, false), rtv.modal);
+    try t.expect(!replica.dead);
+}
+
+
+test "state-sync: a v10 replica gets no modality field and no dialog table" {
+    // Downgrade must be lossless for the OLD reader: it never sees a
+    // byte it cannot place. (It also never receives such a session —
+    // the bind raises native_state_min to 11 — but serializing for it
+    // must still be well-formed.)
+    var btv = TestView{};
+    var brain = try Compositor.init(t.allocator, btv.view());
+    defer brain.deinit();
+    try getRegistry(&brain);
+    try bindGlobal(&brain, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&brain, 5, "xdg_wm_base", 6, 4);
+    try foreignToplevel(&brain, 10);
+    brain.clearOut();
+
+    const v10 = try brain.serializeStateVersion(t.allocator, 10);
+    defer t.allocator.free(v10);
+    const v11 = try brain.serializeStateVersion(t.allocator, 11);
+    defer t.allocator.free(v11);
+    try t.expectEqual(@as(u8, 10), v10[0]);
+    try t.expectEqual(@as(u8, 11), v11[0]);
+    // One modality byte per surface + the (empty) dialog table count.
+    try t.expectEqual(v10.len + 1 + 4, v11.len);
+
+    var rtv = TestView{};
+    var replica = try Compositor.init(t.allocator, rtv.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(t.allocator);
+    try pipe.appendUnit(&units, t.allocator, .state_sync, v10);
+    try replica.feed(units.items);
+    try t.expect(!replica.dead);
+    try t.expect(!replica.surfaces.get(10).?.modal);
+    try t.expectEqual(@as(usize, 0), rtv.modal_events);
 }
