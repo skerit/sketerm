@@ -161,6 +161,28 @@ pub fn controlSocketpair(pair: *[2]c_int, capacity: usize) c_int {
     return 0;
 }
 
+/// Let any same-uid process attach a debugger to the CALLING process.
+///
+/// Linux Yama (`kernel.yama.ptrace_scope=1`, the distro default) allows
+/// ptrace only from an ancestor. A daemon-hosted app therefore cannot be
+/// traced by a gdb the daemon spawns — gdb is the app's SIBLING — which
+/// is why `gdb -p` against one returns EPERM even to its own user. The
+/// relaxation survives `execve`, so this is called once in the forked
+/// child before exec and holds for the app's whole life.
+///
+/// Deliberately scoped: only sessions whose spawn request asked to be
+/// debuggable (headless automation) call it. No-op off Linux, and a
+/// no-op on a kernel without Yama, where the prctl simply fails.
+pub fn allowAnyPtracer() void {
+    if (!is_linux) return;
+    // PR_SET_PTRACER_ANY, spelled out: musl's header defines it as
+    // `(unsigned long)-1` and translate-c turns that into a negation of
+    // an unsigned type, which does not compile (the mux-portable build
+    // is where this surfaces).
+    const ptracer_any: c_ulong = std.math.maxInt(c_ulong);
+    _ = c.prctl(c.PR_SET_PTRACER, ptracer_any, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
+}
+
 // ── runtime library probing ─────────────────────────────────────
 
 extern fn dlopen(filename: [*:0]const u8, flags: c_int) ?*anyopaque;

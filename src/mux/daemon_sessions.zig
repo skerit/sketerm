@@ -751,6 +751,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
         .a11y_bus_addr = if (a11y_addr_z) |z| z.ptr else null,
         .gpu = req.gpu,
+        .debuggable = req.debuggable,
     });
     errdefer _ = pty.closeAndReap();
     // The poll loop does bounded read rounds — master must not
@@ -781,6 +782,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         .pool = pool,
         .screen = screen,
         .app = req.app,
+        .debuggable = req.debuggable,
         .display = req.display,
         .xwayland = null,
         .output_width = req.output_width,

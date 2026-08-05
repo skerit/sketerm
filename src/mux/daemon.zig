@@ -169,6 +169,12 @@ pub const SpawnReq = struct {
     /// which the daemon kills this session. Counted from creation when it
     /// has never been occupied. 0 = live forever.
     ttl_secs: u32 = 0,
+    /// Allow `app_debug` to take a backtrace of this session's child:
+    /// the child relaxes Yama's ptrace restriction before exec, because
+    /// the gdb the daemon spawns is the app's SIBLING and Yama's default
+    /// scope only lets ancestors trace. Set by headless automation
+    /// (appdrive/MCP `launch_app`), never by interactive panes.
+    debuggable: bool = false,
 };
 
 pub const SpawnShellIntegration = struct {
@@ -296,6 +302,10 @@ pub const Session = struct {
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
+    /// The child relaxed Yama before exec (SpawnReq.debuggable), so
+    /// `app_debug` may attach a debugger to it. False = refuse rather
+    /// than spawn a gdb that can only ever report EPERM.
+    debuggable: bool = false,
     /// External display session: the child is the `--keep` keeper and
     /// the session exists to own the Wayland/audio hubs for a process
     /// sketerm never spawned.
@@ -1691,6 +1701,9 @@ pub const FsView = struct {
 /// the event stream; its death never stops the work (durable
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
+/// In-flight debugger attach (see daemon_debug.zig).
+pub const DebugJob = @import("daemon_debug.zig").DebugJob;
+
 pub const FsJob = struct {
     pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete, git_diff };
     pub const State = enum { running, paused, done, failed, canceled };
@@ -1965,6 +1978,10 @@ pub const Daemon = struct {
     /// only stops the event stream, never the work.
     fs_jobs: std.ArrayList(*FsJob) = .empty,
     next_fs_job_id: u64 = 1,
+    /// In-flight `app_debug` debugger subprocesses. Unlike file jobs
+    /// these are pure observation with a single reply, so a dead
+    /// requester means the job is finished and dropped, not orphaned.
+    debug_jobs: std.ArrayList(*DebugJob) = .empty,
     /// Atomic job records live beside the daemon socket and survive a
     /// daemon restart independently of any GUI client.
     fs_job_dir: []u8 = &.{},
@@ -2180,6 +2197,11 @@ pub const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         for (self.fs_jobs.items) |j| j.deinit(true);
         self.fs_jobs.deinit(self.allocator);
+        for (self.debug_jobs.items) |j| {
+            _ = c.kill(-j.pid, c.SIGKILL);
+            j.deinit();
+        }
+        self.debug_jobs.deinit(self.allocator);
         for (self.fs_views.items) |v| v.deinit();
         self.fs_views.deinit(self.allocator);
         for (self.fs_listings.items) |l| l.deinit();
@@ -2459,6 +2481,19 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        // Debugger job pipes.
+        const debugjob_base = fds.items.len;
+        const n_debugjobs_built = self.debug_jobs.items.len;
+        for (self.debug_jobs.items) |j| {
+            try fds.append(self.allocator, .{
+                .fd = j.out_fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
+        // A debugger job that never speaks still has to hit its
+        // deadline, so don't sleep the loop out past it.
+        if (self.debug_jobs.items.len > 0 and (poll_timeout < 0 or poll_timeout > 250)) poll_timeout = 250;
 
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), poll_timeout);
         if (pr < 0) return; // EINTR etc — next tick retries
@@ -2572,6 +2607,25 @@ pub const Daemon = struct {
             if (re & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) self.fsJobReadable(j);
         }
 
+        // Debugger pipes. Servicing one can REMOVE it from the list, so
+        // collect the ready pointers before touching any of them —
+        // indexing on after a removal would skip or misattribute a job.
+        {
+            var ready: [daemon_debug.MAX_JOBS]*DebugJob = undefined;
+            var n_ready: usize = 0;
+            i = 0;
+            while (i < n_debugjobs_built and n_ready < ready.len) : (i += 1) {
+                const j = self.debug_jobs.items[i];
+                if (j.out_fd < 0) continue;
+                const re = fds.items[debugjob_base + i].revents;
+                if (re & (c.POLLIN | c.POLLHUP | c.POLLERR) == 0) continue;
+                ready[n_ready] = j;
+                n_ready += 1;
+            }
+            for (ready[0..n_ready]) |j| self.debugJobReadable(j);
+            self.debugJobsTick();
+        }
+
         self.pumpWinstreams();
         self.pumpDownloads();
         self.pumpFsListings();
@@ -2679,6 +2733,12 @@ pub const Daemon = struct {
     const MetaKV = daemon_fsjobs.MetaKV;
     const fsJobLine = daemon_fsjobs.fsJobLine;
     const fsJobExited = daemon_fsjobs.fsJobExited;
+
+    // ── Debugger jobs: split out to daemon_debug.zig ──
+    const daemon_debug = @import("daemon_debug.zig");
+    pub const handleAppDebug = daemon_debug.handleAppDebug;
+    const debugJobReadable = daemon_debug.debugJobReadable;
+    const debugJobsTick = daemon_debug.debugJobsTick;
 
     /// Stream each active download toward its client, bounded by the
     /// client's write-buffer high-water mark (same backpressure rule as

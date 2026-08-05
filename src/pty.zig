@@ -10,6 +10,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("c.zig").c;
+const platform = @import("util/platform.zig");
 
 pub const SpawnError = error{
     OpenPty,
@@ -74,6 +75,11 @@ pub const SpawnOpts = struct {
     /// Extra child environment as NUL-terminated "KEY=VALUE" strings,
     /// applied last (wins over the defaults above).
     env: []const [*:0]const u8 = &.{},
+    /// Let a sibling debugger attach to the child (Yama relaxation, see
+    /// `platform.allowAnyPtracer`). Set for headless-automation app
+    /// sessions so the daemon can take a backtrace of a hung app;
+    /// interactive terminal sessions leave it false.
+    debuggable: bool = false,
 };
 
 pub const ShellIntegration = struct {
@@ -169,6 +175,10 @@ pub const Pty = struct {
         _ = c.dup2(slave, 2);
         if (slave > 2) _ = c.close(slave);
         _ = c.close(master);
+
+        // Yama relaxation BEFORE exec — it survives execve, and after
+        // exec we no longer run.
+        if (opts.debuggable) platform.allowAnyPtracer();
 
         // Reset signal mask (parent may have blocked SIGCHLD around fork).
         var empty_mask: c.sigset_t = undefined;

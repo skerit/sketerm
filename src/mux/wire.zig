@@ -186,6 +186,12 @@ pub const FrameType = enum(u8) {
     /// the client connection. Only sent to daemons whose welcome
     /// advertises `lsp:true`.
     lsp_open = 28,
+    /// Debugger request against the ATTACHED session's own child (the
+    /// daemon IS its parent, so it can grant a tracer what a caller in
+    /// another process tree cannot get past Yama). JSON
+    /// { op:"backtrace", timeout_ms? }. Answered with `app_debug_data`.
+    /// Attach-scoped: served by the worker owning the session.
+    app_debug = 29,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -288,6 +294,12 @@ pub const FrameType = enum(u8) {
     /// missing local server. On ok:true a `chan_open` (kind lsp) for
     /// `chan` precedes this frame.
     lsp_reply = 92,
+    /// JSON answer to `app_debug`: { ok, pid, tool, text, truncated?,
+    /// timed_out? } or { error }. `text` is the debugger's raw output
+    /// (thread backtraces); the request is served ASYNCHRONOUSLY — the
+    /// debugger runs as a daemon subprocess whose pipe is polled like a
+    /// file job, so a 10-second attach never stalls the poll loop.
+    app_debug_data = 93,
     _,
 };
 

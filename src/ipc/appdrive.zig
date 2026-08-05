@@ -561,6 +561,12 @@ pub const App = struct {
             .rows = opts.rows,
             .cols = opts.cols,
             .app = true,
+            // Headless automation: a hang here has no user at a
+            // keyboard to investigate it, so let the daemon attach a
+            // debugger later (app_backtrace). Decided at spawn because
+            // the Yama relaxation is only settable before exec, and an
+            // app that has already hung cannot be relaunched to get it.
+            .debuggable = true,
             .kb_layout = layout_name,
             .gpu = opts.gpu,
             .no_audio = opts.no_audio,
@@ -1893,6 +1899,36 @@ pub const App = struct {
         return Error.Timeout;
     }
 
+    /// Ask the daemon to attach a debugger to this session's child and
+    /// return its raw JSON answer ({ok, pid, tool, text, ...} or
+    /// {error}); caller owns it. The daemon is the app's PARENT, which
+    /// is the whole reason this round-trip exists: Yama lets it grant a
+    /// tracer what a caller in another process tree cannot get.
+    ///
+    /// `timeout_ms` must exceed the daemon-side debugger deadline this
+    /// request carries, or the wait gives up before the reply that is
+    /// already on its way.
+    pub fn debugBacktrace(self: *App, debugger_ms: i64, timeout_ms: i64) Error![]u8 {
+        self.drain();
+        if (self.exited) return Error.NotConnected;
+        var pbuf: [64]u8 = undefined;
+        const payload = std.fmt.bufPrint(&pbuf, "{{\"op\":\"backtrace\",\"timeout_ms\":{d}}}", .{debugger_ms}) catch
+            return Error.OutOfMemory;
+        self.conn.sendFrame(.app_debug, payload) catch return Error.NotConnected;
+        const deadline = nowMs() + timeout_ms;
+        while (nowMs() < deadline) {
+            const f = self.conn.recvFrameFor(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return Error.NotConnected,
+            };
+            defer f.deinit(self.allocator);
+            if (f.ftype == .app_debug_data)
+                return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
+            self.handleFrame(f.ftype, f.payload);
+        }
+        return Error.Timeout;
+    }
+
     // ── clipboard ───────────────────────────────────────────────
 
     /// Fetch what the app last copied. Requires the app to have
@@ -2185,9 +2221,28 @@ pub const App = struct {
     }
 
     fn encodeWindowPngMarked(self: *App, win: *Window, max_dim: u32, region: ?Region, zoom_req: u32, annot: []const marks_mod.Mark) Error!Shot {
-        if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
-        const uw: u32 = @intCast(win.w);
-        const uh: u32 = @intCast(win.h);
+        return self.encodePixelsPng(win.pixels.items, win.w, win.h, win.format, win.frames, max_dim, region, zoom_req, annot);
+    }
+
+    /// The crop → mark → zoom → downscale → encode pipeline, over any
+    /// shm-layout buffer rather than a live window. Frame timelines
+    /// (`watchChanges`) encode STASHED pixels through the same path, so
+    /// a thumbnail and a screenshot cannot disagree about geometry.
+    pub fn encodePixelsPng(
+        self: *App,
+        pixels: []const u8,
+        pw: i32,
+        ph: i32,
+        format: u32,
+        frame: u64,
+        max_dim: u32,
+        region: ?Region,
+        zoom_req: u32,
+        annot: []const marks_mod.Mark,
+    ) Error!Shot {
+        if (pw <= 0 or ph <= 0 or pixels.len == 0) return Error.NoSuchWindow;
+        const uw: u32 = @intCast(pw);
+        const uh: u32 = @intCast(ph);
         const a = self.allocator;
 
         var ox: u32 = 0;
@@ -2212,12 +2267,12 @@ pub const App = struct {
 
         // Fast path: whole window, no zoom, no marks, within the bound.
         if (annot.len == 0 and region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
-            const bytes = png.encodeShm(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
+            const bytes = png.encodeShm(a, pixels, uw, uh, uw * 4, format) catch
                 return Error.OutOfMemory;
-            return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0, .frame = win.frames };
+            return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0, .frame = frame };
         }
 
-        var rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
+        var rgba = png.shmToRgba(a, pixels, uw, uh, uw * 4, format) catch
             return Error.OutOfMemory;
         var rw: u32 = uw;
         var rh: u32 = uh;
@@ -2275,7 +2330,7 @@ pub const App = struct {
             .scale = @as(f64, @floatFromInt(cw)) / @as(f64, @floatFromInt(rw)),
             .ox = ox,
             .oy = oy,
-            .frame = win.frames,
+            .frame = frame,
         };
     }
 
@@ -2486,6 +2541,168 @@ pub const App = struct {
             if (nowMs() - quiet_since >= quiet_ms) return true;
         }
         return false;
+    }
+
+    /// Surface size of a window (null = no such window / never painted).
+    pub fn windowSize(self: *App, win_id: u32) ?struct { w: i32, h: i32 } {
+        const win = self.winById(win_id) orelse return null;
+        if (win.w <= 0 or win.h <= 0) return null;
+        return .{ .w = win.w, .h = win.h };
+    }
+
+    /// % of pixels currently differing from a `FrameRef`, WITHOUT
+    /// waiting and without moving any baseline — the magnitude behind a
+    /// `waitChangeSince` that already returned true.
+    pub fn peekChangeVs(self: *App, win_id: u32, ref: *const FrameRef, region: ?Region) f64 {
+        const win = self.winById(win_id) orelse return 0;
+        if (ref.px.len == 0) return 100.0;
+        if (win.w != ref.w or win.h != ref.h) return 100.0;
+        return pctDiff(win.pixels.items, ref.px, @intCast(@max(win.w, 0)), region);
+    }
+
+    /// Monotonic ms at which this window last committed a frame (0 =
+    /// no such window, or it has never painted). The pre-input half of
+    /// "did my click do nothing, or had the app already stopped
+    /// painting before it?" — the same counter the daemon feeds, read
+    /// on the caller's clock.
+    pub fn lastCommitMs(self: *App, win_id: u32) i64 {
+        const win = self.winById(win_id) orelse return 0;
+        return win.last_commit_ms;
+    }
+
+    /// One recorded change during a `watchChanges` run.
+    pub const WatchEvent = struct {
+        /// Ms since the watch started.
+        at_ms: i64,
+        /// The window's commit counter when the change was observed.
+        frame: u64,
+        /// % of pixels differing from the PREVIOUS recorded event (or
+        /// from the watch's opening frame, for the first event).
+        pct: f64,
+        /// Stashed shm-layout pixels, when thumbnails were asked for.
+        /// Empty otherwise. Freed by `WatchResult.deinit`.
+        px: []u8 = &.{},
+        w: i32 = 0,
+        h: i32 = 0,
+        format: u32 = 0,
+    };
+
+    pub const WatchResult = struct {
+        events: []WatchEvent,
+        /// Frames the window committed over the whole watch. Nonzero
+        /// with no events means it IS painting and the content simply
+        /// did not change materially — the distinction that stops
+        /// "nothing happened" from being inferred from a still image.
+        frames: u64,
+        /// The commit counter at the start and at the end.
+        frame_first: u64,
+        frame_last: u64,
+        elapsed_ms: i64,
+        /// More changes occurred than `max_events` had room for.
+        truncated: bool,
+        /// The app exited during the watch.
+        exited: bool,
+
+        pub fn deinit(self: *WatchResult, a: std.mem.Allocator) void {
+            for (self.events) |e| if (e.px.len > 0) a.free(e.px);
+            a.free(self.events);
+            self.events = &.{};
+        }
+    };
+
+    /// Sample a window for `duration_ms`, recording every commit whose
+    /// pixels differ from the last recorded one by at least `min_pct`.
+    ///
+    /// This is the measurement a single screenshot cannot make. An
+    /// action with a multi-second pre-roll followed by a short clip is
+    /// invisible to sampling — every capture lands before or after it —
+    /// and the resulting "nothing happened" reads exactly like a dead
+    /// control. A timeline answers "did anything happen, and WHEN"
+    /// without knowing in advance what to look for.
+    ///
+    /// Pixels are stashed for the first `thumbs` events only (a full
+    /// window copy each), so a long watch cannot grow without bound.
+    pub fn watchChanges(
+        self: *App,
+        win_id: u32,
+        duration_ms: i64,
+        min_pct: f64,
+        region: ?Region,
+        max_events: usize,
+        thumbs: usize,
+    ) Error!WatchResult {
+        const a = self.allocator;
+        var events: std.ArrayList(WatchEvent) = .empty;
+        errdefer {
+            for (events.items) |e| if (e.px.len > 0) a.free(e.px);
+            events.deinit(a);
+        }
+        var base: std.ArrayList(u8) = .empty;
+        defer base.deinit(a);
+        var base_w: i32 = 0;
+        var base_h: i32 = 0;
+        var last_frames: u64 = 0;
+        var format: u32 = 0;
+        {
+            const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+            base.appendSlice(a, win.pixels.items) catch return Error.OutOfMemory;
+            base_w = win.w;
+            base_h = win.h;
+            last_frames = win.frames;
+            format = win.format;
+        }
+        const first_frame = last_frames;
+        const t0 = nowMs();
+        const deadline = t0 + duration_ms;
+        var truncated = false;
+        while (nowMs() < deadline) {
+            if (self.exited or self.presentationGone()) break;
+            _ = self.pumpOnce(15);
+            const win = self.winById(win_id) orelse break;
+            if (win.frames == last_frames) continue;
+            last_frames = win.frames;
+            const resized = win.w != base_w or win.h != base_h;
+            const pct = if (resized) 100.0 else pctDiff(win.pixels.items, base.items, @intCast(@max(win.w, 0)), region);
+            if (pct < min_pct) continue;
+            if (events.items.len >= max_events) {
+                truncated = true;
+                // Keep sampling: the frame TOTAL stays honest even once
+                // the timeline itself is full.
+                base.clearRetainingCapacity();
+                base.appendSlice(a, win.pixels.items) catch return Error.OutOfMemory;
+                base_w = win.w;
+                base_h = win.h;
+                continue;
+            }
+            var ev: WatchEvent = .{
+                .at_ms = nowMs() - t0,
+                .frame = win.frames,
+                .pct = pct,
+                .w = win.w,
+                .h = win.h,
+                .format = win.format,
+            };
+            if (events.items.len < thumbs and win.pixels.items.len > 0)
+                ev.px = a.dupe(u8, win.pixels.items) catch &.{};
+            events.append(a, ev) catch {
+                if (ev.px.len > 0) a.free(ev.px);
+                return Error.OutOfMemory;
+            };
+            base.clearRetainingCapacity();
+            base.appendSlice(a, win.pixels.items) catch return Error.OutOfMemory;
+            base_w = win.w;
+            base_h = win.h;
+        }
+        const final_frames = self.frameCount(win_id);
+        return .{
+            .events = events.toOwnedSlice(a) catch return Error.OutOfMemory,
+            .frames = final_frames -| first_frame,
+            .frame_first = first_frame,
+            .frame_last = final_frames,
+            .elapsed_ms = nowMs() - t0,
+            .truncated = truncated,
+            .exited = self.exited,
+        };
     }
 
     pub const DiffStats = struct {
