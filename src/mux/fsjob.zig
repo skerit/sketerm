@@ -78,6 +78,8 @@ pub const Spec = struct {
     /// find: raise the match cap (0 = default; clamped to 200k).
     max_matches: u64 = 0,
     client_token: []const u8 = "",
+    /// Stable logical-transfer identity (see fsjournal.Record).
+    transfer_token: []const u8 = "",
     /// perm_tree: mode to apply (0o7777 mask).
     mode: u32 = 0,
     /// perm_tree: -1 leaves the current owner/group untouched.
@@ -468,6 +470,7 @@ fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8
         .files_done = @max(old_files_done, durable_progress.files_done),
         .files_total = @max(old_files_total, durable_progress.files_total),
         .client_token = spec.client_token,
+        .transfer_token = spec.transfer_token,
         .acknowledged = acknowledged,
     });
 }
@@ -509,6 +512,7 @@ fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, d
         .files_done = progress.entries_done,
         .files_total = progress.entries_total,
         .client_token = spec.client_token,
+        .transfer_token = spec.transfer_token,
     }) catch return false;
     emit(.{
         .ev = "progress",
@@ -1994,6 +1998,68 @@ const CrossCopy = struct {
     /// the panel on the next progress line.
     notice_buf: [160]u8 = undefined,
     notice_len: usize = 0,
+    /// This job is a MOVE — drives the "copy already installed" note
+    /// on failures past the copied boundary.
+    move: bool = false,
+    /// Content digests proven THIS run, keyed on stat identity (dev,
+    /// ino, size, mtime_ns; ctime excluded — the quarantine and
+    /// install renames update it without touching content, the same
+    /// rationale as `fingerprint`). The move flow re-proves the same
+    /// bytes at every durable boundary; without this a multi-GB move
+    /// reread both whole files four to six times after the transfer.
+    hash_seen: std.ArrayList(HashSeen) = .empty,
+
+    const HashSeen = struct {
+        side: Side,
+        dev: u64,
+        ino: u64,
+        size: u64,
+        mtime_ns: i64,
+        digest: [64]u8,
+    };
+    /// Cache cap: a tree larger than this restarts the cache rather
+    /// than growing without bound (the verify passes walk in the same
+    /// order, so even a thrashing cache still covers the big files).
+    const HASH_SEEN_MAX: usize = 1024;
+
+    fn deinitCaches(self: *CrossCopy) void {
+        self.hash_seen.deinit(self.allocator);
+    }
+
+    /// hash() through the per-run digest cache. Trust level: a cache
+    /// hit means "same inode, size and mtime_ns as when the digest was
+    /// computed", which is the identity the manifest checks already
+    /// rely on (`ManifestItem.matches`).
+    fn hashCached(self: *CrossCopy, side: Side, path: []const u8) ?[64]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const before = self.fail_len;
+        const e = self.statProbe(side, arena.allocator(), path) orelse {
+            self.fail_len = before;
+            return self.hash(side, path);
+        };
+        if (!std.mem.eql(u8, e.kind, "file")) return self.hash(side, path);
+        for (self.hash_seen.items) |*seen| {
+            if (seen.side == side and seen.dev == e.dev and seen.ino == e.ino and
+                seen.size == e.size and seen.mtime_ns == e.mtime_ns)
+                return seen.digest;
+        }
+        const digest = self.hash(side, path) orelse return null;
+        self.hashRemember(side, e, &digest);
+        return digest;
+    }
+
+    fn hashRemember(self: *CrossCopy, side: Side, e: fsdrive.Entry, digest: *const [64]u8) void {
+        if (self.hash_seen.items.len >= HASH_SEEN_MAX) self.hash_seen.clearRetainingCapacity();
+        self.hash_seen.append(self.allocator, .{
+            .side = side,
+            .dev = e.dev,
+            .ino = e.ino,
+            .size = e.size,
+            .mtime_ns = e.mtime_ns,
+            .digest = digest.*,
+        }) catch {};
+    }
 
     fn fsOf(self: *CrossCopy, side: Side) *fsdrive.Fs {
         return switch (side) {
@@ -2041,6 +2107,16 @@ const CrossCopy = struct {
         if (self.retryable_transport and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("rename_planned")) {
             durable_retryable_cleanup = true;
             return emitErrorKind("retryable_cleanup", self.failedReason());
+        }
+        if (self.move and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("copied")) {
+            // Past "copied" the destination is verified and installed
+            // under its final name; only source cleanup remains. A bare
+            // "failed" here reads as data loss, which it is not.
+            var buf: [400]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            w.print("the copy is complete and installed; {s}", .{self.failedReason()}) catch
+                return emitError(self.failedReason());
+            return emitError(w.buffered());
         }
         return emitError(self.failedReason());
     }
@@ -2203,8 +2279,8 @@ const CrossCopy = struct {
                     // point of resume; a digest that cannot be taken
                     // just means "copy it again", never a job failure.
                     const before = self.fail_len;
-                    const sh = self.hash(.src, src_path);
-                    const dh = self.hash(.dst, dst_path);
+                    const sh = self.hashCached(.src, src_path);
+                    const dh = self.hashCached(.dst, dst_path);
                     if (sh != null and dh != null and std.mem.eql(u8, &sh.?, &dh.?)) {
                         self.fail_len = before;
                         self.progress.resumed = std.math.add(u64, self.progress.resumed, size) catch {
@@ -2244,33 +2320,19 @@ const CrossCopy = struct {
             return false;
         };
         self.progress.emitNow();
-        var chunk: std.ArrayList(u8) = .empty;
-        defer chunk.deinit(self.allocator);
-        while (off < size) {
-            const want: u32 = @intCast(@min(@as(u64, fsserve.MAX_READ), size - off));
-            if (!self.readChunk(src_path, off, want, &chunk)) return false;
-            if (!self.writeChunk(part, off, chunk.items, .{
-                .create = true,
-                .truncate = off == 0 and resumed_from == 0,
-            })) return false;
-            off += chunk.items.len;
-            if (!self.progress.add(chunk.items.len)) {
-                self.fail("progress overflow while copying {s}", .{tailOf(dst_path)});
-                return false;
-            }
-        }
+        if (size > 0 and !self.transferBytes(src_path, part, size, off)) return false;
         if (size == 0) {
             if (!self.writeChunk(part, 0, &.{}, .{ .create = true, .truncate = true })) return false;
         }
         if (!self.simpleDst("fsync", part, fsdrive.Fs.fsync)) return false;
-        const sh = self.hash(.src, src_path) orelse return false;
-        const dh = self.hash(.dst, part) orelse return false;
+        const sh = self.hashCached(.src, src_path) orelse return false;
+        const dh = self.hashCached(.dst, part) orelse return false;
         if (!std.mem.eql(u8, &sh, &dh)) {
             self.dst.deletePath(part) catch {};
             if (resumed_from > 0) {
                 // The staged prefix did not belong to this source after
                 // all. Start it over from zero rather than fail.
-                self.progress.done -|= off;
+                self.progress.done -|= size;
                 self.progress.resumed -|= resumed_from;
                 self.notice("staged partial for {s} did not verify -- restarting the file", .{tailOf(dst_path)});
                 return self.copyFile(src_path, dst_path, size, false, no_replace);
@@ -2280,7 +2342,7 @@ const CrossCopy = struct {
         }
         // Verification precedes replacement: a corrupt transfer can
         // never destroy the destination that existed before this job.
-        if (!self.renameDst(part, dst_path, no_replace)) {
+        if (!self.renameDstClaimed(part, dst_path, no_replace, &dh, size)) {
             if (no_replace) self.dst.deletePath(part) catch {};
             return false;
         }
@@ -2290,11 +2352,205 @@ const CrossCopy = struct {
             self.dst.chmod(dst_path, e.mode) catch {};
             self.dst.utimens(dst_path, e.atime_ms, e.mtime_ms) catch {};
         }
+        // utimens moved the destination's mtime off the cached
+        // identity: rebind the proven digest to what a later verify
+        // pass will stat, so it does not reread the whole file.
+        arena_meta.deinit();
+        arena_meta = std.heap.ArenaAllocator.init(self.allocator);
+        if (self.statProbe(.dst, arena_meta.allocator(), dst_path)) |e| {
+            if (std.mem.eql(u8, e.kind, "file") and e.size == size)
+                self.hashRemember(.dst, e, &dh);
+        }
         if (!self.progress.entryDone()) {
             self.fail("file-count overflow while copying {s}", .{tailOf(dst_path)});
             return false;
         }
         return true;
+    }
+
+    const Chunk = struct {
+        start: u64,
+        len: u32,
+        filled: u32 = 0,
+        req: u32 = 0,
+        buf: std.ArrayList(u8) = .empty,
+    };
+
+    /// Chunks in flight per side. The old loop was strict stop-and-wait
+    /// (one chunk per source round trip, then one per destination round
+    /// trip), which capped WAN throughput at chunk-size/RTT and never
+    /// overlapped disk reads with the network. Memory cost per file:
+    /// XFER_WINDOW read buffers.
+    const XFER_WINDOW: usize = 4;
+    const XFER_CHUNK: u32 = @min(fsserve.MAX_READ, 1 << 20);
+
+    /// Move [resume_off, size) of src_path into the staged partial with
+    /// a bounded pipeline on both sides. Progress counts a chunk when
+    /// its WRITE is acknowledged; a reconnect on either side restarts
+    /// the window from the acknowledged contiguous prefix (offset
+    /// writes are idempotent, so redoing an unacknowledged chunk is
+    /// safe).
+    fn transferBytes(self: *CrossCopy, src_path: []const u8, part: []const u8, size: u64, resume_off: u64) bool {
+        const InFlightWrite = struct { req: u32, len: u32, end: u64 };
+        var off = resume_off;
+        restart: while (true) {
+            var next = off;
+            var reads: std.ArrayList(Chunk) = .empty;
+            var writes: std.ArrayList(InFlightWrite) = .empty;
+            var unacked_bytes: u64 = 0;
+            var failed_side: ?Side = null;
+            defer {
+                for (reads.items) |*chunk| chunk.buf.deinit(self.allocator);
+                reads.deinit(self.allocator);
+                writes.deinit(self.allocator);
+            }
+            engine: while (true) {
+                while (reads.items.len < XFER_WINDOW and next < size) {
+                    const want: u32 = @intCast(@min(@as(u64, XFER_CHUNK), size - next));
+                    const req = self.src.readSubmit(src_path, next, want) catch |err| {
+                        if (!isTransportError(err)) {
+                            self.failOp(.src, "read", src_path, err);
+                            return false;
+                        }
+                        failed_side = .src;
+                        break :engine;
+                    };
+                    reads.append(self.allocator, Chunk{ .start = next, .len = want, .req = req }) catch {
+                        self.fail("out of memory while copying {s}", .{tailOf(src_path)});
+                        return false;
+                    };
+                    next += want;
+                }
+                if (reads.items.len == 0 and writes.items.len == 0) return true;
+                if (reads.items.len > 0) {
+                    // Oldest chunk first: the daemon answers in order,
+                    // so awaiting out of order would gain nothing.
+                    const chunk = &reads.items[0];
+                    while (chunk.filled < chunk.len) {
+                        var p = self.src.awaitSubmitted(chunk.req, fsdrive.OP_TIMEOUT_MS) catch |err| {
+                            if (!isTransportError(err)) {
+                                self.failOp(.src, "read", src_path, err);
+                                return false;
+                            }
+                            failed_side = .src;
+                            break :engine;
+                        };
+                        defer p.data.deinit(self.allocator);
+                        if (p.data.items.len == 0) {
+                            self.fail("read {s} on {s}: short read at offset {d}", .{
+                                tailOf(src_path), self.hostLabel(.src), chunk.start + chunk.filled,
+                            });
+                            return false;
+                        }
+                        chunk.buf.appendSlice(self.allocator, p.data.items) catch {
+                            self.fail("out of memory while copying {s}", .{tailOf(src_path)});
+                            return false;
+                        };
+                        chunk.filled += @intCast(p.data.items.len);
+                        if (chunk.filled < chunk.len) {
+                            // Short mid-file read: fetch the remainder
+                            // before this chunk may be written.
+                            chunk.req = self.src.readSubmit(src_path, chunk.start + chunk.filled, chunk.len - chunk.filled) catch |err| {
+                                if (!isTransportError(err)) {
+                                    self.failOp(.src, "read", src_path, err);
+                                    return false;
+                                }
+                                failed_side = .src;
+                                break :engine;
+                            };
+                        }
+                    }
+                    const wreq = self.dst.writeSubmit(part, chunk.start, chunk.buf.items, .{
+                        .create = true,
+                        .truncate = chunk.start == 0 and resume_off == 0,
+                    }) catch |err| {
+                        if (!isTransportError(err)) {
+                            self.failOp(.dst, "write", part, err);
+                            return false;
+                        }
+                        failed_side = .dst;
+                        break :engine;
+                    };
+                    writes.append(self.allocator, .{ .req = wreq, .len = chunk.len, .end = chunk.start + chunk.len }) catch {
+                        self.fail("out of memory while copying {s}", .{tailOf(src_path)});
+                        return false;
+                    };
+                    unacked_bytes += chunk.len;
+                    var sent = reads.orderedRemove(0);
+                    sent.buf.deinit(self.allocator);
+                }
+                if (writes.items.len >= XFER_WINDOW or (reads.items.len == 0 and next >= size and writes.items.len > 0)) {
+                    const w = writes.orderedRemove(0);
+                    const idle = fsdrive.OP_TIMEOUT_MS + fsdrive.uploadBudgetMs(unacked_bytes);
+                    const p = self.dst.awaitSubmitted(w.req, idle) catch |err| {
+                        if (!isTransportError(err)) {
+                            self.failOp(.dst, "write", part, err);
+                            return false;
+                        }
+                        failed_side = .dst;
+                        break :engine;
+                    };
+                    unacked_bytes -= w.len;
+                    if (p.written != w.len) {
+                        self.fail("write {s} on {s}: {d} of {d} bytes accepted", .{
+                            tailOf(part), self.hostLabel(.dst), p.written, w.len,
+                        });
+                        return false;
+                    }
+                    // FIFO awaits keep this contiguous: everything up
+                    // to w.end is acknowledged on the destination.
+                    off = w.end;
+                    if (!self.progress.add(w.len)) {
+                        self.fail("progress overflow while copying {s}", .{tailOf(part)});
+                        return false;
+                    }
+                }
+            }
+            // A link died. Everything in flight is void; the staged
+            // partial holds the acknowledged prefix, so the window
+            // restarts there after the reconnect.
+            self.src.cancelSubmitted();
+            self.dst.cancelSubmitted();
+            if (!self.reconnect(failed_side.?)) return false;
+            continue :restart;
+        }
+    }
+
+    /// renameDst that disambiguates a lost acknowledgment: when a
+    /// retried rename answers EXIST or NOENT but the staged file is
+    /// gone and the destination carries the verified digest, the first
+    /// attempt committed and only its reply died. no_replace stays
+    /// collision-safe — nothing but our own proven bytes is claimed.
+    fn renameDstClaimed(self: *CrossCopy, from: []const u8, to: []const u8, no_replace: bool, expected: *const [64]u8, size: u64) bool {
+        while (true) {
+            const result = if (no_replace) self.dst.renameNoReplace(from, to) else self.dst.rename(from, to);
+            result catch |err| {
+                if (isTransportError(err)) {
+                    if (!self.reconnect(.dst)) return false;
+                    if (self.renameCommitted(from, to, expected, size)) return true;
+                    continue;
+                }
+                const detail = self.dst.lastErr();
+                if (err == fsdrive.Error.FsOpFailed and
+                    (std.mem.indexOf(u8, detail, "EXIST") != null or noEntDetail(detail)) and
+                    self.renameCommitted(from, to, expected, size)) return true;
+                self.failOp(.dst, "rename", to, err);
+                return false;
+            };
+            return true;
+        }
+    }
+
+    fn renameCommitted(self: *CrossCopy, from: []const u8, to: []const u8, expected: *const [64]u8, size: u64) bool {
+        const before = self.fail_len;
+        defer self.fail_len = before;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        if (self.statProbe(.dst, arena.allocator(), from) != null) return false;
+        const final = self.statProbe(.dst, arena.allocator(), to) orelse return false;
+        if (!std.mem.eql(u8, final.kind, "file") or final.size != size) return false;
+        const dh = self.hashCached(.dst, to) orelse return false;
+        return std.mem.eql(u8, &dh, expected);
     }
 
     /// A no-argument destination verb (fsync) with the same
@@ -2694,8 +2950,8 @@ const CrossCopy = struct {
 
     fn verifyDestination(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
         if (std.mem.eql(u8, root.kind, "file")) {
-            const sh = self.hash(.src, src_root) orelse return false;
-            const dh = self.hash(.dst, dst_root) orelse return false;
+            const sh = self.hashCached(.src, src_root) orelse return false;
+            const dh = self.hashCached(.dst, dst_root) orelse return false;
             if (!std.mem.eql(u8, &sh, &dh)) {
                 self.fail("destination no longer proves copied file {s}", .{tailOf(dst_root)});
                 return false;
@@ -2728,8 +2984,8 @@ const CrossCopy = struct {
             const dp = treePath(&dbuf, dst_root, item.rel) orelse return false;
             switch (item.kind) {
                 .file => {
-                    const sh = self.hash(.src, sp) orelse return false;
-                    const dh = self.hash(.dst, dp) orelse return false;
+                    const sh = self.hashCached(.src, sp) orelse return false;
+                    const dh = self.hashCached(.dst, dp) orelse return false;
                     if (!std.mem.eql(u8, &sh, &dh)) {
                         self.fail("destination no longer proves copied file {s}", .{tailOf(dp)});
                         return false;
@@ -2906,8 +3162,8 @@ const CrossCopy = struct {
             return false;
         }
         if (item.kind == .file) {
-            const sh = self.hash(.src, src_path) orelse return false;
-            const dh = self.hash(.dst, dst_path) orelse return false;
+            const sh = self.hashCached(.src, src_path) orelse return false;
+            const dh = self.hashCached(.dst, dst_path) orelse return false;
             if (!std.mem.eql(u8, &sh, &dh)) {
                 self.fail("source changed after it was copied; left in place: {s}", .{tailOf(src_path)});
                 return false;
@@ -3082,6 +3338,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         .src_host = spec.src_host,
         .dst_host = spec.dst_host,
         .no_replace = spec.no_replace,
+        .move = spec.delete_src,
         .progress = .{
             .done = if (journal_phase > 0) spec.done else 0,
             .total = if (journal_phase > 0) spec.total else 0,
@@ -3090,6 +3347,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
             .entries_total = if (journal_phase > 0) spec.files_total else 0,
         },
     };
+    defer cc.deinitCaches();
     var move_kind_buf: [16]u8 = undefined;
     var move_durable = durableFromSpec(spec);
     if (spec.delete_src and journal_phase == 0) {
@@ -3188,7 +3446,10 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
 
     var destination_stage_buf: [4096]u8 = undefined;
     var stage_fingerprint_buf: [Sha256.digest_length * 2]u8 = undefined;
-    const staged_root = spec.delete_src and spec.no_replace and
+    // EVERY no_replace transfer stages: the exclusive final-name claim
+    // otherwise makes the job's own partial root read as a collision on
+    // retry, so an interrupted no-replace copy could never resume.
+    const staged_root = spec.no_replace and
         resume_phase < fsjournal.phaseRank("copied");
     var copy_dst = spec.dst;
     if (staged_root) {
@@ -3196,7 +3457,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
             durable.destination_stage = makeDestinationStage(spec.dst, spec.job_id, &destination_stage_buf) orelse
                 return emitError("cannot create destination staging path");
             if (!persistCrossPhase(spec, "rename_planned", &cc.progress, durable))
-                return emitError("move could not persist its destination staging path");
+                return emitError("transfer could not persist its destination staging path");
         }
         copy_dst = durable.destination_stage;
         if (resume_phase == 0) {

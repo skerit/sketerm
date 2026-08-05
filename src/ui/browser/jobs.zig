@@ -525,6 +525,11 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         .no_replace = retry.no_replace,
         .dial_tries = @as(u32, if (retry.direct) 2 else 0),
         .client_token = client_token,
+        // The STABLE per-transfer identity: client_token rotates per
+        // attempt, and this is what lets a capable daemon restart the
+        // failed job that already owns the staged bytes instead of
+        // minting a fresh job with an unreachable stage.
+        .transfer_token = retry.token,
     });
     if (retry.attempts == 0) {
         self.setStatusFmt("durable transfer started: {s}", .{retry.label});
@@ -562,7 +567,9 @@ pub fn dropSupersededRetryRows(self: *BrowserView, fresh: *JobRow) void {
 /// Automatic attempts a failed cross-host copy makes before the row
 /// settles as failed and waits for the user's Retry button. Each one
 /// resumes from the staged partial, so a retry costs a reconnect, not
-/// the bytes already moved.
+/// the bytes already moved: the stable transfer_token makes the daemon
+/// restart the failed job itself (same id, same stage), even though
+/// the per-attempt client_token rotates.
 const COPY_AUTO_RETRIES: u8 = 3;
 /// Delay before an automatic resume: the daemon-side job already spent
 /// its own reconnect budget, so a host that answers again needs a

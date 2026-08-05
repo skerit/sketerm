@@ -1745,6 +1745,9 @@ pub const FsJob = struct {
     src_host: []u8,
     dst_host: []u8,
     client_token: []u8,
+    /// Stable logical-transfer identity kept across attempts (see
+    /// fsjournal.Record.transfer_token); empty for non-transfer jobs.
+    transfer_token: []u8,
     /// copy: the per-entry collision policy this job was started with,
     /// kept so a restart after a daemon crash resumes with the SAME
     /// semantics rather than silently overwriting.
@@ -1797,6 +1800,7 @@ pub const FsJob = struct {
         self.allocator.free(self.src_host);
         self.allocator.free(self.dst_host);
         self.allocator.free(self.client_token);
+        self.allocator.free(self.transfer_token);
         self.allocator.free(self.conflict);
         self.allocator.destroy(self);
     }
@@ -1881,6 +1885,7 @@ test "preview temp source release preserves result ownership" {
         .src_host = try t.allocator.dupe(u8, ""),
         .dst_host = try t.allocator.dupe(u8, ""),
         .client_token = try t.allocator.dupe(u8, ""),
+        .transfer_token = try t.allocator.dupe(u8, ""),
         .conflict = try t.allocator.dupe(u8, ""),
         .owns_src = true,
         .cleanup_at_ms = 500,
@@ -1915,6 +1920,7 @@ test "terminal filesystem jobs are retained until helper EOF" {
         .src_host = empty,
         .dst_host = empty,
         .client_token = empty,
+        .transfer_token = empty,
         .conflict = empty,
     };
     try std.testing.expect(!job.retentionReady());
@@ -2041,6 +2047,75 @@ pub const Daemon = struct {
         return error.BindFailed;
     }
 
+    /// Where this socket's fs-job journals live: under the STATE dir,
+    /// not the runtime dir, so an interrupted transfer's staged data
+    /// (and a completed-but-uncleaned move's quarantine identity) can
+    /// still be found after a reboot clears $XDG_RUNTIME_DIR. Keyed by
+    /// a hash of the socket path so isolated instances never share a
+    /// journal namespace (job ids are per-daemon counters).
+    pub fn fsJobsDirAlloc(allocator: std.mem.Allocator, sock_path: []const u8) ![]u8 {
+        const h = std.hash.Fnv1a_64.hash(sock_path);
+        var state_buf: [4096]u8 = undefined;
+        const state: ?[]const u8 = blk: {
+            if (std.c.getenv("XDG_STATE_HOME")) |sh| {
+                const s = std.mem.span(sh);
+                if (s.len > 0) break :blk std.fmt.bufPrint(&state_buf, "{s}/sketerm", .{s}) catch null;
+            }
+            if (std.c.getenv("HOME")) |home|
+                break :blk std.fmt.bufPrint(&state_buf, "{s}/.local/state/sketerm", .{std.mem.span(home)}) catch null;
+            break :blk null;
+        };
+        const base = state orelse {
+            // No resolvable state dir: fall back to the socket-sibling
+            // location (pre-relocation behavior, reboot-fragile).
+            const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
+            return std.fmt.allocPrint(allocator, "{s}/fsjobs", .{sock_path[0..dir_end]});
+        };
+        return std.fmt.allocPrint(allocator, "{s}/fsjobs/{x:0>16}", .{ base, h });
+    }
+
+    /// One-time adoption of journals from the pre-relocation
+    /// socket-sibling directory. rename first; the runtime dir is
+    /// usually a different filesystem, so EXDEV falls back to a byte
+    /// copy. Best effort — a record that cannot move stays where the
+    /// old code would still have found nothing anyway.
+    fn migrateLegacyFsJournals(sock_dir: []const u8, new_dir: []const u8) void {
+        var legacy_buf: [4096:0]u8 = undefined;
+        const legacy = std.fmt.bufPrintZ(&legacy_buf, "{s}/fsjobs", .{sock_dir}) catch return;
+        if (std.mem.eql(u8, legacy, new_dir)) return;
+        const dir = c.opendir(legacy.ptr) orelse return;
+        defer _ = c.closedir(dir);
+        var target_ready = false;
+        while (c.readdir(dir)) |de| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+            if (!std.mem.endsWith(u8, name, ".json")) continue;
+            if (!target_ready) {
+                if (!fsjournal.ensureDir(new_dir)) return;
+                target_ready = true;
+            }
+            var from_buf: [4096:0]u8 = undefined;
+            var to_buf: [4096:0]u8 = undefined;
+            const from = std.fmt.bufPrintZ(&from_buf, "{s}/{s}", .{ legacy, name }) catch continue;
+            const to = std.fmt.bufPrintZ(&to_buf, "{s}/{s}", .{ new_dir, name }) catch continue;
+            if (c.rename(from.ptr, to.ptr) == 0) continue;
+            const in = c.fopen(from.ptr, "rb") orelse continue;
+            defer _ = c.fclose(in);
+            const out = c.fopen(to.ptr, "wb") orelse continue;
+            var ok = true;
+            var buf: [16 * 1024]u8 = undefined;
+            while (true) {
+                const n = c.fread(&buf, 1, buf.len, in);
+                if (n == 0) break;
+                if (c.fwrite(&buf, 1, n, out) != n) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (c.fclose(out) != 0) ok = false;
+            if (ok) _ = c.unlink(from.ptr) else _ = c.unlink(to.ptr);
+        }
+    }
+
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
         const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
         // mkdir -p the parent (one level is enough in practice:
@@ -2086,7 +2161,7 @@ pub const Daemon = struct {
         if (c.lstat(try pathZ(&z_buf, sock_path), &bound_st) != 0) return error.StatFailed;
 
         const self = try allocator.create(Daemon);
-        const job_dir = try std.fmt.allocPrint(allocator, "{s}/fsjobs", .{sock_path[0..dir_end]});
+        const job_dir = try fsJobsDirAlloc(allocator, sock_path);
         self.* = .{
             .allocator = allocator,
             .listen_fd = fd,
@@ -2095,7 +2170,10 @@ pub const Daemon = struct {
             .sock_ino = @intCast(bound_st.st_ino),
             .fs_job_dir = job_dir,
         };
-        _ = fsjournal.ensureDir(job_dir);
+        // No eager ensureDir: journal saves create the directory on
+        // first use, so short-lived isolated daemons leave no empty
+        // per-socket litter under the user's state dir.
+        migrateLegacyFsJournals(sock_path[0..dir_end], job_dir);
         return self;
     }
 

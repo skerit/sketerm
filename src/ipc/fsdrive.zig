@@ -40,6 +40,13 @@ pub const OP_CAP_MS: i64 = 120_000;
 /// slow uplink as a dead link).
 const WRITE_MIN_RATE: u64 = 32 * 1024; // bytes/sec
 
+/// Idle-wait budget covering `bytes` of not-yet-acknowledged uploads
+/// at the worst-case honest uplink (see WRITE_MIN_RATE). Pipelined
+/// writers add this to OP_TIMEOUT_MS when awaiting a write ack.
+pub fn uploadBudgetMs(bytes: u64) i64 {
+    return @intCast(@min(@as(u64, @intCast(OP_CAP_MS - OP_TIMEOUT_MS)), bytes / (WRITE_MIN_RATE / 1000)));
+}
+
 /// Bytes per staged fs_write in writeFileAtomic — the same 1 MiB
 /// fstransfer moves, comfortably inside wire.MAX_FRAME.
 pub const SAVE_CHUNK: usize = 1 << 20;
@@ -328,10 +335,27 @@ pub const JobEnd = struct {
     }
 };
 
+/// One pipelined read or write in flight (see Fs.readSubmit). Owned by
+/// the Fs until awaitSubmitted hands it (and its buffer) to the caller.
+pub const PendingOp = struct {
+    req: u32,
+    kind: enum { read, write },
+    done: bool = false,
+    failed: bool = false,
+    /// read: collected fs_data payload bytes.
+    data: std.ArrayList(u8) = .empty,
+    info: ReadInfo = .{ .size = 0, .eof = false },
+    written: u64 = 0,
+};
+
 pub const Fs = struct {
     allocator: std.mem.Allocator,
     conn: client.Conn,
     next_req: u32 = 1,
+    /// Pipelined reads/writes awaiting their reply. Bounded by the
+    /// caller's window; every receive loop routes frames here so a
+    /// blocking op in between cannot drop pipelined read data.
+    pending_ops: std.ArrayList(PendingOp) = .empty,
     /// fs_delta frames that arrived while awaiting a reply; consumed
     /// via takeDelta(). Bounded by consumption — a caller that opens
     /// views must drain deltas.
@@ -358,6 +382,8 @@ pub const Fs = struct {
     }
 
     pub fn deinit(self: *Fs) void {
+        self.cancelSubmitted();
+        self.pending_ops.deinit(self.allocator);
         for (self.deltas.items) |*d| d.deinit();
         self.deltas.deinit(self.allocator);
         for (self.job_events.items) |*e| e.deinit();
@@ -608,6 +634,7 @@ pub const Fs = struct {
             defer f.deinit(self.allocator);
             switch (f.ftype) {
                 .fs_delta, .fs_job => self.stashPush(f.ftype, f.payload),
+                .fs_data => self.routePendingData(f.payload),
                 .fs_reply => {
                     // alloc_always: f.payload is freed on return; the
                     // reply must own its strings (use-after-free bug
@@ -616,7 +643,12 @@ pub const Fs = struct {
                         .ignore_unknown_fields = true,
                         .allocate = .alloc_always,
                     }) catch return Error.BadReply;
-                    if (rep.req != req) continue; // stale (abandoned request)
+                    if (rep.req != req) {
+                        // A pipelined op's reply, or a stale reply for
+                        // an abandoned request.
+                        _ = self.completePending(&rep);
+                        continue;
+                    }
                     return rep;
                 },
                 .err => {
@@ -656,6 +688,11 @@ pub const Fs = struct {
             src_host: []const u8 = "",
             dst_host: []const u8 = "",
             client_token: []const u8 = "",
+            /// Stable logical-transfer identity kept across retry
+            /// attempts (client_token rotates per attempt). A daemon
+            /// that knows it restarts the failed job that owns the
+            /// staged data; old daemons ignore the field.
+            transfer_token: []const u8 = "",
             /// cross_copy move + dial cap (see CrossOpts).
             delete_src: bool = false,
             dial_tries: u32 = 0,
@@ -908,6 +945,149 @@ pub const Fs = struct {
         _ = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
     }
 
+    // ── pipelined reads/writes ──────────────────────────────────
+    //
+    // Replies are matched by req nonce, never arrival order, so a
+    // caller may keep several reads and writes outstanding and the
+    // wire stays full instead of paying one round trip per chunk
+    // (the stop-and-wait shape that halved cross-host throughput).
+    // The daemon serves one connection's requests strictly in
+    // submission order, which is what makes a pipelined truncating
+    // first write safe.
+
+    fn pendingIndex(self: *Fs, req: u32) ?usize {
+        for (self.pending_ops.items, 0..) |*p, i| {
+            if (p.req == req) return i;
+        }
+        return null;
+    }
+
+    /// Route one fs_data frame to its pending read, if any.
+    fn routePendingData(self: *Fs, payload: []const u8) void {
+        if (payload.len < 12) return;
+        const req = std.mem.readInt(u32, payload[0..4], .little);
+        const i = self.pendingIndex(req) orelse return;
+        const p = &self.pending_ops.items[i];
+        if (p.kind != .read or p.done) return;
+        p.data.appendSlice(self.allocator, payload[12..]) catch {
+            p.done = true;
+            p.failed = true;
+            self.setErr("out of memory collecting read data");
+        };
+    }
+
+    /// Complete a pending op from a parsed fs_reply. Returns true when
+    /// the reply belonged to one.
+    fn completePending(self: *Fs, rep: *const Reply) bool {
+        const i = self.pendingIndex(rep.req) orelse return false;
+        const p = &self.pending_ops.items[i];
+        if (p.done) return true;
+        p.done = true;
+        if (!rep.ok) {
+            p.failed = true;
+            self.setErr(rep.@"error");
+            return true;
+        }
+        p.info = .{ .size = rep.size, .eof = rep.eof, .mtime_ns = rep.mtime_ns, .ino = rep.ino };
+        p.written = rep.written;
+        return true;
+    }
+
+    /// Submit a ranged read without waiting; pair with awaitSubmitted.
+    pub fn readSubmit(self: *Fs, path: []const u8, off: u64, len: u32) Error!u32 {
+        const req = self.nextReq();
+        self.pending_ops.append(self.allocator, .{ .req = req, .kind = .read }) catch
+            return Error.OutOfMemory;
+        self.sendOp("read", req, .{ .path = path, .off = off, .len = len }) catch |err| {
+            _ = self.pending_ops.pop();
+            return err;
+        };
+        return req;
+    }
+
+    /// Submit an offset write without waiting; pair with awaitSubmitted.
+    /// `data` is fully copied onto the wire before this returns.
+    pub fn writeSubmit(self: *Fs, path: []const u8, off: u64, data: []const u8, flags: WriteFlags) Error!u32 {
+        if (path.len > std.math.maxInt(u16)) return Error.BadRequest;
+        const req = self.nextReq();
+        self.pending_ops.append(self.allocator, .{ .req = req, .kind = .write }) catch
+            return Error.OutOfMemory;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var hdr: [15]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], req, .little);
+        std.mem.writeInt(u64, hdr[4..12], off, .little);
+        hdr[12] = flags.byte();
+        std.mem.writeInt(u16, hdr[13..15], @intCast(path.len), .little);
+        const send: Error!void = blk: {
+            payload.appendSlice(self.allocator, &hdr) catch break :blk Error.OutOfMemory;
+            payload.appendSlice(self.allocator, path) catch break :blk Error.OutOfMemory;
+            payload.appendSlice(self.allocator, data) catch break :blk Error.OutOfMemory;
+            self.conn.sendFrame(.fs_write, payload.items) catch break :blk Error.NotConnected;
+            break :blk {};
+        };
+        send catch |err| {
+            const i = self.pendingIndex(req).?;
+            _ = self.pending_ops.orderedRemove(i);
+            return err;
+        };
+        return req;
+    }
+
+    /// Wait for one submitted op, routing every other frame to its
+    /// stash or pending entry meanwhile. `idle_ms` is the inactivity
+    /// bound (raise it via uploadBudgetMs when unacked uploads are
+    /// queued ahead of this reply). The returned op's `data` is owned
+    /// by the caller.
+    pub fn awaitSubmitted(self: *Fs, req: u32, idle_ms: i64) Error!PendingOp {
+        const cap_deadline = nowMs() + @max(idle_ms, OP_CAP_MS);
+        while (true) {
+            if (self.pendingIndex(req)) |i| {
+                if (self.pending_ops.items[i].done) {
+                    var p = self.pending_ops.orderedRemove(i);
+                    if (p.failed) {
+                        p.data.deinit(self.allocator);
+                        return Error.FsOpFailed;
+                    }
+                    return p;
+                }
+            } else return Error.BadRequest;
+            const cap_remain = cap_deadline - nowMs();
+            if (cap_remain <= 0) return Error.Timeout;
+            const f = self.conn.recvFrameProgressive(idle_ms, cap_remain) catch |err| switch (err) {
+                error.Timeout => return Error.Timeout,
+                else => return Error.NotConnected,
+            };
+            defer f.deinit(self.allocator);
+            switch (f.ftype) {
+                .fs_delta, .fs_job => self.stashPush(f.ftype, f.payload),
+                .fs_data => self.routePendingData(f.payload),
+                .fs_reply => {
+                    var scratch = std.heap.ArenaAllocator.init(self.allocator);
+                    defer scratch.deinit();
+                    const rep = std.json.parseFromSliceLeaky(Reply, scratch.allocator(), f.payload, .{
+                        .ignore_unknown_fields = true,
+                        .allocate = .alloc_always,
+                    }) catch continue;
+                    _ = self.completePending(&rep);
+                },
+                .err => {
+                    self.setErr(f.payload);
+                    return Error.FsOpFailed;
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Drop every submitted-but-unclaimed op (reconnect discard). Late
+    /// replies on the old connection die with it; on a live connection
+    /// they are ignored by the nonce match.
+    pub fn cancelSubmitted(self: *Fs) void {
+        for (self.pending_ops.items) |*p| p.data.deinit(self.allocator);
+        self.pending_ops.clearRetainingCapacity();
+    }
+
     /// Ranged read appended to `out`. One call fetches at most
     /// fsserve.MAX_READ bytes; loop while !eof for more.
     pub fn read(self: *Fs, path: []const u8, off: u64, len: u32, out: *std.ArrayList(u8)) Error!ReadInfo {
@@ -926,7 +1106,10 @@ pub const Fs = struct {
                 .fs_delta, .fs_job => self.stashPush(f.ftype, f.payload),
                 .fs_data => {
                     if (f.payload.len < 12) continue;
-                    if (std.mem.readInt(u32, f.payload[0..4], .little) != req) continue;
+                    if (std.mem.readInt(u32, f.payload[0..4], .little) != req) {
+                        self.routePendingData(f.payload);
+                        continue;
+                    }
                     out.appendSlice(self.allocator, f.payload[12..]) catch
                         return Error.OutOfMemory;
                 },
@@ -937,7 +1120,10 @@ pub const Fs = struct {
                         .ignore_unknown_fields = true,
                         .allocate = .alloc_always,
                     }) catch return Error.BadReply;
-                    if (rep.req != req) continue;
+                    if (rep.req != req) {
+                        _ = self.completePending(&rep);
+                        continue;
+                    }
                     if (!rep.ok) {
                         self.setErr(rep.@"error");
                         return Error.FsOpFailed;
@@ -1402,6 +1588,9 @@ pub const Fs = struct {
         no_replace: bool = false,
         /// Cap the initial dial attempts per side (0 = full budget).
         dial_tries: u32 = 0,
+        /// Stable per-transfer identity that survives attempt
+        /// boundaries (see sendOp.transfer_token).
+        transfer_token: []const u8 = "",
     };
 
     pub fn startCrossCopyOpts(
@@ -1420,6 +1609,7 @@ pub const Fs = struct {
             .src_host = src_host,
             .dst_host = dst_host,
             .@"resume" = resumable,
+            .transfer_token = opts.transfer_token,
             .delete_src = opts.delete_src,
             .no_replace = opts.no_replace,
             .dial_tries = opts.dial_tries,
@@ -1465,6 +1655,7 @@ pub const Fs = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .client_token = client_token,
+            .transfer_token = opts.transfer_token,
             .delete_src = opts.delete_src,
             .no_replace = opts.no_replace,
             .dial_tries = opts.dial_tries,
