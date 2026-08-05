@@ -296,6 +296,31 @@ pub fn build(b: *std.Build) void {
     const smoke_udp_step = b.step("smoke-udp", "UDP transport + hole-punch smoke (headless)");
     smoke_udp_step.dependOn(&smoke_udp_run.step);
 
+    // xdg-foreign / xdg-dialog smoke — `zig build smoke-foreign`
+    // (headless). Daemon thread + scripted raw-Wayland clients:
+    // cross-connection parenting, revocation (surface death AND
+    // vanished exporter, both through the idle-brain sweep), reattach
+    // replay, session-scoped handles, modality.
+    const smoke_foreign_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_foreign.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_foreign_mod, core_cbindings_mod);
+    smoke_foreign_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_foreign_mod);
+    if (have_x264) addVideo(b, smoke_foreign_mod);
+    if (have_vtenc) addVtEnc(b, smoke_foreign_mod);
+    const smoke_foreign = b.addExecutable(.{
+        .name = "sketerm-smoke-foreign",
+        .root_module = smoke_foreign_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_foreign_run = b.addRunArtifact(smoke_foreign);
+    const smoke_foreign_step = b.step("smoke-foreign", "xdg-foreign cross-connection parenting smoke (headless)");
+    smoke_foreign_step.dependOn(&smoke_foreign_run.step);
+
     // File-service smoke — `zig build smoke-fs` (headless). Daemon
     // thread + fsdrive client: listings, live view deltas, verbs,
     // ranged read/write, monolith AND broker mode.
