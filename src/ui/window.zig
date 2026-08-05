@@ -344,6 +344,11 @@ pub const Window = struct {
     copymode_sel: CopyModeSel = .none,
     copymode_anchor_row: i32 = 0,
     copymode_anchor_col: u16 = 0,
+    /// The config's symbol maps in the atlas's own type, rebuilt once
+    /// per config generation (`winconfig.rebuildSymbolSpecs`). Panes
+    /// borrow this slice, so nothing else may reallocate it.
+    symbol_specs: std.ArrayList(@import("../render/atlas.zig").Atlas.SymbolMapSpec) = .empty,
+
     /// Hint mode keeps going after each pick, collecting matches
     /// instead of activating them; Enter copies the lot. Seeded from
     /// `Config.hint_multiple`, toggled in-mode with Tab.
@@ -819,6 +824,7 @@ pub const Window = struct {
         self.allocator.free(self.hint_matches);
         self.hints_overlay_buf.deinit(self.allocator);
         self.hints_collected.deinit(self.allocator);
+        self.symbol_specs.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
         if (self.closed_arena) |*a| a.deinit();

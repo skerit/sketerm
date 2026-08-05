@@ -220,6 +220,22 @@ pub fn applyPaneConfigByName(self: *Window, pane: *Pane) void {
 /// pane-creation paths (new tab/split, layout restore,
 /// addTabInternal) — restored panes used to skip the color push
 /// entirely and kept the built-in gray background.
+/// Translate the config's symbol maps into the atlas's own type once
+/// per config generation. Panes borrow this slice for the lifetime of
+/// the config, so it must not be rebuilt while one is mid-atlas —
+/// which is why it is rebuilt exactly where the config is replaced.
+pub fn rebuildSymbolSpecs(self: *Window) void {
+    self.symbol_specs.clearRetainingCapacity();
+    for (self.config.symbol_maps.items) |sm| {
+        if (sm.family.len == 0) continue;
+        self.symbol_specs.append(self.allocator, .{
+            .lo = sm.lo,
+            .hi = sm.hi,
+            .family = sm.family,
+        }) catch return;
+    }
+}
+
 pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) void {
     const s: *const @import("../config.zig").ProfileSettings =
         if (opts.profile) |p| &p.settings else &self.config.settings;
@@ -229,6 +245,16 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.font_path = s.font_path;
     pane.font_family = if (s.font_family.len > 0) s.font_family else null;
     pane.font_features = if (s.font_features.len > 0) s.font_features else null;
+    pane.font_opts = .{
+        .line_pad_px = s.line_pad_px,
+        .bold_family = s.font_family_bold,
+        .italic_family = s.font_family_italic,
+        .bold_italic_family = s.font_family_bold_italic,
+        .weight = s.font_weight,
+        .bold_weight = s.font_weight_bold,
+        .symbol_maps = self.symbol_specs.items,
+        .builtin_box = s.builtin_box_drawing,
+    };
     pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.setGraphicsOffload(self.config.graphics_offload);
@@ -629,6 +655,7 @@ pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
     var old_cfg = self.config;
     defer old_cfg.deinit();
     self.config = cloned;
+    rebuildSymbolSpecs(self);
     // IM strategy is app-level; faces read it at construction time.
     @import("imhost.zig").setPreference(switch (self.config.input_method) {
         .auto => .auto,
