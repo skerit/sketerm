@@ -14,6 +14,8 @@ const shader_preset_mod = @import("../shader_preset.zig");
 const logActionError = winmod.logActionError;
 const connectManualPopoverClose = winmod.connectManualPopoverClose;
 const isDarkBg = winmod.isDarkBg;
+const ProfileSettings = @import("../config.zig").ProfileSettings;
+const ColorScheme = @import("../config.zig").ColorScheme;
 
 const ProfileButtonCtx = struct {
     window: *Window,
@@ -295,23 +297,14 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.grid_pass.pad = s.padding;
     pane.cell_pass.pad = s.padding;
     pane.bg_pass.source = &self.bg_source;
-    const fg_bg = resolveColorsFor(self, s);
-    pane.grid_pass.default_fg = fg_bg.fg;
-    pane.grid_pass.default_bg = fg_bg.bg;
-    pane.cell_pass.default_fg = fg_bg.fg;
-    pane.cell_pass.default_bg = fg_bg.bg;
+    // Push config-driven defaults onto the screen so OSC 4/10/11
+    // queries reply with the configured values until apps override,
+    // and so DSR ?996 / mode 2031 start from the effective bg's
+    // luminance — that's what apps actually want to know (vim
+    // background=dark/light).
+    pushPaneColors(self, pane, s);
     pane.grid_pass.enable_ligatures = self.config.ligatures;
     pane.grid_pass.enable_bidi = self.config.bidi;
-    // Push config-driven defaults onto the screen so OSC 4/10/11
-    // queries reply with the configured values until apps override.
-    term.screen.default_fg = fg_bg.fg;
-    term.screen.default_bg = fg_bg.bg;
-    term.screen.configured_fg = fg_bg.fg;
-    term.screen.configured_bg = fg_bg.bg;
-    term.screen.cursor_color = if (s.cursor_color_default)
-        .{ 0, 0, 0, 0 }
-    else
-        s.cursor_color;
     term.screen.scrollback_capacity = s.scrollback;
     pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
@@ -321,20 +314,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     // per-tab effect toggles only control what's drawn from it.
     term.screen.track_activity = self.config.track_tab_activity;
     term.screen.allow_clipboard_read = self.config.clipboard_read;
-    // Initial dark/light for DSR ?996 / mode 2031, derived from
-    // the effective background's luminance — that's what apps
-    // actually want to know (vim background=dark/light).
-    term.screen.color_scheme_dark = isDarkBg(fg_bg.bg);
     term.screen.word_chars = self.config.word_chars;
-    // Effective palette: explicit palette > scheme lookup >
-    // built-in defaults.
-    if (resolvePalette(s)) |pal| {
-        var i: usize = 0;
-        while (i < 16) : (i += 1) {
-            term.screen.palette[i] = pal[i];
-            pane.grid_pass.palette[i] = pal[i];
-        }
-    }
 
     // Shader resolution: explicit user pick / clear > profile
     // settings. Both the pick and an explicit clear are sticky —
@@ -629,32 +609,72 @@ pub fn resolveDefaultColors(self: *const Window) ColorPair {
     return resolveColorsFor(self, &self.config.settings);
 }
 
+/// Which light/dark variant is in force, or null when `auto_theme`
+/// is off and the flat (manually configured) colours stand.
+pub fn activeScheme(self: *const Window) ?ColorScheme {
+    if (!self.config.auto_theme) return null;
+    const sm = c.adw_style_manager_get_default();
+    return if (c.adw_style_manager_get_dark(sm) != 0) .dark else .light;
+}
+
+/// A settings bundle with its colour fields resolved for the system's
+/// current light/dark state. Every colour reader goes through this so
+/// none of them has to know variants exist.
+pub fn resolveSettings(self: *const Window, s: *const ProfileSettings) ProfileSettings {
+    return s.forScheme(activeScheme(self));
+}
+
 /// Derive the effective default fg/bg for a settings bundle.
 /// When auto_theme is on we follow AdwStyleManager's dark/light
 /// state so sketerm matches the system appearance. Otherwise
 /// honour the bundle's explicit colors. `background_opacity` is
 /// applied to bg.a after theme resolution so transparency works
 /// under both auto and manual themes.
-pub fn resolveColorsFor(self: *const Window, s: *const @import("../config.zig").ProfileSettings) ColorPair {
-    var pair: ColorPair = if (!self.config.auto_theme) blk: {
-        break :blk .{ .fg = s.default_fg, .bg = s.default_bg };
-    } else blk: {
-        const sm = c.adw_style_manager_get_default();
-        const dark = c.adw_style_manager_get_dark(sm) != 0;
-        if (dark) {
-            break :blk .{
-                .fg = .{ 0.92, 0.92, 0.92, 1.0 },
-                .bg = .{ 0.10, 0.10, 0.10, 1.0 },
-            };
-        } else {
-            break :blk .{
-                .fg = .{ 0.10, 0.10, 0.10, 1.0 },
-                .bg = .{ 0.97, 0.97, 0.97, 1.0 },
-            };
-        }
-    };
+pub fn resolveColorsFor(self: *const Window, s: *const ProfileSettings) ColorPair {
+    const eff = resolveSettings(self, s);
+    return colorPairOf(self, &eff);
+}
+
+/// fg/bg of an ALREADY scheme-resolved bundle, with the window's
+/// background opacity folded into bg.a.
+fn colorPairOf(self: *const Window, eff: *const ProfileSettings) ColorPair {
+    var pair: ColorPair = .{ .fg = eff.default_fg, .bg = eff.default_bg };
     pair.bg[3] *= self.config.background_opacity;
     return pair;
+}
+
+/// Push a bundle's colours onto one pane: default fg/bg on the
+/// screen and both render passes, the DSR ?996 / mode 2031 scheme
+/// notification, the cursor colour and the 16-entry palette.
+/// `s` is the pane's RAW settings; scheme resolution happens here.
+pub fn pushPaneColors(self: *Window, pane: *Pane, s: *const ProfileSettings) void {
+    const eff = resolveSettings(self, s);
+    const fg_bg = colorPairOf(self, &eff);
+    const screen = pane.terminal.screen;
+    screen.default_fg = fg_bg.fg;
+    screen.default_bg = fg_bg.bg;
+    screen.configured_fg = fg_bg.fg;
+    screen.configured_bg = fg_bg.bg;
+    screen.notifyColorScheme(isDarkBg(fg_bg.bg));
+    // Renderer convention: alpha=0 means "use fg colour". We map
+    // cursor_color_default → that sentinel.
+    screen.cursor_color = if (eff.cursor_color_default)
+        .{ 0, 0, 0, 0 }
+    else
+        eff.cursor_color;
+    pane.grid_pass.default_fg = fg_bg.fg;
+    pane.grid_pass.default_bg = fg_bg.bg;
+    pane.cell_pass.default_fg = fg_bg.fg;
+    pane.cell_pass.default_bg = fg_bg.bg;
+    // Palette (16 ANSI colours). Entries 16..255 keep their built-in
+    // 256-table values.
+    if (resolvePalette(&eff)) |pal| {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            screen.palette[i] = pal[i];
+            pane.grid_pass.palette[i] = pal[i];
+        }
+    }
 }
 
 /// Open the preferences dialog. Live-applies changes via
@@ -756,36 +776,12 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         }
         const s = self.config.profileSettings(p.active_profile orelse "");
 
-        // Colors. resolveColorsFor applies auto-theme +
+        // Colors. pushPaneColors applies the light/dark variant +
         // background_opacity so panes get the actual rendering
         // values, not the raw settings struct.
-        const eff = resolveColorsFor(self, s);
-        screen.default_fg = eff.fg;
-        screen.default_bg = eff.bg;
-        screen.configured_fg = eff.fg;
-        screen.configured_bg = eff.bg;
-        screen.notifyColorScheme(isDarkBg(eff.bg));
+        pushPaneColors(self, p, s);
         screen.allow_clipboard_read = self.config.clipboard_read;
         screen.track_activity = self.config.track_tab_activity;
-        // Renderer convention: alpha=0 means "use fg colour". We
-        // map cursor_color_default → that sentinel.
-        screen.cursor_color = if (s.cursor_color_default)
-            .{ 0, 0, 0, 0 }
-        else
-            s.cursor_color;
-        p.grid_pass.default_fg = eff.fg;
-        p.grid_pass.default_bg = eff.bg;
-        p.cell_pass.default_fg = eff.fg;
-        p.cell_pass.default_bg = eff.bg;
-        // Palette (16 ANSI colours). Entries 16..255 keep their
-        // built-in 256-table values.
-        if (resolvePalette(s)) |pal| {
-            var i: usize = 0;
-            while (i < 16) : (i += 1) {
-                screen.palette[i] = pal[i];
-                p.grid_pass.palette[i] = pal[i];
-            }
-        }
         // Cursor. Shape or interval changes re-arm (or drop) the
         // blink timer — it only runs while the shape blinks.
         screen.cursor_shape = mapCursorShape(self.config.cursor_shape, self.config.cursor_blink);
@@ -1268,19 +1264,17 @@ pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker
     _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
 }
 
+/// The system flipped light/dark: re-resolve every pane against its
+/// OWN profile, since each profile carries its own light/dark colour
+/// variants (and a variant can move the palette and cursor colour,
+/// not just fg/bg).
 pub fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     if (!self.config.auto_theme) return;
-    const fg_bg = resolveDefaultColors(self);
     for (self.panes.items) |p| {
-        p.grid_pass.default_fg = fg_bg.fg;
-        p.grid_pass.default_bg = fg_bg.bg;
-        p.terminal.screen.default_fg = fg_bg.fg;
-        p.terminal.screen.default_bg = fg_bg.bg;
-        p.terminal.screen.configured_fg = fg_bg.fg;
-        p.terminal.screen.configured_bg = fg_bg.bg;
-        p.terminal.screen.notifyColorScheme(isDarkBg(fg_bg.bg));
+        pushPaneColors(self, p, self.config.profileSettings(p.active_profile orelse ""));
         p.terminal.screen.dirty = true;
+        p.cell_pass.markAllDirty();
         c.gtk_gl_area_queue_render(@ptrCast(p.area));
     }
 }
