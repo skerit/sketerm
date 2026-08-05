@@ -18,6 +18,7 @@ const ExitAction = @import("../config.zig").ExitAction;
 const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
 const editor_theme = @import("../editor/theme.zig");
+const ecmd = @import("../editor/commands.zig");
 const lsp_proc = @import("../lsp/proc.zig");
 
 // Forward-declare the Window pointer type. We can't import window.zig
@@ -1283,6 +1284,13 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(indent_group)), ctx, "Insert spaces", "Tab inserts spaces to the next stop. Off inserts a literal tab character.", &ctx.cfg.editor_insert_spaces, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(indent_group)));
 
+    const typing_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(typing_group)), "Typing");
+    addSwitchRow(@ptrCast(@alignCast(typing_group)), ctx, "Auto indent", "Enter copies the line's indentation and goes one level deeper after an opening bracket; a pending closer drops onto its own line.", &ctx.cfg.editor_auto_indent, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(typing_group)), ctx, "Auto-close brackets and quotes", "Typing ( [ { \" ' ` inserts the closing half; typing the closer when it is next just moves past it, and Backspace between an empty pair deletes both. Never fires where the grammar says string or comment.", &ctx.cfg.editor_auto_close_pairs, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(typing_group)), ctx, "Smart backspace", "Backspace in a line's leading spaces retreats one tab stop instead of one space.", &ctx.cfg.editor_smart_backspace, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(typing_group)));
+
     const view_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(view_group)), "View");
     addSwitchRow(@ptrCast(@alignCast(view_group)), ctx, "Soft wrap by default", "New editor tabs start wrapped. Alt+Z toggles it per tab.", &ctx.cfg.editor_soft_wrap, applyOnly);
@@ -1644,7 +1652,12 @@ const input_mod = @import("input.zig");
 const KeybindRowCtx = struct {
     allocator: std.mem.Allocator,
     parent: *Ctx,
-    action: input_mod.Action,
+    /// Which binding this row edits: a window/pane action
+    /// (`keybind.*`) or an editor-face command (`editor_keybind.*`).
+    which: union(enum) {
+        act: input_mod.Action,
+        ed: ecmd.Command,
+    },
     button: *c.GtkButton,
     /// Captures the next keypress when "Press a key…" is active.
     capture_ctrl: ?*c.GtkEventController = null,
@@ -1664,14 +1677,28 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 
     inline for (@typeInfo(input_mod.Action).@"enum".fields) |field| {
         const action: input_mod.Action = @enumFromInt(field.value);
-        addKeybindRow(@ptrCast(@alignCast(group)), ctx, action);
+        addKeybindRow(@ptrCast(@alignCast(group)), ctx, .{ .act = action });
+    }
+
+    const ed_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(ed_group)), "Editor Commands");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(ed_group)), "Chords active only while the editor canvas has focus. " ++
+        "Stored as editor_keybind.<command> lines; they never shadow a terminal key.");
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(ed_group)));
+
+    inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
+        const cmd: ecmd.Command = @enumFromInt(field.value);
+        addKeybindRow(@ptrCast(@alignCast(ed_group)), ctx, .{ .ed = cmd });
     }
 }
 
-fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, action: input_mod.Action) void {
+fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, which: @FieldType(KeybindRowCtx, "which")) void {
     const row = c.adw_action_row_new();
-    var label_buf: [64:0]u8 = undefined;
-    const lbl = input_mod.actionLabel(action);
+    var label_buf: [80:0]u8 = undefined;
+    const lbl = switch (which) {
+        .act => |a| input_mod.actionLabel(a),
+        .ed => |cmd| ecmd.label(cmd),
+    };
     const lbl_len = @min(lbl.len, label_buf.len - 1);
     @memcpy(label_buf[0..lbl_len], lbl[0..lbl_len]);
     label_buf[lbl_len] = 0;
@@ -1683,7 +1710,7 @@ fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, action: input_mod.Act
     c.gtk_widget_set_size_request(button, 180, -1);
 
     const rctx = ctx.allocator.create(KeybindRowCtx) catch return;
-    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .action = action, .button = @ptrCast(@alignCast(button)) };
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .which = which, .button = @ptrCast(@alignCast(button)) };
 
     refreshKeybindButtonLabel(rctx);
 
@@ -1694,12 +1721,19 @@ fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, action: input_mod.Act
 }
 
 fn refreshKeybindButtonLabel(rctx: *KeybindRowCtx) void {
-    // Look up the active accel for this action: config override
-    // wins, otherwise default_bindings.
-    const action_name = input_mod.actionName(rctx.action);
+    // Look up the active accel: config override wins, otherwise the
+    // default table for this row's kind.
+    const action_name: []const u8 = switch (rctx.which) {
+        .act => |a| input_mod.actionName(a),
+        .ed => |cmd| ecmd.name(cmd),
+    };
+    const list = switch (rctx.which) {
+        .act => rctx.parent.cfg.keybinds.items,
+        .ed => rctx.parent.cfg.editor_keybinds.items,
+    };
     var accel: []const u8 = "";
     var found_in_config = false;
-    for (rctx.parent.cfg.keybinds.items) |kb| {
+    for (list) |kb| {
         if (std.mem.eql(u8, kb.name, action_name)) {
             accel = kb.accel;
             found_in_config = true;
@@ -1707,14 +1741,22 @@ fn refreshKeybindButtonLabel(rctx: *KeybindRowCtx) void {
         }
     }
     if (!found_in_config) {
-        // Fall back to first matching default.
-        for (input_mod.default_bindings) |b| {
-            if (b.action == rctx.action) {
-                const s = input_mod.accelToString(rctx.parent.allocator, b.keyval, b.mods) catch return;
-                defer rctx.parent.allocator.free(s);
-                setButtonLabel(rctx.button, s);
+        switch (rctx.which) {
+            .act => |action| {
+                // Fall back to first matching default.
+                for (input_mod.default_bindings) |b| {
+                    if (b.action == action) {
+                        const s = input_mod.accelToString(rctx.parent.allocator, b.keyval, b.mods) catch return;
+                        defer rctx.parent.allocator.free(s);
+                        setButtonLabel(rctx.button, s);
+                        return;
+                    }
+                }
+            },
+            .ed => |cmd| {
+                setButtonLabel(rctx.button, ecmd.defaultAccel(cmd));
                 return;
-            }
+            },
         }
         setButtonLabel(rctx.button, "(unbound)");
         return;
@@ -1808,15 +1850,23 @@ fn finishCapture(rctx: *KeybindRowCtx) void {
     refreshKeybindButtonLabel(rctx);
 }
 
-/// Set or replace the override for this action in ctx.cfg.keybinds.
-/// `accel` is borrowed; we dup into the prefs arena.
+/// Set or replace the override for this row in its config list
+/// (`keybinds` or `editor_keybinds`). `accel` is borrowed; we dup
+/// into the prefs arena.
 fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
     const arena = rctx.parent.arena.allocator();
-    const action_name = input_mod.actionName(rctx.action);
+    const action_name: []const u8 = switch (rctx.which) {
+        .act => |a| input_mod.actionName(a),
+        .ed => |cmd| ecmd.name(cmd),
+    };
+    const list = switch (rctx.which) {
+        .act => &rctx.parent.cfg.keybinds,
+        .ed => &rctx.parent.cfg.editor_keybinds,
+    };
     const accel_dup = arena.dupe(u8, accel) catch return;
 
     // Replace existing entry, or append.
-    for (rctx.parent.cfg.keybinds.items) |*entry| {
+    for (list.items) |*entry| {
         if (std.mem.eql(u8, entry.name, action_name)) {
             entry.accel = accel_dup;
             rctx.parent.ev();
@@ -1826,7 +1876,7 @@ fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
     const name_dup = arena.dupe(u8, action_name) catch return;
     // The list's backing array lives in the prefs arena (cloneInto);
     // growing it through the GPA would leak the GPA block on close.
-    rctx.parent.cfg.keybinds.append(arena, .{
+    list.append(arena, .{
         .name = name_dup,
         .accel = accel_dup,
     }) catch return;
