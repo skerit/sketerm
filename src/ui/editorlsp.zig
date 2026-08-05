@@ -24,14 +24,20 @@
 //!
 //! ## Remote documents
 //!
-//! NOT in this change. A server must run near the files, so a document
-//! opened from a remote host needs the daemon to spawn it and tunnel
-//! its stdio — a new `sketerm-mux` frame plus process management in the
-//! poll loop. The structure is ready for it (`Conn` owns a `Child` and
-//! a `Session`; only the transport under `pumpWrite`/`onReadable` is
-//! local-specific), and `attachTab` refuses a host-qualified spec today
-//! rather than silently running the server on the wrong machine. See
-//! docs/lsp.md.
+//! The server runs NEAR THE FILES: for a `host:/path` spec the daemon
+//! on `host` spawns it (`lsp_open`) and bridges its stdio as a byte
+//! channel; this file relays the raw JSON-RPC bytes over a dedicated
+//! per-host mux connection (`RemoteLink`, watched with `g_unix_fd_add`
+//! like every other socket — the connect itself happens on a worker
+//! thread because the ssh bootstrap blocks). The `Session`, staleness
+//! discipline, position-encoding negotiation and every feature are the
+//! LOCAL client unchanged: only `pumpWrite` and the link's frame
+//! router know the transport is not a pipe. Discovery is the daemon's:
+//! the client ships its ordered candidate list and the daemon answers
+//! which server is installed THERE and where the root markers resolve
+//! on ITS filesystem. A host whose daemon predates `lsp:true`, has no
+//! server installed, or drops the connection degrades silently — the
+//! same contract as a missing local server. See docs/lsp.md.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -59,6 +65,8 @@ const semantic = @import("../lsp/semantic.zig");
 const inlay = @import("../lsp/inlay.zig");
 const layout_mod = @import("../render/editor_layout.zig");
 const syntax = @import("../editor/syntax.zig");
+const muxclient = @import("../mux/client.zig");
+const wire = @import("../mux/wire.zig");
 
 /// `SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
 /// published diagnostics to stderr. There is no other way to see why a
@@ -216,6 +224,11 @@ pub const Conn = struct {
     /// `file://` root URI, owned.
     root_uri: []u8,
     child: proc.Child = .{},
+    /// Remote transport: the server runs on the daemon's host and its
+    /// stdio rides `link` as chan_data frames for channel `chan`.
+    /// Null = local child process. Everything except `pumpWrite` and
+    /// teardown is transport-blind.
+    remote: ?Remote = null,
     sess: session.Session,
     watch_out: c_uint = 0,
     watch_err: c_uint = 0,
@@ -273,10 +286,51 @@ pub const Conn = struct {
         if (state == .dead) self.mgr.onServerDead(self);
     }
 
+    pub const Remote = struct {
+        link: *RemoteLink,
+        chan: u32,
+        /// False once chan_close went out (or came in) — nothing may
+        /// be queued for the channel after that.
+        open: bool = true,
+    };
+
     /// Push whatever the session queued into the server's stdin.
     /// Installs a writable watch only when the pipe is full, so the
     /// common case costs one write() and no GLib source.
+    ///
+    /// Remote transport: the bytes become chan_data frames on the
+    /// link's mux connection instead — the link owns the partial-write
+    /// buffering (its own G_IO_OUT watch), so the whole queue moves at
+    /// once.
     fn pumpWrite(self: *Conn) void {
+        if (self.remote) |*rm| {
+            if (self.sess.out.items.len == 0) return;
+            defer {
+                self.sess.out.clearRetainingCapacity();
+                self.out_pos = 0;
+            }
+            if (!rm.open or rm.link.state != .up) return;
+            const CHUNK: usize = 1 << 20;
+            var off: usize = 0;
+            const bytes = self.sess.out.items;
+            while (off < bytes.len) {
+                const end = @min(off + CHUNK, bytes.len);
+                const payload = self.mgr.alloc.alloc(u8, 4 + (end - off)) catch {
+                    self.sess.markDead();
+                    return;
+                };
+                defer self.mgr.alloc.free(payload);
+                std.mem.writeInt(u32, payload[0..4], rm.chan, .little);
+                @memcpy(payload[4..], bytes[off..end]);
+                rm.link.conn.queueFrame(.chan_data, payload) catch {
+                    rm.link.markDead();
+                    return;
+                };
+                off = end;
+            }
+            rm.link.armWriteWatch();
+            return;
+        }
         if (self.child.stdin < 0) return;
         while (self.out_pos < self.sess.out.items.len) {
             const rest = self.sess.out.items[self.out_pos..];
@@ -424,17 +478,321 @@ pub const Conn = struct {
     fn destroy(self: *Conn) void {
         self.closing = true;
         self.dropWatches();
+        const mgr = self.mgr;
+        var drop_link: ?*RemoteLink = null;
+        if (self.remote) |*rm| {
+            // Tell the daemon to take the server down (SIGTERM its
+            // group). A dropped link needs nothing: client death kills
+            // the channel and its child daemon-side.
+            if (rm.open and rm.link.state == .up) {
+                var hdr: [4]u8 = undefined;
+                rm.link.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, rm.chan)) catch {};
+                rm.link.armWriteWatch();
+            }
+            rm.open = false;
+            drop_link = rm.link;
+            self.remote = null;
+        }
         self.child.killHard();
         self.child.closePipes();
         _ = self.child.reap();
         self.sess.deinit();
-        const a = self.mgr.alloc;
+        const a = mgr.alloc;
         a.free(self.name);
         a.free(self.root);
         a.free(self.root_uri);
         a.destroy(self);
+        // After the free: the idle-link scan must not see this Conn.
+        if (drop_link) |link| mgr.maybeDropLink(link);
     }
 };
+
+// ======================================================================
+// Remote links: one mux connection per host, carrying LSP byte channels
+// ======================================================================
+
+/// A dedicated mux connection to one remote host, used ONLY for LSP
+/// traffic (fs jobs make their own short-lived connections; sharing
+/// one would tangle this link's frame stream with request/reply
+/// pumps). Established on a worker thread — the ssh bootstrap blocks —
+/// then watched on the GLib loop like every other socket. Owned by the
+/// Manager; dropped when the last remote Conn on it goes away. A link
+/// that failed to connect, or whose daemon does not advertise
+/// `lsp:true`, stays recorded as `.dead` so repeated attaches on that
+/// host cost nothing (and stay silent).
+pub const RemoteLink = struct {
+    mgr: *Manager,
+    /// Host part of the spec ("box", "user@box", "udp:box"), owned.
+    host: []u8,
+    state: enum { connecting, up, dead } = .connecting,
+    /// Valid only while `.up`.
+    conn: muxclient.Conn = undefined,
+    watch_in: c_uint = 0,
+    watch_out: c_uint = 0,
+    next_req: u32 = 1,
+    /// lsp_open requests in flight.
+    pending: std.ArrayList(Pending) = .empty,
+    /// Tabs parked here until the connect worker hands the socket back.
+    waiting: std.ArrayList(u64) = .empty,
+
+    const Pending = struct { req: u32, tab_id: u64 };
+
+    fn destroyLink(self: *RemoteLink) void {
+        self.dropLinkWatches();
+        if (self.state == .up) self.conn.deinit();
+        self.state = .dead;
+        const a = self.mgr.alloc;
+        self.pending.deinit(a);
+        self.waiting.deinit(a);
+        a.free(self.host);
+        a.destroy(self);
+    }
+
+    fn dropLinkWatches(self: *RemoteLink) void {
+        for ([_]*c_uint{ &self.watch_in, &self.watch_out }) |w| {
+            if (w.* != 0) _ = c.g_source_remove(w.*);
+            w.* = 0;
+        }
+    }
+
+    /// The transport failed (EOF, write error, hangup): every server
+    /// on it is gone. The record stays `.dead` in the Manager's list
+    /// so later attaches on this host degrade silently instead of
+    /// redialing per document.
+    fn markDead(self: *RemoteLink) void {
+        if (self.state == .dead) return;
+        const was_up = self.state == .up;
+        self.state = .dead;
+        dbg("link {s}: dead", .{self.host});
+        self.dropLinkWatches();
+        if (was_up) self.conn.deinit();
+        self.pending.clearRetainingCapacity();
+        self.waiting.clearRetainingCapacity();
+        // markDead on each session routes through onServerDead, which
+        // detaches tabs and clears decorations — the same path a local
+        // server crash takes.
+        for (self.mgr.conns.items) |cn| {
+            if (cn.remote) |*rm| {
+                if (rm.link == self) {
+                    rm.open = false;
+                    cn.sess.markDead();
+                }
+            }
+        }
+    }
+
+    /// Non-blocking flush; a short write leaves the rest in the mux
+    /// Conn's wbuf and a G_IO_OUT watch drains it.
+    fn armWriteWatch(self: *RemoteLink) void {
+        if (self.state != .up) return;
+        self.conn.flushQueued() catch {
+            self.markDead();
+            return;
+        };
+        if (self.conn.wbuf.items.len > 0 and self.watch_out == 0) {
+            self.watch_out = c.g_unix_fd_add(
+                self.conn.fd,
+                c.G_IO_OUT | c.G_IO_ERR | c.G_IO_HUP,
+                @ptrCast(&onLinkWritable),
+                @ptrCast(self),
+            );
+        }
+    }
+
+    fn onLinkWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *RemoteLink = @ptrCast(@alignCast(user.?));
+        if (self.state != .up) {
+            self.watch_out = 0;
+            return 0;
+        }
+        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
+            self.watch_out = 0;
+            self.markDead();
+            return 0;
+        }
+        self.conn.flushQueued() catch {
+            self.watch_out = 0;
+            self.markDead();
+            return 0;
+        };
+        if (self.conn.wbuf.items.len == 0) {
+            self.watch_out = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    fn onLinkReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *RemoteLink = @ptrCast(@alignCast(user.?));
+        if (self.state != .up) {
+            self.watch_in = 0;
+            return 0;
+        }
+        if (!self.conn.fillAvailable()) {
+            self.watch_in = 0;
+            self.markDead();
+            return 0;
+        }
+        while (true) {
+            const maybe = self.conn.takeFrame() catch {
+                self.watch_in = 0;
+                self.markDead();
+                return 0;
+            };
+            const f = maybe orelse break;
+            defer f.deinit(self.conn.allocator);
+            self.handleFrame(f);
+            if (self.state != .up) {
+                self.watch_in = 0;
+                return 0;
+            }
+        }
+        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
+            self.watch_in = 0;
+            self.markDead();
+            return 0;
+        }
+        // Handlers may have queued replies (didOpen after ready, …).
+        self.armWriteWatch();
+        return 1;
+    }
+
+    fn connByChan(self: *RemoteLink, chan: u32) ?*Conn {
+        for (self.mgr.conns.items) |cn| {
+            if (cn.closing) continue;
+            if (cn.remote) |*rm| {
+                if (rm.link == self and rm.chan == chan) return cn;
+            }
+        }
+        return null;
+    }
+
+    fn handleFrame(self: *RemoteLink, f: muxclient.Conn.OwnedFrame) void {
+        switch (f.ftype) {
+            .lsp_reply => self.mgr.onLspReply(self, f.payload),
+            .chan_data => {
+                const id = wire.decodeChanId(f.payload) orelse return;
+                const cn = self.connByChan(id) orelse return;
+                cn.sess.feed(f.payload[4..]);
+                if (cn.sess.state != .dead) cn.pumpWrite();
+            },
+            .chan_close => {
+                const id = wire.decodeChanId(f.payload) orelse return;
+                const cn = self.connByChan(id) orelse return;
+                if (cn.remote) |*rm| rm.open = false;
+                // Same as a local server's stdout EOF.
+                cn.sess.markDead();
+            },
+            // Anything else on this dedicated connection (peer_info,
+            // marker pushes, …) is not for us.
+            else => {},
+        }
+    }
+
+    /// Queue an lsp_open for `tab`'s document, once. The candidate
+    /// list is the CLIENT's config; which of them is installed — and
+    /// where the root markers resolve — only the remote host can say.
+    fn sendOpen(self: *RemoteLink, tab: *ETab) void {
+        if (self.state != .up) return;
+        for (self.pending.items) |p| {
+            if (p.tab_id == tab.id) return;
+        }
+        const mgr = self.mgr;
+        const conf = mgr.cfg() orelse return;
+        const spec = tab.spec orelse return;
+        const loc = paths.parseSpec(spec);
+        const lang = servers.languageId(loc.path);
+        if (lang.len == 0) return;
+        const candidates = conf.lspServerCandidates(lang, mgr.alloc) catch return;
+        defer mgr.alloc.free(candidates);
+        if (candidates.len == 0) return;
+        const req = self.next_req;
+        self.next_req += 1;
+        self.pending.append(mgr.alloc, .{ .req = req, .tab_id = tab.id }) catch return;
+        dbg("link {s}: lsp_open req={d} dir={s} ({d} candidates)", .{ self.host, req, servers.dirnameOf(loc.path), candidates.len });
+        self.conn.queueJson(.lsp_open, .{
+            .req = req,
+            .dir = servers.dirnameOf(loc.path),
+            .servers = candidates,
+        }) catch {
+            self.markDead();
+            return;
+        };
+        self.armWriteWatch();
+    }
+
+    fn takePending(self: *RemoteLink, req: u32) ?u64 {
+        for (self.pending.items, 0..) |p, i| {
+            if (p.req == req) {
+                _ = self.pending.swapRemove(i);
+                return p.tab_id;
+            }
+        }
+        return null;
+    }
+
+    /// Ask the daemon to close (and thereby kill) a channel we ended
+    /// up not using — a reply for a tab that closed meanwhile, or a
+    /// duplicate spawn that lost the (name, root) dedupe race.
+    fn discardChannel(self: *RemoteLink, chan: u32) void {
+        if (self.state != .up) return;
+        var hdr: [4]u8 = undefined;
+        self.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {
+            self.markDead();
+            return;
+        };
+        self.armWriteWatch();
+    }
+};
+
+/// The blocking half of a link connect: ssh bootstrap + hello/welcome
+/// on a g_thread, handed back to the GLib loop via idle. The fence
+/// carries "is the EditorView still alive" across the gap.
+const LinkJob = struct {
+    fence: *editorview.Fence,
+    /// Owned by the job (the link's copy may be freed while we run).
+    host: []u8,
+    conn: muxclient.Conn = undefined,
+    ok: bool = false,
+    lsp: bool = false,
+
+    fn destroy(self: *LinkJob) void {
+        const a = std.heap.c_allocator;
+        a.free(self.host);
+        self.fence.unref();
+        a.destroy(self);
+    }
+};
+
+fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const job: *LinkJob = @ptrCast(@alignCast(data.?));
+    const a = std.heap.c_allocator;
+    run: {
+        var config = Config.load(a);
+        defer config.deinit();
+        const conn = muxclient.Conn.connectRemote(a, job.host, config.udpRange()) catch break :run;
+        job.conn = conn;
+        job.ok = true;
+        job.lsp = conn.lsp_support;
+    }
+    _ = c.g_idle_add(@ptrCast(&linkIdle), @ptrCast(job));
+    return null;
+}
+
+fn linkIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const job: *LinkJob = @ptrCast(@alignCast(user.?));
+    defer job.destroy();
+    const view = job.fence.viewIfAlive() orelse {
+        if (job.ok) job.conn.deinit();
+        return 0;
+    };
+    const mgr = view.lsp orelse {
+        if (job.ok) job.conn.deinit();
+        return 0;
+    };
+    mgr.onLinkConnected(job);
+    return 0;
+}
 
 // ======================================================================
 // Popup list (completion / locations / symbols)
@@ -551,6 +909,10 @@ pub const Manager = struct {
     view: *EditorView,
     alloc: std.mem.Allocator,
     conns: std.ArrayList(*Conn) = .empty,
+    /// One per remote host with (past or present) LSP traffic. Dead
+    /// entries stay recorded so a host that failed once degrades
+    /// silently instead of redialing per document.
+    links: std.ArrayList(*RemoteLink) = .empty,
     list: ListPopup = undefined,
     hover: HoverPopup = undefined,
     sig: SigPopup = undefined,
@@ -587,8 +949,13 @@ pub const Manager = struct {
         self.closeHover();
         self.closeSignature();
         self.unparentPopups();
-        for (self.conns.items) |cn| cn.destroy();
+        // Pop-based: Conn.destroy scans the live conns (and can drop
+        // an idle link), so neither list may hold freed pointers
+        // mid-loop.
+        while (self.conns.pop()) |cn| cn.destroy();
         self.conns.deinit(self.alloc);
+        while (self.links.pop()) |link| link.destroyLink();
+        self.links.deinit(self.alloc);
         self.list.deinit();
         self.hint_view.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
@@ -626,9 +993,276 @@ pub const Manager = struct {
     fn findConn(self: *Manager, name: []const u8, root: []const u8) ?*Conn {
         for (self.conns.items) |cn| {
             if (cn.closing) continue;
+            if (cn.remote != null) continue;
             if (std.mem.eql(u8, cn.name, name) and std.mem.eql(u8, cn.root, root)) return cn;
         }
         return null;
+    }
+
+    /// A live remote server for (host, name, root). Dead sessions are
+    /// skipped: reusing one would attach the tab to a server that will
+    /// never answer, where a fresh lsp_open might succeed.
+    fn findRemoteConn(self: *Manager, link: *RemoteLink, name: []const u8, root: []const u8) ?*Conn {
+        for (self.conns.items) |cn| {
+            if (cn.closing or cn.sess.state == .dead) continue;
+            const rm = cn.remote orelse continue;
+            if (rm.link != link) continue;
+            if (std.mem.eql(u8, cn.name, name) and std.mem.eql(u8, cn.root, root)) return cn;
+        }
+        return null;
+    }
+
+    fn findLink(self: *Manager, host: []const u8) ?*RemoteLink {
+        for (self.links.items) |link| {
+            if (std.mem.eql(u8, link.host, host)) return link;
+        }
+        return null;
+    }
+
+    /// Start connecting to `host`'s daemon on a worker thread (the ssh
+    /// bootstrap blocks). The link is listed immediately in
+    /// `.connecting` state so attaches can park on it.
+    fn startLink(self: *Manager, host: []const u8) ?*RemoteLink {
+        const link = self.alloc.create(RemoteLink) catch return null;
+        const host_dup = self.alloc.dupe(u8, host) catch {
+            self.alloc.destroy(link);
+            return null;
+        };
+        link.* = .{ .mgr = self, .host = host_dup };
+        self.links.append(self.alloc, link) catch {
+            self.alloc.free(host_dup);
+            self.alloc.destroy(link);
+            return null;
+        };
+        const job = std.heap.c_allocator.create(LinkJob) catch {
+            link.state = .dead;
+            return link;
+        };
+        const job_host = std.heap.c_allocator.dupe(u8, host) catch {
+            std.heap.c_allocator.destroy(job);
+            link.state = .dead;
+            return link;
+        };
+        self.view.fence.ref();
+        job.* = .{ .fence = self.view.fence, .host = job_host };
+        const th = c.g_thread_new("sketerm-lsplink", @ptrCast(&linkThread), @ptrCast(job));
+        if (th == null) {
+            job.destroy();
+            link.state = .dead;
+            return link;
+        }
+        c.g_thread_unref(th);
+        dbg("link {s}: connecting", .{host});
+        return link;
+    }
+
+    /// The connect worker handed the socket back (or failed).
+    fn onLinkConnected(self: *Manager, job: *LinkJob) void {
+        const link = self.findLink(job.host) orelse {
+            if (job.ok) job.conn.deinit();
+            return;
+        };
+        if (link.state != .connecting) {
+            if (job.ok) job.conn.deinit();
+            return;
+        }
+        if (!job.ok or !job.lsp) {
+            dbg("link {s}: {s}", .{ link.host, if (!job.ok) "connect failed" else "daemon has no lsp support" });
+            link.state = .dead;
+            link.waiting.clearRetainingCapacity();
+            return;
+        }
+        link.conn = job.conn;
+        link.conn.setNonBlocking();
+        link.state = .up;
+        link.watch_in = c.g_unix_fd_add(
+            link.conn.fd,
+            c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
+            @ptrCast(&RemoteLink.onLinkReadable),
+            @ptrCast(link),
+        );
+        dbg("link {s}: up", .{link.host});
+        // Everything that parked while we dialed.
+        var i: usize = 0;
+        while (i < link.waiting.items.len) : (i += 1) {
+            const tab = self.view.findTabByIdPublic(link.waiting.items[i]) orelse continue;
+            link.sendOpen(tab);
+        }
+        link.waiting.clearRetainingCapacity();
+    }
+
+    /// Drop `link` when nothing references it any more — the remote
+    /// mirror of "the last tab out shuts the server down". Called
+    /// after a remote Conn is destroyed.
+    fn maybeDropLink(self: *Manager, link: *RemoteLink) void {
+        if (link.state == .connecting) return;
+        if (link.pending.items.len > 0 or link.waiting.items.len > 0) return;
+        for (self.conns.items) |cn| {
+            if (cn.remote) |*rm| {
+                if (rm.link == link) return;
+            }
+        }
+        for (self.links.items, 0..) |x, i| {
+            if (x != link) continue;
+            _ = self.links.orderedRemove(i);
+            break;
+        }
+        dbg("link {s}: dropped (idle)", .{link.host});
+        link.destroyLink();
+    }
+
+    /// `lsp_reply` from a host's daemon: it picked a server, resolved
+    /// the root on ITS filesystem, and spawned — or found nothing, in
+    /// which case the tab silently stays serverless.
+    fn onLspReply(self: *Manager, link: *RemoteLink, payload: []const u8) void {
+        const Reply = struct {
+            req: u32 = 0,
+            ok: bool = false,
+            chan: u32 = 0,
+            name: []const u8 = "",
+            root: []const u8 = "",
+        };
+        var parsed = std.json.parseFromSlice(Reply, self.alloc, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        const rep = parsed.value;
+        const tab_id = link.takePending(rep.req) orelse {
+            if (rep.ok) link.discardChannel(rep.chan);
+            return;
+        };
+        if (!rep.ok) {
+            dbg("link {s}: no server for req {d} (remote host has none installed)", .{ link.host, rep.req });
+            return;
+        }
+        const tab = self.view.findTabByIdPublic(tab_id) orelse {
+            // Closed while the request was in flight; the channel's
+            // server was spawned for nothing — take it down.
+            link.discardChannel(rep.chan);
+            return;
+        };
+        dbg("link {s}: {s} root={s} chan={d}", .{ link.host, rep.name, rep.root, rep.chan });
+        if (self.findRemoteConn(link, rep.name, rep.root)) |existing| {
+            // Two documents of one project raced their lsp_opens: keep
+            // the first server, kill the duplicate.
+            link.discardChannel(rep.chan);
+            self.bindTabToConn(tab, existing);
+            return;
+        }
+        const cn = self.createRemoteConn(link, rep.name, rep.root, rep.chan) orelse {
+            link.discardChannel(rep.chan);
+            return;
+        };
+        self.bindTabToConn(tab, cn);
+    }
+
+    fn createRemoteConn(self: *Manager, link: *RemoteLink, name: []const u8, root: []const u8, chan: u32) ?*Conn {
+        const cn = self.alloc.create(Conn) catch return null;
+        const name_dup = self.alloc.dupe(u8, name) catch {
+            self.alloc.destroy(cn);
+            return null;
+        };
+        const root_dup = self.alloc.dupe(u8, root) catch {
+            self.alloc.free(name_dup);
+            self.alloc.destroy(cn);
+            return null;
+        };
+        const root_uri = servers.pathToUri(self.alloc, root) catch {
+            self.alloc.free(name_dup);
+            self.alloc.free(root_dup);
+            self.alloc.destroy(cn);
+            return null;
+        };
+        cn.* = .{
+            .mgr = self,
+            .name = name_dup,
+            .root = root_dup,
+            .root_uri = root_uri,
+            .remote = .{ .link = link, .chan = chan },
+            .sess = undefined,
+        };
+        cn.sess = session.Session.init(self.alloc, cn.handler());
+        self.conns.append(self.alloc, cn) catch {
+            cn.sess.deinit();
+            self.alloc.free(cn.name);
+            self.alloc.free(cn.root);
+            self.alloc.free(cn.root_uri);
+            self.alloc.destroy(cn);
+            return null;
+        };
+        // init_options stays a CLIENT concern (it travels inside
+        // `initialize`); find the config record the daemon's pick
+        // corresponds to. pid 0 = "no processId": ours means nothing
+        // on the server's host, and clangd exits when the advertised
+        // pid does not exist.
+        var init_options: []const u8 = "";
+        if (self.cfg()) |conf| {
+            const list = conf.lspServerList(self.alloc) catch &.{};
+            defer self.alloc.free(list);
+            for (list) |srv| {
+                if (std.mem.eql(u8, srv.name, name)) {
+                    init_options = srv.init_options;
+                    break;
+                }
+            }
+            cn.sess.start(cn.root_uri, 0, init_options);
+        } else cn.sess.start(cn.root_uri, 0, "");
+        cn.pumpWrite();
+        return cn;
+    }
+
+    /// The transport-blind bottom half of an attach: point the tab's
+    /// state at `cn` and open the document once both sides are ready.
+    /// Shared by the local spawn path and the remote reply path.
+    fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) void {
+        const spec = tab.spec orelse return;
+        const loc = paths.parseSpec(spec);
+        const lang = servers.languageId(loc.path);
+        if (lang.len == 0) return;
+        const st = tab.lsp orelse blk: {
+            const fresh = TabState.create(self.alloc, tab) orelse return;
+            tab.lsp = fresh;
+            break :blk fresh;
+        };
+        if (st.conn == cn) return;
+        if (st.conn) |old| self.detachFromConn(tab, st, old);
+        st.conn = cn;
+        cn.refs += 1;
+        st.sync.language_id = lang;
+        const uri = servers.pathToUri(self.alloc, loc.path) catch return;
+        defer self.alloc.free(uri);
+        st.sync.setUri(uri) catch return;
+        tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
+        if (cn.sess.state == .ready) self.openDocument(tab, st);
+    }
+
+    /// Attach a REMOTE document: park it on (or dial) the host's link;
+    /// the daemon answers which server exists there. Every failure on
+    /// this path is silent, like the local one.
+    fn attachRemote(self: *Manager, tab: *ETab, host: []const u8, path: []const u8) void {
+        const conf = self.cfg() orelse return;
+        const lang = servers.languageId(path);
+        if (lang.len == 0) return;
+        // No candidate even claims the language: never dial a host
+        // for a document nothing could serve.
+        const candidates = conf.lspServerCandidates(lang, self.alloc) catch return;
+        const any = candidates.len > 0;
+        self.alloc.free(candidates);
+        if (!any) return;
+        if (tab.lsp) |st| {
+            if (st.conn != null) return; // already served
+        }
+        const link = self.findLink(host) orelse self.startLink(host) orelse return;
+        switch (link.state) {
+            .dead => {},
+            .up => link.sendOpen(tab),
+            .connecting => {
+                for (link.waiting.items) |id| {
+                    if (id == tab.id) return;
+                }
+                link.waiting.append(self.alloc, tab.id) catch {};
+            },
+        }
     }
 
     fn commandInstalled(ctx: ?*anyopaque, command: []const u8) bool {
@@ -743,11 +1377,14 @@ pub const Manager = struct {
         if (!conf.editor_lsp) return;
         const spec = tab.spec orelse return;
         const loc = paths.parseSpec(spec);
-        // Remote documents: a server must run near the files, and this
-        // change spawns only local processes. Running a LOCAL server
-        // against a remote path would resolve every import against the
-        // wrong filesystem, so we do nothing at all.
-        if (loc.host != null) return;
+        // Remote documents: the server must run near the files, so the
+        // HOST's daemon spawns it and relays its stdio (a local server
+        // would resolve every import against the wrong filesystem).
+        // Async by nature — the reply lands in `onLspReply`.
+        if (loc.host) |host| {
+            self.attachRemote(tab, host, loc.path);
+            return;
+        }
         const lang = servers.languageId(loc.path);
         if (lang.len == 0) return;
         // Skip servers whose binary is not present rather than
@@ -763,24 +1400,7 @@ pub const Manager = struct {
             dbg("could not spawn {s}", .{srv.command});
             return;
         };
-
-        const st = tab.lsp orelse blk: {
-            const fresh = TabState.create(self.alloc, tab) orelse return;
-            tab.lsp = fresh;
-            break :blk fresh;
-        };
-        if (st.conn == cn) return;
-        if (st.conn) |old| self.detachFromConn(tab, st, old);
-        st.conn = cn;
-        cn.refs += 1;
-        st.sync.language_id = lang;
-        var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
-        const uri_path = std.fmt.bufPrint(&buf, "{s}", .{loc.path}) catch return;
-        const uri = servers.pathToUri(self.alloc, uri_path) catch return;
-        defer self.alloc.free(uri);
-        st.sync.setUri(uri) catch return;
-        tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
-        if (cn.sess.state == .ready) self.openDocument(tab, st);
+        self.bindTabToConn(tab, cn);
     }
 
     /// Send `didOpen`, but only once the document actually HAS its
@@ -1392,7 +2012,6 @@ pub const Manager = struct {
     }
 
     fn onLocations(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
-        _ = cn;
         const tab = maybe_tab orelse return;
         _ = tab;
         if (env.has_error) {
@@ -1404,7 +2023,7 @@ pub const Manager = struct {
         self.list.tab_id = req.tab_id;
         self.list.revision = req.revision;
         self.list.filter.clearRetainingCapacity();
-        self.collectLocations(env.result);
+        self.collectLocations(cn, env.result);
         if (self.list.items.items.len == 0) {
             self.list.mode = .none;
             self.view.setStatusText("No results.");
@@ -1423,21 +2042,31 @@ pub const Manager = struct {
         self.showPopup();
     }
 
+    /// Spec for a path in one of `cn`'s answers. The path lives on the
+    /// host the SERVER runs on: a remote conn's locations must open as
+    /// `host:/path` or F12 on a remote document would open a same-named
+    /// LOCAL file (or nothing).
+    fn specForConnPath(self: *Manager, cn: *Conn, path: []const u8) ?[]u8 {
+        if (cn.remote) |rm|
+            return std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ rm.link.host, path }) catch null;
+        return std.fmt.allocPrint(self.alloc, "local:{s}", .{path}) catch null;
+    }
+
     /// Accepts Location, Location[], LocationLink[] and null.
-    fn collectLocations(self: *Manager, v: std.json.Value) void {
+    fn collectLocations(self: *Manager, cn: *Conn, v: std.json.Value) void {
         switch (v) {
             .array => |a| {
                 for (a.items) |x| {
                     if (self.list.items.items.len >= MAX_ROWS) break;
-                    self.collectOneLocation(x);
+                    self.collectOneLocation(cn, x);
                 }
             },
-            .object => self.collectOneLocation(v),
+            .object => self.collectOneLocation(cn, v),
             else => {},
         }
     }
 
-    fn collectOneLocation(self: *Manager, v: std.json.Value) void {
+    fn collectOneLocation(self: *Manager, cn: *Conn, v: std.json.Value) void {
         if (v != .object) return;
         const o = v.object;
         // LocationLink uses targetUri/targetSelectionRange.
@@ -1446,7 +2075,7 @@ pub const Manager = struct {
         const rng = pos.parseRange(rng_val);
         const path = (servers.uriToPath(self.alloc, uri) catch return) orelse return;
         defer self.alloc.free(path);
-        const spec = std.fmt.allocPrint(self.alloc, "local:{s}", .{path}) catch return;
+        const spec = self.specForConnPath(cn, path) orelse return;
         const base = servers.basenameOf(path);
         const label = std.fmt.allocPrint(self.alloc, "{s}:{d}", .{ base, rng.start.line + 1 }) catch {
             self.alloc.free(spec);
@@ -1558,8 +2187,7 @@ pub const Manager = struct {
             const tab = maybe_tab orelse break :blk "";
             break :blk tab.spec orelse "";
         };
-        _ = cn;
-        self.collectSymbols(env.result, own_spec, 0);
+        self.collectSymbols(cn, env.result, own_spec, 0);
         if (self.list.items.items.len == 0) {
             self.list.mode = .none;
             self.view.setStatusText("No symbols.");
@@ -1571,7 +2199,7 @@ pub const Manager = struct {
 
     /// DocumentSymbol (hierarchical, `selectionRange` + `children`) and
     /// SymbolInformation (flat, `location`) both land here.
-    fn collectSymbols(self: *Manager, v: std.json.Value, own_spec: []const u8, depth: usize) void {
+    fn collectSymbols(self: *Manager, cn: *Conn, v: std.json.Value, own_spec: []const u8, depth: usize) void {
         const arr = switch (v) {
             .array => |a| a,
             else => return,
@@ -1590,7 +2218,7 @@ pub const Manager = struct {
                     const path = (servers.uriToPath(self.alloc, uri) catch null) orelse null;
                     if (path) |p| {
                         defer self.alloc.free(p);
-                        spec = std.fmt.allocPrint(self.alloc, "local:{s}", .{p}) catch continue;
+                        spec = self.specForConnPath(cn, p) orelse continue;
                     }
                     const rng = pos.parseRange(loc.object.get("range") orelse .null);
                     line = rng.start.line;
@@ -1625,7 +2253,7 @@ pub const Manager = struct {
                 .line = line,
                 .col = col,
             }) catch {};
-            if (o.get("children")) |kids| self.collectSymbols(kids, own_spec, depth + 1);
+            if (o.get("children")) |kids| self.collectSymbols(cn, kids, own_spec, depth + 1);
         }
     }
 
