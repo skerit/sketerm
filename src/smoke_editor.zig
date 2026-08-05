@@ -536,6 +536,124 @@ pub fn main() !u8 {
         std.debug.print("smoke-editor: PASS wrap ({d} rows at 220px)\n", .{ll.rows.len});
     }
 
+    // --- Word wrap: UAX #14 opportunities, hanging spaces, CJK ---
+    {
+        var wl = Layout.init(allocator, &book);
+        defer wl.deinit();
+        wl.wrap_width = 200;
+        var wdoc = try Document.initFromBytes(
+            allocator,
+            "The quick brown fox jumps over the lazy dog once more\n" ++
+                "\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{6587}\u{7AE0}\u{306F}\u{7A7A}\u{767D}\u{306A}\u{3057}\u{3067}\u{3082}\u{6298}\u{308A}\u{8FD4}\u{305B}\u{307E}\u{3059}\n" ++
+                "trailing        \n",
+        );
+        defer wdoc.deinit();
+
+        const prose = try wl.line(&wdoc, 0);
+        if (prose.rows.len < 2) {
+            std.debug.print("smoke-editor: FAIL — word wrap produced {d} row(s)\n", .{prose.rows.len});
+            return 5;
+        }
+        var r: u32 = 1;
+        while (r < prose.rows.len) : (r += 1) {
+            const first = for (prose.clusters) |cl| {
+                if (cl.row == r) break cl;
+            } else unreachable;
+            if (first.byte_start == 0 or prose.text[first.byte_start - 1] != ' ') {
+                std.debug.print("smoke-editor: FAIL — wrapped row {d} starts mid-word (byte {d})\n", .{ r, first.byte_start });
+                return 5;
+            }
+        }
+
+        const cjk = try wl.line(&wdoc, 1);
+        const cjk_w = cjk.clusters[0].x1 - cjk.clusters[0].x0;
+        if (cjk_w > 0.5) {
+            // A CJK-capable font is present: the spaceless line must
+            // wrap between ideographs and fill its rows.
+            if (cjk.rows.len < 2) {
+                std.debug.print("smoke-editor: FAIL — CJK line never wrapped\n", .{});
+                return 5;
+            }
+            var row0: usize = 0;
+            for (cjk.clusters) |cl| {
+                if (cl.row == 0) row0 += 1;
+                if (cl.x1 - cjk.rows[cl.row].x0 > 200.0 + 0.01) {
+                    std.debug.print("smoke-editor: FAIL — CJK cluster overflows its wrap row\n", .{});
+                    return 5;
+                }
+            }
+            if (row0 < 2) {
+                std.debug.print("smoke-editor: FAIL — CJK wrapped one character per row\n", .{});
+                return 5;
+            }
+        }
+
+        // Trailing spaces hang: the text fits one row even though the
+        // spaces run past the wrap column.
+        wl.wrap_width = (try wl.line(&wdoc, 2)).clusters[7].x1 + 2.0; // just past "trailing"
+        wl.invalidateAll();
+        const hang = try wl.line(&wdoc, 2);
+        if (hang.rows.len != 1) {
+            std.debug.print("smoke-editor: FAIL — trailing spaces forced a wrap ({d} rows)\n", .{hang.rows.len});
+            return 5;
+        }
+        std.debug.print(
+            "smoke-editor: PASS word wrap (prose rows={d}, cjk rows={d}, spaces hang)\n",
+            .{ prose.rows.len, cjk.rows.len },
+        );
+    }
+
+    // --- Reload preserves undo history (editor/diff.zig) ---
+    {
+        var rdoc = try Document.initFromBytes(allocator, "alpha\nbeta\ngamma\n");
+        defer rdoc.deinit();
+        // A user edit BEFORE the reload must survive underneath it.
+        var tx = @import("editor/transaction.zig").Transaction.init(rdoc.revision);
+        defer tx.deinit(allocator);
+        try tx.addInsert(allocator, 6, "user-");
+        _ = try rdoc.applyTransaction(&tx);
+
+        const changed = try @import("editor/diff.zig").reloadFromBytes(
+            allocator,
+            &rdoc,
+            "alpha\nuser-beta\nGAMMA\ndelta\n",
+            null,
+        );
+        if (!changed or rdoc.isDirty()) {
+            std.debug.print("smoke-editor: FAIL — reload did not apply cleanly\n", .{});
+            return 5;
+        }
+        _ = try rdoc.undo(); // back through the reload…
+        {
+            const txt = try rdoc.textAlloc(allocator);
+            defer allocator.free(txt);
+            if (!std.mem.eql(u8, txt, "alpha\nuser-beta\ngamma\n")) {
+                std.debug.print("smoke-editor: FAIL — undo past reload lost text: {s}\n", .{txt});
+                return 5;
+            }
+        }
+        _ = try rdoc.undo(); // …and through the user's own edit
+        {
+            const txt = try rdoc.textAlloc(allocator);
+            defer allocator.free(txt);
+            if (!std.mem.eql(u8, txt, "alpha\nbeta\ngamma\n")) {
+                std.debug.print("smoke-editor: FAIL — pre-reload history gone: {s}\n", .{txt});
+                return 5;
+            }
+        }
+        _ = try rdoc.redo();
+        _ = try rdoc.redo();
+        {
+            const txt = try rdoc.textAlloc(allocator);
+            defer allocator.free(txt);
+            if (!std.mem.eql(u8, txt, "alpha\nuser-beta\nGAMMA\ndelta\n")) {
+                std.debug.print("smoke-editor: FAIL — redo did not return to reloaded text\n", .{});
+                return 5;
+            }
+        }
+        std.debug.print("smoke-editor: PASS reload-with-history (undo/redo across a reload)\n", .{});
+    }
+
     // --- Build + draw the frame ---
     var pass = EditorPass.init(allocator);
     defer pass.deinit();
