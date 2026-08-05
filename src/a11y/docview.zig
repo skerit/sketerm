@@ -28,11 +28,16 @@
 //! only.
 //!
 //! The table is keyed on `(document identity, revision)` and is dropped
-//! whole when either moves, because nothing at this layer knows WHERE
-//! an edit landed (the three `Document.EditObserver` slots are taken by
-//! the highlighter, the fold anchors and the LSP client). The cost is
-//! that the first conversion after each edit re-counts from byte 0 up
-//! to the caret; see the limitations note in the AT-SPI bridge.
+//! whole when either moves, because nothing at this layer tracks WHERE
+//! an edit landed. The cost is that the first conversion after each
+//! edit re-counts from byte 0 up to the caret; see the limitations
+//! note in the AT-SPI bridge.
+//!
+//! `ChangeLog` (fed from `Document.EditObserver` slot 3) captures the
+//! REAL ranges of each transaction so a consumer can announce an edit
+//! anywhere in the document — the caret-anchored region diff only sees
+//! its own 32-line block, which is how a reload or replace-all used to
+//! go unannounced.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -192,6 +197,97 @@ pub const Index = struct {
         return self.built_chars;
     }
 };
+
+// ── exact change capture ─────────────────────────────────────────────
+
+/// One exact document change in CHARACTER offsets, GTK semantics: the
+/// old text occupied [start, start+removed), the new text occupies
+/// [start, start+inserted), with `start` in POST-edit coordinates.
+pub const CharChange = struct { start: u32, removed: u32, inserted: u32 };
+
+/// Captures the REAL ranges of every edit, fed from `Document`
+/// edit-observer slot 3 (see document.zig). The deleted text's
+/// character count is only countable BEFORE the rope mutates, which is
+/// why this must be an observer and cannot be derived after the fact;
+/// the byte→character conversion of each start offset happens lazily
+/// at `take` time instead (exact, because the bytes before an edit are
+/// untouched by it), so an edit burst with no screen reader attached
+/// costs a character count of the deleted range and nothing else.
+///
+/// Honesty rule: entries from ONE transaction only. A second
+/// transaction before `take` sets `stale` — its offsets live in a
+/// different coordinate space and composing them would fabricate
+/// ranges, so the consumer falls back to its region diff (or silence).
+pub const ChangeLog = struct {
+    const RawChange = struct { byte: usize, removed: u32, inserted: u32 };
+    /// Edits per transaction worth keeping exactly; a reload diff past
+    /// this is announced via `stale` fallback instead.
+    pub const MAX_ENTRIES: usize = 64;
+
+    /// Document the entries describe (identity only, never deref'd).
+    owner: ?*const Document = null,
+    entries: [MAX_ENTRIES]RawChange = undefined,
+    len: usize = 0,
+    stale: bool = false,
+
+    /// Document observer hook: record `edits` (pre-edit coordinates,
+    /// old text still intact) as post-edit byte offsets + char counts.
+    pub fn observe(self: *ChangeLog, doc: *const Document, edits: []const tr_mod.Edit) void {
+        if (self.owner != @as(?*const Document, doc)) {
+            // A different document: whatever was pending is not ours.
+            self.owner = doc;
+            self.len = 0;
+            self.stale = false;
+        } else if (self.len > 0 or self.stale) {
+            // Second transaction before a take: cannot compose.
+            self.len = 0;
+            self.stale = true;
+            return;
+        }
+        if (edits.len > MAX_ENTRIES) {
+            self.stale = true;
+            return;
+        }
+        var delta: isize = 0;
+        for (edits) |e| {
+            var removed: u32 = 0;
+            var it = doc.rope.iterateRange(e.offset, e.offset + e.deleted_len);
+            while (it.next()) |chunk| removed += countChars(chunk);
+            self.entries[self.len] = .{
+                .byte = @intCast(@as(isize, @intCast(e.offset)) + delta),
+                .removed = removed,
+                .inserted = countChars(e.inserted),
+            };
+            self.len += 1;
+            delta += @as(isize, @intCast(e.inserted.len)) - @as(isize, @intCast(e.deleted_len));
+        }
+    }
+
+    /// Convert and hand out the pending changes, clearing the log.
+    /// Null when there is nothing OR when the log went stale — the
+    /// caller must then fall back, never guess. `doc` must be the
+    /// post-edit document the entries were recorded against.
+    pub fn take(self: *ChangeLog, idx: *Index, doc: *const Document, out: []CharChange) !?[]CharChange {
+        defer {
+            self.len = 0;
+            self.stale = false;
+        }
+        if (self.stale or self.owner != @as(?*const Document, doc)) return null;
+        if (self.len == 0) return null;
+        const n = @min(self.len, out.len);
+        if (n < self.len) return null;
+        for (self.entries[0..self.len], 0..) |raw, i| {
+            out[i] = .{
+                .start = try idx.byteToChar(doc, raw.byte),
+                .removed = raw.removed,
+                .inserted = raw.inserted,
+            };
+        }
+        return out[0..self.len];
+    }
+};
+
+const tr_mod = @import("../editor/transaction.zig");
 
 // ── queries ──────────────────────────────────────────────────────────
 
@@ -449,6 +545,91 @@ test "docview: caret and multi-selection reporting" {
     defer carets.deinit(testing.allocator);
     const none = try selections(&idx, targetOf(&doc, &carets), testing.allocator);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "docview: ChangeLog reports exact char ranges after an edit" {
+    var doc = try Document.initFromBytes(testing.allocator, "abc\ndef\nghi\n");
+    defer doc.deinit();
+    var idx = Index.init(testing.allocator);
+    defer idx.deinit();
+    var log = ChangeLog{};
+    doc.addObserver(.{ .ctx = &log, .before_apply = testObserve });
+
+    // Replace "def" (multibyte-aware: insert é once too).
+    const tx_mod = @import("../editor/transaction.zig");
+    var tx = tx_mod.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addReplace(testing.allocator, 4, 3, "\u{e9}X");
+    _ = try doc.applyTransaction(&tx);
+
+    var buf: [8]CharChange = undefined;
+    const changes = (try log.take(&idx, &doc, &buf)).?;
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(@as(u32, 4), changes[0].start);
+    try testing.expectEqual(@as(u32, 3), changes[0].removed);
+    try testing.expectEqual(@as(u32, 2), changes[0].inserted); // é + X
+    // Consumed: a second take has nothing.
+    try testing.expectEqual(@as(?[]CharChange, null), try log.take(&idx, &doc, &buf));
+}
+
+test "docview: ChangeLog multi-edit transaction uses post-edit offsets" {
+    var doc = try Document.initFromBytes(testing.allocator, "0123456789");
+    defer doc.deinit();
+    var idx = Index.init(testing.allocator);
+    defer idx.deinit();
+    var log = ChangeLog{};
+    doc.addObserver(.{ .ctx = &log, .before_apply = testObserve });
+
+    const tx_mod = @import("../editor/transaction.zig");
+    var tx = tx_mod.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addInsert(testing.allocator, 2, "AA"); // +2
+    try tx.addDelete(testing.allocator, 5, 3); // "567" gone
+    _ = try doc.applyTransaction(&tx); // "01AA234\n89"? -> "01AA23489"
+
+    var buf: [8]CharChange = undefined;
+    const changes = (try log.take(&idx, &doc, &buf)).?;
+    try testing.expectEqual(@as(usize, 2), changes.len);
+    try testing.expectEqual(@as(u32, 2), changes[0].start);
+    try testing.expectEqual(@as(u32, 0), changes[0].removed);
+    try testing.expectEqual(@as(u32, 2), changes[0].inserted);
+    // Second edit's start rides the +2 delta of the first.
+    try testing.expectEqual(@as(u32, 7), changes[1].start);
+    try testing.expectEqual(@as(u32, 3), changes[1].removed);
+    try testing.expectEqual(@as(u32, 0), changes[1].inserted);
+}
+
+test "docview: ChangeLog goes stale on a second transaction, never lies" {
+    var doc = try Document.initFromBytes(testing.allocator, "abcdef");
+    defer doc.deinit();
+    var idx = Index.init(testing.allocator);
+    defer idx.deinit();
+    var log = ChangeLog{};
+    doc.addObserver(.{ .ctx = &log, .before_apply = testObserve });
+
+    const tx_mod = @import("../editor/transaction.zig");
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        var tx = tx_mod.Transaction.init(doc.revision);
+        defer tx.deinit(testing.allocator);
+        try tx.addInsert(testing.allocator, 0, "x");
+        _ = try doc.applyTransaction(&tx);
+    }
+    var buf: [8]CharChange = undefined;
+    try testing.expectEqual(@as(?[]CharChange, null), try log.take(&idx, &doc, &buf));
+    // The stale flag clears with the take: the next lone edit is exact.
+    var tx = tx_mod.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addDelete(testing.allocator, 0, 2);
+    _ = try doc.applyTransaction(&tx);
+    const changes = (try log.take(&idx, &doc, &buf)).?;
+    try testing.expectEqual(@as(u32, 0), changes[0].start);
+    try testing.expectEqual(@as(u32, 2), changes[0].removed);
+}
+
+fn testObserve(ctx: *anyopaque, doc: *const Document, edits: []const tr_mod.Edit) void {
+    const log: *ChangeLog = @ptrCast(@alignCast(ctx));
+    log.observe(doc, edits);
 }
 
 test "docview: the diff region is stable while typing on a line" {

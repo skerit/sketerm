@@ -16,6 +16,8 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atspi = @import("atspi.zig");
 const docview = @import("docview.zig");
+const Document = @import("../editor/document.zig").Document;
+const tr = @import("../editor/transaction.zig");
 
 /// Per-canvas document source. Lives as a field of the editor face
 /// (it must outlive the GL area) and is severed with it.
@@ -28,6 +30,11 @@ pub const DocSource = struct {
     /// Resolve the active document + selections; null when there is
     /// none (no tab open, or one still loading asynchronously).
     get: ?*const fn (ctx: *anyopaque) ?docview.Target = null,
+    /// Exact edit ranges captured via Document observer slot 3 — what
+    /// lets a change OUTSIDE the caret's diff region (reload,
+    /// replace-all, format-on-save) still be announced precisely.
+    /// Attach `editObserver()` to every document this canvas shows.
+    log: docview.ChangeLog = .{},
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn init(
@@ -45,6 +52,24 @@ pub const DocSource = struct {
 
     pub fn deinit(self: *DocSource) void {
         self.index.deinit();
+    }
+
+    /// The Document edit-observer hook feeding `log` (slot 3; see
+    /// document.zig). Keyed on `ctx == self`, so re-attaching after a
+    /// document swap replaces rather than double-registers.
+    pub fn editObserver(self: *DocSource) Document.EditObserver {
+        return .{ .ctx = @ptrCast(self), .before_apply = onDocEdits };
+    }
+
+    /// Pending exact changes of the ACTIVE document, in character
+    /// offsets, consumed on read. Null = nothing pending or the log
+    /// cannot answer honestly (several transactions since the last
+    /// take) — the caller must fall back to its region diff, never
+    /// fabricate a range.
+    pub fn takeChanges(self: *DocSource, out: []docview.CharChange) ?[]docview.CharChange {
+        const get = self.get orelse return null;
+        const t = get(self.ctx orelse return null) orelse return null;
+        return self.log.take(&self.index, t.doc, out) catch null;
     }
 
     pub fn source(self: *DocSource) atspi.Source {
@@ -65,6 +90,11 @@ const vtable: atspi.VTable = .{
     .selections = selections,
     .region = region,
 };
+
+fn onDocEdits(ctx: *anyopaque, doc: *const Document, edits: []const tr.Edit) void {
+    const ds: *DocSource = @ptrCast(@alignCast(ctx));
+    ds.log.observe(doc, edits);
+}
 
 fn resolve(ctx: *anyopaque) ?struct { ds: *DocSource, t: docview.Target } {
     const ds: *DocSource = @ptrCast(@alignCast(ctx));
