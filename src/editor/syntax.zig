@@ -67,6 +67,13 @@ extern fn tree_sitter_markdown_inline() ?*const ts.TSLanguage;
 /// The fixed set of things a theme can colour. Deliberately small: a
 /// grammar's capture vocabulary is open-ended and per-language, a theme
 /// is neither.
+///
+/// NON-EXHAUSTIVE on purpose: the byte a `Kind` travels in also carries
+/// the semantic-token MODIFIER band (see `MOD_*` below), so a value the
+/// renderer reads back out of a glyph is frequently not one of the named
+/// tags. Adding a named tag is still a compile error in every theme,
+/// because `kindTable` builds from an exhaustive switch over
+/// `std.enums.values(Kind)`.
 pub const Kind = enum(u8) {
     none = 0,
     keyword,
@@ -88,9 +95,63 @@ pub const Kind = enum(u8) {
     link,
     emphasis,
     strong,
+    _,
 };
 
+/// `_` is not a field, so this stays the count of NAMED kinds.
 pub const KIND_COUNT: usize = @typeInfo(Kind).@"enum".fields.len;
+
+// ----------------------------------------------------------------------
+// The semantic-token modifier band
+// ----------------------------------------------------------------------
+//
+// A language server tags every semantic token with a bitset of
+// MODIFIERS (`readonly`, `deprecated`, `defaultLibrary`, …) on top of
+// its type. Those are a property of the SPAN, not of the palette, and
+// the only channel from `editorlsp` through `editor_layout` to
+// `editor_pass` is the one kind byte per document byte. So the byte is
+// split: the low five bits are the `Kind`, the top three are a modifier
+// bitset that `theme.style` folds into the resolved colour and face.
+//
+// Three bits is the budget, and it is a deliberate ceiling rather than
+// an accident — see docs/lsp.md for which LSP modifiers map onto them
+// and which are dropped. Tree-sitter never sets any of these bits: only
+// `editorlsp.rebuildSemanticSpans` does.
+
+/// Bits of a kind byte that hold the `Kind` itself.
+pub const KIND_MASK: u8 = 0x1F;
+/// …and the ones that hold modifiers.
+pub const MOD_MASK: u8 = 0xE0;
+
+/// The symbol cannot be assigned through (LSP `readonly`).
+pub const MOD_READONLY: u8 = 0x20;
+/// The symbol is marked deprecated (LSP `deprecated`).
+pub const MOD_DEPRECATED: u8 = 0x40;
+/// The symbol comes from the language's standard library rather than
+/// from this project (LSP `defaultLibrary`).
+pub const MOD_DEFAULT_LIBRARY: u8 = 0x80;
+
+comptime {
+    // Five bits for the palette. Adding a 32nd kind would silently
+    // collide with MOD_READONLY, which is exactly the kind of failure
+    // that shows up as "some identifiers are randomly struck through".
+    if (KIND_COUNT > KIND_MASK + 1) @compileError("Kind no longer fits the low 5 bits of a kind byte");
+}
+
+/// The palette tag inside a kind byte, with the modifier band stripped.
+pub fn baseKind(k: Kind) Kind {
+    return @enumFromInt(@intFromEnum(k) & KIND_MASK);
+}
+
+/// The modifier bits inside a kind byte (a `MOD_*` bitset).
+pub fn modsOf(k: Kind) u8 {
+    return @intFromEnum(k) & MOD_MASK;
+}
+
+/// `kind` re-tagged with `mods`; bits outside the band are ignored.
+pub fn withMods(k: Kind, mods: u8) Kind {
+    return @enumFromInt((@intFromEnum(k) & KIND_MASK) | (mods & MOD_MASK));
+}
 
 const CaptureMap = struct { name: []const u8, kind: Kind };
 
