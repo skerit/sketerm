@@ -236,16 +236,15 @@ pub fn rebuildSymbolSpecs(self: *Window) void {
     }
 }
 
-pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) void {
-    const s: *const @import("../config.zig").ProfileSettings =
-        if (opts.profile) |p| &p.settings else &self.config.settings;
-    const term = pane.terminal;
-
-    pane.font_size = opts.font_size_override orelse s.font_size;
-    pane.font_path = s.font_path;
-    pane.font_family = if (s.font_family.len > 0) s.font_family else null;
-    pane.font_features = if (s.font_features.len > 0) s.font_features else null;
-    pane.font_opts = .{
+/// The atlas options a settings bundle resolves to. Every string in
+/// here is borrowed from the config arena and `symbol_maps` from
+/// `Window.symbol_specs`, so a pane's copy MUST be rebuilt through
+/// this on every config change — see the call in applyConfigChange.
+pub fn fontOptsFor(
+    self: *const Window,
+    s: *const @import("../config.zig").ProfileSettings,
+) @import("../render/atlas.zig").Atlas.Options {
+    return .{
         .line_pad_px = s.line_pad_px,
         .bold_family = s.font_family_bold,
         .italic_family = s.font_family_italic,
@@ -255,6 +254,39 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
         .symbol_maps = self.symbol_specs.items,
         .builtin_box = s.builtin_box_drawing,
     };
+}
+
+/// True when two atlas option sets differ in anything that requires
+/// rebuilding the pane's font (families, weights, box drawing, symbol
+/// maps). `line_pad_px` is compared separately by the callers, which
+/// keep their own copy of it.
+fn fontOptsDiffer(
+    a: @import("../render/atlas.zig").Atlas.Options,
+    b: @import("../render/atlas.zig").Atlas.Options,
+) bool {
+    if (a.weight != b.weight or a.bold_weight != b.bold_weight) return true;
+    if (a.builtin_box != b.builtin_box) return true;
+    if (!std.mem.eql(u8, a.bold_family, b.bold_family)) return true;
+    if (!std.mem.eql(u8, a.italic_family, b.italic_family)) return true;
+    if (!std.mem.eql(u8, a.bold_italic_family, b.bold_italic_family)) return true;
+    if (a.symbol_maps.len != b.symbol_maps.len) return true;
+    for (a.symbol_maps, b.symbol_maps) |x, y| {
+        if (x.lo != y.lo or x.hi != y.hi) return true;
+        if (!std.mem.eql(u8, x.family, y.family)) return true;
+    }
+    return false;
+}
+
+pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) void {
+    const s: *const @import("../config.zig").ProfileSettings =
+        if (opts.profile) |p| &p.settings else &self.config.settings;
+    const term = pane.terminal;
+
+    pane.font_size = opts.font_size_override orelse s.font_size;
+    pane.font_path = s.font_path;
+    pane.font_family = if (s.font_family.len > 0) s.font_family else null;
+    pane.font_features = if (s.font_features.len > 0) s.font_features else null;
+    pane.font_opts = fontOptsFor(self, s);
     pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.setGraphicsOffload(self.config.graphics_offload);
@@ -485,6 +517,7 @@ pub fn applyProfileToPane(self: *Window, pane: *Pane, profile_name: []const u8) 
     const old_family = pane.font_family;
     const old_features = pane.font_features;
     const old_line_pad = pane.line_pad_px;
+    const old_opts = pane.font_opts;
 
     self.applyPaneConfig(pane, .{ .profile = profile });
 
@@ -492,7 +525,8 @@ pub fn applyProfileToPane(self: *Window, pane: *Pane, profile_name: []const u8) 
         !eqOptStr(old_path, pane.font_path) or
         !eqOptStr(old_family, pane.font_family) or
         !eqOptStr(old_features, pane.font_features) or
-        pane.line_pad_px != old_line_pad;
+        pane.line_pad_px != old_line_pad or
+        fontOptsDiffer(old_opts, pane.font_opts);
     if (font_changed) pane.refreshFont();
     c.gtk_widget_queue_resize(pane.widget());
     pane.terminal.screen.dirty = true;
@@ -633,10 +667,26 @@ pub fn openPrefs(self: *Window) void {
     };
 }
 
+/// How an apply treats the file on disk.
+pub const ApplyOpts = struct {
+    /// Write the resulting config back to config.conf. True for edits
+    /// made IN the app (prefs, shader sliders) — they have nowhere
+    /// else to live. False for a config that just came FROM the file:
+    /// re-serialising it would rewrite the user's hand-written file
+    /// (the writer emits non-default keys only, so comments, ordering
+    /// and every default-valued line are lost) and, under the file
+    /// watcher, feed our own write straight back in.
+    persist: bool = true,
+};
+
 /// Push a (possibly-mutated) Config into all live state. Called
 /// by the prefs dialog whenever the user changes anything; also
 /// persists the new values to disk so they survive restart.
 pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
+    applyConfigChangeOpts(self, new_cfg, .{});
+}
+
+pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyOpts) void {
     // Compute diffs we need to react to BEFORE swapping config.
     const old_blink_ms = self.config.cursor_blink_ms;
     const old_tab_pos = self.config.tab_position;
@@ -781,6 +831,12 @@ pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
         p.font_family = if (s.font_family.len > 0) s.font_family else null;
         p.font_features = if (s.font_features.len > 0) s.font_features else null;
         p.line_pad_px = s.line_pad_px;
+        // font_opts holds FIVE more borrowed slices (the three styled
+        // families and the symbol-map list, whose backing array
+        // rebuildSymbolSpecs just reallocated). Rebuilding it here is
+        // what keeps them out of the arena that is freed on return.
+        const old_font_opts = p.font_opts;
+        p.font_opts = fontOptsFor(self, s);
         // Shader state: the overrides slice points into the
         // config arena (about to be freed) — re-point it
         // UNCONDITIONALLY (preset panes own their slice and skip
@@ -826,7 +882,8 @@ pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
             const family_changed = !std.mem.eql(u8, old_s.font_family, s.font_family);
             const features_changed = !std.mem.eql(u8, old_s.font_features, s.font_features);
             const line_pad_changed = old_s.line_pad_px != s.line_pad_px;
-            if (path_changed or family_changed or features_changed or line_pad_changed) {
+            const opts_changed = fontOptsDiffer(old_font_opts, p.font_opts);
+            if (path_changed or family_changed or features_changed or line_pad_changed or opts_changed) {
                 p.refreshFont();
             }
         }
@@ -852,16 +909,27 @@ pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
     self.refreshBindings();
     c.gtk_widget_set_visible(self.tab_bar, if (self.config.show_tab_bar) 1 else 0);
 
-    // Persist.
-    persistConfig(self);
+    // Start / stop the watcher: this config may have flipped
+    // `config_auto_reload`. Before the write below, so the write is
+    // stamped on a watcher that exists.
+    @import("configwatch.zig").afterApply(self);
+
+    if (opts.persist) persistConfig(self);
 }
 
+/// Write the live config back to the file the process reads — the
+/// `--config` override when there is one, so an in-app edit does not
+/// silently land in the XDG file the user isn't using.
 pub fn persistConfig(self: *Window) void {
-    const path = resolveConfigSavePath(self.allocator) catch return;
+    const path = resolveActiveConfigPath(self.allocator) orelse return;
     defer self.allocator.free(path);
     self.config.save(path) catch |err| {
         std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
+        return;
     };
+    // Our own write must not come back through the file watcher as a
+    // user edit — every in-app save lands here, sliders included.
+    @import("configwatch.zig").noteSelfWrite(self);
 }
 
 /// Rebuild bg_source from config: decode the image (if any) or
@@ -1132,18 +1200,41 @@ pub fn refreshTitlebarCss(self: *Window) void {
     c.gtk_css_provider_load_from_string(self.titlebar_css.?, css.ptr);
 }
 
-/// Reload config.conf from disk and live-apply. Uses the XDG
-/// search path (~/.config/sketerm/config.conf or
-/// $XDG_CONFIG_HOME/sketerm/config.conf). Doesn't honour
-/// `--config <path>` overrides — user passed a non-default
-/// path on the command line would need to restart for that.
+/// Reload the active config file from disk and live-apply. Honours a
+/// `--config <path>` override (it used to ignore one and silently
+/// reload the XDG file instead, i.e. a different file from the one the
+/// process was started with) and does NOT write the result back — see
+/// `ApplyOpts.persist`.
 pub fn reloadConfigFromDisk(self: *Window) void {
-    var new_cfg = Config.load(self.allocator);
+    var new_cfg = Config.loadWithOverride(self.allocator, configPathOverride());
     // applyConfigChange deep-copies; the loaded config (and its
     // arena) is ours to free.
     defer new_cfg.deinit();
-    self.applyConfigChange(&new_cfg);
+    self.applyConfigChangeOpts(&new_cfg, .{ .persist = false });
     std.debug.print("sketerm: config reloaded\n", .{});
+}
+
+/// `--config <path>`, or null for the XDG search path. Process-wide:
+/// it is an invocation flag, and every window in the process was
+/// started from the same command line.
+var config_override_path: ?[]const u8 = null;
+
+/// Record the `--config` path. Borrowed for the process lifetime —
+/// main.zig owns the string and never frees it while windows live.
+pub fn setConfigPathOverride(path: ?[]const u8) void {
+    config_override_path = path;
+}
+
+pub fn configPathOverride() ?[]const u8 {
+    return config_override_path;
+}
+
+/// The file the running process loaded its config from: the
+/// `--config` override, else the XDG path. Caller frees. Null when
+/// neither HOME nor XDG_CONFIG_HOME is set (nothing to watch).
+pub fn resolveActiveConfigPath(allocator: std.mem.Allocator) ?[]u8 {
+    if (config_override_path) |p| return allocator.dupe(u8, p) catch null;
+    return resolveConfigSavePath(allocator) catch null;
 }
 
 pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {

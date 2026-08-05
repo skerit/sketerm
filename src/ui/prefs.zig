@@ -129,6 +129,7 @@ fn openForProfile(
     // sheet: preferences should not pin themselves over (or inside)
     // the main window.
     const dialog = c.adw_preferences_window_new();
+    open_dialogs += 1;
     ctx.dialog = dialog;
     c.gtk_window_set_title(@ptrCast(dialog), "Preferences");
     if (ctx.edit_name.len > 0) {
@@ -166,8 +167,19 @@ fn openForProfile(
 
 fn onClosed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
+    if (open_dialogs > 0) open_dialogs -= 1;
     ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
+}
+
+/// Live preference dialogs in this process. They hold a DEEP COPY of
+/// the config taken at open time, so a config reload landing underneath
+/// one would be undone by the dialog's next row change; the file
+/// watcher checks this and stands down instead.
+var open_dialogs: u32 = 0;
+
+pub fn isOpen() bool {
+    return open_dialogs > 0;
 }
 
 const PageBuilder = *const fn (page: *c.AdwPreferencesPage, ctx: *Ctx) void;
@@ -1004,6 +1016,19 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.edit.login_shell, applyOnly);
     addExitActionRow(@ptrCast(@alignCast(shell_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shell_group)));
+
+    // Configuration file.
+    const cfgfile_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(cfgfile_group)), "Configuration file");
+    addSwitchRow(
+        @ptrCast(@alignCast(cfgfile_group)),
+        ctx,
+        "Reload automatically",
+        "Apply config.conf as soon as it changes on disk, without the reload_config keybind.",
+        &ctx.cfg.config_auto_reload,
+        applyOnly,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(cfgfile_group)));
 
     // Forwarded GUI apps.
     const apps_group = c.adw_preferences_group_new();

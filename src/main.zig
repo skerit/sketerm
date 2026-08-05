@@ -224,7 +224,8 @@ const HELP_TEXT =
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).
     \\
-    \\Send SIGUSR1 to reload config without restart:
+    \\Saving config.conf applies it immediately (config_auto_reload).
+    \\With that off, reload on demand:
     \\    kill -USR1 $(pidof sketerm)
     \\
     \\Config: $XDG_CONFIG_HOME/sketerm/config.conf (or
@@ -687,6 +688,9 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             const v = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n)])));
             if (g_app.config_path) |old| g_app.allocator.free(old);
             g_app.config_path = g_app.allocator.dupe(u8, v) catch null;
+            // Every later re-read (reload_config, SIGUSR1, the file
+            // watcher) must go to the same file this flag names.
+            @import("ui/winconfig.zig").setConfigPathOverride(g_app.config_path);
         }
     }
 
