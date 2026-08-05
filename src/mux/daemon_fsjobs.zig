@@ -142,7 +142,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
 /// with the requesting client. They report a view's decoration, not
 /// a mutation worth recovering.
 pub fn ephemeralOp(op: FsJob.Op) bool {
-    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff;
+    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff or op == .git_diff;
 }
 
 /// Recursive-permission arguments; -1 keeps the current owner or
@@ -933,6 +933,10 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         /// never sees this event is talking to a daemon too old to
         /// answer the repository question at all.
         repo: bool = false,
+        /// git_diff `repo` event: git knows the file. Its `initial`
+        /// means "the repository has no HEAD commit yet", and no
+        /// other field of this event applies to git_diff.
+        tracked: bool = false,
         branch: []const u8 = "",
         upstream: []const u8 = "",
         ahead: i64 = 0,
@@ -961,6 +965,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
                 .job = job.id,
                 .ev = e.ev,
                 .repo = e.repo,
+                .tracked = e.tracked,
                 .branch = e.branch,
                 .upstream = e.upstream,
                 .text = e.text,

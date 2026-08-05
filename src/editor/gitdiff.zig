@@ -4,22 +4,25 @@
 //!
 //! The GUI never touches the disk and never runs a process, so the
 //! committed content of a file cannot be read here. What produces the
-//! text this module parses is a DAEMON job: `fsdrive`'s `panelize`
-//! verb, which is a host-side `/bin/sh -lc` whose output lines the
-//! daemon resolves against a root. The editor asks it to run
+//! marks is the daemon's `git_diff` fs job (`mux/fsjob.zig
+//! runGitDiff`), which runs
 //!
-//!     git diff -U0 --no-color --no-ext-diff HEAD -- <path> > <tmp>
+//!     git diff -U0 --no-color --no-ext-diff HEAD -- <name>
 //!
-//! and then reads `<tmp>` back through the ordinary `read` verb. Both
-//! halves run on the file's OWN host, so a remote document gets its
-//! gutter from the remote repository. See `ui/editorgit.zig`.
+//! on the file's OWN host — so a remote document gets its gutter from
+//! the remote repository — and parses the result THERE, with
+//! `parseUnified` below plus `runsFromLines`. What crosses the wire is
+//! therefore a handful of `Run` records (start line, count, kind), not
+//! diff text: one parser implementation for every client, and a reply
+//! that carries only what a gutter needs. `ui/editorproj.zig` expands
+//! the runs straight back into `LineMark`s, so producer and consumer
+//! share these types and this file's tests cover both.
 //!
 //! Neither of the two verbs that sound like they should do this can:
 //! `git_status` reports per-FILE status letters only (no line
 //! information at all), and `diff` diffs two files that both exist on
-//! the host — there is no verb that materializes a committed blob. A
-//! dedicated `git_diff` job verb would remove the `panelize`+temp-file
-//! dance; it is not needed for correctness, only for tidiness.
+//! the host — there is no verb that materializes a committed blob,
+//! which is why `git_diff` exists at all.
 //!
 //! ## Why anchors and not line numbers
 //!
@@ -50,6 +53,63 @@ pub const LineMark = struct {
     line: u32,
     kind: Kind,
 };
+
+/// A maximal run of consecutive lines carrying the same kind — the
+/// wire form of a gutter. A whole-file rewrite is one record instead
+/// of one per line, and a hunk is at most three.
+pub const Run = struct {
+    /// 0-based first line of the run, in the working file.
+    line: u32,
+    /// How many lines the run covers. Never 0.
+    count: u32,
+    kind: Kind,
+};
+
+/// Stable wire spelling of a kind. The daemon puts these on the
+/// `kind` field of a `git_diff` job event; unknown spellings are
+/// dropped by the reader rather than guessed at.
+pub fn kindName(kind: Kind) []const u8 {
+    return @tagName(kind);
+}
+
+pub fn kindFromName(name: []const u8) ?Kind {
+    return std.meta.stringToEnum(Kind, name);
+}
+
+/// Collapse per-line marks (which `parseUnified` produces in ascending
+/// line order) into runs. Sorting is the caller's business: the parser
+/// already emits ascending lines, and a `deleted` mark may share a
+/// line with the change that follows it, which stays two runs.
+pub fn runsFromLines(alloc: std.mem.Allocator, lines: []const LineMark) std.mem.Allocator.Error![]Run {
+    var out: std.ArrayList(Run) = .empty;
+    errdefer out.deinit(alloc);
+    for (lines) |lm| {
+        if (out.items.len > 0) {
+            const last = &out.items[out.items.len - 1];
+            if (last.kind == lm.kind and last.line + last.count == lm.line) {
+                last.count += 1;
+                continue;
+            }
+        }
+        try out.append(alloc, .{ .line = lm.line, .count = 1, .kind = lm.kind });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Expand runs back into per-line marks, for `Marks.setFromLines`.
+pub fn linesFromRuns(alloc: std.mem.Allocator, runs: []const Run) std.mem.Allocator.Error![]LineMark {
+    var total: usize = 0;
+    for (runs) |r| total += r.count;
+    var out = try alloc.alloc(LineMark, total);
+    var w: usize = 0;
+    for (runs) |r| {
+        for (0..r.count) |i| {
+            out[w] = .{ .line = r.line + @as(u32, @intCast(i)), .kind = r.kind };
+            w += 1;
+        }
+    }
+    return out;
+}
 
 /// One mark in DOCUMENT coordinates.
 pub const Mark = struct {
@@ -414,6 +474,46 @@ test "gitdiff: no-newline annotation does not consume the budget" {
 test "gitdiff: an empty or non-diff payload yields nothing" {
     try expectMarks("", &.{});
     try expectMarks("fatal: not a git repository\n", &.{});
+}
+
+test "gitdiff: runs collapse consecutive same-kind lines and round-trip" {
+    const lines = try parseUnified(testing.allocator,
+        \\@@ -7,1 +7,3 @@
+        \\-old
+        \\+new
+        \\+extra
+        \\+more
+        \\@@ -20,2 +22,0 @@
+        \\-a
+        \\-b
+        \\
+    );
+    defer testing.allocator.free(lines);
+    const runs = try runsFromLines(testing.allocator, lines);
+    defer testing.allocator.free(runs);
+    // modified@6 x1, added@7 x2, deleted@22 x1 — three records for
+    // four marks, and the two added lines never travel separately.
+    try testing.expectEqual(@as(usize, 3), runs.len);
+    try testing.expectEqual(Run{ .line = 6, .count = 1, .kind = .modified }, runs[0]);
+    try testing.expectEqual(Run{ .line = 7, .count = 2, .kind = .added }, runs[1]);
+    try testing.expectEqual(Kind.deleted, runs[2].kind);
+    try testing.expectEqual(@as(u32, 1), runs[2].count);
+
+    const back = try linesFromRuns(testing.allocator, runs);
+    defer testing.allocator.free(back);
+    try testing.expectEqual(lines.len, back.len);
+    for (lines, back) |a, b| {
+        try testing.expectEqual(a.line, b.line);
+        try testing.expectEqual(a.kind, b.kind);
+    }
+}
+
+test "gitdiff: kind names survive the wire spelling" {
+    for ([_]Kind{ .added, .modified, .deleted }) |k| {
+        try testing.expectEqual(k, kindFromName(kindName(k)).?);
+    }
+    try testing.expectEqual(@as(?Kind, null), kindFromName("renamed"));
+    try testing.expectEqual(@as(?Kind, null), kindFromName(""));
 }
 
 fn openDoc(bytes: []const u8) !Document {

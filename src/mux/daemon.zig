@@ -1547,7 +1547,7 @@ pub const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 pub const FsJob = struct {
-    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete };
+    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete, git_diff };
     pub const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
