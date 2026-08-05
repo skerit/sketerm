@@ -24,6 +24,8 @@ const proc = @import("lsp/proc.zig");
 const diagnostics = @import("lsp/diagnostics.zig");
 const docsync = @import("lsp/docsync.zig");
 const servers = @import("lsp/servers.zig");
+const inlay = @import("lsp/inlay.zig");
+const semantic = @import("lsp/semantic.zig");
 
 const URI = "file:///smoke/main.zig";
 
@@ -52,7 +54,20 @@ const Harness = struct {
     last_error: bool = false,
 
     fn handler(self: *Harness) session.Handler {
-        return .{ .ctx = self, .on_response = onResponse, .on_notification = onNotification, .on_state = onState };
+        return .{
+            .ctx = self,
+            .on_response = onResponse,
+            .on_notification = onNotification,
+            .on_state = onState,
+            .on_apply_edit = onApplyEdit,
+        };
+    }
+
+    /// The harness applies nothing (it drives the protocol, not the
+    /// editor); answering `false` is the honest reply and still keeps
+    /// the server from blocking.
+    fn onApplyEdit(_: *anyopaque, _: std.json.Value) bool {
+        return false;
     }
 
     fn onState(_: *anyopaque, _: session.State) void {}
@@ -443,11 +458,174 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
             return fail("formatting left trailing whitespace behind", .{});
     }
 
+    // ---- signature help: the ACTIVE parameter follows the caret -------
+    {
+        const call_at = offsetOf(&h.doc, alloc, "call(") orelse return fail("call site gone", .{});
+        // Inside the first argument…
+        try docPos(&h, call_at + 5, "", &params);
+        if (!h.request(.signature_help, "textDocument/signatureHelp", params.items))
+            return fail("signatureHelp timed out", .{});
+        var first = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer first.deinit();
+        if (first.value != .object) return fail("signatureHelp answered {s}", .{h.last_result});
+        if (first.value.object.get("activeParameter").?.integer != 0)
+            return fail("expected parameter 0 inside the first argument", .{});
+        // …and past the comma (`call(BAD, emoji)` — offset +10 is
+        // inside the second argument).
+        try docPos(&h, call_at + 10, "", &params);
+        if (!h.request(.signature_help, "textDocument/signatureHelp", params.items))
+            return fail("second signatureHelp timed out", .{});
+        var second = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer second.deinit();
+        if (second.value.object.get("activeParameter").?.integer != 1)
+            return fail("the active parameter did not follow the caret past the comma", .{});
+    }
+
+    // ---- code actions: the quick fix carries a real edit --------------
+    {
+        const bad = offsetOf(&h.doc, alloc, "BAD") orelse return fail("marker gone", .{});
+        const s = pos.offsetToPosition(&h.doc.rope, bad, h.sess.caps.encoding);
+        const e = pos.offsetToPosition(&h.doc.rope, bad + 3, h.sess.caps.encoding);
+        params.clearRetainingCapacity();
+        try params.print(
+            alloc,
+            "{{\"textDocument\":{{\"uri\":\"{s}\"}},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"context\":{{\"diagnostics\":[]}}}}",
+            .{ URI, s.line, s.character, e.line, e.character },
+        );
+        if (!h.request(.code_action, "textDocument/codeAction", params.items))
+            return fail("codeAction timed out", .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array or parsed.value.array.items.len < 3)
+            return fail("expected three code actions, got {s}", .{h.last_result});
+        // The quickfix's edit must land exactly on BAD.
+        const fix = parsed.value.array.items[0].object;
+        const edits = fix.get("edit").?.object.get("changes").?.object.get(URI).?.array;
+        const r = pos.rangeToOffsets(
+            &h.doc.rope,
+            pos.parseRange(edits.items[0].object.get("range").?),
+            h.sess.caps.encoding,
+        );
+        if (r.start != bad or r.end != bad + 3)
+            return fail("the quick fix targets {d}..{d}, BAD is at {d}", .{ r.start, r.end, bad });
+        // A command-carrying one and a resolve-only one are both there.
+        if (parsed.value.array.items[1].object.get("command") == null)
+            return fail("no command-carrying action offered", .{});
+        const lazy = parsed.value.array.items[2];
+        if (lazy.object.get("edit") != null) return fail("the lazy action should have no edit yet", .{});
+        var raw: std.Io.Writer.Allocating = .init(alloc);
+        defer raw.deinit();
+        try std.json.Stringify.value(lazy, .{}, &raw.writer);
+        if (!h.request(.code_action_resolve, "codeAction/resolve", raw.written()))
+            return fail("codeAction/resolve timed out", .{});
+        var resolved = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer resolved.deinit();
+        if (resolved.value.object.get("edit") == null)
+            return fail("resolve did not fill the edit in: {s}", .{h.last_result});
+    }
+
+    // ---- inlay hints: the RANGE is honoured ---------------------------
+    {
+        params.clearRetainingCapacity();
+        try params.print(
+            alloc,
+            "{{\"textDocument\":{{\"uri\":\"{s}\"}},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":2,\"character\":0}}}}}}",
+            .{URI},
+        );
+        if (!h.request(.inlay_hint, "textDocument/inlayHint", params.items))
+            return fail("inlayHint timed out", .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer parsed.deinit();
+        var set = inlay.Set.init(alloc);
+        defer set.deinit();
+        try set.absorb(parsed.value, &h.doc.rope, h.sess.caps.encoding, h.doc.revision, 0, 2);
+        if (set.items.items.len != 3)
+            return fail("expected 3 hints for lines 0..2, got {d}", .{set.items.items.len});
+        // Every hint sits at a real newline boundary — proof that the
+        // utf-16 positions on the emoji line were mapped, not counted.
+        const text = try h.doc.textAlloc(alloc);
+        defer alloc.free(text);
+        for (set.items.items) |hint| {
+            if (hint.offset >= text.len or text[hint.offset] != '\n')
+                return fail("hint at {d} is not at a line end", .{hint.offset});
+        }
+        if (!set.covers(1, 2)) return fail("the hint set does not claim its own window", .{});
+        if (set.covers(0, 9)) return fail("the hint set claims lines it never asked for", .{});
+    }
+
+    // ---- semantic tokens: full, then a delta that splices -------------
+    {
+        params.clearRetainingCapacity();
+        try params.print(alloc, "{{\"textDocument\":{{\"uri\":\"{s}\"}}}}", .{URI});
+        if (!h.request(.semantic_tokens_full, "textDocument/semanticTokens/full", params.items))
+            return fail("semanticTokens/full timed out", .{});
+        var data = semantic.Data.init(alloc);
+        defer data.deinit();
+        {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+            defer parsed.deinit();
+            if (!data.absorbFull(parsed.value)) return fail("could not absorb the token array", .{});
+        }
+        if (data.result_id.len == 0) return fail("no resultId, so no delta is possible", .{});
+        const full_toks = try data.decode(alloc);
+        defer alloc.free(full_toks);
+        if (full_toks.len < 5) return fail("only {d} semantic tokens", .{full_toks.len});
+        // `fn` is a keyword (index 2) and the name after it a function
+        // (index 0) — the stub's own classification, so a decode bug
+        // shows up as the wrong index rather than as nothing.
+        var saw_fn_kw = false;
+        var saw_fn_name = false;
+        for (full_toks) |t| {
+            if (t.type_index == 2) saw_fn_kw = true;
+            if (t.type_index == 0) saw_fn_name = true;
+        }
+        if (!saw_fn_kw or !saw_fn_name) return fail("token types did not decode", .{});
+        // Positions must land on identifier starts in OUR copy.
+        const first = full_toks[0];
+        const off = pos.positionToOffset(
+            &h.doc.rope,
+            .{ .line = first.line, .character = first.start_char },
+            h.sess.caps.encoding,
+        );
+        const text = try h.doc.textAlloc(alloc);
+        defer alloc.free(text);
+        if (off >= text.len or !isWordyByte(text[off]))
+            return fail("the first token does not start on an identifier (offset {d})", .{off});
+
+        const before_id = try alloc.dupe(u8, data.result_id);
+        defer alloc.free(before_id);
+        params.clearRetainingCapacity();
+        try params.print(
+            alloc,
+            "{{\"textDocument\":{{\"uri\":\"{s}\"}},\"previousResultId\":\"{s}\"}}",
+            .{ URI, before_id },
+        );
+        if (!h.request(.semantic_tokens_delta, "textDocument/semanticTokens/full/delta", params.items))
+            return fail("semanticTokens delta timed out", .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer parsed.deinit();
+        if (!data.absorbDelta(parsed.value)) return fail("could not apply the token delta", .{});
+        if (std.mem.eql(u8, data.result_id, before_id)) return fail("the delta did not move the resultId", .{});
+        const after = try data.decode(alloc);
+        defer alloc.free(after);
+        if (after.len != full_toks.len)
+            return fail("the delta changed the token count ({d} -> {d})", .{ full_toks.len, after.len });
+        for (after, full_toks) |a, b| {
+            if (a.line != b.line or a.start_char != b.start_char or a.type_index != b.type_index)
+                return fail("the delta produced a different token set", .{});
+        }
+    }
+
     std.debug.print(
-        "smoke-editor: PASS lsp/{s} (diagnostics, incremental sync, hover, definition, references, symbols, completion+resolve, rename, formatting)\n",
+        "smoke-editor: PASS lsp/{s} (diagnostics, incremental sync, hover, definition, references, symbols, completion+resolve, rename, formatting, signature help, code actions+resolve, inlay hints, semantic tokens+delta)\n",
         .{@tagName(want_enc)},
     );
     return null;
+}
+
+fn isWordyByte(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or ch == '_' or ch >= 0x80;
 }
 
 /// The same fold the GUI does: LSP TextEdits (original coordinates,

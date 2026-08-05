@@ -136,6 +136,12 @@ const Plan = struct {
     init_options: []const u8 = "",
     /// Prefix typed at the end of the document before Ctrl+Space.
     completion_prefix: []const u8,
+    /// Typed at the end of the document to make the server offer
+    /// signature help — a call whose trigger character is the `(`.
+    /// It must name a TWO-parameter function: the stage then types
+    /// `signature_more` to step onto the second one, and a server
+    /// correctly answers "no signatures" past the last parameter.
+    signature_call: []const u8,
     /// Document basename (its extension picks the languageId).
     file: []const u8,
     /// Marker file that makes the project directory the workspace root.
@@ -147,6 +153,10 @@ const Plan = struct {
 };
 
 const TS_BODY =
+    \\export function pair(first: number, second: number): number {
+    \\  return first + second;
+    \\}
+    \\
     \\export function greet(name: string): string {
     \\  return "hello " + name;
     \\}
@@ -157,8 +167,12 @@ const TS_BODY =
     \\
 ;
 
+/// `SEM` is the semantic-token marker: no grammar gives that identifier
+/// a colour of its own, and the stub tags it `property`, so the
+/// property colour appearing on screen proves the tokens were applied.
 const ZIG_BODY =
     \\const std = @import("std");
+    \\const SEM = 1;
     \\
     \\fn alpha() void {
     \\    call(BAD, 1);
@@ -191,11 +205,19 @@ fn tsInitOptions(allocator: std.mem.Allocator) []const u8 {
     return std.fmt.bufPrint(&ts_init_buf, "{{\"tsserver\":{{\"path\":\"{s}\"}}}}", .{ts}) catch "";
 }
 
+/// `caller` exists so clangd has a CALL to hang a parameter inlay hint
+/// off; `use` is deliberately unterminated so the end of the file is an
+/// expression position for the completion stage.
 const C_BODY =
     \\static int add_two(int x) { return x + 2; }
     \\static int add_three(int x) { return x + 3; }
+    \\static int add_pair(int a, int b) { return a + b; }
     \\
     \\int wrong = "type mismatch";
+    \\
+    \\int caller(void) { return add_two(41); }
+    \\
+    \\int typo = add_twoo(1);
     \\
     \\int use(void) {
     \\    return
@@ -207,6 +229,10 @@ const ZLS_BODY =
     \\fn alpha(x: i32) i32 {
     \\    var unused: i32 = 0;
     \\    return x + 1;
+    \\}
+    \\
+    \\fn pair(a: i32, b: i32) i32 {
+    \\    return a + b;
     \\}
     \\
     \\pub fn main() void {
@@ -243,6 +269,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .marker_body = "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\"},\"include\":[\"*.ts\"]}\n",
             .body = TS_BODY,
             .completion_prefix = "gre",
+            .signature_call = " pair(",
             .real_server = true,
         };
     }
@@ -262,6 +289,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             // Typed at Ctrl+End — inside `use()`'s unterminated body, an
             // expression position where clangd offers both `add_` fns.
             .completion_prefix = " add_t",
+            .signature_call = "; add_pair(",
             .real_server = true,
         };
     }
@@ -278,6 +306,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .body = ZLS_BODY,
             // After the trailing `std.` — member completion.
             .completion_prefix = "deb",
+            .signature_call = " pair(",
             .real_server = true,
         };
     }
@@ -292,6 +321,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
         .marker_body = "// workspace root marker\n",
         .body = ZIG_BODY,
         .completion_prefix = "stub",
+        .signature_call = " stubCall(",
         .real_server = false,
     };
 }
@@ -328,6 +358,53 @@ fn diagPixels(rgba: []const u8, img_w: u32, img_h: u32) usize {
         }
     }
     return hits;
+}
+
+/// Pixels within `tol` of one exact RGB, from `x0` rightwards. Glyph
+/// fragments are `vec4(colour.rgb, coverage)`, so a fully-covered pixel
+/// lands exactly on the colour.
+///
+/// `x0` is per-check, not a constant: the inlay-hint grey is within a
+/// few units of the gutter's line-number grey, so that one has to start
+/// well clear of the gutter, while the semantic-token marker sits in
+/// the first few columns of the text and needs a much smaller offset.
+fn colorPixels(rgba: []const u8, img_w: u32, img_h: u32, want: [3]u8, tol: i32, x0: u32) usize {
+    var hits: usize = 0;
+    var y: u32 = 0;
+    while (y < img_h) : (y += 1) {
+        var x: u32 = x0;
+        while (x < img_w) : (x += 1) {
+            const i = (y * img_w + x) * 4;
+            if (i + 3 >= rgba.len) continue;
+            var ok = true;
+            inline for (0..3) |ch| {
+                const d = @as(i32, rgba[i + ch]) - @as(i32, want[ch]);
+                if (d > tol or d < -tol) ok = false;
+            }
+            if (ok) hits += 1;
+        }
+    }
+    return hits;
+}
+
+/// Poll the window until `want` shows up in at least `need` pixels.
+fn waitForColor(
+    app: *appdrive.App,
+    win_id: u32,
+    want: [3]u8,
+    tol: i32,
+    need: usize,
+    budget_ms: i64,
+    x0: u32,
+) bool {
+    var spent: i64 = 0;
+    while (spent < budget_ms) : (spent += 250) {
+        pumpFor(app, 250);
+        const snap = app.snapshotRgba(win_id, null) catch continue;
+        defer g_alloc.free(snap.px);
+        if (colorPixels(snap.px, snap.w, snap.h, want, tol, x0) >= need) return true;
+    }
+    return false;
 }
 
 /// Id of the most recently committed popup surface, if any. A
@@ -440,6 +517,13 @@ pub fn main() u8 {
     , .{ plan.name, plan.command, plan.args, plan.languages, plan.root_files, plan.init_options }) catch return fail("cfg build", .{});
     if (!writeFile(cfg_path.ptr, cfg_text.items)) return fail("could not write the config", .{});
 
+    // The stub writes the didOpen payload SIZE here (see lsp_stub.zig).
+    // It is inherited by the GUI and from there by the server child.
+    var report_buf: [256]u8 = undefined;
+    const report_path = std.fmt.bufPrintZ(&report_buf, "{s}/didopen.txt", .{rt}) catch
+        return fail("report path", .{});
+    _ = c.unlink(report_path.ptr);
+
     // ── private daemon ────────────────────────────────────────────
     const mux_pid = c.fork();
     if (mux_pid < 0) return fail("mux fork", .{});
@@ -497,6 +581,7 @@ pub fn main() u8 {
         // The client is silent by design; this is the only way to see
         // why a server did not attach when the rig fails.
         _ = c.setenv("SKETERM_LSP_DEBUG", "1", 1);
+        _ = c.setenv("SKETERM_LSP_STUB_REPORT", report_path.ptr, 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "edit", doc_path.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -536,6 +621,61 @@ pub fn main() u8 {
     }
     savePng(app, win_id, "zig-out/smoke-lsp-gui-diagnostics.png");
     say("PASS diagnostics rendered (gutter stripe + squiggle) -> zig-out/smoke-lsp-gui-diagnostics.png", .{});
+
+    // ── 1b. didOpen carried the document ──────────────────────────
+    //
+    // Only the stub can see this: it writes the size of the didOpen
+    // payload it received. A client that opens an EMPTY document and
+    // sends the content as a follow-up didChange is otherwise
+    // indistinguishable — sync ends up correct either way.
+    if (!plan.real_server) {
+        const f = c.fopen(report_path.ptr, "rb");
+        if (f == null) return fail("the stub never reported a didOpen", .{});
+        var rbuf: [128]u8 = undefined;
+        const n = c.fread(&rbuf, 1, rbuf.len - 1, f.?);
+        _ = c.fclose(f.?);
+        rbuf[n] = 0;
+        const got = std.mem.trim(u8, rbuf[0..n], " \n\r");
+        var want_buf: [64]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "didopen_len={d}", .{plan.body.len}) catch "";
+        if (!std.mem.eql(u8, got, want)) {
+            say("stub reported '{s}', expected '{s}'", .{ got, want });
+            return fail("didOpen did not carry the document's content", .{});
+        }
+        say("PASS didOpen carried all {d} bytes", .{plan.body.len});
+    }
+
+    // ── 1c. inlay hints ───────────────────────────────────────────
+    //
+    // The hint colour (editor_pass.Colors.inlay) is used by nothing
+    // else, so its presence to the right of the gutter is proof that a
+    // hint was laid out and drawn.
+    const INLAY_RGB = [3]u8{ 122, 133, 148 };
+    if (waitForColor(app, win_id, INLAY_RGB, 10, 3, 30_000, 240)) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-inlay-hints.png");
+        say("PASS inlay hints rendered -> zig-out/smoke-lsp-gui-inlay-hints.png", .{});
+    } else if (!plan.real_server) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-noinlay.png");
+        return fail("the stub's inlay hints never appeared", .{});
+    } else {
+        // A real server is free to have nothing to annotate here.
+        say("SKIP inlay hints: {s} offered none for this document", .{plan.name});
+    }
+
+    // ── 1d. semantic tokens ───────────────────────────────────────
+    //
+    // Stub only: it tags the `SEM` identifier as `property`, a colour
+    // no grammar gives that word, so seeing it can only mean the
+    // server's tokens were layered on top of the Tree-sitter kinds.
+    if (!plan.real_server) {
+        const PROPERTY_RGB = [3]u8{ 0xBF, 0xD4, 0xEC };
+        if (!waitForColor(app, win_id, PROPERTY_RGB, 8, 3, 30_000, 60)) {
+            savePng(app, win_id, "zig-out/smoke-lsp-gui-nosemantic.png");
+            return fail("the stub's semantic tokens never recoloured anything", .{});
+        }
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-semantic-tokens.png");
+        say("PASS semantic tokens recoloured the marker -> zig-out/smoke-lsp-gui-semantic-tokens.png", .{});
+    }
 
     // Focus the canvas: a click into the document is what the user
     // does, and the popups are positioned from the caret.
@@ -660,6 +800,150 @@ pub fn main() u8 {
     if (changed == 0) return fail("accepting a completion changed nothing on screen", .{});
     savePng(app, win_id, "zig-out/smoke-lsp-gui-completion-accepted.png");
     say("PASS completion accepted ({d} pixels changed) -> zig-out/smoke-lsp-gui-completion-accepted.png", .{changed});
+
+    // ── 4b. signature help ────────────────────────────────────────
+    //
+    // Typing the server's own trigger character must open it — no
+    // keybinding involved. Both servers declare `(`.
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 300);
+    app.pressKey(win_id, "ctrl+End") catch {};
+    pumpFor(app, 300);
+    const popups_before_sig = popupCount(app);
+    app.typeText(win_id, plan.signature_call) catch {};
+    var sig_ok = false;
+    spent = 0;
+    while (spent < 20_000) : (spent += 200) {
+        pumpFor(app, 200);
+        if (popupCount(app) > popups_before_sig) {
+            sig_ok = true;
+            break;
+        }
+    }
+    if (!sig_ok) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-nosignature.png");
+        return fail("typing '{s}' opened no signature popup", .{plan.signature_call});
+    }
+    pumpFor(app, 800);
+    savePng(app, win_id, "zig-out/smoke-lsp-gui-signature.png");
+    savePopupPng(app, "zig-out/smoke-lsp-gui-signature-popup.png");
+    say("PASS signature help -> zig-out/smoke-lsp-gui-signature.png", .{});
+    // …and it survives the caret walking to the next parameter, which
+    // is the re-entrant path (a re-request lands while typing).
+    app.typeText(win_id, "1,") catch {};
+    pumpFor(app, 1500);
+    if (popupCount(app) <= popups_before_sig)
+        return fail("signature help closed itself while moving to the next parameter", .{});
+    savePopupPng(app, "zig-out/smoke-lsp-gui-signature-param2.png");
+    say("PASS signature help followed the active parameter", .{});
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 400);
+
+    // ── 4c. code actions (Ctrl+.) ─────────────────────────────────
+    //
+    // F8 puts the caret on a diagnostic, which is where a quick fix
+    // exists; the request carries that diagnostic back to the server.
+    const popups_before_actions = popupCount(app);
+    var actions_ok = false;
+    // Walk the diagnostics: which one carries a fix is the server's
+    // business, so try each in turn rather than assuming the first.
+    var probe: usize = 0;
+    while (probe < 6 and !actions_ok) : (probe += 1) {
+        app.pressKey(win_id, "F8") catch {};
+        pumpFor(app, 700);
+        // "ctrl+." not "ctrl+period": chord parsing takes a CHARACTER
+        // for anything that is not a named key.
+        app.pressKey(win_id, "ctrl+.") catch |e| return fail("ctrl+. rejected: {s}", .{@errorName(e)});
+        spent = 0;
+        while (spent < 5_000) : (spent += 200) {
+            pumpFor(app, 200);
+            if (popupCount(app) > popups_before_actions) {
+                actions_ok = true;
+                break;
+            }
+        }
+    }
+    if (!actions_ok) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-noactions.png");
+        return fail("Ctrl+. opened no code-action popup", .{});
+    }
+    pumpFor(app, 800);
+    savePng(app, win_id, "zig-out/smoke-lsp-gui-code-actions.png");
+    savePopupPng(app, "zig-out/smoke-lsp-gui-code-actions-popup.png");
+    say("PASS code actions -> zig-out/smoke-lsp-gui-code-actions.png", .{});
+
+    // Applying one must change the document AND close the list.
+    {
+        const before_a = app.snapshotRgba(win_id, null) catch return fail("snapshot", .{});
+        defer allocator.free(before_a.px);
+        app.pressKey(win_id, "Return") catch {};
+        pumpFor(app, 2500);
+        if (popupCount(app) > popups_before_actions)
+            return fail("the code-action list stayed open after applying", .{});
+        const after_a = app.snapshotRgba(win_id, null) catch return fail("snapshot", .{});
+        defer allocator.free(after_a.px);
+        var moved: usize = 0;
+        const na = @min(before_a.px.len, after_a.px.len);
+        var ia: usize = 0;
+        while (ia < na) : (ia += 4) {
+            if (before_a.px[ia] != after_a.px[ia]) moved += 1;
+        }
+        if (moved == 0) return fail("applying a code action changed nothing on screen", .{});
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-code-action-applied.png");
+        say("PASS code action applied ({d} pixels changed)", .{moved});
+    }
+
+    // ── 4d. mouse-dwell hover ─────────────────────────────────────
+    //
+    // Resting the pointer over a symbol must pop a hover WITHOUT any
+    // key being pressed.
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 400);
+    const popups_before_dwell = popupCount(app);
+    var dwell_ok = false;
+    {
+        const w2 = app.winById(win_id).?;
+        // Sweep a few points along the first text lines until one lands
+        // on a symbol: WHERE a symbol is depends on the plan's document
+        // and on the edits the earlier stages made, and a dwell over
+        // whitespace correctly produces nothing at all.
+        const xs = [_]f64{ 0.14, 0.20, 0.26, 0.32, 0.40 };
+        const ys = [_]f64{ 0.13, 0.16, 0.19 };
+        outer: for (ys) |yr| {
+            for (xs) |xr| {
+                const hx = @as(f64, @floatFromInt(w2.w)) * xr;
+                const hy = @as(f64, @floatFromInt(w2.h)) * yr;
+                _ = app.moveMouse(win_id, hx, hy) catch {};
+                pumpFor(app, 60);
+                _ = app.moveMouse(win_id, hx + 2, hy) catch {};
+                var waited_ms: i64 = 0;
+                while (waited_ms < 2_500) : (waited_ms += 200) {
+                    pumpFor(app, 200);
+                    if (popupCount(app) > popups_before_dwell) {
+                        dwell_ok = true;
+                        break :outer;
+                    }
+                }
+            }
+        }
+    }
+    if (dwell_ok) {
+        // Capture the popup FIRST: the screenshot path wants a surface
+        // that has committed recently, and nothing re-commits a hover
+        // popover once it is up.
+        savePopupPng(app, "zig-out/smoke-lsp-gui-dwell-hover-popup.png");
+        pumpFor(app, 400);
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-dwell-hover.png");
+        say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui-dwell-hover.png", .{});
+    } else if (!plan.real_server) {
+        savePng(app, win_id, "zig-out/smoke-lsp-gui-nodwell.png");
+        return fail("resting the pointer opened no hover popup", .{});
+    } else {
+        // A real server may have nothing to say at that exact point.
+        say("SKIP mouse-dwell hover: nothing under the pointer", .{});
+    }
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 300);
 
     // ── 5. go to definition (F12) ─────────────────────────────────
     //

@@ -17,10 +17,32 @@
 //!     occurrence of that word, references at all of them;
 //!   * documentSymbol reports every `fn <name>` line;
 //!   * rename returns a workspace edit renaming every occurrence;
-//!   * formatting strips trailing whitespace from every line.
+//!   * formatting strips trailing whitespace from every line;
+//!   * signature help reports a fixed two-parameter signature whose
+//!     ACTIVE parameter is the number of commas between the enclosing
+//!     `(` and the cursor, so "does the client follow the caret" is
+//!     observable;
+//!   * code actions offer all three shapes that occur in the wild — an
+//!     inline `edit`, a `command` (answered with `workspace/applyEdit`)
+//!     and one carrying neither, which needs `codeAction/resolve`;
+//!   * inlay hints put ` [<line>]` at the end of every line inside the
+//!     REQUESTED RANGE and nowhere else, so a client that asks for the
+//!     whole document, or renders hints outside the answer, shows up;
+//!   * semantic tokens classify every identifier run as keyword,
+//!     function (after `fn `) or variable, with a `full/delta` reply
+//!     that replaces the whole array.
 //!
 //! `--utf8` makes it negotiate `positionEncoding: utf-8`, which is how
 //! the test rig checks both encodings against the same document.
+//!
+//! ## The didOpen report
+//!
+//! With `SKETERM_LSP_STUB_REPORT=<path>` set, the stub writes
+//! `didopen_len=<N>` there the moment `textDocument/didOpen` arrives.
+//! That is the regression fence for a bug the client shipped with for
+//! months: `didOpen` carried ZERO bytes and the content followed as a
+//! full-replace `didChange`. Sync was still correct, so nothing failed —
+//! only a rig that can see the didOpen payload itself can catch it.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -30,6 +52,12 @@ var doc_text: std.ArrayList(u8) = .empty;
 var doc_uri: std.ArrayList(u8) = .empty;
 var utf8_mode = false;
 var alloc: std.mem.Allocator = undefined;
+/// The packed semantic-token array we last sent, and the id that names
+/// it — what a `full/delta` request quotes back.
+var sem_last: std.ArrayList(u32) = .empty;
+var sem_result_id: u32 = 0;
+/// Next id for a server->client request (`workspace/applyEdit`).
+var next_server_id: i64 = 10_000;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
@@ -62,7 +90,9 @@ fn handle(body: []const u8) bool {
         if (std.mem.eql(u8, env.method, "exit")) return true;
         if (std.mem.eql(u8, env.method, "textDocument/didOpen")) {
             const td = objGet(env.params, "textDocument") orelse return false;
-            setDoc(strOf(objGet(td, "uri")) orelse "", strOf(objGet(td, "text")) orelse "");
+            const text = strOf(objGet(td, "text")) orelse "";
+            reportDidOpen(text.len);
+            setDoc(strOf(objGet(td, "uri")) orelse "", text);
             publishDiagnostics();
         } else if (std.mem.eql(u8, env.method, "textDocument/didChange")) {
             applyChanges(env.params);
@@ -100,6 +130,23 @@ fn handle(body: []const u8) bool {
         std.mem.eql(u8, env.method, "textDocument/rangeFormatting"))
     {
         replyFormatting(id);
+    } else if (std.mem.eql(u8, env.method, "textDocument/signatureHelp")) {
+        replySignatureHelp(id, env.params);
+    } else if (std.mem.eql(u8, env.method, "textDocument/codeAction")) {
+        replyCodeActions(id, env.params);
+    } else if (std.mem.eql(u8, env.method, "codeAction/resolve")) {
+        replyResolvedAction(id, env.params);
+    } else if (std.mem.eql(u8, env.method, "workspace/executeCommand")) {
+        replyRaw(id, "null");
+        // The work of a command arrives as a server->client edit — the
+        // shape a client has to support for command-carrying actions.
+        pushApplyEdit();
+    } else if (std.mem.eql(u8, env.method, "textDocument/inlayHint")) {
+        replyInlayHints(id, env.params);
+    } else if (std.mem.eql(u8, env.method, "textDocument/semanticTokens/full")) {
+        replySemanticTokens(id, false);
+    } else if (std.mem.eql(u8, env.method, "textDocument/semanticTokens/full/delta")) {
+        replySemanticTokens(id, true);
     } else {
         replyErr(id, -32601, "unsupported");
     }
@@ -120,7 +167,12 @@ const CAPS =
     \\"typeDefinitionProvider":true,"referencesProvider":true,
     \\"documentSymbolProvider":true,"workspaceSymbolProvider":true,
     \\"renameProvider":true,
-    \\"documentFormattingProvider":true,"documentRangeFormattingProvider":true}
+    \\"documentFormattingProvider":true,"documentRangeFormattingProvider":true,
+    \\"signatureHelpProvider":{"triggerCharacters":["("],"retriggerCharacters":[","]},
+    \\"codeActionProvider":{"resolveProvider":true},
+    \\"executeCommandProvider":{"commands":["stub.fixAllBad"]},
+    \\"inlayHintProvider":true,
+    \\"semanticTokensProvider":{"legend":{"tokenTypes":["function","variable","keyword","property"],"tokenModifiers":[]},"full":{"delta":true},"range":false}}
 ;
 
 const COMPLETION_RESULT =
@@ -421,6 +473,253 @@ fn replyFormatting(id: i64) void {
         line_start = line_end + 1;
     }
     out.append(alloc, ']') catch return;
+    replyRaw(id, out.items);
+}
+
+// ---- didOpen report ---------------------------------------------------------
+
+/// Record how many bytes `didOpen` actually carried. See the module
+/// header: this is the only place that number is observable, and a
+/// client that opens an empty document and follows it with a
+/// full-replace `didChange` is otherwise indistinguishable from a
+/// correct one.
+fn reportDidOpen(len: usize) void {
+    const path = c.getenv("SKETERM_LSP_STUB_REPORT") orelse return;
+    const f = c.fopen(path, "wb") orelse return;
+    defer _ = c.fclose(f);
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "didopen_len={d}\n", .{len}) catch return;
+    _ = c.fwrite(s.ptr, 1, s.len, f);
+}
+
+// ---- signature help ---------------------------------------------------------
+
+/// A fixed signature; the ACTIVE parameter is derived from the text, so
+/// a client that fails to re-request as the caret moves shows a stale
+/// index rather than nothing at all.
+fn replySignatureHelp(id: i64, params: std.json.Value) void {
+    const off = offsetOf(objGet(params, "position") orelse .null);
+    // Walk back to the enclosing '(' counting top-level commas.
+    var i = @min(off, doc_text.items.len);
+    var commas: usize = 0;
+    var depth: usize = 0;
+    var found = false;
+    while (i > 0) {
+        i -= 1;
+        const ch = doc_text.items[i];
+        if (ch == ')') depth += 1;
+        if (ch == ',' and depth == 0) commas += 1;
+        if (ch == '(') {
+            if (depth == 0) {
+                found = true;
+                break;
+            }
+            depth -= 1;
+        }
+        if (ch == '\n') break;
+    }
+    if (!found) {
+        replyRaw(id, "null");
+        return;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.print(alloc,
+        \\{{"signatures":[{{"label":"stubCall(first: i32, second: i32)",
+        \\"documentation":{{"kind":"plaintext","value":"stub signature"}},
+        \\"parameters":[{{"label":"first: i32","documentation":"the first one"}},
+        \\{{"label":"second: i32","documentation":"the second one"}}]}}],
+        \\"activeSignature":0,"activeParameter":{d}}}
+    , .{@min(commas, 1)}) catch return;
+    replyRaw(id, out.items);
+}
+
+// ---- code actions -----------------------------------------------------------
+
+/// Three actions, one of each shape a real server produces.
+fn replyCodeActions(id: i64, params: std.json.Value) void {
+    const rng = objGet(params, "range") orelse std.json.Value.null;
+    const s = offsetOf(objGet(rng, "start") orelse .null);
+    const e = offsetOf(objGet(rng, "end") orelse .null);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.append(alloc, '[') catch return;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, doc_text.items, from, "BAD")) |at| {
+        from = at + 3;
+        if (at + 3 < s or at > e) continue;
+        if (n > 0) out.append(alloc, ',') catch return;
+        out.appendSlice(alloc, "{\"title\":\"Replace BAD with GOOD\",\"kind\":\"quickfix\",\"edit\":{\"changes\":{\"") catch return;
+        out.appendSlice(alloc, doc_uri.items) catch return;
+        out.appendSlice(alloc, "\":[{\"range\":") catch return;
+        appendRange(&out, at, at + 3);
+        out.appendSlice(alloc, ",\"newText\":\"GOOD\"}]}}}") catch return;
+        n += 1;
+    }
+    // Always offered, whatever the range: a command-only action and a
+    // lazily-resolved one.
+    if (n > 0) out.append(alloc, ',') catch return;
+    out.appendSlice(alloc,
+        \\{"title":"Fix all BAD (command)","kind":"source.fixAll",
+        \\"command":{"title":"fix","command":"stub.fixAllBad","arguments":[1]}},
+        \\{"title":"Append a stub marker (resolved)","kind":"refactor","data":{"stub":true}}
+    ) catch return;
+    out.append(alloc, ']') catch return;
+    replyRaw(id, out.items);
+}
+
+/// The lazily-resolved action's edit: append a marker at the very end.
+fn replyResolvedAction(id: i64, params: std.json.Value) void {
+    const title = strOf(objGet(params, "title")) orelse "resolved";
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.print(alloc, "{{\"title\":\"{s}\",\"kind\":\"refactor\",\"edit\":{{\"changes\":{{\"", .{title}) catch return;
+    out.appendSlice(alloc, doc_uri.items) catch return;
+    out.appendSlice(alloc, "\":[{\"range\":") catch return;
+    appendRange(&out, doc_text.items.len, doc_text.items.len);
+    out.appendSlice(alloc, ",\"newText\":\"// stub-resolved\\n\"}]}}}") catch return;
+    replyRaw(id, out.items);
+}
+
+/// `workspace/applyEdit`: replace every BAD with GOOD, as a server
+/// -> client REQUEST (the client must answer it or we would block).
+fn pushApplyEdit() void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.print(
+        alloc,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"workspace/applyEdit\",\"params\":{{\"edit\":{{\"changes\":{{\"",
+        .{next_server_id},
+    ) catch return;
+    next_server_id += 1;
+    out.appendSlice(alloc, doc_uri.items) catch return;
+    out.appendSlice(alloc, "\":[") catch return;
+    var from: usize = 0;
+    var n: usize = 0;
+    while (std.mem.indexOfPos(u8, doc_text.items, from, "BAD")) |at| {
+        if (n > 0) out.append(alloc, ',') catch return;
+        out.appendSlice(alloc, "{\"range\":") catch return;
+        appendRange(&out, at, at + 3);
+        out.appendSlice(alloc, ",\"newText\":\"GOOD\"}") catch return;
+        n += 1;
+        from = at + 3;
+    }
+    out.appendSlice(alloc, "]}}}}") catch return;
+    send(out.items);
+}
+
+// ---- inlay hints ------------------------------------------------------------
+
+/// ` [<line>]` at the end of every line INSIDE the requested range.
+fn replyInlayHints(id: i64, params: std.json.Value) void {
+    const rng = objGet(params, "range") orelse std.json.Value.null;
+    const from_line = intOf(objGet(objGet(rng, "start") orelse .null, "line"));
+    const to_line = intOf(objGet(objGet(rng, "end") orelse .null, "line"));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.append(alloc, '[') catch return;
+    var n: usize = 0;
+    var line: usize = 0;
+    var off: usize = 0;
+    while (off <= doc_text.items.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, doc_text.items, off, '\n') orelse doc_text.items.len;
+        if (line >= from_line and line <= to_line and line_end > off) {
+            if (n > 0) out.append(alloc, ',') catch return;
+            const p = positionOf(line_end);
+            out.print(
+                alloc,
+                "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":\" [{d}]\",\"kind\":1,\"paddingLeft\":true}}",
+                .{ p.line, p.character, line },
+            ) catch return;
+            n += 1;
+        }
+        if (line_end >= doc_text.items.len) break;
+        off = line_end + 1;
+        line += 1;
+    }
+    out.append(alloc, ']') catch return;
+    replyRaw(id, out.items);
+}
+
+// ---- semantic tokens --------------------------------------------------------
+
+const KEYWORDS = [_][]const u8{ "fn", "const", "var", "return", "void", "pub", "static", "int" };
+
+/// One token per identifier run: keyword, function (right after `fn `)
+/// or variable. Encoded relative, exactly as the wire format wants.
+fn buildSemanticTokens(out: *std.ArrayList(u32)) void {
+    out.clearRetainingCapacity();
+    var prev_line: usize = 0;
+    var prev_char: usize = 0;
+    var i: usize = 0;
+    var last_word_was_fn = false;
+    while (i < doc_text.items.len) {
+        if (!isWordy(doc_text.items[i])) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < doc_text.items.len and isWordy(doc_text.items[i])) i += 1;
+        const word = doc_text.items[start..i];
+        var kind: u32 = 1; // variable
+        var is_fn_kw = false;
+        for (KEYWORDS) |kw| {
+            if (std.mem.eql(u8, word, kw)) {
+                kind = 2;
+                is_fn_kw = std.mem.eql(u8, kw, "fn");
+                break;
+            }
+        }
+        if (kind != 2 and last_word_was_fn) kind = 0; // function
+        // The rig's marker: a word no grammar classifies specially, so
+        // seeing the `property` colour on screen can ONLY mean the
+        // semantic tokens were applied.
+        if (std.mem.eql(u8, word, "SEM")) kind = 3;
+        last_word_was_fn = is_fn_kw;
+
+        const ps = positionOf(start);
+        const pe = positionOf(i);
+        // A token never spans lines here, so the length is the
+        // character delta on the line.
+        if (pe.line != ps.line) continue;
+        const dl = ps.line - prev_line;
+        const dc = if (dl == 0) ps.character - prev_char else ps.character;
+        out.append(alloc, @intCast(dl)) catch return;
+        out.append(alloc, @intCast(dc)) catch return;
+        out.append(alloc, @intCast(pe.character - ps.character)) catch return;
+        out.append(alloc, kind) catch return;
+        out.append(alloc, 0) catch return;
+        prev_line = ps.line;
+        prev_char = ps.character;
+    }
+}
+
+fn replySemanticTokens(id: i64, delta: bool) void {
+    var fresh: std.ArrayList(u32) = .empty;
+    defer fresh.deinit(alloc);
+    buildSemanticTokens(&fresh);
+    sem_result_id += 1;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    if (delta) {
+        // One splice replacing the whole previous array: the simplest
+        // legal delta, and it still exercises the client's splice.
+        out.print(
+            alloc,
+            "{{\"resultId\":\"{d}\",\"edits\":[{{\"start\":0,\"deleteCount\":{d},\"data\":[",
+            .{ sem_result_id, sem_last.items.len },
+        ) catch return;
+    } else {
+        out.print(alloc, "{{\"resultId\":\"{d}\",\"data\":[", .{sem_result_id}) catch return;
+    }
+    for (fresh.items, 0..) |v, k| {
+        if (k > 0) out.append(alloc, ',') catch return;
+        out.print(alloc, "{d}", .{v}) catch return;
+    }
+    out.appendSlice(alloc, if (delta) "]}]}" else "]}") catch return;
+    sem_last.clearRetainingCapacity();
+    sem_last.appendSlice(alloc, fresh.items) catch {};
     replyRaw(id, out.items);
 }
 
