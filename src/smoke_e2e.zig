@@ -440,6 +440,12 @@ pub fn main() u8 {
     if (drive) |app| {
         if (realInputStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("real seat input reached the shell and repainted the window");
+
+        // 3c. The pane's context menu, driven by a real right-click and
+        // by the keyboard, and asserted through AT-SPI (so a menu that
+        // paints but is invisible to a screen reader fails here too).
+        if (contextMenuStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("context menu: right-click and Shift+F10 both opened it, Escape closed it, focus returned to the pane");
     }
 
     // 4. split, then list must show two panes.
@@ -1414,6 +1420,97 @@ fn realInputStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [
     defer allocator.free(shot.png);
     if (shot.png.len < 1024 or shot.img_w == 0 or shot.img_h == 0)
         return "the GUI window screenshot is empty";
+    return null;
+}
+
+const MENU_MARKER = "CTXMENU_OK";
+
+/// A GTK4 popover is its OWN xdg_popup surface, not part of the
+/// toplevel's buffer — screenshotting the toplevel never shows it,
+/// and a toplevel pixel-diff "proving" a menu opened is really just
+/// the cursor blinking. So the menu is counted as a popup surface
+/// with committed frames.
+fn openPopup(app: *appdrive.App) ?u32 {
+    _ = app.pumpOnce(120);
+    for (app.windows.items) |w| {
+        if (w.popup and w.frames > 0) return w.id;
+    }
+    return null;
+}
+
+fn waitPopup(app: *appdrive.App, want_open: bool, ms: u32) ?u32 {
+    var waited: u32 = 0;
+    while (true) {
+        const id = openPopup(app);
+        if ((id != null) == want_open) return id orelse 0;
+        if (waited >= ms) return null;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+/// The pane's context menu on the REAL seat: a right-click and
+/// Shift+F10 must both open it, Escape must close it, and focus must
+/// come back to the pane afterwards.
+///
+/// Asserted on the popup surface and on shell bytes, because this
+/// harness runs with GTK_A11Y=none (see the GUI spawn above). The
+/// menu's CONTENTS, per-row sensitivity and row activation are
+/// asserted in `smoke_atspi.zig`, which has a private a11y bus.
+fn contextMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    _ = app.drainLive(3_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    const cx = @as(f64, @floatFromInt(app.windows.items[0].w)) / 2;
+    const cy = @as(f64, @floatFromInt(app.windows.items[0].h)) / 2;
+    if (openPopup(app) != null) return "a popup was already open before the context-menu stage";
+
+    // ── pointer path ────────────────────────────────────────────
+    app.clickEx(win_id, cx, cy, 3, 100, 1) catch return "injecting a right-click failed";
+    const menu_id = waitPopup(app, true, 15_000) orelse
+        return "a right-click on the pane opened no menu popup";
+    _ = app.waitVisualSettle(menu_id, 300, 5_000, 0.002, null);
+
+    // A PNG of the menu surface itself — the artefact a human reviews.
+    if (app.screenshotPng(menu_id, 1024, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-context-menu.png", shot.png);
+        if (shot.img_w < 40 or shot.img_h < 40) return "the context menu popup has no real size";
+    } else |_| return "screenshotting the open context menu failed";
+
+    app.pressKey(null, "Escape") catch return "injecting Escape failed";
+    if (waitPopup(app, false, 10_000) == null)
+        return "the right-click menu never closed on Escape";
+
+    // ── keyboard path ───────────────────────────────────────────
+    // Shift+F10 must open the same menu with no pointer involved.
+    app.pressKey(null, "shift+F10") catch return "injecting Shift+F10 failed";
+    const kb_id = waitPopup(app, true, 15_000) orelse
+        return "Shift+F10 did not open the context menu";
+    _ = app.waitVisualSettle(kb_id, 300, 5_000, 0.002, null);
+    if (app.screenshotPng(kb_id, 1024, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-context-menu-keyboard.png", shot.png);
+    } else |_| return "screenshotting the keyboard-opened context menu failed";
+
+    app.pressKey(null, "Escape") catch return "injecting Escape failed";
+    if (waitPopup(app, false, 10_000) == null)
+        return "the keyboard-opened menu never closed on Escape";
+    _ = app.waitIdle(300, 5_000);
+
+    // ── focus return ────────────────────────────────────────────
+    // Focus is only genuinely back on the pane if typed bytes reach
+    // its shell again — a popover that keeps the keyboard grab, or a
+    // pane that never regains focus, dies here.
+    app.typeText(null, "echo " ++ MENU_MARKER ++ "\n") catch
+        return "injecting keystrokes after the menu closed failed";
+    var tries: u32 = 0;
+    while (tries < 75) : (tries += 1) {
+        const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse continue;
+        defer allocator.free(resp);
+        if (countMarker(allocator, resp, MENU_MARKER) >= 2) break;
+        _ = app.pumpOnce(200);
+    } else return "focus never returned to the pane after the context menu closed";
     return null;
 }
 
