@@ -740,6 +740,10 @@ const MoveHelperKill = struct {
     journal: []const u8,
     remove_after_kill: []const u8 = "",
     stage_child: []const u8 = "",
+    /// Single-file stage watch: how much of the `.skpart` must exist
+    /// before the kill (a later kill leaves journaled progress the
+    /// restart must not double-count).
+    min_bytes: u64 = 1 << 20,
     killed: bool = false,
 };
 
@@ -795,7 +799,7 @@ fn killMoveHelperInDestinationStage(ctx: *MoveHelperKill) void {
                 var z: [4096]u8 = undefined;
                 var st: c.struct_stat = undefined;
                 child_ready = c.stat(pathz.pathZ(&z, part) catch return, &st) == 0 and
-                    st.st_size >= (1 << 20);
+                    st.st_size >= @as(c.off_t, @intCast(ctx.min_bytes));
             }
             if (std.mem.eql(u8, parsed.value.phase, "rename_planned") and
                 parsed.value.destination_stage.len > 0 and
@@ -2879,6 +2883,12 @@ fn crossStage(
         // the whole transfer.
         if (res.resumed_at == 0)
             fail("cross: the copy resumed from byte zero, losing everything already transferred");
+        // ...and the counter stayed honest: a reconnect must not count
+        // replayed chunks twice (done once exceeded the file's size).
+        if (res.max_done > 6 << 20) {
+            std.debug.print("smoke-fs: FAIL flaky max_done {d} > total {d}\n", .{ res.max_done, 6 << 20 });
+            fail("cross: reconnect double-counted transferred bytes");
+        }
     }
     _ = c.unsetenv("SKETERM_SSH");
 
@@ -3072,23 +3082,24 @@ fn crossStage(
         const want_rs = fileSha(rs_src) orelse fail("cross: retry-resume source hash");
         var rd_buf: [256]u8 = undefined;
         const rs_dst = std.fmt.bufPrint(&rd_buf, "{s}/retry-resume.bin", .{dst_dir}) catch unreachable;
+        // no_replace: the browser's paste shape — STAGED, so the kill
+        // lands after the "rename_planned" journal boundary exists.
         const job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", rs_src, "", rs_dst, true, "attempt-1", .{
+            .no_replace = true,
             .transfer_token = "xfer-retry-resume",
         }) catch failErr("cross: start retry-resume", fs.lastErr());
         var journal_buf: [4096]u8 = undefined;
         const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
-        var part_buf: [256]u8 = undefined;
-        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{rs_dst}) catch unreachable;
-        var killer_ctx = CopyHelperKill{ .journal = journal, .part = part };
-        const killer = std.Thread.spawn(.{}, killCopyHelperMidTransfer, .{&killer_ctx}) catch
+        var killer_ctx = MoveHelperKill{ .journal = journal, .min_bytes = 8 << 20 };
+        const killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&killer_ctx}) catch
             fail("cross: retry-resume killer thread");
         const first = collectJob(&fs, job, 120_000);
         killer.join();
         if (!killer_ctx.killed) fail("cross: retry-resume helper was not killed mid-transfer");
         if (!first.is("error")) fail("cross: killed copy attempt did not report failure");
-        if (!exists(part)) fail("cross: killed copy attempt left no staged partial");
         // The retry: NEW client_token, SAME transfer_token.
         const retry_job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", rs_src, "", rs_dst, true, "attempt-2", .{
+            .no_replace = true,
             .transfer_token = "xfer-retry-resume",
         }) catch failErr("cross: start retry-resume attempt 2", fs.lastErr());
         if (retry_job != job)
@@ -3097,6 +3108,13 @@ fn crossStage(
         if (!second.is("done")) failErr("cross: retried copy did not finish", second.messageText());
         if (second.resumed_from == 0)
             fail("cross: the retry restarted from byte zero instead of resuming the staged partial");
+        // The byte counter must stay honest across the restart: the
+        // first attempt's journaled progress and the resumed run's own
+        // counting once SUMMED to more bytes than the file has.
+        if (second.max_done > 24 << 20) {
+            std.debug.print("smoke-fs: FAIL retry-resume max_done {d} > total {d}\n", .{ second.max_done, 24 << 20 });
+            fail("cross: restarted job over-reported its byte progress");
+        }
         const got_rs = fileSha(rs_dst) orelse fail("cross: retry-resume destination hash");
         if (!std.mem.eql(u8, &got_rs, &want_rs)) fail("cross: retried copy content mismatch");
     }

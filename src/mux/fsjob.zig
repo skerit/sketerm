@@ -3340,11 +3340,17 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         .no_replace = spec.no_replace,
         .move = spec.delete_src,
         .progress = .{
-            .done = if (journal_phase > 0) spec.done else 0,
-            .total = if (journal_phase > 0) spec.total else 0,
-            .resumed = if (journal_phase > 0) spec.resumed_from else 0,
-            .entries_done = if (journal_phase > 0) spec.files_done else 0,
-            .entries_total = if (journal_phase > 0) spec.files_total else 0,
+            // Seed the journaled counters ONLY when the byte copy is
+            // being skipped (resume_phase > 0: cleanup-phase recovery).
+            // A rename_planned restart re-runs the copy and re-counts
+            // its own bytes — seeding on top of that once SUMMED a
+            // dead attempt's progress with the fresh run's (done grew
+            // to 1.66x the file's size).
+            .done = if (resume_phase > 0) spec.done else 0,
+            .total = if (resume_phase > 0) spec.total else 0,
+            .resumed = if (resume_phase > 0) spec.resumed_from else 0,
+            .entries_done = if (resume_phase > 0) spec.files_done else 0,
+            .entries_total = if (resume_phase > 0) spec.files_total else 0,
         },
     };
     defer cc.deinitCaches();
@@ -3460,17 +3466,43 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
                 return emitError("transfer could not persist its destination staging path");
         }
         copy_dst = durable.destination_stage;
-        if (resume_phase == 0) {
-            var final_arena = std.heap.ArenaAllocator.init(allocator);
-            defer final_arena.deinit();
-            if (cc.statProbe(.dst, final_arena.allocator(), spec.dst) != null) {
+    }
+    // A no-replace destination that already exists is a collision —
+    // UNLESS this restarted job can show a journaled prior attempt AND
+    // the destination proves to be exactly the source's content: then
+    // its previous attempt (or a lost final acknowledgment) already
+    // delivered it, and reporting failure over bytes that are
+    // verifiably in place would send the client into a retry loop
+    // against its own success. A FRESH job never claims a matching
+    // destination (an identical file is not proof that THIS job put it
+    // there — the collision smoke pins that down for moves).
+    const prior_attempt = spec.destination_stage.len > 0 or spec.phase.len > 0 or spec.done > 0;
+    var already_installed = false;
+    if (spec.no_replace and resume_phase == 0) {
+        var final_arena = std.heap.ArenaAllocator.init(allocator);
+        defer final_arena.deinit();
+        if (cc.statProbe(.dst, final_arena.allocator(), spec.dst)) |existing_dst| {
+            const before = cc.fail_len;
+            const claimed = spec.@"resume" and prior_attempt and
+                std.mem.eql(u8, existing_dst.kind, root.kind) and
+                (!std.mem.eql(u8, root.kind, "dir") or cc.destinationShapeMatches(&manifest, spec.dst)) and
+                cc.verifyDestination(&manifest, active_src, spec.dst, root);
+            cc.fail_len = before;
+            if (!claimed) {
                 cc.fail("destination exists: {s}", .{tailOf(spec.dst)});
                 return cc.emitFailure();
             }
+            already_installed = true;
+            cc.progress.total = if (std.mem.eql(u8, root.kind, "file")) root.size else manifest.total;
+            cc.progress.entries_total = if (std.mem.eql(u8, root.kind, "dir")) manifest.files else 1;
+            cc.progress.done = cc.progress.total;
+            cc.progress.resumed = cc.progress.total;
+            cc.progress.entries_done = cc.progress.entries_total;
+            cc.progress.emitNow();
         }
     }
 
-    if (resume_phase == 0) {
+    if (resume_phase == 0 and !already_installed) {
         cc.progress.total = if (std.mem.eql(u8, root.kind, "file")) root.size else manifest.total;
         cc.progress.entries_total = if (std.mem.eql(u8, root.kind, "dir")) manifest.files else 1;
         cc.progress.emitNow();
@@ -3498,7 +3530,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
             }
         }
     }
-    if (staged_root) {
+    if (staged_root and !already_installed) {
         if (resume_phase < fsjournal.phaseRank("destination_staged")) {
             stage_fingerprint_buf = CrossCopy.fingerprint(root, &manifest);
             durable.fingerprint = &stage_fingerprint_buf;
