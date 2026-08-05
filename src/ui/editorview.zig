@@ -1971,6 +1971,8 @@ pub const EditorView = struct {
         self.tabhost.ctx = @ptrCast(self);
         self.tabhost.on_close = &hostCloseCb;
         self.tabhost.on_new = &hostNewCb;
+        self.tabhost.on_strip_menu = &hostStripMenuCb;
+        self.tabhost.tab_menu = editormenu.tabMenuSpec();
         const nb = self.tabhost.widget();
         c.gtk_widget_set_vexpand(nb, 0);
         _ = c.g_signal_connect_data(nb, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -2405,6 +2407,11 @@ pub const EditorView = struct {
     fn hostNewCb(ctx: ?*anyopaque) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx.?));
         _ = self.newTab(null);
+    }
+
+    fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
+        const self: *EditorView = @ptrCast(@alignCast(ctx.?));
+        editormenu.showStripMenu(self, x, y);
     }
 
     fn onSwitchPage(_: *c.GtkNotebook, page: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
@@ -4265,6 +4272,14 @@ pub const EditorView = struct {
     fn onBannerReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
         const tab = self.active orelse return;
+        self.revertTab(tab);
+    }
+
+    /// Replace a buffer with the version on disk — the banner's
+    /// "Reload", reachable for any tab (the tab context menu's
+    /// "Revert"). A dirty buffer asks first; losing unsaved work stays
+    /// behind a confirmation.
+    pub fn revertTab(self: *EditorView, tab: *ETab) void {
         if (tab.isDirty()) {
             // Losing unsaved work is the one thing that still deserves
             // a confirmation — and it follows a deliberate click.
