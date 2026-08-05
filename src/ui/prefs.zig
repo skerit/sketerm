@@ -1300,6 +1300,31 @@ fn editorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addEditorThemeRow(@ptrCast(@alignCast(syntax_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(syntax_group)));
 
+    const project_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(project_group)), "Project");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(project_group)), "A project is the nearest directory above a file holding a marker (a VCS directory or a build file). A file with no marker above it has no project, and everything here stays switched off for it.");
+    addEntryRowString(
+        @ptrCast(@alignCast(project_group)),
+        ctx,
+        "Root markers",
+        "Comma-separated filenames that identify a project root. Empty = the built-in list (.git, build.zig, Cargo.toml, package.json, …).",
+        &ctx.cfg.editor_project_markers,
+        applyOnly,
+    );
+    addSwitchRow(@ptrCast(@alignCast(project_group)), ctx, "Git change gutter", "Added / modified / deleted markers at the gutter's right edge, against HEAD on the file's own host. F7 and Shift+F7 step between hunks.", &ctx.cfg.editor_git_gutter, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(project_group)), ctx, "Show the outline panel", "Open the symbol outline with every editor face. Ctrl+Shift+O toggles it either way.", &ctx.cfg.editor_outline, applyOnly);
+    addSpinRowU32(
+        @ptrCast(@alignCast(project_group)),
+        ctx,
+        "Project search file cap",
+        "How many files one Ctrl+Shift+F may read. The daemon's grep narrows the candidates first; this only bounds a pattern it cannot pre-filter.",
+        1,
+        1_000_000,
+        &ctx.cfg.editor_project_search_max_files,
+        applyOnly,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(project_group)));
+
     buildLspGroup(page, ctx);
 
     // Font is PER-PROFILE, like the terminal font it falls back to.

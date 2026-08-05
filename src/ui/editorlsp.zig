@@ -45,6 +45,7 @@ const sel_mod = @import("../editor/selection.zig");
 const Selection = sel_mod.Selection;
 const vm = @import("../editor/view_model.zig");
 const paths = @import("../filebrowser/paths.zig");
+const editoroutline = @import("editoroutline.zig");
 const Config = @import("../config.zig").Config;
 
 const rpc = @import("../lsp/rpc.zig");
@@ -1258,18 +1259,29 @@ pub const Manager = struct {
 
     // ---- symbols -----------------------------------------------------------
 
-    pub fn requestDocumentSymbols(self: *Manager) void {
-        const r = self.ready("document symbols") orelse return;
-        if (!r.cn.sess.caps.document_symbol) {
-            self.view.setStatusText("Server offers no document symbols.");
-            return;
-        }
+    /// `documentSymbol` for the OUTLINE PANEL rather than the popup.
+    /// Silent (a missing server is not an error the user asked about),
+    /// and marked with `aux = OUTLINE_AUX` so the reply is routed to the
+    /// panel. @return whether a request actually went out.
+    pub fn requestOutlineSymbols(self: *Manager) bool {
+        const tab = self.view.activeTab() orelse return false;
+        const st = tab.lsp orelse return false;
+        const cn = st.conn orelse return false;
+        if (cn.sess.state != .ready) return false;
+        if (!cn.sess.caps.document_symbol) return false;
+        self.flushChanges(tab);
+        const r = Ready{ .tab = tab, .st = st, .cn = cn };
         self.scratch.clearRetainingCapacity();
-        self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-        session.appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
-        self.scratch.appendSlice(self.alloc, "}}") catch return;
-        self.issue(r, .document_symbol, "textDocument/documentSymbol", self.scratch.items, 0);
+        self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return false;
+        session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return false;
+        self.scratch.appendSlice(self.alloc, "}}") catch return false;
+        self.issue(r, .document_symbol, "textDocument/documentSymbol", self.scratch.items, OUTLINE_AUX);
+        return true;
     }
+
+    /// `Request.aux` value that means "this documentSymbol reply belongs
+    /// to the outline panel".
+    pub const OUTLINE_AUX: u64 = 1;
 
     pub fn requestWorkspaceSymbols(self: *Manager) void {
         const r = self.ready("workspace symbols") orelse return;
@@ -1300,6 +1312,21 @@ pub const Manager = struct {
     }
 
     fn onSymbols(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        // The outline panel asked for this one: it owns the reply, and
+        // a failure there is silent (the tree fallback covers it).
+        if (req.kind == .document_symbol and req.aux == OUTLINE_AUX) {
+            const tab = maybe_tab orelse return;
+            if (env.has_error) {
+                editoroutline.lspFailed(self.view, tab);
+                return;
+            }
+            const enc = if (tab.lsp) |st| blk: {
+                const conn = st.conn orelse break :blk pos.Encoding.utf16;
+                break :blk conn.sess.caps.encoding;
+            } else pos.Encoding.utf16;
+            editoroutline.fillFromLsp(self.view, tab, env.result, enc);
+            return;
+        }
         if (env.has_error) {
             self.view.setStatusText("The server could not answer that.");
             return;

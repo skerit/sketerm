@@ -107,6 +107,10 @@ const vm = @import("../editor/view_model.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
+const project_mod = @import("../editor/project.zig");
+const gitdiff = @import("../editor/gitdiff.zig");
+const outline_mod = @import("../editor/outline.zig");
+const psearch = @import("../editor/psearch.zig");
 const tr = @import("../editor/transaction.zig");
 const theme_mod = @import("../editor/theme.zig");
 const tabhost_mod = @import("tabhost.zig");
@@ -124,6 +128,8 @@ const editorlsp = @import("editorlsp.zig");
 const lsp_session = @import("../lsp/session.zig");
 const lsp_pos = @import("../lsp/position.zig");
 const PickerWindow = @import("picker.zig").PickerWindow;
+const editorproj = @import("editorproj.zig");
+const editoroutline = @import("editoroutline.zig");
 
 /// Open size cap: bigger files are refused with a clear error.
 pub const MAX_FILE_BYTES: usize = 64 << 20;
@@ -164,7 +170,7 @@ var recovery_offered: bool = false;
 /// deliveries, clipboard reads and dialog callbacks. The mutex only
 /// matters for the worker threads; everything else runs on the main
 /// loop.
-const Fence = struct {
+pub const Fence = struct {
     mutex: c.pthread_mutex_t = undefined,
     refs: u32 = 1,
     alive: bool = true,
@@ -180,13 +186,13 @@ const Fence = struct {
         return self;
     }
 
-    fn ref(self: *Fence) void {
+    pub fn ref(self: *Fence) void {
         _ = c.pthread_mutex_lock(&self.mutex);
         self.refs += 1;
         _ = c.pthread_mutex_unlock(&self.mutex);
     }
 
-    fn unref(self: *Fence) void {
+    pub fn unref(self: *Fence) void {
         _ = c.pthread_mutex_lock(&self.mutex);
         self.refs -= 1;
         const destroy = self.refs == 0;
@@ -205,7 +211,7 @@ const Fence = struct {
         self.unref();
     }
 
-    fn viewIfAlive(self: *Fence) ?*EditorView {
+    pub fn viewIfAlive(self: *Fence) ?*EditorView {
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
         return if (self.alive) self.view else null;
@@ -260,7 +266,7 @@ const IoJob = struct {
     }
 };
 
-fn connectFs(host: ?[]const u8) !fsdrive.Fs {
+pub fn connectFs(host: ?[]const u8) !fsdrive.Fs {
     const allocator = std.heap.c_allocator;
     const conn = if (host) |remote| blk: {
         var config = Config.load(allocator);
@@ -298,10 +304,19 @@ fn probePath(fs: *fsdrive.Fs, path: []const u8, out: *reload.DiskState) bool {
     return true;
 }
 
-fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), info_out: *fsdrive.ReadInfo) !void {
+/// Read a whole host-side file into `out`, refusing anything over
+/// `MAX_FILE_BYTES`. The project layer reads files through this too,
+/// so a candidate that is too big is refused identically to one the
+/// user tries to open.
+pub fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), cap: usize) !void {
+    var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
+    return readAllInto(fs, path, out, cap, &info);
+}
+
+fn readAllInto(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), cap: usize, info_out: *fsdrive.ReadInfo) !void {
     const allocator = std.heap.c_allocator;
     const probe = try fs.read(path, 0, 0, out);
-    if (probe.size > MAX_FILE_BYTES) return error.SourceTooLarge;
+    if (probe.size > cap) return error.SourceTooLarge;
     info_out.* = probe;
     try out.ensureTotalCapacity(allocator, @intCast(probe.size));
     var offset: u64 = 0;
@@ -313,7 +328,7 @@ fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), inf
         const received = out.items.len - before;
         if (received == 0) return error.ShortRead;
         offset += received;
-        if (out.items.len > MAX_FILE_BYTES) return error.SourceTooLarge;
+        if (out.items.len > cap) return error.SourceTooLarge;
         if (info.eof) break;
     }
     if (offset != probe.size) return error.ShortRead;
@@ -332,7 +347,7 @@ fn ioThread(job: *IoJob) void {
             .load => {
                 var out: std.ArrayList(u8) = .empty;
                 var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
-                readAllCapped(&fs, loc.path, &out, &info) catch |err| {
+                readAllInto(&fs, loc.path, &out, MAX_FILE_BYTES, &info) catch |err| {
                     out.deinit(allocator);
                     if (err == error.SourceTooLarge or err == error.ShortRead) {
                         job.setErr(@errorName(err));
@@ -594,6 +609,42 @@ pub const ETab = struct {
     /// had to open the file first.
     want_pos: ?lsp_pos.Position = null,
 
+    // ---- project layer -----------------------------------------------
+    //
+    // See editor/project.zig for the model and ui/editorproj.zig for the
+    // daemon round trips. Everything here is null/empty for a loose file
+    // with no project, which is what keeps single-file editing free.
+
+    /// The project this document belongs to (refcounted in
+    /// `EditorView.projects`), resolved asynchronously once the spec is
+    /// known. Null = no project.
+    project: ?*project_mod.Project = null,
+    /// Non-zero while a project resolution is in flight; a mismatch at
+    /// delivery means the tab was reused for another file.
+    proj_gen: u64 = 0,
+
+    /// Per-line VCS marks for the gutter, anchored by byte offset and
+    /// carried through every edit by `observeEdits`.
+    git: gitdiff.Marks,
+    /// Non-zero while a gutter refresh is in flight.
+    git_gen: u64 = 0,
+
+    /// Symbol outline: LSP `documentSymbol` where a server answers, the
+    /// Tree-sitter tree otherwise.
+    outline: outline_mod.Outline,
+    /// Document revision the outline was built at, and whether an LSP
+    /// request for it is outstanding.
+    outline_rev: u64 = 0,
+    outline_pending: bool = false,
+
+    /// Top visible LINE restored from the layout, applied once the
+    /// async load lands (the anchor itself is a wrap-dependent quantity
+    /// and cannot be persisted).
+    want_top_line: ?usize = null,
+    /// Project root recorded by the layout, shown until the async
+    /// re-derivation lands. Owned; dropped as soon as it does.
+    restored_project: ?[]u8 = null,
+
     /// Crash-recovery slot: opened on the first edit that dirties this
     /// buffer and held (lock included) for the tab's lifetime, so no
     /// other process offers OUR record while we are alive.
@@ -610,6 +661,12 @@ pub const ETab = struct {
 
     fn destroy(self: *ETab) void {
         const a = self.view.allocator;
+        // Project first: the set is owned by the view and outlives us.
+        self.view.projects.release(self.project);
+        self.project = null;
+        self.git.deinit();
+        self.outline.deinit();
+        if (self.restored_project) |rp| a.free(rp);
         // Closing a tab (or a clean quit, which destroys every tab) is
         // exactly the "no crash happened" case: drop the record.
         if (self.journal) |*h| {
@@ -647,12 +704,16 @@ pub const ETab = struct {
         a.destroy(self);
     }
 
-    /// Fold anchors are POSITIONS, so they map through every edit
+    /// Everything this tab anchors by POSITION maps through every edit
     /// exactly like selections do — and because the hook is on
-    /// `applyEdits`, undo and redo carry them too.
-    fn observeFoldEdits(ctx: *anyopaque, _: *const Document, edits: []const tr.Edit) void {
+    /// `applyEdits`, undo and redo carry them all too. Fold anchors, the
+    /// git gutter's marks and the symbol outline's ranges share this one
+    /// observer slot rather than each claiming another.
+    fn observeEdits(ctx: *anyopaque, _: *const Document, edits: []const tr.Edit) void {
         const self: *ETab = @ptrCast(@alignCast(ctx));
         if (!self.folds.isEmpty()) self.folds.mapThrough(edits);
+        self.git.mapThrough(edits);
+        self.outline.mapThrough(edits);
         self.folds_valid = false;
         self.fm_valid = false;
         self.br_valid = false;
@@ -855,6 +916,64 @@ pub const EditorView = struct {
     /// across a config-arena swap.
     theme: *const theme_mod.Theme = &theme_mod.dark,
 
+    // ---- project layer -------------------------------------------------
+    //
+    // ui/editorproj.zig owns the daemon round trips and the
+    // search-results panel; ui/editoroutline.zig owns the outline panel.
+    // The state lives here so a tab and a panel can find each other
+    // without a second lifetime to fence.
+
+    /// Every project the open tabs belong to, deduplicated by
+    /// (host, root) and refcounted per tab.
+    projects: project_mod.Set = undefined,
+    /// Project-wide search results + replace plan (one live search per
+    /// face; starting another resets it).
+    results: psearch.Results = undefined,
+    /// Generation of the running project search; a reply stamped with
+    /// anything else is from a superseded query.
+    search_gen: u64 = 0,
+    next_job_gen: u64 = 1,
+
+    /// Bottom panel (project search) and right panel (outline), each
+    /// inside its own GtkPaned so the user can size them.
+    vpaned: *c.GtkWidget = undefined,
+    hpaned: *c.GtkWidget = undefined,
+    search_panel: *c.GtkWidget = undefined,
+    search_entry: *c.GtkWidget = undefined,
+    search_replace_entry: *c.GtkWidget = undefined,
+    search_replace_row: *c.GtkWidget = undefined,
+    search_status: *c.GtkLabel = undefined,
+    search_list: *c.GtkWidget = undefined,
+    search_preview_btn: *c.GtkWidget = undefined,
+    search_apply_btn: *c.GtkWidget = undefined,
+    search_case: *c.GtkWidget = undefined,
+    search_word: *c.GtkWidget = undefined,
+    search_regex: *c.GtkWidget = undefined,
+    search_open: bool = false,
+    /// A replace has been planned and is waiting for Apply.
+    replace_previewed: bool = false,
+
+    outline_panel: *c.GtkWidget = undefined,
+    outline_list: *c.GtkWidget = undefined,
+    outline_status: *c.GtkLabel = undefined,
+    outline_open: bool = false,
+    /// Shape hash the outline rows were built for, and the row the
+    /// caret last selected — both guard against rebuilding (which is
+    /// what would flicker).
+    outline_sig: u64 = 0,
+    outline_row: ?usize = null,
+    /// True while WE are moving the outline selection, so its
+    /// `selected-rows-changed` handler does not navigate.
+    outline_guard: bool = false,
+
+    /// `editor_git_gutter`, `editor_outline` and the project marker
+    /// list, re-read by syncConfig. The marker list is an OWNED copy
+    /// (config arenas are swapped under us).
+    git_gutter: bool = true,
+    outline_default: bool = false,
+    project_markers: ?[]u8 = null,
+    search_max_files: u32 = 4000,
+
     drag_anchor: ?usize = null,
 
     /// STANDALONE hosting (ui/editorwin.zig): the face has no pane and
@@ -890,6 +1009,8 @@ pub const EditorView = struct {
         const self = try allocator.create(EditorView);
         self.* = .{ .allocator = allocator, .pass = EditorPass.init(allocator) };
         errdefer allocator.destroy(self);
+        self.projects = project_mod.Set.init(allocator);
+        self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
         self.pane = pane;
         self.font_size = pane.font_size;
@@ -927,6 +1048,17 @@ pub const EditorView = struct {
         self.folding = cfg.editor_folding;
         self.fold_indent_fallback = cfg.editor_fold_indent_fallback;
         self.crash_recovery = cfg.editor_crash_recovery;
+        self.git_gutter = cfg.editor_git_gutter;
+        self.outline_default = cfg.editor_outline;
+        self.search_max_files = @max(1, cfg.editor_project_search_max_files);
+        // OWNED: the config arena this slice lives in is freed under us
+        // by applyConfigChange, and project.Set borrows the list.
+        if (self.project_markers) |old| self.allocator.free(old);
+        self.project_markers = if (cfg.editor_project_markers.len > 0)
+            self.allocator.dupe(u8, cfg.editor_project_markers) catch null
+        else
+            null;
+        self.projects.markers = self.project_markers orelse "";
         self.theme = theme_mod.byName(cfg.editor_theme);
         self.applyThemeColors();
 
@@ -986,6 +1118,10 @@ pub const EditorView = struct {
         } else {
             for (self.tabs.items) |t| self.attachLsp(t);
         }
+        if (self.outline_default and !self.outline_open) editoroutline.setOpen(self, true);
+        if (!self.git_gutter) {
+            for (self.tabs.items) |t| t.git.clear();
+        } else if (self.active) |t| editorproj.refreshGit(self, t);
         self.queueRender();
     }
 
@@ -1571,7 +1707,12 @@ pub const EditorView = struct {
         // saved set when there is one.
         if (state.files.len > 0) {
             const placeholder = self.active;
-            for (state.files) |f| self.openSpec(f.spec, @intCast(f.cursor));
+            for (state.files) |f| self.openSpecRestored(
+                f.spec,
+                @intCast(f.cursor),
+                if (f.top_line > 0) @intCast(f.top_line) else null,
+                f.project,
+            );
             if (placeholder) |ph| {
                 if (!ph.isDirty() and ph.spec == null and self.tabs.items.len > 1)
                     self.closeTabForce(ph);
@@ -1601,6 +1742,8 @@ pub const EditorView = struct {
         const self = try allocator.create(EditorView);
         self.* = .{ .allocator = allocator, .pass = EditorPass.init(allocator) };
         errdefer allocator.destroy(self);
+        self.projects = project_mod.Set.init(allocator);
+        self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
         self.standalone_config = cfg;
         self.buildUi();
@@ -1717,6 +1860,10 @@ pub const EditorView = struct {
         }
         for (self.tabs.items) |t| t.destroy();
         self.tabs.deinit(self.allocator);
+        // After the tabs: each one releases its project reference.
+        self.projects.deinit();
+        self.results.deinit();
+        if (self.project_markers) |m| self.allocator.free(m);
         if (self.atlas) |a| {
             a.deinit();
             self.atlas = null;
@@ -1836,7 +1983,33 @@ pub const EditorView = struct {
         c.gtk_grid_attach(@ptrCast(grid), hsb, 0, 1, 1, 1);
         _ = c.g_signal_connect_data(self.vadj, "value-changed", @ptrCast(&onVAdjChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(self.hadj, "value-changed", @ptrCast(&onHAdjChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(vbox), grid);
+
+        // Panels. The canvas keeps its grid; the outline sits beside it
+        // and the project-search results below both, each behind a
+        // GtkPaned so the split is the user's. Both start hidden, so a
+        // face that never opens one is the widget tree it always was
+        // plus two panes with an invisible child.
+        const hp = c.gtk_paned_new(c.GTK_ORIENTATION_HORIZONTAL);
+        c.gtk_paned_set_start_child(@ptrCast(hp), grid);
+        c.gtk_paned_set_resize_start_child(@ptrCast(hp), 1);
+        c.gtk_paned_set_shrink_start_child(@ptrCast(hp), 0);
+        self.hpaned = hp.?;
+        editoroutline.buildPanel(self);
+        c.gtk_paned_set_end_child(@ptrCast(hp), self.outline_panel);
+        c.gtk_paned_set_resize_end_child(@ptrCast(hp), 0);
+        c.gtk_paned_set_shrink_end_child(@ptrCast(hp), 0);
+
+        const vp = c.gtk_paned_new(c.GTK_ORIENTATION_VERTICAL);
+        c.gtk_paned_set_start_child(@ptrCast(vp), hp);
+        c.gtk_paned_set_resize_start_child(@ptrCast(vp), 1);
+        c.gtk_paned_set_shrink_start_child(@ptrCast(vp), 0);
+        self.vpaned = vp.?;
+        editorproj.buildPanel(self);
+        c.gtk_paned_set_end_child(@ptrCast(vp), self.search_panel);
+        c.gtk_paned_set_resize_end_child(@ptrCast(vp), 0);
+        c.gtk_paned_set_shrink_end_child(@ptrCast(vp), 0);
+        c.gtk_widget_set_vexpand(vp, 1);
+        c.gtk_box_append(@ptrCast(vbox), vp);
 
         // Status line.
         const status = c.gtk_label_new("");
@@ -2116,8 +2289,10 @@ pub const EditorView = struct {
             .wrap = self.soft_wrap_default,
             .folds = structure.FoldState.init(self.allocator),
             .sel_stack = structure.SelectionStack.init(self.allocator),
+            .git = gitdiff.Marks.init(self.allocator),
+            .outline = outline_mod.Outline.init(self.allocator),
         };
-        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
+        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
         tab.layout.tab_cols = self.tab_width;
         self.next_tab_id += 1;
         if (spec) |s| tab.spec = self.allocator.dupe(u8, s) catch null;
@@ -2138,12 +2313,27 @@ pub const EditorView = struct {
         self.ensureHighlighter(tab);
         if (tab.spec != null) self.startLoad(tab);
         self.attachLsp(tab);
+        editorproj.resolveProject(self, tab);
         self.refresh(tab);
         return tab;
     }
 
     /// Open (or focus) `spec`; `cursor` restores after the load.
     pub fn openSpec(self: *EditorView, spec: []const u8, cursor: ?usize) void {
+        self.openSpecRestored(spec, cursor, null, "");
+    }
+
+    /// `openSpec` plus the session state a layout restore carries. An
+    /// ALREADY OPEN spec is focused, never opened twice — which is what
+    /// keeps a crash-recovered buffer (opened first, from `attach`) and
+    /// the restored session from producing two tabs for one file.
+    pub fn openSpecRestored(
+        self: *EditorView,
+        spec: []const u8,
+        cursor: ?usize,
+        top_line: ?usize,
+        project_root: []const u8,
+    ) void {
         for (self.tabs.items) |t| {
             if (t.spec) |ts| {
                 if (std.mem.eql(u8, ts, spec)) {
@@ -2152,7 +2342,11 @@ pub const EditorView = struct {
                 }
             }
         }
-        if (self.newTab(spec)) |tab| tab.want_cursor = cursor;
+        const tab = self.newTab(spec) orelse return;
+        tab.want_cursor = cursor;
+        tab.want_top_line = top_line;
+        if (project_root.len > 0)
+            tab.restored_project = self.allocator.dupe(u8, project_root) catch null;
     }
 
     fn hostCloseCb(ctx: ?*anyopaque, page: *c.GtkWidget) void {
@@ -2171,6 +2365,10 @@ pub const EditorView = struct {
         if (self.widgets_dead) return;
         self.active = self.findTabByPage(page);
         self.updateBanner();
+        if (self.active) |tab| {
+            editorproj.onTabActivated(self, tab);
+            editoroutline.refresh(self, tab, true);
+        }
         self.updateStatus();
         self.queueRender();
         self.checkDisk();
@@ -2271,6 +2469,16 @@ pub const EditorView = struct {
 
     pub fn findTabByIdPublic(self: *EditorView, id: u64) ?*ETab {
         return self.findTabById(id);
+    }
+
+    /// The open tab holding `spec`, if any — how a project-wide replace
+    /// tells "rewrite the file" from "edit the buffer".
+    pub fn tabForSpec(self: *EditorView, spec: []const u8) ?*ETab {
+        for (self.tabs.items) |t| {
+            const ts = t.spec orelse continue;
+            if (std.mem.eql(u8, ts, spec)) return t;
+        }
+        return null;
     }
 
     pub fn setStatusText(self: *EditorView, text: [*:0]const u8) void {
@@ -2527,6 +2735,7 @@ pub const EditorView = struct {
             .fold_markers = tab.fold_markers.items,
             .brackets = tab.brackets.items,
             .diagnostics = if (self.lsp) |m| m.diagnosticsFor(tab) else &.{},
+            .git_marks = if (self.git_gutter) tab.git.list.items else &.{},
             // Only when this tab is actually highlighted: with no
             // highlighter every glyph's kind is `.none`, and paying the
             // theme lookup to arrive back at `colors.text` is noise.
@@ -3304,6 +3513,7 @@ pub const EditorView = struct {
         // Crash recovery: the first edit that dirties a buffer opens its
         // journal slot on the next tick (editor/journal.zig).
         self.armJournal();
+        editoroutline.onDocumentChanged(self, tab);
         self.refresh(tab);
     }
 
@@ -3429,10 +3639,14 @@ pub const EditorView = struct {
         // second status surface to put it on.
         var lsp_buf: [260]u8 = undefined;
         const lsp_note: []const u8 = if (self.lsp) |m| m.statusSummary(tab, &lsp_buf) else "";
+        // Project + gutter summary. Empty string for a loose file, so a
+        // document with no project reads exactly as it always did.
+        var proj_buf: [160]u8 = undefined;
+        const proj_note = editorproj.statusFragment(self, tab, &proj_buf);
         const txt = if (carets > 1)
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note }) catch return
+            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note, proj_note }) catch return
         else
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note }) catch return;
+            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note, proj_note }) catch return;
         c.gtk_label_set_text(self.status_label, txt.ptr);
     }
 
@@ -3577,7 +3791,7 @@ pub const EditorView = struct {
                 tab.fm_valid = false;
                 tab.br_valid = false;
                 tab.sel_stack.clear();
-                tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
+                tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
                 // The observer the swap dropped has to be re-installed
                 // and the server told the content changed wholesale;
                 // a first-time load is where the server is attached.
@@ -3602,10 +3816,25 @@ pub const EditorView = struct {
                 if (tab.want_pos) |p| {
                     tab.want_pos = null;
                     self.applyWantPos(tab, p);
+                } else if (tab.want_top_line) |top| {
+                    // Restored scroll: a LINE, so it survives a
+                    // different pane width and wrap setting. Applied
+                    // only when nothing else claimed the viewport.
+                    tab.want_top_line = null;
+                    const lines = tab.doc.rope.lineCount();
+                    tab.anchor = .{ .line = @min(top, lines -| 1), .row = 0, .offset = 0 };
                 }
                 self.noteSavedHash(tab);
                 const was_reload = job.keep_position and tab.keep_active;
                 tab.keep_active = false;
+                // The document is new: its project may be too, and the
+                // gutter marks anchored into the old byte space are gone.
+                tab.git.clear();
+                tab.outline.clear();
+                tab.outline_rev = 0;
+                editorproj.resolveProject(self, tab);
+                editorproj.refreshGit(self, tab);
+                editoroutline.refresh(self, tab, true);
                 self.refresh(tab);
                 // AFTER refresh: updateStatus paints Ln/Col over
                 // anything set before it.
@@ -3641,6 +3870,7 @@ pub const EditorView = struct {
                 }
                 self.noteSavedHash(tab);
                 if (self.lsp) |m| m.onSaved(tab);
+                editorproj.refreshGit(self, tab);
                 if (tab.close_after_save) {
                     tab.close_after_save = false;
                     if (!tab.isDirty()) {
@@ -4169,8 +4399,16 @@ pub const EditorView = struct {
         var rec = journal.read(self.allocator, entry.key) catch return false;
         defer rec.deinit(self.allocator);
 
-        const tab = self.newTab(null) orelse return false;
-        if (rec.header.spec.len > 0) {
+        // Restore-vs-recover: the layout decides WHICH files are open,
+        // the journal decides their CONTENT. A tab already holding this
+        // spec is ADOPTED (its in-flight load orphaned) rather than
+        // duplicated, so the two can never produce two tabs for one
+        // file whichever order they run in — and the unsaved bytes win
+        // over the on-disk copy.
+        const existing = if (rec.header.spec.len > 0) self.tabForSpec(rec.header.spec) else null;
+        const tab = existing orelse self.newTab(null) orelse return false;
+        if (existing != null) tab.io_gen = 0;
+        if (existing == null and rec.header.spec.len > 0) {
             if (self.allocator.dupe(u8, rec.header.spec)) |s| {
                 if (tab.spec) |old| self.allocator.free(old);
                 tab.spec = s;
@@ -4183,7 +4421,7 @@ pub const EditorView = struct {
         tab.doc.deinit();
         tab.doc = new_doc;
         tab.doc.markUnsaved();
-        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeFoldEdits });
+        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
         self.ensureHighlighter(tab);
         if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
         tab.layout.invalidateAll();
@@ -4532,6 +4770,15 @@ pub const EditorView = struct {
         if (self.lsp) |m| {
             if (m.handleKey(keyval, ctrl)) return 1;
         }
+        // Ctrl+Shift+O is the outline PANEL. It used to raise a
+        // transient document-symbol popup; the panel is the same data
+        // in a form you can keep open (and it falls back to the syntax
+        // tree where no server answers), so it takes the chord and the
+        // popup path now only serves workspace symbols (Ctrl+T).
+        if (ctrl and shift and !alt and lower == c.GDK_KEY_o) {
+            editoroutline.toggle(self);
+            return 1;
+        }
         if (self.handleLspKey(keyval, lower, ctrl, shift, alt)) return 1;
 
         if (!alt) {
@@ -4624,9 +4871,25 @@ pub const EditorView = struct {
                             self.saveTabAs(tab);
                             return 1;
                         },
+                        // Project-wide search / replace. Shadows the
+                        // global bindings while the editor has focus,
+                        // exactly like Ctrl+Shift+S above.
+                        c.GDK_KEY_f => {
+                            editorproj.openSearch(self, false);
+                            return 1;
+                        },
+                        c.GDK_KEY_h => {
+                            editorproj.openSearch(self, true);
+                            return 1;
+                        },
                         else => {},
                     }
                 }
+            }
+            // Change-hunk navigation, next to F8's diagnostics.
+            if (keyval == c.GDK_KEY_F7 and !ctrl) {
+                editorproj.stepHunk(self, !shift);
+                return 1;
             }
         } else if (self.active) |tab| {
             // Alt+Z: soft wrap toggle (the VS Code chord).
@@ -4710,7 +4973,6 @@ pub const EditorView = struct {
             declaration,
             type_definition,
             references,
-            doc_symbols,
             workspace_symbols,
             rename,
             format,
@@ -4720,7 +4982,6 @@ pub const EditorView = struct {
             if (ctrl and !shift and keyval == c.GDK_KEY_space) break :blk .completion;
             if (ctrl and !shift and lower == c.GDK_KEY_i) break :blk .hover;
             if (ctrl and shift and lower == c.GDK_KEY_i) break :blk .format;
-            if (ctrl and shift and lower == c.GDK_KEY_o) break :blk .doc_symbols;
             if (ctrl and !shift and lower == c.GDK_KEY_t) break :blk .workspace_symbols;
             if (keyval == c.GDK_KEY_F2 and !ctrl and !shift) break :blk .rename;
             if (keyval == c.GDK_KEY_F8) break :blk if (shift) .diag_prev else .diag_next;
@@ -4751,7 +5012,6 @@ pub const EditorView = struct {
             .declaration => m.requestDefinition(.declaration),
             .type_definition => m.requestDefinition(.type_definition),
             .references => m.requestDefinition(.references),
-            .doc_symbols => m.requestDocumentSymbols(),
             .workspace_symbols => m.requestWorkspaceSymbols(),
             .rename => m.startRename(),
             .format => m.requestFormatting(),
@@ -4854,6 +5114,7 @@ pub const EditorView = struct {
         self.revealCaretLines(tab);
         if (!tab.structural_move) tab.sel_stack.clear();
         self.ensureCaretVisible(tab);
+        editoroutline.onCaretMoved(self, tab);
         self.updateStatus();
         self.queueRender();
     }
@@ -4968,9 +5229,16 @@ pub const EditorView = struct {
         for (self.tabs.items) |t| {
             const spec = t.spec orelse continue;
             if (t == self.active) active_idx = i;
+            var root_buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+            const root: []const u8 = if (t.project) |p|
+                p.rootSpec(&root_buf)
+            else
+                t.restored_project orelse "";
             try files.append(arena, .{
                 .spec = try arena.dupe(u8, spec),
                 .cursor = @intCast(t.sels.primary().head),
+                .top_line = @intCast(t.anchor.line),
+                .project = try arena.dupe(u8, root),
             });
             i += 1;
         }
