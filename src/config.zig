@@ -87,6 +87,57 @@ pub const KeybindEntry = struct {
     accel: []const u8,
 };
 
+/// A codepoint range routed to a specific font family, from a
+/// `symbol_map.<name> = U+E0A0-U+E0A3 <family>` line. Consulted
+/// before the primary face, so the mapped font wins even when the
+/// main font has glyphs of its own in that range.
+pub const SymbolMap = struct {
+    name: []const u8,
+    lo: u32 = 0,
+    hi: u32 = 0,
+    family: []const u8 = "",
+};
+
+/// `U+E0A0-U+E0A3 Some Family` or `U+E0A0 Some Family` (a single
+/// codepoint). The `U+` prefix is optional on either end.
+pub fn parseSymbolMap(name: []const u8, value: []const u8) !SymbolMap {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    const sp = std.mem.indexOfAny(u8, trimmed, " \t") orelse return error.BadSymbolMap;
+    const range = trimmed[0..sp];
+    const family = std.mem.trim(u8, trimmed[sp + 1 ..], " \t");
+    if (family.len == 0) return error.BadSymbolMap;
+
+    var lo_s = range;
+    var hi_s = range;
+    if (std.mem.indexOfScalar(u8, range, '-')) |dash| {
+        lo_s = range[0..dash];
+        hi_s = range[dash + 1 ..];
+    }
+    const lo = try parseCodepoint(lo_s);
+    const hi = try parseCodepoint(hi_s);
+    if (hi < lo) return error.BadSymbolMap;
+    return .{ .name = name, .lo = lo, .hi = hi, .family = family };
+}
+
+fn parseCodepoint(text: []const u8) !u32 {
+    var s = std.mem.trim(u8, text, " \t");
+    if (s.len > 2 and (std.mem.startsWith(u8, s, "U+") or std.mem.startsWith(u8, s, "u+"))) s = s[2..];
+    if (s.len > 2 and (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "0X"))) s = s[2..];
+    if (s.len == 0) return error.BadSymbolMap;
+    const v = std.fmt.parseInt(u32, s, 16) catch return error.BadSymbolMap;
+    if (v > 0x10FFFF) return error.BadSymbolMap;
+    return v;
+}
+
+/// CSS-style font weight, 100..900. Anything outside that is a config
+/// error rather than a silent clamp: a weight of 12 is a typo, and
+/// pretending it means 100 hides it.
+fn parseWeight(value: []const u8) !u16 {
+    const v = try parseU32(value);
+    if (v < 100 or v > 900) return error.BadFontWeight;
+    return @intCast(v);
+}
+
 /// What activating a hint does. `open` hands URLs to the desktop and
 /// existing files to the editor; `command` runs `HintRule.command`
 /// with {match} substituted.
@@ -116,6 +167,24 @@ pub const ProfileSettings = struct {
     /// Font family name resolved via fontconfig ("JetBrains Mono").
     /// `font_path` wins when both are set. Empty = unset.
     font_family: []const u8 = "",
+    /// Families for the styled faces. Empty = derive the style from
+    /// `font_family` the way fontconfig would, which is right for a
+    /// family that ships all four and wrong for the common pairing of
+    /// one family's regular with another's italic.
+    font_family_bold: []const u8 = "",
+    font_family_italic: []const u8 = "",
+    font_family_bold_italic: []const u8 = "",
+    /// CSS weight (100..900) for the regular and bold faces. 0 = the
+    /// font's own default (400 / 700). Selects the weight when
+    /// resolving the family AND sets the `wght` axis on a variable
+    /// font, which is the only way to reach the weights in between.
+    font_weight: u16 = 0,
+    font_weight_bold: u16 = 0,
+    /// Draw box-drawing, block and Powerline characters from the cell
+    /// rectangle instead of taking them from the font. On by default:
+    /// a font's outlines are hinted per glyph and rarely tile without
+    /// visible seams. Turn off to get the font's own shapes back.
+    builtin_box_drawing: bool = true,
     /// OpenType features for HarfBuzz shaping, whitespace/comma
     /// separated, CSS/kitty syntax: "-calt +ss01 zero cv05=3".
     /// Empty = font defaults.
@@ -173,6 +242,9 @@ pub const ProfileSettings = struct {
         var out = self.*;
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
         out.font_family = try arena.dupe(u8, self.font_family);
+        out.font_family_bold = try arena.dupe(u8, self.font_family_bold);
+        out.font_family_italic = try arena.dupe(u8, self.font_family_italic);
+        out.font_family_bold_italic = try arena.dupe(u8, self.font_family_bold_italic);
         out.editor_font_family = try arena.dupe(u8, self.editor_font_family);
         out.font_features = try arena.dupe(u8, self.font_features);
         out.scheme = try arena.dupe(u8, self.scheme);
@@ -528,6 +600,11 @@ pub const Config = struct {
     /// order. They are scanned BEFORE the built-in URL/path/hash
     /// scanners, so a rule can claim text those would have taken.
     hint_rules: std.ArrayList(HintRule) = .empty,
+    /// Codepoint ranges routed to specific font families, from
+    /// `symbol_map.<name>` lines. App-level rather than per-profile:
+    /// this is about glyph coverage, which does not sensibly differ
+    /// between two panes of the same session.
+    symbol_maps: std.ArrayList(SymbolMap) = .empty,
 
     // Search
     /// Default state for the search box's case sensitivity. The
@@ -685,6 +762,16 @@ pub const Config = struct {
                 .pattern = try arena.dupe(u8, hr.pattern),
                 .action = hr.action,
                 .command = try arena.dupe(u8, hr.command),
+            });
+        }
+        out.symbol_maps = .empty;
+        try out.symbol_maps.ensureTotalCapacity(arena, self.symbol_maps.items.len);
+        for (self.symbol_maps.items) |sm| {
+            out.symbol_maps.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, sm.name),
+                .lo = sm.lo,
+                .hi = sm.hi,
+                .family = try arena.dupe(u8, sm.family),
             });
         }
         out.background_image = try arena.dupe(u8, self.background_image);
@@ -884,6 +971,17 @@ pub const Config = struct {
         }
         if (!std.mem.eql(u8, s.font_family, base.font_family))
             try w.print("font_family = {s}\n", .{s.font_family});
+        if (!std.mem.eql(u8, s.font_family_bold, base.font_family_bold))
+            try w.print("font_family_bold = {s}\n", .{s.font_family_bold});
+        if (!std.mem.eql(u8, s.font_family_italic, base.font_family_italic))
+            try w.print("font_family_italic = {s}\n", .{s.font_family_italic});
+        if (!std.mem.eql(u8, s.font_family_bold_italic, base.font_family_bold_italic))
+            try w.print("font_family_bold_italic = {s}\n", .{s.font_family_bold_italic});
+        if (s.builtin_box_drawing != base.builtin_box_drawing)
+            try w.print("builtin_box_drawing = {s}\n", .{if (s.builtin_box_drawing) "true" else "false"});
+        if (s.font_weight != base.font_weight) try w.print("font_weight = {d}\n", .{s.font_weight});
+        if (s.font_weight_bold != base.font_weight_bold)
+            try w.print("font_weight_bold = {d}\n", .{s.font_weight_bold});
         if (!std.mem.eql(u8, s.font_features, base.font_features))
             try w.print("font_features = {s}\n", .{s.font_features});
         if (s.font_size != base.font_size) try w.print("font_size = {d}\n", .{s.font_size});
@@ -1050,6 +1148,13 @@ pub const Config = struct {
         if (self.hint_editor.len > 0) try w.print("hint_editor = {s}\n", .{self.hint_editor});
         if (self.hint_alphabet.len > 0) try w.print("hint_alphabet = {s}\n", .{self.hint_alphabet});
         if (self.hint_multiple) try w.writeAll("hint_multiple = true\n");
+        for (self.symbol_maps.items) |sm| {
+            if (sm.lo == sm.hi) {
+                try w.print("symbol_map.{s} = U+{X} {s}\n", .{ sm.name, sm.lo, sm.family });
+            } else {
+                try w.print("symbol_map.{s} = U+{X}-U+{X} {s}\n", .{ sm.name, sm.lo, sm.hi, sm.family });
+            }
+        }
         for (self.hint_rules.items) |hr| {
             if (hr.pattern.len > 0) try w.print("hint.{s}.regex = {s}\n", .{ hr.name, hr.pattern });
             try w.print("hint.{s}.action = {s}\n", .{ hr.name, @tagName(hr.action) });
@@ -1541,6 +1646,18 @@ fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u
         s.font_path = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font_family")) {
         s.font_family = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_family_bold")) {
+        s.font_family_bold = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_family_italic")) {
+        s.font_family_italic = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_family_bold_italic")) {
+        s.font_family_bold_italic = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_weight")) {
+        s.font_weight = try parseWeight(value);
+    } else if (std.mem.eql(u8, key, "font_weight_bold")) {
+        s.font_weight_bold = try parseWeight(value);
+    } else if (std.mem.eql(u8, key, "builtin_box_drawing")) {
+        s.builtin_box_drawing = try parseBool(value);
     } else if (std.mem.eql(u8, key, "font_features")) {
         s.font_features = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
@@ -1645,6 +1762,23 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         } else {
             return error.BadHintRule;
         }
+        return;
+    }
+    // `symbol_map.<name> = U+E0A0-U+E0A3 <family>` — route a
+    // codepoint range to a specific font.
+    if (std.mem.startsWith(u8, key, "symbol_map.")) {
+        const name = key["symbol_map.".len..];
+        if (name.len == 0) return error.BadSymbolMap;
+        const parsed = try parseSymbolMap(try arena.dupe(u8, name), value);
+        var entry = parsed;
+        entry.family = try arena.dupe(u8, parsed.family);
+        for (cfg.symbol_maps.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, name)) {
+                existing.* = entry;
+                return;
+            }
+        }
+        try cfg.symbol_maps.append(arena, entry);
         return;
     }
     // `shader_param.<name> = <float | #rrggbb>` — tunable shader
@@ -2322,6 +2456,55 @@ test "config: visibility defaults are NOT emitted (terse output)" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_bar") == null);
+}
+
+test "config: symbol maps and per-style font families round-trip" {
+    const src =
+        \\font_family = JetBrains Mono
+        \\font_family_italic = Cascadia Code
+        \\font_weight = 300
+        \\font_weight_bold = 600
+        \\symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font
+        \\symbol_map.one = 2603 DejaVu Sans
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("Cascadia Code", cfg.settings.font_family_italic);
+    // An unset style family stays empty rather than echoing the
+    // regular one: empty means "derive it", which is not the same.
+    try std.testing.expectEqualStrings("", cfg.settings.font_family_bold);
+    try std.testing.expectEqual(@as(u16, 300), cfg.settings.font_weight);
+    try std.testing.expectEqual(@as(u16, 600), cfg.settings.font_weight_bold);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.symbol_maps.items.len);
+    try std.testing.expectEqual(@as(u32, 0xE0A0), cfg.symbol_maps.items[0].lo);
+    try std.testing.expectEqual(@as(u32, 0xE0A3), cfg.symbol_maps.items[0].hi);
+    try std.testing.expectEqualStrings("Symbols Nerd Font", cfg.symbol_maps.items[0].family);
+    // A bare codepoint is a one-element range, and the U+ is optional.
+    try std.testing.expectEqual(@as(u32, 0x2603), cfg.symbol_maps.items[1].lo);
+    try std.testing.expectEqual(@as(u32, 0x2603), cfg.symbol_maps.items[1].hi);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "font_weight = 300") != null);
+    var re = try Config.loadFromBytes(std.testing.allocator, out);
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 2), re.symbol_maps.items.len);
+    try std.testing.expectEqualStrings("Cascadia Code", re.settings.font_family_italic);
+}
+
+test "config: malformed symbol maps and weights are rejected" {
+    try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "U+E0A0"));
+    try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "U+E0A3-U+E0A0 Fam"));
+    try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "notahex Fam"));
+    try std.testing.expectError(error.BadFontWeight, parseWeight("12"));
+    try std.testing.expectError(error.BadFontWeight, parseWeight("1000"));
+    try std.testing.expectEqual(@as(u16, 350), try parseWeight("350"));
 }
 
 test "config: hint rules parse, keep file order and round-trip" {
