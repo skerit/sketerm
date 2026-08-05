@@ -74,37 +74,43 @@ pub fn csiAux(self: *Screen, params: Event.Csi) void {
             }
         },
         'u' => {
-            // Kitty kbd: CSI > flags u — set flags directly.
-            self.kitty_kbd_flags = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
+            // Kitty kbd: CSI > flags u — PUSH the current flags and
+            // set the new ones. This is how apps enable the protocol
+            // (`CSI > 1 u`) and later restore whatever the program
+            // that launched them had enabled (`CSI < 1 u`). Setting
+            // without pushing loses the outer program's flags.
+            kittyKbdPush(self, @intCast(@min(params.paramOrDefault(0, 0), 0xFF)));
         },
         else => {},
     }
 }
 
+/// Push the current kitty keyboard flags onto the mode stack and set
+/// new ones. A full stack drops the oldest entry rather than refusing
+/// the push, so a program that pushes without popping cannot wedge
+/// the protocol for everything that comes after it.
+fn kittyKbdPush(self: *Screen, flags: u8) void {
+    if (self.kitty_kbd_depth == self.kitty_kbd_stack.len) {
+        std.mem.copyForwards(u8, self.kitty_kbd_stack[0 .. self.kitty_kbd_stack.len - 1], self.kitty_kbd_stack[1..]);
+        self.kitty_kbd_depth -= 1;
+    }
+    self.kitty_kbd_stack[self.kitty_kbd_depth] = self.kitty_kbd_flags;
+    self.kitty_kbd_depth += 1;
+    self.kitty_kbd_flags = flags;
+}
+
 pub fn csiKittyKbd(self: *Screen, params: Event.Csi) void {
     if (params.private == '=') {
-        // Kitty kbd: CSI = flags ; mode u
-        //   mode 1 = set, 2 = push+set, 3 = pop
+        // Kitty kbd: CSI = flags ; mode u — set flags WITHOUT touching
+        // the stack. mode 1 = assign, 2 = set the given bits, 3 = clear
+        // the given bits. (Push/pop are `CSI > u` and `CSI < u`.)
         if (params.final == 'u') {
             const flags: u8 = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
             const mode: u32 = params.paramOrDefault(1, 1);
             switch (mode) {
                 1 => self.kitty_kbd_flags = flags,
-                2 => {
-                    if (self.kitty_kbd_depth < self.kitty_kbd_stack.len) {
-                        self.kitty_kbd_stack[self.kitty_kbd_depth] = self.kitty_kbd_flags;
-                        self.kitty_kbd_depth += 1;
-                    }
-                    self.kitty_kbd_flags = flags;
-                },
-                3 => {
-                    if (self.kitty_kbd_depth > 0) {
-                        self.kitty_kbd_depth -= 1;
-                        self.kitty_kbd_flags = self.kitty_kbd_stack[self.kitty_kbd_depth];
-                    } else {
-                        self.kitty_kbd_flags = 0;
-                    }
-                },
+                2 => self.kitty_kbd_flags |= flags,
+                3 => self.kitty_kbd_flags &= ~flags,
                 else => {},
             }
         }
@@ -609,6 +615,8 @@ pub fn fullReset(self: *Screen) void {
     self.reverse_screen = false;
     self.kitty_kbd_flags = 0;
     self.kitty_kbd_depth = 0;
+    self.kitty_kbd_other_flags = 0;
+    self.kitty_kbd_other_depth = 0;
     self.last_print_cp = 0;
     self.bell_at_us = 0;
     // OSC 8 link table — drop every URI string. Cells holding
@@ -1185,6 +1193,12 @@ pub fn toggleAltScreen(self: *Screen, on: bool) void {
     } else {
         self.use_alt = false;
     }
+    // Keyboard-protocol state is per-buffer: swap the active set with
+    // the parked one so an app that enabled flags on the alt screen
+    // cannot leave them enabled for the shell underneath.
+    std.mem.swap(u8, &self.kitty_kbd_flags, &self.kitty_kbd_other_flags);
+    std.mem.swap(u8, &self.kitty_kbd_depth, &self.kitty_kbd_other_depth);
+    std.mem.swap([9]u8, &self.kitty_kbd_stack, &self.kitty_kbd_other_stack);
     // Selection coordinates reference the previous buffer — they
     // make no sense after the swap, so wipe them.
     self.selection.clear();

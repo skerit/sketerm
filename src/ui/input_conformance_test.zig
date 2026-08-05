@@ -130,165 +130,269 @@ test "ssoKey F2 shift+alt → ESC [ 1 ; 4 Q" {
     try std.testing.expectEqualStrings("\x1b[1;4Q", buf[0..n]);
 }
 
-test "kittyKey plain Esc → CSI 27 u" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKey(&buf, 27, false, false, false);
-    try std.testing.expectEqualStrings("\x1b[27u", buf[0..n]);
-}
-
-test "kittyKey Shift+Tab → CSI 9 ; 2 u" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKey(&buf, 9, true, false, false);
-    try std.testing.expectEqualStrings("\x1b[9;2u", buf[0..n]);
-}
-
-test "kittyKey Ctrl+I → CSI 105 ; 5 u" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKey(&buf, 105, false, false, true);
-    try std.testing.expectEqualStrings("\x1b[105;5u", buf[0..n]);
-}
-
-test "kittyKey Ctrl+Shift+H → CSI 104 ; 6 u" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKey(&buf, 104, true, false, true);
-    try std.testing.expectEqualStrings("\x1b[104;6u", buf[0..n]);
-}
-
-test "kittyKeyEvent press → no event suffix" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKeyEvent(&buf, 27, false, false, false, 1);
-    try std.testing.expectEqualStrings("\x1b[27u", buf[0..n]);
-}
-
-test "kittyKeyEvent release adds :3 sub-parameter" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKeyEvent(&buf, 105, false, false, true, 3);
-    try std.testing.expectEqualStrings("\x1b[105;5:3u", buf[0..n]);
-}
-
-test "kittyKeyEvent repeat with mods" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKeyEvent(&buf, 113, true, false, false, 2);
-    try std.testing.expectEqualStrings("\x1b[113;2:2u", buf[0..n]);
-}
-
-test "kittyKeyEvent plain repeat → :2 sub-parameter (no mods)" {
-    // Repeat with no modifiers — kitty spec emits `CSI <kc> ; 1 : 2 u`
-    // (mod=1 explicitly, even though it's the default, because the
-    // `:2` event sub-parameter requires the mods column).
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKeyEvent(&buf, 97, false, false, false, 2);
-    try std.testing.expectEqualStrings("\x1b[97;1:2u", buf[0..n]);
-}
+// ── Kitty keyboard protocol ───────────────────────────────────────
+//
+// Expectations below are taken from the protocol specification and
+// cross-checked against kitty's own kitty_tests/keys.py, which is the
+// only authority on the cases the prose leaves implicit.
 
 const c = @import("../c.zig").c;
 
-test "kitty 0x08: plain 'a' goes through CSI u (report-all-keys)" {
-    // Without 0x08, plain 'a' should emit raw byte 0x61.
-    var buf: [16]u8 = undefined;
-    const n_plain = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0, false, false);
-    try std.testing.expectEqualStrings("a", buf[0..n_plain]);
-
-    // With 0x08, plain 'a' should emit CSI 97 u.
-    const n_all = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[97u", buf[0..n_all]);
+/// Encode one key, spelling out only the fields a case cares about.
+fn enc(buf: []u8, in: input.KeyInput) []const u8 {
+    return buf[0..input.encode(buf, in)];
 }
 
-test "kitty 0x08: Shift+'a' → CSI 97 ; 2 u (uppercase folds to lowercase)" {
-    var buf: [16]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_A, c.GDK_SHIFT_MASK, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[97;2u", buf[0..n]);
+test "emitCsi: shortest form omits a default key number" {
+    var buf: [64]u8 = undefined;
+    // Up arrow, nothing held: `CSI A`, not `CSI 1 A`.
+    try std.testing.expectEqualStrings("\x1b[A", buf[0..input.emitCsi(&buf, .{ .trailer = 'A' })]);
+    // A key number that is not the default is always spelled out.
+    try std.testing.expectEqualStrings("\x1b[27u", buf[0..input.emitCsi(&buf, .{ .num = 27 })]);
 }
 
-test "kitty 0x08: Tab still routes through CSI u (implies disambiguate)" {
-    // 0x08 set, 0x01 NOT set — kitty spec says 0x08 implies 0x01.
-    // Tab should emit `CSI 9 u` rather than the raw byte 0x09.
-    var buf: [16]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_Tab, 0, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[9u", buf[0..n]);
+test "emitCsi: event type forces the modifier column" {
+    var buf: [64]u8 = undefined;
+    const n = input.emitCsi(&buf, .{ .num = 97, .event = .release });
+    try std.testing.expectEqualStrings("\x1b[97;1:3u", buf[0..n]);
 }
 
-test "kitty 0x08: F1 → CSI 57364 u (kitty PUA codepoint)" {
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_F1, 0, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[57364u", buf[0..n]);
+test "emitCsi: text section is positional after an absent modifier column" {
+    var buf: [64]u8 = undefined;
+    const text = [_]u32{ 104, 105 };
+    const n = input.emitCsi(&buf, .{ .num = 97, .text = &text });
+    try std.testing.expectEqualStrings("\x1b[97;;104:105u", buf[0..n]);
 }
 
-test "kitty 0x08: Up → CSI 57352 u" {
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_Up, 0, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[57352u", buf[0..n]);
+test "emitCsi: an empty shifted field still positions the base-layout key" {
+    var buf: [64]u8 = undefined;
+    const n = input.emitCsi(&buf, .{ .num = 99, .base_layout = 101, .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings("\x1b[99::101;5u", buf[0..n]);
 }
 
-test "kitty 0x01 alone: F1 keeps legacy SS3 P (no PUA switch)" {
-    // With disambiguate only, F-keys must NOT switch to PUA codepoints.
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_F1, 0, false, 0, 0x01, false, false);
-    try std.testing.expectEqualStrings("\x1bOP", buf[0..n]);
+test "Mods: kitty parameter carries super, hyper, meta and the locks" {
+    try std.testing.expectEqual(@as(u32, 9), (input.Mods{ .super = true }).kittyParam());
+    try std.testing.expectEqual(@as(u32, 17), (input.Mods{ .hyper = true }).kittyParam());
+    try std.testing.expectEqual(@as(u32, 33), (input.Mods{ .meta = true }).kittyParam());
+    try std.testing.expectEqual(@as(u32, 65), (input.Mods{ .caps_lock = true }).kittyParam());
+    try std.testing.expectEqual(@as(u32, 129), (input.Mods{ .num_lock = true }).kittyParam());
+    try std.testing.expectEqual(@as(u32, 69), (input.Mods{ .ctrl = true, .caps_lock = true }).kittyParam());
+    // The legacy parameter deliberately ignores everything xterm has
+    // no encoding for, so a non-kitty application never sees a
+    // sequence change because Caps Lock happens to be on.
+    try std.testing.expectEqual(@as(u8, 1), (input.Mods{ .super = true, .caps_lock = true }).legacyParam());
 }
 
-test "kitty 0x08: Ctrl+F4 → CSI 57367 ; 5 u" {
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_F4, c.GDK_CONTROL_MASK, false, 0, 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[57367;5u", buf[0..n]);
+test "no flags: legacy encodings are untouched" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a", enc(&buf, .{ .keyval = c.GDK_KEY_a }));
+    try std.testing.expectEqualStrings("\r", enc(&buf, .{ .keyval = c.GDK_KEY_Return }));
+    try std.testing.expectEqualStrings("\t", enc(&buf, .{ .keyval = c.GDK_KEY_Tab }));
+    try std.testing.expectEqualStrings("\x7f", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace }));
+    try std.testing.expectEqualStrings("\x1b", enc(&buf, .{ .keyval = c.GDK_KEY_Escape }));
+    try std.testing.expectEqualStrings("\x1b[A", enc(&buf, .{ .keyval = c.GDK_KEY_Up }));
+    try std.testing.expectEqualStrings("\x1bOA", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .app_cursor = true }));
+    try std.testing.expectEqualStrings("\x1b[1;5A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqualStrings("\x1bOP", enc(&buf, .{ .keyval = c.GDK_KEY_F1 }));
+    try std.testing.expectEqualStrings("\x1b[15~", enc(&buf, .{ .keyval = c.GDK_KEY_F5 }));
+    try std.testing.expectEqualStrings("\x1b[Z", enc(&buf, .{ .keyval = c.GDK_KEY_ISO_Left_Tab }));
+    try std.testing.expectEqualStrings("\x08", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .mods = .{ .ctrl = true } }));
+    try std.testing.expectEqualStrings("\x1b\x7f", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .mods = .{ .alt = true } }));
 }
 
-test "kitty 0x04+0x08: plain 'a' adds alt-shifted 'A' sub-param" {
-    // 0x04 (alt-keys) + 0x08 (report-all) — plain 'a' should be
-    // CSI 97:65 u  (alt-shifted = uppercase variant).
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x04 | 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[97:65u", buf[0..n]);
+test "no flags: Super cannot perturb a legacy sequence" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .mods = .{ .super = true } }));
 }
 
-test "kitty 0x04: Ctrl+'a' → CSI 97:65 ; 5 u" {
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_a, c.GDK_CONTROL_MASK, false, 0, 0x04 | 0x01, false, false);
-    try std.testing.expectEqualStrings("\x1b[97:65;5u", buf[0..n]);
+test "0x01 disambiguate: only Escape and modified keys change" {
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_DISAMBIGUATE;
+    try std.testing.expectEqualStrings("a", enc(&buf, .{ .keyval = c.GDK_KEY_a, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[27u", enc(&buf, .{ .keyval = c.GDK_KEY_Escape, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\r", enc(&buf, .{ .keyval = c.GDK_KEY_Return, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\t", enc(&buf, .{ .keyval = c.GDK_KEY_Tab, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x7f", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[13;2u", enc(&buf, .{ .keyval = c.GDK_KEY_Return, .mods = .{ .shift = true }, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[9;2u", enc(&buf, .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[97;5u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .mods = .{ .ctrl = true }, .kitty_flags = f }));
+    // Shift alone on a text key stays legacy: it selects a glyph, and
+    // the glyph is what gets sent.
+    try std.testing.expectEqualStrings("A", enc(&buf, .{ .keyval = c.GDK_KEY_A, .mods = .{ .shift = true }, .kitty_flags = f }));
+    // F-keys and arrows keep their VT encodings under disambiguate.
+    try std.testing.expectEqualStrings("\x1bOP", enc(&buf, .{ .keyval = c.GDK_KEY_F1, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .kitty_flags = f }));
 }
 
-test "kitty 0x04: digit '1' has no alt-shifted (layout-dependent)" {
-    // Conservative: skip alt-shifted for digits + punctuation since
-    // US-layout assumption ('1' → '!') would mislead non-US users.
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_1, c.GDK_CONTROL_MASK, false, 0, 0x04 | 0x01, false, false);
-    try std.testing.expectEqualStrings("\x1b[49;5u", buf[0..n]);
+test "0x08 report-all: every key becomes an escape code" {
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[97u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[97;5u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .mods = .{ .ctrl = true }, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[13u", enc(&buf, .{ .keyval = c.GDK_KEY_Return, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[9u", enc(&buf, .{ .keyval = c.GDK_KEY_Tab, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[127u", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[27u", enc(&buf, .{ .keyval = c.GDK_KEY_Escape, .kitty_flags = f }));
 }
 
-test "kittyKeyEventFull alt_shifted == code_point omits sub-param" {
-    var buf: [16]u8 = undefined;
-    const n = input.kittyKeyEventFull(&buf, 97, 97, false, false, true, 1);
-    try std.testing.expectEqualStrings("\x1b[97;5u", buf[0..n]);
+test "0x08 report-all: keys with a legacy encoding keep it" {
+    // The Private Use Area codepoints are for keys that never had a
+    // VT sequence. Reporting `CSI 57352 u` for Up instead of `CSI A`
+    // leaves the arrow keys dead in every application that does not
+    // implement kitty's optional alias table.
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[D", enc(&buf, .{ .keyval = c.GDK_KEY_Left, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[H", enc(&buf, .{ .keyval = c.GDK_KEY_Home, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[5~", enc(&buf, .{ .keyval = c.GDK_KEY_Page_Up, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[3~", enc(&buf, .{ .keyval = c.GDK_KEY_Delete, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1bOP", enc(&buf, .{ .keyval = c.GDK_KEY_F1, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[1;5S", enc(&buf, .{ .keyval = c.GDK_KEY_F4, .mods = .{ .ctrl = true }, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[24~", enc(&buf, .{ .keyval = c.GDK_KEY_F12, .kitty_flags = f }));
 }
 
-test "kitty 0x10+0x08: plain 'a' → CSI 97;;97 u (assoc text)" {
-    // Plain 'a' with associated text: code=97, no alts, mods empty
-    // (default 1), text=97. Per kitty spec the empty mods section
-    // is signalled by `;;` with the text after.
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x10 | 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[97;;97u", buf[0..n]);
+test "keys with no legacy encoding use their Private Use Area codepoint" {
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[57376u", enc(&buf, .{ .keyval = c.GDK_KEY_F13, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57398u", enc(&buf, .{ .keyval = c.GDK_KEY_F35, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57404u", enc(&buf, .{ .keyval = c.GDK_KEY_KP_5, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57414u", enc(&buf, .{ .keyval = c.GDK_KEY_KP_Enter, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57423u", enc(&buf, .{ .keyval = c.GDK_KEY_KP_Home, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57358u", enc(&buf, .{ .keyval = c.GDK_KEY_Caps_Lock, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57363u", enc(&buf, .{ .keyval = c.GDK_KEY_Menu, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57440u", enc(&buf, .{ .keyval = c.GDK_KEY_AudioMute, .kitty_flags = f }));
 }
 
-test "kitty 0x10+0x08: Shift+'a' → CSI 97;2;65 u (uppercase text)" {
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_A, c.GDK_SHIFT_MASK, false, 0, 0x10 | 0x08, false, false);
-    try std.testing.expectEqualStrings("\x1b[97;2;65u", buf[0..n]);
+test "modifier keys report only under report-all" {
+    var buf: [64]u8 = undefined;
+    for ([_]u8{ 0, input.FLAG_DISAMBIGUATE, input.FLAG_EVENT_TYPES, input.FLAG_ALTERNATE_KEYS }) |f| {
+        try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_Shift_L, .kitty_flags = f }));
+    }
+    const f = input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[57441u", enc(&buf, .{ .keyval = c.GDK_KEY_Shift_L, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57448u", enc(&buf, .{ .keyval = c.GDK_KEY_Control_R, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57444u", enc(&buf, .{ .keyval = c.GDK_KEY_Super_L, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[57453u", enc(&buf, .{ .keyval = c.GDK_KEY_ISO_Level3_Shift, .kitty_flags = f }));
+    // …and their release, once event types are on too.
+    const n = input.encode(&buf, .{
+        .keyval = c.GDK_KEY_Shift_L,
+        .event = .release,
+        .kitty_flags = input.FLAG_REPORT_ALL | input.FLAG_EVENT_TYPES,
+    });
+    try std.testing.expectEqualStrings("\x1b[57441;1:3u", buf[0..n]);
 }
 
-test "kitty 0x10: Ctrl+'a' produces no text (control byte, no plain output)" {
-    // Ctrl+'a' has no plain-mode text, so the associated-text section
-    // must be omitted entirely — falls back to CSI 97;5 u.
-    var buf: [32]u8 = undefined;
-    const n = input.encode(&buf, c.GDK_KEY_a, c.GDK_CONTROL_MASK, false, 0, 0x10 | 0x01, false, false);
-    try std.testing.expectEqualStrings("\x1b[97;5u", buf[0..n]);
+test "0x02 event types: releases and repeats for every reportable key" {
+    var buf: [64]u8 = undefined;
+    const ev = input.FLAG_EVENT_TYPES;
+    // Without the flag there is no release report at all.
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_a, .event = .release }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .event = .release }));
+    // With it, a text key's non-press events switch to CSI form.
+    try std.testing.expectEqualStrings("\x1b[97;1:3u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .event = .release, .kitty_flags = ev }));
+    try std.testing.expectEqualStrings("\x1b[97;1:2u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .event = .repeat, .kitty_flags = ev }));
+    try std.testing.expectEqualStrings("\x1b[97;2:3u", enc(&buf, .{ .keyval = c.GDK_KEY_A, .mods = .{ .shift = true }, .event = .release, .kitty_flags = ev }));
+    // Functional keys keep their trailer and gain the event column.
+    try std.testing.expectEqualStrings("\x1b[1;1:3A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .event = .release, .kitty_flags = ev }));
+    try std.testing.expectEqualStrings("\x1b[15;1:3~", enc(&buf, .{ .keyval = c.GDK_KEY_F5, .event = .release, .kitty_flags = ev }));
+    try std.testing.expectEqualStrings("\x1b[57376;1:3u", enc(&buf, .{ .keyval = c.GDK_KEY_F13, .event = .release, .kitty_flags = ev }));
 }
 
-test "kittyKeyEventComplete with text + alt_shifted + mods" {
-    var buf: [32]u8 = undefined;
-    const n = input.kittyKeyEventComplete(&buf, 97, 65, 65, true, false, false, 1);
-    // code:alt = 97:65, mods = 2 (shift), text = 65 (uppercase)
-    try std.testing.expectEqualStrings("\x1b[97:65;2;65u", buf[0..n]);
+test "0x02 event types: a plain control byte has no release form" {
+    // Escape, Enter, Tab and Backspace are sent as single control
+    // bytes here, and a control byte cannot carry an event type, so
+    // the release is dropped rather than invented. Verified against
+    // kitty, which drops it too.
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_DISAMBIGUATE | input.FLAG_EVENT_TYPES;
+    try std.testing.expectEqualStrings("\x7f", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .event = .release, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_Return, .event = .release, .kitty_flags = f }));
+    // Once they ARE escape codes, their releases report normally.
+    const g = input.FLAG_REPORT_ALL | input.FLAG_EVENT_TYPES;
+    try std.testing.expectEqualStrings("\x1b[127;1:3u", enc(&buf, .{ .keyval = c.GDK_KEY_BackSpace, .event = .release, .kitty_flags = g }));
+}
+
+test "0x04 alternate keys: shifted variant only while Shift is held" {
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_ALTERNATE_KEYS | input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[97u", enc(&buf, .{
+        .keyval = c.GDK_KEY_a,
+        .base_keyval = c.GDK_KEY_a,
+        .shifted_keyval = c.GDK_KEY_A,
+        .kitty_flags = f,
+    }));
+    try std.testing.expectEqualStrings("\x1b[97:65;2u", enc(&buf, .{
+        .keyval = c.GDK_KEY_A,
+        .mods = .{ .shift = true },
+        .base_keyval = c.GDK_KEY_a,
+        .shifted_keyval = c.GDK_KEY_A,
+        .kitty_flags = f,
+    }));
+}
+
+test "0x04 alternate keys: the key number is the unshifted key" {
+    // Shift+2 on a US layout is '@'. The protocol wants the key ('2')
+    // with the glyph as its shifted variant, not the glyph as the key.
+    var buf: [64]u8 = undefined;
+    const n = input.encode(&buf, .{
+        .keyval = c.GDK_KEY_at,
+        .mods = .{ .shift = true },
+        .base_keyval = c.GDK_KEY_2,
+        .shifted_keyval = c.GDK_KEY_at,
+        .kitty_flags = input.FLAG_ALTERNATE_KEYS | input.FLAG_REPORT_ALL,
+    });
+    try std.testing.expectEqualStrings("\x1b[50:64;2u", buf[0..n]);
+}
+
+test "0x04 alternate keys: base layout rescues shortcuts on a non-Latin layout" {
+    // Ctrl+С on a Cyrillic layout sits on the physical 'c' key
+    // (evdev 46 + 8), so the application still sees a 'c' to bind.
+    var buf: [64]u8 = undefined;
+    const n = input.encode(&buf, .{
+        .keyval = 0x06d3, // Cyrillic_es
+        .mods = .{ .ctrl = true },
+        .keycode = 54,
+        .base_keyval = 0x06d3,
+        .kitty_flags = input.FLAG_ALTERNATE_KEYS | input.FLAG_DISAMBIGUATE,
+    });
+    try std.testing.expectEqualStrings("\x1b[1089::99;5u", buf[0..n]);
+}
+
+test "0x10 associated text" {
+    var buf: [64]u8 = undefined;
+    const f = input.FLAG_ASSOCIATED_TEXT | input.FLAG_REPORT_ALL;
+    try std.testing.expectEqualStrings("\x1b[97;;97u", enc(&buf, .{ .keyval = c.GDK_KEY_a, .base_keyval = c.GDK_KEY_a, .kitty_flags = f }));
+    try std.testing.expectEqualStrings("\x1b[97;2;65u", enc(&buf, .{
+        .keyval = c.GDK_KEY_A,
+        .mods = .{ .shift = true },
+        .base_keyval = c.GDK_KEY_a,
+        .kitty_flags = f,
+    }));
+    // A control modifier means the keystroke would have produced no
+    // text, so the section is omitted entirely.
+    try std.testing.expectEqualStrings("\x1b[97;5u", enc(&buf, .{
+        .keyval = c.GDK_KEY_a,
+        .mods = .{ .ctrl = true },
+        .kitty_flags = input.FLAG_ASSOCIATED_TEXT | input.FLAG_DISAMBIGUATE,
+    }));
+}
+
+test "lock keys reach the wire only through the protocol's modifier field" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[97;69u", enc(&buf, .{
+        .keyval = c.GDK_KEY_a,
+        .mods = .{ .ctrl = true, .caps_lock = true },
+        .base_keyval = c.GDK_KEY_a,
+        .kitty_flags = input.FLAG_DISAMBIGUATE,
+    }));
+    // Same event with no flags: the legacy control byte, unchanged.
+    try std.testing.expectEqualStrings("\x01", enc(&buf, .{
+        .keyval = c.GDK_KEY_a,
+        .mods = .{ .ctrl = true, .caps_lock = true },
+    }));
 }
 
 // ── matchBinding dispatch table coverage ──────────────────────────
