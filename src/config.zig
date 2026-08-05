@@ -406,6 +406,28 @@ pub const Config = struct {
     /// hover, go-to-definition) always flushes FIRST regardless, so this
     /// only trades server CPU against how fresh diagnostics feel.
     editor_lsp_debounce_ms: u16 = 250,
+    /// Comma-separated marker filenames that identify a PROJECT root
+    /// (`editor/project.zig`). Empty = the built-in list (every VCS
+    /// directory plus the usual language markers). A file with no
+    /// marker above it has no project, and the project-scoped features
+    /// (project search, the git gutter, the project label) stay off for
+    /// it.
+    ///
+    /// App level, like `editor_lsp`: a project is a property of the
+    /// filesystem, not of the pane profile the file happens to be open
+    /// under.
+    editor_project_markers: []const u8 = "",
+    /// Per-line added/modified/deleted markers in the gutter, computed
+    /// against HEAD on the file's own host. Off costs nothing at all —
+    /// no daemon job is started.
+    editor_git_gutter: bool = true,
+    /// Open the symbol outline panel with every editor face. Off (the
+    /// default) still lets Ctrl+Shift+O open it per face.
+    editor_outline: bool = false,
+    /// Cap on files a project-wide search will READ. The daemon's grep
+    /// narrows the candidates first; this bounds the pathological case
+    /// (a regex with no literal part, which cannot be pre-filtered).
+    editor_project_search_max_files: u32 = 4000,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -596,6 +618,7 @@ pub const Config = struct {
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.editor_theme = try arena.dupe(u8, self.editor_theme);
+        out.editor_project_markers = try arena.dupe(u8, self.editor_project_markers);
         out.keybinds = .empty;
         try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
         for (self.keybinds.items) |kb| {
@@ -909,6 +932,12 @@ pub const Config = struct {
             try w.print("editor_lsp_debounce_ms = {d}\n", .{self.editor_lsp_debounce_ms});
         if (!std.mem.eql(u8, self.editor_theme, "dark"))
             try w.print("editor_theme = {s}\n", .{self.editor_theme});
+        if (self.editor_project_markers.len > 0)
+            try w.print("editor_project_markers = {s}\n", .{self.editor_project_markers});
+        if (!self.editor_git_gutter) try w.writeAll("editor_git_gutter = false\n");
+        if (self.editor_outline) try w.writeAll("editor_outline = true\n");
+        if (self.editor_project_search_max_files != 4000)
+            try w.print("editor_project_search_max_files = {d}\n", .{self.editor_project_search_max_files});
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -1605,6 +1634,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_lsp_debounce_ms = try parseU16(value);
     } else if (std.mem.eql(u8, key, "editor_theme")) {
         cfg.editor_theme = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "editor_project_markers")) {
+        cfg.editor_project_markers = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "editor_git_gutter")) {
+        cfg.editor_git_gutter = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_outline")) {
+        cfg.editor_outline = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_project_search_max_files")) {
+        cfg.editor_project_search_max_files = try parseU32(value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {

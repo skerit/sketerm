@@ -49,6 +49,7 @@ const search = @import("../editor/search.zig");
 const theme_mod = @import("../editor/theme.zig");
 const structure = @import("../editor/structure.zig");
 const lsp_diag = @import("../lsp/diagnostics.zig");
+const gitdiff = @import("../editor/gitdiff.zig");
 
 pub const KIND_BG: f32 = 0;
 pub const KIND_GLYPH: f32 = 1;
@@ -168,6 +169,20 @@ pub const Colors = struct {
     diag_warning: [4]f32 = .{ 0.92, 0.70, 0.20, 1.0 },
     diag_info: [4]f32 = .{ 0.35, 0.65, 0.92, 1.0 },
     diag_hint: [4]f32 = .{ 0.45, 0.75, 0.55, 1.0 },
+    /// Per-line VCS change markers, at the gutter's RIGHT edge (the
+    /// diagnostic stripe owns the left one, and a line can legitimately
+    /// carry both).
+    git_added: [4]f32 = .{ 0.35, 0.72, 0.40, 1.0 },
+    git_modified: [4]f32 = .{ 0.35, 0.60, 0.90, 1.0 },
+    git_deleted: [4]f32 = .{ 0.85, 0.35, 0.32, 1.0 },
+
+    pub fn gitColor(self: *const Colors, kind: gitdiff.Kind) [4]f32 {
+        return switch (kind) {
+            .added => self.git_added,
+            .modified => self.git_modified,
+            .deleted => self.git_deleted,
+        };
+    }
 
     pub fn diagColor(self: *const Colors, sev: lsp_diag.Severity) [4]f32 {
         return switch (sev) {
@@ -249,6 +264,11 @@ pub const Frame = struct {
     /// squiggle is a per-cluster range rect like any other, and giving
     /// it its own pass would double the atlas/clip bookkeeping.
     diagnostics: []const lsp_diag.Diagnostic = &.{},
+    /// Per-line VCS change marks for the WHOLE document, sorted by
+    /// anchor (editor/gitdiff.zig keeps them that way). Painted inside
+    /// the existing gutter for the same reason the diagnostic stripe is:
+    /// a refresh must never re-lay-out the text.
+    git_marks: []const gitdiff.Mark = &.{},
     /// Per-highlight-kind glyph colours. Null = every glyph paints in
     /// `colors.text` (plain text, or syntax highlighting switched off).
     /// The layout tags each glyph with its kind; `Kind.none` resolves
@@ -622,6 +642,27 @@ pub const EditorPass = struct {
                 }
             }
 
+            // VCS gutter marks: a stripe at the gutter's right edge for
+            // an added or modified line, a short tick at the top of the
+            // line that closed a deletion. Sorted by anchor, so the scan
+            // stops at the first mark past this line.
+            if (frame.git_marks.len > 0 and gutter_w > 0) {
+                for (frame.git_marks) |m| {
+                    if (m.anchor > ll.byte_end) break;
+                    if (m.anchor < ll.byte_start) continue;
+                    const x = gutter_w - GIT_STRIPE_W;
+                    const h = if (m.kind == .deleted) @min(line_h * 0.4, 6) else n_rows * line_h;
+                    try self.addRectRaw(
+                        KIND_GUTTER_BG,
+                        x,
+                        y,
+                        GIT_STRIPE_W,
+                        h,
+                        colors.gitColor(m.kind),
+                    );
+                }
+            }
+
             // Folded-region badge, at the end of the header line's last
             // row: the affordance that says "content is hidden here".
             if (frame.folds) |f| {
@@ -735,6 +776,11 @@ pub const EditorPass = struct {
     /// edge. Inside the existing gutter, so publishing diagnostics
     /// never re-lays-out the text.
     pub const DIAG_STRIPE_W: f32 = 3;
+
+    /// Width of the VCS change stripe at the gutter's right edge. Same
+    /// reasoning as DIAG_STRIPE_W: inside the gutter, so a refresh never
+    /// shifts the text.
+    pub const GIT_STRIPE_W: f32 = 3;
 
     /// One period of the squiggle, in px. Two rects per period (up,
     /// down) is the cheapest zigzag that still reads as "wavy" at every
