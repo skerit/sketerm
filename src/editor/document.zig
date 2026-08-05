@@ -108,7 +108,7 @@ pub const Document = struct {
     ///
     /// A fixed array rather than a list: the subscriber set is static
     /// and this fires on every keystroke, so an allocation here would
-    /// be a hot-path cost for no flexibility anyone needs. Three slots,
+    /// be a hot-path cost for no flexibility anyone needs. Four slots,
     /// one per subscriber that genuinely needs PRE-edit coordinates:
     ///
     ///   0. the incremental syntax highlighter (Tree-sitter's
@@ -117,10 +117,13 @@ pub const Document = struct {
     ///   2. the LSP client, which needs the `didChange` range in the
     ///      coordinates the server still holds, and carries the
     ///      diagnostics' anchors through the same edit.
+    ///   3. the accessibility bridge's exact-change capture (the
+    ///      deleted text's character count is unrecoverable after the
+    ///      fact — a11y/docview.zig `ChangeLog`).
     ///
     /// Growing this is the supported way to add a subscriber; a
-    /// fourth one bumps the array, it does not fork the mechanism.
-    observers: [3]?EditObserver = .{ null, null, null },
+    /// fifth one bumps the array, it does not fork the mechanism.
+    observers: [4]?EditObserver = .{ null, null, null, null },
     /// The history entry the last undo/redo consumed, kept alive only
     /// so the `Change` handed back can point at its buffers. Freed at
     /// the next mutation.
@@ -142,10 +145,8 @@ pub const Document = struct {
         };
     }
 
-    /// Detects the line-ending style; a CRLF document is loaded as an
-    /// LF-normalized copy, an LF one byte for byte (see the file
-    /// header). Lone \r bytes are always left untouched.
-    pub fn initFromBytes(alloc: Allocator, bytes: []const u8) !Document {
+    /// Dominant line-ending style of raw file bytes.
+    pub fn detectStyle(bytes: []const u8) LineEnding {
         var crlf: usize = 0;
         var lone_lf: usize = 0;
         var i: usize = 0;
@@ -154,29 +155,50 @@ pub const Document = struct {
                 if (i > 0 and bytes[i - 1] == '\r') crlf += 1 else lone_lf += 1;
             }
         }
-        const style: LineEnding = if (crlf > 0 and crlf >= lone_lf) .crlf else .lf;
+        return if (crlf > 0 and crlf >= lone_lf) .crlf else .lf;
+    }
 
+    /// In-memory form of raw file bytes for `style`: an LF-normalized
+    /// copy for `.crlf`, a plain copy for `.lf`. Caller frees.
+    ///
+    /// Only a CRLF document is normalized. Stripping \r out of a file
+    /// whose style is LF would be silent data loss: `materialize`
+    /// re-applies CR only for the .crlf style, so a mostly-LF file
+    /// with a few CRLF lines (or binary content that happens to hold
+    /// \r\n pairs) would come back from a save with those bytes gone.
+    pub fn normalizeBytes(alloc: Allocator, bytes: []const u8, style: LineEnding) ![]u8 {
+        if (style == .lf) return try alloc.dupe(u8, bytes);
+        var crlf: usize = 0;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\n' and i > 0 and bytes[i - 1] == '\r') crlf += 1;
+        }
+        const norm = try alloc.alloc(u8, bytes.len - crlf);
+        errdefer alloc.free(norm);
+        var w: usize = 0;
+        i = 0;
+        while (i < bytes.len) : (i += 1) {
+            if (bytes[i] == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') continue;
+            norm[w] = bytes[i];
+            w += 1;
+        }
+        std.debug.assert(w == norm.len);
+        return norm;
+    }
+
+    /// Detects the line-ending style; a CRLF document is loaded as an
+    /// LF-normalized copy, an LF one byte for byte (see the file
+    /// header). Lone \r bytes are always left untouched.
+    pub fn initFromBytes(alloc: Allocator, bytes: []const u8) !Document {
+        const style = detectStyle(bytes);
         var doc = initEmpty(alloc);
         errdefer doc.deinit();
         doc.line_ending = style;
-        // Only a CRLF document is normalized. Stripping \r out of a file
-        // whose style is LF would be silent data loss: `materialize`
-        // re-applies CR only for the .crlf style, so a mostly-LF file
-        // with a few CRLF lines (or binary content that happens to hold
-        // \r\n pairs) would come back from a save with those bytes gone.
         if (style == .lf) {
             doc.rope = try Rope.initFromBytes(alloc, bytes);
         } else {
-            const norm = try alloc.alloc(u8, bytes.len - crlf);
+            const norm = try normalizeBytes(alloc, bytes, style);
             defer alloc.free(norm);
-            var w: usize = 0;
-            i = 0;
-            while (i < bytes.len) : (i += 1) {
-                if (bytes[i] == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') continue;
-                norm[w] = bytes[i];
-                w += 1;
-            }
-            std.debug.assert(w == norm.len);
             doc.rope = try Rope.initFromBytes(alloc, norm);
         }
         return doc;
@@ -222,7 +244,7 @@ pub const Document = struct {
     }
 
     pub fn clearObservers(self: *Document) void {
-        self.observers = .{ null, null, null };
+        self.observers = .{ null, null, null, null };
     }
 
     pub fn isDirty(self: *const Document) bool {
