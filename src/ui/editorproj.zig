@@ -671,8 +671,9 @@ pub fn buildPanel(view: *EditorView) void {
     const rrow = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
     c.gtk_widget_add_css_class(rrow, "toolbar");
     const rentry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(rentry), "Replace with");
+    c.gtk_entry_set_placeholder_text(@ptrCast(rentry), "Replace with — Enter previews, Ctrl+Enter applies");
     c.gtk_widget_set_hexpand(rentry, 1);
+    _ = c.g_signal_connect_data(rentry, "activate", @ptrCast(&onPreviewActivate), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(rrow), rentry);
     view.search_replace_entry = rentry.?;
     const prev = c.gtk_button_new_with_label("Preview");
@@ -705,6 +706,13 @@ pub fn buildPanel(view: *EditorView) void {
     c.gtk_scrolled_window_set_child(@ptrCast(scroll), list);
     view.search_list = list.?;
     c.gtk_box_append(@ptrCast(box), scroll);
+
+    // Escape anywhere in the panel closes it and returns focus to the
+    // document — the find bar's contract, for the same reason.
+    const keys = c.gtk_event_controller_key_new();
+    c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
+    _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onPanelKey), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(box, @ptrCast(keys));
 
     view.search_panel = box.?;
 }
@@ -741,7 +749,12 @@ pub fn openSearch(view: *EditorView, replace: bool) void {
             resolveProject(view, tab);
     }
     updateSearchStatus(view);
-    _ = c.gtk_widget_grab_focus(view.search_entry);
+    // Re-opening in replace mode with a needle already typed means
+    // "now tell me what to replace it with".
+    if (replace and entryText(view.search_entry).len > 0)
+        _ = c.gtk_widget_grab_focus(view.search_replace_entry)
+    else
+        _ = c.gtk_widget_grab_focus(view.search_entry);
 }
 
 pub fn closeSearch(view: *EditorView) void {
@@ -882,6 +895,33 @@ fn onSearchCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     closeSearch(cast.userData(EditorView, user));
 }
 
+/// Escape closes the panel; Ctrl+Enter applies a previewed replace
+/// (the destructive half needs a modifier, and it is the one action
+/// with no keyboard route through the entries).
+fn onPanelKey(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    state: c.GdkModifierType,
+    user: ?*anyopaque,
+) callconv(.c) c.gboolean {
+    const view = cast.userData(EditorView, user);
+    const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
+    if (keyval == c.GDK_KEY_Escape) {
+        closeSearch(view);
+        return 1;
+    }
+    if (ctrl and (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter)) {
+        applyReplace(view);
+        return 1;
+    }
+    return 0;
+}
+
+fn onPreviewActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    startSearchJob(cast.userData(EditorView, user), .preview);
+}
+
 // ---- applying a previewed replace -------------------------------------
 
 const ApplyItem = struct {
@@ -932,7 +972,15 @@ fn applyReplace(view: *EditorView) void {
         const spec = r.fileSpec(@intCast(fi));
         if (view.tabForSpec(spec)) |tab| {
             if (replaceInDoc(view, tab, r.needle, r.replacement, r.opts)) |n| {
-                if (n > 0) in_buffers += 1;
+                if (n > 0) {
+                    in_buffers += 1;
+                    // Apply means the same thing for every file: an
+                    // open buffer is saved too, so disk and buffer
+                    // agree afterwards. The transaction is still ONE
+                    // undo step — undoing re-dirties the buffer and the
+                    // user saves again.
+                    view.saveTab(tab);
+                }
             }
             continue;
         }

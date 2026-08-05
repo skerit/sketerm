@@ -2334,13 +2334,9 @@ pub const EditorView = struct {
         top_line: ?usize,
         project_root: []const u8,
     ) void {
-        for (self.tabs.items) |t| {
-            if (t.spec) |ts| {
-                if (std.mem.eql(u8, ts, spec)) {
-                    self.tabhost.setCurrentPage(t.page);
-                    return;
-                }
-            }
+        if (self.tabForSpec(spec)) |t| {
+            self.tabhost.setCurrentPage(t.page);
+            return;
         }
         const tab = self.newTab(spec) orelse return;
         tab.want_cursor = cursor;
@@ -2476,9 +2472,21 @@ pub const EditorView = struct {
     pub fn tabForSpec(self: *EditorView, spec: []const u8) ?*ETab {
         for (self.tabs.items) |t| {
             const ts = t.spec orelse continue;
-            if (std.mem.eql(u8, ts, spec)) return t;
+            if (specEql(ts, spec)) return t;
         }
         return null;
+    }
+
+    /// Two specs name the same document when their (host, path) agree.
+    /// A raw string compare is not enough: `paths.formatSpec` writes a
+    /// local path as `local:/x` while the picker and the CLI hand over
+    /// a bare `/x`, and both must resolve to ONE tab.
+    fn specEql(a: []const u8, b: []const u8) bool {
+        if (std.mem.eql(u8, a, b)) return true;
+        const la = paths.parseSpec(a);
+        const lb = paths.parseSpec(b);
+        if (!std.mem.eql(u8, la.host orelse "", lb.host orelse "")) return false;
+        return std.mem.eql(u8, la.path, lb.path);
     }
 
     pub fn setStatusText(self: *EditorView, text: [*:0]const u8) void {
