@@ -1368,7 +1368,7 @@ fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Language servers");
     c.adw_preferences_group_set_description(
         @ptrCast(@alignCast(group)),
-        "LSP gives the editor diagnostics (Ctrl+Space completion, Ctrl+I hover, F12 go to definition, Shift+F12 references, F8 next problem, Ctrl+Shift+O symbols, F2 rename, Ctrl+Shift+I format). A server that is not installed is skipped silently.",
+        "LSP gives the editor diagnostics (Ctrl+Space completion, Ctrl+I hover, F12 go to definition, Shift+F12 references, F8 next problem, Ctrl+Shift+O symbols, F2 rename, Ctrl+Shift+I format, Ctrl+. code actions, Ctrl+Shift+Space signature help). A server that is not installed is skipped silently.",
     );
     addSwitchRow(@ptrCast(@alignCast(group)), ctx, "Enable language servers", "Off never spawns a server.", &ctx.cfg.editor_lsp, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(group)), ctx, "Show diagnostics", "Squiggles in the text and a stripe in the gutter.", &ctx.cfg.editor_lsp_diagnostics, applyOnly);
@@ -1380,6 +1380,40 @@ fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
         10,
         5000,
         &ctx.cfg.editor_lsp_debounce_ms,
+        applyOnly,
+    );
+    addSwitchRow(
+        @ptrCast(@alignCast(group)),
+        ctx,
+        "Inlay hints",
+        "Inline type and parameter annotations for the visible lines. They are drawn, never inserted: the file on disk is untouched.",
+        &ctx.cfg.editor_lsp_inlay_hints,
+        applyOnly,
+    );
+    addSwitchRow(
+        @ptrCast(@alignCast(group)),
+        ctx,
+        "Semantic highlighting",
+        "Let the server refine the syntax colours where it knows better. Off leaves the built-in highlighting alone.",
+        &ctx.cfg.editor_lsp_semantic_tokens,
+        applyOnly,
+    );
+    addSwitchRow(
+        @ptrCast(@alignCast(group)),
+        ctx,
+        "Signature help",
+        "Show the parameter list while typing a call, and on Ctrl+Shift+Space.",
+        &ctx.cfg.editor_lsp_signature_help,
+        applyOnly,
+    );
+    addSpinRowU16(
+        @ptrCast(@alignCast(group)),
+        ctx,
+        "Hover delay (ms)",
+        "How long the pointer must rest on a symbol before its documentation pops up. 0 turns mouse hover off; Ctrl+I still works.",
+        0,
+        5000,
+        &ctx.cfg.editor_lsp_hover_delay_ms,
         applyOnly,
     );
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));

@@ -2555,6 +2555,36 @@ pub const EditorView = struct {
     /// points at. Deliberately the same geometry `setImCursorLocation`
     /// ships to the input method, so a completion list and an IME
     /// candidate window never disagree about where the caret is.
+    /// Visible logical line range — what an inlay-hint range request
+    /// asks for.
+    pub fn visibleLineSpanPublic(self: *EditorView, tab: *ETab) struct { from: usize, to: usize } {
+        const span = self.visibleLineSpan(tab);
+        return .{ .from = span.from, .to = span.to };
+    }
+
+    /// Byte offset under a WIDGET-coordinate point, or null when the
+    /// point is over the gutter (where a dwell means nothing).
+    pub fn offsetAtPointPublic(self: *EditorView, tab: *ETab, lx: f64, ly: f64) ?usize {
+        if (self.widgets_dead or self.atlas == null) return null;
+        const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (@as(f32, @floatCast(lx)) * scale < self.gutterWidthOf(tab)) return null;
+        return self.hitTest(tab, lx, ly);
+    }
+
+    /// A one-cell rectangle at a WIDGET-coordinate point — what a
+    /// pointer-anchored popover points at.
+    pub fn pointRectPx(self: *EditorView, lx: f64, ly: f64) ?c.GdkRectangle {
+        if (self.widgets_dead) return null;
+        const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (scale <= 0) return null;
+        return .{
+            .x = @intFromFloat(lx),
+            .y = @intFromFloat(ly),
+            .width = 1,
+            .height = @intFromFloat(self.lineHeight() / scale),
+        };
+    }
+
     pub fn caretRectPx(self: *EditorView) ?c.GdkRectangle {
         if (self.widgets_dead) return null;
         const tab = self.active orelse return null;
@@ -2720,6 +2750,18 @@ pub const EditorView = struct {
         const span = self.visibleLineSpan(tab);
         self.ensureFoldMarkers(tab, span.from, span.to);
         self.ensureBrackets(tab);
+        // Language-server decorations are BORROWED by the layout for
+        // exactly this frame; a stale set is unbound here rather than
+        // filtered later (editorlsp.applyDecorations).
+        if (self.lsp) |m| {
+            m.applyDecorations(tab);
+            m.onViewportMoved();
+        } else {
+            tab.layout.sem = &.{};
+            tab.layout.sem_gen = 0;
+            tab.layout.hints = &.{};
+            tab.layout.hints_gen = 0;
+        }
         const view = editor_pass.View{
             .width_px = @floatFromInt(pw),
             .height_px = @floatFromInt(ph),
@@ -3775,6 +3817,11 @@ pub const EditorView = struct {
                     tab.disk = .{};
                     tab.keep_active = false;
                     self.clearAlert(tab);
+                    // No document-replace rides on this branch, so the
+                    // (empty, but now FINAL) buffer has to be opened on
+                    // the server from here — `openDocument` defers
+                    // while `loading` is set, which it no longer is.
+                    if (self.lsp) |m| m.ensureOpen(tab) else self.attachLsp(tab);
                     self.setStatus("New file.");
                     self.refresh(tab);
                     return;
@@ -4986,8 +5033,15 @@ pub const EditorView = struct {
             format,
             diag_next,
             diag_prev,
+            signature,
+            code_action,
         } = blk: {
+            if (ctrl and shift and keyval == c.GDK_KEY_space) break :blk .signature;
             if (ctrl and !shift and keyval == c.GDK_KEY_space) break :blk .completion;
+            // Ctrl+. — VS Code's Quick Fix. `period` and `KP_Decimal`
+            // are different keyvals and both reach here.
+            if (ctrl and (keyval == c.GDK_KEY_period or keyval == c.GDK_KEY_KP_Decimal))
+                break :blk .code_action;
             if (ctrl and !shift and lower == c.GDK_KEY_i) break :blk .hover;
             if (ctrl and shift and lower == c.GDK_KEY_i) break :blk .format;
             if (ctrl and !shift and lower == c.GDK_KEY_t) break :blk .workspace_symbols;
@@ -5025,6 +5079,8 @@ pub const EditorView = struct {
             .format => m.requestFormatting(),
             .diag_next => m.stepDiagnostic(true),
             .diag_prev => m.stepDiagnostic(false),
+            .signature => m.requestSignatureHelp(true, 1, 0),
+            .code_action => m.requestCodeActions(),
         }
         return true;
     }
@@ -5133,6 +5189,7 @@ pub const EditorView = struct {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         const tab = self.active orelse return;
         _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        if (self.lsp) |m| m.cancelDwell();
         // Clicking into an ALREADY focused canvas raises no focus
         // event, and is just as much a "I am back at this document"
         // signal (rate-limited like every other trigger).
@@ -5190,6 +5247,9 @@ pub const EditorView = struct {
 
     fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
+        // Dwell hover: this only RESTARTS a timer, it never issues a
+        // request (editorlsp.onPointerMoved).
+        if (self.lsp) |m| m.onPointerMoved(x, y);
         const anchor = self.drag_anchor orelse return;
         const tab = self.active orelse return;
         const pos = self.hitTest(tab, x, y);
@@ -5205,6 +5265,7 @@ pub const EditorView = struct {
     fn onScroll(ctl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         const tab = self.active orelse return 0;
+        if (self.lsp) |m| m.cancelDwell();
         const state = c.gtk_event_controller_get_current_event_state(@ptrCast(ctl));
         const shift = (state & input.SIGNIFICANT_MODS & c.GDK_SHIFT_MASK) != 0;
         const line_h = self.lineHeight();

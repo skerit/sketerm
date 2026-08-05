@@ -406,6 +406,22 @@ pub const Config = struct {
     /// hover, go-to-definition) always flushes FIRST regardless, so this
     /// only trades server CPU against how fresh diagnostics feel.
     editor_lsp_debounce_ms: u16 = 250,
+    /// Inline type / parameter-name annotations from the server
+    /// (`textDocument/inlayHint`), requested for the visible viewport
+    /// only. Display-only: they never enter the document and never move
+    /// a byte offset.
+    editor_lsp_inlay_hints: bool = true,
+    /// Server-computed token colours (`textDocument/semanticTokens`)
+    /// layered ON TOP of the Tree-sitter highlighting — the server wins
+    /// where it speaks, the grammar keeps everything else.
+    editor_lsp_semantic_tokens: bool = true,
+    /// Signature help while typing a call, on the server's trigger
+    /// characters and on Ctrl+Shift+Space.
+    editor_lsp_signature_help: bool = true,
+    /// How long the pointer has to sit still over a symbol before a
+    /// hover is requested for it. 0 disables mouse-dwell hover
+    /// entirely; Ctrl+I is unaffected either way.
+    editor_lsp_hover_delay_ms: u16 = 500,
     /// Comma-separated marker filenames that identify a PROJECT root
     /// (`editor/project.zig`). Empty = the built-in list (every VCS
     /// directory plus the usual language markers). A file with no
@@ -930,6 +946,11 @@ pub const Config = struct {
         if (!self.editor_lsp_diagnostics) try w.writeAll("editor_lsp_diagnostics = false\n");
         if (self.editor_lsp_debounce_ms != 250)
             try w.print("editor_lsp_debounce_ms = {d}\n", .{self.editor_lsp_debounce_ms});
+        if (!self.editor_lsp_inlay_hints) try w.writeAll("editor_lsp_inlay_hints = false\n");
+        if (!self.editor_lsp_semantic_tokens) try w.writeAll("editor_lsp_semantic_tokens = false\n");
+        if (!self.editor_lsp_signature_help) try w.writeAll("editor_lsp_signature_help = false\n");
+        if (self.editor_lsp_hover_delay_ms != 500)
+            try w.print("editor_lsp_hover_delay_ms = {d}\n", .{self.editor_lsp_hover_delay_ms});
         if (!std.mem.eql(u8, self.editor_theme, "dark"))
             try w.print("editor_theme = {s}\n", .{self.editor_theme});
         if (self.editor_project_markers.len > 0)
@@ -1632,6 +1653,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_lsp_diagnostics = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_lsp_debounce_ms")) {
         cfg.editor_lsp_debounce_ms = try parseU16(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_inlay_hints")) {
+        cfg.editor_lsp_inlay_hints = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_semantic_tokens")) {
+        cfg.editor_lsp_semantic_tokens = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_signature_help")) {
+        cfg.editor_lsp_signature_help = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_lsp_hover_delay_ms")) {
+        cfg.editor_lsp_hover_delay_ms = try parseU16(value);
     } else if (std.mem.eql(u8, key, "editor_theme")) {
         cfg.editor_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "editor_project_markers")) {

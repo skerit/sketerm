@@ -55,6 +55,10 @@ const servers = @import("../lsp/servers.zig");
 const proc = @import("../lsp/proc.zig");
 const diagnostics = @import("../lsp/diagnostics.zig");
 const docsync = @import("../lsp/docsync.zig");
+const semantic = @import("../lsp/semantic.zig");
+const inlay = @import("../lsp/inlay.zig");
+const layout_mod = @import("../render/editor_layout.zig");
+const syntax = @import("../editor/syntax.zig");
 
 /// `SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
 /// published diagnostics to stderr. There is no other way to see why a
@@ -73,10 +77,27 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
 const COMPLETION_DEBOUNCE_MS: c_uint = 120;
 /// How long a server gets to exit after `shutdown` before SIGKILL.
 const SHUTDOWN_GRACE_MS: c_uint = 1500;
+/// Signature help re-request debounce as the caret walks the argument
+/// list. Same reasoning as COMPLETION_DEBOUNCE_MS: the active parameter
+/// has to keep up with the typing.
+const SIGNATURE_DEBOUNCE_MS: c_uint = 120;
+/// Delay before an inlay-hint / semantic-token request goes out after a
+/// document or viewport change. Longer than the completion debounce
+/// because neither is something the user is waiting on keystroke by
+/// keystroke, and both are whole-viewport / whole-document work.
+const DECOR_DEBOUNCE_MS: c_uint = 220;
+/// Extra lines requested above and below the viewport, so scrolling by
+/// a few rows costs no `inlayHint` round trip at all.
+const HINT_MARGIN_LINES: u32 = 80;
 /// Popup geometry.
 const POPUP_W: c_int = 460;
 const POPUP_H: c_int = 260;
 const HOVER_W: c_int = 520;
+/// Signature-help popover width. Fixed, and every label inside it is
+/// ellipsized to a fixed character count, because a popover that grows
+/// its MINIMUM while mapped is popped down by GTK rather than resized
+/// (see the invariant on `ensurePopup`).
+const SIG_W: c_int = 560;
 /// Hard cap on rows built into a popup — a `references` answer on a
 /// popular symbol can be tens of thousands, and building that many
 /// GtkLabels locks the UI for seconds.
@@ -96,6 +117,33 @@ pub const TabState = struct {
     change_timer: c_uint = 0,
     /// Debounced completion re-request; 0 = idle.
     completion_timer: c_uint = 0,
+    /// Debounced signature-help re-request; 0 = idle.
+    signature_timer: c_uint = 0,
+    /// Debounced inlay-hint / semantic-token refresh; 0 = idle.
+    decor_timer: c_uint = 0,
+
+    // ---- display-only decorations ------------------------------------
+    //
+    // Both are revision-stamped and simply NOT SHOWN when the document
+    // has moved on (`Manager.applyDecorations`), which is the same
+    // discipline every other request answer follows. Neither is ever
+    // carried through an edit the way diagnostics are: a hint or a token
+    // span pointing at moved bytes is worse than none.
+
+    /// Inlay hints for the viewport window, owned.
+    hints: inlay.Set,
+    /// The packed semantic-token array as the server last sent it, kept
+    /// so `semanticTokens/full/delta` has something to splice into.
+    sem_data: semantic.Data,
+    /// …decoded and mapped to document byte ranges + highlight kinds.
+    sem_spans: std.ArrayList(layout_mod.SemSpan) = .empty,
+    /// Document revision `sem_spans` is exact for, and the render-side
+    /// cache key (bumped on every replace).
+    sem_revision: u64 = 0,
+    sem_generation: u64 = 0,
+    /// A semantic-token request is worth making again (the document
+    /// changed since the last answer).
+    sem_stale: bool = true,
 
     pub fn create(alloc: std.mem.Allocator, tab: *ETab) ?*TabState {
         const self = alloc.create(TabState) catch return null;
@@ -104,6 +152,8 @@ pub const TabState = struct {
             .tab = tab,
             .sync = docsync.DocSync.init(alloc),
             .diags = diagnostics.Store.init(alloc),
+            .hints = inlay.Set.init(alloc),
+            .sem_data = semantic.Data.init(alloc),
         };
         return self;
     }
@@ -112,18 +162,33 @@ pub const TabState = struct {
         self.stopTimers();
         self.sync.deinit();
         self.diags.deinit();
+        self.hints.deinit();
+        self.sem_data.deinit();
+        self.sem_spans.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
     fn stopTimers(self: *TabState) void {
-        if (self.change_timer != 0) {
-            _ = c.g_source_remove(self.change_timer);
-            self.change_timer = 0;
+        for ([_]*c_uint{
+            &self.change_timer,
+            &self.completion_timer,
+            &self.signature_timer,
+            &self.decor_timer,
+        }) |t| {
+            if (t.* != 0) _ = c.g_source_remove(t.*);
+            t.* = 0;
         }
-        if (self.completion_timer != 0) {
-            _ = c.g_source_remove(self.completion_timer);
-            self.completion_timer = 0;
-        }
+    }
+
+    /// Every decoration the server produced is void: the document moved
+    /// under it, or the connection went away.
+    pub fn dropDecorations(self: *TabState) void {
+        self.hints.clear();
+        self.sem_data.reset();
+        self.sem_spans.clearRetainingCapacity();
+        self.sem_generation +%= 1;
+        self.sem_revision = 0;
+        self.sem_stale = true;
     }
 
     /// Document observer slot 2: queue the change for didChange AND
@@ -173,7 +238,21 @@ pub const Conn = struct {
             .on_response = onResponse,
             .on_notification = onNotification,
             .on_state = onState,
+            .on_apply_edit = onApplyEdit,
         };
+    }
+
+    /// The server asked us to write a `WorkspaceEdit` — how a code
+    /// action that carries only a `command` gets its work done.
+    fn onApplyEdit(ctx: *anyopaque, params: std.json.Value) bool {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (self.closing) return false;
+        const edit = switch (params) {
+            .object => |o| o.get("edit") orelse std.json.Value.null,
+            else => std.json.Value.null,
+        };
+        const r = self.mgr.applyWorkspaceEdit(self, edit);
+        return r.touched > 0;
     }
 
     fn onResponse(ctx: *anyopaque, req: session.Request, env: rpc.Envelope) void {
@@ -361,7 +440,7 @@ pub const Conn = struct {
 // Popup list (completion / locations / symbols)
 // ======================================================================
 
-const Mode = enum { none, completion, locations, symbols };
+const Mode = enum { none, completion, locations, symbols, actions };
 
 const Item = struct {
     /// Row label, owned.
@@ -436,6 +515,32 @@ const HoverPopup = struct {
     popover: ?*c.GtkWidget = null,
     label: ?*c.GtkLabel = null,
     open: bool = false,
+    /// Point the popover HERE instead of at the caret — a dwell hover
+    /// describes what is under the pointer, so anchoring it to the
+    /// caret would put the answer next to unrelated text.
+    at: ?c.GdkRectangle = null,
+};
+
+/// Signature help. Its own popover rather than a mode of the list,
+/// because it coexists with the completion list (VS Code shows both)
+/// and must therefore be able to be open at the same time.
+///
+/// Every label in it is single-line and ellipsized with a fixed
+/// `max_width_chars`, and the whole popover carries a fixed width
+/// request. That is not cosmetic: a MAPPED popover whose minimum grows
+/// is popped down by GTK, and this widget's content changes on nearly
+/// every keystroke (see the invariant on `ensurePopup`).
+const SigPopup = struct {
+    mgr: *Manager,
+    popover: ?*c.GtkWidget = null,
+    /// "1/2  foo(a: int, b: int)".
+    label: ?*c.GtkLabel = null,
+    /// The active parameter's documentation, or the signature's.
+    doc_label: ?*c.GtkLabel = null,
+    open: bool = false,
+    /// Byte offset the current help was requested at; the caret moving
+    /// BEFORE it means the call being described is gone.
+    anchor: usize = 0,
 };
 
 // ======================================================================
@@ -448,24 +553,44 @@ pub const Manager = struct {
     conns: std.ArrayList(*Conn) = .empty,
     list: ListPopup = undefined,
     hover: HoverPopup = undefined,
+    sig: SigPopup = undefined,
     /// Scratch for building JSON params.
     scratch: std.ArrayList(u8) = .empty,
+    /// Render-side view of the active tab's inlay hints. The layout
+    /// takes plain `(offset, text)` pairs and deliberately knows nothing
+    /// about `src/lsp/`, so this is where the two shapes meet. Rebuilt
+    /// once per frame for ONE tab, so it is a viewport's worth of
+    /// entries, not a document's.
+    hint_view: std.ArrayList(layout_mod.InlayHint) = .empty,
+    /// Mouse-dwell hover: the pointer's last position and the timer
+    /// that fires if it stops moving. A request is issued from the
+    /// TIMER, never from a motion event.
+    dwell_timer: c_uint = 0,
+    dwell_x: f64 = 0,
+    dwell_y: f64 = 0,
+    /// Byte offset the last dwell request was made for — a pointer
+    /// wandering within one word must not re-ask.
+    dwell_offset: usize = std.math.maxInt(usize),
 
     pub fn create(view: *EditorView) ?*Manager {
         const self = view.allocator.create(Manager) catch return null;
         self.* = .{ .view = view, .alloc = view.allocator };
         self.list = .{ .mgr = self };
         self.hover = .{ .mgr = self };
+        self.sig = .{ .mgr = self };
         return self;
     }
 
     pub fn destroy(self: *Manager) void {
+        self.cancelDwell();
         self.closePopup();
         self.closeHover();
+        self.closeSignature();
         self.unparentPopups();
         for (self.conns.items) |cn| cn.destroy();
         self.conns.deinit(self.alloc);
         self.list.deinit();
+        self.hint_view.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -475,17 +600,20 @@ pub const Manager = struct {
     /// "Finalizing GtkGLArea, but it still has children left" (the same
     /// rule menu.zig documents).
     pub fn unparentPopups(self: *Manager) void {
-        for ([_]?*c.GtkWidget{ self.list.popover, self.hover.popover }) |maybe| {
+        for ([_]?*c.GtkWidget{ self.list.popover, self.hover.popover, self.sig.popover }) |maybe| {
             const w = maybe orelse continue;
             if (c.gtk_widget_get_parent(w) != null) c.gtk_widget_unparent(w);
         }
         self.list.popover = null;
         self.hover.popover = null;
+        self.sig.popover = null;
         self.list.listbox = null;
         self.list.scroll = null;
         self.list.header = null;
         self.list.doc_label = null;
         self.hover.label = null;
+        self.sig.label = null;
+        self.sig.doc_label = null;
     }
 
     fn cfg(self: *Manager) ?*const Config {
@@ -597,8 +725,10 @@ pub const Manager = struct {
             st.sync.open = false;
             st.diags.clear();
             st.diags.published = false;
+            st.dropDecorations();
         }
         if (self.list.open and self.list.mode != .none) self.closePopup();
+        self.closeSignature();
         cn.dropWatches();
         self.view.queueRenderExternal();
     }
@@ -653,6 +783,22 @@ pub const Manager = struct {
         if (cn.sess.state == .ready) self.openDocument(tab, st);
     }
 
+    /// Send `didOpen`, but only once the document actually HAS its
+    /// content.
+    ///
+    /// A tab is created and attached to a server the moment the user
+    /// asks for a file; its bytes arrive later, on the async load
+    /// (`EditorView.newTab` -> attach, load lands -> onDocumentReplaced).
+    /// Opening here regardless is what used to make every session start
+    /// with a zero-byte `didOpen` followed by a full-replace
+    /// `didChange` — provably equivalent, and wrong: `languageId` and
+    /// the first parse are what a server does its one-time indexing
+    /// work from, and an empty file is a bad thing to hand it.
+    ///
+    /// So a LOADING tab is skipped and the load's own
+    /// `onDocumentReplaced` opens it. Nothing is stranded: that path
+    /// calls back in here, and so does `onServerReady` for a document
+    /// that finished loading before the server finished starting.
     fn openDocument(self: *Manager, tab: *ETab, st: *TabState) void {
         const cn = st.conn orelse return;
         if (st.sync.open) return;
@@ -661,6 +807,10 @@ pub const Manager = struct {
         // documents it believes are already open, and the server would
         // never see this one at all.
         if (cn.sess.state != .ready) return;
+        if (tab.loading) {
+            dbg("didOpen deferred for {s}: still loading", .{st.sync.uri});
+            return;
+        }
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.version = 1;
@@ -669,7 +819,23 @@ pub const Manager = struct {
         st.sync.open = true;
         st.sync.clearQueue();
         st.sync.needs_full = false;
+        st.dropDecorations();
         cn.pumpWrite();
+        self.armDecorations(tab);
+    }
+
+    /// The async load finished with nothing to load (a new file): there
+    /// is no document-replace to ride on, so open it from here.
+    pub fn ensureOpen(self: *Manager, tab: *ETab) void {
+        const st = tab.lsp orelse {
+            self.attachTab(tab);
+            return;
+        };
+        if (st.conn == null) {
+            self.attachTab(tab);
+            return;
+        }
+        self.openDocument(tab, st);
     }
 
     fn detachFromConn(self: *Manager, tab: *ETab, st: *TabState, cn: *Conn) void {
@@ -717,6 +883,13 @@ pub const Manager = struct {
         const st = tab.lsp orelse return;
         if (self.list.open and self.list.tab_id == tab.id) self.closePopup();
         if (self.hover.open) self.closeHover();
+        self.closeSignature();
+        self.cancelDwell();
+        // The layout borrows the decoration arrays this state owns.
+        tab.layout.sem = &.{};
+        tab.layout.sem_gen = 0;
+        tab.layout.hints = &.{};
+        tab.layout.hints_gen = 0;
         if (st.conn) |cn| self.detachFromConn(tab, st, cn);
         st.destroy();
         tab.lsp = null;
@@ -729,6 +902,12 @@ pub const Manager = struct {
     pub fn onEdited(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse return;
         if (st.conn == null or !st.sync.open) return;
+        // Hints and token spans describe bytes that just moved. They
+        // are dropped rather than mapped: a decoration in the wrong
+        // place is worse than none, and the refresh is one round trip.
+        st.sem_stale = true;
+        st.hints.valid = false;
+        self.armDecorations(tab);
         if (!st.sync.hasPendingChanges()) return;
         if (st.change_timer != 0) return;
         const ms: c_uint = if (self.cfg()) |conf| @max(10, conf.editor_lsp_debounce_ms) else 250;
@@ -782,6 +961,7 @@ pub const Manager = struct {
         st.diags.published = false;
         st.sync.clearQueue();
         st.sync.needs_full = false;
+        st.dropDecorations();
         tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
         const cn = st.conn orelse {
             self.attachTab(tab);
@@ -796,6 +976,7 @@ pub const Manager = struct {
         st.sync.version += 1;
         cn.sess.didChange(st.sync.uri, st.sync.version, &.{}, text);
         cn.pumpWrite();
+        self.armDecorations(tab);
     }
 
     // ---- inbound -------------------------------------------------------
@@ -829,7 +1010,13 @@ pub const Manager = struct {
             else => return,
         };
         var list: std.ArrayList(diagnostics.Diagnostic) = .empty;
-        defer list.deinit(self.alloc);
+        // The raw JSON is owned HERE until `Store.replace` dupes it.
+        defer {
+            for (list.items) |d| {
+                if (d.raw.len > 0) self.alloc.free(d.raw);
+            }
+            list.deinit(self.alloc);
+        }
         const enc = cn.sess.caps.encoding;
         for (arr.items) |d| {
             if (d != .object) continue;
@@ -847,13 +1034,21 @@ pub const Manager = struct {
                 .integer => |i| diagnostics.Severity.fromInt(i),
                 else => .err,
             };
+            // Kept verbatim so `codeAction`'s context can hand the
+            // server back its OWN diagnostic objects (`data` included),
+            // which is what a fixit provider matches on.
+            const raw: []u8 = serializeValue(self.alloc, d) catch &.{};
             list.append(self.alloc, .{
                 .start = offs.start,
                 .end = offs.end,
                 .severity = sev,
                 .message = @constCast(msg),
                 .source = @constCast(src),
-            }) catch break;
+                .raw = raw,
+            }) catch {
+                if (raw.len > 0) self.alloc.free(raw);
+                break;
+            };
         }
         dbg("diagnostics for {s}: {d}", .{ uri, list.items.len });
         st.diags.replace(tab.doc.revision, list.items) catch {};
@@ -869,8 +1064,14 @@ pub const Manager = struct {
             .hover => self.onHover(req, env, tab),
             .definition, .declaration, .type_definition, .references => self.onLocations(cn, req, env, tab),
             .document_symbol, .workspace_symbol => self.onSymbols(cn, req, env, tab),
-            .rename => self.onWorkspaceEdit(cn, req, env),
+            .rename => self.onRenameEdit(cn, req, env),
             .formatting, .range_formatting => self.onFormatting(req, env, tab),
+            .signature_help => self.onSignatureHelp(req, env, tab),
+            .code_action => self.onCodeActions(req, env, tab),
+            .code_action_resolve => self.onCodeActionResolved(cn, req, env),
+            .execute_command => self.onCommandDone(env),
+            .inlay_hint => self.onInlayHints(cn, req, env, tab),
+            .semantic_tokens_full, .semantic_tokens_delta => self.onSemanticTokens(cn, req, env, tab),
             else => {},
         }
     }
@@ -1103,34 +1304,49 @@ pub const Manager = struct {
             self.view.setStatusText("Server offers no hover.");
             return;
         }
+        self.hover.at = null;
         const params = self.docPosParams(r, r.tab.sels.primary().head, "") orelse return;
         self.issue(r, .hover, "textDocument/hover", params, 0);
     }
 
     fn onHover(self: *Manager, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
         const tab = maybe_tab orelse return;
+        const dwell = req.aux == HOVER_DWELL_AUX;
         if (env.has_error or tab.doc.revision != req.revision) return;
         const text = hoverText(self.alloc, env.result) catch return;
         defer self.alloc.free(text);
         var combined: std.ArrayList(u8) = .empty;
         defer combined.deinit(self.alloc);
-        if (self.diagnosticTextAtCaret(tab)) |d| {
+        // A dwell describes what is under the POINTER; the caret's
+        // diagnostic has nothing to do with it.
+        const diag = if (dwell)
+            self.diagnosticTextAt(tab, self.dwell_offset)
+        else
+            self.diagnosticTextAtCaret(tab);
+        if (diag) |d| {
             defer self.alloc.free(d);
             combined.appendSlice(self.alloc, d) catch {};
             if (text.len > 0) combined.appendSlice(self.alloc, "\n\n") catch {};
         }
         combined.appendSlice(self.alloc, text) catch {};
         if (combined.items.len == 0) {
-            self.view.setStatusText("Nothing to show here.");
+            // A dwell that found nothing must say nothing at all: the
+            // user did not ask, they just moved the mouse.
+            if (!dwell) self.view.setStatusText("Nothing to show here.");
             return;
         }
+        if (!dwell) self.hover.at = null;
         self.showHover(combined.items);
     }
 
     /// "severity: message [source]" for the diagnostic under the caret.
     fn diagnosticTextAtCaret(self: *Manager, tab: *ETab) ?[]u8 {
+        return self.diagnosticTextAt(tab, tab.sels.primary().head);
+    }
+
+    fn diagnosticTextAt(self: *Manager, tab: *ETab, offset: usize) ?[]u8 {
         const st = tab.lsp orelse return null;
-        const d = st.diags.at(tab.sels.primary().head) orelse return null;
+        const d = st.diags.at(offset) orelse return null;
         return std.fmt.allocPrint(self.alloc, "{s}: {s}{s}{s}", .{
             d.severity.label(),
             d.message,
@@ -1441,47 +1657,68 @@ pub const Manager = struct {
         self.issue(r, .rename, "textDocument/rename", params, 0);
     }
 
-    fn onWorkspaceEdit(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
+    fn onRenameEdit(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
         _ = req;
         if (env.has_error) {
             self.view.setStatusText("Rename failed.");
             return;
         }
-        const obj = switch (env.result) {
+        if (env.result != .object) {
+            self.view.setStatusText("Rename produced no changes.");
+            return;
+        }
+        const r = self.applyWorkspaceEdit(cn, env.result);
+        var buf: [200:0]u8 = undefined;
+        const msg = if (r.skipped > 0)
+            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s); {d} not open (open them and retry).", .{ r.touched, r.skipped }) catch "Renamed."
+        else
+            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s).", .{r.touched}) catch "Renamed.";
+        self.view.setStatusText(msg);
+    }
+
+    pub const EditOutcome = struct { touched: usize = 0, skipped: usize = 0 };
+
+    /// Apply a `WorkspaceEdit`. THE cross-file applier: rename, code
+    /// actions and the server-initiated `workspace/applyEdit` all come
+    /// through here, so the one-transaction-per-document rule (and its
+    /// documented one-undo-unit-per-FILE consequence) holds for every
+    /// one of them rather than being re-derived per feature.
+    fn applyWorkspaceEdit(self: *Manager, cn: *Conn, edit: std.json.Value) EditOutcome {
+        const obj = switch (edit) {
             .object => |o| o,
-            else => {
-                self.view.setStatusText("Rename produced no changes.");
-                return;
-            },
+            else => return .{},
         };
-        var touched: usize = 0;
-        var skipped: usize = 0;
+        var out = EditOutcome{};
         // `documentChanges` (ordered, versioned) wins over `changes`
         // when both are present, per the spec.
         if (obj.get("documentChanges")) |dc| {
             if (dc == .array) {
                 for (dc.array.items) |entry| {
                     if (entry != .object) continue;
+                    // create/rename/delete file operations carry a
+                    // `kind` instead of edits. The editor never writes
+                    // files behind the user's back (the file browser is
+                    // the daemon's job), so they are counted as skipped
+                    // rather than silently ignored.
+                    if (entry.object.get("kind") != null) {
+                        out.skipped += 1;
+                        continue;
+                    }
                     const td = entry.object.get("textDocument") orelse continue;
                     const uri = strOf(if (td == .object) td.object.get("uri") else null) orelse continue;
                     const edits = entry.object.get("edits") orelse continue;
-                    if (self.applyEditsToUri(cn, uri, edits)) touched += 1 else skipped += 1;
+                    if (self.applyEditsToUri(cn, uri, edits)) out.touched += 1 else out.skipped += 1;
                 }
             }
         } else if (obj.get("changes")) |ch| {
             if (ch == .object) {
                 var it = ch.object.iterator();
                 while (it.next()) |kv| {
-                    if (self.applyEditsToUri(cn, kv.key_ptr.*, kv.value_ptr.*)) touched += 1 else skipped += 1;
+                    if (self.applyEditsToUri(cn, kv.key_ptr.*, kv.value_ptr.*)) out.touched += 1 else out.skipped += 1;
                 }
             }
         }
-        var buf: [200:0]u8 = undefined;
-        const msg = if (skipped > 0)
-            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s); {d} not open (open them and retry).", .{ touched, skipped }) catch "Renamed."
-        else
-            std.fmt.bufPrintZ(&buf, "Renamed in {d} file(s).", .{touched}) catch "Renamed.";
-        self.view.setStatusText(msg);
+        return out;
     }
 
     /// Apply a `TextEdit[]` to the tab holding `uri`, as ONE
@@ -1602,6 +1839,627 @@ pub const Manager = struct {
             self.view.setStatusText("Formatted.");
         }
     }
+
+    // ---- signature help --------------------------------------------------------
+
+    /// Ask for signature help at the caret.
+    ///
+    /// `trigger` is 1 (invoked by the user), 2 (a trigger character was
+    /// typed) or 3 (the popup was already open and is being refreshed).
+    /// Servers use it: clangd will not offer help for kind 2 unless the
+    /// character it saw is really one of its triggers.
+    pub fn requestSignatureHelp(self: *Manager, explicit: bool, trigger: u8, ch: u8) void {
+        if (!self.signatureEnabled()) return;
+        const r = if (explicit) self.ready("signature help") orelse return else blk: {
+            break :blk self.quietReady() orelse return;
+        };
+        if (!r.cn.sess.caps.signature_help) {
+            if (explicit) self.view.setStatusText("Server offers no signature help.");
+            return;
+        }
+        const caret = r.tab.sels.primary().head;
+        var extra: [160]u8 = undefined;
+        const ctx = if (trigger == 2 and ch >= 0x20 and ch < 0x7F)
+            std.fmt.bufPrint(
+                &extra,
+                ",\"context\":{{\"triggerKind\":2,\"triggerCharacter\":\"{c}\",\"isRetrigger\":{s}}}",
+                .{ ch, if (self.sig.open) "true" else "false" },
+            ) catch ""
+        else
+            std.fmt.bufPrint(
+                &extra,
+                ",\"context\":{{\"triggerKind\":{d},\"isRetrigger\":{s}}}",
+                .{ trigger, if (self.sig.open) "true" else "false" },
+            ) catch "";
+        const params = self.docPosParams(r, caret, ctx) orelse return;
+        self.sig.anchor = caret;
+        self.issue(r, .signature_help, "textDocument/signatureHelp", params, 0);
+    }
+
+    fn onSignatureHelp(self: *Manager, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const tab = maybe_tab orelse return;
+        if (env.has_error or tab.doc.revision != req.revision) {
+            // A stale answer must not leave a signature on screen that
+            // describes text the user has already replaced.
+            self.closeSignature();
+            return;
+        }
+        const obj = switch (env.result) {
+            .object => |o| o,
+            else => return self.closeSignature(),
+        };
+        const sigs = switch (obj.get("signatures") orelse std.json.Value.null) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+        if (sigs.len == 0) return self.closeSignature();
+        const active_sig: usize = @min(intOf(obj.get("activeSignature")), sigs.len - 1);
+        const sig = sigs[active_sig];
+        if (sig != .object) return self.closeSignature();
+        const label = strOf(sig.object.get("label")) orelse return self.closeSignature();
+
+        // The active parameter is per-signature in 3.17 and falls back
+        // to the top-level one, which is what every 3.16 server sends.
+        const params_arr = switch (sig.object.get("parameters") orelse std.json.Value.null) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+        const active_param: usize = if (sig.object.get("activeParameter")) |ap|
+            intOf(ap)
+        else
+            intOf(obj.get("activeParameter"));
+
+        var head: std.ArrayList(u8) = .empty;
+        defer head.deinit(self.alloc);
+        if (sigs.len > 1) head.print(self.alloc, "{d}/{d}  ", .{ active_sig + 1, sigs.len }) catch {};
+        head.appendSlice(self.alloc, label) catch {};
+
+        // The parameter's own text, so the popup says WHICH argument the
+        // caret is on even though the label cannot be styled inline.
+        var detail: std.ArrayList(u8) = .empty;
+        defer detail.deinit(self.alloc);
+        if (active_param < params_arr.len and params_arr[active_param] == .object) {
+            const po = params_arr[active_param].object;
+            if (parameterLabel(label, po.get("label") orelse .null)) |pl| {
+                detail.print(self.alloc, "{s}", .{pl}) catch {};
+            }
+            if (po.get("documentation")) |d| {
+                const txt = hoverText(self.alloc, d) catch &.{};
+                defer if (txt.len > 0) self.alloc.free(txt);
+                if (txt.len > 0) {
+                    if (detail.items.len > 0) detail.appendSlice(self.alloc, " — ") catch {};
+                    detail.appendSlice(self.alloc, firstLine(txt)) catch {};
+                }
+            }
+        }
+        if (detail.items.len == 0) {
+            if (sig.object.get("documentation")) |d| {
+                const txt = hoverText(self.alloc, d) catch &.{};
+                defer if (txt.len > 0) self.alloc.free(txt);
+                detail.appendSlice(self.alloc, firstLine(txt)) catch {};
+            }
+        }
+        self.showSignature(head.items, detail.items);
+    }
+
+    fn signatureEnabled(self: *Manager) bool {
+        const conf = self.cfg() orelse return false;
+        return conf.editor_lsp_signature_help;
+    }
+
+    /// The active tab's live server WITHOUT the "no server" report — for
+    /// the paths a user did not explicitly ask for (typing a trigger
+    /// character, a dwell, a viewport refresh).
+    fn quietReady(self: *Manager) ?Ready {
+        const tab = self.view.activeTab() orelse return null;
+        const st = tab.lsp orelse return null;
+        const cn = st.conn orelse return null;
+        if (cn.sess.state != .ready) return null;
+        self.flushChanges(tab);
+        return .{ .tab = tab, .st = st, .cn = cn };
+    }
+
+    // ---- code actions ----------------------------------------------------------
+
+    /// Quick fixes and refactorings for the selection, or for the caret
+    /// when there is none.
+    pub fn requestCodeActions(self: *Manager) void {
+        const r = self.ready("code actions") orelse return;
+        if (!r.cn.sess.caps.code_action) {
+            self.view.setStatusText("Server offers no code actions.");
+            return;
+        }
+        const sel = r.tab.sels.primary();
+        const enc = r.cn.sess.caps.encoding;
+        const s = pos.offsetToPosition(&r.tab.doc.rope, sel.start(), enc);
+        const e = pos.offsetToPosition(&r.tab.doc.rope, sel.end(), enc);
+        self.scratch.clearRetainingCapacity();
+        self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
+        session.appendJsonString(self.alloc, &self.scratch, r.st.sync.uri) catch return;
+        self.scratch.print(
+            self.alloc,
+            "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"context\":{{\"diagnostics\":[",
+            .{ s.line, s.character, e.line, e.character },
+        ) catch return;
+        // Only the diagnostics OVERLAPPING the range, handed back
+        // verbatim — a server matches its fixits on its own objects.
+        var n: usize = 0;
+        const lo = sel.start();
+        const hi = @max(sel.end(), sel.start() + 1);
+        for (r.st.diags.items.items) |d| {
+            if (d.raw.len == 0) continue;
+            const d_end = @max(d.end, d.start + 1);
+            if (d_end <= lo or d.start >= hi) continue;
+            if (n > 0) self.scratch.append(self.alloc, ',') catch return;
+            self.scratch.appendSlice(self.alloc, d.raw) catch return;
+            n += 1;
+        }
+        self.scratch.appendSlice(self.alloc, "]}}") catch return;
+        dbg("codeAction at {d}..{d} with {d} diagnostic(s)", .{ sel.start(), sel.end(), n });
+        self.issue(r, .code_action, "textDocument/codeAction", self.scratch.items, 0);
+    }
+
+    fn onCodeActions(self: *Manager, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const tab = maybe_tab orelse return;
+        if (env.has_error) {
+            self.view.setStatusText("The server could not answer that.");
+            return;
+        }
+        // The actions' edits are in this revision's coordinates.
+        if (tab.doc.revision != req.revision) {
+            self.view.setStatusText("Document changed; ask again.");
+            return;
+        }
+        const arr = switch (env.result) {
+            .array => |a| a.items,
+            else => &.{},
+        };
+        self.list.clearItems();
+        self.list.mode = .actions;
+        self.list.tab_id = req.tab_id;
+        self.list.revision = req.revision;
+        self.list.filter.clearRetainingCapacity();
+        self.list.sel = 0;
+        for (arr) |a| {
+            if (self.list.items.items.len >= MAX_ROWS) break;
+            if (a != .object) continue;
+            // A bare Command (no `title` at the action level is
+            // impossible; a Command has one too) and a CodeAction both
+            // land here — `applyCodeAction` tells them apart.
+            const title = strOf(a.object.get("title")) orelse continue;
+            const kind = strOf(a.object.get("kind")) orelse "";
+            const raw = serializeValue(self.alloc, a) catch continue;
+            const label = self.alloc.dupe(u8, title) catch {
+                self.alloc.free(raw);
+                continue;
+            };
+            const detail = self.alloc.dupe(u8, kind) catch {
+                self.alloc.free(raw);
+                self.alloc.free(label);
+                continue;
+            };
+            self.list.items.append(self.alloc, .{
+                .label = label,
+                .detail = detail,
+                .payload = &.{},
+                .raw = raw,
+            }) catch {
+                self.alloc.free(raw);
+                self.alloc.free(label);
+                self.alloc.free(detail);
+                break;
+            };
+        }
+        if (self.list.items.items.len == 0) {
+            self.list.mode = .none;
+            self.view.setStatusText("No code actions here.");
+            return;
+        }
+        self.applyFilter();
+        self.showPopup();
+    }
+
+    /// Run the selected action. Three shapes exist and all three occur
+    /// in the wild:
+    ///   * an inline `edit` — applied straight away;
+    ///   * a `command` — sent to `workspace/executeCommand`, and the
+    ///     server usually answers by asking US to apply an edit
+    ///     (`workspace/applyEdit`, see `Conn.onApplyEdit`);
+    ///   * neither, because the server computes the edit lazily — then
+    ///     `codeAction/resolve` fills it in first.
+    fn acceptCodeAction(self: *Manager) void {
+        if (self.list.shown.items.len == 0) return self.closePopup();
+        const idx = self.list.shown.items[self.list.sel];
+        const raw = self.alloc.dupe(u8, self.list.items.items[idx].raw) catch return self.closePopup();
+        defer self.alloc.free(raw);
+        self.closePopup();
+        const r = self.quietReady() orelse return;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{}) catch return;
+        defer parsed.deinit();
+        self.runCodeAction(r.cn, parsed.value, raw);
+    }
+
+    fn runCodeAction(self: *Manager, cn: *Conn, action: std.json.Value, raw: []const u8) void {
+        if (action != .object) return;
+        const o = action.object;
+        var did_something = false;
+        if (o.get("edit")) |edit| {
+            const res = self.applyWorkspaceEdit(cn, edit);
+            did_something = res.touched > 0 or res.skipped > 0;
+            self.reportEditOutcome(res);
+        }
+        if (o.get("command")) |cmd| {
+            self.executeCommand(cn, cmd);
+            return;
+        }
+        if (did_something) return;
+        // Neither: the server owes us a resolve. Anything without a
+        // `title` is not a CodeAction and cannot be resolved.
+        if (!cn.sess.caps.code_action_resolve) {
+            self.view.setStatusText("The server offered an action with nothing to apply.");
+            return;
+        }
+        const tab = self.view.activeTab() orelse return;
+        _ = cn.sess.sendRequest(.code_action_resolve, "codeAction/resolve", raw, .{
+            .id = 0,
+            .kind = .code_action_resolve,
+            .tab_id = tab.id,
+            .revision = tab.doc.revision,
+        });
+        cn.pumpWrite();
+    }
+
+    fn onCodeActionResolved(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
+        _ = req;
+        if (env.has_error) {
+            self.view.setStatusText("The server could not resolve that action.");
+            return;
+        }
+        const o = switch (env.result) {
+            .object => |obj| obj,
+            else => return,
+        };
+        if (o.get("edit")) |edit| {
+            self.reportEditOutcome(self.applyWorkspaceEdit(cn, edit));
+            return;
+        }
+        if (o.get("command")) |cmd| {
+            self.executeCommand(cn, cmd);
+            return;
+        }
+        self.view.setStatusText("The resolved action had nothing to apply.");
+    }
+
+    fn executeCommand(self: *Manager, cn: *Conn, cmd: std.json.Value) void {
+        // A `command` is either a Command object or (on a bare Command
+        // action) the action itself with `command` as a string.
+        const name = switch (cmd) {
+            .string => |s| s,
+            .object => |o| strOf(o.get("command")) orelse return,
+            else => return,
+        };
+        const args: ?std.json.Value = if (cmd == .object) cmd.object.get("arguments") else null;
+        self.scratch.clearRetainingCapacity();
+        self.scratch.appendSlice(self.alloc, "{\"command\":") catch return;
+        session.appendJsonString(self.alloc, &self.scratch, name) catch return;
+        if (args) |a| {
+            const txt = serializeValue(self.alloc, a) catch return;
+            defer self.alloc.free(txt);
+            self.scratch.appendSlice(self.alloc, ",\"arguments\":") catch return;
+            self.scratch.appendSlice(self.alloc, txt) catch return;
+        }
+        self.scratch.appendSlice(self.alloc, "}") catch return;
+        const tab = self.view.activeTab() orelse return;
+        dbg("executeCommand {s}", .{name});
+        _ = cn.sess.sendRequest(.execute_command, "workspace/executeCommand", self.scratch.items, .{
+            .id = 0,
+            .kind = .execute_command,
+            .tab_id = tab.id,
+            .revision = tab.doc.revision,
+        });
+        cn.pumpWrite();
+    }
+
+    /// A command's own result is almost always null; the work arrived as
+    /// a `workspace/applyEdit` before this landed.
+    fn onCommandDone(self: *Manager, env: rpc.Envelope) void {
+        if (env.has_error) self.view.setStatusText("The command failed.");
+    }
+
+    fn reportEditOutcome(self: *Manager, r: EditOutcome) void {
+        var buf: [200:0]u8 = undefined;
+        const msg = if (r.skipped > 0)
+            std.fmt.bufPrintZ(
+                &buf,
+                "Applied in {d} file(s); {d} skipped (not open, or a file operation).",
+                .{ r.touched, r.skipped },
+            ) catch "Applied."
+        else
+            std.fmt.bufPrintZ(&buf, "Applied in {d} file(s).", .{r.touched}) catch "Applied.";
+        self.view.setStatusText(msg);
+    }
+
+    // ---- inlay hints -----------------------------------------------------------
+
+    /// Arm the debounced viewport refresh for hints and tokens. Every
+    /// path that invalidates either (an edit, a scroll, an open) calls
+    /// this rather than requesting directly, so a burst of keystrokes or
+    /// a flung scrollbar costs ONE round trip.
+    pub fn armDecorations(self: *Manager, tab: *ETab) void {
+        const st = tab.lsp orelse return;
+        if (st.conn == null) return;
+        if (st.decor_timer != 0) return;
+        const ctx = TabCtx.create(self, tab) orelse return;
+        st.decor_timer = c.g_timeout_add(DECOR_DEBOUNCE_MS, @ptrCast(&onDecorTimer), @ptrCast(ctx));
+    }
+
+    fn onDecorTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        const r = ctx.resolve() orelse return 0;
+        const st = r.tab.lsp orelse return 0;
+        st.decor_timer = 0;
+        r.mgr.refreshDecorations(r.tab);
+        return 0;
+    }
+
+    /// The viewport moved. Only re-asks when the visible lines have left
+    /// the window the current hints were fetched for.
+    pub fn onViewportMoved(self: *Manager) void {
+        const tab = self.view.activeTab() orelse return;
+        const st = tab.lsp orelse return;
+        if (st.conn == null) return;
+        if (!self.hintsEnabled()) return;
+        const span = self.view.visibleLineSpanPublic(tab);
+        if (st.hints.valid and st.hints.revision == tab.doc.revision and
+            st.hints.covers(@intCast(span.from), @intCast(span.to))) return;
+        self.armDecorations(tab);
+    }
+
+    fn hintsEnabled(self: *Manager) bool {
+        const conf = self.cfg() orelse return false;
+        return conf.editor_lsp_inlay_hints;
+    }
+
+    fn semanticEnabled(self: *Manager) bool {
+        const conf = self.cfg() orelse return false;
+        return conf.editor_lsp_semantic_tokens;
+    }
+
+    fn refreshDecorations(self: *Manager, tab: *ETab) void {
+        const st = tab.lsp orelse return;
+        const cn = st.conn orelse return;
+        if (cn.sess.state != .ready or !st.sync.open) return;
+        self.flushChanges(tab);
+        const r = Ready{ .tab = tab, .st = st, .cn = cn };
+
+        if (self.hintsEnabled() and cn.sess.caps.inlay_hint) {
+            const span = self.view.visibleLineSpanPublic(tab);
+            const n_lines: u32 = @intCast(tab.doc.rope.lineCount());
+            const from: u32 = @as(u32, @intCast(span.from)) -| HINT_MARGIN_LINES;
+            const to: u32 = @min(n_lines, @as(u32, @intCast(span.to)) +| HINT_MARGIN_LINES);
+            self.scratch.clearRetainingCapacity();
+            self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
+            session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return;
+            self.scratch.print(
+                self.alloc,
+                "}},\"range\":{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":0}}}}}}",
+                .{ from, to },
+            ) catch return;
+            // aux carries the window back so the answer can record what
+            // it covers without a second lookup.
+            self.issue(r, .inlay_hint, "textDocument/inlayHint", self.scratch.items, packWindow(from, to));
+        }
+
+        if (self.semanticEnabled() and cn.sess.caps.semantic_tokens and st.sem_stale) {
+            st.sem_stale = false;
+            self.scratch.clearRetainingCapacity();
+            self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
+            session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return;
+            self.scratch.appendSlice(self.alloc, "}") catch return;
+            // A delta is only possible when the server gave us a
+            // resultId for the array we are still holding.
+            const delta = cn.sess.caps.semantic_tokens_delta and
+                st.sem_data.valid and st.sem_data.result_id.len > 0;
+            if (delta) {
+                self.scratch.appendSlice(self.alloc, ",\"previousResultId\":") catch return;
+                session.appendJsonString(self.alloc, &self.scratch, st.sem_data.result_id) catch return;
+            }
+            self.scratch.appendSlice(self.alloc, "}") catch return;
+            self.issue(
+                r,
+                if (delta) .semantic_tokens_delta else .semantic_tokens_full,
+                if (delta) "textDocument/semanticTokens/full/delta" else "textDocument/semanticTokens/full",
+                self.scratch.items,
+                0,
+            );
+        }
+    }
+
+    fn onInlayHints(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const tab = maybe_tab orelse return;
+        const st = tab.lsp orelse return;
+        if (env.has_error) return;
+        // Hints describe byte positions; a moved document invalidates
+        // every one of them.
+        if (tab.doc.revision != req.revision) return;
+        const win = unpackWindow(req.aux);
+        st.hints.absorb(
+            env.result,
+            &tab.doc.rope,
+            cn.sess.caps.encoding,
+            req.revision,
+            win.from,
+            win.to,
+        ) catch return;
+        dbg("inlayHint: {d} hints for lines {d}..{d}", .{ st.hints.items.items.len, win.from, win.to });
+        self.view.queueRenderExternal();
+    }
+
+    // ---- semantic tokens -------------------------------------------------------
+
+    fn onSemanticTokens(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const tab = maybe_tab orelse return;
+        const st = tab.lsp orelse return;
+        if (env.has_error) {
+            // A refused delta (the server dropped our resultId) is
+            // normal; drop the cached array so the next request is full.
+            st.sem_data.reset();
+            st.sem_stale = true;
+            return;
+        }
+        if (tab.doc.revision != req.revision) {
+            // The array we would have spliced is no longer what the
+            // server holds either; start over rather than keep a
+            // resultId that describes text nobody has.
+            st.sem_data.reset();
+            st.sem_stale = true;
+            return;
+        }
+        const ok = if (req.kind == .semantic_tokens_delta and env.result == .object and
+            env.result.object.get("edits") != null)
+            st.sem_data.absorbDelta(env.result)
+        else
+            st.sem_data.absorbFull(env.result);
+        if (!ok) {
+            st.sem_data.reset();
+            return;
+        }
+        self.rebuildSemanticSpans(tab, st, cn);
+        self.view.queueRenderExternal();
+    }
+
+    /// Decode the packed array into document byte ranges tagged with a
+    /// highlight kind. Tokens whose type this editor has no colour for
+    /// are DROPPED rather than emitted as `.none`: `.none` would blank
+    /// out the Tree-sitter kind underneath, which is a regression, not
+    /// extra information.
+    fn rebuildSemanticSpans(self: *Manager, tab: *ETab, st: *TabState, cn: *Conn) void {
+        st.sem_spans.clearRetainingCapacity();
+        st.sem_generation +%= 1;
+        st.sem_revision = tab.doc.revision;
+        const toks = st.sem_data.decode(self.alloc) catch return;
+        defer self.alloc.free(toks);
+        const enc = cn.sess.caps.encoding;
+        const legend = &cn.sess.caps.token_types;
+        for (toks) |t| {
+            const kind = semanticKind(legend.name(t.type_index));
+            if (kind == .none) continue;
+            const start = pos.positionToOffset(&tab.doc.rope, .{ .line = t.line, .character = t.start_char }, enc);
+            const end = pos.positionToOffset(
+                &tab.doc.rope,
+                .{ .line = t.line, .character = t.start_char +| t.length },
+                enc,
+            );
+            if (end <= start) continue;
+            st.sem_spans.append(self.alloc, .{
+                .start = start,
+                .end = end,
+                .kind = @intFromEnum(kind),
+            }) catch break;
+        }
+        // The layout binary-searches these, and a server is free to send
+        // them out of order across lines.
+        std.mem.sort(layout_mod.SemSpan, st.sem_spans.items, {}, struct {
+            fn less(_: void, a: layout_mod.SemSpan, b: layout_mod.SemSpan) bool {
+                return a.start < b.start;
+            }
+        }.less);
+        dbg("semanticTokens: {d} tokens -> {d} spans", .{ toks.len, st.sem_spans.items.len });
+    }
+
+    /// Point the layout at this tab's decorations, or at nothing when
+    /// they are stale / switched off. Called once per frame, before the
+    /// frame is built: this is the ONLY place the borrow is established,
+    /// so a stale set can never be painted.
+    pub fn applyDecorations(self: *Manager, tab: *ETab) void {
+        tab.layout.sem = &.{};
+        tab.layout.sem_gen = 0;
+        tab.layout.hints = &.{};
+        tab.layout.hints_gen = 0;
+        const st = tab.lsp orelse return;
+        if (st.conn == null) return;
+        if (self.semanticEnabled() and st.sem_revision == tab.doc.revision and st.sem_spans.items.len > 0) {
+            tab.layout.sem = st.sem_spans.items;
+            tab.layout.sem_gen = st.sem_generation;
+        }
+        if (self.hintsEnabled() and st.hints.valid and st.hints.revision == tab.doc.revision and
+            st.hints.items.items.len > 0)
+        {
+            // inlay.Hint and layout.InlayHint are the same two fields;
+            // the render side deliberately does not import lsp/, so the
+            // handful of hints is copied into the view's scratch list.
+            self.hint_view.clearRetainingCapacity();
+            for (st.hints.items.items) |h| {
+                self.hint_view.append(self.alloc, .{ .offset = h.offset, .text = h.text }) catch break;
+            }
+            tab.layout.hints = self.hint_view.items;
+            tab.layout.hints_gen = st.hints.generation;
+        }
+    }
+
+    // ---- mouse-dwell hover -----------------------------------------------------
+
+    /// The pointer moved. Restarts the dwell timer; NEVER issues a
+    /// request — a motion event stream is hundreds of events per second
+    /// and one request each would flood the server.
+    pub fn onPointerMoved(self: *Manager, x: f64, y: f64) void {
+        self.dwell_x = x;
+        self.dwell_y = y;
+        if (self.hover.open and self.hover.at != null) self.closeHover();
+        const ms = self.dwellMs();
+        if (ms == 0) return;
+        if (self.dwell_timer != 0) {
+            _ = c.g_source_remove(self.dwell_timer);
+            self.dwell_timer = 0;
+        }
+        // A dwell is only interesting where a server could answer.
+        const tab = self.view.activeTab() orelse return;
+        const st = tab.lsp orelse return;
+        const cn = st.conn orelse return;
+        if (cn.sess.state != .ready or !cn.sess.caps.hover) return;
+        self.dwell_timer = c.g_timeout_add(ms, @ptrCast(&onDwellTimer), @ptrCast(self));
+    }
+
+    fn dwellMs(self: *Manager) c_uint {
+        const conf = self.cfg() orelse return 0;
+        if (!conf.editor_lsp) return 0;
+        return conf.editor_lsp_hover_delay_ms;
+    }
+
+    /// Any key, scroll, click or teardown kills a pending dwell.
+    pub fn cancelDwell(self: *Manager) void {
+        if (self.dwell_timer != 0) {
+            _ = c.g_source_remove(self.dwell_timer);
+            self.dwell_timer = 0;
+        }
+        self.dwell_offset = std.math.maxInt(usize);
+        if (self.hover.open and self.hover.at != null) self.closeHover();
+    }
+
+    fn onDwellTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Manager = @ptrCast(@alignCast(user.?));
+        self.dwell_timer = 0;
+        if (self.view.widgets_dead) return 0;
+        // Not while a list is up: the popup would be under the pointer
+        // and the two would fight for the same screen corner.
+        if (self.list.open) return 0;
+        const tab = self.view.activeTab() orelse return 0;
+        const r = self.quietReady() orelse return 0;
+        if (!r.cn.sess.caps.hover) return 0;
+        const off = self.view.offsetAtPointPublic(tab, self.dwell_x, self.dwell_y) orelse return 0;
+        if (off == self.dwell_offset) return 0;
+        self.dwell_offset = off;
+        const params = self.docPosParams(r, off, "") orelse return 0;
+        self.hover.at = self.view.pointRectPx(self.dwell_x, self.dwell_y);
+        self.issue(r, .hover, "textDocument/hover", params, HOVER_DWELL_AUX);
+        return 0;
+    }
+
+    /// `Request.aux` marking a hover that came from the pointer rather
+    /// than from Ctrl+I — it is anchored at the pointer, and it stays
+    /// silent when there is nothing to say.
+    pub const HOVER_DWELL_AUX: u64 = 1;
 
     // ---- diagnostics navigation ----------------------------------------------
 
@@ -1802,6 +2660,7 @@ pub const Manager = struct {
             .completion => "Completion",
             .locations => "Results",
             .symbols => "Symbols",
+            .actions => "Code actions",
             .none => "",
         };
         var full: [512:0]u8 = undefined;
@@ -1868,9 +2727,77 @@ pub const Manager = struct {
         const z = self.alloc.dupeZ(u8, text[0..@min(text.len, 4000)]) catch return;
         defer self.alloc.free(z);
         c.gtk_label_set_text(self.hover.label.?, z.ptr);
-        self.positionAtCaret(self.hover.popover.?);
+        if (self.hover.at) |rect| {
+            var r = rect;
+            c.gtk_popover_set_pointing_to(@ptrCast(self.hover.popover.?), &r);
+        } else {
+            self.positionAtCaret(self.hover.popover.?);
+        }
         c.gtk_popover_popup(@ptrCast(self.hover.popover.?));
         self.hover.open = true;
+    }
+
+    // ---- signature popup -------------------------------------------------------
+
+    /// Same minimum-size invariant as `ensurePopup`: both labels are
+    /// single-line, ellipsized, capped in characters, and start with a
+    /// space placeholder so their height is reserved from the first
+    /// present. Signature help updates on nearly every keystroke, so a
+    /// growable label here would pop the widget down mid-typing.
+    fn ensureSignature(self: *Manager) bool {
+        if (self.sig.popover != null) return true;
+        const pop = c.gtk_popover_new() orelse return false;
+        c.gtk_widget_set_parent(pop, @ptrCast(self.view.area));
+        c.gtk_popover_set_has_arrow(@ptrCast(pop), 0);
+        c.gtk_popover_set_autohide(@ptrCast(pop), 0);
+        // ABOVE the caret: the completion list lives below it, and the
+        // two are routinely open at the same time.
+        c.gtk_popover_set_position(@ptrCast(pop), c.GTK_POS_TOP);
+        c.gtk_widget_set_can_focus(pop, 0);
+
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        c.gtk_widget_set_size_request(box, SIG_W, -1);
+        const label = c.gtk_label_new(" ");
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(label), 72);
+        c.gtk_box_append(@ptrCast(box), label);
+        const doc = c.gtk_label_new(" ");
+        c.gtk_label_set_xalign(@ptrCast(doc), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(doc), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(doc), 72);
+        c.gtk_widget_add_css_class(doc, "dim-label");
+        c.gtk_box_append(@ptrCast(box), doc);
+        c.gtk_popover_set_child(@ptrCast(pop), box);
+
+        self.sig.popover = pop;
+        self.sig.label = @ptrCast(label);
+        self.sig.doc_label = @ptrCast(doc);
+        return true;
+    }
+
+    fn showSignature(self: *Manager, label: []const u8, detail: []const u8) void {
+        if (self.view.widgets_dead) return;
+        if (!self.ensureSignature()) return;
+        var lbuf: [1024:0]u8 = undefined;
+        const lz = std.fmt.bufPrintZ(&lbuf, "{s}", .{label[0..@min(label.len, 900)]}) catch return;
+        c.gtk_label_set_text(self.sig.label.?, if (lz.len > 0) lz.ptr else " ");
+        var dbuf: [1024:0]u8 = undefined;
+        const dz = std.fmt.bufPrintZ(&dbuf, "{s}", .{detail[0..@min(detail.len, 900)]}) catch return;
+        c.gtk_label_set_text(self.sig.doc_label.?, if (dz.len > 0) dz.ptr else " ");
+        self.positionAtCaret(self.sig.popover.?);
+        if (!self.sig.open) c.gtk_popover_popup(@ptrCast(self.sig.popover.?));
+        self.sig.open = true;
+    }
+
+    pub fn closeSignature(self: *Manager) void {
+        if (!self.sig.open) return;
+        self.sig.open = false;
+        if (self.sig.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
+    }
+
+    pub fn signatureOpen(self: *const Manager) bool {
+        return self.sig.open;
     }
 
     pub fn closeHover(self: *Manager) void {
@@ -1884,6 +2811,13 @@ pub const Manager = struct {
     /// Keys the popup claims while it is open. Returns true when the
     /// editor must NOT see the key.
     pub fn handleKey(self: *Manager, keyval: c_uint, ctrl: bool) bool {
+        // Any key is deliberate pointer-free activity: a dwell hover
+        // must not appear over text the user is typing.
+        self.cancelDwell();
+        if (keyval == c.GDK_KEY_Escape and self.sig.open and !self.list.open and !self.hover.open) {
+            self.closeSignature();
+            return true;
+        }
         if (self.hover.open) {
             // Any key dismisses hover, and only Escape is swallowed.
             self.closeHover();
@@ -1916,7 +2850,7 @@ pub const Manager = struct {
                 return true;
             },
             c.GDK_KEY_BackSpace => {
-                if (self.list.mode == .symbols or self.list.mode == .locations) {
+                if (self.list.mode != .completion and self.list.mode != .none) {
                     if (self.list.filter.items.len > 0) {
                         _ = self.list.filter.pop();
                         self.applyFilter();
@@ -1971,6 +2905,7 @@ pub const Manager = struct {
     fn accept(self: *Manager) void {
         switch (self.list.mode) {
             .completion => self.acceptCompletion(),
+            .actions => self.acceptCodeAction(),
             .locations, .symbols => {
                 if (self.list.shown.items.len == 0) return self.closePopup();
                 const it = self.list.items.items[self.list.shown.items[self.list.sel]];
@@ -1988,6 +2923,8 @@ pub const Manager = struct {
     /// The caret moved or the document changed under an open popup.
     pub fn onCaretMoved(self: *Manager) void {
         self.closeHover();
+        self.cancelDwell();
+        self.trackSignature();
         if (!self.list.open) return;
         if (self.list.mode != .completion) return;
         const tab = self.view.activeTab() orelse return self.closePopup();
@@ -2012,15 +2949,55 @@ pub const Manager = struct {
         return 0;
     }
 
-    /// A trigger character was just typed: pop the list open.
+    /// Follow the caret while signature help is open.
+    ///
+    /// The re-entrancy here is the hard part: the answer that updates
+    /// the active parameter arrives WHILE the user keeps typing, so
+    /// every re-request is debounced, supersedes its predecessor
+    /// (`issue` cancels the in-flight one of the same kind) and is
+    /// dropped on arrival if the revision moved. The popup is closed
+    /// outright as soon as the caret walks back past the offset the
+    /// current help was requested at, because that call is gone.
+    fn trackSignature(self: *Manager) void {
+        if (!self.sig.open) return;
+        const tab = self.view.activeTab() orelse return self.closeSignature();
+        const st = tab.lsp orelse return self.closeSignature();
+        if (tab.sels.primary().head < self.sig.anchor -| 1) return self.closeSignature();
+        if (st.signature_timer != 0) return;
+        const ctx = TabCtx.create(self, tab) orelse return;
+        st.signature_timer = c.g_timeout_add(SIGNATURE_DEBOUNCE_MS, @ptrCast(&onSignatureTimer), @ptrCast(ctx));
+    }
+
+    fn onSignatureTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        const r = ctx.resolve() orelse return 0;
+        const st = r.tab.lsp orelse return 0;
+        st.signature_timer = 0;
+        if (!r.mgr.sig.open) return 0;
+        r.mgr.requestSignatureHelp(false, 3, 0);
+        return 0;
+    }
+
+    /// A character was just committed. A completion trigger pops the
+    /// list; a signature trigger (or a retrigger while help is up) asks
+    /// for signature help. They are independent: `(` opens both in
+    /// every editor that has both.
     pub fn maybeTrigger(self: *Manager, text: []const u8) void {
         if (text.len != 1) return;
         const tab = self.view.activeTab() orelse return;
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
         if (cn.sess.state != .ready) return;
-        if (!cn.sess.caps.isTrigger(text[0])) return;
-        self.requestCompletion(false);
+        const ch = text[0];
+        if (cn.sess.caps.signature_help and self.signatureEnabled()) {
+            if (cn.sess.caps.isSignatureTrigger(ch) or
+                (self.sig.open and cn.sess.caps.isSignatureRetrigger(ch)))
+            {
+                self.requestSignatureHelp(false, 2, ch);
+            }
+        }
+        if (cn.sess.caps.isTrigger(ch)) self.requestCompletion(false);
     }
 };
 
@@ -2055,6 +3032,107 @@ const TabCtx = struct {
 // ======================================================================
 // Helpers
 // ======================================================================
+
+/// Two u32 line numbers in one `Request.aux` slot, so an `inlayHint`
+/// answer knows the window it was asked for without a second lookup.
+fn packWindow(from: u32, to: u32) u64 {
+    return (@as(u64, from) << 32) | @as(u64, to);
+}
+
+fn unpackWindow(v: u64) struct { from: u32, to: u32 } {
+    return .{ .from = @intCast(v >> 32), .to = @truncate(v) };
+}
+
+/// LSP semantic token type name -> the editor's highlight kind.
+///
+/// `.none` means "we have no colour for this", and the caller DROPS
+/// such a token rather than emitting it: painting `.none` would erase
+/// the Tree-sitter kind underneath, which is the opposite of the
+/// documented precedence (semantic tokens augment the grammar's work,
+/// they do not replace it).
+fn semanticKind(name: []const u8) syntax.Kind {
+    const table = .{
+        .{ "namespace", syntax.Kind.namespace },
+        .{ "type", syntax.Kind.type },
+        .{ "class", syntax.Kind.type },
+        .{ "enum", syntax.Kind.type },
+        .{ "interface", syntax.Kind.type },
+        .{ "struct", syntax.Kind.type },
+        .{ "typeParameter", syntax.Kind.type },
+        .{ "parameter", syntax.Kind.variable },
+        .{ "variable", syntax.Kind.variable },
+        .{ "property", syntax.Kind.property },
+        .{ "event", syntax.Kind.property },
+        .{ "enumMember", syntax.Kind.constant },
+        .{ "function", syntax.Kind.function },
+        .{ "method", syntax.Kind.function },
+        .{ "macro", syntax.Kind.attribute },
+        .{ "decorator", syntax.Kind.attribute },
+        .{ "keyword", syntax.Kind.keyword },
+        .{ "modifier", syntax.Kind.keyword },
+        .{ "comment", syntax.Kind.comment },
+        .{ "string", syntax.Kind.string },
+        .{ "regexp", syntax.Kind.string },
+        .{ "number", syntax.Kind.number },
+        .{ "operator", syntax.Kind.operator },
+        .{ "label", syntax.Kind.label },
+        // clangd's non-standard additions.
+        .{ "concept", syntax.Kind.type },
+        .{ "bracket", syntax.Kind.punctuation },
+    };
+    inline for (table) |row| {
+        if (std.mem.eql(u8, name, row[0])) return row[1];
+    }
+    return .none;
+}
+
+/// A `ParameterInformation.label`: a string, or a `[start, end]` pair of
+/// UTF-16 offsets INTO THE SIGNATURE LABEL (not into the document, so
+/// no rope is involved — but they are still utf-16 units, so the slice
+/// is taken by counting code units, not bytes).
+fn parameterLabel(sig_label: []const u8, v: std.json.Value) ?[]const u8 {
+    switch (v) {
+        .string => |s| return s,
+        .array => |a| {
+            if (a.items.len < 2) return null;
+            const s = utf16ToByte(sig_label, jsonUsize(a.items[0]));
+            const e = utf16ToByte(sig_label, jsonUsize(a.items[1]));
+            if (e <= s or e > sig_label.len) return null;
+            return sig_label[s..e];
+        },
+        else => return null,
+    }
+}
+
+/// Byte index of UTF-16 code unit `units` within `s`, clamped.
+fn utf16ToByte(s: []const u8, units: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and n < units) {
+        const b = s[i];
+        const len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+        n += if (b >= 0xF0) 2 else 1;
+        i += @min(len, s.len - i);
+    }
+    return i;
+}
+
+fn jsonUsize(v: std.json.Value) usize {
+    return switch (v) {
+        .integer => |i| if (i < 0) 0 else @intCast(i),
+        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        else => 0,
+    };
+}
+
+fn intOf(v: ?std.json.Value) usize {
+    const val = v orelse return 0;
+    return jsonUsize(val);
+}
+
+fn firstLine(s: []const u8) []const u8 {
+    return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
+}
 
 fn strOf(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
