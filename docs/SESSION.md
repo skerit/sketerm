@@ -13153,3 +13153,84 @@ and the clipboard checked, Shift+F10 opens the same menu, and Close
 Other Tabs really closes the others. Reverting either consumer's
 `tab_menu` assignment, or the strip key controller, fails exactly the
 matching assertion.
+
+## MCP app observability: measuring instead of sampling (2026-08-06)
+
+Field feedback from an assistant driving a ported DOS-era game through
+these tools reported five places where the harness cost time or led to
+a wrong conclusion. All five are addressed.
+
+**app_watch** — there was no primitive for "did anything happen in the
+next N seconds". `screenshot_app` samples an instant, `app_wait` counts
+frames; neither answers it. The reporter published a false bug report
+off that gap: a menu row was called dead after two investigations, when
+the action actually had a ~5.7s pre-roll followed by a 6s clip, so every
+capture landed before or after it. `App.watchChanges` samples
+continuously and returns a change timeline with inline thumbnails of the
+first few change points, encoded after the run from stashed pixels so
+the encode cannot perturb the sampling. Zero changes with frames still
+committing is reported as a measurement; zero frames is a separate
+verdict.
+
+**app_backtrace** — a crash dumps a full report into `app_log`; a hang
+gave nothing, because `gdb -p` against a daemon-hosted app returns
+EPERM: Yama's default `ptrace_scope=1` only lets an ancestor trace, and
+the app's ancestor is the daemon, not the caller. Both halves now live
+in the daemon. `SpawnReq.debuggable` makes the forked child call
+`prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` before exec (verified to
+survive execve — which is why it cannot be granted retroactively to an
+app that has already hung); appdrive sets it for every app it launches,
+interactive panes never do. New `app_debug`/`app_debug_data` frames run
+gdb as a daemon subprocess whose pipe is polled per tick like a file
+job, so a multi-second attach never stalls the poll loop. Jobs resolve
+back to their client by ID, output is capped, and a deadline SIGKILLs
+the debugger so a slow attach yields a partial dump rather than nothing.
+
+**app_hover_map** — with no accessibility tree, finding clickable things
+was pure coordinate guessing (the reporter spent a long click sequence
+failing to leave a room whose exit was a door drawn as background art).
+The sweep moves the pointer over a grid and reports which cells repaint.
+It refuses up front on an app that repaints by itself, detected with
+three pointer-still control samples, rather than answering with a map of
+noise, and an empty map says explicitly that "draws no hover feedback"
+is not "nothing here is clickable".
+
+**app_wait `min_frames`** no longer claims "NOT LIVE / it is not
+painting (frozen...)" when the app simply paints slower than the
+requested frames-per-timeout arithmetic allows. 1400 frames at 12fps
+needs ~117s; against a 115s timeout that was a false alarm frequent
+enough to train callers into ignoring the message, which is exactly the
+wrong reflex since the identical sentence is how a real freeze
+announces itself. Only zero frames makes a liveness claim now.
+
+**PostInputWait** records the window's last commit time before the input,
+so a dry wait on a window that had already been silent for seconds
+reports an app-liveness warning pointing at `app_backtrace` instead of
+leading with "it may have hit a dead area". In the field that ambiguity
+buried the first evidence of a hang. app_click also stops auto-retrying
+in that state.
+
+Files: `src/ipc/appdrive.zig` (watchChanges, peekChangeVs, windowSize,
+lastCommitMs, debugBacktrace, encodePixelsPng extracted from the window
+encoder), `src/ipc/mcp.zig` + `src/ipc/mcp_app.zig` (three tools,
+schemas, verdicts), `src/mux/daemon_debug.zig` (new), `src/mux/wire.zig`
+(app_debug 29 / app_debug_data 93), `src/mux/daemon.zig`,
+`src/mux/daemon_sessions.zig`, `src/mux/daemon_serve.zig`,
+`src/pty.zig`, `src/util/platform.zig`.
+
+Verification: full suite 1630/0, test-core 1387/0 (4 new tests),
+`mux-portable` musl + `aarch64-macos` cross green, `ldd sketerm-mux`
+still libc+libm only. Driven live against `sketerm mcp` with real apps
+under a private daemon: app_watch timed two scripted screen changes at
+t=4502ms and t=7507ms (scheduled 6s and 9s after launch) and reported
+capped timelines on a continuously-animating app; app_hover_map refused
+that same animating app "3 of 3 control samples changed"; app_wait
+reported "about 6.5 fps ... 400 frames needs roughly 61738ms"; a
+SIGSTOPped app produced "APP LIVENESS WARNING ... had ALREADY not
+painted for 5512ms" from app_click and a real thread table from
+app_backtrace.
+
+Known limitation: app_hover_map only finds controls that draw hover
+feedback, so an app with none yields an empty map — that is reported,
+not implied. Clicking every cell would find more but is destructive, so
+it is deliberately not offered.
