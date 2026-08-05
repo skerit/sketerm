@@ -43,6 +43,8 @@ const wsproto = @import("../winstream/proto.zig");
 const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
+const lsp_proc = @import("../lsp/proc.zig");
+const lsp_servers = @import("../lsp/servers.zig");
 const shell_util = @import("shell.zig");
 const platform = @import("../util/platform.zig");
 const Pty = @import("../pty.zig").Pty;
@@ -842,8 +844,14 @@ pub const Channel = struct {
     /// Winstream/tcp only; null on native channels (broadcast).
     client: ?*Client,
     /// Raw TCP forward (kind tcp_forward): chan_data is unframed
-    /// socket bytes, strictly 1:1 with `client`.
+    /// socket bytes, strictly 1:1 with `client`. LSP channels reuse
+    /// this relay (their fd is a socketpair to the child's stdio).
     tcp: bool = false,
+    /// LSP channels only (kind lsp): the spawned language server, in
+    /// its own process group. The child DIES with the channel — the
+    /// daemon SIGTERMs the group when the channel drops (client
+    /// disconnect included) and escalates to SIGKILL via `lsp_reaps`.
+    child_pid: c.pid_t = -1,
     /// Infrastructure client (currently xwayland-satellite): its surfaces
     /// are forwarded normally, but its persistent connection does not keep
     /// an external display's no-viewer TTL occupied.
@@ -1063,6 +1071,148 @@ test "daemon startup recovers a refused stale socket" {
     const daemon = try Daemon.init(t.allocator, path);
     daemon.deinit();
     try t.expect(c.access(path.ptr, c.F_OK) != 0);
+}
+
+test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on close" {
+    const t = std.testing;
+    const muxclient = @import("client.zig");
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-lsp-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+
+    // A project tree whose marker sits one level above the document:
+    // the daemon must answer the MARKER directory as the root.
+    var root_buf: [256:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sketerm-lsp-root-{d}", .{c.getpid()});
+    var sub_buf: [256:0]u8 = undefined;
+    const sub = try std.fmt.bufPrintZ(&sub_buf, "{s}/src", .{root});
+    var mark_buf: [256:0]u8 = undefined;
+    const mark = try std.fmt.bufPrintZ(&mark_buf, "{s}/rootmark", .{root});
+    _ = c.mkdir(root.ptr, 0o700);
+    _ = c.mkdir(sub.ptr, 0o700);
+    {
+        const f = c.fopen(mark.ptr, "wb") orelse return error.TestSetupFailed;
+        _ = c.fclose(f);
+    }
+    defer {
+        _ = c.unlink(mark.ptr);
+        _ = c.rmdir(sub.ptr);
+        _ = c.rmdir(root.ptr);
+    }
+
+    var conn = try muxclient.Conn.connect(t.allocator, path);
+    defer conn.deinit();
+
+    const Pump = struct {
+        fn next(dm: *Daemon, cn: *muxclient.Conn) !muxclient.Conn.OwnedFrame {
+            var spins: usize = 0;
+            while (spins < 4000) : (spins += 1) {
+                try dm.tick(0);
+                if (!cn.fillAvailable()) return error.Disconnected;
+                if (try cn.takeFrame()) |f| return f;
+                _ = c.usleep(1000);
+            }
+            return error.Timeout;
+        }
+    };
+
+    const Reply = struct {
+        req: u32 = 0,
+        ok: bool = false,
+        chan: u32 = 0,
+        name: []const u8 = "",
+        root: []const u8 = "",
+    };
+
+    // 1. No candidate installed -> silent ok:false, no channel.
+    try conn.sendJson(.lsp_open, .{
+        .req = @as(u32, 7),
+        .dir = @as([]const u8, sub),
+        .servers = [_]Daemon.LspOpenSrv{
+            .{ .name = "nope", .command = "sketerm-no-such-binary-xyz" },
+        },
+    });
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.lsp_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expectEqual(@as(u32, 7), parsed.value.req);
+        try t.expect(!parsed.value.ok);
+        try t.expectEqual(@as(usize, 0), d.channels.items.len);
+    }
+
+    // 2. The first candidate is missing, the second (`cat`) is not: the
+    // daemon walks the list, resolves the marker root, spawns, answers
+    // chan_open then lsp_reply.
+    try conn.sendJson(.lsp_open, .{
+        .req = @as(u32, 8),
+        .dir = @as([]const u8, sub),
+        .servers = [_]Daemon.LspOpenSrv{
+            .{ .name = "nope", .command = "sketerm-no-such-binary-xyz" },
+            .{ .name = "echo", .command = "cat", .root_files = "rootmark" },
+        },
+    });
+    var chan_id: u32 = 0;
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.chan_open, f.ftype);
+        const co = wire.decodeChanOpen(f.payload).?;
+        try t.expectEqual(wire.ChannelKind.lsp, co.kind);
+        chan_id = co.id;
+    }
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.lsp_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expect(parsed.value.ok);
+        try t.expectEqual(@as(u32, 8), parsed.value.req);
+        try t.expectEqual(chan_id, parsed.value.chan);
+        try t.expectEqualStrings("echo", parsed.value.name);
+        try t.expectEqualStrings(root, parsed.value.root);
+    }
+
+    // 3. Bytes bridge both ways (`cat` echoes its stdin).
+    {
+        var payload: [4 + 5]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], chan_id, .little);
+        @memcpy(payload[4..], "ping\n");
+        try conn.sendFrame(.chan_data, &payload);
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.chan_data, f.ftype);
+        try t.expectEqual(chan_id, wire.decodeChanId(f.payload).?);
+        try t.expectEqualStrings("ping\n", f.payload[4..]);
+    }
+
+    // 4. chan_close kills the child (SIGTERM -> reap) and empties both
+    // the channel list and the reap list — nothing zombifies.
+    {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, payload[0..4], chan_id, .little);
+        try conn.sendFrame(.chan_close, &payload);
+        var spins: usize = 0;
+        while (spins < 4000) : (spins += 1) {
+            try d.tick(0);
+            if (d.channels.items.len == 0 and d.lsp_reaps.items.len == 0) break;
+            _ = c.usleep(1000);
+        }
+        try t.expectEqual(@as(usize, 0), d.channels.items.len);
+        try t.expectEqual(@as(usize, 0), d.lsp_reaps.items.len);
+    }
 }
 
 pub const Native = struct {
@@ -1814,6 +1964,9 @@ pub const Daemon = struct {
     fs_job_dir: []u8 = &.{},
     fs_jobs_restored: bool = false,
     next_chan_id: u32 = 1,
+    /// Language-server children whose channel died: SIGTERM was sent,
+    /// SIGKILL follows after a grace period, the zombie is reaped here.
+    lsp_reaps: std.ArrayList(LspReap) = .empty,
     /// Monotonic client-connection id (controller labels + viewer age).
     next_client_id: u32 = 1,
     /// Monotonic id for per-session Wayland socket paths (session
@@ -1958,6 +2111,21 @@ pub const Daemon = struct {
         self.uploads.deinit(self.allocator);
         for (self.downloads.items) |dl| dl.deinit();
         self.downloads.deinit(self.allocator);
+        // Language-server children die with the daemon: SIGKILL the
+        // groups (no grace at teardown) and reap so nothing zombifies.
+        for (self.channels.items) |ch| {
+            if (ch.child_pid > 0) {
+                _ = c.kill(-ch.child_pid, c.SIGKILL);
+                var st: c_int = 0;
+                _ = c.waitpid(ch.child_pid, &st, 0);
+            }
+        }
+        for (self.lsp_reaps.items) |r| {
+            _ = c.kill(-r.pid, c.SIGKILL);
+            var st: c_int = 0;
+            _ = c.waitpid(r.pid, &st, 0);
+        }
+        self.lsp_reaps.deinit(self.allocator);
         for (self.channels.items) |ch| ch.deinit();
         self.channels.deinit(self.allocator);
         if (self.dmabuf_importer) |*importer| importer.deinit();
@@ -3814,6 +3982,103 @@ pub const Daemon = struct {
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .tcp_forward));
     }
 
+    pub const LspOpenSrv = struct {
+        name: []const u8 = "",
+        command: []const u8 = "",
+        args: []const u8 = "",
+        root_files: []const u8 = "",
+    };
+    const LspOpenReq = struct {
+        req: u32 = 0,
+        /// Directory of the document (on THIS host's filesystem).
+        dir: []const u8 = "",
+        /// Ordered candidates from the client's config; first installed
+        /// one wins — same policy as the local attach path.
+        servers: []const LspOpenSrv = &.{},
+    };
+
+    fn lspRootExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
+        var buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+        return c.access(full.ptr, c.F_OK) == 0;
+    }
+
+    /// Spawn a language server NEAR THE FILES: resolve the first
+    /// installed candidate on THIS host's PATH, walk `dir` up for its
+    /// root markers on THIS host's filesystem, fork it with stdio on a
+    /// socketpair, and bridge that fd as an ordinary byte channel. The
+    /// daemon relays the raw JSON-RPC bytes and never parses them —
+    /// the LSP client stays in the GUI. ok:false is SILENT degradation
+    /// ("no server on this host"), never an `.err` frame.
+    pub fn handleLspOpen(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(LspOpenReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad lsp_open request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.dir.len == 0 or req.dir[0] != '/') {
+            cl.queueJson(.lsp_reply, .{ .req = req.req, .ok = false, .@"error" = "bad dir" });
+            return;
+        }
+        for (req.servers) |srv| {
+            if (srv.command.len == 0) continue;
+            if (!lsp_proc.onPath(self.allocator, srv.command)) continue;
+            const root = lsp_servers.findRoot(req.dir, srv.root_files, lspRootExists, null);
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(self.allocator);
+            lsp_proc.splitArgs(self.allocator, srv.args, &argv) catch {};
+            const child = lsp_proc.spawnSock(self.allocator, srv.command, argv.items, root) catch {
+                log.warn("lsp_open: spawn of '{s}' failed", .{srv.command});
+                continue;
+            };
+            const ch = self.allocator.create(Channel) catch {
+                _ = c.kill(-child.pid, c.SIGKILL);
+                _ = c.close(child.fd);
+                var st: c_int = 0;
+                _ = c.waitpid(child.pid, &st, 0);
+                cl.queueJson(.lsp_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+                return;
+            };
+            ch.* = .{
+                .allocator = self.allocator,
+                .id = self.next_chan_id,
+                .fd = child.fd,
+                .session = null,
+                .client = cl,
+                .tcp = true,
+                .child_pid = child.pid,
+            };
+            self.next_chan_id += 1;
+            self.channels.append(self.allocator, ch) catch {
+                ch.dead = true; // dropDeadChannels won't see it; kill directly
+                _ = c.kill(-child.pid, c.SIGKILL);
+                var st: c_int = 0;
+                _ = c.waitpid(child.pid, &st, 0);
+                ch.child_pid = -1;
+                ch.deinit();
+                cl.queueJson(.lsp_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+                return;
+            };
+            log.debug("lsp_open: '{s}' pid {d} root '{s}' -> channel {d}", .{ srv.command, child.pid, root, ch.id });
+            var ob: [5]u8 = undefined;
+            cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .lsp));
+            cl.queueJson(.lsp_reply, .{
+                .req = req.req,
+                .ok = true,
+                .chan = ch.id,
+                .name = srv.name,
+                .root = root,
+            });
+            return;
+        }
+        // No candidate installed here: the client degrades silently,
+        // exactly like a missing local server.
+        cl.queueJson(.lsp_reply, .{ .req = req.req, .ok = false });
+    }
+
     const SearchReq = struct { pattern: []const u8, max: u32 = 50 };
 
     /// Case-insensitive substring search over the attached session's
@@ -3966,11 +4231,51 @@ pub const Daemon = struct {
         while (i < self.channels.items.len) {
             const ch = self.channels.items[i];
             if (ch.dead) {
+                // A dying LSP channel takes its server down: SIGTERM
+                // the group now (build tooling included), SIGKILL via
+                // the reap list if it lingers past the grace period.
+                if (ch.child_pid > 0) {
+                    _ = c.kill(-ch.child_pid, c.SIGTERM);
+                    self.lsp_reaps.append(self.allocator, .{
+                        .pid = ch.child_pid,
+                        .kill_at_ms = nowMs() + LSP_KILL_GRACE_MS,
+                    }) catch {
+                        _ = c.kill(-ch.child_pid, c.SIGKILL);
+                        var st: c_int = 0;
+                        _ = c.waitpid(ch.child_pid, &st, 0);
+                    };
+                }
                 _ = self.channels.swapRemove(i);
                 ch.deinit();
             } else {
                 i += 1;
             }
+        }
+    }
+
+    pub const LspReap = struct { pid: c.pid_t, kill_at_ms: i64, killed: bool = false };
+    /// How long a language server gets between SIGTERM and SIGKILL —
+    /// same grace the GUI gives a local server (editorlsp.zig).
+    const LSP_KILL_GRACE_MS: i64 = 1500;
+
+    /// Non-blocking sweep of dying language-server children. Zombies
+    /// are reaped by exact pid (never waitpid(-1) — PTY sessions own
+    /// their own children).
+    fn reapLspChildren(self: *Daemon) void {
+        var i: usize = 0;
+        while (i < self.lsp_reaps.items.len) {
+            const r = &self.lsp_reaps.items[i];
+            var st: c_int = 0;
+            const w = c.waitpid(r.pid, &st, c.WNOHANG);
+            if (w == r.pid or w < 0) {
+                _ = self.lsp_reaps.swapRemove(i);
+                continue;
+            }
+            if (!r.killed and nowMs() >= r.kill_at_ms) {
+                _ = c.kill(-r.pid, c.SIGKILL);
+                r.killed = true;
+            }
+            i += 1;
         }
     }
 
@@ -4144,6 +4449,7 @@ pub const Daemon = struct {
     }
 
     fn reap(self: *Daemon) void {
+        self.reapLspChildren();
         // A dying client takes its WINSTREAM channels down. Native
         // channels are session-owned and deliberately survive client
         // death — the daemon brain keeps the app alive for the next

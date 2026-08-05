@@ -710,6 +710,12 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // destruction. New clients must gate those requests because
                 // old daemons silently ignore unknown JSON members.
                 .display_v2 = true,
+                // Capability, same reasoning as udp_ticket: an lsp_open
+                // toward an old daemon would answer `.err`, which is
+                // misattributable on a multiplexed connection — and its
+                // absence is exactly the "no server on this host"
+                // silent-degradation path the client already has.
+                .lsp = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -782,6 +788,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .search => self.handleSearch(cl, frame.payload),
         .log_get => self.handleLogGet(cl, frame.payload),
         .forward_open => self.handleForward(cl, frame.payload),
+        // NOT attach-scoped (like fs_op): served by whichever process
+        // owns the client connection — the broker, in broker mode.
+        .lsp_open => self.handleLspOpen(cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

@@ -172,6 +172,20 @@ pub const FrameType = enum(u8) {
     /// advertises `quit_idle:true` AND a `build` differing from the
     /// client's own; older daemons never see the frame.
     quit_idle = 27,
+    /// Spawn a language server NEAR THE FILES (on this daemon's host)
+    /// and bridge its stdio as a byte channel. JSON { req, dir,
+    /// servers: [{name, command, args, root_files}] } — an ordered
+    /// candidate list from the CLIENT's config; the daemon picks the
+    /// first whose command resolves on ITS PATH, resolves the workspace
+    /// root by walking `dir` up for `root_files` markers on ITS
+    /// filesystem (falling back to `dir`, same semantics as the local
+    /// client), spawns it, and answers `chan_open` (kind lsp) +
+    /// `lsp_reply`. Raw Content-Length-framed JSON-RPC then flows as
+    /// chan_data both ways — the daemon never parses it. NOT
+    /// attach-scoped (like fs_op): served by whichever process owns
+    /// the client connection. Only sent to daemons whose welcome
+    /// advertises `lsp:true`.
+    lsp_open = 28,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -267,6 +281,13 @@ pub const FrameType = enum(u8) {
     /// mosh-server model: one instance per connection) and retires
     /// itself when no client authenticates within its grace window.
     udp_ticket = 91,
+    /// Answer to `lsp_open`, ALWAYS echoing the request's `req` (fs_op
+    /// nonce discipline): JSON { req, ok, chan?, name?, root?, error? }.
+    /// ok:false = no candidate server is installed on this host (or the
+    /// spawn failed) — the client degrades silently, exactly like a
+    /// missing local server. On ok:true a `chan_open` (kind lsp) for
+    /// `chan` precedes this frame.
+    lsp_reply = 92,
     _,
 };
 
@@ -288,6 +309,13 @@ pub const ChannelKind = enum(u8) {
     /// Raw TCP forward (answering `forward_open`): chan_data carries
     /// unframed socket bytes; 1:1 with the requesting client.
     tcp_forward = 5,
+    /// Language-server stdio bridge (answering `lsp_open`): chan_data
+    /// carries the server's raw Content-Length-framed JSON-RPC bytes;
+    /// 1:1 with the requesting client, and the daemon-side child DIES
+    /// with the channel (client disconnect included) — an LSP session
+    /// cannot be re-attached mid-`initialize`, so a durable server
+    /// process would only leak memory on the remote host.
+    lsp = 6,
     _,
 };
 
