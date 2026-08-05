@@ -404,6 +404,22 @@ pub const Pane = struct {
         );
         c.gtk_widget_add_controller(tb_box, @ptrCast(tb_click));
 
+        // Right-click on the titlebar opens the pane's own context
+        // menu. It forwards to the GLArea's popover rather than
+        // attaching a second one, so there is exactly one menu, one
+        // action group and one pre-popup hook per pane.
+        const tb_rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(tb_rclick), 3);
+        _ = c.g_signal_connect_data(
+            tb_rclick,
+            "pressed",
+            @ptrCast(&onTitlebarRightClicked),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(tb_box, @ptrCast(tb_rclick));
+
         // Wrap the GLArea in a GtkGraphicsOffload (GTK ≥ 4.16). The
         // offload widget tells GTK4 to attach our rendered output as
         // a Wayland subsurface with a dmabuf, bypassing GSK's
@@ -2755,7 +2771,12 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
 
     var has_link = false;
     const cell = self.cellAt(x, y);
-    if (cell.col >= 0 and cell.col < screen.cols) {
+    // A negative anchor means the menu was opened from OUTSIDE the
+    // grid (the pane titlebar, which sits above it). cellAt clamps
+    // such coordinates to cell (0,0), so probing would report a link
+    // belonging to the top-left cell that the user never pointed at.
+    const on_grid = x >= 0 and y >= 0;
+    if (on_grid and cell.col >= 0 and cell.col < screen.cols) {
         // cellAt's row can be negative when the click landed in
         // scrollback. Resolve via lineCellsAt (negative rows index
         // scrollback from the bottom).
@@ -2835,7 +2856,7 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
 
     // No OSC 8 link — fall back to the auto-URL detector, same as
     // hover and Ctrl+click do.
-    if (!has_link and self.grid_pass.enable_url_underline) {
+    if (on_grid and !has_link and self.grid_pass.enable_url_underline) {
         if (screen.urlAtVisible(self.allocator, cell.row, cell.col) catch null) |url| {
             self.menu_link_uri = url;
             has_link = true;
@@ -2861,6 +2882,23 @@ fn onTitlebarClicked(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user
     if (n_press == 2) {
         paneMenuSink(@ptrCast(self), .set_pane_title);
     }
+}
+
+/// Right-click on the per-pane titlebar → the pane's context menu.
+/// The popover is parented to the GLArea, so the titlebar-local
+/// pointer position is translated into area coordinates first; the
+/// resulting y is NEGATIVE (the bar sits above the grid), which is
+/// exactly what tells `paneMenuPrePopup` not to probe for a link.
+fn onTitlebarRightClicked(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    const widget = c.gtk_event_controller_get_widget(@ptrCast(@alignCast(g))) orelse return;
+    var out: c.graphene_point_t = undefined;
+    const from = c.graphene_point_t{ .x = @floatCast(x), .y = @floatCast(y) };
+    if (c.gtk_widget_compute_point(widget, @ptrCast(self.area), &from, &out) == 0) return;
+    // Claim before popping up, for the same reason menu.zig's own
+    // gesture does: an unclaimed RELEASE dismisses the fresh popover.
+    _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    _ = menu.popupAt(@ptrCast(self.area), @floatCast(out.x), @floatCast(out.y));
 }
 
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
