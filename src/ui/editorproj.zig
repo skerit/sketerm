@@ -284,8 +284,9 @@ fn gitThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
         defer fs.deinit();
         // One daemon job on the FILE'S host: it finds the repository
         // from the file's own directory, runs the diff there and
-        // parses it there. A daemon too old for the verb refuses at
-        // startGitDiff, and the tab keeps saying it does not know.
+        // parses it there. Any failure (including a daemon whose
+        // build has no such verb, which answers "unknown fs job op")
+        // leaves the tab saying it does not know, never "clean".
         const res = fs.gitDiff(wa, loc.path, JOB_TIMEOUT_MS) catch break :run;
         job.runs = res.runs;
         job.repo = res.repo;

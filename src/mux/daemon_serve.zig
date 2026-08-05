@@ -706,13 +706,6 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // terminal job survives until an explicit job_ack.
                 .durable_copy = true,
                 .copy_no_replace = true,
-                // The `git_diff` fs job (per-line marks for one file
-                // against HEAD) exists. Capability rather than a proto
-                // bump: an older daemon answers the verb with
-                // "unknown fs job op", so a client that cannot see
-                // this flag must not ask and must say it does not
-                // know, instead of drawing an empty gutter.
-                .git_diff = true,
                 // Additive JSON display fields plus guarded display-only
                 // destruction. New clients must gate those requests because
                 // old daemons silently ignore unknown JSON members.
