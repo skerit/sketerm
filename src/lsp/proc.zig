@@ -166,6 +166,71 @@ pub fn spawn(
     };
 }
 
+/// A child whose stdin AND stdout are one socketpair end — the shape
+/// the mux daemon's byte channels want (a `Channel` owns exactly one
+/// fd). stderr goes to /dev/null: the daemon has nobody to show it to,
+/// and /dev/null trivially satisfies "stderr must be drained or the
+/// server stalls".
+pub const SockChild = struct {
+    pid: c.pid_t = -1,
+    /// Our socketpair end (server stdio, both directions). Non-blocking.
+    fd: c_int = -1,
+};
+
+/// Fork+exec `command` with stdio bridged over a socketpair, for the
+/// daemon-hosted remote-LSP path. Same process-group and CLOEXEC rules
+/// as `spawn`; an exec failure surfaces as immediate EOF on `fd`.
+pub fn spawnSock(
+    alloc: std.mem.Allocator,
+    command: []const u8,
+    args: []const []const u8,
+    cwd: []const u8,
+) Error!SockChild {
+    var pair: [2]c_int = .{ -1, -1 };
+    if (@import("../util/platform.zig").socketpairCloexec(&pair) != 0) return Error.PipeFailed;
+    errdefer {
+        _ = c.close(pair[0]);
+        _ = c.close(pair[1]);
+    }
+
+    // argv/cwd NUL-terminated BEFORE the fork (no allocation between
+    // fork and exec — same rule as `spawn`).
+    var argv_store: std.ArrayList([:0]u8) = .empty;
+    defer {
+        for (argv_store.items) |s| alloc.free(s);
+        argv_store.deinit(alloc);
+    }
+    var argv: std.ArrayList(?[*:0]u8) = .empty;
+    defer argv.deinit(alloc);
+    const cmd_z = alloc.dupeZ(u8, command) catch return Error.OutOfMemory;
+    argv_store.append(alloc, cmd_z) catch return Error.OutOfMemory;
+    argv.append(alloc, cmd_z.ptr) catch return Error.OutOfMemory;
+    for (args) |a| {
+        const z = alloc.dupeZ(u8, a) catch return Error.OutOfMemory;
+        argv_store.append(alloc, z) catch return Error.OutOfMemory;
+        argv.append(alloc, z.ptr) catch return Error.OutOfMemory;
+    }
+    argv.append(alloc, null) catch return Error.OutOfMemory;
+    const cwd_z = alloc.dupeZ(u8, cwd) catch return Error.OutOfMemory;
+    defer alloc.free(cwd_z);
+
+    const pid = c.fork();
+    if (pid < 0) return Error.ForkFailed;
+    if (pid == 0) {
+        _ = c.setpgid(0, 0);
+        _ = c.chdir(cwd_z.ptr);
+        _ = c.dup2(pair[1], 0);
+        _ = c.dup2(pair[1], 1);
+        const devnull = c.open("/dev/null", c.O_WRONLY);
+        if (devnull >= 0) _ = c.dup2(devnull, 2);
+        _ = c.execvp(cmd_z.ptr, @ptrCast(argv.items.ptr));
+        c._exit(127);
+    }
+    _ = c.close(pair[1]);
+    setNonBlocking(pair[0]);
+    return .{ .pid = pid, .fd = pair[0] };
+}
+
 /// Full path `command` resolves to, or null. Caller frees.
 pub fn resolveOnPath(alloc: std.mem.Allocator, command: []const u8) ?[]u8 {
     if (command.len == 0) return null;
@@ -246,6 +311,47 @@ test "proc: spawn round-trips bytes through a child's stdio" {
         if (n > 0) got += @intCast(n) else _ = c.usleep(1000);
     }
     try testing.expectEqualStrings(msg, buf[0..got]);
+}
+
+test "proc: spawnSock round-trips bytes over one socketpair fd" {
+    const child = try spawnSock(testing.allocator, "cat", &.{}, "/");
+    defer {
+        if (child.pid > 0) _ = c.kill(-child.pid, c.SIGKILL);
+        if (child.fd >= 0) _ = c.close(child.fd);
+        var status: c_int = 0;
+        _ = c.waitpid(child.pid, &status, 0);
+    }
+    const msg = "remote lsp\n";
+    try testing.expectEqual(@as(isize, msg.len), c.write(child.fd, msg.ptr, msg.len));
+    var buf: [64]u8 = undefined;
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got < msg.len and spins < 2000) : (spins += 1) {
+        const n = c.read(child.fd, buf[got..].ptr, buf.len - got);
+        if (n > 0) got += @intCast(n) else _ = c.usleep(1000);
+    }
+    try testing.expectEqualStrings(msg, buf[0..got]);
+}
+
+test "proc: spawnSock of a missing binary yields immediate EOF" {
+    const child = try spawnSock(testing.allocator, "sketerm-no-such-binary-xyz", &.{}, "/");
+    defer {
+        if (child.fd >= 0) _ = c.close(child.fd);
+        var status: c_int = 0;
+        _ = c.waitpid(child.pid, &status, 0);
+    }
+    var buf: [16]u8 = undefined;
+    var spins: usize = 0;
+    var eof = false;
+    while (spins < 2000) : (spins += 1) {
+        const n = c.read(child.fd, &buf, buf.len);
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        _ = c.usleep(1000);
+    }
+    try testing.expect(eof);
 }
 
 test "proc: spawning a missing binary yields a child that dies immediately" {

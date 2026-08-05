@@ -461,11 +461,17 @@ pub const Session = struct {
 
     /// Send `initialize`. `root_uri` may be empty (a single file with
     /// no project); `client_pid` lets the server exit if we vanish.
+    /// Pass 0 (or negative) when the server runs on ANOTHER host: our
+    /// pid is meaningless there, and servers that watch `processId`
+    /// (clangd does) would exit the moment they find no such process.
     pub fn start(self: *Session, root_uri: []const u8, client_pid: i32, init_options: []const u8) void {
         if (self.state != .idle) return;
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.alloc);
-        params.print(self.alloc, "{{\"processId\":{d},", .{client_pid}) catch return;
+        if (client_pid > 0)
+            params.print(self.alloc, "{{\"processId\":{d},", .{client_pid}) catch return
+        else
+            params.appendSlice(self.alloc, "{\"processId\":null,") catch return;
         if (root_uri.len > 0) {
             params.appendSlice(self.alloc, "\"rootUri\":") catch return;
             appendJsonString(self.alloc, &params, root_uri) catch return;
