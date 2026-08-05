@@ -12861,3 +12861,60 @@ active tab. `smoke-lsp-gui` proves the outline is fed by a live server
 process ("2 symbol(s) -- language server"). Its completion-popup stage
 fails, and a worktree at the commit before this work fails identically:
 pre-existing, not a regression.
+
+## Terminal canvas AT-SPI: selection, live notifications, and a bus of its own
+
+The June bridge (`a11y/atspi.zig` + the neutral `a11y/view.zig`) made
+the pane's GtkGLArea answer GtkAccessibleText pulls -- text, caret,
+line/word ranges -- but a screen reader also needs to be TOLD when
+things change, selections were reported as "none", the pane had no
+label, and nothing in the tree proved any of it. This session closes
+those four gaps.
+
+**Selection is part of the snapshot now.** `view.build` maps the
+grid selection to a flat character range: `.normal` end-col-exclusive
+runs and `.line_select` whole-row spans (newline included), clamped
+against scrollback (fully-invisible selections report none, straddling
+ones clamp to text start/end). `.rectangular` deliberately stays
+unexposed -- a block is not a flat range, and announcing the wrong text
+is worse than announcing none. The bridge's `get_selection` vfunc
+serves it as the single AT-SPI Text selection.
+
+**Notification policy.** `notifyChanged` fires per applied event batch
+(and now also from every host-side selection mutation in `pane.zig`,
+which never passes through the daemon drain), but emission is
+trailing-edge coalesced to one burst per 75ms -- a busy TUI redraws far
+faster than speech. Each burst diffs the previous announced text
+against the fresh snapshot (`view.diffChars`, common prefix/suffix
+hull in codepoints) and emits text-REMOVE/INSERT for the hull,
+caret-moved and selection-changed only when those actually moved. The
+whole diff path is gated on `at_active`: until a real AT invokes any
+vfunc, an emission is one no-op'd caret nudge and no snapshot is ever
+built -- a session without a screen reader pays nothing. Lifetime: the
+coalescing timer refs the widget; `Pane.severFaces` (and the area's own
+`::destroy`, for paths that never reach it) cancels the timer and drops
+the Terminal back-pointer before the Terminal can die. The accessible
+label starts as "Terminal" and tracks OSC 0/1/2 titles.
+
+**`zig build smoke-atspi`** is the proof, and the reason it exists is
+that smoke-e2e pins `GTK_A11Y=none` (its GUI children must never
+register on the developer's real a11y bus). Same self-hosted rig --
+private daemon, display session, viewer attached first -- plus a
+private accessibility bus from `mux/a11yhub.zig`, whose `Hub.setup`
+already encodes all five independent requirements for a populated
+tree. The GUI runs with `GTK_A11Y=atspi` on that bus, and the harness
+asserts real `org.a11y.atspi.Text` replies via the Hub's new
+`textState`/`textNSelections`/`textSelection` (libc-only, also useful
+to MCP later): a TERMINAL-role node exists, typed text comes back with
+the caret right after it, the caret advances by exactly the typed
+count, a real pointer drag becomes exactly one multi-line selection,
+and a click clears it. SKIPs cleanly where dbus-daemon/registryd are
+not installed.
+
+Not covered: the emitted change events are not themselves captured off
+the bus (that needs Registry event subscription in the Zig D-Bus
+client); the smoke asserts state, and the notification path is the
+same code emitting it. Attributes (colors/bold) still report empty.
+The macOS twin can adopt selection by reading the same snapshot
+fields. Verification: 1539 tests, test-core, mux-portable (ldd:
+libc/libm only), smoke-atspi PASS, smoke-e2e PASS.
