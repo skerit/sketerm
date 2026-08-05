@@ -285,7 +285,7 @@ pub const JobEvent = struct {
     xy: []const u8 = "",
     orig: []const u8 = "",
     /// git_status `repo` event: the branch header of the browsed
-    /// root. Absent entirely from a daemon too old to report it.
+    /// root, and whether it is a repository at all.
     /// git_diff sends the same event for its own three states, of
     /// which only `repo`, `tracked`, `initial` and `truncated` mean
     /// anything.

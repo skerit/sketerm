@@ -190,9 +190,9 @@ pub const WireJobEv = struct {
     /// which is exactly what makes `text` still load-bearing.
     xy: []const u8 = "",
     orig: []const u8 = "",
-    /// git_status `repo` event: the branch header of the browsed root.
-    /// The event itself is absent from a pre-v2 daemon, which is how
-    /// the browser tells "no answer" from "not a repository".
+    /// git_status `repo` event: the branch header of the browsed root,
+    /// and the only way to tell a clean repository from a directory
+    /// that is no repository at all.
     repo: bool = false,
     branch: []const u8 = "",
     upstream: []const u8 = "",
