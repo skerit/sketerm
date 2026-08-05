@@ -496,6 +496,30 @@ pub fn main() u8 {
     savePng(app, win_id, "zig-out/smoke-lsp-gui-hover.png");
     savePopupPng(app, "zig-out/smoke-lsp-gui-hover-popup.png");
     say("PASS hover popup -> zig-out/smoke-lsp-gui-hover.png", .{});
+
+    // ── 3b. the outline panel, fed by the SERVER ───────────────────
+    //
+    // `editoroutline` fills from the tree first and replaces that with
+    // `textDocument/documentSymbol` when a server answers. Here one
+    // does, so the panel's own status line reads "language server" —
+    // which is the difference this stage exists to prove.
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 300);
+    var before_ref = app.frameRef(win_id, true);
+    defer if (before_ref) |*r| r.deinit(g_alloc);
+    app.pressKey(win_id, "ctrl+shift+o") catch {};
+    pumpFor(app, 2500);
+    if (before_ref) |*r| {
+        if (!app.waitChangeSince(win_id, r, 15_000, 0.01, null)) {
+            say("FAIL ctrl+shift+o did not open the outline panel", .{});
+            teardown();
+            return 1;
+        }
+    }
+    pumpFor(app, 1500);
+    savePng(app, win_id, "zig-out/smoke-lsp-gui-outline.png");
+    say("PASS outline panel opened against a live server -> zig-out/smoke-lsp-gui-outline.png", .{});
+
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 500);
 
