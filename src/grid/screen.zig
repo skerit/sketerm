@@ -434,11 +434,19 @@ pub const Screen = struct {
 
     /// Kitty progressive-enhancement keyboard flags. Bitmask:
     /// 0x01 disambiguate, 0x02 events, 0x04 alt-keys, 0x08 all-keys,
-    /// 0x10 associated-text. Toggled via CSI > N u (set), CSI = N;M u
-    /// (set/push/pop), CSI < N u (pop). Stack depth 9.
+    /// 0x10 associated-text. `CSI > N u` pushes, `CSI < N u` pops,
+    /// `CSI = N ; M u` sets/ors/clears without touching the stack.
+    /// Stack depth 9.
     kitty_kbd_flags: u8 = 0,
     kitty_kbd_stack: [9]u8 = [_]u8{0} ** 9,
     kitty_kbd_depth: u8 = 0,
+    /// The same three values for the buffer that is NOT active: the
+    /// protocol keeps separate stacks per screen, so a full-screen app
+    /// cannot leak its flags to the shell it returns to. Swapped by
+    /// `toggleAltScreen`.
+    kitty_kbd_other_flags: u8 = 0,
+    kitty_kbd_other_stack: [9]u8 = [_]u8{0} ** 9,
+    kitty_kbd_other_depth: u8 = 0,
 
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
@@ -6399,41 +6407,112 @@ test "extractSelection emits OSC 8 as markdown link" {
     try std.testing.expectEqualStrings("[link](https://example.com) tail", text);
 }
 
-test "kitty kbd: CSI > N u sets flags" {
-    var pool = try Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
-    defer s.deinit();
+/// `CSI > flags u`, the sequence every kitty-protocol application
+/// uses to turn the protocol on.
+fn kittyKbdPushCsi(s: *Screen, flags: u16) void {
     var csi = Event.Csi{};
     csi.private = '>';
-    csi.params[0] = 5; // disambiguate + report-events
+    csi.params[0] = flags;
     csi.n_params = 1;
     csi.final = 'u';
     s.csi(csi);
-    try std.testing.expectEqual(@as(u8, 5), s.kitty_kbd_flags);
 }
 
-test "kitty kbd: CSI = N ; 2 u pushes, < pops" {
+fn kittyKbdPopCsi(s: *Screen, n: u16) void {
+    var csi = Event.Csi{};
+    csi.private = '<';
+    csi.params[0] = n;
+    csi.n_params = 1;
+    csi.final = 'u';
+    s.csi(csi);
+}
+
+fn kittyKbdSetCsi(s: *Screen, flags: u16, mode: u16) void {
+    var csi = Event.Csi{};
+    csi.private = '=';
+    csi.params[0] = flags;
+    csi.params[1] = mode;
+    csi.n_params = 2;
+    csi.final = 'u';
+    s.csi(csi);
+}
+
+test "kitty kbd: CSI > N u pushes so CSI < N u restores the caller's flags" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
     defer s.deinit();
-    s.kitty_kbd_flags = 0x01;
-    var push = Event.Csi{};
-    push.private = '=';
-    push.params[0] = 0x0F;
-    push.params[1] = 2;
-    push.n_params = 2;
-    push.final = 'u';
-    s.csi(push);
+    // A shell has the protocol on; a program it launches turns on
+    // more, then puts things back the way it found them.
+    kittyKbdPushCsi(s, 0x01);
+    try std.testing.expectEqual(@as(u8, 0x01), s.kitty_kbd_flags);
+    kittyKbdPushCsi(s, 0x0F);
     try std.testing.expectEqual(@as(u8, 0x0F), s.kitty_kbd_flags);
+    kittyKbdPopCsi(s, 1);
+    try std.testing.expectEqual(@as(u8, 0x01), s.kitty_kbd_flags);
+}
+
+test "kitty kbd: CSI = N ; M u sets, ors and clears without touching the stack" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    kittyKbdPushCsi(s, 0x01);
+    kittyKbdSetCsi(s, 0x0A, 2); // set these bits, leave the rest
+    try std.testing.expectEqual(@as(u8, 0x0B), s.kitty_kbd_flags);
+    kittyKbdSetCsi(s, 0x02, 3); // clear these bits
+    try std.testing.expectEqual(@as(u8, 0x09), s.kitty_kbd_flags);
+    kittyKbdSetCsi(s, 0x04, 1); // assign
+    try std.testing.expectEqual(@as(u8, 0x04), s.kitty_kbd_flags);
     try std.testing.expectEqual(@as(u8, 1), s.kitty_kbd_depth);
-    var pop = Event.Csi{};
-    pop.private = '<';
-    pop.params[0] = 1;
-    pop.n_params = 1;
-    pop.final = 'u';
-    s.csi(pop);
+    kittyKbdPopCsi(s, 1);
+    try std.testing.expectEqual(@as(u8, 0), s.kitty_kbd_flags);
+}
+
+test "kitty kbd: popping an empty stack disables the protocol" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    kittyKbdSetCsi(s, 0x0F, 1);
+    kittyKbdPopCsi(s, 3);
+    try std.testing.expectEqual(@as(u8, 0), s.kitty_kbd_flags);
+    try std.testing.expectEqual(@as(u8, 0), s.kitty_kbd_depth);
+}
+
+test "kitty kbd: a full stack drops its oldest entry" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    // Ten pushes into a nine-deep stack: the first is forgotten, the
+    // rest still unwind in order.
+    var i: u16 = 1;
+    while (i <= 10) : (i += 1) kittyKbdPushCsi(s, i);
+    try std.testing.expectEqual(@as(u8, 9), s.kitty_kbd_depth);
+    try std.testing.expectEqual(@as(u8, 10), s.kitty_kbd_flags);
+    kittyKbdPopCsi(s, 1);
+    try std.testing.expectEqual(@as(u8, 9), s.kitty_kbd_flags);
+}
+
+test "kitty kbd: the alternate screen keeps its own flags" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    kittyKbdPushCsi(s, 0x01); // the shell's flags
+    var alt = Event.Csi{};
+    alt.private = '?';
+    alt.params[0] = 1049;
+    alt.n_params = 1;
+    alt.final = 'h';
+    s.csi(alt);
+    try std.testing.expectEqual(@as(u8, 0), s.kitty_kbd_flags);
+    kittyKbdPushCsi(s, 0x1F); // a full-screen application's
+    alt.final = 'l';
+    s.csi(alt);
+    // Back on the main screen the shell's flags are exactly as it
+    // left them, whether or not the application cleaned up.
     try std.testing.expectEqual(@as(u8, 0x01), s.kitty_kbd_flags);
 }
 

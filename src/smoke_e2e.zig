@@ -458,6 +458,8 @@ pub fn main() u8 {
     if (drive) |app| {
         if (realInputStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("real seat input reached the shell and repainted the window");
+        if (kittyKbdStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("kitty keyboard protocol encodes real key events correctly");
 
         // 3c. The pane's context menu, driven by a real right-click and
         // by the keyboard. Contents and per-row sensitivity are
@@ -1639,6 +1641,72 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     viewer_pid = -1;
     _ = app.drainLive(2_000);
     return null;
+}
+
+/// The kitty keyboard protocol, end to end on a real seat. The
+/// encoder itself is unit-tested; what only a live run can prove is
+/// the layer between GDK and it — that the flags an application set
+/// reach the encoder, that a hardware keycode translates to the right
+/// unmodified key, and that a chord which produces no character at
+/// all still arrives.
+///
+/// `cat -v` renders the control bytes as text, so the assertions read
+/// the pane's own grid: no separate capture channel to get wrong.
+fn kittyKbdStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    // One command line does the whole stage: `CSI > 1 u` pushes the
+    // disambiguate flag the way a real application would, and the
+    // tail pops it back off. `cat` gets a timeout because with the
+    // flag on there is no longer any such thing as a Ctrl+D byte —
+    // which is the point, and would otherwise wedge the pane.
+    app.typeText(
+        null,
+        "printf '\\033[>1u'; echo KBDON; timeout 6 cat -v; printf '\\033[<1u'; echo KBDOFF\n",
+    ) catch return "injecting the protocol-enable command failed";
+    // Twice: once as the echoed command line, once as its output.
+    if (!waitMarkerCount(allocator, sock_path, "KBDON", 2, 15_000))
+        return "the shell never ran the protocol-enable command";
+
+    // Ctrl+A: a chord with no character of its own. Under
+    // disambiguate it must arrive as a full key report rather than
+    // the legacy 0x01 byte — and the key number must be the 'a' key
+    // itself, which only the keycode translation can supply.
+    app.pressKey(null, "ctrl+a") catch return "injecting ctrl+a failed";
+    // Up: a key that HAS a legacy encoding, which the protocol keeps.
+    // Reporting a Private Use Area codepoint here instead would leave
+    // the arrow keys dead in every application that does not
+    // implement kitty's optional alias table.
+    app.pressKey(null, "up") catch return "injecting up failed";
+    app.typeText(null, "\n") catch return "injecting newline failed";
+
+    if (!waitPaneText(allocator, sock_path, 1, "^[[97;5u", 10_000))
+        return "ctrl+a did not arrive as a kitty key report";
+    if (!waitPaneText(allocator, sock_path, 1, "^[[A", 10_000))
+        return "the up arrow lost its legacy encoding under the protocol";
+
+    // The tail of the command line pops the flags again, so the pane
+    // is an ordinary shell for every stage after this one.
+    if (!waitMarkerCount(allocator, sock_path, "KBDOFF", 2, 20_000))
+        return "the pane never returned to a plain shell";
+    return null;
+}
+
+/// Poll a pane's text until `needle` appears at least `want` times.
+fn waitMarkerCount(
+    allocator: std.mem.Allocator,
+    sock: [:0]const u8,
+    needle: []const u8,
+    want: usize,
+    ms: u32,
+) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        if (roundtrip(allocator, sock, "{\"cmd\":\"get-text\",\"pane\":1}\n")) |resp| {
+            defer allocator.free(resp);
+            if (std.mem.count(u8, resp, needle) >= want) return true;
+        }
+        _ = c.usleep(200_000);
+    }
+    return false;
 }
 
 /// Poll `list` until it reports the wanted number of `"id":` fields
