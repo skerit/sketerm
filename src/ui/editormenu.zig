@@ -12,7 +12,14 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
-const EditorView = @import("editorview.zig").EditorView;
+const editorview = @import("editorview.zig");
+const EditorView = editorview.EditorView;
+const ETab = editorview.ETab;
+const classicmenu = @import("browser/classicmenu.zig");
+const tabhost = @import("tabhost.zig");
+const clipboard = @import("clipboard.zig");
+const siblingapp = @import("siblingapp.zig");
+const paths = @import("../filebrowser/paths.zig");
 
 pub const Action = enum {
     cut,
@@ -418,4 +425,206 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     };
     c.gtk_popover_set_pointing_to(@ptrCast(ctx.popover), &rect);
     c.gtk_popover_popup(@ptrCast(ctx.popover));
+}
+
+// ---- document tab strip -------------------------------------------
+//
+// The mechanical rows (Close / Close Others / Close to the Right /
+// Close Unmodified / Open in New Window) are tabhost.zig's, shared
+// with the file browser. Everything below is the editor's DOMAIN
+// half: the per-document verbs and the predicates that decide which
+// mechanical rows can act.
+
+/// Heap context for one row of a popped tab menu. Identifies the tab
+/// by ID, not by pointer: the menu outlives a `closeTabForce` that
+/// destroys the ETab, so every handler re-resolves.
+const TabCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *EditorView,
+    tab_id: u64,
+
+    fn make(root: *classicmenu.Root, view: *EditorView, tab: *ETab) ?*TabCtx {
+        const ctx = view.allocator.create(TabCtx) catch return null;
+        ctx.* = .{ .allocator = view.allocator, .view = view, .tab_id = tab.id };
+        root.own(&free, @ptrCast(ctx));
+        return ctx;
+    }
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const self: *TabCtx = @ptrCast(@alignCast(user.?));
+        self.allocator.destroy(self);
+    }
+
+    fn resolve(user: ?*anyopaque) ?struct { view: *EditorView, tab: *ETab } {
+        const self: *TabCtx = @ptrCast(@alignCast(user.?));
+        const tab = self.view.findTabByIdPublic(self.tab_id) orelse return null;
+        return .{ .view = self.view, .tab = tab };
+    }
+};
+
+/// The editor's half of the shared per-tab menu contract.
+pub fn tabMenuSpec() tabhost.TabMenu {
+    return .{
+        .extra = &menuExtra,
+        // No Duplicate: a second tab on the same file is refused by
+        // design (openSpec focuses the tab that already has it).
+        .new_window = &menuNewWindow,
+        .can_new_window = &menuCanNewWindow,
+        .modified = &menuModified,
+    };
+}
+
+fn tabForPage(view: *EditorView, page: *c.GtkWidget) ?*ETab {
+    for (view.tabs.items) |t| {
+        if (t.page == page) return t;
+    }
+    return null;
+}
+
+/// The document rows. Insensitive rather than absent wherever the
+/// verb is merely unavailable RIGHT NOW (nothing to save, no file on
+/// disk yet, no project to be relative to) — the menu should still
+/// show what a document tab can do.
+fn menuExtra(ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, m: classicmenu.Menu) void {
+    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(view, page) orelse return;
+    const saved = tab.spec != null;
+
+    if (TabCtx.make(root, view, tab)) |cx| {
+        m.itemIconEnabled("Save", .{ .name = "document-save-symbolic" }, tab.isDirty() and !tab.loading, &onSave, @ptrCast(cx));
+        m.itemIcon("Save As…", .{ .name = "document-save-as-symbolic" }, &onSaveAs, @ptrCast(cx));
+        m.itemIconEnabled("Revert", .{ .name = "document-revert-symbolic" }, saved and !tab.loading, &onRevert, @ptrCast(cx));
+
+        const p = m.section();
+        p.itemIconEnabled("Copy Full Path", .{ .name = "edit-copy-symbolic" }, saved, &onCopyFullPath, @ptrCast(cx));
+        // A loose file has NO project (project.zig answers null on a
+        // marker miss), and there is then nothing to be relative to.
+        p.itemIconEnabled(
+            "Copy Relative Path",
+            .{ .name = "edit-copy-symbolic" },
+            saved and tab.project != null,
+            &onCopyRelativePath,
+            @ptrCast(cx),
+        );
+        p.itemIconEnabled("Reveal in File Browser", .{ .name = "folder-open-symbolic" }, saved, &onReveal, @ptrCast(cx));
+    }
+}
+
+/// "Open in New Window": a standalone Sketerm Editor window on this
+/// file — `siblingapp.openInEditor`, the same handoff the viewer and
+/// the file browser use. Nothing is moved, so the tab stays.
+fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
+    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(view, page) orelse return;
+    const spec = tab.spec orelse return;
+    _ = siblingapp.openInEditor(spec, null);
+}
+
+fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
+    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(view, page) orelse return false;
+    return tab.spec != null;
+}
+
+fn menuModified(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
+    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const tab = tabForPage(view, page) orelse return false;
+    return tab.isDirty();
+}
+
+fn onSave(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    r.view.saveTab(r.tab);
+}
+
+fn onSaveAs(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    r.view.saveTabAs(r.tab);
+}
+
+fn onRevert(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    r.view.revertTab(r.tab);
+}
+
+fn onCopyFullPath(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    const spec = r.tab.spec orelse return;
+    var buf: [4096:0]u8 = undefined;
+    // The PATH, not the host-qualified spec: what you paste into a
+    // shell or another editor.
+    const path = paths.parseSpec(spec).path;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    clipboard.copyToClipboard(@ptrCast(r.view.area), z);
+    r.view.setStatusText(z.ptr);
+}
+
+fn onCopyRelativePath(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    const spec = r.tab.spec orelse return;
+    const project = r.tab.project orelse return;
+    const path = paths.parseSpec(spec).path;
+    const rel = relativeTo(project.root, path) orelse return;
+    var buf: [4096:0]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{rel}) catch return;
+    clipboard.copyToClipboard(@ptrCast(r.view.area), z);
+    r.view.setStatusText(z.ptr);
+}
+
+/// `path` with `root` (a directory prefix) and its slash removed, or
+/// null when the file is not under that root at all.
+fn relativeTo(root: []const u8, path: []const u8) ?[]const u8 {
+    const trimmed = if (root.len > 1 and root[root.len - 1] == '/') root[0 .. root.len - 1] else root;
+    if (!std.mem.startsWith(u8, path, trimmed)) return null;
+    const rest = path[trimmed.len..];
+    if (rest.len == 0) return null;
+    if (rest[0] != '/') return null;
+    return rest[1..];
+}
+
+/// Reveal in a file browser: a browser tab in THIS window with the
+/// file selected, or — with no window to host one (the standalone
+/// editor) — the Sketerm Files identity, exactly what that window's
+/// own "Reveal" button does.
+fn onReveal(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const r = TabCtx.resolve(user) orelse return;
+    const spec = r.tab.spec orelse return;
+    if (r.view.ownerWindow()) |win| {
+        win.newBrowserTabFromReveal(r.view.pane, spec, spec) catch {};
+        return;
+    }
+    _ = siblingapp.showInFiles(spec);
+}
+
+// ---- the strip's empty area ---------------------------------------
+
+/// TabHost strip right-click: the editor's own two ways to get a new
+/// document, the browser's New Tab / Reopen precedent.
+pub fn showStripMenu(view: *EditorView, x: f64, y: f64) void {
+    const root = classicmenu.Root.create(view.allocator) orelse return;
+    const m = root.top();
+    m.itemIcon("New Document", .{ .name = "tab-new-symbolic" }, &onStripNew, @ptrCast(view));
+    m.itemIcon("Open File…", .{ .name = "document-open-symbolic" }, &onStripOpen, @ptrCast(view));
+    _ = root.popupVia(view.tabhost.widget(), view.root_box, x, y);
+}
+
+fn onStripNew(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const view: *EditorView = @ptrCast(@alignCast(user.?));
+    _ = view.newTab(null);
+}
+
+fn onStripOpen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const view: *EditorView = @ptrCast(@alignCast(user.?));
+    view.openPicker();
+}
+
+test "relativeTo strips the project root and its slash" {
+    const t = std.testing;
+    try t.expectEqualStrings("src/main.zig", relativeTo("/home/x/proj", "/home/x/proj/src/main.zig").?);
+    try t.expectEqualStrings("src/main.zig", relativeTo("/home/x/proj/", "/home/x/proj/src/main.zig").?);
+    // A sibling directory that merely shares a prefix is not inside.
+    try t.expect(relativeTo("/home/x/proj", "/home/x/projector/a.txt") == null);
+    // The root itself is not a relative path.
+    try t.expect(relativeTo("/home/x/proj", "/home/x/proj") == null);
+    try t.expectEqualStrings("a.txt", relativeTo("/", "/a.txt").?);
 }
