@@ -656,6 +656,14 @@ round-trip as the seeded value rather than as "unset": clearing a
 profile's `palette` back to none, and clearing a `light.` / `dark.`
 field back to inherit.
 
+The list-shaped families do not have that problem: removing every
+`symbol_map.<name>` or every `hint.<name>.*` entry writes no line for
+them and reloads as an empty list. One related detail: a symbol map
+whose family is empty routes nothing and is **not written** -- with an
+empty family the line would end in a trailing space, which the parser
+rejects on the next load. The Preferences dialog flags such an entry
+instead of saving it.
+
 ## See also
 
 - `data/sample.conf` -- a commented file to copy to
