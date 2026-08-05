@@ -604,7 +604,9 @@ pub fn guessMime(buf: []u8, name: []const u8) []const u8 {
 pub fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []const WireApp) void {
     ow.req = 0;
     if (!ok) {
-        c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: unavailable (older daemon)");
+        // Any refused app-list query: the section simply has nothing
+        // to offer. Local apps are listed regardless.
+        c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: unavailable");
         return;
     }
     var hostz: [280:0]u8 = undefined;
