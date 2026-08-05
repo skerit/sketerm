@@ -104,6 +104,8 @@ const sel_mod = @import("../editor/selection.zig");
 const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("../editor/view_model.zig");
+const ecmd = @import("../editor/commands.zig");
+const editormenu = @import("editormenu.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
@@ -925,6 +927,21 @@ pub const EditorView = struct {
     /// comptime constant in `editor/theme.zig`, so it never dangles
     /// across a config-arena swap.
     theme: *const theme_mod.Theme = &theme_mod.dark,
+    /// Typing behaviour toggles (`editor_auto_indent`,
+    /// `editor_auto_close_pairs`, `editor_smart_backspace`).
+    auto_indent: bool = true,
+    auto_close: bool = true,
+    smart_backspace: bool = true,
+    /// Resolved editor-command bindings: `editor/commands.zig` defaults
+    /// overlaid with `editor_keybind.*` config entries. Rebuilt by
+    /// syncConfig; owned.
+    ed_bindings: std.ArrayList(EdBinding) = .empty,
+    /// Corner of an in-progress Shift+Alt block selection, in
+    /// (line, byte column). Null when no block drag is active.
+    block_anchor: ?struct { line: usize, col: usize } = null,
+    /// The go-to-line dialog's entry while it is up (same lifetime
+    /// contract as `rename_entry`).
+    goto_entry: ?*c.GtkWidget = null,
 
     // ---- project layer -------------------------------------------------
     //
@@ -1058,6 +1075,10 @@ pub const EditorView = struct {
         self.folding = cfg.editor_folding;
         self.fold_indent_fallback = cfg.editor_fold_indent_fallback;
         self.crash_recovery = cfg.editor_crash_recovery;
+        self.auto_indent = cfg.editor_auto_indent;
+        self.auto_close = cfg.editor_auto_close_pairs;
+        self.smart_backspace = cfg.editor_smart_backspace;
+        self.rebuildEdBindings(cfg);
         self.git_gutter = cfg.editor_git_gutter;
         self.outline_default = cfg.editor_outline;
         self.search_max_files = @max(1, cfg.editor_project_search_max_files);
@@ -1889,6 +1910,7 @@ pub const EditorView = struct {
             a.deinit();
             self.atlas = null;
         }
+        self.ed_bindings.deinit(self.allocator);
         self.pass.deinit();
         if (self.font_path) |s| self.allocator.free(s);
         if (self.font_family) |s| self.allocator.free(s);
@@ -2088,6 +2110,9 @@ pub const EditorView = struct {
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(motion, "motion", @ptrCast(&onMotion), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(motion));
+
+        // Right-click context menu on the canvas.
+        editormenu.attach(self, area_widget, self.allocator) catch {};
 
         // Wheel scrolling.
         const scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
@@ -4718,6 +4743,26 @@ pub const EditorView = struct {
         if (self.lsp) |m| {
             if (m.handleText(text)) return;
         }
+        // Auto-close intercepts single typed brackets/quotes ONLY on
+        // the IM commit path — paste, IPC inserts and multi-byte
+        // commits go straight through.
+        if (self.auto_close and text.len == 1) {
+            const gate: ecmd.Gate = .{ .ctx = @ptrCast(tab), .is_code = &gateIsCode };
+            switch (ecmd.autoClose(self.allocator, &tab.doc, &tab.sels, text[0], gate) catch .not_handled) {
+                .not_handled => {},
+                .typed_over => {
+                    tab.goal_x = null;
+                    self.afterMove(tab);
+                    return;
+                },
+                .inserted_pair, .surrounded => {
+                    tab.goal_x = null;
+                    self.afterDocEdit(tab);
+                    if (self.lsp) |m| m.maybeTrigger(text);
+                    return;
+                },
+            }
+        }
         self.insertText(tab, text);
         if (self.lsp) |m| m.maybeTrigger(text);
     }
@@ -4893,6 +4938,17 @@ pub const EditorView = struct {
             return 1;
         }
         if (self.handleLspKey(keyval, lower, ctrl, shift, alt)) return 1;
+
+        // Editor-command bindings (editor/commands.zig): defaults
+        // overlaid with `editor_keybind.*`, resolved in syncConfig. A
+        // user override deliberately wins over the hardcoded chords
+        // below.
+        if (self.active) |tab| {
+            if (self.matchEdBinding(keyval, lower, mods)) |cmd| {
+                self.runCommand(tab, cmd);
+                return 1;
+            }
+        }
 
         if (!alt) {
             if (self.active) |tab| {
@@ -5190,6 +5246,22 @@ pub const EditorView = struct {
                 return true;
             },
             c.GDK_KEY_BackSpace => {
+                if (!ctrl) {
+                    // Pair delete, then indent-stop retreat; both are
+                    // one transaction and decline cleanly.
+                    if (self.auto_close and (ecmd.backspacePair(a, &tab.doc, &tab.sels) catch false)) {
+                        tab.goal_x = null;
+                        self.afterDocEdit(tab);
+                        return true;
+                    }
+                    if (self.smart_backspace and
+                        (ecmd.smartBackspace(a, &tab.doc, &tab.sels, self.tab_width) catch false))
+                    {
+                        tab.goal_x = null;
+                        self.afterDocEdit(tab);
+                        return true;
+                    }
+                }
                 vm.deleteBackward(a, &tab.doc, &tab.sels, ctrl) catch {};
                 tab.goal_x = null;
                 self.afterDocEdit(tab);
@@ -5202,14 +5274,38 @@ pub const EditorView = struct {
                 return true;
             },
             c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
-                vm.insertNewlineIndent(a, &tab.doc, &tab.sels) catch {};
+                if (self.auto_indent) {
+                    ecmd.newlineAutoIndent(a, &tab.doc, &tab.sels, .{
+                        .width = self.tab_width,
+                        .spaces = self.insert_spaces,
+                        .auto_indent = true,
+                    }) catch {};
+                } else {
+                    vm.insertNewlineIndent(a, &tab.doc, &tab.sels) catch {};
+                }
                 tab.goal_x = null;
                 self.afterDocEdit(tab);
                 return true;
             },
-            c.GDK_KEY_Tab => {
-                if (ctrl or shift) return false;
-                vm.insertTabStop(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch {};
+            c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => {
+                if (ctrl) return false;
+                if (shift or keyval == c.GDK_KEY_ISO_Left_Tab) {
+                    ecmd.dedentLines(a, &tab.doc, &tab.sels, self.tab_width) catch {};
+                    self.afterDocEdit(tab);
+                    return true;
+                }
+                // Tab with any real selection indents the covered
+                // lines (the universal editor rule); a bare caret
+                // inserts a tab stop.
+                var any_range = false;
+                for (tab.sels.sels.items) |s| {
+                    if (!s.isCaret()) any_range = true;
+                }
+                if (any_range) {
+                    ecmd.indentLines(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch {};
+                } else {
+                    vm.insertTabStop(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch {};
+                }
                 tab.goal_x = null;
                 self.afterDocEdit(tab);
                 return true;
@@ -5239,6 +5335,361 @@ pub const EditorView = struct {
         editoroutline.onCaretMoved(self, tab);
         self.updateStatus();
         self.queueRender();
+    }
+
+    // ---- editor commands (editor/commands.zig) ------------------------
+
+    pub const EdBinding = struct {
+        keyval: c_uint,
+        mods: c_uint,
+        cmd: ecmd.Command,
+    };
+
+    /// Resolve the editor-command binding table: each command's default
+    /// accelerator, overridden (or unbound, empty accel) by
+    /// `editor_keybind.<command>` config entries. A separate table from
+    /// the window/pane bindings on purpose: these chords exist only
+    /// while the editor canvas has focus and can never eat a terminal
+    /// key.
+    fn rebuildEdBindings(self: *EditorView, cfg: *const Config) void {
+        self.ed_bindings.clearRetainingCapacity();
+        inline for (@typeInfo(ecmd.Command).@"enum".fields) |f| {
+            const cmd: ecmd.Command = @enumFromInt(f.value);
+            var accel: []const u8 = ecmd.defaultAccel(cmd);
+            for (cfg.editor_keybinds.items) |kb| {
+                if (std.mem.eql(u8, kb.name, f.name)) accel = kb.accel;
+            }
+            if (accel.len > 0) {
+                if (input.parseAccel(accel)) |p| {
+                    self.ed_bindings.append(self.allocator, .{
+                        .keyval = p.keyval,
+                        .mods = p.mods & input.SIGNIFICANT_MODS,
+                        .cmd = cmd,
+                    }) catch return;
+                } else {
+                    std.debug.print("sketerm: editor_keybind: bad accelerator '{s}' for '{s}'\n", .{ accel, f.name });
+                }
+            }
+        }
+    }
+
+    fn matchEdBinding(self: *EditorView, keyval: c_uint, lower: c_uint, mods: c_uint) ?ecmd.Command {
+        for (self.ed_bindings.items) |b| {
+            if ((b.keyval == lower or b.keyval == keyval) and b.mods == mods) return b.cmd;
+        }
+        return null;
+    }
+
+    /// Language for comment toggling: like `detectLang` but NOT gated
+    /// on `editor_syntax` — the comment prefix is a fact about the
+    /// file, not about whether highlighting is drawn.
+    fn commentLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
+        _ = self;
+        if (tab.hl_lang) |l| return l;
+        var buf: [SHEBANG_PROBE]u8 = undefined;
+        var head: []const u8 = "";
+        const n = @min(buf.len, tab.doc.rope.len());
+        if (n > 0) {
+            var it = tab.doc.rope.iterateRange(0, n);
+            var w: usize = 0;
+            while (it.next()) |chunk| {
+                @memcpy(buf[w .. w + chunk.len], chunk);
+                w += chunk.len;
+            }
+            head = buf[0..w];
+            if (std.mem.indexOfScalar(u8, head, '\n')) |nl| head = head[0..nl];
+        }
+        return syntax.detect(tab.spec, head);
+    }
+
+    /// Dispatch one editor command (keybinding, palette or context
+    /// menu). Every mutation is one transaction = one undo step.
+    pub fn runCommand(self: *EditorView, tab: *ETab, cmd: ecmd.Command) void {
+        const a = self.allocator;
+        switch (cmd) {
+            .duplicate_line_up, .duplicate_line_down => {
+                ecmd.duplicate(a, &tab.doc, &tab.sels, cmd == .duplicate_line_down) catch return;
+                tab.goal_x = null;
+                self.afterDocEdit(tab);
+            },
+            .move_line_up, .move_line_down => {
+                ecmd.moveLines(a, &tab.doc, &tab.sels, cmd == .move_line_down) catch return;
+                tab.goal_x = null;
+                self.afterDocEdit(tab);
+            },
+            .join_lines => {
+                ecmd.joinLines(a, &tab.doc, &tab.sels) catch return;
+                tab.goal_x = null;
+                self.afterDocEdit(tab);
+            },
+            .sort_lines => {
+                var any = false;
+                for (tab.sels.sels.items) |s| {
+                    if (!s.isCaret()) any = true;
+                }
+                if (!any) {
+                    self.setStatus("Select the lines to sort.");
+                    return;
+                }
+                ecmd.sortLines(a, &tab.doc, &tab.sels) catch return;
+                self.afterDocEdit(tab);
+            },
+            .toggle_comment => {
+                const lang = self.commentLang(tab) orelse {
+                    self.setStatus("No known language for this file — no comment syntax.");
+                    return;
+                };
+                const prefix = lang.lineComment() orelse {
+                    self.setStatus("This language has no line-comment syntax.");
+                    return;
+                };
+                _ = ecmd.toggleComment(a, &tab.doc, &tab.sels, prefix) catch return;
+                tab.goal_x = null;
+                self.afterDocEdit(tab);
+            },
+            .indent => {
+                ecmd.indentLines(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch return;
+                self.afterDocEdit(tab);
+            },
+            .dedent => {
+                ecmd.dedentLines(a, &tab.doc, &tab.sels, self.tab_width) catch return;
+                self.afterDocEdit(tab);
+            },
+            .trim_trailing_ws => {
+                ecmd.trimTrailingWhitespace(a, &tab.doc, &tab.sels) catch return;
+                self.afterDocEdit(tab);
+            },
+            .upper_case, .lower_case, .title_case => {
+                const mode: ecmd.CaseMode = switch (cmd) {
+                    .upper_case => .upper,
+                    .lower_case => .lower,
+                    else => .title,
+                };
+                ecmd.changeCase(a, &tab.doc, &tab.sels, mode) catch return;
+                self.afterDocEdit(tab);
+            },
+            .goto_line => self.promptGotoLine(),
+            .select_next_occurrence => {
+                const found = ecmd.selectNextOccurrence(a, &tab.doc, &tab.sels) catch false;
+                self.afterMove(tab);
+                if (!found) self.setStatus("No further occurrence.");
+            },
+            .skip_occurrence => {
+                const found = ecmd.skipOccurrence(a, &tab.doc, &tab.sels) catch false;
+                self.afterMove(tab);
+                if (!found) self.setStatus("No further occurrence.");
+            },
+            .select_all_occurrences => {
+                const n = ecmd.selectAllOccurrences(a, &tab.doc, &tab.sels) catch 0;
+                self.afterMove(tab);
+                // After afterMove: its updateStatus would overwrite this.
+                if (n > 0) {
+                    var buf: [48]u8 = undefined;
+                    if (std.fmt.bufPrintZ(&buf, "{d} occurrence(s) selected.", .{n})) |z| {
+                        self.setStatus(z.ptr);
+                    } else |_| {}
+                }
+            },
+            .add_caret_above, .add_caret_below => {
+                ecmd.addCaretVertical(a, &tab.doc, &tab.sels, cmd == .add_caret_below) catch return;
+                self.afterMove(tab);
+            },
+            .split_selection_lines => {
+                ecmd.splitSelectionIntoLines(a, &tab.doc, &tab.sels) catch return;
+                self.afterMove(tab);
+            },
+        }
+    }
+
+    /// Syntax gate for quote auto-close: an offset whose token is a
+    /// string or comment is content, not code. No tree (or a stale
+    /// one) gates nothing — small documents re-parse synchronously on
+    /// every edit, so staleness is a one-keystroke window.
+    fn gateIsCode(ctx: ?*anyopaque, offset: usize) bool {
+        const tab: *ETab = @ptrCast(@alignCast(ctx.?));
+        const hl = tab.hl orelse return true;
+        if (hl.isStale(&tab.doc)) return true;
+        const kind = hl.kindAt(&tab.doc, offset) catch return true;
+        return switch (kind) {
+            .string, .comment, .escape => false,
+            else => true,
+        };
+    }
+
+    fn promptGotoLine(self: *EditorView) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse return;
+        const ctx = DlgCtx.create(self, tab) orelse return;
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(
+            c.adw_alert_dialog_new("Go to line", "Line, or line:column"),
+        ));
+        const entry = c.gtk_entry_new();
+        // AdwAlertDialog does not run Enter through the default-widget
+        // machinery, so the entry's own activate is the Enter path;
+        // the "Go" button is the response path. Both share
+        // applyGotoText; the fenced ctx carries its own free.
+        const ectx = DlgCtx.create(self, tab) orelse {
+            ctx.destroy();
+            return;
+        };
+        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onGotoLineActivate), @ptrCast(ectx), @ptrCast(&freeDlgCtx), c.G_CONNECT_DEFAULT);
+        c.adw_alert_dialog_set_extra_child(dialog, entry);
+        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+        c.adw_alert_dialog_add_response(dialog, "go", "Go");
+        c.adw_alert_dialog_set_response_appearance(dialog, "go", c.ADW_RESPONSE_SUGGESTED);
+        c.adw_alert_dialog_set_default_response(dialog, "go");
+        c.adw_alert_dialog_set_close_response(dialog, "cancel");
+        self.goto_entry = entry;
+        // Without this the dialog maps with nothing focused and typed
+        // digits vanish into the modal barrier.
+        c.adw_dialog_set_focus(@ptrCast(dialog), entry);
+        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onGotoLineResponse, @ptrCast(ctx));
+    }
+
+    fn freeDlgCtx(user: ?*anyopaque) callconv(.c) void {
+        if (user) |u| {
+            const ctx: *DlgCtx = @ptrCast(@alignCast(u));
+            ctx.destroy();
+        }
+    }
+
+    /// Parse "line" or "line:col" (1-based) and jump.
+    fn applyGotoText(view: *EditorView, tab: *ETab, text: []const u8) void {
+        const trimmed = std.mem.trim(u8, text, " \t");
+        if (trimmed.len == 0) return;
+        var line_part = trimmed;
+        var col: usize = 1;
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            line_part = trimmed[0..colon];
+            col = std.fmt.parseInt(usize, trimmed[colon + 1 ..], 10) catch 1;
+        }
+        const line = std.fmt.parseInt(usize, line_part, 10) catch return;
+        view.gotoLineCol(tab, @max(1, line), @max(1, col));
+        _ = c.gtk_widget_grab_focus(@ptrCast(view.area));
+    }
+
+    fn onGotoLineActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        const r = ctx.resolve() orelse return;
+        const raw = c.gtk_editable_get_text(@ptrCast(entry));
+        if (raw != null) {
+            applyGotoText(r.view, r.tab, std.mem.span(@as([*:0]const u8, @ptrCast(raw))));
+        }
+        r.view.goto_entry = null;
+        if (c.gtk_widget_get_ancestor(@ptrCast(entry), c.adw_dialog_get_type())) |dlg| {
+            c.adw_dialog_force_close(@ptrCast(@alignCast(dlg)));
+        }
+    }
+
+    fn onGotoLineResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
+        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
+        const r = ctx.resolve() orelse return;
+        const entry = r.view.goto_entry;
+        r.view.goto_entry = null;
+        if (!std.mem.eql(u8, resp, "go")) return;
+        const e = entry orelse return;
+        const raw = c.gtk_editable_get_text(@ptrCast(e));
+        if (raw == null) return;
+        applyGotoText(r.view, r.tab, std.mem.span(@as([*:0]const u8, @ptrCast(raw))));
+    }
+
+    // ---- context menu (ui/editormenu.zig) -----------------------------
+
+    /// Per-popup state for the context menu: place the caret when the
+    /// click lands outside every selection, then enable/disable rows
+    /// that cannot act. Returning false suppresses the menu.
+    pub fn menuPrePopup(self: *EditorView, group: *c.GSimpleActionGroup, x: f64, y: f64) bool {
+        if (self.widgets_dead) return false;
+        const tab = self.active orelse return false;
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        const pos = self.hitTest(tab, x, y);
+        var inside = false;
+        for (tab.sels.sels.items) |s| {
+            if (!s.isCaret() and pos >= s.start() and pos <= s.end()) inside = true;
+        }
+        if (!inside) {
+            tab.sels.keepPrimaryOnly();
+            tab.sels.sels.items[0] = Selection.caret(pos);
+            tab.goal_x = null;
+            self.afterMove(tab);
+        }
+        var has_selection = false;
+        for (tab.sels.sels.items) |s| {
+            if (!s.isCaret()) has_selection = true;
+        }
+        const lsp_on = tab.lsp != null and self.lsp != null;
+        const lang = self.commentLang(tab);
+        const has_comment = lang != null and lang.?.lineComment() != null;
+        setActionEnabled(group, "cut", has_selection);
+        setActionEnabled(group, "copy", has_selection);
+        setActionEnabled(group, "sort", has_selection);
+        setActionEnabled(group, "toggle-comment", has_comment);
+        setActionEnabled(group, "fold", self.folding);
+        setActionEnabled(group, "unfold", self.folding);
+        setActionEnabled(group, "fold-all", self.folding);
+        setActionEnabled(group, "unfold-all", self.folding);
+        for ([_][*:0]const u8{ "goto-def", "references", "rename", "format", "code-actions" }) |n| {
+            setActionEnabled(group, n, lsp_on);
+        }
+        return true;
+    }
+
+    fn setActionEnabled(group: *c.GSimpleActionGroup, name: [*:0]const u8, on: bool) void {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(on));
+        }
+    }
+
+    /// Context-menu dispatch. Rows that reduce to an editor command go
+    /// through `runCommand` (same code path as the keybindings).
+    pub fn menuAction(self: *EditorView, act: editormenu.Action) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse return;
+        switch (act) {
+            .cut => self.cutSelection(tab),
+            .copy => self.copySelection(tab),
+            .paste => self.pasteClipboard(),
+            .select_all => {
+                vm.selectAll(&tab.doc, &tab.sels);
+                self.refresh(tab);
+            },
+            .toggle_comment => self.runCommand(tab, .toggle_comment),
+            .duplicate => self.runCommand(tab, .duplicate_line_down),
+            .move_up => self.runCommand(tab, .move_line_up),
+            .move_down => self.runCommand(tab, .move_line_down),
+            .join => self.runCommand(tab, .join_lines),
+            .sort => self.runCommand(tab, .sort_lines),
+            .indent => self.runCommand(tab, .indent),
+            .dedent => self.runCommand(tab, .dedent),
+            .trim_ws => self.runCommand(tab, .trim_trailing_ws),
+            .case_upper => self.runCommand(tab, .upper_case),
+            .case_lower => self.runCommand(tab, .lower_case),
+            .case_title => self.runCommand(tab, .title_case),
+            .goto_def, .references, .rename, .format, .code_actions => {
+                const m = self.lsp orelse {
+                    self.setStatus("No language server for this file.");
+                    return;
+                };
+                switch (act) {
+                    .goto_def => m.requestDefinition(.definition),
+                    .references => m.requestDefinition(.references),
+                    .rename => m.startRename(),
+                    .format => m.requestFormatting(),
+                    .code_actions => m.requestCodeActions(),
+                    else => unreachable,
+                }
+            },
+            .fold => self.foldAtCaret(tab),
+            .unfold => self.unfoldAtCaret(tab),
+            .fold_all => self.foldAll(tab),
+            .unfold_all => self.unfoldAll(tab),
+            .find => self.openFind(false),
+            .replace => self.openFind(true),
+            .goto_line => self.promptGotoLine(),
+        }
     }
 
     // ---- mouse --------------------------------------------------------
@@ -5271,6 +5722,20 @@ pub const EditorView = struct {
         }
         const pos = self.hitTest(tab, x, y);
         tab.goal_x = null;
+        const alt = (mods & c.GDK_ALT_MASK) != 0;
+        // Shift+Alt+drag: block (column) selection — one range per
+        // line between the press corner and the pointer.
+        if (alt and shift and n_press == 1) {
+            const lc = tab.doc.rope.offsetToLineCol(pos);
+            self.block_anchor = .{ .line = lc.line, .col = pos - tab.doc.rope.lineToOffset(lc.line) };
+            self.drag_anchor = null;
+            tab.sels.keepPrimaryOnly();
+            tab.sels.sels.items[0] = Selection.caret(pos);
+            self.updateStatus();
+            self.queueRender();
+            return;
+        }
+        self.block_anchor = null;
         if (n_press >= 3) {
             const sel = vm.lineRangeAt(&tab.doc, pos);
             tab.sels.keepPrimaryOnly();
@@ -5301,6 +5766,7 @@ pub const EditorView = struct {
     fn onClickReleased(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
         const self: *EditorView = @ptrCast(@alignCast(user.?));
         self.drag_anchor = null;
+        self.block_anchor = null;
     }
 
     fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -5308,6 +5774,16 @@ pub const EditorView = struct {
         // Dwell hover: this only RESTARTS a timer, it never issues a
         // request (editorlsp.onPointerMoved).
         if (self.lsp) |m| m.onPointerMoved(x, y);
+        if (self.block_anchor) |ba| {
+            const btab = self.active orelse return;
+            const pos = self.hitTest(btab, x, y);
+            const lc = btab.doc.rope.offsetToLineCol(pos);
+            const col = pos - btab.doc.rope.lineToOffset(lc.line);
+            ecmd.blockSelection(self.allocator, &btab.doc, &btab.sels, ba.line, ba.col, lc.line, col) catch return;
+            self.updateStatus();
+            self.queueRender();
+            return;
+        }
         const anchor = self.drag_anchor orelse return;
         const tab = self.active orelse return;
         const pos = self.hitTest(tab, x, y);
