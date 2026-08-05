@@ -3292,7 +3292,75 @@ const StreamOutcome = struct {
     /// +++ header) — proof diff actually ran rather than silently
     /// producing nothing.
     saw_added_line: bool = false,
+    /// git_status: every match, keyed by path, plus the one repo
+    /// event. Bounded so a runaway stream cannot grow the rig.
+    records: [64]GitRecord = undefined,
+    record_count: usize = 0,
+    saw_repo_ev: bool = false,
+    repo: GitRepo = .{},
+
+    /// The two porcelain columns reported for `path`, or null.
+    fn xyOf(self: *const StreamOutcome, path: []const u8) ?[]const u8 {
+        for (self.records[0..self.record_count]) |r| {
+            if (std.mem.eql(u8, r.pathText(), path)) return r.xyText();
+        }
+        return null;
+    }
+
+    fn origOf(self: *const StreamOutcome, path: []const u8) ?[]const u8 {
+        for (self.records[0..self.record_count]) |r| {
+            if (std.mem.eql(u8, r.pathText(), path)) return r.origText();
+        }
+        return null;
+    }
 };
+
+/// One git_status match, copied out of its arena-backed event.
+const GitRecord = struct {
+    path: [512]u8 = undefined,
+    path_len: usize = 0,
+    xy: [2]u8 = .{ 0, 0 },
+    xy_len: usize = 0,
+    orig: [512]u8 = undefined,
+    orig_len: usize = 0,
+
+    fn pathText(self: *const GitRecord) []const u8 {
+        return self.path[0..self.path_len];
+    }
+    fn xyText(self: *const GitRecord) []const u8 {
+        return self.xy[0..self.xy_len];
+    }
+    fn origText(self: *const GitRecord) []const u8 {
+        return self.orig[0..self.orig_len];
+    }
+};
+
+/// The git_status `repo` event, copied the same way.
+const GitRepo = struct {
+    is_repo: bool = false,
+    detached: bool = false,
+    initial: bool = false,
+    at_root: bool = false,
+    have_ab: bool = false,
+    ahead: i64 = 0,
+    behind: i64 = 0,
+    branch: [128]u8 = undefined,
+    branch_len: usize = 0,
+    upstream: [128]u8 = undefined,
+    upstream_len: usize = 0,
+
+    fn branchText(self: *const GitRepo) []const u8 {
+        return self.branch[0..self.branch_len];
+    }
+    fn upstreamText(self: *const GitRepo) []const u8 {
+        return self.upstream[0..self.upstream_len];
+    }
+};
+
+fn copyInto(dst: []u8, len: *usize, src: []const u8) void {
+    len.* = @min(src.len, dst.len);
+    @memcpy(dst[0..len.*], src[0..len.*]);
+}
 
 fn collectStream(fs: *fsdrive.Fs, job: u64, want_name: []const u8, timeout_ms: i64) StreamOutcome {
     var out = StreamOutcome{ .outcome = .{} };
@@ -3302,9 +3370,30 @@ fn collectStream(fs: *fsdrive.Fs, job: u64, want_name: []const u8, timeout_ms: i
             var e = e0;
             defer e.deinit();
             if (e.job != job) continue;
+            if (std.mem.eql(u8, e.ev, "repo")) {
+                out.saw_repo_ev = true;
+                out.repo.is_repo = e.repo;
+                out.repo.detached = e.detached;
+                out.repo.initial = e.initial;
+                out.repo.at_root = e.root;
+                out.repo.have_ab = e.have_ab;
+                out.repo.ahead = e.ahead;
+                out.repo.behind = e.behind;
+                copyInto(&out.repo.branch, &out.repo.branch_len, e.branch);
+                copyInto(&out.repo.upstream, &out.repo.upstream_len, e.upstream);
+                continue;
+            }
             if (std.mem.eql(u8, e.ev, "match")) {
                 out.matches += 1;
                 if (want_name.len > 0 and std.mem.eql(u8, e.path, want_name)) out.saw_name = true;
+                if (out.record_count < out.records.len) {
+                    var r = GitRecord{};
+                    copyInto(&r.path, &r.path_len, e.path);
+                    copyInto(&r.xy, &r.xy_len, e.xy);
+                    copyInto(&r.orig, &r.orig_len, e.orig);
+                    out.records[out.record_count] = r;
+                    out.record_count += 1;
+                }
                 continue;
             }
             if (std.mem.eql(u8, e.ev, "line")) {
@@ -3370,10 +3459,22 @@ fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime ta
         mkdirAt(repo);
         const have_git = haveTool("git");
         if (have_git) {
-            runIn(repo, "git init -q .");
+            // `git init -b` needs git 2.28; the symbolic-ref does not.
+            runIn(repo, "git init -q . && git symbolic-ref HEAD refs/heads/main");
             touch(repo, "tracked.txt", "one\n");
-            runIn(repo, "git add tracked.txt && git -c user.email=s@x -c user.name=s commit -qm init");
+            touch(repo, "moved.txt", "content that is long enough to survive rename detection\n");
+            touch(repo, "staged.txt", "one\n");
+            touch(repo, ".gitignore", "ignored/\n");
+            mkdirAt(std.fmt.bufPrint(&pb[1], "{s}/ignored", .{repo}) catch unreachable);
+            touch(std.fmt.bufPrint(&pb[1], "{s}/ignored", .{repo}) catch unreachable, "junk.o", "x\n");
+            runIn(repo, "git add -A && git -c user.email=s@x -c user.name=s commit -qm init");
+            // One of every state the browser now claims to render.
             touch(repo, "untracked.txt", "new\n");
+            runIn(repo, "git mv moved.txt renamed.txt");
+            // Parenthesised: runIn appends its own `>/dev/null`, which
+            // would otherwise win over a trailing append redirection.
+            runIn(repo, "( printf 'two\\n' >> staged.txt && git add staged.txt && printf 'three\\n' >> staged.txt )");
+            runIn(repo, "( printf 'edit\\n' >> tracked.txt )");
         }
         const job = fs.startGitStatus(repo) catch failErr("git_status refused", fs.lastErr());
         const out = collectStream(&fs, job, "untracked.txt", 20_000);
@@ -3381,6 +3482,46 @@ fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime ta
         if (have_git) {
             if (out.matches == 0) fail("git_status reported no changes in a dirty repo");
             if (!out.saw_name) fail("git_status did not name the untracked file");
+            if (!out.saw_repo_ev) fail("git_status sent no repo event");
+            if (!out.repo.is_repo) fail("git_status called a repository a non-repo");
+            if (!out.repo.at_root) fail("git_status did not report the browsed dir as the repo root");
+            if (!std.mem.eql(u8, out.repo.branchText(), "main")) fail("git_status branch name");
+            if (out.repo.detached or out.repo.initial) fail("git_status branch flags");
+            // Both porcelain columns, kept apart.
+            const unstaged = out.xyOf("tracked.txt") orelse fail("no record for the modified file");
+            if (!std.mem.eql(u8, unstaged, ".M")) fail("unstaged modification lost its column");
+            const both = out.xyOf("staged.txt") orelse fail("no record for the staged file");
+            if (!std.mem.eql(u8, both, "MM")) fail("staged-then-modified collapsed to one side");
+            if (!std.mem.eql(u8, out.xyOf("untracked.txt") orelse "", "??")) fail("untracked columns");
+            // The rename, with its source.
+            const ren = out.xyOf("renamed.txt") orelse fail("no rename record");
+            if (ren[0] != 'R') fail("rename not reported as a rename");
+            if (!std.mem.eql(u8, out.origOf("renamed.txt") orelse "", "moved.txt")) fail("rename lost its source path");
+            // The ignored directory, collapsed to one record.
+            if (out.xyOf("ignored/") == null) fail("no ignored record");
+        }
+
+        // A detached HEAD, and a directory that is not a repository at
+        // all -- which must be distinguishable from a clean one.
+        if (have_git) {
+            runIn(repo, "git checkout -q --detach HEAD");
+            const djob = fs.startGitStatus(repo) catch failErr("git_status (detached) refused", fs.lastErr());
+            const dout = collectStream(&fs, djob, "", 20_000);
+            if (!dout.outcome.is("done")) fail("git_status (detached) outcome");
+            if (!dout.repo.is_repo or !dout.repo.detached) fail("detached HEAD not reported");
+            if (dout.repo.branch_len != 0) fail("detached HEAD reported a branch name");
+        }
+        {
+            const plain = std.fmt.bufPrint(&pb[1], "{s}/plain", .{dir}) catch unreachable;
+            mkdirAt(plain);
+            const pjob = fs.startGitStatus(plain) catch failErr("git_status (non-repo) refused", fs.lastErr());
+            const pout = collectStream(&fs, pjob, "", 20_000);
+            if (!pout.outcome.is("done")) fail("git_status (non-repo) outcome");
+            if (pout.matches != 0) fail("git_status found changes outside a repository");
+            if (have_git) {
+                if (!pout.saw_repo_ev) fail("git_status sent no repo event outside a repository");
+                if (pout.repo.is_repo) fail("git_status called a plain directory a repository");
+            }
         }
     }
 

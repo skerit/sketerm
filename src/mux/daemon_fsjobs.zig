@@ -925,6 +925,22 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         /// done: the result path is a PERSISTENT host-side cache
         /// file, not a temp asset — nobody may unlink it.
         keep: bool = false,
+        /// git_status match detail: the two porcelain-v2 columns and
+        /// a rename/copy source. Absent on every other verb.
+        xy: []const u8 = "",
+        orig: []const u8 = "",
+        /// git_status `repo` event: the branch header. A client that
+        /// never sees this event is talking to a daemon too old to
+        /// answer the repository question at all.
+        repo: bool = false,
+        branch: []const u8 = "",
+        upstream: []const u8 = "",
+        ahead: i64 = 0,
+        behind: i64 = 0,
+        have_ab: bool = false,
+        detached: bool = false,
+        initial: bool = false,
+        root: bool = false,
     };
     const parsed = std.json.parseFromSlice(Ev, self.allocator, line, .{
         .ignore_unknown_fields = true,
@@ -935,6 +951,28 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         job.done_path_len = @min(e.path.len, job.done_path.len);
         @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
         job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
+        return;
+    }
+    if (std.mem.eql(u8, e.ev, "repo")) {
+        // git_status' repository header. Its own field set, so the
+        // per-record events below stay as small as they were.
+        if (job.owner) |owner| {
+            if (!owner.dead) owner.queueJson(.fs_job, .{
+                .job = job.id,
+                .ev = e.ev,
+                .repo = e.repo,
+                .branch = e.branch,
+                .upstream = e.upstream,
+                .text = e.text,
+                .ahead = e.ahead,
+                .behind = e.behind,
+                .have_ab = e.have_ab,
+                .detached = e.detached,
+                .initial = e.initial,
+                .root = e.root,
+                .truncated = e.truncated,
+            });
+        }
         return;
     }
     if (std.mem.eql(u8, e.ev, "match") or std.mem.eql(u8, e.ev, "unmatch") or
@@ -965,6 +1003,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
                 .truncated = e.truncated,
                 .watches = e.watches,
                 .watch_limit = e.watch_limit,
+                .xy = e.xy,
+                .orig = e.orig,
             });
         }
         return;
