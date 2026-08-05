@@ -15,6 +15,8 @@ const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const render_kick = @import("../util/render_kick.zig");
 const input = @import("input.zig");
+const ecmd = @import("../editor/commands.zig");
+const EditorView = @import("editorview.zig").EditorView;
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
 
@@ -164,6 +166,9 @@ const RowCtx = struct {
     /// durable tab on this transport-prefixed host instead of
     /// dispatching `action`. Arena-owned.
     domain_host: ?[]const u8 = null,
+    /// Non-null = an editor-face command row: activation runs it on
+    /// the focused pane's editor view instead of dispatching `action`.
+    editor_cmd: ?ecmd.Command = null,
 };
 
 const Ctx = struct {
@@ -253,10 +258,16 @@ pub fn open(window: *Window) !void {
     };
     defer if (fallback_theme) |ft| c.g_object_unref(ft);
 
-    // Build rows: the curated static set plus one "New Tab on <name>"
-    // per configured [domain.<name>].
+    // Build rows: the curated static set, plus the editor-face command
+    // set when the focused pane wears an editor, plus one "New Tab on
+    // <name>" per configured [domain.<name>].
     const domains = window.config.domains.items;
-    const rows = try arena.alloc(*RowCtx, ENTRIES.len + domains.len);
+    const editor_here: bool = blk: {
+        const pane = window.focusedPane() orelse break :blk false;
+        break :blk EditorView.fromPane(pane) != null;
+    };
+    const n_ed: usize = if (editor_here) ecmd.COMMAND_COUNT else 0;
+    const rows = try arena.alloc(*RowCtx, ENTRIES.len + n_ed + domains.len);
     for (ENTRIES, 0..) |entry, i| {
         const rctx = try arena.create(RowCtx);
         rctx.* = .{
@@ -295,6 +306,36 @@ pub fn open(window: *Window) !void {
     }
 
     var row_count: usize = ENTRIES.len;
+    if (editor_here) {
+        inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
+            const cmd: ecmd.Command = @enumFromInt(field.value);
+            const rctx = try arena.create(RowCtx);
+            rctx.* = .{
+                .palette = ctx,
+                .action = .toggle_editor_face, // unused for editor rows
+                .title_lower = try toLowerOwned(arena, ecmd.label(cmd)),
+                .desc_lower = try toLowerOwned(arena, ecmd.describe(cmd)),
+                .editor_cmd = cmd,
+            };
+            rows[row_count] = rctx;
+            row_count += 1;
+
+            const row = c.adw_action_row_new();
+            c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), ecmd.label(cmd));
+            c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), ecmd.describe(cmd));
+            c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
+            const icon = iconImage(window, fallback_theme, "document-edit-symbolic", 20);
+            c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
+            if (findEdBindingLabel(arena, window, cmd)) |label_z| {
+                const kbd = c.gtk_label_new(label_z);
+                c.gtk_widget_add_css_class(kbd, "dim-label");
+                c.gtk_widget_add_css_class(kbd, "monospace");
+                c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), kbd);
+            }
+            c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
+            c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
+        }
+    }
     for (domains) |dom| {
         if (dom.host.len == 0) continue;
         const title_z = try std.fmt.allocPrintSentinel(arena, "New Tab on {s}", .{dom.name}, 0);
@@ -486,6 +527,7 @@ fn onListBoxRowActivated(
     const win = ctx.window;
     const action = rctx.action;
     const domain_host = rctx.domain_host;
+    const editor_cmd = rctx.editor_cmd;
     // Dismiss BEFORE dispatching: actions like .prefs_open open
     // another dialog, and the palette would otherwise stack on top.
     // NOTE: domain_host is arena memory freed by the dialog's
@@ -503,6 +545,13 @@ fn onListBoxRowActivated(
         win.newDurableTab(h) catch {
             std.debug.print("sketerm: durable tab on {s} failed (ssh/key auth?)\n", .{h});
         };
+        return;
+    }
+    if (editor_cmd) |cmd| {
+        const pane = win.focusedPane() orelse return;
+        const view = EditorView.fromPane(pane) orelse return;
+        const tab = view.activeTab() orelse return;
+        view.runCommand(tab, cmd);
         return;
     }
     window_mod.dispatchAction(win, action);
@@ -581,6 +630,24 @@ fn matches(query: []const u8, title_lower: []const u8, desc_lower: []const u8) b
     if (std.mem.indexOf(u8, title_lower, q) != null) return true;
     if (std.mem.indexOf(u8, desc_lower, q) != null) return true;
     return false;
+}
+
+/// Keybind hint for an editor-command row: the `editor_keybind.*`
+/// override when one exists, else the command's default accelerator.
+fn findEdBindingLabel(arena: std.mem.Allocator, window: *Window, cmd: ecmd.Command) ?[*:0]const u8 {
+    var accel: []const u8 = ecmd.defaultAccel(cmd);
+    for (window.config.editor_keybinds.items) |kb| {
+        if (std.mem.eql(u8, kb.name, ecmd.name(cmd))) accel = kb.accel;
+    }
+    if (accel.len == 0) return null;
+    const parsed = input.parseAccel(accel) orelse return null;
+    const label_ptr = c.gtk_accelerator_get_label(parsed.keyval, parsed.mods);
+    if (label_ptr == null) return null;
+    defer c.g_free(label_ptr);
+    const label = std.mem.span(@as([*:0]const u8, @ptrCast(label_ptr)));
+    const z = arena.allocSentinel(u8, label.len, 0) catch return null;
+    @memcpy(z, label);
+    return z.ptr;
 }
 
 fn findBindingLabel(arena: std.mem.Allocator, window: *Window, action: input.Action) ?[*:0]const u8 {
