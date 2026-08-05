@@ -13457,3 +13457,44 @@ grid, so one assertion catches either mistake. It measures the pane's
 right edge off a real frame instead of assuming the toplevel edge: the
 CSD shadow is ~25 px at the sides and ~33 px at the bottom, and every
 hard-coded guess landed in it.
+
+## Sixel DCS parameters: P1 aspect, P2 background select, P3 ignored
+
+The sixel decoder had honoured exactly one thing from the DCS header:
+nothing. `DCS P1 ; P2 ; P3 q` was parsed by the VT state machine and
+then dropped on the floor, and the raster attribute's `Pan`/`Pad` were
+read into locals and discarded (only `Ph`/`Pv` sized the buffer).
+
+`sixel.decode` now takes an `Options` — an aspect ratio and an
+optional background fill — and `Screen.onDcs` resolves both from the
+header. P1 goes through `aspectFromP1`, the VT330/VT340 macro table
+(0/1/5/6 = 2:1, 2 = 5:1, 3/4 = 3:1, 7/8/9 = 1:1; anything above 9 is
+not in the table and gets 1:1 rather than a guess), and the ratio is
+applied by whole-pixel replication after painting, clamped to the same
+`MAX_DIM` the allocation is. A raster attribute that states a ratio
+overrides P1 — P1 picks one of nine macros, `Pan;Pad` says the ratio
+outright — which is also why this is safe for modern encoders: they
+all emit `"1;1;...`, so their `P1 = 0` never doubles anything.
+`Pan;Pad` count on their own now, so a `"2;1` prefix with no size is
+honoured.
+
+P2 is the one that is easy to invert: 0 and 2 mean "pixels the data
+never paints take the current background colour", 1 means leave them
+transparent. Painted pixels are unaffected either way. `.default` as
+the current background resolves to transparent rather than to an
+opaque box in the default colour, because a pane background image or
+window transparency IS the current background there; a palette or RGB
+SGR background fills opaque.
+
+P3 (horizontal grid size) stays unread, deliberately: DEC defined it
+for the VT240's device grid and xterm and libsixel ignore it. A test
+pins that a wildly different P3 changes nothing.
+
+`img2sixel` is not installed here, so the real-producer check ran
+against ImageMagick's sixel coder (`magick x.png sixel:x.six`), which
+emits `\x1bP0;1;0q"1;1;W;H` — P2 = 1, raster 1:1 — plus hand-edited
+variants of that same output for P2 = 0, a 5:1 P1 with the raster
+ratio removed, and a junk P3. `zig build replay` now prints an
+`image WxH at (row,col) ... px0=(r,g,b,a)` line per image event, since
+images leave no cells behind and the grid dump alone could not show
+any of this.
