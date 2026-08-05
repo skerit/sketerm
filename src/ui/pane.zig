@@ -1964,6 +1964,8 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         .src_y = img.src_y,
         .src_w = img.src_w,
         .src_h = img.src_h,
+        .cell_x_offset = img.cell_x_offset,
+        .cell_y_offset = img.cell_y_offset,
         .anchor_id = img.anchor_id,
     }) catch |err| {
         std.debug.print("sketerm: image_store.addFull failed (id={d}): {s}\n", .{ img.image_id, @errorName(err) });
@@ -1977,31 +1979,32 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     self.ensureTickRunning();
 }
 
+/// The image NUMBER a stored image was transmitted with, for the
+/// `d=n/N` selector. Lives on the Screen's manager, which the store
+/// has no reference to.
+fn imageNumberOf(ctx: ?*anyopaque, image_id: u32) u32 {
+    const self = cast.userData(Pane, ctx);
+    return self.terminal.screen.kitty_images.numberOf(image_id);
+}
+
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
     const self = cast.userData(Pane, ctx);
     // Kitty `d=` semantics. Lowercase leaves data on disk, uppercase
     // also frees it. We don't distinguish on free behaviour — every
     // delete tears down the GL texture on the next flush.
     switch (ev.what) {
-        'a', 'A' => self.image_store.markAllForDelete(),
-        'i', 'I' => {
-            if (ev.image_id != 0) self.image_store.markByIdForDelete(ev.image_id);
-        },
-        'p', 'P' => {
-            if (ev.image_id != 0) self.image_store.markByPlacementForDelete(ev.image_id, ev.placement_id);
-        },
-        // 'n','N' (image_number), 'r','R' (z-range), 'x','y','c'
-        // (coordinates), 'z','Z' (z-index): not yet implemented.
-        // Fallback: if we have an image_id, scope the delete to that
-        // image; otherwise leave images alone rather than nuke all.
-        else => {
-            if (ev.image_id != 0) {
-                if (ev.placement_id != 0)
-                    self.image_store.markByPlacementForDelete(ev.image_id, ev.placement_id)
-                else
-                    self.image_store.markByIdForDelete(ev.image_id);
+        // `d=a` with no id is the common "clear the screen" call; the
+        // selector table would need a rectangle for it.
+        'a', 'A' => {
+            if (ev.image_id == 0) {
+                self.image_store.markAllForDelete();
+            } else {
+                self.image_store.markByIdForDelete(ev.image_id);
             }
         },
+        // Everything else goes through the protocol's own selector
+        // table, including the positional ones.
+        else => self.image_store.markSelectedForDelete(ev, imageNumberOf, @ptrCast(self)),
     }
     self.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));

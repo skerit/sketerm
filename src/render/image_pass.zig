@@ -157,8 +157,12 @@ pub const ImagePass = struct {
             // Anchored images that scrolled out of the viewport are kept
             // but not drawn (they may scroll back in).
             if (!img.on_screen) continue;
-            const x: f32 = self.pad + @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
-            const y: f32 = self.pad + @as(f32, @floatFromInt(img.draw_row)) * store.cell_h;
+            // The sub-cell offsets let an image sit off the cell grid
+            // (kitty `X=`/`Y=`); they are zero for everything else.
+            const x: f32 = self.pad + @as(f32, @floatFromInt(img.cell_col)) * store.cell_w +
+                @as(f32, @floatFromInt(img.cell_x_offset));
+            const y: f32 = self.pad + @as(f32, @floatFromInt(img.draw_row)) * store.cell_h +
+                @as(f32, @floatFromInt(img.cell_y_offset));
 
             // Destination size:
             //   - cells_wide/cells_high > 0 → scale to that many cells

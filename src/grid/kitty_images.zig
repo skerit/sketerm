@@ -50,6 +50,9 @@ pub const StoredImage = struct {
     loops_remaining: i32 = -1,
     /// Insertion order, for FIFO eviction under the memory budget.
     seq: u64 = 0,
+    /// The client's own image NUMBER (`I=`), if it sent one. Zero
+    /// otherwise. `d=n/N` deletes by this rather than by id.
+    number: u32 = 0,
 
     fn rgbaLen(self: *const StoredImage) usize {
         return @as(usize, self.width) * @as(usize, self.height) * 4;
@@ -95,6 +98,9 @@ pub const Accum = struct {
     frame_target: u32 = 0, // 0 = append at end
     frame_compose_from: u32 = 0,
     frame_compose_mode: u8 = 0,
+    /// The client's image NUMBER (`I=`) from the first chunk, carried
+    /// to the stored image so `d=n/N` can find it.
+    number: u32 = 0,
     /// Concatenated base64 payload, awaiting final decode.
     payload: std.ArrayList(u8) = .empty,
     /// Set when an appendSlice into `payload` failed mid-stream. A
@@ -299,6 +305,7 @@ pub const Manager = struct {
                         .frame_target = cmd.cells_wide,
                         .frame_compose_from = cmd.cells_high,
                         .frame_compose_mode = cmd.no_cursor_move,
+                        .number = cmd.image_number,
                     }) catch return default;
                     self.active_transmit_id = effective_id;
                 }
@@ -367,6 +374,45 @@ pub const Manager = struct {
         while (ait.next()) |e| e.value_ptr.deinit(self.allocator);
         self.accums.clearRetainingCapacity();
         self.active_transmit_id = 0;
+    }
+
+    /// Drop every image the client tagged with this number (`d=N`).
+    /// A number can be reused across ids, so this is not a single
+    /// lookup.
+    pub fn dropByNumber(self: *Manager, number: u32) void {
+        if (number == 0) return;
+        var doomed: [32]u32 = undefined;
+        var n: usize = 0;
+        var it = self.store.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.number != number) continue;
+            if (n == doomed.len) break;
+            doomed[n] = e.key_ptr.*;
+            n += 1;
+        }
+        for (doomed[0..n]) |id| self.drop(id);
+    }
+
+    /// Drop every image whose id falls in an inclusive range (`d=R`).
+    pub fn dropRange(self: *Manager, lo: u32, hi: u32) void {
+        if (hi < lo) return;
+        var doomed: [64]u32 = undefined;
+        var n: usize = 0;
+        var it = self.store.iterator();
+        while (it.next()) |e| {
+            const id = e.key_ptr.*;
+            if (id < lo or id > hi) continue;
+            if (n == doomed.len) break;
+            doomed[n] = id;
+            n += 1;
+        }
+        for (doomed[0..n]) |id| self.drop(id);
+    }
+
+    /// The number a stored image was transmitted with, or 0.
+    pub fn numberOf(self: *Manager, image_id: u32) u32 {
+        const img = self.store.get(image_id) orelse return 0;
+        return img.number;
     }
 
     /// Look up a stored image's RGBA + dims.
@@ -522,7 +568,9 @@ pub const Manager = struct {
             var v = old.value;
             self.freeStoredImage(&v);
         }
-        try self.insertStored(image_id, stored);
+        var with_number = stored;
+        with_number.number = acc.number;
+        try self.insertStored(image_id, with_number);
         return true;
     }
 
