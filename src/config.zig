@@ -444,6 +444,22 @@ pub const Config = struct {
     /// narrows the candidates first; this bounds the pathological case
     /// (a regex with no literal part, which cannot be pre-filtered).
     editor_project_search_max_files: u32 = 4000,
+    /// Enter deepens the indent after an opening bracket (and drops a
+    /// pending closer onto its own line). Off copies the previous
+    /// line's leading whitespace only.
+    editor_auto_indent: bool = true,
+    /// Typing an opening bracket/quote inserts its closer (typing the
+    /// closer when it is next just moves past it; Backspace between an
+    /// empty pair deletes both). Wrapping a selection surrounds it.
+    editor_auto_close_pairs: bool = true,
+    /// Backspace in a line's leading spaces retreats one tab stop.
+    editor_smart_backspace: bool = true,
+    /// Editor-face keybind overrides, parsed from
+    /// `editor_keybind.<command> = <accel>` lines. Command names are
+    /// `editor/commands.zig`'s `Command` tags; empty accel unbinds.
+    /// Kept apart from `keybinds` so an editor chord can never shadow
+    /// (or be consumed by) the terminal's binding table.
+    editor_keybinds: std.ArrayList(KeybindEntry) = .empty,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -639,6 +655,14 @@ pub const Config = struct {
         try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
         for (self.keybinds.items) |kb| {
             out.keybinds.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, kb.name),
+                .accel = try arena.dupe(u8, kb.accel),
+            });
+        }
+        out.editor_keybinds = .empty;
+        try out.editor_keybinds.ensureTotalCapacity(arena, self.editor_keybinds.items.len);
+        for (self.editor_keybinds.items) |kb| {
+            out.editor_keybinds.appendAssumeCapacity(.{
                 .name = try arena.dupe(u8, kb.name),
                 .accel = try arena.dupe(u8, kb.accel),
             });
@@ -959,6 +983,9 @@ pub const Config = struct {
         if (self.editor_outline) try w.writeAll("editor_outline = true\n");
         if (self.editor_project_search_max_files != 4000)
             try w.print("editor_project_search_max_files = {d}\n", .{self.editor_project_search_max_files});
+        if (!self.editor_auto_indent) try w.writeAll("editor_auto_indent = false\n");
+        if (!self.editor_auto_close_pairs) try w.writeAll("editor_auto_close_pairs = false\n");
+        if (!self.editor_smart_backspace) try w.writeAll("editor_smart_backspace = false\n");
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -995,6 +1022,9 @@ pub const Config = struct {
         // Custom keybindings — emit one line per non-default override.
         for (self.keybinds.items) |kb| {
             try w.print("keybind.{s} = {s}\n", .{ kb.name, kb.accel });
+        }
+        for (self.editor_keybinds.items) |kb| {
+            try w.print("editor_keybind.{s} = {s}\n", .{ kb.name, kb.accel });
         }
 
         // Shader param overrides.
@@ -1519,6 +1549,22 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         try cfg.keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
         return;
     }
+    // `editor_keybind.<command> = <accel>` — the editor face's own
+    // binding namespace (never consulted by the terminal).
+    if (std.mem.startsWith(u8, key, "editor_keybind.")) {
+        const name = key["editor_keybind.".len..];
+        if (name.len == 0) return error.BadKeybindName;
+        const name_dup = try arena.dupe(u8, name);
+        const accel_dup = try arena.dupe(u8, value);
+        for (cfg.editor_keybinds.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.accel = accel_dup;
+                return;
+            }
+        }
+        try cfg.editor_keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
+        return;
+    }
     // `shader_param.<name> = <float | #rrggbb>` — tunable shader
     // uniforms (floats and vec3 colors).
     if (std.mem.startsWith(u8, key, "shader_param.")) {
@@ -1696,6 +1742,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_outline = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_project_search_max_files")) {
         cfg.editor_project_search_max_files = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "editor_auto_indent")) {
+        cfg.editor_auto_indent = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_auto_close_pairs")) {
+        cfg.editor_auto_close_pairs = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_smart_backspace")) {
+        cfg.editor_smart_backspace = try parseBool(value);
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {
@@ -2209,6 +2261,37 @@ test "config: keybind.<action> entries round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 3), parsed.keybinds.items.len);
     try std.testing.expectEqualStrings("<Control><Alt>d", parsed.keybinds.items[1].accel);
+}
+
+test "config: editor_keybind entries and typing toggles round-trip" {
+    const body =
+        \\editor_keybind.toggle_comment = <Control>k
+        \\editor_keybind.sort_lines =
+        \\editor_auto_indent = false
+        \\editor_auto_close_pairs = false
+        \\editor_smart_backspace = false
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.editor_keybinds.items.len);
+    try std.testing.expectEqualStrings("toggle_comment", cfg.editor_keybinds.items[0].name);
+    try std.testing.expectEqualStrings("<Control>k", cfg.editor_keybinds.items[0].accel);
+    try std.testing.expectEqualStrings("", cfg.editor_keybinds.items[1].accel);
+    try std.testing.expect(!cfg.editor_auto_indent);
+    try std.testing.expect(!cfg.editor_auto_close_pairs);
+    try std.testing.expect(!cfg.editor_smart_backspace);
+    // They live in their own list, not the terminal's.
+    try std.testing.expectEqual(@as(usize, 0), cfg.keybinds.items.len);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.editor_keybinds.items.len);
+    try std.testing.expectEqualStrings("<Control>k", parsed.editor_keybinds.items[0].accel);
+    try std.testing.expect(!parsed.editor_auto_indent);
 }
 
 test "config: later keybind for same action overrides earlier" {
