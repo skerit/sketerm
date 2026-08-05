@@ -628,6 +628,7 @@ pub const Pane = struct {
                     self.terminal.screen.selection.clear();
                     self.terminal.screen.dirty = true;
                     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+                    self.a11yNudge();
                 }
                 return true;
             },
@@ -861,6 +862,22 @@ pub const Pane = struct {
         self.detachBrowser();
         self.detachEditor();
         self.detachAppHost();
+        // AT-SPI bridge: drop the Terminal back-pointer and cancel the
+        // coalescing timer before the Terminal can die. The area's own
+        // ::destroy severs too, but on ordinary paths the Terminal is
+        // torn down first — this call is the one that runs in time.
+        // Skip once the widgets are gone (last-resort deinit call): the
+        // destroy signal already severed, and self.area then dangles.
+        if (!platform.is_macos and !self.widgets_dead) a11y.sever(@ptrCast(self.area));
+    }
+
+    /// Nudge the AT-SPI bridge after a host-side selection mutation —
+    /// selection lives GUI-side, so no daemon drain (and thus no
+    /// onRenderRequest) announces it. Coalesced in the bridge; free
+    /// when no screen reader is attached.
+    fn a11yNudge(self: *Pane) void {
+        if (platform.is_macos) return;
+        a11y.notifyChanged(@ptrCast(self.area));
     }
 
     /// Adopt an existing AppHost (a tabless session materialized
@@ -1468,10 +1485,14 @@ pub const Pane = struct {
             self.allocator.free(old);
         }
         self.titlebar_text = self.allocator.dupe(u8, text) catch null;
-        const lbl = self.titlebar_label orelse return;
         const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
         defer self.allocator.free(z);
         @memcpy(z, text);
+        // Screen readers announce the pane by its accessible label:
+        // keep it tracking the terminal title (OSC 0/1/2).
+        if (!platform.is_macos and !self.widgets_dead and text.len > 0)
+            a11y.setLabel(@ptrCast(self.area), z.ptr);
+        const lbl = self.titlebar_label orelse return;
         c.gtk_label_set_text(lbl, z.ptr);
     }
 
@@ -2920,6 +2941,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
             self.terminal.screen.selection.clear();
             self.terminal.screen.dirty = true;
             c.gtk_gl_area_queue_render(@ptrCast(self.area));
+            self.a11yNudge();
         }
         return;
     }
@@ -2935,6 +2957,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
             self.terminal.screen.selection.clear();
             self.terminal.screen.dirty = true;
             c.gtk_gl_area_queue_render(@ptrCast(self.area));
+            self.a11yNudge();
         }
         return;
     }
@@ -2943,6 +2966,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     const mode: @import("../grid/selection.zig").Mode = if (alt_held) .rectangular else .normal;
     self.terminal.screen.selection.start(cell.row, cell.col, mode);
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    self.a11yNudge();
 }
 
 fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -2974,6 +2998,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
             if (self.terminal.screen.selectCmdZoneAt(cell.row)) {
                 self.pushSelectionToClipboards();
                 c.gtk_gl_area_queue_render(@ptrCast(self.area));
+                self.a11yNudge();
                 return;
             }
         }
@@ -2993,6 +3018,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
                 self.terminal.screen.selection.clear();
                 self.terminal.screen.dirty = true;
                 c.gtk_gl_area_queue_render(@ptrCast(self.area));
+                self.a11yNudge();
             }
             return;
         }
@@ -3008,6 +3034,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
         // paste; also to SYSTEM clipboard if copy_on_selection is on.
         self.pushSelectionToClipboards();
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
+        self.a11yNudge();
         return;
     }
 
@@ -3149,6 +3176,7 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
     const cell = self.cellAtLogical(sx + dx, sy + dy);
     self.terminal.screen.selection.extend(cell.row, cell.col);
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    self.a11yNudge();
 }
 
 fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
