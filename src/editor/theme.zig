@@ -18,6 +18,41 @@ pub const Style = struct {
     rgba: [4]f32,
     bold: bool = false,
     italic: bool = false,
+    /// Draw a line THROUGH the glyphs. Only a modifier ever sets it, and
+    /// only `editor_pass` reads it — it is a decoration, not a face, so
+    /// it deliberately does NOT split an itemization run the way
+    /// bold/italic do.
+    strike: bool = false,
+};
+
+/// What a theme may say about ONE semantic-token modifier, applied on
+/// top of whatever `Style` the token's kind resolved to.
+///
+/// Deliberately a small delta rather than a second palette: a modifier
+/// qualifies a kind ("this variable is readonly"), it does not replace
+/// it, and giving every (kind x modifier) pair its own entry would be
+/// 20 x 8 colours per theme for a distinction users read as a shade.
+pub const ModStyle = struct {
+    /// Blend the kind's colour this far toward `toward` (0 = no change,
+    /// 1 = replace). Alpha is never touched.
+    blend: f32 = 0,
+    toward: [4]f32 = .{ 0, 0, 0, 1 },
+    /// Force the face on or off; null leaves the kind's own choice.
+    bold: ?bool = null,
+    italic: ?bool = null,
+    strike: bool = false,
+
+    fn apply(self: ModStyle, s: Style) Style {
+        var out = s;
+        if (self.blend > 0) {
+            const t = @min(self.blend, 1.0);
+            inline for (0..3) |i| out.rgba[i] = s.rgba[i] * (1 - t) + self.toward[i] * t;
+        }
+        if (self.bold) |b| out.bold = b;
+        if (self.italic) |i| out.italic = i;
+        if (self.strike) out.strike = true;
+        return out;
+    }
 };
 
 pub const Theme = struct {
@@ -42,13 +77,30 @@ pub const Theme = struct {
     fold_fg: [4]f32,
     /// Indexed by `@intFromEnum(Kind)`.
     kinds: [syntax.KIND_COUNT]Style,
+    /// The three semantic-token modifiers a theme can speak about, in
+    /// the order they are folded in (a symbol can carry all three).
+    mod_readonly: ModStyle = .{},
+    mod_default_library: ModStyle = .{},
+    mod_deprecated: ModStyle = .{},
 
+    /// Resolved style for a kind BYTE — the palette tag plus whatever
+    /// modifier bits `editorlsp` packed alongside it (syntax.zig). Every
+    /// caller passes a byte straight off a glyph, so masking here rather
+    /// than at each call site is what keeps the modifier band invisible
+    /// to the layout and the highlighter.
     pub fn style(self: *const Theme, kind: Kind) Style {
-        return self.kinds[@intFromEnum(kind)];
+        var out = self.kinds[@intFromEnum(syntax.baseKind(kind))];
+        const mods = syntax.modsOf(kind);
+        if (mods == 0) return out;
+        if (mods & syntax.MOD_READONLY != 0) out = self.mod_readonly.apply(out);
+        if (mods & syntax.MOD_DEFAULT_LIBRARY != 0) out = self.mod_default_library.apply(out);
+        // Deprecated is folded LAST so its dimming survives the others.
+        if (mods & syntax.MOD_DEPRECATED != 0) out = self.mod_deprecated.apply(out);
+        return out;
     }
 
     pub fn colorOf(self: *const Theme, kind: Kind) [4]f32 {
-        return self.kinds[@intFromEnum(kind)].rgba;
+        return self.style(kind).rgba;
     }
 };
 
@@ -98,6 +150,10 @@ fn darkStyle(k: Kind) Style {
         .link => .{ .rgba = rgb(0x6BC2B4) },
         .emphasis => .{ .rgba = rgb(0xE6E8E3), .italic = true },
         .strong => .{ .rgba = rgb(0xE6E8E3), .bold = true },
+        // Only ever called from kindTable, over the NAMED kinds. The
+        // `_` prong is the price of the modifier band living in the same
+        // byte; adding a named kind is still a compile error here.
+        _ => unreachable,
     };
 }
 
@@ -123,6 +179,7 @@ fn lightStyle(k: Kind) Style {
         .link => .{ .rgba = rgb(0x0F6F63) },
         .emphasis => .{ .rgba = rgb(0x2B2F33), .italic = true },
         .strong => .{ .rgba = rgb(0x2B2F33), .bold = true },
+        _ => unreachable,
     };
 }
 
@@ -143,6 +200,16 @@ pub const dark = Theme{
     .fold_badge = rgba(0x808891, 0.25),
     .fold_fg = rgb(0x9AA3AD),
     .kinds = kindTable(darkStyle),
+    // A readonly binding reads like a constant, because that is what it
+    // is — half-way to the palette's constant violet, whatever kind the
+    // server actually gave it.
+    .mod_readonly = .{ .blend = 0.45, .toward = rgb(0xD7A2E8) },
+    // Standard-library symbols pull toward the type/namespace teal: the
+    // grammar can never know a name is not this project's.
+    .mod_default_library = .{ .blend = 0.35, .toward = rgb(0x6BC2B4) },
+    // Struck through and dimmed toward the comment grey — the one
+    // rendering every editor agrees on.
+    .mod_deprecated = .{ .blend = 0.5, .toward = rgb(0x6F7A6B), .strike = true },
 };
 
 pub const light = Theme{
@@ -161,6 +228,9 @@ pub const light = Theme{
     .fold_badge = rgba(0x9198A0, 0.28),
     .fold_fg = rgb(0x6E757D),
     .kinds = kindTable(lightStyle),
+    .mod_readonly = .{ .blend = 0.45, .toward = rgb(0x7A3FA5) },
+    .mod_default_library = .{ .blend = 0.35, .toward = rgb(0x0F6F63) },
+    .mod_deprecated = .{ .blend = 0.5, .toward = rgb(0x7A857A), .strike = true },
 };
 
 pub const all = [_]*const Theme{ &dark, &light };
@@ -184,6 +254,51 @@ test "theme: byName resolves both built-ins and falls back to dark" {
     try testing.expectEqualStrings("light", byName("Light").name);
     try testing.expectEqualStrings("dark", byName("").name);
     try testing.expectEqualStrings("dark", byName("solarized-neon").name);
+}
+
+test "theme: a modifier band changes the resolved style, not the palette" {
+    for (all) |t| {
+        const plain = t.style(.variable);
+        try testing.expect(!plain.strike);
+
+        // readonly shifts the colour without touching the palette entry.
+        const ro = t.style(syntax.withMods(.variable, syntax.MOD_READONLY));
+        try testing.expect(!std.mem.eql(u8, &std.mem.toBytes(plain.rgba), &std.mem.toBytes(ro.rgba)));
+        try testing.expect(!ro.strike);
+        try testing.expectEqual(@as(f32, 1.0), ro.rgba[3]);
+        try testing.expectEqual(plain.rgba[0], t.style(.variable).rgba[0]);
+
+        // deprecated strikes through AND dims.
+        const dep = t.style(syntax.withMods(.function, syntax.MOD_DEPRECATED));
+        try testing.expect(dep.strike);
+        try testing.expect(!std.mem.eql(
+            u8,
+            &std.mem.toBytes(t.style(.function).rgba),
+            &std.mem.toBytes(dep.rgba),
+        ));
+
+        // All three at once resolve, and deprecated's strike survives.
+        const all_mods = t.style(syntax.withMods(
+            .type,
+            syntax.MOD_READONLY | syntax.MOD_DEFAULT_LIBRARY | syntax.MOD_DEPRECATED,
+        ));
+        try testing.expect(all_mods.strike);
+        try testing.expectEqual(@as(f32, 1.0), all_mods.rgba[3]);
+
+        // An unmapped modifier bit cannot exist: the band is exactly
+        // three bits and every one of them is spoken for.
+        try testing.expectEqual(
+            @as(u8, syntax.MOD_READONLY | syntax.MOD_DEPRECATED | syntax.MOD_DEFAULT_LIBRARY),
+            syntax.MOD_MASK,
+        );
+    }
+}
+
+test "theme: colorOf agrees with style for a byte carrying modifiers" {
+    const k = syntax.withMods(.variable, syntax.MOD_READONLY);
+    try testing.expectEqual(dark.style(k).rgba, dark.colorOf(k));
+    // …and a bare kind is unaffected by the masking.
+    try testing.expectEqual(dark.kinds[@intFromEnum(Kind.string)].rgba, dark.colorOf(.string));
 }
 
 test "theme: every kind has an opaque colour and a sane face" {
