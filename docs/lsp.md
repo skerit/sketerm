@@ -15,8 +15,11 @@ src/lsp/docsync.zig      per-document version counter + the didChange queue
 src/lsp/diagnostics.zig  diagnostics as anchored byte ranges
 src/lsp/semantic.zig     the token legend, the packed data array, delta splicing
 src/lsp/inlay.zig        inlay hints as (byte offset, text) pairs
-src/lsp/proc.zig         fork/exec with non-blocking stdio pipes (libc only)
-src/ui/editorlsp.zig     the ONLY GTK part: fd watches, popups, every feature
+src/lsp/proc.zig         fork/exec with non-blocking stdio pipes (libc only);
+                         spawnSock = the daemon-side socketpair variant
+src/mux/daemon.zig       handleLspOpen: remote spawn + root resolution + relay
+src/ui/editorlsp.zig     the ONLY GTK part: fd watches, popups, every feature,
+                         and RemoteLink (the per-host LSP transport)
 ```
 
 Everything above `editorlsp.zig` is GTK-free and lives in **both** test
@@ -50,26 +53,89 @@ A server that is not installed is never spawned (`proc.onPath`), and a
 server whose `exec` fails shows up as immediate EOF on stdout, which is
 the same "dead" path as a crash. Both are silent.
 
-## Remote documents: a documented follow-up, not in this change
+## Remote documents: the server runs on the host that owns the files
 
-A language server must run **near the files**. For a document opened from
-a remote host (`box:/path`), that means the server has to run on `box`,
-which means `sketerm-mux` spawning it and tunnelling its stdio — a new
-frame type plus process management in the daemon's poll loop.
+A language server must run **near the files** — running a local server
+against `box:/path` would resolve every include, project root and
+`compile_commands.json` against the wrong filesystem and produce
+confidently wrong answers. That rule survives unchanged; what changed
+is that a host-qualified spec is now SERVED instead of refused: the
+daemon on `box` spawns the server and this GUI stays the client.
 
-That is not in this change. `Manager.attachTab` therefore **refuses a
-host-qualified spec outright**: running a local server against a remote
-path would resolve every import against the wrong filesystem and produce
-confidently wrong diagnostics and jumps.
+**What crosses the wire is the server's own raw bytes.** The mux
+protocol's "parsed events, never re-encoded escape sequences" rule
+exists because terminal escape streams do not survive re-encoding;
+JSON-RPC with Content-Length framing is already a structured,
+length-delimited protocol, and the byte channels
+(`chan_open`/`chan_data`/`chan_close`) are the wire protocol's
+sanctioned generic stream (Wayland apps, audio, TCP forwards ride them
+already, over every transport including roaming UDP). Parsing LSP in
+the daemon only to re-serialize it would buy nothing and cost a second
+LSP schema to keep in sync. The daemon never parses a single JSON-RPC
+byte.
 
-The structure is prepared for it: `Conn` owns a `proc.Child` and a
-`session.Session`, and only `pumpWrite`/`onReadable` know that the
-transport is a local pipe. A remote `Conn` replaces those two with the
-daemon's byte-channel frames (`chan_open`/`chan_data`/`chan_close`,
-already multiplexed over every mux transport) and everything else —
-lifecycle, capabilities, sync, staleness, every feature — is unchanged.
-The daemon-side piece must stay libc-only; `src/lsp/proc.zig` already is,
-so it can move there as-is.
+**The client stays in the GUI, whole.** One `Session` implementation
+serves both transports; only `Conn.pumpWrite` and the link's frame
+router know whether the far side is a pipe or a channel. Consequently
+the per-server position-encoding negotiation and the revision-stamped
+staleness discipline hold across the network hop by construction: the
+`initialize` exchange happens over the relay exactly as over the pipe,
+and revisions are stamped/checked entirely GUI-side (slower round
+trips just mean more answers get dropped as stale — which is the
+correct outcome). One deliberate difference: `Session.start` is given
+pid 0 for a remote conn and sends `processId: null`, because our pid
+means nothing on the server's host and clangd exits when the
+advertised pid does not exist there. Lifetime is the daemon's job
+instead (below).
+
+**Discovery and roots are answered by the remote host.** `attachTab`
+ships the config's ordered candidate list (name, command, args,
+root_files) in one `lsp_open` frame together with the document's
+directory; the daemon picks the first candidate whose command resolves
+on ITS PATH, walks the directory's ancestors for the root markers on
+ITS filesystem (falling back to the document's directory — the same
+`servers.findRoot` semantics as local), spawns via a socketpair
+(`lsp/proc.zig spawnSock`, libc-only) and answers `chan_open` (kind
+`lsp`) plus `lsp_reply {req, ok, chan, name, root}`. `init_options`
+stays client-side — it travels inside `initialize` anyway. Connections
+are still deduplicated per (host, server, root): a reply naming a
+(name, root) that already has a live conn closes the duplicate channel
+and attaches the tab to the existing server.
+
+**Transport.** The GUI keeps one dedicated mux connection per host
+(`editorlsp.RemoteLink`), dialed on a worker thread because the ssh
+bootstrap blocks, then watched with `g_unix_fd_add` — the GLib loop is
+never blocked, writes queue in the mux `Conn`'s buffer behind a
+`G_IO_OUT` watch when short. It is separate from the fs connections on
+purpose: file IO uses short-lived request/reply pumps that would
+tangle with a long-lived multiplexed frame stream.
+
+**Lifecycle: the server dies with its channel.** The daemon SIGTERMs
+the child's process group when the channel closes (explicit
+`chan_close`, client disconnect, daemon shutdown) and escalates to
+SIGKILL after 1.5 s (`Daemon.lsp_reaps`), reaping by exact pid. A warm
+index argues for keeping servers alive across a GUI restart, but an
+LSP session cannot be re-adopted — `initialize` happens once per
+process and the daemon holds none of the client state — so a surviving
+server could never answer a new GUI and would only hold memory on
+someone else's machine. Symmetric with local: the last tab out shuts
+the server down there too.
+
+**Degradation is silent at every layer**, matching the local contract:
+a daemon that predates the feature does not advertise `lsp:true` in
+its welcome and is never asked; a host with no server installed
+answers `ok:false`; a spawn failure likewise; a dropped link marks
+every session on it dead through the same `onServerDead` path a local
+crash takes. Each failure surfaces only where the user explicitly asks
+for a feature ("No language server for hover."). A host that failed
+once is remembered (`RemoteLink` stays listed as dead) so repeated
+attaches neither redial nor prompt.
+
+Known limitations: the remote server's stderr goes to /dev/null on the
+daemon host (nobody is there to read it; the GUI's status line loses
+the last-stderr-line nicety for remote conns), and a dead link is not
+redialed until the editor face is recreated — reconnect-on-demand was
+traded away to avoid a retry storm against an unreachable host.
 
 ## Position encoding
 
@@ -425,6 +491,17 @@ that dies takes its diagnostics down with it and the editor keeps working.
   race-shaped bugs (a fast `completionItem/resolve` growing a popover's
   minimum size once popped the completion list down; see the invariant
   on `ensurePopup`).
+
+  The whole battery then runs a SECOND time on a **remote** document:
+  a fake-ssh script (`$SKETERM_SSH`) execs `sketerm-mux --proxy` into
+  a second private daemon built from this tree, the document opens as
+  `rbox:/...`, and that daemon spawns the server and relays its stdio.
+  Hermetic — no passwordless ssh, no installed daemon, and the leg
+  cannot silently skip. Remote screenshots carry a `-remote-` infix.
+  The daemon relay itself is unit-tested in `src/mux/daemon.zig`
+  ("lsp_open resolves the root remotely…"): candidate walk, marker
+  root, byte bridge through a real child, and kill-on-close with no
+  zombie left.
 
   Asserts the diagnostic stripe renders, that Ctrl+I, Ctrl+Space,
   Ctrl+. and a typed `(` each open a popup (a GtkPopover is its own

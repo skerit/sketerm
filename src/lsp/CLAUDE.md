@@ -65,10 +65,22 @@
   stdin gets a `G_IO_OUT` watch only while a write is short; stderr must
   be drained or the server stalls when its pipe fills.
 
-- **Remote documents are refused, deliberately.** A server must run near
-  the files; `Manager.attachTab` returns early for a host-qualified spec
-  rather than resolving imports against the wrong filesystem. The daemon
-  side is a documented follow-up (docs/lsp.md).
+- **A remote document's server runs ON THE REMOTE HOST, never here.**
+  The rule behind the old outright refusal still holds: a local server
+  answering about `box:/src/main.c` would resolve includes, roots and
+  compile_commands.json against the wrong filesystem. `attachTab`
+  routes a host-qualified spec to the host's daemon (`lsp_open`), which
+  picks the first candidate installed on ITS PATH, walks root markers
+  on ITS filesystem, spawns the server and relays its raw JSON-RPC as a
+  byte channel — the daemon never parses LSP. The client stays here,
+  whole: one `Session`, same staleness stamps, same per-server encoding
+  negotiation. `Session.start` with pid<=0 sends `processId:null` —
+  OUR pid on the server's host would make clangd exit at once. The
+  daemon-side child dies with its channel (chan_close, client death,
+  daemon exit): an LSP session cannot be re-adopted mid-initialize, so
+  a surviving process would only hold memory on someone else's machine.
+  Daemon pieces are `lsp/proc.zig spawnSock` + `Daemon.handleLspOpen`
+  (libc only); GUI transport is `editorlsp.RemoteLink`. See docs/lsp.md.
 
 - `sketerm-lsp-stub` (`src/lsp_stub.zig`) is a REAL scripted server
   process used by `zig build smoke-editor`. It keeps its own copy of the
