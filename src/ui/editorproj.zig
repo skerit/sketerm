@@ -4,9 +4,9 @@
 //! Everything here is a DAEMON round trip on a worker thread, handed
 //! back through a `g_idle_add` fenced by `EditorView.Fence` — exactly
 //! the shape `editorview.zig`'s load/save/probe jobs already have. The
-//! GUI never touches the disk and never runs a process; the shell
-//! commands the git gutter needs run on the file's own host, inside the
-//! daemon's `panelize` job.
+//! GUI never touches the disk and never runs a process: the git
+//! gutter is the daemon's `git_diff` job, which runs git on the
+//! file's own host and hands back parsed per-line runs.
 //!
 //! The models these jobs fill are GTK-free and unit-tested:
 //! `editor/project.zig`, `editor/psearch.zig`, `editor/gitdiff.zig`.
@@ -42,11 +42,6 @@ const servers = @import("../lsp/servers.zig");
 /// editor IO job: the models they build are MOVED onto the main thread
 /// wholesale, so both sides must agree on the allocator.
 const wa = std.heap.c_allocator;
-
-/// Cap on the diff text a single file's gutter refresh will carry back.
-/// A file whose diff is larger than this is one nobody reads a gutter
-/// on.
-const MAX_DIFF_BYTES: usize = 1 << 20;
 
 /// Bound on one project-wide job. A search over a big tree is minutes
 /// of daemon work at worst; past this the user has asked the wrong
@@ -231,24 +226,21 @@ const GitJob = struct {
     tab_id: u64,
     gen: u64,
     spec: []u8,
-    root: []u8,
-    /// Raw unified diff (plus the untracked marker line), owned.
-    text: []u8 = &.{},
+    /// Per-line marks, already folded into runs by the daemon. Owned.
+    runs: []fsdrive.gitdiff.Run = &.{},
+    /// The daemon's answer to "is there anything to compare against?".
+    repo: bool = false,
+    tracked: bool = false,
+    initial: bool = false,
     ok: bool = false,
 
     fn destroy(self: *GitJob) void {
         wa.free(self.spec);
-        wa.free(self.root);
-        if (self.text.len > 0) wa.free(self.text);
+        if (self.runs.len > 0) wa.free(self.runs);
         self.fence.unref();
         wa.destroy(self);
     }
 };
-
-/// Sentinel the daemon-side shell prints when `git ls-files` does not
-/// know the file. Deliberately not a valid hunk header (`@@ ` needs the
-/// space), so `gitdiff.parseUnified` ignores it.
-const UNTRACKED_MARK = "@@SKETERM-UNTRACKED@@";
 
 /// Recompute `tab`'s gutter marks against HEAD. No-op without a
 /// version-controlled project, with `editor_git_gutter = false`, or
@@ -264,11 +256,6 @@ pub fn refreshGit(view: *EditorView, tab: *ETab) void {
         wa.destroy(job);
         return;
     };
-    const root_copy = wa.dupe(u8, proj.root) catch {
-        wa.free(spec_copy);
-        wa.destroy(job);
-        return;
-    };
     view.next_job_gen += 1;
     tab.git_gen = view.next_job_gen;
     tab.git.refreshing = true;
@@ -278,7 +265,6 @@ pub fn refreshGit(view: *EditorView, tab: *ETab) void {
         .tab_id = tab.id,
         .gen = tab.git_gen,
         .spec = spec_copy,
-        .root = root_copy,
     };
     const th = c.g_thread_new("sketerm-gitgutter", @ptrCast(&gitThread), @ptrCast(job));
     if (th == null) {
@@ -290,60 +276,23 @@ pub fn refreshGit(view: *EditorView, tab: *ETab) void {
     c.g_thread_unref(th);
 }
 
-/// Append `text` to `out` with single quotes escaped for `/bin/sh`.
-fn shQuote(out: *std.ArrayList(u8), text: []const u8) !void {
-    try out.append(wa, '\'');
-    for (text) |ch| {
-        if (ch == '\'') try out.appendSlice(wa, "'\\''") else try out.append(wa, ch);
-    }
-    try out.append(wa, '\'');
-}
-
 fn gitThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
     const job: *GitJob = @ptrCast(@alignCast(data.?));
     run: {
         const loc = paths.parseSpec(job.spec);
         var fs = ev.connectFs(loc.host) catch break :run;
         defer fs.deinit();
-
-        // Path relative to the repository root, which is what `git
-        // diff --` wants with the job's cwd set to that root.
-        var rel = loc.path;
-        if (std.mem.startsWith(u8, rel, job.root) and rel.len > job.root.len)
-            rel = rel[job.root.len + 1 ..];
-
-        var tmp_buf: [128]u8 = undefined;
-        const tmp = std.fmt.bufPrint(
-            &tmp_buf,
-            "/tmp/sketerm-gutter-{d}-{d}.diff",
-            .{ c.getpid(), job.gen },
-        ) catch break :run;
-
-        var cmd: std.ArrayList(u8) = .empty;
-        defer cmd.deinit(wa);
-        cmd.appendSlice(wa, "{ git diff -U0 --no-color --no-ext-diff HEAD -- ") catch break :run;
-        shQuote(&cmd, rel) catch break :run;
-        cmd.appendSlice(wa, " ; git ls-files --error-unmatch -- ") catch break :run;
-        shQuote(&cmd, rel) catch break :run;
-        cmd.appendSlice(wa, " >/dev/null 2>&1 || echo '" ++ UNTRACKED_MARK ++ "' ; } > ") catch break :run;
-        shQuote(&cmd, tmp) catch break :run;
-        cmd.appendSlice(wa, " 2>/dev/null; printf '%s\\n' ") catch break :run;
-        shQuote(&cmd, tmp) catch break :run;
-
-        const pjob = fs.startPanelize(job.root, cmd.items) catch break :run;
-        var end = fs.waitJobTerminal(pjob, JOB_TIMEOUT_MS) catch break :run;
-        end.deinit();
-        drainJobEvents(&fs);
-
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(wa);
-        ev.readAllCapped(&fs, tmp, &out, MAX_DIFF_BYTES) catch {
-            fs.unlink(tmp) catch {};
-            break :run;
-        };
-        fs.unlink(tmp) catch {};
-        job.text = out.toOwnedSlice(wa) catch break :run;
+        // One daemon job on the FILE'S host: it finds the repository
+        // from the file's own directory, runs the diff there and
+        // parses it there. A daemon too old for the verb refuses at
+        // startGitDiff, and the tab keeps saying it does not know.
+        const res = fs.gitDiff(wa, loc.path, JOB_TIMEOUT_MS) catch break :run;
+        job.runs = res.runs;
+        job.repo = res.repo;
+        job.tracked = res.tracked;
+        job.initial = res.initial;
         job.ok = true;
+        drainJobEvents(&fs);
     }
     _ = c.g_idle_add(@ptrCast(&gitIdle), @ptrCast(job));
     return null;
@@ -368,12 +317,16 @@ fn gitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     tab.git.refreshing = false;
     if (!job.ok) return 0;
 
-    if (std.mem.indexOf(u8, job.text, UNTRACKED_MARK) != null) {
+    // Outside a repository (or on a host without git) nothing is
+    // KNOWN — an empty mark set would claim the file is clean.
+    if (!job.repo) return 0;
+    if (!job.tracked or job.initial) {
+        // Nothing committed to compare against: every line is new.
         const marks = gitdiff.allAdded(view.allocator, &tab.doc) catch return 0;
         defer view.allocator.free(marks);
         tab.git.setFromLines(&tab.doc, marks) catch return 0;
     } else {
-        const marks = gitdiff.parseUnified(view.allocator, job.text) catch return 0;
+        const marks = gitdiff.linesFromRuns(view.allocator, job.runs) catch return 0;
         defer view.allocator.free(marks);
         tab.git.setFromLines(&tab.doc, marks) catch return 0;
     }

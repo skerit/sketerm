@@ -3525,6 +3525,100 @@ fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime ta
         }
     }
 
+    // ── git_diff (the editor gutter's verb) ───────────────────
+    {
+        const repo = std.fmt.bufPrint(&pb[0], "{s}/gutter", .{dir}) catch unreachable;
+        mkdirAt(repo);
+        const have_git = haveTool("git");
+        const tracked = std.fmt.bufPrint(&pb[1], "{s}/src/main.txt", .{repo}) catch unreachable;
+        const sub = std.fmt.bufPrint(&pb[2], "{s}/src", .{repo}) catch unreachable;
+        const untracked = std.fmt.bufPrint(&pb[3], "{s}/src/new.txt", .{repo}) catch unreachable;
+        const clean = std.fmt.bufPrint(&pb[4], "{s}/src/clean.txt", .{repo}) catch unreachable;
+        mkdirAt(sub);
+        if (have_git) {
+            runIn(repo, "git init -q . && git symbolic-ref HEAD refs/heads/main");
+            touch(sub, "main.txt", "a\nb\nc\nd\n");
+            touch(sub, "clean.txt", "untouched\n");
+            runIn(repo, "git add -A && git -c user.email=s@x -c user.name=s commit -qm init");
+            // One replaced line and two appended ones: the shape a
+            // gutter must tell apart, and the reason the daemon
+            // parses rather than counts.
+            touch(sub, "main.txt", "a\nB\nc\nd\ne\nf\n");
+            touch(sub, "new.txt", "brand\nnew\n");
+        }
+
+        // Routing first: the verb must be reachable at all.
+        const job = fs.startGitDiff(tracked) catch failErr("git_diff refused", fs.lastErr());
+        const out = collectStream(&fs, job, "", 20_000);
+        if (!out.outcome.is("done")) fail("git_diff outcome");
+
+        if (have_git) {
+            const res = fs.gitDiff(allocator, tracked, 20_000) catch failErr("git_diff (collect) failed", fs.lastErr());
+            defer allocator.free(res.runs);
+            if (!res.repo) fail("git_diff called a repository file untracked by a repo");
+            if (!res.tracked) fail("git_diff called a committed file untracked");
+            if (res.initial) fail("git_diff called a repo with a commit initial");
+            if (res.runs.len != 2) fail("git_diff did not fold the change into two runs");
+            if (res.runs[0].line != 1 or res.runs[0].count != 1 or res.runs[0].kind != .modified)
+                fail("git_diff lost the replaced line");
+            if (res.runs[1].line != 4 or res.runs[1].count != 2 or res.runs[1].kind != .added)
+                fail("git_diff did not collapse the two appended lines into one run");
+
+            // An untracked file inside the repo: known repo, no diff.
+            const ur = fs.gitDiff(allocator, untracked, 20_000) catch failErr("git_diff (untracked) failed", fs.lastErr());
+            defer allocator.free(ur.runs);
+            if (!ur.repo) fail("git_diff lost the repo for an untracked file");
+            if (ur.tracked) fail("git_diff called an untracked file tracked");
+            if (ur.runs.len != 0) fail("git_diff invented runs for an untracked file");
+
+            // A committed file nobody touched: tracked, clean, and
+            // that is an ANSWER — not the same as "unknown".
+            const cr = fs.gitDiff(allocator, clean, 20_000) catch failErr("git_diff (clean) failed", fs.lastErr());
+            defer allocator.free(cr.runs);
+            if (!cr.repo or !cr.tracked) fail("git_diff clean-file flags");
+            if (cr.runs.len != 0) fail("git_diff found changes in an untouched file");
+
+            // A repository whose HEAD has no commit: there is nothing
+            // to diff against, which the gutter renders as all-added.
+            const fresh = std.fmt.bufPrint(&pb[5], "{s}/fresh", .{dir}) catch unreachable;
+            mkdirAt(fresh);
+            runIn(fresh, "git init -q .");
+            touch(fresh, "first.txt", "hello\n");
+            runIn(fresh, "git add first.txt");
+            var fpath_buf: [4096]u8 = undefined;
+            const fpath = std.fmt.bufPrint(&fpath_buf, "{s}/first.txt", .{fresh}) catch unreachable;
+            const fr = fs.gitDiff(allocator, fpath, 20_000) catch failErr("git_diff (initial) failed", fs.lastErr());
+            defer allocator.free(fr.runs);
+            if (!fr.repo or !fr.tracked) fail("git_diff initial-repo flags");
+            if (!fr.initial) fail("git_diff did not report a commit-less repository as initial");
+        }
+
+        // Outside a repository: repo=false, which the caller must read
+        // as UNKNOWN rather than clean.
+        {
+            const loose = std.fmt.bufPrint(&pb[1], "{s}/loose.txt", .{dir}) catch unreachable;
+            touch(dir, "loose.txt", "no repo here\n");
+            const lr = fs.gitDiff(allocator, loose, 20_000) catch failErr("git_diff (non-repo) failed", fs.lastErr());
+            defer allocator.free(lr.runs);
+            if (have_git and lr.repo) fail("git_diff called a plain directory a repository");
+            if (lr.runs.len != 0) fail("git_diff produced runs outside a repository");
+        }
+
+        // Old-daemon direction: without the welcome capability the
+        // client refuses to ask instead of eating "unknown fs job op".
+        {
+            const had = fs.conn.git_diff;
+            fs.conn.git_diff = false;
+            if (fs.startGitDiff(tracked)) |_| {
+                fail("git_diff asked a daemon that never announced the verb");
+            } else |err| {
+                if (err != fsdrive.Error.BadRequest) fail("git_diff gate wrong error");
+            }
+            fs.conn.git_diff = had;
+            if (!had) fail("daemon did not announce the git_diff capability");
+        }
+    }
+
     // ── diff ──────────────────────────────────────────────────
     {
         const a = std.fmt.bufPrint(&pb[0], "{s}/a.txt", .{dir}) catch unreachable;
