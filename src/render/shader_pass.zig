@@ -359,6 +359,7 @@ pub const FRAG_HEADER =
     \\uniform int iFrame;
     \\uniform float sketerm_dim_darken;
     \\uniform float sketerm_dim_desat;
+    \\uniform float sketerm_corner_radius;
     \\#line 1
     \\
 ;
@@ -389,6 +390,13 @@ pub const FRAG_FOOTER =
     \\    sketerm_frag.rgb *= (1.0 - sketerm_dim_darken);
     \\    float sketerm_d = sketerm_hash(gl_FragCoord.xy) - sketerm_hash(gl_FragCoord.xy + 0.5);
     \\    sketerm_frag.rgb += vec3(sketerm_d / 255.0);
+    \\    if (sketerm_corner_radius > 0.0) {
+    \\        vec2 sketerm_half = iResolution.xy * 0.5;
+    \\        vec2 sketerm_q = abs(gl_FragCoord.xy - sketerm_half)
+    \\                       - (sketerm_half - vec2(sketerm_corner_radius));
+    \\        float sketerm_sd = length(max(sketerm_q, 0.0)) - sketerm_corner_radius;
+    \\        sketerm_frag *= 1.0 - smoothstep(-0.5, 0.5, sketerm_sd);
+    \\    }
     \\}
     \\
 ;
@@ -418,11 +426,18 @@ pub const ShaderPass = struct {
     u_frame: c_int = -1,
     u_dim_darken: c_int = -1,
     u_dim_desat: c_int = -1,
+    u_corner_radius: c_int = -1,
     /// Inactive-pane dim, applied in the footer (and the dim-only
     /// program). Both 0 = no effect. Driven by the pane per frame
     /// from config + focus.
     dim_darken: f32 = 0,
     dim_desat: f32 = 0,
+    /// Corner rounding in framebuffer pixels, cut out of the
+    /// composited pane by the footer. Non-zero forces the offscreen
+    /// post-process on even for a focused, shader-less pane — there
+    /// is nowhere else to apply it, since a GtkGLArea's own GL output
+    /// is not clipped by CSS.
+    corner_radius: f32 = 0,
     /// Lazily-built identity+dim program for the dim-only path (an
     /// inactive pane with no custom shader). Separate from `program`
     /// so it survives the user-shader generation cache.
@@ -431,6 +446,7 @@ pub const ShaderPass = struct {
     dim_u_resolution: c_int = -1,
     dim_u_darken: c_int = -1,
     dim_u_desat: c_int = -1,
+    dim_u_corner_radius: c_int = -1,
     /// Previous-frame feedback (iChannel1): the user shader renders
     /// into a ping-pong texture pair instead of straight to screen;
     /// last frame's OUTPUT is sampled this frame (phosphor
@@ -564,6 +580,7 @@ pub const ShaderPass = struct {
         self.u_frame = c.glGetUniformLocation(self.program, "iFrame");
         self.u_dim_darken = c.glGetUniformLocation(self.program, "sketerm_dim_darken");
         self.u_dim_desat = c.glGetUniformLocation(self.program, "sketerm_dim_desat");
+        self.u_corner_radius = c.glGetUniformLocation(self.program, "sketerm_corner_radius");
 
         // Tunable uniforms: //@param declarations → locations. A
         // param whose uniform got optimized out keeps loc -1 and is
@@ -770,6 +787,7 @@ pub const ShaderPass = struct {
         c.glUniform1i(self.u_frame, self.frame_counter);
         if (self.u_dim_darken >= 0) c.glUniform1f(self.u_dim_darken, self.dim_darken);
         if (self.u_dim_desat >= 0) c.glUniform1f(self.u_dim_desat, self.dim_desat);
+        if (self.u_corner_radius >= 0) c.glUniform1f(self.u_corner_radius, self.corner_radius);
         // Tunable params: shader default, overridden by any matching
         // `shader_param.<name>` config entry. Uploaded every frame so
         // a config reload re-tunes live without recompiling.
@@ -807,9 +825,11 @@ pub const ShaderPass = struct {
         c.glEnable(c.GL_BLEND);
     }
 
-    /// Whether an inactive-pane dim is requested this frame.
+    /// Whether the offscreen post-process is requested this frame:
+    /// an inactive-pane dim, or a corner radius (which the footer
+    /// applies through the very same program).
     pub fn wantsDim(self: *const ShaderPass) bool {
-        return self.dim_darken > 0.0 or self.dim_desat > 0.0;
+        return self.dim_darken > 0.0 or self.dim_desat > 0.0 or self.corner_radius > 0.0;
     }
 
     fn ensureDimProgram(self: *ShaderPass, allocator: std.mem.Allocator) bool {
@@ -821,6 +841,7 @@ pub const ShaderPass = struct {
         self.dim_u_resolution = c.glGetUniformLocation(self.dim_program, "iResolution");
         self.dim_u_darken = c.glGetUniformLocation(self.dim_program, "sketerm_dim_darken");
         self.dim_u_desat = c.glGetUniformLocation(self.dim_program, "sketerm_dim_desat");
+        self.dim_u_corner_radius = c.glGetUniformLocation(self.dim_program, "sketerm_corner_radius");
         self.ensureQuad(self.dim_program);
         return true;
     }
@@ -849,6 +870,7 @@ pub const ShaderPass = struct {
         c.glUniform3f(self.dim_u_resolution, @floatFromInt(w), @floatFromInt(h), 1.0);
         if (self.dim_u_darken >= 0) c.glUniform1f(self.dim_u_darken, self.dim_darken);
         if (self.dim_u_desat >= 0) c.glUniform1f(self.dim_u_desat, self.dim_desat);
+        if (self.dim_u_corner_radius >= 0) c.glUniform1f(self.dim_u_corner_radius, self.corner_radius);
         c.glBindVertexArray(self.vao);
         c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
         c.glBindVertexArray(0);
