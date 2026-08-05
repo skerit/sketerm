@@ -1,17 +1,26 @@
 //! Shared GtkNotebook tab-strip mechanics, extracted from the file
 //! browser so the editor face can reuse them: notebook creation,
 //! the ellipsized tab label + close button recipe, middle-click
-//! close, scroll-to-switch with a touchpad accumulator, and the
-//! strip's empty-area gestures (double-click = new tab, right-click
-//! = consumer-provided menu).
+//! close, scroll-to-switch with a touchpad accumulator, the strip's
+//! empty-area gestures (double-click = new tab, right-click =
+//! consumer-provided menu), and the PER-TAB context menu.
 //!
-//! Consumers keep everything domain-specific (context menus, DnD
-//! targets, closed-tab rings) layered on the returned TabLabel's
-//! `box`. The host struct's address must be stable for the lifetime
-//! of the notebook widgets (gesture callbacks hold it raw).
+//! The per-tab menu is shared on purpose. Close / Close Others /
+//! Close to the Right / Close Unmodified / Duplicate / Open in New
+//! Window are the same verbs in any tabbed host, so TabHost builds
+//! those rows itself out of `on_close` plus the `TabMenu` predicates,
+//! and each consumer contributes only its DOMAIN rows through
+//! `TabMenu.extra`. Neither consumer owns a second implementation of
+//! "close every tab but this one".
+//!
+//! Consumers keep everything else domain-specific (DnD targets,
+//! closed-tab rings) layered on the returned TabLabel's `box`. The
+//! host struct's address must be stable for the lifetime of the
+//! notebook widgets (gesture callbacks hold it raw).
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const classicmenu = @import("browser/classicmenu.zig");
 
 /// Per-page label handle. Heap-allocated by addPage and freed
 /// automatically when the label box is destroyed (qdata notify), so
@@ -60,6 +69,44 @@ pub const TabLabel = struct {
     }
 };
 
+/// Per-tab context-menu contract. Every hook is optional and a null
+/// one simply removes its row — that is how "Close Unmodified Tabs"
+/// exists in the editor (documents have unsaved changes) and not in
+/// the file browser (listings do not).
+///
+/// The predicates are asked at POPUP time, never cached: a row whose
+/// predicate answers false is built insensitive.
+pub const TabMenu = struct {
+    /// Domain rows, built into the top of the menu ahead of the
+    /// mechanical section. The consumer gets the `Root` so it can
+    /// register its own per-row heap contexts with `root.own`.
+    extra: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, menu: classicmenu.Menu) void = null,
+    /// "Duplicate Tab". No row when null.
+    duplicate: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget) void = null,
+    can_duplicate: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget) bool = null,
+    /// "Open in New Window". No row when null.
+    new_window: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget) void = null,
+    can_new_window: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget) bool = null,
+    /// Unsaved-changes predicate. No "Close Unmodified Tabs" row when
+    /// null (a host whose tabs cannot be modified).
+    modified: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget) bool = null,
+};
+
+/// Heap context for one popped tab menu; owned by the menu Root, so
+/// it dies with the popover (`classicmenu.Root.own`).
+const TabMenuCtx = struct {
+    allocator: std.mem.Allocator,
+    host: *TabHost,
+    /// The page the menu was opened ON — not necessarily the current
+    /// one (right-clicking an inactive tab acts on that tab).
+    page: *c.GtkWidget,
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const self: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        self.allocator.destroy(self);
+    }
+};
+
 pub const TabHost = struct {
     allocator: std.mem.Allocator,
     notebook: *c.GtkNotebook,
@@ -75,6 +122,9 @@ pub const TabHost = struct {
     /// Right-click on the strip's empty area, at notebook-space
     /// coordinates; the consumer builds and pops its own menu.
     on_strip_menu: ?*const fn (ctx: ?*anyopaque, x: f64, y: f64) void = null,
+    /// Per-tab context menu. Null = no per-tab menu at all (the
+    /// right-click and the Menu key then do nothing).
+    tab_menu: ?TabMenu = null,
 
     /// Build the notebook (scrollable strip, expand both ways). The
     /// caller appends `notebook` to its layout and connects any
@@ -146,6 +196,14 @@ pub const TabHost = struct {
         _ = c.g_signal_connect_data(scr, "scroll", @ptrCast(&onStripScroll), @ptrCast(handle), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(label_box, @ptrCast(scr));
 
+        // Per-tab context menu (shared rows + the consumer's own).
+        // Installed unconditionally: `tab_menu` is read at popup time,
+        // so a consumer may set it after its first page exists.
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onTabRightClick), @ptrCast(handle), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(label_box, @ptrCast(rclick));
+
         _ = c.gtk_notebook_append_page(self.notebook, content, label_box);
         return handle;
     }
@@ -173,6 +231,17 @@ pub const TabHost = struct {
         return if (n > 0) @intCast(n) else 0;
     }
 
+    /// Page at `idx`, or null past the end.
+    pub fn pageAt(self: *TabHost, idx: usize) ?*c.GtkWidget {
+        if (idx >= self.pageCount()) return null;
+        return c.gtk_notebook_get_nth_page(self.notebook, @intCast(idx));
+    }
+
+    fn pageIndex(self: *TabHost, page: *c.GtkWidget) ?usize {
+        const idx = c.gtk_notebook_page_num(self.notebook, page);
+        return if (idx < 0) null else @intCast(idx);
+    }
+
     /// Wire the strip's empty-area gestures: right-click for the
     /// consumer's menu, double-click for a new tab. Install once,
     /// after the callbacks are set.
@@ -186,6 +255,195 @@ pub const TabHost = struct {
         c.gtk_gesture_single_set_button(@ptrCast(dclick), c.GDK_BUTTON_PRIMARY);
         _ = c.g_signal_connect_data(dclick, "pressed", @ptrCast(&onStripDoubleClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(nb, @ptrCast(dclick));
+        // Keyboard parity for the per-tab menu. The controller sits on
+        // the NOTEBOOK, not on the label boxes: GtkNotebook focuses its
+        // own per-tab gizmo (the label box's PARENT), so a controller
+        // on the label would never see the key. Bubble phase, and only
+        // while focus is actually in the tab strip, so a page's own
+        // content keeps every Menu press it wants.
+        const keys = c.gtk_event_controller_key_new();
+        _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onStripKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(nb, @ptrCast(keys));
+    }
+
+    // -- per-tab context menu -----------------------------------------
+
+    /// The page whose tab label currently holds focus, or null when
+    /// focus is anywhere else (page content, another widget).
+    fn focusedStripPage(self: *TabHost) ?*c.GtkWidget {
+        const root = c.gtk_widget_get_root(self.widget()) orelse return null;
+        const focus = c.gtk_root_get_focus(@ptrCast(root)) orelse return null;
+        var i: usize = 0;
+        while (self.pageAt(i)) |page| : (i += 1) {
+            const label = c.gtk_notebook_get_tab_label(self.notebook, page) orelse continue;
+            if (label == focus) return page;
+            // The focused widget is the notebook's tab gizmo, i.e. an
+            // ANCESTOR of our label box; a theme could equally focus
+            // something inside it, so both directions count.
+            if (c.gtk_widget_is_ancestor(label, focus) != 0) return page;
+            if (c.gtk_widget_is_ancestor(focus, label) != 0) return page;
+        }
+        return null;
+    }
+
+    /// Menu key / Shift+F10 on the tab strip: the same menu the
+    /// right-click builds, anchored at the focused tab's label.
+    fn onStripKey(
+        _: *c.GtkEventControllerKey,
+        keyval: c.guint,
+        _: c.guint,
+        state: c.GdkModifierType,
+        user: ?*anyopaque,
+    ) callconv(.c) c.gboolean {
+        const self: *TabHost = @ptrCast(@alignCast(user.?));
+        const wanted = keyval == c.GDK_KEY_Menu or
+            (keyval == c.GDK_KEY_F10 and (state & c.GDK_SHIFT_MASK) != 0);
+        if (!wanted) return 0;
+        const page = self.focusedStripPage() orelse return 0;
+        const label = c.gtk_notebook_get_tab_label(self.notebook, page) orelse return 0;
+        // Anchor under the label's bottom-left corner, the same place a
+        // right-click near the label's start would put it.
+        const x: f64 = @floatFromInt(@divTrunc(c.gtk_widget_get_width(label), 2));
+        const y: f64 = @floatFromInt(c.gtk_widget_get_height(label));
+        return @intFromBool(self.showTabMenu(page, label, x, y));
+    }
+
+    /// Build and pop the per-tab menu for `page`. `(x, y)` are in
+    /// `anchor`'s coordinates; the popover itself is parented to the
+    /// NOTEBOOK, so closing the tab it acts on cannot destroy its
+    /// parent mid-handler.
+    ///
+    /// @return false when no per-tab menu is configured.
+    pub fn showTabMenu(self: *TabHost, page: *c.GtkWidget, anchor: *c.GtkWidget, x: f64, y: f64) bool {
+        const spec = self.tab_menu orelse return false;
+        const idx = self.pageIndex(page) orelse return false;
+        const total = self.pageCount();
+
+        const ctx = self.allocator.create(TabMenuCtx) catch return false;
+        ctx.* = .{ .allocator = self.allocator, .host = self, .page = page };
+        const root = classicmenu.Root.create(self.allocator) orelse {
+            self.allocator.destroy(ctx);
+            return false;
+        };
+        root.own(&TabMenuCtx.free, @ptrCast(ctx));
+
+        const m = root.top();
+        if (spec.extra) |f| f(self.ctx, page, root, m);
+
+        const tools = m.section();
+        if (spec.duplicate != null) {
+            const ok = if (spec.can_duplicate) |p| p(self.ctx, page) else true;
+            tools.itemIconEnabled("Duplicate Tab", .{ .name = "edit-copy-symbolic" }, ok, &onMenuDuplicate, @ptrCast(ctx));
+        }
+        if (spec.new_window != null) {
+            const ok = if (spec.can_new_window) |p| p(self.ctx, page) else true;
+            tools.itemIconEnabled("Open in New Window", .{ .name = "window-new-symbolic" }, ok, &onMenuNewWindow, @ptrCast(ctx));
+        }
+
+        const closes = m.section();
+        closes.itemIcon("Close Tab", .{ .name = "window-close-symbolic" }, &onMenuClose, @ptrCast(ctx));
+        closes.itemIconEnabled("Close Other Tabs", .none, total > 1, &onMenuCloseOthers, @ptrCast(ctx));
+        closes.itemIconEnabled("Close Tabs to the Right", .none, idx + 1 < total, &onMenuCloseRight, @ptrCast(ctx));
+        if (spec.modified) |is_dirty| {
+            var closable: usize = 0;
+            var i: usize = 0;
+            while (self.pageAt(i)) |p| : (i += 1) {
+                if (!is_dirty(self.ctx, p)) closable += 1;
+            }
+            closes.itemIconEnabled("Close Unmodified Tabs", .none, closable > 0, &onMenuCloseUnmodified, @ptrCast(ctx));
+        }
+
+        const pop = root.popupVia(anchor, self.widget(), x, y);
+        // Focus return, ui/menu.zig's rule reused verbatim: a menu
+        // opened from the keyboard would otherwise strand focus in a
+        // dead popover, while a row that opens a dialog must keep the
+        // focus it just took.
+        _ = c.g_signal_connect_data(pop, "closed", @ptrCast(&onTabMenuClosed), @ptrCast(self.widget()), null, c.G_CONNECT_DEFAULT);
+        return true;
+    }
+
+    fn onTabMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+        const nb: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+        @import("menu.zig").returnFocusTo(nb, @ptrCast(pop));
+    }
+
+    /// Close every page the predicate selects. The page list is
+    /// snapshotted FIRST: `on_close` destroys widgets (and may show a
+    /// dialog), so walking the live notebook mid-close is not safe.
+    fn closeMatching(
+        self: *TabHost,
+        keep: *c.GtkWidget,
+        want: *const fn (self: *TabHost, page: *c.GtkWidget, keep: *c.GtkWidget) bool,
+    ) void {
+        const cb = self.on_close orelse return;
+        var pages: std.ArrayList(*c.GtkWidget) = .empty;
+        defer pages.deinit(self.allocator);
+        var i: usize = 0;
+        while (self.pageAt(i)) |p| : (i += 1) {
+            if (want(self, p, keep)) pages.append(self.allocator, p) catch return;
+        }
+        for (pages.items) |p| cb(self.ctx, p);
+    }
+
+    fn wantOthers(_: *TabHost, page: *c.GtkWidget, keep: *c.GtkWidget) bool {
+        return page != keep;
+    }
+
+    fn wantRight(self: *TabHost, page: *c.GtkWidget, keep: *c.GtkWidget) bool {
+        const at = self.pageIndex(page) orelse return false;
+        const pivot = self.pageIndex(keep) orelse return false;
+        return at > pivot;
+    }
+
+    fn wantUnmodified(self: *TabHost, page: *c.GtkWidget, _: *c.GtkWidget) bool {
+        const spec = self.tab_menu orelse return false;
+        const is_dirty = spec.modified orelse return false;
+        return !is_dirty(self.ctx, page);
+    }
+
+    fn onTabRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const handle: *TabLabel = @ptrCast(@alignCast(user.?));
+        const host = handle.host;
+        if (host.tab_menu == null) return;
+        // Claim before popping up: an unclaimed release dismisses the
+        // popover the frame it maps (ui/menu.zig documents the race).
+        _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+        _ = host.showTabMenu(handle.page, handle.box, x, y);
+    }
+
+    fn onMenuClose(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const cb = ctx.host.on_close orelse return;
+        cb(ctx.host.ctx, ctx.page);
+    }
+
+    fn onMenuCloseOthers(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        ctx.host.closeMatching(ctx.page, &wantOthers);
+    }
+
+    fn onMenuCloseRight(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        ctx.host.closeMatching(ctx.page, &wantRight);
+    }
+
+    fn onMenuCloseUnmodified(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        ctx.host.closeMatching(ctx.page, &wantUnmodified);
+    }
+
+    fn onMenuDuplicate(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const spec = ctx.host.tab_menu orelse return;
+        const f = spec.duplicate orelse return;
+        f(ctx.host.ctx, ctx.page);
+    }
+
+    fn onMenuNewWindow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const spec = ctx.host.tab_menu orelse return;
+        const f = spec.new_window orelse return;
+        f(ctx.host.ctx, ctx.page);
     }
 
     /// Was this notebook-space click on the strip's EMPTY area? False
