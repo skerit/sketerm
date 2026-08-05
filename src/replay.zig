@@ -6,6 +6,11 @@
 //! Rows render between `|` gutters so trailing whitespace is visible.
 //! Cells with a non-default style print their rune normally; wide-char
 //! continuations print `_`, truly empty cells ` `.
+//!
+//! Images (sixel / kitty / iTerm2) leave no cells behind, so each one
+//! prints an `image` line as it arrives — dimensions, placement and the
+//! first pixel, which is what a sixel background-select or aspect-ratio
+//! regression shows up in.
 
 const std = @import("std");
 const Parser = @import("parser/vt.zig").Parser;
@@ -23,6 +28,14 @@ fn emit(user: ?*anyopaque, ev: Event) void {
     var mut_ev = ev;
     ctx.screen.apply(ev);
     mut_ev.deinit(ctx.allocator);
+}
+
+fn onImage(_: ?*anyopaque, ev: Screen.ImageEvent) void {
+    const px = if (ev.rgba.len >= 4) ev.rgba[0..4] else &[_]u8{ 0, 0, 0, 0 };
+    std.debug.print("image {d}x{d} at ({d},{d}) id={d} bytes={d} px0=({d},{d},{d},{d})\n", .{
+        ev.width, ev.height, ev.row, ev.col, ev.image_id, ev.rgba.len,
+        px[0],    px[1],     px[2],  px[3],
+    });
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -65,6 +78,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer pool.deinit();
     const screen = try Screen.init(allocator, &pool, cols, rows);
     defer screen.deinit();
+
+    screen.sink = .{ .ctx = null, .on_image = onImage };
 
     var parser = Parser.init(allocator);
     defer parser.deinit();
