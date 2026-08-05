@@ -705,6 +705,70 @@ pub fn main() !u8 {
         sp.releaseGL();
     }
 
+    // Pane corner radius: a non-zero radius must engage the
+    // post-process on its own (no dim asked for) and cut the corner
+    // pixels to alpha 0 while the centre stays untouched.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        var sp = ShaderPass{};
+        sp.corner_radius = 24.0;
+        if (!sp.wantsDim()) {
+            std.debug.print("smoke-cell: FAIL — corner radius did not request the post pass\n", .{});
+            return 28;
+        }
+        if (!sp.beginDim(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — beginDim (corner) failed\n", .{});
+            return 29;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(1.0, 1.0, 1.0, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        sp.finishDim(W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        const px = struct {
+            fn a(buf: []const u8, x: usize, y: usize) i32 {
+                return buf[(y * @as(usize, W) + x) * 4 + 3];
+            }
+        };
+        const corner = px.a(fb, 0, 0);
+        const centre = px.a(fb, W / 2, H / 2);
+        const edge_mid = px.a(fb, 0, H / 2); // mid-height left edge: inside
+        std.debug.print(
+            "smoke-cell: corner radius alpha corner={d} centre={d} edge_mid={d}\n",
+            .{ corner, centre, edge_mid },
+        );
+        if (corner != 0 or centre != 255 or edge_mid != 255) {
+            std.debug.print("smoke-cell: FAIL — corner radius cut the wrong pixels\n", .{});
+            return 30;
+        }
+        sp.releaseGL();
+    }
+
+    // …and a zero radius must leave every pixel alone, including the
+    // very corner (the SDF sits exactly ON the edge there, so an
+    // unguarded smoothstep would halve it).
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        var sp = ShaderPass{};
+        sp.corner_radius = 0.0;
+        sp.dim_darken = 0.001; // engage the pass without changing colour
+        if (!sp.beginDim(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — beginDim (no corner) failed\n", .{});
+            return 31;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(1.0, 1.0, 1.0, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        sp.finishDim(W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        if (fb[3] != 255) {
+            std.debug.print("smoke-cell: FAIL — zero radius still cut the corner (a={d})\n", .{fb[3]});
+            return 32;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

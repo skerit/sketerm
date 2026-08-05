@@ -305,6 +305,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pushPaneColors(self, pane, s);
     pane.grid_pass.enable_ligatures = self.config.ligatures;
     pane.grid_pass.enable_bidi = self.config.bidi;
+    applyPanePresentation(self, pane, s);
     term.screen.scrollback_capacity = s.scrollback;
     pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
@@ -331,6 +332,27 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     }
     pane.refreshShaderBinding();
     pane.updateShaderTick();
+}
+
+/// Push the pane-presentation settings (border, corner radius, and
+/// the window-level overlay scrollbar) into the render passes. Split
+/// out of `applyPaneConfig` because the live-reload path needs the
+/// same six assignments. All plain values — nothing here borrows the
+/// config arena, so a config swap cannot dangle them.
+pub fn applyPanePresentation(
+    self: *Window,
+    pane: *Pane,
+    s: *const @import("../config.zig").ProfileSettings,
+) void {
+    pane.grid_pass.border_width = s.pane_border_width;
+    pane.grid_pass.border_color_active = s.pane_border_color_active;
+    pane.grid_pass.border_color = s.pane_border_color;
+    pane.shader_pass.corner_radius = s.pane_corner_radius;
+    pane.grid_pass.scrollbar_mode = self.config.scrollbar;
+    pane.grid_pass.scrollbar_width = self.config.scrollbar_width;
+    pane.grid_pass.scrollbar_trough_color = self.config.scrollbar_trough_color;
+    pane.grid_pass.scrollbar_thumb_color = self.config.scrollbar_thumb_color;
+    pane.grid_pass.scrollbar_thumb_active_color = self.config.scrollbar_thumb_active_color;
 }
 
 /// Effective 16-colour palette for a settings bundle: explicit
@@ -866,6 +888,8 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         p.inactive_darken = self.config.inactive_darken;
         p.inactive_desaturate = self.config.inactive_desaturate;
         p.applyDim();
+        // Pane border / corner radius / overlay scrollbar.
+        applyPanePresentation(self, p, s);
         // Font rebuilds, per pane against ITS settings bundle. A
         // size change takes the heavy atlas-rebuild path (and
         // resets any Ctrl± zoom, like before); same size with a
@@ -904,6 +928,9 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.refreshOpaqueRegion();
     self.refreshBindings();
     c.gtk_widget_set_visible(self.tab_bar, if (self.config.show_tab_bar) 1 else 0);
+    // Quake geometry: primary only, and a no-op while quake is off —
+    // so a reload never resizes an ordinary window under the user.
+    if (self.is_primary) self.applyQuakeGeometry();
 
     // Start / stop the watcher: this config may have flipped
     // `config_auto_reload`. Before the write below, so the write is
@@ -1089,8 +1116,11 @@ pub fn refreshTitlebarCss(self: *Window) void {
     const ab = self.config.title_active_bg;
     const inf = self.config.title_inactive_fg;
     const ib = self.config.title_inactive_bg;
+    const gap = self.config.pane_gap_color;
     // Format rgba(r, g, b, a) with values 0..255 + 0..1 alpha.
-    var buf: [4096]u8 = undefined;
+    // Generous buffer: a bufPrintZ overflow here would silently drop
+    // EVERY rule in this provider, not just the one that grew it.
+    var buf: [8192]u8 = undefined;
     const css = std.fmt.bufPrintZ(&buf,
         \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
         \\.sketerm-titlebar-active {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
@@ -1144,25 +1174,26 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\   1-px box-shadow lines on both edges; we have to
         \\   match that selector to override.
         \\
-        \\   Width is 4 logical px (not 2) so it stays a multiple
-        \\   of 4 — every fractional surface scale we care about
-        \\   (1.25, 1.5, 1.75) maps that to integer device pixels,
-        \\   keeping the pane rectangles on the GtkGraphicsOffload-
-        \\   compatible grid. With an odd-width separator at scale
-        \\   1.5 one pane always falls off-grid and offload
-        \\   silently rejects every frame. */
+        \\   Width defaults to 4 logical px (not 2) so it stays a
+        \\   multiple of 4 — every fractional surface scale we care
+        \\   about (1.25, 1.5, 1.75) maps that to integer device
+        \\   pixels, keeping the pane rectangles on the
+        \\   GtkGraphicsOffload-compatible grid. With an odd-width
+        \\   separator at scale 1.5 one pane always falls off-grid
+        \\   and offload silently rejects every frame. `pane_gap`
+        \\   and `pane_gap_color` override both. */
         \\paned.horizontal > separator,
         \\paned.vertical > separator,
         \\paned.horizontal > separator.wide,
         \\paned.vertical > separator.wide {{
-        \\    background-color: #353535;
+        \\    background-color: rgba({d}, {d}, {d}, {d:.3});
         \\    background-image: none;
         \\    box-shadow: none;
         \\    border: none;
         \\    margin: 0;
         \\    padding: 0;
-        \\    min-width: 4px;
-        \\    min-height: 4px;
+        \\    min-width: {d:.0}px;
+        \\    min-height: {d:.0}px;
         \\}}
         \\paned.horizontal > separator:hover,
         \\paned.vertical > separator:hover,
@@ -1192,6 +1223,12 @@ pub fn refreshTitlebarCss(self: *Window) void {
         @as(u8, @intFromFloat(@round(inf[1] * 255))),
         @as(u8, @intFromFloat(@round(inf[2] * 255))),
         inf[3],
+        @as(u8, @intFromFloat(@round(gap[0] * 255))),
+        @as(u8, @intFromFloat(@round(gap[1] * 255))),
+        @as(u8, @intFromFloat(@round(gap[2] * 255))),
+        gap[3],
+        self.config.pane_gap,
+        self.config.pane_gap,
     }) catch return;
     c.gtk_css_provider_load_from_string(self.titlebar_css.?, css.ptr);
 }

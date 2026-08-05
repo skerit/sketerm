@@ -13264,3 +13264,67 @@ Covered by a smoke-e2e stage (in-place write, then a temp-file rename
 over the target, asserting the grid re-flows and flows back through
 `screen-info`), verified non-vacuous by disabling the watcher and
 watching the stage fail.
+
+## Feature completion pass 2: a real scrollbar, quake geometry, pane chrome
+
+Three things that already existed halfway and now go all the way.
+
+**The scrollback indicator became a scrollbar.** It was a display-only
+strip drawn by `GridPass`; the geometry moved into a pure
+`src/render/scrollbar.zig` (track + thumb rects, hit-test, thumb-top →
+`view_offset`, page-toward-click), which both the render pass and
+`Pane`'s pointer handlers now read — so the thumb a user grabs is
+exactly the thumb they see. Ten unit tests cover the arithmetic with
+no GUI, including the case that used to be wrong by construction: with
+the 8 px minimum thumb clamping, position maps over `track_h -
+thumb_h`, not `track_h`, or the last screenful of scrollback is
+unreachable.
+
+The wiring rule is "consult the scrollbar first, but only when the
+pointer is actually over it". `onDragBegin` / `onMousePressed` /
+`onMouseReleased` / `onMotion` all yield to it BEFORE the mouse-mode
+branch, so the scrollbar keeps working inside tmux/vim/htop while
+every other pixel of the pane still reaches the app. Config:
+`scrollbar` (never/auto/always), `scrollbar_width`, and three colours.
+`auto` means "once there is scrollback"; there is no timed fade.
+
+**Quake mode got geometry** — `quake_enabled`, `quake_monitor`
+(active / primary / index / connector name), `quake_edge`,
+`quake_width_percent`, `quake_height_percent`, applied at window
+creation, on every `--toggle` reveal, and on config reload. Full
+coverage takes `gtk_window_fullscreen_on_monitor`, the one GTK4 call
+that names a monitor; anything less is `gtk_window_set_default_size`.
+**The edge cannot be honoured and is documented as advisory**: GTK4
+removed toplevel positioning on every backend and Wayland forbids a
+client placing its own toplevel, so a partial-size quake window lands
+wherever the compositor puts it. `gdk_monitor_get_workarea` is gone
+too — "work area" is the monitor rectangle. Recording the edge anyway
+keeps it available to a compositor window rule and to a future
+layer-shell backend.
+
+**Pane presentation.** The unfocused dim was already built and already
+configurable (`inactive_darken` / `inactive_desaturate`); what was
+missing was everything around it. Added per profile — a red border on
+a `prod` profile is the point — `pane_border_width`,
+`pane_border_color_active`, `pane_border_color` (the hard-coded focus
+border became these three, defaults unchanged) and
+`pane_corner_radius`, plus window-level `pane_gap` / `pane_gap_color`
+for the separator, since one CSS provider styles every GtkPaned and no
+single profile owns the space between two panes.
+
+The corner radius is an alpha cut in the shader footer, so it reveals
+what is behind the pane rather than painting a fake corner. That means
+a non-zero radius forces the offscreen post-process on for a focused,
+shader-less pane — `wantsDim()` covers it — and the SDF is guarded on
+`radius > 0`, because at radius 0 the edge pixels sit exactly on the
+boundary and an unguarded smoothstep halves them. Both facts are
+asserted on read-back pixels in `smoke-cell`.
+
+Verification: `smoke-e2e` gained a scrollbar stage that drags the
+thumb and clicks the trough with real seat input, then repeats the
+drag with DECSET 1000 on under `cat -v` — a pane that forwarded the
+press would both fail to scroll and leave an `^[[<` report in the
+grid, so one assertion catches either mistake. It measures the pane's
+right edge off a real frame instead of assuming the toplevel edge: the
+CSD shadow is ~25 px at the sides and ~33 px at the bottom, and every
+hard-coded guess landed in it.

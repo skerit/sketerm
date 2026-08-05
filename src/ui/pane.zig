@@ -17,6 +17,7 @@ const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ShaderSource = @import("../render/shader_pass.zig").Source;
 const ShaderParamKV = @import("../render/shader_pass.zig").ParamKV;
 const gl_mod = @import("../render/gl.zig");
+const scrollbar = @import("../render/scrollbar.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -348,6 +349,14 @@ pub const Pane = struct {
     is_focused: bool = false,
     inactive_darken: f32 = 0.2,
     inactive_desaturate: f32 = 0.0,
+
+    /// Overlay-scrollbar drag in progress. While set, every pointer
+    /// handler yields to the scrollbar — no selection, no mouse
+    /// reports — until the button comes up.
+    sb_dragging: bool = false,
+    /// Pointer offset inside the thumb at grab time (framebuffer
+    /// pixels), so the thumb doesn't jump to centre on the pointer.
+    sb_drag_dy: f32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -2977,6 +2986,18 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         c.gtk_widget_set_cursor(@ptrCast(self.area), null);
     }
 
+    // A held thumb owns the pointer; a hover over the track keeps
+    // motion reports (and link hovers) off the app's plate.
+    if (self.sb_dragging) return;
+    if (overScrollbar(self, x, y)) {
+        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
+        if (self.cursor_over_link) {
+            c.gtk_widget_set_cursor(@ptrCast(self.area), null);
+            self.cursor_over_link = false;
+        }
+        return;
+    }
+
     const cell = self.cellAt(x, y);
     const screen = self.terminal.screen;
 
@@ -3047,10 +3068,80 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
     }
 }
 
+/// Live scrollbar geometry for this pane, in framebuffer pixels, or
+/// null when the scrollbar is off or has nothing to show.
+const SbGeom = struct { view: scrollbar.View, layout: scrollbar.Layout };
+
+fn scrollbarGeom(self: *Pane) ?SbGeom {
+    const w = c.gtk_widget_get_width(@ptrCast(self.area));
+    const h = c.gtk_widget_get_height(@ptrCast(self.area));
+    if (w <= 0 or h <= 0) return null;
+    const scale = c.gtk_widget_get_scale_factor(@ptrCast(self.area));
+    const view = self.grid_pass.scrollbarView(
+        self.terminal.screen,
+        @floatFromInt(w * scale),
+        @floatFromInt(h * scale),
+    ) orelse return null;
+    const l = scrollbar.layout(view) orelse return null;
+    return .{ .view = view, .layout = l };
+}
+
+/// GTK pointer coordinates are widget-local LOGICAL pixels; the
+/// scrollbar lives in framebuffer pixels. Same correction as
+/// `cellAt`.
+fn toPhysical(self: *Pane, v: f64) f32 {
+    const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+    return @floatCast(v * scale);
+}
+
+/// True when the pointer is over the scrollbar track. Consulted
+/// BEFORE mouse reporting so the scrollbar stays usable while an app
+/// holds the mouse — but only for points actually over it, so every
+/// other pixel of the pane keeps reaching the app.
+fn overScrollbar(self: *Pane, x: f64, y: f64) bool {
+    const g = scrollbarGeom(self) orelse return false;
+    return scrollbar.hitTest(g.layout, toPhysical(self, x), toPhysical(self, y)) != .none;
+}
+
+fn setViewOffset(self: *Pane, off: u32) void {
+    if (self.terminal.screen.view_offset == off) return;
+    self.terminal.screen.view_offset = off;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
+}
+
+/// Button-1 press over the scrollbar: grab the thumb, or page toward
+/// a click in the trough. Returns true when the press was consumed.
+fn scrollbarPress(self: *Pane, x: f64, y: f64) bool {
+    const g = scrollbarGeom(self) orelse return false;
+    const py = toPhysical(self, y);
+    switch (scrollbar.hitTest(g.layout, toPhysical(self, x), py)) {
+        .none => return false,
+        .thumb => {
+            self.sb_dragging = true;
+            self.sb_drag_dy = py - g.layout.thumb_y;
+        },
+        .page_up => setViewOffset(self, scrollbar.pageOffset(g.view, true)),
+        .page_down => setViewOffset(self, scrollbar.pageOffset(g.view, false)),
+    }
+    return true;
+}
+
+/// Pointer moved while the thumb is held: map its top edge back to a
+/// view offset.
+fn scrollbarDrag(self: *Pane, y: f64) void {
+    const g = scrollbarGeom(self) orelse return;
+    const thumb_y = toPhysical(self, y) - self.sb_drag_dy;
+    setViewOffset(self, scrollbar.offsetForThumbTop(g.view, g.layout, thumb_y));
+}
+
 fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     // Always grab focus on click.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+
+    // Overlay scrollbar first — it outranks selection AND the app's
+    // mouse mode, but only for presses actually on the track.
+    if (scrollbarPress(self, x, y)) return;
 
     // Read modifiers up-front — Shift overrides app-level mouse
     // tracking (xterm/kitty/gnome-terminal convention).
@@ -3100,6 +3191,11 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
 fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     const button = c.gtk_gesture_single_get_current_button(@ptrCast(g));
+
+    // A press on the overlay scrollbar belongs to it (the drag
+    // gesture already acted on it) — never to the app, and never to
+    // middle-click paste or the gutter/word-selection paths.
+    if (self.sb_dragging or overScrollbar(self, x, y)) return;
 
     // Middle-click PRIMARY paste when the running app isn't asking
     // for mouse reports. With mouse_mode > 0 the app sees the click.
@@ -3175,6 +3271,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
 
 fn onMouseReleased(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+    if (self.sb_dragging or overScrollbar(self, x, y)) return;
     if (self.terminal.screen.mouse_mode == 0) return;
     if (shiftHeld(@ptrCast(g))) return;
     emitMouseSeq(self, g, x, y, false);
@@ -3301,6 +3398,10 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
     var sx: f64 = 0;
     var sy: f64 = 0;
     _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
+    if (self.sb_dragging) {
+        scrollbarDrag(self, sy + dy);
+        return;
+    }
     const cell = self.cellAtLogical(sx + dx, sy + dy);
     self.terminal.screen.selection.extend(cell.row, cell.col);
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
@@ -3309,6 +3410,12 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
 
 fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+
+    // Scrollbar drag: no selection to push, no link to follow.
+    if (self.sb_dragging) {
+        self.sb_dragging = false;
+        return;
+    }
 
     // Tiny drags = a click. If Ctrl was held and the click landed on
     // a hyperlinked cell, launch its URI.
