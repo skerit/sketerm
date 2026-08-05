@@ -22,6 +22,14 @@
 //! Ctrl+I, and F8 moving the caret onto the problem. Screenshots of
 //! each land in zig-out/ for inspection.
 //!
+//! The battery runs TWICE: once on a local document, then again on a
+//! REMOTE one (`rbox:/...`) — a fake-ssh script ($SKETERM_SSH) that
+//! execs `sketerm-mux --proxy` into a second private daemon built from
+//! THIS tree, which spawns the language server near the files and
+//! relays its stdio as a byte channel (the smoke_e2e pattern: hermetic,
+//! no passwordless ssh, asserts this build, cannot silently skip).
+//! Remote screenshots carry a `-remote-` infix.
+//!
 //! Everything created here is destroyed by exact pid / by session name.
 //! Nothing is ever killed by process name (CLAUDE.md).
 
@@ -33,15 +41,29 @@ const appdrive = @import("ipc/appdrive.zig");
 const display_cli = @import("mux/display.zig");
 const proc = @import("lsp/proc.zig");
 
-const SESSION = "lspsmoke";
 const TTL = "240";
 
 var g_alloc: std.mem.Allocator = undefined;
 var g_mux_sock: []const u8 = "";
+var g_session: []const u8 = "lspsmoke";
+/// "" on the local leg, "-remote" on the remote one — keeps both legs'
+/// screenshots side by side in zig-out/.
+var g_leg: []const u8 = "";
 var drive: ?*appdrive.App = null;
 var child_pid: c.pid_t = 0;
 var daemon_pid: c.pid_t = 0;
+/// The REMOTE leg's second private daemon (the fake-ssh target).
+var remote_mux_pid: c.pid_t = 0;
 var display_ready = false;
+
+var g_shot_buf: [160:0]u8 = undefined;
+
+/// "zig-out/smoke-lsp-gui[-remote]-<name>" in a static buffer (one
+/// screenshot is saved at a time).
+fn shot(comptime name: []const u8) [*:0]const u8 {
+    const s = std.fmt.bufPrintZ(&g_shot_buf, "zig-out/smoke-lsp-gui{s}-" ++ name, .{g_leg}) catch unreachable;
+    return s.ptr;
+}
 
 fn say(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
@@ -62,7 +84,7 @@ fn teardown() void {
         child_pid = 0;
     }
     if (display_ready and g_mux_sock.len > 0) {
-        const r = runDisplayCli(g_alloc, &.{ "destroy", SESSION, "--socket", g_mux_sock });
+        const r = runDisplayCli(g_alloc, &.{ "destroy", g_session, "--socket", g_mux_sock });
         g_alloc.free(r.out);
         display_ready = false;
     }
@@ -72,6 +94,13 @@ fn teardown() void {
         _ = c.waitpid(daemon_pid, &status, 0);
         daemon_pid = 0;
     }
+    if (remote_mux_pid > 0) {
+        _ = c.kill(remote_mux_pid, c.SIGTERM);
+        var status: c_int = 0;
+        _ = c.waitpid(remote_mux_pid, &status, 0);
+        remote_mux_pid = 0;
+    }
+    _ = c.unsetenv("SKETERM_SSH");
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
@@ -429,9 +458,9 @@ fn savePopupPng(app: *appdrive.App, path: [*:0]const u8) void {
 }
 
 fn savePng(app: *appdrive.App, win_id: u32, path: [*:0]const u8) void {
-    const shot = app.screenshotPng(win_id, 1600, null, 0) catch return;
-    defer g_alloc.free(shot.png);
-    _ = writeFile(path, shot.png);
+    const png = app.screenshotPng(win_id, 1600, null, 0) catch return;
+    defer g_alloc.free(png.png);
+    _ = writeFile(path, png.png);
 }
 
 /// Number of popup surfaces the session currently shows — a GtkPopover
@@ -461,17 +490,38 @@ pub fn main() u8 {
         return 0;
     }
 
+    // Leg 1: a LOCAL document served by a locally spawned server.
+    const local_rc = runLeg(allocator, false);
+    if (local_rc != 0) return local_rc;
+    // Leg 2: the SAME battery on a REMOTE document ("rbox:/..."):
+    // $SKETERM_SSH fakes the ssh hop into a second private daemon
+    // built from THIS tree, which spawns the server near the files and
+    // relays its stdio as a byte channel. Hermetic — no passwordless
+    // ssh, no installed daemon, and it cannot silently skip.
+    return runLeg(allocator, true);
+}
+
+fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
+    g_session = if (remote) "lspsmoker" else "lspsmoke";
+    g_leg = if (remote) "-remote" else "";
+    say("=== {s} document leg ===", .{if (remote) "remote" else "local"});
+
     // Short isolated runtime dir: sockaddr_un caps at ~108 bytes and a
     // daemon that cannot bind makes the GUI autostart the INSTALLED one
     // (CLAUDE.md).
     var rt_buf: [128]u8 = undefined;
-    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/skl-{d}", .{c.getpid()}) catch return fail("runtime path", .{});
+    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/skl{s}-{d}", .{ if (remote) "r" else "", c.getpid() }) catch return fail("runtime path", .{});
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
+    _ = c.unsetenv("SKETERM_SSH");
     defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+    // Isolated XDG_CONFIG_HOME races pango/fontconfig into heap
+    // corruption unless the cache is warmed first (memory:
+    // isolated-xdg-fontconfig-crash).
+    _ = c.system("fc-cache >/dev/null 2>&1");
 
     // Absolute stub path: the config's `command` is resolved by the
     // GUI, whose cwd we do not control.
@@ -544,12 +594,69 @@ pub fn main() u8 {
     }
     g_mux_sock = mux_sock;
 
+    // ── the "remote" host: fake ssh + a second private daemon ─────
+    //
+    // Same shape smoke_e2e established: $SKETERM_SSH points at a
+    // script that execs `sketerm-mux --proxy` against a second daemon
+    // under <rt>/r, pre-started here so its pid is owned. The remote
+    // daemon inherits SKETERM_LSP_STUB_REPORT because IT is what
+    // spawns the stub on this leg.
+    if (remote) {
+        var rrt_buf: [160]u8 = undefined;
+        const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return fail("remote rt path", .{});
+        _ = c.mkdir(rrt.ptr, 0o700);
+        var mux_abs_buf: [4096]u8 = undefined;
+        const mux_abs_raw = c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return fail("realpath sketerm-mux", .{});
+        const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(mux_abs_raw)));
+        const rmt_pid = c.fork();
+        if (rmt_pid < 0) return fail("remote mux fork", .{});
+        if (rmt_pid == 0) {
+            dieWithParent();
+            _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
+            _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
+            _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+            // On this leg the REMOTE daemon spawns the stub, so the
+            // didOpen report env must travel with it, not the GUI.
+            _ = c.setenv("SKETERM_LSP_STUB_REPORT", report_path.ptr, 1);
+            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
+            _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        remote_mux_pid = rmt_pid;
+        var rsock_buf: [256]u8 = undefined;
+        const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return fail("remote sock path", .{});
+        var rwaited: u32 = 0;
+        while (c.access(rsock.ptr, c.F_OK) != 0) {
+            _ = c.usleep(50_000);
+            rwaited += 1;
+            if (rwaited > 100) return fail("remote mux socket never appeared", .{});
+        }
+        var ssh_path_buf: [200:0]u8 = undefined;
+        const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path", .{});
+        var script_buf: [2048]u8 = undefined;
+        const body = std.fmt.bufPrint(&script_buf,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\export XDG_RUNTIME_DIR='{s}'
+            \\export XDG_STATE_HOME='{s}'
+            \\export XDG_CONFIG_HOME='{s}'
+            \\export SKETERM_MUX_BIN='{s}'
+            \\exec '{s}' --proxy
+            \\
+        , .{ rrt, rrt, rrt, mux_abs, mux_abs }) catch return fail("fake ssh body", .{});
+        if (!writeFile(ssh_path.ptr, body)) return fail("fake ssh write", .{});
+        if (c.chmod(ssh_path.ptr, 0o755) != 0) return fail("fake ssh chmod", .{});
+        _ = c.setenv("SKETERM_SSH", ssh_path.ptr, 1);
+        say("remote daemon up (fake ssh -> {s})", .{rsock});
+    }
+
     // ── display session + viewer ──────────────────────────────────
     var wl_z: [4096:0]u8 = undefined;
     {
-        const r = runDisplayCli(allocator, &.{
-            "create", "--name", SESSION, "--ttl", TTL, "--size", "1280x800", "--json", "--socket", mux_sock,
-        });
+        const create_args = [_][]const u8{
+            "create", "--name", g_session, "--ttl", TTL, "--size", "1280x800", "--json", "--socket", mux_sock,
+        };
+        const r = runDisplayCli(allocator, &create_args);
         defer allocator.free(r.out);
         if (r.code != 0) return fail("display create failed", .{});
         display_ready = true;
@@ -563,11 +670,18 @@ pub fn main() u8 {
         _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long", .{});
     }
     // BEFORE the GUI: the brain is client-side.
-    drive = appdrive.App.attachExisting(allocator, SESSION, null, mux_sock) catch
+    drive = appdrive.App.attachExisting(allocator, g_session, null, mux_sock) catch
         return fail("could not attach a viewer", .{});
     const app = drive.?;
 
     // ── the editor ────────────────────────────────────────────────
+    // A host-qualified spec routes the document — and therefore its
+    // language server — through the fake ssh hop on the remote leg.
+    var spec_buf: [560:0]u8 = undefined;
+    const doc_spec: [:0]const u8 = if (remote)
+        std.fmt.bufPrintZ(&spec_buf, "rbox:{s}", .{doc_path}) catch return fail("doc spec", .{})
+    else
+        doc_path;
     const pid = c.fork();
     if (pid < 0) return fail("fork", .{});
     if (pid == 0) {
@@ -582,7 +696,7 @@ pub fn main() u8 {
         // why a server did not attach when the rig fails.
         _ = c.setenv("SKETERM_LSP_DEBUG", "1", 1);
         _ = c.setenv("SKETERM_LSP_STUB_REPORT", report_path.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "edit", doc_path.ptr, null };
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "edit", doc_spec.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -616,11 +730,11 @@ pub fn main() u8 {
         }
     }
     if (!saw_diag) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nodiag.png");
-        return fail("no diagnostic stripe appeared in the gutter (see zig-out/smoke-lsp-gui-nodiag.png)", .{});
+        savePng(app, win_id, shot("nodiag.png"));
+        return fail("no diagnostic stripe appeared in the gutter (see zig-out/smoke-lsp-gui{s}-nodiag.png)", .{g_leg});
     }
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-diagnostics.png");
-    say("PASS diagnostics rendered (gutter stripe + squiggle) -> zig-out/smoke-lsp-gui-diagnostics.png", .{});
+    savePng(app, win_id, shot("diagnostics.png"));
+    say("PASS diagnostics rendered (gutter stripe + squiggle) -> zig-out/smoke-lsp-gui{s}-diagnostics.png", .{g_leg});
 
     // ── 1b. didOpen carried the document ──────────────────────────
     //
@@ -652,10 +766,10 @@ pub fn main() u8 {
     // hint was laid out and drawn.
     const INLAY_RGB = [3]u8{ 122, 133, 148 };
     if (waitForColor(app, win_id, INLAY_RGB, 10, 3, 30_000, 240)) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-inlay-hints.png");
-        say("PASS inlay hints rendered -> zig-out/smoke-lsp-gui-inlay-hints.png", .{});
+        savePng(app, win_id, shot("inlay-hints.png"));
+        say("PASS inlay hints rendered -> zig-out/smoke-lsp-gui{s}-inlay-hints.png", .{g_leg});
     } else if (!plan.real_server) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-noinlay.png");
+        savePng(app, win_id, shot("noinlay.png"));
         return fail("the stub's inlay hints never appeared", .{});
     } else {
         // A real server is free to have nothing to annotate here.
@@ -670,11 +784,11 @@ pub fn main() u8 {
     if (!plan.real_server) {
         const PROPERTY_RGB = [3]u8{ 0xBF, 0xD4, 0xEC };
         if (!waitForColor(app, win_id, PROPERTY_RGB, 8, 3, 30_000, 60)) {
-            savePng(app, win_id, "zig-out/smoke-lsp-gui-nosemantic.png");
+            savePng(app, win_id, shot("nosemantic.png"));
             return fail("the stub's semantic tokens never recoloured anything", .{});
         }
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-semantic-tokens.png");
-        say("PASS semantic tokens recoloured the marker -> zig-out/smoke-lsp-gui-semantic-tokens.png", .{});
+        savePng(app, win_id, shot("semantic-tokens.png"));
+        say("PASS semantic tokens recoloured the marker -> zig-out/smoke-lsp-gui{s}-semantic-tokens.png", .{g_leg});
     }
 
     // Focus the canvas: a click into the document is what the user
@@ -686,8 +800,8 @@ pub fn main() u8 {
     // ── 2. next diagnostic (F8) ───────────────────────────────────
     app.pressKey(win_id, "F8") catch {};
     pumpFor(app, 1200);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-diagnostic-nav.png");
-    say("PASS F8 diagnostic navigation -> zig-out/smoke-lsp-gui-diagnostic-nav.png", .{});
+    savePng(app, win_id, shot("diagnostic-nav.png"));
+    say("PASS F8 diagnostic navigation -> zig-out/smoke-lsp-gui{s}-diagnostic-nav.png", .{g_leg});
 
     // ── 3. hover (Ctrl+I) ─────────────────────────────────────────
     const popups_before_hover = popupCount(app);
@@ -702,13 +816,13 @@ pub fn main() u8 {
         }
     }
     if (!hover_ok) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nohover.png");
+        savePng(app, win_id, shot("nohover.png"));
         return fail("Ctrl+I opened no hover popup", .{});
     }
     pumpFor(app, 400);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-hover.png");
-    savePopupPng(app, "zig-out/smoke-lsp-gui-hover-popup.png");
-    say("PASS hover popup -> zig-out/smoke-lsp-gui-hover.png", .{});
+    savePng(app, win_id, shot("hover.png"));
+    savePopupPng(app, shot("hover-popup.png"));
+    say("PASS hover popup -> zig-out/smoke-lsp-gui{s}-hover.png", .{g_leg});
 
     // ── 3b. the outline panel, fed by the SERVER ───────────────────
     //
@@ -730,8 +844,8 @@ pub fn main() u8 {
         }
     }
     pumpFor(app, 1500);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-outline.png");
-    say("PASS outline panel opened against a live server -> zig-out/smoke-lsp-gui-outline.png", .{});
+    savePng(app, win_id, shot("outline.png"));
+    say("PASS outline panel opened against a live server -> zig-out/smoke-lsp-gui{s}-outline.png", .{g_leg});
 
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 500);
@@ -758,7 +872,7 @@ pub fn main() u8 {
         }
     }
     if (!completion_ok) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nocompletion.png");
+        savePng(app, win_id, shot("nocompletion.png"));
         return fail("Ctrl+Space opened no completion popup", .{});
     }
     // The popup must SURVIVE, not just flash into one frame: a
@@ -767,12 +881,12 @@ pub fn main() u8 {
     // that single frame while the user saw nothing.
     pumpFor(app, 1500);
     if (popupCount(app) <= popups_before_completion) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nocompletion.png");
+        savePng(app, win_id, shot("nocompletion.png"));
         return fail("completion popup closed itself right after opening", .{});
     }
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-completion.png");
-    savePopupPng(app, "zig-out/smoke-lsp-gui-completion-popup.png");
-    say("PASS completion popup -> zig-out/smoke-lsp-gui-completion.png", .{});
+    savePng(app, win_id, shot("completion.png"));
+    savePopupPng(app, shot("completion-popup.png"));
+    say("PASS completion popup -> zig-out/smoke-lsp-gui{s}-completion.png", .{g_leg});
 
     // Down + Enter accepts an item: the document must change, which is
     // the whole point of the feature.
@@ -798,8 +912,8 @@ pub fn main() u8 {
         if (before.px[i] != after.px[i]) changed += 1;
     }
     if (changed == 0) return fail("accepting a completion changed nothing on screen", .{});
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-completion-accepted.png");
-    say("PASS completion accepted ({d} pixels changed) -> zig-out/smoke-lsp-gui-completion-accepted.png", .{changed});
+    savePng(app, win_id, shot("completion-accepted.png"));
+    say("PASS completion accepted ({d} pixels changed) -> zig-out/smoke-lsp-gui{s}-completion-accepted.png", .{ changed, g_leg });
 
     // ── 4b. signature help ────────────────────────────────────────
     //
@@ -821,20 +935,20 @@ pub fn main() u8 {
         }
     }
     if (!sig_ok) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nosignature.png");
+        savePng(app, win_id, shot("nosignature.png"));
         return fail("typing '{s}' opened no signature popup", .{plan.signature_call});
     }
     pumpFor(app, 800);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-signature.png");
-    savePopupPng(app, "zig-out/smoke-lsp-gui-signature-popup.png");
-    say("PASS signature help -> zig-out/smoke-lsp-gui-signature.png", .{});
+    savePng(app, win_id, shot("signature.png"));
+    savePopupPng(app, shot("signature-popup.png"));
+    say("PASS signature help -> zig-out/smoke-lsp-gui{s}-signature.png", .{g_leg});
     // …and it survives the caret walking to the next parameter, which
     // is the re-entrant path (a re-request lands while typing).
     app.typeText(win_id, "1,") catch {};
     pumpFor(app, 1500);
     if (popupCount(app) <= popups_before_sig)
         return fail("signature help closed itself while moving to the next parameter", .{});
-    savePopupPng(app, "zig-out/smoke-lsp-gui-signature-param2.png");
+    savePopupPng(app, shot("signature-param2.png"));
     say("PASS signature help followed the active parameter", .{});
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 400);
@@ -864,13 +978,13 @@ pub fn main() u8 {
         }
     }
     if (!actions_ok) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-noactions.png");
+        savePng(app, win_id, shot("noactions.png"));
         return fail("Ctrl+. opened no code-action popup", .{});
     }
     pumpFor(app, 800);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-code-actions.png");
-    savePopupPng(app, "zig-out/smoke-lsp-gui-code-actions-popup.png");
-    say("PASS code actions -> zig-out/smoke-lsp-gui-code-actions.png", .{});
+    savePng(app, win_id, shot("code-actions.png"));
+    savePopupPng(app, shot("code-actions-popup.png"));
+    say("PASS code actions -> zig-out/smoke-lsp-gui{s}-code-actions.png", .{g_leg});
 
     // Applying one must change the document AND close the list.
     {
@@ -889,7 +1003,7 @@ pub fn main() u8 {
             if (before_a.px[ia] != after_a.px[ia]) moved += 1;
         }
         if (moved == 0) return fail("applying a code action changed nothing on screen", .{});
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-code-action-applied.png");
+        savePng(app, win_id, shot("code-action-applied.png"));
         say("PASS code action applied ({d} pixels changed)", .{moved});
     }
 
@@ -931,12 +1045,12 @@ pub fn main() u8 {
         // Capture the popup FIRST: the screenshot path wants a surface
         // that has committed recently, and nothing re-commits a hover
         // popover once it is up.
-        savePopupPng(app, "zig-out/smoke-lsp-gui-dwell-hover-popup.png");
+        savePopupPng(app, shot("dwell-hover-popup.png"));
         pumpFor(app, 400);
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-dwell-hover.png");
-        say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui-dwell-hover.png", .{});
+        savePng(app, win_id, shot("dwell-hover.png"));
+        say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui{s}-dwell-hover.png", .{g_leg});
     } else if (!plan.real_server) {
-        savePng(app, win_id, "zig-out/smoke-lsp-gui-nodwell.png");
+        savePng(app, win_id, shot("nodwell.png"));
         return fail("resting the pointer opened no hover popup", .{});
     } else {
         // A real server may have nothing to say at that exact point.
@@ -953,8 +1067,8 @@ pub fn main() u8 {
     pumpFor(app, 300);
     app.pressKey(win_id, "F12") catch {};
     pumpFor(app, 4000);
-    savePng(app, win_id, "zig-out/smoke-lsp-gui-definition.png");
-    say("PASS go-to-definition ran -> zig-out/smoke-lsp-gui-definition.png", .{});
+    savePng(app, win_id, shot("definition.png"));
+    say("PASS go-to-definition ran -> zig-out/smoke-lsp-gui{s}-definition.png", .{g_leg});
 
     say("PASS ({s} server)", .{if (plan.real_server) "real" else "stub"});
     teardown();
