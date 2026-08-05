@@ -169,6 +169,10 @@ pub const Colors = struct {
     diag_warning: [4]f32 = .{ 0.92, 0.70, 0.20, 1.0 },
     diag_info: [4]f32 = .{ 0.35, 0.65, 0.92, 1.0 },
     diag_hint: [4]f32 = .{ 0.45, 0.75, 0.55, 1.0 },
+    /// Language-server inlay hints. Deliberately dimmer than any
+    /// highlight kind: a hint is not code and must never read as if it
+    /// were something you can put the caret in.
+    inlay: [4]f32 = .{ 0.48, 0.52, 0.58, 1.0 },
     /// Per-line VCS change markers, at the gutter's RIGHT edge (the
     /// diagnostic stripe owns the left one, and a line can legitimately
     /// carry both).
@@ -582,7 +586,9 @@ pub const EditorPass = struct {
             // Glyphs.
             for (ll.glyphs) |pg| {
                 const row_y = y + @as(f32, @floatFromInt(pg.row)) * line_h;
-                const fg = if (frame.theme) |th|
+                const fg = if (pg.hint)
+                    colors.inlay
+                else if (frame.theme) |th|
                     th.colorOf(@enumFromInt(pg.kind))
                 else
                     colors.text;

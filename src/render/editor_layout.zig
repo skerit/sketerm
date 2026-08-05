@@ -33,6 +33,31 @@
 //! viewport would keep painting the pre-parse colours.
 //! A stale highlighter is not an error here — the line simply lays out
 //! unhighlighted and re-lays out when the parse catches up.
+//!
+//! ## Language-server decorations
+//!
+//! Two more inputs ride alongside the highlighter, both borrowed from
+//! the caller and both keyed into the cache by their own generation
+//! counter for exactly the reason `hl_gen` exists:
+//!
+//! * `sem` — semantic token spans. They are applied ON TOP of the
+//!   Tree-sitter kinds, per byte, and only where they resolve to a kind
+//!   we know: the server knows whether `foo` is a type or a variable,
+//!   the grammar does not, but the server also does not bother to
+//!   classify punctuation or (usually) comments, and blanking those out
+//!   would be a regression. Tree-sitter is the base layer; a semantic
+//!   token overrides it.
+//!
+//! * `hints` — inlay hints. These are the delicate ones. A hint is
+//!   DISPLAY ONLY: it advances the pen and emits glyphs, but it appends
+//!   NO `Cluster`, so `caretPos` / `byteToX` / `xToByte` keep seeing
+//!   exactly the document's byte space. The caret can therefore never
+//!   land inside a hint and hit testing can never return a byte that is
+//!   not in the rope. Hints DO shift the x of everything after them on
+//!   the line, and can therefore change a line's wrapped row count —
+//!   which needs no new invalidation contract, because `RowIndex` is
+//!   already an estimate refined by `note()` on every line the renderer
+//!   lays out.
 
 const std = @import("std");
 const atlas_mod = @import("atlas.zig");
@@ -63,6 +88,26 @@ pub const PlacedGlyph = struct {
     /// `@intFromEnum(syntax.Kind)` of the glyph's cluster; 0 (`.none`)
     /// when the line is unhighlighted.
     kind: u8 = 0,
+    /// This glyph belongs to an inlay hint, not to the document. It has
+    /// no cluster and `cluster_byte` is the ANCHOR it was drawn before.
+    hint: bool = false,
+};
+
+/// One semantic-token span, in absolute document bytes. Sorted by
+/// `start` and non-overlapping; `kind` is `@intFromEnum(syntax.Kind)`
+/// and is never `.none` (an unmapped token type is dropped by the
+/// caller rather than blanking the Tree-sitter kind underneath).
+pub const SemSpan = struct {
+    start: usize,
+    end: usize,
+    kind: u8,
+};
+
+/// One inlay hint, in absolute document bytes. `text` is borrowed for
+/// as long as the Layout points at the set.
+pub const InlayHint = struct {
+    offset: usize,
+    text: []const u8,
 };
 
 /// One hit-testing cluster: byte range + unwrapped x range, in VISUAL
@@ -100,6 +145,10 @@ pub const LaidLine = struct {
     atlas_gens: [atlas_mod.PAGE_COUNT]u32,
     /// Highlighter generation the kinds came from (0 = unhighlighted).
     hl_gen: u64 = 0,
+    /// Semantic-token / inlay-hint generations baked into this line
+    /// (0 = none applied).
+    sem_gen: u64 = 0,
+    hints_gen: u64 = 0,
 
     fn free(self: *LaidLine, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
@@ -123,6 +172,15 @@ pub const Layout = struct {
     hl: ?*syntax.Highlighter = null,
     /// Colour + face source for highlight kinds.
     theme: *const theme_mod.Theme = &theme_mod.dark,
+    /// Language-server semantic token spans for the WHOLE document,
+    /// sorted by start. Borrowed; the caller clears it (and `sem_gen`)
+    /// whenever the answer goes stale.
+    sem: []const SemSpan = &.{},
+    sem_gen: u64 = 0,
+    /// Language-server inlay hints, sorted by offset. Borrowed, same
+    /// staleness contract as `sem`.
+    hints: []const InlayHint = &.{},
+    hints_gen: u64 = 0,
     cache: std.AutoHashMap(usize, *LaidLine),
 
     pub fn init(alloc: std.mem.Allocator, book: *FontBook) Layout {
@@ -173,9 +231,13 @@ pub const Layout = struct {
     pub fn line(self: *Layout, doc: *const Document, idx: usize) !*const LaidLine {
         const gens = self.atlasGens();
         const hl_gen = self.liveHlGen(doc);
+        const sem_gen = if (self.sem.len > 0) self.sem_gen else 0;
+        const hints_gen = if (self.hints.len > 0) self.hints_gen else 0;
         if (self.cache.get(idx)) |cached| {
             if (cached.revision == doc.revision and
                 cached.hl_gen == hl_gen and
+                cached.sem_gen == sem_gen and
+                cached.hints_gen == hints_gen and
                 std.mem.eql(u32, &cached.atlas_gens, &gens))
                 return cached;
             cached.free(self.alloc);
@@ -191,19 +253,46 @@ pub const Layout = struct {
 
         // One highlight kind per line byte. A highlighter that errors
         // (stale, or a window it cannot serve) degrades to plain text
-        // rather than failing the frame.
+        // rather than failing the frame. Semantic tokens then overwrite
+        // the bytes they cover — see the module header for why that is
+        // the precedence and not the reverse.
         var kinds: ?[]u8 = null;
         defer if (kinds) |k| self.alloc.free(k);
-        if (hl_gen != 0 and text.len > 0) {
+        var used_hl = false;
+        if (text.len > 0 and (hl_gen != 0 or sem_gen != 0)) {
             const buf = try self.alloc.alloc(u8, text.len);
-            if (self.hl.?.fillKinds(doc, start, end, buf)) |_| {
-                kinds = buf;
-            } else |_| {
-                self.alloc.free(buf);
+            @memset(buf, 0);
+            var any = false;
+            if (hl_gen != 0) {
+                if (self.hl.?.fillKinds(doc, start, end, buf)) |_| {
+                    used_hl = true;
+                    any = true;
+                } else |_| {
+                    @memset(buf, 0);
+                }
+            }
+            if (sem_gen != 0 and self.overlaySemantic(buf, start, end)) any = true;
+            if (any) kinds = buf else self.alloc.free(buf);
+        }
+
+        // Hints for this line, rebased to line-relative offsets. The
+        // range is inclusive of `end` so a hint sitting at the line's
+        // trailing edge (a return-type hint) still shows.
+        var line_hints: std.ArrayList(LineHint) = .empty;
+        defer line_hints.deinit(self.alloc);
+        if (hints_gen != 0) {
+            for (self.hints) |h| {
+                if (h.offset < start) continue;
+                if (h.offset > end) break;
+                if (h.text.len == 0) continue;
+                try line_hints.append(self.alloc, .{
+                    .byte = @intCast(h.offset - start),
+                    .text = h.text,
+                });
             }
         }
 
-        const built = try self.buildLine(text, kinds);
+        const built = try self.buildLine(text, kinds, line_hints.items);
         const ll = try self.alloc.create(LaidLine);
         errdefer self.alloc.destroy(ll);
         ll.* = .{
@@ -219,11 +308,45 @@ pub const Layout = struct {
             .n_notdef = built.n_notdef,
             .revision = doc.revision,
             .atlas_gens = gens,
-            .hl_gen = if (kinds != null) hl_gen else 0,
+            .hl_gen = if (used_hl) hl_gen else 0,
+            .sem_gen = sem_gen,
+            .hints_gen = hints_gen,
         };
         try self.cache.put(idx, ll);
         return ll;
     }
+
+    /// Overwrite `kinds` (line-relative, one byte per document byte)
+    /// with the semantic tokens covering `[start, end)`.
+    /// @return whether any token applied.
+    fn overlaySemantic(self: *Layout, kinds: []u8, start: usize, end: usize) bool {
+        // The spans are sorted, so binary-search to the first one that
+        // could reach into this line rather than scanning a
+        // whole-document list per line.
+        var lo: usize = 0;
+        var hi: usize = self.sem.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.sem[mid].end <= start) lo = mid + 1 else hi = mid;
+        }
+        var any = false;
+        var i = lo;
+        while (i < self.sem.len) : (i += 1) {
+            const sp = self.sem[i];
+            if (sp.start >= end) break;
+            if (sp.kind == 0) continue;
+            const s = @max(sp.start, start) - start;
+            const e = @min(sp.end, end) - start;
+            if (e <= s or s >= kinds.len) continue;
+            @memset(kinds[s..@min(e, kinds.len)], sp.kind);
+            any = true;
+        }
+        return any;
+    }
+
+    /// A hint rebased onto one line: the byte it is drawn BEFORE, and
+    /// the borrowed text.
+    const LineHint = struct { byte: u32, text: []const u8 };
 
     const Built = struct {
         glyphs: []PlacedGlyph,
@@ -234,8 +357,9 @@ pub const Layout = struct {
         n_notdef: usize,
     };
 
-    fn buildLine(self: *Layout, text: []const u8, kinds: ?[]const u8) !Built {
+    fn buildLine(self: *Layout, text: []const u8, kinds: ?[]const u8, hints: []const LineHint) !Built {
         const alloc = self.alloc;
+        var hint_idx: usize = 0;
         var glyphs: std.ArrayList(PlacedGlyph) = .empty;
         errdefer glyphs.deinit(alloc);
         var clusters: std.ArrayList(Cluster) = .empty;
@@ -316,11 +440,14 @@ pub const Layout = struct {
                                 &pen,
                                 &glyphs,
                                 &clusters,
+                                hints,
+                                &hint_idx,
                             );
                             n_runs += stats.runs;
                             n_notdef += stats.notdef;
                         }
                         if (at_tab) {
+                            try self.flushHints(hints, &hint_idx, @intCast(i), &pen, &glyphs, @intCast(clusters.items.len));
                             const stop = (@floor(pen / tab_px) + 1.0) * tab_px;
                             try clusters.append(alloc, .{
                                 .byte_start = @intCast(i),
@@ -336,6 +463,10 @@ pub const Layout = struct {
                 }
             }
         }
+
+        // Hints anchored at (or past) the line's end: everything the
+        // cluster walk did not reach.
+        try self.flushHints(hints, &hint_idx, std.math.maxInt(u32), &pen, &glyphs, @intCast(clusters.items.len));
 
         // Merge clusters whose byte_start is inside a grapheme into the
         // visually-previous cluster; build old->new index remap for the
@@ -402,8 +533,22 @@ pub const Layout = struct {
         for (rows.items) |r| width = @max(width, r.x1 - r.x0);
 
         // Glyph rows: PlacedGlyph.row held the pre-merge cluster index.
+        // A HINT glyph carries the index of the cluster it was drawn
+        // BEFORE, which for a trailing hint is one past the end — hence
+        // the clamp, and the empty-line case where there is no cluster
+        // to inherit a row from at all.
         for (glyphs.items) |*g| {
-            g.row = merged.items[remap[g.row]].row;
+            if (merged.items.len == 0 or remap.len == 0) {
+                g.row = 0;
+                continue;
+            }
+            g.row = merged.items[remap[@min(g.row, @as(u32, @intCast(remap.len - 1)))]].row;
+        }
+        // Hints add pen advance without a cluster, so the row spans
+        // computed above can under-report the line's real extent.
+        for (glyphs.items) |g| {
+            if (!g.hint) continue;
+            width = @max(width, g.x + g.advance - rows.items[g.row].x0);
         }
 
         return .{
@@ -445,6 +590,47 @@ pub const Layout = struct {
         return spans.toOwnedSlice(self.alloc);
     }
 
+    /// Emit every pending hint anchored at or before `upto`, at the
+    /// current pen. Hint glyphs get NO cluster (that is what keeps the
+    /// caret and hit testing inside the document's byte space); their
+    /// `row` field carries `next_cluster`, the index of the cluster
+    /// they precede, which the post-merge remap turns into a real row.
+    fn flushHints(
+        self: *Layout,
+        hints: []const LineHint,
+        idx: *usize,
+        upto: u32,
+        pen: *f32,
+        glyphs: *std.ArrayList(PlacedGlyph),
+        next_cluster: u32,
+    ) !void {
+        while (idx.* < hints.len and hints[idx.*].byte <= upto) : (idx.* += 1) {
+            const h = hints[idx.*];
+            const runs = try self.book.itemize(self.alloc, h.text, &.{}, false);
+            defer self.alloc.free(runs);
+            for (runs) |run| {
+                const shaped = try self.book.shape(run, h.text[run.start..run.end]);
+                for (shaped) |sg| {
+                    const g = self.book.glyphFor(run.face, sg.glyph_id) catch continue;
+                    const adv: f32 = if (g.colored)
+                        g.advance
+                    else
+                        @as(f32, @floatFromInt(sg.x_advance)) / 64.0;
+                    try glyphs.append(self.alloc, .{
+                        .x = pen.* + @as(f32, @floatFromInt(sg.x_offset)) / 64.0,
+                        .y_offset = @as(f32, @floatFromInt(sg.y_offset)) / 64.0,
+                        .glyph = g,
+                        .cluster_byte = h.byte,
+                        .advance = adv,
+                        .row = next_cluster,
+                        .hint = true,
+                    });
+                    pen.* += adv;
+                }
+            }
+        }
+    }
+
     fn emitPiece(
         self: *Layout,
         text: []const u8,
@@ -455,6 +641,8 @@ pub const Layout = struct {
         pen: *f32,
         glyphs: *std.ArrayList(PlacedGlyph),
         clusters: *std.ArrayList(Cluster),
+        hints: []const LineHint,
+        hint_idx: *usize,
     ) !PieceStats {
         const alloc = self.alloc;
         const piece = text[piece_start..piece_end];
@@ -477,9 +665,20 @@ pub const Layout = struct {
             var i: usize = 0;
             while (i < shaped.len) {
                 const cluster = shaped[i].cluster;
+                const cluster_byte = piece_start + run.start + cluster;
+                // Hints anchored at (or before) this cluster go FIRST,
+                // so `x + width` of an inserted hint pushes the code
+                // right rather than overlapping it.
+                if (!rtl) try self.flushHints(
+                    hints,
+                    hint_idx,
+                    cluster_byte,
+                    pen,
+                    glyphs,
+                    @intCast(clusters.items.len),
+                );
                 const seg_x0 = pen.*;
                 const temp_cluster_idx: u32 = @intCast(clusters.items.len);
-                const cluster_byte = piece_start + run.start + cluster;
                 const cluster_kind: u8 = if (kinds) |kk|
                     (if (cluster_byte < kk.len) kk[cluster_byte] else 0)
                 else
@@ -803,6 +1002,134 @@ test "layout: theme faces become itemization style spans" {
     defer a.free(cspans);
     try testing.expectEqual(@as(usize, 1), cspans.len);
     try testing.expect(cspans[0].italic);
+}
+
+test "layout: an inlay hint shifts glyphs but adds no cluster" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "let x = 1;");
+    defer doc.deinit();
+    const plain = try rig.layout.line(&doc, 0);
+    const n_clusters = plain.clusters.len;
+    const x_after = Layout.caretPos(plain, 8).x;
+
+    // ": i32" before byte 5 (the '=').
+    const hints = [_]InlayHint{.{ .offset = 5, .text = ": i32" }};
+    rig.layout.hints = &hints;
+    rig.layout.hints_gen = 1;
+    const hinted = try rig.layout.line(&doc, 0);
+
+    // The document's byte space is untouched: same clusters, same
+    // byte ranges, so hit testing and caret movement cannot move.
+    try testing.expectEqual(n_clusters, hinted.clusters.len);
+    for (hinted.clusters, plain.clusters) |h, p| {
+        try testing.expectEqual(p.byte_start, h.byte_start);
+        try testing.expectEqual(p.byte_end, h.byte_end);
+    }
+    // …but everything at or after the anchor is pushed right.
+    try testing.expect(Layout.caretPos(hinted, 8).x > x_after);
+    try testing.expect(hinted.width > plain.width);
+
+    // Hint glyphs exist, are tagged, and no x inside the hint resolves
+    // to a byte that is not a real document offset.
+    var hint_glyphs: usize = 0;
+    for (hinted.glyphs) |g| {
+        if (g.hint) hint_glyphs += 1;
+    }
+    try testing.expect(hint_glyphs >= 4);
+    var x: f32 = 0;
+    while (x < hinted.width) : (x += 1.0) {
+        const b = Layout.xToByte(hinted, 0, x);
+        try testing.expect(b <= hinted.text.len);
+    }
+
+    // Dropping the hints restores the original layout exactly.
+    rig.layout.hints = &.{};
+    rig.layout.hints_gen = 0;
+    const back = try rig.layout.line(&doc, 0);
+    try testing.expectApproxEqAbs(plain.width, back.width, 0.01);
+}
+
+test "layout: a hint at the line end lays out on an empty line too" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "\nsecond");
+    defer doc.deinit();
+    const hints = [_]InlayHint{.{ .offset = 0, .text = "//" }};
+    rig.layout.hints = &hints;
+    rig.layout.hints_gen = 3;
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expectEqual(@as(usize, 0), ll.clusters.len);
+    try testing.expectEqual(@as(usize, 1), ll.rows.len);
+    try testing.expect(ll.glyphs.len > 0);
+    for (ll.glyphs) |g| {
+        try testing.expect(g.hint);
+        try testing.expectEqual(@as(u32, 0), g.row);
+    }
+    // The caret still sits at 0 on an empty line.
+    try testing.expectEqual(@as(u32, 0), Layout.caretPos(ll, 0).row);
+}
+
+test "layout: semantic tokens override tree-sitter but only where they land" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    const src = "const x = 42;\n";
+    var doc = try Document.initFromBytes(a, src);
+    defer doc.deinit();
+    var hl = try syntax.Highlighter.init(a, .zig);
+    defer hl.deinit();
+    rig.layout.hl = &hl;
+    try hl.parse(&doc);
+
+    // Claim bytes 6..7 (`x`) as a `type`; leave `const` alone.
+    const spans = [_]SemSpan{.{ .start = 6, .end = 7, .kind = @intFromEnum(syntax.Kind.type) }};
+    rig.layout.sem = &spans;
+    rig.layout.sem_gen = 5;
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expectEqual(@as(u64, 5), ll.sem_gen);
+    var saw_type = false;
+    var saw_keyword = false;
+    for (ll.glyphs) |g| {
+        const kind: syntax.Kind = @enumFromInt(g.kind);
+        if (g.cluster_byte == 6) {
+            try testing.expectEqual(syntax.Kind.type, kind);
+            saw_type = true;
+        }
+        // The base layer survives everywhere the server said nothing.
+        if (g.cluster_byte < 5 and kind == .keyword) saw_keyword = true;
+    }
+    try testing.expect(saw_type);
+    try testing.expect(saw_keyword);
+}
+
+test "layout: semantic tokens colour a document with no highlighter at all" {
+    const a = testing.allocator;
+    const rig = TestRig.open(a) orelse return error.SkipZigTest;
+    defer rig.close(a);
+
+    var doc = try Document.initFromBytes(a, "alpha beta\n");
+    defer doc.deinit();
+    const spans = [_]SemSpan{.{ .start = 0, .end = 5, .kind = @intFromEnum(syntax.Kind.function) }};
+    rig.layout.sem = &spans;
+    rig.layout.sem_gen = 2;
+    const ll = try rig.layout.line(&doc, 0);
+    try testing.expectEqual(@as(u64, 0), ll.hl_gen);
+    var lit: usize = 0;
+    for (ll.glyphs) |g| {
+        if (g.cluster_byte < 5) {
+            try testing.expectEqual(syntax.Kind.function, @as(syntax.Kind, @enumFromInt(g.kind)));
+            lit += 1;
+        } else {
+            try testing.expectEqual(@as(u8, 0), g.kind);
+        }
+    }
+    try testing.expect(lit >= 5);
 }
 
 test "layout: empty line yields one empty row and caret at 0" {
