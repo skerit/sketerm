@@ -42,6 +42,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const clock = @import("../util/clock.zig");
 const editorview = @import("editorview.zig");
 const EditorView = editorview.EditorView;
 const ETab = editorview.ETab;
@@ -975,6 +976,18 @@ pub const Manager = struct {
     /// so far, for the "…and here is the final count" status line the
     /// deferred half owes the user.
     pending_touched: usize = 0,
+    /// The last WorkspaceEdit outcome sentence, and when it was set.
+    ///
+    /// It lives here rather than being pushed once into the status
+    /// label because the label is REBUILT by `EditorView.updateStatus`
+    /// on every caret move, edit, tab switch and diagnostic publish —
+    /// a rename applies several of those within a few hundred ms, so a
+    /// one-shot `setStatusText` is gone before it can be read. Being
+    /// part of `statusSummary` instead means every rebuild re-emits it
+    /// until it expires.
+    edit_note: [220]u8 = undefined,
+    edit_note_len: usize = 0,
+    edit_note_at_ms: i64 = 0,
 
     pub fn create(view: *EditorView) ?*Manager {
         const self = view.allocator.create(Manager) catch return null;
@@ -2947,6 +2960,28 @@ pub const Manager = struct {
         self.reportOutcome("Applied", r);
     }
 
+    /// How long a WorkspaceEdit outcome keeps re-appearing in the
+    /// status line. Long enough to survive the burst of updateStatus
+    /// calls a cross-file edit causes (and to actually be read), short
+    /// enough that it is not still there next time the user looks.
+    const EDIT_NOTE_MS: i64 = 8_000;
+
+    fn setEditNote(self: *Manager, text: []const u8) void {
+        const n = @min(text.len, self.edit_note.len);
+        @memcpy(self.edit_note[0..n], text[0..n]);
+        self.edit_note_len = n;
+        self.edit_note_at_ms = clock.nowMs();
+    }
+
+    fn editNote(self: *Manager) ?[]const u8 {
+        if (self.edit_note_len == 0) return null;
+        if (clock.nowMs() -| self.edit_note_at_ms > EDIT_NOTE_MS) {
+            self.edit_note_len = 0;
+            return null;
+        }
+        return self.edit_note[0..self.edit_note_len];
+    }
+
     /// Say exactly what a WorkspaceEdit did — including the two things
     /// it did NOT do, which is the point of the wording.
     ///
@@ -2979,8 +3014,10 @@ pub const Manager = struct {
             w.print(self.alloc, "; {d} could not be applied", .{r.skipped}) catch {};
         }
         w.append(self.alloc, '.') catch {};
+        self.setEditNote(w.items);
         const msg = std.fmt.bufPrintZ(&buf, "{s}", .{w.items}) catch return self.view.setStatusText(verb ++ ".");
         self.view.setStatusText(msg);
+        self.view.updateStatusExternal();
     }
 
     /// The deferred half of a WorkspaceEdit landed (a file that had to
@@ -3001,7 +3038,9 @@ pub const Manager = struct {
                 "Edited {d} file(s) — {d} separate undo steps, one per file.",
                 .{ self.pending_touched, self.pending_touched },
             ) catch "Edited.";
+        self.setEditNote(std.mem.span(@as([*:0]const u8, msg)));
         self.view.setStatusText(msg);
+        self.view.updateStatusExternal();
     }
 
     // ---- inlay hints -----------------------------------------------------------
@@ -3466,6 +3505,10 @@ pub const Manager = struct {
 
     /// "3 errors, 1 warning" for the status line; empty when quiet.
     pub fn statusSummary(self: *Manager, tab: *ETab, buf: []u8) []const u8 {
+        // A fresh WorkspaceEdit outcome outranks everything else: it is
+        // the answer to something the user just asked for, and it says
+        // how many undo steps they now have.
+        if (self.editNote()) |note| return std.fmt.bufPrint(buf, "  —  {s}", .{note}) catch "";
         const st = tab.lsp orelse return "";
         if (st.conn == null) return "";
         if (self.diagnosticTextAtCaret(tab)) |txt| {

@@ -51,6 +51,15 @@ const rpc = @import("lsp/rpc.zig");
 var doc_text: std.ArrayList(u8) = .empty;
 var doc_uri: std.ArrayList(u8) = .empty;
 var utf8_mode = false;
+/// `--range-only`: advertise `semanticTokens/range` and NOT `full`, the
+/// shape a client that only implements `full` treats as no provider at
+/// all. Exists so the range path has a real server behind it.
+var range_only = false;
+/// `--rename-multi`: answer `textDocument/rename` with a
+/// `documentChanges` array naming the open document, a SIBLING file the
+/// editor has not opened, and a `create` file operation — the three
+/// outcomes a client's WorkspaceEdit applier has to tell apart.
+var rename_multi = false;
 var alloc: std.mem.Allocator = undefined;
 /// The packed semantic-token array we last sent, and the id that names
 /// it — what a `full/delta` request quotes back.
@@ -65,6 +74,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     for (init.args.vector) |arg| {
         const s = std.mem.span(arg);
         if (std.mem.eql(u8, s, "--utf8")) utf8_mode = true;
+        if (std.mem.eql(u8, s, "--range-only")) range_only = true;
+        if (std.mem.eql(u8, s, "--rename-multi")) rename_multi = true;
     }
 
     var reader = rpc.Reader{};
@@ -143,10 +154,14 @@ fn handle(body: []const u8) bool {
         pushApplyEdit();
     } else if (std.mem.eql(u8, env.method, "textDocument/inlayHint")) {
         replyInlayHints(id, env.params);
+    } else if (std.mem.eql(u8, env.method, "inlayHint/resolve")) {
+        replyResolvedHint(id, env.params);
     } else if (std.mem.eql(u8, env.method, "textDocument/semanticTokens/full")) {
-        replySemanticTokens(id, false);
+        replySemanticTokens(id, false, null);
     } else if (std.mem.eql(u8, env.method, "textDocument/semanticTokens/full/delta")) {
-        replySemanticTokens(id, true);
+        replySemanticTokens(id, true, null);
+    } else if (std.mem.eql(u8, env.method, "textDocument/semanticTokens/range")) {
+        replySemanticTokens(id, false, env.params);
     } else {
         replyErr(id, -32601, "unsupported");
     }
@@ -154,6 +169,12 @@ fn handle(body: []const u8) bool {
 }
 
 fn initializeResult() []const u8 {
+    if (range_only) {
+        return if (utf8_mode)
+            "{\"positionEncoding\":\"utf-8\",\"capabilities\":" ++ CAPS_RANGE_ONLY ++ "}"
+        else
+            "{\"positionEncoding\":\"utf-16\",\"capabilities\":" ++ CAPS_RANGE_ONLY ++ "}";
+    }
     return if (utf8_mode)
         "{\"positionEncoding\":\"utf-8\",\"capabilities\":" ++ CAPS ++ "}"
     else
@@ -171,8 +192,18 @@ const CAPS =
     \\"signatureHelpProvider":{"triggerCharacters":["("],"retriggerCharacters":[","]},
     \\"codeActionProvider":{"resolveProvider":true},
     \\"executeCommandProvider":{"commands":["stub.fixAllBad"]},
-    \\"inlayHintProvider":true,
-    \\"semanticTokensProvider":{"legend":{"tokenTypes":["function","variable","keyword","property"],"tokenModifiers":[]},"full":{"delta":true},"range":false}}
+    \\"inlayHintProvider":{"resolveProvider":true},
+    \\"semanticTokensProvider":{"legend":{"tokenTypes":["function","variable","keyword","property"],"tokenModifiers":["declaration","readonly","deprecated","defaultLibrary"]},"full":{"delta":true},"range":true}}
+;
+
+/// Same server minus `full`: the shape a client that only implements
+/// `semanticTokens/full` treats as offering nothing at all. Selected
+/// with `SKETERM_LSP_STUB_RANGE_ONLY=1`.
+const CAPS_RANGE_ONLY =
+    \\{"textDocumentSync":{"openClose":true,"change":2,"save":{"includeText":false}},
+    \\"hoverProvider":true,
+    \\"inlayHintProvider":{"resolveProvider":true},
+    \\"semanticTokensProvider":{"legend":{"tokenTypes":["function","variable","keyword","property"],"tokenModifiers":["declaration","readonly","deprecated","defaultLibrary"]},"range":true}}
 ;
 
 const COMPLETION_RESULT =
@@ -444,6 +475,46 @@ fn replyRename(id: i64, params: std.json.Value) void {
         from = at + word.len;
     }
     out.appendSlice(alloc, "]}}") catch return;
+    if (rename_multi) {
+        replyRenameMulti(id, word, new_name);
+        return;
+    }
+    replyRaw(id, out.items);
+}
+
+/// The `documentChanges` shape, naming three things at once: the open
+/// document, a sibling the editor has NOT opened, and a file operation.
+fn replyRenameMulti(id: i64, word: []const u8, new_name: []const u8) void {
+    const slash = std.mem.lastIndexOfScalar(u8, doc_uri.items, '/') orelse {
+        replyRaw(id, "null");
+        return;
+    };
+    const dir = doc_uri.items[0 .. slash + 1];
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, "{\"documentChanges\":[{\"textDocument\":{\"uri\":\"") catch return;
+    out.appendSlice(alloc, doc_uri.items) catch return;
+    out.appendSlice(alloc, "\",\"version\":null},\"edits\":[") catch return;
+    var from: usize = 0;
+    var n: usize = 0;
+    while (std.mem.indexOfPos(u8, doc_text.items, from, word)) |at| {
+        if (n > 0) out.append(alloc, ',') catch return;
+        out.appendSlice(alloc, "{\"range\":") catch return;
+        appendRange(&out, at, at + word.len);
+        out.print(alloc, ",\"newText\":\"{s}\"}}", .{new_name}) catch return;
+        n += 1;
+        from = at + word.len;
+    }
+    // The sibling: line 0, characters 0..0 — a pure insertion, so it
+    // works whatever that file happens to contain.
+    out.print(
+        alloc,
+        "]}},{{\"textDocument\":{{\"uri\":\"{s}other.zig\",\"version\":null}}," ++
+            "\"edits\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}}," ++
+            "\"end\":{{\"line\":0,\"character\":0}}}},\"newText\":\"// touched by {s}\\n\"}}]}}," ++
+            "{{\"kind\":\"create\",\"uri\":\"{s}created.zig\"}}]}}",
+        .{ dir, new_name, dir },
+    ) catch return;
     replyRaw(id, out.items);
 }
 
@@ -629,8 +700,9 @@ fn replyInlayHints(id: i64, params: std.json.Value) void {
             const p = positionOf(line_end);
             out.print(
                 alloc,
-                "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":\" [{d}]\",\"kind\":1,\"paddingLeft\":true}}",
-                .{ p.line, p.character, line },
+                "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":\" [{d}]\"," ++
+                    "\"kind\":1,\"paddingLeft\":true,\"data\":{d}}}",
+                .{ p.line, p.character, line, line + 100 },
             ) catch return;
             n += 1;
         }
@@ -642,13 +714,31 @@ fn replyInlayHints(id: i64, params: std.json.Value) void {
     replyRaw(id, out.items);
 }
 
+/// `inlayHint/resolve`: echo the hint back with a `tooltip` filled in.
+/// The label is echoed verbatim so a client that reconstructs the hint
+/// instead of keeping the server's own object gets caught — the tooltip
+/// quotes the `data` field, which only the original object carries.
+fn replyResolvedHint(id: i64, params: std.json.Value) void {
+    const data = intOf(objGet(params, "data"));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    const p = objGet(params, "position") orelse std.json.Value.null;
+    out.print(
+        alloc,
+        "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":\"resolved\"," ++
+            "\"tooltip\":{{\"kind\":\"plaintext\",\"value\":\"stub tooltip for data={d}\"}}}}",
+        .{ intOf(objGet(p, "line")), intOf(objGet(p, "character")), data },
+    ) catch return;
+    replyRaw(id, out.items);
+}
+
 // ---- semantic tokens --------------------------------------------------------
 
 const KEYWORDS = [_][]const u8{ "fn", "const", "var", "return", "void", "pub", "static", "int" };
 
 /// One token per identifier run: keyword, function (right after `fn `)
 /// or variable. Encoded relative, exactly as the wire format wants.
-fn buildSemanticTokens(out: *std.ArrayList(u32)) void {
+fn buildSemanticTokens(out: *std.ArrayList(u32), from_line: usize, to_line: usize) void {
     out.clearRetainingCapacity();
     var prev_line: usize = 0;
     var prev_char: usize = 0;
@@ -676,6 +766,20 @@ fn buildSemanticTokens(out: *std.ArrayList(u32)) void {
         // seeing the `property` colour on screen can ONLY mean the
         // semantic tokens were applied.
         if (std.mem.eql(u8, word, "SEM")) kind = 3;
+        // …and two more that additionally carry a MODIFIER, so the
+        // modifier band has a real server driving it. Legend order is
+        // declaration, readonly, deprecated, defaultLibrary.
+        var mods: u32 = 0;
+        if (std.mem.eql(u8, word, "SEMRO")) {
+            kind = 3;
+            mods = 1 << 1; // readonly
+        } else if (std.mem.eql(u8, word, "SEMDEP")) {
+            kind = 0;
+            mods = 1 << 2; // deprecated
+        } else if (std.mem.eql(u8, word, "SEMLIB")) {
+            kind = 0;
+            mods = 1 << 3; // defaultLibrary
+        }
         last_word_was_fn = is_fn_kw;
 
         const ps = positionOf(start);
@@ -683,22 +787,32 @@ fn buildSemanticTokens(out: *std.ArrayList(u32)) void {
         // A token never spans lines here, so the length is the
         // character delta on the line.
         if (pe.line != ps.line) continue;
+        if (ps.line < from_line or ps.line >= to_line) continue;
         const dl = ps.line - prev_line;
         const dc = if (dl == 0) ps.character - prev_char else ps.character;
         out.append(alloc, @intCast(dl)) catch return;
         out.append(alloc, @intCast(dc)) catch return;
         out.append(alloc, @intCast(pe.character - ps.character)) catch return;
         out.append(alloc, kind) catch return;
-        out.append(alloc, 0) catch return;
+        out.append(alloc, mods) catch return;
         prev_line = ps.line;
         prev_char = ps.character;
     }
 }
 
-fn replySemanticTokens(id: i64, delta: bool) void {
+/// `range` non-null = a `semanticTokens/range` request, whose answer
+/// must contain ONLY tokens inside it. Same reply shape as `full`.
+fn replySemanticTokens(id: i64, delta: bool, range: ?std.json.Value) void {
+    var from_line: usize = 0;
+    var to_line: usize = std.math.maxInt(usize);
+    if (range) |p| {
+        const rng = objGet(p, "range") orelse std.json.Value.null;
+        from_line = intOf(objGet(objGet(rng, "start") orelse .null, "line"));
+        to_line = intOf(objGet(objGet(rng, "end") orelse .null, "line"));
+    }
     var fresh: std.ArrayList(u32) = .empty;
     defer fresh.deinit(alloc);
-    buildSemanticTokens(&fresh);
+    buildSemanticTokens(&fresh, from_line, to_line);
     sem_result_id += 1;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);

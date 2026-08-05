@@ -226,7 +226,7 @@ test "session: capabilities are absorbed exactly" {
     try testing.expectEqualStrings("", s.caps.token_types.name(7));
 }
 
-test "session: a semanticTokens provider offering only range is not a provider" {
+test "session: a semanticTokens provider offering only range is still a provider" {
     const alloc = testing.allocator;
     var rec = Recorder{ .alloc = alloc };
     defer rec.deinit();
@@ -237,12 +237,81 @@ test "session: a semanticTokens provider offering only range is not a provider" 
     defer freeSent(alloc, &sent);
     try drain(alloc, &s, &sent);
     try feedJson(&s, alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"semanticTokensProvider":{"legend":{"tokenTypes":["type"]},"range":true}}}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"semanticTokensProvider":{"legend":{"tokenTypes":["type"],"tokenModifiers":["readonly"]},"range":true}}}}
     );
-    // The client asks for the whole document first, so a range-only
-    // provider offers it nothing it can use.
     try testing.expect(!s.caps.semantic_tokens);
     try testing.expect(!s.caps.semantic_tokens_delta);
+    try testing.expect(s.caps.semantic_tokens_range);
+    // The legend must survive: a range-only provider's tokens are
+    // decoded through exactly the same table.
+    try testing.expectEqual(@as(usize, 1), s.caps.token_types.types.items.len);
+    try testing.expectEqualStrings("readonly", s.caps.token_types.modName(0));
+}
+
+test "session: an options-object range provider counts, a false one does not" {
+    const alloc = testing.allocator;
+    for ([_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"semanticTokensProvider":{"legend":{"tokenTypes":["type"]},"range":{}}}}}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"semanticTokensProvider":{"legend":{"tokenTypes":["type"]},"range":false}}}}
+        ,
+    }, 0..) |msg, i| {
+        var rec = Recorder{ .alloc = alloc };
+        defer rec.deinit();
+        var s = Session.init(alloc, rec.handler());
+        defer s.deinit();
+        s.start("", 1, "");
+        var sent: std.ArrayList(Sent) = .empty;
+        defer freeSent(alloc, &sent);
+        try drain(alloc, &s, &sent);
+        try feedJson(&s, alloc, msg);
+        try testing.expectEqual(i == 0, s.caps.semantic_tokens_range);
+    }
+}
+
+test "session: inlayHintProvider.resolveProvider is picked up" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    s.start("", 1, "");
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try feedJson(&s, alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"inlayHintProvider":{"resolveProvider":true}}}}
+    );
+    try testing.expect(s.caps.inlay_hint);
+    try testing.expect(s.caps.inlay_hint_resolve);
+}
+
+test "session: a bare-true inlayHintProvider offers no resolve" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    s.start("", 1, "");
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try feedJson(&s, alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"inlayHintProvider":true}}}
+    );
+    try testing.expect(s.caps.inlay_hint);
+    try testing.expect(!s.caps.inlay_hint_resolve);
+}
+
+test "session: the client advertises what these features actually need" {
+    // A capability we send but do not implement is a lie a server acts
+    // on; one we implement but do not send is a feature that silently
+    // never arrives.
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"range\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"tooltip\"") != null);
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"readonly\"") != null);
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"deprecated\"") != null);
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"defaultLibrary\"") != null);
 }
 
 test "session: the new capabilities default to off" {
@@ -259,7 +328,9 @@ test "session: the new capabilities default to off" {
     try testing.expect(!s.caps.signature_help);
     try testing.expect(!s.caps.code_action);
     try testing.expect(!s.caps.inlay_hint);
+    try testing.expect(!s.caps.inlay_hint_resolve);
     try testing.expect(!s.caps.semantic_tokens);
+    try testing.expect(!s.caps.semantic_tokens_range);
     try testing.expectEqual(@as(usize, 0), s.caps.signature_triggers.len);
 }
 

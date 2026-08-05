@@ -26,6 +26,18 @@ const docsync = @import("lsp/docsync.zig");
 const servers = @import("lsp/servers.zig");
 const inlay = @import("lsp/inlay.zig");
 const semantic = @import("lsp/semantic.zig");
+const syntax = @import("editor/syntax.zig");
+const theme = @import("editor/theme.zig");
+
+/// The client's own LSP-modifier-name -> render-bit map, duplicated
+/// here on purpose: editorlsp.zig is GTK and cannot be imported into a
+/// headless rig, and hard-coding the BITS instead would test nothing.
+fn modBit(name: []const u8) u8 {
+    if (std.mem.eql(u8, name, "readonly")) return syntax.MOD_READONLY;
+    if (std.mem.eql(u8, name, "deprecated")) return syntax.MOD_DEPRECATED;
+    if (std.mem.eql(u8, name, "defaultLibrary")) return syntax.MOD_DEFAULT_LIBRARY;
+    return 0;
+}
 
 const URI = "file:///smoke/main.zig";
 
@@ -37,7 +49,8 @@ const SRC =
     "    const greek = \"\u{03b1}\u{03b2}\u{03b3}\";\n" ++
     "    call(BAD, emoji);\n" ++
     "}\n" ++
-    "fn beta() void { MEH; }\n";
+    "fn beta() void { MEH; }\n" ++
+    "var SEMRO = SEMDEP;\n";
 
 const Harness = struct {
     alloc: std.mem.Allocator,
@@ -230,6 +243,64 @@ pub fn stage(alloc: std.mem.Allocator) !?u8 {
     for ([_]bool{ false, true }) |utf8| {
         if (try runOnce(alloc, utf8)) |code| return code;
     }
+    return rangeOnlyStage(alloc);
+}
+
+/// A server offering `semanticTokens/range` and NOT `full` used to be
+/// treated as offering nothing. One extra child proves the whole path:
+/// the capability is seen, the request is answered, and the answer
+/// contains ONLY tokens inside the window asked for.
+fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
+    const exe = "zig-out/bin/sketerm-lsp-stub";
+    if (c.access(exe, c.X_OK) != 0) return null;
+    var h = Harness{
+        .alloc = alloc,
+        .child = try proc.spawn(alloc, exe, &.{"--range-only"}, "."),
+        .sess = undefined,
+        .doc = try Document.initFromBytes(alloc, SRC),
+        .sync = docsync.DocSync.init(alloc),
+        .diags = diagnostics.Store.init(alloc),
+    };
+    h.sess = session.Session.init(alloc, h.handler());
+    defer h.deinit();
+    h.sess.start("file:///smoke", c.getpid(), "");
+    if (!h.waitFor(&h, Harness.readyCond, 4000)) return fail("range-only stub never reached ready", .{});
+    if (h.sess.caps.semantic_tokens) return fail("range-only stub advertised `full`", .{});
+    if (!h.sess.caps.semantic_tokens_range) return fail("the `range` provider was not recognised", .{});
+    if (h.sess.caps.token_types.types.items.len == 0)
+        return fail("a range-only provider's legend was thrown away", .{});
+
+    try h.sync.setUri(URI);
+    h.sync.open = true;
+    h.sync.version = 1;
+    {
+        const text = try h.doc.textAlloc(alloc);
+        defer alloc.free(text);
+        h.sess.didOpen(URI, "zig", 1, text);
+    }
+
+    var params: std.ArrayList(u8) = .empty;
+    defer params.deinit(alloc);
+    // Lines 0..2 only — the document is six lines long.
+    try params.print(
+        alloc,
+        "{{\"textDocument\":{{\"uri\":\"{s}\"}},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":2,\"character\":0}}}}}}",
+        .{URI},
+    );
+    if (!h.request(.semantic_tokens_range, "textDocument/semanticTokens/range", params.items))
+        return fail("semanticTokens/range timed out", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+    defer parsed.deinit();
+    var data = semantic.Data.init(alloc);
+    defer data.deinit();
+    if (!data.absorbFull(parsed.value)) return fail("could not absorb the range token array", .{});
+    const toks = try data.decode(alloc);
+    defer alloc.free(toks);
+    if (toks.len == 0) return fail("the range answer carried no tokens", .{});
+    for (toks) |t| {
+        if (t.line >= 2) return fail("a range answer carried a token on line {d}, outside 0..2", .{t.line});
+    }
+    std.debug.print("smoke-editor: PASS lsp/range-only ({d} tokens, all inside the window)\n", .{toks.len});
     return null;
 }
 
@@ -551,6 +622,27 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
         }
         if (!set.covers(1, 2)) return fail("the hint set does not claim its own window", .{});
         if (set.covers(0, 9)) return fail("the hint set claims lines it never asked for", .{});
+
+        // ---- inlayHint/resolve ---------------------------------------
+        //
+        // The stub answers with a tooltip quoting the `data` field it
+        // put on the hint, which ONLY the server's own object carries —
+        // so a client that reconstructs a hint instead of keeping the
+        // raw JSON resolves to `data=0` and this fails.
+        if (!h.sess.caps.inlay_hint_resolve) return fail("stub did not offer inlayHint/resolve", .{});
+        if (set.items.items[0].raw.len == 0) return fail("the hint kept no raw JSON to resolve with", .{});
+        if (set.items.items[0].tooltip.len != 0) return fail("the hint arrived with a tooltip already", .{});
+        if (!h.request(.inlay_hint_resolve, "inlayHint/resolve", set.items.items[0].raw))
+            return fail("inlayHint/resolve timed out", .{});
+        var rparsed = try std.json.parseFromSlice(std.json.Value, alloc, h.last_result, .{});
+        defer rparsed.deinit();
+        if (!set.absorbResolved(0, rparsed.value)) return fail("the resolved hint carried no tooltip", .{});
+        if (std.mem.indexOf(u8, set.items.items[0].tooltip, "data=100") == null)
+            return fail("resolve did not round-trip the server's own data field: '{s}'", .{set.items.items[0].tooltip});
+        // The hint's own offset is unchanged — resolve decorates, it
+        // does not move anything.
+        if (set.indexAtOffset(set.items.items[0].offset) != 0)
+            return fail("the resolved hint is no longer findable at its anchor", .{});
     }
 
     // ---- semantic tokens: full, then a delta that splices -------------
@@ -580,6 +672,49 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
             if (t.type_index == 0) saw_fn_name = true;
         }
         if (!saw_fn_kw or !saw_fn_name) return fail("token types did not decode", .{});
+
+        // Token MODIFIERS: the stub marks SEMRO readonly (legend bit 1)
+        // and SEMDEP deprecated (bit 2). Fold them by NAME through the
+        // legend, exactly as the client does, and check the render-side
+        // bits that come out — a legend-order assumption would pass
+        // here and mis-colour against every real server.
+        {
+            const ro_off = offsetOf(&h.doc, alloc, "SEMRO") orelse
+                return fail("test document lost SEMRO", .{});
+            const dep_off = offsetOf(&h.doc, alloc, "SEMDEP") orelse
+                return fail("test document lost SEMDEP", .{});
+            var saw_ro = false;
+            var saw_dep = false;
+            for (full_toks) |t| {
+                const toff = pos.positionToOffset(
+                    &h.doc.rope,
+                    .{ .line = t.line, .character = t.start_char },
+                    h.sess.caps.encoding,
+                );
+                const bits = h.sess.caps.token_types.foldMods(t.modifiers, u8, &modBit);
+                if (toff == ro_off) {
+                    if (bits != syntax.MOD_READONLY)
+                        return fail("SEMRO folded to modifier bits 0x{x}, wanted readonly", .{bits});
+                    saw_ro = true;
+                }
+                if (toff == dep_off) {
+                    if (bits != syntax.MOD_DEPRECATED)
+                        return fail("SEMDEP folded to modifier bits 0x{x}, wanted deprecated", .{bits});
+                    saw_dep = true;
+                }
+                // Nothing else may pick up a modifier by accident.
+                if (toff != ro_off and toff != dep_off and bits != 0)
+                    return fail("an unmarked token carried modifier bits 0x{x}", .{bits});
+            }
+            if (!saw_ro or !saw_dep) return fail("the modified tokens never arrived", .{});
+            // …and the theme turns those bits into a different style.
+            const plain = theme.dark.style(.property);
+            const ro = theme.dark.style(syntax.withMods(.property, syntax.MOD_READONLY));
+            if (std.mem.eql(u8, &std.mem.toBytes(plain.rgba), &std.mem.toBytes(ro.rgba)))
+                return fail("readonly resolved to the same colour as plain", .{});
+            if (!theme.dark.style(syntax.withMods(.function, syntax.MOD_DEPRECATED)).strike)
+                return fail("deprecated did not resolve to a strikethrough", .{});
+        }
         // Positions must land on identifier starts in OUR copy.
         const first = full_toks[0];
         const off = pos.positionToOffset(
