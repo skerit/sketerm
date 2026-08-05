@@ -583,6 +583,9 @@ that dies takes its diagnostics down with it and the editor keeps working.
   covers the RENDER side in `render/editor_layout.zig`: that a hint
   shifts glyphs without adding a cluster or moving a byte, and that a
   semantic token overrides the Tree-sitter kind only where it lands.
+  `editor/theme.zig` covers the modifier band: that a modifier changes
+  the resolved style without touching the palette entry, that
+  `deprecated` resolves to a strikethrough, and that all three compose.
 * `zig build smoke-editor` — the LSP stage spawns
   **`sketerm-lsp-stub`**, a real child process speaking the base protocol
   over real pipes, and drives diagnostics, incremental sync, hover,
@@ -591,7 +594,14 @@ that dies takes its diagnostics down with it and the editor keeps working.
   active parameter must move with the caret), all three code-action
   shapes including `codeAction/resolve`, range-honouring inlay hints,
   and `semanticTokens/full` followed by a `full/delta` that has to
-  decode to the same token set. The stub maintains its **own**
+  decode to the same token set. Token MODIFIERS are folded by NAME
+  through the legend, exactly as the client does — a rig that hardcoded
+  the BITS would pass while mis-colouring against every real server —
+  and `inlayHint/resolve` has to round-trip the hint's own `data` field,
+  which only the raw JSON carries. A THIRD stub child runs with
+  `--range-only` (a `semanticTokens/range` provider with no `full`) and
+  its answer must contain only tokens inside the window asked for.
+  The stub maintains its **own**
   copy of the document from the `contentChanges` it receives and publishes
   diagnostics against it, so an off-by-one range makes the two copies
   diverge and the stage fail. The whole stage runs twice, once per
