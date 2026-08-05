@@ -32,6 +32,27 @@
 - **Every response is revision-stamped and dropped when stale**, exactly
   as `editor/syntax.zig` does. Diagnostics are the one exception: they
   are anchored byte ranges carried through edits by `mapThrough`.
+  Inlay hints and semantic tokens are deliberately NOT carried — they
+  are dropped on any edit and re-requested.
+
+- **`didOpen` must carry the document's real content.** A tab is
+  attached to a server before its async load lands, so
+  `Manager.openDocument` returns early while `ETab.loading` is set and
+  the load opens it. Do not "simplify" that away: it is how the
+  zero-byte-didOpen-plus-full-didChange bug came back once already.
+
+- **An inlay hint appends NO `Cluster`.** Hints advance the pen and emit
+  glyphs in `editor_layout`, and that is all. Clusters are the whole
+  hit-testing and caret currency, so giving a hint one would put the
+  caret inside text that is not in the rope.
+
+- **Semantic tokens AUGMENT Tree-sitter, they do not replace it**, and a
+  token type with no `syntax.Kind` mapping is DROPPED rather than
+  painted as `.none` (which would erase the grammar's answer).
+
+- **`applyWorkspaceEdit` is the single cross-file applier.** Rename,
+  code actions and `workspace/applyEdit` all go through it; do not add
+  a second one.
 
 - **Server-to-client requests must always be answered** (null, or a real
   MethodNotFound). A server waiting on us stops serving the user.
