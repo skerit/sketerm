@@ -384,6 +384,11 @@ pub const Config = struct {
     /// Colour theme name — see `editor/theme.zig`'s `byName`, which
     /// falls back to "dark" for anything it does not know.
     editor_theme: []const u8 = "dark",
+    /// Snapshot unsaved editor buffers to
+    /// `$XDG_STATE_HOME/sketerm/editor-recovery.d` so a crash can offer
+    /// them back (`editor/journal.zig`). Off writes nothing and offers
+    /// nothing; records already on disk are left alone.
+    editor_crash_recovery: bool = true,
     /// Master switch for the editor's language-server client
     /// (src/lsp/). Off means no server is ever spawned; every LSP
     /// feature reports "no language server" when asked for explicitly
@@ -897,6 +902,7 @@ pub const Config = struct {
         if (!self.editor_folding) try w.writeAll("editor_folding = false\n");
         if (!self.editor_fold_indent_fallback)
             try w.writeAll("editor_fold_indent_fallback = false\n");
+        if (!self.editor_crash_recovery) try w.writeAll("editor_crash_recovery = false\n");
         if (!self.editor_lsp) try w.writeAll("editor_lsp = false\n");
         if (!self.editor_lsp_diagnostics) try w.writeAll("editor_lsp_diagnostics = false\n");
         if (self.editor_lsp_debounce_ms != 250)
@@ -1587,6 +1593,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.editor_bracket_match = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_folding")) {
         cfg.editor_folding = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "editor_crash_recovery")) {
+        cfg.editor_crash_recovery = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_fold_indent_fallback")) {
         cfg.editor_fold_indent_fallback = try parseBool(value);
     } else if (std.mem.eql(u8, key, "editor_lsp")) {

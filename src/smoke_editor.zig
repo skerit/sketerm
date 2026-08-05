@@ -28,6 +28,8 @@ const unicode = @import("editor/unicode.zig");
 const syntax = @import("editor/syntax.zig");
 const structure = @import("editor/structure.zig");
 const theme_mod = @import("editor/theme.zig");
+const journal = @import("editor/journal.zig");
+const reload = @import("editor/reload.zig");
 const lsp_smoke = @import("smoke_editor_lsp.zig");
 const lspStage = lsp_smoke.stage;
 
@@ -182,6 +184,93 @@ fn regexStage(allocator: std.mem.Allocator) !?u8 {
         return 12;
     }
     std.debug.print("smoke-editor: PASS regex replace-all ({d} matches, one undo step)\n", .{matches.len});
+    return null;
+}
+
+/// The crash-recovery journal end to end: a dirty buffer snapshots, a
+/// process that dies (its lock released without a discard) is offered
+/// back with caret and content intact, and a clean close leaves nothing.
+fn journalStage(allocator: std.mem.Allocator) !?u8 {
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-smoke-journal-{d}", .{c.getpid()});
+    _ = c.mkdir(dir.ptr, 0o700);
+    const saved = c.getenv("XDG_STATE_HOME");
+    _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
+    defer {
+        if (saved) |v| {
+            _ = c.setenv("XDG_STATE_HOME", v, 1);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+        var cmd: [200]u8 = undefined;
+        if (std.fmt.bufPrintZ(&cmd, "rm -rf '{s}'", .{dir})) |z| {
+            _ = c.system(z.ptr);
+        } else |_| {}
+    }
+
+    var doc = try Document.initFromBytes(allocator, "line one\nline two\n");
+    defer doc.deinit();
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(allocator);
+    try tx.addInsert(allocator, 9, "UNSAVED ");
+    _ = try doc.applyTransaction(&tx);
+
+    var h = try journal.open(allocator, "/tmp/smoke-target.txt");
+    var hdr = journal.Header{ .spec = "/tmp/smoke-target.txt", .cursor = 17 };
+    hdr.setBaseline(.{ .known = true, .present = true, .mtime_ns = 42, .size = 18, .ino = 7, .mode = 0o644 });
+    try h.writeDocument(&doc, hdr);
+
+    // A LIVE owner is never offered.
+    {
+        const live = try journal.list(allocator);
+        defer journal.freeEntries(allocator, live);
+        if (live.len != 0) {
+            std.debug.print("smoke-editor: FAIL - a live editor's record was offered ({d})\n", .{live.len});
+            return 13;
+        }
+    }
+
+    // Process death: the lock goes, the record stays.
+    const key = try allocator.dupe(u8, h.key);
+    defer allocator.free(key);
+    h.release();
+
+    const entries = try journal.list(allocator);
+    defer journal.freeEntries(allocator, entries);
+    if (entries.len != 1) {
+        std.debug.print("smoke-editor: FAIL - crashed record not offered ({d})\n", .{entries.len});
+        return 13;
+    }
+    var rec = try journal.read(allocator, entries[0].key);
+    defer rec.deinit(allocator);
+    const want = try doc.textAlloc(allocator);
+    defer allocator.free(want);
+    if (!std.mem.eql(u8, want, rec.content) or rec.header.cursor != 17) {
+        std.debug.print("smoke-editor: FAIL - recovered content/caret differ\n", .{});
+        return 13;
+    }
+    // The verdict against a file that moved on is SHOWN, never applied.
+    var moved = rec.baseline();
+    moved.ino = 9;
+    if (reload.compare(rec.baseline(), moved) != .replaced) {
+        std.debug.print("smoke-editor: FAIL - baseline comparison lost\n", .{});
+        return 13;
+    }
+    // Recovering consumes the record.
+    try journal.remove(allocator, entries[0].key);
+
+    // A clean save + close leaves nothing behind.
+    var h2 = try journal.open(allocator, "/tmp/smoke-target.txt");
+    try h2.writeDocument(&doc, hdr);
+    doc.markSaved();
+    h2.discard();
+    const after = try journal.list(allocator);
+    defer journal.freeEntries(allocator, after);
+    if (after.len != 0) {
+        std.debug.print("smoke-editor: FAIL - a cleanly closed buffer left a record\n", .{});
+        return 13;
+    }
+    std.debug.print("smoke-editor: PASS crash-recovery journal round trip\n", .{});
     return null;
 }
 
@@ -992,6 +1081,9 @@ pub fn main() !u8 {
     );
     // ---- regex find/replace ------------------------------------------
     if (try regexStage(allocator)) |code| return code;
+
+    // ---- crash-recovery journal round trip ---------------------------
+    if (try journalStage(allocator)) |code| return code;
 
     // ---- LSP against a REAL stub server process ----------------------
     if (try lspStage(allocator)) |code| return code;
