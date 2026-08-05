@@ -24,6 +24,7 @@ const platform = @import("../util/platform.zig");
 const muxclient = @import("client.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const thumbs = @import("../filebrowser/thumbs.zig");
+const gitstatus = @import("../filebrowser/gitstatus.zig");
 const mediameta = @import("mediameta.zig");
 const uniqueName = @import("../filebrowser/paths.zig").uniqueName;
 
@@ -1147,11 +1148,33 @@ fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8
     return 0;
 }
 
-/// `git status --porcelain -z` for the browsed directory, run on the
-/// host that owns the repo. Emits one `match` per record — `path`
-/// already relative to the BROWSED dir (the repo prefix is stripped
-/// here), `text` the 1-char aggregate status — so the client only
-/// maps first path segments to badges.
+/// Bytes of `git status` output read before the stream is cut. A
+/// porcelain-v2 record is ~90 bytes, so this is room for ~11k of them
+/// — an order of magnitude past the record caps below, which is what
+/// decides what actually ships.
+const GIT_STATUS_BYTES: usize = 1 << 20;
+/// Records that describe a CHANGE (anything but `!`). Emitted first,
+/// so a repository whose ignore rules match tens of thousands of
+/// individual files loses ignored decoration and never a change.
+const GIT_STATUS_CHANGES: u64 = 4096;
+/// Total records, changes plus ignored.
+const GIT_STATUS_RECORDS: u64 = 8192;
+
+/// `git status --porcelain=v2 --branch --ignored -z` for the browsed
+/// directory, run on the host that owns the repo.
+///
+/// Emits one `match` per record — `path` relative to the BROWSED dir
+/// (the repo prefix is stripped here), `text` the 1-char aggregate
+/// status a pre-v2 client understands, `xy` the two porcelain columns,
+/// `orig` a rename source and `kind` "submodule" — then one `repo`
+/// event carrying the branch header. A client too old to know those
+/// fields ignores them and sees exactly the stream it always saw.
+///
+/// `--ignored` is unconditional because its default (`traditional`)
+/// collapses a wholly ignored DIRECTORY into a single record: a
+/// 50k-file `build/` costs one line, not 50k, so the cost is bounded
+/// by the number of ignore rules that match rather than by the tree
+/// they hide.
 fn runGitStatus(allocator: std.mem.Allocator, spec: Spec) u8 {
     var cmd: [4400:0]u8 = undefined;
     var w = std.Io.Writer.fixed(cmd[0 .. cmd.len - 1]);
@@ -1159,7 +1182,14 @@ fn runGitStatus(allocator: std.mem.Allocator, spec: Spec) u8 {
     for (spec.src) |ch| {
         if (ch == '\'') w.writeAll("'\\''") catch return emitError("path too long") else w.writeByte(ch) catch return emitError("path too long");
     }
-    w.writeAll("' 2>/dev/null && git status --porcelain --no-renames -z 2>/dev/null | head -c 65536 && printf '\\x01' && git rev-parse --show-prefix 2>/dev/null") catch return emitError("path too long");
+    // \x01 closes the status stream, \x02 closes the prefix — and the
+    // latter is only printed when rev-parse SUCCEEDED, which is the
+    // "this is a repository" answer that survives a git too old for
+    // porcelain v2 (its status output would be empty).
+    w.print(
+        "' 2>/dev/null && git status --porcelain=v2 --branch --ignored -z 2>/dev/null | head -c {d} && printf '\\x01' && git rev-parse --show-prefix 2>/dev/null && printf '\\x02'",
+        .{GIT_STATUS_BYTES},
+    ) catch return emitError("path too long");
     cmd[w.buffered().len] = 0;
     const fp = c.popen(&cmd, "r") orelse return emitError("cannot run git");
     var out: std.ArrayList(u8) = .empty;
@@ -1169,34 +1199,94 @@ fn runGitStatus(allocator: std.mem.Allocator, spec: Spec) u8 {
         const n = c.fread(&buf, 1, buf.len, fp);
         if (n == 0) break;
         out.appendSlice(allocator, buf[0..n]) catch break;
-        if (out.items.len > 128 * 1024) break;
+        if (out.items.len > GIT_STATUS_BYTES + 8192) break;
     }
     _ = c.pclose(fp);
     const sep = std.mem.indexOfScalar(u8, out.items, 1) orelse {
-        // Not a repo (or git missing): an empty done, not an error —
-        // "no overlay" is a normal answer.
+        // `cd` failed, or the shell never ran: not an error — "no
+        // overlay" is a normal answer — but nothing is known either,
+        // so no repo event is invented.
         emit(.{ .ev = "done", .done = @as(u64, 0), .total = @as(u64, 0) });
         return 0;
     };
-    const status = out.items[0..sep];
-    const prefix = std.mem.trim(u8, out.items[sep + 1 ..], "\n ");
-    var emitted: u64 = 0;
-    var it = std.mem.tokenizeScalar(u8, status, 0);
-    while (it.next()) |rec| {
-        if (rec.len < 4) continue;
-        const st: u8 = if (rec[0] != ' ' and rec[0] != '?') rec[0] else rec[1];
-        var path = rec[3..];
-        if (prefix.len > 0) {
-            if (!std.mem.startsWith(u8, path, prefix)) continue;
-            path = path[prefix.len..];
-        }
-        if (path.len == 0) continue;
-        emit(.{ .ev = "match", .path = path, .text = &[1]u8{st} });
-        emitted += 1;
-        if (emitted >= 4096) break;
+    var status = out.items[0..sep];
+    const tail = out.items[sep + 1 ..];
+    const end = std.mem.indexOfScalar(u8, tail, 2);
+    const prefix = std.mem.trim(u8, tail[0 .. end orelse tail.len], "\n ");
+    // rev-parse succeeded: a repository, whatever the status said.
+    const rev_parse_ok = end != null;
+
+    var truncated = false;
+    if (status.len > 0 and status[status.len - 1] != 0) {
+        // `head -c` cut mid-record; drop the partial tail rather than
+        // scanning garbage into a badge.
+        truncated = true;
+        status = if (std.mem.lastIndexOfScalar(u8, status, 0)) |last| status[0 .. last + 1] else status[0..0];
     }
+
+    // Two passes so the caps spend themselves on changes first.
+    var header = gitstatus.Header{};
+    var emitted: u64 = 0;
+    for ([_]bool{ false, true }) |ignored_pass| {
+        var s = gitstatus.Scanner.init(status);
+        while (s.next()) |rec| {
+            if ((rec.kind == .ignored) != ignored_pass) continue;
+            const cap = if (ignored_pass) GIT_STATUS_RECORDS else GIT_STATUS_CHANGES;
+            if (emitted >= cap) {
+                truncated = true;
+                break;
+            }
+            const path = stripGitPrefix(rec.path, prefix) orelse continue;
+            if (path.len == 0) continue;
+            // JSON cannot carry a non-UTF-8 name; the listing that
+            // would wear the badge cannot either.
+            if (!std.unicode.utf8ValidateSlice(path)) {
+                truncated = true;
+                continue;
+            }
+            const orig = stripGitPrefix(rec.orig, prefix) orelse rec.orig;
+            const xy = [2]u8{ rec.x, rec.y };
+            emit(.{
+                .ev = "match",
+                .path = path,
+                .text = &[1]u8{rec.legacyChar()},
+                .xy = &xy,
+                .orig = if (std.unicode.utf8ValidateSlice(orig)) orig else "",
+                .kind = if (rec.submodule) "submodule" else "",
+            });
+            emitted += 1;
+        }
+        header = s.header;
+    }
+
+    // Last, so `truncated` is already known. A client that never sees
+    // this event is talking to a pre-v2 daemon and keeps its old,
+    // branch-less behaviour instead of claiming "not a repository".
+    emit(.{
+        .ev = "repo",
+        .repo = header.is_repo or rev_parse_ok,
+        .branch = header.branch,
+        .upstream = header.upstream,
+        .text = header.oid[0..@min(header.oid.len, 8)],
+        .ahead = header.ahead,
+        .behind = header.behind,
+        .have_ab = header.have_ab,
+        .detached = header.detached,
+        .initial = header.initial,
+        .root = prefix.len == 0,
+        .truncated = truncated,
+    });
     emit(.{ .ev = "done", .done = emitted, .total = emitted });
     return 0;
+}
+
+/// Re-root one repository-relative path onto the browsed directory,
+/// or null when it names something outside it.
+fn stripGitPrefix(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    if (prefix.len == 0) return path;
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    return path[prefix.len..];
 }
 
 /// `diff -u src dst` on this host, streamed as one `line` event per

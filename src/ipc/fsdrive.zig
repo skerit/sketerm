@@ -276,6 +276,21 @@ pub const JobEvent = struct {
     cached: bool = false,
     /// done: `path` is a persistent host-side cache file.
     keep: bool = false,
+    /// git_status match detail: the two porcelain-v2 columns (`M.`,
+    /// `.M`, `??`, `UU`, …) and a rename/copy source path.
+    xy: []const u8 = "",
+    orig: []const u8 = "",
+    /// git_status `repo` event: the branch header of the browsed
+    /// root. Absent entirely from a daemon too old to report it.
+    repo: bool = false,
+    branch: []const u8 = "",
+    upstream: []const u8 = "",
+    ahead: i64 = 0,
+    behind: i64 = 0,
+    have_ab: bool = false,
+    detached: bool = false,
+    initial: bool = false,
+    root: bool = false,
 
     pub fn deinit(self: *JobEvent) void {
         self.arena.deinit();
@@ -424,6 +439,17 @@ pub const Fs = struct {
             meta: []const MediaField = &.{},
             cached: bool = false,
             keep: bool = false,
+            xy: []const u8 = "",
+            orig: []const u8 = "",
+            repo: bool = false,
+            branch: []const u8 = "",
+            upstream: []const u8 = "",
+            ahead: i64 = 0,
+            behind: i64 = 0,
+            have_ab: bool = false,
+            detached: bool = false,
+            initial: bool = false,
+            root: bool = false,
         };
         const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
@@ -460,6 +486,17 @@ pub const Fs = struct {
             .meta = parsed.meta,
             .cached = parsed.cached,
             .keep = parsed.keep,
+            .xy = parsed.xy,
+            .orig = parsed.orig,
+            .repo = parsed.repo,
+            .branch = parsed.branch,
+            .upstream = parsed.upstream,
+            .ahead = parsed.ahead,
+            .behind = parsed.behind,
+            .have_ab = parsed.have_ab,
+            .detached = parsed.detached,
+            .initial = parsed.initial,
+            .root = parsed.root,
         }) catch arena.deinit();
     }
 
@@ -1068,8 +1105,10 @@ pub const Fs = struct {
         return self.startJob("hash", .{ .path = path });
     }
 
-    /// `git status` overlay for `root`; one "match" event per changed
-    /// path (`text` = the single-letter status). A non-repo (or a host
+    /// `git status` overlay for `root`; one "match" event per record
+    /// (`text` = the collapsed single-letter status, `xy` = the two
+    /// porcelain-v2 columns, `orig` = a rename source), then one
+    /// "repo" event with the branch header. A non-repo (or a host
     /// without git) completes with zero matches, not an error.
     pub fn startGitStatus(self: *Fs, root: []const u8) Error!u64 {
         return self.startJob("git_status", .{ .path = root });
