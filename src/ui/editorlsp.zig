@@ -392,6 +392,7 @@ const ListPopup = struct {
     listbox: ?*c.GtkListBox = null,
     scroll: ?*c.GtkWidget = null,
     header: ?*c.GtkLabel = null,
+    doc_label: ?*c.GtkLabel = null,
     items: std.ArrayList(Item) = .empty,
     /// Indices of `items` currently shown (the filter's output).
     shown: std.ArrayList(usize) = .empty,
@@ -483,6 +484,7 @@ pub const Manager = struct {
         self.list.listbox = null;
         self.list.scroll = null;
         self.list.header = null;
+        self.list.doc_label = null;
         self.hover.label = null;
     }
 
@@ -1648,6 +1650,16 @@ pub const Manager = struct {
 
     // ---- popup widgets --------------------------------------------------------
 
+    /// HARD INVARIANT for everything inside this popover: its MINIMUM
+    /// size must never grow while the popup is open. GTK lays a mapped
+    /// popover out at the size of the last xdg_popup configure, and
+    /// `gtk_popover_native_layout` POPDOWNS the popover outright when
+    /// its minimum no longer fits that size (`is_acceptable_size`).
+    /// A same-tick `completionItem/resolve` reply growing the header
+    /// used to land exactly between `gdk_popup_present` and the
+    /// configure round-trip and silently closed the list — which is
+    /// why every label in here is single-line and ellipsized, never
+    /// wrapped or unbounded.
     fn ensurePopup(self: *Manager) bool {
         if (self.list.popover != null) return true;
         const pop = c.gtk_popover_new() orelse return false;
@@ -1663,9 +1675,19 @@ pub const Manager = struct {
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
         const header = c.gtk_label_new("");
         c.gtk_label_set_xalign(@ptrCast(header), 0);
-        c.gtk_label_set_wrap(@ptrCast(header), 1);
+        c.gtk_label_set_ellipsize(@ptrCast(header), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(header), 56);
         c.gtk_widget_add_css_class(header, "dim-label");
         c.gtk_box_append(@ptrCast(box), header);
+        // The lazily-resolved documentation line. A single-space
+        // placeholder keeps the line's height reserved from the first
+        // present on (empty -> non-empty would grow the minimum).
+        const docl = c.gtk_label_new(" ");
+        c.gtk_label_set_xalign(@ptrCast(docl), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(docl), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(docl), 56);
+        c.gtk_widget_add_css_class(docl, "dim-label");
+        c.gtk_box_append(@ptrCast(box), docl);
 
         const list = c.gtk_list_box_new();
         c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_SINGLE);
@@ -1680,6 +1702,7 @@ pub const Manager = struct {
         self.list.listbox = @ptrCast(list);
         self.list.scroll = scroll;
         self.list.header = @ptrCast(header);
+        self.list.doc_label = @ptrCast(docl);
         return true;
     }
 
@@ -1735,6 +1758,12 @@ pub const Manager = struct {
             const ntext = std.fmt.bufPrintZ(&nbuf, "{s}", .{it.label}) catch "";
             c.gtk_label_set_text(@ptrCast(name), ntext.ptr);
             c.gtk_label_set_xalign(@ptrCast(name), 0);
+            // Ellipsized, or a long symbol would raise the popover's
+            // minimum width mid-flight (see ensurePopup's invariant;
+            // the scroll's horizontal policy is NEVER, so row minima
+            // propagate straight to the popover).
+            c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
+            c.gtk_label_set_max_width_chars(@ptrCast(name), 40);
             c.gtk_widget_set_hexpand(name, 1);
             c.gtk_box_append(@ptrCast(row), name);
             if (it.detail.len > 0) {
@@ -1743,6 +1772,8 @@ pub const Manager = struct {
                 const dtext = std.fmt.bufPrintZ(&dbuf, "{s}", .{it.detail}) catch "";
                 c.gtk_label_set_text(@ptrCast(det), dtext.ptr);
                 c.gtk_label_set_xalign(@ptrCast(det), 1);
+                c.gtk_label_set_ellipsize(@ptrCast(det), c.PANGO_ELLIPSIZE_END);
+                c.gtk_label_set_max_width_chars(@ptrCast(det), 24);
                 c.gtk_widget_add_css_class(det, "dim-label");
                 c.gtk_box_append(@ptrCast(row), det);
             }
@@ -1773,22 +1804,27 @@ pub const Manager = struct {
             .symbols => "Symbols",
             .none => "",
         };
-        var docline: []const u8 = "";
-        if (self.list.mode == .completion and self.list.shown.items.len > 0) {
-            docline = self.list.items.items[self.list.shown.items[self.list.sel]].doc;
-        }
-        // Title line, then the lazily-resolved documentation when the
-        // server has sent it.
-        var full: [1024:0]u8 = undefined;
-        const all = std.fmt.bufPrintZ(&full, "{s}  ({d}){s}{s}{s}{s}", .{
+        var full: [512:0]u8 = undefined;
+        const all = std.fmt.bufPrintZ(&full, "{s}  ({d}){s}{s}", .{
             title,
             self.list.shown.items.len,
             if (self.list.filter.items.len > 0) "  filter: " else "",
             if (self.list.filter.items.len > 0) self.list.filter.items else "",
-            if (docline.len > 0) "\n" else "",
-            if (docline.len > 0) docline[0..@min(docline.len, 400)] else "",
         }) catch return;
         c.gtk_label_set_text(hdr, all.ptr);
+        // The selected item's documentation, on its own ellipsized
+        // single line (see the invariant on ensurePopup: this label
+        // must never change the popover's minimum size).
+        var docline: []const u8 = " ";
+        if (self.list.mode == .completion and self.list.shown.items.len > 0) {
+            const d = self.list.items.items[self.list.shown.items[self.list.sel]].doc;
+            if (d.len > 0) docline = d[0 .. std.mem.indexOfScalar(u8, d, '\n') orelse d.len];
+        }
+        if (self.list.doc_label) |dl| {
+            var dbuf: [512:0]u8 = undefined;
+            const dz = std.fmt.bufPrintZ(&dbuf, "{s}", .{docline[0..@min(docline.len, 400)]}) catch return;
+            c.gtk_label_set_text(dl, if (dz.len > 0) dz.ptr else " ");
+        }
     }
 
     /// Point a popover at the caret, using the SAME geometry the IME
@@ -1823,6 +1859,12 @@ pub const Manager = struct {
     fn showHover(self: *Manager, text: []const u8) void {
         if (self.view.widgets_dead) return;
         if (!self.ensureHover()) return;
+        // Same minimum-size rule as ensurePopup: growing a MAPPED
+        // popover's wrap-label while its configure is in flight makes
+        // GTK popdown it. Remap instead of mutating in place.
+        if (self.hover.open) {
+            if (self.hover.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
+        }
         const z = self.alloc.dupeZ(u8, text[0..@min(text.len, 4000)]) catch return;
         defer self.alloc.free(z);
         c.gtk_label_set_text(self.hover.label.?, z.ptr);
