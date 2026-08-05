@@ -435,6 +435,56 @@ pub const Span = struct {
     kind: Kind,
 };
 
+/// Read-only cursor over a parsed tree.
+///
+/// Exists so `editor/outline.zig` can walk the syntax tree without the
+/// Tree-sitter C bindings leaking out of this file: everything else in
+/// the editor treats a tree as an opaque source of ranges, and the
+/// symbol outline is the one consumer that genuinely needs node types
+/// and field names. Cursors are valid only until the next parse.
+pub const TreeNode = struct {
+    raw: ts.TSNode,
+
+    /// Grammar node type ("function_declaration", "identifier", …).
+    pub fn kind(self: TreeNode) []const u8 {
+        const p = ts.ts_node_type(self.raw) orelse return "";
+        return std.mem.span(p);
+    }
+
+    pub fn isNamed(self: TreeNode) bool {
+        return ts.ts_node_is_named(self.raw);
+    }
+
+    pub fn startByte(self: TreeNode) usize {
+        return ts.ts_node_start_byte(self.raw);
+    }
+
+    pub fn endByte(self: TreeNode) usize {
+        return ts.ts_node_end_byte(self.raw);
+    }
+
+    /// 0-based row of the node's first byte.
+    pub fn startRow(self: TreeNode) usize {
+        return ts.ts_node_start_point(self.raw).row;
+    }
+
+    pub fn namedChildCount(self: TreeNode) u32 {
+        return ts.ts_node_named_child_count(self.raw);
+    }
+
+    pub fn namedChild(self: TreeNode, i: u32) ?TreeNode {
+        const n = ts.ts_node_named_child(self.raw, i);
+        if (ts.ts_node_is_null(n)) return null;
+        return TreeNode{ .raw = n };
+    }
+
+    pub fn childByField(self: TreeNode, name: []const u8) ?TreeNode {
+        const n = ts.ts_node_child_by_field_name(self.raw, name.ptr, @intCast(name.len));
+        if (ts.ts_node_is_null(n)) return null;
+        return TreeNode{ .raw = n };
+    }
+};
+
 /// Window of the document the kind cache currently covers. Several
 /// viewports wide so ordinary scrolling stays inside it, but no wider:
 /// the query cost is linear in the window, and it is paid in ONE frame
@@ -973,6 +1023,17 @@ pub const Highlighter = struct {
     fn primaryTree(self: *const Highlighter) ?*ts.TSTree {
         if (self.layers.len == 0) return null;
         return self.layers[0].tree;
+    }
+
+    /// Root of the primary tree as a walkable cursor, or null when
+    /// nothing has parsed yet. `Error.Stale` on a lagging highlighter,
+    /// exactly like every other structural query.
+    pub fn rootNode(self: *const Highlighter, doc: *const Document) Error!?TreeNode {
+        if (self.isStale(doc)) return Error.Stale;
+        const tree = self.primaryTree() orelse return null;
+        const root = ts.ts_tree_root_node(tree);
+        if (ts.ts_node_is_null(root)) return null;
+        return TreeNode{ .raw = root };
     }
 
     /// Matched bracket pair for a caret at `offset`, resolved through
