@@ -177,6 +177,24 @@ test "session: initialize handshake reaches ready and sends initialized" {
     try testing.expectEqual(session.State.ready, rec.states.items[1]);
 }
 
+test "session: a non-positive client pid initializes with processId null" {
+    // The remote transport passes 0: our pid means nothing on the
+    // server's host, and servers that watch processId (clangd) exit
+    // when the advertised pid does not exist there.
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    s.start("file:///proj", 0, "");
+    var sent: std.ArrayList(Sent) = .empty;
+    defer freeSent(alloc, &sent);
+    try drain(alloc, &s, &sent);
+    try testing.expectEqualStrings("initialize", sent.items[0].method());
+    const pid_field = sent.items[0].params().object.get("processId") orelse return error.TestExpectedField;
+    try testing.expect(pid_field == .null);
+}
+
 test "session: capabilities are absorbed exactly" {
     const alloc = testing.allocator;
     var rec = Recorder{ .alloc = alloc };
