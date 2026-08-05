@@ -141,6 +141,18 @@ pub const Tag = enum(u8) {
     /// events are plain wl_msg units around it, so this unit must
     /// keep its position in the stream.
     dmabuf_feedback = 37,
+    /// Resolved xdg-foreign parent relation, daemon -> replica:
+    /// u32 child surface (this channel's id space), u32 parent
+    /// CONNECTION id (the exporting app channel's id, 0 = clear),
+    /// u32 parent surface (in that connection's id space).
+    ///
+    /// Daemon-injected like `toplevel_icon`, and for the same reason
+    /// the replica cannot derive it: handles are minted from the
+    /// brain's entropy, so a replica re-parsing `import_toplevel`
+    /// holds a handle its own registry has never seen. Replayed on
+    /// reattach. An older viewer skips the unknown tag and simply
+    /// keeps today's behaviour (no cross-connection parenting).
+    foreign_parent = 38,
     _,
 };
 
@@ -418,6 +430,16 @@ pub fn appendRequestClose(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u3
     var pl: [4]u8 = undefined;
     putU32At(&pl, 0, sid);
     try appendUnit(out, a, .request_close, &pl);
+}
+
+/// Resolved cross-connection parent for `sid`. `conn`/`parent` zero
+/// clears the relation.
+pub fn appendForeignParent(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, conn: u32, parent: u32) !void {
+    var pl: [12]u8 = undefined;
+    putU32At(&pl, 0, sid);
+    putU32At(&pl, 4, conn);
+    putU32At(&pl, 8, parent);
+    try appendUnit(out, a, .foreign_parent, &pl);
 }
 
 pub const max_unit = 16 << 20; // matches mux MAX_FRAME; sanity bound

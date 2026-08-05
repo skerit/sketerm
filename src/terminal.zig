@@ -1994,6 +1994,14 @@ pub const Terminal = struct {
         na.* = .{ .terminal = self, .id = id, .host = host };
         host.on_flush = nappFlushCb;
         host.flush_ctx = na;
+        // xdg-foreign relations name windows session-wide as (app
+        // channel id, surface id). Every app channel of this session
+        // rides THIS mux connection, so the Terminal is exactly the
+        // scope in which the connection half resolves.
+        host.conn_id = id;
+        host.foreign_ctx = na;
+        host.foreign_resolve = nappResolveForeign;
+        host.foreign_changed = nappForeignChanged;
         host.on_first_window = nappFirstWindow;
         host.first_window_ctx = na;
         host.setDriven(self.peer_drivers > 0);
@@ -2019,6 +2027,30 @@ pub const Terminal = struct {
         const remote = t.remote orelse return;
         remote.app_window_opened = true;
         if (t.on_app_window) |f| f(t.user_ctx);
+    }
+
+    /// Resolve a session-wide window identity for an AppHost holding a
+    /// cross-connection xdg-foreign parent. The exporting connection is
+    /// another `wayland_native` channel of this same session, so its
+    /// AppHost is a sibling in `remote.napps`.
+    fn nappResolveForeign(ctx: ?*anyopaque, conn: u32, surface: u32) ?*@import("c.zig").c.GtkWindow {
+        const na = @import("util/cast.zig").userData(NApp, ctx);
+        const remote = na.terminal.remote orelse return null;
+        for (remote.napps.items) |other| {
+            if (other.id == conn) return other.host.windowForSurface(surface);
+        }
+        return null;
+    }
+
+    /// One connection's toplevel appeared or vanished: sibling
+    /// connections may have dialogs latched onto it.
+    fn nappForeignChanged(ctx: ?*anyopaque, conn: u32, surface: u32, gone: bool) void {
+        const na = @import("util/cast.zig").userData(NApp, ctx);
+        const remote = na.terminal.remote orelse return;
+        for (remote.napps.items) |other| {
+            if (other.id == conn) continue;
+            other.host.refreshForeignChildrenOf(.{ .conn = conn, .surface = surface }, gone);
+        }
     }
 
     fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {

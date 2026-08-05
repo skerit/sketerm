@@ -655,6 +655,33 @@ pub const zxdg_imported_v2 = Interface{
     },
 };
 
+// ─── xdg-dialog v1 ──────────────────────────────────────────────
+// The ONLY way an xdg-shell client can say "this toplevel is modal
+// over its parent" — xdg_toplevel has no modality request at all.
+// GTK4 (>= 4.14) binds it and calls set_modal for every
+// gtk_window_set_modal dialog, which is what makes a forwarded
+// app's file dialog block its own window. Transcribed from
+// staging/xdg-dialog/xdg-dialog-v1.xml (both interfaces v1).
+
+pub const xdg_wm_dialog_v1 = Interface{
+    .name = "xdg_wm_dialog_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_xdg_dialog", .sig = "no", .new_id_iface = &xdg_dialog_v1 },
+    },
+};
+
+pub const xdg_dialog_v1 = Interface{
+    .name = "xdg_dialog_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_modal", .sig = "" },
+        .{ .name = "unset_modal", .sig = "" },
+    },
+};
+
 // ─── primary selection (middle-click paste) ─────────────────────
 
 pub const zwp_primary_selection_offer_v1 = Interface{
@@ -1029,6 +1056,7 @@ pub const all = [_]*const Interface{
     &zwp_linux_dmabuf_feedback_v1,   &zxdg_output_manager_v1,                  &zxdg_output_v1,
     &wl_fixes,                       &zxdg_exporter_v2,                        &zxdg_importer_v2,
     &zxdg_exported_v2,               &zxdg_imported_v2,
+    &xdg_wm_dialog_v1,               &xdg_dialog_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────

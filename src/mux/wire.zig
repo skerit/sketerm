@@ -40,7 +40,7 @@ pub const PROTO_VERSION: u32 = 6;
 pub const MIN_SERVER_PROTO: u32 = 2;
 pub const NATIVE_STATE_PROTO_VERSION: u32 = 6;
 pub const LEGACY_NATIVE_STATE_VERSION: u8 = 6;
-pub const NATIVE_STATE_VERSION: u8 = 10;
+pub const NATIVE_STATE_VERSION: u8 = 11;
 /// State-sync version a replica needs to parse a session whose
 /// compositor advertises modifier-backed dmabufs.
 pub const DMABUF_MODIFIER_STATE_VERSION: u8 = 7;
@@ -53,6 +53,11 @@ pub const CORE_BUMP_STATE_VERSION: u8 = 9;
 /// ... and one whose app bound an xdg-foreign global (zxdg_exporter_v2
 /// / zxdg_importer_v2 are absent from a v9 replica's tables).
 pub const FOREIGN_STATE_VERSION: u8 = 10;
+/// ... and one whose app bound xdg_wm_dialog_v1 (neither
+/// xdg_wm_dialog_v1 nor xdg_dialog_v1 exists in a v10 replica's
+/// tables, so the bind alone kills it). v11 also carries the
+/// per-surface modality flag.
+pub const DIALOG_STATE_VERSION: u8 = 11;
 pub const WINSTREAM_PROTO_VERSION: u32 = 5;
 
 /// Select the newest core profile both advertised ranges share, or zero.
