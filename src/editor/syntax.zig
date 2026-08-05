@@ -190,6 +190,18 @@ pub const Lang = enum {
             .markdown => "Markdown",
         };
     }
+
+    /// Line-comment prefix, null for languages without one. JSON has
+    /// no comments per the spec (and Markdown only has HTML block
+    /// comments), so toggle-comment reports rather than guessing.
+    pub fn lineComment(self: Lang) ?[]const u8 {
+        return switch (self) {
+            .zig => "//",
+            .c => "//",
+            .json => null,
+            .markdown => null,
+        };
+    }
 };
 
 const ExtMap = struct { ext: []const u8, lang: Lang };
