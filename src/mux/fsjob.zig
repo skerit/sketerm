@@ -1262,9 +1262,7 @@ fn runGitStatus(allocator: std.mem.Allocator, spec: Spec) u8 {
         header = s.header;
     }
 
-    // Last, so `truncated` is already known. A client that never sees
-    // this event is talking to a pre-v2 daemon and keeps its old,
-    // branch-less behaviour instead of claiming "not a repository".
+    // Last, so `truncated` is already known.
     emit(.{
         .ev = "repo",
         .repo = header.is_repo or rev_parse_ok,

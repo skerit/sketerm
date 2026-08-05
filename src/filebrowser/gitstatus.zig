@@ -649,15 +649,12 @@ pub const Overlay = struct {
 
 /// Repository-level answer for the browsed root.
 ///
-/// `known` is the SKEW flag and the reason this type exists: a daemon
-/// too old to answer the repository question sends no repo event at
-/// all, and the browser must then keep its pre-branch behaviour rather
-/// than claim "not a repository". `known and !is_repo` is a real
-/// negative; `known and is_repo` with an empty overlay is a clean
-/// repository, which used to be indistinguishable from a non-repo.
+/// This is what tells a CLEAN repository from a directory that is no
+/// repository at all — indistinguishable from an empty overlay alone.
+/// `is_repo` stays false until the job's `repo` event lands, so a
+/// listing in flight simply carries no version-control phrase.
 pub const Repo = struct {
     allocator: std.mem.Allocator,
-    known: bool = false,
     is_repo: bool = false,
     detached: bool = false,
     /// No commit yet: there is a branch name but nothing to be ahead
@@ -709,7 +706,6 @@ pub const Repo = struct {
     }) void {
         const a = self.allocator;
         self.clear();
-        self.known = true;
         self.is_repo = in.is_repo;
         self.detached = in.detached;
         self.initial = in.initial;
@@ -726,15 +722,13 @@ pub const Repo = struct {
 
 /// The version-control phrase appended to the browser's status line.
 ///
-/// Three cases, in the order they matter:
-/// - the daemon never answered the repository question (old build):
-///   the pre-branch phrase, empty when nothing changed;
-/// - a real "not a repository": nothing at all;
+/// Two cases:
+/// - not a repository (and a root whose answer has not landed yet):
+///   nothing at all;
 /// - a repository: `, on main +2 -1, 3 modified` — and `, clean` (or
 ///   `, no changes here` below the root) when there is nothing, which
 ///   is what makes a clean repository visible at all.
 pub fn statusNote(repo: *const Repo, ov: *const Overlay, buf: []u8) []const u8 {
-    if (!repo.known) return ov.summary(buf);
     if (!repo.is_repo) return buf[0..0];
     var w = std.Io.Writer.fixed(buf);
     if (repo.detached) {
@@ -1260,19 +1254,18 @@ test "unmerged pairs are exactly git's seven" {
         try std.testing.expect(!isUnmergedPair(p[0], p[1]));
 }
 
-test "status note distinguishes an old daemon, a non-repo and a clean repo" {
+test "status note distinguishes a non-repo from a clean repo" {
     var buf: [200]u8 = undefined;
     var ov = Overlay.init(std.testing.allocator);
     defer ov.deinit();
     var repo = Repo.init(std.testing.allocator);
     defer repo.deinit();
 
-    // Old daemon: no repo answer at all, so the pre-branch phrase.
+    // No answer yet, and a real "not a repository": nothing at all,
+    // whatever the overlay happens to hold.
     try std.testing.expectEqualStrings("", statusNote(&repo, &ov, &buf));
     ov.applyInput(.{ .path = "a.txt", .x = '.', .y = 'M' });
-    try std.testing.expectEqualStrings(", 1 modified", statusNote(&repo, &ov, &buf));
-
-    // A real "not a repository" says nothing at all.
+    try std.testing.expectEqualStrings("", statusNote(&repo, &ov, &buf));
     repo.set(.{ .is_repo = false });
     try std.testing.expectEqualStrings("", statusNote(&repo, &ov, &buf));
 

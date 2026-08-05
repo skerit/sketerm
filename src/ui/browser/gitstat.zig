@@ -152,7 +152,7 @@ fn notePollCost(self: *BrowserView) void {
 /// background window is still a wrong badge.
 fn ensurePoll(self: *BrowserView) void {
     if (self.widgets_dead or self.git_poll_src != 0) return;
-    if (!self.git_repo.known or !self.git_repo.is_repo) return;
+    if (!self.git_repo.is_repo) return;
     const ms = @max(POLL_MIN_MS, self.git_poll_ms);
     self.git_poll_src = c.g_timeout_add(@intCast(ms), @ptrCast(&onGitPollTick), @ptrCast(self));
 }

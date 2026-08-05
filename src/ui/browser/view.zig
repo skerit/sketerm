@@ -346,7 +346,7 @@ pub const BrowserView = struct {
     /// outside any repository) does not respawn git per step.
     git_cache: gitstatus.Cache = undefined,
     /// Branch header of the overlay's root: the answer to "is this a
-    /// repository at all", which a pre-v2 daemon cannot give.
+    /// repository at all", which an empty overlay cannot give.
     git_repo: gitstatus.Repo = undefined,
     /// Trailing debounce for change-driven refreshes (0 = none).
     git_delta_src: c.guint = 0,

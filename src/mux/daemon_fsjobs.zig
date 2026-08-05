@@ -929,9 +929,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         /// a rename/copy source. Absent on every other verb.
         xy: []const u8 = "",
         orig: []const u8 = "",
-        /// git_status `repo` event: the branch header. A client that
-        /// never sees this event is talking to a daemon too old to
-        /// answer the repository question at all.
+        /// git_status `repo` event: the branch header, and whether
+        /// the browsed root is a repository at all.
         repo: bool = false,
         /// git_diff `repo` event: git knows the file. Its `initial`
         /// means "the repository has no HEAD commit yet", and no
