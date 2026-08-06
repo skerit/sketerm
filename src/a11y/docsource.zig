@@ -36,6 +36,12 @@ pub const DocSource = struct {
     /// replace-all, format-on-save) still be announced precisely.
     /// Attach `editObserver()` to every document this canvas shows.
     log: docview.ChangeLog = .{},
+    /// The canvas this source feeds; set by `newArea`, needed so the
+    /// preedit relay below can reach the bridge's per-widget state.
+    /// NOT owned; nulled by the widget's own destroy signal (DocSource
+    /// outlives the GL area by contract), so a late relay call cannot
+    /// touch a dead widget.
+    area: ?*c.GtkWidget = null,
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn init(
@@ -72,6 +78,20 @@ pub const DocSource = struct {
         return self.log.take(t.doc, out);
     }
 
+    /// Relay the IME's uncommitted composition to a screen reader (an
+    /// AT-SPI announcement; see `atspi.announcePreedit`). Call from the
+    /// face's preedit-changed hook with the current preedit string.
+    pub fn setPreedit(self: *DocSource, text: []const u8) void {
+        atspi.announcePreedit(self.area orelse return, text);
+    }
+
+    /// Composition ended (committed or cancelled): cancel any pending
+    /// announcement. Committed text announces itself through the
+    /// document's own change events.
+    pub fn clearPreedit(self: *DocSource) void {
+        atspi.announcePreedit(self.area orelse return, "");
+    }
+
     pub fn source(self: *DocSource) atspi.Source {
         return .{ .ctx = @ptrCast(self), .vtable = &vtable };
     }
@@ -80,7 +100,15 @@ pub const DocSource = struct {
 /// Create an editor canvas: a SketermEditArea (role TEXT_BOX, editable,
 /// multi-line) bound to `ds`.
 pub fn newArea(ds: *DocSource, label: [*:0]const u8) *c.GtkWidget {
-    return atspi.newArea(.text_box, ds.source(), label, ds.allocator);
+    const w = atspi.newArea(.text_box, ds.source(), label, ds.allocator);
+    ds.area = w;
+    _ = c.g_signal_connect_data(w, "destroy", @ptrCast(&onAreaDestroy), @ptrCast(ds), null, c.G_CONNECT_DEFAULT);
+    return w;
+}
+
+fn onAreaDestroy(_: ?*c.GtkWidget, user: c.gpointer) callconv(.c) void {
+    const ds: *DocSource = @ptrCast(@alignCast(user.?));
+    ds.area = null;
 }
 
 const vtable: atspi.VTable = .{
