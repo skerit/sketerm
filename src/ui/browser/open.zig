@@ -258,7 +258,8 @@ fn scheduleViewerManifestCleanup(path: []const u8) void {
         _ = cleanupViewerManifest(@ptrCast(cleanup));
 }
 
-/// Launch the internal Viewer with this tab's ordered image sequence without FUSE.
+/// Launch the internal Viewer with this tab's ordered viewable sequence
+/// (images and `.cast` recordings, which it plays in place) without FUSE.
 pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     const allocator = self.allocator;
     var specs: std.ArrayList([]u8) = .empty;
@@ -274,7 +275,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     };
     if (selected_only) {
         for (tab.selected.items) |path| {
-            if (!paths.isImageName(path)) continue;
+            if (!paths.isViewerName(path)) continue;
             const is_current = std.mem.eql(u8, path, current);
             const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
             specs.append(allocator, owned) catch {
@@ -291,7 +292,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
             .icons => {
                 var path_buf: [4096]u8 = undefined;
                 for (tab.root.entries.items) |entry| {
-                    if (entry.tdir or !views.entryVisible(tab, entry) or !paths.isImageName(entry.name)) continue;
+                    if (entry.tdir or !views.entryVisible(tab, entry) or !paths.isViewerName(entry.name)) continue;
                     const path = tab.root.fullPath(entry, &path_buf) orelse continue;
                     const is_current = std.mem.eql(u8, path, current);
                     const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
@@ -309,7 +310,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
                 var pos: c.guint = 0;
                 while (pos < colview.itemCount(tab)) : (pos += 1) {
                     const item = colview.itemDataAt(tab, pos) orelse continue;
-                    if (item.kind != .entry or item.is_dir or !paths.isImageName(item.path)) continue;
+                    if (item.kind != .entry or item.is_dir or !paths.isViewerName(item.path)) continue;
                     const is_current = std.mem.eql(u8, item.path, current);
                     const owned = paths.formatSpecAlloc(allocator, tab.hc.host, item.path) catch continue;
                     specs.append(allocator, owned) catch {
@@ -343,7 +344,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
         break :blk candidate.ptr;
     };
     const manifest = viewer_model.encodeManifest(allocator, specs.items, initial) catch {
-        self.setStatus("image sequence is too large to open in Sketerm Viewer");
+        self.setStatus("this sequence is too large to open in Sketerm Viewer");
         return;
     };
     defer allocator.free(manifest);
