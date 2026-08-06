@@ -3111,16 +3111,17 @@ pub const Screen = struct {
                 self.respondForce(glyph_protocol.fmtQuery(&resp_buf, cp, in_system, in_glossary));
             },
             .register => |r| {
-                // Structural glyf validation happens HERE (not at the
+                // Structural validation happens HERE (not at the
                 // parser) so the daemon rejects composite/hinted/broken
-                // records before storing them.
-                if (glyph_protocol.validateGlyf(self.allocator, r.payload)) |reason| {
+                // records — and broken colrv0 containers — before
+                // storing them.
+                if (glyph_protocol.validatePayload(self.allocator, r.fmt, r.payload)) |reason| {
                     self.allocator.free(r.payload);
                     if (r.reply.emitError())
                         self.respond(glyph_protocol.fmtRegisterErr(&resp_buf, r.cp, reason));
                     return;
                 }
-                self.glyphs.registerAdopt(r.cp, r.payload, r.upm, r.width) catch {
+                self.glyphs.registerAdopt(r.cp, r.payload, r.fmt, r.upm, r.width) catch {
                     // OOM storing the slot (payload already freed by
                     // the glossary). No reply code fits better.
                     if (r.reply.emitError())
@@ -5263,6 +5264,43 @@ test "glyph protocol: register stores entry and replies status=0" {
     try std.testing.expect(s.dirty);
 }
 
+test "glyph protocol: colrv0 register stores fmt; broken container rejected" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    const a = std.testing.allocator;
+    const tri = try glyph_protocol.triangleBytes(a);
+    defer a.free(tri);
+    const container = try glyph_protocol.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = glyph_protocol.PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(container);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(container.len));
+    defer a.free(b64);
+    _ = enc.encode(b64, container);
+    const body = try std.fmt.allocPrint(a, "25a1;r;cp=E100;fmt=colrv0;{s}", .{b64});
+    defer a.free(body);
+    s.onApc(body);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    try std.testing.expectEqual(glyph_protocol.Format.colrv0, s.glyphs.get(0xE100).?.fmt);
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=0\x1b\\", GlyphTestSink.got());
+
+    // A bare glyf record under fmt=colrv0 is not a container.
+    GlyphTestSink.reset();
+    const tri_b64 = try a.alloc(u8, enc.calcSize(tri.len));
+    defer a.free(tri_b64);
+    _ = enc.encode(tri_b64, tri);
+    const bad = try std.fmt.allocPrint(a, "25a1;r;cp=E101;fmt=colrv0;{s}", .{tri_b64});
+    defer a.free(bad);
+    s.onApc(bad);
+    try std.testing.expect(!s.glyphs.contains(0xE101));
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e101;status=1;reason=malformed_payload\x1b\\", GlyphTestSink.got());
+}
+
 test "glyph protocol: reply modes 0 and 2 suppress the success ACK" {
     GlyphTestSink.reset();
     var pool = try Pool.init(std.testing.allocator);
@@ -5314,7 +5352,7 @@ test "glyph protocol: structural rejects — composite, hinted, malformed" {
     try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=1;reason=composite_unsupported\x1b\\", GlyphTestSink.got());
 }
 
-test "glyph protocol: support advertises fmt=glyf; clear replies; kitty still dispatches" {
+test "glyph protocol: support advertises fmt=glyf,colrv0; clear replies; kitty still dispatches" {
     GlyphTestSink.reset();
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -5322,7 +5360,7 @@ test "glyph protocol: support advertises fmt=glyf; clear replies; kitty still di
     defer s.deinit();
     s.sink = .{ .on_write_pty = GlyphTestSink.write };
     s.onApc("25a1;s");
-    try std.testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf\x1b\\", GlyphTestSink.got());
+    try std.testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0\x1b\\", GlyphTestSink.got());
 
     GlyphTestSink.reset();
     const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");

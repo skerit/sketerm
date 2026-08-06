@@ -1232,7 +1232,7 @@ pub const GridPass = struct {
             fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic) catch {
+            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch {
                 col += 1;
                 continue;
             };
@@ -1311,7 +1311,7 @@ pub const GridPass = struct {
             fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic) catch continue;
+            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch continue;
             if (g.w == 0 or g.h == 0) continue;
             const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
             const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;

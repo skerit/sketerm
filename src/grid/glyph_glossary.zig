@@ -17,7 +17,9 @@
 
 const std = @import("std");
 
-pub const isPua = @import("../parser/glyph_protocol.zig").isPua;
+const glyph_protocol = @import("../parser/glyph_protocol.zig");
+pub const isPua = glyph_protocol.isPua;
+pub const Format = glyph_protocol.Format;
 
 /// Maximum simultaneous registrations per session (spec section 4).
 pub const CAPACITY: usize = 1024;
@@ -27,8 +29,10 @@ pub const CAPACITY: usize = 1024;
 var next_render_key = std.atomic.Value(u64).init(1);
 
 pub const Entry = struct {
-    /// Raw glyf record, owned by the glossary's allocator.
+    /// Raw payload (glyf record or colrv0 container), owned by the
+    /// glossary's allocator.
     payload: []u8,
+    fmt: Format,
     upm: u16,
     /// Render span (1 or 2) — paint hint, never layout.
     width: u8,
@@ -61,7 +65,7 @@ pub const Glossary = struct {
     /// glossary on overwrite/clear/evict/deinit — and immediately on
     /// error). Caller has already validated cp is PUA and the payload
     /// is a structurally sound simple glyph.
-    pub fn registerAdopt(self: *Glossary, cp: u32, payload: []u8, upm: u16, width: u8) !void {
+    pub fn registerAdopt(self: *Glossary, cp: u32, payload: []u8, fmt: Format, upm: u16, width: u8) !void {
         if (!isPua(cp)) {
             // Defence in depth — the parser rejects this earlier.
             self.map.allocator.free(payload);
@@ -73,6 +77,7 @@ pub const Glossary = struct {
             self.payload_bytes -= e.payload.len;
             self.map.allocator.free(e.payload);
             e.payload = payload;
+            e.fmt = fmt;
             e.upm = upm;
             e.width = width;
             e.render_key = rk;
@@ -83,6 +88,7 @@ pub const Glossary = struct {
         if (self.map.count() >= CAPACITY) self.evictOldest();
         self.map.put(cp, .{
             .payload = payload,
+            .fmt = fmt,
             .upm = upm,
             .width = width,
             .insertion = self.next_insertion,
@@ -100,8 +106,8 @@ pub const Glossary = struct {
     /// explicit insertion stamp so FIFO order survives reattach. The
     /// render_key is still freshly minted — keys from another process
     /// are meaningless here.
-    pub fn registerRestored(self: *Glossary, cp: u32, payload: []u8, upm: u16, width: u8, insertion: u64) !void {
-        try self.registerAdopt(cp, payload, upm, width);
+    pub fn registerRestored(self: *Glossary, cp: u32, payload: []u8, fmt: Format, upm: u16, width: u8, insertion: u64) !void {
+        try self.registerAdopt(cp, payload, fmt, upm, width);
         const e = self.map.getPtr(cp) orelse return;
         e.insertion = insertion;
         if (insertion >= self.next_insertion) self.next_insertion = insertion + 1;
@@ -160,7 +166,7 @@ const testing = std.testing;
 
 fn reg(g: *Glossary, cp: u32, bytes: []const u8, upm: u16, width: u8) !void {
     const owned = try g.map.allocator.dupe(u8, bytes);
-    try g.registerAdopt(cp, owned, upm, width);
+    try g.registerAdopt(cp, owned, .glyf, upm, width);
 }
 
 test "register and lookup" {
@@ -180,7 +186,7 @@ test "register rejects non-PUA (defence in depth)" {
     var g = Glossary.init(testing.allocator);
     defer g.deinit();
     const owned = try testing.allocator.dupe(u8, &.{1});
-    try testing.expectError(error.OutOfNamespace, g.registerAdopt(0x61, owned, 1000, 1));
+    try testing.expectError(error.OutOfNamespace, g.registerAdopt(0x61, owned, .glyf, 1000, 1));
     try testing.expectEqual(@as(usize, 0), g.count());
 }
 
@@ -261,10 +267,11 @@ test "registerRestored keeps FIFO stamps and advances the mint" {
     var g = Glossary.init(testing.allocator);
     defer g.deinit();
     const p1 = try testing.allocator.dupe(u8, &.{1});
-    try g.registerRestored(0xE0A0, p1, 1000, 1, 41);
+    try g.registerRestored(0xE0A0, p1, .colrv0, 1000, 1, 41);
     const p2 = try testing.allocator.dupe(u8, &.{2});
-    try g.registerRestored(0xE0A1, p2, 1000, 2, 7);
+    try g.registerRestored(0xE0A1, p2, .glyf, 1000, 2, 7);
     try testing.expectEqual(@as(u64, 41), g.get(0xE0A0).?.insertion);
+    try testing.expectEqual(Format.colrv0, g.get(0xE0A0).?.fmt);
     try testing.expectEqual(@as(u64, 7), g.get(0xE0A1).?.insertion);
     // New registrations land after the highest restored stamp.
     try reg(&g, 0xE0A2, &.{3}, 1000, 1);

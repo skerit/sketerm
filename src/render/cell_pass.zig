@@ -696,7 +696,7 @@ pub const CellPass = struct {
             // below if applicable). Bold pulls a real bold glyph from the
             // atlas (bold face or outline-embolden) — no shader fakery.
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
-                const g = atlas.lookupGlyph(glossary, cell.rune, cached_bold > 0.5, cached_attr_italic) catch continue;
+                const g = atlas.lookupGlyph(glossary, cell.rune, cached_bold > 0.5, cached_attr_italic, cached_fg) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
                     const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;

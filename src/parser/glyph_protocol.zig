@@ -10,9 +10,14 @@
 //! notably `width` is a render-span hint only — layout, cursor and
 //! selection keep following wcwidth — and unknown parameters
 //! (including the spec's aw/lh/size/align/pad) are silently ignored.
-//! This build accepts `fmt=glyf` only; `colrv0`/`colrv1` are treated
+//! This build accepts `fmt=glyf` and `fmt=colrv0`; `colrv1` is treated
 //! exactly like an unknown fmt (silently dropped), which is what a
 //! conforming client discovers via the `s` advertisement.
+//!
+//! One deliberate departure from Rio for colrv0: Rio hands the COLR/
+//! CPAL tables to the renderer unvalidated; we validate the whole
+//! container at register time (like glyf) so a broken payload is
+//! rejected on the wire instead of caching as an invisible glyph.
 //!
 //! Pure Zig, no libc — compiles into `sketerm-mux`.
 
@@ -25,7 +30,14 @@ pub const PREFIX = "25a1";
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Formats advertised in the `s` reply.
-pub const SUPPORTED_FORMATS = "glyf";
+pub const SUPPORTED_FORMATS = "glyf,colrv0";
+
+/// Payload container format of a registration. The u8 tag rides the
+/// snapshot wire — append-only, never renumber.
+pub const Format = enum(u8) {
+    glyf = 0,
+    colrv0 = 1,
+};
 
 /// The three Unicode Private Use Areas. Note the FFFD ends — the two
 /// plane-final noncharacters are excluded.
@@ -77,9 +89,11 @@ pub const RegisterError = enum {
 
 pub const Register = struct {
     cp: u32,
-    /// Decoded glyf record, allocated with the allocator handed to
-    /// `parse`. Caller owns (frees or adopts into the glossary).
+    /// Decoded payload (glyf record or colrv0 container), allocated
+    /// with the allocator handed to `parse`. Caller owns (frees or
+    /// adopts into the glossary).
     payload: []u8,
+    fmt: Format,
     upm: u16,
     /// Render span (1 or 2). A paint hint only, never layout.
     width: u8,
@@ -149,10 +163,15 @@ fn parseRegister(allocator: std.mem.Allocator, rest: []const u8) Result {
     if (!isPua(cp))
         return .{ .register_failed = .{ .cp = cp, .reason = .out_of_namespace, .reply = reply } };
 
-    // fmt=glyf only in this build; anything else (incl. colrv0/colrv1)
-    // is dropped like an unknown fmt — see the module doc.
-    if (params.get("fmt")) |fmt| {
-        if (!std.mem.eql(u8, fmt, "glyf")) return .malformed;
+    // fmt=glyf and fmt=colrv0 in this build; anything else (incl.
+    // colrv1) is dropped like an unknown fmt — see the module doc.
+    var fmt: Format = .glyf;
+    if (params.get("fmt")) |raw_fmt| {
+        if (std.mem.eql(u8, raw_fmt, "glyf")) {
+            fmt = .glyf;
+        } else if (std.mem.eql(u8, raw_fmt, "colrv0")) {
+            fmt = .colrv0;
+        } else return .malformed;
     }
 
     var upm: u16 = 1000;
@@ -187,7 +206,7 @@ fn parseRegister(allocator: std.mem.Allocator, rest: []const u8) Result {
         return .{ .register_failed = .{ .cp = cp, .reason = .malformed_payload, .reply = reply } };
     };
 
-    return .{ .register = .{ .cp = cp, .payload = raw, .upm = upm, .width = width, .reply = reply } };
+    return .{ .register = .{ .cp = cp, .payload = raw, .fmt = fmt, .upm = upm, .width = width, .reply = reply } };
 }
 
 fn parseClear(rest: []const u8) Result {
@@ -451,6 +470,210 @@ pub fn validateGlyf(allocator: std.mem.Allocator, data: []const u8) ?RegisterErr
     return null;
 }
 
+// ── colrv0 container ─────────────────────────────────────────────
+
+/// Upper bound on outlines carried in one colour payload (Rio's
+/// MAX_COLR_GLYPHS).
+pub const MAX_COLR_GLYPHS: usize = 1024;
+
+/// CPAL palette index meaning "the current SGR foreground". Layers
+/// using it make the rasterisation foreground-dependent.
+pub const PALETTE_FOREGROUND: u16 = 0xFFFF;
+
+pub const ColrLayer = struct {
+    /// Index into the carried outline array.
+    glyph: u16,
+    /// Resolved straight RGBA (0xRRGGBBAA) from CPAL palette 0.
+    /// Undefined-but-zero when `is_fg` — the renderer substitutes the
+    /// live foreground.
+    rgba: u32,
+    is_fg: bool,
+};
+
+/// Decoded colrv0 container. `outlines` are borrowed slices into the
+/// input payload; only the arrays are allocated.
+pub const Colr = struct {
+    outlines: []const []const u8,
+    /// The base glyph's layer run, painter's order (first painted
+    /// first). May be empty — a zero-layer base renders blank.
+    layers: []const ColrLayer,
+    /// Any layer references PALETTE_FOREGROUND, so the rasterisation
+    /// depends on the current foreground colour.
+    uses_fg: bool,
+
+    pub fn deinit(self: *Colr, allocator: std.mem.Allocator) void {
+        allocator.free(self.outlines);
+        allocator.free(self.layers);
+        self.* = undefined;
+    }
+};
+
+pub const ColrDecodeError = error{ Malformed, OutOfMemory };
+
+const BeCursor = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn u16be(self: *BeCursor) ?u16 {
+        if (self.pos + 2 > self.data.len) return null;
+        const v = std.mem.readInt(u16, self.data[self.pos..][0..2], .big);
+        self.pos += 2;
+        return v;
+    }
+
+    fn slice(self: *BeCursor, n: usize) ?[]const u8 {
+        if (self.pos + n > self.data.len) return null;
+        const s = self.data[self.pos .. self.pos + n];
+        self.pos += n;
+        return s;
+    }
+};
+
+fn readU16(data: []const u8, off: usize) ?u16 {
+    if (off + 2 > data.len) return null;
+    return std.mem.readInt(u16, data[off..][0..2], .big);
+}
+
+fn readU32(data: []const u8, off: usize) ?u32 {
+    if (off + 4 > data.len) return null;
+    return std.mem.readInt(u32, data[off..][0..4], .big);
+}
+
+/// Decode the custom big-endian colrv0 container (NOT an sfnt):
+/// `u16 n_glyphs, n×(u16 len + glyf bytes), u16 colr_len + COLR,
+/// u16 cpal_len + CPAL`. Trailing bytes are malformed (Rio parity).
+/// The base layer run is the COLR record for GlyphId 0 (the spec's
+/// base glyph); with no record for 0 the first record is used
+/// defensively. Carried outlines are NOT glyf-decoded here — see
+/// `validateColr` for the register-time structural check.
+pub fn decodeColr(allocator: std.mem.Allocator, data: []const u8) ColrDecodeError!Colr {
+    var cur = BeCursor{ .data = data };
+    const n_glyphs = cur.u16be() orelse return error.Malformed;
+    if (n_glyphs == 0 or n_glyphs > MAX_COLR_GLYPHS) return error.Malformed;
+
+    const outlines = try allocator.alloc([]const u8, n_glyphs);
+    errdefer allocator.free(outlines);
+    for (outlines) |*o| {
+        const len = cur.u16be() orelse return error.Malformed;
+        o.* = cur.slice(len) orelse return error.Malformed;
+    }
+
+    const colr_len = cur.u16be() orelse return error.Malformed;
+    if (colr_len == 0) return error.Malformed;
+    const colr = cur.slice(colr_len) orelse return error.Malformed;
+
+    const cpal_len = cur.u16be() orelse return error.Malformed;
+    const cpal = cur.slice(cpal_len) orelse return error.Malformed;
+
+    if (cur.pos != data.len) return error.Malformed;
+
+    // CPAL (may be absent — then every layer must use the foreground
+    // sentinel). Header: version, numPaletteEntries, numPalettes,
+    // numColorRecords, colorRecordsArrayOffset, u16 indices[palettes].
+    // ColorRecords are BGRA bytes. Only palette 0 is consulted.
+    var n_palette_entries: u16 = 0;
+    var palette0_first: u16 = 0;
+    var records_off: usize = 0;
+    if (cpal.len > 0) {
+        if (cpal.len < 12) return error.Malformed;
+        const cpal_version = readU16(cpal, 0).?;
+        // v1 adds trailing offset fields we don't consult; both parse.
+        if (cpal_version > 1) return error.Malformed;
+        n_palette_entries = readU16(cpal, 2).?;
+        const n_palettes = readU16(cpal, 4).?;
+        const n_color_records = readU16(cpal, 6).?;
+        records_off = readU32(cpal, 8).?;
+        if (n_palette_entries == 0 or n_palettes == 0) return error.Malformed;
+        if (12 + @as(usize, n_palettes) * 2 > cpal.len) return error.Malformed;
+        palette0_first = readU16(cpal, 12).?;
+        if (@as(usize, palette0_first) + n_palette_entries > n_color_records) return error.Malformed;
+        if (records_off + @as(usize, n_color_records) * 4 > cpal.len) return error.Malformed;
+    }
+
+    // COLR v0 header: version, numBaseGlyphRecords,
+    // baseGlyphRecordsOffset, layerRecordsOffset, numLayerRecords.
+    if (colr.len < 14) return error.Malformed;
+    if (readU16(colr, 0).? != 0) return error.Malformed; // v1 table under fmt=colrv0
+    const n_base = readU16(colr, 2).?;
+    const base_off: usize = readU32(colr, 4).?;
+    const layers_off: usize = readU32(colr, 8).?;
+    const n_layer_records = readU16(colr, 12).?;
+    if (n_base == 0) return error.Malformed;
+    if (base_off + @as(usize, n_base) * 6 > colr.len) return error.Malformed;
+    if (layers_off + @as(usize, n_layer_records) * 4 > colr.len) return error.Malformed;
+
+    // Base record for GlyphId 0, else the first record.
+    var chosen: usize = 0;
+    var bi: usize = 0;
+    while (bi < n_base) : (bi += 1) {
+        if (readU16(colr, base_off + bi * 6).? == 0) {
+            chosen = bi;
+            break;
+        }
+    }
+    const first_layer = readU16(colr, base_off + chosen * 6 + 2).?;
+    const n_layers = readU16(colr, base_off + chosen * 6 + 4).?;
+    if (@as(usize, first_layer) + n_layers > n_layer_records) return error.Malformed;
+
+    const layers = try allocator.alloc(ColrLayer, n_layers);
+    errdefer allocator.free(layers);
+    var uses_fg = false;
+    for (layers, 0..) |*l, i| {
+        const rec = layers_off + (@as(usize, first_layer) + i) * 4;
+        const glyph = readU16(colr, rec).?;
+        const palette = readU16(colr, rec + 2).?;
+        if (glyph >= n_glyphs) return error.Malformed;
+        if (palette == PALETTE_FOREGROUND) {
+            l.* = .{ .glyph = glyph, .rgba = 0, .is_fg = true };
+            uses_fg = true;
+        } else {
+            if (palette >= n_palette_entries) return error.Malformed;
+            const co = records_off + (@as(usize, palette0_first) + palette) * 4;
+            // BGRA on disk → straight 0xRRGGBBAA.
+            const b: u32 = cpal[co];
+            const g: u32 = cpal[co + 1];
+            const r: u32 = cpal[co + 2];
+            const a: u32 = cpal[co + 3];
+            l.* = .{ .glyph = glyph, .rgba = (r << 24) | (g << 16) | (b << 8) | a, .is_fg = false };
+        }
+    }
+
+    return .{ .outlines = outlines, .layers = layers, .uses_fg = uses_fg };
+}
+
+/// Register-time structural validation of a colrv0 container:
+/// container framing + COLR/CPAL structure via `decodeColr`, then
+/// EVERY carried outline through the glyf decoder so a composite or
+/// hinted glyph anywhere in the array is rejected with its own code.
+pub fn validateColr(allocator: std.mem.Allocator, data: []const u8) ?RegisterError {
+    var colr = decodeColr(allocator, data) catch |err| return switch (err) {
+        error.Malformed => .malformed_payload,
+        error.OutOfMemory => .payload_too_large,
+    };
+    defer colr.deinit(allocator);
+    for (colr.outlines) |o| {
+        if (validateGlyf(allocator, o)) |reason| return reason;
+    }
+    return null;
+}
+
+/// Format-dispatching register-time validation.
+pub fn validatePayload(allocator: std.mem.Allocator, fmt: Format, data: []const u8) ?RegisterError {
+    return switch (fmt) {
+        .glyf => validateGlyf(allocator, data),
+        .colrv0 => validateColr(allocator, data),
+    };
+}
+
+/// Cheap foreground-dependence probe for a stored colrv0 payload.
+/// False on anything that fails to decode (broken payloads raster as
+/// empty, which is foreground-independent).
+pub fn colrUsesForeground(allocator: std.mem.Allocator, data: []const u8) bool {
+    var colr = decodeColr(allocator, data) catch return false;
+    defer colr.deinit(allocator);
+    return colr.uses_fg;
+}
+
 // ── tests (ported from Rio's glyph_protocol.rs / glyf_decode.rs) ──
 
 const testing = std.testing;
@@ -588,17 +811,32 @@ test "register: missing cp / empty cp are malformed" {
     }
 }
 
-test "register: unknown fmt (and unsupported colrv0/colrv1) are dropped" {
+test "register: unknown fmt (and unsupported colrv1) are dropped" {
     const a = testing.allocator;
     const payload = try b64(a, "x");
     defer a.free(payload);
-    for ([_][]const u8{ "svg", "colrv0", "colrv1" }) |fmt| {
+    for ([_][]const u8{ "svg", "colrv1", "COLRV0" }) |fmt| {
         const res = try parseFmt(a, "25a1;r;cp=E0A0;fmt={s};upm=1000;{s}", .{ fmt, payload });
         try testing.expectEqual(Result.malformed, res);
     }
-    const ok = try parseFmt(a, "25a1;r;cp=E0A0;fmt=glyf;upm=1000;{s}", .{payload});
-    defer freeResult(a, ok);
-    try testing.expect(ok == .register);
+    {
+        const ok = try parseFmt(a, "25a1;r;cp=E0A0;fmt=glyf;upm=1000;{s}", .{payload});
+        defer freeResult(a, ok);
+        try testing.expect(ok == .register);
+        try testing.expectEqual(Format.glyf, ok.register.fmt);
+    }
+    {
+        const ok = try parseFmt(a, "25a1;r;cp=E0A0;fmt=colrv0;upm=1000;{s}", .{payload});
+        defer freeResult(a, ok);
+        try testing.expect(ok == .register);
+        try testing.expectEqual(Format.colrv0, ok.register.fmt);
+    }
+    {
+        // Omitted fmt defaults to glyf.
+        const ok = try parseFmt(a, "25a1;r;cp=E0A0;upm=1000;{s}", .{payload});
+        defer freeResult(a, ok);
+        try testing.expectEqual(Format.glyf, ok.register.fmt);
+    }
 }
 
 test "register: bad base64 rejects malformed_payload" {
@@ -704,7 +942,7 @@ test "unknown verb is malformed; unknown params on query ignored" {
 
 test "reply formatting matches Rio's wire strings" {
     var buf: [96]u8 = undefined;
-    try testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf\x1b\\", fmtSupport(&buf));
+    try testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0\x1b\\", fmtSupport(&buf));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=\x1b\\", fmtQuery(&buf, 0xE0A0, false, false));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=system\x1b\\", fmtQuery(&buf, 0xE0A0, true, false));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=glossary\x1b\\", fmtQuery(&buf, 0xE0A0, false, true));
@@ -935,6 +1173,267 @@ test "glyf: non-increasing contour ends and repeat overflow are malformed" {
         try out.append(a, 5); // repeat past n_points
         try testing.expectError(error.Malformed, decodeGlyf(a, out.items));
     }
+}
+
+// ── colrv0 container tests ───────────────────────────────────────
+
+/// Test/smoke builder for a well-formed colrv0 container: one base
+/// record for GlyphId 0 covering all `layers`, CPAL palette 0 with
+/// `palette_colors` straight-RGBA entries (empty slice = cpal_len 0).
+pub fn colrContainerBytes(
+    allocator: std.mem.Allocator,
+    outlines: []const []const u8,
+    layers: []const struct { glyph: u16, palette: u16 },
+    palette_colors: []const u32,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = struct {
+        fn u16be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u16) !void {
+            var tmp: [2]u8 = undefined;
+            std.mem.writeInt(u16, &tmp, v, .big);
+            try l.appendSlice(a, &tmp);
+        }
+        fn u32be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) !void {
+            var tmp: [4]u8 = undefined;
+            std.mem.writeInt(u32, &tmp, v, .big);
+            try l.appendSlice(a, &tmp);
+        }
+    };
+    try w.u16be(&out, allocator, @intCast(outlines.len));
+    for (outlines) |o| {
+        try w.u16be(&out, allocator, @intCast(o.len));
+        try out.appendSlice(allocator, o);
+    }
+    // COLR v0: header(14) + 1 base record(6) + layer records.
+    const colr_len: u16 = @intCast(14 + 6 + layers.len * 4);
+    try w.u16be(&out, allocator, colr_len);
+    try w.u16be(&out, allocator, 0); // version
+    try w.u16be(&out, allocator, 1); // numBaseGlyphRecords
+    try w.u32be(&out, allocator, 14); // baseGlyphRecordsOffset
+    try w.u32be(&out, allocator, 20); // layerRecordsOffset
+    try w.u16be(&out, allocator, @intCast(layers.len));
+    try w.u16be(&out, allocator, 0); // base GlyphId
+    try w.u16be(&out, allocator, 0); // firstLayerIndex
+    try w.u16be(&out, allocator, @intCast(layers.len));
+    for (layers) |l| {
+        try w.u16be(&out, allocator, l.glyph);
+        try w.u16be(&out, allocator, l.palette);
+    }
+    // CPAL v0: header(12) + 1 index(2) + BGRA records.
+    if (palette_colors.len == 0) {
+        try w.u16be(&out, allocator, 0);
+    } else {
+        const cpal_len: u16 = @intCast(12 + 2 + palette_colors.len * 4);
+        try w.u16be(&out, allocator, cpal_len);
+        try w.u16be(&out, allocator, 0); // version
+        try w.u16be(&out, allocator, @intCast(palette_colors.len)); // numPaletteEntries
+        try w.u16be(&out, allocator, 1); // numPalettes
+        try w.u16be(&out, allocator, @intCast(palette_colors.len)); // numColorRecords
+        try w.u32be(&out, allocator, 14); // colorRecordsArrayOffset
+        try w.u16be(&out, allocator, 0); // colorRecordIndices[0]
+        for (palette_colors) |rgba| {
+            try out.append(allocator, @truncate(rgba >> 8)); // B
+            try out.append(allocator, @truncate(rgba >> 16)); // G
+            try out.append(allocator, @truncate(rgba >> 24)); // R
+            try out.append(allocator, @truncate(rgba)); // A
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "colrv0: decodes a two-layer container with resolved palette colours" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const bytes = try colrContainerBytes(a, &.{ tri, tri }, &.{
+        .{ .glyph = 0, .palette = 0 },
+        .{ .glyph = 1, .palette = 1 },
+    }, &.{ 0xFF0000FF, 0x00FF00FF });
+    defer a.free(bytes);
+    var colr = try decodeColr(a, bytes);
+    defer colr.deinit(a);
+    try testing.expectEqual(@as(usize, 2), colr.outlines.len);
+    try testing.expectEqualSlices(u8, tri, colr.outlines[0]);
+    try testing.expectEqual(@as(usize, 2), colr.layers.len);
+    try testing.expectEqual(@as(u32, 0xFF0000FF), colr.layers[0].rgba);
+    try testing.expectEqual(@as(u32, 0x00FF00FF), colr.layers[1].rgba);
+    try testing.expect(!colr.uses_fg);
+    try testing.expectEqual(@as(?RegisterError, null), validateColr(a, bytes));
+}
+
+test "colrv0: 0xFFFF palette resolves as foreground, empty CPAL accepted" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(bytes);
+    var colr = try decodeColr(a, bytes);
+    defer colr.deinit(a);
+    try testing.expect(colr.uses_fg);
+    try testing.expect(colr.layers[0].is_fg);
+    try testing.expectEqual(@as(?RegisterError, null), validateColr(a, bytes));
+    try testing.expect(colrUsesForeground(a, bytes));
+}
+
+test "colrv0: n_glyphs bounds" {
+    const a = testing.allocator;
+    // n_glyphs = 0.
+    try testing.expectError(error.Malformed, decodeColr(a, &.{ 0, 0 }));
+    // n_glyphs = 1025 (over MAX_COLR_GLYPHS) — truncation would also
+    // fail, but the bound must reject before reading records.
+    var big: [2]u8 = undefined;
+    std.mem.writeInt(u16, &big, 1025, .big);
+    try testing.expectError(error.Malformed, decodeColr(a, &big));
+}
+
+test "colrv0: truncation at every byte boundary is malformed" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = 0 },
+    }, &.{0x336699FF});
+    defer a.free(bytes);
+    var cut: usize = 0;
+    while (cut < bytes.len) : (cut += 1) {
+        try testing.expectError(error.Malformed, decodeColr(a, bytes[0..cut]));
+    }
+}
+
+test "colrv0: trailing bytes rejected" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = 0 },
+    }, &.{0x336699FF});
+    defer a.free(bytes);
+    const padded = try std.mem.concat(a, u8, &.{ bytes, &.{0x00} });
+    defer a.free(padded);
+    try testing.expectError(error.Malformed, decodeColr(a, padded));
+}
+
+test "colrv0: zero-length COLR rejected" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    var tmp: [2]u8 = undefined;
+    std.mem.writeInt(u16, &tmp, 1, .big);
+    try out.appendSlice(a, &tmp); // n_glyphs
+    std.mem.writeInt(u16, &tmp, @intCast(tri.len), .big);
+    try out.appendSlice(a, &tmp);
+    try out.appendSlice(a, tri);
+    std.mem.writeInt(u16, &tmp, 0, .big);
+    try out.appendSlice(a, &tmp); // colr_len = 0
+    try out.appendSlice(a, &tmp); // cpal_len = 0
+    try testing.expectError(error.Malformed, decodeColr(a, out.items));
+}
+
+test "colrv0: layer glyph id / palette index out of range rejected" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    {
+        const bytes = try colrContainerBytes(a, &.{tri}, &.{
+            .{ .glyph = 1, .palette = 0 }, // only outline 0 exists
+        }, &.{0x336699FF});
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr(a, bytes));
+        try testing.expectEqual(RegisterError.malformed_payload, validateColr(a, bytes).?);
+    }
+    {
+        const bytes = try colrContainerBytes(a, &.{tri}, &.{
+            .{ .glyph = 0, .palette = 1 }, // palette 0 has one entry
+        }, &.{0x336699FF});
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr(a, bytes));
+    }
+    {
+        // Non-sentinel palette index with NO CPAL at all.
+        const bytes = try colrContainerBytes(a, &.{tri}, &.{
+            .{ .glyph = 0, .palette = 0 },
+        }, &.{});
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr(a, bytes));
+    }
+}
+
+test "colrv0: carried composite / hinted glyph rejected through the glyf decoder" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    var comp: [10]u8 = @splat(0);
+    std.mem.writeInt(i16, comp[0..2], -1, .big);
+    {
+        const bytes = try colrContainerBytes(a, &.{ tri, &comp }, &.{
+            .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+        }, &.{});
+        defer a.free(bytes);
+        // Container structure is fine (glyph 1 unreferenced), but the
+        // carried composite must still be rejected at register time.
+        try testing.expectEqual(RegisterError.composite_unsupported, validateColr(a, bytes).?);
+    }
+    {
+        // Hinted glyph: 1 contour, 1 point, instructionLength 1.
+        var hinted: std.ArrayList(u8) = .empty;
+        defer hinted.deinit(a);
+        var tmp: [2]u8 = undefined;
+        std.mem.writeInt(i16, &tmp, 1, .big);
+        try hinted.appendSlice(a, &tmp);
+        try hinted.appendSlice(a, &(.{0} ** 8));
+        std.mem.writeInt(u16, &tmp, 0, .big);
+        try hinted.appendSlice(a, &tmp); // endPts
+        std.mem.writeInt(u16, &tmp, 1, .big);
+        try hinted.appendSlice(a, &tmp); // instr len
+        try hinted.append(a, 0);
+        try hinted.append(a, FLAG_ON_CURVE);
+        std.mem.writeInt(i16, &tmp, 0, .big);
+        try hinted.appendSlice(a, &tmp);
+        try hinted.appendSlice(a, &tmp);
+        const bytes = try colrContainerBytes(a, &.{hinted.items}, &.{
+            .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+        }, &.{});
+        defer a.free(bytes);
+        try testing.expectEqual(RegisterError.hinting_unsupported, validateColr(a, bytes).?);
+    }
+}
+
+test "colrv0: COLR v1 table under fmt=colrv0 is malformed" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(bytes);
+    const mut = try a.dupe(u8, bytes);
+    defer a.free(mut);
+    // COLR version field sits right after the container's colr_len:
+    // 2 (n_glyphs) + 2 + tri.len (outline) + 2 (colr_len).
+    const colr_start = 2 + 2 + tri.len + 2;
+    std.mem.writeInt(u16, mut[colr_start..][0..2], 1, .big);
+    try testing.expectError(error.Malformed, decodeColr(a, mut));
+}
+
+test "validatePayload dispatches by format" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    try testing.expectEqual(@as(?RegisterError, null), validatePayload(a, .glyf, tri));
+    // A glyf record is not a container...
+    try testing.expect(validatePayload(a, .colrv0, tri) != null);
+    const bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(bytes);
+    try testing.expectEqual(@as(?RegisterError, null), validatePayload(a, .colrv0, bytes));
+    // ...and a container is not a glyf record.
+    try testing.expect(validatePayload(a, .glyf, bytes) != null);
 }
 
 test "validateGlyf maps decode errors to wire reasons" {

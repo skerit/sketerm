@@ -74,7 +74,21 @@ const GlyphRef = struct {
     /// matching `custom_cache`, so eviction removes the right entry.
     key: u64,
     kind: Kind,
+    /// kind=.custom only: the CustomKey.fg half (0 for foreground-
+    /// independent rasterisations).
+    fg: u32 = 0,
     pub const Kind = enum { codepoint, gid, face_gid, custom };
+};
+
+/// Key of `custom_cache`. `fg` is 0 for foreground-independent
+/// rasterisations (all glyf, colrv0 without a 0xFFFF layer) and the
+/// quantized 0xRRGGBBFF foreground for colrv0 glyphs that reference
+/// CPAL index 0xFFFF — those must re-rasterise when the SGR
+/// foreground changes (a deliberate non-copy of Rio's stale-colour
+/// bug, where the atlas key omits the foreground).
+pub const CustomKey = struct {
+    render_key: u64,
+    fg: u32,
 };
 
 /// Bold / italic glyphs share the `cache` / `glyph_cache` maps with
@@ -245,7 +259,7 @@ pub const Atlas = struct {
     /// per-Screen, so two panes may legally hold different glyphs at
     /// the same codepoint; keying on render_key also makes stale
     /// pixels after an overwrite unreachable by construction.
-    custom_cache: std.AutoHashMap(u64, Glyph) = undefined,
+    custom_cache: std.AutoHashMap(CustomKey, Glyph) = undefined,
 
     /// Codepoint ranges pinned to fonts of their own, ahead of the
     /// primary face and the fallback machinery.
@@ -397,7 +411,7 @@ pub const Atlas = struct {
             .fc_initialized = fc_ok,
             .cp_to_shape_fallback = std.AutoHashMap(u32, ?u16).init(allocator),
             .face_gid_cache = std.AutoHashMap(u64, Glyph).init(allocator),
-            .custom_cache = std.AutoHashMap(u64, Glyph).init(allocator),
+            .custom_cache = std.AutoHashMap(CustomKey, Glyph).init(allocator),
         };
         self.builtin_box = opts.builtin_box;
         // Symbol maps load eagerly: there are a handful at most, and a
@@ -830,46 +844,91 @@ pub const Atlas = struct {
     /// Cell-content glyph resolution with Glyph Protocol precedence:
     /// a live glossary registration outranks the system font. The PUA
     /// range test keeps non-PUA text at one comparison before the
-    /// normal path.
+    /// normal path. `fg` is the RESOLVED cell foreground (post
+    /// reverse/dim/min-contrast) — colrv0 glyphs with a 0xFFFF layer
+    /// bake it into their texels and cache per foreground.
     pub fn lookupGlyph(
         self: *Atlas,
         glossary: *const glyph_glossary.Glossary,
         cp: u32,
         bold: bool,
         italic: bool,
+        fg: [4]f32,
     ) !Glyph {
         if (glyph_glossary.isPua(cp)) {
             if (glossary.get(cp)) |e| {
-                return self.lookupOrLoadCustom(e.render_key, e.payload, e.upm, e.width);
+                return self.lookupOrLoadCustom(e.render_key, e.payload, e.fmt, e.upm, e.width, fg);
             }
         }
         return self.lookupOrLoad(cp, bold, italic);
     }
 
+    /// Quantize a resolved foreground to the nonzero cache-key form
+    /// (0xRRGGBBFF — the forced alpha byte keeps even black distinct
+    /// from the fg-independent sentinel 0).
+    fn fgKey(fg: [4]f32) u32 {
+        const r: u32 = @intFromFloat(std.math.clamp(fg[0], 0.0, 1.0) * 255.0);
+        const g: u32 = @intFromFloat(std.math.clamp(fg[1], 0.0, 1.0) * 255.0);
+        const b: u32 = @intFromFloat(std.math.clamp(fg[2], 0.0, 1.0) * 255.0);
+        return (r << 24) | (g << 16) | (b << 8) | 0xFF;
+    }
+
     /// Rasterize (or fetch) a Glyph Protocol registration. Keyed by
     /// `render_key`, so an overwritten registration can never serve
-    /// the previous rasterisation. A structurally broken payload
+    /// the previous rasterisation. Foreground-INDEPENDENT results
+    /// (all glyf; colrv0 with no 0xFFFF layer) live under fg=0 and are
+    /// rasterised exactly once; a colrv0 glyph referencing 0xFFFF
+    /// caches one entry per distinct quantized foreground it is drawn
+    /// in (worst case: one atlas slot per distinct fg, reclaimed by
+    /// normal page LRU eviction). A structurally broken payload
     /// (which the daemon should have rejected at register time)
-    /// caches as an empty glyph.
-    pub fn lookupOrLoadCustom(self: *Atlas, render_key: u64, payload: []const u8, upm: u16, width: u8) !Glyph {
-        if (self.custom_cache.get(render_key)) |g| {
+    /// caches as an empty glyph under fg=0.
+    pub fn lookupOrLoadCustom(
+        self: *Atlas,
+        render_key: u64,
+        payload: []const u8,
+        fmt: glyph_glossary.Format,
+        upm: u16,
+        width: u8,
+        fg: [4]f32,
+    ) !Glyph {
+        // fg=0 first: the common, foreground-independent case — and
+        // the only key glyf ever uses.
+        if (self.custom_cache.get(.{ .render_key = render_key, .fg = 0 })) |g| {
             self.touchPage(g.layer);
             return g;
         }
-        const g = self.rasterCustom(payload, upm, width) orelse {
+        var key = CustomKey{ .render_key = render_key, .fg = 0 };
+        if (fmt == .colrv0) {
+            key.fg = fgKey(fg);
+            if (self.custom_cache.get(key)) |g| {
+                self.touchPage(g.layer);
+                return g;
+            }
+        }
+        const raster: ?CustomRaster = switch (fmt) {
+            .glyf => if (self.rasterCustom(payload, upm, width)) |g|
+                .{ .g = g, .uses_fg = false }
+            else
+                null,
+            .colrv0 => self.rasterColr(payload, upm, width, key.fg),
+        };
+        const r = raster orelse {
             const empty = self.emptyGlyph();
-            _ = self.custom_cache.put(render_key, empty) catch {};
+            _ = self.custom_cache.put(.{ .render_key = render_key, .fg = 0 }, empty) catch {};
             return empty;
         };
-        try self.custom_cache.put(render_key, g);
-        self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+        if (!r.uses_fg) key.fg = 0;
+        try self.custom_cache.put(key, r.g);
+        self.pages[r.g.layer].glyphs_on_page.append(self.allocator, .{
             .key = render_key,
             .kind = .custom,
+            .fg = key.fg,
         }) catch |err| {
-            _ = self.custom_cache.remove(render_key);
+            _ = self.custom_cache.remove(key);
             return err;
         };
-        return g;
+        return r.g;
     }
 
     /// Decode a glyf simple-glyph record and rasterise it into a
@@ -897,6 +956,34 @@ pub const Atlas = struct {
             return self.emptyGlyph();
         }
 
+        const cov = self.renderOutlineCoverage(&outline, upm, w, h) orelse return null;
+        defer self.allocator.free(cov);
+
+        // Same alpha-coverage RGBA path as drawBuiltin, so the glyph
+        // tints with the cell foreground for free (colored=false).
+        const rgba = self.allocator.alloc(u8, w * h * 4) catch return null;
+        defer self.allocator.free(rgba);
+        for (cov, 0..) |a, i| {
+            rgba[i * 4 + 0] = 255;
+            rgba[i * 4 + 1] = 255;
+            rgba[i * 4 + 2] = 255;
+            rgba[i * 4 + 3] = a;
+        }
+        return self.packRgba(rgba, w, h, 0, @intCast(self.ascent), @floatFromInt(w), false) catch null;
+    }
+
+    /// Scan-convert one decoded simple glyph into a w×h 8-bit
+    /// coverage buffer (caller frees). Same coordinate mapping as the
+    /// original glyf raster: `upm` units, y=0 at the baseline (Y-up),
+    /// baseline placed `descent` above the bitmap bottom;
+    /// FT_Outline_Get_Bitmap with positive pitch does the Y-flip.
+    fn renderOutlineCoverage(
+        self: *Atlas,
+        outline: *const @import("../parser/glyph_protocol.zig").Outline,
+        upm: u16,
+        w: u32,
+        h: u32,
+    ) ?[]u8 {
         const scale: f32 = @as(f32, @floatFromInt(h)) / @as(f32, @floatFromInt(upm));
         const descent_px: f32 = @floatFromInt(@max(0, @as(i32, @intCast(h)) - @as(i32, self.ascent)));
 
@@ -927,7 +1014,6 @@ pub const Atlas = struct {
         };
 
         const cov = self.allocator.alloc(u8, w * h) catch return null;
-        defer self.allocator.free(cov);
         @memset(cov, 0);
         const bm = c.FT_Bitmap{
             .rows = h,
@@ -939,19 +1025,92 @@ pub const Atlas = struct {
             .palette_mode = 0,
             .palette = null,
         };
-        if (c.FT_Outline_Get_Bitmap(self.ft_lib, &ol, &bm) != 0) return null;
-
-        // Same alpha-coverage RGBA path as drawBuiltin, so the glyph
-        // tints with the cell foreground for free (colored=false).
-        const rgba = self.allocator.alloc(u8, w * h * 4) catch return null;
-        defer self.allocator.free(rgba);
-        for (cov, 0..) |a, i| {
-            rgba[i * 4 + 0] = 255;
-            rgba[i * 4 + 1] = 255;
-            rgba[i * 4 + 2] = 255;
-            rgba[i * 4 + 3] = a;
+        if (c.FT_Outline_Get_Bitmap(self.ft_lib, &ol, &bm) != 0) {
+            self.allocator.free(cov);
+            return null;
         }
-        return self.packRgba(rgba, w, h, 0, @intCast(self.ascent), @floatFromInt(w), false) catch null;
+        return cov;
+    }
+
+    const CustomRaster = struct { g: Glyph, uses_fg: bool };
+
+    /// Rasterise a colrv0 container: each layer's outline is
+    /// scan-converted to coverage and composited src-over (painter's
+    /// order — first layer painted first) with the layer's flat CPAL
+    /// colour, or `fg_rgba` for the 0xFFFF foreground sentinel.
+    /// Compositing runs premultiplied, then un-premultiplies into
+    /// straight RGBA for the emoji SRC_ALPHA pipeline (colored=true —
+    /// the shader samples texels instead of tinting coverage).
+    fn rasterColr(
+        self: *Atlas,
+        payload: []const u8,
+        upm: u16,
+        width: u8,
+        fg_rgba: u32,
+    ) ?CustomRaster {
+        const gp = @import("../parser/glyph_protocol.zig");
+        if (upm == 0) return null;
+        var colr = gp.decodeColr(self.allocator, payload) catch return null;
+        defer colr.deinit(self.allocator);
+
+        const span: u32 = if (width >= 2) 2 else 1;
+        const w: u32 = @as(u32, self.cell_w) * span;
+        const h: u32 = self.cell_h;
+        if (w == 0 or h == 0) return null;
+        if (colr.layers.len == 0) {
+            // A zero-layer base renders blank — foreground-independent
+            // regardless of what unreferenced layers might use.
+            return .{ .g = self.emptyGlyph(), .uses_fg = false };
+        }
+
+        // Premultiplied f32 accumulation buffer.
+        const accum = self.allocator.alloc(f32, w * h * 4) catch return null;
+        defer self.allocator.free(accum);
+        @memset(accum, 0);
+
+        for (colr.layers) |layer| {
+            var outline = gp.decodeGlyf(self.allocator, colr.outlines[layer.glyph]) catch return null;
+            defer outline.deinit(self.allocator);
+            if (outline.ends.len == 0 or outline.points.len == 0) continue;
+            const cov = self.renderOutlineCoverage(&outline, upm, w, h) orelse return null;
+            defer self.allocator.free(cov);
+
+            const rgba: u32 = if (layer.is_fg) fg_rgba else layer.rgba;
+            const sr: f32 = @as(f32, @floatFromInt((rgba >> 24) & 0xFF)) / 255.0;
+            const sg: f32 = @as(f32, @floatFromInt((rgba >> 16) & 0xFF)) / 255.0;
+            const sb: f32 = @as(f32, @floatFromInt((rgba >> 8) & 0xFF)) / 255.0;
+            const sa: f32 = @as(f32, @floatFromInt(rgba & 0xFF)) / 255.0;
+            for (cov, 0..) |cv, i| {
+                if (cv == 0) continue;
+                const a = @as(f32, @floatFromInt(cv)) / 255.0 * sa;
+                const inv = 1.0 - a;
+                accum[i * 4 + 0] = sr * a + accum[i * 4 + 0] * inv;
+                accum[i * 4 + 1] = sg * a + accum[i * 4 + 1] * inv;
+                accum[i * 4 + 2] = sb * a + accum[i * 4 + 2] * inv;
+                accum[i * 4 + 3] = a + accum[i * 4 + 3] * inv;
+            }
+        }
+
+        const rgba_out = self.allocator.alloc(u8, w * h * 4) catch return null;
+        defer self.allocator.free(rgba_out);
+        var i: usize = 0;
+        while (i < w * h) : (i += 1) {
+            const a = accum[i * 4 + 3];
+            if (a <= 0.0) {
+                rgba_out[i * 4 + 0] = 0;
+                rgba_out[i * 4 + 1] = 0;
+                rgba_out[i * 4 + 2] = 0;
+                rgba_out[i * 4 + 3] = 0;
+            } else {
+                rgba_out[i * 4 + 0] = @intFromFloat(std.math.clamp(accum[i * 4 + 0] / a, 0.0, 1.0) * 255.0);
+                rgba_out[i * 4 + 1] = @intFromFloat(std.math.clamp(accum[i * 4 + 1] / a, 0.0, 1.0) * 255.0);
+                rgba_out[i * 4 + 2] = @intFromFloat(std.math.clamp(accum[i * 4 + 2] / a, 0.0, 1.0) * 255.0);
+                rgba_out[i * 4 + 3] = @intFromFloat(std.math.clamp(a, 0.0, 1.0) * 255.0);
+            }
+        }
+
+        const g = self.packRgba(rgba_out, w, h, 0, @intCast(self.ascent), @floatFromInt(w), true) catch return null;
+        return .{ .g = g, .uses_fg = colr.uses_fg };
     }
 
     /// Would the terminal render `cp` as something other than tofu
@@ -1624,7 +1783,7 @@ pub const Atlas = struct {
                 .codepoint => _ = self.cache.remove(@intCast(ref.key)),
                 .gid => _ = self.glyph_cache.remove(@intCast(ref.key)),
                 .face_gid => _ = self.face_gid_cache.remove(ref.key),
-                .custom => _ = self.custom_cache.remove(ref.key),
+                .custom => _ = self.custom_cache.remove(.{ .render_key = ref.key, .fg = ref.fg }),
             }
         }
         p.glyphs_on_page.clearRetainingCapacity();
