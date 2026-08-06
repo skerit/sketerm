@@ -10,6 +10,7 @@
 //! is off) whenever the file changes on disk (`ui/configwatch.zig`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
@@ -632,6 +633,47 @@ pub const McpProfile = struct {
     tools: []const u8 = "",
 };
 
+/// The operating systems a `[platform.<name>]` section can name.
+/// Comptime only: the current platform is decided from
+/// `builtin.os.tag` the same way `src/util/platform.zig` does it, so
+/// the non-matching branches are dead code rather than a runtime
+/// probe (and `sketerm-mux` cross-compiled for macOS reads a config
+/// as macOS even when the file was written on Linux).
+pub const Platform = enum {
+    linux,
+    macos,
+
+    /// Null on a target that is neither — every platform section is
+    /// then validated and retained, and none of them applies.
+    pub const current: ?Platform = switch (builtin.os.tag) {
+        .linux => .linux,
+        .macos => .macos,
+        else => null,
+    };
+
+    pub fn matchesCurrent(name: []const u8) bool {
+        const cur = current orelse return false;
+        return std.mem.eql(u8, name, @tagName(cur));
+    }
+};
+
+/// One `key = value` line of a `[platform.<name>]` section, kept
+/// verbatim so the serialiser can write the section back byte for
+/// byte — including sections for a platform this build is not.
+pub const RawKv = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// One `[platform.<name>]` section. Its lines are applied inline, in
+/// file order, when `name` is this build's platform; the record is
+/// retained either way so a save never drops another machine's
+/// settings.
+pub const PlatformSection = struct {
+    name: []const u8,
+    lines: std.ArrayList(RawKv) = .empty,
+};
+
 /// When to ask "are you sure?" before destroying panes / tabs.
 /// Matches Terminator's `ask_before_closing` semantics:
 ///   never    — close immediately, no dialog
@@ -1118,6 +1160,14 @@ pub const Config = struct {
     /// for round-trip serialisation.
     mcp_profiles: std.ArrayList(McpProfile) = .empty,
 
+    /// `[platform.<name>]` sections, in file order, with their lines
+    /// verbatim. The section for THIS platform has already been
+    /// applied (inline, where it appeared) — the record is kept only
+    /// so the serialiser can write every section back, including the
+    /// ones belonging to another machine. Read `platformOverridesKey`
+    /// before assuming a base key survived a save unchanged.
+    platform_sections: std.ArrayList(PlatformSection) = .empty,
+
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
     /// the OSC 0/1/2 terminal title. Off by default — many users
@@ -1260,6 +1310,19 @@ pub const Config = struct {
                 .enabled = s.enabled,
             });
         }
+        out.platform_sections = .empty;
+        try out.platform_sections.ensureTotalCapacity(arena, self.platform_sections.items.len);
+        for (self.platform_sections.items) |sec| {
+            var copy = PlatformSection{ .name = try arena.dupe(u8, sec.name) };
+            try copy.lines.ensureTotalCapacity(arena, sec.lines.items.len);
+            for (sec.lines.items) |kv| {
+                copy.lines.appendAssumeCapacity(.{
+                    .key = try arena.dupe(u8, kv.key),
+                    .value = try arena.dupe(u8, kv.value),
+                });
+            }
+            out.platform_sections.appendAssumeCapacity(copy);
+        }
         return out;
     }
 
@@ -1357,9 +1420,45 @@ pub const Config = struct {
     /// the format round-trips through `loadFromBytes` exactly. Uses
     /// libc since Zig 0.16's `std.fs` now needs an `Io` instance we
     /// don't thread through here.
+    /// Whether the `[platform.<this platform>]` section sets `key`.
+    ///
+    /// This is the one place the platform feature is lossy, and it is
+    /// worth knowing about: the section is applied INLINE at parse
+    /// time, so by the time anything reads a Config there is no
+    /// difference between "the user wrote `font_size = 16` at top
+    /// level" and "`[platform.macos]` set it". A save therefore writes
+    /// the effective value at top level as well, and the other
+    /// platform's default for that key becomes this platform's value
+    /// unless its own section says otherwise. Undoing that would mean
+    /// per-key provenance through all ~150 serialiser branches; the
+    /// sections themselves survive verbatim, which is the part that
+    /// would actually be data loss.
+    pub fn platformOverridesKey(self: *const Config, key: []const u8) bool {
+        for (self.platform_sections.items) |sec| {
+            if (!Platform.matchesCurrent(sec.name)) continue;
+            for (sec.lines.items) |kv| {
+                if (std.mem.eql(u8, kv.key, key)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether this config carries any `[platform.<name>]` section —
+    /// what a UI checks before warning that a save flattens the
+    /// current platform's overrides into the top level.
+    pub fn hasPlatformSections(self: *const Config) bool {
+        return self.platform_sections.items.len > 0;
+    }
+
     pub fn save(self: *const Config, path: []const u8) !void {
         const c = @import("c.zig").c;
         try makeParentDirs(path);
+        if (self.hasPlatformSections()) {
+            warnConfig(
+                "saving a config with [platform.*] sections: the sections are kept verbatim, but this platform's overrides are also written at top level (see docs/config.md)",
+                .{},
+            );
+        }
 
         var path_z: [4096]u8 = undefined;
         if (path.len + 4 >= path_z.len) return error.PathTooLong;
@@ -1759,6 +1858,17 @@ pub const Config = struct {
         // the parse-time seed — so the round-trip is exact.
         if (self.default_profile.len > 0)
             try w.print("default_profile = {s}\n", .{self.default_profile});
+
+        // Platform sections go BEFORE the profile sections, because a
+        // profile is seeded from the Default settings as parsed so far
+        // — writing them after would drop their values out of every
+        // profile on the next load and quietly change the file's
+        // meaning.
+        for (self.platform_sections.items) |sec| {
+            try w.print("\n[platform.{s}]\n", .{sec.name});
+            for (sec.lines.items) |kv| try w.print("{s} = {s}\n", .{ kv.key, kv.value });
+        }
+
         for (self.profiles.items) |prof| {
             try w.print("\n[profile.{s}]\n", .{prof.name});
             try serialiseSettings(&prof.settings, &self.settings, w);
@@ -2085,6 +2195,15 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     var current_domain: ?*Domain = null;
     var current_lsp: ?*LspServer = null;
     var current_mcp: ?*McpProfile = null;
+    // `[platform.<name>]` for a platform that is NOT ours: the lines
+    // are still parsed, against a throwaway Config, so a typo in the
+    // macOS section is reported on Linux instead of waiting until the
+    // user changes machines. One scratch config for the whole parse —
+    // it is written to and never read.
+    var current_platform: ?*PlatformSection = null;
+    var current_platform_applies = false;
+    var scratch: ?Config = null;
+    defer if (scratch) |*s| s.deinit();
     while (lines.next()) |raw| {
         lineno += 1;
         const line = trim(stripComment(raw));
@@ -2100,6 +2219,29 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             current_domain = null;
             current_lsp = null;
             current_mcp = null;
+            current_platform = null;
+            current_platform_applies = false;
+            if (std.mem.startsWith(u8, inside, "platform.")) {
+                const name = inside["platform.".len..];
+                if (name.len == 0) {
+                    warnConfigAt(lineno, "empty platform name", .{});
+                    continue;
+                }
+                // An unrecognised platform name warns and is ignored,
+                // exactly like an unknown key or section — but the
+                // section is still retained and its keys are still
+                // checked, so a build that does not know `windows`
+                // neither drops the user's lines on save nor pretends
+                // they are correct.
+                if (std.meta.stringToEnum(Platform, name) == null)
+                    warnConfigAt(lineno, "unknown platform '{s}' (keys checked, never applied)", .{name});
+                current_platform = findOrCreatePlatformSection(cfg, arena, name) catch {
+                    warnConfigAt(lineno, "out of memory creating platform section", .{});
+                    continue;
+                };
+                current_platform_applies = Platform.matchesCurrent(name);
+                continue;
+            }
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
                 if (name.len == 0) {
@@ -2165,6 +2307,28 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         };
         const key = trim(line[0..eq]);
         const value = trim(line[eq + 1 ..]);
+        if (current_platform) |sec| {
+            const stored: ?RawKv = blk: {
+                const k = arena.dupe(u8, key) catch break :blk null;
+                const v = arena.dupe(u8, value) catch break :blk null;
+                sec.lines.append(arena, .{ .key = k, .value = v }) catch break :blk null;
+                break :blk .{ .key = k, .value = v };
+            };
+            if (stored == null) {
+                warnConfigAt(lineno, "out of memory storing platform key '{s}'", .{key});
+                continue;
+            }
+            if (current_platform_applies) {
+                // Applied inline, in file order, into the top-level
+                // scope — a platform section is a conditional splice
+                // of the global scope, nothing more.
+                applyKvReporting(cfg, arena, key, value, lineno);
+            } else {
+                if (scratch == null) scratch = Config{ .arena = std.heap.ArenaAllocator.init(cfg.arena.?.child_allocator) };
+                applyKvReporting(&scratch.?, scratch.?.arena.?.allocator(), key, value, lineno);
+            }
+            continue;
+        }
         if (current_lsp) |srv| {
             applyLspKv(srv, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "lsp '{s}': bad value for '{s}' ({s})", .{ srv.name, key, @errorName(err) });
@@ -2185,11 +2349,40 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             if (!handled)
                 warnConfig("unknown profile key '{s}' (ignoring)", .{key});
         } else {
-            applyKv(cfg, arena, key, value) catch |err| {
-                warnConfigAt(lineno, "bad value for '{s}' ({s})", .{ key, @errorName(err) });
-            };
+            applyKvReporting(cfg, arena, key, value, lineno);
         }
     }
+}
+
+/// `applyKv` plus the parser's warning policy: an unknown key warns
+/// without a line number (it is not a syntax error, just a key this
+/// build does not have), a bad value warns with one. Shared by the
+/// top-level scope and by `[platform.<name>]` sections, so a line
+/// inside a platform section is reported exactly as it would be at
+/// top level.
+fn applyKvReporting(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8, lineno: usize) void {
+    applyKv(cfg, arena, key, value) catch |err| switch (err) {
+        error.UnknownKey => warnConfig("unknown key '{s}' (ignoring)", .{key}),
+        else => warnConfigAt(lineno, "bad value for '{s}' ({s})", .{ key, @errorName(err) }),
+    };
+}
+
+/// Check one top-level `key = value` as the parser would, without a
+/// live Config: what a `[platform.<name>]` section for another
+/// platform gets, so its keys are validated instead of skipped.
+/// `error.UnknownKey` for a key this build does not have.
+pub fn validateTopLevelKv(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    var scratch = Config{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    defer scratch.deinit();
+    try applyKv(&scratch, scratch.arena.?.allocator(), key, value);
+}
+
+fn findOrCreatePlatformSection(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*PlatformSection {
+    for (cfg.platform_sections.items) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    try cfg.platform_sections.append(arena, .{ .name = try arena.dupe(u8, name) });
+    return &cfg.platform_sections.items[cfg.platform_sections.items.len - 1];
 }
 
 fn findOrCreateDomain(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*Domain {
@@ -2794,8 +2987,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
     } else if (std.mem.eql(u8, key, "title_inactive_bg")) {
         cfg.title_inactive_bg = try parseColor(value);
     } else {
-        // Unknown key — warn but don't abort.
-        warnConfig("unknown key '{s}' (ignoring)", .{key});
+        // Unknown key. Reported (never fatal) by the caller, which
+        // also gets to say WHERE — the same line may be a platform
+        // section's, checked against a throwaway config.
+        return error.UnknownKey;
     }
 }
 
@@ -4345,4 +4540,297 @@ test "config: the styled font families and box drawing round-trip" {
     try std.testing.expectEqualStrings("Cascadia Italic", re.settings.font_family_italic);
     try std.testing.expectEqualStrings("Cascadia Bold Italic", re.settings.font_family_bold_italic);
     try std.testing.expect(!re.settings.builtin_box_drawing);
+}
+
+// -- [platform.<name>] sections ------------------------------------
+//
+// Every test below asserts RELATIVE behaviour (this platform vs the
+// other one) rather than "linux applies", so the same assertions hold
+// on the macOS build.
+
+const PlatformNames = struct { mine: []const u8, other: []const u8 };
+
+fn platformNames() !PlatformNames {
+    return switch (Platform.current orelse return error.SkipZigTest) {
+        .linux => .{ .mine = "linux", .other = "macos" },
+        .macos => .{ .mine = "macos", .other = "linux" },
+    };
+}
+
+test "config: this platform's section applies, another platform's does not" {
+    const p = try platformNames();
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\font_size = 10
+        \\scrollback = 100
+        \\
+        \\[platform.{s}]
+        \\font_size = 20
+        \\
+        \\[platform.{s}]
+        \\font_size = 30
+        \\scrollback = 300
+        \\
+    , .{ p.mine, p.other });
+
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    // Ours wins over the base; theirs never lands.
+    try std.testing.expectEqual(@as(u16, 20), cfg.settings.font_size);
+    try std.testing.expectEqual(@as(u32, 100), cfg.settings.scrollback);
+    // Both sections are retained so a save cannot drop the other
+    // machine's settings.
+    try std.testing.expectEqual(@as(usize, 2), cfg.platform_sections.items.len);
+    try std.testing.expectEqualStrings(p.mine, cfg.platform_sections.items[0].name);
+    try std.testing.expectEqualStrings(p.other, cfg.platform_sections.items[1].name);
+    try std.testing.expect(cfg.platformOverridesKey("font_size"));
+    try std.testing.expect(!cfg.platformOverridesKey("scrollback"));
+}
+
+test "config: app-level keys work inside a platform section" {
+    // A platform section is a conditional splice of the TOP LEVEL, not
+    // of a profile - so app-level keys are legal in it, unlike inside
+    // [profile.<name>].
+    const p = try platformNames();
+    var body_buf: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\[platform.{s}]
+        \\cursor_shape = bar
+        \\pane_gap = 8
+        \\
+    , .{p.mine});
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(CursorShape.bar, cfg.cursor_shape);
+    try std.testing.expectEqual(@as(f32, 8), cfg.pane_gap);
+}
+
+test "config: keys of a non-matching platform are validated, not skipped" {
+    // Directly: the check the parser runs for a section that is not
+    // ours. An unknown key is error.UnknownKey, a bad value is the
+    // value's own error - the same reports the top level gives.
+    const alloc = std.testing.allocator;
+    try validateTopLevelKv(alloc, "font_size", "20");
+    try std.testing.expectError(error.UnknownKey, validateTopLevelKv(alloc, "font_sizee", "20"));
+    try std.testing.expectError(error.BadCursorShape, validateTopLevelKv(alloc, "cursor_shape", "wedge"));
+    try std.testing.expectError(error.UnknownKey, validateTopLevelKv(alloc, "host", "devbox"));
+
+    // And through the parser: a broken line in the other platform's
+    // section is reported (to stderr) yet changes nothing here, and
+    // the section is still stored verbatim for the save path.
+    const p = try platformNames();
+    var body_buf: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\[platform.{s}]
+        \\font_sizee = 20
+        \\cursor_shape = wedge
+        \\
+    , .{p.other});
+    var cfg = try Config.loadFromBytes(alloc, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 14), cfg.settings.font_size);
+    try std.testing.expectEqual(CursorShape.block, cfg.cursor_shape);
+    try std.testing.expectEqual(@as(usize, 2), cfg.platform_sections.items[0].lines.items.len);
+}
+
+test "config: platform sections and [profile.<name>] seeding are order-sensitive" {
+    const p = try platformNames();
+    var buf: [512]u8 = undefined;
+
+    // Section BEFORE the profile: the profile is seeded from the
+    // Default settings as parsed so far, which already carry the
+    // platform value.
+    const before = try std.fmt.bufPrint(&buf,
+        \\font_size = 10
+        \\
+        \\[platform.{s}]
+        \\font_size = 20
+        \\
+        \\[profile.dev]
+        \\padding = 2
+        \\
+    , .{p.mine});
+    {
+        var cfg = try Config.loadFromBytes(std.testing.allocator, before);
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(u16, 20), cfg.profileSettings("dev").font_size);
+    }
+
+    // Section AFTER it: the profile was already seeded from 10, and
+    // nothing re-seeds it. Same rule as a plain global key written
+    // after a profile section.
+    const after = try std.fmt.bufPrint(&buf,
+        \\font_size = 10
+        \\
+        \\[profile.dev]
+        \\padding = 2
+        \\
+        \\[platform.{s}]
+        \\font_size = 20
+        \\
+    , .{p.mine});
+    {
+        var cfg = try Config.loadFromBytes(std.testing.allocator, after);
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(u16, 20), cfg.settings.font_size);
+        try std.testing.expectEqual(@as(u16, 10), cfg.profileSettings("dev").font_size);
+    }
+}
+
+test "config: prefix-keyed families inside a platform section" {
+    const p = try platformNames();
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\keybind.new_tab = <Control>t
+        \\symbol_map.powerline = U+E0A0-U+E0A3 Base Font
+        \\
+        \\[platform.{s}]
+        \\keybind.copy = <Super>c
+        \\keybind.new_tab = <Super>t
+        \\symbol_map.powerline = U+E0A0-U+E0A3 Mine Font
+        \\
+        \\[platform.{s}]
+        \\keybind.copy = <Control><Shift>c
+        \\symbol_map.powerline = U+E0A0-U+E0A3 Theirs Font
+        \\
+    , .{ p.mine, p.other });
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    // The list-accumulating family: a new action APPENDS, an action
+    // already bound is REPLACED - exactly as at top level.
+    try std.testing.expectEqual(@as(usize, 2), cfg.keybinds.items.len);
+    try std.testing.expectEqualStrings("new_tab", cfg.keybinds.items[0].name);
+    try std.testing.expectEqualStrings("<Super>t", cfg.keybinds.items[0].accel);
+    try std.testing.expectEqualStrings("copy", cfg.keybinds.items[1].name);
+    try std.testing.expectEqualStrings("<Super>c", cfg.keybinds.items[1].accel);
+
+    // The assigning family: one entry, ours.
+    try std.testing.expectEqual(@as(usize, 1), cfg.symbol_maps.items.len);
+    try std.testing.expectEqualStrings("Mine Font", cfg.symbol_maps.items[0].family);
+}
+
+test "config: an unknown platform name warns, applies nothing, and is kept" {
+    const body =
+        \\font_size = 10
+        \\
+        \\[platform.plan9]
+        \\font_size = 20
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 10), cfg.settings.font_size);
+    try std.testing.expectEqual(@as(usize, 1), cfg.platform_sections.items.len);
+    try std.testing.expectEqualStrings("plan9", cfg.platform_sections.items[0].name);
+    try std.testing.expect(!cfg.platformOverridesKey("font_size"));
+}
+
+test "config: platform sections round-trip through serialise and clone" {
+    const p = try platformNames();
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\font_size = 10
+        \\
+        \\[platform.{s}]
+        \\font_size = 20
+        \\keybind.copy = <Super>c
+        \\
+        \\[platform.{s}]
+        \\font_size = 30
+        \\
+        \\[profile.dev]
+        \\padding = 2
+        \\
+    , .{ p.mine, p.other });
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    var out: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try cfg.serialise(&w);
+    const text = w.buffered();
+
+    // Sections come out verbatim, and BEFORE the profile sections so
+    // the seeding they feed survives the round-trip.
+    var mine_hdr_buf: [32]u8 = undefined;
+    const mine_hdr = try std.fmt.bufPrint(&mine_hdr_buf, "[platform.{s}]", .{p.mine});
+    var other_hdr_buf: [32]u8 = undefined;
+    const other_hdr = try std.fmt.bufPrint(&other_hdr_buf, "[platform.{s}]", .{p.other});
+    const mine_at = std.mem.indexOf(u8, text, mine_hdr) orelse return error.TestUnexpectedResult;
+    const other_at = std.mem.indexOf(u8, text, other_hdr) orelse return error.TestUnexpectedResult;
+    const prof_at = std.mem.indexOf(u8, text, "[profile.dev]") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(mine_at < other_at);
+    try std.testing.expect(other_at < prof_at);
+    try std.testing.expect(std.mem.indexOf(u8, text, "font_size = 30") != null);
+
+    var re = try Config.loadFromBytes(std.testing.allocator, text);
+    defer re.deinit();
+    try std.testing.expectEqual(@as(u16, 20), re.settings.font_size);
+    try std.testing.expectEqual(@as(u16, 20), re.profileSettings("dev").font_size);
+    try std.testing.expectEqual(@as(usize, 2), re.platform_sections.items.len);
+    try std.testing.expectEqualStrings(p.other, re.platform_sections.items[1].name);
+    try std.testing.expectEqualStrings("font_size", re.platform_sections.items[1].lines.items[0].key);
+    try std.testing.expectEqualStrings("30", re.platform_sections.items[1].lines.items[0].value);
+    try std.testing.expectEqual(@as(usize, 1), re.keybinds.items.len);
+
+    // A second pass is byte-identical: the serialiser is a fixed point.
+    var out2: [4096]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&out2);
+    try re.serialise(&w2);
+    try std.testing.expectEqualStrings(text, w2.buffered());
+
+    // clone deep-copies the sections rather than aliasing the arena.
+    var cloned = try cfg.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cloned.platform_sections.items.len);
+    try std.testing.expectEqualStrings("keybind.copy", cloned.platform_sections.items[0].lines.items[1].key);
+    try std.testing.expectEqualStrings("<Super>c", cloned.platform_sections.items[0].lines.items[1].value);
+}
+
+test "config: the prefs save path keeps platform sections and flattens this platform's values" {
+    const p = try platformNames();
+    const c = @import("c.zig").c;
+    var tmpl = "/tmp/sketerm-cfgplat-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    defer _ = c.unlink(path.ptr);
+    defer _ = c.rmdir(dir);
+
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf,
+        \\font_size = 10
+        \\
+        \\[platform.{s}]
+        \\font_size = 20
+        \\
+        \\[platform.{s}]
+        \\scrollback = 300
+        \\
+    , .{ p.mine, p.other });
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try cfg.save(path);
+
+    var re = try Config.loadFromPath(std.testing.allocator, path);
+    defer re.deinit();
+    // Both sections survived the write.
+    try std.testing.expectEqual(@as(usize, 2), re.platform_sections.items.len);
+    try std.testing.expectEqualStrings("scrollback", re.platform_sections.items[1].lines.items[0].key);
+    // Behaviour on THIS platform is unchanged by the save.
+    try std.testing.expectEqual(@as(u16, 20), re.settings.font_size);
+
+    // The documented lossy part, pinned so a change to it is
+    // deliberate: `font_size = 10` is gone from the top level - the
+    // saved file carries the effective (platform) value there, so the
+    // OTHER platform would now start from 20 rather than 10.
+    var saved: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&saved);
+    try cfg.serialise(&w);
+    const text = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text, "font_size = 10") == null);
+    const hdr_at = std.mem.indexOf(u8, text, "[platform.") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, text[0..hdr_at], "font_size = 20") != null);
 }

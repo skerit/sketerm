@@ -112,7 +112,9 @@ further down.
 
 `light.` / `dark.` are profile-level and therefore work both at the
 top level and inside a profile section. The other four are app-level
-and only work at the top level.
+and only work at the top level -- which includes a
+`[platform.<name>]` section, since that is the top level made
+conditional.
 
 Within a family, a later line for the same name replaces the earlier
 one (for `hint.<name>.*`, a later line for the same *field* replaces
@@ -124,6 +126,7 @@ first, and that is also the order rules are scanned in).
 | Header | Contents |
 | --- | --- |
 | `[profile.<name>]` | profile-level keys; `<name>` = `default` edits the Default bundle |
+| `[platform.<name>]` | anything the top level accepts, applied only on `<name>` (`linux`, `macos`) |
 | `[domain.<name>]` | `host`, `transport` |
 | `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `enabled` |
 | `[mcp.<name>]` | `tools` (an MCP tool-exposure policy; a different namespace from `[profile.<name>]`) |
@@ -606,6 +609,110 @@ pane.
 
 ---
 
+## `[platform.<name>]` -- per-operating-system overrides
+
+One config file that behaves differently on two machines. The
+section's lines are exactly the lines you would write at the top
+level, and they are applied **only when `<name>` is the operating
+system this build runs on**.
+
+```
+font_family = JetBrains Mono
+font_size   = 12
+
+[platform.macos]
+font_family = SF Mono
+font_size   = 14
+keybind.copy = <Meta>c
+
+[platform.linux]
+keybind.copy = <Control><Shift>c
+```
+
+`<name>` is `linux` or `macos`, the two platforms sketerm targets.
+The test is a compile-time one (`builtin.os.tag`), not a runtime
+probe, so a `sketerm-mux` built for macOS reads a config as macOS
+even if the file was written on a Linux box. An unrecognised name
+(`windows`, a typo) warns and never applies -- the same policy
+unknown keys and unknown sections already have -- but the section is
+still kept and its keys are still checked, so a future platform name
+is not silently deleted from your file the next time you save.
+
+### Where in the parse it applies
+
+**Inline, in file order.** A platform section is a conditional splice
+of the *top level*: while it is open, every line is handled exactly as
+if it had been written at the top level, and when the platform does
+not match, the line is parsed for errors and then dropped.
+
+Three things follow.
+
+- **Everything the top level accepts is accepted here**: profile-level
+  keys (they edit the Default profile, as at the top level), app-level
+  keys, and the prefix-keyed families. `keybind.<action>` inside a
+  platform section appends to the same list as at the top level -- a
+  later line for the same action replaces the earlier one -- and
+  `symbol_map.<name>` / `shader_param.<name>` / `hint.<name>.<field>`
+  behave identically.
+- **A platform section cannot target a named profile.** It writes the
+  top level, so it edits the Default bundle. To give a *profile* a
+  per-platform value, put the platform section **before** the
+  `[profile.<name>]` section and let the ordinary seeding rule carry
+  it in.
+- **Order matters, exactly as it already does for global keys.** A
+  profile is seeded from the Default settings *as parsed so far*. So:
+
+  ```
+  font_size = 10
+  [platform.linux]
+  font_size = 20
+  [profile.dev]        # seeded with 20 on Linux
+  ```
+
+  and the other order:
+
+  ```
+  font_size = 10
+  [profile.dev]        # seeded with 10 everywhere
+  [platform.linux]
+  font_size = 20       # Default becomes 20; `dev` stays 10
+  ```
+
+  The serialiser always writes platform sections *before* the profile
+  sections, so a file it produced reloads to the same thing.
+
+### Keys for the other platform are still checked
+
+A `[platform.macos]` section is parsed on Linux too -- against a
+throwaway config that is then discarded. A misspelled key or an
+unparseable value in it warns at load with the same message it would
+get at the top level. The alternative (skip the section entirely)
+means half your file is never checked and breaks the day you switch
+machines.
+
+### What a Preferences save does to it
+
+Read this before mixing platform sections with the Preferences
+dialog.
+
+- **Your platform sections survive verbatim.** They are written back
+  with their lines unchanged, before the `[profile.*]` sections.
+- **But this platform's overrides also end up at the top level.** The
+  section is applied inline at parse time, so nothing downstream can
+  tell `font_size = 14` in `[platform.macos]` apart from
+  `font_size = 14` written at the top level. The dialog serialises the
+  effective value, so after a save on macOS the top level carries 14
+  and the original top-level 12 is gone. On macOS nothing changes
+  (the section sets 14 anyway); on **Linux** that key now starts from
+  14 rather than 12, unless `[platform.linux]` sets it too.
+- Consequence: **either give every key you override a value in both
+  platform sections, or do not save from the dialog** on a config that
+  uses them. The dialog already rewrites a hand-written file (comments
+  and ordering are lost); this is the one case where it can also
+  change what the file *means* on the other machine.
+- `Config.save` prints a warning to stderr whenever it writes a config
+  that has platform sections.
+
 ## `[domain.<name>]` -- named mux endpoints
 
 Each section names a remote `sketerm-mux` endpoint. The command
@@ -678,7 +785,9 @@ start on an unknown term, naming it.
 
 1. Built-in defaults (the field initialisers in `src/config.zig`).
 2. The config file, in file order -- a later line for the same key
-   wins.
+   wins. A `[platform.<name>]` line counts as a line at the position
+   it appears in the file, so a matching platform section beats an
+   earlier top-level line and loses to a later one.
 3. Environment overrides, which beat the file because an explicit
    invocation beats persistent config. They apply to the **Default
    profile only**; named profiles keep their own values.
@@ -732,6 +841,11 @@ Two states are not expressible in the format and so survive a
 round-trip as the seeded value rather than as "unset": clearing a
 profile's `palette` back to none, and clearing a `light.` / `dark.`
 field back to inherit.
+
+A third, bigger one: a config using `[platform.<name>]` sections
+keeps them verbatim but has this platform's overrides flattened into
+the top level. See that section for what that costs and how to avoid
+it.
 
 The list-shaped families do not have that problem: removing every
 `symbol_map.<name>` or every `hint.<name>.*` entry writes no line for
