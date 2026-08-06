@@ -84,20 +84,20 @@ const RowCtx = struct {
 pub fn open(win: *Window) bool {
     const pane = win.focusedPane() orelse return false;
     const src: []const u8 = blk: {
-        if (pane.shader_own.src) |s| break :blk s;
+        if (pane.surface.shader_own.src) |s| break :blk s;
         if (win.shader_source.src) |s| break :blk s;
         return false;
     };
 
     const ctx = win.allocator.create(Ctx) catch return false;
     ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
-    const eff_path: []const u8 = if (pane.custom_shader_path) |p| p else win.config.settings.custom_shader;
+    const eff_path: []const u8 = if (pane.surface.custom_shader_path) |p| p else win.config.settings.custom_shader;
     ctx.path_copy = win.allocator.dupe(u8, eff_path) catch null;
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
     ctx.src_copy = win.allocator.dupe(u8, src) catch null;
     if (ctx.src_copy) |sc| {
-        const src_dir: ?[]const u8 = if (pane.shader_own.src != null)
-            pane.shader_own.dir
+        const src_dir: ?[]const u8 = if (pane.surface.shader_own.src != null)
+            pane.surface.shader_own.dir
         else
             win.shader_source.dir;
         if (src_dir) |d| ctx.dir_copy = win.allocator.dupe(u8, d) catch null;
@@ -268,7 +268,7 @@ pub fn open(win: *Window) bool {
                 defer win.allocator.free(nz);
                 c.gtk_string_list_append(model, nz.ptr);
                 count += 1;
-                if (pane.preset_name) |bound| {
+                if (pane.surface.preset_name) |bound| {
                     if (std.mem.eql(u8, bound, nm)) preselect = count;
                 }
             }
@@ -316,7 +316,7 @@ pub fn open(win: *Window) bool {
 
         // Prefill the name with the pane's bound preset (if any) and
         // settle initial button sensitivity.
-        if (pane.preset_name) |pn| {
+        if (pane.surface.preset_name) |pn| {
             if (dupZ(win.allocator, pn)) |pz| {
                 defer win.allocator.free(pz);
                 c.gtk_editable_set_text(@ptrCast(srow), pz.ptr);
@@ -369,7 +369,7 @@ fn alivePane(ctx: *Ctx) ?*Pane {
 /// preset params when a preset is bound, else the global config.
 fn effectiveOverrides(ctx: *Ctx) []const shader_pass.ParamKV {
     if (alivePane(ctx)) |pane| {
-        if (pane.hasOwnShaderParams()) return pane.preset_params.items;
+        if (pane.hasOwnShaderParams()) return pane.surface.preset_params.items;
     }
     return ctx.win.config.shader_params.items;
 }
@@ -549,7 +549,7 @@ fn onPresetDeleteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // its current shader and values, just loses the (now dangling)
     // name so layouts stop referencing it.
     if (alivePane(ctx)) |pane| {
-        if (pane.preset_name) |bound| {
+        if (pane.surface.preset_name) |bound| {
             if (std.mem.eql(u8, bound, name)) pane.unbindPresetName();
         }
     }

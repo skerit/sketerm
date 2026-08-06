@@ -527,7 +527,7 @@ pub fn onNotifyActivate(_: *c.GSimpleAction, param: ?*c.GVariant, user: ?*anyopa
         if (tabPageForPane(self, slot.pane)) |page| {
             c.adw_tab_view_set_selected_page(self.tab_view, page);
         }
-        _ = c.gtk_widget_grab_focus(@ptrCast(slot.pane.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(slot.pane.surface.area));
     }
     if (slot.want_report) {
         // Spec: OSC 99 ; i=<id> ; <button-or-empty>. id was sanitized

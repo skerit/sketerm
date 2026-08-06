@@ -1067,10 +1067,10 @@ pub const EditorView = struct {
         self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
         self.pane = pane;
-        self.font_size = pane.font_size;
-        self.line_pad = pane.line_pad_px;
-        if (pane.font_path) |fp| self.font_path = allocator.dupe(u8, fp) catch null;
-        if (pane.font_family) |ff| self.font_family = allocator.dupe(u8, ff) catch null;
+        self.font_size = pane.surface.font_size;
+        self.line_pad = pane.surface.line_pad_px;
+        if (pane.surface.font_path) |fp| self.font_path = allocator.dupe(u8, fp) catch null;
+        if (pane.surface.font_family) |ff| self.font_family = allocator.dupe(u8, ff) catch null;
 
         self.buildUi();
         pane.attachEditor(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
@@ -3315,7 +3315,7 @@ pub const EditorView = struct {
     // ---- caret blink ---------------------------------------------------
 
     /// g_timeout, NOT a frame-clock tick: a tick callback on a
-    /// GtkGLArea leaks under Wayland (Pane.blink_timer, same reason).
+    /// GtkGLArea leaks under Wayland (TerminalSurface.blink_timer, same reason).
     fn startBlink(self: *EditorView) void {
         if (self.blink_timer != 0) return;
         self.blink_timer = c.g_timeout_add(530, @ptrCast(&onBlinkTimer), @ptrCast(self));

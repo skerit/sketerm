@@ -727,8 +727,8 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             if (pane.editorFaceVisible()) {
                 if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
                     ev.focusFace();
-                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
-            } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+            } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (req.tab != null) {
             const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
@@ -829,7 +829,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         if (req.pane != null or req.session != null) {
             const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             target = ownerWindow(self, pane);
-            _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+            _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
         }
         winmod.dispatchAction(target, action);
         try ipc_protocol.writeOk(out, allocator, null, {});

@@ -52,7 +52,7 @@ pub fn attachSessionByHost(self: *Window, name: []const u8, host: ?[]const u8) b
 pub fn focusPaneTab(self: *Window, pane: *Pane) void {
     if (winmod.tabPageForPane(self, pane)) |page| {
         c.adw_tab_view_set_selected_page(self.tab_view, page);
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
     }
     c.gtk_window_present(@ptrCast(self.app_window));
 }
@@ -201,7 +201,7 @@ pub fn focusOrAttachSession(self: *Window, name: []const u8) void {
         if (!std.mem.eql(u8, r.session, name)) continue;
         if (winmod.tabPageForPane(self, p)) |page| {
             c.adw_tab_view_set_selected_page(self.tab_view, page);
-            _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+            _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
             return;
         }
     }
@@ -765,7 +765,7 @@ pub fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
     };
     const profile = if (old.active_profile) |name| win.findProfile(name) else null;
     pane.active_profile = if (profile) |p| p.name else null;
-    win.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = old.font_size });
+    win.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = old.surface.font_size });
     _ = win.swapPaneInPlace(old, pane) catch {
         // No tab slot to land in (mid-teardown) — drop the new pane.
         win.unlistPane(pane);
@@ -869,7 +869,7 @@ pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Co
     c.adw_tab_page_set_title(page, title_z.ptr);
     c.adw_tab_page_set_tooltip(page, title_z.ptr);
     c.adw_tab_view_set_selected_page(self.tab_view, page);
-    _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+    _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
 }
 
 // ── tabless app-session callbacks (Terminal → AppSession) ────────
