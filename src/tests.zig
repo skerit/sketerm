@@ -51,6 +51,7 @@ comptime {
     _ = @import("render/boxdraw.zig");
     _ = @import("render/scrollbar.zig");
     _ = @import("render/cursor_trail.zig");
+    _ = @import("render/blend.zig");
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
     _ = @import("editor_app.zig");

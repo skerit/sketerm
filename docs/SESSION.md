@@ -14216,3 +14216,63 @@ compositor-driven pointer for one that lags every frame of input
 latency, for a novelty sprite. The feature-parity list called the item
 "cursor trails and custom pointer effects"; only the first half is a
 feature.
+
+## Text blending: gamma space, linear light, and the corrected middle
+
+sRGB values are not proportional to light - 128 carries about 21% of
+255's light, not half - so blending antialiased glyph coverage on the
+encoded values, which is what this renderer has always done at all six
+blend sites, leaves partially covered edge pixels too dark. The visible
+symptoms are a dark fringe where complementary colours meet along a
+glyph edge (red on green is the classic) and light-on-dark text reading
+thinner than it should.
+
+`text_blending` now picks the space: `native` (unchanged, and the
+default), `linear`, or `linear_corrected`. Ghostty's `linear-corrected`
+spelling parses too, so a value copied from its docs works. The reason
+the third mode exists is that font rasterisation has been tuned against
+gamma-space blending for decades: correcting the maths alone thins dark
+text and thickens light text, which reads as "my font broke" rather
+than as a fix, so the corrected mode puts perceived weight back where
+native had it while keeping the fringe gone.
+
+Both linear modes detour through an sRGB offscreen target, because a
+GtkGLArea's framebuffer is a hardcoded GL_RGBA8 texture with no way to
+ask for an sRGB format - the same GTK limitation that made Display P3
+unimplementable here. The detour sits INSIDE the existing custom-shader
+and pane-dim detour, so the scene resolves back to sRGB-encoded RGBA8
+before a user shader ever sees it and a CRT shader keeps operating on
+the pixels it always did. If that target cannot be built the frame
+renders `native` rather than handing linear light to a plain RGBA8
+framebuffer, which would wash the whole pane out; every pass writing
+into the framebuffer is set from one value so they cannot disagree.
+`glClearColor` is the one colour that never passes through a fragment
+shader, so the linear modes owe it linear light explicitly.
+
+`smoke-cell` is what makes any of this checkable. Per mode it probes a
+glyph EDGE pixel, a fully covered INTERIOR pixel and an untouched
+BACKGROUND pixel, on both shader pairs - CellPass for an ASCII row,
+GridPass for a DECDWL row, since emoji and CJK rows route through the
+other pair and a correction applied to one only would leave adjacent
+lines looking different:
+
+    blend CellPass(ASCII)  edge=390 interior=110 bg=940
+                           moved(lin/cor)=390/390 lighter=390 darker=0
+                           native_drift=0
+    blend GridPass(DECDWL) edge=610 interior=1008 bg=634
+                           moved(lin/cor)=610/610 lighter=610 darker=0
+                           native_drift=0
+
+`native_drift=0` is the regression guard that makes "the default is
+byte-identical" a measurement instead of a claim. Every edge pixel
+moves in both new modes while interior and background pixels do not,
+which is what proves the change is confined to antialiased coverage
+rather than tinting whole cells; and all 390/610 of them move LIGHTER,
+which is the fringe collapse being undone rather than some other
+difference.
+
+Default stays `native` deliberately. Ghostty defaults to
+linear-corrected on Linux and there is a good case for following, but
+flipping it changes how every glyph looks for every existing user, so
+it is one line and a taste call rather than something to slip into a
+release.

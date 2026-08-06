@@ -1372,6 +1372,312 @@ pub fn main() !u8 {
         }
     }
 
+    // text_blending = native | linear | linear_corrected.
+    {
+        const rc = try blendModeStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
+    return 0;
+}
+
+// ---- text_blending -------------------------------------------------
+
+const Blend = @import("render/blend.zig");
+
+/// Render the SAME scene once per `text_blending` mode and prove the
+/// change is confined to antialiased coverage.
+///
+/// The scene is deliberately red fg on green bg: complementary
+/// colours are the case gamma-space blending wrecks (a half-covered
+/// edge pixel collapses toward black), so it is the case `linear`
+/// exists to fix.
+///
+/// Nothing here is compared against a golden dump. Instead the native
+/// pass is used to RECOVER each edge pixel's coverage — native IS a
+/// lerp in encoded space, so `a = (N - B) / (F - B)` is exact — and
+/// the other two modes are then predicted analytically from that same
+/// `a`. That makes the test non-circular: it would still fail if the
+/// native path had silently changed, because the recovered coverage
+/// would no longer predict anything consistent, and it pins the
+/// linear maths to the sRGB curve rather than to whatever the shader
+/// happens to compute.
+fn blendModeStage(allocator: std.mem.Allocator) !u8 {
+    const BW: c_int = 256;
+    const BH: c_int = 64;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, BW, BH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: blend FAIL — framebuffer incomplete\n", .{});
+        return 70;
+    }
+
+    var atlas: ?*Atlas = null;
+    for (FONT_CANDIDATES) |path| {
+        if (Atlas.init(allocator, path, FONT_SIZE)) |a| {
+            atlas = a;
+            break;
+        } else |_| continue;
+    }
+    if (atlas == null) {
+        std.debug.print("smoke-cell: blend FAIL — no font\n", .{});
+        return 71;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(allocator, &pool, 24, 3);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    // Row 0: pure red on pure green, ASCII — CellPass.
+    // Row 2: the same colours and the same glyphs, but the line is
+    //        DECDWL (ESC # 6). `ln.scaling != .single` is what routes
+    //        a row to the GridPass overlay, so this exercises the
+    //        OTHER shader pair without depending on a CJK or emoji
+    //        font being installed on the build host.
+    parser.advance(
+        "\x1b[38;2;255;0;0m\x1b[48;2;0;255;0mHHHHHHHHHH" ++
+            // Full blocks alongside the letters: a 2x-scaled `H` stem
+            // never reaches full coverage under the atlas's linear
+            // filter, so without them the row has no interior pixels
+            // to hold still.
+            "\x1b[3;1H\x1b#6\x1b[38;2;255;0;0m\x1b[48;2;0;255;0mH█H█H█H█\x1b[0m",
+        Emit.cb,
+        @ptrCast(&ec),
+    );
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(BW);
+    grid_pass.canvas_h = @floatFromInt(BH);
+
+    var target: Blend.LinearTarget = .{};
+    defer target.releaseGL();
+
+    const px_count: usize = @intCast(BW * BH);
+    var shots: [3][]u8 = undefined;
+    for (&shots) |*s| s.* = try allocator.alloc(u8, px_count * 4);
+    defer for (shots) |s| allocator.free(s);
+
+    const modes = [3]Blend.Mode{ .native, .linear, .linear_corrected };
+    for (modes, 0..) |mode, mi| {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        const on = target.begin(mode, BW, BH);
+        if (mode != .native and !on) {
+            std.debug.print("smoke-cell: blend FAIL — sRGB target unavailable for {s}\n", .{@tagName(mode)});
+            return 72;
+        }
+        const eff: Blend.Mode = if (on) mode else .native;
+        cell_pass.blend_mode = eff;
+        grid_pass.blend_mode = eff;
+        c.glViewport(0, 0, BW, BH);
+        // Black clear, so a background pixel is unambiguously "no cell
+        // drew here" and the cell bg quads are what carry the green.
+        const clear = Blend.clearColor(eff, .{ 0, 0, 0, 1 });
+        c.glClearColor(clear[0], clear[1], clear[2], clear[3]);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.markAllDirty();
+        try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+        cell_pass.draw(atlas.?, BW, BH);
+        grid_pass.vbuf_valid = false;
+        try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+        grid_pass.draw(atlas.?, BW, BH);
+        if (on) target.finish(BW, BH);
+        c.glFinish();
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        c.glReadPixels(0, 0, BW, BH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, shots[mi].ptr);
+    }
+
+    // Cell geometry: row 0 is the CellPass row, row 2 the GridPass one.
+    // glReadPixels is bottom-up, so a screen row r maps to scanlines
+    // [BH - (pad + (r+1)*ch), BH - (pad + r*ch)).
+    const ch: usize = atlas.?.cell_h;
+    const pad: usize = @intFromFloat(grid_pass.pad);
+    const hu: usize = @intCast(BH);
+    const wu: usize = @intCast(BW);
+
+    const Row = struct { name: []const u8, y_lo: usize, y_hi: usize };
+    const rows = [2]Row{
+        .{ .name = "CellPass(ASCII)", .y_lo = hu -| (pad + ch), .y_hi = hu -| pad },
+        .{ .name = "GridPass(DECDWL)", .y_lo = hu -| (pad + 3 * ch), .y_hi = hu -| (pad + 2 * ch) },
+    };
+
+    var failures: u8 = 0;
+    for (rows) |row| {
+        var n_edge: usize = 0;
+        var n_interior: usize = 0;
+        var n_bg: usize = 0;
+        var interior_moved: usize = 0;
+        var bg_moved: usize = 0;
+        var edge_moved_linear: usize = 0;
+        var edge_moved_corrected: usize = 0;
+        var edge_lighter: usize = 0;
+        var edge_darker: usize = 0;
+        var native_drifted: usize = 0;
+        // Worst analytic mismatch across every edge pixel, in 8-bit
+        // levels, for each of the two linear modes.
+        var worst_lin: f32 = 0;
+        var worst_cor: f32 = 0;
+
+        var y = row.y_lo;
+        while (y < row.y_hi) : (y += 1) {
+            var x: usize = pad;
+            while (x < wu - pad) : (x += 1) {
+                const o = (y * wu + x) * 4;
+                const nr: i32 = shots[0][o + 0];
+                const ng: i32 = shots[0][o + 1];
+                const nb: i32 = shots[0][o + 2];
+                // Green cell bg with red text: R rises and G falls
+                // together with coverage, B stays 0 throughout.
+                if (nb != 0) continue;
+                if (nr == 0 and ng == 0) continue; // outside the cell run
+                const is_bg = (nr == 0 and ng == 255);
+                const is_fg = (nr == 255 and ng == 0);
+                const is_edge = !is_bg and !is_fg and nr > 4 and nr < 251;
+
+                if (is_bg or is_fg) {
+                    // Fully-covered and fully-uncovered pixels must not
+                    // move: that is what proves the modes only touch
+                    // partial coverage. One 8-bit level of slack for the
+                    // sRGB texture round trip through the resolve.
+                    if (is_bg) n_bg += 1 else n_interior += 1;
+                    for (1..3) |m| {
+                        var ch_i: usize = 0;
+                        while (ch_i < 3) : (ch_i += 1) {
+                            const d = @abs(@as(i32, shots[m][o + ch_i]) - @as(i32, shots[0][o + ch_i]));
+                            if (d > 1) {
+                                if (is_bg) bg_moved += 1 else interior_moved += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (!is_edge) continue;
+                n_edge += 1;
+
+                // Recover coverage from native: native = fg*a + bg*(1-a)
+                // in ENCODED space, fg.r = 1, bg.r = 0 -> a = nr/255.
+                const a: f32 = @as(f32, @floatFromInt(nr)) / 255.0;
+                const fg = [3]f32{ 1, 0, 0 };
+                const bg = [3]f32{ 0, 1, 0 };
+                // ...and cross-check it against the OTHER channel. If
+                // `native` had stopped being a plain lerp in encoded
+                // space — i.e. if the default had drifted — green would
+                // no longer be 255*(1-a).
+                if (@abs(255.0 * (1.0 - a) - @as(f32, @floatFromInt(ng))) > 1.5) native_drifted += 1;
+
+                // Predicted `linear`: lerp in linear light, re-encoded.
+                var want_lin: [3]f32 = undefined;
+                for (0..3) |k| {
+                    const l = Blend.linearize(fg[k]) * a + Blend.linearize(bg[k]) * (1 - a);
+                    want_lin[k] = Blend.unlinearize(l);
+                }
+                // Predicted `linear_corrected`: same, with the remapped
+                // coverage.
+                const a2 = Blend.correctCoverage(a, fg, bg);
+                var want_cor: [3]f32 = undefined;
+                for (0..3) |k| {
+                    const l = Blend.linearize(fg[k]) * a2 + Blend.linearize(bg[k]) * (1 - a2);
+                    want_cor[k] = Blend.unlinearize(l);
+                }
+                for (0..3) |k| {
+                    const got_l: f32 = @floatFromInt(shots[1][o + k]);
+                    const got_c: f32 = @floatFromInt(shots[2][o + k]);
+                    worst_lin = @max(worst_lin, @abs(got_l - want_lin[k] * 255.0));
+                    worst_cor = @max(worst_cor, @abs(got_c - want_cor[k] * 255.0));
+                }
+
+                var moved_l = false;
+                var moved_c = false;
+                for (0..3) |k| {
+                    if (@abs(@as(i32, shots[1][o + k]) - @as(i32, shots[0][o + k])) > 2) moved_l = true;
+                    if (@abs(@as(i32, shots[2][o + k]) - @as(i32, shots[0][o + k])) > 2) moved_c = true;
+                }
+                if (moved_l) edge_moved_linear += 1;
+                if (moved_c) edge_moved_corrected += 1;
+
+                // The artifact itself: red-on-green in gamma space
+                // collapses the edge toward black. `linear` must give
+                // that pixel MORE light.
+                const lum_n = 0.2126 * Blend.linearize(@as(f32, @floatFromInt(nr)) / 255.0) +
+                    0.7152 * Blend.linearize(@as(f32, @floatFromInt(ng)) / 255.0);
+                const lum_l = 0.2126 * Blend.linearize(@as(f32, @floatFromInt(shots[1][o + 0])) / 255.0) +
+                    0.7152 * Blend.linearize(@as(f32, @floatFromInt(shots[1][o + 1])) / 255.0);
+                if (lum_l > lum_n + 0.002) edge_lighter += 1;
+                if (lum_l < lum_n - 0.002) edge_darker += 1;
+            }
+        }
+
+        std.debug.print(
+            "smoke-cell: blend {s} edge={d} interior={d} bg={d} moved(lin/cor)={d}/{d} lighter={d} darker={d} native_drift={d} maxerr(lin/cor)={d:.2}/{d:.2}\n",
+            .{ row.name, n_edge, n_interior, n_bg, edge_moved_linear, edge_moved_corrected, edge_lighter, edge_darker, native_drifted, worst_lin, worst_cor },
+        );
+
+        if (native_drifted != 0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} native is no longer a plain gamma-space lerp ({d} px)\n", .{ row.name, native_drifted });
+            failures += 1;
+        }
+
+        if (n_edge < 5 or n_interior < 5 or n_bg < 5) {
+            std.debug.print("smoke-cell: blend FAIL — {s} did not produce enough classified pixels\n", .{row.name});
+            failures += 1;
+            continue;
+        }
+        if (interior_moved != 0 or bg_moved != 0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} moved fully-covered ({d}) or background ({d}) pixels\n", .{ row.name, interior_moved, bg_moved });
+            failures += 1;
+        }
+        if (edge_moved_linear == 0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} linear is indistinguishable from native at glyph edges\n", .{row.name});
+            failures += 1;
+        }
+        if (edge_moved_corrected == 0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} linear_corrected is indistinguishable from native at glyph edges\n", .{row.name});
+            failures += 1;
+        }
+        if (edge_lighter == 0 or edge_darker != 0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} red-on-green edges did not get lighter under linear\n", .{row.name});
+            failures += 1;
+        }
+        // 3 levels of 255 covers the sRGB round trip plus the shader's
+        // float pow; anything larger means the maths, not the encoding.
+        if (worst_lin > 3.0 or worst_cor > 3.0) {
+            std.debug.print("smoke-cell: blend FAIL — {s} pixels do not match the analytic prediction\n", .{row.name});
+            failures += 1;
+        }
+    }
+
+    if (failures != 0) return 73;
     return 0;
 }

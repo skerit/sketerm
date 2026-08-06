@@ -31,6 +31,18 @@ const ProfileButtonCtx = struct {
 
 const ColorPair = struct { fg: [4]f32, bg: [4]f32 };
 
+/// `config.TextBlending` -> the render layer's mirror of it. The two
+/// enums are separate because `render/blend.zig` must not import
+/// config (which compiles into the libc-only `sketerm-mux`), and this
+/// switch is what keeps them from silently diverging.
+fn textBlendMode(v: @import("../config.zig").TextBlending) @import("../render/blend.zig").Mode {
+    return switch (v) {
+        .native => .native,
+        .linear => .linear,
+        .linear_corrected => .linear_corrected,
+    };
+}
+
 const PresetButtonCtx = struct {
     window: *Window,
     preset_name: [:0]u8, // owned, freed by GDestroyNotify
@@ -306,6 +318,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pushPaneColors(self, pane, s);
     pane.grid_pass.enable_ligatures = self.config.ligatures;
     pane.grid_pass.enable_bidi = self.config.bidi;
+    pane.text_blending = textBlendMode(self.config.text_blending);
     applyPanePresentation(self, pane, s);
     term.screen.scrollback_capacity = s.scrollback;
     pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
@@ -833,6 +846,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         p.cell_pass.bold_is_bright = self.config.bold_is_bright;
         p.grid_pass.min_contrast = self.config.minimum_contrast;
         p.cell_pass.min_contrast = self.config.minimum_contrast;
+        p.text_blending = textBlendMode(self.config.text_blending);
         // Behavior.
         screen.bracketed_paste = self.config.bracketed_paste;
         screen.modify_other_keys = self.config.modify_other_keys;

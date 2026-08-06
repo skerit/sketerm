@@ -14,6 +14,7 @@ const cast = @import("../util/cast.zig");
 const render_kick = @import("../util/render_kick.zig");
 const Config = @import("../config.zig").Config;
 const CursorShape = @import("../config.zig").CursorShape;
+const TextBlending = @import("../config.zig").TextBlending;
 const ExitAction = @import("../config.zig").ExitAction;
 const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
@@ -423,6 +424,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.edit.font_size, applyOnly);
     addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.edit.line_pad_px, applyOnly);
     addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.edit.padding, applyOnly);
+    addTextBlendingRow(@ptrCast(@alignCast(font_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
 
     const cursor_group = c.adw_preferences_group_new();
@@ -1369,6 +1371,32 @@ fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
         const dup = ctx.dupe(slice) catch return;
         ctx.edit.shell = dup;
     }
+    ctx.ev();
+}
+
+/// `text_blending`: the subtitle has to warn about the weight shift,
+/// because that is what a user notices first and would otherwise read
+/// as "my font broke" rather than as the mode doing its job.
+fn addTextBlendingRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{
+        "Native (gamma space)",
+        "Linear light",
+        "Linear, weight-corrected",
+    });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Text blending");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Native is what terminals have always done. Linear removes the dark fringe where complementary colours meet, but thins dark text and thickens light text; the corrected variant keeps the fringe fix without the weight shift.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(ctx.cfg.text_blending));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = textBlendingSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn textBlendingSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.text_blending = std.enums.fromInt(TextBlending, @min(idx, 2)) orelse .native;
     ctx.ev();
 }
 

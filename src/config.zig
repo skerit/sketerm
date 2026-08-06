@@ -77,6 +77,35 @@ pub const AppView = enum { window, tab };
 /// `multi` overrides every face.
 pub const InputMethod = enum { auto, simple, multi };
 
+/// Colour space antialiased glyph coverage (and image alpha) is
+/// blended in. Ghostty's `alpha-blending` key, which it shipped as
+/// `text-blending` first; the value names are kept identical so its
+/// documentation transfers.
+///
+/// - `native` — blend in the framebuffer's own (sRGB-encoded) space.
+///   Physically wrong (sRGB values are not proportional to light) but
+///   it is what every terminal did for decades, so it is the default.
+/// - `linear` — blend in linear light. Removes the dark fringe that
+///   complementary colours (red on green) produce at glyph edges, at
+///   the cost of dark text reading thinner and light text thicker.
+/// - `linear_corrected` — `linear` plus a per-fragment coverage
+///   correction that restores `native`'s apparent stem weight, so the
+///   fringe goes without the weight shift.
+///
+/// `linear-corrected` (ghostty's spelling) parses too.
+pub const TextBlending = enum(u8) {
+    native = 0,
+    linear = 1,
+    linear_corrected = 2,
+
+    /// Whether the render path has to detour through the linear-light
+    /// offscreen target. `native` renders straight to the GtkGLArea
+    /// framebuffer and costs nothing.
+    pub fn needsLinearTarget(self: TextBlending) bool {
+        return self != .native;
+    }
+};
+
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
@@ -1113,6 +1142,16 @@ pub const Config = struct {
     /// minimum-contrast.
     minimum_contrast: f32 = 1.0,
 
+    /// Colour space glyph coverage is blended in (see TextBlending).
+    /// App-level, like every other rendering flag: it changes the GL
+    /// target every pane in the window draws into, and a per-profile
+    /// value would mean two framebuffer formats in one share group.
+    ///
+    /// DEFAULT DELIBERATELY `native`: anything else changes how every
+    /// glyph looks on upgrade. Flipping this one line to
+    /// `.linear_corrected` is the intended way to change that.
+    text_blending: TextBlending = .native,
+
     /// Background image (absolute path, PNG/JPEG via stb). Empty =
     /// off. Drawn cover-cropped behind the cell grid; wins over the
     /// gradient when both are set.
@@ -1829,6 +1868,8 @@ pub const Config = struct {
             try w.print("inactive_desaturate = {d:.2}\n", .{self.inactive_desaturate});
         if (self.minimum_contrast != 1.0)
             try w.print("minimum_contrast = {d:.2}\n", .{self.minimum_contrast});
+        if (self.text_blending != .native)
+            try w.print("text_blending = {s}\n", .{@tagName(self.text_blending)});
 
         // Background layer.
         if (self.background_image.len > 0)
@@ -2946,6 +2987,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "minimum_contrast")) {
         cfg.minimum_contrast = std.math.clamp(try parseFloat(value), 1.0, 21.0);
+    } else if (std.mem.eql(u8, key, "text_blending")) {
+        // Ghostty spells the third value `linear-corrected`; accept
+        // both so a config copied from its docs just works.
+        if (std.mem.eql(u8, value, "native")) cfg.text_blending = .native
+        else if (std.mem.eql(u8, value, "linear")) cfg.text_blending = .linear
+        else if (std.mem.eql(u8, value, "linear_corrected") or
+            std.mem.eql(u8, value, "linear-corrected")) cfg.text_blending = .linear_corrected
+        else return error.BadTextBlending;
     } else if (std.mem.eql(u8, key, "tab_title_template")) {
         cfg.tab_title_template = try parseTitleTemplate(arena, key, value, default_tab_title);
     } else if (std.mem.eql(u8, key, "window_title_template")) {

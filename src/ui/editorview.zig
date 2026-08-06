@@ -910,6 +910,10 @@ pub const EditorView = struct {
     /// Valid iff `atlas != null`; address handed to every Layout.
     book: FontBook = undefined,
     pass: EditorPass,
+    /// sRGB offscreen detour for the non-native `text_blending` modes
+    /// — the editor face owns its own GtkGLArea, so it needs its own.
+    linear_target: @import("../render/blend.zig").LinearTarget = .{},
+    text_blending: @import("../render/blend.zig").Mode = .native,
     colors: editor_pass.Colors = .{},
 
     tabs: std.ArrayList(*ETab) = .empty,
@@ -1113,6 +1117,11 @@ pub const EditorView = struct {
         self.auto_close = cfg.editor_auto_close_pairs;
         self.smart_backspace = cfg.editor_smart_backspace;
         self.rebuildEdBindings(cfg);
+        self.text_blending = switch (cfg.text_blending) {
+            .native => .native,
+            .linear => .linear,
+            .linear_corrected => .linear_corrected,
+        };
         self.git_gutter = cfg.editor_git_gutter;
         self.outline_default = cfg.editor_outline;
         self.search_max_files = @max(1, cfg.editor_project_search_max_files);
@@ -2808,6 +2817,7 @@ pub const EditorView = struct {
             self.atlas = null;
         }
         self.pass.forgetGL();
+        self.linear_target.forgetGL();
         self.atlas = self.createAtlas();
         if (self.atlas == null) {
             std.debug.print("sketerm: editor realize found no usable font\n", .{});
@@ -2830,6 +2840,7 @@ pub const EditorView = struct {
             return;
         }
         self.pass.releaseGL();
+        self.linear_target.releaseGL();
         if (self.atlas) |a| a.releaseGL();
     }
 
@@ -2840,10 +2851,17 @@ pub const EditorView = struct {
         const scale = c.gtk_widget_get_scale_factor(@ptrCast(area));
         const pw: c_int = w * scale;
         const ph: c_int = h * scale;
+        const linear_on = self.linear_target.begin(self.text_blending, pw, ph);
+        const eff_mode = if (linear_on) self.text_blending else .native;
+        self.pass.blend_mode = eff_mode;
         c.glViewport(0, 0, pw, ph);
         const bg = self.theme.bg;
-        c.glClearColor(bg[0], bg[1], bg[2], bg[3]);
+        self.pass.default_bg = bg;
+        // glClear writes through the target's sRGB encode too.
+        const clear = @import("../render/blend.zig").clearColor(eff_mode, bg);
+        c.glClearColor(clear[0], clear[1], clear[2], clear[3]);
         c.glClear(c.GL_COLOR_BUFFER_BIT);
+        defer if (linear_on) self.linear_target.finish(pw, ph);
         const atlas = self.atlas orelse return 1;
         const tab = self.active orelse return 1;
         self.syncFolds(tab);

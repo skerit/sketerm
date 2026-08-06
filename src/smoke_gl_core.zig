@@ -16,6 +16,7 @@ const cell_pass = @import("render/cell_pass.zig");
 const grid_pass = @import("render/grid_pass.zig");
 const shader_pass = @import("render/shader_pass.zig");
 const editor_pass = @import("render/editor_pass.zig");
+const blend = @import("render/blend.zig");
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -96,6 +97,9 @@ pub fn main() !u8 {
     failures += try check("cell_pass", cell_pass.VERT_SRC, cell_pass.FRAG_SRC);
     failures += try check("grid_pass", grid_pass.VERT_SRC, grid_pass.FRAG_SRC);
     failures += try check("editor_pass", editor_pass.VERT_SRC, editor_pass.FRAG_SRC);
+    // The linear-blending resolve pass — its sources are private to
+    // blend.zig, so it exposes them for exactly this check.
+    failures += try check("blend(resolve)", blend.RESOLVE_VERT_SRC, blend.RESOLVE_FRAG_SRC);
 
     // shader_pass: identity dim shader and the real shipped CRT
     // preset, wrapped exactly the way ensureProgram wraps them.

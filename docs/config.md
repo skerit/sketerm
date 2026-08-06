@@ -285,6 +285,34 @@ pane, while scrolled back, in copy mode, while the cursor is hidden
 cursor — a full-screen erase, an alternate-screen switch (opening or
 leaving `vim`, `less`, …), a resize, or a session reattach.
 
+### Text blending
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `text_blending` | enum | `native` | `native`, `linear`, `linear_corrected`. `linear-corrected` also parses. |
+
+Which colour space antialiased glyph coverage is blended in. sRGB
+values are not proportional to light — `128` is about 21% of the light
+of `255`, not half — so blending the encoded values directly, which is
+what every terminal has always done, makes partially covered edge
+pixels come out too dark. The visible symptoms are a dark fringe along
+glyph edges where complementary colours meet (red on green is the
+classic) and light-on-dark text reading thinner than it should.
+
+`native` keeps that behaviour, and is the default: font rasterisation
+has been tuned against gamma-space blending for decades, so correcting
+it changes how every glyph looks. `linear` blends in linear light,
+which removes the fringing but shifts apparent weight — dark text on a
+light background thins, light text on a dark one thickens.
+`linear_corrected` applies a correction on top so the perceived weight
+lands back where `native` had it while keeping the fringe fix; it is
+the mode to try first.
+
+Both linear modes render the pane through an offscreen linear target,
+since a `GtkGLArea`'s framebuffer is a hardcoded `GL_RGBA8` texture
+that cannot be asked for an sRGB format. `native` draws straight to
+that framebuffer and costs nothing extra.
+
 ### Behaviour
 
 | Key | Type | Default | Notes |
