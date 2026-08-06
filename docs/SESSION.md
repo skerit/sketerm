@@ -13606,3 +13606,38 @@ now delegates to the config-side implementation so there is one.
 `quake_edge` kept its row, labelled as having no effect on this backend.
 A key that parses and serialises but that the dialog cannot see would be
 a worse trap than a row that explains itself.
+
+## a11y: rope character aggregate, anchor table deleted, preedit announced
+
+The editor canvas's AT-SPI layer converted byte offsets to characters
+through a sparse anchor table in `a11y/docview.zig` that was dropped
+whole on every document revision, so the first conversion after each
+edit re-counted from byte 0 to the caret - O(caret) per keystroke with
+Orca attached, measurably worse the deeper in the file you type. The
+clean fix landed: `editor/rope.zig` now carries a per-node character
+aggregate (non-continuation bytes) next to bytes/newlines, maintained
+through split, join, `joinCompact` seam fusing and the in-place leaf
+paths, asserted by `checkInvariants`, and fuzzed against a naive
+recount every step of `editor/fuzz.zig` (soaked at 40k steps/seed).
+Node grows 8 bytes (48 -> 56); ~8KB per MB of well-packed document.
+`charsBefore`/`charToOffset`/`charCount` are O(log n) descents;
+`docview.Index` and its revision invalidation are deleted, and the
+ChangeLog/queries take a Document directly. Measured on a 32MB file,
+edit-then-convert at the far end: 17.2 ms -> 6 us per cycle.
+
+IME preedit is now announced: AT-SPI has no composition event on the
+text widget (GTK's own editables are silent during preedit; the
+INPUT_METHOD_WINDOW role belongs to the IM's popup), so the bridge
+speaks the composing string via `gtk_accessible_announce` (AT-SPI
+`object:announcement`, POLITE - Orca's `_on_announcement` path),
+debounced 150ms trailing-edge, cancelled on preedit end; the
+accessible TEXT stays equal to the document so offsets never include
+uncommitted bytes. `DocSource.setPreedit/clearPreedit` are the relay;
+the two one-line calls from `EditorView.onPreedit`/`onPreeditEndCb`
+were left to the editorview owner (file was fenced this session).
+
+CharacterCount stays a cliff, in GTK not here: GtkAccessibleText has
+no character-count vfunc, and GTK 4.22's AT-SPI adapter derives the
+property via `get_contents(0, G_MAXUINT)` + `g_utf8_strlen`
+(gtkaccessibletext.c), i.e. an AT polling it on a 60MB buffer forces
+one full materialization per poll regardless of our O(1) count.
