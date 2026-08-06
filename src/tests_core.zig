@@ -114,6 +114,7 @@ comptime {
     _ = @import("a11y/docview.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
+    _ = @import("mux/cast_play.zig");
     _ = @import("mux/dbus.zig");
     _ = @import("mux/desktop.zig");
     _ = @import("mux/deploy.zig");
