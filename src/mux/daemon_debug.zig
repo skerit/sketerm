@@ -107,7 +107,7 @@ pub fn handleAppDebug(self: *Daemon, cl: *Client, payload: []const u8) void {
         return replyErr(cl, "the session's process has already exited — its crash report, if any, is in the log ring");
     if (!s.debuggable)
         return replyErr(cl, "this session was not spawned debuggable, so no debugger can attach to it (Yama restricts tracing to ancestors). Sessions launched through the MCP/appdrive app tools are debuggable; a GUI pane is not.");
-    const target = s.pty.child_pid;
+    const target = s.childPid();
     if (target <= 0) return replyErr(cl, "the session has no live child process");
 
     // One job per client at a time: a second attach to the same stopped

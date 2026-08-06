@@ -192,6 +192,13 @@ pub const FrameType = enum(u8) {
     /// { op:"backtrace", timeout_ms? }. Answered with `app_debug_data`.
     /// Attach-scoped: served by the worker owning the session.
     app_debug = 29,
+    /// Playback control for the ATTACHED cast-playback session. JSON
+    /// { op, ms?, speed? } where op ∈ play|pause|restart|seek|speed
+    /// (seek uses `ms`, speed uses `speed`, clamped to [0.1, 10]).
+    /// Silently ignored for PTY sessions and by older daemons — only
+    /// sent when the welcome advertises `cast_playback:true`. Answered
+    /// by a `play_state` broadcast, never ok/err.
+    play_control = 30,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -300,6 +307,12 @@ pub const FrameType = enum(u8) {
     /// debugger runs as a daemon subprocess whose pipe is polled like a
     /// file job, so a 10-second attach never stalls the poll loop.
     app_debug_data = 93,
+    /// Playback state of a cast-playback session, pushed to every
+    /// attached client on state changes and throttled (>=500ms apart)
+    /// while playing: JSON { state:"playing"|"paused"|"seeking"|
+    /// "finished", position_ms, duration_ms (null until EOF is known),
+    /// speed, markers:[[ms,"label"],...] }. Sent once per attach.
+    play_state = 94,
     _,
 };
 
