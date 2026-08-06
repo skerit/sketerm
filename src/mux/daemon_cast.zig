@@ -292,6 +292,9 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
     var out_budget: usize = OUT_BATCH;
     var ev_budget: u32 = EV_BATCH;
     var read_budget: usize = READ_BATCH;
+    // Deferred so the "finished" play_state is queued AFTER the last
+    // EVENTS frame — clients see the final output before the state.
+    var finish = false;
     var col = self.ingestBegin(s);
 
     loop: while (true) {
@@ -323,12 +326,12 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
         const got = cp.player.next() catch |err| {
             // Corrupt tail of an untrusted file: retain what played.
             log.warn("cast '{s}': parse error {s}; ending playback", .{ s.name, @errorName(err) });
-            finishPlayback(self, s, cp, now);
+            finish = true;
             break;
         };
         const ev = got orelse {
             if (cp.player.finished) {
-                finishPlayback(self, s, cp, now);
+                finish = true;
                 break;
             }
             if (read_budget == 0) {
@@ -336,7 +339,7 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
                 break;
             }
             const file = cp.file orelse {
-                finishPlayback(self, s, cp, now);
+                finish = true;
                 break;
             };
             var chunk: [32768]u8 = undefined;
@@ -357,7 +360,7 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
             // Not due yet: stash an owned copy (the player scratch is
             // invalidated by the next `next` call).
             cp.pending = CastPlayback.PendingEvent.copy(self.allocator, ev) catch {
-                finishPlayback(self, s, cp, now);
+                finish = true;
                 break;
             };
             deadline = now + relMs(ev.time_ms - cp.position_ms, cp.speed);
@@ -376,6 +379,7 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
         }
     }
     self.ingestFinish(s, &col, true);
+    if (finish) finishPlayback(self, s, cp, now);
 
     if (cp.state == .playing) {
         if (now - cp.last_push_ms >= STATE_PUSH_MS) broadcastPlayState(self, s, cp, now);
