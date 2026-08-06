@@ -82,7 +82,7 @@ pub fn exitHints(self: *Window) void {
     imBypass(pane, false);
     pane.terminal.screen.hints_overlay = &.{};
     pane.terminal.screen.dirty = true;
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
     @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
     self.allocator.free(self.hint_matches);
     self.hint_matches = &.{};
@@ -108,7 +108,7 @@ pub fn refreshHintOverlay(self: *Window) void {
     }
     pane.terminal.screen.hints_overlay = self.hints_overlay_buf.items;
     pane.terminal.screen.dirty = true;
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
 
 /// A label was completed: open URLs with the default handler;
@@ -152,7 +152,7 @@ pub fn activateHintAs(self: *Window, m: @import("hints.zig").Match, action: @imp
             screen.selection.start(row, m.col_start, .normal);
             screen.selection.extend(row, m.col_end);
             screen.dirty = true;
-            c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+            c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
         },
         .command => runHintCommand(self, pane, m),
     }
@@ -162,8 +162,8 @@ fn copyHintText(self: *Window, pane: *Pane, text: []const u8) void {
     const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
     defer self.allocator.free(z);
     @memcpy(z, text);
-    clipboard.copyToClipboard(@ptrCast(pane.area), z);
-    clipboard.copyToPrimary(@ptrCast(pane.area), z);
+    clipboard.copyToClipboard(@ptrCast(pane.surface.area), z);
+    clipboard.copyToPrimary(@ptrCast(pane.surface.area), z);
 }
 
 /// `action = command`: run the rule's command line with `{match}`
@@ -287,7 +287,7 @@ pub fn closeSearch(self: *Window) void {
         p.terminal.screen.search_highlights = &.{};
         p.terminal.screen.search_active_idx = -1;
         p.terminal.screen.dirty = true;
-        _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
     }
     self.search_pane = null;
     self.search_matches.clearRetainingCapacity();
@@ -337,7 +337,7 @@ pub fn updateSearch(self: *Window, query: []const u8) void {
         pane.terminal.screen.dirty = true;
         // Pane is unfocused (search bar has focus); explicit
         // render needed to clear the previous highlight overlay.
-        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+        c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
     }
 }
 
@@ -375,7 +375,7 @@ pub fn applyCurrentMatch(self: *Window) void {
     // bell / animation). Without an explicit queue_render the
     // view-offset change wouldn't repaint until something else
     // wakes the GLArea.
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
     refreshSearchLabel(self);
 }
 
@@ -451,7 +451,7 @@ pub fn exitCopyMode(self: *Window) void {
     screen.copy_cursor = null;
     screen.selection.clear();
     screen.dirty = true;
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
 
 /// Copy-mode key dispatch. Returns true when the key is
@@ -779,8 +779,8 @@ pub fn copyModeYank(self: *Window) void {
         const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch break :blk;
         defer self.allocator.free(cstr);
         @memcpy(cstr, text);
-        clipboard.copyToClipboard(@ptrCast(pane.area), cstr);
-        clipboard.copyToPrimary(@ptrCast(pane.area), cstr);
+        clipboard.copyToClipboard(@ptrCast(pane.surface.area), cstr);
+        clipboard.copyToPrimary(@ptrCast(pane.surface.area), cstr);
     }
     self.exitCopyMode();
 }
@@ -821,7 +821,7 @@ pub fn copyModeRefresh(self: *Window) void {
     }
     screen.copy_cursor = .{ .row = row, .col = col };
     screen.dirty = true;
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
 
 /// input.Ctx copy-mode sink — forwards into the Window method.

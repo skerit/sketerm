@@ -14494,3 +14494,47 @@ equality at a mid position and at EOF.
 Verification: `zig build test` (2019 pass), `test-core`, `smoke-mux`,
 `smoke-broker`, `mux-portable` (+ aarch64-macos) green; `ldd
 sketerm-mux` still libc/libm only.
+## TerminalSurface: the renderer extracted from Pane
+
+`src/ui/pane.zig` had grown into both the terminal RENDERER and the
+interactive workspace container (~3900 lines). The rendering half now
+lives in `src/ui/terminal_surface.zig` as `TerminalSurface`, composed
+by value inside Pane (`pane.surface`): the GtkGLArea and its
+realize/unrealize/re-realize lifecycle (the every-realize-is-a-
+re-realize invariant moved with it), all render passes (grid, cell,
+image, bg, custom shader, the linear-light blend target and the
+one-effective-blend-mode coordination), the ImageStore, the Atlas
+reference, and every visual timer that exists purely to redraw the
+surface - cursor blink, cursor trail, bell fade, kitty animation,
+shader animation - behind a single `stopVisualSources()`.
+
+Pane keeps input, menus, selection, faces, banners, Window sinks and
+split-tree participation, and drives the surface through a narrow
+API. The post-atlas-rebuild invariant (markAllDirty + the GridPass
+vbuf/row-cache resets) is now one method, `surface.onAtlasRebuilt()`,
+so it can never be half-applied again. What the render half notices
+but only a session owner can act on goes out through nullable host
+hooks: `on_child_exit` (tick saw the PTY child die),
+`on_before_redraw` (IME caret placement), `on_grid_geometry` (column/
+row COUNT changed).
+
+The point of the split is a future cast-playback viewer: a
+`TerminalSurface` renders a terminal without inheriting Pane's input
+or faces. That is also why the surface carries an explicit
+presentation-geometry policy, `TerminalSurface.Geometry`:
+`live_terminal` (the pane behaviour - allocation drives the grid,
+resizes propagate to the session) vs `fixed_grid` (a fixed cols x
+rows grid letterboxed and scaled into the allocation, geometry never
+propagated). Nothing exercises `fixed_grid` yet; the viewport math is
+real (offscreen detours render at the grid's native size, the final
+hop to the window framebuffer letterboxes), and under `live_terminal`
+every expression degenerates to the old 1:1 path.
+
+Zero behavior change intended: same frames, same invalidation, same
+teardown order; signal lifetime mechanisms preserved per connection
+(area signals still rely on Pane's deferred free outliving the widget
+tree; the blink/bell/trail timeouts are still severed before free,
+now inside the surface; the frame tick stays widget-owned).
+
+Verification: `zig build`, `test`, `smoke-gl-core`, `mux-portable`,
+`smoke-e2e` green.

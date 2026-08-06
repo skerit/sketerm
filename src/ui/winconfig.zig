@@ -79,7 +79,7 @@ pub fn pickPaneShader(self: *Window) void {
     const pane = self.focusedPane() orelse return;
     // Start where the user will actually find shaders: the folder of
     // the pane's current pick, else the shipped presets directory.
-    const start: ?[]const u8 = if (pane.custom_shader_path) |cur|
+    const start: ?[]const u8 = if (pane.surface.custom_shader_path) |cur|
         std.fs.path.dirname(cur)
     else if (shaderPresetDirZ()) |dir|
         std.mem.span(dir)
@@ -145,7 +145,7 @@ pub fn repointShaderOverrides(self: *Window) void {
     for (self.panes.items) |p| {
         // A preset pane owns its override slice — leave it alone.
         if (!p.hasOwnShaderParams())
-            p.shader_own.overrides = self.config.shader_params.items;
+            p.surface.shader_own.overrides = self.config.shader_params.items;
     }
 }
 
@@ -200,7 +200,7 @@ pub fn setShaderParam(self: *Window, name: []const u8, value: f32, color: ?[3]f3
         }) catch return;
     }
     repointShaderOverrides(self);
-    for (self.panes.items) |p| c.gtk_gl_area_queue_render(@ptrCast(p.area));
+    for (self.panes.items) |p| c.gtk_gl_area_queue_render(@ptrCast(p.surface.area));
     persistConfig(self);
 }
 
@@ -296,32 +296,32 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
         if (opts.profile) |p| &p.settings else &self.config.settings;
     const term = pane.terminal;
 
-    pane.font_size = opts.font_size_override orelse s.font_size;
-    pane.font_path = s.font_path;
-    pane.font_family = if (s.font_family.len > 0) s.font_family else null;
-    pane.font_features = if (s.font_features.len > 0) s.font_features else null;
-    pane.font_opts = fontOptsFor(self, s);
-    pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+    pane.surface.font_size = opts.font_size_override orelse s.font_size;
+    pane.surface.font_path = s.font_path;
+    pane.surface.font_family = if (s.font_family.len > 0) s.font_family else null;
+    pane.surface.font_features = if (s.font_features.len > 0) s.font_features else null;
+    pane.surface.font_opts = fontOptsFor(self, s);
+    pane.surface.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
     pane.setGraphicsOffload(self.config.graphics_offload);
     pane.app_view_tab = self.config.app_view == .tab;
-    pane.line_pad_px = s.line_pad_px;
-    pane.grid_pass.pad = s.padding;
-    pane.cell_pass.pad = s.padding;
-    pane.bg_pass.source = &self.bg_source;
+    pane.surface.line_pad_px = s.line_pad_px;
+    pane.surface.grid_pass.pad = s.padding;
+    pane.surface.cell_pass.pad = s.padding;
+    pane.surface.bg_pass.source = &self.bg_source;
     // Push config-driven defaults onto the screen so OSC 4/10/11
     // queries reply with the configured values until apps override,
     // and so DSR ?996 / mode 2031 start from the effective bg's
     // luminance — that's what apps actually want to know (vim
     // background=dark/light).
     pushPaneColors(self, pane, s);
-    pane.grid_pass.enable_ligatures = self.config.ligatures;
-    pane.grid_pass.enable_bidi = self.config.bidi;
-    pane.text_blending = textBlendMode(self.config.text_blending);
+    pane.surface.grid_pass.enable_ligatures = self.config.ligatures;
+    pane.surface.grid_pass.enable_bidi = self.config.bidi;
+    pane.surface.text_blending = textBlendMode(self.config.text_blending);
     applyPanePresentation(self, pane, s);
     term.screen.scrollback_capacity = s.scrollback;
-    pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
+    pane.surface.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.bracketed_paste = self.config.bracketed_paste;
     term.screen.scroll_on_output = self.config.scroll_on_output;
@@ -334,10 +334,10 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     // Shader resolution: explicit user pick / clear > profile
     // settings. Both the pick and an explicit clear are sticky —
     // config reloads / profile pushes leave them alone.
-    pane.shader_default_source = &self.shader_source;
+    pane.surface.shader_default_source = &self.shader_source;
     if (!pane.hasOwnShaderParams())
-        pane.shader_own.overrides = self.config.shader_params.items;
-    if (!pane.custom_shader_user and !pane.shader_cleared) {
+        pane.surface.shader_own.overrides = self.config.shader_params.items;
+    if (!pane.surface.custom_shader_user and !pane.surface.shader_cleared) {
         _ = pane.setCustomShader(
             if (s.custom_shader.len > 0) s.custom_shader else null,
             self.config.custom_shader_animation,
@@ -358,15 +358,15 @@ pub fn applyPanePresentation(
     pane: *Pane,
     s: *const @import("../config.zig").ProfileSettings,
 ) void {
-    pane.grid_pass.border_width = s.pane_border_width;
-    pane.grid_pass.border_color_active = s.pane_border_color_active;
-    pane.grid_pass.border_color = s.pane_border_color;
-    pane.shader_pass.corner_radius = s.pane_corner_radius;
-    pane.grid_pass.scrollbar_mode = self.config.scrollbar;
-    pane.grid_pass.scrollbar_width = self.config.scrollbar_width;
-    pane.grid_pass.scrollbar_trough_color = self.config.scrollbar_trough_color;
-    pane.grid_pass.scrollbar_thumb_color = self.config.scrollbar_thumb_color;
-    pane.grid_pass.scrollbar_thumb_active_color = self.config.scrollbar_thumb_active_color;
+    pane.surface.grid_pass.border_width = s.pane_border_width;
+    pane.surface.grid_pass.border_color_active = s.pane_border_color_active;
+    pane.surface.grid_pass.border_color = s.pane_border_color;
+    pane.surface.shader_pass.corner_radius = s.pane_corner_radius;
+    pane.surface.grid_pass.scrollbar_mode = self.config.scrollbar;
+    pane.surface.grid_pass.scrollbar_width = self.config.scrollbar_width;
+    pane.surface.grid_pass.scrollbar_trough_color = self.config.scrollbar_trough_color;
+    pane.surface.grid_pass.scrollbar_thumb_color = self.config.scrollbar_thumb_color;
+    pane.surface.grid_pass.scrollbar_thumb_active_color = self.config.scrollbar_thumb_active_color;
 }
 
 /// Effective 16-colour palette for a settings bundle: explicit
@@ -475,11 +475,11 @@ pub fn presentPanePopover(pane: *Pane, popover: *c.GtkWidget, content: ?*c.GtkWi
     c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), content);
     c.gtk_popover_set_child(@ptrCast(popover), scroller);
-    c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+    c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
     connectManualPopoverClose(popover);
     var rect = c.GdkRectangle{
-        .x = @divTrunc(c.gtk_widget_get_width(@ptrCast(pane.area)), 2),
-        .y = @divTrunc(c.gtk_widget_get_height(@ptrCast(pane.area)), 2),
+        .x = @divTrunc(c.gtk_widget_get_width(@ptrCast(pane.surface.area)), 2),
+        .y = @divTrunc(c.gtk_widget_get_height(@ptrCast(pane.surface.area)), 2),
         .width = 1,
         .height = 1,
     };
@@ -528,26 +528,26 @@ pub fn applyProfileToPane(self: *Window, pane: *Pane, profile_name: []const u8) 
     const profile = self.findProfile(profile_name);
     pane.active_profile = if (profile) |p| p.name else null;
 
-    const old_size = pane.font_size;
-    const old_path = pane.font_path;
-    const old_family = pane.font_family;
-    const old_features = pane.font_features;
-    const old_line_pad = pane.line_pad_px;
-    const old_opts = pane.font_opts;
+    const old_size = pane.surface.font_size;
+    const old_path = pane.surface.font_path;
+    const old_family = pane.surface.font_family;
+    const old_features = pane.surface.font_features;
+    const old_line_pad = pane.surface.line_pad_px;
+    const old_opts = pane.surface.font_opts;
 
     self.applyPaneConfig(pane, .{ .profile = profile });
 
-    const font_changed = pane.font_size != old_size or
-        !eqOptStr(old_path, pane.font_path) or
-        !eqOptStr(old_family, pane.font_family) or
-        !eqOptStr(old_features, pane.font_features) or
-        pane.line_pad_px != old_line_pad or
-        fontOptsDiffer(old_opts, pane.font_opts);
+    const font_changed = pane.surface.font_size != old_size or
+        !eqOptStr(old_path, pane.surface.font_path) or
+        !eqOptStr(old_family, pane.surface.font_family) or
+        !eqOptStr(old_features, pane.surface.font_features) or
+        pane.surface.line_pad_px != old_line_pad or
+        fontOptsDiffer(old_opts, pane.surface.font_opts);
     if (font_changed) pane.refreshFont();
     c.gtk_widget_queue_resize(pane.widget());
     pane.terminal.screen.dirty = true;
-    pane.cell_pass.markAllDirty();
-    c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    pane.surface.markAllCellsDirty();
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
 
 /// Right-click → "Shader Preset…" picker. A popover anchored on
@@ -698,17 +698,17 @@ pub fn pushPaneColors(self: *Window, pane: *Pane, s: *const ProfileSettings) voi
         .{ 0, 0, 0, 0 }
     else
         eff.cursor_color;
-    pane.grid_pass.default_fg = fg_bg.fg;
-    pane.grid_pass.default_bg = fg_bg.bg;
-    pane.cell_pass.default_fg = fg_bg.fg;
-    pane.cell_pass.default_bg = fg_bg.bg;
+    pane.surface.grid_pass.default_fg = fg_bg.fg;
+    pane.surface.grid_pass.default_bg = fg_bg.bg;
+    pane.surface.cell_pass.default_fg = fg_bg.fg;
+    pane.surface.cell_pass.default_bg = fg_bg.bg;
     // Palette (16 ANSI colours). Entries 16..255 keep their built-in
     // 256-table values.
     if (resolvePalette(&eff)) |pal| {
         var i: usize = 0;
         while (i < 16) : (i += 1) {
             screen.palette[i] = pal[i];
-            pane.grid_pass.palette[i] = pal[i];
+            pane.surface.grid_pass.palette[i] = pal[i];
         }
     }
 }
@@ -822,14 +822,14 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // blink timer — it only runs while the shape blinks.
         screen.cursor_shape = mapCursorShape(self.config.cursor_shape, self.config.cursor_blink);
         if (self.config.cursor_blink_ms != old_blink_ms) {
-            p.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+            p.surface.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         }
         p.restartBlinkTimer();
         p.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
         // Padding.
         if (s.padding != old_s.padding) {
-            p.grid_pass.pad = s.padding;
-            p.cell_pass.pad = s.padding;
+            p.surface.grid_pass.pad = s.padding;
+            p.surface.cell_pass.pad = s.padding;
             c.gtk_widget_queue_resize(p.widget());
         }
         // Rendering.
@@ -837,16 +837,16 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // Affects the next app launch; live views keep their mode
         // (pop in/out via the window's host menu).
         p.app_view_tab = self.config.app_view == .tab;
-        p.grid_pass.enable_ligatures = self.config.ligatures;
-        p.grid_pass.enable_bidi = self.config.bidi;
-        p.grid_pass.enable_url_underline = self.config.auto_url_detect;
-        p.grid_pass.allow_bold = self.config.allow_bold;
-        p.grid_pass.bold_is_bright = self.config.bold_is_bright;
-        p.cell_pass.allow_bold = self.config.allow_bold;
-        p.cell_pass.bold_is_bright = self.config.bold_is_bright;
-        p.grid_pass.min_contrast = self.config.minimum_contrast;
-        p.cell_pass.min_contrast = self.config.minimum_contrast;
-        p.text_blending = textBlendMode(self.config.text_blending);
+        p.surface.grid_pass.enable_ligatures = self.config.ligatures;
+        p.surface.grid_pass.enable_bidi = self.config.bidi;
+        p.surface.grid_pass.enable_url_underline = self.config.auto_url_detect;
+        p.surface.grid_pass.allow_bold = self.config.allow_bold;
+        p.surface.grid_pass.bold_is_bright = self.config.bold_is_bright;
+        p.surface.cell_pass.allow_bold = self.config.allow_bold;
+        p.surface.cell_pass.bold_is_bright = self.config.bold_is_bright;
+        p.surface.grid_pass.min_contrast = self.config.minimum_contrast;
+        p.surface.cell_pass.min_contrast = self.config.minimum_contrast;
+        p.surface.text_blending = textBlendMode(self.config.text_blending);
         // Behavior.
         screen.bracketed_paste = self.config.bracketed_paste;
         screen.modify_other_keys = self.config.modify_other_keys;
@@ -861,32 +861,32 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // These slices pointed into the old config arena (freed
         // when this function returns) — re-point them at the new
         // config's copies.
-        p.font_path = s.font_path;
-        p.font_family = if (s.font_family.len > 0) s.font_family else null;
-        p.font_features = if (s.font_features.len > 0) s.font_features else null;
-        p.line_pad_px = s.line_pad_px;
+        p.surface.font_path = s.font_path;
+        p.surface.font_family = if (s.font_family.len > 0) s.font_family else null;
+        p.surface.font_features = if (s.font_features.len > 0) s.font_features else null;
+        p.surface.line_pad_px = s.line_pad_px;
         // font_opts holds FIVE more borrowed slices (the three styled
         // families and the symbol-map list, whose backing array
         // rebuildSymbolSpecs just reallocated). Rebuilding it here is
         // what keeps them out of the arena that is freed on return.
-        const old_font_opts = p.font_opts;
-        p.font_opts = fontOptsFor(self, s);
+        const old_font_opts = p.surface.font_opts;
+        p.surface.font_opts = fontOptsFor(self, s);
         // Shader state: the overrides slice points into the
         // config arena (about to be freed) — re-point it
         // UNCONDITIONALLY (preset panes own their slice and skip
         // this), then re-resolve the settings shader for panes
         // without a sticky user pick.
-        p.shader_default_source = &self.shader_source;
+        p.surface.shader_default_source = &self.shader_source;
         if (!p.hasOwnShaderParams())
-            p.shader_own.overrides = self.config.shader_params.items;
-        if (!p.custom_shader_user and !p.shader_cleared) {
+            p.surface.shader_own.overrides = self.config.shader_params.items;
+        if (!p.surface.custom_shader_user and !p.surface.shader_cleared) {
             _ = p.setCustomShader(
                 if (s.custom_shader.len > 0) s.custom_shader else null,
                 self.config.custom_shader_animation,
                 false,
             );
-        } else if (p.custom_shader_user) {
-            p.shader_own.animate = self.config.custom_shader_animation;
+        } else if (p.surface.custom_shader_user) {
+            p.surface.shader_own.animate = self.config.custom_shader_animation;
         }
         p.refreshShaderBinding();
         // Mouse / link / autohide flags on the Pane itself.
@@ -901,8 +901,8 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // Per-pane titlebar visibility (never in files identity).
         p.setTitlebarVisible(self.config.show_titlebar and !Window.filesIdentity());
         // Inactive-pane dimming.
-        p.inactive_darken = self.config.inactive_darken;
-        p.inactive_desaturate = self.config.inactive_desaturate;
+        p.surface.inactive_darken = self.config.inactive_darken;
+        p.surface.inactive_desaturate = self.config.inactive_desaturate;
         p.applyDim();
         // Pane border / corner radius / overlay scrollbar.
         applyPanePresentation(self, p, s);
@@ -918,15 +918,15 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
             const family_changed = !std.mem.eql(u8, old_s.font_family, s.font_family);
             const features_changed = !std.mem.eql(u8, old_s.font_features, s.font_features);
             const line_pad_changed = old_s.line_pad_px != s.line_pad_px;
-            const opts_changed = fontOptsDiffer(old_font_opts, p.font_opts);
+            const opts_changed = fontOptsDiffer(old_font_opts, p.surface.font_opts);
             if (path_changed or family_changed or features_changed or line_pad_changed or opts_changed) {
                 p.refreshFont();
             }
         }
         // Repaint.
         screen.dirty = true;
-        p.cell_pass.markAllDirty();
-        c.gtk_gl_area_queue_render(@ptrCast(p.area));
+        p.surface.markAllCellsDirty();
+        c.gtk_gl_area_queue_render(@ptrCast(p.surface.area));
     }
 
     // Refresh CSS provider so any title_*_* color changes take
@@ -1333,8 +1333,8 @@ pub fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callco
     for (self.panes.items) |p| {
         pushPaneColors(self, p, self.config.profileSettings(p.active_profile orelse ""));
         p.terminal.screen.dirty = true;
-        p.cell_pass.markAllDirty();
-        c.gtk_gl_area_queue_render(@ptrCast(p.area));
+        p.surface.markAllCellsDirty();
+        c.gtk_gl_area_queue_render(@ptrCast(p.surface.area));
     }
 }
 

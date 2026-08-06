@@ -327,7 +327,7 @@ pub fn restoreLastClosed(self: *Window) void {
     const title_for_page: [*:0]const u8 = title_z orelse "Tab";
     c.adw_tab_page_set_title(adw_page, title_for_page);
     c.adw_tab_page_set_tooltip(adw_page, title_for_page);
-    _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+    _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
 }
 
 /// Load the default last.json and rebuild tabs from it.
@@ -507,7 +507,7 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
             // Save font_size only if it diverges from the pane's
             // profile settings — keeps layout files terse.
             const base_fs = self.config.profileSettings(p.active_profile orelse "").font_size;
-            const fs: ?u16 = if (p.font_size != base_fs) p.font_size else null;
+            const fs: ?u16 = if (p.surface.font_size != base_fs) p.surface.font_size else null;
             // Carry profile name so split-tree restore / duplicate
             // can reapply per-pane profile overrides.
             const prof: []const u8 = if (p.active_profile) |pn|
@@ -516,11 +516,11 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
                 "";
             // Explicit shader pick travels with the layout;
             // profile/global shaders re-resolve on restore.
-            const shader: []const u8 = if (p.custom_shader_user)
-                (if (p.custom_shader_path) |sp| try arena.dupe(u8, sp) else "")
+            const shader: []const u8 = if (p.surface.custom_shader_user)
+                (if (p.surface.custom_shader_path) |sp| try arena.dupe(u8, sp) else "")
             else
                 "";
-            const preset: []const u8 = if (p.preset_name) |pn|
+            const preset: []const u8 = if (p.surface.preset_name) |pn|
                 try arena.dupe(u8, pn)
             else
                 "";
@@ -574,7 +574,7 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
                 .profile = prof,
                 .custom_shader = shader,
                 .shader_preset = preset,
-                .shader_cleared = p.shader_cleared,
+                .shader_cleared = p.surface.shader_cleared,
                 .mux_session = mux_session,
                 .mux_host = mux_host,
                 .browser_tabs = browser_tabs,
