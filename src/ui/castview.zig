@@ -301,11 +301,15 @@ pub const CastView = struct {
         }
         if (st.markers.len != self.marker_count) self.redrawMarkers(st.markers);
 
-        // Keep the thumb off the user's fingers: skip programmatic
-        // updates right after a user seek (a throttled play_state may
-        // still carry the pre-seek position).
+        // Keep the thumb off the user's fingers: right after a user
+        // seek, a THROTTLED position push (kind .playing) may still
+        // carry the pre-seek position — skip only those. Event-driven
+        // pushes (seeking/paused/finished — seek completions included)
+        // always carry the fresh position and must land, or the thumb
+        // sticks wherever the user left it.
         const now = c.g_get_monotonic_time();
-        if (self.duration_ms > 0 and now - self.user_seek_us > SEEK_GUARD_US) {
+        const guard = st.kind == .playing and now - self.user_seek_us < SEEK_GUARD_US;
+        if (self.duration_ms > 0 and !guard) {
             c.gtk_range_set_value(@ptrCast(self.scale), @floatFromInt(st.position_ms));
         }
 
