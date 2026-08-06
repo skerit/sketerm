@@ -811,6 +811,13 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             return ipc_protocol.writeErr(out, allocator, "bad color (want #RRGGBB or none)");
         }
         try ipc_protocol.writeOk(out, allocator, null, {});
+    } else if (std.mem.startsWith(u8, req.cmd, "panel-")) {
+        // Declarative UI panels (src/ui/panel): show / patch / get /
+        // events / list / close. Kept in ui/panelhost.zig — the
+        // registry, the (session, name) scoping and the three host
+        // shapes are a subsystem of their own, not six more branches
+        // here.
+        try @import("panelhost.zig").dispatch(self, req, out, allocator);
     } else if (eql(u8, req.cmd, "action")) {
         // Dispatch any bindable action by name — the scripting
         // equivalent of pressing its keybind ("zoom_pane",

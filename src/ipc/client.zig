@@ -64,6 +64,19 @@ const CLI_HELP =
     \\  action [--pane N] <name>          run a bindable action by its
     \\                                    keybind.* name (zoom_pane,
     \\                                    copy_mode, show_scrollback, …)
+    \\  panel-show --name N [--target pane|tab|window] [--session S]
+    \\             (--file DOC.json | <json...>)
+    \\                                    render a declarative UI panel
+    \\                                    (see src/ui/panel/doc.zig);
+    \\                                    reusing a name in the same
+    \\                                    session replaces its document
+    \\  panel-patch --panel-id N (--file PATCH.json | <json...>)
+    \\                                    apply a patch op array
+    \\  panel-get --panel-id N            the panel's current document,
+    \\                                    canonically serialized
+    \\  panel-events --panel-id N         drain queued interactions
+    \\  panel-list [--session S]          panels in scope
+    \\  panel-close --panel-id N          close one
     \\
     \\Socket resolution: --socket, then $SKETERM_SOCKET (set inside
     \\every sketerm pane), then the single *.sock under
@@ -106,6 +119,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var press_enter = false;
     var watch_timeout_ms: u64 = 0; // 0 = wait forever
     var watch_interval_ms: u32 = 300;
+    // panel-*: read the document/patch from a file (or "-" = stdin)
+    // instead of argv — a JSON document rarely survives shell quoting.
+    var payload_file: ?[]const u8 = null;
+    var explicit_session = false;
 
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -155,6 +172,25 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--dir") and i + 1 < args.len) {
             i += 1;
             req.direction = args[i];
+        } else if (std.mem.eql(u8, a, "--name") and i + 1 < args.len) {
+            i += 1;
+            req.name = args[i];
+        } else if (std.mem.eql(u8, a, "--target") and i + 1 < args.len) {
+            i += 1;
+            req.target = args[i];
+        } else if (std.mem.eql(u8, a, "--session") and i + 1 < args.len) {
+            i += 1;
+            req.session = args[i];
+            explicit_session = true;
+        } else if (std.mem.eql(u8, a, "--panel-id") and i + 1 < args.len) {
+            i += 1;
+            req.panel_id = std.fmt.parseInt(u32, args[i], 10) catch {
+                _ = c.fprintf(platform.stderr(), "sketerm cli: bad --panel-id value\n");
+                return 2;
+            };
+        } else if (std.mem.eql(u8, a, "--file") and i + 1 < args.len) {
+            i += 1;
+            payload_file = args[i];
         } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
             i += 1;
             req.data = args[i]; // screenshot output path
@@ -173,6 +209,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             return 0;
         } else {
             text_parts.append(allocator, a) catch return 1;
+        }
+    }
+
+    // panel-*: the payload is a JSON document/patch, so it comes from
+    // --file (or stdin) when it cannot survive shell quoting, and the
+    // caller's own session identity scopes it by default — exactly the
+    // way `--pane self` addresses the calling pane.
+    const is_panel = std.mem.startsWith(u8, cmd, "panel-");
+    if (is_panel) {
+        if (!explicit_session and req.session == null) {
+            if (c.getenv("SKETERM_SESSION")) |env| req.session = std.mem.span(env);
+        }
+        if (payload_file) |path| {
+            const body = readWholeFile(allocator, path) orelse {
+                _ = c.fprintf(platform.stderr(), "sketerm cli: cannot read --file\n");
+                return 1;
+            };
+            if (std.mem.eql(u8, cmd, "panel-patch")) req.patch = body else req.document = body;
+        } else if (text_parts.items.len > 0) {
+            const joined = std.mem.join(allocator, " ", text_parts.items) catch return 1;
+            if (std.mem.eql(u8, cmd, "panel-patch")) req.patch = joined else req.document = joined;
+            text_parts.clearRetainingCapacity();
         }
     }
 
@@ -461,6 +519,29 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
     }
     _ = c.fputs("{\"ok\":true}\n", platform.stdout());
     return 0;
+}
+
+/// Read a whole file (or stdin for "-") into memory. Leaked into the
+/// request; the process exits right after.
+fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const from_stdin = std.mem.eql(u8, path, "-");
+    const f = if (from_stdin) platform.stdin() orelse return null else blk: {
+        const path_z = allocator.dupeZ(u8, path) catch return null;
+        defer allocator.free(path_z);
+        break :blk c.fopen(path_z.ptr, "rb") orelse return null;
+    };
+    defer if (!from_stdin) {
+        _ = c.fclose(f);
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = c.fread(&chunk, 1, chunk.len, f);
+        if (n == 0) break;
+        buf.appendSlice(allocator, chunk[0..n]) catch return null;
+        if (n < chunk.len) break;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
 }
 
 /// Numeric "--pane N". ("self" is handled in the arg loop, where it

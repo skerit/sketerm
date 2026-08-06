@@ -103,9 +103,24 @@ const Mcp = struct {
     /// Issue a tools/call and return the first content text (substring
     /// checks are enough for a smoke).
     fn callTool(self: *Mcp, name: []const u8, args_json: []const u8) []const u8 {
+        self.sendTool(name, args_json);
+        return self.recvLine(15_000);
+    }
+
+    /// Issue a tools/call WITHOUT reading the reply — for calls that
+    /// make the server talk to a socket this process must serve first.
+    fn sendTool(self: *Mcp, name: []const u8, args_json: []const u8) void {
         self.id += 1;
         var buf: [4096]u8 = undefined;
         const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ self.id, name, args_json }) catch fail("req too long");
+        self.send(req);
+    }
+
+    /// Issue tools/list and return the raw reply line.
+    fn listTools(self: *Mcp) []const u8 {
+        self.id += 1;
+        var buf: [256]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/list\"}}", .{self.id}) catch unreachable;
         self.send(req);
         return self.recvLine(15_000);
     }
@@ -227,6 +242,64 @@ fn killDaemonsUnderRt(rt: []const u8, allocator: std.mem.Allocator) void {
         }
     }
 }
+
+/// A stand-in for the GUI's control socket: one JSON line in, one
+/// canned JSON line out. Enough to prove what the ui_* tools SEND —
+/// which for ui_show_files (a server-side document generator) is the
+/// whole point, and needs no GTK.
+const FakeGui = struct {
+    fd: c_int,
+
+    fn listen(path: [:0]const u8) FakeGui {
+        _ = c.unlink(path.ptr);
+        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) fail("fake gui: socket");
+        var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
+        addr.sun_family = c.AF_UNIX;
+        if (path.len >= addr.sun_path.len) fail("fake gui: socket path too long");
+        @memcpy(addr.sun_path[0..path.len], path);
+        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("fake gui: bind");
+        if (c.listen(fd, 4) != 0) fail("fake gui: listen");
+        return .{ .fd = fd };
+    }
+
+    /// Accept one connection, read its request line, answer with
+    /// `reply`, close. Returns the request (valid until the next call).
+    fn serveOne(self: *FakeGui, reply: []const u8, timeout_ms: i64) []const u8 {
+        const deadline = nowMs() + timeout_ms;
+        var conn: c_int = -1;
+        while (true) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 200) > 0) {
+                conn = c.accept(self.fd, null, null);
+                if (conn >= 0) break;
+            }
+            if (nowMs() > deadline) fail("fake gui: no connection from the mcp server");
+        }
+        defer _ = c.close(conn);
+        gui_req_len = 0;
+        while (true) {
+            if (std.mem.indexOfScalar(u8, gui_req[0..gui_req_len], '\n') != null) break;
+            var pfd = c.struct_pollfd{ .fd = conn, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 200) > 0) {
+                const n = c.read(conn, gui_req[gui_req_len..].ptr, gui_req.len - gui_req_len);
+                if (n <= 0) break;
+                gui_req_len += @intCast(n);
+            }
+            if (nowMs() > deadline) fail("fake gui: request line never arrived");
+        }
+        _ = c.write(conn, reply.ptr, reply.len);
+        _ = c.write(conn, "\n", 1);
+        return gui_req[0..gui_req_len];
+    }
+
+    fn deinit(self: *FakeGui) void {
+        _ = c.close(self.fd);
+    }
+};
+
+var gui_req: [1 << 18]u8 = undefined;
+var gui_req_len: usize = 0;
 
 pub fn main() u8 {
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -571,6 +644,258 @@ pub fn main() u8 {
         if (std.mem.indexOf(u8, run, "DURABLE-OK") == null) fail("reconnected durable term_run failed");
         m2.closeStdinWait();
         say("smoke-mcp: named durable daemon survives restart ok");
+    }
+
+    // ── Stage 3: tool exposure policy (SKETERM_MCP_TOOLS) ─────────
+    // Filtering tools/list is presentation; the load-bearing half is
+    // that tools/call refuses a withheld tool a client learned about
+    // some other way, with an error that says why.
+    {
+        _ = c.setenv("SKETERM_MCP_TOOLS", "app:ro, term_list", 1);
+        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+
+        const listed = m.listTools();
+        // The reply must be complete (recvLine truncates at 1MB, and a
+        // truncated list would read as a successfully filtered one).
+        if (!std.mem.endsWith(u8, listed, "}")) fail("tools/list reply truncated");
+        if (std.mem.indexOf(u8, listed, "\"screenshot_app\"") == null or
+            std.mem.indexOf(u8, listed, "\"app_a11y_tree\"") == null)
+            fail("tools/list dropped an allowed read-only app tool");
+        if (std.mem.indexOf(u8, listed, "\"capabilities\"") == null)
+            fail("tools/list dropped the always-on capabilities tool");
+        if (std.mem.indexOf(u8, listed, "\"term_list\"") == null)
+            fail("tools/list dropped the single-tool allow term");
+        if (std.mem.indexOf(u8, listed, "\"app_click\"") != null)
+            fail("tools/list kept a mutating tool under a :ro group term");
+        if (std.mem.indexOf(u8, listed, "\"run_command\"") != null or
+            std.mem.indexOf(u8, listed, "\"file_write\"") != null or
+            std.mem.indexOf(u8, listed, "\"term_open\"") != null)
+            fail("tools/list kept a tool from a suppressed group");
+
+        // Enforcement.
+        const refused = m.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
+        if (std.mem.indexOf(u8, refused, "isError") == null or
+            std.mem.indexOf(u8, refused, "EXISTS but is not enabled") == null or
+            std.mem.indexOf(u8, refused, "--tools term") == null)
+            fail("tools/call did not refuse a withheld tool with a helpful error");
+        if (std.mem.indexOf(u8, refused, "opened headless terminal") != null)
+            fail("a withheld tool RAN (tools/list filtering is not enforcement)");
+
+        // An allowed tool still works, including the single-tool term.
+        const allowed = m.callTool("term_list", "{}");
+        if (std.mem.indexOf(u8, allowed, "isError") != null)
+            fail("an allowed tool was refused");
+
+        // capabilities explains the policy from inside the session.
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\\\"tool_policy\\\"") == null or
+            std.mem.indexOf(u8, caps, "app:ro, term_list") == null or
+            std.mem.indexOf(u8, caps, "SKETERM_MCP_TOOLS") == null or
+            std.mem.indexOf(u8, caps, "\\\"groups_suppressed\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"panes\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"files\\\"") == null)
+            fail("capabilities does not report the active tool policy");
+        m.closeStdinWait();
+        say("smoke-mcp: tool exposure policy ok");
+    }
+
+    // ── Stage 4: an invalid policy fails loudly at startup ────────
+    {
+        _ = c.setenv("SKETERM_MCP_TOOLS", "app, browzer", 1);
+        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        var err_pipe: [2]c_int = undefined;
+        if (c.pipe(&err_pipe) != 0) fail("pipe");
+        const pid = c.fork();
+        if (pid < 0) fail("fork");
+        if (pid == 0) {
+            _ = c.dup2(err_pipe[1], 2);
+            _ = c.close(err_pipe[0]);
+            _ = c.close(err_pipe[1]);
+            var argv: [3:null]?[*:0]const u8 = .{ exe, "mcp", null };
+            _ = c.execv(exe, @ptrCast(&argv));
+            c._exit(127);
+        }
+        _ = c.close(err_pipe[1]);
+        var buf: [4096]u8 = undefined;
+        const n = c.read(err_pipe[0], &buf, buf.len);
+        _ = c.close(err_pipe[0]);
+        var st: c_int = 0;
+        _ = c.waitpid(pid, &st, 0);
+        const errtxt = if (n > 0) buf[0..@intCast(n)] else "";
+        if (std.mem.indexOf(u8, errtxt, "browzer") == null or
+            std.mem.indexOf(u8, errtxt, "groups:") == null)
+            fail("a typo'd tool policy did not name the offending term + the valid groups");
+        if (st == 0) fail("a typo'd tool policy did not fail the startup");
+        say("smoke-mcp: invalid tool policy refuses to start ok");
+    }
+
+    // ── Stage 5: the ui_* panel tools under a `ui` policy ─────────
+    // No GUI here on purpose: this proves the group is reachable on its
+    // own, that the live-panel half refuses HONESTLY (naming --shared)
+    // instead of hanging or lying, and that the saved half works
+    // regardless — including for a session name with a space in it,
+    // which the store used to reject outright.
+    {
+        _ = c.setenv("SKETERM_MCP_TOOLS", "ui", 1);
+        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+
+        const listed = m.listTools();
+        if (!std.mem.endsWith(u8, listed, "}")) fail("tools/list reply truncated");
+        for ([_][]const u8{ "ui_show", "ui_patch", "ui_wait_event", "ui_panels", "ui_save", "ui_close", "ui_delete" }) |tool| {
+            var nb: [64]u8 = undefined;
+            const quoted = std.fmt.bufPrint(&nb, "\"{s}\"", .{tool}) catch unreachable;
+            if (std.mem.indexOf(u8, listed, quoted) == null) fail("tools/list dropped a ui tool under --tools ui");
+        }
+        if (std.mem.indexOf(u8, listed, "\"term_open\"") != null or
+            std.mem.indexOf(u8, listed, "\"run_command\"") != null or
+            std.mem.indexOf(u8, listed, "\"file_write\"") != null)
+            fail("tools/list kept a non-ui tool under --tools ui");
+
+        const refused = m.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
+        if (std.mem.indexOf(u8, refused, "EXISTS but is not enabled") == null or
+            std.mem.indexOf(u8, refused, "--tools term") == null)
+            fail("a terminal tool was not refused under --tools ui");
+        if (std.mem.indexOf(u8, refused, "opened headless terminal") != null)
+            fail("a withheld terminal tool RAN under --tools ui");
+
+        // The live half: no GUI socket, so a described refusal naming
+        // the flag that would fix it — never a hang.
+        const no_gui = m.callTool("ui_show", "{\"name\":\"p\",\"session\":\"smoke ui\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
+        if (std.mem.indexOf(u8, no_gui, "isError") == null or
+            std.mem.indexOf(u8, no_gui, "--shared") == null)
+            fail("ui_show without a GUI socket did not explain that panels need --shared");
+
+        // The saved half works anyway, under a session with a space.
+        const saved = m.callTool("ui_save", "{\"name\":\"vsr\",\"session\":\"smoke ui\",\"document\":{\"title\":\"Epoch 41\",\"root\":\"c\",\"components\":{\"c\":{\"type\":\"column\",\"children\":[\"h\"]},\"h\":{\"type\":\"heading\",\"text\":\"Epoch 41\",\"level\":2}}}}");
+        if (std.mem.indexOf(u8, saved, "isError") != null) fail("ui_save failed without a GUI");
+        var pbuf: [512]u8 = undefined;
+        const panel_file = std.fmt.bufPrint(&pbuf, "{s}/sketerm/panels/smoke%20ui/vsr.json", .{rt}) catch unreachable;
+        if (!fileExists(panel_file)) fail("ui_save did not percent-encode the session into one directory");
+
+        const panels = m.callTool("ui_panels", "{\"session\":\"smoke ui\"}");
+        if (std.mem.indexOf(u8, panels, "Epoch 41") == null or
+            std.mem.indexOf(u8, panels, "\\\"live\\\":null") == null or
+            std.mem.indexOf(u8, panels, "--shared") == null)
+            fail("ui_panels did not separate the saved list from the unavailable live list");
+        const other = m.callTool("ui_panels", "{\"session\":\"someone-else\"}");
+        if (std.mem.indexOf(u8, other, "Epoch 41") != null)
+            fail("a saved panel leaked into another session's list");
+
+        // An invalid document is refused with the parser's message and
+        // nothing is written.
+        const bad = m.callTool("ui_save", "{\"name\":\"nope\",\"session\":\"smoke ui\",\"document\":{\"root\":\"r\",\"components\":{\"r\":{\"type\":\"webview\"}}}}");
+        if (std.mem.indexOf(u8, bad, "isError") == null or std.mem.indexOf(u8, bad, "webview") == null)
+            fail("ui_save accepted (or silently mangled) an invalid document");
+
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\\\"panels\\\":false") == null or
+            std.mem.indexOf(u8, caps, "panels_hint") == null or
+            std.mem.indexOf(u8, caps, "\\\"ui\\\"") == null)
+            fail("capabilities does not report panel availability + the ui group");
+
+        const deleted = m.callTool("ui_delete", "{\"name\":\"vsr\",\"session\":\"smoke ui\"}");
+        if (std.mem.indexOf(u8, deleted, "isError") != null) fail("ui_delete failed");
+        if (fileExists(panel_file)) fail("ui_delete left the saved document on disk");
+        m.closeStdinWait();
+        say("smoke-mcp: ui_* panel tools ok");
+    }
+
+    // ── Stage 6: ui_show_files, against a stand-in GUI socket ─────
+    // ui_show_files is a document GENERATOR over ui_show's path, so the
+    // load-bearing assertion is what it SENDS: a stand-in socket
+    // answers panel-show and the stage reads the document off the wire.
+    {
+        _ = c.setenv("SKETERM_MCP_TOOLS", "ui", 1);
+        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        var sock_buf: [320]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/gui.sock", .{rt}) catch return 1;
+        var gui = FakeGui.listen(sock);
+        defer gui.deinit();
+        // Two real files; a third path deliberately never exists.
+        for ([_][]const u8{ "e40.png", "e41.png" }) |nm| {
+            var f_buf: [320]u8 = undefined;
+            const p = std.fmt.bufPrintZ(&f_buf, "{s}/{s}", .{ rt, nm }) catch return 1;
+            const f = c.fopen(p.ptr, "wb") orelse fail("cannot create smoke image file");
+            _ = c.fwrite("x", 1, 1, f);
+            _ = c.fclose(f);
+        }
+
+        var m = Mcp.spawn(allocator, exe, &.{ "--socket", sock });
+        m.initialize();
+        const listed = m.listTools();
+        if (std.mem.indexOf(u8, listed, "\"ui_show_files\"") == null)
+            fail("tools/list dropped ui_show_files under --tools ui");
+
+        // compare:true + exactly two files: ONE image_compare, the
+        // captions as its side labels, over the same panel-show ui_show
+        // uses, under the default panel name.
+        var args_buf: [1024]u8 = undefined;
+        const cmp_args = std.fmt.bufPrint(&args_buf, "{{\"session\":\"vsr\",\"title\":\"E41 vs E40\",\"compare\":true,\"files\":[{{\"path\":\"{s}/e40.png\",\"caption\":\"epoch 40\"}},{{\"path\":\"{s}/e41.png\",\"caption\":\"epoch 41\"}}]}}", .{ rt, rt }) catch unreachable;
+        m.sendTool("ui_show_files", cmp_args);
+        const sent = gui.serveOne("{\"ok\":true,\"panel_id\":4}", 15_000);
+        if (std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") == null or
+            std.mem.indexOf(u8, sent, "\"name\":\"files\"") == null or
+            std.mem.indexOf(u8, sent, "\"session\":\"vsr\"") == null or
+            std.mem.indexOf(u8, sent, "image_compare") == null or
+            std.mem.indexOf(u8, sent, "epoch 40") == null or
+            std.mem.indexOf(u8, sent, "epoch 41") == null)
+            fail("ui_show_files did not send an image_compare document over panel-show");
+        const cmp_reply = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, cmp_reply, "isError") != null or
+            std.mem.indexOf(u8, cmp_reply, "\\\"panel_id\\\":4") == null or
+            std.mem.indexOf(u8, cmp_reply, "image_compare") == null)
+            fail("ui_show_files did not report the shown compare panel");
+
+        // Stacked, with one unreadable path: still shown (the renderer
+        // draws a placeholder), and the reply NAMES the file.
+        const stack_args = std.fmt.bufPrint(&args_buf, "{{\"session\":\"vsr\",\"name\":\"epoch42\",\"files\":[\"{s}/e40.png\",\"{s}/ghost.png\"]}}", .{ rt, rt }) catch unreachable;
+        m.sendTool("ui_show_files", stack_args);
+        const sent2 = gui.serveOne("{\"ok\":true,\"panel_id\":5}", 15_000);
+        if (std.mem.indexOf(u8, sent2, "\"name\":\"epoch42\"") == null or
+            std.mem.indexOf(u8, sent2, "image_compare") != null or
+            std.mem.indexOf(u8, sent2, "e40.png") == null or
+            std.mem.indexOf(u8, sent2, "ghost.png") == null)
+            fail("ui_show_files did not stack the images it was given");
+        const stack_reply = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, stack_reply, "stacked_images") == null or
+            std.mem.indexOf(u8, stack_reply, "unreadable") == null or
+            std.mem.indexOf(u8, stack_reply, "ghost.png") == null)
+            fail("ui_show_files hid an unreadable file instead of naming it");
+
+        // Bad arity: refused clearly, and NOTHING is shown (the fake GUI
+        // would still be waiting — the next served call proves it).
+        const arity = m.callTool("ui_show_files", std.fmt.bufPrint(&args_buf, "{{\"compare\":true,\"files\":[\"{s}/e40.png\",\"{s}/e41.png\",\"{s}/e40.png\"]}}", .{ rt, rt, rt }) catch unreachable);
+        if (std.mem.indexOf(u8, arity, "isError") == null or
+            std.mem.indexOf(u8, arity, "exactly two") == null)
+            fail("compare:true with three files was not refused clearly");
+
+        // Nothing readable at all: refused rather than shown as a wall
+        // of placeholders.
+        const gone = m.callTool("ui_show_files", std.fmt.bufPrint(&args_buf, "{{\"files\":[\"{s}/ghost1.png\",\"{s}/ghost2.png\"]}}", .{ rt, rt }) catch unreachable);
+        if (std.mem.indexOf(u8, gone, "isError") == null or
+            std.mem.indexOf(u8, gone, "none of the 2 file(s) can be read") == null)
+            fail("an all-unreadable file set was not refused");
+
+        // A relative path is refused too (documents are persisted).
+        const rel = m.callTool("ui_show_files", "{\"files\":[\"rel.png\"]}");
+        if (std.mem.indexOf(u8, rel, "isError") == null or
+            std.mem.indexOf(u8, rel, "ABSOLUTE") == null)
+            fail("a relative image path was not refused");
+
+        // The generic tool still works on the same socket: the refusals
+        // above did not leave the connection or the server wedged.
+        m.sendTool("ui_show", "{\"name\":\"plain\",\"session\":\"vsr\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
+        const sent3 = gui.serveOne("{\"ok\":true,\"panel_id\":6}", 15_000);
+        if (std.mem.indexOf(u8, sent3, "\"name\":\"plain\"") == null)
+            fail("ui_show stopped working after ui_show_files refusals");
+        _ = m.recvLine(15_000);
+
+        m.closeStdinWait();
+        say("smoke-mcp: ui_show_files ok");
     }
 
     // Retire the durable daemon we started.

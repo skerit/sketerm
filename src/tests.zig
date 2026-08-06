@@ -117,6 +117,8 @@ comptime {
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
     _ = @import("ipc/mcpassets.zig");
+    _ = @import("ipc/mcpfilter.zig");
+    _ = @import("ipc/panelstore.zig");
     _ = @import("util/template.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/mounts.zig");
@@ -242,6 +244,13 @@ comptime {
     _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
     _ = @import("ui/menu.zig");
+    _ = @import("ui/palette.zig");
+    _ = @import("ui/panel/doc.zig");
+    _ = @import("ui/panel/events.zig");
+    _ = @import("ui/panel/view.zig");
+    _ = @import("ui/panelhost.zig");
+    _ = @import("ui/panelwin.zig");
+    _ = @import("ui/panelpicker.zig");
     _ = @import("wlapp.zig");
 }
 

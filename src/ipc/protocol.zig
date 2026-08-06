@@ -48,6 +48,22 @@ pub const Request = struct {
     /// without ever driving; `control` = force a takeover.
     read_only: bool = false,
     control: bool = false,
+
+    // ---- panel-* (declarative UI panels, src/ui/panel) ----------------
+    /// Panel name. Panels are keyed by (session, name): showing a name
+    /// that already exists in that session REPLACES its document.
+    name: ?[]const u8 = null,
+    /// panel-show placement: "pane" (the requesting pane wears the
+    /// panel face), "tab" (a new tab in its window), "window" (a
+    /// standalone panel window). Default "tab".
+    target: ?[]const u8 = null,
+    /// panel-show: the whole panel document, as a JSON string.
+    document: ?[]const u8 = null,
+    /// panel-patch: a JSON array of patch ops.
+    patch: ?[]const u8 = null,
+    /// panel-patch / panel-events / panel-close: the handle panel-show
+    /// returned.
+    panel_id: ?u32 = null,
 };
 
 pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(Request) {
@@ -83,6 +99,26 @@ pub const TabInfo = struct {
     panes: []const PaneInfo,
 };
 
+/// One live panel, as reported by `panel-list`.
+pub const PanelInfo = struct {
+    panel_id: u32,
+    name: []const u8,
+    session: []const u8,
+    title: []const u8,
+    /// "pane" | "tab" | "window".
+    target: []const u8,
+};
+
+/// One queued interaction, as reported by `panel-events`. `value` is
+/// null / number / bool / string depending on the component; `ts` is
+/// monotonic milliseconds (ordering and deltas only, not wall time).
+pub const PanelEvent = struct {
+    component: []const u8,
+    kind: []const u8,
+    value: std.json.Value,
+    ts: i64,
+};
+
 /// Append a JSON response line (including trailing '\n') to `out`.
 /// `payload` is any Stringify-able value merged in as a field.
 pub fn writeOk(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime field: ?[]const u8, payload: anytype) !void {
@@ -99,6 +135,31 @@ pub fn writeOk(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime f
         try w.writeAll("{\"ok\":true}\n");
     }
     try out.appendSlice(allocator, aw.written());
+}
+
+/// Like `writeOk`, but MERGES the payload's fields into the top-level
+/// response object instead of nesting them under a name — the reply
+/// shape the panel-* commands are specified in
+/// (`{"ok":true,"panel_id":3,"session":"s"}`). `payload` must
+/// stringify as a JSON object; an empty one degrades to `{"ok":true}`.
+pub fn writeOkFlat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, payload: anytype) !void {
+    // `.{}` is an empty TUPLE, which stringifies as `[]` — the one
+    // shape that cannot be merged. It means "no extra fields".
+    if (@typeInfo(@TypeOf(payload)).@"struct".fields.len == 0) {
+        try out.appendSlice(allocator, "{\"ok\":true}\n");
+        return;
+    }
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(payload, .{}, &aw.writer);
+    const body = aw.written();
+    if (body.len < 2 or body[0] != '{' or body[body.len - 1] != '}') return error.NotAnObject;
+    try out.appendSlice(allocator, "{\"ok\":true");
+    if (body.len > 2) {
+        try out.append(allocator, ',');
+        try out.appendSlice(allocator, body[1 .. body.len - 1]);
+    }
+    try out.appendSlice(allocator, "}\n");
 }
 
 pub fn writeErr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, msg: []const u8) !void {
@@ -123,6 +184,50 @@ test "parseRequest: minimal + addressed" {
     try std.testing.expectEqual(@as(?u32, 7), p2.value.pane);
     try std.testing.expectEqualStrings("ls\n", p2.value.data.?);
     try std.testing.expect(p2.value.paste);
+}
+
+test "parseRequest: panel-* fields" {
+    const a = std.testing.allocator;
+    var p = try parseRequest(a,
+        \\{"cmd":"panel-show","name":"train","session":"s1","target":"window","document":"{\"root\":\"r\"}"}
+    );
+    defer p.deinit();
+    try std.testing.expectEqualStrings("panel-show", p.value.cmd);
+    try std.testing.expectEqualStrings("train", p.value.name.?);
+    try std.testing.expectEqualStrings("s1", p.value.session.?);
+    try std.testing.expectEqualStrings("window", p.value.target.?);
+    try std.testing.expectEqualStrings("{\"root\":\"r\"}", p.value.document.?);
+
+    var p2 = try parseRequest(a, "{\"cmd\":\"panel-events\",\"panel_id\":7}");
+    defer p2.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), p2.value.panel_id);
+}
+
+test "writeOkFlat merges payload fields at the top level" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    try writeOkFlat(&out, a, .{ .panel_id = @as(u32, 3), .session = "s1" });
+    try std.testing.expectEqualStrings("{\"ok\":true,\"panel_id\":3,\"session\":\"s1\"}\n", out.items);
+
+    // An empty payload is still a well-formed ok line.
+    out.clearRetainingCapacity();
+    try writeOkFlat(&out, a, .{});
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
+
+    // Panel event array shape, including a null and a string value.
+    out.clearRetainingCapacity();
+    const evs = [_]PanelEvent{
+        .{ .component = "ok", .kind = "click", .value = .null, .ts = 5 },
+        .{ .component = "pick", .kind = "change", .value = .{ .string = "epoch 41" }, .ts = 6 },
+    };
+    try writeOkFlat(&out, a, .{ .events = evs[0..], .dropped = @as(u32, 2) });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"value\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"value\":\"epoch 41\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"dropped\":2") != null);
+    // NDJSON framing: the whole reply is one line.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "\n"));
 }
 
 test "parseRequest: unknown fields ignored, junk rejected" {

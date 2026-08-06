@@ -291,6 +291,16 @@ pub const Pane = struct {
     editor_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     editor_deinit: ?*const fn (*anyopaque) void = null,
     editor_focus: ?*const fn (*anyopaque) void = null,
+
+    /// Panel face (src/ui/panel/view.zig, hosted by ui/panelhost.zig):
+    /// a declarative document an assistant authored, rendered as real
+    /// widgets. Same five-pointer contract and two-phase teardown as
+    /// the editor face above.
+    panel_widget: ?*c.GtkWidget = null,
+    panel_ctx: ?*anyopaque = null,
+    panel_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
+    panel_deinit: ?*const fn (*anyopaque) void = null,
+    panel_focus: ?*const fn (*anyopaque) void = null,
     /// "File browser hidden - click to show it" strip, shown on the
     /// TERMINAL face while a browser face exists on this pane. Without
     /// it the browser is unreachable once hidden: only its own toolbar
@@ -940,8 +950,8 @@ pub const Pane = struct {
     }
 
     /// Sever every face that outlives the pane's widget subtree — IM
-    /// context, browser, editor, forwarded-app embed — while that
-    /// subtree is still alive. Idempotent.
+    /// context, browser, editor, panel, forwarded-app embed — while
+    /// that subtree is still alive. Idempotent.
     ///
     /// THE single teardown entry point: every path that is about to
     /// destroy a pane's widgets (close, split-collapse, mux takeover,
@@ -955,6 +965,7 @@ pub const Pane = struct {
         self.detachIm();
         self.detachBrowser();
         self.detachEditor();
+        self.detachPanel();
         self.detachAppHost();
         // AT-SPI bridge: drop the Terminal back-pointer and cancel the
         // coalescing timer before the Terminal can die. The area's own
@@ -1021,8 +1032,9 @@ pub const Pane = struct {
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
         if (show) {
             // Faces are exclusive: raising the browser hides an
-            // editor face too.
+            // editor or panel face too.
             if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
+            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
         }
         if (self.offload_widget) |ow|
             c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
@@ -1125,6 +1137,7 @@ pub const Pane = struct {
         c.gtk_widget_set_visible(ew, if (show) @as(c_int, 1) else 0);
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
+            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
             if (self.editor_focus) |focus| {
                 if (self.editor_ctx) |ctx| focus(ctx);
@@ -1175,6 +1188,93 @@ pub const Pane = struct {
         }
         if (ctx) |editor_ctx| {
             if (deinit_cb) |cb| cb(editor_ctx);
+        }
+    }
+
+    /// Attach a panel face (src/ui/panel/view.zig): the widget joins
+    /// the pane's wrapper box as another face; the terminal stays alive
+    /// underneath. Identical ownership contract to attachEditor — the
+    /// view's exported `prepareDestroyCb`/`destroyCb`/`focusCb`
+    /// trampolines match these parameters by design.
+    pub fn attachPanel(
+        self: *Pane,
+        face: *c.GtkWidget,
+        ctx: *anyopaque,
+        prepare_destroy_cb: *const fn (*anyopaque, widgets_dead: bool) void,
+        deinit_cb: *const fn (*anyopaque) void,
+        focus_cb: *const fn (*anyopaque) void,
+    ) void {
+        const wrap = self.wrapper_box orelse return;
+        self.detachPanel();
+        self.panel_widget = face;
+        self.panel_ctx = ctx;
+        self.panel_prepare_destroy = prepare_destroy_cb;
+        self.panel_deinit = deinit_cb;
+        self.panel_focus = focus_cb;
+        c.gtk_widget_set_vexpand(face, 1);
+        c.gtk_widget_set_hexpand(face, 1);
+        c.gtk_box_append(@ptrCast(wrap), face);
+        self.setPanelVisible(true);
+    }
+
+    /// Flip between the panel face and whatever else the pane shows
+    /// (terminal, browser or editor — showing the panel hides them all).
+    pub fn setPanelVisible(self: *Pane, show: bool) void {
+        const pw = self.panel_widget orelse return;
+        c.gtk_widget_set_visible(pw, if (show) @as(c_int, 1) else 0);
+        if (show) {
+            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
+            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
+            if (self.panel_focus) |focus| {
+                if (self.panel_ctx) |ctx| focus(ctx);
+            }
+        } else {
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        }
+    }
+
+    pub fn hasPanelFace(self: *Pane) bool {
+        return self.panel_widget != null;
+    }
+
+    pub fn panelFaceVisible(self: *Pane) bool {
+        const pw = self.panel_widget orelse return false;
+        return c.gtk_widget_get_visible(pw) != 0;
+    }
+
+    /// Swap panel face and shell. @return false when there is no panel
+    /// face to swap to.
+    pub fn togglePanelFace(self: *Pane) bool {
+        if (!self.hasPanelFace()) return false;
+        self.setPanelVisible(!self.panelFaceVisible());
+        return true;
+    }
+
+    /// Two-phase panel teardown, tolerant of dead widgets — mirror of
+    /// detachEditor. Reached from `severFaces`, never from a call site.
+    pub fn detachPanel(self: *Pane) void {
+        const ctx = self.panel_ctx;
+        const prepare_destroy_cb = self.panel_prepare_destroy;
+        const deinit_cb = self.panel_deinit;
+        const face = self.panel_widget;
+        self.panel_ctx = null;
+        self.panel_prepare_destroy = null;
+        self.panel_deinit = null;
+        self.panel_focus = null;
+        self.panel_widget = null;
+        if (ctx) |panel_ctx| {
+            if (prepare_destroy_cb) |cb| cb(panel_ctx, self.widgets_dead);
+        }
+        if (face) |pw| {
+            if (!self.widgets_dead) {
+                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), pw);
+                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            }
+        }
+        if (ctx) |panel_ctx| {
+            if (deinit_cb) |cb| cb(panel_ctx);
         }
     }
 

@@ -119,6 +119,10 @@ const ENTRIES = [_]Entry{
        .desc = "Edit text files (local or remote) with multi-caret editing; the pane's shell is one click away.", .action = .new_editor_tab },
     .{ .icon = "document-edit-symbolic", .title = "Show Editor / Show Shell",
        .desc = "Swap this pane between its text editor and its shell. Both stay alive; neither is closed.", .action = .toggle_editor_face },
+    .{ .icon = "view-paged-symbolic", .title = "Open Saved Panel…",
+       .desc = "Reopen a declarative UI panel saved for this pane's session. Broken documents are listed with the reason; each row can be deleted.", .action = .panel_open },
+    .{ .icon = "window-close-symbolic", .title = "Close Panel",
+       .desc = "Take the panel off this pane, or off this tab. A panel that replaced a shell gives the shell back.", .action = .panel_close },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",
@@ -648,6 +652,22 @@ fn findEdBindingLabel(arena: std.mem.Allocator, window: *Window, cmd: ecmd.Comma
     const z = arena.allocSentinel(u8, label.len, 0) catch return null;
     @memcpy(z, label);
     return z.ptr;
+}
+
+test "the curated set carries the panel actions" {
+    // The saved-panel picker is reachable ONLY from here (no default
+    // chord, no menu item), so a missing row is the whole feature
+    // missing. `zig build smoke-e2e` drives the actions themselves
+    // through a config keybind — see `panelPickerStage` for why the
+    // palette's own entry cannot be typed into on that display.
+    var open_row = false;
+    var close_row = false;
+    for (ENTRIES) |e| {
+        if (e.action == .panel_open) open_row = true;
+        if (e.action == .panel_close) close_row = true;
+    }
+    try std.testing.expect(open_row);
+    try std.testing.expect(close_row);
 }
 
 fn findBindingLabel(arena: std.mem.Allocator, window: *Window, action: input.Action) ?[*:0]const u8 {

@@ -3212,6 +3212,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_editor_tab => self.newEditorTab() catch |err| logActionError("new_editor_tab", err),
         // Only reached when the focused pane has NO editor face.
         .toggle_editor_face => showToast(self, "This pane has no editor. Use New Editor Tab."),
+        .panel_open => @import("panelpicker.zig").open(self),
+        .panel_close => if (!@import("panelhost.zig").closeNearest(self, self.focusedPane()))
+            showToast(self, "No panel to close here. Use Open Saved Panel… to show one."),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
