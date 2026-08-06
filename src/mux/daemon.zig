@@ -381,14 +381,14 @@ pub const Session = struct {
     winstream: ?*WsSource = null,
     /// Live asciicast v2 recording of this session's PTY output
     /// (rec_start/rec_stop). Survives client detach.
-    cast: ?cast_rec.Rec = null,
+    cast_recorder: ?cast_rec.Rec = null,
     /// Indexed escape-free log of the child's output (log_get / MCP
     /// app_log): one monotonically-increasing id per line, bounded.
     log: logring.LogRing,
     pub fn deinit(self: *Session) void {
         if (self.xwayland) |*xwl| xwl.deinit();
         self.log.deinit();
-        if (self.cast) |*rec| rec.finish();
+        if (self.cast_recorder) |*rec| rec.finish();
         if (self.winstream) |ws| {
             ws.deinit();
             self.allocator.destroy(ws);
@@ -4489,7 +4489,7 @@ pub const Daemon = struct {
                 break;
             }
             const n: usize = @intCast(n_raw);
-            if (s.cast) |*rec| rec.output(nowMs(), chunk[0..n]);
+            if (s.cast_recorder) |*rec| rec.output(nowMs(), chunk[0..n]);
             s.parser.advance(chunk[0..n], EventCollector.emit, @ptrCast(&total_events));
             if (n < chunk.len) break;
         }
