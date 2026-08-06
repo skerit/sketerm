@@ -518,6 +518,7 @@ pub const Pane = struct {
         terminal.on_program_changed = onProgramEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_clipboard_get = onClipboardGetEvent;
+        terminal.on_glyph_coverage = onGlyphCoverageEvent;
         terminal.on_render_request = onRenderRequest;
         terminal.on_crashed = onCrashEvent;
         terminal.on_connection_state = onConnectionStateEvent;
@@ -2308,6 +2309,12 @@ const ClipReadCtx = struct {
     drain: *DrainHandle,
     selection: u8,
 };
+
+fn onGlyphCoverageEvent(ctx: ?*anyopaque, cp: u32) bool {
+    const self = cast.userData(Pane, ctx);
+    const atlas = self.atlas orelse return false;
+    return atlas.hasSystemGlyph(cp);
+}
 
 fn onClipboardGetEvent(ctx: ?*anyopaque, selection: u8) void {
     const self = cast.userData(Pane, ctx);

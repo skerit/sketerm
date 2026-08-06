@@ -769,6 +769,217 @@ pub fn main() !u8 {
         }
     }
 
+    // Glyph Protocol (fmt=glyf) rasteriser proof: register through
+    // Parser→Screen, render, read pixels back. Also proves overwrite
+    // invalidation (glossary generation → cell rebuild), the clear
+    // fallback, width=2 spanning two cells, and re-rasterisation from
+    // retained payloads after an Atlas rebuild at a new cell size.
+    {
+        const helpers = struct {
+            /// One-contour axis-aligned rectangle, coordinates in font
+            /// units, y=0 at the baseline (Y-up).
+            fn rectGlyf(a: std.mem.Allocator, x0: i16, y0: i16, x1: i16, y1: i16) ![]u8 {
+                var out: std.ArrayList(u8) = .empty;
+                errdefer out.deinit(a);
+                var tmp: [2]u8 = undefined;
+                const wi16 = struct {
+                    fn go(l: *std.ArrayList(u8), al: std.mem.Allocator, t: *[2]u8, v: i16) !void {
+                        std.mem.writeInt(i16, t, v, .big);
+                        try l.appendSlice(al, t);
+                    }
+                }.go;
+                try wi16(&out, a, &tmp, 1); // numberOfContours
+                try wi16(&out, a, &tmp, x0);
+                try wi16(&out, a, &tmp, y0);
+                try wi16(&out, a, &tmp, x1);
+                try wi16(&out, a, &tmp, y1);
+                std.mem.writeInt(u16, &tmp, 3, .big); // endPtsOfContours
+                try out.appendSlice(a, &tmp);
+                std.mem.writeInt(u16, &tmp, 0, .big); // instructionLength
+                try out.appendSlice(a, &tmp);
+                try out.appendSlice(a, &.{ 0x01, 0x01, 0x01, 0x01 }); // 4 on-curve
+                for ([_]i16{ x0, x1 - x0, 0, x0 - x1 }) |dx| try wi16(&out, a, &tmp, dx);
+                for ([_]i16{ y0, 0, y1 - y0, 0 }) |dy| try wi16(&out, a, &tmp, dy);
+                return out.toOwnedSlice(a);
+            }
+
+            fn registerApc(a: std.mem.Allocator, cp: u32, extra: []const u8, glyf: []const u8) ![]u8 {
+                const enc = std.base64.standard.Encoder;
+                const b64 = try a.alloc(u8, enc.calcSize(glyf.len));
+                defer a.free(b64);
+                _ = enc.encode(b64, glyf);
+                return std.fmt.allocPrint(a, "\x1b_25a1;r;cp={x};reply=0{s};{s}\x1b\\", .{ cp, extra, b64 });
+            }
+
+            /// Lit-pixel count + screen-y centroid over a screen-space
+            /// rect (glReadPixels row 0 is the framebuffer BOTTOM).
+            fn stats(fbuf: []const u8, x0: usize, y0: usize, w: usize, h: usize) struct { count: usize, ysum: usize } {
+                var count: usize = 0;
+                var ysum: usize = 0;
+                var y = y0;
+                while (y < y0 + h) : (y += 1) {
+                    const fb_row = @as(usize, @intCast(H)) - 1 - y;
+                    var x = x0;
+                    while (x < x0 + w) : (x += 1) {
+                        const o = (fb_row * @as(usize, @intCast(W)) + x) * 4;
+                        const sum: u32 = @as(u32, fbuf[o]) + fbuf[o + 1] + fbuf[o + 2];
+                        if (sum > 260) {
+                            count += 1;
+                            ysum += y;
+                        }
+                    }
+                }
+                return .{ .count = count, .ysum = ysum };
+            }
+        };
+
+        const cw: usize = atlas.?.cell_w;
+        const chh: usize = atlas.?.cell_h;
+        const padu: usize = 6;
+
+        // Wipe the earlier scene; drop overlays.
+        screen.hints_overlay = &.{};
+        parser.advance("\x1b[0m\x1b[2J\x1b[H", Emit.cb, @ptrCast(&ec));
+
+        // Stage A: rect high above the baseline (y 250..450 of upm
+        // 1000) at U+F0100 (plane-15 PUA: no system font covers it,
+        // so the post-clear fallback below is honest tofu).
+        const rect_hi = try helpers.rectGlyf(allocator, 0, 250, 1000, 450);
+        defer allocator.free(rect_hi);
+        const apc_hi = try helpers.registerApc(allocator, 0xF0100, "", rect_hi);
+        defer allocator.free(apc_hi);
+        parser.advance(apc_hi, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[1;1H\u{F0100}", Emit.cb, @ptrCast(&ec));
+
+        const render = struct {
+            fn go(cp_: *CellPass, sc: *Screen, pl: *StylePool, at: *Atlas, fbuf: []u8) !void {
+                // Caller has the offscreen FBO bound; keep it.
+                c.glViewport(0, 0, W, H);
+                c.glClearColor(0.05, 0.05, 0.10, 1.0);
+                c.glClear(c.GL_COLOR_BUFFER_BIT);
+                try cp_.rebuildAndUpload(sc, pl, at);
+                cp_.draw(at, W, H);
+                c.glFinish();
+                c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fbuf.ptr);
+            }
+        }.go;
+
+        // The offscreen FBO from the top of main is still what we
+        // want to render into (id in `fbo`).
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const a_stats = helpers.stats(fb, padu, padu, cw, chh);
+        std.debug.print("smoke-cell: glyph-protocol A lit={d}\n", .{a_stats.count});
+        if (a_stats.count < 4) {
+            std.debug.print("smoke-cell: FAIL — registered glyph did not render\n", .{});
+            return 40;
+        }
+        const a_centroid = a_stats.ysum / a_stats.count;
+
+        // Stage B: overwrite the SAME codepoint with a rect hugging
+        // the baseline (y -50..150). No cell changed — only the
+        // glossary generation may trigger the rebuild. The centroid
+        // must move DOWN the screen (also proves the Y-flip is right).
+        const rect_lo = try helpers.rectGlyf(allocator, 0, -50, 1000, 150);
+        defer allocator.free(rect_lo);
+        const apc_lo = try helpers.registerApc(allocator, 0xF0100, "", rect_lo);
+        defer allocator.free(apc_lo);
+        parser.advance(apc_lo, Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const b_stats = helpers.stats(fb, padu, padu, cw, chh);
+        std.debug.print("smoke-cell: glyph-protocol B lit={d}\n", .{b_stats.count});
+        if (b_stats.count < 4) {
+            std.debug.print("smoke-cell: FAIL — overwritten glyph did not render\n", .{});
+            return 41;
+        }
+        const b_centroid = b_stats.ysum / b_stats.count;
+        std.debug.print("smoke-cell: glyph-protocol centroids a={d} b={d}\n", .{ a_centroid, b_centroid });
+        if (b_centroid <= a_centroid + 1) {
+            std.debug.print("smoke-cell: FAIL — overwrite did not change pixels (stale atlas?) or Y orientation wrong\n", .{});
+            return 42;
+        }
+
+        // Stage C: clear the slot; the cell must fall back to tofu
+        // (U+F0100 has no system-font coverage — the cell goes dark).
+        parser.advance("\x1b_25a1;c;cp=F0100\x1b\\", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const c_stats = helpers.stats(fb, padu, padu, cw, chh);
+        std.debug.print("smoke-cell: glyph-protocol post-clear lit={d}\n", .{c_stats.count});
+        if (c_stats.count >= 4) {
+            std.debug.print("smoke-cell: FAIL — cleared glyph still renders\n", .{});
+            return 43;
+        }
+
+        // Stage D: width=2 paints across two cells (layout stays 1).
+        const rect_wide = try helpers.rectGlyf(allocator, 0, 100, 2000, 500);
+        defer allocator.free(rect_wide);
+        const apc_wide = try helpers.registerApc(allocator, 0xF0101, ";width=2", rect_wide);
+        defer allocator.free(apc_wide);
+        parser.advance(apc_wide, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[3;1H\u{F0101}", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const d_first = helpers.stats(fb, padu, padu + 2 * chh, cw, chh);
+        const d_second = helpers.stats(fb, padu + cw, padu + 2 * chh, cw, chh);
+        std.debug.print("smoke-cell: glyph-protocol width=2 first={d} second={d}\n", .{ d_first.count, d_second.count });
+        if (d_first.count < 4 or d_second.count < 4) {
+            std.debug.print("smoke-cell: FAIL — width=2 glyph does not span both cells\n", .{});
+            return 44;
+        }
+
+        // Stage E: the GridPass overlay path (a row containing RTL is
+        // routed there) must resolve the glossary too. Hebrew aleph +
+        // the wide glyph on row 5.
+        parser.advance("\x1b[5;1H\u{05D0} \u{F0101}", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+        grid_pass.draw(atlas.?, W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        // An RTL-leading row reorders to the right margin — accept
+        // lit pixels anywhere in the row band (nothing else draws
+        // there: focused=false means no border).
+        const e_stats = helpers.stats(fb, padu, padu + 4 * chh, @as(usize, @intCast(W)) - 2 * padu, chh);
+        std.debug.print("smoke-cell: glyph-protocol overlay-row lit={d}\n", .{e_stats.count});
+        if (e_stats.count < 4) {
+            std.debug.print("smoke-cell: FAIL — overlay (bidi) row lost the custom glyph\n", .{});
+            return 45;
+        }
+
+        // Stage F: Atlas rebuild at a different cell size — the glyph
+        // must re-rasterise from the retained payload (resolution
+        // independence). Fresh Atlas exactly like a font-size change;
+        // per the renderer invariants the passes are marked dirty.
+        var atlas2: ?*Atlas = null;
+        for (FONT_CANDIDATES) |path| {
+            if (Atlas.init(allocator, path, FONT_SIZE + 6)) |a2| {
+                atlas2 = a2;
+                break;
+            } else |_| continue;
+        }
+        if (atlas2 == null) return 46;
+        atlas2.?.realize();
+        cell_pass.markAllDirty();
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas2.?, fb);
+        const cw2: usize = atlas2.?.cell_w;
+        const ch2: usize = atlas2.?.cell_h;
+        const f_stats = helpers.stats(fb, padu, padu + 2 * ch2, cw2 * 2, ch2);
+        std.debug.print("smoke-cell: glyph-protocol rebuilt-atlas lit={d} (cell {d}x{d} -> {d}x{d})\n", .{ f_stats.count, cw, chh, cw2, ch2 });
+        const f_failed = f_stats.count < 4;
+        atlas2.?.releaseGL();
+        atlas2.?.deinit();
+        // Leave the shared passes pointing back at the original atlas.
+        cell_pass.markAllDirty();
+        if (f_failed) {
+            std.debug.print("smoke-cell: FAIL — glyph did not re-rasterise after atlas rebuild\n", .{});
+            return 47;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

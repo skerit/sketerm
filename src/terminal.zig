@@ -77,6 +77,10 @@ pub const Terminal = struct {
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// OSC 52 read query (only fired when the screen allows reads).
     on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
+    /// Glyph Protocol `q` system-font coverage probe (see
+    /// Screen.Sink.on_glyph_coverage). Answered synchronously from
+    /// the pane's Atlas; unset = no system coverage.
+    on_glyph_coverage: ?*const fn (ctx: ?*anyopaque, cp: u32) bool = null,
     /// Fires once at the end of a socket drain when events left
     /// `screen.dirty = true` (and we're not in DECSET 2026 sync
     /// mode). UI uses it to schedule a GL render directly from the
@@ -866,6 +870,7 @@ pub const Terminal = struct {
             .on_write_pty = sinkWritePty,
             .on_clipboard_set = sinkClipboard,
             .on_clipboard_get = sinkClipboardGet,
+            .on_glyph_coverage = sinkGlyphCoverage,
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
@@ -2217,6 +2222,12 @@ pub const Terminal = struct {
         if (self.on_clipboard_get) |f| f(self.user_ctx, selection);
     }
 
+    fn sinkGlyphCoverage(ctx: ?*anyopaque, cp: u32) bool {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_glyph_coverage) |f| return f(self.user_ctx, cp);
+        return false;
+    }
+
     fn sinkCwd(ctx: ?*anyopaque, cwd_in: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         // OSC 7 sends `file://hostname/path/to/cwd`.
@@ -2340,6 +2351,7 @@ pub const Terminal = struct {
         self.on_cwd_changed = null;
         self.on_clipboard_set = null;
         self.on_clipboard_get = null;
+        self.on_glyph_coverage = null;
         self.on_render_request = null;
         self.on_crashed = null;
         self.on_connection_state = null;

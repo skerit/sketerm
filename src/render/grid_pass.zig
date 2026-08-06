@@ -169,6 +169,12 @@ const Snapshot = struct {
     selection_end_col: i32 = 0,
     selection_bg: [4]f32 = .{ 0, 0, 0, 0 },
 
+    /// Glyph Protocol glossary generation — a register/overwrite/
+    /// clear repaints visible PUA cells without touching cell data,
+    /// so it must invalidate the overlay vbuf too (CLAUDE.md: every
+    /// new Screen-side render state needs a Snapshot field).
+    glyph_gen: u64 = 0,
+
     search_count: u32 = 0,
     search_active_idx: i32 = -1,
     search_hash: u64 = 0,
@@ -502,7 +508,7 @@ pub const GridPass = struct {
             }
             if (!self.row_overlay_needed.items[row]) continue;
 
-            try self.emitOverlayRow(atlas, pool, cells, row, cw, ch, ascent, ln.scaling);
+            try self.emitOverlayRow(atlas, pool, &screen.glyphs, cells, row, cw, ch, ascent, ln.scaling);
         }
 
         // Search-result overlay — every match in `screen.search_highlights`
@@ -1028,6 +1034,8 @@ pub const GridPass = struct {
             .selection_end_col = screen.selection.end_col,
             .selection_bg = screen.selection_bg,
 
+            .glyph_gen = screen.glyphs.generation,
+
             .search_count = @intCast(screen.search_highlights.len),
             .search_active_idx = screen.search_active_idx,
             .search_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.search_highlights)),
@@ -1085,6 +1093,7 @@ pub const GridPass = struct {
         self: *GridPass,
         atlas: *Atlas,
         pool: *const StylePool,
+        glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cells: []const Cell,
         row: u16,
         cw: f32,
@@ -1117,9 +1126,9 @@ pub const GridPass = struct {
 
         // Glyphs — bidi-reorder runs to visual order before shaping.
         if (rowNeedsBidi(cells) and self.enable_bidi) {
-            try self.emitBidiGlyphs(atlas, pool, cells, row, cw, ch, ascent, scaling);
+            try self.emitBidiGlyphs(atlas, pool, glossary, cells, row, cw, ch, ascent, scaling);
         } else {
-            try self.emitLogicalGlyphs(atlas, pool, cells, row, cw, ch, ascent, scaling, x_scale, y_scale, y_origin_shift);
+            try self.emitLogicalGlyphs(atlas, pool, glossary, cells, row, cw, ch, ascent, scaling, x_scale, y_scale, y_origin_shift);
         }
     }
 
@@ -1182,6 +1191,7 @@ pub const GridPass = struct {
         self: *GridPass,
         atlas: *Atlas,
         pool: *const StylePool,
+        glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cells: []const Cell,
         row: u16,
         cw: f32,
@@ -1222,7 +1232,7 @@ pub const GridPass = struct {
             fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch {
+            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic) catch {
                 col += 1;
                 continue;
             };
@@ -1256,6 +1266,7 @@ pub const GridPass = struct {
         self: *GridPass,
         atlas: *Atlas,
         pool: *const StylePool,
+        glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cells: []const Cell,
         row: u16,
         cw: f32,
@@ -1300,7 +1311,7 @@ pub const GridPass = struct {
             fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch continue;
+            const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic) catch continue;
             if (g.w == 0 or g.h == 0) continue;
             const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
             const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;

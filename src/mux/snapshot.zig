@@ -17,8 +17,14 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 4;
+pub const SNAPSHOT_VERSION = 5;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
+
+/// v5: byte budget for the Glyph Protocol glossary tail. Newest
+/// registrations win when the lot would overflow (same policy as
+/// `RETAIN_IMAGE_BUDGET` for image payloads). Worst case is 1024
+/// slots x 64 KiB = 64 MiB, which no attach frame should carry.
+pub const GLYPH_SNAPSHOT_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Select a snapshot body for a negotiated or historical core profile.
 pub fn negotiateVersion(proto: u32, advertised_max: u8, negotiated: bool) u8 {
@@ -222,6 +228,42 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         try s.int(u64, screen.last_output_end_id);
         try s.int(i32, screen.last_cmd_exit);
         try s.int(u64, screen.cmd_completion_seq);
+    }
+
+    // v5 tail: the Glyph Protocol glossary, so a client attaching
+    // LATER still renders glyphs registered before it connected. An
+    // empty glossary costs 4 bytes. Entries are budgeted newest-first
+    // by insertion stamp; the stamps ride along so FIFO eviction
+    // order survives the round-trip.
+    if (version >= 5) {
+        const GlyphEntry = struct { cp: u32, e: @import("../grid/glyph_glossary.zig").Entry };
+        var entries: std.ArrayList(GlyphEntry) = .empty;
+        defer entries.deinit(allocator);
+        var git = screen.glyphs.map.iterator();
+        while (git.next()) |kv| {
+            try entries.append(allocator, .{ .cp = kv.key_ptr.*, .e = kv.value_ptr.* });
+        }
+        std.mem.sort(GlyphEntry, entries.items, {}, struct {
+            fn lt(_: void, a: GlyphEntry, b: GlyphEntry) bool {
+                return a.e.insertion < b.e.insertion;
+            }
+        }.lt);
+        var budget: usize = GLYPH_SNAPSHOT_BUDGET;
+        var first_kept: usize = entries.items.len;
+        while (first_kept > 0) {
+            const need = entries.items[first_kept - 1].e.payload.len;
+            if (need > budget) break;
+            budget -= need;
+            first_kept -= 1;
+        }
+        try s.int(u32, @intCast(entries.items.len - first_kept));
+        for (entries.items[first_kept..]) |ge| {
+            try s.int(u32, ge.cp);
+            try s.int(u16, ge.e.upm);
+            try s.byte(ge.e.width);
+            try s.int(u64, ge.e.insertion);
+            try s.bytes(ge.e.payload);
+        }
     }
 }
 
@@ -507,6 +549,24 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
         screen.cmd_completion_seq = try src.int(u64);
     }
 
+    // v5 tail: Glyph Protocol glossary. `registerRestored` re-mints
+    // render keys locally (foreign keys are meaningless in this
+    // process) while keeping the FIFO insertion stamps.
+    if (version >= 5) {
+        const n_glyphs = try src.int(u32);
+        for (0..n_glyphs) |_| {
+            const cp = try src.int(u32);
+            const upm = try src.int(u16);
+            const width = try src.byte();
+            const insertion = try src.int(u64);
+            const plen = try src.int(u32);
+            const pdata = try src.take(plen);
+            if (upm == 0 or (width != 1 and width != 2) or plen == 0) return error.BadSnapshot;
+            const owned = allocator.dupe(u8, pdata) catch return error.OutOfMemory;
+            screen.glyphs.registerRestored(cp, owned, upm, width, insertion) catch return error.BadSnapshot;
+        }
+    }
+
     screen.dirty = true;
     return screen;
 }
@@ -625,7 +685,7 @@ test "snapshot: v3 payload (no command tail) restores with defaults" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try serialize(h.screen, &buf, a);
+    try serializeVersion(h.screen, &buf, a, 4);
 
     // A v3 payload is exactly a v4 one without the 37-byte command
     // tail — chop it off and stamp version 3.
@@ -726,7 +786,7 @@ test "snapshot: transitional v4 legacy field is not an image count" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try serialize(h.screen, &buf, a);
+    try serializeVersion(h.screen, &buf, a, 4);
     try testing.expectEqual(@as(usize, 0), h.screen.retained_images.items.len);
 
     // The transitional writer put a legacy non-zero u32 immediately before
@@ -878,4 +938,62 @@ test "restore normalizes lines whose serialized width diverges from cols" {
     try testing.expectEqual(@as(usize, 8), padded.cells.len);
     try testing.expectEqual(@as(u32, 'W'), padded.cells[4].rune);
     try testing.expectEqual(@as(u32, 0), padded.cells[5].rune);
+}
+
+test "snapshot: glyph glossary round-trips with FIFO stamps" {
+    const a = testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    const p1 = try a.dupe(u8, tri);
+    try h.screen.glyphs.registerAdopt(0xE100, p1, 1000, 1);
+    const p2 = try a.dupe(u8, tri);
+    try h.screen.glyphs.registerAdopt(0xF0100, p2, 2048, 2);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serialize(h.screen, &buf, a);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, buf.items);
+    defer back.deinit();
+
+    try testing.expectEqual(@as(usize, 2), back.glyphs.count());
+    const e1 = back.glyphs.get(0xE100).?;
+    try testing.expectEqualSlices(u8, tri, e1.payload);
+    try testing.expectEqual(@as(u16, 1000), e1.upm);
+    try testing.expectEqual(@as(u8, 1), e1.width);
+    const e2 = back.glyphs.get(0xF0100).?;
+    try testing.expectEqual(@as(u16, 2048), e2.upm);
+    try testing.expectEqual(@as(u8, 2), e2.width);
+    // FIFO order preserved across the round-trip.
+    try testing.expect(e1.insertion < e2.insertion);
+    // Render keys are freshly minted locally, never zero.
+    try testing.expect(e1.render_key != 0 and e2.render_key != 0);
+    try testing.expect(e1.render_key != e2.render_key);
+}
+
+test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+
+    var v4buf: std.ArrayList(u8) = .empty;
+    defer v4buf.deinit(a);
+    try serializeVersion(h.screen, &v4buf, a, 4);
+    var v5buf: std.ArrayList(u8) = .empty;
+    defer v5buf.deinit(a);
+    try serialize(h.screen, &v5buf, a);
+    // Only the u32 count separates an empty-glossary v5 from a v4.
+    try testing.expectEqual(v4buf.items.len + 4, v5buf.items.len);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, v4buf.items);
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 0), back.glyphs.count());
 }

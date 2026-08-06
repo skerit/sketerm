@@ -21,6 +21,7 @@ const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
 const palette_default_256 = @import("palette.zig").default_256;
 const kitty_ph = @import("kitty_placeholder.zig");
+const glyph_protocol = @import("../parser/glyph_protocol.zig");
 
 pub const CMD_ZONE_CAP = 64;
 
@@ -318,6 +319,12 @@ pub const Screen = struct {
     /// stored images for separate place actions, PNG decode).
     kitty_images: @import("kitty_images.zig").Manager,
 
+    /// Glyph Protocol glossary (APC `25a1;r` registrations). Side
+    /// table like `links`/`clusters` — the cell's rune IS the key.
+    /// Deliberately NOT cleared by fullReset (RIS) and shared across
+    /// the alt-screen switch, matching Rio.
+    glyphs: @import("glyph_glossary.zig").Glossary,
+
     /// Kitty Unicode-placeholder virtual placements, keyed by image_id.
     /// A `U=1` placement registers here instead of drawing at the
     /// cursor; U+10EEEE cells later tile the image across the grid.
@@ -556,6 +563,11 @@ pub const Screen = struct {
         /// asynchronously with `OSC 52 ; <sel> ; <base64>` via
         /// write-pty. `selection` is 'c' (clipboard) or 'p' (primary).
         on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
+        /// Glyph Protocol `q` system-coverage probe: does a system
+        /// font render `cp` as something other than tofu? Only the
+        /// GUI (with its Atlas + fontconfig) can answer; unset means
+        /// "no system coverage".
+        on_glyph_coverage: ?*const fn (ctx: ?*anyopaque, cp: u32) bool = null,
         /// OSC 1337 ; SetProfile=<name> — app requests this pane adopt
         /// a configured profile. Untrusted: the GUI maps an unknown
         /// name to the Default profile.
@@ -902,6 +914,7 @@ pub const Screen = struct {
             .links = std.AutoHashMap(u8, []u8).init(allocator),
             .clusters = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator),
             .kitty_images = @import("kitty_images.zig").Manager.init(allocator),
+            .glyphs = @import("glyph_glossary.zig").Glossary.init(allocator),
             .virtual_placements = std.AutoHashMap(u32, VirtualPlacement).init(allocator),
             .next_line_id = id_counter,
         };
@@ -938,6 +951,7 @@ pub const Screen = struct {
         while (cl_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.clusters.deinit();
         self.kitty_images.deinit();
+        self.glyphs.deinit();
         self.virtual_placements.deinit();
         for (self.user_vars.items) |uv| {
             self.allocator.free(uv.name);
@@ -2952,6 +2966,10 @@ pub const Screen = struct {
     }
 
     pub fn onApc(self: *Screen, body: []const u8) void {
+        // Glyph Protocol: APC bodies prefixed with the literal `25a1`.
+        // Dispatched before the kitty check (kitty bodies start 'G',
+        // so the prefixes can never collide).
+        if (std.mem.startsWith(u8, body, glyph_protocol.PREFIX)) return self.onGlyphApc(body);
         // Kitty graphics protocol: APC G=...
         if (body.len < 1 or body[0] != 'G') return;
         const kitty = @import("../parser/kitty_image.zig");
@@ -3068,6 +3086,62 @@ pub const Screen = struct {
             .cell_y_offset = cmd.cell_y_offset,
         });
         self.dirty = true;
+    }
+
+    /// Rio Glyph Protocol dispatch (APC `25a1;...`). Framing/param
+    /// validation lives in `parser/glyph_protocol.zig`; this decides
+    /// who replies. `s`/`r`/`c` go through `respond` — on a mux mirror
+    /// that is muted so the daemon's authoritative Screen answers
+    /// alone. `q` needs the system-font coverage bit only the GUI has,
+    /// so it mirrors the OSC 52 clipboard-read split: the daemon
+    /// defers (`defer_gui_queries`) and the attached mirror answers
+    /// via `respondForce`.
+    fn onGlyphApc(self: *Screen, body: []const u8) void {
+        var resp_buf: [96]u8 = undefined;
+        switch (glyph_protocol.parse(self.allocator, body)) {
+            .not_glyph_protocol, .malformed => {},
+            .support => self.respond(glyph_protocol.fmtSupport(&resp_buf)),
+            .query => |cp| {
+                if (self.defer_gui_queries) return;
+                const in_glossary = self.glyphs.contains(cp);
+                const in_system = if (self.sink.on_glyph_coverage) |f|
+                    f(self.sink.ctx, cp)
+                else
+                    false;
+                self.respondForce(glyph_protocol.fmtQuery(&resp_buf, cp, in_system, in_glossary));
+            },
+            .register => |r| {
+                // Structural glyf validation happens HERE (not at the
+                // parser) so the daemon rejects composite/hinted/broken
+                // records before storing them.
+                if (glyph_protocol.validateGlyf(self.allocator, r.payload)) |reason| {
+                    self.allocator.free(r.payload);
+                    if (r.reply.emitError())
+                        self.respond(glyph_protocol.fmtRegisterErr(&resp_buf, r.cp, reason));
+                    return;
+                }
+                self.glyphs.registerAdopt(r.cp, r.payload, r.upm, r.width) catch {
+                    // OOM storing the slot (payload already freed by
+                    // the glossary). No reply code fits better.
+                    if (r.reply.emitError())
+                        self.respond(glyph_protocol.fmtRegisterErr(&resp_buf, r.cp, .payload_too_large));
+                    return;
+                };
+                self.dirty = true;
+                if (r.reply.emitSuccess())
+                    self.respond(glyph_protocol.fmtRegisterOk(&resp_buf, r.cp));
+            },
+            .register_failed => |rf| {
+                if (rf.reply.emitError())
+                    self.respond(glyph_protocol.fmtRegisterErr(&resp_buf, rf.cp, rf.reason));
+            },
+            .clear => |cp_opt| {
+                if (cp_opt) |cp| self.glyphs.clearOne(cp) else self.glyphs.clearAll();
+                self.dirty = true;
+                self.respond(glyph_protocol.fmtClearOk(&resp_buf, cp_opt));
+            },
+            .clear_out_of_namespace => self.respond(glyph_protocol.fmtClearErrOutOfNamespace(&resp_buf)),
+        }
     }
 
     /// The fill colour for sixel background-select (DCS P2 = 0/2): the
@@ -5132,6 +5206,245 @@ test "kitty graphics query honours q=1 quiet — no reply" {
     s.sink = .{ .on_write_pty = TestSink.write };
     s.onApc("Gi=42,a=q,q=1");
     try std.testing.expectEqual(@as(usize, 0), TestSink.captured_len);
+}
+
+// Shared helper for the Glyph Protocol tests: captures respond()d
+// bytes and builds `r` bodies around a valid hand-encoded triangle.
+const GlyphTestSink = struct {
+    var captured: [256]u8 = undefined;
+    var captured_len: usize = 0;
+    var coverage_queries: usize = 0;
+    var coverage_answer: bool = false;
+
+    fn reset() void {
+        captured_len = 0;
+        coverage_queries = 0;
+        coverage_answer = false;
+    }
+    fn write(_: ?*anyopaque, bytes: []const u8) void {
+        const n = @min(bytes.len, captured.len - captured_len);
+        @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+        captured_len += n;
+    }
+    fn coverage(_: ?*anyopaque, _: u32) bool {
+        coverage_queries += 1;
+        return coverage_answer;
+    }
+    fn got() []const u8 {
+        return captured[0..captured_len];
+    }
+};
+
+fn glyphRegisterBody(allocator: std.mem.Allocator, params: []const u8) ![]u8 {
+    const tri = try glyph_protocol.triangleBytes(allocator);
+    defer allocator.free(tri);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try allocator.alloc(u8, enc.calcSize(tri.len));
+    defer allocator.free(b64);
+    _ = enc.encode(b64, tri);
+    return std.fmt.allocPrint(allocator, "25a1;r;{s};{s}", .{ params, b64 });
+}
+
+test "glyph protocol: register stores entry and replies status=0" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;upm=2048;width=2");
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    const e = s.glyphs.get(0xE100).?;
+    try std.testing.expectEqual(@as(u16, 2048), e.upm);
+    try std.testing.expectEqual(@as(u8, 2), e.width);
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=0\x1b\\", GlyphTestSink.got());
+    try std.testing.expect(s.dirty);
+}
+
+test "glyph protocol: reply modes 0 and 2 suppress the success ACK" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    const silent = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");
+    defer std.testing.allocator.free(silent);
+    s.onApc(silent);
+    try std.testing.expectEqual(@as(usize, 0), GlyphTestSink.captured_len);
+    const errs_only = try glyphRegisterBody(std.testing.allocator, "cp=E101;reply=2");
+    defer std.testing.allocator.free(errs_only);
+    s.onApc(errs_only);
+    try std.testing.expectEqual(@as(usize, 0), GlyphTestSink.captured_len);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    try std.testing.expect(s.glyphs.contains(0xE101));
+    // reply=2 still reports failures.
+    const bad = try glyphRegisterBody(std.testing.allocator, "cp=61;reply=2");
+    defer std.testing.allocator.free(bad);
+    s.onApc(bad);
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=61;status=1;reason=out_of_namespace\x1b\\", GlyphTestSink.got());
+    // ...unless reply=0 suppressed those too.
+    GlyphTestSink.reset();
+    const bad_silent = try glyphRegisterBody(std.testing.allocator, "cp=61;reply=0");
+    defer std.testing.allocator.free(bad_silent);
+    s.onApc(bad_silent);
+    try std.testing.expectEqual(@as(usize, 0), GlyphTestSink.captured_len);
+}
+
+test "glyph protocol: structural rejects — composite, hinted, malformed" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    // Composite: numberOfContours = -1.
+    var comp: [10]u8 = @splat(0);
+    std.mem.writeInt(i16, comp[0..2], -1, .big);
+    const enc = std.base64.standard.Encoder;
+    var b64buf: [32]u8 = undefined;
+    const b64 = b64buf[0..enc.calcSize(comp.len)];
+    _ = enc.encode(b64, &comp);
+    const body = try std.fmt.allocPrint(std.testing.allocator, "25a1;r;cp=E100;{s}", .{b64});
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    try std.testing.expect(!s.glyphs.contains(0xE100));
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=1;reason=composite_unsupported\x1b\\", GlyphTestSink.got());
+}
+
+test "glyph protocol: support advertises fmt=glyf; clear replies; kitty still dispatches" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    s.onApc("25a1;s");
+    try std.testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf\x1b\\", GlyphTestSink.got());
+
+    GlyphTestSink.reset();
+    const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    s.onApc("25a1;c;cp=E100");
+    try std.testing.expect(!s.glyphs.contains(0xE100));
+    try std.testing.expectEqualStrings("\x1b_25a1;c;cp=e100;status=0\x1b\\", GlyphTestSink.got());
+
+    // Clearing an empty slot is still a success.
+    GlyphTestSink.reset();
+    s.onApc("25a1;c;cp=E100");
+    try std.testing.expectEqualStrings("\x1b_25a1;c;cp=e100;status=0\x1b\\", GlyphTestSink.got());
+
+    // Clear-all and the non-PUA clear error.
+    GlyphTestSink.reset();
+    s.onApc("25a1;c");
+    try std.testing.expectEqualStrings("\x1b_25a1;c;status=0\x1b\\", GlyphTestSink.got());
+    GlyphTestSink.reset();
+    s.onApc("25a1;c;cp=61");
+    try std.testing.expectEqualStrings("\x1b_25a1;c;status=1;reason=out_of_namespace\x1b\\", GlyphTestSink.got());
+
+    // A kitty APC must still take its own path.
+    GlyphTestSink.reset();
+    s.onApc("Gi=42,a=q");
+    try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", GlyphTestSink.got());
+}
+
+test "glyph protocol: mux mirror stays silent on register/clear, daemon defers q" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    // Mirror: respond() is muted but the glossary still applies —
+    // both Screens run the same events.
+    s.mute_responses = true;
+    const body = try glyphRegisterBody(std.testing.allocator, "cp=E100");
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    s.onApc("25a1;c;cp=E100");
+    s.onApc("25a1;s");
+    try std.testing.expectEqual(@as(usize, 0), GlyphTestSink.captured_len);
+
+    // Daemon side: defer_gui_queries leaves q unanswered there.
+    s.mute_responses = false;
+    s.defer_gui_queries = true;
+    s.onApc("25a1;q;cp=E100");
+    try std.testing.expectEqual(@as(usize, 0), GlyphTestSink.captured_len);
+}
+
+test "glyph protocol: mirror answers q via respondForce with coverage bits" {
+    GlyphTestSink.reset();
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write, .on_glyph_coverage = GlyphTestSink.coverage };
+    // Mirror config: muted for protocol replies, but q is GUI-owned.
+    s.mute_responses = true;
+
+    s.onApc("25a1;q;cp=E100");
+    try std.testing.expectEqualStrings("\x1b_25a1;q;cp=e100;status=\x1b\\", GlyphTestSink.got());
+    try std.testing.expectEqual(@as(usize, 1), GlyphTestSink.coverage_queries);
+
+    GlyphTestSink.reset();
+    const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    GlyphTestSink.coverage_answer = true;
+    s.onApc("25a1;q;cp=E100");
+    try std.testing.expectEqualStrings("\x1b_25a1;q;cp=e100;status=system,glossary\x1b\\", GlyphTestSink.got());
+}
+
+test "glyph protocol: RIS and alt-screen leave the glossary intact" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");
+    defer std.testing.allocator.free(body);
+    s.onApc(body);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    // Alt-screen round trip.
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 1049;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    csi.final = 'l';
+    s.csi(csi);
+    try std.testing.expect(s.glyphs.contains(0xE100));
+    // RIS is a factory reset for everything EXCEPT the glossary
+    // (Rio parity — only `c` clears it).
+    s.fullReset();
+    try std.testing.expect(s.glyphs.contains(0xE100));
+}
+
+test "glyph protocol: oversized payload rejected via the full APC path" {
+    GlyphTestSink.reset();
+    const a = std.testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    var s = try Screen.init(a, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = GlyphTestSink.write };
+    const big = try a.alloc(u8, glyph_protocol.MAX_PAYLOAD_BYTES + 1);
+    defer a.free(big);
+    @memset(big, 0);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(big.len));
+    defer a.free(b64);
+    _ = enc.encode(b64, big);
+    const body = try std.fmt.allocPrint(a, "25a1;r;cp=E100;{s}", .{b64});
+    defer a.free(body);
+    s.onApc(body);
+    try std.testing.expect(!s.glyphs.contains(0xE100));
+    try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=1;reason=payload_too_large\x1b\\", GlyphTestSink.got());
 }
 
 test "RIS resets charset state" {

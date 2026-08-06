@@ -355,6 +355,11 @@ pub const CellPass = struct {
     /// we're scrolled-back, the displayed scrollback indices shift —
     /// content at row R now comes from a different cached Line.
     last_sb_count: u32 = std.math.maxInt(u32),
+    /// Last `screen.glyphs.generation` (Glyph Protocol glossary). A
+    /// register/overwrite/clear changes what a visible PUA cell
+    /// renders as WITHOUT touching the cell, so any bump forces a
+    /// full rebuild — otherwise stale pixels stay on screen.
+    last_glyph_gen: u64 = 0,
 
     /// Set by `rebuildAndUpload` whenever any row was rebuilt during
     /// the call (covers per-row dirty, color/palette change, atlas
@@ -539,6 +544,12 @@ pub const CellPass = struct {
             for (self.row_needs_upload.items) |*r| r.* = true;
         }
 
+        // Glyph Protocol glossary mutation — see `last_glyph_gen`.
+        if (screen.glyphs.generation != self.last_glyph_gen) {
+            self.last_glyph_gen = screen.glyphs.generation;
+            for (self.row_needs_upload.items) |*r| r.* = true;
+        }
+
         const cw: f32 = @floatFromInt(atlas.cell_w);
         const ch: f32 = @floatFromInt(atlas.cell_h);
         const ascent: f32 = @floatFromInt(atlas.ascent);
@@ -573,7 +584,7 @@ pub const CellPass = struct {
             const need_rebuild = ln_ptr.*.dirty or self.row_needs_upload.items[row] or atlas_evicted;
             if (!need_rebuild) continue;
 
-            try self.rebuildRow(ln_ptr.*, row, screen.cols, atlas, pool, cw, ch, ascent, pad);
+            try self.rebuildRow(ln_ptr.*, row, screen.cols, atlas, pool, &screen.glyphs, cw, ch, ascent, pad);
             ln_ptr.*.dirty = false;
             self.row_needs_upload.items[row] = true;
             self.rebuilt_rows.items[row] = true;
@@ -602,6 +613,7 @@ pub const CellPass = struct {
         cols: u16,
         atlas: *Atlas,
         pool: *const StylePool,
+        glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cw: f32,
         ch: f32,
         ascent: f32,
@@ -684,7 +696,7 @@ pub const CellPass = struct {
             // below if applicable). Bold pulls a real bold glyph from the
             // atlas (bold face or outline-embolden) — no shader fakery.
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
-                const g = atlas.lookupOrLoad(cell.rune, cached_bold > 0.5, cached_attr_italic) catch continue;
+                const g = atlas.lookupGlyph(glossary, cell.rune, cached_bold > 0.5, cached_attr_italic) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
                     const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
