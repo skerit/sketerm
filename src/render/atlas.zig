@@ -17,6 +17,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const boxdraw = @import("boxdraw.zig");
+const glyph_glossary = @import("../grid/glyph_glossary.zig");
 
 /// Pixels per page side. Cap at 2048 — cross-vendor safe.
 pub const PAGE_SIZE: u32 = 2048;
@@ -67,12 +68,13 @@ const Page = struct {
 const GlyphRef = struct {
     /// Either codepoint (kind=.codepoint), font glyph index (kind=.gid)
     /// — both with `BOLD_KEY_BIT` OR-ed in for bold variants, the same
-    /// encoding the `cache` / `glyph_cache` maps use — or a packed
+    /// encoding the `cache` / `glyph_cache` maps use — a packed
     /// (face_idx+1)<<32 | gid key (kind=.face_gid) matching
-    /// `face_gid_cache`, so eviction removes the right entry.
+    /// `face_gid_cache`, or a Glyph Protocol render_key (kind=.custom)
+    /// matching `custom_cache`, so eviction removes the right entry.
     key: u64,
     kind: Kind,
-    pub const Kind = enum { codepoint, gid, face_gid };
+    pub const Kind = enum { codepoint, gid, face_gid, custom };
 };
 
 /// Bold / italic glyphs share the `cache` / `glyph_cache` maps with
@@ -237,6 +239,14 @@ pub const Atlas = struct {
     /// bits (0x4000_0000 / 0x2000_0000) burned into the high range.
     face_gid_cache: std.AutoHashMap(u64, Glyph) = undefined,
 
+    /// Glyph Protocol registrations, keyed by the glossary entry's
+    /// process-wide `render_key` — NOT by codepoint. The Atlas is
+    /// per-window and shared by every pane while glossaries are
+    /// per-Screen, so two panes may legally hold different glyphs at
+    /// the same codepoint; keying on render_key also makes stale
+    /// pixels after an overwrite unreachable by construction.
+    custom_cache: std.AutoHashMap(u64, Glyph) = undefined,
+
     /// Codepoint ranges pinned to fonts of their own, ahead of the
     /// primary face and the fallback machinery.
     symbol_faces: std.ArrayList(SymbolFace) = .empty,
@@ -387,6 +397,7 @@ pub const Atlas = struct {
             .fc_initialized = fc_ok,
             .cp_to_shape_fallback = std.AutoHashMap(u32, ?u16).init(allocator),
             .face_gid_cache = std.AutoHashMap(u64, Glyph).init(allocator),
+            .custom_cache = std.AutoHashMap(u64, Glyph).init(allocator),
         };
         self.builtin_box = opts.builtin_box;
         // Symbol maps load eagerly: there are a handful at most, and a
@@ -590,6 +601,7 @@ pub const Atlas = struct {
         self.shape_fallbacks.deinit(self.allocator);
         self.cp_to_shape_fallback.deinit();
         self.face_gid_cache.deinit();
+        self.custom_cache.deinit();
         if (self.ft_face_bold) |bf| _ = c.FT_Done_Face(bf);
         if (self.ft_face_italic) |f| _ = c.FT_Done_Face(f);
         if (self.ft_face_bold_italic) |f| _ = c.FT_Done_Face(f);
@@ -813,6 +825,150 @@ pub const Atlas = struct {
             }
         }
         return self.cacheEmpty(key);
+    }
+
+    /// Cell-content glyph resolution with Glyph Protocol precedence:
+    /// a live glossary registration outranks the system font. The PUA
+    /// range test keeps non-PUA text at one comparison before the
+    /// normal path.
+    pub fn lookupGlyph(
+        self: *Atlas,
+        glossary: *const glyph_glossary.Glossary,
+        cp: u32,
+        bold: bool,
+        italic: bool,
+    ) !Glyph {
+        if (glyph_glossary.isPua(cp)) {
+            if (glossary.get(cp)) |e| {
+                return self.lookupOrLoadCustom(e.render_key, e.payload, e.upm, e.width);
+            }
+        }
+        return self.lookupOrLoad(cp, bold, italic);
+    }
+
+    /// Rasterize (or fetch) a Glyph Protocol registration. Keyed by
+    /// `render_key`, so an overwritten registration can never serve
+    /// the previous rasterisation. A structurally broken payload
+    /// (which the daemon should have rejected at register time)
+    /// caches as an empty glyph.
+    pub fn lookupOrLoadCustom(self: *Atlas, render_key: u64, payload: []const u8, upm: u16, width: u8) !Glyph {
+        if (self.custom_cache.get(render_key)) |g| {
+            self.touchPage(g.layer);
+            return g;
+        }
+        const g = self.rasterCustom(payload, upm, width) orelse {
+            const empty = self.emptyGlyph();
+            _ = self.custom_cache.put(render_key, empty) catch {};
+            return empty;
+        };
+        try self.custom_cache.put(render_key, g);
+        self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+            .key = render_key,
+            .kind = .custom,
+        }) catch |err| {
+            _ = self.custom_cache.remove(render_key);
+            return err;
+        };
+        return g;
+    }
+
+    /// Decode a glyf simple-glyph record and rasterise it into a
+    /// `width`-cell × cell_h coverage box via the standalone FreeType
+    /// outline API. Coordinates are `upm` units with y=0 at the
+    /// baseline (Y-up); `pixel = value * cell_h / upm`. The outline is
+    /// fed to FreeType in Cartesian 26.6 space with the baseline
+    /// placed `descent` above the bitmap bottom — FT_Outline_Get_Bitmap
+    /// with a positive pitch performs the Y-flip itself (buffer row 0
+    /// is the TOP row), which the smoke-cell top-half/bottom-half
+    /// pixel assertions prove end to end. Spans outside the box are
+    /// clipped by the raster.
+    fn rasterCustom(self: *Atlas, payload: []const u8, upm: u16, width: u8) ?Glyph {
+        const gp = @import("../parser/glyph_protocol.zig");
+        if (upm == 0) return null;
+        var outline = gp.decodeGlyf(self.allocator, payload) catch return null;
+        defer outline.deinit(self.allocator);
+
+        const span: u32 = if (width >= 2) 2 else 1;
+        const w: u32 = @as(u32, self.cell_w) * span;
+        const h: u32 = self.cell_h;
+        if (w == 0 or h == 0) return null;
+        if (outline.ends.len == 0 or outline.points.len == 0) {
+            // Zero contours is a legal (blank) glyph.
+            return self.emptyGlyph();
+        }
+
+        const scale: f32 = @as(f32, @floatFromInt(h)) / @as(f32, @floatFromInt(upm));
+        const descent_px: f32 = @floatFromInt(@max(0, @as(i32, @intCast(h)) - @as(i32, self.ascent)));
+
+        const pts = self.allocator.alloc(c.FT_Vector, outline.points.len) catch return null;
+        defer self.allocator.free(pts);
+        const tags = self.allocator.alloc(u8, outline.points.len) catch return null;
+        defer self.allocator.free(tags);
+        const conts = self.allocator.alloc(c_ushort, outline.ends.len) catch return null;
+        defer self.allocator.free(conts);
+        for (outline.points, 0..) |p, i| {
+            const px = @as(f32, @floatFromInt(p.x)) * scale;
+            const py = @as(f32, @floatFromInt(p.y)) * scale + descent_px;
+            pts[i] = .{
+                .x = @intFromFloat(@round(px * 64.0)),
+                .y = @intFromFloat(@round(py * 64.0)),
+            };
+            tags[i] = if (p.on_curve) c.FT_CURVE_TAG_ON else c.FT_CURVE_TAG_CONIC;
+        }
+        for (outline.ends, 0..) |e, i| conts[i] = e;
+
+        var ol = c.FT_Outline{
+            .n_contours = @intCast(outline.ends.len),
+            .n_points = @intCast(outline.points.len),
+            .points = pts.ptr,
+            .tags = tags.ptr,
+            .contours = conts.ptr,
+            .flags = c.FT_OUTLINE_NONE,
+        };
+
+        const cov = self.allocator.alloc(u8, w * h) catch return null;
+        defer self.allocator.free(cov);
+        @memset(cov, 0);
+        const bm = c.FT_Bitmap{
+            .rows = h,
+            .width = w,
+            .pitch = @intCast(w),
+            .buffer = cov.ptr,
+            .num_grays = 256,
+            .pixel_mode = c.FT_PIXEL_MODE_GRAY,
+            .palette_mode = 0,
+            .palette = null,
+        };
+        if (c.FT_Outline_Get_Bitmap(self.ft_lib, &ol, &bm) != 0) return null;
+
+        // Same alpha-coverage RGBA path as drawBuiltin, so the glyph
+        // tints with the cell foreground for free (colored=false).
+        const rgba = self.allocator.alloc(u8, w * h * 4) catch return null;
+        defer self.allocator.free(rgba);
+        for (cov, 0..) |a, i| {
+            rgba[i * 4 + 0] = 255;
+            rgba[i * 4 + 1] = 255;
+            rgba[i * 4 + 2] = 255;
+            rgba[i * 4 + 3] = a;
+        }
+        return self.packRgba(rgba, w, h, 0, @intCast(self.ascent), @floatFromInt(w), false) catch null;
+    }
+
+    /// Would the terminal render `cp` as something other than tofu
+    /// from system fonts? Answers Glyph Protocol `q` coverage. Uses
+    /// the same resolution order as `lookupOrLoad` minus the glossary:
+    /// builtin box drawing, symbol maps, the primary face, then the
+    /// (cached) fontconfig fallback query.
+    pub fn hasSystemGlyph(self: *Atlas, cp: u32) bool {
+        if (self.builtin_box and boxdraw.covers(cp)) return true;
+        if (self.symbolFace(cp)) |sf| {
+            if (c.FT_Get_Char_Index(sf, cp) != 0) return true;
+        }
+        if (c.FT_Get_Char_Index(self.ft_face, cp) != 0) return true;
+        if (self.findFallbackFace(cp)) |fb| {
+            if (c.FT_Get_Char_Index(fb, cp) != 0) return true;
+        }
+        return false;
     }
 
     /// Best-effort negative caching: under allocation pressure we may
@@ -1468,6 +1624,7 @@ pub const Atlas = struct {
                 .codepoint => _ = self.cache.remove(@intCast(ref.key)),
                 .gid => _ = self.glyph_cache.remove(@intCast(ref.key)),
                 .face_gid => _ = self.face_gid_cache.remove(ref.key),
+                .custom => _ = self.custom_cache.remove(ref.key),
             }
         }
         p.glyphs_on_page.clearRetainingCapacity();

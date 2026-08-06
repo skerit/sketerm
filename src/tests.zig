@@ -56,6 +56,8 @@ comptime {
     _ = @import("shader_preset.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");
+    _ = @import("parser/glyph_protocol.zig");
+    _ = @import("grid/glyph_glossary.zig");
     _ = @import("parser/iterm_image.zig");
     _ = @import("parser/kitty_image.zig");
     _ = @import("ui/input.zig");
