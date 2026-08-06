@@ -9,6 +9,9 @@
 //! (`retain_images`) ride along, so reattach restores images.
 //! v4: OSC 133 command state (open C marker, last zone, exit code,
 //! completion sequence), so command waits survive resyncs.
+//! v6: a format byte per glossary entry (glyf vs colrv0). A v5 peer
+//! gets glyf entries only — its tail has no format field, so colrv0
+//! payloads would be misread as glyf records.
 
 const std = @import("std");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -17,7 +20,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 5;
+pub const SNAPSHOT_VERSION = 6;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// v5: byte budget for the Glyph Protocol glossary tail. Newest
@@ -241,6 +244,9 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         defer entries.deinit(allocator);
         var git = screen.glyphs.map.iterator();
         while (git.next()) |kv| {
+            // A v5 tail has no format field; a colrv0 payload written
+            // there would restore as a glyf record and misrender.
+            if (version < 6 and kv.value_ptr.fmt != .glyf) continue;
             try entries.append(allocator, .{ .cp = kv.key_ptr.*, .e = kv.value_ptr.* });
         }
         std.mem.sort(GlyphEntry, entries.items, {}, struct {
@@ -261,6 +267,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             try s.int(u32, ge.cp);
             try s.int(u16, ge.e.upm);
             try s.byte(ge.e.width);
+            if (version >= 6) try s.byte(@intFromEnum(ge.e.fmt));
             try s.int(u64, ge.e.insertion);
             try s.bytes(ge.e.payload);
         }
@@ -551,19 +558,25 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
 
     // v5 tail: Glyph Protocol glossary. `registerRestored` re-mints
     // render keys locally (foreign keys are meaningless in this
-    // process) while keeping the FIFO insertion stamps.
+    // process) while keeping the FIFO insertion stamps. v6 adds the
+    // per-entry format byte; a v5 body is glyf-only by construction.
     if (version >= 5) {
+        const gp = @import("../parser/glyph_protocol.zig");
         const n_glyphs = try src.int(u32);
         for (0..n_glyphs) |_| {
             const cp = try src.int(u32);
             const upm = try src.int(u16);
             const width = try src.byte();
+            const fmt: gp.Format = if (version >= 6)
+                std.enums.fromInt(gp.Format, try src.byte()) orelse return error.BadSnapshot
+            else
+                .glyf;
             const insertion = try src.int(u64);
             const plen = try src.int(u32);
             const pdata = try src.take(plen);
             if (upm == 0 or (width != 1 and width != 2) or plen == 0) return error.BadSnapshot;
             const owned = allocator.dupe(u8, pdata) catch return error.OutOfMemory;
-            screen.glyphs.registerRestored(cp, owned, upm, width, insertion) catch return error.BadSnapshot;
+            screen.glyphs.registerRestored(cp, owned, fmt, upm, width, insertion) catch return error.BadSnapshot;
         }
     }
 
@@ -949,9 +962,13 @@ test "snapshot: glyph glossary round-trips with FIFO stamps" {
     const tri = try gp.triangleBytes(a);
     defer a.free(tri);
     const p1 = try a.dupe(u8, tri);
-    try h.screen.glyphs.registerAdopt(0xE100, p1, 1000, 1);
-    const p2 = try a.dupe(u8, tri);
-    try h.screen.glyphs.registerAdopt(0xF0100, p2, 2048, 2);
+    try h.screen.glyphs.registerAdopt(0xE100, p1, .glyf, 1000, 1);
+    const container = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(container);
+    const p2 = try a.dupe(u8, container);
+    try h.screen.glyphs.registerAdopt(0xF0100, p2, .colrv0, 2048, 2);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -967,14 +984,47 @@ test "snapshot: glyph glossary round-trips with FIFO stamps" {
     try testing.expectEqualSlices(u8, tri, e1.payload);
     try testing.expectEqual(@as(u16, 1000), e1.upm);
     try testing.expectEqual(@as(u8, 1), e1.width);
+    try testing.expectEqual(gp.Format.glyf, e1.fmt);
     const e2 = back.glyphs.get(0xF0100).?;
     try testing.expectEqual(@as(u16, 2048), e2.upm);
     try testing.expectEqual(@as(u8, 2), e2.width);
+    try testing.expectEqual(gp.Format.colrv0, e2.fmt);
+    try testing.expectEqualSlices(u8, container, e2.payload);
     // FIFO order preserved across the round-trip.
     try testing.expect(e1.insertion < e2.insertion);
     // Render keys are freshly minted locally, never zero.
     try testing.expect(e1.render_key != 0 and e2.render_key != 0);
     try testing.expect(e1.render_key != e2.render_key);
+}
+
+test "snapshot: a v5 body carries only glyf entries (no format field to ride)" {
+    const a = testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    const p1 = try a.dupe(u8, tri);
+    try h.screen.glyphs.registerAdopt(0xE100, p1, .glyf, 1000, 1);
+    const container = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(container);
+    const p2 = try a.dupe(u8, container);
+    try h.screen.glyphs.registerAdopt(0xF0100, p2, .colrv0, 1000, 1);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serializeVersion(h.screen, &buf, a, 5);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, buf.items);
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 1), back.glyphs.count());
+    try testing.expect(back.glyphs.contains(0xE100));
+    try testing.expect(!back.glyphs.contains(0xF0100));
 }
 
 test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {
@@ -988,7 +1038,7 @@ test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {
     var v5buf: std.ArrayList(u8) = .empty;
     defer v5buf.deinit(a);
     try serialize(h.screen, &v5buf, a);
-    // Only the u32 count separates an empty-glossary v5 from a v4.
+    // Only the u32 count separates an empty-glossary v5+/v6 from a v4.
     try testing.expectEqual(v4buf.items.len + 4, v5buf.items.len);
 
     var pool2 = try Pool.init(a);

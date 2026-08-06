@@ -769,11 +769,14 @@ pub fn main() !u8 {
         }
     }
 
-    // Glyph Protocol (fmt=glyf) rasteriser proof: register through
-    // Parser→Screen, render, read pixels back. Also proves overwrite
-    // invalidation (glossary generation → cell rebuild), the clear
-    // fallback, width=2 spanning two cells, and re-rasterisation from
-    // retained payloads after an Atlas rebuild at a new cell size.
+    // Glyph Protocol (fmt=glyf + fmt=colrv0) rasteriser proof:
+    // register through Parser→Screen, render, read pixels back. Also
+    // proves overwrite invalidation (glossary generation → cell
+    // rebuild), the clear fallback, width=2 spanning two cells,
+    // re-rasterisation from retained payloads after an Atlas rebuild
+    // at a new cell size, colrv0 painter-order layer compositing, and
+    // the 0xFFFF current-foreground palette sentinel re-rasterising
+    // per SGR foreground.
     {
         const helpers = struct {
             /// One-contour axis-aligned rectangle, coordinates in font
@@ -977,6 +980,103 @@ pub fn main() !u8 {
         if (f_failed) {
             std.debug.print("smoke-cell: FAIL — glyph did not re-rasterise after atlas rebuild\n", .{});
             return 47;
+        }
+
+        // ── colrv0 stages ────────────────────────────────────────
+        const gp = @import("parser/glyph_protocol.zig");
+        const colr_helpers = struct {
+            fn registerColrApc(a: std.mem.Allocator, cp: u32, container: []const u8) ![]u8 {
+                const enc = std.base64.standard.Encoder;
+                const b64 = try a.alloc(u8, enc.calcSize(container.len));
+                defer a.free(b64);
+                _ = enc.encode(b64, container);
+                return std.fmt.allocPrint(a, "\x1b_25a1;r;cp={x};fmt=colrv0;reply=0;{s}\x1b\\", .{ cp, b64 });
+            }
+
+            /// Sample the framebuffer at screen (x, y) — y from the TOP
+            /// (glReadPixels row 0 is the framebuffer bottom).
+            fn px(fbuf: []const u8, x: usize, y: usize) [3]u8 {
+                const fb_row = @as(usize, @intCast(H)) - 1 - y;
+                const o = (fb_row * @as(usize, @intCast(W)) + x) * 4;
+                return .{ fbuf[o], fbuf[o + 1], fbuf[o + 2] };
+            }
+
+            fn countColor(fbuf: []const u8, x0: usize, y0: usize, w_: usize, h_: usize, hot: usize, cold_a: usize, cold_b: usize) usize {
+                var count: usize = 0;
+                var y = y0;
+                while (y < y0 + h_) : (y += 1) {
+                    var x = x0;
+                    while (x < x0 + w_) : (x += 1) {
+                        const p = px(fbuf, x, y);
+                        if (p[hot] > 150 and p[cold_a] < 100 and p[cold_b] < 100) count += 1;
+                    }
+                }
+                return count;
+            }
+        };
+
+        // Stage G: a two-layer colrv0 glyph — layer 1 fills the box
+        // red, layer 2 paints a smaller green rect ON TOP (painter's
+        // order). Both colours must land, and the covered centre must
+        // show the SECOND layer's green.
+        const outer = try helpers.rectGlyf(allocator, 0, -200, 1000, 800);
+        defer allocator.free(outer);
+        // Full-width band: x is scaled by cell HEIGHT (scale = h/upm)
+        // and clipped at the cell's right edge, so only y separates
+        // the two layers reliably.
+        const inner = try helpers.rectGlyf(allocator, 0, 200, 1000, 500);
+        defer allocator.free(inner);
+        const two_layer = try gp.colrContainerBytes(allocator, &.{ outer, inner }, &.{
+            .{ .glyph = 0, .palette = 0 },
+            .{ .glyph = 1, .palette = 1 },
+        }, &.{ 0xFF0000FF, 0x00FF00FF });
+        defer allocator.free(two_layer);
+        const apc_colr = try colr_helpers.registerColrApc(allocator, 0xF0102, two_layer);
+        defer allocator.free(apc_colr);
+        parser.advance(apc_colr, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[2;1H\u{F0102}", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const g_x0 = padu;
+        const g_y0 = padu + 1 * chh;
+        const reds = colr_helpers.countColor(fb, g_x0, g_y0, cw, chh, 0, 1, 2);
+        const greens = colr_helpers.countColor(fb, g_x0, g_y0, cw, chh, 1, 0, 2);
+        const center = colr_helpers.px(fb, g_x0 + cw / 2, g_y0 + (chh * 45) / 100);
+        std.debug.print("smoke-cell: colrv0 two-layer reds={d} greens={d} center=({d},{d},{d})\n", .{ reds, greens, center[0], center[1], center[2] });
+        if (reds < 3 or greens < 3) {
+            std.debug.print("smoke-cell: FAIL — colrv0 layers missing a colour (red={d} green={d})\n", .{ reds, greens });
+            return 48;
+        }
+        if (center[1] <= center[0]) {
+            std.debug.print("smoke-cell: FAIL — colrv0 layer order wrong (centre not green)\n", .{});
+            return 49;
+        }
+
+        // Stage H: palette 0xFFFF resolves to the CURRENT SGR
+        // foreground, and a different foreground re-rasterises
+        // rather than reusing the cached pixels (the Rio stale-colour
+        // bug this build refuses to copy).
+        const fg_container = try gp.colrContainerBytes(allocator, &.{outer}, &.{
+            .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
+        }, &.{});
+        defer allocator.free(fg_container);
+        const apc_fg = try colr_helpers.registerColrApc(allocator, 0xF0103, fg_container);
+        defer allocator.free(apc_fg);
+        parser.advance(apc_fg, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{F0103}\x1b[4;3H\x1b[38;2;0;0;255m\u{F0103}\x1b[0m", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+        const fg_y = padu + 3 * chh + chh / 2;
+        const p_red = colr_helpers.px(fb, padu + cw / 2, fg_y);
+        const p_blue = colr_helpers.px(fb, padu + 2 * cw + cw / 2, fg_y);
+        std.debug.print("smoke-cell: colrv0 0xFFFF fg red-cell=({d},{d},{d}) blue-cell=({d},{d},{d})\n", .{ p_red[0], p_red[1], p_red[2], p_blue[0], p_blue[1], p_blue[2] });
+        if (!(p_red[0] > 150 and p_red[2] < 100)) {
+            std.debug.print("smoke-cell: FAIL — 0xFFFF layer did not take the red foreground\n", .{});
+            return 50;
+        }
+        if (!(p_blue[2] > 150 and p_blue[0] < 100)) {
+            std.debug.print("smoke-cell: FAIL — 0xFFFF glyph reused the first foreground's pixels (Rio bug)\n", .{});
+            return 51;
         }
     }
 

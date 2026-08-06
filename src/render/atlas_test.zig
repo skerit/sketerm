@@ -175,3 +175,71 @@ test "bold ligature path: shape + rasterize bold gids without crashing" {
         _ = g; // just assert no error / no crash on the bold gid path
     }
 }
+
+test "colrv0: 0xFFFF glyphs cache per foreground; plain colrv0 caches once" {
+    const a = std.testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+
+    // Foreground-dependent: single layer at the 0xFFFF sentinel.
+    const fg_dep = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(fg_dep);
+    const red: [4]f32 = .{ 1, 0, 0, 1 };
+    const blue: [4]f32 = .{ 0, 0, 1, 1 };
+    const g_red = try atlas.lookupOrLoadCustom(101, fg_dep, .colrv0, 1000, 1, red);
+    const g_blue = try atlas.lookupOrLoadCustom(101, fg_dep, .colrv0, 1000, 1, blue);
+    try std.testing.expect(g_red.colored and g_blue.colored);
+    // Two distinct atlas slots — a foreground change re-rasterises
+    // instead of serving the first colour forever (Rio's bug).
+    try std.testing.expect(g_red.layer != g_blue.layer or g_red.u0 != g_blue.u0 or g_red.v0 != g_blue.v0);
+    // Same foreground again: cache hit, identical placement.
+    const g_red2 = try atlas.lookupOrLoadCustom(101, fg_dep, .colrv0, 1000, 1, red);
+    try std.testing.expectEqual(g_red.layer, g_red2.layer);
+    try std.testing.expectEqual(g_red.u0, g_red2.u0);
+    try std.testing.expectEqual(g_red.v0, g_red2.v0);
+
+    // Foreground-independent: fixed palette colour. One slot for any
+    // foreground.
+    const fg_ind = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = 0 },
+    }, &.{0x00FF00FF});
+    defer a.free(fg_ind);
+    const gi_red = try atlas.lookupOrLoadCustom(102, fg_ind, .colrv0, 1000, 1, red);
+    const gi_blue = try atlas.lookupOrLoadCustom(102, fg_ind, .colrv0, 1000, 1, blue);
+    try std.testing.expect(gi_red.colored);
+    try std.testing.expectEqual(gi_red.layer, gi_blue.layer);
+    try std.testing.expectEqual(gi_red.u0, gi_blue.u0);
+    try std.testing.expectEqual(gi_red.v0, gi_blue.v0);
+
+    // glyf stays foreground-independent and coverage-tinted.
+    const g_glyf_red = try atlas.lookupOrLoadCustom(103, tri, .glyf, 1000, 1, red);
+    const g_glyf_blue = try atlas.lookupOrLoadCustom(103, tri, .glyf, 1000, 1, blue);
+    try std.testing.expect(!g_glyf_red.colored);
+    try std.testing.expectEqual(g_glyf_red.u0, g_glyf_blue.u0);
+    try std.testing.expectEqual(g_glyf_red.v0, g_glyf_blue.v0);
+}
+
+test "colrv0: broken container caches as an empty glyph" {
+    const a = std.testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    // A glyf record is not a container.
+    const g = try atlas.lookupOrLoadCustom(104, tri, .colrv0, 1000, 1, .{ 1, 1, 1, 1 });
+    try std.testing.expectEqual(@as(u16, 0), g.w);
+    try std.testing.expectEqual(@as(u16, 0), g.h);
+}
