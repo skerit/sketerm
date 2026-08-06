@@ -14440,3 +14440,57 @@ window was closed under a theme flip"; with it, green.
 
 Verification: `zig build test`, `test-core`, `mux-portable`,
 `smoke-mcp`, `smoke-e2e` green.
+
+## Daemon-side asciicast playback sessions
+
+`SpawnReq.cast_path` spawns a session whose "child" is an asciicast
+v2/v3 file replayed by the daemon on its own monotonic clock - no
+child process, no keeper, no PTY, no Wayland/audio/a11y hubs. The
+structural change is that `Session` is now source-aware:
+`source: union(enum) { pty: Pty, cast: *CastPlayback }`, with
+`ptyPtr()/masterFd()/childPid()` helpers that degrade to null/-1 so
+the ~24 former `.pty` call sites (poll registration, drain, input,
+resize, fg/cwd sampling, kill fences, broker meta, debug) stop
+assuming a child exists. Broker mode needed nothing special: the
+worker's `spawnSession` takes the same early branch.
+
+Playback rides a `pulseTick`-shaped `castTick`: events whose
+normalized time falls due are dispatched, output bytes going through
+the SAME ingestion path PTY reads use - the byte-parsing half of
+`drainSession` was refactored into `ingestBegin`/`ingestBytes`/
+`ingestFinish`, so the wire stays parsed-events-only and the events
+backlog/resync machinery applies unchanged. Catch-up work is bounded
+(256 KiB output / 500 events / 512 KiB file reads per tick, then an
+immediate re-tick; output is never dropped). Recorded resizes flush
+the batch, resize the Screen and broadcast a fresh SNAPSHOT. EOF
+retains the final screen and marks the playback finished - the
+session stays alive for late viewers; it never goes through
+`sessionExited`.
+
+A cast is untrusted content: `EventCollector.untrusted` drops kitty
+`t=f`/`t=t`/`t=s` APCs before they can reach `kitty_inline.rewrite`
+or `grid/kitty_images.zig` (both open - and for tempfiles DELETE -
+daemon-host paths named by the file); Screen-generated responses
+discard through the source-aware `sinkWritePty`; client `.input` is
+dropped and client `.resize` ignored (recorded dimensions win);
+`rec_start` on a playback is refused.
+
+Controls are two append-only frames: `play_control` (30, JSON
+op play|pause|restart|seek|speed, speed clamped to [0.1, 10]) and
+`play_state` (94, state/position/duration/speed/markers, throttled
+>=500ms while playing, sent per attach). The welcome advertises
+`cast_playback:true` and `Conn.cast_playback` parses it. Playback
+starts paused at 0 and auto-plays on the first attach. Seek resets
+parser + Screen (fresh style pool, images gone with it) and replays
+from the file start in bounded silent chunks across ticks
+("seeking" play_state), then one SNAPSHOT; restart is seek 0.
+
+Tests (`src/mux/daemon_cast.zig`, in both roots) drive the engine on
+a synthetic clock: ordered delivery, resize snapshots, input/resize
+rejection, kitty neutralization (t=t survives untouched, t=d passes),
+EOF retention, pause/play/speed clamp, and seek-vs-linear grid
+equality at a mid position and at EOF.
+
+Verification: `zig build test` (2019 pass), `test-core`, `smoke-mux`,
+`smoke-broker`, `mux-portable` (+ aarch64-macos) green; `ldd
+sketerm-mux` still libc/libm only.
