@@ -67,6 +67,9 @@ var restore_pid: c.pid_t = -1;
 var viewer_pid: c.pid_t = -1;
 /// The theme-flip GUI (themeSingletonStage), killed by EXACT pid.
 var theme_pid: c.pid_t = -1;
+/// The cast-playback GUI (`sketerm play`, castPlaybackStage), killed
+/// by EXACT pid.
+var cast_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -121,6 +124,10 @@ fn teardown() void {
     if (restore_pid > 0) {
         reap(restore_pid, c.SIGKILL, 0);
         restore_pid = -1;
+    }
+    if (cast_pid > 0) {
+        reap(cast_pid, c.SIGKILL, 0);
+        cast_pid = -1;
     }
     if (drive) |app| {
         // detach, not kill: the session is destroyed by name below, so
@@ -972,6 +979,16 @@ pub fn main() u8 {
     if (!platform.is_macos) {
         if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
         say("secondary window detached and closed while the global style manager kept flipping light/dark");
+    }
+
+    // 6c-9. Cast playback: `sketerm play` end to end, with the
+    // fixed_grid render path and every transport control on a real
+    // seat, cross-checked against the daemon's play_state stream.
+    if (drive) |app| {
+        if (have_wl) {
+            if (castPlaybackStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
+            say("cast playback: rendered, paused, seeked to EOF, restarted and closed (session died with the window)");
+        }
     }
 
     // 6d. Dead keys, composed by a real seat on a Belgian keymap, in
@@ -1938,6 +1955,287 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     var vst: c_int = 0;
     _ = c.waitpid(viewer_pid, &vst, 0);
     viewer_pid = -1;
+    _ = app.drainLive(2_000);
+    return null;
+}
+
+/// One play_state frame's JSON, as the daemon ships it.
+const CastMsg = struct {
+    state: []const u8 = "",
+    position_ms: u64 = 0,
+    duration_ms: ?u64 = null,
+    speed: f64 = 1,
+    markers: []const struct { u64, []const u8 } = &.{},
+};
+
+/// Scalars of the LAST play_state castWaitState saw (marker labels are
+/// frame-scoped, so only the first marker's time is kept).
+const CastObserved = struct {
+    position_ms: u64 = 0,
+    duration_ms: ?u64 = null,
+    n_markers: usize = 0,
+    first_marker_ms: u64 = 0,
+};
+
+/// Consume frames on an attached side connection until a play_state
+/// with `want` arrives (other frames are ignored). Every play_state
+/// seen updates `out`, so the caller reads the winning frame's fields.
+fn castWaitState(
+    allocator: std.mem.Allocator,
+    conn: *@import("mux/client.zig").Conn,
+    want: []const u8,
+    timeout_ms: i64,
+    out: *CastObserved,
+) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        const f = conn.recvFrameFor(500) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return false,
+        };
+        defer f.deinit(conn.allocator);
+        if (f.ftype != .play_state) continue;
+        const parsed = std.json.parseFromSlice(CastMsg, allocator, f.payload, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        defer parsed.deinit();
+        const m = parsed.value;
+        out.* = .{
+            .position_ms = m.position_ms,
+            .duration_ms = m.duration_ms,
+            .n_markers = m.markers.len,
+            .first_marker_ms = if (m.markers.len > 0) m.markers[0][0] else 0,
+        };
+        if (std.mem.eql(u8, m.state, want)) return true;
+    }
+    return false;
+}
+
+/// One-shot daemon session list into `buf` (the raw .ok JSON), over a
+/// fresh connection. Empty slice on any failure.
+fn castListSessions(allocator: std.mem.Allocator, mux_sock: []const u8, buf: []u8) []const u8 {
+    const mux_client = @import("mux/client.zig");
+    var conn = mux_client.Conn.connectProbed(allocator, mux_sock) catch return buf[0..0];
+    defer conn.deinit();
+    conn.sendFrame(.list, "") catch return buf[0..0];
+    // Monolith answers .ok; a broker answers with a refreshed .welcome
+    // carrying the aggregated worker roster.
+    const f = conn.recvExpectFor(&.{ .ok, .welcome }, 5_000) catch return buf[0..0];
+    defer f.deinit(allocator);
+    const n = @min(f.payload.len, buf.len);
+    @memcpy(buf[0..n], f.payload[0..n]);
+    return buf[0..n];
+}
+
+/// Pixels in `win_id` within tolerance of `rgb`.
+fn castCountRgb(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rgb: [3]u8) usize {
+    const shot = app.snapshotRgba(win_id, null) catch return 0;
+    defer allocator.free(shot.px);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < shot.px.len) : (i += 4) {
+        const dr = @abs(@as(i32, shot.px[i]) - @as(i32, rgb[0]));
+        const dg = @abs(@as(i32, shot.px[i + 1]) - @as(i32, rgb[1]));
+        const db = @abs(@as(i32, shot.px[i + 2]) - @as(i32, rgb[2]));
+        if (dr <= 40 and dg <= 40 and db <= 40) n += 1;
+    }
+    return n;
+}
+
+/// Poll until `win_id` shows (or stops showing) at least `min` pixels
+/// of `rgb`.
+fn castWaitRgb(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rgb: [3]u8, min: usize, present: bool, timeout_ms: i64) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.pumpOnce(200);
+        const n = castCountRgb(allocator, app, win_id, rgb);
+        if (present and n >= min) return true;
+        if (!present and n < min) return true;
+    }
+    return false;
+}
+
+/// Cast playback end to end: `sketerm play` on a hand-written v2 cast,
+/// rendered through the fixed_grid TerminalSurface (its first-ever
+/// runtime exercise), every transport control driven by REAL
+/// keystrokes, and the daemon's play_state transitions asserted over a
+/// read-only side attachment. The recording's only late event sits at
+/// 30s so pause/seek behaviour is deterministic — normal playback
+/// never reaches it inside this stage.
+fn castPlaybackStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    mux_sock: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const mux_client = @import("mux/client.zig");
+
+    // The recording: red at 0.1s, a recorded RESIZE (40x10 -> 30x8), a
+    // green block only printable on the post-resize grid, a marker,
+    // and a blue block at 30s.
+    var cast_path_buf: [512:0]u8 = undefined;
+    const cast_path = std.fmt.bufPrintZ(&cast_path_buf, "{s}/e2e.cast", .{rt}) catch return "cast path too long";
+    {
+        const body =
+            "{\"version\": 2, \"width\": 40, \"height\": 10}\n" ++
+            "[0.1, \"o\", \"\\u001b[48;2;255;0;0m  RED BLOCK  \\u001b[0m cast-e2e\"]\n" ++
+            "[0.6, \"r\", \"30x8\"]\n" ++
+            "[0.9, \"o\", \"\\r\\n\\u001b[48;2;0;255;0m  GREEN BLOCK  \\u001b[0m\"]\n" ++
+            "[1.4, \"m\", \"half\"]\n" ++
+            "[30.0, \"o\", \"\\r\\n\\u001b[48;2;0;0;255m  BLUE BLOCK  \\u001b[0m\"]\n";
+        const f = c.fopen(cast_path.ptr, "wb") orelse return "could not write the cast file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the cast file";
+    }
+
+    _ = app.drainLive(2_000);
+    var known: [16]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for sketerm play failed";
+    if (pid == 0) {
+        dieWithParent();
+        // Its own app id: it must not join the terminal instance
+        // already running in this display session.
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2ecast", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "play", cast_path.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    cast_pid = pid;
+
+    var waited: u32 = 0;
+    const cast_win = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "sketerm play never mapped a window";
+    _ = app.waitVisualSettle(cast_win, 400, 10_000, 0.002, null);
+
+    // Side attachment: find the GUI-minted session (name prefix
+    // "cast") and follow its play_state stream read-only.
+    var name_buf: [64]u8 = undefined;
+    var name: []const u8 = &.{};
+    var name_tries: u32 = 0;
+    while (name_tries < 50) : (name_tries += 1) {
+        var list_buf: [16384]u8 = undefined;
+        const listing = castListSessions(allocator, mux_sock, &list_buf);
+        if (std.mem.indexOf(u8, listing, "\"name\":\"cast")) |at| {
+            const start = at + "\"name\":\"".len;
+            const end = std.mem.indexOfScalarPos(u8, listing, start, '"') orelse break;
+            const found = listing[start..end];
+            if (found.len <= name_buf.len) {
+                @memcpy(name_buf[0..found.len], found);
+                name = name_buf[0..found.len];
+                break;
+            }
+        }
+        _ = c.usleep(200_000);
+    }
+    if (name.len == 0) return "the cast session never appeared in the daemon's list";
+
+    var side = mux_client.Conn.connectProbed(allocator, mux_sock) catch return "side connect failed";
+    defer side.deinit();
+    side.sendJson(.attach, .{ .name = name, .kind = "cli", .read_only = true }) catch return "side attach send failed";
+    {
+        const snap = side.recvExpectFor(&.{.snapshot}, 10_000) catch return "side attach got no snapshot";
+        snap.deinit(allocator);
+    }
+    var st: CastObserved = .{};
+    if (!castWaitState(allocator, &side, "playing", 10_000, &st))
+        return "the cast never reported state playing (auto-play on first attach)";
+
+    // Playback rendered through fixed_grid: the green block only
+    // exists AFTER the recorded resize applied.
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 255, 0 }, 40, true, 20_000))
+        return "the green block never rendered (playback or fixed_grid broken)";
+    if (castCountRgb(allocator, app, cast_win, .{ 255, 0, 0 }) < 40)
+        return "the red block is missing from the rendered frame";
+
+    // Space pauses (keyboard -> play_control -> daemon).
+    app.pressKey(cast_win, "space") catch return "injecting space failed";
+    if (!castWaitState(allocator, &side, "paused", 8_000, &st))
+        return "space did not pause the cast";
+    if (st.position_ms >= 30_000)
+        return "playback passed the 30s guard event before the pause (host too slow for this stage's timing)";
+
+    // Space resumes.
+    app.pressKey(cast_win, "space") catch return "injecting space failed";
+    if (!castWaitState(allocator, &side, "playing", 8_000, &st))
+        return "space did not resume the cast";
+
+    // Shift+Right seeks +30s -> past EOF -> finished, with the final
+    // frame (blue block) materialized by the seek replay.
+    app.pressKey(cast_win, "shift+right") catch return "injecting shift+right failed";
+    if (!castWaitState(allocator, &side, "finished", 15_000, &st))
+        return "the +30s seek never reported finished";
+    if (st.duration_ms != 30_000) return "finished state carries the wrong duration";
+    if (st.position_ms != 30_000) return "finished state carries the wrong position";
+    if (st.n_markers < 1 or st.first_marker_ms != 1400)
+        return "the recorded marker is missing from play_state";
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, true, 10_000))
+        return "the blue block never rendered after the seek";
+
+    // EOF retains the final screen and the session stays alive.
+    _ = app.drainLive(1_500);
+    if (castCountRgb(allocator, app, cast_win, .{ 0, 0, 255 }) < 40)
+        return "the final frame was not retained after playback finished";
+    {
+        var list_buf: [16384]u8 = undefined;
+        const listing = castListSessions(allocator, mux_sock, &list_buf);
+        if (std.mem.indexOf(u8, listing, name) == null)
+            return "the finished cast session vanished from the daemon";
+    }
+
+    // R restarts: back to the top (blue gone), playing again.
+    app.pressKey(cast_win, "r") catch return "injecting r failed";
+    if (!castWaitState(allocator, &side, "playing", 10_000, &st))
+        return "restart never reported playing";
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, false, 10_000))
+        return "restart did not reset the screen (blue block still visible)";
+
+    // Q closes the window; the ephemeral session must die with it.
+    app.pressKey(cast_win, "q") catch return "injecting q failed";
+    {
+        var status: c_int = 0;
+        var reaped = false;
+        var t: u32 = 0;
+        while (t < 15_000) : (t += 100) {
+            if (c.waitpid(cast_pid, &status, c.WNOHANG) == cast_pid) {
+                reaped = true;
+                break;
+            }
+            _ = c.usleep(100_000);
+        }
+        if (!reaped) return "sketerm play did not exit on q";
+        cast_pid = -1;
+        if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0))
+            return "sketerm play exited abnormally on q";
+    }
+    var gone = false;
+    var t2: u32 = 0;
+    while (t2 < 10_000) : (t2 += 250) {
+        var list_buf: [16384]u8 = undefined;
+        const listing = castListSessions(allocator, mux_sock, &list_buf);
+        if (std.mem.indexOf(u8, listing, name) == null) {
+            gone = true;
+            break;
+        }
+        _ = c.usleep(250_000);
+    }
+    if (!gone) return "closing the window did not kill the ephemeral cast session";
     _ = app.drainLive(2_000);
     return null;
 }
