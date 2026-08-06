@@ -250,6 +250,7 @@ comptime {
     _ = @import("render/editor_pass.zig");
     _ = @import("ui/menu.zig");
     _ = @import("ui/palette.zig");
+    _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
     _ = @import("ui/panel/events.zig");
     _ = @import("ui/panel/view.zig");

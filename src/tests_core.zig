@@ -104,6 +104,7 @@ comptime {
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/xkblayout.zig");
     // ui/panel data layer: under ui/ by home, but GTK-free by contract.
+    _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
     _ = @import("ui/panel/events.zig");
     _ = @import("layout.zig");

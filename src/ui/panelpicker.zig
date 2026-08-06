@@ -21,11 +21,11 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
-const cast = @import("../util/cast.zig");
 const render_kick = @import("../util/render_kick.zig");
 const panelstore = @import("../ipc/panelstore.zig");
 const panelhost = @import("panelhost.zig");
 const Doc = @import("panel/doc.zig");
+const canary = @import("panel/canary.zig");
 const Pane = @import("pane.zig").Pane;
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
@@ -44,6 +44,13 @@ const RowCtx = struct {
 };
 
 const Ctx = struct {
+    pub const MAGIC: u32 = 0x504B4358; // "PKCX"
+    /// Use-after-free DETECTOR, not a lifetime mechanism — see
+    /// panel/canary.zig. The dialog owns this context through the
+    /// GDestroyNotify on its "closed" connection; every other handler
+    /// below borrows the same pointer with no notify of its own, so a
+    /// stale borrow is exactly what this catches.
+    magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     window: *Window,
@@ -59,6 +66,10 @@ const Ctx = struct {
 /// needs (and a reference to the two widgets it touches), so it stays
 /// valid however the picker behind it ends.
 const DeleteCtx = struct {
+    pub const MAGIC: u32 = 0x504B4443; // "PKDC"
+    /// Detector only (panel/canary.zig): this context is owned by the
+    /// async response callback that consumes it exactly once.
+    magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     window: *Window,
     /// Owned.
@@ -71,10 +82,12 @@ const DeleteCtx = struct {
     row: *c.GtkWidget,
 
     fn destroy(self: *DeleteCtx) void {
+        if (!canary.alive(self)) return;
         c.g_object_unref(@ptrCast(self.listbox));
         c.g_object_unref(@ptrCast(self.row));
         self.allocator.free(self.session);
         self.allocator.free(self.name);
+        canary.poison(self);
         self.allocator.destroy(self);
     }
 };
@@ -294,7 +307,7 @@ fn livePane(window: *Window, pane: ?*Pane) ?*Pane {
 }
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Ctx, user);
+    const ctx = canary.live(Ctx, user) orelse return;
     const data = c.g_object_get_data(@ptrCast(@alignCast(row)), "panel-row") orelse return;
     const rctx: *RowCtx = @ptrCast(@alignCast(data));
     // A broken document's row is not activatable, so this is belt and
@@ -325,7 +338,7 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) ca
 }
 
 fn onDeleteClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Ctx, user);
+    const ctx = canary.live(Ctx, user) orelse return;
     const data = c.g_object_get_data(@ptrCast(@alignCast(button)), "panel-row") orelse return;
     const rctx: *RowCtx = @ptrCast(@alignCast(data));
     const row_data = c.g_object_get_data(@ptrCast(@alignCast(button)), "panel-row-widget") orelse return;
@@ -372,7 +385,7 @@ fn onDeleteClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onDeleteResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const dctx = cast.userData(DeleteCtx, user);
+    const dctx = canary.live(DeleteCtx, user) orelse return;
     defer dctx.destroy();
     const alert: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
     const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(alert, result))));
@@ -402,11 +415,54 @@ fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn freeCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *Ctx = @ptrCast(@alignCast(u));
+    if (canary.live(Ctx, user)) |ctx| {
         ctx.arena.deinit();
+        canary.poison(ctx);
         ctx.allocator.destroy(ctx);
     }
+}
+
+test "a poisoned picker Ctx makes freeCtx bail instead of double-freeing" {
+    const a = std.testing.allocator;
+    const ctx = try a.create(Ctx);
+    ctx.* = .{
+        .allocator = a,
+        .arena = std.heap.ArenaAllocator.init(a),
+        .window = undefined,
+        .dialog = undefined,
+        .listbox = undefined,
+        .pane = null,
+    };
+    // Stands in for "the dialog's destroy-notify already ran".
+    canary.poison(ctx);
+
+    const before = canary.trips;
+    freeCtx(@ptrCast(ctx));
+    try std.testing.expectEqual(before + 1, canary.trips);
+
+    // Had the guard not fired, freeCtx would have deinited the arena
+    // and freed the struct, and these two would be double frees the
+    // testing allocator reports.
+    ctx.arena.deinit();
+    a.destroy(ctx);
+}
+
+test "a poisoned DeleteCtx is not destroyed twice" {
+    const a = std.testing.allocator;
+    var dctx = DeleteCtx{
+        .allocator = a,
+        .window = undefined,
+        .session = undefined,
+        .name = undefined,
+        .listbox = undefined,
+        .row = undefined,
+    };
+    canary.poison(&dctx);
+    const before = canary.trips;
+    // Every field is undefined: reaching any of them would crash, so
+    // returning cleanly IS the proof that the guard came first.
+    dctx.destroy();
+    try std.testing.expectEqual(before + 1, canary.trips);
 }
 
 test "panel picker decls type-check" {

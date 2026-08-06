@@ -34,9 +34,9 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const cast = @import("../../util/cast.zig");
 const Doc = @import("doc.zig");
 const events = @import("events.zig");
+const canary = @import("canary.zig");
 
 const COMPARE_QDATA = "sketerm-panel-compare";
 
@@ -76,6 +76,12 @@ fn optionsHash(options: []const []u8) u64 {
 }
 
 pub const PanelView = struct {
+    pub const MAGIC: u32 = 0x504E4C56; // "PNLV"
+    /// Use-after-free DETECTOR, not a lifetime mechanism — see
+    /// canary.zig. The disconnect in `deinit` is what makes the root
+    /// ::destroy handler safe; this only makes a future regression in
+    /// that reasoning fail loudly at the first stale callback.
+    magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     doc: ?Doc.Document = null,
     queue: events.Queue,
@@ -196,29 +202,34 @@ pub const PanelView = struct {
         // tree this finalizes the (destroyed) widget, otherwise it
         // destroys it now — or leaves it to whoever holds the last ref.
         c.g_object_unref(@ptrCast(self.root_box));
+        canary.poison(self);
         self.allocator.destroy(self);
     }
 
     fn onRootDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(PanelView, user);
+        const self = canary.live(PanelView, user) orelse return;
         self.widgets_dead = true;
         self.queue.close();
     }
 
     // ---- pane-face trampolines (signatures match Pane.attachEditor) --
+    //
+    // The host holds these as an opaque pointer across its own
+    // teardown ordering, so they are exactly where a lifetime mistake
+    // would land: check the canary before dereferencing.
 
     pub fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
-        const self: *PanelView = @ptrCast(@alignCast(ctx));
+        const self = canary.live(PanelView, ctx) orelse return;
         self.prepareDestroy(widgets_dead);
     }
 
     pub fn destroyCb(ctx: *anyopaque) void {
-        const self: *PanelView = @ptrCast(@alignCast(ctx));
+        const self = canary.live(PanelView, ctx) orelse return;
         self.deinit();
     }
 
     pub fn focusCb(ctx: *anyopaque) void {
-        const self: *PanelView = @ptrCast(@alignCast(ctx));
+        const self = canary.live(PanelView, ctx) orelse return;
         self.focusFace();
     }
 
@@ -602,6 +613,10 @@ pub const PanelView = struct {
     /// null once the view has been freed under a widget that outlived
     /// it — the context itself lives on until GTK drops the closure.
     const CompCtx = struct {
+        pub const MAGIC: u32 = 0x434D5043; // "CMPC"
+        /// Detector only (canary.zig): the GDestroyNotify below is
+        /// what actually owns this allocation.
+        magic: u32 = @This().MAGIC,
         allocator: std.mem.Allocator,
         view: ?*PanelView,
         id: []u8,
@@ -645,18 +660,19 @@ pub const PanelView = struct {
     }
 
     fn freeCompCtx(user: ?*anyopaque) callconv(.c) void {
-        if (user) |u| {
-            const ctx: *CompCtx = @ptrCast(@alignCast(u));
-            // A null view means the view is already gone and took the
-            // registry with it.
-            if (ctx.view) |view| view.forgetCtx(ctx);
-            ctx.allocator.free(ctx.id);
-            ctx.allocator.destroy(ctx);
-        }
+        // Guarded like the handlers: a second closure destruction on
+        // the same context leaks it instead of double-freeing.
+        const ctx = canary.live(CompCtx, user) orelse return;
+        // A null view means the view is already gone and took the
+        // registry with it.
+        if (ctx.view) |view| view.forgetCtx(ctx);
+        ctx.allocator.free(ctx.id);
+        canary.poison(ctx);
+        ctx.allocator.destroy(ctx);
     }
 
     fn onButtonClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const ctx = cast.userData(CompCtx, user);
+        const ctx = canary.live(CompCtx, user) orelse return;
         const view = ctx.view orelse return;
         if (view.widgets_dead or view.applying) return;
         const d = &(view.doc orelse return);
@@ -668,7 +684,7 @@ pub const PanelView = struct {
     }
 
     fn onSliderChanged(range: *c.GtkRange, user: ?*anyopaque) callconv(.c) void {
-        const ctx = cast.userData(CompCtx, user);
+        const ctx = canary.live(CompCtx, user) orelse return;
         const view = ctx.view orelse return;
         if (view.widgets_dead or view.applying) return;
         const v = c.gtk_range_get_value(range);
@@ -676,7 +692,7 @@ pub const PanelView = struct {
     }
 
     fn onSelectChanged(obj: [*c]c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        const ctx = cast.userData(CompCtx, user);
+        const ctx = canary.live(CompCtx, user) orelse return;
         const view = ctx.view orelse return;
         if (view.widgets_dead or view.applying) return;
         const d = &(view.doc orelse return);
@@ -769,6 +785,13 @@ fn applyClasses(widget: *c.GtkWidget, classes: []const []u8) void {
 // scale so pixel-peeping shows pixels, not mush.
 
 const Compare = struct {
+    pub const MAGIC: u32 = 0x434D5052; // "CMPR"
+    /// Detector only (canary.zig): the qdata destroy-notify owns this
+    /// allocation, and the four gesture controllers below borrow the
+    /// pointer with no notify of their own — which is precisely the
+    /// arrangement that goes wrong if the qdata ever stops being the
+    /// single free path.
+    magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     area: *c.GtkWidget,
     left_pix: ?*c.GdkPixbuf = null,
@@ -832,14 +855,14 @@ const Compare = struct {
     }
 
     fn freeCompare(user: ?*anyopaque) callconv(.c) void {
-        if (user) |u| {
-            const self: *Compare = @ptrCast(@alignCast(u));
+        if (canary.live(Compare, user)) |self| {
             if (self.left_pix) |p| c.g_object_unref(@ptrCast(p));
             if (self.right_pix) |p| c.g_object_unref(@ptrCast(p));
             self.allocator.free(self.left_path);
             self.allocator.free(self.right_path);
             self.allocator.free(self.left_label);
             self.allocator.free(self.right_label);
+            canary.poison(self);
             self.allocator.destroy(self);
         }
     }
@@ -884,7 +907,7 @@ const Compare = struct {
     }
 
     fn drawCb(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, wi: c_int, hi: c_int, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         const ctx = cr orelse return;
         const w: f64 = @floatFromInt(wi);
         const h: f64 = @floatFromInt(hi);
@@ -1033,7 +1056,7 @@ const Compare = struct {
     }
 
     fn onDragBegin(_: *c.GtkGestureDrag, x: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         const w = self.widgetW();
         const split_x = self.split * w;
         if (@abs(x - split_x) <= SPLIT_GRAB_PX) {
@@ -1053,7 +1076,7 @@ const Compare = struct {
     }
 
     fn onDragUpdate(_: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         switch (self.drag) {
             .none => return,
             .split => self.split = std.math.clamp(self.split0 + dx / self.widgetW(), 0, 1),
@@ -1067,18 +1090,20 @@ const Compare = struct {
     }
 
     fn onDragEnd(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         self.drag = .none;
     }
 
     fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         self.mouse_x = x;
         self.mouse_y = y;
     }
 
     fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Compare, user);
+        // Claim the event either way: a stale context must not let the
+        // scroll fall through to the scroller behind it.
+        const self = canary.live(Compare, user) orelse return 1;
         const w = self.widgetW();
         const h = self.widgetH();
         const base = self.baseScale(w, h) orelse return 1;
@@ -1106,7 +1131,7 @@ const Compare = struct {
     }
 
     fn onPressed(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Compare, user);
+        const self = canary.live(Compare, user) orelse return;
         if (n_press < 2) return;
         self.zoom = 1;
         self.pan_x = 0;
@@ -1148,6 +1173,46 @@ test "classMask maps names to Doc.CLASSES bit positions" {
     try std.testing.expectEqual(@as(u16, 0b1000000001), mask);
     var none = [_][]u8{};
     try std.testing.expectEqual(@as(u16, 0), classMask(&none));
+}
+
+test "a poisoned PanelView makes the face trampolines bail" {
+    // No GTK: prepareDestroyCb only touches plain fields, and the
+    // poisoned call must not even get that far.
+    var view = PanelView{
+        .allocator = std.testing.allocator,
+        .queue = events.Queue.init(),
+        .root_box = undefined,
+        .scroller = undefined,
+    };
+    const before = canary.trips;
+    PanelView.prepareDestroyCb(@ptrCast(&view), true);
+    try std.testing.expect(view.widgets_dead);
+    try std.testing.expectEqual(before, canary.trips);
+
+    // Simulate the freed-but-still-referenced case: poison, then let a
+    // stale callback in. It must bail without writing anything.
+    canary.poison(&view);
+    view.widgets_dead = false;
+    PanelView.prepareDestroyCb(@ptrCast(&view), true);
+    try std.testing.expect(!view.widgets_dead);
+    try std.testing.expectEqual(before + 1, canary.trips);
+}
+
+test "a poisoned CompCtx makes freeCompCtx bail instead of double-freeing" {
+    const a = std.testing.allocator;
+    const ctx = try a.create(PanelView.CompCtx);
+    ctx.* = .{ .allocator = a, .view = null, .id = try a.dupe(u8, "btn") };
+    // Stand in for "this closure was destroyed once already".
+    canary.poison(ctx);
+
+    const before = canary.trips;
+    PanelView.freeCompCtx(@ptrCast(ctx));
+    try std.testing.expectEqual(before + 1, canary.trips);
+
+    // If the guard had not fired, these two would be a double free and
+    // the testing allocator would say so.
+    a.free(ctx.id);
+    a.destroy(ctx);
 }
 
 test "optionsHash tracks option-list identity" {
