@@ -35,6 +35,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
+const blend = @import("blend.zig");
 const atlas_mod = @import("atlas.zig");
 const Atlas = atlas_mod.Atlas;
 const layout_mod = @import("editor_layout.zig");
@@ -117,13 +118,20 @@ pub const VERT_SRC =
     \\}
 ;
 
-pub const FRAG_SRC =
+pub const FRAG_SRC = blend.GLSL_HELPERS ++
     \\in vec4 v_color;
     \\in vec3 v_uvw;
     \\in float v_is_glyph;
     \\in float v_colored;
     \\
     \\uniform sampler2DArray u_atlas;
+    \\// Editor theme background. The editor has no per-quad bg (unlike
+    \\// a terminal cell), so the coverage remap uses the document
+    \\// background for every glyph. Text sitting on a selection or a
+    \\// current-line band therefore gets corrected against the plain
+    \\// background instead — a bounded error, since both are subtle
+    \\// tints of it.
+    \\uniform vec4 u_default_bg;
     \\
     \\out vec4 o_frag;
     \\
@@ -131,12 +139,13 @@ pub const FRAG_SRC =
     \\    if (v_is_glyph > 0.5) {
     \\        vec4 t = texture(u_atlas, v_uvw);
     \\        if (v_colored > 0.5) {
-    \\            o_frag = vec4(t.rgb, t.a * v_color.a);
+    \\            o_frag = sk_out(vec4(t.rgb, t.a * v_color.a));
     \\        } else {
-    \\            o_frag = vec4(v_color.rgb, t.a * v_color.a);
+    \\            float cov = sk_correctCoverage(t.a, v_color.rgb, u_default_bg.rgb);
+    \\            o_frag = sk_out(vec4(v_color.rgb, cov * v_color.a));
     \\        }
     \\    } else {
-    \\        o_frag = v_color;
+    \\        o_frag = sk_out(v_color);
     \\    }
     \\}
 ;
@@ -290,6 +299,13 @@ pub const EditorPass = struct {
     u_screen_px: c_int = -1,
     u_atlas: c_int = -1,
     u_kind: c_int = -1,
+    u_default_bg: c_int = -1,
+    u_blend_mode: c_int = -1,
+    /// Colour space to blend in — see `render/blend.zig`.
+    blend_mode: blend.Mode = .native,
+    /// Document background, for the coverage remap. Pushed by the
+    /// editor view from its resolved theme each frame.
+    default_bg: [4]f32 = .{ 0.09, 0.09, 0.12, 1.0 },
 
     instances: std.ArrayList(Instance) = .empty,
     allocator: std.mem.Allocator,
@@ -326,6 +342,8 @@ pub const EditorPass = struct {
         self.u_screen_px = -1;
         self.u_atlas = -1;
         self.u_kind = -1;
+        self.u_default_bg = -1;
+        self.u_blend_mode = -1;
     }
 
     /// glDelete every owned resource under a still-current context,
@@ -345,6 +363,8 @@ pub const EditorPass = struct {
         self.u_screen_px = c.glGetUniformLocation(self.program, "u_screen_px");
         self.u_atlas = c.glGetUniformLocation(self.program, "u_atlas");
         self.u_kind = c.glGetUniformLocation(self.program, "u_kind");
+        self.u_default_bg = c.glGetUniformLocation(self.program, "u_default_bg");
+        self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
         c.glGenVertexArrays(3, &self.vaos[0]);
         c.glGenBuffers(3, &self.vbos[0]);
         for (0..3) |i| {
@@ -1007,6 +1027,8 @@ pub const EditorPass = struct {
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);
+        c.glUniform4fv(self.u_default_bg, 1, &self.default_bg);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
         c.glBindVertexArray(self.vaos[self.vbo_slot]);
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);

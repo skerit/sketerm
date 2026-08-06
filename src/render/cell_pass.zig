@@ -25,6 +25,7 @@ const Line = @import("../grid/line.zig").Line;
 const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
 const style_util = @import("style.zig");
+const blend = @import("blend.zig");
 
 /// Per-cell instance data. Layout matches the vertex attribs
 /// declared in `realize`. 100 bytes — for 200×80 cells: 1.6 MB.
@@ -91,8 +92,14 @@ pub const VERT_SRC =
     \\// full brightness.
     \\uniform float u_dim_fg;
     \\uniform float u_dim_bg;
+    \\// Pane clear colour — the effective bg of a cell that carries no
+    \\// explicit one (a_bg.a == 0). Only the linear-corrected coverage
+    \\// remap reads it; it is the same `eff_bg` resolveStyleColors
+    \\// feeds to applyMinContrast, so the two agree by construction.
+    \\uniform vec4 u_default_bg;
     \\
     \\out vec4 v_color;
+    \\out vec3 v_bg;
     \\out vec3 v_uvw;
     \\out float v_is_glyph;
     \\out float v_emit;
@@ -119,6 +126,7 @@ pub const VERT_SRC =
     \\    v_bold = a_bold;
     \\    v_colored = a_colored;
     \\    v_dim_k = u_dim_fg;
+    \\    v_bg = ((a_bg.a > 0.001) ? a_bg.rgb : u_default_bg.rgb) * u_dim_bg;
     \\    if (u_kind == 0) {
     \\        v_color = vec4(a_bg.rgb * u_dim_bg, a_bg.a);
     \\        v_is_glyph = 0.0;
@@ -201,7 +209,7 @@ pub const VERT_SRC =
 //                    the strip's local y).
 //   WAVE_THICKNESS_PX
 //                  = curly underline line thickness, in pixels.
-pub const FRAG_SRC = std.fmt.comptimePrint(
+pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\const float WAVE_TWO_PI = 6.2831853;
@@ -209,6 +217,7 @@ pub const FRAG_SRC = std.fmt.comptimePrint(
     \\const float WAVE_THICKNESS_PX = 1.5;
     \\
     \\in vec4 v_color;
+    \\in vec3 v_bg;
     \\in vec3 v_uvw;
     \\in float v_is_glyph;
     \\in float v_emit;
@@ -233,15 +242,20 @@ pub const FRAG_SRC = std.fmt.comptimePrint(
     \\        // RGBA sampled directly (only pane-dim applies).
     \\        vec4 t = texture(u_atlas, v_uvw);
     \\        if (v_colored > 0.5) {{
-    \\            o_frag = vec4(t.rgb * v_dim_k, t.a * v_color.a);
+    \\            // Colour emoji carry their own RGB, so there is no
+    \\            // single fg to remap coverage against — ghostty skips
+    \\            // the correction on its colour atlas for the same
+    \\            // reason. They still linearize for the blend.
+    \\            o_frag = sk_out(vec4(t.rgb * v_dim_k, t.a * v_color.a));
     \\        }} else {{
-    \\            o_frag = vec4(v_color.rgb, t.a * v_color.a);
+    \\            float cov = sk_correctCoverage(t.a, v_color.rgb, v_bg);
+    \\            o_frag = sk_out(vec4(v_color.rgb, cov * v_color.a));
     \\        }}
     \\        return;
     \\    }}
     \\    if (v_deco_kind < 0.5) {{
     \\        // Plain bg quad.
-    \\        o_frag = v_color;
+    \\        o_frag = sk_out(v_color);
     \\        return;
     \\    }}
     \\    // Decoration shaders: kinds 1/4/5 (under, strike, over) are flat
@@ -252,7 +266,7 @@ pub const FRAG_SRC = std.fmt.comptimePrint(
     \\        // Double underline: top half + bottom half drawn, gap in middle.
     \\        float vy = v_deco_local.y;
     \\        if (vy > 0.33 && vy < 0.66) discard;
-    \\        o_frag = v_color;
+    \\        o_frag = sk_out(v_color);
     \\        return;
     \\    }}
     \\    if (kind >= 3.0 && kind < 4.0) {{
@@ -267,10 +281,12 @@ pub const FRAG_SRC = std.fmt.comptimePrint(
     \\        if (dist > thickness) discard;
     \\        // Anti-alias the edge.
     \\        float aa = clamp((thickness - dist) / (thickness * 0.5), 0.0, 1.0);
-    \\        o_frag = vec4(v_color.rgb, v_color.a * aa);
+    \\        // The curly wave's own antialiasing is coverage too, so it
+    \\        // gets the same remap as a glyph edge.
+    \\        o_frag = sk_out(vec4(v_color.rgb, v_color.a * sk_correctCoverage(aa, v_color.rgb, v_bg)));
     \\        return;
     \\    }}
-    \\    o_frag = v_color;
+    \\    o_frag = sk_out(v_color);
     \\}}
 , .{atlas_mod.PAGE_SIZE});
 
@@ -301,6 +317,15 @@ pub const CellPass = struct {
     u_kind: c_int = -1,
     u_dim_fg: c_int = -1,
     u_dim_bg: c_int = -1,
+    u_default_bg: c_int = -1,
+    u_blend_mode: c_int = -1,
+
+    /// Colour space glyph coverage blends in — see `render/blend.zig`.
+    /// Pushed from config; must match every other pass drawing into
+    /// the same framebuffer, and must match GridPass in particular or
+    /// a line containing an emoji would render differently from its
+    /// neighbours.
+    blend_mode: blend.Mode = .native,
 
     /// Dimming applied to fg / bg (and decorations) when the pane is
     /// unfocused. 1.0 = no dim. Set by the renderer (Window /
@@ -400,6 +425,8 @@ pub const CellPass = struct {
         self.u_kind = -1;
         self.u_dim_fg = -1;
         self.u_dim_bg = -1;
+        self.u_default_bg = -1;
+        self.u_blend_mode = -1;
         // Mark every row to re-upload into the new context.
         for (self.row_needs_upload.items) |*r| r.* = true;
     }
@@ -427,6 +454,8 @@ pub const CellPass = struct {
         self.u_kind = c.glGetUniformLocation(self.program, "u_kind");
         self.u_dim_fg = c.glGetUniformLocation(self.program, "u_dim_fg");
         self.u_dim_bg = c.glGetUniformLocation(self.program, "u_dim_bg");
+        self.u_default_bg = c.glGetUniformLocation(self.program, "u_default_bg");
+        self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
 
         // Three independent VAO+VBO pairs, each pre-configured with
         // the same vertex attribute layout. We rotate slots per frame
@@ -910,6 +939,8 @@ pub const CellPass = struct {
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
         c.glUniform1f(self.u_dim_fg, self.dim_fg);
         c.glUniform1f(self.u_dim_bg, self.dim_bg);
+        c.glUniform4fv(self.u_default_bg, 1, &self.default_bg);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);

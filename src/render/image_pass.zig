@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
+const blend = @import("blend.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
 
 pub const VERT_SRC =
@@ -18,12 +19,15 @@ pub const VERT_SRC =
     \\}
 ;
 
-pub const FRAG_SRC =
+pub const FRAG_SRC = blend.GLSL_HELPERS ++
     \\in vec2 v_uv;
     \\uniform sampler2D u_image;
     \\out vec4 o_frag;
     \\void main() {
-    \\    o_frag = texture(u_image, v_uv);
+    \\    // Image texels are sRGB-encoded; sk_out hands the linear
+    \\    // modes linear light so a partially transparent image
+    \\    // composites in light rather than in gamma.
+    \\    o_frag = sk_out(texture(u_image, v_uv));
     \\}
 ;
 
@@ -38,6 +42,10 @@ pub const ImagePass = struct {
     vbo: c_uint = 0,
     u_screen_px: c_int = -1,
     u_image: c_int = -1,
+    u_blend_mode: c_int = -1,
+    /// Colour space to blend in — see `render/blend.zig`. Every pass
+    /// writing into the same framebuffer must agree on this.
+    blend_mode: blend.Mode = .native,
     /// Inner padding (pixels) applied to the cell grid. Images must
     /// be offset by this same amount so they line up with the cells
     /// that referenced them. Set by the Pane each frame from
@@ -63,6 +71,7 @@ pub const ImagePass = struct {
         self.vbo = 0;
         self.u_screen_px = -1;
         self.u_image = -1;
+        self.u_blend_mode = -1;
     }
 
     /// Like `forgetGL`, but ALSO `glDelete*`s every resource we own.
@@ -92,6 +101,7 @@ pub const ImagePass = struct {
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);
         self.u_screen_px = c.glGetUniformLocation(self.program, "u_screen_px");
         self.u_image = c.glGetUniformLocation(self.program, "u_image");
+        self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
 
         c.glGenVertexArrays(1, &self.vao);
         c.glBindVertexArray(self.vao);
@@ -143,6 +153,7 @@ pub const ImagePass = struct {
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
 
         for (store.images.items) |img| {
             switch (zfilter) {

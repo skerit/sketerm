@@ -22,6 +22,7 @@ const Color = @import("../grid/style_pool.zig").Color;
 const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
+const blend = @import("blend.zig");
 pub const scrollbar = @import("scrollbar.zig");
 
 pub const VERT_SRC =
@@ -42,6 +43,9 @@ pub const VERT_SRC =
     \\in float a_baseline_y;
     \\// 1.0 = colour (emoji) glyph — atlas RGBA sampled directly.
     \\in float a_colored;
+    \\// Effective bg behind this quad — only the linear-corrected
+    \\// coverage remap reads it.
+    \\in vec3 a_bg;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform float u_dim_fg;
@@ -49,6 +53,7 @@ pub const VERT_SRC =
     \\
     \\out vec3 v_uv;
     \\out vec4 v_color;
+    \\out vec3 v_bg;
     \\out float v_is_glyph;
     \\out float v_bold;
     \\out float v_colored;
@@ -67,6 +72,7 @@ pub const VERT_SRC =
     \\    if (a_dim > 1.5) k = u_dim_bg;
     \\    else if (a_dim > 0.5) k = u_dim_fg;
     \\    v_color = vec4(a_color.rgb * k, a_color.a);
+    \\    v_bg = a_bg * u_dim_bg;
     \\    v_is_glyph = a_is_glyph;
     \\    v_bold = a_bold;
     \\    v_colored = a_colored;
@@ -76,12 +82,13 @@ pub const VERT_SRC =
 
 // ATLAS_TEXEL = 1/PAGE_SIZE — per-texel UV step for the faux-bold
 // left-neighbor sample (see cell_pass.zig comment).
-pub const FRAG_SRC = std.fmt.comptimePrint(
+pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\
     \\in vec3 v_uv;
     \\in vec4 v_color;
+    \\in vec3 v_bg;
     \\in float v_is_glyph;
     \\in float v_bold;
     \\in float v_colored;
@@ -98,14 +105,17 @@ pub const FRAG_SRC = std.fmt.comptimePrint(
     \\        vec4 t = texture(u_atlas, v_uv);
     \\        if (v_colored > 0.5) {{
     \\            // Colour emoji: atlas carries straight RGBA. Only the
-    \\            // pane-dim factor applies; fg tint does not.
-    \\            o_frag = vec4(t.rgb * v_dim_k, t.a * v_color.a);
+    \\            // pane-dim factor applies; fg tint does not. No
+    \\            // coverage remap — there is no single fg to remap
+    \\            // against (same call ghostty makes on its colour atlas).
+    \\            o_frag = sk_out(vec4(t.rgb * v_dim_k, t.a * v_color.a));
     \\        }} else {{
     \\            // Mono: coverage in alpha (RGB=255), tinted with fg.
-    \\            o_frag = vec4(v_color.rgb, t.a * v_color.a);
+    \\            float cov = sk_correctCoverage(t.a, v_color.rgb, v_bg);
+    \\            o_frag = sk_out(vec4(v_color.rgb, cov * v_color.a));
     \\        }}
     \\    }} else {{
-    \\        o_frag = v_color;
+    \\        o_frag = sk_out(v_color);
     \\    }}
     \\}}
 , .{atlas_mod.PAGE_SIZE});
@@ -122,6 +132,11 @@ const Vertex = extern struct {
     /// 1.0 = colour (emoji) glyph: sample atlas RGBA directly instead
     /// of tinting coverage with `color`.
     colored: f32 = 0.0,
+    /// The bg this quad actually sits on (`effectiveBg`). Read ONLY by
+    /// the linear-corrected coverage remap; ignored in every other
+    /// mode, and left at the pane clear colour for overlays that are
+    /// not cell glyphs (cursor, selection, focus border, …).
+    bg: [3]f32 = .{ 0, 0, 0 },
 };
 
 /// Snapshot of every input that affects the overlay vertex buffer
@@ -205,6 +220,12 @@ const Snapshot = struct {
     allow_bold: bool = true,
     bold_is_bright: bool = true,
     min_contrast: f32 = 1.0,
+    /// The vbuf itself does not vary with the blend mode (the mode is
+    /// a uniform, and the per-vertex `bg` is written unconditionally),
+    /// but CLAUDE.md's rule is that every new render state gets a
+    /// Snapshot field — and a live `text_blending` change must force a
+    /// repaint through some route, so it forces one through this.
+    blend_mode: blend.Mode = .native,
 
     border_width: f32 = 0,
     border_color_active: [4]f32 = .{ 0, 0, 0, 0 },
@@ -224,6 +245,12 @@ pub const GridPass = struct {
     u_atlas: c_int = -1,
     u_dim_fg: c_int = -1,
     u_dim_bg: c_int = -1,
+    u_blend_mode: c_int = -1,
+    /// Colour space glyph coverage blends in — see `render/blend.zig`.
+    /// Kept in lockstep with CellPass: emoji/CJK rows come through
+    /// here while their ASCII neighbours come through CellPass, so a
+    /// mismatch would be visible within one line.
+    blend_mode: blend.Mode = .native,
     /// Inactive-pane dimming. fg multiplier (glyphs + IME preedit) and
     /// bg multiplier (cell bg quads in bidi/DW overlay rows). Cursor,
     /// focus border, selection, search highlight, bell flash are
@@ -338,6 +365,7 @@ pub const GridPass = struct {
         self.u_atlas = -1;
         self.u_dim_fg = -1;
         self.u_dim_bg = -1;
+        self.u_blend_mode = -1;
         self.vbuf_valid = false;
         self.vbo_uploaded = false;
         self.last_atlas_generations = [_]u32{0} ** atlas_mod.PAGE_COUNT;
@@ -381,6 +409,7 @@ pub const GridPass = struct {
         self.u_atlas = c.glGetUniformLocation(self.program, "u_atlas");
         self.u_dim_fg = c.glGetUniformLocation(self.program, "u_dim_fg");
         self.u_dim_bg = c.glGetUniformLocation(self.program, "u_dim_bg");
+        self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
 
         c.glGenVertexArrays(1, &self.vao);
         c.glBindVertexArray(self.vao);
@@ -398,6 +427,7 @@ pub const GridPass = struct {
             .{ .name = "a_bold", .off = @offsetOf(Vertex, "bold"), .count = 1 },
             .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
             .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
+            .{ .name = "a_bg", .off = @offsetOf(Vertex, "bg"), .count = 3 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name);
@@ -1082,6 +1112,7 @@ pub const GridPass = struct {
             .allow_bold = self.allow_bold,
             .bold_is_bright = self.bold_is_bright,
             .min_contrast = self.min_contrast,
+            .blend_mode = self.blend_mode,
 
             .border_width = self.border_width,
             .border_color_active = self.border_color_active,
@@ -1284,7 +1315,7 @@ pub const GridPass = struct {
                 const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 const baseline_y: f32 = y + ch;
                 const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f);
+                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, self.effectiveBg(style));
             }
             col += 1;
         }
@@ -1356,7 +1387,7 @@ pub const GridPass = struct {
             const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
             const baseline_y: f32 = y + ch;
             const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f);
+            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, self.effectiveBg(style));
         }
 
         // Decorations at visual columns — separate sweep so
@@ -1445,7 +1476,7 @@ pub const GridPass = struct {
         dim: f32,
         colored: f32,
     ) !void {
-        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0, colored);
+        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0, colored, self.default_bg);
     }
 
     /// Glyph quad with italic shear + faux-bold support. Used by the
@@ -1466,15 +1497,19 @@ pub const GridPass = struct {
         bold: f32,
         baseline_y: f32,
         colored: f32,
+        /// Effective bg behind the glyph (`effectiveBg`). Feeds the
+        /// linear-corrected coverage remap only.
+        bg_rgba: [4]f32,
     ) !void {
         const px0 = origin[0];
         const py0 = origin[1];
         const px1 = origin[0] + size[0];
         const py1 = origin[1] + size[1];
-        const v0 = Vertex{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
-        const v1 = Vertex{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
-        const v2 = Vertex{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
-        const v3 = Vertex{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
+        const bg: [3]f32 = .{ bg_rgba[0], bg_rgba[1], bg_rgba[2] };
+        const v0 = Vertex{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored, .bg = bg };
+        const v1 = Vertex{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored, .bg = bg };
+        const v2 = Vertex{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored, .bg = bg };
+        const v3 = Vertex{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored, .bg = bg };
         const verts = [_]Vertex{ v0, v1, v2, v1, v3, v2 };
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
@@ -1504,6 +1539,7 @@ pub const GridPass = struct {
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
         c.glUniform1f(self.u_dim_fg, self.dim_fg);
         c.glUniform1f(self.u_dim_bg, self.dim_bg);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);

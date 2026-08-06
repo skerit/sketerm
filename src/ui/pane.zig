@@ -13,6 +13,7 @@ const GridPass = @import("../render/grid_pass.zig").GridPass;
 const CellPass = @import("../render/cell_pass.zig").CellPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const BgPass = @import("../render/bg_pass.zig").BgPass;
+const blend_mod = @import("../render/blend.zig");
 const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ShaderSource = @import("../render/shader_pass.zig").Source;
 const ShaderParamKV = @import("../render/shader_pass.zig").ParamKV;
@@ -93,6 +94,13 @@ pub const Pane = struct {
     image_pass: ImagePass = ImagePass.init(),
     bg_pass: BgPass = .{},
     shader_pass: ShaderPass = .{},
+    /// sRGB offscreen detour for `text_blending = linear |
+    /// linear_corrected`. Inert (no FBO, no pass) under `native`.
+    linear_target: blend_mod.LinearTarget = .{},
+    /// Configured `text_blending`. Kept on the Pane rather than on a
+    /// pass because a frame can fall back to `native` (sRGB target
+    /// unavailable) and must not clobber the configured value.
+    text_blending: blend_mod.Mode = .native,
     /// iTime epoch for the custom shader (monotonic µs; 0 = unset).
     shader_epoch_us: i64 = 0,
     /// Window-level shader source (the config-global one). The pane
@@ -2009,6 +2017,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         self.image_pass.forgetGL();
         self.bg_pass.forgetGL();
         self.shader_pass.forgetGL();
+        self.linear_target.forgetGL();
         self.image_store.forgetGL();
         return;
     }
@@ -2017,6 +2026,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.image_pass.releaseGL();
     self.bg_pass.releaseGL();
     self.shader_pass.releaseGL();
+    self.linear_target.releaseGL();
     self.image_store.releaseGL();
     if (self.atlas) |a| a.releaseGL();
 }
@@ -2047,6 +2057,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.image_pass.forgetGL();
     self.bg_pass.forgetGL();
     self.shader_pass.forgetGL();
+    self.linear_target.forgetGL();
     self.image_store.forgetGL();
 
     // Resolution order: explicit Pane.font_path → Pane.font_family
@@ -2104,9 +2115,33 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
         self.shader_pass.begin(self.allocator, phys_w, phys_h);
     const dim_on = !shader_on and self.shader_pass.beginDim(self.allocator, phys_w, phys_h);
 
+    // Linear-light detour, INSIDE the custom-shader / dim detour: the
+    // scene blends in linear light, resolves back to sRGB-encoded
+    // RGBA8, and only then does a user shader see it — so a CRT shader
+    // keeps operating on the pixels it always did.
+    const blend_mode = self.text_blending;
+    const linear_on = self.linear_target.begin(blend_mode, phys_w, phys_h);
+
     c.glViewport(0, 0, phys_w, phys_h);
-    c.glClearColor(self.grid_pass.default_bg[0], self.grid_pass.default_bg[1], self.grid_pass.default_bg[2], self.grid_pass.default_bg[3]);
+    // The clear writes through the same sRGB encode a fragment does,
+    // so the linear modes owe glClearColor linear light. This is the
+    // one colour that never passes through a shader.
+    const clear = blend_mod.clearColor(
+        if (linear_on) blend_mode else .native,
+        self.grid_pass.default_bg,
+    );
+    c.glClearColor(clear[0], clear[1], clear[2], clear[3]);
     c.glClear(c.GL_COLOR_BUFFER_BIT);
+
+    // If the sRGB target could not be built we render `native` this
+    // frame: handing linear light to a plain RGBA8 framebuffer would
+    // wash the whole pane out. Every pass writing into this
+    // framebuffer must agree, so they are all set from one value.
+    const eff_mode: blend_mod.Mode = if (linear_on) blend_mode else .native;
+    self.cell_pass.blend_mode = eff_mode;
+    self.grid_pass.blend_mode = eff_mode;
+    self.image_pass.blend_mode = eff_mode;
+    self.bg_pass.blend_mode = eff_mode;
 
     self.grid_pass.canvas_w = @floatFromInt(phys_w);
     self.grid_pass.canvas_h = @floatFromInt(phys_h);
@@ -2174,6 +2209,9 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
         self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
         if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }
+    // Resolve linear light back to the sRGB-encoded RGBA8 target the
+    // custom-shader / dim post-process (or GTK itself) expects.
+    if (linear_on) self.linear_target.finish(phys_w, phys_h);
     if (shader_on) {
         const now_us = c.g_get_monotonic_time();
         if (self.shader_epoch_us == 0) self.shader_epoch_us = now_us;

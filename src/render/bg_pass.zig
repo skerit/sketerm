@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
+const blend = @import("blend.zig");
 
 pub const Mode = enum { none, gradient, image };
 
@@ -42,7 +43,7 @@ pub const VERT_SRC =
     \\}
 ;
 
-pub const FRAG_SRC =
+pub const FRAG_SRC = blend.GLSL_HELPERS ++
     \\in vec2 v_uv;
     \\uniform int u_mode;       // 0 = gradient, 1 = image
     \\uniform vec4 u_color0;
@@ -57,10 +58,10 @@ pub const FRAG_SRC =
     \\    if (u_mode == 0) {
     \\        float t = clamp(dot(v_uv - 0.5, u_dir) + 0.5, 0.0, 1.0);
     \\        vec4 col = mix(u_color0, u_color1, t);
-    \\        o_frag = vec4(col.rgb, col.a * u_opacity);
+    \\        o_frag = sk_out(vec4(col.rgb, col.a * u_opacity));
     \\    } else {
     \\        vec4 tex = texture(u_image, u_uv_off + v_uv * u_uv_scale);
-    \\        o_frag = vec4(tex.rgb, tex.a * u_opacity);
+    \\        o_frag = sk_out(vec4(tex.rgb, tex.a * u_opacity));
     \\    }
     \\}
 ;
@@ -96,8 +97,12 @@ pub const BgPass = struct {
     u_uv_scale: c_int = -1,
     u_uv_off: c_int = -1,
     u_image: c_int = -1,
+    u_blend_mode: c_int = -1,
     /// Window-owned shared source. Null until the Window wires it.
     source: ?*const Source = null,
+    /// Colour space to blend in — see `render/blend.zig`. Pushed from
+    /// config; every pass drawing into the same framebuffer must agree.
+    blend_mode: blend.Mode = .native,
 
     pub fn forgetGL(self: *BgPass) void {
         self.program = 0;
@@ -135,6 +140,7 @@ pub const BgPass = struct {
         self.u_uv_scale = c.glGetUniformLocation(self.program, "u_uv_scale");
         self.u_uv_off = c.glGetUniformLocation(self.program, "u_uv_off");
         self.u_image = c.glGetUniformLocation(self.program, "u_image");
+        self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
 
         c.glGenVertexArrays(1, &self.vao);
         c.glBindVertexArray(self.vao);
@@ -160,6 +166,7 @@ pub const BgPass = struct {
         c.glBindVertexArray(self.vao);
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
 
         switch (src.mode) {
             .gradient => {
