@@ -497,7 +497,7 @@ pub fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopa
         if (t.last_focused) |lf| {
             for (self.panes.items) |p| {
                 if (p == lf and winmod.widgetIsAncestor(@ptrCast(child), p.widget())) {
-                    _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+                    _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
                     return;
                 }
             }
@@ -507,7 +507,7 @@ pub fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopa
     // No (valid) last-focused pane — fall back to the first pane.
     for (self.panes.items) |p| {
         if (winmod.widgetIsAncestor(@ptrCast(child), p.widget())) {
-            _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+            _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
             return;
         }
     }

@@ -1572,7 +1572,7 @@ pub const Window = struct {
     pub fn focusedPaneCwd(self: *Window) ?[]const u8 {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
-            if (focus == @as(*c.GtkWidget, @ptrCast(p.area))) {
+            if (focus == @as(*c.GtkWidget, @ptrCast(p.surface.area))) {
                 return p.terminal.cwd;
             }
         }
@@ -1624,9 +1624,9 @@ pub const Window = struct {
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
-        pane.image_store.debug = self.debug_images;
-        pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
-        pane.image_pass.debug = self.debug_images;
+        pane.surface.image_store.debug = self.debug_images;
+        pane.surface.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
+        pane.surface.image_pass.debug = self.debug_images;
         pane.terminal.screen.kitty_images.debug = self.debug_images;
         pane.terminal.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
         // Mouse / link flags from config.
@@ -1638,26 +1638,26 @@ pub const Window = struct {
         pane.mouse_autohide = self.config.mouse_autohide;
         pane.middle_click_action = self.config.mouse_middle_click;
         pane.right_click_action = self.config.mouse_right_click;
-        pane.bg_pass.source = &self.bg_source;
-        pane.shader_default_source = &self.shader_source;
+        pane.surface.bg_pass.source = &self.bg_source;
+        pane.surface.shader_default_source = &self.shader_source;
         pane.refreshShaderBinding();
         pane.updateShaderTick();
         // Renderer bold flags.
-        pane.grid_pass.allow_bold = self.config.allow_bold;
-        pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
-        pane.cell_pass.allow_bold = self.config.allow_bold;
-        pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
-        pane.grid_pass.min_contrast = self.config.minimum_contrast;
-        pane.cell_pass.min_contrast = self.config.minimum_contrast;
-        pane.grid_pass.enable_url_underline = self.config.auto_url_detect;
+        pane.surface.grid_pass.allow_bold = self.config.allow_bold;
+        pane.surface.grid_pass.bold_is_bright = self.config.bold_is_bright;
+        pane.surface.cell_pass.allow_bold = self.config.allow_bold;
+        pane.surface.cell_pass.bold_is_bright = self.config.bold_is_bright;
+        pane.surface.grid_pass.min_contrast = self.config.minimum_contrast;
+        pane.surface.cell_pass.min_contrast = self.config.minimum_contrast;
+        pane.surface.grid_pass.enable_url_underline = self.config.auto_url_detect;
         // Per-pane titlebar visibility. The file-manager identity never
         // shows it: a Files window's panes wear a browser face whose own
         // location bar already names the pane, so the strip under the tab
         // bar is pure redundancy there.
         pane.setTitlebarVisible(self.config.show_titlebar and !files_identity);
         // Inactive-pane dimming factors.
-        pane.inactive_darken = self.config.inactive_darken;
-        pane.inactive_desaturate = self.config.inactive_desaturate;
+        pane.surface.inactive_darken = self.config.inactive_darken;
+        pane.surface.inactive_desaturate = self.config.inactive_desaturate;
         pane.applyDim();
         return pane;
     }
@@ -2031,7 +2031,7 @@ pub const Window = struct {
         if (self.zoom_hidden.items.len == 0) return; // single pane — nothing to zoom
         self.zoom_pane = pane;
         termsinks_mod.titleFactChanged(self, pane, .zoom);
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
     }
 
     pub fn unzoomPane(self: *Window) void {
@@ -2043,7 +2043,7 @@ pub const Window = struct {
             c.g_object_unref(w);
         }
         self.zoom_hidden.clearRetainingCapacity();
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
     }
 
     /// Split whatever currently has keyboard focus. A no-op when focus
@@ -2051,7 +2051,7 @@ pub const Window = struct {
     pub fn splitFocused(self: *Window, orientation: c_uint) !void {
         // Find the focused Pane. The wrapper Box isn't focusable, so
         // gtk_window_get_focus returns the inner GLArea. Match against
-        // p.area, then operate on p.widget() (== the wrapper) for
+        // p.surface.area, then operate on p.widget() (== the wrapper) for
         // reparenting.
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
         const focused_pane = self.paneForWidget(focus) orelse return;
@@ -2182,7 +2182,7 @@ pub const Window = struct {
         c.gtk_widget_queue_resize(new_w);
         // new_w is the wrapper Box when padding is set — queue the
         // render on the GLArea itself, not the wrapper.
-        c.gtk_gl_area_queue_render(@ptrCast(new_pane.area));
+        c.gtk_gl_area_queue_render(@ptrCast(new_pane.surface.area));
         c.gtk_widget_queue_resize(@ptrCast(paned));
 
         _ = c.gtk_widget_grab_focus(focused_w);
@@ -2326,8 +2326,8 @@ pub const Window = struct {
         if (pane.titlebar_box) |tb| {
             c.gtk_widget_set_parent(popover, tb);
         } else {
-            c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
-            const w = c.gtk_widget_get_width(@ptrCast(pane.area));
+            c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
+            const w = c.gtk_widget_get_width(@ptrCast(pane.surface.area));
             const rect = c.GdkRectangle{
                 .x = @divFloor(w, 2),
                 .y = 1,
@@ -2388,9 +2388,9 @@ pub const Window = struct {
         }
 
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
         connectManualPopoverClose(popover);
-        const w = c.gtk_widget_get_width(@ptrCast(pane.area));
+        const w = c.gtk_widget_get_width(@ptrCast(pane.surface.area));
         const rect = c.GdkRectangle{
             .x = @divFloor(w, 2),
             .y = 1,
@@ -2442,16 +2442,16 @@ pub const Window = struct {
     /// Ctrl+- / Ctrl+= / Ctrl+0.
     pub fn adjustFocusedFontSize(self: *Window, delta: i32) void {
         const pane = self.focusedPane() orelse return;
-        const new: i32 = @as(i32, @intCast(pane.font_size)) + delta;
+        const new: i32 = @as(i32, @intCast(pane.surface.font_size)) + delta;
         const clamped: u16 = @intCast(std.math.clamp(new, 6, 72));
-        if (clamped == pane.font_size) return;
+        if (clamped == pane.surface.font_size) return;
         pane.setFontSize(clamped);
     }
 
     pub fn resetFocusedFontSize(self: *Window) void {
         const pane = self.focusedPane() orelse return;
         const base = self.config.profileSettings(pane.active_profile orelse "").font_size;
-        if (pane.font_size == base) return;
+        if (pane.surface.font_size == base) return;
         pane.setFontSize(base);
     }
 
@@ -2464,7 +2464,7 @@ pub const Window = struct {
             .prev => screen.jumpPrevPrompt(),
             .next => screen.jumpNextPrompt(),
         };
-        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+        c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
     }
 
     pub fn focusedPane(self: *Window) ?*Pane {
@@ -2479,7 +2479,7 @@ pub const Window = struct {
         var w: ?*c.GtkWidget = widget;
         while (w) |cur| : (w = c.gtk_widget_get_parent(cur)) {
             for (self.panes.items) |p| {
-                if (@intFromPtr(p.area) == @intFromPtr(cur)) return p;
+                if (@intFromPtr(p.surface.area) == @intFromPtr(cur)) return p;
                 if (@intFromPtr(p.widget()) == @intFromPtr(cur)) return p;
             }
         }
@@ -2506,7 +2506,7 @@ pub const Window = struct {
         var idx: usize = 0;
         if (focus != null) {
             for (in_tab.items, 0..) |p, i| {
-                if (focus == @as(*c.GtkWidget, @ptrCast(p.area))) {
+                if (focus == @as(*c.GtkWidget, @ptrCast(p.surface.area))) {
                     idx = i;
                     break;
                 }
@@ -2517,7 +2517,7 @@ pub const Window = struct {
             .next => (idx + 1) % n,
             .prev => (idx + n - 1) % n,
         };
-        _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].surface.area));
     }
 
     /// Insert a new tab into self.tab_view, honouring the
@@ -2633,16 +2633,16 @@ pub const Window = struct {
     /// explicit pick, then a sticky clear); `new` already had the
     /// default applied by its config push, so this is an override.
     pub fn transferPaneShader(self: *Window, old: *Pane, new: *Pane) void {
-        if (old.preset_name) |pn| {
+        if (old.surface.preset_name) |pn| {
             if (self.applyShaderPresetByName(new, pn)) return;
         }
-        if (old.custom_shader_user) {
-            if (old.custom_shader_path) |sp| {
+        if (old.surface.custom_shader_user) {
+            if (old.surface.custom_shader_path) |sp| {
                 _ = new.setCustomShader(sp, self.config.custom_shader_animation, true);
                 return;
             }
         }
-        if (old.shader_cleared) new.clearShader();
+        if (old.surface.shader_cleared) new.clearShader();
     }
 
     /// Put `pane` into `old`'s slot — tree model and widget tree in
@@ -2720,7 +2720,7 @@ pub const Window = struct {
             c.adw_tab_page_set_title(page, t.ptr);
             c.adw_tab_page_set_tooltip(page, t.ptr);
         }
-        _ = c.gtk_widget_grab_focus(@ptrCast(fresh.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(fresh.surface.area));
     }
 
     /// A forwarded app (`sketerm app`) exited before ever showing a
@@ -2761,10 +2761,10 @@ pub const Window = struct {
         const wrap = pane.widget();
         // The GLArea sits inside a graphics-offload widget (black bg); hide
         // that whole subtree, not just the GLArea, so the crash panel fills.
-        if (c.gtk_widget_get_parent(@ptrCast(pane.area))) |offload| {
+        if (c.gtk_widget_get_parent(@ptrCast(pane.surface.area))) |offload| {
             c.gtk_widget_set_visible(offload, 0);
         } else {
-            c.gtk_widget_set_visible(@ptrCast(pane.area), 0);
+            c.gtk_widget_set_visible(@ptrCast(pane.surface.area), 0);
         }
         // Drop the per-pane titlebar too (if any): its stale session title
         // above a "session crashed" panel reads as a contradiction.
@@ -3013,7 +3013,7 @@ pub const Window = struct {
         }
         // Re-use closeFocusedPane's path by temporarily focusing the
         // target then calling it. Simpler than duplicating.
-        _ = c.gtk_widget_grab_focus(@ptrCast(target.area));
+        _ = c.gtk_widget_grab_focus(@ptrCast(target.surface.area));
         self.closeFocusedPane();
     }
 
@@ -3118,11 +3118,11 @@ pub const Window = struct {
         // subtree (model hint) — without this, focus can land on the
         // now-empty GtkPaned wrapper and keypresses go nowhere.
         if (focus_hint) |fp| {
-            _ = c.gtk_widget_grab_focus(@ptrCast(fp.area));
+            _ = c.gtk_widget_grab_focus(@ptrCast(fp.surface.area));
         } else if (sibling) |sib| {
             for (self.panes.items) |p| {
                 if (widgetIsAncestor(@ptrCast(sib), @ptrCast(p.widget()))) {
-                    _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+                    _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
                     break;
                 }
             }
