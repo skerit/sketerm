@@ -43,7 +43,8 @@ src/
 │   ├── app.zig             AdwApplication singleton
 │   ├── window.zig          AdwApplicationWindow + AdwTabView + root GL context
 │   ├── tab.zig             one tab = one pane_tree + sticky title
-│   ├── pane.zig            GtkGLArea subclass hosting one Terminal
+│   ├── pane.zig            interactive pane: input/menus/faces around a surface
+│   ├── terminal_surface.zig terminal renderer: GLArea + passes + visual timers
 │   ├── pane_tree.zig       binary tree {Leaf(Pane) | Split(H|V, a, b)}
 │   ├── menu.zig            GMenu / GActionMap builder
 │   ├── clipboard.zig       GdkClipboard ↔ OSC 52 bridge
@@ -196,13 +197,24 @@ Summarized here; full detail in `docs/gpu.md`.
 - **Re-realize on reparent.** `gtk_widget_unparent` unrealizes the
   GLArea, which destroys its `GdkGLContext`. Splits / tab moves /
   layout shuffles all reparent and therefore cycle the context.
-  `Pane.onRealize` treats every realize as potentially a re-realize:
-  the prior `Atlas` is `deinit`-ed, then `forgetGL()` zeros the
-  cached handles on `GridPass` / `ImagePass` / `ImageStore` so the
-  realize path actually rebuilds against the fresh context. Without
-  this, `program != 0` early-returns leak dead-context shader IDs
-  and `glUseProgram` silently renders nothing.
-- Pane GL resources (per-pane VBOs) are released in `unrealize`.
+  `TerminalSurface`'s realize handler (`src/ui/terminal_surface.zig`)
+  treats every realize as potentially a re-realize: the prior
+  `Atlas` is `deinit`-ed, then `forgetGL()` zeros the cached handles
+  on `GridPass` / `ImagePass` / `ImageStore` so the realize path
+  actually rebuilds against the fresh context. Without this,
+  `program != 0` early-returns leak dead-context shader IDs and
+  `glUseProgram` silently renders nothing.
+- Surface GL resources (per-pane VBOs) are released in `unrealize`.
+- **Pane vs TerminalSurface.** `Pane` (src/ui/pane.zig) is the
+  interactive workspace cell: input, menus, faces, Window sinks,
+  split-tree participation. The rendering half — GtkGLArea +
+  lifecycle, all render passes, ImageStore, visual timers — is
+  `TerminalSurface` (src/ui/terminal_surface.zig), composed by value
+  inside Pane and reusable without it (e.g. a cast-playback viewer).
+  The surface carries the presentation-geometry policy
+  (`Geometry.live_terminal` = allocation drives the grid;
+  `Geometry.fixed_grid` = letterboxed fixed cols x rows, no
+  geometry propagation).
 
 ## Key design decisions
 
