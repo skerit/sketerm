@@ -11,6 +11,8 @@ const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
+const castbox = @import("castbox.zig");
+const Terminal = @import("../terminal.zig").Terminal;
 
 pub const Variant = enum { preview, original, external_copy };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -455,6 +457,21 @@ pub fn textureFromDecoded(image: *const decoder.Decoded) ?*c.GdkTexture {
 
 const VIEWER_QDATA = "sketerm-viewer-window";
 
+/// What the viewer window currently shows. `.image` routes to the
+/// window-owned canvas/loader pipeline, which persists across items
+/// (LoadTargets, canvas, session all live for the window's whole
+/// life); `.cast` carries a per-item playback controller that is torn
+/// down completely on every navigation (its ephemeral daemon session
+/// dies with it).
+pub const Content = union(enum) {
+    image,
+    cast: *castbox.CastPlayerBox,
+};
+
+/// Number of header controls that only make sense for images and hide
+/// while a cast is showing.
+const IMAGE_CONTROL_COUNT = 10;
+
 pub const ViewerWindow = struct {
     allocator: std.mem.Allocator,
     window: *c.GtkWidget,
@@ -473,6 +490,15 @@ pub const ViewerWindow = struct {
     prev_button: *c.GtkWidget,
     next_button: *c.GtkWidget,
     fullscreen: bool = false,
+    content: Content = .image,
+    /// Vertical box the cast surface + transport bar mount into;
+    /// hidden (and empty) while an image is showing.
+    cast_slot: *c.GtkWidget,
+    /// Header controls hidden while a cast is showing.
+    image_controls: [IMAGE_CONTROL_COUNT]*c.GtkWidget,
+    /// Latest recording title (cast header / OSC title / basename).
+    cast_title: [512]u8 = undefined,
+    cast_title_len: usize = 0,
     pending_mount: ?*MountOpen = null,
     /// Image-canvas context menu. Borrowed: the click gesture on the
     /// canvas owns it and frees it when the canvas dies.
@@ -562,6 +588,10 @@ pub const ViewerWindow = struct {
         const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
         c.gtk_widget_set_vexpand(canvas.widget(), 1);
         c.gtk_box_append(@ptrCast(content), canvas.widget());
+        const cast_slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+        c.gtk_widget_set_vexpand(cast_slot, 1);
+        c.gtk_widget_set_visible(cast_slot, 0);
+        c.gtk_box_append(@ptrCast(content), cast_slot);
         const footer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10).?;
         c.gtk_widget_set_margin_start(footer, 12);
         c.gtk_widget_set_margin_end(footer, 12);
@@ -602,6 +632,12 @@ pub const ViewerWindow = struct {
             .metadata_label = @ptrCast(@alignCast(metadata_label)),
             .prev_button = prev_button,
             .next_button = next_button,
+            .cast_slot = cast_slot,
+            .image_controls = .{
+                zoom_out,    @ptrCast(@alignCast(zoom_label)), zoom_in,     fit_button,
+                fill_button, actual_button,                    rotate_left, rotate_right,
+                play_button, menu_button,
+            },
         };
         self.canvas.enableInput();
         self.canvas.on_zoom = &onCanvasZoom;
@@ -614,6 +650,10 @@ pub const ViewerWindow = struct {
         self.session.setPlaybackCallback(@ptrCast(self), &onSessionPlaybackChanged);
 
         c.g_object_set_data_full(@ptrCast(window), VIEWER_QDATA, @ptrCast(self), @ptrCast(&destroyViewer));
+        // Cast content's surface timers and terminal sinks reach into
+        // widgets; fence them the moment the window starts dying, not
+        // at finalize (same contract as castview.zig).
+        _ = c.g_signal_connect_data(window, "destroy", @ptrCast(&onWindowDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(open_button, "clicked", @ptrCast(&onOpenClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(prev_button, "clicked", @ptrCast(&onPrevious), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(next_button, "clicked", @ptrCast(&onNext), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -669,6 +709,13 @@ pub const ViewerWindow = struct {
 
     fn destroyViewer(user: ?*anyopaque) callconv(.c) void {
         const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        // Finalize path: the widget tree is already gone, so free the
+        // controller without touching the cast_slot (onWindowDestroy
+        // severed the timers/sinks when the window started dying).
+        switch (self.content) {
+            .cast => |box| box.destroy(),
+            .image => {},
+        }
         if (self.pending_mount) |pending| pending.viewer = null;
         self.pending_mount = null;
         self.open_target.close();
@@ -683,7 +730,67 @@ pub const ViewerWindow = struct {
         return model.Resource.parse(self.batch.specs[self.index]);
     }
 
+    fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        switch (self.content) {
+            .cast => |box| box.severLive(),
+            .image => {},
+        }
+    }
+
+    /// Show or hide the image-mode chrome (canvas + header controls)
+    /// against the cast slot.
+    fn setContentMode(self: *ViewerWindow, image: bool) void {
+        c.gtk_widget_set_visible(self.canvas.widget(), @intFromBool(image));
+        c.gtk_widget_set_visible(self.cast_slot, @intFromBool(!image));
+        for (self.image_controls) |w| c.gtk_widget_set_visible(w, @intFromBool(image));
+        if (!image) c.gtk_widget_set_visible(self.original_button, 0);
+    }
+
+    /// Tear down the outgoing cast controller COMPLETELY: fence the
+    /// timers/sinks, let the widgets die (removal from the slot is
+    /// their last reference), then kill the ephemeral session and free
+    /// the controller. Safe to call in any content mode.
+    fn closeCast(self: *ViewerWindow) void {
+        const box = switch (self.content) {
+            .cast => |b| b,
+            .image => return,
+        };
+        self.content = .image;
+        box.severLive();
+        c.gtk_box_remove(@ptrCast(self.cast_slot), box.surfaceWidget());
+        c.gtk_box_remove(@ptrCast(self.cast_slot), box.barWidget());
+        box.destroy();
+        self.cast_title_len = 0;
+        self.setContentMode(true);
+    }
+
+    fn showCast(self: *ViewerWindow, resource: model.Resource) void {
+        // A still-running image load must not deliver into cast mode.
+        self.target.cancel();
+        c.gtk_label_set_text(self.metadata_label, "Asciicast terminal recording");
+        c.gtk_label_set_text(self.status, "Loading recording...");
+        const box = castbox.CastPlayerBox.create(self.allocator, resource.spec, "sketerm view", .{
+            .ctx = @ptrCast(self),
+            .on_title = &onCastTitle,
+            .on_state = &onCastState,
+        }) catch |err| {
+            var buf: [256:0]u8 = undefined;
+            const text = std.fmt.bufPrintZ(&buf, "Unable to play {s}: {s}", .{
+                resource.name(), @errorName(err),
+            }) catch "Unable to play the recording";
+            c.gtk_label_set_text(self.status, text.ptr);
+            return;
+        };
+        self.content = .{ .cast = box };
+        c.gtk_widget_set_tooltip_text(box.scale, "Seek (,/. 5s, </> 30s)");
+        c.gtk_box_append(@ptrCast(self.cast_slot), box.surfaceWidget());
+        c.gtk_box_append(@ptrCast(self.cast_slot), box.barWidget());
+        self.setContentMode(false);
+    }
+
     fn showCurrent(self: *ViewerWindow) void {
+        self.closeCast();
         self.session.clear();
         self.canvas.fit();
         c.gtk_widget_set_sensitive(self.play_button, 0);
@@ -703,10 +810,12 @@ pub const ViewerWindow = struct {
         var pos: [64:0]u8 = undefined;
         const pos_z = std.fmt.bufPrintZ(&pos, "{d} of {d}", .{ self.index + 1, self.batch.specs.len }) catch "";
         c.gtk_label_set_text(self.position, pos_z.ptr);
-        c.gtk_label_set_text(self.status, "Loading preview...");
-        self.canvas.setAccessible(resource.name(), "Loading preview", true);
         c.gtk_widget_set_sensitive(self.prev_button, @intFromBool(self.index > 0));
         c.gtk_widget_set_sensitive(self.next_button, @intFromBool(self.index + 1 < self.batch.specs.len));
+        // Route by classification BEFORE any image load starts.
+        if (paths.isCastName(resource.name())) return self.showCast(resource);
+        c.gtk_label_set_text(self.status, "Loading preview...");
+        self.canvas.setAccessible(resource.name(), "Loading preview", true);
         if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
     }
 
@@ -1125,6 +1234,42 @@ fn onPlayPause(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.session.togglePlayback();
 }
 
+fn onCastTitle(user: ?*anyopaque, name: []const u8) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const n = @min(name.len, self.cast_title.len);
+    @memcpy(self.cast_title[0..n], name[0..n]);
+    self.cast_title_len = n;
+    var buf: [600:0]u8 = undefined;
+    const t = std.fmt.bufPrintZ(&buf, "{s} - {s}", .{ name, model.APP_NAME }) catch model.APP_NAME;
+    c.gtk_window_set_title(@ptrCast(self.window), t.ptr);
+}
+
+/// Status line for casts: recording title + position/duration, where
+/// images show dimensions.
+fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const title = self.cast_title[0..self.cast_title_len];
+    var buf: [700:0]u8 = undefined;
+    const suffix: []const u8 = switch (st.kind) {
+        .paused => "  Paused",
+        .finished => "  Finished",
+        .seeking => "  Seeking...",
+        .playing => "",
+    };
+    const text = if (st.duration_ms) |d|
+        std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2} / {d}:{d:0>2}{s}", .{
+            title,
+            st.position_ms / 60_000, (st.position_ms / 1000) % 60,
+            d / 60_000,              (d / 1000) % 60,
+            suffix,
+        }) catch return
+    else
+        std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2} / --:--{s}", .{
+            title, st.position_ms / 60_000, (st.position_ms / 1000) % 60, suffix,
+        }) catch return;
+    c.gtk_label_set_text(self.status, text.ptr);
+}
+
 fn onSessionPlaybackChanged(user: ?*anyopaque) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
     self.updatePlaybackButton();
@@ -1190,11 +1335,14 @@ fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .{
             .mode = .open_file,
             .title = "Open Image",
-            .filters = &.{.{ .label = "Images", .patterns = &.{
-                "*.png",   "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
-                "*.jxl",   "*.bmp",  "*.svg",  "*.ico",  "*.tif",
-                "*.tiff",  "*.avif", "*.heic", "*.heif",
-            } }},
+            .filters = &.{
+                .{ .label = "Images", .patterns = &.{
+                    "*.png",   "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
+                    "*.jxl",   "*.bmp",  "*.svg",  "*.ico",  "*.tif",
+                    "*.tiff",  "*.avif", "*.heic", "*.heif",
+                } },
+                .{ .label = "Recordings", .patterns = &.{"*.cast"} },
+            },
         },
         &onOpenDone,
         @ptrCast(self.window),
@@ -1225,9 +1373,32 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
     if (keyval == c.GDK_KEY_Menu or
         (keyval == c.GDK_KEY_F10 and (state & c.GDK_SHIFT_MASK) != 0))
     {
+        if (self.content != .image) return 0; // the menu mirrors image controls
         const menu = self.canvas_menu orelse return 0;
         showCanvasMenuCentred(menu);
         return 1;
+    }
+    // Cast content: Left/Right stay batch navigation (consistency in
+    // mixed batches — the STANDALONE play window seeks with arrows);
+    // seeking is ,/. (5s) and </> (30s), Space toggles, R restarts.
+    switch (self.content) {
+        .cast => |box| {
+            switch (keyval) {
+                c.GDK_KEY_Left => self.move(-1),
+                c.GDK_KEY_Right => self.move(1),
+                c.GDK_KEY_space, c.GDK_KEY_KP_Space => box.togglePlay(),
+                c.GDK_KEY_comma => box.seekRelative(-5_000),
+                c.GDK_KEY_period => box.seekRelative(5_000),
+                c.GDK_KEY_less => box.seekRelative(-30_000),
+                c.GDK_KEY_greater => box.seekRelative(30_000),
+                c.GDK_KEY_r, c.GDK_KEY_R => box.restart(),
+                c.GDK_KEY_F11 => toggleFullscreen(self),
+                c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
+                else => return 0,
+            }
+            return 1;
+        },
+        .image => {},
     }
     switch (keyval) {
         c.GDK_KEY_Left => self.move(-1),
