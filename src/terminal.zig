@@ -164,6 +164,11 @@ pub const Terminal = struct {
     /// actually appears (see app_window_opened). The pane shows its
     /// "app window open" banner off this in window view mode.
     on_app_window: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Cast-playback state (play_state frames from a cast session).
+    /// `st.markers` is valid only for the duration of the callback.
+    on_play_state: ?*const fn (ctx: ?*anyopaque, st: PlayState) void = null,
+    /// Latest play_state, markers stripped (they are callback-scoped).
+    last_play_state: ?PlayState = null,
 
     /// OSC 133/633 shell-integration command lifecycle: running=true
     /// at C (output starts), running=false at D with the exit code.
@@ -242,6 +247,22 @@ pub const Terminal = struct {
         /// Human-readable reason on `.failed`.
         message: []const u8 = "",
     };
+
+    /// One step of a cast-playback session's transport state (a
+    /// `play_state` frame). `duration_ms` stays null until the daemon
+    /// has seen the recording's EOF once.
+    pub const PlayState = struct {
+        pub const Kind = enum { playing, paused, seeking, finished };
+        pub const Marker = struct { ms: u64, label: []const u8 };
+        kind: Kind,
+        position_ms: u64 = 0,
+        duration_ms: ?u64 = null,
+        speed: f64 = 1.0,
+        /// Valid only inside the `on_play_state` callback.
+        markers: []const Marker = &.{},
+    };
+
+    pub const PlayOp = enum { play, pause, restart, seek, speed };
 
     /// Remote (mux) attachment state.
     pub const Remote = struct {
@@ -1052,6 +1073,7 @@ pub const Terminal = struct {
             .app_listing => self.handleAppListing(frame.payload),
             .peer_info => self.handlePeerInfo(frame.payload),
             .control_state => self.handleControlState(frame.payload),
+            .play_state => self.handlePlayState(frame.payload),
             .session_meta => {
                 const Meta = struct { cwd: []const u8 = "", program: []const u8 = "" };
                 var parsed = std.json.parseFromSlice(Meta, self.allocator, frame.payload, .{
@@ -1833,6 +1855,73 @@ pub const Terminal = struct {
         }
     }
 
+    /// JSON shape of a daemon play_state frame. Marker tuples arrive as
+    /// [[ms,"label"],...].
+    const PlayStateMsg = struct {
+        state: []const u8 = "",
+        position_ms: u64 = 0,
+        duration_ms: ?u64 = null,
+        speed: f64 = 1.0,
+        markers: []const struct { u64, []const u8 } = &.{},
+    };
+
+    fn playKindFromName(name: []const u8) ?PlayState.Kind {
+        inline for (@typeInfo(PlayState.Kind).@"enum".fields) |f| {
+            if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+
+    fn handlePlayState(self: *Terminal, payload: []const u8) void {
+        const parsed = std.json.parseFromSlice(PlayStateMsg, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        const m = parsed.value;
+        // Unknown state names (a future daemon) drop the frame rather
+        // than mislabel it — the next known state resyncs everything.
+        const kind = playKindFromName(m.state) orelse return;
+        var st: PlayState = .{
+            .kind = kind,
+            .position_ms = m.position_ms,
+            .duration_ms = m.duration_ms,
+            .speed = m.speed,
+        };
+        // Stored copy carries no markers (their strings live in the
+        // parsed arena, freed on return).
+        self.last_play_state = st;
+        const f = self.on_play_state orelse return;
+        var markers = self.allocator.alloc(PlayState.Marker, m.markers.len) catch return;
+        defer self.allocator.free(markers);
+        for (m.markers, 0..) |t, i| markers[i] = .{ .ms = t[0], .label = t[1] };
+        st.markers = markers;
+        f(self.user_ctx, st);
+    }
+
+    /// Render a play_control payload into `buf`. Only `.seek` reads
+    /// `ms` and only `.speed` reads `speed`.
+    fn playControlPayload(buf: []u8, op: PlayOp, ms: u64, speed: f64) ?[]const u8 {
+        return switch (op) {
+            .seek => std.fmt.bufPrint(buf, "{{\"op\":\"seek\",\"ms\":{d}}}", .{ms}) catch null,
+            .speed => std.fmt.bufPrint(buf, "{{\"op\":\"speed\",\"speed\":{d}}}", .{speed}) catch null,
+            else => std.fmt.bufPrint(buf, "{{\"op\":\"{s}\"}}", .{@tagName(op)}) catch null,
+        };
+    }
+
+    /// Send a play_control frame to the attached cast session. No-op on
+    /// daemons that don't advertise cast_playback (they would log an
+    /// unknown frame) and on non-remote/closed terminals.
+    pub fn sendPlayControl(self: *Terminal, op: PlayOp, ms: u64, speed: f64) void {
+        const remote = self.remote orelse return;
+        if (!remote.canSend()) return;
+        if (!remote.conn.cast_playback) return;
+        var buf: [96]u8 = undefined;
+        const payload = playControlPayload(&buf, op, ms, speed) orelse return;
+        remote.conn.sendFrame(.play_control, payload) catch {
+            self.transportLost("play control write failed");
+        };
+    }
+
     /// Ask the daemon for the session's controller lease. `force` evicts
     /// the current holder; without it a held lease is left alone.
     pub fn requestControl(self: *Terminal, force: bool) void {
@@ -2394,6 +2483,7 @@ pub const Terminal = struct {
             }
         }
         self.on_cmd_status = null;
+        self.on_play_state = null;
         self.broadcast_sink = null;
         self.broadcast_ctx = null;
     }
@@ -2712,6 +2802,73 @@ fn isSinkField(comptime T: type) bool {
         else => return false,
     };
     return @typeInfo(ptr) == .@"fn";
+}
+
+test "play_state parses state, null duration and marker tuples" {
+    const a = std.testing.allocator;
+
+    const Captured = struct {
+        var st: ?Terminal.PlayState = null;
+        var marker_ms: u64 = 0;
+        var marker_label_ok = false;
+        fn on(_: ?*anyopaque, s: Terminal.PlayState) void {
+            st = s;
+            if (s.markers.len == 1) {
+                marker_ms = s.markers[0].ms;
+                marker_label_ok = std.mem.eql(u8, s.markers[0].label, "half way");
+            }
+        }
+    };
+
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.user_ctx = null;
+    term.last_play_state = null;
+    term.on_play_state = Captured.on;
+
+    term.handlePlayState(
+        \\{"state":"playing","position_ms":1234,"duration_ms":null,"speed":1.5,
+        \\ "markers":[[1500,"half way"]]}
+    );
+    const got = Captured.st orelse return error.NoCallback;
+    try std.testing.expectEqual(Terminal.PlayState.Kind.playing, got.kind);
+    try std.testing.expectEqual(@as(u64, 1234), got.position_ms);
+    try std.testing.expectEqual(@as(?u64, null), got.duration_ms);
+    try std.testing.expectEqual(@as(f64, 1.5), got.speed);
+    try std.testing.expectEqual(@as(u64, 1500), Captured.marker_ms);
+    try std.testing.expect(Captured.marker_label_ok);
+    // Stored copy: same scalars, no markers (callback-scoped memory).
+    const stored = term.last_play_state orelse return error.NoStore;
+    try std.testing.expectEqual(@as(u64, 1234), stored.position_ms);
+    try std.testing.expectEqual(@as(usize, 0), stored.markers.len);
+
+    // A finished state with a known duration.
+    Captured.st = null;
+    term.handlePlayState("{\"state\":\"finished\",\"position_ms\":2000,\"duration_ms\":2000,\"speed\":1}");
+    try std.testing.expectEqual(Terminal.PlayState.Kind.finished, Captured.st.?.kind);
+    try std.testing.expectEqual(@as(?u64, 2000), Captured.st.?.duration_ms);
+
+    // Unknown state names and garbage drop the frame (append-only wire).
+    Captured.st = null;
+    term.handlePlayState("{\"state\":\"warping\",\"position_ms\":9}");
+    try std.testing.expect(Captured.st == null);
+    term.handlePlayState("not json");
+    try std.testing.expect(Captured.st == null);
+}
+
+test "play_control payloads carry op-specific fields only" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"op\":\"seek\",\"ms\":12500}",
+        Terminal.playControlPayload(&buf, .seek, 12500, 1.0).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"op\":\"speed\",\"speed\":2}",
+        Terminal.playControlPayload(&buf, .speed, 0, 2.0).?,
+    );
+    try std.testing.expectEqualStrings("{\"op\":\"pause\"}", Terminal.playControlPayload(&buf, .pause, 0, 1.0).?);
+    try std.testing.expectEqualStrings("{\"op\":\"play\"}", Terminal.playControlPayload(&buf, .play, 0, 1.0).?);
+    try std.testing.expectEqualStrings("{\"op\":\"restart\"}", Terminal.playControlPayload(&buf, .restart, 0, 1.0).?);
 }
 
 test "clearSinks nulls every on_* callback (reflection drift guard)" {
