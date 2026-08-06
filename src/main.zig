@@ -54,6 +54,9 @@ const App = struct {
     files_reveal: ?[]const u8 = null,
     /// Ordered resource batch for the next standalone Viewer window.
     viewer_batch: ?viewer.Batch = null,
+    /// Cast files (`sketerm play`) to open on the next activate, each
+    /// in its own playback window. Owned specs.
+    play_specs: ?[][]u8 = null,
     /// Documents (and optional caret) for the next standalone Editor
     /// window.
     editor_request: ?editor_app.Request = null,
@@ -148,6 +151,13 @@ const HELP_TEXT =
     \\                         in (--here) or a new tab of that pane's
     \\                         window (--tab), like `sketerm files`.
     \\                         Needs to be run from inside a pane.
+    \\  sketerm play <file.cast> Play back an asciicast v2/v3 recording
+    \\                         in a terminal-rendered window with a
+    \\                         transport bar (pause/seek/speed).
+    \\                         host:/path plays a recording that lives
+    \\                         on a remote host's daemon. Keyboard:
+    \\                         Space pause, Left/Right seek 5s (Shift:
+    \\                         30s), R restart, Q close.
     \\  sketerm view [images...] Image viewer as its OWN application
     \\                         ("Sketerm Viewer", own icon and taskbar
     \\                         entry). Local, file:// and host:/path
@@ -751,6 +761,36 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         }
     }
 
+    // `sketerm play <file.cast> ...`: queue cast-playback windows for
+    // this activate. Terminal identity (no suffix), so a forwarded
+    // invocation opens its window in the running instance.
+    if (g_app.mode == .terminal and argc >= 2) {
+        const first = argv_raw[1];
+        if (first != null and std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(first))), "play")) {
+            const cwd_raw = c.g_application_command_line_get_cwd(cmdline);
+            const cwd: ?[]const u8 = if (cwd_raw != null) std.mem.span(@as([*:0]const u8, @ptrCast(cwd_raw))) else null;
+            var specs: std.ArrayList([]u8) = .empty;
+            var n2: usize = 2;
+            while (n2 < @as(usize, @intCast(argc))) : (n2 += 1) {
+                const raw = argv_raw[n2] orelse break;
+                const arg = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+                if (arg.len == 0 or arg[0] == '-') continue;
+                const owned = resolvePlaySpec(g_app.allocator, arg, cwd) catch continue;
+                specs.append(g_app.allocator, owned) catch {
+                    g_app.allocator.free(owned);
+                    continue;
+                };
+            }
+            if (specs.items.len == 0) {
+                specs.deinit(g_app.allocator);
+                c.g_application_command_line_printerr_literal(cmdline, "usage: sketerm play <file.cast>\n");
+                return 1;
+            }
+            freePlaySpecs();
+            g_app.play_specs = specs.toOwnedSlice(g_app.allocator) catch null;
+        }
+    }
+
     if (saw_toggle) {
         // Activate the toggle action if a window already exists; if
         // we are the primary and no window yet, fall through to
@@ -800,6 +840,20 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         } else |err| {
             batch.deinit();
             std.debug.print("sketerm: viewer window failed: {s}\n", .{@errorName(err)});
+        }
+        return;
+    }
+
+    // `sketerm play`: cast-playback windows only — never a terminal
+    // window of their own, whether or not one already exists.
+    if (takePlaySpecs()) |specs| {
+        defer {
+            for (specs) |s| g_app.allocator.free(s);
+            g_app.allocator.free(specs);
+        }
+        for (specs) |spec| {
+            _ = @import("ui/castview.zig").CastView.open(g_app.allocator, app, spec) catch |err|
+                std.debug.print("sketerm play: could not open '{s}': {s}\n", .{ spec, @errorName(err) });
         }
         return;
     }
@@ -900,6 +954,32 @@ fn takeEditorRequest() editor_app.Request {
     return req;
 }
 
+/// Resolve one `sketerm play` argument: host:/path specs pass through,
+/// relative local paths resolve against the invoking cwd.
+fn resolvePlaySpec(allocator: std.mem.Allocator, arg: []const u8, cwd: ?[]const u8) ![]u8 {
+    const loc = @import("filebrowser/paths.zig").parseSpec(arg);
+    if (loc.host != null or !loc.current_host) return allocator.dupe(u8, arg);
+    if (loc.path.len > 0 and (loc.path[0] == '/' or loc.path[0] == '~'))
+        return allocator.dupe(u8, loc.path);
+    const base = cwd orelse ".";
+    if (std.mem.eql(u8, base, "/")) return std.fmt.allocPrint(allocator, "/{s}", .{loc.path});
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, loc.path });
+}
+
+fn takePlaySpecs() ?[][]u8 {
+    const specs = g_app.play_specs;
+    g_app.play_specs = null;
+    return specs;
+}
+
+fn freePlaySpecs() void {
+    if (g_app.play_specs) |specs| {
+        for (specs) |s| g_app.allocator.free(s);
+        g_app.allocator.free(specs);
+    }
+    g_app.play_specs = null;
+}
+
 fn takeViewerBatch() viewer.Batch {
     const batch = g_app.viewer_batch orelse return viewer.Batch.empty(g_app.allocator);
     g_app.viewer_batch = null;
@@ -909,6 +989,7 @@ fn takeViewerBatch() viewer.Batch {
 fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.viewer_batch) |*batch| batch.deinit();
     g_app.viewer_batch = null;
+    freePlaySpecs();
     if (g_app.editor_request) |*req| req.deinit();
     g_app.editor_request = null;
     // The editor owns no panes, no daemon sessions and no layout: its
