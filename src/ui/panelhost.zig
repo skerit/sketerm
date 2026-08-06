@@ -62,14 +62,18 @@ pub const Target = enum {
     }
 };
 
-/// Session key used when the caller has no session identity at all
-/// (a script talking to the socket from outside any pane).
+/// How "no session at all" travels: a caller with no session identity
+/// (a script talking to the socket from outside any pane) sends
+/// `"session":""`, and gets `""` back in every reply that echoes one.
 ///
-/// ONE definition, shared with the disk store: a live panel and its
-/// saved document must land under the same key, and the store's
-/// encoding is what makes the bucket unspoofable (a leading `_`
-/// percent-encodes, so no real daemon session can spell it).
-pub const NO_SESSION = panelstore.NO_SESSION;
+/// It is not a session NAME — the daemon never issues an empty one,
+/// and nothing here or in the store ever treats it as one: in code the
+/// scope is `?[]const u8` and this is only its wire spelling, which is
+/// what keeps a sessionless panel and its saved document (a directory
+/// of its own, `panelstore.NO_SESSION_DIR`) under the same key.
+/// Distinct from an ABSENT `session` field, which means "scope me to
+/// the requesting pane".
+pub const NO_SESSION_WIRE: []const u8 = "";
 
 /// One live panel. Heap-allocated and pointer-stable: it doubles as
 /// the pane face's context, so its address is handed to GTK.
@@ -78,8 +82,8 @@ pub const Entry = struct {
     panel_id: u32,
     /// Owned.
     name: []u8,
-    /// Owned.
-    session: []u8,
+    /// Owned. `null` = the caller had no session identity.
+    session: ?[]u8,
     target: Target,
     view: *PanelView,
     /// Pane hosting the face (.pane / .tab targets). Valid for as long
@@ -91,7 +95,7 @@ pub const Entry = struct {
     fn destroy(self: *Entry) void {
         const a = self.allocator;
         a.free(self.name);
-        a.free(self.session);
+        if (self.session) |sess| a.free(sess);
         a.destroy(self);
     }
 };
@@ -122,11 +126,18 @@ fn byId(id: u32) ?*Entry {
     return null;
 }
 
-fn byKey(session: []const u8, name: []const u8) ?*Entry {
+fn byKey(session: ?[]const u8, name: []const u8) ?*Entry {
     for (panels.items) |e| {
-        if (std.mem.eql(u8, e.session, session) and std.mem.eql(u8, e.name, name)) return e;
+        if (sameSession(e.session, session) and std.mem.eql(u8, e.name, name)) return e;
     }
     return null;
+}
+
+/// Two scopes are the same panel key. Sessionless matches ONLY
+/// sessionless: it is a different shape, not a name.
+fn sameSession(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// The daemon session a pane renders — the identity behind
@@ -139,12 +150,18 @@ fn paneSession(pane: ?*Pane) ?[]const u8 {
 
 /// The session a request is scoped to: the explicit `session` field
 /// (which is also how a pane names itself), else the resolved pane's
-/// own session, else the no-session bucket.
-fn scopeOf(req: protocol.Request, pane: ?*Pane) []const u8 {
-    if (req.session) |s| {
-        if (s.len > 0) return s;
-    }
-    return paneSession(pane) orelse NO_SESSION;
+/// own session — and `null` when there is none, which is a scope of
+/// its own rather than a name. An EMPTY explicit session is a caller
+/// stating it has no session identity (`NO_SESSION_WIRE`), so it does
+/// not fall through to the pane.
+fn scopeOf(req: protocol.Request, pane: ?*Pane) ?[]const u8 {
+    if (req.session) |s| return if (s.len == 0) null else s;
+    return paneSession(pane);
+}
+
+/// The wire spelling of a scope, for a reply that echoes one.
+fn wireSession(session: ?[]const u8) []const u8 {
+    return session orelse NO_SESSION_WIRE;
 }
 
 // ─── dispatch ───────────────────────────────────────────────────
@@ -234,7 +251,7 @@ fn panelShow(
     presentEntry(self, entry);
     try protocol.writeOkFlat(out, allocator, .{
         .panel_id = entry.panel_id,
-        .session = entry.session,
+        .session = wireSession(entry.session),
     });
 }
 
@@ -259,7 +276,7 @@ pub const ShowError = error{
 pub fn showDocument(
     self: *Window,
     origin: ?*Pane,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     document: []const u8,
     target: Target,
@@ -296,12 +313,12 @@ pub fn showDocument(
             view.deinit();
             return oom(diag);
         },
-        .session = allocator.dupe(u8, session) catch {
+        .session = if (session) |sess| allocator.dupe(u8, sess) catch {
             allocator.free(entry.name);
             allocator.destroy(entry);
             view.deinit();
             return oom(diag);
-        },
+        } else null,
         .target = target,
         .view = view,
     };
@@ -356,10 +373,18 @@ fn oom(diag: *Doc.Diag) ShowError {
     return ShowError.OutOfMemory;
 }
 
-/// The session a panel opened from `pane` is scoped to — the identity
-/// behind `$SKETERM_SESSION`, or the sessionless bucket.
+/// The scope a panel opened from `pane` gets — the identity behind
+/// `$SKETERM_SESSION`, or `null` when the pane has none. THE typed
+/// answer; `sessionForPane` is its string rendering.
+pub fn sessionScopeForPane(pane: ?*Pane) ?[]const u8 {
+    return paneSession(pane);
+}
+
+/// `sessionScopeForPane` as a plain string, for GUI callers that both
+/// display it and hand it to the store (the saved-panel picker). The
+/// empty string is the store's sessionless bucket, never a session.
 pub fn sessionForPane(pane: ?*Pane) []const u8 {
-    return paneSession(pane) orelse NO_SESSION;
+    return paneSession(pane) orelse NO_SESSION_WIRE;
 }
 
 /// Open the SAVED panel `name` (disk store) scoped to `pane`'s session
@@ -375,7 +400,7 @@ pub fn openSaved(
     diag: *Doc.Diag,
 ) !*Entry {
     const allocator = self.allocator;
-    const session = sessionForPane(pane);
+    const session = sessionScopeForPane(pane);
     const json = try panelstore.loadJson(allocator, session, name, diag);
     defer allocator.free(json);
     const entry = try showDocument(self, pane, session, name, json, target, diag);
@@ -435,7 +460,7 @@ fn panelGet(
     try protocol.writeOkFlat(out, allocator, .{
         .document = json,
         .name = entry.name,
-        .session = entry.session,
+        .session = wireSession(entry.session),
         .title = entry.view.title(),
     });
 }
@@ -481,6 +506,17 @@ fn panelEvents(
     });
 }
 
+/// Which live panels a `panel-list` is asking for. `none` and a named
+/// session are DIFFERENT scopes — a sessionless caller sees sessionless
+/// panels, not everyone's.
+const Filter = union(enum) {
+    /// No session identity anywhere in the request: show everything.
+    all,
+    /// Explicitly sessionless (`"session":""`).
+    none,
+    session: []const u8,
+};
+
 fn panelList(
     self: *Window,
     req: protocol.Request,
@@ -488,14 +524,17 @@ fn panelList(
     allocator: std.mem.Allocator,
 ) !void {
     // Scoping is the point: an assistant lists ITS panels. An explicit
-    // session filters to that session; otherwise the requesting pane's
-    // session does, and only a caller with no session identity at all
-    // sees everything.
+    // session filters to that session and an explicitly EMPTY one to
+    // the sessionless panels; otherwise the requesting pane's session
+    // filters, and only a caller with no session identity at all — no
+    // field, no pane — sees everything.
     const origin = remotectl.reqPane(self, req);
-    const filter: ?[]const u8 = if (req.session) |s|
-        (if (s.len > 0) s else null)
+    const filter: Filter = if (req.session) |s|
+        (if (s.len == 0) .none else .{ .session = s })
+    else if (paneSession(origin)) |s|
+        .{ .session = s }
     else
-        paneSession(origin);
+        .all;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -503,13 +542,15 @@ fn panelList(
 
     var list: std.ArrayList(protocol.PanelInfo) = .empty;
     for (panels.items) |e| {
-        if (filter) |want| {
-            if (!std.mem.eql(u8, e.session, want)) continue;
+        switch (filter) {
+            .all => {},
+            .none => if (e.session != null) continue,
+            .session => |want| if (!sameSession(e.session, want)) continue,
         }
         try list.append(arena, .{
             .panel_id = e.panel_id,
             .name = e.name,
-            .session = e.session,
+            .session = wireSession(e.session),
             .title = e.view.title(),
             .target = e.target.name(),
         });
@@ -649,11 +690,6 @@ test "target names round-trip, and default to a tab" {
 }
 
 test "a sessionless panel-show and a sessionless store operation agree on the key" {
-    // The bucket has ONE definition. Two spellings would put a live
-    // panel and its saved document under different keys the moment a
-    // caller with no session identity showed one.
-    try std.testing.expectEqualStrings(panelstore.NO_SESSION, NO_SESSION);
-
     // `resolveSession` consults the environment, and this test may well
     // be run from inside a sketerm pane.
     _ = c.unsetenv("SKETERM_SESSION");
@@ -661,21 +697,31 @@ test "a sessionless panel-show and a sessionless store operation agree on the ke
     // What panel-show scopes to with neither an explicit session nor a
     // pane to inherit one from...
     const scoped = scopeOf(.{ .cmd = "panel-show", .name = "p" }, null);
-    try std.testing.expectEqualStrings(NO_SESSION, scoped);
-    // ...is exactly what the store resolves to for the same caller.
-    try std.testing.expectEqualStrings(scoped, panelstore.resolveSession(null));
+    try std.testing.expectEqual(@as(?[]const u8, null), scoped);
+    // ...is exactly what the store resolves to for the same caller: no
+    // session, expressed as an absence on both sides rather than as a
+    // name the two halves could spell differently.
+    try std.testing.expectEqual(@as(?[]const u8, null), panelstore.resolveSession(null));
 
-    // And the store accepts that key: it encodes to itself, in one
-    // directory component.
-    var buf: [panelstore.MAX_SESSION_DIR]u8 = undefined;
-    try std.testing.expectEqualStrings(scoped, try panelstore.encodeSession(&buf, scoped));
+    // An explicitly empty `session` field says the same thing, and does
+    // NOT fall through to a pane's session.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        scopeOf(.{ .cmd = "panel-show", .name = "p", .session = NO_SESSION_WIRE }, null),
+    );
+    try std.testing.expectEqualStrings(NO_SESSION_WIRE, wireSession(scoped));
 
-    // Why THIS name and not the old "default": a leading `_` encodes,
-    // so every ordinary session name lands somewhere else, while
-    // "default" is a perfectly ordinary session name that would have
-    // shared the bucket outright.
-    try std.testing.expect(!std.mem.eql(u8, scoped, try panelstore.encodeSession(&buf, "_no-session-2")));
-    try std.testing.expectEqualStrings("default", try panelstore.encodeSession(&buf, "default"));
+    // And the store files it apart from every session, including one
+    // named like the bucket's own directory or like the old sentinel.
+    const a = std.testing.allocator;
+    const none_dir = try panelstore.sessionDir(a, scoped);
+    defer a.free(none_dir);
+    try std.testing.expect(std.mem.endsWith(u8, none_dir, panelstore.NO_SESSION_DIR));
+    for ([_][]const u8{ "_no-session", panelstore.NO_SESSION_DIR, "default" }) |name| {
+        const dir = try panelstore.sessionDir(a, name);
+        defer a.free(dir);
+        try std.testing.expect(!std.mem.eql(u8, dir, none_dir));
+    }
 }
 
 test "registry keys by (session, name)" {
@@ -698,13 +744,28 @@ test "registry keys by (session, name)" {
         .target = .window,
         .view = &fake_view,
     };
+    var e3 = Entry{
+        .allocator = a,
+        .panel_id = 3,
+        .name = @constCast("train"),
+        .session = null,
+        .target = .tab,
+        .view = &fake_view,
+    };
     try register(a, &e1);
     try register(a, &e2);
+    try register(a, &e3);
     // Same name, different sessions: two distinct panels.
     try std.testing.expectEqual(@as(u32, 1), byKey("s1", "train").?.panel_id);
     try std.testing.expectEqual(@as(u32, 2), byKey("s2", "train").?.panel_id);
     try std.testing.expectEqual(@as(?*Entry, null), byKey("s3", "train"));
     try std.testing.expectEqual(@as(u32, 2), byId(2).?.panel_id);
+    // Sessionless is a THIRD key, not a session named anything: no
+    // session name reaches it, and it reaches no session's panel.
+    try std.testing.expectEqual(@as(u32, 3), byKey(null, "train").?.panel_id);
+    try std.testing.expectEqual(@as(?*Entry, null), byKey("_no-session", "train"));
+    unregister(&e3);
+    try std.testing.expectEqual(@as(?*Entry, null), byKey(null, "train"));
     unregister(&e1);
     try std.testing.expectEqual(@as(?*Entry, null), byKey("s1", "train"));
     try std.testing.expectEqual(@as(usize, 1), panels.items.len);

@@ -324,6 +324,10 @@ pub fn main() u8 {
     // App/GUI socket auto-discovery must not find anything; keep the
     // env clean.
     _ = c.unsetenv("SKETERM_SOCKET");
+    // ...and the panel stage's SESSIONLESS calls must really have no
+    // session: run from inside a sketerm pane, the inherited
+    // $SKETERM_SESSION would scope them to that pane instead.
+    _ = c.unsetenv("SKETERM_SESSION");
     defer killDaemonsUnderRt(rt, allocator);
 
     const exe = "zig-out/bin/sketerm";
@@ -773,8 +777,29 @@ pub fn main() u8 {
         const saved = m.callTool("ui_save", "{\"name\":\"vsr\",\"session\":\"smoke ui\",\"document\":{\"title\":\"Epoch 41\",\"root\":\"c\",\"components\":{\"c\":{\"type\":\"column\",\"children\":[\"h\"]},\"h\":{\"type\":\"heading\",\"text\":\"Epoch 41\",\"level\":2}}}}");
         if (std.mem.indexOf(u8, saved, "isError") != null) fail("ui_save failed without a GUI");
         var pbuf: [512]u8 = undefined;
-        const panel_file = std.fmt.bufPrint(&pbuf, "{s}/sketerm/panels/smoke%20ui/vsr.json", .{rt}) catch unreachable;
-        if (!fileExists(panel_file)) fail("ui_save did not percent-encode the session into one directory");
+        const panel_file = std.fmt.bufPrint(&pbuf, "{s}/sketerm/panels/by-session/smoke%20ui/vsr.json", .{rt}) catch unreachable;
+        if (!fileExists(panel_file)) fail("ui_save did not percent-encode the session into one directory under by-session/");
+
+        // A sessionless save is a different PARENT directory, not a
+        // session with a reserved name: nothing a real session can be
+        // called reaches it, and it does not reach any session.
+        const anon = m.callTool("ui_save", "{\"name\":\"anon\",\"document\":{\"title\":\"No session\",\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
+        if (std.mem.indexOf(u8, anon, "isError") != null) fail("a sessionless ui_save failed");
+        var nbuf: [512]u8 = undefined;
+        const anon_file = std.fmt.bufPrint(&nbuf, "{s}/sketerm/panels/no-session/anon.json", .{rt}) catch unreachable;
+        if (!fileExists(anon_file)) fail("a sessionless ui_save did not land in panels/no-session/");
+        // The old sentinel is now an ordinary session name, filed with
+        // every other session and blind to the sessionless bucket.
+        const sentinel = m.callTool("ui_panels", "{\"session\":\"_no-session\"}");
+        if (std.mem.indexOf(u8, sentinel, "No session") != null)
+            fail("a session named _no-session can still see the sessionless panels");
+        const anon_list = m.callTool("ui_panels", "{}");
+        if (std.mem.indexOf(u8, anon_list, "No session") == null or
+            std.mem.indexOf(u8, anon_list, "Epoch 41") != null)
+            fail("the sessionless list is not exactly the sessionless panels");
+        const anon_deleted = m.callTool("ui_delete", "{\"name\":\"anon\"}");
+        if (std.mem.indexOf(u8, anon_deleted, "isError") != null) fail("a sessionless ui_delete failed");
+        if (fileExists(anon_file)) fail("a sessionless ui_delete left the document on disk");
 
         const panels = m.callTool("ui_panels", "{\"session\":\"smoke ui\"}");
         if (std.mem.indexOf(u8, panels, "Epoch 41") == null or

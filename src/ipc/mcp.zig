@@ -3526,10 +3526,13 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
 // - **One session key for both halves.** Several assistants drive one
 //   sketerm, so a panel is (session, name). The session is resolved
 //   ONCE per call (`panelstore.resolveSession`: explicit arg, else
-//   $SKETERM_SESSION, else the sessionless bucket) and passed
-//   explicitly to the GUI, so a live panel and its saved document can
-//   never end up under different keys. `panelhost.NO_SESSION` IS
-//   `panelstore.NO_SESSION` — one constant, one definition.
+//   $SKETERM_SESSION, else NONE — `?[]const u8`, never a magic name)
+//   and passed explicitly to the GUI, so a live panel and its saved
+//   document can never end up under different keys. "No session" is a
+//   different SHAPE, not a reserved session name: on the wire it is an
+//   empty `session` field (`panelhost.NO_SESSION_WIRE`, distinct from
+//   an absent one, which means "scope me to the requesting pane"), and
+//   on disk it is its own directory (`panelstore.NO_SESSION_DIR`).
 // - **The GUI holds the document; this server holds none.** `ui_save`
 //   with no `document` reads the panel back with `panel-get`, so it
 //   works against a panel any process showed, at any time. There is
@@ -3624,9 +3627,18 @@ fn uiFilesDocument(
     return aw.written();
 }
 
-/// The session a ui_* call is scoped to.
-fn uiSession(args: std.json.Value) []const u8 {
+/// The session a ui_* call is scoped to — `null` when there is none.
+/// Resolved ONCE per call and passed explicitly to both halves, so a
+/// live panel and its saved document cannot land under different keys.
+fn uiSession(args: std.json.Value) ?[]const u8 {
     return panelstore.resolveSession(argStr(args, "session"));
+}
+
+/// The scope as the control socket spells it: an EMPTY `session`
+/// states "this caller has no session", which the GUI must not confuse
+/// with an absent field (= scope me to the requesting pane).
+fn uiWireSession(session: ?[]const u8) []const u8 {
+    return session orelse "";
 }
 
 /// An argument that may be given either as a JSON value (the natural
@@ -3674,7 +3686,7 @@ fn uiResolve(
     arena: std.mem.Allocator,
     backend: Backend,
     args: std.json.Value,
-    session: []const u8,
+    session: ?[]const u8,
 ) UiResolved {
     if (argInt(args, "panel_id")) |pid| {
         if (pid <= 0 or pid > std.math.maxInt(u32))
@@ -3684,7 +3696,7 @@ fn uiResolve(
     const name = argStr(args, "name") orelse
         return .{ .err = "address the panel by 'name' (stable, preferred) or by 'panel_id'" };
 
-    const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = session });
+    const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = uiWireSession(session) });
     if (!reply.ok) return .{ .err = reply.err };
     const panels = reply.value.object.get("panels") orelse
         return .{ .err = "malformed panel-list reply" };
@@ -3699,8 +3711,8 @@ fn uiResolve(
     }
     return .{ .err = std.fmt.allocPrint(
         arena,
-        "no LIVE panel named \"{s}\" in session \"{s}\". `ui_panels` lists what is on screen and what is saved; `ui_show` opens one (with load=\"{s}\" if it is saved).",
-        .{ name, session, name },
+        "no LIVE panel named \"{s}\" in session {s}. `ui_panels` lists what is on screen and what is saved; `ui_show` opens one (with load=\"{s}\" if it is saved).",
+        .{ name, panelstore.sessionLabel(session), name },
     ) catch "no live panel with that name" };
 }
 
@@ -3773,7 +3785,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const reply = uiTalk(arena, backend, .{
             .cmd = "panel-show",
             .name = panel_name,
-            .session = session,
+            .session = uiWireSession(session),
             .target = target,
             .document = document,
         });
@@ -3934,7 +3946,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const reply = uiTalk(arena, backend, .{
             .cmd = "panel-show",
             .name = panel_name,
-            .session = session,
+            .session = uiWireSession(session),
             .target = target,
             .document = document,
         });
@@ -4033,7 +4045,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
             try w.writeAll("null,\"live_note\":");
             try std.json.Stringify.value(UI_NEEDS_GUI, .{}, w);
         } else {
-            const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = session });
+            const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = uiWireSession(session) });
             if (reply.ok) {
                 const panels = reply.value.object.get("panels");
                 if (panels != null and panels.? == .array)

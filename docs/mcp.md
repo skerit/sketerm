@@ -208,23 +208,30 @@ GUI socket; passing `document` explicitly does not.
 
 Panels are keyed by `(session, name)`. The session is resolved once per
 call: the explicit `session` argument, else `$SKETERM_SESSION` (which
-every pane exports), else the reserved sessionless bucket
-(`_no-session`, defined once in `panelstore.zig` and re-exported by
-`panelhost.zig` -- the live panel and its saved document cannot end up
-under different keys, and a real session's leading `_` percent-encodes
-away from it). Several
-assistants drive one sketerm, so one assistant's panels are neither
-visible to nor collidable with another's, and re-showing a name
-REPLACES that panel's document in place -- same window, same
+every pane exports), else NO SESSION -- which is a state, not a name.
+An `sketerm mcp` running outside any pane has no session, and its
+panels are filed apart from every session's rather than under some
+reserved session name that a real session could also be called. In
+code that is `?[]const u8` (`panelstore.resolveSession`); on the
+control socket it is an empty `session` field, which the GUI keeps
+distinct from an ABSENT one (absent means "scope me to the requesting
+pane"). Several assistants drive one sketerm, so one assistant's panels
+are neither visible to nor collidable with another's, and re-showing a
+name REPLACES that panel's document in place -- same window, same
 `panel_id`, and an `image_compare` keeps its zoom, pan and split across
 the swap.
 
 Saved documents live in
-`$XDG_STATE_HOME/sketerm/panels/<session>/<name>.json`. The session is
-percent-encoded into that one directory component, because a session
-name is inherited from the daemon (which only length-checks it) and
-`my work` must not be unstorable. Panel names, which the caller
-chooses, are still rejected rather than sanitized.
+
+    $XDG_STATE_HOME/sketerm/panels/by-session/<session>/<name>.json
+    $XDG_STATE_HOME/sketerm/panels/no-session/<name>.json
+
+Two parents, so the two sets share no directory and nothing can
+collide. The session is percent-encoded into that one directory
+component, because a session name is inherited from the daemon (which
+only length-checks it) and `my work` must not be unstorable. Panel
+names, which the caller chooses, are still rejected rather than
+sanitized.
 
 ### `ui_wait_event` polls; it never blocks the GUI
 
