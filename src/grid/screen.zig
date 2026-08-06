@@ -217,6 +217,14 @@ pub const Screen = struct {
     /// Blink phase — true=visible, false=hidden. Toggled by the
     /// rendering layer when the shape is a blinking variant.
     cursor_blink_on: bool = true,
+    /// Bumped whenever the whole viewport is replaced under the
+    /// cursor: a full erase (ED 2 / ED 3), an alternate-screen swap,
+    /// a resize, or a reattach snapshot. Purely advisory — the
+    /// cursor trail watches it so it teleports instead of smearing a
+    /// diagonal across content that no longer exists. Never
+    /// serialised; wrapping is harmless since only inequality is
+    /// tested.
+    viewport_epoch: u32 = 0,
     /// Mouse mode (1000/1002/1003) — last-set value.
     mouse_mode: u16 = 0,
     /// Mouse encoding (1006/1015 etc).
@@ -1291,6 +1299,7 @@ pub const Screen = struct {
     /// their own resize. Cursor is re-placed at its logical position.
     pub fn resize(self: *Screen, new_cols: u16, new_rows: u16) !void {
         if (new_cols == self.cols and new_rows == self.rows) return;
+        self.viewport_epoch +%= 1;
 
         const cols_changed = new_cols != self.cols;
         if (cols_changed and !self.use_alt) {

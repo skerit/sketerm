@@ -713,6 +713,18 @@ pub const Config = struct {
     /// Cursor blink interval in milliseconds. Each interval is one
     /// half-cycle (on→off OR off→on). 500 = full blink every 1000ms.
     cursor_blink_ms: u32 = 500,
+    /// Animated trail that stretches from the cursor's old cell to
+    /// its new one. App-level, like shape and blink, because the
+    /// cost is a property of the machine (a 60 Hz redraw runs for
+    /// the length of each jump) rather than of a colour scheme; the
+    /// trail is drawn in whatever the active profile's cursor colour
+    /// is. Off by default — nothing should silently start animating
+    /// on a laptop.
+    cursor_trail: bool = false,
+    /// How long one trail takes to catch up, in milliseconds. This
+    /// is a hard deadline, not just a time constant: the trail is
+    /// always gone this long after the cursor last moved.
+    cursor_trail_ms: u32 = 300,
 
     // Layout
     /// Snap view back to the bottom on any output, not just on
@@ -1625,6 +1637,8 @@ pub const Config = struct {
         if (self.cursor_shape != .block) try w.print("cursor_shape = {s}\n", .{@tagName(self.cursor_shape)});
         if (!self.cursor_blink) try w.writeAll("cursor_blink = false\n");
         if (self.cursor_blink_ms != 500) try w.print("cursor_blink_ms = {d}\n", .{self.cursor_blink_ms});
+        if (self.cursor_trail) try w.writeAll("cursor_trail = true\n");
+        if (self.cursor_trail_ms != 300) try w.print("cursor_trail_ms = {d}\n", .{self.cursor_trail_ms});
 
         // Behaviour.
         if (!self.bracketed_paste) try w.writeAll("bracketed_paste = false\n");
@@ -2733,6 +2747,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.cursor_blink = try parseBool(value);
     } else if (std.mem.eql(u8, key, "cursor_blink_ms")) {
         cfg.cursor_blink_ms = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "cursor_trail")) {
+        cfg.cursor_trail = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "cursor_trail_ms")) {
+        const ms = try parseU32(value);
+        if (ms < 30 or ms > 2000) return error.BadCursorTrailMs;
+        cfg.cursor_trail_ms = ms;
     } else if (std.mem.eql(u8, key, "bracketed_paste")) {
         cfg.bracketed_paste = try parseBool(value);
     } else if (std.mem.eql(u8, key, "modify_other_keys")) {

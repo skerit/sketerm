@@ -14010,3 +14010,40 @@ seconds of pumping the display session while `screen-info` round-trips
 prove the GUI is still serving. A unit test cannot reach this; it needs
 a real widget lifecycle on a real frame clock. The stage fails (GUI
 SIGSEGV, first round) without the fix.
+Cursor trails landed. Rio's `[effects] trail-cursor` is a neovide port
+built on a critically-damped spring per corner of the cursor rect; the
+leading corners snap to the new cell while the trailing one lags, so
+the quad they span stretches along the path and then contracts.
+`render/cursor_trail.zig` is that state machine as pure math (no GL, no
+GTK, no allocator), `GridPass` gained an arbitrary-convex-quad emit and
+a `trail_quad` input hashed into its Snapshot, and `Pane` drives it
+from `onRender` behind a 60 fps GLib timeout.
+
+The timeout is the whole design constraint. An installed frame-clock
+tick leaks Wayland object ids on KWin (see the `tick_id` doc), so the
+trail follows the bell fade's precedent instead: a plain `g_timeout`
+that queues renders for one pane, self-removing the frame the trail
+settles - which is also the frame that publishes a null quad and
+erases it. `cursor_trail_ms` is a hard deadline, not a time constant,
+because a critically-damped spring's absolute settle time grows with
+jump distance; cutting at the deadline leaves under a fifth of a pixel
+of residual for any jump a terminal can produce. Termination is
+unconditional: dt is clamped to a 1 ms floor so a frozen clock cannot
+stall the deadline either.
+
+Proven, not asserted: `smoke-cell` renders one mid-flight frame and
+checks lit pixels halfway between the old and new cursor cells, then
+runs the trail to rest and checks the same probe reads zero (and that
+the cursor quad survived). `smoke-e2e` measures the GUI's own CPU
+jiffies - idle with the trail off, during two seconds of repeated
+cursor jumps, and idle again after settling: 6 / 103 / 10 per
+measurement window, i.e. the animation costs 17x idle while it runs
+and nothing at all once it lands.
+
+Rio's other effect, `custom-mouse-cursor`, was NOT ported: it hides
+the system pointer and paints a hardcoded 21x25 pixel-art hand from an
+RLE table at the last known mouse position. On Wayland that trades a
+compositor-driven pointer for one that lags every frame of input
+latency, for a novelty sprite. The feature-parity list called the item
+"cursor trails and custom pointer effects"; only the first half is a
+feature.

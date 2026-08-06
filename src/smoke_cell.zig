@@ -13,6 +13,7 @@ const CellPass = @import("render/cell_pass.zig").CellPass;
 const GridPass = @import("render/grid_pass.zig").GridPass;
 const Screen = @import("grid/screen.zig").Screen;
 const StylePool = @import("grid/style_pool.zig").Pool;
+const CursorTrail = @import("render/cursor_trail.zig").Trail;
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -1258,6 +1259,116 @@ pub fn main() !u8 {
         if (m_greens < 4 or m_reds != 0) {
             std.debug.print("smoke-cell: FAIL — sweep degradation wrong (want first-stop green solid)\n", .{});
             return 59;
+        }
+    }
+
+    // ── Stage N: cursor trail draws, then cleans up ──────────
+    //
+    // The two halves are the whole point. "It draws" is easy; "the
+    // pixels are gone once it settles" is the property that decides
+    // whether the effect leaves smear behind on a real screen.
+    {
+        const cwf: f32 = @floatFromInt(atlas.?.cell_w);
+        const chf: f32 = @floatFromInt(atlas.?.cell_h);
+        const padf: f32 = grid_pass.pad;
+
+        // Blank grid, cursor parked at home so nothing but the trail
+        // can light up the middle of the viewport.
+        parser.advance("\x1b[0m\x1b[2J\x1b[H", Emit.cb, @ptrCast(&ec));
+        screen.hints_overlay = &.{};
+        screen.cursor_shape = .block_steady;
+
+        const from_x = padf;
+        const from_y = padf;
+        const to_col: f32 = 20;
+        const to_row: f32 = 3;
+        const to_x = padf + to_col * cwf;
+        const to_y = padf + to_row * chf;
+
+        var trail = CursorTrail.init(0.3);
+        trail.setDestination(from_x, from_y, cwf, chf);
+        _ = trail.advance(1.0 / 60.0, cwf, chf); // teleport home
+        trail.setDestination(to_x, to_y, cwf, chf);
+        const moving = trail.advance(1.0 / 60.0, cwf, chf);
+        if (!moving) {
+            std.debug.print("smoke-cell: FAIL — trail reported settled on the frame it jumped\n", .{});
+            return 60;
+        }
+
+        const trail_render = struct {
+            fn go(gp: *GridPass, sc: *Screen, pl: *StylePool, at: *Atlas, fbuf: []u8) !void {
+                c.glViewport(0, 0, W, H);
+                c.glClearColor(0.05, 0.05, 0.10, 1.0);
+                c.glClear(c.GL_COLOR_BUFFER_BIT);
+                try gp.buildVertices(sc, pl, at, true, true, &.{});
+                gp.draw(at, W, H);
+                c.glFinish();
+                c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fbuf.ptr);
+            }
+        }.go;
+
+        // Sample halfway between the old and new cursor centres —
+        // a spot no cursor quad and no glyph can ever reach, so any
+        // lit pixel there is the trail and nothing else. Readback
+        // row 0 is the framebuffer BOTTOM, hence the flip.
+        const mid_x: usize = @intFromFloat((from_x + to_x) * 0.5 + cwf * 0.5);
+        const mid_y_top: usize = @intFromFloat((from_y + to_y) * 0.5 + chf * 0.5);
+        const mid_y: usize = @as(usize, @intCast(H)) - 1 - mid_y_top;
+        const probe = struct {
+            fn lit(fbuf: []const u8, cx: usize, cy: usize) usize {
+                var n: usize = 0;
+                var dy: usize = 0;
+                while (dy < 3) : (dy += 1) {
+                    var dx: usize = 0;
+                    while (dx < 3) : (dx += 1) {
+                        const x = cx + dx - 1;
+                        const y = cy + dy - 1;
+                        const off = (y * @as(usize, @intCast(W)) + x) * 4;
+                        // Background is (13,13,26); the trail is the
+                        // near-white cursor colour at alpha 0.45.
+                        if (fbuf[off] > 60 and fbuf[off + 1] > 60) n += 1;
+                    }
+                }
+                return n;
+            }
+        }.lit;
+
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        grid_pass.trail_quad = trail.quad();
+        try trail_render(&grid_pass, screen, &pool, atlas.?, fb);
+        const lit_moving = probe(fb, mid_x, mid_y);
+        std.debug.print("smoke-cell: cursor trail mid-flight lit={d} at ({d},{d})\n", .{ lit_moving, mid_x, mid_y_top });
+        if (lit_moving != 9) {
+            std.debug.print("smoke-cell: FAIL — no trail between the old and new cursor cell\n", .{});
+            return 61;
+        }
+
+        // Run it to rest the way the pane's timer would, then publish
+        // what the pane publishes on the settling frame: nothing.
+        var frames: usize = 0;
+        while (trail.advance(1.0 / 60.0, cwf, chf)) {
+            frames += 1;
+            if (frames > 240) {
+                std.debug.print("smoke-cell: FAIL — trail never settled\n", .{});
+                return 62;
+            }
+        }
+        grid_pass.trail_quad = null;
+        try trail_render(&grid_pass, screen, &pool, atlas.?, fb);
+        const lit_settled = probe(fb, mid_x, mid_y);
+        std.debug.print("smoke-cell: cursor trail settled after {d} frames, lit={d}\n", .{ frames, lit_settled });
+        if (lit_settled != 0) {
+            std.debug.print("smoke-cell: FAIL — trail pixels survived the settle\n", .{});
+            return 63;
+        }
+
+        // And the cursor itself is still there: a trail that erased
+        // the cursor along with itself would pass the check above.
+        const cur_y_top: usize = @intFromFloat(padf + chf * 0.5);
+        const cur_lit = probe(fb, @intFromFloat(padf + cwf * 0.5), @as(usize, @intCast(H)) - 1 - cur_y_top);
+        if (cur_lit != 9) {
+            std.debug.print("smoke-cell: FAIL — cursor quad missing after the trail settled\n", .{});
+            return 64;
         }
     }
 

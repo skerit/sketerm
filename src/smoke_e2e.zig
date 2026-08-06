@@ -723,6 +723,12 @@ pub fn main() u8 {
     if (configReloadStage(allocator, sock_path, rt)) |why| return failMsg(why);
     say("config.conf edited on disk applied live, in-place AND rename-over");
 
+    // 3e. The cursor trail animates and then leaves the pane fully
+    // idle — measured in CPU, since "no timer is armed" has no other
+    // observable.
+    if (cursorTrailStage(allocator, sock_path, rt, pid)) |why| return failMsg(why);
+    say("cursor trail animated on cursor jumps and returned the pane to idle");
+
     // 4. split, then list must show two panes.
     const split_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return fail("split roundtrip");
     defer allocator.free(split_resp);
@@ -3409,6 +3415,122 @@ fn configReloadStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     allocator.free(rl2);
     if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
         return "the stage could not put the defaults back for the stages after it";
+    return null;
+}
+
+/// Combined user+system jiffies of a pid, from /proc/<pid>/stat.
+/// The comm field can contain spaces and parentheses, so the parse
+/// starts after the LAST ')'.
+fn cpuJiffies(pid: c.pid_t) ?u64 {
+    var path: [64:0]u8 = undefined;
+    _ = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return null;
+    const fp = c.fopen(&path, "rb") orelse return null;
+    defer _ = c.fclose(fp);
+    var buf: [1024]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len - 1, fp);
+    if (n == 0) return null;
+    const text = buf[0..n];
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+    // Fields after comm: state(3) ... utime(14) stime(15), so the
+    // 12th and 13th tokens here.
+    var idx: usize = 0;
+    var utime: u64 = 0;
+    while (it.next()) |tok| {
+        idx += 1;
+        if (idx == 12) utime = std.fmt.parseInt(u64, tok, 10) catch return null;
+        if (idx == 13) return utime + (std.fmt.parseInt(u64, tok, 10) catch return null);
+    }
+    return null;
+}
+
+/// CPU jiffies burned by `pid` over `ms` of wall clock.
+fn cpuOver(pid: c.pid_t, ms: u32) ?u64 {
+    const before = cpuJiffies(pid) orelse return null;
+    _ = c.usleep(ms * 1000);
+    const after = cpuJiffies(pid) orelse return null;
+    return after -| before;
+}
+
+/// The cursor trail's one dangerous property, measured rather than
+/// asserted by construction: that it stops.
+///
+/// The trail is the only thing in a pane that schedules its own
+/// redraws, and a 60 fps timeout left armed would pin the process at
+/// frame rate forever — a battery and compositor bug (this rig's GL
+/// is software, so a leaked timer is loud). Nothing observable from
+/// outside says "no GLib source is armed", but CPU does: with the
+/// trail settled the GUI must cost no more than it did before the
+/// trail existed, over a window long enough that 60 fps of software
+/// GL could not hide in it.
+///
+/// The animating measurement in the middle is a diagnostic, not an
+/// assertion — its magnitude depends on the host's GL — but it is
+/// what makes the idle number mean something: if the trail never ran
+/// at all, the third measurement would pass trivially.
+fn cursorTrailStage(
+    allocator: std.mem.Allocator,
+    sock_path: [:0]const u8,
+    rt: []const u8,
+    gui: c.pid_t,
+) ?[]const u8 {
+    var path_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+
+    const base_cols = paneCols(allocator, sock_path) orelse return "screen-info reported no cols";
+
+    // Baseline: the pane at rest with the trail OFF. The blinking
+    // cursor still repaints twice a second, so this is not zero, and
+    // that is exactly why it is the reference and not a constant.
+    _ = c.usleep(1_000_000);
+    const idle_off = cpuOver(gui, 2_000) orelse return "could not read the GUI's CPU time";
+
+    // Turn the trail on. font_size rides along purely so `cols` moves
+    // and the stage can tell the config was actually applied.
+    if (!writeFile(cfg_path, "# smoke\ncursor_trail = true\ncursor_trail_ms = 300\nfont_size = 24\n"))
+        return "could not write the cursor-trail config";
+    if (waitCols(allocator, sock_path, base_cols, false, 15_000) == null)
+        return "the cursor-trail config was never applied";
+
+    // Jump the cursor across the viewport, over and over, for about
+    // two seconds. Every jump is far enough to get the long
+    // animation rather than the typing one.
+    const jump =
+        "{\"cmd\":\"send-text\",\"pane\":1,\"data\":\"" ++
+        "for i in 1 2 3 4 5 6 7 8 9 10; do printf '\\\\033[2;4H'; sleep 0.1; printf '\\\\033[12;40H'; sleep 0.1; done; printf 'TRAILDONE\\\\n'\\n" ++
+        "\"}\n";
+    const jr = roundtrip(allocator, sock_path, jump) orelse return "cursor-jump roundtrip";
+    allocator.free(jr);
+    _ = c.usleep(300_000);
+    const busy = cpuOver(gui, 2_000) orelse return "could not read the GUI's CPU time while animating";
+
+    // Let the loop finish and the last trail land, then measure the
+    // same window again. The shell is back at an idle prompt for it,
+    // which is exactly the state the baseline was measured in.
+    if (!waitPaneText(allocator, sock_path, 1, "TRAILDONE", 15_000))
+        return "the cursor-jump loop never finished";
+    _ = c.usleep(1_500_000);
+    const idle_on = cpuOver(gui, 3_000) orelse return "could not read the GUI's CPU time after settling";
+
+    _ = c.fprintf(
+        platform.stderr(),
+        "smoke-e2e: cursor trail CPU jiffies — trail off idle=%llu, animating=%llu, settled idle=%llu\n",
+        @as(c_ulonglong, idle_off), @as(c_ulonglong, busy), @as(c_ulonglong, idle_on),
+    );
+
+    // Over three seconds, a leaked 60 fps timeout is ~180 software-GL
+    // frames. The allowance below is 0.6 s of CPU, which those cannot
+    // fit inside on any host where this rig is worth running.
+    if (idle_on > idle_off + 60)
+        return "the pane kept burning CPU after the cursor trail settled (a redraw timer was left armed)";
+
+    // Restore the defaults for the stages that follow.
+    _ = c.unlink(cfg_path.ptr);
+    const rl = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"reload_config\"}\n") orelse
+        return "reload_config roundtrip";
+    allocator.free(rl);
+    if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
+        return "the stage could not put the default config back";
     return null;
 }
 

@@ -430,6 +430,8 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addCursorShapeRow(@ptrCast(@alignCast(cursor_group)), ctx);
     addSwitchRow(@ptrCast(@alignCast(cursor_group)), ctx, "Blink", "Toggle cursor visibility periodically", &ctx.cfg.cursor_blink, applyOnly);
     addSpinRowU32(@ptrCast(@alignCast(cursor_group)), ctx, "Blink interval (ms)", "Half-cycle. 500 = full blink every 1 s.", 100, 2000, &ctx.cfg.cursor_blink_ms, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(cursor_group)), ctx, "Motion trail", "Stretch a trail from the cursor's old cell to its new one. Redraws at 60 fps while a jump is in flight, and stops completely once it lands.", &ctx.cfg.cursor_trail, applyOnly);
+    addSpinRowU32(@ptrCast(@alignCast(cursor_group)), ctx, "Trail duration (ms)", "How long the trail takes to catch up, and a hard cap on how long it can linger.", 30, 2000, &ctx.cfg.cursor_trail_ms, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(cursor_group)));
 
     // Per-pane title bar (Terminator-style).

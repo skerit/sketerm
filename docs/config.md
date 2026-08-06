@@ -262,6 +262,28 @@ Valid only at the top level.
 | `cursor_shape` | enum | `block` | `block`, `underline`, `bar` |
 | `cursor_blink` | bool | `true` | |
 | `cursor_blink_ms` | int | `500` | One half-cycle, so 500 = a full blink per second. |
+| `cursor_trail` | bool | `false` | Animated trail between the cursor's old and new cell. |
+| `cursor_trail_ms` | int | `300` | Trail duration, `30`..`2000`. Out of range is a parse error. |
+
+The trail is a quad spanned by four spring-driven corners: the ones
+leading the movement snap to the new cell while the trailing one lags,
+so the cursor stretches along its path and then contracts. It is drawn
+in the active profile's cursor colour, under the cursor itself.
+
+`cursor_trail_ms` is a deadline, not just a time constant — the trail
+is always gone that long after the cursor last moved. That matters
+because the animation is the only thing in a pane that redraws on a
+timer: the pane runs a 60 fps GLib timeout while a jump is in flight
+and drops it the frame the trail settles, leaving no timer and no
+frame-clock tick behind. A pane whose cursor is not moving never
+schedules anything, including a pane sitting next to one that is.
+
+The trail is suppressed, and teleports rather than animating on its
+next move, whenever drawing it would be misleading: on an unfocused
+pane, while scrolled back, in copy mode, while the cursor is hidden
+(DECSET 25), and across any event that replaces the viewport under the
+cursor — a full-screen erase, an alternate-screen switch (opening or
+leaving `vim`, `less`, …), a resize, or a session reattach.
 
 ### Behaviour
 
