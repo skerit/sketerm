@@ -16,6 +16,7 @@ const tabPageForPane = winmod.tabPageForPane;
 const showToast = winmod.showToast;
 const tab_effects = @import("tab_effects.zig");
 const remotectl = @import("remotectl.zig");
+const titlefmt = @import("../util/titlefmt.zig");
 
 /// A pane's file transfer (upload or download) changed state: drive
 /// the tab progress ring and, on completion/failure, a toast. Mirrors
@@ -206,24 +207,21 @@ pub fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
     {
         const page = tabPageForPane(self, pane) orelse return;
 
+        // A cwd-bearing template must re-render before we read the
+        // title back for the tooltip, or the tooltip lags one change.
+        if (titlefmt.uses(self.config.tab_title_template).contains(.absolute_path) or
+            titlefmt.uses(self.config.tab_title_template).contains(.relative_path))
+            refreshTabTitle(self, pane);
+        if (pane == self.focusedPane()) {
+            const wm = titlefmt.uses(self.config.window_title_template);
+            if (wm.contains(.absolute_path) or wm.contains(.relative_path))
+                refreshWindowTitleTemplate(self);
+        }
+
         // Abbreviate $HOME → ~ so the tooltip stays compact for the
-        // common case of working under your home directory. Falls
-        // through to the raw cwd when HOME isn't set or doesn't
-        // prefix the path (e.g. /tmp, /var/log).
+        // common case of working under your home directory.
         var abbrev_buf: [512]u8 = undefined;
-        const display_cwd: []const u8 = blk: {
-            const home = @import("../util/profile.zig").getenv("HOME") orelse break :blk cwd;
-            if (home.len == 0 or !std.mem.startsWith(u8, cwd, home)) break :blk cwd;
-            // Match either `HOME` exactly or `HOME/...` — `HOMEextra`
-            // would be a different dir and shouldn't be folded.
-            const after = cwd[home.len..];
-            if (after.len != 0 and after[0] != '/') break :blk cwd;
-            const total = 1 + after.len; // "~" + rest
-            if (total > abbrev_buf.len) break :blk cwd;
-            abbrev_buf[0] = '~';
-            @memcpy(abbrev_buf[1..total], after);
-            break :blk abbrev_buf[0..total];
-        };
+        const display_cwd = abbreviateHome(cwd, &abbrev_buf);
 
         const title_c = c.adw_tab_page_get_title(page);
         const title_str: []const u8 = if (title_c != null)
@@ -245,15 +243,139 @@ pub fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
     }
 }
 
+/// Fold `$HOME` to `~` for `{{ RELATIVE_PATH }}` and the tab tooltip.
+/// Falls through to the raw path when HOME isn't set, doesn't prefix
+/// it, or the result wouldn't fit. `HOMEextra` is a different
+/// directory, so only an exact match or a `HOME/` prefix folds.
+pub fn abbreviateHome(cwd: []const u8, buf: []u8) []const u8 {
+    const home = @import("../util/profile.zig").getenv("HOME") orelse return cwd;
+    if (home.len == 0 or !std.mem.startsWith(u8, cwd, home)) return cwd;
+    const after = cwd[home.len..];
+    if (after.len != 0 and after[0] != '/') return cwd;
+    const total = 1 + after.len;
+    if (total > buf.len) return cwd;
+    buf[0] = '~';
+    @memcpy(buf[1..total], after);
+    return buf[0..total];
+}
+
+/// Everything a title template can substitute, gathered for one pane.
+///
+/// `title` comes from `Screen.last_title` — the RAW OSC 0/2 string —
+/// never from `adw_tab_page_get_title`. Reading back the rendered
+/// label would make a template like `"{{ TITLE }} !"` append a `!` on
+/// every render and grow without bound; sourcing the fact upstream of
+/// the label is what makes re-rendering idempotent.
+///
+/// `rel_buf` must outlive the returned Facts: `relative_path` borrows
+/// it.
+pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8) titlefmt.Facts {
+    const term = pane.terminal;
+    const cwd: []const u8 = if (term.cwd) |p| p else "";
+    var facts = titlefmt.Facts{
+        .title = if (term.screen.last_title) |t| t else "",
+        .program = term.program(),
+        .absolute_path = cwd,
+        .relative_path = if (cwd.len > 0) abbreviateHome(cwd, rel_buf) else "",
+        .columns = term.screen.cols,
+        .lines = term.screen.rows,
+        .profile = if (pane.active_profile) |p| p else "",
+        .zoomed = self.zoom_pane == pane,
+    };
+    if (term.remote) |r| facts.session = r.session;
+    if (tabPageForPane(self, pane)) |page| {
+        const pos = c.adw_tab_view_get_page_position(self.tab_view, page);
+        if (pos >= 0) facts.index = @intCast(pos + 1);
+    }
+    return facts;
+}
+
+/// Re-render `pane`'s tab label from `tab_title_template`.
+///
+/// Safe to call as often as facts move: it allocates nothing beyond
+/// the NUL-terminated copy GTK needs, and it cannot feed itself —
+/// every fact is read from Terminal/Screen/the pane tree, never from
+/// the label being written. `adw_tab_page_set_title` emits
+/// `notify::title`, which `tabbar.zig` handles by copying the string
+/// into a GtkLabel; that path never re-enters rendering.
+pub fn refreshTabTitle(self: *Window, pane: *Pane) void {
+    const page = tabPageForPane(self, pane) orelse return;
+    if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null) return;
+    var rel_buf: [512]u8 = undefined;
+    var out: [titlefmt.MAX]u8 = undefined;
+    const facts = paneFacts(self, pane, &rel_buf);
+    const rendered = titlefmt.render(&out, self.config.tab_title_template, facts);
+    // A template with nothing to say must not WIPE a label somebody
+    // else set. Mux session tabs ("⌁ work @ host") and the initial
+    // "Tab N" carry no OSC title, so the default `{{ TITLE }}` renders
+    // empty for them — before templates existed, only a real OSC title
+    // could overwrite those, and that must stay true.
+    if (rendered.len == 0) return;
+    setTabPageTitleFromUtf8(self.allocator, page, rendered);
+}
+
+/// Re-render the window title from `window_title_template`, using the
+/// focused pane's facts. No-op when the key is unset, which is the
+/// default and keeps sketerm's historical fixed window title.
+pub fn refreshWindowTitleTemplate(self: *Window) void {
+    if (self.config.window_title_template.len == 0) return;
+    const pane = self.focusedPane() orelse return;
+    var rel_buf: [512]u8 = undefined;
+    var out: [titlefmt.MAX]u8 = undefined;
+    const facts = paneFacts(self, pane, &rel_buf);
+    const rendered = titlefmt.render(&out, self.config.window_title_template, facts);
+    self.setWindowTitleText(rendered);
+}
+
+/// One fact moved for `pane`; refresh the titles that depend on it.
+/// `field` is what changed, so a template that never mentions it costs
+/// a bitmask test rather than a re-render.
+pub fn titleFactChanged(self: *Window, pane: *Pane, field: titlefmt.Field) void {
+    if (titlefmt.uses(self.config.tab_title_template).contains(field))
+        refreshTabTitle(self, pane);
+    if (pane == self.focusedPane() and
+        titlefmt.uses(self.config.window_title_template).contains(field))
+        refreshWindowTitleTemplate(self);
+}
+
+/// True when either configured template reads `field`.
+pub fn titlefmtUses(self: *Window, field: titlefmt.Field) bool {
+    return titlefmt.uses(self.config.tab_title_template).contains(field) or
+        titlefmt.uses(self.config.window_title_template).contains(field);
+}
+
+/// Re-render every pane's tab label and the window title. For changes
+/// that move facts for all panes at once: a config reload, or a tab
+/// reorder (which shifts `{{ INDEX }}`).
+pub fn refreshAllTitles(self: *Window) void {
+    for (self.panes.items) |p| refreshTabTitle(self, p);
+    refreshWindowTitleTemplate(self);
+}
+
 /// Wired from `Pane.win_on_title`. Updates the AdwTabPage's title from
 /// OSC 0/1/2 events emitted by the shell, but only while the page
 /// hasn't been user-renamed. The "user-locked" flag lives on the
 /// page as `g_object_set_data(page, "sketerm-title-locked")`.
-pub fn onTermTitleChanged(ctx: ?*anyopaque, pane: *Pane, title: []const u8) void {
+pub fn onTermTitleChanged(ctx: ?*anyopaque, pane: *Pane, _: []const u8) void {
     const self = cast.userData(Window, ctx);
-    const page = tabPageForPane(self, pane) orelse return;
-    if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null) return;
-    setTabPageTitleFromUtf8(self.allocator, page, title);
+    // The raw title is ignored: `paneFacts` reads it back from
+    // `screen.last_title`, which the Screen has already stored by the
+    // time this fires, so both paths agree on one source.
+    titleFactChanged(self, pane, .title);
+}
+
+/// Wired from `Pane.win_on_program`.
+pub fn onTermProgramChanged(ctx: ?*anyopaque, pane: *Pane, _: []const u8) void {
+    const self = cast.userData(Window, ctx);
+    titleFactChanged(self, pane, .program);
+}
+
+/// Wired from `Pane.win_on_geometry` — the pane's column/row count
+/// changed.
+pub fn onPaneGeometryChanged(ctx: ?*anyopaque, pane: *Pane) void {
+    const self = cast.userData(Window, ctx);
+    titleFactChanged(self, pane, .columns);
+    titleFactChanged(self, pane, .lines);
 }
 
 pub fn setTabPageTitleFromUtf8(allocator: std.mem.Allocator, page: *c.AdwTabPage, title: []const u8) void {
@@ -451,6 +573,9 @@ pub fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) voi
 /// re-selecting the tab restores it (instead of the first pane).
 pub fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
+    // The window title follows the FOCUSED pane, so moving focus is
+    // itself a fact change. Cheap: a no-op unless the key is set.
+    refreshWindowTitleTemplate(self);
     const page = tabPageForPane(self, pane) orelse return;
     if (Window.tabTreeOf(page)) |t| t.last_focused = pane;
 }

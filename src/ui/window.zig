@@ -621,6 +621,22 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Tab ORDER changes shift every `{{ INDEX }}` after the moved
+        // tab, so re-render the labels. Connected after the attach /
+        // detach handlers above so the pane bookkeeping is already
+        // settled by the time we walk it; a no-op unless a template
+        // actually mentions the index.
+        for ([_][*:0]const u8{ "page-reordered", "page-attached", "page-detached" }) |sig| {
+            _ = c.g_signal_connect_data(
+                tab_view_w,
+                sig,
+                @ptrCast(&onPageOrderChanged),
+                @ptrCast(self),
+                null,
+                c.G_CONNECT_AFTER,
+            );
+        }
+
         // Confirm-on-close gate. AdwTabView emits "close-page" before
         // detaching; returning TRUE = "I'll handle it asynchronously",
         // then we MUST call adw_tab_view_close_page_finish(view, page,
@@ -1746,6 +1762,8 @@ pub const Window = struct {
         // string clears the lock and lets OSC tracking resume.
         pane.win_title_ctx = @ptrCast(self);
         pane.win_on_title = termsinks_mod.onTermTitleChanged;
+        pane.win_on_program = termsinks_mod.onTermProgramChanged;
+        pane.win_on_geometry = termsinks_mod.onPaneGeometryChanged;
         pane.win_session_rename_ctx = @ptrCast(self);
         pane.win_on_session_renamed = termsinks_mod.onTermSessionRenamed;
     }
@@ -1935,12 +1953,14 @@ pub const Window = struct {
         }
         if (self.zoom_hidden.items.len == 0) return; // single pane — nothing to zoom
         self.zoom_pane = pane;
+        termsinks_mod.titleFactChanged(self, pane, .zoom);
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
     }
 
     pub fn unzoomPane(self: *Window) void {
         const pane = self.zoom_pane orelse return;
         self.zoom_pane = null;
+        termsinks_mod.titleFactChanged(self, pane, .zoom);
         for (self.zoom_hidden.items) |w| {
             c.gtk_widget_set_visible(w, 1);
             c.g_object_unref(w);
@@ -2816,15 +2836,31 @@ pub const Window = struct {
     /// Visible regardless of `show_titlebar` (per-pane bars), so
     /// users always have a cue that typing is being multiplexed.
     fn refreshWindowTitle(self: *Window) void {
+        // With a window_title_template set, the focused pane owns the
+        // title text; the broadcast suffix is appended to whatever it
+        // renders (setWindowTitleText).
+        if (self.config.window_title_template.len > 0) {
+            termsinks_mod.refreshWindowTitleTemplate(self);
+            return;
+        }
+        self.setWindowTitleText(self.title_base);
+    }
+
+    /// Set the GTK window title to `base` plus the broadcast suffix.
+    /// The suffix is the one thing that must survive whatever supplies
+    /// the base — a fixed name, a file-manager identity, or a rendered
+    /// title template.
+    pub fn setWindowTitleText(self: *Window, base: []const u8) void {
         const suffix: []const u8 = switch (self.groupsend) {
             .off => "",
             .group => " — broadcast: group",
             .all => " — broadcast: all",
         };
-        // title_base, not a literal: a file-manager window keeps its own
-        // name when broadcast mode is toggled off again.
-        var buf: [128:0]u8 = undefined;
-        const title = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ self.title_base, suffix }) catch return;
+        // title_base as the fallback, not a literal: a file-manager
+        // window keeps its own name when a template renders empty.
+        const text = if (base.len > 0) base else self.title_base;
+        var buf: [640:0]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ text, suffix }) catch return;
         c.gtk_window_set_title(@ptrCast(self.app_window), title.ptr);
     }
 
@@ -3843,6 +3879,14 @@ fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
 /// defer the close-vs-transfer decision one main-loop iteration; by
 /// then an adopted page's panes are gone from our lists and the
 /// teardown below finds nothing to free.
+/// Tab order moved: `{{ INDEX }}` in a title template is now stale for
+/// every tab at or after the change. Cheap when no template uses it.
+fn onPageOrderChanged(_: *c.AdwTabView, _: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    if (!termsinks_mod.titlefmtUses(self, .index)) return;
+    termsinks_mod.refreshAllTitles(self);
+}
+
 fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     const child = c.adw_tab_page_get_child(page);

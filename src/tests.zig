@@ -120,6 +120,7 @@ comptime {
     _ = @import("ipc/mcpfilter.zig");
     _ = @import("ipc/panelstore.zig");
     _ = @import("util/template.zig");
+    _ = @import("util/titlefmt.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/mounts.zig");
     _ = @import("render/bg_pass.zig");

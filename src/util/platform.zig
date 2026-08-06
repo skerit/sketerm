@@ -309,6 +309,49 @@ pub fn cwdOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
     return buf[0..@intCast(n)];
 }
 
+/// macOS: short process name for a pid (libproc). Preferred over
+/// picking `pbi_comm` out of `proc_bsdinfo` by offset, which we have no
+/// hardware here to verify.
+extern fn proc_name(pid: c_int, buffer: ?*anyopaque, buffersize: u32) c_int;
+
+/// Name of the FOREGROUND process on a pty — what the user is actually
+/// looking at (`nvim`), not the shell that spawned it. Feeds the
+/// `{{ PROGRAM }}` title placeholder.
+///
+/// `tcgetpgrp` on the MASTER fd gives the foreground process group the
+/// terminal is currently steering; its pgid doubles as the group
+/// leader's pid. Null when there is no foreground group (child gone,
+/// fd not a tty) or the name cannot be read.
+///
+/// NOT VERIFIED on macOS hardware — the Linux path is what the daemon
+/// exercises today; the libproc call is the documented equivalent.
+pub fn foregroundProgram(master_fd: c_int, buf: []u8) ?[]const u8 {
+    if (master_fd < 0) return null;
+    const pgrp = c.tcgetpgrp(master_fd);
+    if (pgrp <= 0) return null;
+
+    if (is_macos) {
+        var name_buf: [256]u8 = undefined;
+        const n = proc_name(@intCast(pgrp), &name_buf, name_buf.len);
+        if (n <= 0) return null;
+        const len = @min(@as(usize, @intCast(n)), buf.len);
+        @memcpy(buf[0..len], name_buf[0..len]);
+        return buf[0..len];
+    }
+
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pgrp}) catch return null;
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    const n = c.read(fd, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    var len: usize = @intCast(n);
+    // /proc/<pid>/comm is newline-terminated.
+    while (len > 0 and (buf[len - 1] == '\n' or buf[len - 1] == 0)) len -= 1;
+    return buf[0..len];
+}
+
 /// memfd_create is in both glibc and musl libc but its declaration
 /// hides behind _GNU_SOURCE, which the translate-c pass doesn't
 /// define — declare it ourselves (Linux-only; resolved at link).
@@ -461,4 +504,49 @@ test "Wakeup signal/read round-trip" {
     const n = c.poll(&pfd, 1, 1000);
     try std.testing.expect(n == 1);
     try std.testing.expect(pfd[0].revents & c.POLLIN != 0);
+}
+
+test "foregroundProgram reads the real foreground process on a pty" {
+    if (!is_linux) return error.SkipZigTest;
+
+    // forkpty does the setsid + TIOCSCTTY dance, so the child's process
+    // group really is the pty's foreground group — which is exactly
+    // what tcgetpgrp must report.
+    var master: c_int = undefined;
+    const pid = c.forkpty(&master, null, null, null);
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) {
+        _ = c.execl("/bin/sleep", "sleep", "5", @as([*c]const u8, null));
+        c._exit(127);
+    }
+    defer {
+        _ = c.kill(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(pid, &status, 0);
+        _ = c.close(master);
+    }
+
+    // Poll: the name only becomes "sleep" once the child has exec'd.
+    var buf: [32]u8 = undefined;
+    var tries: u32 = 0;
+    while (tries < 200) : (tries += 1) {
+        if (foregroundProgram(master, &buf)) |name| {
+            if (std.mem.eql(u8, name, "sleep")) return;
+        }
+        _ = c.usleep(10_000);
+    }
+    return error.ForegroundProgramNeverResolved;
+}
+
+test "foregroundProgram returns null for a non-tty fd" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expect(foregroundProgram(-1, &buf) == null);
+    // A pipe read end is a valid fd but has no foreground process group.
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(c.pipe(&fds) == 0);
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    try std.testing.expect(foregroundProgram(fds[0], &buf) == null);
 }

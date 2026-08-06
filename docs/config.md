@@ -325,6 +325,58 @@ They are still accepted and ignored, so old files do not warn; use
 | `title_inactive_fg` | colour | `#000000` | |
 | `title_inactive_bg` | colour | `#c0bebf` | |
 
+### Title format
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `tab_title_template` | string | `{{ TITLE }}` | Format of a tab label. The default is the OSC 0/2 title verbatim. |
+| `window_title_template` | string | *(empty)* | Format of the window title, from the FOCUSED pane. Empty leaves the window titled `sketerm` (or `Sketerm Files`), which is the historical behaviour. |
+
+Both are app-level, not per-profile: a tab strip mixing two title
+*formats* reads as a bug, and the window title has no profile to
+belong to. Manual titles still win — a tab renamed via **Rename Tab…**
+is locked and ignores the template until the lock is cleared (rename
+it to an empty string).
+
+Placeholders are `{{ NAME }}`, case-insensitive, and `||` gives a
+fallback chain (`{{ TITLE || PROGRAM }}` uses the first non-empty).
+The set is closed:
+
+| Placeholder | Resolves to |
+| --- | --- |
+| `title` | The OSC 0/2 title, exactly as the application set it. |
+| `program` | Foreground process on the pane's pty (`nvim`, `ssh`, `bash`). Sampled by the daemon off the back of terminal output, so it needs no shell integration. |
+| `absolute_path` | Working directory (OSC 7, or the daemon's `/proc` lookup). |
+| `relative_path` | The same path with `$HOME` folded to `~`. |
+| `columns`, `lines` | Current grid size. |
+| `index` | 1-based tab position. |
+| `session` | Mux session name; empty for a plain local pane. |
+| `profile` | Active profile name; empty on the Default profile. |
+| `zoom` | `zoom` while the pane is zoomed, otherwise empty. |
+
+**Unknown placeholders are rejected at parse time.** The set is closed,
+so `{{ TITEL }}` can only be a typo; sketerm warns (naming the bad
+placeholder and listing the valid ones) and falls back to the default
+for that key. The rest of the config still loads — one bad line never
+costs you the file.
+
+**Empty values do not leave dangling separators.** A placeholder that
+resolves to nothing takes one adjacent punctuation-only literal with
+it — the one after it, or the one before it if it is last:
+
+| Template | Result |
+| --- | --- |
+| `{{ PROGRAM }} - {{ RELATIVE_PATH }}` with no path | `nvim` |
+| `{{ PROGRAM }} - {{ RELATIVE_PATH }}` with no program | `~/src/sketerm` |
+| `{{ INDEX }} - {{ PROGRAM }} - {{ TITLE }}` with no program | `3 - vim README.md` |
+| `{{ PROGRAM }} ({{ COLUMNS }}x{{ LINES }})` with no size | `nvim` |
+
+Literals carrying letters or digits are treated as text you meant and
+are kept — except when wedged between two empty placeholders, which is
+the `x` in `{{ COLUMNS }}x{{ LINES }}`. Brackets are not paired, so
+`[{{ ZOOM }}] {{ TITLE }}` leaves a stray `[` on an unzoomed pane;
+write `{{ ZOOM }} {{ TITLE }}` instead.
+
 ### Split separators
 
 | Key | Type | Default | Notes |

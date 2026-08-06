@@ -298,6 +298,13 @@ pub const Session = struct {
     /// `list` — computed daemon-side so detached sessions are observable with
     /// no client attached. Seeded at spawn (a fresh session is "active").
     last_activity_ms: i64 = 0,
+    /// Foreground process name on the pty, for the GUI's
+    /// `{{ PROGRAM }}` title placeholder. Sampled off the back of PTY
+    /// output only (never on a timer), so an idle daemon stays idle;
+    /// pushed to attached clients only when it CHANGES.
+    fg_program: [32]u8 = undefined,
+    fg_program_len: u8 = 0,
+    fg_sampled_ms: i64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
@@ -3963,9 +3970,46 @@ pub const Daemon = struct {
         };
         cl.queueFrame(.snapshot, buf.items);
         var cwd_buf: [4096]u8 = undefined;
+        // A newly attached client has no facts yet, so sample the
+        // foreground program now rather than making it wait for the
+        // session's next output.
+        var fg_buf: [32]u8 = undefined;
+        const fg = platform.foregroundProgram(s.pty.master_fd, &fg_buf) orelse "";
         cl.queueJson(.session_meta, .{
             .cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse "",
+            .program = fg,
         });
+    }
+
+    /// Minimum gap between two foreground-program samples for one
+    /// session. A busy session produces output continuously, and the
+    /// title only needs to keep up with a human's reading speed.
+    const FG_SAMPLE_INTERVAL_MS: i64 = 500;
+
+    /// Re-read the pty's foreground process name and, if it moved,
+    /// push it to attached clients.
+    ///
+    /// Called ONLY from the PTY drain, so this costs nothing on an
+    /// idle daemon: no timer, no extra poll wakeup. The rate limit
+    /// keeps a flooding session to two `tcgetpgrp` + `/proc` reads a
+    /// second, and the change check keeps the wire quiet — running
+    /// `ls` in a loop re-reports `bash` once, not once per command.
+    pub fn sampleForeground(self: *Daemon, s: *Session) void {
+        const now = nowMs();
+        if (now - s.fg_sampled_ms < FG_SAMPLE_INTERVAL_MS) return;
+        s.fg_sampled_ms = now;
+
+        var buf: [32]u8 = undefined;
+        const name = platform.foregroundProgram(s.pty.master_fd, &buf) orelse "";
+        const len: u8 = @intCast(@min(name.len, s.fg_program.len));
+        if (len == s.fg_program_len and std.mem.eql(u8, s.fg_program[0..len], name[0..len])) return;
+        @memcpy(s.fg_program[0..len], name[0..len]);
+        s.fg_program_len = len;
+
+        for (self.clients.items) |cl| {
+            if (cl.attached != s or cl.dead) continue;
+            cl.queueJson(.session_meta, .{ .program = s.fg_program[0..len] });
+        }
     }
 
     pub fn broadcastSnapshot(self: *Daemon, s: *Session) void {
@@ -4461,6 +4505,7 @@ pub const Daemon = struct {
                 break;
             }
         }
+        if (any_attached) self.sampleForeground(s);
         if (any_attached and n_events > 0) {
             var payload: std.ArrayList(u8) = .empty;
             defer payload.deinit(self.allocator);

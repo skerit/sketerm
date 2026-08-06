@@ -70,6 +70,10 @@ pub const Terminal = struct {
     /// Fired after OSC 7 updates `self.cwd`. UI uses this to refresh
     /// the AdwTabPage tooltip so hovering shows the live shell cwd.
     on_cwd_changed: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
+    /// Fired when the daemon reports a different foreground process
+    /// for this session. UI uses it to re-render a title template
+    /// that mentions `{{ PROGRAM }}`.
+    on_program_changed: ?*const fn (ctx: ?*anyopaque, program: []const u8) void = null,
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// OSC 52 read query (only fired when the screen allows reads).
     on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
@@ -177,6 +181,13 @@ pub const Terminal = struct {
     /// Most recent cwd reported via OSC 7 (file://host/path → /path).
     /// Owned. Used by layout save in preference to /proc lookup.
     cwd: ?[]u8 = null,
+
+    /// Foreground process name on the session's pty, pushed by the
+    /// daemon in `session_meta`. Feeds the `{{ PROGRAM }}` title
+    /// placeholder. Fixed buffer, not an allocation: it is one short
+    /// comm string and it changes as often as the user runs a command.
+    program_buf: [32]u8 = undefined,
+    program_len: u8 = 0,
 
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
@@ -1037,12 +1048,13 @@ pub const Terminal = struct {
             .peer_info => self.handlePeerInfo(frame.payload),
             .control_state => self.handleControlState(frame.payload),
             .session_meta => {
-                const Meta = struct { cwd: []const u8 = "" };
+                const Meta = struct { cwd: []const u8 = "", program: []const u8 = "" };
                 var parsed = std.json.parseFromSlice(Meta, self.allocator, frame.payload, .{
                     .ignore_unknown_fields = true,
                 }) catch return;
                 defer parsed.deinit();
                 if (parsed.value.cwd.len > 0) self.setCwd(parsed.value.cwd);
+                if (parsed.value.program.len > 0) self.setProgram(parsed.value.program);
             },
             .file_data => self.downloadData(frame.payload),
             .udp_ticket => {
@@ -2223,6 +2235,19 @@ pub const Terminal = struct {
     fn setCwd(self: *Terminal, cwd: []const u8) void {
         const owned = self.allocator.dupe(u8, cwd) catch return;
         self.replaceCwd(owned);
+    }
+
+    /// Foreground process name, or "" while unknown.
+    pub fn program(self: *const Terminal) []const u8 {
+        return self.program_buf[0..self.program_len];
+    }
+
+    fn setProgram(self: *Terminal, name: []const u8) void {
+        const len: u8 = @intCast(@min(name.len, self.program_buf.len));
+        if (len == self.program_len and std.mem.eql(u8, self.program_buf[0..len], name[0..len])) return;
+        @memcpy(self.program_buf[0..len], name[0..len]);
+        self.program_len = len;
+        if (self.on_program_changed) |f| f(self.user_ctx, self.program_buf[0..len]);
     }
 
     fn replaceCwd(self: *Terminal, owned: []u8) void {
