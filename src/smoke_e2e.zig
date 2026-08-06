@@ -70,6 +70,9 @@ var theme_pid: c.pid_t = -1;
 /// The cast-playback GUI (`sketerm play`, castPlaybackStage), killed
 /// by EXACT pid.
 var cast_pid: c.pid_t = -1;
+/// The viewer-cast GUI (`sketerm view` on a mixed image+cast batch,
+/// viewerCastStage), killed by EXACT pid.
+var vcast_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -128,6 +131,10 @@ fn teardown() void {
     if (cast_pid > 0) {
         reap(cast_pid, c.SIGKILL, 0);
         cast_pid = -1;
+    }
+    if (vcast_pid > 0) {
+        reap(vcast_pid, c.SIGKILL, 0);
+        vcast_pid = -1;
     }
     if (drive) |app| {
         // detach, not kill: the session is destroyed by name below, so
@@ -988,6 +995,11 @@ pub fn main() u8 {
         if (have_wl) {
             if (castPlaybackStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
             say("cast playback: rendered, paused, seeked to EOF, restarted and closed (session died with the window)");
+
+            // 6c-10. The same recording INSIDE the Sketerm Viewer, in
+            // a mixed image+cast batch, navigated both directions.
+            if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
+            say("viewer cast: played in place, paused, and batch navigation killed/rebuilt the ephemeral session without a leak");
         }
     }
 
@@ -2236,6 +2248,198 @@ fn castPlaybackStage(
         _ = c.usleep(250_000);
     }
     if (!gone) return "closing the window did not kill the ephemeral cast session";
+    _ = app.drainLive(2_000);
+    return null;
+}
+
+/// Cast playback INSIDE the Sketerm Viewer: `sketerm view` on a mixed
+/// batch (image + cast), navigated both directions on a real seat.
+/// What only a live run can prove: the shared CastPlayerBox renders
+/// through the viewer's content slot, Space reaches the daemon as a
+/// pause, and BATCH NAVIGATION tears the ephemeral cast session down
+/// completely (no leaked session) and can rebuild a fresh one.
+fn viewerCastStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    mux_sock: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const mux_client = @import("mux/client.zig");
+
+    _ = app.drainLive(2_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const term_win = app.windows.items[0].id;
+
+    // The image half of the batch: a screenshot of the terminal
+    // window, guaranteed to exist and to decode.
+    const img_path = std.fmt.allocPrintSentinel(allocator, "{s}/viewer-cast-img.png", .{rt}, 0) catch
+        return "allocating the sample image path failed";
+    defer allocator.free(img_path);
+    if (app.screenshotPng(term_win, 512, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng(img_path, shot.png);
+    } else |_| return "could not produce a sample image for the viewer";
+
+    // The cast half: red+green early, a blue guard event at 30s so
+    // normal playback never changes the asserted pixels mid-stage.
+    var cast_path_buf: [512:0]u8 = undefined;
+    const cast_path = std.fmt.bufPrintZ(&cast_path_buf, "{s}/viewer-e2e.cast", .{rt}) catch return "cast path too long";
+    {
+        const body =
+            "{\"version\": 2, \"width\": 40, \"height\": 10}\n" ++
+            "[0.1, \"o\", \"\\u001b[48;2;255;0;0m  RED BLOCK  \\u001b[0m viewer-cast-e2e\"]\n" ++
+            "[0.5, \"o\", \"\\r\\n\\u001b[48;2;0;255;0m  GREEN BLOCK  \\u001b[0m\"]\n" ++
+            "[30.0, \"o\", \"\\r\\n\\u001b[48;2;0;0;255m  BLUE BLOCK  \\u001b[0m\"]\n";
+        const f = c.fopen(cast_path.ptr, "wb") orelse return "could not write the cast file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the cast file";
+    }
+
+    var known: [16]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for the viewer failed";
+    if (pid == 0) {
+        dieWithParent();
+        // Its own app id: it must not join any instance already
+        // running in this display session.
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evcast", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    vcast_pid = pid;
+
+    var waited: u32 = 0;
+    const vwin = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "sketerm view never mapped a window";
+    _ = app.waitVisualSettle(vwin, 400, 10_000, 0.002, null);
+
+    // The batch starts on the image, so no cast session may exist yet.
+    {
+        var list_buf: [16384]u8 = undefined;
+        const listing = castListSessions(allocator, mux_sock, &list_buf);
+        if (std.mem.indexOf(u8, listing, "\"name\":\"cast") != null)
+            return "a cast session existed before navigating to the cast item";
+    }
+
+    // Right -> the cast item: playback renders in place.
+    app.pressKey(vwin, "Right") catch return "injecting Right failed";
+    if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
+        return "the red block never rendered inside the viewer";
+    if (!castWaitRgb(allocator, app, vwin, .{ 0, 255, 0 }, 40, true, 20_000))
+        return "the green block never rendered inside the viewer";
+
+    // The GUI-minted ephemeral session (name prefix "cast").
+    var name_buf: [64]u8 = undefined;
+    var name: []const u8 = &.{};
+    var name_tries: u32 = 0;
+    while (name_tries < 50) : (name_tries += 1) {
+        var list_buf: [16384]u8 = undefined;
+        const listing = castListSessions(allocator, mux_sock, &list_buf);
+        if (std.mem.indexOf(u8, listing, "\"name\":\"cast")) |at| {
+            const start = at + "\"name\":\"".len;
+            const end = std.mem.indexOfScalarPos(u8, listing, start, '"') orelse break;
+            const found = listing[start..end];
+            if (found.len <= name_buf.len) {
+                @memcpy(name_buf[0..found.len], found);
+                name = name_buf[0..found.len];
+                break;
+            }
+        }
+        _ = c.usleep(200_000);
+    }
+    if (name.len == 0) return "the viewer's cast session never appeared in the daemon's list";
+
+    // Space pauses, cross-checked on a read-only side attachment.
+    {
+        var side = mux_client.Conn.connectProbed(allocator, mux_sock) catch return "side connect failed";
+        defer side.deinit();
+        side.sendJson(.attach, .{ .name = name, .kind = "cli", .read_only = true }) catch return "side attach send failed";
+        const snap = side.recvExpectFor(&.{.snapshot}, 10_000) catch return "side attach got no snapshot";
+        snap.deinit(allocator);
+        var st: CastObserved = .{};
+        app.pressKey(vwin, "space") catch return "injecting space failed";
+        if (!castWaitState(allocator, &side, "paused", 8_000, &st))
+            return "space did not pause the cast inside the viewer";
+        // Resume so the teardown below kills a RUNNING playback.
+        app.pressKey(vwin, "space") catch return "injecting space failed";
+        if (!castWaitState(allocator, &side, "playing", 8_000, &st))
+            return "space did not resume the cast inside the viewer";
+    }
+
+    // Left -> back to the image: the outgoing controller must kill
+    // its ephemeral session (this is the no-leak invariant).
+    app.pressKey(vwin, "Left") catch return "injecting Left failed";
+    if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, false, 15_000))
+        return "navigating back to the image did not clear the cast frame";
+    {
+        var gone = false;
+        var t: u32 = 0;
+        while (t < 10_000) : (t += 250) {
+            var list_buf: [16384]u8 = undefined;
+            const listing = castListSessions(allocator, mux_sock, &list_buf);
+            if (std.mem.indexOf(u8, listing, name) == null) {
+                gone = true;
+                break;
+            }
+            _ = c.usleep(250_000);
+        }
+        if (!gone) return "navigating away leaked the ephemeral cast session";
+    }
+
+    // Right again -> a FRESH controller and session (rebuild path).
+    app.pressKey(vwin, "Right") catch return "injecting Right failed";
+    if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
+        return "re-navigating to the cast never rendered again";
+
+    // WM close -> clean exit, and the second session dies too.
+    app.closeWindow(vwin) catch return "closing the viewer window failed";
+    {
+        var status: c_int = 0;
+        var reaped = false;
+        var t: u32 = 0;
+        while (t < 15_000) : (t += 100) {
+            if (c.waitpid(vcast_pid, &status, c.WNOHANG) == vcast_pid) {
+                reaped = true;
+                break;
+            }
+            _ = c.usleep(100_000);
+        }
+        if (!reaped) return "the viewer did not exit on window close";
+        vcast_pid = -1;
+        if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0))
+            return "the viewer exited abnormally on window close";
+    }
+    {
+        var gone = false;
+        var t: u32 = 0;
+        while (t < 10_000) : (t += 250) {
+            var list_buf: [16384]u8 = undefined;
+            const listing = castListSessions(allocator, mux_sock, &list_buf);
+            if (std.mem.indexOf(u8, listing, "\"name\":\"cast") == null) {
+                gone = true;
+                break;
+            }
+            _ = c.usleep(250_000);
+        }
+        if (!gone) return "closing the viewer did not kill the ephemeral cast session";
+    }
     _ = app.drainLive(2_000);
     return null;
 }
