@@ -8,9 +8,20 @@
 //! neither collide with nor be listable by another's. The session is
 //! therefore a directory level, not a name prefix.
 //!
-//! On disk: `$XDG_STATE_HOME/sketerm/panels/<session>/<name>.json`
-//! (falling back to `$HOME/.local/state`), holding the CANONICAL form
-//! produced by `doc.Document.toJson` — sorted keys, fixed field order,
+//! On disk (falling back to `$HOME/.local/state`):
+//!
+//!     $XDG_STATE_HOME/sketerm/panels/by-session/<encoded>/<name>.json
+//!     $XDG_STATE_HOME/sketerm/panels/no-session/<name>.json
+//!
+//! Two PARENT directories, not one namespace with a reserved name in
+//! it: a caller with no session (an `sketerm mcp` outside any pane) is
+//! a different shape, not a session called something special, so there
+//! is nothing for a real session name to collide with no matter what
+//! the daemon called it. In code that difference is `?[]const u8` —
+//! `null` is "no session", and no string value means it.
+//!
+//! Files hold the CANONICAL form produced by
+//! `doc.Document.toJson` — sorted keys, fixed field order,
 //! byte-stable across round-trips, so a stored panel diffs cleanly and
 //! re-saving an unchanged document rewrites identical bytes.
 //!
@@ -35,9 +46,10 @@ pub const Error = error{
     /// Panel name is empty, too long, or contains anything but
     /// `[A-Za-z0-9._-]` (and never a leading dot).
     BadName,
-    /// Session identifier is empty or longer than the daemon's own
-    /// 64-byte cap. Nothing else about a session is rejected — see
-    /// `encodeSession`.
+    /// Session identifier is longer than the daemon's own 64-byte cap.
+    /// Nothing else about a session is rejected — see `encodeSession`.
+    /// A `null` (or empty) session is not an error: it is the
+    /// sessionless bucket.
     BadSession,
     NotFound,
     /// Document larger than `MAX_BYTES`.
@@ -66,13 +78,33 @@ pub const MAX_PANELS: usize = 64;
 pub const MAX_NAME: usize = 64;
 pub const MAX_SESSION: usize = 64;
 
+/// Parent of every real session's panel directory.
+pub const BY_SESSION_DIR: []const u8 = "by-session";
+
 /// Where panels land when the caller has no session: `sketerm mcp` can
 /// run outside any pane, and refusing to save at all there would make
-/// the feature unusable from a bare shell. It is a real bucket with a
-/// name no session can take (`validSession` rejects a leading `_`), so
-/// sessionless panels are isolated from every session's panels rather
-/// than leaking into one.
-pub const NO_SESSION: []const u8 = "_no-session";
+/// the feature unusable from a bare shell. A SIBLING of
+/// `BY_SESSION_DIR`, never a directory inside it, so no session name —
+/// encoded or not — can address it.
+pub const NO_SESSION_DIR: []const u8 = "no-session";
+
+/// The one place "no session" is decided. `null` is the shape callers
+/// should use; the empty string is accepted as the same thing because
+/// the string-typed edges (the control socket's `session` field, and
+/// `panelhost.sessionForPane`, which must stay a plain string for the
+/// GUI's saved-panel picker) have no other way to spell it, and an
+/// empty string is not a session name in any layer — the daemon caps
+/// a session at 1..64 bytes, so nothing can be lost to this.
+fn norm(session: ?[]const u8) ?[]const u8 {
+    const s = session orelse return null;
+    return if (s.len == 0) null else s;
+}
+
+/// How a session reads in a diagnostic. Sessionless is a state, not a
+/// name, so it must never render as one.
+pub fn sessionLabel(session: ?[]const u8) []const u8 {
+    return norm(session) orelse "(no session)";
+}
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     const v = c.getenv(name) orelse return null;
@@ -119,28 +151,24 @@ fn hexDigit(n: u4) u8 {
     return "0123456789ABCDEF"[n];
 }
 
-/// The directory name holding `session`'s panels: `[A-Za-z0-9.\-_]`
-/// pass through, every other byte becomes `%XX` — and so does a
-/// LEADING `.` or `_`. That last rule is what makes the encoding safe
-/// rather than merely tidy: with every `/` encoded the result is one
-/// path component, and encoding a LEADING `.` means that component can
-/// never be `.` or `..`, so traversal is structurally impossible and
-/// no real session can spell the reserved `_no-session` bucket (its
-/// leading `_` encodes too). The mapping is injective (`%` is
-/// itself encoded), so two sessions can never collide in one
-/// directory. Writes into `buf`, which must hold `MAX_SESSION_DIR`.
+/// The directory name holding `session`'s panels, under
+/// `BY_SESSION_DIR`: `[A-Za-z0-9.\-_]` pass through, every other byte
+/// becomes `%XX` — and so does a LEADING `.`. That last rule is what
+/// makes the encoding safe rather than merely tidy: with every `/`
+/// encoded the result is one path component, and encoding a LEADING
+/// `.` means that component can never be `.` or `..`, so traversal is
+/// structurally impossible. The mapping is injective (`%` is itself
+/// encoded), so two sessions can never collide in one directory. There
+/// are no reserved names to steer around: sessionless panels live
+/// under a different parent entirely. Writes into `buf`, which must
+/// hold `MAX_SESSION_DIR`.
 pub fn encodeSession(buf: []u8, session: []const u8) Error![]u8 {
-    if (std.mem.eql(u8, session, NO_SESSION)) {
-        if (buf.len < NO_SESSION.len) return Error.IoFailed;
-        @memcpy(buf[0..NO_SESSION.len], NO_SESSION);
-        return buf[0..NO_SESSION.len];
-    }
     if (!validSession(session)) return Error.BadSession;
     var n: usize = 0;
     for (session, 0..) |ch, i| {
         const plain = switch (ch) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-' => true,
-            '.', '_' => i > 0,
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => true,
+            '.' => i > 0,
             else => false,
         };
         if (plain) {
@@ -159,25 +187,24 @@ pub fn encodeSession(buf: []u8, session: []const u8) Error![]u8 {
 }
 
 /// The session a caller should use: an explicit one when given, else
-/// `$SKETERM_SESSION`, else the sessionless bucket. The result borrows
-/// from `explicit` or from the environment; it is never allocated.
-pub fn resolveSession(explicit: ?[]const u8) []const u8 {
-    if (explicit) |s| {
-        if (s.len > 0) return s;
-    }
-    if (getenv("SKETERM_SESSION")) |s| return s;
-    return NO_SESSION;
+/// `$SKETERM_SESSION`, else NONE. `null` is a real answer, not a
+/// fallback name — the sessionless bucket is a different directory,
+/// not a session called something. The result borrows from `explicit`
+/// or from the environment; it is never allocated.
+pub fn resolveSession(explicit: ?[]const u8) ?[]const u8 {
+    if (norm(explicit)) |s| return s;
+    return getenv("SKETERM_SESSION");
 }
 
-fn checkSession(session: []const u8, diag: ?*Diag) Error!void {
-    if (std.mem.eql(u8, session, NO_SESSION)) return; // the one reserved bucket
-    if (!validSession(session)) {
-        if (diag) |d| d.set("invalid session \"{s}\": must be 1..{d} bytes (the daemon's own cap)", .{ session, MAX_SESSION });
+fn checkSession(session: ?[]const u8, diag: ?*Diag) Error!void {
+    const s = norm(session) orelse return; // sessionless: its own bucket
+    if (!validSession(s)) {
+        if (diag) |d| d.set("invalid session \"{s}\": must be 1..{d} bytes (the daemon's own cap)", .{ s, MAX_SESSION });
         return Error.BadSession;
     }
 }
 
-fn checkKey(session: []const u8, name: []const u8, diag: ?*Diag) Error!void {
+fn checkKey(session: ?[]const u8, name: []const u8, diag: ?*Diag) Error!void {
     try checkSession(session, diag);
     if (!validName(name)) {
         if (diag) |d| d.set("invalid panel name \"{s}\": 1..{d} chars of [A-Za-z0-9._-], no leading \".\"", .{ name, MAX_NAME });
@@ -198,25 +225,30 @@ fn panelsRoot(allocator: std.mem.Allocator) Error![]u8 {
     return Error.IoFailed;
 }
 
-/// Directory holding `session`'s panels, with the session
-/// percent-encoded into one path component. Caller frees.
-pub fn sessionDir(allocator: std.mem.Allocator, session: []const u8) Error![]u8 {
+/// Directory holding `session`'s panels: `<root>/by-session/<encoded>`
+/// for a real session, `<root>/no-session` for a sessionless caller.
+/// The two can never be the same path — `by-session` is a directory
+/// level, so no session name reaches the sessionless bucket and the
+/// bucket is not a name anything can spell. Caller frees.
+pub fn sessionDir(allocator: std.mem.Allocator, session: ?[]const u8) Error![]u8 {
     try checkSession(session, null);
-    var enc_buf: [MAX_SESSION_DIR]u8 = undefined;
-    const enc = try encodeSession(&enc_buf, session);
     const root = try panelsRoot(allocator);
     defer allocator.free(root);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, enc }) catch Error.OutOfMemory;
+    const s = norm(session) orelse
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, NO_SESSION_DIR }) catch Error.OutOfMemory;
+    var enc_buf: [MAX_SESSION_DIR]u8 = undefined;
+    const enc = try encodeSession(&enc_buf, s);
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ root, BY_SESSION_DIR, enc }) catch Error.OutOfMemory;
 }
 
-fn panelPath(allocator: std.mem.Allocator, session: []const u8, name: []const u8, diag: ?*Diag) Error![]u8 {
+fn panelPath(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8, diag: ?*Diag) Error![]u8 {
     try checkKey(session, name, diag);
     const dir = try sessionDir(allocator, session);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, name }) catch Error.OutOfMemory;
 }
 
-fn stagePath(allocator: std.mem.Allocator, session: []const u8, name: []const u8) Error![]u8 {
+fn stagePath(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8) Error![]u8 {
     const dir = try sessionDir(allocator, session);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.sketerm-part", .{ dir, name, c.getpid() }) catch Error.OutOfMemory;
@@ -285,7 +317,7 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) Error![]u8 {
 /// disk, so `save` is idempotent byte-for-byte.
 pub fn save(
     allocator: std.mem.Allocator,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     document: *const Document,
     diag: ?*Diag,
@@ -305,7 +337,7 @@ pub fn save(
 /// is written.
 pub fn saveJson(
     allocator: std.mem.Allocator,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     json_text: []const u8,
     diag: ?*Diag,
@@ -322,7 +354,7 @@ pub fn saveJson(
 
 fn saveBytes(
     allocator: std.mem.Allocator,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     bytes: []const u8,
     diag: ?*Diag,
@@ -339,7 +371,7 @@ fn saveBytes(
     if (!fileExists(path)) {
         const n = try countPanels(allocator, session);
         if (n >= MAX_PANELS) {
-            if (diag) |d| d.set("session \"{s}\" already holds {d} panels (cap {d}); delete one first", .{ session, n, MAX_PANELS });
+            if (diag) |d| d.set("session {s} already holds {d} panels (cap {d}); delete one first", .{ sessionLabel(session), n, MAX_PANELS });
             return Error.TooMany;
         }
     }
@@ -354,7 +386,7 @@ fn saveBytes(
 /// never a crash and never a silently empty panel.
 pub fn load(
     allocator: std.mem.Allocator,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     diag: ?*Diag,
 ) Error!Document {
@@ -375,7 +407,7 @@ pub fn load(
 /// this only to hand the document straight back to a client.
 pub fn loadJson(
     allocator: std.mem.Allocator,
-    session: []const u8,
+    session: ?[]const u8,
     name: []const u8,
     diag: ?*Diag,
 ) Error![]u8 {
@@ -383,25 +415,25 @@ pub fn loadJson(
     defer allocator.free(path);
     return readFile(allocator, path) catch |err| {
         if (err == Error.NotFound) {
-            if (diag) |d| d.set("no panel \"{s}\" saved in session \"{s}\"", .{ name, session });
+            if (diag) |d| d.set("no panel \"{s}\" saved in session {s}", .{ name, sessionLabel(session) });
         }
         return err;
     };
 }
 
-pub fn exists(allocator: std.mem.Allocator, session: []const u8, name: []const u8) bool {
+pub fn exists(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8) bool {
     const path = panelPath(allocator, session, name, null) catch return false;
     defer allocator.free(path);
     return fileExists(path);
 }
 
-pub fn delete(allocator: std.mem.Allocator, session: []const u8, name: []const u8, diag: ?*Diag) Error!void {
+pub fn delete(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8, diag: ?*Diag) Error!void {
     const path = try panelPath(allocator, session, name, diag);
     defer allocator.free(path);
     var zbuf: [4096]u8 = undefined;
     const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
     if (c.unlink(z) != 0) {
-        if (diag) |d| d.set("no panel \"{s}\" saved in session \"{s}\"", .{ name, session });
+        if (diag) |d| d.set("no panel \"{s}\" saved in session {s}", .{ name, sessionLabel(session) });
         return Error.NotFound;
     }
 }
@@ -424,7 +456,7 @@ pub const Entry = struct {
 /// Every panel stored for `session`, sorted by name. Free with
 /// `freeList`. An unknown or never-used session lists empty rather
 /// than erroring — "no panels yet" is not a failure.
-pub fn list(allocator: std.mem.Allocator, session: []const u8) Error![]Entry {
+pub fn list(allocator: std.mem.Allocator, session: ?[]const u8) Error![]Entry {
     const dir = try sessionDir(allocator, session);
     defer allocator.free(dir);
 
@@ -528,7 +560,7 @@ fn dirNames(allocator: std.mem.Allocator, dir: []const u8) Error!std.ArrayList([
     return out;
 }
 
-fn countPanels(allocator: std.mem.Allocator, session: []const u8) Error!usize {
+fn countPanels(allocator: std.mem.Allocator, session: ?[]const u8) Error!usize {
     const dir = try sessionDir(allocator, session);
     defer allocator.free(dir);
     var names = try dirNames(allocator, dir);
@@ -632,6 +664,9 @@ test "panel names are validated; sessions are only length-checked" {
 test "sessions are percent-encoded into one traversal-proof directory" {
     var buf: [MAX_SESSION_DIR]u8 = undefined;
     try t.expectEqualStrings("main-3", try encodeSession(&buf, "main-3"));
+    // No name is reserved any more: `_no-session` encodes to itself and
+    // is simply one more ordinary session directory.
+    try t.expectEqualStrings("_no-session", try encodeSession(&buf, "_no-session"));
     try t.expectEqualStrings("my%20work", try encodeSession(&buf, "my work"));
     try t.expectEqualStrings("a%2Fb", try encodeSession(&buf, "a/b"));
     // A LEADING `.` encodes, which is what keeps the only two dangerous
@@ -646,12 +681,9 @@ test "sessions are percent-encoded into one traversal-proof directory" {
         try t.expect(!std.mem.eql(u8, enc, ".."));
         try t.expect(std.mem.indexOfScalar(u8, enc, '/') == null);
     }
-    // A leading `.` or `_` is encoded; an interior one is not.
-    try t.expectEqualStrings("%5Fx._y", try encodeSession(&buf, "_x._y"));
-    // The reserved bucket is the one literal name, and no real session
-    // can spell it (the leading `_` encodes).
-    try t.expectEqualStrings(NO_SESSION, try encodeSession(&buf, NO_SESSION));
-    try t.expect(!std.mem.eql(u8, NO_SESSION, try encodeSession(&buf, "_no-session_")));
+    // A leading `.` is encoded; an interior one is not, and `_` never
+    // needs to be (it guarded a reserved name that no longer exists).
+    try t.expectEqualStrings("_x._y", try encodeSession(&buf, "_x._y"));
     // `%` itself encodes, so the mapping cannot collide.
     try t.expectEqualStrings("a%2Fb", try encodeSession(&buf, "a/b"));
     try t.expectEqualStrings("a%252Fb", try encodeSession(&buf, "a%2Fb"));
@@ -676,9 +708,11 @@ test "a hostile panel name is rejected; a hostile session is encoded" {
     defer t.allocator.free(dir);
     const root = try panelsRoot(t.allocator);
     defer t.allocator.free(root);
-    try t.expect(std.mem.startsWith(u8, dir, root));
-    try t.expect(std.mem.indexOf(u8, dir[root.len..], "/") == 0);
-    try t.expect(std.mem.indexOf(u8, dir[root.len + 1 ..], "/") == null);
+    const by_session = try std.fmt.allocPrint(t.allocator, "{s}/{s}/", .{ root, BY_SESSION_DIR });
+    defer t.allocator.free(by_session);
+    try t.expect(std.mem.startsWith(u8, dir, by_session));
+    // ...as ONE component under `by-session`, so nothing escapes it.
+    try t.expect(std.mem.indexOf(u8, dir[by_session.len..], "/") == null);
     try t.expect(fileExists(dir));
 
     // A session with a space and one with a slash both round-trip, and
@@ -697,14 +731,76 @@ test "a hostile panel name is rejected; a hostile session is encoded" {
     defer freeList(t.allocator, spaced_list);
     try t.expectEqual(@as(usize, 1), spaced_list.len);
 
-    // An empty or over-long session is still refused, with the reason.
+    // An over-long session is still refused, with the reason.
     diag = Diag{};
-    try t.expectError(Error.BadSession, saveJson(t.allocator, "", "p", DOC, &diag));
+    try t.expectError(Error.BadSession, saveJson(t.allocator, "x" ** 65, "p", DOC, &diag));
     try t.expect(std.mem.indexOf(u8, diag.msg(), "session") != null);
     try t.expectError(Error.BadSession, delete(t.allocator, "x" ** 65, "p", null));
+}
 
-    // The reserved bucket is usable as the resolved sessionless one.
-    try saveJson(t.allocator, NO_SESSION, "p", DOC, null);
+test "the sessionless bucket shares no namespace with any session" {
+    var scratch: Scratch = undefined;
+    try scratch.init("nosession");
+    defer scratch.deinit();
+
+    // The full sessionless lifecycle works without a session at all.
+    try saveJson(t.allocator, null, "p", DOC, null);
+    var loaded = try load(t.allocator, null, "p", null);
+    defer loaded.deinit();
+    try t.expectEqualStrings("VSR compare", loaded.title);
+    try t.expect(exists(t.allocator, null, "p"));
+    {
+        const listed = try list(t.allocator, null);
+        defer freeList(t.allocator, listed);
+        try t.expectEqual(@as(usize, 1), listed.len);
+        try t.expectEqualStrings("p", listed[0].name);
+    }
+
+    // A session LITERALLY named `_no-session` (the old sentinel) is an
+    // ordinary session: its panels are somewhere else entirely, and
+    // neither side can see or overwrite the other's.
+    try saveJson(t.allocator, "_no-session", "p",
+        \\{"root":"r","title":"Impostor","components":{"r":{"type":"text","text":"i"}}}
+    , null);
+    var impostor = try load(t.allocator, "_no-session", "p", null);
+    defer impostor.deinit();
+    try t.expectEqualStrings("Impostor", impostor.title);
+    var sessionless = try load(t.allocator, null, "p", null);
+    defer sessionless.deinit();
+    try t.expectEqualStrings("VSR compare", sessionless.title);
+
+    // Same for the directory name the bucket happens to use, and for
+    // the parent every real session lives under.
+    for ([_][]const u8{ NO_SESSION_DIR, BY_SESSION_DIR }) |spoof| {
+        try saveJson(t.allocator, spoof, "p",
+            \\{"root":"r","title":"Spoof","components":{"r":{"type":"text","text":"s"}}}
+        , null);
+        var spoofed = try load(t.allocator, spoof, "p", null);
+        defer spoofed.deinit();
+        try t.expectEqualStrings("Spoof", spoofed.title);
+        const dir = try sessionDir(t.allocator, spoof);
+        defer t.allocator.free(dir);
+        const none_dir = try sessionDir(t.allocator, null);
+        defer t.allocator.free(none_dir);
+        try t.expect(!std.mem.eql(u8, dir, none_dir));
+    }
+    {
+        // ...and the sessionless bucket still holds exactly its own one.
+        const listed = try list(t.allocator, null);
+        defer freeList(t.allocator, listed);
+        try t.expectEqual(@as(usize, 1), listed.len);
+    }
+
+    // Deleting the sessionless panel touches nothing else.
+    try delete(t.allocator, null, "p", null);
+    try t.expect(!exists(t.allocator, null, "p"));
+    try t.expect(exists(t.allocator, "_no-session", "p"));
+
+    // The string-typed edges spell "no session" as the empty string,
+    // which is not a session name in any layer — same bucket, and an
+    // explicit "" is never a session of its own.
+    try saveJson(t.allocator, "", "empty", DOC, null);
+    try t.expect(exists(t.allocator, null, "empty"));
 }
 
 test "save/load round-trip keeps the document byte-stable" {
@@ -878,13 +974,17 @@ test "caps trip and say what happened" {
     try t.expect(!exists(t.allocator, "s1", "huge"));
 }
 
-test "resolveSession prefers explicit, then env, then the reserved bucket" {
+test "resolveSession prefers explicit, then env, else there is no session" {
     _ = c.unsetenv("SKETERM_SESSION");
-    try t.expectEqualStrings(NO_SESSION, resolveSession(null));
-    try t.expectEqualStrings(NO_SESSION, resolveSession(""));
-    try t.expectEqualStrings("explicit", resolveSession("explicit"));
+    // Not a fallback NAME: the absence is the answer, and the type says so.
+    try t.expectEqual(@as(?[]const u8, null), resolveSession(null));
+    try t.expectEqual(@as(?[]const u8, null), resolveSession(""));
+    try t.expectEqualStrings("explicit", resolveSession("explicit").?);
     _ = c.setenv("SKETERM_SESSION", "pane-7", 1);
     defer _ = c.unsetenv("SKETERM_SESSION");
-    try t.expectEqualStrings("pane-7", resolveSession(null));
-    try t.expectEqualStrings("explicit", resolveSession("explicit"));
+    try t.expectEqualStrings("pane-7", resolveSession(null).?);
+    try t.expectEqualStrings("explicit", resolveSession("explicit").?);
+    try t.expectEqualStrings("(no session)", sessionLabel(null));
+    try t.expectEqualStrings("(no session)", sessionLabel(""));
+    try t.expectEqualStrings("pane-7", sessionLabel("pane-7"));
 }
