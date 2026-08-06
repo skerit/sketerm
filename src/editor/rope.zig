@@ -1,4 +1,5 @@
-//! Balanced rope over UTF-8 bytes with per-node byte/newline aggregates.
+//! Balanced rope over UTF-8 bytes with per-node byte/newline/character
+//! aggregates.
 //!
 //! AVL-balanced binary tree of fixed-capacity leaves (MAX_LEAF bytes).
 //! All edits are expressed as split/join, which keeps the height
@@ -30,6 +31,11 @@ pub const Rope = struct {
     const Node = struct {
         bytes: usize,
         newlines: usize,
+        /// Non-continuation bytes, i.e. codepoints when the content is
+        /// valid UTF-8. Counted per byte, so splitting a sequence
+        /// across nodes still totals correctly: the lead byte is
+        /// counted wherever it lands and continuations never are.
+        chars: usize,
         height: u16,
         kind: Kind,
 
@@ -79,6 +85,11 @@ pub const Rope = struct {
         return self.newlineCount() + 1;
     }
 
+    /// Total non-continuation bytes (codepoints for valid UTF-8). O(1).
+    pub fn charCount(self: *const Rope) usize {
+        return if (self.root) |n| n.chars else 0;
+    }
+
     // ---- node helpers -------------------------------------------------
 
     fn newLeaf(self: *Rope, content: []const u8) !*Node {
@@ -90,6 +101,7 @@ pub const Rope = struct {
         node.* = .{
             .bytes = content.len,
             .newlines = countNewlines(content),
+            .chars = countChars(content),
             .height = 1,
             .kind = .{ .leaf = .{ .data = buf.ptr, .len = @intCast(content.len) } },
         };
@@ -101,6 +113,7 @@ pub const Rope = struct {
         node.* = .{
             .bytes = 0,
             .newlines = 0,
+            .chars = 0,
             .height = 0,
             .kind = .{ .inner = .{ .left = left, .right = right } },
         };
@@ -136,6 +149,7 @@ pub const Rope = struct {
         const in = node.kind.inner;
         node.bytes = in.left.bytes + in.right.bytes;
         node.newlines = in.left.newlines + in.right.newlines;
+        node.chars = in.left.chars + in.right.chars;
         node.height = 1 + @max(in.left.height, in.right.height);
     }
 
@@ -143,6 +157,19 @@ pub const Rope = struct {
         var n: usize = 0;
         for (bytes) |b| {
             if (b == '\n') n += 1;
+        }
+        return n;
+    }
+
+    fn isCont(b: u8) bool {
+        return (b & 0xC0) == 0x80;
+    }
+
+    /// Non-continuation bytes in `bytes`.
+    pub fn countChars(bytes: []const u8) usize {
+        var n: usize = 0;
+        for (bytes) |b| {
+            if (!isCont(b)) n += 1;
         }
         return n;
     }
@@ -232,10 +259,12 @@ pub const Rope = struct {
     /// right spine. Caller guarantees the leaf has capacity.
     fn appendToRightmost(node: *Node, text: []const u8) void {
         const added_nl = countNewlines(text);
+        const added_ch = countChars(text);
         var n = node;
         while (true) {
             n.bytes += text.len;
             n.newlines += added_nl;
+            n.chars += added_ch;
             switch (n.kind) {
                 .leaf => |l| {
                     std.debug.assert(@as(usize, l.len) + text.len <= MAX_LEAF);
@@ -292,6 +321,7 @@ pub const Rope = struct {
                 node.kind.leaf.len = @intCast(k);
                 node.bytes = k;
                 node.newlines = countNewlines(content[0..k]);
+                node.chars = countChars(content[0..k]);
                 return .{ .left = node, .right = right };
             },
             .inner => |in| {
@@ -365,11 +395,14 @@ pub const Rope = struct {
                     @memcpy(buf[off .. off + text.len], text);
                     node.kind.leaf.len = @intCast(@as(usize, l.len) + text.len);
                     const added_nl = countNewlines(text);
+                    const added_ch = countChars(text);
                     node.bytes += text.len;
                     node.newlines += added_nl;
+                    node.chars += added_ch;
                     for (path_buf[0..depth]) |p| {
                         p.bytes += text.len;
                         p.newlines += added_nl;
+                        p.chars += added_ch;
                     }
                     return true;
                 },
@@ -450,6 +483,63 @@ pub const Rope = struct {
                         node = in.left;
                     } else {
                         target -= in.left.newlines;
+                        off += in.left.bytes;
+                        node = in.right;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Non-continuation bytes in [0, offset) — the character offset of
+    /// byte `offset`. O(log n) descent plus at most one leaf scan.
+    pub fn charsBefore(self: *const Rope, offset: usize) usize {
+        std.debug.assert(offset <= self.len());
+        var node = self.root orelse return 0;
+        var k = offset;
+        var acc: usize = 0;
+        while (true) {
+            if (k >= node.bytes) return acc + node.chars;
+            switch (node.kind) {
+                .leaf => return acc + countChars(leafSlice(node)[0..k]),
+                .inner => |in| {
+                    if (k <= in.left.bytes) {
+                        node = in.left;
+                    } else {
+                        acc += in.left.chars;
+                        k -= in.left.bytes;
+                        node = in.right;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Byte offset of the lead byte of 0-based character `ch`; the
+    /// rope length when `ch` is at or past `charCount()`. O(log n)
+    /// descent plus at most one leaf scan.
+    pub fn charToOffset(self: *const Rope, ch: usize) usize {
+        if (ch >= self.charCount()) return self.len();
+        var node = self.root.?;
+        var target = ch;
+        var off: usize = 0;
+        while (true) {
+            switch (node.kind) {
+                .leaf => {
+                    var seen: usize = 0;
+                    for (leafSlice(node), 0..) |b, i| {
+                        if (!isCont(b)) {
+                            if (seen == target) return off + i;
+                            seen += 1;
+                        }
+                    }
+                    unreachable;
+                },
+                .inner => |in| {
+                    if (target < in.left.chars) {
+                        node = in.left;
+                    } else {
+                        target -= in.left.chars;
                         off += in.left.bytes;
                         node = in.right;
                     }
@@ -562,6 +652,7 @@ pub const Rope = struct {
                 std.debug.assert(l.len <= MAX_LEAF);
                 std.debug.assert(node.bytes == l.len);
                 std.debug.assert(node.newlines == countNewlines(leafSlice(node)));
+                std.debug.assert(node.chars == countChars(leafSlice(node)));
                 std.debug.assert(node.height == 1);
             },
             .inner => |in| {
@@ -569,6 +660,7 @@ pub const Rope = struct {
                 checkNode(in.right);
                 std.debug.assert(node.bytes == in.left.bytes + in.right.bytes);
                 std.debug.assert(node.newlines == in.left.newlines + in.right.newlines);
+                std.debug.assert(node.chars == in.left.chars + in.right.chars);
                 std.debug.assert(node.height == 1 + @max(in.left.height, in.right.height));
                 const diff = @as(i32, in.left.height) - @as(i32, in.right.height);
                 std.debug.assert(diff >= -1 and diff <= 1);
@@ -688,6 +780,53 @@ test "rope trailing newline makes an empty last line" {
     try testing.expectEqual(@as(usize, 0), lc.col);
 }
 
+test "rope character aggregate counts codepoints, not bytes" {
+    var r = try Rope.initFromBytes(testing.allocator, "ab\u{e9}c\n\u{1F600}xy\n");
+    defer r.deinit();
+    // 9 characters, 13 bytes.
+    try testing.expectEqual(@as(usize, 13), r.len());
+    try testing.expectEqual(@as(usize, 9), r.charCount());
+    try testing.expectEqual(@as(usize, 2), r.charsBefore(2)); // before é
+    try testing.expectEqual(@as(usize, 3), r.charsBefore(4)); // after é
+    try testing.expectEqual(@as(usize, 2), r.charToOffset(2));
+    try testing.expectEqual(@as(usize, 4), r.charToOffset(3));
+    // The emoji is one character, four bytes.
+    try testing.expectEqual(@as(usize, 6), r.charToOffset(5));
+    try testing.expectEqual(@as(usize, 10), r.charToOffset(6));
+    // At/past the end clamps to the rope length.
+    try testing.expectEqual(@as(usize, 13), r.charToOffset(9));
+    try testing.expectEqual(@as(usize, 13), r.charToOffset(999));
+
+    // Edits keep the aggregate exact, including a delete that cuts a
+    // multi-byte sequence in half.
+    try r.insert(2, "\u{4e2d}\u{6587}");
+    try testing.expectEqual(@as(usize, 11), r.charCount());
+    try r.delete(3, 8); // mid-sequence on both ends of the range
+    r.checkInvariants();
+    const got = try r.sliceAlloc(testing.allocator, 0, r.len());
+    defer testing.allocator.free(got);
+    try testing.expectEqual(Rope.countChars(got), r.charCount());
+}
+
+test "rope char queries straddle leaf boundaries" {
+    // A multi-byte sequence sitting exactly on a leaf seam: build from
+    // two inserts so the 4-byte emoji is cut across leaves.
+    var r = Rope.init(testing.allocator);
+    defer r.deinit();
+    const big = try testing.allocator.alloc(u8, MAX_LEAF);
+    defer testing.allocator.free(big);
+    @memset(big, 'a');
+    try r.insert(0, big);
+    try r.insert(MAX_LEAF, big);
+    try r.insert(MAX_LEAF, "\u{1F600}"); // may land on the seam
+    r.checkInvariants();
+    try testing.expectEqual(@as(usize, 2 * MAX_LEAF + 1), r.charCount());
+    try testing.expectEqual(@as(usize, MAX_LEAF), r.charsBefore(MAX_LEAF));
+    try testing.expectEqual(@as(usize, MAX_LEAF + 1), r.charsBefore(MAX_LEAF + 4));
+    try testing.expectEqual(@as(usize, MAX_LEAF), r.charToOffset(MAX_LEAF));
+    try testing.expectEqual(@as(usize, MAX_LEAF + 4), r.charToOffset(MAX_LEAF + 1));
+}
+
 test "rope initFromBytes crosses leaf boundaries" {
     // Big enough to force a multi-leaf tree.
     const n = MAX_LEAF * 7 + 123;
@@ -776,6 +915,7 @@ test "rope fuzz vs byte-array oracle" {
             r.checkInvariants();
             try expectContent(&r, oracle.items);
             try testing.expectEqual(Rope.countNewlines(oracle.items), r.newlineCount());
+            try testing.expectEqual(Rope.countChars(oracle.items), r.charCount());
         }
         if (op % 37 == 0 and oracle.items.len > 0) {
             // Random line/offset queries vs oracle.
@@ -789,6 +929,11 @@ test "rope fuzz vs byte-array oracle" {
             while (line_start > 0 and oracle.items[line_start - 1] != '\n') line_start -= 1;
             try testing.expectEqual(line_start, r.lineToOffset(lc.line));
             try testing.expectEqual(off - line_start, lc.col);
+            // Character queries vs oracle (content is 'a'..'z' + '\n',
+            // so lead-byte counting equals byte counting here; the
+            // multibyte cases live in the dedicated tests and the
+            // document fuzzer).
+            try testing.expectEqual(Rope.countChars(oracle.items[0..off]), r.charsBefore(off));
         }
     }
     r.checkInvariants();
