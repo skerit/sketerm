@@ -177,6 +177,33 @@ pub fn connectManualPopoverClose(popover: *c.GtkWidget) void {
     );
 }
 
+var theme_flip_installed = false;
+
+/// Test hook: `SKETERM_THEME_FLIP_MS=<ms>` flips the process-global
+/// colour scheme on a timer. It exists because `notify::dark` has no
+/// other trigger a test rig can reach — libadwaita 1.9 takes the
+/// system preference from the desktop portal only (its GSettings
+/// fallback is gone; `system_supports_color_schemes` reads 0 without a
+/// portal), so nothing outside the process can emit that signal.
+/// Unset, this costs one getenv per process.
+fn installThemeFlipHook() void {
+    if (theme_flip_installed) return; // the style manager is a singleton
+    const raw = c.getenv("SKETERM_THEME_FLIP_MS") orelse return;
+    const ms = std.fmt.parseInt(c_uint, std.mem.span(raw), 10) catch return;
+    if (ms == 0) return;
+    theme_flip_installed = true;
+    _ = c.g_timeout_add(ms, @ptrCast(&onThemeFlipTick), null);
+}
+
+fn onThemeFlipTick(_: ?*anyopaque) callconv(.c) c.gboolean {
+    const sm = c.adw_style_manager_get_default();
+    c.adw_style_manager_set_color_scheme(sm, if (c.adw_style_manager_get_color_scheme(sm) == c.ADW_COLOR_SCHEME_FORCE_DARK)
+        c.ADW_COLOR_SCHEME_FORCE_LIGHT
+    else
+        c.ADW_COLOR_SCHEME_FORCE_DARK);
+    return 1; // G_SOURCE_CONTINUE
+}
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -731,6 +758,7 @@ pub const Window = struct {
             null,
             c.G_CONNECT_DEFAULT,
         );
+        installThemeFlipHook();
 
         // Apply persisted tab_position. Init defaults to top via the
         // add_top_bar call earlier; only reposition on bottom.
@@ -808,6 +836,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        self.detachGlobalSignals();
         // Teardown order matters. Steps:
         //
         // 1. Null every Terminal sink + user_ctx so any idle/deferred
@@ -877,6 +906,54 @@ pub const Window = struct {
         if (self.si_bash_shim) |s| self.allocator.free(s);
         self.config.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Drop every signal handler this Window installed on an object
+    /// that OUTLIVES it — the `AdwStyleManager` singleton and the
+    /// application's own action map. Both are process-global, so a
+    /// handler left behind dispatches into freed memory the next time
+    /// the desktop flips light/dark or a notification is activated.
+    ///
+    /// Mechanism 2 of CLAUDE.md's memory-ownership rules (disconnect at
+    /// teardown, `G_SIGNAL_MATCH_DATA`), which is sound here because
+    /// `deinit` is the single choke point every teardown path reaches:
+    /// a secondary window's `onWindowDestroyed` -> `deferredWindowFree`
+    /// idle, and `shutdownWindow` in `main.zig` for app shutdown.
+    /// A `GDestroyNotify` (mechanism 1) is wrong for the same reason —
+    /// the data must outlive the widgets, not die with them.
+    fn detachGlobalSignals(self: *Window) void {
+        _ = c.g_signal_handlers_disconnect_matched(
+            @as(c.gpointer, @ptrCast(c.adw_style_manager_get_default())),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @as(c.gpointer, @ptrCast(self)),
+        );
+
+        // "notify-act" is registered ONCE, by whichever window found it
+        // missing, and its GSimpleAction lives as long as the
+        // application. Take the action away with the handler rather
+        // than leave an inert one behind: the next window's init sees
+        // it missing again and re-registers against itself.
+        //
+        // `gtk_window_get_application` is useless from here — GTK has
+        // already unlinked a destroyed window from its application.
+        if (c.g_application_get_default()) |gapp| {
+            if (c.g_action_map_lookup_action(@ptrCast(gapp), "notify-act")) |act| {
+                const n = c.g_signal_handlers_disconnect_matched(
+                    @as(c.gpointer, @ptrCast(act)),
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    @as(c.gpointer, @ptrCast(self)),
+                );
+                if (n > 0) c.g_action_map_remove_action(@ptrCast(gapp), "notify-act");
+            }
+        }
     }
 
     // ── Tab chrome: split out to ui/tabchrome.zig ──

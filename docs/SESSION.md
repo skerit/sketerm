@@ -14276,3 +14276,167 @@ linear-corrected on Linux and there is a good case for following, but
 flipping it changes how every glyph looks for every existing user, so
 it is one line and a taste call rather than something to slip into a
 release.
+
+## Panels: "no session" is a shape, not a name
+
+`panelstore` filed sessionless panels under a reserved session NAME,
+`NO_SESSION = "_no-session"`, in the same directory namespace as every
+real session. `encodeSession` percent-encoded a leading `_` so real
+names could not spell it - but it made an explicit exception for that
+literal, so a daemon session actually CALLED `_no-session` encoded to
+itself and landed in the sessionless bucket. The two then saw and
+overwrote each other's panels. Classic in-band signalling: a value
+inside the normal range used to mean "not a normal value".
+
+The namespaces are separate on disk now:
+
+    panels/by-session/<encoded-session>/<name>.json
+    panels/no-session/<name>.json
+
+Two PARENTS, so there is no shared directory and nothing to collide -
+a session may be called `_no-session`, `no-session` or `by-session`
+and it is still just one more directory under `by-session/`. The
+percent-encoding of real session names stays (it is what makes `my
+work`, `a/b` and `..` storable as ONE component), minus two things that
+only existed to protect the sentinel: the reserved-literal exception,
+and the leading-`_` escape. A leading `.` still encodes, which is what
+keeps `.` and `..` unreachable as component names.
+
+In the code the sessionless case is `?[]const u8`, not a string that
+might be magic. `panelstore.resolveSession` - where the sentinel used
+to be born, as `explicit orelse $SKETERM_SESSION orelse NO_SESSION` -
+returns `null`, and every store entry point (`save`/`saveJson`/`load`/
+`loadJson`/`exists`/`delete`/`list`/`sessionDir`) takes `?[]const u8`.
+`panelhost` follows: `Entry.session` is optional, `scopeOf` returns an
+optional, and `byKey` compares through `sameSession`, where sessionless
+matches only sessionless. `panel-list`'s filter became a three-way
+`Filter` union (`all` / `none` / `session`) because "no session
+identity in the request at all -> show everything" and "explicitly
+sessionless -> show the sessionless panels" are different questions
+that a `?[]const u8` filter had to answer with the same `null`.
+
+Where the optional STOPS is the string-typed edges, deliberately:
+
+- The control socket carries JSON, and absence already means something
+  else there ("scope me to the requesting pane"). So the wire spelling
+  of sessionless is an EMPTY `session` field - `panelhost
+  .NO_SESSION_WIRE`, documented as a wire encoding and never as a
+  session name. `panelstore` accepts `""` as `null` for the same
+  reason, in ONE place (`norm`), and it is safe because the daemon caps
+  a session at 1..64 bytes: no session can ever be the empty string.
+- `panelhost.sessionForPane` keeps returning `[]const u8` for the GUI's
+  saved-panel picker, which both displays it and hands it to the store;
+  `sessionScopeForPane` is the typed answer used everywhere inside.
+  Making the picker's call optional would have churned four call sites
+  (a dupe, a `{s}` format, a struct field) for no additional safety -
+  the picker cannot construct a wrong key either way.
+
+`panelhost.NO_SESSION` is gone with `panelstore.NO_SESSION`; the test
+that pinned the two spellings together now pins the shapes: what
+`scopeOf` resolves to with neither an explicit session nor a pane is
+`null`, so is `panelstore.resolveSession(null)`, an explicitly empty
+`session` field resolves to the same thing rather than falling through
+to a pane, and the directory that resolves to is not the directory of a
+session called `_no-session`, `no-session` or `default`.
+
+Tests: `panelstore` grew "the sessionless bucket shares no namespace
+with any session" (full sessionless save/load/list/delete/exists; a
+session literally named `_no-session` round-tripping to its own file
+with its own content; the same for `no-session` and `by-session`; and
+`""` reaching the sessionless bucket); the encoder test pins
+`_no-session` encoding to itself as an ordinary name; the traversal
+test now proves the encoded component sits under `by-session/` with no
+separator of its own. `panelhost`'s registry test grew a sessionless
+third entry that no session name can address. `smoke-mcp` stage 5
+checks `panels/by-session/smoke%20ui/vsr.json` (the encoding proof it
+always was), plus a sessionless `ui_save` landing in
+`panels/no-session/`, a `ui_panels session=_no-session` that cannot see
+it, and a sessionless `ui_panels`/`ui_delete` that can.
+
+No migration code: pre-release, and the only stored panels were from
+the same day's testing. A `panels/<session>/` directory left over from
+the old layout is simply never read again - `list` only ever looks in
+the two new parents - so a stale one is dead weight, not a source of
+wrong answers.
+
+Verification: `zig build test`, `test-core`, `mux-portable`,
+`smoke-mcp` green.
+
+### Signal-lifetime rule + a panel-context use-after-free detector
+
+The `panel/view.zig` `::destroy` use-after-free had no written rule
+behind it: the codebase solves that class three ways (disconnect at
+teardown, the widget owns the data, a liveness fence) and nothing said
+which to reach for. CLAUDE.md's memory-ownership section now states the
+choice, the condition each mechanism depends on, and the trap that a
+`GDestroyNotify` on a signal connection is freed BY the disconnect - so
+"do both for safety" turns a disconnect into a free and is worse than
+either alone. Qdata-at-finalize is the exception, and is why
+`panelwin.zig`'s ordering is sound.
+
+On top of one correct owner, `src/ui/panel/canary.zig` adds a DETECTOR
+rather than more redundancy: every panel heap context (`PanelView`,
+`CompCtx`, `Compare`, `PanelWindow`, the picker's `Ctx`/`DeleteCtx`)
+carries a magic word poisoned at free, and each callback resolves its
+user-data through `canary.live`, bailing loudly on a mismatch instead of
+running into freed memory. Guarding the free paths too means a second
+free leaks rather than double-frees. It is an explicit branch, not an
+assert: this project builds ReleaseFast only. Eight tests, including
+double-free shapes the testing allocator would catch if the guard failed
+to fire.
+
+An audit of all 454 `g_signal_connect*` sites in `src/ui/**` found one
+live bug, fixed separately: `window.zig:709` hung `notify::dark` off the
+process-global AdwStyleManager with a raw `*Window` and never
+disconnected, so closing a secondary window and then flipping the system
+theme ran `onThemeChanged` on freed memory.
+
+### The AdwStyleManager use-after-free, fixed and covered end to end
+
+The bug the audit above named is now fixed and has a smoke stage of its
+own. `Window.init` connected `notify::dark` on
+`adw_style_manager_get_default()` - a PROCESS-GLOBAL singleton - with a
+heap `*Window` and no destroy-notify, while `Window.deinit` ends in
+`allocator.destroy(self)`. Detach a tab into a secondary window (or
+`openShellWindow` / `openFilesWindow`), close it, and
+`onWindowDestroyed` -> `deferredWindowFree` frees the Window; the
+singleton then still holds a handler pointing at it.
+
+Reproduced before fixing: with pointer-identity tracing,
+`deferredWindowFree` freed `Window@...b3a60000` and the very next
+colour-scheme flip ran `winconfig.onThemeChanged` on that exact
+pointer. Left running, the GUI stops answering its control socket.
+
+`Window.deinit` now calls `detachGlobalSignals`, which is
+`g_signal_handlers_disconnect_matched` with `G_SIGNAL_MATCH_DATA` -
+mechanism 2 of the memory-ownership rules, because the data must
+outlive the widgets and the target is shared. Its precondition holds:
+`deinit` is the one choke point every teardown path reaches, the
+secondary-window idle and `main.zig`'s `shutdownWindow` both landing
+there.
+
+A second instance of the same shape turned up in the same file and is
+fixed alongside: the app-scoped `notify-act` GAction (desktop
+notification activation) is registered once, on the GApplication's
+action map, with the registering window as user data. Its
+`GSimpleAction` lives as long as the application, so the handler
+outlived that window too. The action is now removed with its handler,
+which also repairs a second defect - the next window's init finds it
+missing and re-registers against itself, where before a closed
+registrant left notification activation permanently pointed at freed
+memory.
+
+Covered by `themeSingletonStage` in `smoke_e2e.zig`. `notify::dark` has
+no trigger outside the process (libadwaita 1.9 takes the system
+preference from the desktop portal only - its GSettings fallback is
+gone, and `system_supports_color_schemes` reads 0 without a portal), so
+the GUI gained one env-gated test hook, `SKETERM_THEME_FLIP_MS=<ms>`,
+which flips the scheme on a timer. The stage runs its OWN GUI instance
+on the shared display session: the variable has to be set at exec time,
+and a window repainting five times a second would wreck every pixel
+assertion the other stages make. Negative control: with the disconnect
+removed the stage fails on "the GUI went unhealthy after a secondary
+window was closed under a theme flip"; with it, green.
+
+Verification: `zig build test`, `test-core`, `mux-portable`,
+`smoke-mcp`, `smoke-e2e` green.
