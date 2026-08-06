@@ -14538,3 +14538,69 @@ now inside the surface; the frame tick stays widget-owned).
 
 Verification: `zig build`, `test`, `smoke-gl-core`, `mux-portable`,
 `smoke-e2e` green.
+
+## GUI cast playback: `sketerm play <file.cast>`
+
+The client half of the daemon's cast-playback sessions. `sketerm play
+<path>` (terminal application identity, no suffix - a forwarded
+invocation opens its window in the running instance, several
+invocations several windows) spawns an EPHEMERAL cast session
+(`SpawnReq.cast_path`) on the local autostarted daemon - or, for
+`host:/path`, on that host's daemon over the usual transports - and
+opens a `CastView` (`src/ui/castview.zig`): an AdwApplicationWindow
+owning a `Terminal` (initRemote) and a `TerminalSurface` in
+`fixed_grid` geometry, plus a transport bar (play/pause, restart,
+seek slider with `gtk_scale_add_mark` ticks for recorded markers,
+m:ss position/duration, speed dropdown 0.25x-4x). Keyboard: Space
+play/pause (Space on finished restarts), Left/Right seek 5s, Shift
+30s, R restart, Q/Escape close. Ephemeral means Terminal.deinit
+KILLS the session, so closing the window leaks nothing; a GUI crash
+leaves it reattachable.
+
+Terminal-side plumbing (`src/terminal.zig`): `play_state` frames
+parse into `Terminal.PlayState` (markers callback-scoped; a scalar
+copy stays on `last_play_state`), dispatched via the new
+`on_play_state` sink - covered automatically by the clearSinks
+reflection guard - and `sendPlayControl(op, ms, speed)` emits
+op-specific JSON, gated on the welcome's `cast_playback` so an old
+daemon never sees the frame.
+
+The sink wiring is deliberately PASSIVE (the cast is untrusted
+content): render request, images, glyph coverage, title, play_state -
+and nothing else. No clipboard, notifications, pointer shape, cwd,
+command status, bell side effects or profile switches can reach the
+GUI from a recording, and the view never sends input or resize.
+Recorded resizes arrive as snapshot swaps; the render-request sink
+tracks `screen.cols/rows` into the fixed_grid dims. Fonts follow the
+user's config; colors/theme stay at renderer defaults for now.
+
+`fixed_grid` held up on its first real render: letterboxing, the
+offscreen-detour viewport ordering and the resize path all worked
+unmodified. The one bug found was CastView's own: the post-seek
+slider guard also swallowed seek-COMPLETION play_state pushes, so
+the thumb stuck at the drag point; only throttled `.playing` pushes
+can be stale, and event-driven states now always land.
+
+Slider seeks are throttled to one per 250ms - every seek is a full
+daemon-side replay from byte zero, and a drag must not stream one
+per pixel. Selection/copy inside the view is out of scope for v1;
+`sketerm play` with a dead file prints the daemon's reason and opens
+no window (exit status stays 0 when GApplication had nothing else
+to show - known cosmetic gap).
+
+smoke-e2e grew a `castPlaybackStage`: a hand-written v2 cast (red
+block, recorded resize, green block, marker, blue block at 30s so
+normal playback never reaches it), `sketerm play` launched into the
+display session, pixels asserted per color, every control driven on
+the real seat, and the daemon's play_state stream cross-checked over
+a read-only side attachment (playing -> paused -> playing ->
+finished at 30000/30000 with the 1400ms marker -> restart) - ending
+with Q, a clean GUI exit and the session gone from the daemon list.
+Broker gotcha the stage found: `.list` on a broker answers with a
+refreshed `.welcome`, not `.ok`.
+
+Verification: `zig build`, unit suite (2027 tests via the test
+binary; the `zig build test` wrapper trips a pre-existing tesseract
+leak flake on this host, also on clean master), `smoke-e2e`,
+`mux-portable` (+ aarch64-macos cross) green; `ldd sketerm-mux`
+still libc/libm only.
