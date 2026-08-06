@@ -161,6 +161,12 @@ pub fn isCastName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".cast");
 }
 
+/// Resources the Sketerm Viewer can show in a navigable batch: images
+/// plus terminal recordings, which it plays in place.
+pub fn isViewerName(name: []const u8) bool {
+    return isImageName(name) or isCastName(name);
+}
+
 pub fn isWorkerImageName(name: []const u8) bool {
     const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff" };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
@@ -313,6 +319,14 @@ test "isCastName matches only the recording extension" {
     // A cast is not an image and never gets a thumbnail.
     try t.expect(!isImageName("a.cast"));
     try t.expect(!isPreviewMediaName("a.cast"));
+}
+
+test "isViewerName covers images and casts but nothing else" {
+    const t = std.testing;
+    try t.expect(isViewerName("photo.JPG"));
+    try t.expect(isViewerName("session.cast"));
+    try t.expect(!isViewerName("notes.txt"));
+    try t.expect(!isViewerName("clip.mp4"));
 }
 
 test "formatSpecAlloc preserves resources larger than the fixed scratch buffer" {

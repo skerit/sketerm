@@ -16,7 +16,7 @@ const countSelected = @import("nav.zig").countSelected;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
 const isCastName = @import("../../filebrowser/paths.zig").isCastName;
-const isImageName = @import("../../filebrowser/paths.zig").isImageName;
+const isViewerName = @import("../../filebrowser/paths.zig").isViewerName;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
 const launchLocal = @import("open.zig").launchLocal;
@@ -456,7 +456,9 @@ fn addOpenAppItem(
 /// chooser dialog's local section.
 fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
-    if (isImageName(path))
+    // A cast gets BOTH: the Viewer for a navigable batch alongside the
+    // folder's other resources, "Play in Sketerm" for a dedicated window.
+    if (isViewerName(path))
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
     if (isCastName(path))
         m.itemIcon("Play in Sketerm", .{ .name = "media-playback-start-symbolic" }, &onMenuCastPlay, ctx);

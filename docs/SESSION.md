@@ -14672,7 +14672,13 @@ Registration: `data/dev.sker.sketerm.viewer.desktop` gained
 `application/x-asciicast` and a widened Comment/Keywords; the batch
 collector needed nothing (it is extension-agnostic). Files' "Open in
 Sketerm Viewer" menu exposure for casts was left alone (browser
-files off-limits this run) - follow-up if wanted.
+files off-limits this run) - follow-up if wanted. That follow-up
+landed right after: `paths.isViewerName` (images + casts) now gates
+both the Files "Open in Sketerm Viewer" row and all three branches
+of `open.launchViewer`'s sequence builder (multi-selection, icons
+walk, column-view walk), so a folder holding both hands the Viewer
+one mixed batch with the clicked item as initial, while "Play in
+Sketerm" stays as the dedicated-window route.
 
 smoke-e2e grew `viewerCastStage`: `sketerm view <png> <cast>` into
 the display session, Right -> red+green blocks render in place, a
