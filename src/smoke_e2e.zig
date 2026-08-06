@@ -65,6 +65,8 @@ var restore_pid: c.pid_t = -1;
 /// The standalone image viewer (`sketerm view`) spawned into the same
 /// display session by viewerMenuStage. Killed by EXACT pid.
 var viewer_pid: c.pid_t = -1;
+/// The theme-flip GUI (themeSingletonStage), killed by EXACT pid.
+var theme_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -109,6 +111,7 @@ fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
 /// this run started is gone" true regardless of who started it.
 fn teardown() void {
     dkTeardown();
+    themeTeardown();
     if (viewer_pid > 0) {
         _ = c.kill(viewer_pid, c.SIGKILL);
         var vst: c_int = 0;
@@ -337,6 +340,17 @@ fn dkTeardown() void {
         const r = runDisplayCli(g_alloc, &.{ "destroy", DEADKEY_SESSION, "--socket", g_mux_sock });
         g_alloc.free(r.out);
         dk_ready = false;
+    }
+}
+
+/// Tear down only the theme stage's GUI, by exact pid. Idempotent, so
+/// the stage's own early returns and the global teardown share it.
+fn themeTeardown() void {
+    if (theme_pid > 0) {
+        _ = c.kill(theme_pid, c.SIGKILL);
+        var st: c_int = 0;
+        _ = c.waitpid(theme_pid, &st, 0);
+        theme_pid = -1;
     }
 }
 
@@ -951,6 +965,13 @@ pub fn main() u8 {
         // running long enough for the face's widgets to be finalized.
         if (panePanelLifetimeStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("panel face on a pane: shown and closed three times, and the GUI outlived every deferred widget destroy");
+    }
+
+    // 6c-8. The process-global signal targets: a secondary window
+    // freed while the AdwStyleManager singleton keeps emitting.
+    if (!platform.is_macos) {
+        if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
+        say("secondary window detached and closed while the global style manager kept flipping light/dark");
     }
 
     // 6d. Dead keys, composed by a real seat on a Belgian keymap, in
@@ -2840,6 +2861,126 @@ fn panePanelLifetimeStage(
         defer allocator.free(listed);
         if (std.mem.indexOf(u8, listed, "\"name\":\"e2e-life\"") != null)
             return "a closed pane panel is still listed";
+    }
+    return null;
+}
+
+/// A secondary window's `Window` struct is freed by
+/// `deferredWindowFree` while the process lives on, so anything still
+/// pointing at it from a PROCESS-GLOBAL object is a use-after-free
+/// waiting for the next emission. The one that bit was the
+/// `AdwStyleManager` singleton's `notify::dark`: connected per window
+/// in `Window.init`, never disconnected, and the singleton outlives
+/// every window. Detach a tab, close that window, then keep flipping
+/// light/dark and keep asking whether the GUI still answers.
+///
+/// Its OWN GUI instance, for two reasons: the flip hook has to be set
+/// in the environment at exec time, and a colour scheme changing every
+/// 200ms would repaint the window under every pixel assertion the
+/// other stages make. It shares the display session — a second viewer
+/// is not needed, the same hub sees both instances' windows.
+fn themeSingletonStage(
+    allocator: std.mem.Allocator,
+    maybe_app: ?*appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const app = maybe_app orelse return null;
+
+    // Windows already on the hub belong to the other instances; only
+    // ids that appear after this fork are ours.
+    _ = app.drainLive(500);
+    var pre: std.ArrayList(u32) = .empty;
+    defer pre.deinit(allocator);
+    for (app.windows.items) |w| pre.append(allocator, w.id) catch return "alloc";
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for the theme GUI failed";
+    if (pid == 0) {
+        dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.theme", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        // The hook this stage exists for: nothing outside the process
+        // can emit notify::dark (libadwaita takes the system preference
+        // from the desktop portal only).
+        _ = c.setenv("SKETERM_THEME_FLIP_MS", "200", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    theme_pid = pid;
+    defer themeTeardown();
+
+    const sock = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, pid }, 0) catch
+        return "alloc";
+    defer allocator.free(sock);
+    var waited: u32 = 0;
+    while (c.access(sock.ptr, c.F_OK) != 0) {
+        _ = c.usleep(100_000);
+        waited += 1;
+        if (waited > 200) return "the theme GUI never opened its control socket";
+    }
+    _ = app.drainLive(3_000);
+
+    // A second tab, selected, so `detach_tab` moves a SINGLE-pane tab:
+    // one pane means the confirm-close policy lets the window go
+    // without putting a dialog up. A tab created over IPC is not
+    // necessarily the selected one, hence the explicit focus.
+    const opened = roundtrip(allocator, sock, "{\"cmd\":\"new-tab\"}\n") orelse
+        return "new-tab(for detach) roundtrip";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "new-tab(for detach) not ok";
+    const pane = parseNumAfter(opened, "\"pane\":") orelse
+        return "new-tab(for detach) reply has no pane id";
+
+    var buf: [128]u8 = undefined;
+    const focus_req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch
+        return "focus fmt";
+    const focused = roundtrip(allocator, sock, focus_req) orelse return "focus roundtrip";
+    defer allocator.free(focused);
+    if (std.mem.indexOf(u8, focused, "\"ok\":true") == null) return "focus not ok";
+
+    const detached = roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"detach_tab\"}\n") orelse
+        return "detach_tab roundtrip";
+    defer allocator.free(detached);
+    if (std.mem.indexOf(u8, detached, "\"ok\":true") == null) return "detach_tab not ok";
+
+    // Let the new toplevel map and paint: an unrealized window has not
+    // handed out the references that make its teardown deferred.
+    _ = app.drainLive(2_000);
+    var secondary: u32 = 0;
+    for (app.windows.items) |w| {
+        if (w.popup) continue;
+        if (std.mem.indexOfScalar(u32, pre.items, w.id) != null) continue;
+        secondary = w.id;
+    }
+    if (secondary == 0) return "detach_tab produced no new window on the display session";
+
+    app.closeWindow(secondary) catch return "closing the detached window failed";
+    var gone: u32 = 0;
+    while (gone < 8_000) : (gone += 250) {
+        _ = app.pumpOnce(250);
+        if (app.windowGone(secondary)) break;
+    }
+    if (!app.windowGone(secondary)) return "the detached window never closed";
+
+    // The fuse. `deferredWindowFree` runs on an idle after the destroy
+    // chain unwinds, and the flip timer fires five times a second, so
+    // by the end of this loop a handler left on the style manager has
+    // dispatched into the freed Window many times over.
+    var alive_waited: u32 = 0;
+    while (alive_waited < 5_000) : (alive_waited += 250) {
+        _ = app.pumpOnce(250);
+        const alive = roundtrip(allocator, sock, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
+            return "the GUI stopped serving after a secondary window was closed under a theme flip";
+        defer allocator.free(alive);
+        if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
+            return "the GUI went unhealthy after a secondary window was closed under a theme flip";
     }
     return null;
 }
