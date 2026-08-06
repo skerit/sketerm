@@ -197,13 +197,31 @@ fn checkText(doc: *const Document, model: *const Model, seed: u64, step: usize) 
     }
 }
 
-/// The rope's line index must agree with a naive recount, at random
-/// offsets and lines.
+/// Byte offset of the lead byte of character `ch` in `text`, or
+/// text.len when past the end — a naive scan, the oracle for
+/// `Rope.charToOffset`.
+fn naiveCharToOffset(text: []const u8, ch: usize) usize {
+    var seen: usize = 0;
+    for (text, 0..) |b, i| {
+        if (b & 0xC0 != 0x80) {
+            if (seen == ch) return i;
+            seen += 1;
+        }
+    }
+    return text.len;
+}
+
+/// The rope's line AND character indexes must agree with a naive
+/// recount, at random offsets and lines. The insertion pieces include
+/// 2/3/4-byte sequences, lone continuation bytes and edits that land
+/// mid-sequence, so the character aggregate is exercised on exactly
+/// the byte soup that would expose a drifting count.
 fn checkLineIndex(doc: *const Document, model: *const Model, rand: std.Random) !void {
     const text = model.text.items;
     const expect_lines = std.mem.count(u8, text, "\n") + 1;
     try testing.expectEqual(expect_lines, doc.rope.lineCount());
     try testing.expectEqual(text.len, doc.rope.len());
+    try testing.expectEqual(Rope.countChars(text), doc.rope.charCount());
 
     var probe: usize = 0;
     while (probe < 4) : (probe += 1) {
@@ -222,6 +240,18 @@ fn checkLineIndex(doc: *const Document, model: *const Model, rand: std.Random) !
         const lstart = doc.rope.lineToOffset(line);
         try testing.expect(lstart <= text.len);
         try testing.expectEqual(line, doc.rope.newlinesBefore(lstart));
+
+        // Character index vs naive recount, and the inverse mapping.
+        const expect_chars = Rope.countChars(text[0..off]);
+        try testing.expectEqual(expect_chars, doc.rope.charsBefore(off));
+        const total = doc.rope.charCount();
+        const ch = rand.intRangeAtMost(usize, 0, total + 1);
+        try testing.expectEqual(naiveCharToOffset(text, ch), doc.rope.charToOffset(ch));
+        // charsBefore is the left inverse of charToOffset for real
+        // character indexes.
+        if (ch < total) {
+            try testing.expectEqual(ch, doc.rope.charsBefore(doc.rope.charToOffset(ch)));
+        }
     }
 }
 
