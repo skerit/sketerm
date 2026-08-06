@@ -2,16 +2,16 @@
 Type=Application
 Name=Sketerm Viewer
 GenericName=Image Viewer
-Comment=View local and remote images through the sketerm file service
+Comment=View local and remote images and terminal recordings through the sketerm file service
 TryExec=sketerm-viewer
 Exec=sketerm-viewer %U
 Icon=dev.sker.sketerm.viewer
 Categories=Graphics;Viewer;
-MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/svg+xml;image/avif;image/heif;image/jxl;image/vnd.microsoft.icon;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/svg+xml;image/avif;image/heif;image/jxl;image/vnd.microsoft.icon;application/x-asciicast;
 StartupNotify=true
 StartupWMClass=dev.sker.sketerm.viewer
 Terminal=false
-Keywords=image;photo;picture;viewer;remote;
+Keywords=image;photo;picture;viewer;remote;recording;asciicast;
 Actions=new-window;
 
 [Desktop Action new-window]
