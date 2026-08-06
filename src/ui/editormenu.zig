@@ -408,6 +408,14 @@ fn setGroupVisible(group: *c.GSimpleActionGroup, action: [*:0]const u8, widgets:
 
 fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
+    // The gutter shares this widget with the text but not its menu:
+    // a click there is about the LINE under the pointer, so it gets
+    // the line-oriented menu instead of the caret-oriented one.
+    if (ctx.view.gutterLineAt(x, y)) |line| {
+        _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
+        showGutterMenu(ctx.view, line, x, y);
+        return;
+    }
     if (!ctx.view.menuPrePopup(ctx.group, x, y)) return;
     // Claim before popup: without it the release event dismisses the
     // popover the frame it maps (ui/menu.zig documents the race).
@@ -425,6 +433,217 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     };
     c.gtk_popover_set_pointing_to(@ptrCast(ctx.popover), &rect);
     c.gtk_popover_popup(@ptrCast(ctx.popover));
+}
+
+// ---- the gutter ---------------------------------------------------
+//
+// The line-number / fold / VCS column. Its menu is line-oriented: it
+// acts on the line that was clicked, not on the caret, and it offers
+// nothing that needs a selection.
+//
+// What is deliberately NOT here:
+//   * breakpoints — sketerm has no debugger, and a row that toggles a
+//     mark nothing reads would be a lie;
+//   * stage / revert hunk — the GUI never touches the disk and never
+//     runs a process (browser/CLAUDE.md), and the daemon's VCS verbs
+//     (`git_status`, `git_diff`) are read-only. There is no write path
+//     to put behind such a row.
+
+pub const GutterAction = enum {
+    toggle_fold,
+    fold_all,
+    unfold_all,
+    goto_line,
+    copy_line_number,
+    select_line,
+    next_hunk,
+    prev_hunk,
+};
+
+/// Heap context for one gutter-menu row: the view, the verb and the
+/// line the menu was opened on. Owned by the classicmenu Root.
+const GutterCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *EditorView,
+    action: GutterAction,
+    line: usize,
+
+    fn make(root: *classicmenu.Root, view: *EditorView, action: GutterAction, line: usize) ?*GutterCtx {
+        const ctx = view.allocator.create(GutterCtx) catch return null;
+        ctx.* = .{ .allocator = view.allocator, .view = view, .action = action, .line = line };
+        root.own(&free, @ptrCast(ctx));
+        return ctx;
+    }
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const self: *GutterCtx = @ptrCast(@alignCast(user.?));
+        self.allocator.destroy(self);
+    }
+};
+
+fn onGutterRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *GutterCtx = @ptrCast(@alignCast(user.?));
+    ctx.view.gutterAction(ctx.action, ctx.line);
+}
+
+/// Add one gutter row, or nothing at all when the context could not be
+/// allocated (a row with no handler must never appear).
+fn gutterRow(
+    m: classicmenu.Menu,
+    root: *classicmenu.Root,
+    view: *EditorView,
+    label: [*:0]const u8,
+    icon: [*:0]const u8,
+    enabled: bool,
+    action: GutterAction,
+    line: usize,
+) void {
+    const ctx = GutterCtx.make(root, view, action, line) orelse return;
+    m.itemIconEnabled(label, .{ .name = icon }, enabled, &onGutterRow, @ptrCast(ctx));
+}
+
+/// The gutter's context menu, built fresh for each popup so every row's
+/// sensitivity is the state at popup time.
+pub fn showGutterMenu(view: *EditorView, line: usize, x: f64, y: f64) void {
+    const st = view.gutterState(line) orelse return;
+    const root = classicmenu.Root.create(view.allocator) orelse return;
+    const m = root.top();
+
+    // Folding. One toggle row whose label says what it will do; it is
+    // insensitive (not absent) when folding is off or this line heads
+    // no region, so the gutter still explains what it can do.
+    gutterRow(
+        m,
+        root,
+        view,
+        if (st.folded) "Unfold This Region" else "Fold This Region",
+        if (st.folded) "list-add-symbolic" else "list-remove-symbolic",
+        st.folded or st.foldable,
+        .toggle_fold,
+        line,
+    );
+    gutterRow(m, root, view, "Fold All", "view-restore-symbolic", st.folding, .fold_all, line);
+    gutterRow(m, root, view, "Unfold All", "view-fullscreen-symbolic", st.any_folded, .unfold_all, line);
+
+    // The line itself. The label carries no line number: the number
+    // is in the gutter directly under the pointer, and a row whose
+    // text changes per click is harder to find again than one whose
+    // text never moves.
+    const l = m.section();
+    gutterRow(l, root, view, "Copy Line Number", "edit-copy-symbolic", true, .copy_line_number, line);
+    gutterRow(l, root, view, "Select This Line", "edit-select-all-symbolic", true, .select_line, line);
+    gutterRow(l, root, view, "Go to Line\u{2026}", "go-jump-symbolic", true, .goto_line, line);
+
+    // Change navigation: the gutter is where the diff marks are drawn,
+    // so this is where a person looks for them. Insensitive with no
+    // marks rather than absent — "this file has no changes" is the
+    // answer to the question, and `stepHunk` says which of the two
+    // reasons it is on the status line.
+    const g = m.section();
+    gutterRow(g, root, view, "Next Change", "go-down-symbolic", st.has_hunks, .next_hunk, line);
+    gutterRow(g, root, view, "Previous Change", "go-up-symbolic", st.has_hunks, .prev_hunk, line);
+
+    _ = root.popupVia(@ptrCast(view.area), view.root_box, x, y);
+}
+
+// ---- the status line ----------------------------------------------
+//
+// The one-line summary under the canvas. Its menu offers exactly what
+// the line REPORTS and nothing else: soft wrap (which it shows as
+// "Wrap"), the caret position (Go to Line), the change count, and the
+// diagnostic counts. There is no row for the language or the
+// line-ending style, because the editor detects the language from the
+// filename and shebang and has no override to expose, and has no
+// re-encoding path to put behind a line-ending row — a menu that
+// exists to not be empty is worse than no menu.
+
+pub const StatusAction = enum {
+    toggle_wrap,
+    goto_line,
+    next_hunk,
+    prev_hunk,
+    next_diag,
+    prev_diag,
+};
+
+const StatusCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *EditorView,
+    action: StatusAction,
+
+    fn make(root: *classicmenu.Root, view: *EditorView, action: StatusAction) ?*StatusCtx {
+        const ctx = view.allocator.create(StatusCtx) catch return null;
+        ctx.* = .{ .allocator = view.allocator, .view = view, .action = action };
+        root.own(&free, @ptrCast(ctx));
+        return ctx;
+    }
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const self: *StatusCtx = @ptrCast(@alignCast(user.?));
+        self.allocator.destroy(self);
+    }
+};
+
+fn onStatusRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *StatusCtx = @ptrCast(@alignCast(user.?));
+    ctx.view.statusAction(ctx.action);
+}
+
+fn statusRow(
+    m: classicmenu.Menu,
+    root: *classicmenu.Root,
+    view: *EditorView,
+    label: [*:0]const u8,
+    icon: [*:0]const u8,
+    enabled: bool,
+    action: StatusAction,
+) void {
+    const ctx = StatusCtx.make(root, view, action) orelse return;
+    m.itemIconEnabled(label, .{ .name = icon }, enabled, &onStatusRow, @ptrCast(ctx));
+}
+
+/// Right-click on the status label. Nothing pops when there is no
+/// document: every row would be inert.
+pub fn showStatusMenu(view: *EditorView, x: f64, y: f64) void {
+    const st = view.statusState() orelse return;
+    const root = classicmenu.Root.create(view.allocator) orelse return;
+    const m = root.top();
+
+    if (StatusCtx.make(root, view, .toggle_wrap)) |cx| {
+        m.check("Soft Wrap", st.wrap, &onStatusRow, @ptrCast(cx));
+    }
+    statusRow(m, root, view, "Go to Line\u{2026}", "go-jump-symbolic", true, .goto_line);
+
+    const g = m.section();
+    statusRow(g, root, view, "Next Change", "go-down-symbolic", st.has_hunks, .next_hunk);
+    statusRow(g, root, view, "Previous Change", "go-up-symbolic", st.has_hunks, .prev_hunk);
+
+    // Diagnostics ride this same line; with no server attached there
+    // are none to step through, so the rows are absent rather than
+    // permanently dead — exactly the rule the canvas menu's LSP rows
+    // already follow.
+    if (st.lsp) {
+        const d = m.section();
+        statusRow(d, root, view, "Next Diagnostic", "dialog-warning-symbolic", true, .next_diag);
+        statusRow(d, root, view, "Previous Diagnostic", "dialog-warning-symbolic", true, .prev_diag);
+    }
+
+    _ = root.popupVia(@ptrCast(@alignCast(view.status_label)), view.root_box, x, y);
+}
+
+/// Attach the status-line menu to the status label. The label is a
+/// plain GtkLabel, so the gesture is all it takes.
+pub fn attachStatusMenu(view: *EditorView, label: *c.GtkWidget) void {
+    const click = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(click), 3);
+    _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onStatusClick), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(label, @ptrCast(click));
+}
+
+fn onStatusClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const view = cast.userData(EditorView, user);
+    _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    showStatusMenu(view, x, y);
 }
 
 // ---- document tab strip -------------------------------------------
