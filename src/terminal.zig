@@ -2349,6 +2349,7 @@ pub const Terminal = struct {
         self.user_ctx = null;
         self.on_title = null;
         self.on_cwd_changed = null;
+        self.on_program_changed = null;
         self.on_clipboard_set = null;
         self.on_clipboard_get = null;
         self.on_glyph_coverage = null;
@@ -2698,4 +2699,44 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     remote.napps.deinit(alloc);
     remote.wsapps.deinit(alloc);
     remote.aapps.deinit(alloc);
+}
+
+/// True for `?*const fn (...) ...` field types (the external-sink shape).
+fn isSinkField(comptime T: type) bool {
+    const opt = switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => return false,
+    };
+    const ptr = switch (@typeInfo(opt)) {
+        .pointer => |p| p.child,
+        else => return false,
+    };
+    return @typeInfo(ptr) == .@"fn";
+}
+
+test "clearSinks nulls every on_* callback (reflection drift guard)" {
+    // Regression: on_program_changed was added long after clearSinks and never
+    // listed there, so a late session_meta frame dispatched it with a nulled
+    // user_ctx and cast.userData crashed. Reflection covers any future sink
+    // automatically -- never hand-maintain a second list of field names.
+    var term: Terminal = undefined;
+    term.remote = null; // failPendingTicket + the napp loop bail out
+
+    const fields = @typeInfo(Terminal).@"struct".fields;
+    inline for (fields) |fld| {
+        if (comptime (isSinkField(fld.type) and std.mem.startsWith(u8, fld.name, "on_"))) {
+            @field(term, fld.name) = @ptrFromInt(0x1000);
+        }
+    }
+
+    term.clearSinks();
+
+    inline for (fields) |fld| {
+        if (comptime (isSinkField(fld.type) and std.mem.startsWith(u8, fld.name, "on_"))) {
+            if (@field(term, fld.name) != null) {
+                std.debug.print("clearSinks missed field: {s}\n", .{fld.name});
+                return error.SinkNotCleared;
+            }
+        }
+    }
 }
