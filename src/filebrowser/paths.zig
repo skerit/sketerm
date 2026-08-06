@@ -154,6 +154,13 @@ pub fn isImageName(name: []const u8) bool {
     return false;
 }
 
+/// Terminal recordings (asciicast v2/v3) `sketerm play` can play back.
+/// Deliberately NOT part of the image/preview sets: a cast has no
+/// thumbnail and no gdk-pixbuf loader.
+pub fn isCastName(name: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(name, ".cast");
+}
+
 pub fn isWorkerImageName(name: []const u8) bool {
     const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff" };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
@@ -295,6 +302,17 @@ test "isImageName recognizes previewable extensions" {
     try t.expect(isImageName("a.jxl"));
     try t.expect(!isImageName("notes.txt"));
     try t.expect(!isImageName("jpg"));
+}
+
+test "isCastName matches only the recording extension" {
+    const t = std.testing;
+    try t.expect(isCastName("session.cast"));
+    try t.expect(isCastName("SESSION.CAST"));
+    try t.expect(!isCastName("cast"));
+    try t.expect(!isCastName("a.cast.gz"));
+    // A cast is not an image and never gets a thumbnail.
+    try t.expect(!isImageName("a.cast"));
+    try t.expect(!isPreviewMediaName("a.cast"));
 }
 
 test "formatSpecAlloc preserves resources larger than the fixed scratch buffer" {

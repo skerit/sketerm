@@ -751,6 +751,7 @@ pub const BrowserView = struct {
     pub const openPathOnHost = @import("open.zig").openPathOnHost;
     pub const openWithDialog = @import("open.zig").openWithDialog;
     pub const launchViewer = @import("open.zig").launchViewer;
+    pub const launchCastPlayer = @import("open.zig").launchCastPlayer;
     pub const appChoiceButton = @import("open.zig").appChoiceButton;
     pub const onAppBtnClicked = @import("open.zig").onAppBtnClicked;
     pub const populateHostApps = @import("open.zig").populateHostApps;
