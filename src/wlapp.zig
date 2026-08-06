@@ -115,6 +115,92 @@ pub const HostMenuRow = struct {
     ctx: ?*anyopaque,
 };
 
+/// A row of the host menu as a DECISION rather than a widget.
+///
+/// Which rows a forwarded window offers, in what order, and with what
+/// wording is the same question for both backends and depends only on
+/// the window's state — so it is decided here, once, by a pure
+/// function `hostMenuPlan`, and each backend only maps items onto its
+/// own handlers. Two things fall out of that:
+///
+///   * the two backends cannot drift apart in row order or labelling
+///     (winapp's half raises a real window only against a remote macOS
+///     agent, so drift there would go unnoticed indefinitely);
+///   * a backend's `switch` over this enum is EXHAUSTIVE, so adding a
+///     row here is a compile error in any backend that has not decided
+///     what to do about it. That is the same class of guard as the
+///     comptime action-name table in `ui/menu.zig`, for the same
+///     reason: nothing at runtime complains about a row that looks
+///     live and does nothing.
+pub const HostMenuItem = enum {
+    screenshot,
+    /// Start a WebM recording — nothing is recording yet.
+    record_webm,
+    /// Stop whatever is recording. Occupies the WebM row's slot,
+    /// because `WindowRec.toggle` stops whichever kind is running.
+    stop_recording,
+    /// Start a GIF recording. Offered only when nothing is recording:
+    /// with a recording live there is one stop row, not two.
+    record_gif,
+    /// Wayland only: leave the embedding pane for a floating toplevel.
+    pop_out,
+    /// Wayland only: move this floating toplevel into a pane.
+    show_in_tab,
+    close,
+};
+
+/// The one spelling of each row. Shared so the backends cannot word
+/// the same verb two ways.
+pub fn hostMenuLabel(item: HostMenuItem) [*:0]const u8 {
+    return switch (item) {
+        .screenshot => "Screenshot Window\u{2026}",
+        .record_webm => "Record Window (WebM)",
+        .stop_recording => "Stop Recording\u{2026}",
+        .record_gif => "Record Window (GIF)",
+        .pop_out => "Pop Out Window",
+        .show_in_tab => "Show in Tab",
+        .close => "Close Window",
+    };
+}
+
+/// What a forwarded window's host menu offers right now.
+pub const HostMenuState = struct {
+    /// A GIF or WebM recording of this window is running.
+    recording: bool = false,
+    /// This window is currently embedded in a pane (Wayland only).
+    embedded: bool = false,
+    /// This host CAN embed a window and none is embedded (Wayland
+    /// only). Ignored when `embedded` is set.
+    can_embed: bool = false,
+};
+
+/// Upper bound on the rows a plan can hold.
+pub const MAX_HOST_MENU_ROWS: usize = 5;
+
+/// The rows this window's host menu shows, in order. Pure: unit-tested
+/// without a window, a GTK context or a remote agent.
+pub fn hostMenuPlan(st: HostMenuState, out: *[MAX_HOST_MENU_ROWS]HostMenuItem) []const HostMenuItem {
+    var n: usize = 0;
+    out[n] = .screenshot;
+    n += 1;
+    out[n] = if (st.recording) .stop_recording else .record_webm;
+    n += 1;
+    if (!st.recording) {
+        out[n] = .record_gif;
+        n += 1;
+    }
+    if (st.embedded) {
+        out[n] = .pop_out;
+        n += 1;
+    } else if (st.can_embed) {
+        out[n] = .show_in_tab;
+        n += 1;
+    }
+    out[n] = .close;
+    n += 1;
+    return out[0..n];
+}
+
 /// Pop a host menu of `rows`, parented to `parent` at (x, y) in its
 /// coordinates. Handlers call `popdownHostMenu` on their button.
 pub fn popupHostMenu(parent: *c.GtkWidget, x: f64, y: f64, rows: []const HostMenuRow) void {
@@ -559,31 +645,30 @@ pub const AppHost = struct {
         /// mechanism (`popupHostMenu`), which winapp.zig uses too; the
         /// embedding rows are this backend's alone.
         fn showHostMenu(self: *Win, x: f64, y: f64) void {
-            var rows: [5]HostMenuRow = undefined;
-            var n: usize = 0;
-            rows[n] = .{ .label = "Screenshot Window\u{2026}", .cb = &onMenuScreenshot, .ctx = self };
-            n += 1;
-            const recording = self.rec.active();
-            rows[n] = .{
-                .label = if (recording) "Stop Recording\u{2026}" else "Record Window (WebM)",
-                .cb = &onMenuRecordWebm,
-                .ctx = self,
-            };
-            n += 1;
-            if (!recording) {
-                rows[n] = .{ .label = "Record Window (GIF)", .cb = &onMenuRecord, .ctx = self };
-                n += 1;
+            var plan_buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+            const plan = hostMenuPlan(.{
+                .recording = self.rec.active(),
+                .embedded = self.embedded,
+                .can_embed = self.host.on_request_embed != null and self.host.embed_surface == 0,
+            }, &plan_buf);
+            var rows: [MAX_HOST_MENU_ROWS]HostMenuRow = undefined;
+            for (plan, 0..) |item, i| {
+                rows[i] = .{
+                    .label = hostMenuLabel(item),
+                    // Exhaustive on purpose: a new HostMenuItem must be
+                    // decided here, not silently dropped.
+                    .cb = switch (item) {
+                        .screenshot => &onMenuScreenshot,
+                        .record_webm, .stop_recording => &onMenuRecordWebm,
+                        .record_gif => &onMenuRecord,
+                        .pop_out => &onMenuPopOut,
+                        .show_in_tab => &onMenuShowInTab,
+                        .close => &onMenuClose,
+                    },
+                    .ctx = self,
+                };
             }
-            if (self.embedded) {
-                rows[n] = .{ .label = "Pop Out Window", .cb = &onMenuPopOut, .ctx = self };
-                n += 1;
-            } else if (self.host.on_request_embed != null and self.host.embed_surface == 0) {
-                rows[n] = .{ .label = "Show in Tab", .cb = &onMenuShowInTab, .ctx = self };
-                n += 1;
-            }
-            rows[n] = .{ .label = "Close Window", .cb = &onMenuClose, .ctx = self };
-            n += 1;
-            popupHostMenu(self.picture, x, y, rows[0..n]);
+            popupHostMenu(self.picture, x, y, rows[0..plan.len]);
         }
 
         fn popdownFrom(btn: ?*c.GtkButton) void {
@@ -2671,3 +2756,96 @@ pub const AppHost = struct {
         return 1; // handled; wait for the app
     }
 };
+
+// ---- host-menu plan tests -----------------------------------------
+//
+// This is the part of the forwarded-window host menu that CAN be
+// covered on a Linux box: the row decision is pure, so both backends'
+// menus are asserted here without a window, a GTK context, a
+// compositor or (for winapp) a remote macOS agent.
+
+const testing = std.testing;
+
+fn planLabels(st: HostMenuState, buf: *[MAX_HOST_MENU_ROWS]HostMenuItem) []const HostMenuItem {
+    return hostMenuPlan(st, buf);
+}
+
+test "host menu: an idle floating window offers screenshot, both recorders and close" {
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    const plan = planLabels(.{}, &buf);
+    try testing.expectEqualSlices(HostMenuItem, &.{ .screenshot, .record_webm, .record_gif, .close }, plan);
+}
+
+test "host menu: recording collapses the two record rows into one stop row" {
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    const plan = planLabels(.{ .recording = true }, &buf);
+    try testing.expectEqualSlices(HostMenuItem, &.{ .screenshot, .stop_recording, .close }, plan);
+    // The stop row sits where the WebM row was, because the toggle
+    // stops whichever kind is running.
+    try testing.expect(plan[1] == .stop_recording);
+    for (plan) |it| try testing.expect(it != .record_gif and it != .record_webm);
+}
+
+test "host menu: an embedded window offers Pop Out and never Show in Tab" {
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    const plan = planLabels(.{ .embedded = true, .can_embed = true }, &buf);
+    try testing.expectEqualSlices(
+        HostMenuItem,
+        &.{ .screenshot, .record_webm, .record_gif, .pop_out, .close },
+        plan,
+    );
+}
+
+test "host menu: a floating window on an embedding host offers Show in Tab" {
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    const plan = planLabels(.{ .can_embed = true }, &buf);
+    try testing.expectEqualSlices(
+        HostMenuItem,
+        &.{ .screenshot, .record_webm, .record_gif, .show_in_tab, .close },
+        plan,
+    );
+}
+
+test "host menu: no plan ever exceeds the row buffer, and Close is always last" {
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    for ([_]bool{ false, true }) |rec| {
+        for ([_]bool{ false, true }) |emb| {
+            for ([_]bool{ false, true }) |can| {
+                const plan = planLabels(.{ .recording = rec, .embedded = emb, .can_embed = can }, &buf);
+                try testing.expect(plan.len <= MAX_HOST_MENU_ROWS);
+                try testing.expect(plan.len >= 3);
+                try testing.expect(plan[0] == .screenshot);
+                try testing.expect(plan[plan.len - 1] == .close);
+                // Never two rows for the same verb.
+                for (plan, 0..) |a, i| for (plan[i + 1 ..]) |b| try testing.expect(a != b);
+            }
+        }
+    }
+}
+
+test "host menu: winapp's state can never produce a row it has no handler for" {
+    // winapp.zig maps the plan onto its handlers with an exhaustive
+    // switch whose only skip is `.pop_out, .show_in_tab => continue`.
+    // That skip is safe exactly because a winstream window is always
+    // floating: `embedded` and `can_embed` are both false there, and
+    // this pins that such a state never yields either row. Without it,
+    // a future change to hostMenuPlan could drop a row from the
+    // winstream menu with nothing anywhere complaining.
+    var buf: [MAX_HOST_MENU_ROWS]HostMenuItem = undefined;
+    for ([_]bool{ false, true }) |rec| {
+        const plan = planLabels(.{ .recording = rec }, &buf);
+        for (plan) |it| try testing.expect(it != .pop_out and it != .show_in_tab);
+    }
+}
+
+test "host menu: every row has a non-empty label and no two share one" {
+    inline for (@typeInfo(HostMenuItem).@"enum".fields) |fa| {
+        const a: HostMenuItem = @enumFromInt(fa.value);
+        try testing.expect(std.mem.span(hostMenuLabel(a)).len > 0);
+        inline for (@typeInfo(HostMenuItem).@"enum".fields) |fb| {
+            const b: HostMenuItem = @enumFromInt(fb.value);
+            if (fa.value == fb.value) continue;
+            try testing.expect(!std.mem.eql(u8, std.mem.span(hostMenuLabel(a)), std.mem.span(hostMenuLabel(b))));
+        }
+    }
+}
