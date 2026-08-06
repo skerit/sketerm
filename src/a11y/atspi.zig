@@ -38,6 +38,10 @@ const STATE_KEY = "sketerm-a11y-state";
 /// instant to a human listener.
 const INTERVAL_MS: i64 = 75;
 
+/// Preedit announcement debounce: a composing keystroke burst speaks
+/// only its final state, this many ms after the last change.
+const PREEDIT_MS: c.guint = 150;
+
 /// Text granularity an AT asked for, collapsed to the three units both
 /// backends can answer. SENTENCE/PARAGRAPH map onto LINE.
 pub const Gran = enum { character, word, line };
@@ -105,6 +109,11 @@ const State = struct {
     prev_char0: u32 = 0,
     prev_caret: u32 = 0,
     prev_sel: []Range = &.{},
+    /// IME preedit debounce (see `announcePreedit`): the latest
+    /// composition string, NUL-terminated for gtk_accessible_announce,
+    /// and its trailing-edge timer.
+    preedit: ?[:0]u8 = null,
+    preedit_timer: c.guint = 0,
 
     fn dropPrev(self: *State) void {
         if (self.prev_text) |t| self.allocator.free(t);
@@ -112,6 +121,15 @@ const State = struct {
         if (self.prev_sel.len > 0) self.allocator.free(self.prev_sel);
         self.prev_sel = &.{};
         self.have_prev = false;
+    }
+
+    fn dropPreedit(self: *State) void {
+        if (self.preedit) |p| self.allocator.free(p);
+        self.preedit = null;
+        if (self.preedit_timer != 0) {
+            _ = c.g_source_remove(self.preedit_timer); // destroy-notify unrefs the widget
+            self.preedit_timer = 0;
+        }
     }
 };
 
@@ -213,6 +231,64 @@ pub fn sever(widget: *c.GtkWidget) void {
         st.timer = 0;
     }
     st.dropPrev();
+    st.dropPreedit();
+}
+
+/// Tell an attached AT what the IME is composing over this canvas.
+///
+/// AT-SPI has no composition event on the text widget itself and GTK's
+/// own editables expose nothing during preedit (the composed text is
+/// only announced when it commits, through the normal text-changed
+/// path). The vocabulary that DOES reach a reader today is the AT-SPI
+/// Announcement (`object:announcement`, live-region semantics), which
+/// Orca speaks at POLITE priority — so the uncommitted string is
+/// announced as transient speech and the accessible TEXT stays equal to
+/// the document, keeping every offset honest.
+///
+/// Debounced trailing-edge (`PREEDIT_MS`): composing rewrites the
+/// string per keystroke, and only the latest state is worth speaking.
+/// An empty `text` cancels (preedit ended: the commit announces itself
+/// via the document's own change events). No-op until an AT has
+/// actually queried the canvas, so sessions without a reader pay one
+/// branch.
+pub fn announcePreedit(widget: *c.GtkWidget, text: []const u8) void {
+    const st = stateOf(widget) orelse return;
+    if (!st.at_active or st.source == null) return;
+    if (st.preedit) |p| st.allocator.free(p);
+    st.preedit = null;
+    if (text.len == 0) {
+        if (st.preedit_timer != 0) {
+            _ = c.g_source_remove(st.preedit_timer);
+            st.preedit_timer = 0;
+        }
+        return;
+    }
+    st.preedit = st.allocator.dupeZ(u8, text) catch return;
+    if (st.preedit_timer != 0) return; // trailing emit already scheduled
+    st.preedit_timer = c.g_timeout_add_full(
+        c.G_PRIORITY_DEFAULT,
+        PREEDIT_MS,
+        onPreeditTimer,
+        c.g_object_ref(@as(c.gpointer, @ptrCast(widget))),
+        unrefWidget,
+    );
+}
+
+fn onPreeditTimer(user: c.gpointer) callconv(.c) c.gboolean {
+    const widget: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    if (stateOf(widget)) |st| {
+        st.preedit_timer = 0;
+        if (st.preedit) |p| {
+            c.gtk_accessible_announce(
+                @ptrCast(@alignCast(widget)),
+                p.ptr,
+                c.GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM,
+            );
+            st.allocator.free(p);
+            st.preedit = null;
+        }
+    }
+    return 0; // one-shot; destroy-notify unrefs the widget
 }
 
 /// Tell AT clients the caret/contents/selection may have changed.
@@ -345,6 +421,7 @@ fn onAreaDestroy(widget: ?*c.GtkWidget, _: c.gpointer) callconv(.c) void {
 fn destroyState(p: ?*anyopaque) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(p.?));
     st.dropPrev();
+    st.dropPreedit();
     st.allocator.destroy(st);
 }
 
