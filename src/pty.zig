@@ -11,6 +11,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
+const version = @import("version.zig");
 
 pub const SpawnError = error{
     OpenPty,
@@ -189,7 +190,7 @@ pub const Pty = struct {
         _ = c.setenv("TERM", opts.term, 1);
         _ = c.setenv("COLORTERM", opts.color_term, 1);
         _ = c.setenv("TERM_PROGRAM", "sketerm", 1);
-        _ = c.setenv("TERM_PROGRAM_VERSION", "0.1.0", 1);
+        _ = c.setenv("TERM_PROGRAM_VERSION", version.string, 1);
         // Image-protocol detection hints. Most tools (yazi, lf, btop,
         // chafa, viu) look at $KITTY_WINDOW_ID for kitty graphics
         // capability and trust it without further interrogation. We
