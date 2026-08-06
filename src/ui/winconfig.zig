@@ -917,6 +917,12 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     // effect immediately on the active/inactive classes.
     refreshTitlebarCss(self);
 
+    // Title templates: re-render every tab label and the window title
+    // against the NEW template. Unconditional rather than diffed —
+    // it is a bounded walk over the open panes with no allocation,
+    // and the config path is not hot.
+    @import("termsinks.zig").refreshAllTitles(self);
+
     // Tab position swap.
     if (self.config.tab_position != old_tab_pos) {
         self.setTabPosition(self.config.tab_position);

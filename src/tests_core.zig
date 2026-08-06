@@ -172,6 +172,7 @@ comptime {
     _ = @import("util/shellintegration.zig");
     _ = @import("util/shellquote.zig");
     _ = @import("util/template.zig");
+    _ = @import("util/titlefmt.zig");
     _ = @import("util/utf8.zig");
     _ = @import("util/videorec.zig");
     _ = @import("util/webm.zig");

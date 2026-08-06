@@ -151,6 +151,14 @@ pub const Pane = struct {
     /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
     win_cwd_ctx: ?*anyopaque = null,
     win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
+    /// Forward the daemon-sampled foreground process name so Window
+    /// can re-render a `{{ PROGRAM }}` title template. Reuses
+    /// win_cwd_ctx — same owner, same lifetime.
+    win_on_program: ?*const fn (ctx: ?*anyopaque, pane: *Pane, program: []const u8) void = null,
+    /// Fires when a resize changed the pane's column/row COUNT, so a
+    /// `{{ COLUMNS }}`/`{{ LINES }}` title can follow. Reuses
+    /// win_cwd_ctx.
+    win_on_geometry: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Forward OSC 1337 ; SetProfile so Window can restyle this pane.
     win_setprofile_ctx: ?*anyopaque = null,
     win_on_set_profile: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
@@ -507,6 +515,7 @@ pub const Pane = struct {
         terminal.on_image_delete_full = onImageDeleteFullEvent;
         terminal.on_title = onTitleEvent;
         terminal.on_cwd_changed = onCwdEvent;
+        terminal.on_program_changed = onProgramEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_clipboard_get = onClipboardGetEvent;
         terminal.on_render_request = onRenderRequest;
@@ -2141,6 +2150,11 @@ fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
     if (self.win_on_cwd) |f| f(self.win_cwd_ctx, self, cwd);
 }
 
+fn onProgramEvent(ctx: ?*anyopaque, program: []const u8) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_program) |f| f(self.win_cwd_ctx, self, program);
+}
+
 /// Drain finished a batch with screen.dirty set — schedule a GL
 /// render now instead of waiting for the next frame's tick to
 /// notice. Also clears the dirty flag so the tick path doesn't
@@ -3686,6 +3700,10 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
 
     self.terminal.screen.resize(cols, rows) catch return;
     self.terminal.requestResize(rows, cols);
+    // Only reached when the COUNT changed (the guard above returns
+    // otherwise), so a dimensions-bearing title re-renders per real
+    // geometry change, not per pixel of drag.
+    if (self.win_on_geometry) |f| f(self.win_cwd_ctx, self);
     // Resize reallocates the framebuffer; with auto_render off we
     // must explicitly schedule a repaint or the user sees stale
     // contents from the old size.

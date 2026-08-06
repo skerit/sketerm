@@ -11,6 +11,10 @@
 
 const std = @import("std");
 const lsp_servers = @import("lsp/servers.zig");
+pub const titlefmt = @import("util/titlefmt.zig");
+
+/// Historical tab-label behaviour: the OSC 0/2 title, verbatim.
+pub const default_tab_title = "{{ TITLE }}";
 
 /// One `[lsp.<name>]` section. The record lives in src/lsp/servers.zig
 /// (with the built-in table and the matching rules) so the LSP client
@@ -1133,6 +1137,17 @@ pub const Config = struct {
     title_inactive_fg: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 },
     title_inactive_bg: [4]f32 = .{ 192.0/255.0, 190.0/255.0, 191.0/255.0, 1.0 },
 
+    // Title templates (src/util/titlefmt.zig). App-level, not
+    // per-profile: a tab strip mixing two title FORMATS reads as a
+    // bug, and the window title has no profile to belong to.
+    /// Tab label format. The default is the historical behaviour —
+    /// the OSC 0/2 title verbatim — so upgrading changes nothing.
+    tab_title_template: []const u8 = default_tab_title,
+    /// Window title format. Empty (the default) keeps the window
+    /// title fixed at the application name, which is what sketerm has
+    /// always done; set it to make the window follow its focused pane.
+    window_title_template: []const u8 = "",
+
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
     arena: ?std.heap.ArenaAllocator = null,
@@ -1189,6 +1204,8 @@ pub const Config = struct {
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.editor_theme = try arena.dupe(u8, self.editor_theme);
         out.editor_project_markers = try arena.dupe(u8, self.editor_project_markers);
+        out.tab_title_template = try arena.dupe(u8, self.tab_title_template);
+        out.window_title_template = try arena.dupe(u8, self.window_title_template);
         out.keybinds = .empty;
         try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
         for (self.keybinds.items) |kb| {
@@ -1716,6 +1733,10 @@ pub const Config = struct {
 
         // Per-pane titlebar.
         if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
+        if (!std.mem.eql(u8, self.tab_title_template, default_tab_title))
+            try w.print("tab_title_template = {s}\n", .{self.tab_title_template});
+        if (self.window_title_template.len > 0)
+            try w.print("window_title_template = {s}\n", .{self.window_title_template});
         if (!self.show_tab_bar) try w.writeAll("show_tab_bar = false\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
         const default_tab: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 };
@@ -2260,6 +2281,35 @@ fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8)
 /// config keys. Returns an arena-duped slice (either the original
 /// or the expanded form). `~user` (other-user expansion) is
 /// intentionally NOT supported — shell-only, would need pwent.
+/// Title templates are validated where they are parsed, because the
+/// placeholder set is CLOSED: `{{ TITEL }}` can only ever be a typo,
+/// and a title that silently renders blank forever is the worst way to
+/// learn that. A rejected template warns (naming the bad placeholder
+/// and listing the valid ones) and falls back to `fallback`, so one
+/// bad line never costs the user the rest of their config.
+fn parseTitleTemplate(
+    arena: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+    fallback: []const u8,
+) ![]const u8 {
+    var diag: titlefmt.Diag = .{};
+    titlefmt.validate(value, &diag) catch |err| {
+        switch (err) {
+            error.UnknownPlaceholder => warnConfig(
+                "{s}: unknown placeholder '{s}' (valid: {s}) - using the default",
+                .{ key, diag.name, titlefmt.field_list },
+            ),
+            error.UnterminatedPlaceholder => warnConfig(
+                "{s}: unterminated '{{{{' at offset {d} - using the default",
+                .{ key, diag.offset },
+            ),
+        }
+        return fallback;
+    };
+    return arena.dupe(u8, value);
+}
+
 fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     if (value.len == 0 or value[0] != '~') return arena.dupe(u8, value);
     if (value.len > 1 and value[1] != '/') return arena.dupe(u8, value);
@@ -2683,6 +2733,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "minimum_contrast")) {
         cfg.minimum_contrast = std.math.clamp(try parseFloat(value), 1.0, 21.0);
+    } else if (std.mem.eql(u8, key, "tab_title_template")) {
+        cfg.tab_title_template = try parseTitleTemplate(arena, key, value, default_tab_title);
+    } else if (std.mem.eql(u8, key, "window_title_template")) {
+        cfg.window_title_template = try parseTitleTemplate(arena, key, value, "");
     } else if (std.mem.eql(u8, key, "background_image")) {
         cfg.background_image = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "background_image_opacity")) {
@@ -3373,6 +3427,62 @@ test "config: shader_param.<name> entries parse, dedupe, round-trip, clone" {
     var cl = try cfg.clone(std.testing.allocator);
     defer cl.deinit();
     try std.testing.expectEqualStrings("curvature", cl.shader_params.items[1].name);
+}
+
+test "config: title templates parse, round-trip and clone" {
+    const src =
+        "tab_title_template = {{ INDEX }}: {{ PROGRAM || TITLE }}\n" ++
+        "window_title_template = {{ TITLE }} - {{ RELATIVE_PATH }}\n";
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("{{ INDEX }}: {{ PROGRAM || TITLE }}", cfg.tab_title_template);
+    try std.testing.expectEqualStrings("{{ TITLE }} - {{ RELATIVE_PATH }}", cfg.window_title_template);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqualStrings(cfg.tab_title_template, re.tab_title_template);
+    try std.testing.expectEqualStrings(cfg.window_title_template, re.window_title_template);
+
+    var cl = try cfg.clone(std.testing.allocator);
+    defer cl.deinit();
+    try std.testing.expectEqualStrings(cfg.tab_title_template, cl.tab_title_template);
+    try std.testing.expectEqualStrings(cfg.window_title_template, cl.window_title_template);
+}
+
+test "config: defaults keep the historical title behaviour and stay unserialised" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "");
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("{{ TITLE }}", cfg.tab_title_template);
+    try std.testing.expectEqualStrings("", cfg.window_title_template);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "tab_title_template") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "window_title_template") == null);
+}
+
+test "config: a bad title template falls back to the default" {
+    // Unknown placeholder and unterminated braces both warn and keep
+    // the default rather than failing the whole config.
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "tab_title_template = {{ TITEL }}\n");
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("{{ TITLE }}", cfg.tab_title_template);
+
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, "window_title_template = {{ TITLE\n");
+    defer cfg2.deinit();
+    try std.testing.expectEqualStrings("", cfg2.window_title_template);
+
+    // A valid key on a later line still parses — one bad template
+    // must not poison the rest of the file.
+    var cfg3 = try Config.loadFromBytes(std.testing.allocator,
+        "tab_title_template = {{ nope }}\nwindow_title_template = {{ SESSION }}\n");
+    defer cfg3.deinit();
+    try std.testing.expectEqualStrings("{{ TITLE }}", cfg3.tab_title_template);
+    try std.testing.expectEqualStrings("{{ SESSION }}", cfg3.window_title_template);
 }
 
 test "config: shader_param color values (#rrggbb) round-trip" {

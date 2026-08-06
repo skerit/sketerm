@@ -1837,6 +1837,30 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // libadwaita gains a property for it.
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
 
+    // Title templates. App-level (see Config.tab_title_template): a
+    // tab strip mixing two title FORMATS reads as a bug.
+    const title_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(title_group)), "Title format");
+    c.adw_preferences_group_set_description(
+        @ptrCast(@alignCast(title_group)),
+        "Placeholders are {{ NAME }}, with || for a fallback: {{ TITLE || PROGRAM }}. " ++
+            "Available: " ++ config_mod.titlefmt.field_list ++ ". " ++
+            "A placeholder with no value takes its adjacent separator with it, so no template ends in a dangling dash.",
+    );
+    addTitleTemplateRow(
+        @ptrCast(@alignCast(title_group)),
+        ctx,
+        "Tab label",
+        &ctx.cfg.tab_title_template,
+    );
+    addTitleTemplateRow(
+        @ptrCast(@alignCast(title_group)),
+        ctx,
+        "Window title (empty = just the app name)",
+        &ctx.cfg.window_title_template,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(title_group)));
+
     const stack_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(stack_group)), "Stacking");
     addSwitchRow(@ptrCast(@alignCast(stack_group)), ctx, "Always on top", "Best effort: GTK4 has no native API; use compositor window rules. (See terminal output for hints.)", &ctx.cfg.always_on_top, applyOnly);
@@ -2306,6 +2330,74 @@ fn clearRowError(row: anytype) void {
 fn markRowErrorSlice(row: anytype, msg: []const u8) void {
     var z = cast.sliceToZ(192, msg);
     markRowError(row, &z);
+}
+
+// ── Title templates ────────────────────────────────────────────
+
+const TitleTemplateCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    field: *[]const u8,
+};
+
+/// Describe why a template was rejected, in the row's tooltip.
+fn titleTemplateError(tmpl: []const u8, buf: []u8) ?[]const u8 {
+    var diag: config_mod.titlefmt.Diag = .{};
+    config_mod.titlefmt.validate(tmpl, &diag) catch |err| {
+        return switch (err) {
+            error.UnknownPlaceholder => std.fmt.bufPrint(
+                buf,
+                "Unknown placeholder '{s}'. Available: {s}",
+                .{ diag.name, config_mod.titlefmt.field_list },
+            ) catch "Unknown placeholder.",
+            error.UnterminatedPlaceholder => "Unterminated '{{' - every placeholder needs a closing '}}'.",
+        };
+    };
+    return null;
+}
+
+/// An entry row whose value must pass `titlefmt.validate`. The parser
+/// REJECTS a bad template (it falls back to the default), so this
+/// rejects too rather than writing a value the next load would drop.
+fn addTitleTemplateRow(
+    group: *c.AdwPreferencesGroup,
+    ctx: *Ctx,
+    title: [*:0]const u8,
+    field: *[]const u8,
+) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    var z = cast.sliceToZ(256, field.*);
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    var err_buf: [256]u8 = undefined;
+    if (titleTemplateError(field.*, &err_buf)) |msg| markRowErrorSlice(row, msg);
+    const tctx = ctx.allocator.create(TitleTemplateCtx) catch return;
+    tctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field };
+    _ = c.g_signal_connect_data(
+        row,
+        "changed",
+        @ptrCast(&titleTemplateChanged),
+        @ptrCast(tctx),
+        @ptrCast(cast.destroyCtx(TitleTemplateCtx)),
+        c.G_CONNECT_DEFAULT,
+    );
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn titleTemplateChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const tctx = cast.userData(TitleTemplateCtx, user);
+    const text = cast.editableText(row);
+    var err_buf: [256]u8 = undefined;
+    if (titleTemplateError(text, &err_buf)) |msg| {
+        // Half-typed input is invalid on the way to being valid, so
+        // flag it and leave the working config on its last good value.
+        markRowErrorSlice(row, msg);
+        return;
+    }
+    clearRowError(row);
+    const dup = tctx.parent.dupe(text) catch return;
+    tctx.field.* = dup;
+    tctx.parent.ev();
 }
 
 // ── Symbol maps (symbol_map.<name>) ────────────────────────────
