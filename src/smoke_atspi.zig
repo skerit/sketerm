@@ -420,6 +420,13 @@ pub fn main() u8 {
         return 1;
     }
 
+    // ── 11. the editor's CHROME: gutter menu, status menu, sticky ───
+    if (editorChromeStage(allocator, rt, sock_path)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
     // Graceful GUI shutdown.
     _ = c.kill(pid, c.SIGTERM);
     var status: c_int = 0;
@@ -1313,4 +1320,348 @@ fn roundtrip(allocator: std.mem.Allocator, sock_path: [:0]const u8, line: []cons
     }
     defer c.g_free(resp);
     return allocator.dupe(u8, resp[0..rlen]) catch null;
+}
+
+// ======================================================================
+// The editor's CHROME: the gutter menu, the status-line menu, and the
+// sticky status message.
+//
+// All three were dead or defective before: right-clicking the gutter
+// gave the caret-oriented CANVAS menu (whose rows act on a selection
+// the pointer is not near), right-clicking the status line gave
+// nothing at all, and any message written to the status line was
+// erased by the next `EditorView.updateStatus` — which runs on every
+// caret move, edit, tab switch and diagnostic publish.
+//
+// The three menus are told apart by rows that exist in exactly one of
+// them: `Select This Line` (gutter), `Toggle Line Comment` (canvas),
+// `Soft Wrap` (status). Each stage asserts its own row IS there AND
+// the other two are NOT, so a routing regression that silently falls
+// back to the canvas menu fails here instead of passing.
+// ======================================================================
+
+/// A `.zig` document, so the tree-sitter grammar gives the gutter real
+/// fold regions to offer.
+const CHROME_DOC =
+    \\pub fn main() void {
+    \\    const a = 1;
+    \\    const b = 2;
+    \\    const c = 3;
+    \\}
+    \\
+;
+
+/// Full accessible name of the node whose name starts with `prefix`,
+/// copied into `out`. The editor's status line is found this way (by
+/// its "Ln " prefix) because GTK4-on-Wayland reports every accessible
+/// rect at 0,0, so there is nothing to locate it by position with.
+fn nameStartingWith(allocator: std.mem.Allocator, prefix: []const u8, out: []u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ",\"name\":\"{s}", .{prefix}) catch return null;
+    const json = hub.?.treeJson(allocator) orelse return null;
+    defer allocator.free(json);
+    const at = std.mem.indexOf(u8, json, needle) orelse return null;
+    const vstart = at + ",\"name\":\"".len;
+    const vend = std.mem.indexOfScalarPos(u8, json, vstart, '"') orelse return null;
+    const n = @min(vend - vstart, out.len);
+    @memcpy(out[0..n], json[vstart..][0..n]);
+    return out[0..n];
+}
+
+/// The editor status line's current text ("Ln 1, Col 1  —  …").
+fn statusLineText(allocator: std.mem.Allocator, out: []u8) ?[]const u8 {
+    return nameStartingWith(allocator, "Ln ", out);
+}
+
+/// Poll until the status line contains `want`. Pumping the viewer
+/// between polls is what lets the GUI actually repaint.
+fn awaitStatusContains(allocator: std.mem.Allocator, want: []const u8, budget_ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < budget_ms) : (waited += 250) {
+        if (drive) |app| app.drain();
+        var buf: [512]u8 = undefined;
+        if (statusLineText(allocator, &buf)) |txt| {
+            if (std.mem.indexOf(u8, txt, want) != null) return true;
+        }
+        _ = c.usleep(250_000);
+    }
+    return false;
+}
+
+/// True while `want` is ABSENT from the status line for the whole
+/// budget — the expiry assertion.
+fn awaitStatusLacks(allocator: std.mem.Allocator, want: []const u8, budget_ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < budget_ms) : (waited += 500) {
+        if (drive) |app| app.drain();
+        var buf: [512]u8 = undefined;
+        if (statusLineText(allocator, &buf)) |txt| {
+            if (std.mem.indexOf(u8, txt, want) == null) return true;
+        }
+        _ = c.usleep(500_000);
+    }
+    return false;
+}
+
+/// Is a menu row with this label open right now? (Zero budget: asked
+/// only about a menu already on screen.)
+fn menuHasRow(allocator: std.mem.Allocator, label: []const u8) bool {
+    const n = findMenuRow(allocator, label, 1) orelse return false;
+    allocator.free(n.id);
+    return true;
+}
+
+/// Right-click a series of candidate points until one opens a menu
+/// containing `marker`, dismissing every wrong menu on the way.
+///
+/// Probing rather than aiming: the a11y tree reports every rect at
+/// 0,0 on Wayland, so the gutter's and the status line's positions can
+/// only be found by hitting them (`locateTabStrip` documents the same
+/// constraint for the tab strip). The marker row is what confirms the
+/// hit, so a near-miss that opens the canvas menu is a retry, not a
+/// pass.
+fn probeMenuAt(allocator: std.mem.Allocator, points: []const Point, marker: []const u8) ?u32 {
+    const app = drive orelse return null;
+    for (points) |p| {
+        dismissPopup(app);
+        _ = waitTabPopup(app, false, 2_000);
+        const id = rightClickAt(p.x, p.y, 6_000) orelse continue;
+        if (menuHasRow(allocator, marker)) return id;
+    }
+    dismissPopup(app);
+    _ = waitTabPopup(app, false, 2_000);
+    return null;
+}
+
+fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
+    const app = drive orelse return "the display session has no driver";
+    var path_buf: [512]u8 = undefined;
+    const efile = std.fmt.bufPrintZ(&path_buf, "{s}/chrome.zig", .{rt}) catch return "chrome path";
+    {
+        const f = c.fopen(efile.ptr, "wb") orelse return "creating the chrome document failed";
+        _ = c.fwrite(CHROME_DOC.ptr, 1, CHROME_DOC.len, f);
+        _ = c.fclose(f);
+    }
+
+    var req_buf: [700]u8 = undefined;
+    var epane: u64 = 0;
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "new-editor-tab roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "new-editor-tab not ok";
+        epane = parseNumAfter(rp, "\"pane\":") orelse return "new-editor-tab reply has no pane id";
+    }
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{epane}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "focus roundtrip";
+        defer allocator.free(rp);
+        if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "focusing the chrome editor tab was refused";
+    }
+    var settle: u32 = 0;
+    while (settle < 20) : (settle += 1) {
+        app.drain();
+        _ = c.usleep(100_000);
+    }
+    // The status line is the anchor for everything below; if it never
+    // reaches the tree there is nothing to assert on.
+    if (!awaitStatusContains(allocator, "Ln ", 20_000))
+        return "the editor status line never appeared in the AT-SPI tree";
+    say("editor chrome: status line readable over AT-SPI");
+
+    _ = app.drainLive(2_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win = app.windows.items[0];
+    const w: f64 = @floatFromInt(win.w);
+    const h: f64 = @floatFromInt(win.h);
+    // Client-side decorations: frame_w is the toplevel width the a11y
+    // tree measures, the driver's window is that plus an even margin.
+    const margin: f64 = @max(0.0, (w - frame_w) / 2);
+
+    // ── the GUTTER menu ────────────────────────────────────────────
+    var pts: [6]Point = undefined;
+    for ([_]f64{ 4, 8, 12, 16, 22, 30 }, 0..) |dx, i| pts[i] = .{ .x = margin + dx, .y = h * 0.5 };
+    const gutter_id = probeMenuAt(allocator, &pts, "Select This Line") orelse
+        return "right-clicking the editor gutter never opened the line menu";
+    _ = app.waitVisualSettle(gutter_id, 300, 5_000, 0.002, null);
+    shotPopup(allocator, gutter_id, "/tmp/sketerm-atspi-editor-gutter-menu.png");
+
+    // It must be the LINE menu and not the canvas menu that used to
+    // answer here.
+    if (menuHasRow(allocator, "Toggle Line Comment"))
+        return "the gutter opened the CANVAS menu (Toggle Line Comment is present), not the line menu";
+    if (menuHasRow(allocator, "Soft Wrap"))
+        return "the gutter opened the status-line menu";
+    for ([_][]const u8{ "Copy Line Number", "Go to Line\u{2026}", "Fold All", "Unfold All", "Next Change", "Previous Change" }) |label| {
+        if (!menuHasRow(allocator, label)) {
+            _ = c.fprintf(platform.stderr(), "smoke-atspi: gutter menu has no '%.*s' row\n", @as(c_int, @intCast(label.len)), label.ptr);
+            return "the gutter menu is missing a row";
+        }
+    }
+    // Sensitivity is the state at popup time, not a fixed table: the
+    // isolated runtime dir is not a repository, so there are no change
+    // hunks to step to, and nothing is folded yet.
+    if (findMenuRow(allocator, "Next Change", 2_000)) |n| {
+        defer allocator.free(n.id);
+        if (n.states_lo & STATE_SENSITIVE_BIT != 0)
+            return "Next Change is sensitive on a document with no VCS changes";
+    } else return "the gutter menu lost its Next Change row";
+    if (findMenuRow(allocator, "Unfold All", 2_000)) |n| {
+        defer allocator.free(n.id);
+        if (n.states_lo & STATE_SENSITIVE_BIT != 0)
+            return "Unfold All is sensitive with nothing folded";
+    } else return "the gutter menu lost its Unfold All row";
+    say("editor chrome: the gutter opens its own line menu, rows sensitive per document state");
+
+    // ── a gutter row that really acts, and its message STICKS ──────
+    const copy = findMenuRow(allocator, "Copy Line Number", 5_000) orelse
+        return "the gutter menu lost its Copy Line Number row";
+    defer allocator.free(copy.id);
+    if (!hub.?.doAction(allocator, copy.id, 0)) return "activating Copy Line Number over AT-SPI failed";
+    _ = waitTabPopup(app, false, 5_000);
+    var line_no: [16]u8 = undefined;
+    var line_len: usize = 0;
+    {
+        var tries: u32 = 0;
+        while (tries < 40) : (tries += 1) {
+            app.drain();
+            if (app.getClipboard(3_000)) |text| {
+                defer allocator.free(text);
+                const t = std.mem.trim(u8, text, " \n\r\t");
+                if (t.len > 0 and t.len < line_no.len and std.ascii.isDigit(t[0])) {
+                    @memcpy(line_no[0..t.len], t);
+                    line_len = t.len;
+                    break;
+                }
+            } else |_| {}
+            _ = c.usleep(250_000);
+        }
+        if (line_len == 0) return "Copy Line Number put no line number on the clipboard";
+    }
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Copied line number {s}.", .{line_no[0..line_len]}) catch return "fmt";
+    if (!awaitStatusContains(allocator, msg, 6_000))
+        return "Copy Line Number's message never reached the status line";
+    say("editor chrome: Copy Line Number copied the number and reported it");
+
+    // THE defect this stage exists for: `updateStatus` rebuilds the
+    // whole label on every caret move and every edit. Typing forces a
+    // burst of exactly those rebuilds; a message that is written into
+    // the label rather than POSTED is gone by the first one.
+    if (typeInto(allocator, sock_path, epane, "abcdef")) |m| return m;
+    {
+        // Tight budget on purpose: the message is TRANSIENT (8s), so a
+        // slow poll here would race its own expiry and report an
+        // erasure that never happened.
+        var tries: u32 = 0;
+        var moved = false;
+        while (tries < 16) : (tries += 1) {
+            app.drain();
+            var buf: [512]u8 = undefined;
+            if (statusLineText(allocator, &buf)) |txt| {
+                // The caret really moved (so rebuilds really happened)
+                // AND the message is still there.
+                if (std.mem.indexOf(u8, txt, "Col 7") != null or std.mem.indexOf(u8, txt, "Col 8") != null) {
+                    if (std.mem.indexOf(u8, txt, msg) == null) {
+                        _ = c.fprintf(platform.stderr(), "smoke-atspi: status line after typing: %.*s\n", @as(c_int, @intCast(txt.len)), txt.ptr);
+                        return "the status message did not survive the rebuilds typing caused";
+                    }
+                    moved = true;
+                    break;
+                }
+            }
+            _ = c.usleep(250_000);
+        }
+        if (!moved) return "typing never moved the caret in the status line (rebuilds not proven)";
+    }
+    // The artefact a human reviews: the whole editor with the caret
+    // six characters further on and the message still on the line.
+    // Settle first — the a11y tree updates the instant the label does,
+    // but the compositor mirror only has the LAST COMMITTED frame.
+    _ = app.waitVisualSettle(win.id, 400, 4_000, 0.0, null);
+    if (app.screenshotPng(win.id, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        if (c.fopen("/tmp/sketerm-atspi-editor-sticky-status.png", "wb")) |f| {
+            _ = c.fwrite(shot.png.ptr, 1, shot.png.len, f);
+            _ = c.fclose(f);
+        }
+    } else |_| {}
+    say("editor chrome: the posted message survived the rebuilds six keystrokes caused");
+
+    // …and it is TRANSIENT, not permanent: it expires on its own with
+    // no further interaction (the expiry timer, not another rebuild).
+    if (!awaitStatusLacks(allocator, msg, 20_000))
+        return "the status message never expired (it is sticky, not transient)";
+    say("editor chrome: the message expired on its own");
+
+    // ── the CANVAS menu still answers over the text ────────────────
+    // The other half of the gutter routing assertion: the same widget,
+    // a different x, must still give the caret-oriented menu.
+    var canvas_has_lsp = false;
+    {
+        var cpts: [1]Point = .{.{ .x = margin + w * 0.4, .y = h * 0.5 }};
+        const id = probeMenuAt(allocator, &cpts, "Toggle Line Comment") orelse
+            return "right-clicking the editor TEXT no longer opens the canvas menu";
+        _ = id;
+        if (menuHasRow(allocator, "Select This Line"))
+            return "the canvas menu grew the gutter's Select This Line row";
+        // Whether a server is attached to a loose .zig file depends on
+        // what is installed on the host, so it is not asserted either
+        // way — it is CARRIED, and the status menu must agree with it.
+        canvas_has_lsp = menuHasRow(allocator, "Go to Definition");
+        dismissPopup(app);
+        _ = waitTabPopup(app, false, 3_000);
+    }
+    say("editor chrome: the text still opens the canvas menu, and only that one");
+
+    // ── the STATUS-LINE menu ───────────────────────────────────────
+    var spts: [6]Point = undefined;
+    for ([_]f64{ 4, 8, 12, 18, 26, 34 }, 0..) |dy, i|
+        spts[i] = .{ .x = margin + 40, .y = h - margin - dy };
+    const status_id = probeMenuAt(allocator, &spts, "Soft Wrap") orelse
+        return "right-clicking the editor status line never opened its menu";
+    _ = app.waitVisualSettle(status_id, 300, 5_000, 0.002, null);
+    shotPopup(allocator, status_id, "/tmp/sketerm-atspi-editor-status-menu.png");
+    if (menuHasRow(allocator, "Toggle Line Comment"))
+        return "the status line opened the canvas menu";
+    if (menuHasRow(allocator, "Select This Line"))
+        return "the status line opened the gutter menu";
+    if (!menuHasRow(allocator, "Go to Line\u{2026}")) return "the status menu has no Go to Line row";
+    // Diagnostics ride the status line only while a server is attached,
+    // and the canvas menu's LSP rows follow the same predicate — so the
+    // two menus must agree. Asserting the AGREEMENT rather than a fixed
+    // answer keeps this honest on a host that has (or has not) a Zig
+    // language server installed.
+    if (menuHasRow(allocator, "Next Diagnostic") != canvas_has_lsp) {
+        return if (canvas_has_lsp)
+            "the canvas menu offers LSP rows but the status menu has no Next Diagnostic"
+        else
+            "the status menu offers Next Diagnostic with no language server attached";
+    }
+    say("editor chrome: the status line opens its own menu, its diagnostic rows track the attached server");
+
+    // ── a status row that really acts: Soft Wrap ───────────────────
+    const wrap = findMenuRow(allocator, "Soft Wrap", 5_000) orelse
+        return "the status menu lost its Soft Wrap row";
+    defer allocator.free(wrap.id);
+    if (!hub.?.doAction(allocator, wrap.id, 0)) return "activating Soft Wrap over AT-SPI failed";
+    _ = waitTabPopup(app, false, 5_000);
+    if (!awaitStatusContains(allocator, "Wrap", 10_000))
+        return "Soft Wrap did not turn wrapping on (the status line never said Wrap)";
+    say("editor chrome: Soft Wrap really wrapped, and the status line says so");
+    dismissPopup(app);
+
+    // Leave nothing dirty behind: the GUI's SIGTERM must not meet an
+    // unsaved-buffer prompt.
+    {
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return "fmt";
+        const rp = roundtrip(allocator, sock_path, rq) orelse return "ctrl+s roundtrip";
+        allocator.free(rp);
+    }
+    var saved: u32 = 0;
+    while (saved < 40) : (saved += 1) {
+        app.drain();
+        _ = c.usleep(200_000);
+    }
+    return null;
 }
