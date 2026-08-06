@@ -17,14 +17,21 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
-const cast = @import("../util/cast.zig");
 const PanelView = @import("panel/view.zig").PanelView;
+const canary = @import("panel/canary.zig");
 
 const PANEL_QDATA = "sketerm-panel-window";
 
 pub const APP_NAME = "Sketerm Panel";
 
 pub const PanelWindow = struct {
+    pub const MAGIC: u32 = 0x504E4C57; // "PNLW"
+    /// Use-after-free DETECTOR, not a lifetime mechanism — see
+    /// canary.zig. The window OWNS this struct through the qdata
+    /// destroy-notify, which is what makes the raw `self` on the
+    /// ::destroy connection sound; the canary only makes a future
+    /// regression in that arrangement fail loudly and at once.
+    magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     window: *c.GtkWidget,
     view: *PanelView,
@@ -89,7 +96,7 @@ pub const PanelWindow = struct {
     /// The document's title, else the app name. Called from the view
     /// whenever setDocument or a title patch lands.
     fn onViewChanged(ctx: *anyopaque) void {
-        const self: *PanelWindow = @ptrCast(@alignCast(ctx));
+        const self = canary.live(PanelWindow, ctx) orelse return;
         self.syncTitle();
     }
 
@@ -104,7 +111,7 @@ pub const PanelWindow = struct {
     }
 
     fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(PanelWindow, user);
+        const self = canary.live(PanelWindow, user) orelse return;
         if (self.destroyed) return;
         self.destroyed = true;
         // Phase 1 of the face's two-phase teardown: fences every
@@ -120,11 +127,36 @@ pub const PanelWindow = struct {
     }
 
     fn finalizePanelWindow(user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(PanelWindow, user);
+        const self = canary.live(PanelWindow, user) orelse return;
         self.view.deinit();
+        canary.poison(self);
         self.allocator.destroy(self);
     }
 };
+
+test "a poisoned PanelWindow makes finalize bail instead of double-freeing" {
+    const a = std.testing.allocator;
+    const self = try a.create(PanelWindow);
+    // `view` and `window` are never reached: the guard is the first
+    // statement, so this stands in for "the window finalized twice".
+    self.* = .{ .allocator = a, .window = undefined, .view = undefined };
+    canary.poison(self);
+
+    const before = canary.trips;
+    PanelWindow.finalizePanelWindow(@ptrCast(self));
+    try std.testing.expectEqual(before + 1, canary.trips);
+    // A double free here would be reported by the testing allocator.
+    a.destroy(self);
+}
+
+test "a poisoned PanelWindow does not run the ::destroy handler" {
+    var self = PanelWindow{ .allocator = std.testing.allocator, .window = undefined, .view = undefined };
+    canary.poison(&self);
+    const before = canary.trips;
+    PanelWindow.onWindowDestroy(undefined, @ptrCast(&self));
+    try std.testing.expectEqual(before + 1, canary.trips);
+    try std.testing.expect(!self.destroyed);
+}
 
 test "panel window decls type-check" {
     // Lazy analysis: without this, a signature error in a callback no
