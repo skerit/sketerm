@@ -140,6 +140,7 @@ const editoroutline = @import("editoroutline.zig");
 const a11y = @import("../a11y/atspi.zig");
 const a11ydoc = @import("../a11y/docsource.zig");
 const docview = @import("../a11y/docview.zig");
+const clock = @import("../util/clock.zig");
 
 /// Open size cap: bigger files are refused with a clear error.
 pub const MAX_FILE_BYTES: usize = 64 << 20;
@@ -872,6 +873,23 @@ pub const EditorView = struct {
     /// probe jobs are in flight (never stack them).
     last_probe_ms: i64 = 0,
     probes_in_flight: u32 = 0,
+
+    // ---- sticky transient status ------------------------------------
+    //
+    // `updateStatus` REBUILDS the status label from scratch on every
+    // caret move, edit, tab switch, fold change and diagnostic publish.
+    // A message written straight into the label is therefore gone
+    // within milliseconds of being written — a rename that reported its
+    // outcome, a "No VCS information for this file.", a "Formatted."
+    // all vanished before they could be read. So a message is not
+    // painted, it is POSTED: it lives here and every rebuild re-emits
+    // it until it expires. See `postStatus`.
+    note: [320]u8 = undefined,
+    note_len: usize = 0,
+    note_at_ms: i64 = 0,
+    /// Fires once at expiry so a note also disappears from an IDLE
+    /// face (nothing else would rebuild the label).
+    note_timer: c_uint = 0,
 
     // Caret blink. A g_timeout, never a frame-clock tick: a tick
     // callback on a GtkGLArea leaks on Wayland (same reason Pane uses
@@ -1879,6 +1897,7 @@ pub const EditorView = struct {
         self.stopBlink();
         self.stopScrollbarSync();
         self.stopJournalTimer();
+        self.stopNoteExpiry();
         self.detachIm();
     }
 
@@ -1907,6 +1926,7 @@ pub const EditorView = struct {
         self.stopBlink();
         self.stopScrollbarSync();
         self.stopJournalTimer();
+        self.stopNoteExpiry();
         self.dropRecovery();
         self.clearPreedit();
         self.detachIm();
@@ -2085,6 +2105,9 @@ pub const EditorView = struct {
         c.gtk_widget_set_margin_bottom(status, 2);
         c.gtk_box_append(@ptrCast(vbox), status);
         self.status_label = @ptrCast(@alignCast(status));
+        // Right-click on the status line: the verbs behind what it
+        // reports (wrap, position, changes, diagnostics).
+        editormenu.attachStatusMenu(self, status.?);
 
         // Keyboard: IM context first (dead keys / compose), our chord
         // handler for what the IM leaves, pane bindings as fallback.
@@ -2565,8 +2588,11 @@ pub const EditorView = struct {
         return std.mem.eql(u8, la.path, lb.path);
     }
 
+    /// Post a transient message to the status line. It survives the
+    /// rebuilds `updateStatus` does on every caret move / edit / tab
+    /// switch, for `STATUS_NOTE_MS`, then disappears on its own.
     pub fn setStatusText(self: *EditorView, text: [*:0]const u8) void {
-        self.setStatus(text);
+        self.postStatus(std.mem.span(text));
     }
 
     pub fn queueRenderExternal(self: *EditorView) void {
@@ -3780,15 +3806,10 @@ pub const EditorView = struct {
         // place a standalone host has to watch to keep its window title
         // honest.
         if (self.on_changed) |cb| cb(self.changed_ctx orelse undefined);
-        const tab = self.active orelse {
-            c.gtk_label_set_text(self.status_label, "");
-            return;
-        };
+        const note = self.statusNote() orelse "";
+        const tab = self.active orelse return self.paintStatus("", note);
         var buf: [520:0]u8 = undefined;
-        if (tab.loading) {
-            c.gtk_label_set_text(self.status_label, "Loading…");
-            return;
-        }
+        if (tab.loading) return self.paintStatus("Loading…", note);
         const lc = tab.doc.rope.offsetToLineCol(tab.sels.primary().head);
         const carets = tab.sels.count();
         const wrap_note: []const u8 = if (tab.wrap) "  —  Wrap" else "";
@@ -3802,15 +3823,111 @@ pub const EditorView = struct {
         var proj_buf: [160]u8 = undefined;
         const proj_note = editorproj.statusFragment(self, tab, &proj_buf);
         const txt = if (carets > 1)
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note, proj_note }) catch return
+            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note, proj_note }) catch return
         else
-            std.fmt.bufPrintZ(&buf, "Ln {d}, Col {d}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note, proj_note }) catch return;
+            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note, proj_note }) catch return;
+        self.paintStatus(txt, note);
+    }
+
+    /// The composed status line: what the document IS (position, wrap,
+    /// diagnostics, project) plus whatever transient message is still
+    /// live, in that order. The message goes LAST so the standing
+    /// facts never move around under the eye when one arrives.
+    fn paintStatus(self: *EditorView, base: []const u8, note: []const u8) void {
+        var out: [900:0]u8 = undefined;
+        const txt = blk: {
+            if (note.len == 0) break :blk std.fmt.bufPrintZ(&out, "{s}", .{base}) catch return;
+            if (base.len == 0) break :blk std.fmt.bufPrintZ(&out, "{s}", .{note}) catch return;
+            break :blk std.fmt.bufPrintZ(&out, "{s}  —  {s}", .{ base, note }) catch return;
+        };
         c.gtk_label_set_text(self.status_label, txt.ptr);
     }
 
+    /// Post a NUL-terminated message (the in-module spelling; the
+    /// exported one is `setStatusText`).
     fn setStatus(self: *EditorView, text: [*:0]const u8) void {
+        self.postStatus(std.mem.span(text));
+    }
+
+    // ---- sticky transient status --------------------------------------
+
+    /// How long a posted message keeps re-appearing on the status line.
+    ///
+    /// Long enough to survive the burst of `updateStatus` calls that
+    /// the action which produced it causes (a cross-file rename fires
+    /// several within a few hundred ms) and to actually be read; short
+    /// enough that it is not still sitting there next time the user
+    /// looks at the line for the caret position.
+    ///
+    /// ONE duration for every message, errors included. The editor has
+    /// no error/info channel distinction at any call site (they are all
+    /// `setStatusText`), and inventing one would mean reclassifying
+    /// forty LSP call sites on a guess about which sentences are
+    /// "errors" — several of them ("Already formatted.", "No results.")
+    /// are neither. A message that must not be missed does not belong
+    /// on a dim one-line label at all; that is what the inline banners
+    /// are for.
+    pub const STATUS_NOTE_MS: i64 = 8_000;
+
+    /// Post `text` to the status line for `STATUS_NOTE_MS`.
+    ///
+    /// A newer message REPLACES an older one unconditionally: each is
+    /// the answer to the most recent thing the user asked for, and
+    /// holding the previous answer on screen would be answering the
+    /// wrong question.
+    pub fn postStatus(self: *EditorView, text: []const u8) void {
         if (self.widgets_dead) return;
-        c.gtk_label_set_text(self.status_label, text);
+        const n = @min(text.len, self.note.len);
+        @memcpy(self.note[0..n], text[0..n]);
+        self.note_len = n;
+        self.note_at_ms = clock.nowMs();
+        self.armNoteExpiry();
+        self.updateStatus();
+    }
+
+    /// Drop the posted message now. Escape on the canvas does this
+    /// (without consuming the key).
+    pub fn clearStatusNote(self: *EditorView) void {
+        if (self.note_len == 0) return;
+        self.note_len = 0;
+        self.stopNoteExpiry();
+        self.updateStatus();
+    }
+
+    /// The live message, or null once it has expired.
+    fn statusNote(self: *EditorView) ?[]const u8 {
+        if (self.note_len == 0) return null;
+        if (clock.nowMs() -| self.note_at_ms > STATUS_NOTE_MS) {
+            self.note_len = 0;
+            return null;
+        }
+        return self.note[0..self.note_len];
+    }
+
+    fn armNoteExpiry(self: *EditorView) void {
+        self.stopNoteExpiry();
+        self.note_timer = c.g_timeout_add(
+            @intCast(STATUS_NOTE_MS + 50),
+            @ptrCast(&onNoteExpiry),
+            @ptrCast(self),
+        );
+    }
+
+    fn stopNoteExpiry(self: *EditorView) void {
+        if (self.note_timer == 0) return;
+        _ = c.g_source_remove(self.note_timer);
+        self.note_timer = 0;
+    }
+
+    fn onNoteExpiry(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(EditorView, user);
+        self.note_timer = 0;
+        if (self.widgets_dead) return 0;
+        // statusNote() re-checks the clock, so a note re-posted since
+        // this timer was armed simply keeps its own (later) deadline —
+        // armNoteExpiry cancelled this source in that case anyway.
+        self.updateStatus();
+        return 0; // G_SOURCE_REMOVE
     }
 
     // ---- IO -----------------------------------------------------------
@@ -4087,8 +4204,6 @@ pub const EditorView = struct {
         editorproj.refreshGit(self, tab);
         editoroutline.refresh(self, tab, true);
         self.refresh(tab);
-        // AFTER refresh: updateStatus paints Ln/Col over anything set
-        // before it.
         self.setStatus("Reloaded: the file changed on disk.");
     }
 
@@ -5363,6 +5478,11 @@ pub const EditorView = struct {
                     self.closeFind();
                     return true;
                 }
+                // A posted status message is dismissible: Escape is
+                // already "put this away" everywhere else in the face.
+                // It does NOT consume the key — collapsing extra carets
+                // is the more visible meaning and must still happen.
+                self.clearStatusNote();
                 if (tab.sels.count() <= 1) return false;
                 vm.collapseToPrimary(&tab.sels);
                 self.refresh(tab);
@@ -5530,7 +5650,6 @@ pub const EditorView = struct {
             .select_all_occurrences => {
                 const n = ecmd.selectAllOccurrences(a, &tab.doc, &tab.sels) catch 0;
                 self.afterMove(tab);
-                // After afterMove: its updateStatus would overwrite this.
                 if (n > 0) {
                     var buf: [48]u8 = undefined;
                     if (std.fmt.bufPrintZ(&buf, "{d} occurrence(s) selected.", .{n})) |z| {
@@ -5737,6 +5856,127 @@ pub const EditorView = struct {
             .find => self.openFind(false),
             .replace => self.openFind(true),
             .goto_line => self.promptGotoLine(),
+        }
+    }
+
+    // ---- gutter and status-line menus ----------------------------------
+    //
+    // The gutter is part of the SAME GtkGLArea as the text, so its
+    // right-click arrives on the canvas gesture and is routed here by
+    // x-coordinate. It gets its own menu because a click there is
+    // line-oriented: the line under the pointer, not the caret and not
+    // the selection.
+
+    /// The document line under (x, y) when the point is inside the
+    /// gutter, null when it is over the text (or there is no gutter).
+    /// Widget coordinates, exactly what the click gesture reports.
+    pub fn gutterLineAt(self: *EditorView, x: f64, y: f64) ?usize {
+        if (self.widgets_dead) return null;
+        const tab = self.active orelse return null;
+        if (tab.loading) return null;
+        const gw = self.gutterWidthOf(tab);
+        if (gw <= 0) return null;
+        const scale: f32 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (@as(f32, @floatCast(x)) * scale >= gw) return null;
+        const hit = self.locateY(tab, @as(f32, @floatCast(y)) * scale) orelse return null;
+        return hit.line;
+    }
+
+    /// What the gutter menu's rows may do on `line`, resolved at popup
+    /// time — never cached (menus reflect state when they open).
+    pub const GutterState = struct {
+        /// `editor_folding` is on at all.
+        folding: bool,
+        /// A fold is currently collapsed AT this line.
+        folded: bool,
+        /// A foldable region is headed by this line.
+        foldable: bool,
+        /// Any fold is collapsed anywhere in the document.
+        any_folded: bool,
+        /// The git gutter is on and this document has change marks.
+        has_hunks: bool,
+        /// 1-based line number, for the labels.
+        line_no: usize,
+    };
+
+    pub fn gutterState(self: *EditorView, line: usize) ?GutterState {
+        if (self.widgets_dead) return null;
+        const tab = self.active orelse return null;
+        const folded = self.folding and tab.folds.entryAtLine(line) != null;
+        return .{
+            .folding = self.folding,
+            .folded = folded,
+            .foldable = self.folding and !folded and self.foldRegionAtLine(tab, line) != null,
+            .any_folded = self.folding and !tab.folds.isEmpty(),
+            .has_hunks = self.git_gutter and !tab.git.isEmpty(),
+            .line_no = line + 1,
+        };
+    }
+
+    /// Gutter-menu dispatch. `line` is the 0-based line the menu was
+    /// opened on, carried from popup time (the caret may have moved,
+    /// and these verbs are about the clicked line either way).
+    pub fn gutterAction(self: *EditorView, act: editormenu.GutterAction, line: usize) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse return;
+        switch (act) {
+            .toggle_fold => self.toggleFoldLine(tab, line),
+            .fold_all => self.foldAll(tab),
+            .unfold_all => self.unfoldAll(tab),
+            .goto_line => self.promptGotoLine(),
+            .copy_line_number => {
+                var buf: [24:0]u8 = undefined;
+                const z = std.fmt.bufPrintZ(&buf, "{d}", .{line + 1}) catch return;
+                const display = c.gtk_widget_get_display(@ptrCast(self.area));
+                c.gdk_clipboard_set_text(c.gdk_display_get_clipboard(display), z.ptr);
+                var msg: [48:0]u8 = undefined;
+                const m = std.fmt.bufPrintZ(&msg, "Copied line number {d}.", .{line + 1}) catch return;
+                self.setStatus(m.ptr);
+            },
+            .select_line => {
+                const at = tab.doc.rope.lineToOffset(@min(line, tab.doc.rope.lineCount() -| 1));
+                tab.sels.keepPrimaryOnly();
+                tab.sels.sels.items[0] = vm.lineRangeAt(&tab.doc, at);
+                tab.goal_x = null;
+                self.afterMove(tab);
+            },
+            .next_hunk => editorproj.stepHunk(self, true),
+            .prev_hunk => editorproj.stepHunk(self, false),
+        }
+    }
+
+    /// What the status-line menu's rows may do, resolved at popup time.
+    pub const StatusState = struct {
+        wrap: bool,
+        has_hunks: bool,
+        /// A language server is attached to the active document, so
+        /// the diagnostics this line reports can be stepped through.
+        lsp: bool,
+    };
+
+    pub fn statusState(self: *EditorView) ?StatusState {
+        if (self.widgets_dead) return null;
+        const tab = self.active orelse return null;
+        return .{
+            .wrap = tab.wrap,
+            .has_hunks = self.git_gutter and !tab.git.isEmpty(),
+            .lsp = tab.lsp != null and self.lsp != null,
+        };
+    }
+
+    /// Status-line menu dispatch. Every row here acts on something the
+    /// status line itself reports — there is deliberately nothing else
+    /// on it.
+    pub fn statusAction(self: *EditorView, act: editormenu.StatusAction) void {
+        if (self.widgets_dead) return;
+        const tab = self.active orelse return;
+        switch (act) {
+            .toggle_wrap => self.toggleWrap(tab),
+            .goto_line => self.promptGotoLine(),
+            .next_hunk => editorproj.stepHunk(self, true),
+            .prev_hunk => editorproj.stepHunk(self, false),
+            .next_diag => if (self.lsp) |m| m.stepDiagnostic(true),
+            .prev_diag => if (self.lsp) |m| m.stepDiagnostic(false),
         }
     }
 
