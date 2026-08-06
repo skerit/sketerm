@@ -26,13 +26,16 @@ const ocr = @import("../util/ocr.zig");
 pub const png_util = @import("../util/png.zig");
 pub const mcpassets = @import("mcpassets.zig");
 const cdp = @import("cdp.zig");
+pub const mcpfilter = @import("mcpfilter.zig");
+pub const panelstore = @import("panelstore.zig");
+const paneldoc = @import("../ui/panel/doc.zig");
 pub const shellquote = @import("../util/shellquote.zig");
 pub const pattern = @import("../util/pattern.zig");
 const wire = @import("../mux/wire.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
-    \\                   [--log DIR]
+    \\                   [--log DIR] [--tools SPEC | --profile NAME]
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -92,6 +95,28 @@ const MCP_HELP =
     \\else $XDG_STATE_HOME/sketerm/mcp-casts/<stamp>-<pid>/.
     \\  --no-record    disable the automatic terminal recordings
     \\
+    \\Tool exposure: by default every tool is offered. Narrow it so one
+    \\assistant sees only what it needs (several assistants can share
+    \\one machine with different subsets).
+    \\  --tools SPEC   comma/space separated terms:
+    \\                   all            every tool
+    \\                   GROUP          a whole group
+    \\                   GROUP:ro       that group's read-only tools
+    \\                   TOOL           one tool by name
+    \\                   -GROUP, -TOOL  deny (always wins)
+    \\                 Groups: panes, app, term, files, net, browser,
+    \\                 ui, core. `core` (capabilities) is always on.
+    \\                 A spec with any allow term starts from nothing;
+    \\                 a spec of only deny terms keeps everything else.
+    \\                 Example: --tools "app, files:ro"
+    \\  --profile NAME reuse a [mcp.NAME] section's `tools = ...` from
+    \\                 config.conf
+    \\  $SKETERM_MCP_TOOLS  same grammar; overrides --profile, and is
+    \\                 overridden by --tools. Set it per project in
+    \\                 .mcp.json's env block.
+    \\Withheld tools are absent from tools/list AND refused by
+    \\tools/call, with an error naming the term that would enable them.
+    \\
 ;
 
 const PROTOCOL_VERSION = "2025-06-18";
@@ -117,6 +142,10 @@ pub const Opts = struct {
     log_dir: ?[]const u8 = null,
     no_record: bool = false,
     help: bool = false,
+    /// `--tools <spec>`: mcpfilter grammar, highest precedence.
+    tools: ?[]const u8 = null,
+    /// `--profile <name>`: a `[mcp.<name>]` section in config.conf.
+    profile: ?[]const u8 = null,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
 
@@ -143,6 +172,15 @@ pub const Opts = struct {
                 if (i + 1 >= args.len) return error.MissingValue;
                 i += 1;
                 o.log_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--tools")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                o.tools = args[i];
+            } else if (std.mem.eql(u8, a, "--profile")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                if (!validInstanceName(args[i])) return error.BadName;
+                o.profile = args[i];
             } else if (std.mem.eql(u8, a, "--no-record")) {
                 o.no_record = true;
             } else if (std.mem.eql(u8, a, "--help")) {
@@ -488,12 +526,79 @@ fn installQuitSignals() void {
     _ = c.sigaction(c.SIGPIPE, &sp, null);
 }
 
+/// Owned strings backing the process-wide `policy` (its spec is
+/// borrowed for the whole run, so it cannot live in a config arena
+/// that is freed right after parsing).
+const OwnedPolicy = struct { spec: []u8, source: []u8 };
+
+/// Resolve the tool exposure policy, lowest precedence first:
+/// `[mcp.<name>]` from config.conf, then $SKETERM_MCP_TOOLS, then
+/// `--tools`. Sets `policy`/`policy_source`; returns the owned strings
+/// (null when nothing narrowed the tool set). Every failure prints a
+/// complete diagnostic and returns an error — a bad spec must never
+/// degrade into "everything" or into a silently missing group.
+fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts) error{BadPolicy}!?OwnedPolicy {
+    var spec: []const u8 = "";
+    var source: []const u8 = "none";
+    var name_buf: [96]u8 = undefined;
+    var cfg_spec: []u8 = &.{};
+    defer allocator.free(cfg_spec);
+
+    if (opts.profile) |name| {
+        var cfg = @import("../config.zig").Config.load(allocator);
+        defer cfg.deinit();
+        const prof = cfg.mcpProfile(name) orelse {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: --profile {s}: no [mcp.{s}] section in config.conf\n  add one, e.g.:\n    [mcp.{s}]\n    tools = app, files:ro\n", .{ name, name, name }) catch "sketerm mcp: unknown --profile\n";
+            _ = c.fputs(msg.ptr, platform.stderr());
+            return error.BadPolicy;
+        };
+        // The record dies with the config arena below.
+        cfg_spec = allocator.dupe(u8, prof.tools) catch return error.BadPolicy;
+        spec = cfg_spec;
+        source = std.fmt.bufPrint(&name_buf, "config [mcp.{s}]", .{name}) catch "config [mcp.*]";
+    }
+    if (c.getenv("SKETERM_MCP_TOOLS")) |v| {
+        spec = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+        source = "SKETERM_MCP_TOOLS";
+    }
+    if (opts.tools) |t| {
+        spec = t;
+        source = "--tools";
+    }
+
+    var bad: []const u8 = "";
+    mcpfilter.Policy.validate(spec, &bad) catch {
+        var msg_buf: [1024]u8 = undefined;
+        var groups_buf: [256]u8 = undefined;
+        var gw = std.Io.Writer.fixed(&groups_buf);
+        for (std.enums.values(mcpfilter.Group), 0..) |g, i| {
+            if (i > 0) gw.writeAll(", ") catch {};
+            gw.writeAll(g.name()) catch {};
+        }
+        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad tool policy term '{s}' (from {s})\n  spec: {s}\n  groups: {s}\n  terms: all | GROUP | GROUP:ro | TOOL | -GROUP | -TOOL\n", .{ bad, source, spec, gw.buffered() }) catch "sketerm mcp: bad tool policy\n";
+        _ = c.fputs(msg.ptr, platform.stderr());
+        return error.BadPolicy;
+    };
+
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const owned_spec = allocator.dupe(u8, trimmed) catch return error.BadPolicy;
+    const owned_source = allocator.dupe(u8, source) catch {
+        allocator.free(owned_spec);
+        return error.BadPolicy;
+    };
+    policy = .{ .spec = owned_spec };
+    policy_source = owned_source;
+    return .{ .spec = owned_spec, .source = owned_source };
+}
+
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const opts = Opts.parse(args) catch |err| {
         const msg = switch (err) {
             error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",
             error.MissingValue => "sketerm mcp: flag needs a value\n",
-            error.BadName => "sketerm mcp: --name must be 1-48 chars of [A-Za-z0-9_-]\n",
+            error.BadName => "sketerm mcp: --name/--profile must be 1-48 chars of [A-Za-z0-9_-]\n",
             error.SharedConflict => "sketerm mcp: --shared conflicts with --durable/--name\n",
         };
         _ = c.fputs(msg, platform.stderr());
@@ -503,6 +608,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         _ = c.fputs(MCP_HELP, platform.stdout());
         return 0;
     }
+
+    // Tool exposure policy, resolved BEFORE any daemon or socket work:
+    // a typo must cost one clear line on stderr, never a silently
+    // half-equipped server.
+    const policy_owned = resolveToolPolicy(allocator, opts) catch return 2;
+    defer if (policy_owned) |p| {
+        allocator.free(p.spec);
+        allocator.free(p.source);
+        policy = .unrestricted;
+        policy_source = "none";
+    };
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {
@@ -624,6 +740,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
 
     if (mcp_log) |*l| {
+        if (!policy.isUnrestricted()) {
+            var pbuf: [1024]u8 = undefined;
+            const note = std.fmt.bufPrint(&pbuf, "tool policy: {s} (from {s})", .{ policy.spec, policy_source }) catch "tool policy set";
+            l.logNote(note);
+        }
         var nbuf: [512]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s}", .{
             c.getpid(),
@@ -793,6 +914,13 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         const name_v = params.object.get("name") orelse return rpcError(arena, id, -32602, "missing tool name");
         if (name_v != .string) return rpcError(arena, id, -32602, "bad tool name");
         const args: std.json.Value = params.object.get("arguments") orelse .null;
+        // Enforcement, not presentation: a client that learned the name
+        // from documentation must be refused here too.
+        if (!policy.allows(name_v.string)) {
+            if (is_notification) return null;
+            const msg = withheldMessage(arena, name_v.string) catch return null;
+            return rpcResult(arena, id, toolResult(arena, msg, true) orelse return null);
+        }
         const outcome = callTool(arena, backend, name_v.string, args) catch |err| {
             const msg = std.fmt.allocPrint(arena, "tool failed: {s}", .{@errorName(err)}) catch return null;
             return rpcResult(arena, id, toolResult(arena, msg, true) orelse return null);
@@ -802,6 +930,24 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
     }
     if (is_notification) return null;
     return rpcError(arena, id, -32601, "method not found");
+}
+
+/// Refusal text for a tool the policy withholds. Deliberately NOT
+/// "method not found": that reads as a missing feature and costs the
+/// assistant a round of guessing. It says the tool exists, that the
+/// operator restricted this connection, and the exact term that would
+/// bring it back.
+fn withheldMessage(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const meta = mcpfilter.lookup(name) orelse return std.fmt.allocPrint(
+        arena,
+        "tool '{s}' is not enabled for this connection (and is not a known sketerm tool). This MCP server runs with the tool policy \"{s}\"; call `capabilities` to see which groups are available.",
+        .{ name, policy.spec },
+    );
+    return std.fmt.allocPrint(
+        arena,
+        "tool '{s}' EXISTS but is not enabled for this connection: this MCP server was started with the tool policy \"{s}\" (from {s}), which withholds it. This is an operator decision, not a missing feature or a bug — do not retry. To enable it, the server must be restarted with `--tools {s}` (whole group) or `--tools {s}` (that one tool). `capabilities` reports the active policy and the suppressed groups.",
+        .{ name, policy.spec, policy_source, meta.group.name(), name },
+    );
 }
 
 fn rpcResult(arena: std.mem.Allocator, id: std.json.Value, result_json: []const u8) ?[]const u8 {
@@ -1026,6 +1172,14 @@ const TOOLS_JSON_RAW =
     \\{"name":"file_media_info","description":"Media metadata for MANY files in ONE daemon-side batch: image/video dimensions, JPEG EXIF (camera, lens, orientation, DateTimeOriginal, exposure, GPS), audio tags (ID3v1/v2, Vorbis, MP4 ilst), duration and bitrate. Extraction runs on the host that owns the files and is cached there keyed on path+mtime+size, so re-asking is nearly free and no file bytes cross the network. Values are flat key=value pairs in a stable namespace (media.*, tag.*, exif.*, image.*, doc.*); a duration marked estimated was derived from a bitrate, not read from a header. Files that are not media are answered with an empty field list rather than an error.","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Absolute file paths (max 128 per call)"}},"required":["paths"]}},
     \\{"name":"file_jobs","description":"List file jobs (running + recently finished): id, op, state, progress. Jobs survive client disconnects.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"file_job","description":"Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).","inputSchema":{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}},
+    \\{"name":"ui_show","description":"Show the user a real native UI PANEL in their sketerm window: a declarative document you author, rendered as GTK widgets — not text, not a screenshot. Use it to present what a terminal cannot: an image set, an A/B before/after comparison slider, a training dashboard, an approve/reject button. The user interacts and you read the interactions back with ui_wait_event. Panels are keyed by (session, name): re-showing a name REPLACES that panel's document IN PLACE (same window, same panel_id, compare sliders keep their zoom/pan/split), which is what makes a repeated 'here is epoch 42' cheap. Pass EITHER 'document' (the panel itself) OR 'load' (the name of a document stored earlier with ui_save) — exactly one. Needs a running sketerm GUI (start the MCP server with --shared; `capabilities` reports `panels`). DOCUMENT FORMAT: {\"title\":\"Epoch 41\",\"root\":\"main\",\"components\":{\"main\":{\"type\":\"column\",\"children\":[\"h\",\"cmp\"]},...}} — a FLAT map of components keyed by id and referenced BY ID, never nested. Types and their props: column/row {children:[ids]}; heading {text,level 1-4}; text {text}; image {src,caption} (src = ABSOLUTE local path, no '..'); image_compare {left:{src,label},right:{src,label}} = the A/B slider; button {text,action} (action is the value the click event carries); slider {min,max,step,value}; select {options:[...],value}; progress {value,label,indeterminate}; separator; spacer {size} (0 = expand). Any component may carry \"class\":[...] from: dim accent success warning error card monospace center end expand. There is deliberately no raw HTML, CSS or script — this catalog is the whole vocabulary. Limits: 512 components, 1MB, ids [A-Za-z0-9_.-]. A rejected document comes back with the parser's own message naming the offending component id — fix that and re-send.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name, unique per session. Re-using it replaces that panel's document in place."},"document":{"description":"The panel document (a JSON object, or a JSON string). Mutually exclusive with 'load'."},"load":{"type":"string","description":"Show a document saved earlier with ui_save, by its saved name. Mutually exclusive with 'document'."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Where it goes: 'tab' (default) = a new tab in the user's window; 'pane' = takes over the calling pane (its shell comes back when the panel closes); 'window' = a standalone panel window."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION — your own pane). Panels are invisible to other sessions."}},"required":["name"]}},
+    \\{"name":"ui_show_files","description":"FAST PATH for \"show me these images\": hand it a list of local image files and it builds the panel document for you and shows it — ONE call instead of hand-authoring a ui_show document. Reach for ui_show only when the panel needs more than pictures and captions (buttons, sliders, progress, mixed layout); everything else about it is identical, and what it makes IS a normal panel — ui_patch, ui_save, ui_close and ui_wait_event all work on it. 'files' is [{\"path\":\"/abs/img.png\",\"caption\":\"epoch 41\"}]; a bare \"/abs/path\" string is accepted too, and a missing caption falls back to the file's basename. LAYOUT: with compare:true and EXACTLY two files you get an image_compare — the A/B slider, with each file's caption as its side label (this is the before/after review component). compare:true with any other number of files is REFUSED. Otherwise you get a heading (only when you pass 'title') plus one image per file, stacked in a scrolling column, in the order given. PATHS must be absolute and free of \"..\" (a bad one is refused, naming it). Readability is checked first: files that cannot be read are still shown — the renderer draws an explicit placeholder rather than failing the panel — and every one of them is named back to you in \"unreadable\", but if NOT ONE file can be read the call is refused instead of showing a panel of placeholders. Max 64 files. 'name' defaults to \"files\", and re-showing the same name REPLACES that panel in place (same window, same panel_id), so \"here is the next epoch\" is the same one-line call again. Needs a running sketerm GUI (start this server with --shared; `capabilities` reports `panels`).","inputSchema":{"type":"object","properties":{"files":{"type":"array","description":"1..64 images: {\"path\":\"/abs/path.png\",\"caption\":\"...\"} objects, or plain absolute-path strings. Caption defaults to the basename.","items":{}},"name":{"type":"string","description":"Panel name, unique per session. Default \"files\"; re-using it replaces that panel in place."},"title":{"type":"string","description":"Panel title. When given it is also drawn as a heading above the images."},"compare":{"type":"boolean","description":"Two files only: draw the A/B comparison slider instead of stacking them. The captions become the side labels."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Same as ui_show: 'tab' (default), 'pane' (takes over the calling pane), 'window'."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION)."}},"required":["files"]}},
+    \\{"name":"ui_patch","description":"Update a live panel WITHOUT rebuilding it: a JSON array of ops applied as one transaction (all or nothing). Leaf changes update the widget in place — label text, slider value, progress fraction, a new image on either side of an image_compare — so the compare keeps its zoom, pan and split position across an epoch swap, and the user's scroll position survives. Ops: {\"op\":\"set\",\"id\":\"<id>\",\"component\":{...}} (add or replace a component), {\"op\":\"remove\",\"id\":\"<id>\"}, {\"op\":\"title\",\"value\":\"...\"}, {\"op\":\"root\",\"id\":\"<id>\"}, {\"op\":\"data\",\"key\":\"k\",\"value\":<scalar|null>}. Max 256 ops. A patch that names a component that does not exist is REFUSED with the parser's message and the panel is left exactly as it was. Address the panel by 'name' (preferred — stable) or by 'panel_id'.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"patch":{"description":"JSON array of ops (or a JSON string of one)"},"session":{"type":"string"}},"required":["patch"]}},
+    \\{"name":"ui_wait_event","description":"BLOCK until the user interacts with a panel, then return the queued interactions: button clicks (value = the button's action), slider/select changes (value = the new value), each with the component id and a monotonic ms timestamp. This is how a panel becomes a conversation — show an approve/reject panel, wait here, act on the answer. Returns as soon as anything is queued, including interactions that happened BEFORE the call (the queue is drained, never sampled), so no click can be missed between calls. On timeout it says so plainly rather than pretending nothing was clicked. timeout_ms is clamped to 120000 (120s, under the MCP call watchdog); the default is 30000. If the queue overflowed (64 events) the reply reports how many were dropped — a truncated interaction stream is stated, never hidden. A panel closed by the user ends the wait immediately and says so.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"timeout_ms":{"type":"integer","description":"Wait budget, default 30000, clamped to 120000"},"session":{"type":"string"}}}},
+    \\{"name":"ui_panels","description":"Inventory of panels in a session, in two clearly separate lists: LIVE panels (on screen right now — panel_id, name, title, target) and SAVED documents (stored on disk by ui_save — name, title, size, mtime, and whether the stored file still parses). A saved panel is not showing; a live panel is not saved. Panels are session-scoped, so this lists YOURS and never another assistant's.","inputSchema":{"type":"object","properties":{"session":{"type":"string","description":"Default $SKETERM_SESSION"}}}},
+    \\{"name":"ui_save","description":"Persist a panel document to disk under (session, name) so a later ui_show can bring it back with load=<name>. With 'document' it saves that document; without one it saves the panel's CURRENT live document, read back from the GUI — every ui_patch included, and it works for any panel on screen no matter which process showed it (that half needs a GUI socket). Saving does not close or change anything on screen. The document is validated first: an invalid one is refused with the parser's message and nothing is written, and the write is atomic (staged + renamed), so a saved panel is never half-written. Session-scoped: another assistant cannot see or overwrite your saved panels. Cap: 64 panels per session.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Saved name, 1..64 chars of [A-Za-z0-9._-]"},"document":{"description":"Document to save (object or JSON string). Omit to save the LIVE panel of that name, read back from the GUI as it is right now."},"panel_id":{"type":"integer","description":"Address the live panel by handle instead of by 'name' when omitting 'document'; it is still saved under 'name'."},"session":{"type":"string"}},"required":["name"]}},
+    \\{"name":"ui_close","description":"Close a LIVE panel: it disappears from the user's screen. Nothing on disk is touched — a document saved with ui_save stays saved and can be shown again with ui_show load=<name>. (To delete the saved document instead, that is ui_delete — a different, destructive tool.) A pane-target panel gives the pane back to its shell; a tab-target panel takes its tab with it. Closing an already-closed panel is a plain refusal, not an error state.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"session":{"type":"string"}}}},
+    \\{"name":"ui_delete","description":"DESTRUCTIVE: permanently delete a SAVED panel document from disk. This is not how you close a panel — closing what is on screen is ui_close, and it keeps the saved copy. There is no undo and no trash: the file is unlinked. It does not affect a panel currently on screen; that keeps rendering until ui_close. Use it only when the user asked to get rid of a stored panel.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Saved panel name to delete"},"session":{"type":"string"}},"required":["name"]}},
     \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a sketerm GUI window's socket is attached (gui_socket — needed only by GUI-targeting terminal tools; false does NOT mean GUI apps can't run), OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
@@ -1122,6 +1276,15 @@ pub const Tuning = struct {
     }
 };
 
+/// Process-wide tool exposure policy — resolved once at startup from
+/// (lowest to highest precedence) a `[mcp.<name>]` config section,
+/// $SKETERM_MCP_TOOLS, and `--tools`. Held like Tuning: one place both
+/// tools/list and tools/call read, so presentation and enforcement can
+/// never disagree.
+pub var policy: mcpfilter.Policy = .unrestricted;
+/// Where `policy.spec` came from, for the capabilities report.
+var policy_source: []const u8 = "none";
+
 fn replaceAll(arena: std.mem.Allocator, haystack: []const u8, needle: []const u8, repl: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, haystack, needle) == null) return haystack;
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -1145,7 +1308,8 @@ fn renderedToolsJson(arena: std.mem.Allocator) ![]const u8 {
     out = try replaceAll(arena, out, "%SETTLE_DEF%", Tuning.defText(&buf, &Tuning.settle_ms));
     out = try replaceAll(arena, out, "%TIMEOUT_DEF%", Tuning.defText(&buf, &Tuning.timeout_ms));
     out = try replaceAll(arena, out, "%RETRY_DEF%", Tuning.defText(&buf, &Tuning.click_retry));
-    return out;
+    // Filter LAST so the surviving entries keep the substituted text.
+    return mcpfilter.filterToolsJson(arena, out, policy);
 }
 
 pub fn argInt(args: std.json.Value, key: []const u8) ?i64 {
@@ -3014,6 +3178,14 @@ fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
     });
     if (!std.mem.eql(u8, srv_mode, "shared"))
         try w.writeAll(",\"mode_hint\":\"this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)\"");
+    // Panels (ui_*): the live half needs the GUI socket, the saved half
+    // never does — a bare `panels:false` would read as "no panels here"
+    // and hide ui_save/ui_panels/ui_delete, which do work.
+    try w.print(",\"panels\":{}", .{srv_gui_socket});
+    try w.writeAll(if (srv_gui_socket)
+        ",\"panels_hint\":\"ui_show renders a declarative document as native widgets in the user's window and ui_wait_event reads their clicks back; panels are scoped to (session, name)\""
+    else
+        ",\"panels_hint\":\"ui_show/ui_patch/ui_wait_event/ui_close need a running sketerm GUI window — start this server with --shared (or --socket <path>). ui_save/ui_panels/ui_delete work on the saved-document store either way.\"");
     const ocr_ok = ocr.available();
     try w.print(",\"ocr\":{}", .{ocr_ok});
     if (!ocr_ok) try w.writeAll(",\"ocr_hint\":\"app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine\"");
@@ -3043,6 +3215,37 @@ fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
     }
     try w.writeAll("}");
     if (any_override) try w.writeAll(",\"input_tuning_hint\":\"values marked overridden were set via SKETERM_MCP_* env (project .mcp.json); the tools/list descriptions already state these effective defaults\"");
+    // Tool exposure. A missing tool must be explicable from inside the
+    // session: without this an assistant reads a filtered tools/list as
+    // "sketerm cannot do that" and goes looking for workarounds.
+    try w.writeAll(",\"tool_policy\":{\"spec\":");
+    try std.json.Stringify.value(policy.spec, .{}, w);
+    try w.print(",\"source\":\"{s}\",\"restricted\":{},\"groups_available\":[", .{ policy_source, !policy.isUnrestricted() });
+    var first = true;
+    for (std.enums.values(mcpfilter.Group)) |g| {
+        var any = false;
+        for (mcpfilter.TOOL_META) |m| {
+            if (m.group == g and policy.allowsMeta(m)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try std.json.Stringify.value(g.name(), .{}, w);
+    }
+    try w.writeAll("],\"groups_suppressed\":[");
+    var sup_buf: [std.enums.values(mcpfilter.Group).len]mcpfilter.Group = undefined;
+    const suppressed = mcpfilter.suppressedGroups(policy, &sup_buf);
+    for (suppressed, 0..) |g, i| {
+        if (i > 0) try w.writeAll(",");
+        try std.json.Stringify.value(g.name(), .{}, w);
+    }
+    try w.writeAll("]");
+    if (!policy.isUnrestricted())
+        try w.writeAll(",\"hint\":\"the operator restricted this connection's tools; withheld tools are absent from tools/list AND refused by tools/call. Groups: panes, app, term, files, net, browser, ui, core (core is always on). A withheld tool is not a missing capability — ask the user to restart the server with --tools/--profile or $SKETERM_MCP_TOOLS if you need one.\"");
+    try w.writeAll("}");
     // App/terminal sessions have no idle timeout; what ends them is
     // this server's own lifetime in isolated mode. Saying so removes a
     // whole class of "the app exited with status 0 for no reason".
@@ -3308,6 +3511,620 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
     return appErr(arena, "unknown file tool");
 }
 
+// ── ui_*: agent-authored UI panels ────────────────────────────────
+//
+// Live panels are RENDERED BY THE GUI: every one of these tools is a
+// thin adapter over the `panel-*` control-socket commands
+// (src/ui/panelhost.zig), plus `panelstore.zig` for the saved half.
+// Two invariants hold it together:
+//
+// - **Poll here, never block there.** `panel-events` answers
+//   immediately by design: it is dispatched on the GLib main loop, and
+//   blocking that would freeze every window the user has. So
+//   `ui_wait_event`'s BLOCKING semantics live here, as a poll loop.
+//   Do not "fix" it by teaching the GUI side to wait.
+// - **One session key for both halves.** Several assistants drive one
+//   sketerm, so a panel is (session, name). The session is resolved
+//   ONCE per call (`panelstore.resolveSession`: explicit arg, else
+//   $SKETERM_SESSION, else the sessionless bucket) and passed
+//   explicitly to the GUI, so a live panel and its saved document can
+//   never end up under different keys. `panelhost.NO_SESSION` IS
+//   `panelstore.NO_SESSION` — one constant, one definition.
+// - **The GUI holds the document; this server holds none.** `ui_save`
+//   with no `document` reads the panel back with `panel-get`, so it
+//   works against a panel any process showed, at any time. There is
+//   deliberately no server-side mirror to go stale.
+
+/// Poll granularity for ui_wait_event. Human interaction latency is
+/// orders of magnitude above this, and each tick is one tiny IPC
+/// round-trip on the GUI's main loop.
+const UI_POLL_MS: u32 = 100;
+
+const UI_WAIT_DEFAULT_MS: i64 = 30_000;
+
+const UI_NEEDS_GUI =
+    "panels are drawn by a running sketerm GUI window, and this MCP server has no GUI socket. " ++
+    "`sketerm mcp` is ISOLATED by default: it drives its own private daemon, which has no window. " ++
+    "Restart it with `--shared` (join the user's running GUI) or with `--socket <path>` for a specific instance. " ++
+    "A retry cannot fix this — it is a startup decision. `capabilities` reports `panels` and `gui_socket`. " ++
+    "ui_save / ui_panels / ui_delete still work: they only touch the saved-document store.";
+
+/// `ui_save` with no document reads the panel back from the GUI
+/// (`panel-get`), which is why this server keeps no document state of
+/// its own.
+const UI_SAVE_NEEDS_GUI =
+    "ui_save without 'document' reads the panel's CURRENT document back from the sketerm GUI, " ++
+    "and this MCP server has no GUI socket. Either pass 'document' explicitly (the store half works without a GUI), " ++
+    "or restart with `--shared` (join the user's running GUI) or `--socket <path>`. " ++
+    "`capabilities` reports `panels` and `gui_socket`.";
+
+/// Cap on `ui_show_files`. Well under doc.MAX_CHILDREN (128, and the
+/// heading takes one), and past a few dozen images a scrolling column
+/// is the wrong presentation anyway.
+const UI_FILES_MAX: usize = 64;
+
+/// Default panel name for `ui_show_files`, so the common call is
+/// genuinely one line. Re-showing it replaces the panel in place,
+/// which is what "here is the next epoch" wants.
+const UI_FILES_NAME = "files";
+
+/// One entry of `ui_show_files`: an absolute image path plus the
+/// caption drawn under it (or, in compare mode, its side label).
+const UiFile = struct { path: []const u8, caption: []const u8 };
+
+/// Build the panel document `ui_show_files` shows. Pure — no IPC, no
+/// disk — so "the generator emits a document the parser accepts" is a
+/// unit-testable property rather than a GUI-side refusal.
+fn uiFilesDocument(
+    arena: std.mem.Allocator,
+    files: []const UiFile,
+    title: []const u8,
+    compare: bool,
+) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    const heading = title.len > 0;
+
+    try w.writeAll("{\"version\":1,\"title\":");
+    try std.json.Stringify.value(if (heading) title else "Images", .{}, w);
+    try w.writeAll(",\"root\":\"main\",\"components\":{\"main\":{\"type\":\"column\",\"children\":[");
+    if (heading) try w.writeAll("\"h\"");
+    if (compare) {
+        if (heading) try w.writeByte(',');
+        try w.writeAll("\"cmp\"");
+    } else for (files, 0..) |_, i| {
+        if (heading or i > 0) try w.writeByte(',');
+        try w.print("\"img{d}\"", .{i + 1});
+    }
+    try w.writeAll("]}");
+
+    if (heading) {
+        try w.writeAll(",\"h\":{\"type\":\"heading\",\"level\":2,\"text\":");
+        try std.json.Stringify.value(title, .{}, w);
+        try w.writeByte('}');
+    }
+    if (compare) {
+        try w.writeAll(",\"cmp\":{\"type\":\"image_compare\",\"left\":{\"src\":");
+        try std.json.Stringify.value(files[0].path, .{}, w);
+        try w.writeAll(",\"label\":");
+        try std.json.Stringify.value(files[0].caption, .{}, w);
+        try w.writeAll("},\"right\":{\"src\":");
+        try std.json.Stringify.value(files[1].path, .{}, w);
+        try w.writeAll(",\"label\":");
+        try std.json.Stringify.value(files[1].caption, .{}, w);
+        try w.writeAll("}}");
+    } else for (files, 0..) |f, i| {
+        try w.print(",\"img{d}\":{{\"type\":\"image\",\"src\":", .{i + 1});
+        try std.json.Stringify.value(f.path, .{}, w);
+        try w.writeAll(",\"caption\":");
+        try std.json.Stringify.value(f.caption, .{}, w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("}}");
+    return aw.written();
+}
+
+/// The session a ui_* call is scoped to.
+fn uiSession(args: std.json.Value) []const u8 {
+    return panelstore.resolveSession(argStr(args, "session"));
+}
+
+/// An argument that may be given either as a JSON value (the natural
+/// way for an assistant to write a document) or as a JSON string (the
+/// way the control socket carries it). Returns the raw JSON text.
+fn uiJsonArg(arena: std.mem.Allocator, args: std.json.Value, key: []const u8) !?[]const u8 {
+    if (args != .object) return null;
+    const v = args.object.get(key) orelse return null;
+    return switch (v) {
+        .null => null,
+        .string => |s| s,
+        else => blk: {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            std.json.Stringify.value(v, .{}, &aw.writer) catch return error.OutOfMemory;
+            break :blk aw.written();
+        },
+    };
+}
+
+/// One IPC round-trip whose transport failure is a described error
+/// rather than a JSON-RPC fault — a GUI that went away mid-flow is a
+/// normal thing for an assistant to be told about.
+fn uiTalk(arena: std.mem.Allocator, backend: Backend, req: protocol.Request) IpcReply {
+    return ipcParsed(arena, backend, req) catch |err| .{
+        .ok = false,
+        .value = .null,
+        .err = std.fmt.allocPrint(
+            arena,
+            "the sketerm GUI socket did not answer ({s}) — the window may have closed. `capabilities` reports `gui_socket`.",
+            .{@errorName(err)},
+        ) catch "the sketerm GUI socket did not answer",
+    };
+}
+
+const UiResolved = struct {
+    id: u32 = 0,
+    /// Non-empty when the panel could not be addressed.
+    err: []const u8 = "",
+};
+
+/// Resolve `panel_id`, or look a `name` up in the session's live
+/// panels. Name is the stable address; panel_id is what ui_show hands
+/// back and what the control socket speaks.
+fn uiResolve(
+    arena: std.mem.Allocator,
+    backend: Backend,
+    args: std.json.Value,
+    session: []const u8,
+) UiResolved {
+    if (argInt(args, "panel_id")) |pid| {
+        if (pid <= 0 or pid > std.math.maxInt(u32))
+            return .{ .err = "panel_id must be a positive integer (the handle ui_show returned)" };
+        return .{ .id = @intCast(pid) };
+    }
+    const name = argStr(args, "name") orelse
+        return .{ .err = "address the panel by 'name' (stable, preferred) or by 'panel_id'" };
+
+    const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = session });
+    if (!reply.ok) return .{ .err = reply.err };
+    const panels = reply.value.object.get("panels") orelse
+        return .{ .err = "malformed panel-list reply" };
+    if (panels == .array) {
+        for (panels.array.items) |p| {
+            if (p != .object) continue;
+            const n = p.object.get("name") orelse continue;
+            if (n != .string or !std.mem.eql(u8, n.string, name)) continue;
+            const idv = p.object.get("panel_id") orelse continue;
+            if (idv == .integer and idv.integer > 0) return .{ .id = @intCast(idv.integer) };
+        }
+    }
+    return .{ .err = std.fmt.allocPrint(
+        arena,
+        "no LIVE panel named \"{s}\" in session \"{s}\". `ui_panels` lists what is on screen and what is saved; `ui_show` opens one (with load=\"{s}\" if it is saved).",
+        .{ name, session, name },
+    ) catch "no live panel with that name" };
+}
+
+/// The live document behind a panel, canonically serialized, straight
+/// from the GUI's own `doc.Document`. Any panel is readable this way —
+/// including one another process showed, or one shown before this
+/// server started.
+fn uiLiveDocument(
+    arena: std.mem.Allocator,
+    backend: Backend,
+    id: u32,
+) struct { json: []const u8 = "", err: []const u8 = "" } {
+    const reply = uiTalk(arena, backend, .{ .cmd = "panel-get", .panel_id = id });
+    if (!reply.ok) return .{ .err = reply.err };
+    const dv = reply.value.object.get("document") orelse
+        return .{ .err = "panel-get answered without a document" };
+    if (dv != .string) return .{ .err = "panel-get answered with a malformed document" };
+    return .{ .json = dv.string };
+}
+
+/// panelstore failure → the store's own diagnostic (which names the
+/// offending panel or component) with the tool-level next step added.
+fn uiStoreErr(
+    arena: std.mem.Allocator,
+    err: panelstore.Error,
+    diag: *const paneldoc.Diag,
+    what: []const u8,
+) ![]const u8 {
+    const detail = if (diag.len > 0) diag.msg() else @errorName(err);
+    const hint: []const u8 = switch (err) {
+        error.NotFound => " — `ui_panels` lists the saved documents in this session",
+        error.Corrupt => " — the stored file no longer parses; re-save it with ui_save",
+        error.Invalid => " — fix the document and re-send; nothing was written",
+        error.TooMany => " — delete one with ui_delete",
+        else => "",
+    };
+    const msg = std.fmt.allocPrint(arena, "{s}: {s}{s}", .{ what, detail, hint }) catch
+        return error.OutOfMemory;
+    return appErr(arena, msg);
+}
+
+fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    const session = uiSession(args);
+
+    // The store-only tools work with or without a GUI; everything that
+    // touches a live panel needs the socket, and says so once.
+    const needs_gui = eql(u8, name, "ui_show") or eql(u8, name, "ui_show_files") or
+        eql(u8, name, "ui_patch") or
+        eql(u8, name, "ui_wait_event") or eql(u8, name, "ui_close");
+    if (needs_gui and !srv_gui_socket) return appErr(arena, UI_NEEDS_GUI);
+
+    if (eql(u8, name, "ui_show")) {
+        const panel_name = argStr(args, "name") orelse
+            return appErr(arena, "ui_show requires 'name' (the panel's identity in this session)");
+        const inline_doc = try uiJsonArg(arena, args, "document");
+        const load_name = argStr(args, "load");
+        if (inline_doc != null and load_name != null)
+            return appErr(arena, "pass either 'document' (an inline document) or 'load' (a saved one), not both");
+
+        var diag = paneldoc.Diag{};
+        const document = inline_doc orelse blk: {
+            const saved = load_name orelse
+                return appErr(arena, "ui_show requires 'document' (the panel to render) or 'load' (the name of a document saved with ui_save)");
+            break :blk panelstore.loadJson(arena, session, saved, &diag) catch |err|
+                return uiStoreErr(arena, err, &diag, "ui_show could not load the saved panel");
+        };
+
+        const target = argStr(args, "target") orelse "tab";
+        const reply = uiTalk(arena, backend, .{
+            .cmd = "panel-show",
+            .name = panel_name,
+            .session = session,
+            .target = target,
+            .document = document,
+        });
+        // A rejected document answers with doc.Diag's own message,
+        // VERBATIM: it names the offending component id, and that text
+        // is how the assistant fixes what it wrote.
+        if (!reply.ok) return appErr(arena, reply.err);
+
+        const pid = reply.value.object.get("panel_id");
+        const id: i64 = if (pid) |p| (if (p == .integer) p.integer else 0) else 0;
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"panel_id\":{d},\"name\":", .{id});
+        try std.json.Stringify.value(panel_name, .{}, w);
+        try w.writeAll(",\"session\":");
+        try std.json.Stringify.value(session, .{}, w);
+        try w.writeAll(",\"target\":");
+        try std.json.Stringify.value(target, .{}, w);
+        try w.writeAll(",\"showing\":true,\"note\":\"the panel is on the user's screen; ui_wait_event returns their interactions, ui_patch updates it in place\"}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    // A document GENERATOR over the exact path ui_show uses: it builds
+    // the document server-side and hands it to the same panel-show.
+    // There is no second rendering path, no new component and no new
+    // control command here, deliberately.
+    if (eql(u8, name, "ui_show_files")) {
+        const files_v = if (args == .object) args.object.get("files") else null;
+        const items = blk: {
+            const v = files_v orelse
+                return appErr(arena, "ui_show_files requires 'files': a list of absolute image paths, or {path, caption} objects");
+            if (v != .array or v.array.items.len == 0)
+                return appErr(arena, "'files' must be a NON-EMPTY array of absolute image paths (or {path, caption} objects)");
+            break :blk v.array.items;
+        };
+        if (items.len > UI_FILES_MAX) {
+            const msg = std.fmt.allocPrint(
+                arena,
+                "ui_show_files shows at most {d} files at once and got {d} — show a subset (the user can be sent the next batch by re-calling with the same 'name'), or author a paged panel with ui_show.",
+                .{ UI_FILES_MAX, items.len },
+            ) catch return error.OutOfMemory;
+            return appErr(arena, msg);
+        }
+        const compare = argBool(args, "compare");
+        if (compare and items.len != 2) {
+            const msg = std.fmt.allocPrint(
+                arena,
+                "compare:true draws ONE A/B slider between exactly two images, and 'files' has {d}. Pass exactly two files, or drop 'compare' to stack them as separate images.",
+                .{items.len},
+            ) catch return error.OutOfMemory;
+            return appErr(arena, msg);
+        }
+
+        const files = arena.alloc(UiFile, items.len) catch return error.OutOfMemory;
+        var unreadable: std.ArrayList([]const u8) = .empty;
+        for (items, 0..) |item, i| {
+            const path: []const u8 = switch (item) {
+                .string => |s| s,
+                .object => |o| pblk: {
+                    const pv = o.get("path") orelse {
+                        const msg = std.fmt.allocPrint(arena, "files[{d}] has no \"path\"", .{i}) catch
+                            return error.OutOfMemory;
+                        return appErr(arena, msg);
+                    };
+                    if (pv != .string) {
+                        const msg = std.fmt.allocPrint(arena, "files[{d}].path must be a string", .{i}) catch
+                            return error.OutOfMemory;
+                        return appErr(arena, msg);
+                    }
+                    break :pblk pv.string;
+                },
+                else => {
+                    const msg = std.fmt.allocPrint(
+                        arena,
+                        "files[{d}] must be an absolute path string or a {{path, caption}} object",
+                        .{i},
+                    ) catch return error.OutOfMemory;
+                    return appErr(arena, msg);
+                },
+            };
+            if (!paneldoc.validImagePath(path)) {
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "files[{d}]: \"{s}\" must be an ABSOLUTE path with no \"..\" segment and no control characters (panels are persisted and re-opened later, so paths are constrained structurally)",
+                    .{ i, path },
+                ) catch return error.OutOfMemory;
+                return appErr(arena, msg);
+            }
+            var caption: []const u8 = std.fs.path.basename(path);
+            if (item == .object) {
+                if (item.object.get("caption")) |cv| {
+                    if (cv != .string) {
+                        const msg = std.fmt.allocPrint(arena, "files[{d}].caption must be a string", .{i}) catch
+                            return error.OutOfMemory;
+                        return appErr(arena, msg);
+                    }
+                    caption = cv.string;
+                }
+            }
+            if (caption.len > paneldoc.MAX_TEXT) {
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "files[{d}].caption is longer than {d} characters",
+                    .{ i, paneldoc.MAX_TEXT },
+                ) catch return error.OutOfMemory;
+                return appErr(arena, msg);
+            }
+            files[i] = .{ .path = path, .caption = caption };
+
+            // Readability is checked HERE rather than left to the
+            // renderer's placeholder: a placeholder is right for the
+            // one image that vanished mid-training, but a panel made
+            // entirely of them is a typo the assistant must be told
+            // about, not shown to the user.
+            const z = std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0) catch
+                return error.OutOfMemory;
+            if (c.access(z.ptr, c.R_OK) != 0)
+                unreadable.append(arena, path) catch return error.OutOfMemory;
+        }
+
+        if (unreadable.items.len == items.len) {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            const w = &aw.writer;
+            try w.print(
+                "none of the {d} file(s) can be read, so nothing was shown (a panel of nothing but placeholders would only look broken). Check the paths:",
+                .{items.len},
+            );
+            for (unreadable.items, 0..) |p, i| {
+                if (i >= 5) {
+                    try w.print(" … and {d} more", .{unreadable.items.len - i});
+                    break;
+                }
+                try w.print(" {s}", .{p});
+            }
+            return appErr(arena, aw.written());
+        }
+
+        const title = argStr(args, "title") orelse "";
+        const document = uiFilesDocument(arena, files, title, compare) catch
+            return error.OutOfMemory;
+        // The generator's own output is validated before it leaves:
+        // an invalid document must never reach the GUI as an opaque
+        // rejection of something the assistant did not write.
+        var gen_diag = paneldoc.Diag{};
+        var checked = paneldoc.Document.parse(arena, document, &gen_diag) catch |err| {
+            const msg = std.fmt.allocPrint(
+                arena,
+                "ui_show_files built a document its own parser rejected ({s}: {s}) — that is a sketerm bug; ui_show with a hand-written document still works",
+                .{ @errorName(err), gen_diag.msg() },
+            ) catch return error.OutOfMemory;
+            return appErr(arena, msg);
+        };
+        checked.deinit();
+
+        const panel_name = argStr(args, "name") orelse UI_FILES_NAME;
+        const target = argStr(args, "target") orelse "tab";
+        const reply = uiTalk(arena, backend, .{
+            .cmd = "panel-show",
+            .name = panel_name,
+            .session = session,
+            .target = target,
+            .document = document,
+        });
+        if (!reply.ok) return appErr(arena, reply.err);
+        const pid = reply.value.object.get("panel_id");
+        const id: i64 = if (pid) |p| (if (p == .integer) p.integer else 0) else 0;
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"panel_id\":{d},\"name\":", .{id});
+        try std.json.Stringify.value(panel_name, .{}, w);
+        try w.writeAll(",\"session\":");
+        try std.json.Stringify.value(session, .{}, w);
+        try w.writeAll(",\"target\":");
+        try std.json.Stringify.value(target, .{}, w);
+        try w.print(",\"files\":{d},\"layout\":\"{s}\",\"showing\":true", .{
+            files.len,
+            if (compare) "image_compare" else "stacked_images",
+        });
+        if (unreadable.items.len > 0) {
+            try w.writeAll(",\"unreadable\":");
+            try std.json.Stringify.value(unreadable.items, .{}, w);
+            try w.print(
+                ",\"unreadable_note\":\"{d} of {d} file(s) could not be read; they are drawn as an explicit placeholder in the panel, the rest render normally\"",
+                .{ unreadable.items.len, files.len },
+            );
+        }
+        try w.writeAll(",\"note\":\"the panel is on the user's screen; re-call with the same 'name' to replace it in place, or ui_patch/ui_save/ui_close it like any other panel\"}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "ui_patch")) {
+        const patch = (try uiJsonArg(arena, args, "patch")) orelse
+            return appErr(arena, "ui_patch requires 'patch' (a JSON array of ops)");
+        const target = uiResolve(arena, backend, args, session);
+        if (target.err.len > 0) return appErr(arena, target.err);
+        const reply = uiTalk(arena, backend, .{ .cmd = "panel-patch", .panel_id = target.id, .patch = patch });
+        if (!reply.ok) return appErr(arena, reply.err);
+        const msg = std.fmt.allocPrint(arena, "{{\"panel_id\":{d},\"patched\":true}}", .{target.id}) catch
+            return error.OutOfMemory;
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "ui_wait_event")) {
+        const asked: i64 = argInt(args, "timeout_ms") orelse UI_WAIT_DEFAULT_MS;
+        const timeout_ms = @min(@max(asked, 0), WAIT_CAP_MS);
+        const target = uiResolve(arena, backend, args, session);
+        if (target.err.len > 0) return appErr(arena, target.err);
+
+        // The GUI answers panel-events immediately (it runs on the main
+        // loop and must never block), so the WAIT is ours: poll until
+        // something is queued or the budget runs out.
+        const start = backend.nowMs(backend.ctx);
+        var dropped_total: i64 = 0;
+        while (true) {
+            const reply = uiTalk(arena, backend, .{ .cmd = "panel-events", .panel_id = target.id });
+            if (!reply.ok) {
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "the panel is gone ({s}) — the user closed it, or it was never open. Nothing was missed: a closed panel ends the wait immediately.",
+                    .{reply.err},
+                ) catch return error.OutOfMemory;
+                return appErr(arena, msg);
+            }
+            if (reply.value.object.get("dropped")) |d| {
+                if (d == .integer) dropped_total += d.integer;
+            }
+            const evs = reply.value.object.get("events");
+            const count: usize = if (evs) |e| (if (e == .array) e.array.items.len else 0) else 0;
+            const elapsed = backend.nowMs(backend.ctx) - start;
+            if (count > 0 or elapsed >= timeout_ms) {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                const w = &aw.writer;
+                try w.print("{{\"panel_id\":{d},\"waited_ms\":{d},\"events\":", .{ target.id, elapsed });
+                if (count > 0) try std.json.Stringify.value(evs.?, .{}, w) else try w.writeAll("[]");
+                try w.print(",\"dropped\":{d}", .{dropped_total});
+                if (count == 0)
+                    try w.print(",\"timed_out\":true,\"note\":\"no interaction within {d}ms — the panel is still showing; wait again or ui_patch it\"", .{timeout_ms});
+                if (dropped_total > 0)
+                    try w.print(",\"dropped_note\":\"the panel's event queue overflowed and {d} OLDER interaction(s) were discarded; this reply is not the complete history\"", .{dropped_total});
+                try w.writeAll("}");
+                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+            }
+            backend.sleepMs(backend.ctx, UI_POLL_MS);
+        }
+    }
+
+    if (eql(u8, name, "ui_panels")) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"session\":");
+        try std.json.Stringify.value(session, .{}, w);
+
+        try w.writeAll(",\"live\":");
+        if (!srv_gui_socket) {
+            try w.writeAll("null,\"live_note\":");
+            try std.json.Stringify.value(UI_NEEDS_GUI, .{}, w);
+        } else {
+            const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = session });
+            if (reply.ok) {
+                const panels = reply.value.object.get("panels");
+                if (panels != null and panels.? == .array)
+                    try std.json.Stringify.value(panels.?, .{}, w)
+                else
+                    try w.writeAll("[]");
+            } else {
+                try w.writeAll("null,\"live_error\":");
+                try std.json.Stringify.value(reply.err, .{}, w);
+            }
+        }
+
+        try w.writeAll(",\"saved\":");
+        if (panelstore.list(arena, session)) |entries| {
+            try w.writeAll("[");
+            for (entries, 0..) |e, i| {
+                if (i > 0) try w.writeAll(",");
+                try w.writeAll("{\"name\":");
+                try std.json.Stringify.value(e.name, .{}, w);
+                try w.writeAll(",\"title\":");
+                try std.json.Stringify.value(e.title, .{}, w);
+                try w.print(",\"bytes\":{d},\"mtime\":{d},\"parses\":{}}}", .{ e.bytes, e.mtime, e.ok });
+            }
+            try w.writeAll("]");
+        } else |err| {
+            try w.writeAll("null,\"saved_error\":");
+            try std.json.Stringify.value(@errorName(err), .{}, w);
+        }
+        try w.writeAll(",\"note\":\"live = on screen now (ui_close closes one); saved = stored documents (ui_show load=<name> shows one, ui_delete removes one permanently)\"}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "ui_save")) {
+        const panel_name = argStr(args, "name") orelse
+            return appErr(arena, "ui_save requires 'name' (what to save it as)");
+        var diag = paneldoc.Diag{};
+        // No document: read the LIVE one back from the GUI. That works
+        // for ANY panel on screen — including one another process
+        // showed — because the GUI's registry is the only copy.
+        const document = (try uiJsonArg(arena, args, "document")) orelse blk: {
+            if (!srv_gui_socket) return appErr(arena, UI_SAVE_NEEDS_GUI);
+            const target = uiResolve(arena, backend, args, session);
+            if (target.err.len > 0) return appErr(arena, target.err);
+            const live = uiLiveDocument(arena, backend, target.id);
+            if (live.err.len > 0) return appErr(arena, live.err);
+            break :blk live.json;
+        };
+        panelstore.saveJson(arena, session, panel_name, document, &diag) catch |err|
+            return uiStoreErr(arena, err, &diag, "ui_save refused to store the panel");
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"saved\":");
+        try std.json.Stringify.value(panel_name, .{}, w);
+        try w.writeAll(",\"session\":");
+        try std.json.Stringify.value(session, .{}, w);
+        try w.print(",\"bytes\":{d},\"note\":\"stored on disk; show it again with ui_show load=<name>. Nothing on screen changed.\"}}", .{document.len});
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "ui_close")) {
+        const target = uiResolve(arena, backend, args, session);
+        if (target.err.len > 0) return appErr(arena, target.err);
+        const reply = uiTalk(arena, backend, .{ .cmd = "panel-close", .panel_id = target.id });
+        if (!reply.ok) return appErr(arena, reply.err);
+        const msg = std.fmt.allocPrint(
+            arena,
+            "{{\"panel_id\":{d},\"closed\":true,\"note\":\"removed from the screen; any document saved under this name is untouched (ui_delete is what removes that)\"}}",
+            .{target.id},
+        ) catch return error.OutOfMemory;
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "ui_delete")) {
+        const panel_name = argStr(args, "name") orelse
+            return appErr(arena, "ui_delete requires 'name' (the SAVED panel to delete)");
+        var diag = paneldoc.Diag{};
+        panelstore.delete(arena, session, panel_name, &diag) catch |err|
+            return uiStoreErr(arena, err, &diag, "ui_delete could not delete the saved panel");
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"deleted\":");
+        try std.json.Stringify.value(panel_name, .{}, w);
+        try w.writeAll(",\"session\":");
+        try std.json.Stringify.value(session, .{}, w);
+        try w.writeAll(",\"note\":\"the SAVED document is gone for good. A panel of that name still on screen keeps rendering until ui_close.\"}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    return appErr(arena, "unknown ui tool");
+}
+
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
 
@@ -3331,6 +4148,9 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     }
     if (std.mem.startsWith(u8, name, "file_")) {
         return fsTool(arena, name, args);
+    }
+    if (std.mem.startsWith(u8, name, "ui_")) {
+        return uiTool(arena, backend, name, args);
     }
     if (eql(u8, name, "capabilities")) {
         return capabilitiesTool(arena);
@@ -3997,6 +4817,93 @@ test "the advertised tool list is well-formed JSON" {
     try std.testing.expect(seen.contains("app_wait_log"));
 }
 
+test "TOOLS_JSON and mcpfilter.TOOL_META name exactly the same tools" {
+    // The group/read-only classification lives in typed Zig, not in the
+    // JSON payload, so the two lists can drift: a tool added to
+    // TOOLS_JSON alone would be silently ungrouped (and unreachable
+    // under any group term), one left behind in TOOL_META would make
+    // a policy term look like it works when nothing answers it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = policy;
+    policy = .unrestricted;
+    defer policy = saved;
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, try renderedToolsJson(arena), .{});
+    var in_json: std.StringHashMapUnmanaged(void) = .empty;
+    defer in_json.deinit(arena);
+    for (parsed.array.items) |t| {
+        const nm = t.object.get("name").?.string;
+        if (mcpfilter.lookup(nm) == null) {
+            std.debug.print("tool '{s}' is in TOOLS_JSON but has no mcpfilter.TOOL_META entry\n", .{nm});
+            return error.ToolMissingFromToolMeta;
+        }
+        try in_json.put(arena, nm, {});
+    }
+    for (mcpfilter.TOOL_META) |m| {
+        if (!in_json.contains(m.name)) {
+            std.debug.print("tool '{s}' is in mcpfilter.TOOL_META but not in TOOLS_JSON\n", .{m.name});
+            return error.ToolMetaNamesUnknownTool;
+        }
+    }
+    // Every entry unique, or the last one silently decides the group.
+    for (mcpfilter.TOOL_META, 0..) |m, i| {
+        for (mcpfilter.TOOL_META[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, m.name, other.name)) {
+                std.debug.print("duplicate mcpfilter.TOOL_META entry for '{s}'\n", .{m.name});
+                return error.DuplicateToolMeta;
+            }
+        }
+    }
+}
+
+test "a policy filters tools/list and refuses tools/call" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeBackend{ .responses = &.{"{\"ok\":true}"}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    const saved = policy;
+    const saved_src = policy_source;
+    policy = .{ .spec = "app:ro" };
+    policy_source = "test";
+    defer {
+        policy = saved;
+        policy_source = saved_src;
+    }
+
+    const listed = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"screenshot_app\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"app_click\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"run_command\"") == null);
+
+    // Enforcement: a name learned elsewhere is still refused, and the
+    // refusal names the term that would enable it.
+    const refused = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"ls"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, refused, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "EXISTS but is not enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "--tools panes") != null);
+    // Nothing reached the backend.
+    try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
+    // (capabilities' policy block needs the process-wide rec/app state
+    // a real server sets up — smoke-mcp asserts it end to end.)
+}
+
+test "mcp Opts parses --tools and --profile" {
+    const o = try Opts.parse(&.{ "--tools", "app, files:ro", "--profile", "readonly" });
+    try std.testing.expectEqualStrings("app, files:ro", o.tools.?);
+    try std.testing.expectEqualStrings("readonly", o.profile.?);
+    try std.testing.expectError(error.MissingValue, Opts.parse(&.{"--tools"}));
+    try std.testing.expectError(error.BadName, Opts.parse(&.{ "--profile", "no spaces" }));
+}
+
 test "tools/call send_keys routes to IPC send-keys" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -4015,6 +4922,559 @@ test "tools/call send_keys routes to IPC send-keys" {
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"send-keys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"pane\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "ctrl+c enter") != null);
+}
+
+/// XDG_STATE_HOME pointed at a scratch dir, plus a GUI socket the
+/// ui_* tools will believe in. Every panelstore path derives from the
+/// state dir, so without this the tests would write into the
+/// developer's real panel store.
+const UiScratch = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+    saved_gui: bool = false,
+
+    fn init(self: *UiScratch, tag: []const u8, gui: bool) !void {
+        self.* = .{};
+        const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-mcp-ui-{s}-{d}", .{ tag, c.getpid() });
+        self.len = p.len;
+        _ = c.mkdir(@ptrCast(&self.buf), 0o755);
+        _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.buf), 1);
+        _ = c.unsetenv("SKETERM_SESSION");
+        self.saved_gui = srv_gui_socket;
+        srv_gui_socket = gui;
+    }
+
+    fn deinit(self: *UiScratch) void {
+        srv_gui_socket = self.saved_gui;
+        _ = c.unsetenv("XDG_STATE_HOME");
+        var cmd: [256]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}) catch return;
+        _ = c.system(z.ptr);
+        self.* = undefined;
+    }
+};
+
+const UI_DOC =
+    \\{"title":"Epoch 41","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve"}}}
+;
+
+test "ui_show sends the document to the GUI, and ui_save reads the live one back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("show", true);
+    defer scratch.deinit();
+
+    const LIVE_DOC =
+        \\{"title":"Epoch 42","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve"}}}
+    ;
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"panel_id\":7,\"session\":\"s1\"}", // panel-show
+            "{\"ok\":true,\"panels\":[{\"panel_id\":7,\"name\":\"train\",\"session\":\"s1\",\"title\":\"Epoch 41\",\"target\":\"tab\"}]}", // panel-list (name -> id)
+            "{\"ok\":true}", // panel-patch
+            "{\"ok\":true,\"panels\":[{\"panel_id\":7,\"name\":\"train\",\"session\":\"s1\",\"title\":\"Epoch 42\",\"target\":\"tab\"}]}", // panel-list (name -> id)
+            "{\"ok\":true,\"document\":\"{\\\"title\\\":\\\"Epoch 42\\\",\\\"root\\\":\\\"ok\\\",\\\"components\\\":{\\\"ok\\\":{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Approve\\\",\\\"action\\\":\\\"approve\\\"}}}\",\"name\":\"train\",\"session\":\"s1\",\"title\":\"Epoch 42\"}", // panel-get
+        },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"train","session":"s1","document":{"title":"Epoch 41","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"panel_id\\\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+    // The document travelled as the control socket's JSON string, and
+    // the target defaulted to a tab.
+    const req = fake.requests.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"cmd\":\"panel-show\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"target\":\"tab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"session\":\"s1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "image_compare") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Approve") != null);
+
+    // A patch by name resolves the id and forwards the ops — and does
+    // NOT keep any document state on this side.
+    const patched = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_patch","arguments":{"name":"train","session":"s1","patch":[{"op":"title","value":"Epoch 42"}]}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, patched, "isError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[2], "\"cmd\":\"panel-patch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[2], "\"panel_id\":7") != null);
+    // Exactly one list + one patch: no extra round-trip to learn a name.
+    try std.testing.expectEqual(@as(usize, 3), fake.requests.items.len);
+
+    // ui_save with no document reads the panel back over panel-get and
+    // stores THAT — the patched title included, because the GUI is the
+    // one holding the document.
+    const saved = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"train","session":"s1"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[4], "\"cmd\":\"panel-get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[4], "\"panel_id\":7") != null);
+    try std.testing.expect(panelstore.exists(arena, "s1", "train"));
+    var loaded = try panelstore.load(arena, "s1", "train", null);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("Epoch 42", loaded.title);
+
+    // The stored bytes are exactly what the GUI reported, canonically
+    // serialized — not a re-derivation of anything held here.
+    var live = try paneldoc.Document.parse(arena, LIVE_DOC, null);
+    defer live.deinit();
+    const want = try live.toJson(arena);
+    const on_disk = try panelstore.loadJson(arena, "s1", "train", null);
+    try std.testing.expectEqualStrings(want, on_disk);
+}
+
+test "ui_save persists a panel this server never showed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("foreign", true);
+    defer scratch.deinit();
+
+    // Nothing was ever shown through THIS server: the panel belongs to
+    // another process (or to a run before this one). The mirror this
+    // path replaced could not save it at all.
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"panels\":[{\"panel_id\":3,\"name\":\"theirs\",\"session\":\"s9\",\"title\":\"Theirs\",\"target\":\"window\"}]}", // panel-list
+            "{\"ok\":true,\"document\":\"{\\\"title\\\":\\\"Theirs\\\",\\\"root\\\":\\\"t\\\",\\\"components\\\":{\\\"t\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"hi\\\"}}}\",\"name\":\"theirs\",\"session\":\"s9\",\"title\":\"Theirs\"}", // panel-get
+        },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    const saved = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"theirs","session":"s9"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
+    var loaded = try panelstore.load(arena, "s9", "theirs", null);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("Theirs", loaded.title);
+
+    // A panel that is not on screen is a described refusal naming the
+    // session, not a save of something stale.
+    var fake2 = FakeBackend{
+        .responses = &.{"{\"ok\":true,\"panels\":[]}"},
+        .allocator = std.testing.allocator,
+    };
+    defer fake2.deinit();
+    const missing = handleMessage(arena, fake2.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"ghost","session":"s9"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, missing, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "ghost") != null);
+}
+
+test "ui_save without a document needs the GUI and says so" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("savenogui", false);
+    defer scratch.deinit();
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"p","session":"s1"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "--shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "'document'") != null);
+    // Nothing was attempted on the socket, and nothing was written.
+    try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
+    try std.testing.expect(!panelstore.exists(arena, "s1", "p"));
+}
+
+test "ui_show refuses a bad document with the parser's own message" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("bad", true);
+    defer scratch.deinit();
+
+    // The GUI is the one that parses; its Diag message must reach the
+    // assistant verbatim, component id and all.
+    var fake = FakeBackend{
+        .responses = &.{"{\"ok\":false,\"error\":\"component \\\"r\\\": unknown type \\\"webview\\\"\"}"},
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"x","session":"s1","document":"{\"root\":\"r\",\"components\":{\"r\":{\"type\":\"webview\"}}}"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "webview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "unknown type") != null);
+
+    // document + load together is a caller error caught before any IPC.
+    const both = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"x","document":{},"load":"y"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, both, "not both") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
+}
+
+/// Create an empty file so ui_show_files' readability check passes.
+fn touchFile(dir: []const u8, name: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return;
+    const f = c.fopen(p.ptr, "wb") orelse return;
+    _ = c.fwrite("x", 1, 1, f);
+    _ = c.fclose(f);
+}
+
+test "ui_show_files generates a document the panel parser accepts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Stacked: a heading (because a title was given) plus one image per
+    // file, in order, captions attached.
+    const stacked = try uiFilesDocument(arena, &.{
+        .{ .path = "/tmp/e40.png", .caption = "epoch 40" },
+        .{ .path = "/tmp/e41.png", .caption = "e41.png" },
+    }, "Epoch 41", false);
+    var doc = try paneldoc.Document.parse(arena, stacked, null);
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("Epoch 41", doc.title);
+    try std.testing.expectEqualStrings("main", doc.root);
+    const main = doc.get("main").?;
+    try std.testing.expectEqual(@as(usize, 3), main.props.column.children.len);
+    try std.testing.expectEqualStrings("h", main.props.column.children[0]);
+    try std.testing.expectEqual(paneldoc.Kind.heading, doc.kindOf("h").?);
+    try std.testing.expectEqualStrings("/tmp/e40.png", doc.get("img1").?.props.image.src);
+    try std.testing.expectEqualStrings("epoch 40", doc.get("img1").?.props.image.caption);
+    try std.testing.expectEqualStrings("/tmp/e41.png", doc.get("img2").?.props.image.src);
+
+    // No title: no heading, and the column is images only.
+    const untitled = try uiFilesDocument(arena, &.{
+        .{ .path = "/tmp/a.png", .caption = "a.png" },
+    }, "", false);
+    var doc2 = try paneldoc.Document.parse(arena, untitled, null);
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), doc2.get("main").?.props.column.children.len);
+    try std.testing.expect(doc2.get("h") == null);
+
+    // Compare: ONE image_compare, each caption becoming a side label.
+    const cmp = try uiFilesDocument(arena, &.{
+        .{ .path = "/tmp/e40.png", .caption = "epoch 40" },
+        .{ .path = "/tmp/e41.png", .caption = "epoch 41" },
+    }, "E41 vs E40", true);
+    var doc3 = try paneldoc.Document.parse(arena, cmp, null);
+    defer doc3.deinit();
+    try std.testing.expectEqual(paneldoc.Kind.image_compare, doc3.kindOf("cmp").?);
+    const ic = doc3.get("cmp").?.props.image_compare;
+    try std.testing.expectEqualStrings("/tmp/e40.png", ic.left.src);
+    try std.testing.expectEqualStrings("epoch 40", ic.left.label);
+    try std.testing.expectEqualStrings("/tmp/e41.png", ic.right.src);
+    try std.testing.expectEqualStrings("epoch 41", ic.right.label);
+    try std.testing.expect(doc3.get("img1") == null);
+
+    // A caption with quotes/newlines cannot break the generated JSON.
+    const nasty = try uiFilesDocument(arena, &.{
+        .{ .path = "/tmp/x.png", .caption = "he said \"hi\"\nthen \\left" },
+    }, "a \"quoted\" title", false);
+    var doc4 = try paneldoc.Document.parse(arena, nasty, null);
+    defer doc4.deinit();
+    try std.testing.expectEqualStrings("he said \"hi\"\nthen \\left", doc4.get("img1").?.props.image.caption);
+
+    // Full cap: still one valid document (heading + 64 images < MAX_CHILDREN).
+    var many: [UI_FILES_MAX]UiFile = undefined;
+    for (&many) |*f| f.* = .{ .path = "/tmp/e.png", .caption = "e" };
+    const big = try uiFilesDocument(arena, &many, "All", false);
+    var doc5 = try paneldoc.Document.parse(arena, big, null);
+    defer doc5.deinit();
+    try std.testing.expectEqual(@as(usize, UI_FILES_MAX + 1), doc5.get("main").?.props.column.children.len);
+}
+
+test "ui_show_files shows an image set in one call, through the ui_show path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("files", true);
+    defer scratch.deinit();
+    const dir = scratch.buf[0..scratch.len];
+    touchFile(dir, "e40.png");
+    touchFile(dir, "e41.png");
+
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"panel_id\":9}", // compare
+            "{\"ok\":true,\"panel_id\":9}", // stacked, one file missing
+        },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    // compare:true with exactly two files -> the A/B slider, captions
+    // as side labels.
+    const req_cmp = try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"session":"s1","title":"E41 vs E40","compare":true,"files":[{{"path":"{s}/e40.png","caption":"epoch 40"}},{{"path":"{s}/e41.png","caption":"epoch 41"}}]}}}}}}
+    , .{ dir, dir });
+    const resp = handleMessage(arena, fake.backend(), req_cmp).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"panel_id\\\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "image_compare") != null);
+    // It went out over the SAME panel-show the hand-authored path uses,
+    // under the default name, as an image_compare document.
+    const sent = fake.requests.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"name\":\"files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"target\":\"tab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "image_compare") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "epoch 40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "epoch 41") != null);
+
+    // Stacked, with one path that does not exist: the panel is still
+    // shown (the renderer draws a placeholder) and the reply NAMES the
+    // file, so the assistant can tell.
+    const req_stack = try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"session":"s1","name":"preview","files":["{s}/e40.png","{s}/ghost.png"]}}}}}}
+    , .{ dir, dir });
+    const resp2 = handleMessage(arena, fake.backend(), req_stack).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "isError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "stacked_images") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "unreadable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "ghost.png") != null);
+    const sent2 = fake.requests.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, sent2, "\"name\":\"preview\"") != null);
+    // Bare strings caption themselves with the basename, and no title
+    // means no heading.
+    try std.testing.expect(std.mem.indexOf(u8, sent2, "\\\"caption\\\":\\\"e40.png\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent2, "heading") == null);
+    try std.testing.expectEqual(@as(usize, 2), fake.requests.items.len);
+}
+
+test "ui_show_files refuses bad arity, bad paths and an all-missing set" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("files-bad", true);
+    defer scratch.deinit();
+    const dir = scratch.buf[0..scratch.len];
+    touchFile(dir, "a.png");
+
+    var fake = FakeBackend{ .responses = &.{"{\"ok\":true,\"panel_id\":1}"}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    // compare with three files: refused, clearly, before any IPC.
+    const arity = handleMessage(arena, fake.backend(), try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"compare":true,"files":["{s}/a.png","{s}/a.png","{s}/a.png"]}}}}}}
+    , .{ dir, dir, dir })).?;
+    try std.testing.expect(std.mem.indexOf(u8, arity, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arity, "exactly two") != null);
+
+    // compare with one file: same refusal.
+    const one = handleMessage(arena, fake.backend(), try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"compare":true,"files":["{s}/a.png"]}}}}}}
+    , .{dir})).?;
+    try std.testing.expect(std.mem.indexOf(u8, one, "exactly two") != null);
+
+    // Empty list, a relative path and a traversing path.
+    const empty = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_show_files","arguments":{"files":[]}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, empty, "NON-EMPTY") != null);
+    const relative = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ui_show_files","arguments":{"files":["rel.png"]}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, relative, "ABSOLUTE") != null);
+    const traverse = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ui_show_files","arguments":{"files":["/a/../etc/shadow"]}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, traverse, "isError") != null);
+
+    // Nothing readable at all: refused rather than shown as a wall of
+    // placeholders, and the message names the paths.
+    const gone = handleMessage(arena, fake.backend(), try std.fmt.allocPrint(arena,
+        \\{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"ui_show_files","arguments":{{"files":["{s}/gone1.png","{s}/gone2.png"]}}}}}}
+    , .{ dir, dir })).?;
+    try std.testing.expect(std.mem.indexOf(u8, gone, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "none of the 2 file(s) can be read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "gone2.png") != null);
+
+    // Over the cap.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(std.testing.allocator);
+    try big.appendSlice(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ui_show_files","arguments":{"files":[
+    );
+    for (0..UI_FILES_MAX + 1) |i| {
+        if (i > 0) try big.append(std.testing.allocator, ',');
+        try big.appendSlice(std.testing.allocator, "\"/tmp/x.png\"");
+    }
+    try big.appendSlice(std.testing.allocator, "]}}}");
+    const capped = handleMessage(arena, fake.backend(), big.items).?;
+    try std.testing.expect(std.mem.indexOf(u8, capped, "at most 64 files") != null);
+
+    // Not one of those reached the GUI.
+    try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
+}
+
+test "ui_wait_event polls instead of blocking the GUI, and reports drops" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("wait", true);
+    defer scratch.deinit();
+
+    // panel-events answers immediately every time (it runs on the GLib
+    // main loop); the WAIT is this tool's poll loop.
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"events\":[],\"dropped\":0}",
+            "{\"ok\":true,\"events\":[],\"dropped\":2}",
+            "{\"ok\":true,\"events\":[{\"component\":\"ok\",\"kind\":\"click\",\"value\":\"approve\",\"ts\":42}],\"dropped\":0}",
+        },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":5000}}}
+    ).?;
+    try std.testing.expectEqual(@as(usize, 3), fake.requests.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"panel-events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "approve") != null);
+    // The drop counter seen on an earlier poll is not lost.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"dropped\\\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "dropped_note") != null);
+    // Two poll ticks were slept, not spun.
+    try std.testing.expectEqual(@as(i64, 2 * UI_POLL_MS), fake.clock_ms);
+}
+
+test "ui_wait_event times out honestly and clamps the budget" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("timeout", true);
+    defer scratch.deinit();
+
+    var bufs: [4][]const u8 = @splat("{\"ok\":true,\"events\":[],\"dropped\":0}");
+    var fake = FakeBackend{ .responses = &bufs, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":250}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "timed_out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "still showing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+
+    // A wait longer than the watchdog allows is clamped, not promised.
+    var bufs2: [1][]const u8 = @splat("{\"ok\":true,\"events\":[{\"component\":\"s\",\"kind\":\"change\",\"value\":3,\"ts\":1}],\"dropped\":0}");
+    var fake2 = FakeBackend{ .responses = &bufs2, .allocator = std.testing.allocator };
+    defer fake2.deinit();
+    const clamped = handleMessage(arena, fake2.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":999999}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, clamped, "\\\"change\\\"") != null);
+
+    // A panel that went away ends the wait at once, and says so.
+    var bufs3: [1][]const u8 = @splat("{\"ok\":false,\"error\":\"no such panel\"}");
+    var fake3 = FakeBackend{ .responses = &bufs3, .allocator = std.testing.allocator };
+    defer fake3.deinit();
+    const gone = handleMessage(arena, fake3.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":60000}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, gone, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "panel is gone") != null);
+}
+
+test "ui_* tools that need the GUI say so, and the store-only ones still work" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("nogui", false);
+    defer scratch.deinit();
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    for ([_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"x","document":{}}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_close","arguments":{"panel_id":1}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":1}}}
+        ,
+    }) |msg| {
+        const resp = handleMessage(arena, fake.backend(), msg).?;
+        try std.testing.expect(std.mem.indexOf(u8, resp, "isError") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "--shared") != null);
+    }
+    // Nothing was even attempted on the socket.
+    try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
+
+    // The saved half is independent of the GUI: save, list, delete.
+    const saved = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"kept","session":"s2","document":{"title":"Kept","root":"t","components":{"t":{"type":"text","text":"hi"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
+
+    const listed = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ui_panels","arguments":{"session":"s2"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\\\"live\\\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "--shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "kept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "Kept") != null);
+
+    const deleted = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ui_delete","arguments":{"name":"kept","session":"s2"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, deleted, "isError") == null);
+    try std.testing.expect(!panelstore.exists(arena, "s2", "kept"));
+
+    // Deleting what is not there names the panel and the session.
+    const again = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ui_delete","arguments":{"name":"kept","session":"s2"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, again, "isError") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "kept") != null);
+}
+
+test "ui panels are session-scoped, including a session with a space" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("scope", false);
+    defer scratch.deinit();
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+
+    // A legal daemon session name the old charset rule would have
+    // rejected outright.
+    const save_a =
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"p","session":"my work","document":{"title":"Mine","root":"t","components":{"t":{"type":"text","text":"a"}}}}}}
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, handleMessage(arena, fake.backend(), save_a).?, "isError") == null);
+    const save_b =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"p","session":"other","document":{"title":"Theirs","root":"t","components":{"t":{"type":"text","text":"b"}}}}}}
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, handleMessage(arena, fake.backend(), save_b).?, "isError") == null);
+
+    const mine = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_panels","arguments":{"session":"my work"}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, mine, "Mine") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mine, "Theirs") == null);
 }
 
 test "read_screen last_command extracts the OSC 133 zone" {

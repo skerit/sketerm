@@ -612,6 +612,22 @@ pub const Domain = struct {
     }
 };
 
+/// `[mcp.<name>]` sections — named MCP tool-exposure policies, so the
+/// same spec can be reused by several assistants via
+/// `sketerm mcp --profile <name>`.
+///
+/// The section namespace is `mcp.`, NOT `profile.`: `[profile.<name>]`
+/// already means a pane ProfileSettings bundle, and the two have
+/// nothing in common beyond the word.
+pub const McpProfile = struct {
+    name: []const u8,
+    /// Tool exposure spec — the grammar lives in src/ipc/mcpfilter.zig.
+    /// Empty = every tool (this module never validates it: config.zig
+    /// is compiled into sketerm-mux and must not depend on the MCP
+    /// tool table; `sketerm mcp` validates at startup).
+    tools: []const u8 = "",
+};
+
 /// When to ask "are you sure?" before destroying panes / tabs.
 /// Matches Terminator's `ask_before_closing` semantics:
 ///   never    — close immediately, no dialog
@@ -1092,6 +1108,11 @@ pub const Config = struct {
     /// it is switching off, and one carrying only `args` keeps the
     /// built-in's languages and root markers.
     lsp_servers: std.ArrayList(LspServer) = .empty,
+
+    /// Named MCP tool-exposure policies from `[mcp.<name>]` sections,
+    /// selected with `sketerm mcp --profile <name>`. Order preserved
+    /// for round-trip serialisation.
+    mcp_profiles: std.ArrayList(McpProfile) = .empty,
 
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
@@ -1742,6 +1763,21 @@ pub const Config = struct {
             if (srv.init_options.len > 0) try w.print("init_options = {s}\n", .{srv.init_options});
             if (!srv.enabled) try w.writeAll("enabled = false\n");
         }
+
+        for (self.mcp_profiles.items) |prof| {
+            try w.print("\n[mcp.{s}]\n", .{prof.name});
+            if (prof.tools.len > 0) try w.print("tools = {s}\n", .{prof.tools});
+        }
+    }
+
+    /// The `[mcp.<name>]` policy record, or null when no such section
+    /// exists (`sketerm mcp --profile` treats that as a hard error —
+    /// silently running unrestricted would be the worst outcome).
+    pub fn mcpProfile(self: *const Config, name: []const u8) ?*const McpProfile {
+        for (self.mcp_profiles.items) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
+        }
+        return null;
     }
 
     /// The server that should handle `language_id`: a `[lsp.<name>]`
@@ -2027,6 +2063,7 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     var current_profile_name: []const u8 = "";
     var current_domain: ?*Domain = null;
     var current_lsp: ?*LspServer = null;
+    var current_mcp: ?*McpProfile = null;
     while (lines.next()) |raw| {
         lineno += 1;
         const line = trim(stripComment(raw));
@@ -2041,6 +2078,7 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             current_profile_name = "";
             current_domain = null;
             current_lsp = null;
+            current_mcp = null;
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
                 if (name.len == 0) {
@@ -2072,6 +2110,18 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
                 };
                 continue;
             }
+            if (std.mem.startsWith(u8, inside, "mcp.")) {
+                const name = inside["mcp.".len..];
+                if (name.len == 0) {
+                    warnConfigAt(lineno, "empty mcp profile name", .{});
+                    continue;
+                }
+                current_mcp = findOrCreateMcpProfile(cfg, arena, name) catch {
+                    warnConfigAt(lineno, "out of memory creating mcp profile", .{});
+                    continue;
+                };
+                continue;
+            }
             if (std.mem.startsWith(u8, inside, "domain.")) {
                 const name = inside["domain.".len..];
                 if (name.len == 0) {
@@ -2097,6 +2147,10 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         if (current_lsp) |srv| {
             applyLspKv(srv, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "lsp '{s}': bad value for '{s}' ({s})", .{ srv.name, key, @errorName(err) });
+            };
+        } else if (current_mcp) |prof| {
+            applyMcpKv(prof, arena, key, value) catch |err| {
+                warnConfigAt(lineno, "mcp '{s}': bad value for '{s}' ({s})", .{ prof.name, key, @errorName(err) });
             };
         } else if (current_domain) |dom| {
             applyDomainKv(dom, arena, key, value) catch |err| {
@@ -2157,6 +2211,21 @@ fn applyLspKv(srv: *LspServer, arena: std.mem.Allocator, key: []const u8, value:
         srv.init_options = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "enabled")) {
         srv.enabled = try parseBool(value);
+    } else return error.UnknownKey;
+}
+
+fn findOrCreateMcpProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*McpProfile {
+    for (cfg.mcp_profiles.items) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    const dup = try arena.dupe(u8, name);
+    try cfg.mcp_profiles.append(arena, .{ .name = dup });
+    return &cfg.mcp_profiles.items[cfg.mcp_profiles.items.len - 1];
+}
+
+fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "tools")) {
+        prof.tools = try arena.dupe(u8, value);
     } else return error.UnknownKey;
 }
 
@@ -3596,6 +3665,34 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     try std.testing.expectEqual(.auto, cfg2.domains.items[1].transport);
     try std.testing.expectEqual(.ssh, cfg2.domains.items[2].transport);
     try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
+}
+
+test "config: [mcp.name] sections parse and round-trip" {
+    const body =
+        \\[mcp.wayland]
+        \\tools = app, files:ro
+        \\
+        \\[mcp.readonly]
+        \\tools = -run_command
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_profiles.items.len);
+    try std.testing.expectEqualStrings("app, files:ro", cfg.mcpProfile("wayland").?.tools);
+    try std.testing.expectEqualStrings("-run_command", cfg.mcpProfile("readonly").?.tools);
+    try std.testing.expect(cfg.mcpProfile("nope") == null);
+    // A different namespace from the pane profiles of the same name.
+    try std.testing.expectEqual(@as(usize, 0), cfg.profiles.items.len);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer cfg2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg2.mcp_profiles.items.len);
+    try std.testing.expectEqualStrings("app, files:ro", cfg2.mcpProfile("wayland").?.tools);
 }
 
 test "config: [lsp.name] sections parse, seed from builtins and round-trip" {

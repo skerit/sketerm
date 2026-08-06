@@ -13641,3 +13641,372 @@ no character-count vfunc, and GTK 4.22's AT-SPI adapter derives the
 property via `get_contents(0, G_MAXUINT)` + `g_utf8_strlen`
 (gtkaccessibletext.c), i.e. an AT polling it on a 60MB buffer forces
 one full materialization per poll regardless of our O(1) count.
+
+## MCP tool exposure policy: whitelist, groups, read-only mode
+
+`sketerm mcp` offered all ~104 tools to every client, which is a lot of
+noise for an assistant that only needs to drive a Wayland app - and for
+someone running three assistants at once there was no way to give each a
+different reach. A policy now narrows the tool set per server instance.
+
+`src/ipc/mcpfilter.zig` holds the grammar and a `TOOL_META` table giving
+every tool a group (`panes app term files net browser ui core`) and a
+`mutates` flag. Terms are comma/space separated: `all`, `<group>`,
+`<group>:ro`, `<tool>`, and `-`-prefixed denials. Deny is absolute and
+order-independent, any allow term flips the baseline to deny-all (so a
+spec of only denials is a plain blocklist), and `core` - the
+`capabilities` tool - is never filtered, because an assistant must
+always be able to ask what it is allowed to do.
+
+The policy resolves once at startup from `[mcp.<name>]` in config.conf
+(`sketerm mcp --profile <name>`), then `SKETERM_MCP_TOOLS`, then
+`--tools <spec>`; an unknown term prints the offending term, its source
+and the valid group names and exits 2. A typo that silently withheld a
+whole group would look, from the far side, exactly like a missing
+feature.
+
+Two decisions carry the design. **Filtering `tools/list` is
+presentation, not enforcement**: `tools/call` consults the same policy,
+and refuses with a message saying the tool exists, that the operator
+restricted this connection, and the exact term that would enable it -
+not `-32601`, which an assistant reads as "sketerm cannot do this" and
+spends turns working around. **Group metadata lives in typed Zig**, not
+as extra fields in TOOLS_JSON, so the payload stays a pure MCP document;
+the drift that creates is the one real risk, so a test asserts the two
+lists name exactly the same tools and names the offender when they do
+not. `capabilities` reports the active spec, its source and the
+suppressed groups.
+
+`zig build smoke-mcp` grew two stages: a real server started with
+`SKETERM_MCP_TOOLS=app:ro, term_list` whose `tools/list` is filtered,
+whose `term_open` is refused rather than executed, and whose
+`capabilities` explains why; and a typo'd spec that refuses to start.
+
+## Panels: hosting the renderer, and the panel-* control commands
+
+`src/ui/panel/` renders a declarative document; nothing hosted it. It
+now has three homes and one addressing scheme.
+
+**Pane face.** `Pane.attachPanel` is the editor face's five-pointer
+contract verbatim (widget, ctx, prepare-destroy taking `widgets_dead`,
+deinit, focus), and `detachPanel` is in `Pane.severFaces()` - the one
+place a face may be added, which is exactly the bug the editor face
+carried for a while. Faces stay mutually exclusive: raising any of
+terminal / browser / editor / panel hides the others.
+
+**Standalone window.** `src/ui/panelwin.zig` wraps a `PanelView` in an
+AdwApplicationWindow on editorwin.zig's model - view struct teardown
+deferred to the window's finalize, because GtkWindow dispose destroys
+children before ::destroy. The window title follows the document title
+through `view.on_changed`.
+
+**Control socket.** `panel-show` / `panel-patch` / `panel-events` /
+`panel-list` / `panel-close`, dispatched out of `remotectl` into
+`src/ui/panelhost.zig`, with matching `sketerm cli` subcommands
+(`--file DOC.json`, or `-` for stdin, because a JSON document does not
+survive shell quoting). Replies are flat (`{"ok":true,"panel_id":3,
+"session":"s"}`) via `protocol.writeOkFlat`.
+
+Three decisions carry it. **Panels are keyed by (session, name)**:
+several assistants drive one sketerm, so a panel is scoped to the
+daemon session of the pane that asked for it (`$SKETERM_SESSION`), and
+re-showing a name REPLACES that panel's document in place instead of
+opening a second window - which is what makes a training loop's "here
+is epoch 42" cheap. **`panel-events` never blocks**: it runs on the
+GLib main loop, so it drains whatever is queued and answers, empty or
+not; `events.Queue.waitAny` is for a thread that may sleep and is not
+called here. **A rejected document answers with `doc.Diag`'s message
+verbatim** - it names the offending component, and the assistant that
+wrote the document is the one who has to fix it.
+
+Liveness has exactly one path: the registry entry IS the pane face's
+context pointer, so every pane teardown route reaches
+`paneFaceDestroy`, which unregisters before freeing; a window panel
+unregisters from its ::destroy. A `panel_id` therefore never outlives
+its widgets, and addressing a dead one is a plain refusal.
+
+`smoke-e2e` grew a panel stage: a document rendered into its own
+window, a real seat click on the button read back as an event, a real
+drag on a slider read back as a change, an image_compare drag asserted
+to repaint, `panel-patch`/`panel-list`/scoping/replace-in-place, all
+three targets closed the way each should (a pane panel gives the pane
+back to its shell, a tab panel takes its tab with it), plus the same
+feature driven through `sketerm cli` with the document in a file.
+
+## `ui_*`: the panel feature as MCP tools
+
+The renderer, the hosting and the disk store existed; nothing exposed
+them to an assistant. Seven tools now do, in `src/ipc/mcp.zig`:
+`ui_show` (inline `document`, or `load` a saved one; target
+pane/tab/window, default tab), `ui_patch`, `ui_wait_event`,
+`ui_panels`, `ui_save`, `ui_close`, `ui_delete`. Each is a thin adapter
+over the five `panel-*` control-socket commands plus `panelstore.zig`,
+and each carries a `mcpfilter.TOOL_META` entry in the `ui` group, which
+had been reserved and empty (`suppressedGroups`' "a group with no tools
+is absent, not withheld" branch now actually has a populated group to
+report, and its test says so).
+
+Three things were easy to get wrong and are therefore stated in
+`src/ipc/CLAUDE.md`:
+
+**`ui_wait_event` polls; it must never block the GUI.** `panel-events`
+answers immediately by design - it is dispatched on the GLib main loop,
+where blocking would freeze every window - so the blocking semantics
+belong to the MCP side. It polls at 100ms, drains rather than samples
+(an interaction between calls is still delivered), clamps `timeout_ms`
+to `WAIT_CAP_MS` (120s, under the 150s watchdog) and says so in the
+schema, and reports a non-zero `dropped` count with an explicit note:
+a silently truncated interaction stream is a wrong conclusion waiting
+to happen. A timeout is answered plainly, not as an error, and a panel
+the user closed ends the wait immediately with its own message.
+
+**The session is resolved once, for both halves.** Explicit argument,
+else `$SKETERM_SESSION`, else the sessionless bucket - and the result
+is passed explicitly to the GUI, so a live panel and its saved document
+can never end up under different keys while several assistants share
+one sketerm.
+
+**Panels need a GUI socket.** `sketerm mcp` is isolated by default;
+without `--shared` (or `--socket`) the four live-panel tools return a
+described error naming the flag, while `ui_save`/`ui_panels`/
+`ui_delete` keep working on the store. `capabilities` reports `panels`
+with a hint saying exactly that, next to `gui_socket`.
+
+`doc.Diag` messages pass through verbatim everywhere - they name the
+offending component id, which is what the authoring assistant needs.
+`ui_close` and `ui_delete` are deliberately separate tools with
+descriptions that say what the other one does; `ui_save` with no
+document uses the server's own mirror of what it showed (kept in step
+by re-applying every ACCEPTED patch through the same document model),
+and a mirror that cannot follow is dropped so `ui_save` says it cannot
+see the live document rather than storing a stale one.
+
+**A wrong instruction, corrected.** `panelstore` validated the SESSION
+against `[A-Za-z0-9._-]`, but the daemon only length-checks session
+names - so a perfectly legal session called `my work` could never store
+a panel, and the user could not fix it from their side. The session is
+now percent-encoded into one directory component (`my%20work`,
+`a%2Fb`); a leading `.` or `_` encodes too, so the component can never
+be `.`, `..` or the reserved `_no-session` bucket, and the mapping is
+injective because `%` encodes as well. The caller-chosen PANEL name is
+still rejected rather than sanitized.
+
+`PanelView.prepareDestroy` had `widgets_dead = self.widgets_dead or
+dead;` immediately followed by `widgets_dead = true;`, so the parameter
+read as if it were honoured and was not. Every caller is about to
+destroy the subtree, so the unconditional fence is the correct line; it
+stays, with a comment saying why and `_ = dead`.
+
+Verification: `zig build test` / `test-core` / `mux-portable` green.
+`smoke-mcp` grew a stage that runs a server with
+`SKETERM_MCP_TOOLS=ui`: the seven tools are listed, `term_open` is
+refused, `ui_show` explains that panels need `--shared`, and
+`ui_save`/`ui_panels`/`ui_delete` work anyway - under a session named
+`smoke ui`, whose panel lands in `panels/smoke%20ui/`. `smoke-e2e` grew
+`mcpPanelStage`: a real `sketerm mcp --shared --socket` child against
+the real GUI in a display session - `ui_show` renders a panel window,
+`ui_wait_event` is started, a real seat click lands on it, and the tool
+returns that click; then patch, save-from-live, close, re-show by
+`load`, and delete. Its reads pump the compositor while they wait,
+because this harness IS the brain for that toplevel.
+
+## Panels: one sessionless bucket, and `panel-get` instead of a mirror
+
+Two defects the panel subsystem shipped with, both found by the agents
+that built it and both left as decisions rather than guesses.
+
+**The sessionless bucket had two names.** `panelhost.NO_SESSION` was
+`"default"` while `panelstore.NO_SESSION` was `"_no-session"`. The MCP
+tools always pass an explicit session, so it could not bite through
+them - but a `sketerm cli panel-show` from outside any pane scoped the
+LIVE panel to `default`, while a store operation from the same place
+scoped the SAVED document to `_no-session`. One constant now, defined
+in `panelstore.zig` and re-exported by `panelhost.zig`. `_no-session`
+is the surviving name because `default` is a perfectly ordinary daemon
+session name - a real session called `default` would have shared the
+bucket outright - whereas `encodeSession` percent-encodes a leading
+`_`, so every real session name lands somewhere else. A test in
+`panelhost.zig` pins the agreement: what `scopeOf` resolves to with
+neither an explicit session nor a pane is what `panelstore
+.resolveSession(null)` resolves to, it encodes to itself in one
+directory component, and `default` demonstrably does not.
+
+**The per-server document mirror is gone.** `ui_save` with no
+`document` used to read `UiMirror`, this MCP process's own copy of what
+it had shown, maintained by re-applying every accepted patch. That copy
+could go stale, needed an extra `panel-list` round-trip per `ui_patch`
+just to stay keyed, carried a "the mirror could not follow" refusal
+path - and structurally could not save a panel shown by a DIFFERENT
+process or before an MCP restart.
+
+The GUI already holds the document, so it now answers for it. A sixth
+control command, `panel-get {panel_id}`, returns
+`{"document","name","session","title"}` with the document straight from
+the live `doc.Document` via `toJson` (canonical, byte-stable, which is
+what makes the reply diffable against the store). `ui_save` fetches
+through it; `UiMirror`, `uiNameForId` and `uiMirrorPatch` are deleted,
+along with every `set`/`drop` call site and the mirror's test
+scaffolding. Net: less state, one fewer round-trip on `ui_patch`, one
+fewer failure mode, and `ui_save` works against any panel on screen no
+matter who opened it. Without a GUI socket that half of `ui_save` now
+refuses (naming `--shared` and the `document` argument) instead of
+silently saving from a mirror that never existed in that mode.
+
+Verification: `zig build test` (1835 pass), `test-core` (1529 pass),
+`mux-portable`, `smoke-mcp` and `smoke-e2e` all green. Unit tests
+replaced the mirror ones: `ui_save` reads back over `panel-get` and the
+stored bytes equal the reported document byte for byte; a panel this
+server never showed saves anyway; a panel that is not on screen is a
+refusal; no GUI socket is a described refusal that writes nothing.
+`smoke-e2e`'s `mcpPanelStage` proves the same live: `ui_save` with no
+`document`, then `panel-get` over the control socket compared byte for
+byte against the file the store wrote - once for the panel the MCP
+server showed and once for a panel the SMOKE PROCESS showed over the
+control socket, which is exactly the case the mirror could not serve.
+
+## `ui_show_files`: the one-call image case on top of `ui_show`
+
+The panel primitive is correct and stays, but the driving use case -
+"show me these images" while a super-resolution model trains - cost
+roughly thirty lines of hand-authored JSON per call. `ui_show_files`
+is a document GENERATOR over the exact `ui_show` path: it builds the
+document server-side, validates it through `doc.Document.parse`, and
+hands it to the same `panel-show`. No new component type, no new
+control command, no second rendering path, and what it makes is an
+ordinary panel that `ui_patch`/`ui_save`/`ui_close`/`ui_wait_event`
+all address normally.
+
+```
+ui_show_files {files: [{path, caption?} | "/abs/path"], name?, title?,
+               target?, session?, compare?}
+```
+
+The decisions worth recording:
+
+- **`compare:true` needs exactly two files** and emits one
+  `image_compare` with each caption as its side label - the A/B slider
+  the review actually turns on. Any other count is refused, naming the
+  count it got, rather than silently falling back to a stack.
+- **`name` defaults to `files`.** A unique default name would have made
+  "here is the next epoch" open a new tab every epoch; a fixed one
+  replaces the panel in place (same window, same `panel_id`, an
+  `image_compare` keeps its zoom/pan/split), which is the behavior the
+  use case wants. The description says so.
+- **Missing paths are pre-validated, but only an ALL-missing set is
+  refused.** The renderer already draws an explicit placeholder for an
+  unreadable image rather than failing the panel, so one file that
+  vanished mid-training is not worth losing the panel over: it is shown
+  and named back in `unreadable`. But a panel made entirely of
+  placeholders reads as a sketerm bug rather than a wrong `--out-dir`,
+  so that case is a refusal that lists the paths.
+- **Captions default to the basename**, so a bare array of paths still
+  labels itself, and **the cap is 64 files** (`doc.MAX_CHILDREN` is 128;
+  the heading takes one).
+
+Files: `src/ipc/mcp.zig` (`uiFilesDocument` + the `ui_show_files`
+branch of `uiTool` + the schema), `src/ipc/mcpfilter.zig` (group `ui`,
+mutating), `src/smoke_mcp.zig`, `docs/mcp.md`.
+
+Verification: `zig build test` (1840 pass), `test-core`,
+`mux-portable`, `smoke-mcp` all green. Three unit tests: the generator
+output parses back through `doc.Document.parse` for the stacked,
+untitled, compare, hostile-caption and full-cap shapes (compare
+asserted down to `left.label`/`right.label`); a `handleMessage` test
+proving the document leaves over `panel-show` under the default name
+with the captions intact and that an unreadable file is shown AND
+reported; and a refusal test covering bad arity both ways, an empty
+list, relative and `..` paths, an all-missing set and the cap - with
+nothing reaching the backend. `smoke-mcp` grew a stage that serves a
+STAND-IN GUI control socket (`FakeGui`) and reads the generated
+document off the wire, so the compare document and the refusals are
+proven end to end through a real `sketerm mcp` process without a GTK
+window.
+
+### Saved panels are reachable from the GUI (command palette)
+
+Panels persisted fine, but only an assistant could bring one back
+(`ui_show load=<name>`) — the user had no way to reopen his own saved
+panel. Two palette actions close that:
+
+- **Open Saved Panel…** (`panel_open`) opens `src/ui/panelpicker.zig`:
+  every document stored for the FOCUSED PANE'S SESSION
+  (`panelhost.sessionForPane`, the same scoping rule as the rest of the
+  subsystem), one row each with the document's title, size and age.
+  Activating a row goes through `panelhost.openSaved` →
+  `showDocument`, the same single mounting path `panel-show` uses, so
+  the (session, name) keying and the replace-in-place rule cannot
+  diverge between an assistant's call and the user's click. Target is a
+  TAB of its own: "open" must not take away the shell of the pane it
+  was invoked from.
+- **Close Panel** (`panel_close`) → `panelhost.closeNearest`: the
+  focused pane's panel, else that pane's tab, else the window's only
+  one. The ladder is load-bearing — a panel face has no key controller,
+  so the palette can only ever be opened from a pane that is NOT the
+  panel, and "the focused pane's panel" alone would be unreachable.
+
+A document that no longer parses is LISTED with the parser's own
+message as its subtitle and is not activatable — `panelstore`
+distinguishes Corrupt from Invalid on purpose, and hiding the broken
+one reads as "my panel is gone". Deleting is a per-row trash button
+confirmed with an AdwAlertDialog (destructive), not a palette action of
+its own: it needs this list to pick from anyway.
+
+`panelShow` was split so `showDocument` is the one mounting path and
+`closeEntry` the one teardown path; `panel-show`/`panel-close` are now
+thin request wrappers over them.
+
+Covered by `zig build smoke-e2e` (`panelPickerStage`): a good and a
+corrupt document written into the pane's session store, the action
+invoked on the real seat, Enter on the corrupt row mounting nothing,
+the good one coming back keyed (session, name) on its own tab, and
+Close Panel taking it down without touching the stored documents. The
+stage reaches the actions through a config keybind rather than by
+typing into the palette's search entry: with `GTK_IM_MODULE=wayland`
+and a session advertising text-input-v3, a GtkText expects the
+compositor to produce its text and the harness plays no IME, so the
+entry cannot be filled there. Everything after dispatch is identical
+(`dispatchAction` is the one path) and the picker itself has no text
+entry.
+
+### A panel face on a pane killed the GUI seconds after it closed
+
+`panel-show target=pane` followed by `panel-close` answered "ok" and
+then SIGSEGV'd the whole GUI a second or two later. `PanelView.create`
+connects a last-resort ::destroy fence on `root_box` with the view
+itself as raw user data, and `deinit` unref'd that widget and freed the
+view immediately after. The view owns a reference to `root_box`, but on
+a pane face it does not own the LAST one: the host unparents the widget
+and GTK (with an accessibility bus up, the AT context) can hold on for
+frames, so the widget's ::destroy fired after the free and
+`onRootDestroy` wrote `widgets_dead` into freed memory.
+
+The fix is to DISCONNECT the handler in `deinit`, before dropping the
+reference. A GDestroyNotify — the usual rule for a heap context — does
+not help here: it runs when the closure dies, i.e. at that same too-late
+moment, and cannot stop `onRootDestroy` from running first. Disconnecting
+is the only thing that makes "no callback outlives the struct" true.
+
+The same fuse burns on the per-component contexts (`CompCtx`), which sit
+on descendant widgets and therefore outlive the view exactly as long as
+`root_box` does — and a GtkDropDown emits `notify::selected` from its own
+dispose. Those keep their GDestroyNotify (they are heap contexts and must
+free themselves), but the view now tracks them and NULLs their `view`
+back-pointer in `deinit`; the three handlers bail on a null view.
+
+Audited the rest of the subsystem for the same shape. `panelwin.zig`'s
+::destroy is safe because the window frees the `PanelWindow` from its
+qdata destroy-notify at FINALIZE, strictly after ::destroy. `Compare`'s
+gesture handlers are safe because the gestures are owned by the drawing
+area and die at its dispose, while `Compare` itself is freed by that
+widget's qdata notify at finalize. `panelpicker.zig`'s null-notify
+connections (the per-row delete button, the listbox's row-activated) are
+safe because their widgets are children of the dialog whose "closed"
+destroy-notify owns the `Ctx`: the children are disposed before the
+dialog finalizes.
+
+Regression: `panePanelLifetimeStage` in `src/smoke_e2e.zig` — three
+show/close rounds of a panel face on pane 1, each followed by three
+seconds of pumping the display session while `screen-info` round-trips
+prove the GUI is still serving. A unit test cannot reach this; it needs
+a real widget lifecycle on a real frame clock. The stage fails (GUI
+SIGSEGV, first round) without the fix.

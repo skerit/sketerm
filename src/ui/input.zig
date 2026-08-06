@@ -181,6 +181,15 @@ pub const Action = enum {
     /// Flip the focused pane between its editor face and its
     /// terminal face. Dispatched locally like toggle_browser_face.
     toggle_editor_face,
+    /// Open the saved-panel picker: every declarative panel document
+    /// stored for the focused pane's session, opened in a tab of its
+    /// own (src/ui/panelpicker.zig). The user's own way back to a
+    /// panel an assistant saved for him.
+    panel_open,
+    /// Close the panel the focused pane is hosting. A panel put ON a
+    /// pane hides that pane's shell, and this is how the shell comes
+    /// back without an assistant.
+    panel_close,
     /// Detach the focused mux pane: the session keeps running on the
     /// daemon; the pane lands in a fresh local shell. No-op on
     /// non-mux panes.
@@ -390,6 +399,8 @@ pub fn actionName(a: Action) []const u8 {
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
         .toggle_editor_face => "toggle_editor_face",
+        .panel_open => "panel_open",
+        .panel_close => "panel_close",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -475,6 +486,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",
         .toggle_editor_face => "Show the text editor / show the shell (this pane)",
+        .panel_open => "Open a saved panel (this session's stored documents)…",
+        .panel_close => "Close the panel on this pane, its tab, or the window's only one",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",

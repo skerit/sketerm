@@ -29,6 +29,7 @@ const display_cli = @import("mux/display.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const editor_pass = @import("render/editor_pass.zig");
 const wlcomp = @import("wlhost/compositor.zig");
+const clock = @import("util/clock.zig");
 
 const MARKER = "sketerm-e2e-marker-7423";
 /// Typed on a real seat (not over IPC) — a distinct marker so the two
@@ -396,6 +397,34 @@ fn runDisplayCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResu
     return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
 }
 
+/// Run the real `sketerm cli` in-process with stdout captured — the
+/// same bytes a shell would see. The CLI leaks its request payloads on
+/// purpose (the real process exits right after), so it runs against an
+/// arena the caller drops.
+fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
+    var pfds: [2]c_int = undefined;
+    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
+    const saved = c.dup(1);
+    _ = c.dup2(pfds[1], 1);
+    _ = c.close(pfds[1]);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    const code = @import("ipc/client.zig").run(arena_state.allocator(), argv);
+    arena_state.deinit();
+    _ = c.fflush(platform.stdout());
+    _ = c.dup2(saved, 1);
+    _ = c.close(saved);
+
+    var out: std.ArrayList(u8) = .empty;
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = c.read(pfds[0], &buf, buf.len);
+        if (n <= 0) break;
+        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
+    }
+    _ = c.close(pfds[0]);
+    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
+}
+
 const CreateReply = struct {
     session: []const u8 = "",
     environment: struct {
@@ -665,6 +694,7 @@ pub fn main() u8 {
     if (drive) |app| {
         if (realInputStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("real seat input reached the shell and repainted the window");
+
         if (kittyKbdStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("kitty keyboard protocol encodes real key events correctly");
         if (copyModeStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -891,6 +921,30 @@ pub fn main() u8 {
         const after_editor = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("GUI stopped serving after editor close");
         defer allocator.free(after_editor);
         if (std.mem.indexOf(u8, after_editor, "\"ok\":true") == null) return fail("GUI unhealthy after editor close");
+    }
+
+    // 6c-4. Declarative UI panels (src/ui/panel + ui/panelhost.zig):
+    // a document rendered into a real window, clicked on a real seat,
+    // and the interaction read back over the socket.
+    if (drive) |app| {
+        if (panelStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("panel: document rendered in its own window, a real click and a slider drag came back as events, patch/list/close held");
+
+        // 6c-5. The same panels through a REAL `sketerm mcp` server —
+        // the path an assistant actually takes.
+        if (mcpPanelStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("mcp: ui_show rendered a panel, ui_wait_event returned a real click, ui_save read the live document back (another process's panel included), save/load/close/delete held");
+
+        // 6c-6. The same store, retrieved by the USER: the saved-panel
+        // picker the command palette opens, driven by real keystrokes.
+        if (panelPickerStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("picker: a saved panel reopened from the GUI (corrupt document refused), and Close Panel took it down again");
+
+        // 6c-7. The pane-face lifetime, with the fuse it needs: a panel
+        // put ON an existing pane, closed, and then the GUI kept
+        // running long enough for the face's widgets to be finalized.
+        if (panePanelLifetimeStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("panel face on a pane: shown and closed three times, and the GUI outlived every deferred widget destroy");
     }
 
     // 6d. Dead keys, composed by a real seat on a Belgian keymap, in
@@ -1859,6 +1913,949 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     viewer_pid = -1;
     _ = app.drainLive(2_000);
     return null;
+}
+
+/// Declarative UI panels, end to end. What only a live run can prove:
+/// the renderer builds real widgets from a document, GTK gestures
+/// reach the event queue (the button click and the slider drag are
+/// injected on the session's seat, not synthesized), a patch updates
+/// the live tree, and the image_compare's own drag handling actually
+/// moves pixels. Every assertion goes through the SAME control-socket
+/// commands an assistant uses.
+fn panelStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    rt: []const u8,
+) ?[]const u8 {
+    _ = app.drainLive(2_000);
+    var known: [16]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    // 1. A panel in its own window whose ROOT is the button: the whole
+    // client area is then the click target, so the coordinate cannot
+    // drift with theme metrics.
+    const show_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Epoch 41\\\",\\\"root\\\":\\\"ok\\\"," ++
+        "\\\"components\\\":{\\\"ok\\\":{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Approve\\\"," ++
+        "\\\"action\\\":\\\"approve\\\",\\\"class\\\":[\\\"expand\\\"]}}}\"}\n";
+    const show = roundtrip(allocator, sock_path, show_req) orelse return "panel-show roundtrip";
+    defer allocator.free(show);
+    if (std.mem.indexOf(u8, show, "\"ok\":true") == null) return "panel-show not ok";
+    const panel_id = parseNumAfter(show, "\"panel_id\":") orelse return "panel-show reply has no panel_id";
+    if (std.mem.indexOf(u8, show, "\"session\":\"e2e-scope\"") == null)
+        return "panel-show did not echo the session it scoped the panel to";
+
+    // A malformed document must be REFUSED with the parser's own
+    // message (the assistant fixes its document from that text).
+    const bad = roundtrip(
+        allocator,
+        sock_path,
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e-bad\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+            "\"document\":\"{\\\"root\\\":\\\"r\\\",\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"webview\\\"}}}\"}\n",
+    ) orelse return "panel-show(bad) roundtrip";
+    defer allocator.free(bad);
+    if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return "a webview component was accepted";
+    if (std.mem.indexOf(u8, bad, "webview") == null)
+        return "the rejection did not name the offending component type";
+
+    var waited: u32 = 0;
+    const win_id = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "the panel never mapped a window";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+
+    const pw = app.winById(win_id) orelse return "the panel window vanished";
+    const cx = @as(f64, @floatFromInt(pw.w)) / 2;
+    const cy = @as(f64, @floatFromInt(pw.h)) / 2;
+
+    // 2. A real click on the real seat, and the event read back.
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the panel button failed";
+    var got_click = false;
+    var tries: u32 = 0;
+    while (tries < 40 and !got_click) : (tries += 1) {
+        _ = app.pumpOnce(150);
+        var ev_buf: [128]u8 = undefined;
+        const ev_req = std.fmt.bufPrint(&ev_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d}}}\n", .{panel_id}) catch
+            return "panel-events fmt";
+        const evs = roundtrip(allocator, sock_path, ev_req) orelse return "panel-events roundtrip";
+        defer allocator.free(evs);
+        if (std.mem.indexOf(u8, evs, "\"ok\":true") == null) return "panel-events not ok";
+        if (std.mem.indexOf(u8, evs, "\"dropped\":") == null) return "panel-events reply has no dropped count";
+        if (std.mem.indexOf(u8, evs, "\"component\":\"ok\"") != null and
+            std.mem.indexOf(u8, evs, "\"kind\":\"click\"") != null)
+        {
+            if (std.mem.indexOf(u8, evs, "\"value\":\"approve\"") == null)
+                return "the click event carried no action value";
+            got_click = true;
+        }
+    }
+    if (!got_click) return "a real click on the panel button produced no event";
+
+    // 3. panel-patch updates the live document (and the window title
+    // follows it), and panel-list reports the panel in its session.
+    var patch_buf: [512]u8 = undefined;
+    const patch_req = std.fmt.bufPrint(
+        &patch_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"patch\":\"[{{\\\"op\\\":\\\"title\\\",\\\"value\\\":\\\"Epoch 42\\\"}}]\"}}\n",
+        .{panel_id},
+    ) catch return "panel-patch fmt";
+    const patched = roundtrip(allocator, sock_path, patch_req) orelse return "panel-patch roundtrip";
+    defer allocator.free(patched);
+    if (std.mem.indexOf(u8, patched, "\"ok\":true") == null) return "panel-patch not ok";
+
+    // A patch naming a component that does not exist must fail with the
+    // parser's message and leave the panel alone.
+    const bad_patch_req = std.fmt.bufPrint(
+        &patch_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"patch\":\"[{{\\\"op\\\":\\\"remove\\\",\\\"id\\\":\\\"ghost\\\"}}]\"}}\n",
+        .{panel_id},
+    ) catch return "panel-patch fmt";
+    const bad_patch = roundtrip(allocator, sock_path, bad_patch_req) orelse return "bad panel-patch roundtrip";
+    defer allocator.free(bad_patch);
+    if (std.mem.indexOf(u8, bad_patch, "\"ok\":false") == null) return "removing a missing component was accepted";
+    if (std.mem.indexOf(u8, bad_patch, "ghost") == null) return "the patch rejection did not name the component";
+
+    const listed = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
+        return "panel-list roundtrip";
+    defer allocator.free(listed);
+    if (std.mem.indexOf(u8, listed, "\"name\":\"e2e\"") == null) return "panel-list does not report the panel";
+    if (std.mem.indexOf(u8, listed, "\"title\":\"Epoch 42\"") == null)
+        return "the patched title never reached the live document";
+    if (std.mem.indexOf(u8, listed, "\"target\":\"window\"") == null) return "panel-list lost the target";
+
+    // Session scoping: another assistant's session must not see it.
+    const other = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-other\"}\n") orelse
+        return "panel-list(other) roundtrip";
+    defer allocator.free(other);
+    if (std.mem.indexOf(u8, other, "\"name\":\"e2e\"") != null)
+        return "a panel leaked into another session's list";
+
+    // 4. Re-showing the SAME name replaces the document in place: same
+    // panel_id, no second window. The new root is a slider, which the
+    // next step drags.
+    const again_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Threshold\\\",\\\"root\\\":\\\"thr\\\"," ++
+        "\\\"components\\\":{\\\"thr\\\":{\\\"type\\\":\\\"slider\\\",\\\"min\\\":0,\\\"max\\\":100," ++
+        "\\\"step\\\":1,\\\"value\\\":0,\\\"class\\\":[\\\"expand\\\"]}}}\"}\n";
+    const again = roundtrip(allocator, sock_path, again_req) orelse return "panel-show(again) roundtrip";
+    defer allocator.free(again);
+    if (std.mem.indexOf(u8, again, "\"ok\":true") == null) return "panel-show(again) not ok";
+    const again_id = parseNumAfter(again, "\"panel_id\":") orelse return "panel-show(again) has no panel_id";
+    if (again_id != panel_id) return "re-showing a name opened a SECOND panel instead of replacing it";
+    if (hasToplevelOtherThan(app, known[0..n_known])) |id| {
+        if (id != win_id) return "re-showing a name opened a second window";
+    }
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+
+    // 5. A real drag across the slider: gesture -> value-changed ->
+    // queue, with a number payload.
+    const w_f = @as(f64, @floatFromInt(pw.w));
+    app.drag(win_id, w_f * 0.15, cy, w_f * 0.85, cy, 1) catch return "dragging the slider failed";
+    var got_change = false;
+    tries = 0;
+    while (tries < 40 and !got_change) : (tries += 1) {
+        _ = app.pumpOnce(150);
+        var ev_buf: [128]u8 = undefined;
+        const ev_req = std.fmt.bufPrint(&ev_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d}}}\n", .{panel_id}) catch
+            return "panel-events fmt";
+        const evs = roundtrip(allocator, sock_path, ev_req) orelse return "panel-events roundtrip";
+        defer allocator.free(evs);
+        if (std.mem.indexOf(u8, evs, "\"component\":\"thr\"") != null and
+            std.mem.indexOf(u8, evs, "\"kind\":\"change\"") != null) got_change = true;
+    }
+    if (!got_change) return "dragging the slider produced no change event";
+
+    // 6. The image_compare, on a PANE face this time: two generated
+    // images, then a drag that must move the split (i.e. repaint).
+    const left_png = std.fmt.allocPrintSentinel(allocator, "{s}/panel-left.png", .{rt}, 0) catch return "alloc";
+    defer allocator.free(left_png);
+    const right_png = std.fmt.allocPrintSentinel(allocator, "{s}/panel-right.png", .{rt}, 0) catch return "alloc";
+    defer allocator.free(right_png);
+    if (!writeSolidPng(allocator, left_png, 0x20, 0x80, 0xff)) return "could not write the left compare image";
+    if (!writeSolidPng(allocator, right_png, 0xff, 0x90, 0x20)) return "could not write the right compare image";
+
+    var cmp_buf: [1400]u8 = undefined;
+    const cmp_req = std.fmt.bufPrint(
+        &cmp_buf,
+        "{{\"cmd\":\"panel-show\",\"name\":\"e2e-cmp\",\"session\":\"e2e-scope\",\"target\":\"pane\",\"pane\":1," ++
+            "\"document\":\"{{\\\"root\\\":\\\"c\\\",\\\"components\\\":{{\\\"c\\\":{{\\\"type\\\":\\\"image_compare\\\"," ++
+            "\\\"left\\\":{{\\\"src\\\":\\\"{s}\\\",\\\"label\\\":\\\"before\\\"}}," ++
+            "\\\"right\\\":{{\\\"src\\\":\\\"{s}\\\",\\\"label\\\":\\\"after\\\"}}}}}}}}\"}}\n",
+        .{ left_png, right_png },
+    ) catch return "compare req fmt";
+    const cmp = roundtrip(allocator, sock_path, cmp_req) orelse return "panel-show(compare) roundtrip";
+    defer allocator.free(cmp);
+    if (std.mem.indexOf(u8, cmp, "\"ok\":true") == null) return "panel-show(compare) not ok";
+    const cmp_id = parseNumAfter(cmp, "\"panel_id\":") orelse return "compare panel has no panel_id";
+
+    const term_win = known[0];
+    _ = app.waitVisualSettle(term_win, 500, 10_000, 0.002, null);
+    const before = app.screenshotPng(term_win, 640, null, 0) catch return "screenshotting the compare panel failed";
+    defer allocator.free(before.png);
+    const tw = app.winById(term_win) orelse return "the terminal window vanished";
+    const ty = @as(f64, @floatFromInt(tw.h)) * 0.5;
+    // Not zoomed, so a drag anywhere on the surface moves the split.
+    app.drag(term_win, @as(f64, @floatFromInt(tw.w)) * 0.5, ty, @as(f64, @floatFromInt(tw.w)) * 0.2, ty, 1) catch
+        return "dragging the compare split failed";
+    _ = app.waitVisualSettle(term_win, 400, 8_000, 0.002, null);
+    const after = app.screenshotPng(term_win, 640, null, 0) catch return "screenshotting after the drag failed";
+    defer allocator.free(after.png);
+    if (std.mem.eql(u8, before.png, after.png))
+        return "dragging the image_compare split repainted nothing";
+
+    // 7. Close both. The compare panel sat ON pane 1, so closing it
+    // must give the pane back to its shell rather than close the tab.
+    var close_buf: [128]u8 = undefined;
+    const close_cmp = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{cmp_id}) catch
+        return "panel-close fmt";
+    const closed_cmp = roundtrip(allocator, sock_path, close_cmp) orelse return "panel-close roundtrip";
+    defer allocator.free(closed_cmp);
+    if (std.mem.indexOf(u8, closed_cmp, "\"ok\":true") == null) return "panel-close(compare) not ok";
+
+    const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{panel_id}) catch
+        return "panel-close fmt";
+    const closed = roundtrip(allocator, sock_path, close_req) orelse return "panel-close roundtrip";
+    defer allocator.free(closed);
+    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "panel-close not ok";
+    _ = app.pumpOnce(500);
+
+    const gone = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
+        return "panel-list(after close) roundtrip";
+    defer allocator.free(gone);
+    if (std.mem.indexOf(u8, gone, "\"name\":\"e2e\"") != null) return "a closed panel is still listed";
+    if (std.mem.indexOf(u8, gone, "\"name\":\"e2e-cmp\"") != null) return "a closed pane panel is still listed";
+
+    // Addressing a dead panel must be a plain refusal, not a crash.
+    const stale = roundtrip(allocator, sock_path, close_req) orelse return "stale panel-close roundtrip";
+    defer allocator.free(stale);
+    if (std.mem.indexOf(u8, stale, "\"ok\":false") == null) return "closing a dead panel reported success";
+
+    // The pane the compare panel rode on is still a working terminal.
+    const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
+        return "screen-info after panel close roundtrip";
+    defer allocator.free(alive);
+    if (std.mem.indexOf(u8, alive, "\"ok\":true") == null) return "the pane did not survive its panel";
+
+    // 7b. The DEFAULT target: a tab of its own. Closing that panel
+    // must take its tab with it (the pane exists only for the panel),
+    // which is the opposite of the pane-target rule just asserted.
+    {
+        const before_list = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list roundtrip";
+        defer allocator.free(before_list);
+        const ids_before = std.mem.count(u8, before_list, "\"id\":");
+        const tab_req =
+            "{\"cmd\":\"panel-show\",\"name\":\"e2e-tab\",\"session\":\"e2e-scope\",\"pane\":1," ++
+            "\"document\":\"{\\\"title\\\":\\\"Tabbed\\\",\\\"root\\\":\\\"t\\\"," ++
+            "\\\"components\\\":{\\\"t\\\":{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"In a tab\\\",\\\"level\\\":1}}}\"}\n";
+        const tabbed = roundtrip(allocator, sock_path, tab_req) orelse return "panel-show(tab) roundtrip";
+        defer allocator.free(tabbed);
+        if (std.mem.indexOf(u8, tabbed, "\"ok\":true") == null) return "panel-show(tab) not ok";
+        const tab_id = parseNumAfter(tabbed, "\"panel_id\":") orelse return "tab panel has no panel_id";
+        const tab_list = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
+            return "panel-list(tab) roundtrip";
+        defer allocator.free(tab_list);
+        if (std.mem.indexOf(u8, tab_list, "\"target\":\"tab\"") == null)
+            return "omitting target did not default to a tab";
+        if (!waitIdCount(allocator, sock_path, ids_before + 2, true, 10_000))
+            return "the tab panel did not add a tab and a pane";
+        var tclose: [128]u8 = undefined;
+        const tclose_req = std.fmt.bufPrint(&tclose, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{tab_id}) catch
+            return "fmt";
+        const tclosed = roundtrip(allocator, sock_path, tclose_req) orelse return "panel-close(tab) roundtrip";
+        defer allocator.free(tclosed);
+        if (std.mem.indexOf(u8, tclosed, "\"ok\":true") == null) return "panel-close(tab) not ok";
+        if (!waitIdCount(allocator, sock_path, ids_before, true, 10_000))
+            return "closing a tab panel left its tab behind";
+    }
+
+    // 8. The same feature through `sketerm cli`, document read from a
+    // FILE — the path a human (or a shell script) actually uses, and
+    // the one no socket-level assertion above covers.
+    const doc_path = std.fmt.allocPrint(allocator, "{s}/panel-doc.json", .{rt}) catch return "alloc";
+    defer allocator.free(doc_path);
+    {
+        const doc_z = allocator.dupeZ(u8, doc_path) catch return "alloc";
+        defer allocator.free(doc_z);
+        const body =
+            "{\"version\":1,\"title\":\"From the CLI\",\"root\":\"t\"," ++
+            "\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hello from a file\"}}}";
+        const f = c.fopen(doc_z.ptr, "wb") orelse return "could not write the panel document";
+        _ = c.fwrite(body.ptr, 1, body.len, f);
+        _ = c.fclose(f);
+    }
+    const cli_show = runCli(allocator, &.{
+        "--socket",     sock_path,   "panel-show", "--name", "cli-panel",
+        "--session",    "e2e-scope", "--target",   "window", "--file",
+        doc_path,
+    });
+    defer allocator.free(cli_show.out);
+    if (cli_show.code != 0) return "sketerm cli panel-show exited nonzero";
+    const cli_id = parseNumAfter(cli_show.out, "\"panel_id\":") orelse
+        return "sketerm cli panel-show printed no panel_id";
+
+    const cli_list = runCli(allocator, &.{ "--socket", sock_path, "panel-list", "--session", "e2e-scope" });
+    defer allocator.free(cli_list.out);
+    if (cli_list.code != 0) return "sketerm cli panel-list exited nonzero";
+    if (std.mem.indexOf(u8, cli_list.out, "\"title\":\"From the CLI\"") == null)
+        return "the CLI-shown panel is missing from panel-list";
+
+    var idbuf: [16]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{cli_id}) catch return "fmt";
+    const cli_close = runCli(allocator, &.{ "--socket", sock_path, "panel-close", "--panel-id", id_str });
+    defer allocator.free(cli_close.out);
+    if (cli_close.code != 0) return "sketerm cli panel-close exited nonzero";
+    _ = app.pumpOnce(300);
+    return null;
+}
+
+/// A real `sketerm mcp` server on its own stdio pipes.
+///
+/// Reads PUMP the display session while they wait: this process is the
+/// compositor brain for the GUI's toplevel, so a blocking read here
+/// (ui_wait_event blocks for as long as the user takes) would starve
+/// configure/frame handling and the panel would never paint or receive
+/// the click it is waiting for.
+const McpChild = struct {
+    pid: c.pid_t,
+    to_child: c_int,
+    from_child: c_int,
+    id: u32 = 0,
+    rbuf: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+    line: [1 << 16]u8 = undefined,
+
+    fn spawn(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?McpChild {
+        var in_pipe: [2]c_int = undefined;
+        var out_pipe: [2]c_int = undefined;
+        if (c.pipe(&in_pipe) != 0 or c.pipe(&out_pipe) != 0) return null;
+        const pid = c.fork();
+        if (pid < 0) return null;
+        if (pid == 0) {
+            dieWithParent();
+            _ = c.dup2(in_pipe[0], 0);
+            _ = c.dup2(out_pipe[1], 1);
+            _ = c.close(in_pipe[0]);
+            _ = c.close(in_pipe[1]);
+            _ = c.close(out_pipe[0]);
+            _ = c.close(out_pipe[1]);
+            // --shared skips the private daemon entirely (no second
+            // mux to clean up); --socket points it at THIS GUI.
+            const argv = [_:null]?[*:0]const u8{
+                "zig-out/bin/sketerm", "mcp", "--shared", "--socket", sock_path.ptr, null,
+            };
+            _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        _ = c.close(in_pipe[0]);
+        _ = c.close(out_pipe[1]);
+        return .{ .pid = pid, .to_child = in_pipe[1], .from_child = out_pipe[0], .allocator = allocator };
+    }
+
+    fn send(self: *McpChild, text: []const u8) bool {
+        var off: usize = 0;
+        while (off < text.len) {
+            const n = c.write(self.to_child, text.ptr + off, text.len - off);
+            if (n <= 0) return false;
+            off += @intCast(n);
+        }
+        return c.write(self.to_child, "\n", 1) == 1;
+    }
+
+    /// One reply line, valid until the next call. Pumps while waiting.
+    fn recv(self: *McpChild, timeout_ms: i64) ?[]const u8 {
+        const deadline = clock.nowMs() + timeout_ms;
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.rbuf.items, '\n')) |nl| {
+                const n = @min(nl, self.line.len);
+                @memcpy(self.line[0..n], self.rbuf.items[0..n]);
+                const rest = self.rbuf.items[nl + 1 ..];
+                std.mem.copyForwards(u8, self.rbuf.items[0..rest.len], rest);
+                self.rbuf.shrinkRetainingCapacity(rest.len);
+                return self.line[0..n];
+            }
+            if (clock.nowMs() > deadline) return null;
+            if (drive) |app| _ = app.pumpOnce(20);
+            var pfd = c.struct_pollfd{ .fd = self.from_child, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 20) <= 0) continue;
+            var tmp: [65536]u8 = undefined;
+            const n = c.read(self.from_child, &tmp, tmp.len);
+            if (n <= 0) return null;
+            self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return null;
+        }
+    }
+
+    fn startCall(self: *McpChild, name: []const u8, args_json: []const u8) bool {
+        self.id += 1;
+        var buf: [4096]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ self.id, name, args_json }) catch return false;
+        return self.send(req);
+    }
+
+    fn call(self: *McpChild, name: []const u8, args_json: []const u8, timeout_ms: i64) ?[]const u8 {
+        if (!self.startCall(name, args_json)) return null;
+        return self.recv(timeout_ms);
+    }
+
+    fn initialize(self: *McpChild) bool {
+        self.id += 1;
+        var buf: [512]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"smoke-e2e\",\"version\":\"0\"}}}}}}", .{self.id}) catch return false;
+        if (!self.send(req)) return false;
+        return self.recv(20_000) != null;
+    }
+
+    fn close(self: *McpChild) void {
+        _ = c.close(self.to_child);
+        var st: c_int = 0;
+        var tries: u32 = 0;
+        while (tries < 60) : (tries += 1) {
+            if (c.waitpid(self.pid, &st, 1) == self.pid) break;
+            if (drive) |app| _ = app.pumpOnce(50);
+        }
+        if (tries >= 60) {
+            _ = c.kill(self.pid, c.SIGKILL);
+            _ = c.waitpid(self.pid, &st, 0);
+        }
+        _ = c.close(self.from_child);
+        self.rbuf.deinit(self.allocator);
+    }
+};
+
+/// The panel feature through a REAL `sketerm mcp` server: the exact
+/// path an assistant takes. What only this proves is the MCP layer
+/// itself — that `ui_show` reaches the GUI, that `ui_wait_event`'s
+/// POLL loop returns a real seat click (it must not block the GUI, and
+/// the GUI's own panel-events never waits), that `ui_save` with no
+/// document persists the GUI's OWN live document (read back over
+/// `panel-get` — including for a panel another process showed), and
+/// that save/load/close and delete stay distinct operations.
+fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    _ = app.drainLive(2_000);
+    var known: [16]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    var m = McpChild.spawn(allocator, sock_path) orelse return "could not spawn `sketerm mcp`";
+    defer m.close();
+    if (!m.initialize()) return "the mcp server never answered initialize";
+
+    // The GUI socket is attached, so panels are available — and the
+    // preflight must say so.
+    const caps = m.call("capabilities", "{}", 20_000) orelse return "capabilities timed out";
+    if (std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null)
+        return "capabilities does not report panels as available with a GUI socket";
+
+    // 1. ui_show, with the document as a JSON OBJECT (the natural shape
+    // for an assistant) rather than a pre-stringified document.
+    const show = m.call("ui_show",
+        \\{"name":"mcp-e2e","session":"e2e-mcp","target":"window","document":{"title":"Epoch 41","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve","class":["expand"]}}}}
+    , 30_000) orelse return "ui_show timed out";
+    if (std.mem.indexOf(u8, show, "isError") != null) return "ui_show returned an error";
+    const panel_id = parseNumAfter(show, "\\\"panel_id\\\":") orelse return "ui_show returned no panel_id";
+
+    // A malformed document must come back with the parser's own text.
+    const bad = m.call("ui_show",
+        \\{"name":"mcp-bad","session":"e2e-mcp","document":{"root":"r","components":{"r":{"type":"webview"}}}}
+    , 20_000) orelse return "ui_show(bad) timed out";
+    if (std.mem.indexOf(u8, bad, "isError") == null) return "a webview component was accepted through MCP";
+    if (std.mem.indexOf(u8, bad, "webview") == null) return "the MCP rejection did not name the offending component";
+
+    var waited: u32 = 0;
+    const win_id = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "ui_show never mapped a panel window";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    const pw = app.winById(win_id) orelse return "the MCP panel window vanished";
+
+    // 2. ui_wait_event BLOCKS in the server while the GUI stays live:
+    // start the call, then click the real seat, then read the reply.
+    if (!m.startCall("ui_wait_event",
+        \\{"name":"mcp-e2e","session":"e2e-mcp","timeout_ms":20000}
+    )) return "could not start ui_wait_event";
+    // Give the server a moment to be inside its poll loop, pumping so
+    // the compositor side keeps running.
+    var settle: u32 = 0;
+    while (settle < 5) : (settle += 1) _ = app.pumpOnce(100);
+    app.clickEx(win_id, @as(f64, @floatFromInt(pw.w)) / 2, @as(f64, @floatFromInt(pw.h)) / 2, 1, 100, 1) catch
+        return "clicking the MCP panel button failed";
+    const ev = m.recv(30_000) orelse return "ui_wait_event never answered";
+    if (std.mem.indexOf(u8, ev, "isError") != null) return "ui_wait_event returned an error";
+    if (std.mem.indexOf(u8, ev, "timed_out") != null) return "ui_wait_event timed out on a real click";
+    if (std.mem.indexOf(u8, ev, "approve") == null) return "ui_wait_event did not return the button's action";
+    if (std.mem.indexOf(u8, ev, "\\\"kind\\\":\\\"click\\\"") == null) return "the MCP event was not a click";
+
+    // 3. ui_patch updates the live document, ui_panels sees the new
+    // title, and the panel is listed as live rather than saved.
+    const patched = m.call("ui_patch",
+        \\{"name":"mcp-e2e","session":"e2e-mcp","patch":[{"op":"title","value":"Epoch 42"}]}
+    , 20_000) orelse return "ui_patch timed out";
+    if (std.mem.indexOf(u8, patched, "isError") != null) return "ui_patch returned an error";
+    const listed = m.call("ui_panels", "{\"session\":\"e2e-mcp\"}", 20_000) orelse return "ui_panels timed out";
+    if (std.mem.indexOf(u8, listed, "Epoch 42") == null) return "ui_panels does not show the patched title";
+    if (std.mem.indexOf(u8, listed, "\\\"saved\\\":[]") == null) return "ui_panels claims a saved document that was never saved";
+
+    // 4. ui_save with no document persists what is on screen, patch
+    // included. The server keeps NO copy of what it showed: it reads
+    // the document back over panel-get, so the bytes on disk must equal
+    // the live document byte for byte (both are doc.toJson canonical).
+    const saved = m.call("ui_save", "{\"name\":\"mcp-e2e\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_save timed out";
+    if (std.mem.indexOf(u8, saved, "isError") != null) return "ui_save (from the live document) returned an error";
+    if (savedPanelMatchesLive(allocator, sock_path, "e2e-mcp", "mcp-e2e", panel_id)) |why| return why;
+
+    // 4b. The hole a server-side mirror could never cover: a panel THIS
+    // server never showed. It was shown over the control socket by this
+    // smoke process, so only a read-back from the GUI can save it.
+    const foreign_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"foreign\",\"session\":\"e2e-mcp\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"title\\\":\\\"Not mine\\\",\\\"root\\\":\\\"t\\\"," ++
+        "\\\"components\\\":{\\\"t\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"shown by another process\\\"}}}\"}\n";
+    const foreign = roundtrip(allocator, sock_path, foreign_req) orelse return "panel-show(foreign) roundtrip";
+    defer allocator.free(foreign);
+    if (std.mem.indexOf(u8, foreign, "\"ok\":true") == null) return "panel-show(foreign) not ok";
+    const foreign_id = parseNumAfter(foreign, "\"panel_id\":") orelse return "foreign panel has no panel_id";
+    _ = app.pumpOnce(300);
+    const foreign_saved = m.call("ui_save", "{\"name\":\"foreign\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_save(foreign) timed out";
+    if (std.mem.indexOf(u8, foreign_saved, "isError") != null)
+        return "ui_save could not persist a panel shown by another process";
+    if (savedPanelMatchesLive(allocator, sock_path, "e2e-mcp", "foreign", foreign_id)) |why| return why;
+    {
+        var fbuf: [128]u8 = undefined;
+        const fclose_req = std.fmt.bufPrint(&fbuf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{foreign_id}) catch
+            return "panel-close fmt";
+        const fclosed = roundtrip(allocator, sock_path, fclose_req) orelse return "panel-close(foreign) roundtrip";
+        defer allocator.free(fclosed);
+        if (std.mem.indexOf(u8, fclosed, "\"ok\":true") == null) return "panel-close(foreign) not ok";
+    }
+    const dropped = m.call("ui_delete", "{\"name\":\"foreign\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_delete(foreign) timed out";
+    if (std.mem.indexOf(u8, dropped, "isError") != null) return "ui_delete(foreign) returned an error";
+    _ = app.pumpOnce(300);
+
+    // ui_save cannot invent a document for a panel that is not on
+    // screen: that is a refusal, never a stale save.
+    const ghost = m.call("ui_save", "{\"name\":\"never-shown\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_save(ghost) timed out";
+    if (std.mem.indexOf(u8, ghost, "isError") == null)
+        return "ui_save claimed to save a panel that was never shown";
+    const closed = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_close timed out";
+    if (std.mem.indexOf(u8, closed, "isError") != null) return "ui_close returned an error";
+    _ = app.pumpOnce(500);
+    const after_close = m.call("ui_panels", "{\"session\":\"e2e-mcp\"}", 20_000) orelse return "ui_panels timed out";
+    if (std.mem.indexOf(u8, after_close, "\\\"live\\\":[]") == null) return "a closed panel is still listed as live";
+    if (std.mem.indexOf(u8, after_close, "Epoch 42") == null) return "ui_close destroyed the saved document";
+
+    // 5. The saved document renders again, and ui_delete removes only
+    // the stored copy.
+    const reshown = m.call("ui_show",
+        \\{"name":"mcp-e2e","session":"e2e-mcp","target":"window","load":"mcp-e2e"}
+    , 30_000) orelse return "ui_show(load) timed out";
+    if (std.mem.indexOf(u8, reshown, "isError") != null) return "ui_show could not re-open the saved panel";
+    _ = app.pumpOnce(500);
+    const deleted = m.call("ui_delete", "{\"name\":\"mcp-e2e\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "ui_delete timed out";
+    if (std.mem.indexOf(u8, deleted, "isError") != null) return "ui_delete returned an error";
+    const final = m.call("ui_panels", "{\"session\":\"e2e-mcp\"}", 20_000) orelse return "ui_panels timed out";
+    if (std.mem.indexOf(u8, final, "\\\"saved\\\":[]") == null) return "ui_delete left the saved document behind";
+    if (std.mem.indexOf(u8, final, "\\\"live\\\":[]") != null) return "ui_delete closed the live panel too";
+
+    const gone = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"e2e-mcp\"}", 20_000) orelse
+        return "final ui_close timed out";
+    if (std.mem.indexOf(u8, gone, "isError") != null) return "the re-opened panel could not be closed";
+    _ = app.pumpOnce(500);
+    return null;
+}
+
+/// The bytes `ui_save` wrote must BE the panel's live document.
+///
+/// Both sides are `doc.Document.toJson` canonical output, so this is a
+/// byte-for-byte comparison rather than a fuzzy one: a server-side
+/// mirror that had drifted from the screen, or a save that stored
+/// anything other than what the GUI holds, cannot pass it.
+/// @return null when they match, else why they do not.
+fn savedPanelMatchesLive(
+    allocator: std.mem.Allocator,
+    sock_path: [:0]const u8,
+    session: []const u8,
+    name: []const u8,
+    panel_id: u32,
+) ?[]const u8 {
+    const panelstore = @import("ipc/panelstore.zig");
+
+    var req_buf: [128]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"panel-get\",\"panel_id\":{d}}}\n", .{panel_id}) catch
+        return "panel-get fmt";
+    const resp = roundtrip(allocator, sock_path, req) orelse return "panel-get roundtrip";
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return "panel-get not ok";
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+        return "panel-get did not answer JSON";
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return "panel-get did not answer a JSON object",
+    };
+    const live = switch (obj.get("document") orelse return "panel-get carries no document") {
+        .string => |str| str,
+        else => return "panel-get's document is not a JSON string",
+    };
+
+    // This process shares XDG_STATE_HOME with the GUI and the MCP
+    // server, so the store read here IS the one ui_save wrote.
+    const stored = panelstore.loadJson(allocator, session, name, null) catch
+        return "ui_save wrote no document a store read can find";
+    defer allocator.free(stored);
+    if (!std.mem.eql(u8, stored, live))
+        return "the saved bytes are not the panel's live document";
+    return null;
+}
+
+/// Row count of pane 1's grid — the cheapest socket-visible proof that
+/// a config change (font size) actually landed.
+fn paneRows(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse return null;
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
+    return parseNumAfter(resp, "\"rows\":");
+}
+
+/// Retrieval WITHOUT an assistant: the user reopens his own saved
+/// panel from the GUI, through the saved-panel picker the command
+/// palette's "Open Saved Panel..." row opens.
+///
+/// Only a live run proves this. The picker dialog, the store read and
+/// the mount all happen inside one GTK process, driven here by real
+/// keystrokes on the session's seat. Two halves matter equally: a
+/// stored document that still parses must come back on screen keyed
+/// exactly as `panel-show` would key it, and a stored document that no
+/// longer parses must be listed-but-unopenable rather than crash or
+/// silently vanish. "Close Panel" then takes it down again.
+///
+/// The action is reached by a CONFIG KEYBIND rather than by typing its
+/// name into the palette's search entry, because a GtkText cannot be
+/// typed into on this display: the GUI child runs with
+/// `GTK_IM_MODULE=wayland` and the session advertises
+/// `zwp_text_input_manager_v3` (both deliberate — see
+/// `editorInputStage`), so an entry that takes focus enables a
+/// text-input and GTK then expects the compositor, not raw key events,
+/// to produce its text. Nothing in this harness plays IME, so the
+/// palette's entry stays empty. Everything AFTER the action is
+/// dispatched is identical either way — `dispatchAction` is the one
+/// path — and the picker itself takes plain key events because it has
+/// no text entry at all.
+fn panelPickerStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    rt: []const u8,
+) ?[]const u8 {
+    const panelstore = @import("ipc/panelstore.zig");
+
+    _ = app.drainLive(2_000);
+    var term_win: u32 = 0;
+    for (app.windows.items) |w| {
+        if (w.popup) continue;
+        term_win = w.id;
+        break;
+    }
+    if (term_win == 0) return "no GUI window to drive the picker on";
+
+    // The picker scopes to the FOCUSED pane's session, so pin the focus
+    // first and learn that pane's session the way the subsystem itself
+    // reports it (a panel-show with no explicit session echoes the
+    // session it resolved to).
+    const focused = roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n") orelse
+        return "focus roundtrip";
+    defer allocator.free(focused);
+    if (std.mem.indexOf(u8, focused, "\"ok\":true") == null) return "focusing pane 1 failed";
+
+    const probe = roundtrip(
+        allocator,
+        sock_path,
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e-probe\",\"pane\":1,\"target\":\"window\"," ++
+            "\"document\":\"{\\\"root\\\":\\\"r\\\",\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"probe\\\"}}}\"}\n",
+    ) orelse return "panel-show(probe) roundtrip";
+    defer allocator.free(probe);
+    if (std.mem.indexOf(u8, probe, "\"ok\":true") == null) return "panel-show(probe) not ok";
+    const probe_id = parseNumAfter(probe, "\"panel_id\":") orelse return "probe has no panel_id";
+    var sess_buf: [128]u8 = undefined;
+    const session = blk: {
+        const key = "\"session\":\"";
+        const at = std.mem.indexOf(u8, probe, key) orelse return "the probe did not echo its session";
+        const rest = probe[at + key.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return "malformed session in the probe reply";
+        if (end == 0 or end > sess_buf.len) return "implausible session name";
+        @memcpy(sess_buf[0..end], rest[0..end]);
+        break :blk sess_buf[0..end];
+    };
+    var close_buf: [128]u8 = undefined;
+    const close_probe = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{probe_id}) catch
+        return "panel-close fmt";
+    const probe_closed = roundtrip(allocator, sock_path, close_probe) orelse return "panel-close(probe) roundtrip";
+    defer allocator.free(probe_closed);
+    if (std.mem.indexOf(u8, probe_closed, "\"ok\":true") == null) return "panel-close(probe) not ok";
+    _ = app.pumpOnce(500);
+    _ = roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n");
+
+    // The fixture: one document that parses, one that does not. This
+    // process shares XDG_STATE_HOME with the GUI, so the store it
+    // writes IS the store the GUI reads.
+    const SAVED_DOC =
+        "{\"version\":1,\"title\":\"Saved By Hand\",\"root\":\"r\",\"components\":" ++
+        "{\"r\":{\"type\":\"heading\",\"text\":\"Reopened from the palette\",\"level\":2}}}";
+    panelstore.saveJson(allocator, session, "e2e-saved", SAVED_DOC, null) catch
+        return "saving the panel document failed";
+    {
+        const dir = panelstore.sessionDir(allocator, session) catch return "resolving the session dir failed";
+        defer allocator.free(dir);
+        const broken = std.fmt.allocPrintSentinel(allocator, "{s}/e2e-broken.json", .{dir}, 0) catch return "alloc";
+        defer allocator.free(broken);
+        // Valid JSON, invalid document: the root names a component that
+        // is not there, which is what `panelstore` calls Corrupt.
+        if (!writeFile(broken, "{\"root\":\"gone\",\"components\":{}}"))
+            return "could not stage the corrupt panel document";
+    }
+    {
+        const listed = panelstore.list(allocator, session) catch return "listing the fixture failed";
+        defer panelstore.freeList(allocator, listed);
+        if (listed.len != 2) return "the panel fixture is not what the store reports";
+        if (!std.mem.eql(u8, listed[0].name, "e2e-broken") or listed[0].ok)
+            return "the corrupt fixture is not listed as unopenable";
+        if (!std.mem.eql(u8, listed[1].name, "e2e-saved") or !listed[1].ok)
+            return "the good fixture is not listed as openable";
+    }
+
+    // Bind the two palette actions to chords, and let the config
+    // watcher pick the file up (the same live-apply this smoke already
+    // proves in `configWatchStage`). The font size rides along purely
+    // as an ACK: it changes the pane's cell grid, so `screen-info`
+    // tells us when the new config is live — pressing the chord before
+    // that would prove nothing.
+    const rows_before = paneRows(allocator, sock_path) orelse return "screen-info before the config write";
+    var cfg_buf: [4096]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    if (!writeFile(cfg_path,
+        \\# smoke: panel picker
+        \\font_size = 13
+        \\keybind.panel_open = <Control><Shift>F9
+        \\keybind.panel_close = <Control><Shift>F10
+        \\
+    )) return "could not write the keybind config";
+    {
+        var waited: u32 = 0;
+        while (waited < 20_000) : (waited += 200) {
+            _ = app.pumpOnce(200);
+            const now = paneRows(allocator, sock_path) orelse continue;
+            if (now != rows_before) break;
+        } else return "the keybind config was written but never applied";
+    }
+
+    var list_buf: [256]u8 = undefined;
+    const list_req = std.fmt.bufPrint(&list_buf, "{{\"cmd\":\"panel-list\",\"session\":\"{s}\"}}\n", .{session}) catch
+        return "panel-list fmt";
+
+    // The chord now opens the picker: the dialog covers a good part of
+    // the window, so its arrival is a pixel fact rather than a guess.
+    {
+        _ = app.waitVisualSettle(term_win, 500, 8_000, 0.002, null);
+        var ref = app.frameRef(term_win, true) orelse return "no baseline frame for the picker";
+        defer ref.deinit(allocator);
+        app.pressKey(term_win, "ctrl+shift+F9") catch return "injecting the panel_open chord failed";
+        if (!app.waitChangeSince(term_win, &ref, 10_000, 0.02, null))
+            return "the panel_open action never opened the saved-panel picker";
+        _ = app.waitVisualSettle(term_win, 400, 8_000, 0.002, null);
+    }
+
+    var tries: u32 = 0;
+
+    // The picker lists broken-then-good (sorted by name) and focuses the
+    // first row. Activating the BROKEN one must mount nothing at all.
+    app.pressKey(term_win, "Return") catch return "activating the broken row failed";
+    _ = app.pumpOnce(900);
+    {
+        const after_broken = roundtrip(allocator, sock_path, list_req) orelse
+            return "panel-list(after the broken row) roundtrip";
+        defer allocator.free(after_broken);
+        if (std.mem.indexOf(u8, after_broken, "\"name\":\"e2e-broken\"") != null)
+            return "a corrupt stored document was mounted anyway";
+    }
+
+    // Down to the good row, Enter: it must mount, keyed (session, name),
+    // in a tab of its own.
+    app.pressKey(term_win, "Down") catch return "moving to the saved row failed";
+    _ = app.pumpOnce(400);
+    app.pressKey(term_win, "Return") catch return "opening the saved panel failed";
+
+    tries = 0;
+    while (tries < 50) : (tries += 1) {
+        _ = app.pumpOnce(200);
+        const live = roundtrip(allocator, sock_path, list_req) orelse continue;
+        defer allocator.free(live);
+        if (std.mem.indexOf(u8, live, "\"name\":\"e2e-saved\"") == null) continue;
+        if (std.mem.indexOf(u8, live, "\"title\":\"Saved By Hand\"") == null)
+            return "the reopened panel is not the saved document";
+        if (std.mem.indexOf(u8, live, "\"target\":\"tab\"") == null)
+            return "the picker opened the panel somewhere other than its own tab";
+        break;
+    } else return "the picker never opened the saved panel";
+
+    // "Close Panel" takes it down again. The panel sits on its own tab
+    // and a panel face swallows no chords of its own, so the chord is
+    // sent from the terminal pane — exactly the ladder `closeNearest`
+    // exists for.
+    _ = roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n");
+    _ = app.pumpOnce(500);
+    app.pressKey(term_win, "ctrl+shift+F10") catch return "injecting the panel_close chord failed";
+    var closed = false;
+    tries = 0;
+    while (tries < 50 and !closed) : (tries += 1) {
+        _ = app.pumpOnce(200);
+        const live = roundtrip(allocator, sock_path, list_req) orelse continue;
+        defer allocator.free(live);
+        closed = std.mem.indexOf(u8, live, "\"name\":\"e2e-saved\"") == null;
+    }
+    if (!closed) return "Close Panel left the panel live";
+
+    // Closing is not deleting: both stored documents are still there.
+    const still = panelstore.list(allocator, session) catch return "re-listing the store failed";
+    defer panelstore.freeList(allocator, still);
+    if (still.len != 2) return "closing a panel disturbed the stored documents";
+
+    // The pane the picker was driven from is still a working terminal.
+    const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
+        return "screen-info after the picker stage roundtrip";
+    defer allocator.free(alive);
+    if (std.mem.indexOf(u8, alive, "\"ok\":true") == null) return "the pane did not survive the picker stage";
+    return null;
+}
+
+/// Show a panel ON an existing pane and close it again — the one
+/// hosting shape whose teardown has a FUSE on it.
+///
+/// A pane face is unparented by `Pane.detachPanel` and then unref'd by
+/// `PanelView.deinit`, but the pane's widget tree is not the only thing
+/// holding a reference to it: GTK (and, with an accessibility bus up,
+/// the AT context) can hold the last one for frames after the close
+/// answered "ok". The view's ::destroy handler therefore runs LATER
+/// than the free of the struct it points at — the use-after-free this
+/// stage exists to catch, which killed the GUI a second or two after a
+/// perfectly successful `panel-close`.
+///
+/// So the assertion is not that the close reports success (every
+/// earlier stage already covers that) but that the GUI is still
+/// SERVING seconds afterwards, with the display session pumping so the
+/// deferred destroy actually gets a chance to fire. Three rounds,
+/// because "whoever held the last reference" varies with what the
+/// compositor did in between. A unit test cannot reach any of this: it
+/// needs a real widget lifecycle on a real frame clock.
+fn panePanelLifetimeStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+) ?[]const u8 {
+    _ = app.drainLive(1_000);
+    var term_win: u32 = 0;
+    for (app.windows.items) |w| {
+        if (w.popup) continue;
+        term_win = w.id;
+        break;
+    }
+    if (term_win == 0) return "no GUI window to host a pane panel on";
+
+    // Interactive components on purpose: a button and a slider each
+    // carry their own heap signal context, so this also exercises the
+    // per-component teardown alongside the view's own.
+    const show_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e-life\",\"session\":\"e2e-scope\"," ++
+        "\"target\":\"pane\",\"pane\":1,\"document\":\"{\\\"title\\\":\\\"Lifetime\\\"," ++
+        "\\\"root\\\":\\\"c\\\",\\\"components\\\":{\\\"c\\\":{\\\"type\\\":\\\"column\\\"," ++
+        "\\\"children\\\":[\\\"h\\\",\\\"b\\\",\\\"s\\\"]}," ++
+        "\\\"h\\\":{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"On the pane\\\",\\\"level\\\":2}," ++
+        "\\\"b\\\":{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Press\\\",\\\"action\\\":\\\"go\\\"}," ++
+        "\\\"s\\\":{\\\"type\\\":\\\"slider\\\",\\\"min\\\":0,\\\"max\\\":10,\\\"value\\\":3}}}\"}\n";
+
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        const shown = roundtrip(allocator, sock_path, show_req) orelse
+            return "panel-show(pane face) roundtrip";
+        defer allocator.free(shown);
+        if (std.mem.indexOf(u8, shown, "\"ok\":true") == null) return "panel-show(pane face) not ok";
+        const id = parseNumAfter(shown, "\"panel_id\":") orelse
+            return "panel-show(pane face) reply has no panel_id";
+
+        // Let the face realize and paint: an unrealized widget tree
+        // hands out none of the extra references that make the destroy
+        // deferred in the first place.
+        _ = app.waitVisualSettle(term_win, 400, 8_000, 0.002, null);
+
+        var buf: [128]u8 = undefined;
+        const close_req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}\n", .{id}) catch
+            return "panel-close fmt";
+        const closed = roundtrip(allocator, sock_path, close_req) orelse
+            return "panel-close(pane face) roundtrip";
+        defer allocator.free(closed);
+        if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "panel-close(pane face) not ok";
+
+        // The fuse. Keep the display session pumping and keep asking:
+        // a GUI that faulted on the deferred destroy stops answering,
+        // and `screen-info` is the cheapest round-trip that proves it
+        // is both alive and still owning pane 1.
+        var waited: u32 = 0;
+        while (waited < 3_000) : (waited += 250) {
+            _ = app.pumpOnce(250);
+            const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
+                return "the GUI stopped serving after a pane panel was closed";
+            defer allocator.free(alive);
+            if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
+                return "the GUI went unhealthy after a pane panel was closed";
+        }
+
+        // And the panel really is gone, so the next round mounts a
+        // fresh face rather than replacing a live one in place.
+        const listed = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
+            return "panel-list(after the pane face closed) roundtrip";
+        defer allocator.free(listed);
+        if (std.mem.indexOf(u8, listed, "\"name\":\"e2e-life\"") != null)
+            return "a closed pane panel is still listed";
+    }
+    return null;
+}
+
+/// A solid-colour PNG for the image_compare sides. Two visibly
+/// different images make "the split moved" a real pixel assertion.
+fn writeSolidPng(allocator: std.mem.Allocator, path: [*:0]const u8, r: u8, g: u8, b: u8) bool {
+    const w: u32 = 160;
+    const h: u32 = 120;
+    const rgba = allocator.alloc(u8, w * h * 4) catch return false;
+    defer allocator.free(rgba);
+    var i: usize = 0;
+    while (i < rgba.len) : (i += 4) {
+        rgba[i] = r;
+        rgba[i + 1] = g;
+        rgba[i + 2] = b;
+        rgba[i + 3] = 0xff;
+    }
+    const png = @import("util/png.zig").encodeRgba(allocator, rgba, w, h) catch return false;
+    defer allocator.free(png);
+    writePng(path, png);
+    return true;
 }
 
 /// The kitty keyboard protocol, end to end on a real seat. The

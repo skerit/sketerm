@@ -126,6 +126,7 @@ first, and that is also the order rules are scanned in).
 | `[profile.<name>]` | profile-level keys; `<name>` = `default` edits the Default bundle |
 | `[domain.<name>]` | `host`, `transport` |
 | `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `enabled` |
+| `[mcp.<name>]` | `tools` (an MCP tool-exposure policy; a different namespace from `[profile.<name>]`) |
 
 A section header with an unrecognised prefix warns and leaves the
 following lines in the no-section (top level) state, so an unknown
@@ -594,6 +595,30 @@ an LSP section is written out rather than diffed against the
 built-in: a section that silently inherited half its fields from a
 built-in that later changed would quietly change behaviour on
 upgrade. See `docs/lsp.md` for the client itself.
+
+## `[mcp.<name>]` -- named MCP tool-exposure policies
+
+A reusable tool subset for `sketerm mcp --profile <name>`, so several
+assistants can share one machine with different reach. The section
+namespace is `mcp.`, not `profile.`: `[profile.<name>]` is a pane
+settings bundle and the two have nothing in common.
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `tools` | string | Tool-exposure spec. Grammar and group names in `docs/mcp.md`. Empty = every tool. |
+
+```
+[mcp.wayland]
+tools = app, files:ro
+
+[mcp.safe]
+tools = -run_command, -file_delete_tree
+```
+
+The spec is NOT validated at config-parse time -- `src/config.zig` is
+compiled into `sketerm-mux` and must not depend on the MCP tool table.
+`sketerm mcp --profile <name>` validates it at startup and refuses to
+start on an unknown term, naming it.
 
 ---
 

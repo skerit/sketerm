@@ -97,10 +97,15 @@ comptime {
     _ = @import("ipc/fstransfer.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/mcpassets.zig");
+    _ = @import("ipc/mcpfilter.zig");
     _ = @import("ipc/mux_cli.zig");
+    _ = @import("ipc/panelstore.zig");
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/xkblayout.zig");
+    // ui/panel data layer: under ui/ by home, but GTK-free by contract.
+    _ = @import("ui/panel/doc.zig");
+    _ = @import("ui/panel/events.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
     _ = @import("viewer.zig");
