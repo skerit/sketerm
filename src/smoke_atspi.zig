@@ -1651,6 +1651,62 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     say("editor chrome: Soft Wrap really wrapped, and the status line says so");
     dismissPopup(app);
 
+    // ── IME preedit stays OUT of the accessible text ───────────────
+    //
+    // The editor announces an uncommitted composition to a screen
+    // reader as transient speech (`a11y/atspi.zig announcePreedit`, via
+    // DocSource.setPreedit from EditorView.setPreedit). The design rule
+    // that goes with it is asserted here: the accessible TEXT must stay
+    // byte-for-byte the COMMITTED document, so no accessible offset
+    // ever covers characters the user has not committed. Routing
+    // preedit into the rope would break screen-reader navigation
+    // silently — nothing on screen would look wrong.
+    //
+    // NOT asserted: the announcement itself. `gtk_accessible_announce`
+    // emits an `object:announcement` D-Bus SIGNAL, and this smoke's bus
+    // client (`mux/a11yhub.zig`) only makes method calls — it has no
+    // signal subscription — so the speech channel is not observable
+    // from here at all. Said plainly rather than covered weakly.
+    {
+        const node = findNamedNode(allocator, "chrome.zig", ROLE_TEXT_BOX, 15_000) orelse
+            return "the chrome document's canvas node vanished from the AT-SPI tree";
+        defer allocator.free(node.id);
+        const before = hub.?.textState(allocator, node.id) orelse
+            return "could not read the editor's accessible text before composing";
+        defer allocator.free(before.text);
+
+        // Ctrl+Shift+U starts a composition on ANY layout (no compose
+        // key needed), which is why it is the chord used here rather
+        // than a dead key — a dead key would need a second display
+        // session with a non-US keymap, and this session's other stages
+        // type US characters.
+        app.pressKey(win.id, "ctrl+shift+u") catch return "injecting Ctrl+Shift+U failed";
+        var tries: u32 = 0;
+        while (tries < 12) : (tries += 1) {
+            app.drain();
+            _ = c.usleep(150_000);
+            const during = hub.?.textState(allocator, node.id) orelse continue;
+            defer allocator.free(during.text);
+            if (!std.mem.eql(u8, during.text, before.text)) {
+                _ = c.fprintf(platform.stderr(), "smoke-atspi: text during composition: %.*s\n", @as(c_int, @intCast(during.text.len)), during.text.ptr);
+                return "the composing string leaked into the editor's accessible text";
+            }
+        }
+        // Cancel the composition; the document must still be untouched.
+        app.pressKey(win.id, "Escape") catch return "injecting Escape failed";
+        var settled: u32 = 0;
+        while (settled < 10) : (settled += 1) {
+            app.drain();
+            _ = c.usleep(150_000);
+        }
+        const after = hub.?.textState(allocator, node.id) orelse
+            return "could not read the editor's accessible text after cancelling";
+        defer allocator.free(after.text);
+        if (!std.mem.eql(u8, after.text, before.text))
+            return "cancelling the composition changed the editor's accessible text";
+    }
+    say("editor chrome: a composing string never enters the accessible text (announcement itself is not bus-observable)");
+
     // Leave nothing dirty behind: the GUI's SIGTERM must not meet an
     // unsaved-buffer prompt.
     {

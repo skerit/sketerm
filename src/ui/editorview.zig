@@ -3359,6 +3359,12 @@ pub const EditorView = struct {
     /// `cursor_chars` is GTK's character offset; the pass wants bytes.
     fn setPreedit(self: *EditorView, span: []const u8, cursor_chars: usize) void {
         self.clearPreedit();
+        // Speech-only channel: the composing string is ANNOUNCED, never
+        // routed into the document. The accessible text stays
+        // byte-for-byte the committed rope, so no accessible offset
+        // ever covers uncommitted composition; the commit announces
+        // itself through the ordinary text-changed events.
+        self.a11y_src.setPreedit(span);
         if (span.len == 0) return;
         var doc = Document.initFromBytes(self.allocator, span) catch return;
         self.preedit_doc = doc;
@@ -3383,6 +3389,10 @@ pub const EditorView = struct {
 
     fn onPreeditEndCb(user: ?*anyopaque) void {
         const self = cast.userData(EditorView, user);
+        // Composition ended (committed or cancelled): drop a pending
+        // announcement so a composition the user abandoned is not read
+        // out after the fact.
+        self.a11y_src.clearPreedit();
         self.clearPreedit();
         self.queueRender();
     }
