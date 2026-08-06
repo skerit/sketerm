@@ -243,3 +243,138 @@ test "colrv0: broken container caches as an empty glyph" {
     try std.testing.expectEqual(@as(u16, 0), g.w);
     try std.testing.expectEqual(@as(u16, 0), g.h);
 }
+
+/// A solid-under-glyph colrv1 container at the 0xFFFF sentinel, and a
+/// fixed-palette sibling. Shared by the caching and leak tests.
+fn v1FgContainer(a: std.mem.Allocator, fg_dependent: bool) ![]u8 {
+    const gp = @import("../parser/glyph_protocol.zig");
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    const solid = gp.V1Node{ .solid = .{
+        .palette = if (fg_dependent) gp.PALETTE_FOREGROUND else 0,
+    } };
+    return gp.colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid },
+    }, if (fg_dependent) &.{} else &.{0x00FF00FF}, null);
+}
+
+test "colrv1: 0xFFFF glyphs cache per foreground; plain colrv1 caches once" {
+    const a = std.testing.allocator;
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+
+    const fg_dep = try v1FgContainer(a, true);
+    defer a.free(fg_dep);
+    const red: [4]f32 = .{ 1, 0, 0, 1 };
+    const blue: [4]f32 = .{ 0, 0, 1, 1 };
+    const g_red = try atlas.lookupOrLoadCustom(201, fg_dep, .colrv1, 1000, 1, red);
+    const g_blue = try atlas.lookupOrLoadCustom(201, fg_dep, .colrv1, 1000, 1, blue);
+    try std.testing.expect(g_red.colored and g_blue.colored);
+    try std.testing.expect(g_red.w > 0 and g_red.h > 0);
+    // Distinct atlas slots per foreground — the graph-deep sentinel
+    // must key the cache exactly like colrv0's layer sentinel.
+    try std.testing.expect(g_red.layer != g_blue.layer or g_red.u0 != g_blue.u0 or g_red.v0 != g_blue.v0);
+    const g_red2 = try atlas.lookupOrLoadCustom(201, fg_dep, .colrv1, 1000, 1, red);
+    try std.testing.expectEqual(g_red.layer, g_red2.layer);
+    try std.testing.expectEqual(g_red.u0, g_red2.u0);
+
+    const fg_ind = try v1FgContainer(a, false);
+    defer a.free(fg_ind);
+    const gi_red = try atlas.lookupOrLoadCustom(202, fg_ind, .colrv1, 1000, 1, red);
+    const gi_blue = try atlas.lookupOrLoadCustom(202, fg_ind, .colrv1, 1000, 1, blue);
+    try std.testing.expect(gi_red.colored);
+    try std.testing.expectEqual(gi_red.layer, gi_blue.layer);
+    try std.testing.expectEqual(gi_red.u0, gi_blue.u0);
+    try std.testing.expectEqual(gi_red.v0, gi_blue.v0);
+}
+
+test "colrv1: broken container caches as an empty glyph" {
+    const a = std.testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    // A glyf record is not a v1 container...
+    const g = try atlas.lookupOrLoadCustom(203, tri, .colrv1, 1000, 1, .{ 1, 1, 1, 1 });
+    try std.testing.expectEqual(@as(u16, 0), g.w);
+    // ...and neither is a v0 container.
+    const v0 = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = 0 },
+    }, &.{0xFF0000FF});
+    defer a.free(v0);
+    const g2 = try atlas.lookupOrLoadCustom(204, v0, .colrv1, 1000, 1, .{ 1, 1, 1, 1 });
+    try std.testing.expectEqual(@as(u16, 0), g2.w);
+}
+
+test "colrv1: repeated rasterisation leaks no C-heap memory (cairo surfaces)" {
+    // cairo surfaces, contexts and patterns live on the C heap, which
+    // the Zig leak detector cannot see — a missed cairo_*_destroy in
+    // the raster path would grow every repaint. Rasterise the same
+    // fg-dependent glyph under a rotating foreground (a cache MISS
+    // every time, exercising surface + context + gradient pattern +
+    // group allocation per call) and assert malloc-space stays flat.
+    // Linux-only: mallinfo2 is glibc.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    const c = @import("../c.zig").c;
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    // Gradient + composite + transform in one graph so every cairo
+    // object kind the walker creates is exercised each iteration.
+    const stops = [_]gp.V1Stop{
+        .{ .offset = 0, .palette = gp.PALETTE_FOREGROUND },
+        .{ .offset = 1, .palette = 0 },
+    };
+    const lin = gp.V1Node{ .linear = .{ .stops = &stops, .x0 = 0, .y0 = 0, .x1 = 1000, .y1 = 0, .x2 = 0, .y2 = 1000 } };
+    const g_lin = gp.V1Node{ .glyph = .{ .glyph_id = 0, .child = &lin } };
+    const rot = gp.V1Node{ .rotate = .{ .angle = 0.1, .child = &g_lin } };
+    const solid = gp.V1Node{ .solid = .{ .palette = gp.PALETTE_FOREGROUND } };
+    const g_solid = gp.V1Node{ .glyph = .{ .glyph_id = 0, .child = &solid } };
+    const cmp = gp.V1Node{ .composite = .{ .source = &rot, .mode = 12, .backdrop = &g_solid } };
+    const container = try gp.colr1ContainerBytes(a, &.{tri}, cmp, &.{0x336699FF}, null);
+    defer a.free(container);
+
+    // Warm-up: first calls populate cairo/freetype internal caches.
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        const fg: [4]f32 = .{ @as(f32, @floatFromInt(i % 8)) / 8.0, 0.5, 0.5, 1 };
+        _ = try atlas.lookupOrLoadCustom(300, container, .colrv1, 1000, 1, fg);
+    }
+    const before = c.mallinfo2().uordblks;
+    const ITERS: u32 = 300;
+    while (i < 8 + ITERS) : (i += 1) {
+        // 256 distinct foregrounds → distinct cache keys → a real
+        // raster every iteration.
+        const fg: [4]f32 = .{
+            @as(f32, @floatFromInt(i % 256)) / 255.0,
+            @as(f32, @floatFromInt((i * 7) % 256)) / 255.0,
+            0.25,
+            1,
+        };
+        _ = try atlas.lookupOrLoadCustom(300, container, .colrv1, 1000, 1, fg);
+    }
+    const after = c.mallinfo2().uordblks;
+    const growth = if (after > before) after - before else 0;
+    // A leaked cell-sized ARGB32 surface alone is ~3-6 KiB × 300
+    // iterations ≈ 1-2 MiB; genuine steady-state jitter (allocator
+    // bins, atlas CPU-side bookkeeping in the C heap: none) stays
+    // far below this.
+    if (growth > 512 * 1024) {
+        std.debug.print("colrv1 raster C-heap growth: {d} bytes over {d} iters\n", .{ growth, ITERS });
+        return error.CairoResourceLeak;
+    }
+}

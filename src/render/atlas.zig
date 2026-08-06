@@ -899,7 +899,7 @@ pub const Atlas = struct {
             return g;
         }
         var key = CustomKey{ .render_key = render_key, .fg = 0 };
-        if (fmt == .colrv0) {
+        if (fmt != .glyf) {
             key.fg = fgKey(fg);
             if (self.custom_cache.get(key)) |g| {
                 self.touchPage(g.layer);
@@ -912,6 +912,7 @@ pub const Atlas = struct {
             else
                 null,
             .colrv0 => self.rasterColr(payload, upm, width, key.fg),
+            .colrv1 => self.rasterColr1(payload, upm, width, key.fg),
         };
         const r = raster orelse {
             const empty = self.emptyGlyph();
@@ -1112,6 +1113,436 @@ pub const Atlas = struct {
         const g = self.packRgba(rgba_out, w, h, 0, @intCast(self.ascent), @floatFromInt(w), true) catch return null;
         return .{ .g = g, .uses_fg = colr.uses_fg };
     }
+
+    /// Rasterise a colrv1 container by walking its paint graph into a
+    /// cairo image surface (cairo is our tiny-skia: gradients with all
+    /// three extend modes, affine transforms, clipping, the full
+    /// Porter-Duff + separable/HSL operator set). The daemon validated
+    /// the graph at register time; this walk stays defensive anyway
+    /// (bad node → skip, depth/budget cap → stop) and degrades to a
+    /// blank glyph rather than failing.
+    ///
+    /// Correctness budget, stated Rio-style:
+    ///  - painted for real: solid fills, linear + radial gradients
+    ///    (pad/repeat/reflect, stops outside [0,1] remapped into range
+    ///    by moving the gradient geometry), glyph clips, all ten
+    ///    transform forms, PaintColrLayers, PaintColrGlyph, and all 28
+    ///    composite modes via native cairo operators;
+    ///  - degraded: sweep gradients paint the FIRST colour stop as a
+    ///    solid (cairo has no sweep shader — same degradation as Rio /
+    ///    tiny-skia); a pad colour line whose stops all share one
+    ///    offset paints the last stop's solid;
+    ///  - ignored: variation deltas (PaintVar* render at the default
+    ///    instance; the protocol cannot carry variation coordinates).
+    fn rasterColr1(
+        self: *Atlas,
+        payload: []const u8,
+        upm: u16,
+        width: u8,
+        fg_rgba: u32,
+    ) ?CustomRaster {
+        const gp = @import("../parser/glyph_protocol.zig");
+        if (upm == 0) return null;
+        var c1 = gp.decodeColr1(self.allocator, payload) catch return null;
+        defer c1.deinit(self.allocator);
+
+        const span: u32 = if (width >= 2) 2 else 1;
+        const w: u32 = @as(u32, self.cell_w) * span;
+        const h: u32 = self.cell_h;
+        if (w == 0 or h == 0) return null;
+
+        const surface = c.cairo_image_surface_create(c.CAIRO_FORMAT_ARGB32, @intCast(w), @intCast(h));
+        defer c.cairo_surface_destroy(surface);
+        if (c.cairo_surface_status(surface) != c.CAIRO_STATUS_SUCCESS) return null;
+        const cr = c.cairo_create(surface);
+        defer c.cairo_destroy(cr);
+        if (c.cairo_status(cr) != c.CAIRO_STATUS_SUCCESS) return null;
+
+        // Same coordinate mapping as renderOutlineCoverage: font
+        // units, y-up, baseline `descent` above the bitmap bottom.
+        const scale: f64 = @as(f64, @floatFromInt(h)) / @as(f64, @floatFromInt(upm));
+        c.cairo_translate(cr, 0, @floatFromInt(self.ascent));
+        c.cairo_scale(cr, scale, -scale);
+
+        if (c1.clip_box) |box| {
+            c.cairo_rectangle(
+                cr,
+                @floatFromInt(box.x_min),
+                @floatFromInt(box.y_min),
+                @floatFromInt(@as(i32, box.x_max) - box.x_min),
+                @floatFromInt(@as(i32, box.y_max) - box.y_min),
+            );
+            c.cairo_clip(cr);
+        }
+
+        var ctx = V1PaintCtx{
+            .atlas = self,
+            .c1 = &c1,
+            .cr = cr,
+            .fg = fg_rgba,
+            .budget = gp.MAX_V1_NODES,
+        };
+        ctx.paint(c1.root_paint, 0);
+
+        c.cairo_surface_flush(surface);
+        const stride: usize = @intCast(c.cairo_image_surface_get_stride(surface));
+        const pix = c.cairo_image_surface_get_data(surface);
+        if (pix == null) return null;
+
+        // ARGB32 is premultiplied, native-endian u32 — un-premultiply
+        // into the straight RGBA the emoji SRC_ALPHA pipeline expects.
+        const rgba_out = self.allocator.alloc(u8, w * h * 4) catch return null;
+        defer self.allocator.free(rgba_out);
+        var y: usize = 0;
+        while (y < h) : (y += 1) {
+            const row: [*]const u32 = @ptrCast(@alignCast(pix + y * stride));
+            var x: usize = 0;
+            while (x < w) : (x += 1) {
+                const px = row[x];
+                const a: u32 = px >> 24;
+                const o = (y * w + x) * 4;
+                if (a == 0) {
+                    rgba_out[o + 0] = 0;
+                    rgba_out[o + 1] = 0;
+                    rgba_out[o + 2] = 0;
+                    rgba_out[o + 3] = 0;
+                } else {
+                    rgba_out[o + 0] = @intCast(@min(255, ((px >> 16) & 0xFF) * 255 / a));
+                    rgba_out[o + 1] = @intCast(@min(255, ((px >> 8) & 0xFF) * 255 / a));
+                    rgba_out[o + 2] = @intCast(@min(255, (px & 0xFF) * 255 / a));
+                    rgba_out[o + 3] = @intCast(a);
+                }
+            }
+        }
+
+        const g = self.packRgba(rgba_out, w, h, 0, @intCast(self.ascent), @floatFromInt(w), true) catch return null;
+        return .{ .g = g, .uses_fg = c1.uses_fg };
+    }
+
+    /// Recursive cairo walker over a validated colrv1 paint graph.
+    const V1PaintCtx = struct {
+        const gp = @import("../parser/glyph_protocol.zig");
+
+        atlas: *Atlas,
+        c1: *const gp.Colr1,
+        cr: ?*c.cairo_t,
+        /// Resolved cell foreground, straight 0xRRGGBBAA (the atlas
+        /// CustomKey.fg quantisation).
+        fg: u32,
+        budget: usize,
+
+        /// COLR composite mode (0..27) → cairo operator, spec order.
+        const OPERATORS = [28]c_uint{
+            c.CAIRO_OPERATOR_CLEAR,     c.CAIRO_OPERATOR_SOURCE,
+            c.CAIRO_OPERATOR_DEST,      c.CAIRO_OPERATOR_OVER,
+            c.CAIRO_OPERATOR_DEST_OVER, c.CAIRO_OPERATOR_IN,
+            c.CAIRO_OPERATOR_DEST_IN,   c.CAIRO_OPERATOR_OUT,
+            c.CAIRO_OPERATOR_DEST_OUT,  c.CAIRO_OPERATOR_ATOP,
+            c.CAIRO_OPERATOR_DEST_ATOP, c.CAIRO_OPERATOR_XOR,
+            c.CAIRO_OPERATOR_ADD,       c.CAIRO_OPERATOR_SCREEN,
+            c.CAIRO_OPERATOR_OVERLAY,   c.CAIRO_OPERATOR_DARKEN,
+            c.CAIRO_OPERATOR_LIGHTEN,   c.CAIRO_OPERATOR_COLOR_DODGE,
+            c.CAIRO_OPERATOR_COLOR_BURN, c.CAIRO_OPERATOR_HARD_LIGHT,
+            c.CAIRO_OPERATOR_SOFT_LIGHT, c.CAIRO_OPERATOR_DIFFERENCE,
+            c.CAIRO_OPERATOR_EXCLUSION, c.CAIRO_OPERATOR_MULTIPLY,
+            c.CAIRO_OPERATOR_HSL_HUE,   c.CAIRO_OPERATOR_HSL_SATURATION,
+            c.CAIRO_OPERATOR_HSL_COLOR, c.CAIRO_OPERATOR_HSL_LUMINOSITY,
+        };
+
+        /// Straight (r, g, b, a) in 0..1 for a palette reference;
+        /// 0xFFFF is the current foreground. Alpha clamps to [0,1]
+        /// per spec.
+        fn resolve(self: *V1PaintCtx, palette: u16, alpha: f32) ?[4]f64 {
+            const rgba: u32 = if (palette == gp.PALETTE_FOREGROUND)
+                self.fg
+            else
+                self.c1.cpal.rgba(palette) orelse return null;
+            const a = std.math.clamp(alpha, 0.0, 1.0);
+            return .{
+                @as(f64, @floatFromInt((rgba >> 24) & 0xFF)) / 255.0,
+                @as(f64, @floatFromInt((rgba >> 16) & 0xFF)) / 255.0,
+                @as(f64, @floatFromInt((rgba >> 8) & 0xFF)) / 255.0,
+                @as(f64, @floatFromInt(rgba & 0xFF)) / 255.0 * a,
+            };
+        }
+
+        fn paint(self: *V1PaintCtx, off: usize, depth: usize) void {
+            if (depth >= gp.MAX_V1_DEPTH or self.budget == 0) return;
+            self.budget -= 1;
+            const node = gp.readPaint(self.c1.colr, off) catch return;
+            switch (node) {
+                .layers => |l| {
+                    var i: usize = 0;
+                    while (i < l.count) : (i += 1) {
+                        const idx = @as(u64, l.first) + i;
+                        if (idx >= self.c1.n_layer_paints) return;
+                        const rec = self.c1.layer_list + 4 + @as(usize, @intCast(idx)) * 4;
+                        const rel = std.mem.readInt(u32, self.c1.colr[rec..][0..4], .big);
+                        const abs = self.c1.layer_list + rel;
+                        if (rel == 0 or abs >= self.c1.colr.len) continue;
+                        // Layers composite src-over in order — cairo's
+                        // default operator, no group needed.
+                        self.paint(abs, depth + 1);
+                    }
+                },
+                .solid => |s| {
+                    const col = self.resolve(s.palette, s.alpha) orelse return;
+                    c.cairo_set_source_rgba(self.cr, col[0], col[1], col[2], col[3]);
+                    c.cairo_paint(self.cr);
+                },
+                .linear => |g| self.paintLinear(g),
+                .radial => |g| self.paintRadial(g),
+                .sweep => |g| {
+                    // DELIBERATE DEGRADATION: cairo has no sweep
+                    // (conic) shader, exactly like tiny-skia — Rio
+                    // paints the first colour stop as a solid and so
+                    // do we. Angles are parsed and dropped.
+                    const cl = gp.readColorLine(self.c1.colr, g.color_line) catch return;
+                    if (cl.n_stops == 0) return;
+                    const stop = gp.readStop(self.c1.colr, cl, 0);
+                    const col = self.resolve(stop.palette, stop.alpha) orelse return;
+                    c.cairo_set_source_rgba(self.cr, col[0], col[1], col[2], col[3]);
+                    c.cairo_paint(self.cr);
+                },
+                .glyph => |g| {
+                    if (g.glyph_id >= self.c1.outlines.len) return;
+                    var outline = gp.decodeGlyf(self.atlas.allocator, self.c1.outlines[g.glyph_id]) catch return;
+                    defer outline.deinit(self.atlas.allocator);
+                    c.cairo_save(self.cr);
+                    defer c.cairo_restore(self.cr);
+                    c.cairo_new_path(self.cr);
+                    addOutlinePath(self.cr, &outline);
+                    c.cairo_clip(self.cr);
+                    self.paint(g.child, depth + 1);
+                },
+                .colr_glyph => |g| {
+                    const root = self.c1.baseRootPaint(g.glyph_id) orelse return;
+                    self.paint(root, depth + 1);
+                },
+                .transform => |t| {
+                    for (t.m) |v| {
+                        if (!std.math.isFinite(v)) return; // tan(±90°) skew etc.
+                    }
+                    var m: c.cairo_matrix_t = undefined;
+                    c.cairo_matrix_init(&m, t.m[0], t.m[1], t.m[2], t.m[3], t.m[4], t.m[5]);
+                    c.cairo_save(self.cr);
+                    defer c.cairo_restore(self.cr);
+                    c.cairo_transform(self.cr, &m);
+                    // A singular matrix put cr in an error state; all
+                    // further ops no-op, which is the blank degrade.
+                    self.paint(t.child, depth + 1);
+                },
+                .composite => |cmp| {
+                    if (cmp.mode > gp.MAX_COMPOSITE_MODE) return;
+                    // Isolated group: backdrop, then source composited
+                    // onto it with the mode, then the result src-over
+                    // onto the canvas.
+                    c.cairo_push_group(self.cr);
+                    self.paint(cmp.backdrop, depth + 1);
+                    c.cairo_push_group(self.cr);
+                    self.paint(cmp.source, depth + 1);
+                    const src = c.cairo_pop_group(self.cr);
+                    c.cairo_set_source(self.cr, src);
+                    c.cairo_set_operator(self.cr, OPERATORS[cmp.mode]);
+                    c.cairo_paint(self.cr);
+                    c.cairo_pattern_destroy(src);
+                    c.cairo_set_operator(self.cr, c.CAIRO_OPERATOR_OVER);
+                    c.cairo_pop_group_to_source(self.cr);
+                    c.cairo_paint(self.cr);
+                },
+            }
+        }
+
+        /// Colour-line summary for gradient normalisation.
+        const LineInfo = struct {
+            cl: gp.ColorLine,
+            t_min: f32,
+            t_max: f32,
+        };
+
+        fn lineInfo(self: *V1PaintCtx, ref: gp.ColorLineRef) ?LineInfo {
+            const cl = gp.readColorLine(self.c1.colr, ref) catch return null;
+            if (cl.n_stops == 0) return null;
+            var t_min = gp.readStop(self.c1.colr, cl, 0).offset;
+            var t_max = t_min;
+            var i: usize = 1;
+            while (i < cl.n_stops) : (i += 1) {
+                const t = gp.readStop(self.c1.colr, cl, i).offset;
+                t_min = @min(t_min, t);
+                t_max = @max(t_max, t);
+            }
+            return .{ .cl = cl, .t_min = t_min, .t_max = t_max };
+        }
+
+        /// Add the (normalised) stops and extend mode to `pattern`,
+        /// then fill the clip with it.
+        fn fillWithPattern(self: *V1PaintCtx, pattern: ?*c.cairo_pattern_t, info: LineInfo) void {
+            defer c.cairo_pattern_destroy(pattern);
+            const denom = info.t_max - info.t_min;
+            var i: usize = 0;
+            while (i < info.cl.n_stops) : (i += 1) {
+                const stop = gp.readStop(self.c1.colr, info.cl, i);
+                const col = self.resolve(stop.palette, stop.alpha) orelse continue;
+                const t: f64 = if (denom > 0) (stop.offset - info.t_min) / denom else 0.0;
+                c.cairo_pattern_add_color_stop_rgba(pattern, t, col[0], col[1], col[2], col[3]);
+            }
+            c.cairo_pattern_set_extend(pattern, switch (info.cl.extend) {
+                1 => c.CAIRO_EXTEND_REPEAT,
+                2 => c.CAIRO_EXTEND_REFLECT,
+                else => c.CAIRO_EXTEND_PAD,
+            });
+            c.cairo_set_source(self.cr, pattern);
+            c.cairo_paint(self.cr);
+        }
+
+        /// Degenerate colour lines: repeat/reflect with a zero-length
+        /// interval is ill-formed (spec: render nothing); pad paints
+        /// the LAST stop's solid (approximates the spec's two-colour
+        /// step — the below-first-offset half is rarely visible).
+        fn degenerateLine(self: *V1PaintCtx, info: LineInfo) bool {
+            if (info.t_max > info.t_min) return false;
+            if (info.cl.extend != 0) return true; // painted nothing
+            const stop = gp.readStop(self.c1.colr, info.cl, info.cl.n_stops - 1);
+            if (self.resolve(stop.palette, stop.alpha)) |col| {
+                c.cairo_set_source_rgba(self.cr, col[0], col[1], col[2], col[3]);
+                c.cairo_paint(self.cr);
+            }
+            return true;
+        }
+
+        fn paintLinear(self: *V1PaintCtx, g: anytype) void {
+            const info = self.lineInfo(g.color_line) orelse return;
+            if (self.degenerateLine(info)) return;
+            // The spec's p2 rotates the gradient: project p0→p1 onto
+            // the perpendicular of p0→p2 (skrifa's algorithm). p1==p0,
+            // p2==p0 or p0p1 ∥ p0p2 are ill-formed — render nothing.
+            const dx = g.x1 - g.x0;
+            const dy = g.y1 - g.y0;
+            const rx = g.x2 - g.x0;
+            const ry = g.y2 - g.y0;
+            if ((dx == 0 and dy == 0) or (rx == 0 and ry == 0)) return;
+            const px = ry; // perpendicular of (rx, ry)
+            const py = -rx;
+            const pp = px * px + py * py;
+            const proj = (dx * px + dy * py) / pp;
+            const p3x = g.x0 + proj * px;
+            const p3y = g.y0 + proj * py;
+            if (p3x == g.x0 and p3y == g.y0) return; // parallel
+            // Stops outside [0,1]: cairo clamps offsets, so remap the
+            // colour line into [0,1] by sliding the gradient geometry
+            // instead (exact, not Rio's truncation).
+            const ax = g.x0 + (p3x - g.x0) * info.t_min;
+            const ay = g.y0 + (p3y - g.y0) * info.t_min;
+            const bx = g.x0 + (p3x - g.x0) * info.t_max;
+            const by = g.y0 + (p3y - g.y0) * info.t_max;
+            const pattern = c.cairo_pattern_create_linear(ax, ay, bx, by);
+            self.fillWithPattern(pattern, info);
+        }
+
+        fn paintRadial(self: *V1PaintCtx, g: anytype) void {
+            const info = self.lineInfo(g.color_line) orelse return;
+            if (self.degenerateLine(info)) return;
+            if (g.x0 == g.x1 and g.y0 == g.y1 and g.r0 == g.r1) return; // spec: nothing
+            // Same [0,1] remap as linear: lerp both circles along ω.
+            const lerp = struct {
+                fn go(a: f32, b: f32, t: f32) f64 {
+                    return a + (b - a) * t;
+                }
+            }.go;
+            // COLR allows negative interpolated radii (the cone
+            // algorithm handles them); cairo does not — clamp to 0,
+            // a marginal degradation on exotic gradients.
+            const pattern = c.cairo_pattern_create_radial(
+                lerp(g.x0, g.x1, info.t_min),
+                lerp(g.y0, g.y1, info.t_min),
+                @max(0.0, lerp(g.r0, g.r1, info.t_min)),
+                lerp(g.x0, g.x1, info.t_max),
+                lerp(g.y0, g.y1, info.t_max),
+                @max(0.0, lerp(g.r0, g.r1, info.t_max)),
+            );
+            self.fillWithPattern(pattern, info);
+        }
+
+        /// Build a cairo path from a decoded TrueType outline (font
+        /// units — the CTM does the scaling): conic runs get their
+        /// implied on-curve midpoints, quadratics lift to cubics.
+        fn addOutlinePath(cr: ?*c.cairo_t, outline: *const gp.Outline) void {
+            var start: usize = 0;
+            for (outline.ends) |e| {
+                const end = @as(usize, e) + 1;
+                if (end <= start or end > outline.points.len) return;
+                emitContour(cr, outline.points[start..end]);
+                start = end;
+            }
+        }
+
+        const P = struct { x: f64, y: f64 };
+
+        fn pt(p: gp.Point) P {
+            return .{ .x = @floatFromInt(p.x), .y = @floatFromInt(p.y) };
+        }
+
+        fn mid(a: P, b: P) P {
+            return .{ .x = (a.x + b.x) / 2, .y = (a.y + b.y) / 2 };
+        }
+
+        fn quadTo(cr: ?*c.cairo_t, from: P, ctrl: P, to: P) void {
+            // Exact quadratic→cubic lift.
+            const c1x = from.x + (ctrl.x - from.x) * 2.0 / 3.0;
+            const c1y = from.y + (ctrl.y - from.y) * 2.0 / 3.0;
+            const c2x = to.x + (ctrl.x - to.x) * 2.0 / 3.0;
+            const c2y = to.y + (ctrl.y - to.y) * 2.0 / 3.0;
+            c.cairo_curve_to(cr, c1x, c1y, c2x, c2y, to.x, to.y);
+        }
+
+        fn emitContour(cr: ?*c.cairo_t, pts: []const gp.Point) void {
+            const n = pts.len;
+            if (n == 0) return;
+            // Start point: first on-curve point; a fully off-curve
+            // contour starts at the implied midpoint of its ends.
+            var first: usize = 0;
+            var start: P = undefined;
+            if (pts[0].on_curve) {
+                start = pt(pts[0]);
+                first = 1;
+            } else if (pts[n - 1].on_curve) {
+                start = pt(pts[n - 1]);
+            } else {
+                start = mid(pt(pts[n - 1]), pt(pts[0]));
+            }
+            c.cairo_move_to(cr, start.x, start.y);
+            var cur = start;
+            var pending: ?P = null;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const idx = (first + i) % n;
+                // When we started at the LAST point (off-curve p0
+                // case handled above), don't revisit it.
+                if (first == 0 and !pts[0].on_curve and pts[n - 1].on_curve and idx == n - 1) continue;
+                const p = pt(pts[idx]);
+                if (pts[idx].on_curve) {
+                    if (pending) |q| {
+                        quadTo(cr, cur, q, p);
+                        pending = null;
+                    } else {
+                        c.cairo_line_to(cr, p.x, p.y);
+                    }
+                    cur = p;
+                } else {
+                    if (pending) |q| {
+                        const m = mid(q, p);
+                        quadTo(cr, cur, q, m);
+                        cur = m;
+                    }
+                    pending = p;
+                }
+            }
+            if (pending) |q| {
+                quadTo(cr, cur, q, start);
+            }
+            c.cairo_close_path(cr);
+        }
+    };
 
     /// Would the terminal render `cp` as something other than tofu
     /// from system fonts? Answers Glyph Protocol `q` coverage. Uses

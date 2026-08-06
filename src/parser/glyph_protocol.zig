@@ -10,14 +10,19 @@
 //! notably `width` is a render-span hint only — layout, cursor and
 //! selection keep following wcwidth — and unknown parameters
 //! (including the spec's aw/lh/size/align/pad) are silently ignored.
-//! This build accepts `fmt=glyf` and `fmt=colrv0`; `colrv1` is treated
-//! exactly like an unknown fmt (silently dropped), which is what a
-//! conforming client discovers via the `s` advertisement.
+//! This build accepts `fmt=glyf`, `fmt=colrv0` and `fmt=colrv1` —
+//! full format parity with Rio.
 //!
-//! One deliberate departure from Rio for colrv0: Rio hands the COLR/
-//! CPAL tables to the renderer unvalidated; we validate the whole
-//! container at register time (like glyf) so a broken payload is
-//! rejected on the wire instead of caching as an invisible glyph.
+//! One deliberate departure from Rio for the colour formats: Rio hands
+//! the COLR/CPAL tables to the renderer unvalidated; we validate the
+//! whole container at register time (like glyf) so a broken payload is
+//! rejected on the wire instead of caching as an invisible glyph. For
+//! colrv1 that includes a bounded walk of the whole paint graph
+//! (formats, offsets, indices, cycles, boundedness) — only geometric
+//! degeneracy that needs raster arithmetic (zero-length gradients,
+//! repeat-extend colour lines whose stops coincide, singular
+//! transforms) is left to the GUI rasteriser, which degrades those
+//! nodes to nothing rather than failing the glyph.
 //!
 //! Pure Zig, no libc — compiles into `sketerm-mux`.
 
@@ -30,13 +35,14 @@ pub const PREFIX = "25a1";
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Formats advertised in the `s` reply.
-pub const SUPPORTED_FORMATS = "glyf,colrv0";
+pub const SUPPORTED_FORMATS = "glyf,colrv0,colrv1";
 
 /// Payload container format of a registration. The u8 tag rides the
 /// snapshot wire — append-only, never renumber.
 pub const Format = enum(u8) {
     glyf = 0,
     colrv0 = 1,
+    colrv1 = 2,
 };
 
 /// The three Unicode Private Use Areas. Note the FFFD ends — the two
@@ -163,14 +169,16 @@ fn parseRegister(allocator: std.mem.Allocator, rest: []const u8) Result {
     if (!isPua(cp))
         return .{ .register_failed = .{ .cp = cp, .reason = .out_of_namespace, .reply = reply } };
 
-    // fmt=glyf and fmt=colrv0 in this build; anything else (incl.
-    // colrv1) is dropped like an unknown fmt — see the module doc.
+    // All three advertised formats; anything else is dropped like an
+    // unknown fmt — see the module doc.
     var fmt: Format = .glyf;
     if (params.get("fmt")) |raw_fmt| {
         if (std.mem.eql(u8, raw_fmt, "glyf")) {
             fmt = .glyf;
         } else if (std.mem.eql(u8, raw_fmt, "colrv0")) {
             fmt = .colrv0;
+        } else if (std.mem.eql(u8, raw_fmt, "colrv1")) {
+            fmt = .colrv1;
         } else return .malformed;
     }
 
@@ -539,14 +547,17 @@ fn readU32(data: []const u8, off: usize) ?u32 {
     return std.mem.readInt(u32, data[off..][0..4], .big);
 }
 
-/// Decode the custom big-endian colrv0 container (NOT an sfnt):
-/// `u16 n_glyphs, n×(u16 len + glyf bytes), u16 colr_len + COLR,
-/// u16 cpal_len + CPAL`. Trailing bytes are malformed (Rio parity).
-/// The base layer run is the COLR record for GlyphId 0 (the spec's
-/// base glyph); with no record for 0 the first record is used
-/// defensively. Carried outlines are NOT glyf-decoded here — see
-/// `validateColr` for the register-time structural check.
-pub fn decodeColr(allocator: std.mem.Allocator, data: []const u8) ColrDecodeError!Colr {
+/// Shared container framing for both colour formats: `u16 n_glyphs,
+/// n×(u16 len + glyf bytes), u16 colr_len + COLR, u16 cpal_len +
+/// CPAL`. Trailing bytes are malformed (Rio parity). `outlines` is
+/// the only allocation; the table slices borrow the input.
+const Container = struct {
+    outlines: [][]const u8,
+    colr: []const u8,
+    cpal: []const u8,
+};
+
+fn splitContainer(allocator: std.mem.Allocator, data: []const u8) ColrDecodeError!Container {
     var cur = BeCursor{ .data = data };
     const n_glyphs = cur.u16be() orelse return error.Malformed;
     if (n_glyphs == 0 or n_glyphs > MAX_COLR_GLYPHS) return error.Malformed;
@@ -566,29 +577,74 @@ pub fn decodeColr(allocator: std.mem.Allocator, data: []const u8) ColrDecodeErro
     const cpal = cur.slice(cpal_len) orelse return error.Malformed;
 
     if (cur.pos != data.len) return error.Malformed;
+    return .{ .outlines = outlines, .colr = colr, .cpal = cpal };
+}
 
-    // CPAL (may be absent — then every layer must use the foreground
-    // sentinel). Header: version, numPaletteEntries, numPalettes,
-    // numColorRecords, colorRecordsArrayOffset, u16 indices[palettes].
-    // ColorRecords are BGRA bytes. Only palette 0 is consulted.
-    var n_palette_entries: u16 = 0;
-    var palette0_first: u16 = 0;
-    var records_off: usize = 0;
-    if (cpal.len > 0) {
-        if (cpal.len < 12) return error.Malformed;
-        const cpal_version = readU16(cpal, 0).?;
-        // v1 adds trailing offset fields we don't consult; both parse.
-        if (cpal_version > 1) return error.Malformed;
-        n_palette_entries = readU16(cpal, 2).?;
-        const n_palettes = readU16(cpal, 4).?;
-        const n_color_records = readU16(cpal, 6).?;
-        records_off = readU32(cpal, 8).?;
-        if (n_palette_entries == 0 or n_palettes == 0) return error.Malformed;
-        if (12 + @as(usize, n_palettes) * 2 > cpal.len) return error.Malformed;
-        palette0_first = readU16(cpal, 12).?;
-        if (@as(usize, palette0_first) + n_palette_entries > n_color_records) return error.Malformed;
-        if (records_off + @as(usize, n_color_records) * 4 > cpal.len) return error.Malformed;
+/// Parsed view of the (optional) CPAL table. Only palette 0 is
+/// consulted. Absent CPAL (`data.len == 0`) is legal — then every
+/// colour reference must be the 0xFFFF foreground sentinel.
+pub const CpalView = struct {
+    data: []const u8,
+    n_entries: u16,
+    first: u16,
+    records_off: usize,
+
+    /// Straight 0xRRGGBBAA for a palette index, null when out of
+    /// range (records are BGRA on disk).
+    pub fn rgba(self: *const CpalView, idx: u16) ?u32 {
+        if (idx >= self.n_entries) return null;
+        const co = self.records_off + (@as(usize, self.first) + idx) * 4;
+        const b: u32 = self.data[co];
+        const g: u32 = self.data[co + 1];
+        const r: u32 = self.data[co + 2];
+        const a: u32 = self.data[co + 3];
+        return (r << 24) | (g << 16) | (b << 8) | a;
     }
+};
+
+/// CPAL header: version, numPaletteEntries, numPalettes,
+/// numColorRecords, colorRecordsArrayOffset, u16 indices[palettes].
+fn parseCpal(cpal: []const u8) error{Malformed}!CpalView {
+    if (cpal.len == 0)
+        return .{ .data = cpal, .n_entries = 0, .first = 0, .records_off = 0 };
+    if (cpal.len < 12) return error.Malformed;
+    const cpal_version = readU16(cpal, 0).?;
+    // v1 adds trailing offset fields we don't consult; both parse.
+    if (cpal_version > 1) return error.Malformed;
+    const n_palette_entries = readU16(cpal, 2).?;
+    const n_palettes = readU16(cpal, 4).?;
+    const n_color_records = readU16(cpal, 6).?;
+    const records_off: usize = readU32(cpal, 8).?;
+    if (n_palette_entries == 0 or n_palettes == 0) return error.Malformed;
+    if (12 + @as(usize, n_palettes) * 2 > cpal.len) return error.Malformed;
+    const palette0_first = readU16(cpal, 12).?;
+    if (@as(usize, palette0_first) + n_palette_entries > n_color_records) return error.Malformed;
+    if (records_off + @as(usize, n_color_records) * 4 > cpal.len) return error.Malformed;
+    return .{
+        .data = cpal,
+        .n_entries = n_palette_entries,
+        .first = palette0_first,
+        .records_off = records_off,
+    };
+}
+
+/// Decode the custom big-endian colrv0 container (NOT an sfnt).
+/// The base layer run is the COLR record for GlyphId 0 (the spec's
+/// base glyph); with no record for 0 the first record is used
+/// defensively. Carried outlines are NOT glyf-decoded here — see
+/// `validateColr` for the register-time structural check.
+pub fn decodeColr(allocator: std.mem.Allocator, data: []const u8) ColrDecodeError!Colr {
+    const cont = try splitContainer(allocator, data);
+    const outlines = cont.outlines;
+    errdefer allocator.free(outlines);
+    const colr = cont.colr;
+    const n_glyphs = outlines.len;
+
+    const cpal_view = parseCpal(cont.cpal) catch return error.Malformed;
+    const n_palette_entries = cpal_view.n_entries;
+    const palette0_first = cpal_view.first;
+    const records_off = cpal_view.records_off;
+    const cpal = cont.cpal;
 
     // COLR v0 header: version, numBaseGlyphRecords,
     // baseGlyphRecordsOffset, layerRecordsOffset, numLayerRecords.
@@ -662,16 +718,589 @@ pub fn validatePayload(allocator: std.mem.Allocator, fmt: Format, data: []const 
     return switch (fmt) {
         .glyf => validateGlyf(allocator, data),
         .colrv0 => validateColr(allocator, data),
+        .colrv1 => validateColr1(allocator, data),
     };
 }
 
-/// Cheap foreground-dependence probe for a stored colrv0 payload.
+/// Cheap foreground-dependence probe for a stored colour payload.
 /// False on anything that fails to decode (broken payloads raster as
-/// empty, which is foreground-independent).
-pub fn colrUsesForeground(allocator: std.mem.Allocator, data: []const u8) bool {
-    var colr = decodeColr(allocator, data) catch return false;
-    defer colr.deinit(allocator);
-    return colr.uses_fg;
+/// empty, which is foreground-independent) — and for glyf, which is
+/// coverage-tinted rather than colour-baked.
+pub fn colrUsesForeground(allocator: std.mem.Allocator, fmt: Format, data: []const u8) bool {
+    switch (fmt) {
+        .glyf => return false,
+        .colrv0 => {
+            var colr = decodeColr(allocator, data) catch return false;
+            defer colr.deinit(allocator);
+            return colr.uses_fg;
+        },
+        .colrv1 => {
+            var c1 = decodeColr1(allocator, data) catch return false;
+            defer c1.deinit(allocator);
+            return c1.uses_fg;
+        },
+    }
+}
+
+// ── colrv1 container ─────────────────────────────────────────────
+//
+// Same container framing as colrv0; the COLR table inside is version
+// 1 and holds a paint GRAPH (a DAG of solid fills, gradients, affine
+// transforms, glyph clips, composites and glyph references) instead
+// of v0's flat layer list. Everything here is pure Zig — the decoded
+// form is both the daemon's register-time validator and the GUI
+// rasteriser's input; the GUI walks the graph again with cairo.
+//
+// Deliberately NOT interpreted anywhere (parsed and ignored):
+// variation deltas — `PaintVar*` nodes read like their non-var
+// siblings at the default instance (the protocol cannot carry
+// variation coordinates), and varIndexBase/VarIndexMap/
+// ItemVariationStore bytes are never consulted.
+
+/// Traversal caps for the paint graph — a walk exceeding either is
+/// rejected as malformed. Depth guards true cycles (an offset already
+/// on the walk stack is also an immediate reject); the node budget
+/// guards ttf-parser's `branching^depth` shared-subgraph blowup.
+pub const MAX_V1_DEPTH: usize = 32;
+pub const MAX_V1_NODES: usize = 4096;
+
+/// ClipBox for the base glyph, font units.
+pub const ClipBox = struct { x_min: i16, y_min: i16, x_max: i16, y_max: i16 };
+
+/// Decoded colrv1 container. Table slices borrow the input payload;
+/// only `outlines` is allocated. The paint graph itself stays in
+/// `colr` bytes and is re-read node by node via `readPaint` — decode
+/// time already walked and validated every reachable node.
+pub const Colr1 = struct {
+    outlines: []const []const u8,
+    colr: []const u8,
+    cpal: CpalView,
+    /// Absolute offset of BaseGlyphList in `colr`.
+    base_list: usize,
+    n_base: u32,
+    /// Absolute offset of LayerList in `colr`; 0 = absent.
+    layer_list: usize,
+    n_layer_paints: u32,
+    /// Absolute offset of the chosen base glyph's root paint.
+    root_paint: usize,
+    /// Clip box for the chosen base glyph, if the ClipList has one.
+    clip_box: ?ClipBox,
+    /// Any reachable colour reference is the 0xFFFF foreground
+    /// sentinel, so rasterisation depends on the SGR foreground.
+    uses_fg: bool,
+
+    pub fn deinit(self: *Colr1, allocator: std.mem.Allocator) void {
+        allocator.free(self.outlines);
+        self.* = undefined;
+    }
+
+    /// Root paint offset for a referenced COLR glyph (PaintColrGlyph),
+    /// null when the BaseGlyphList has no record for `glyph_id`.
+    pub fn baseRootPaint(self: *const Colr1, glyph_id: u16) ?usize {
+        return baseListFind(self.colr, self.base_list, self.n_base, glyph_id);
+    }
+};
+
+/// Reference to a ColorLine table. Var colour lines carry a
+/// varIndexBase per stop (stride 10 instead of 6) that is skipped.
+pub const ColorLineRef = struct { off: usize, var_stops: bool };
+
+pub const ColorLine = struct {
+    /// 0 = pad, 1 = repeat, 2 = reflect.
+    extend: u8,
+    n_stops: u16,
+    stops_off: usize,
+    stride: usize,
+};
+
+pub const ColorStop = struct {
+    /// Stop offset — NOT clamped; COLR allows values outside [0,1].
+    offset: f32,
+    palette: u16,
+    alpha: f32,
+};
+
+/// One decoded paint node. All offsets are ABSOLUTE into the COLR
+/// table slice. The ten transform formats (12–31, var included) fold
+/// into `.transform` with the equivalent affine already computed
+/// (matrix order xx yx xy yy dx dy, point map x' = xx·x + xy·y + dx);
+/// angles are F2Dot14 × 180 counter-clockwise degrees per the spec.
+pub const Paint = union(enum) {
+    layers: struct { first: u32, count: u8 },
+    solid: struct { palette: u16, alpha: f32 },
+    linear: struct { color_line: ColorLineRef, x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32 },
+    radial: struct { color_line: ColorLineRef, x0: f32, y0: f32, r0: f32, x1: f32, y1: f32, r1: f32 },
+    /// Angles in degrees with the spec's +1.0 (i.e. +180°) bias
+    /// applied. Carried for completeness: the rasteriser degrades
+    /// sweep gradients to the first stop's solid colour.
+    sweep: struct { color_line: ColorLineRef, cx: f32, cy: f32, start_deg: f32, end_deg: f32 },
+    glyph: struct { child: usize, glyph_id: u16 },
+    colr_glyph: struct { glyph_id: u16 },
+    transform: struct { child: usize, m: [6]f32 },
+    composite: struct { source: usize, mode: u8, backdrop: usize },
+};
+
+/// COLR composite modes (u8 0..27), spec order. Kept as raw u8 in
+/// `Paint.composite`; this is the validation ceiling.
+pub const MAX_COMPOSITE_MODE: u8 = 27;
+
+fn readI16(data: []const u8, off: usize) ?i16 {
+    const v = readU16(data, off) orelse return null;
+    return @bitCast(v);
+}
+
+fn readF2Dot14(data: []const u8, off: usize) ?f32 {
+    const v = readI16(data, off) orelse return null;
+    return @as(f32, @floatFromInt(v)) / 16384.0;
+}
+
+fn readFixed(data: []const u8, off: usize) ?f32 {
+    const v = readU32(data, off) orelse return null;
+    return @as(f32, @floatFromInt(@as(i32, @bitCast(v)))) / 65536.0;
+}
+
+fn readOffset24(data: []const u8, off: usize) ?u32 {
+    if (off + 3 > data.len) return null;
+    return (@as(u32, data[off]) << 16) | (@as(u32, data[off + 1]) << 8) | data[off + 2];
+}
+
+/// Fword coordinate as f32.
+fn readCoord(data: []const u8, off: usize) ?f32 {
+    const v = readI16(data, off) orelse return null;
+    return @floatFromInt(v);
+}
+
+/// Child offset: Offset24 relative to the referencing paint table's
+/// own start, zero forbidden (a paint is never its own child).
+fn childOffset(colr: []const u8, paint_off: usize, field_off: usize) ?usize {
+    const rel = readOffset24(colr, paint_off + field_off) orelse return null;
+    if (rel == 0) return null;
+    const abs = paint_off + rel;
+    if (abs >= colr.len) return null;
+    return abs;
+}
+
+/// Decode one paint node at an absolute offset. Var formats read as
+/// their non-var siblings (default instance; varIndexBase skipped).
+pub fn readPaint(colr: []const u8, off: usize) error{Malformed}!Paint {
+    if (off >= colr.len) return error.Malformed;
+    const format = colr[off];
+    switch (format) {
+        1 => { // PaintColrLayers
+            if (off + 6 > colr.len) return error.Malformed;
+            return .{ .layers = .{
+                .count = colr[off + 1],
+                .first = readU32(colr, off + 2).?,
+            } };
+        },
+        2, 3 => { // PaintSolid / PaintVarSolid
+            if (off + 5 > colr.len) return error.Malformed;
+            return .{ .solid = .{
+                .palette = readU16(colr, off + 1).?,
+                .alpha = readF2Dot14(colr, off + 3).?,
+            } };
+        },
+        4, 5 => { // Paint(Var)LinearGradient
+            if (off + 16 > colr.len) return error.Malformed;
+            const cl = childOffset(colr, off, 1) orelse return error.Malformed;
+            return .{ .linear = .{
+                .color_line = .{ .off = cl, .var_stops = format == 5 },
+                .x0 = readCoord(colr, off + 4).?,
+                .y0 = readCoord(colr, off + 6).?,
+                .x1 = readCoord(colr, off + 8).?,
+                .y1 = readCoord(colr, off + 10).?,
+                .x2 = readCoord(colr, off + 12).?,
+                .y2 = readCoord(colr, off + 14).?,
+            } };
+        },
+        6, 7 => { // Paint(Var)RadialGradient
+            if (off + 16 > colr.len) return error.Malformed;
+            const cl = childOffset(colr, off, 1) orelse return error.Malformed;
+            return .{ .radial = .{
+                .color_line = .{ .off = cl, .var_stops = format == 7 },
+                .x0 = readCoord(colr, off + 4).?,
+                .y0 = readCoord(colr, off + 6).?,
+                .r0 = @floatFromInt(readU16(colr, off + 8).?),
+                .x1 = readCoord(colr, off + 10).?,
+                .y1 = readCoord(colr, off + 12).?,
+                .r1 = @floatFromInt(readU16(colr, off + 14).?),
+            } };
+        },
+        8, 9 => { // Paint(Var)SweepGradient
+            if (off + 12 > colr.len) return error.Malformed;
+            const cl = childOffset(colr, off, 1) orelse return error.Malformed;
+            return .{ .sweep = .{
+                .color_line = .{ .off = cl, .var_stops = format == 9 },
+                .cx = readCoord(colr, off + 4).?,
+                .cy = readCoord(colr, off + 6).?,
+                .start_deg = readF2Dot14(colr, off + 8).? * 180.0 + 180.0,
+                .end_deg = readF2Dot14(colr, off + 10).? * 180.0 + 180.0,
+            } };
+        },
+        10 => { // PaintGlyph
+            if (off + 6 > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            return .{ .glyph = .{ .child = child, .glyph_id = readU16(colr, off + 4).? } };
+        },
+        11 => { // PaintColrGlyph
+            if (off + 3 > colr.len) return error.Malformed;
+            return .{ .colr_glyph = .{ .glyph_id = readU16(colr, off + 1).? } };
+        },
+        12, 13 => { // Paint(Var)Transform — Affine2x3 of six Fixed
+            if (off + 7 > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            const t = childOffset(colr, off, 4) orelse return error.Malformed;
+            if (t + 24 > colr.len) return error.Malformed;
+            return .{ .transform = .{ .child = child, .m = .{
+                readFixed(colr, t).?, // xx
+                readFixed(colr, t + 4).?, // yx
+                readFixed(colr, t + 8).?, // xy
+                readFixed(colr, t + 12).?, // yy
+                readFixed(colr, t + 16).?, // dx
+                readFixed(colr, t + 20).?, // dy
+            } } };
+        },
+        14, 15 => { // Paint(Var)Translate
+            if (off + 8 > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            return .{ .transform = .{ .child = child, .m = .{
+                1, 0, 0, 1,
+                readCoord(colr, off + 4).?,
+                readCoord(colr, off + 6).?,
+            } } };
+        },
+        16...23 => { // Paint(Var)Scale[Uniform][AroundCenter]
+            const uniform = format >= 20;
+            const around = format == 18 or format == 19 or format == 22 or format == 23;
+            const scale_len: usize = if (uniform) 2 else 4;
+            const need = 4 + scale_len + @as(usize, if (around) 4 else 0);
+            if (off + need > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            const sx = readF2Dot14(colr, off + 4).?;
+            const sy = if (uniform) sx else readF2Dot14(colr, off + 6).?;
+            var cx: f32 = 0;
+            var cy: f32 = 0;
+            if (around) {
+                cx = readCoord(colr, off + 4 + scale_len).?;
+                cy = readCoord(colr, off + 6 + scale_len).?;
+            }
+            return .{ .transform = .{ .child = child, .m = .{
+                sx, 0, 0, sy, cx - sx * cx, cy - sy * cy,
+            } } };
+        },
+        24...27 => { // Paint(Var)Rotate[AroundCenter]
+            const around = format >= 26;
+            const need: usize = if (around) 10 else 6;
+            if (off + need > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            const rad = readF2Dot14(colr, off + 4).? * std.math.pi;
+            const cos_v = @cos(rad);
+            const sin_v = @sin(rad);
+            var cx: f32 = 0;
+            var cy: f32 = 0;
+            if (around) {
+                cx = readCoord(colr, off + 6).?;
+                cy = readCoord(colr, off + 8).?;
+            }
+            return .{ .transform = .{ .child = child, .m = .{
+                cos_v,                        sin_v,
+                -sin_v,                       cos_v,
+                sin_v * cy + (1 - cos_v) * cx, -sin_v * cx + (1 - cos_v) * cy,
+            } } };
+        },
+        28...31 => { // Paint(Var)Skew[AroundCenter]
+            const around = format >= 30;
+            const need: usize = if (around) 12 else 8;
+            if (off + need > colr.len) return error.Malformed;
+            const child = childOffset(colr, off, 1) orelse return error.Malformed;
+            const tan_x = @tan(readF2Dot14(colr, off + 4).? * std.math.pi);
+            const tan_y = @tan(readF2Dot14(colr, off + 6).? * std.math.pi);
+            var cx: f32 = 0;
+            var cy: f32 = 0;
+            if (around) {
+                cx = readCoord(colr, off + 8).?;
+                cy = readCoord(colr, off + 10).?;
+            }
+            return .{ .transform = .{ .child = child, .m = .{
+                1, tan_y, -tan_x, 1, tan_x * cy, -tan_y * cx,
+            } } };
+        },
+        32 => { // PaintComposite
+            if (off + 8 > colr.len) return error.Malformed;
+            const source = childOffset(colr, off, 1) orelse return error.Malformed;
+            const backdrop = childOffset(colr, off, 5) orelse return error.Malformed;
+            return .{ .composite = .{
+                .source = source,
+                .mode = colr[off + 4],
+                .backdrop = backdrop,
+            } };
+        },
+        else => return error.Malformed,
+    }
+}
+
+pub fn readColorLine(colr: []const u8, ref: ColorLineRef) error{Malformed}!ColorLine {
+    if (ref.off + 3 > colr.len) return error.Malformed;
+    const extend = colr[ref.off];
+    if (extend > 2) return error.Malformed;
+    const n_stops = readU16(colr, ref.off + 1).?;
+    const stride: usize = if (ref.var_stops) 10 else 6;
+    const stops_off = ref.off + 3;
+    if (stops_off + @as(usize, n_stops) * stride > colr.len) return error.Malformed;
+    return .{ .extend = extend, .n_stops = n_stops, .stops_off = stops_off, .stride = stride };
+}
+
+pub fn readStop(colr: []const u8, cl: ColorLine, i: usize) ColorStop {
+    const off = cl.stops_off + i * cl.stride;
+    return .{
+        .offset = readF2Dot14(colr, off).?,
+        .palette = readU16(colr, off + 2).?,
+        .alpha = readF2Dot14(colr, off + 4).?,
+    };
+}
+
+fn baseListFind(colr: []const u8, base_list: usize, n_base: u32, glyph_id: u16) ?usize {
+    var i: usize = 0;
+    while (i < n_base) : (i += 1) {
+        const rec = base_list + 4 + i * 6;
+        if (readU16(colr, rec).? == glyph_id) {
+            const rel = readU32(colr, rec + 2).?;
+            const abs = base_list + rel;
+            if (rel == 0 or abs >= colr.len) return null;
+            return abs;
+        }
+    }
+    return null;
+}
+
+const Walk = struct {
+    colr: []const u8,
+    n_glyphs: usize,
+    n_palette_entries: u16,
+    base_list: usize,
+    n_base: u32,
+    layer_list: usize,
+    n_layer_paints: u32,
+    uses_fg: bool = false,
+    budget: usize = MAX_V1_NODES,
+    /// Offsets on the current root-to-leaf path (cycle detection —
+    /// DAG sharing across siblings stays legal).
+    stack: [MAX_V1_DEPTH]usize = undefined,
+
+    fn checkPalette(self: *Walk, palette: u16) error{Malformed}!void {
+        if (palette == PALETTE_FOREGROUND) {
+            self.uses_fg = true;
+            return;
+        }
+        if (palette >= self.n_palette_entries) return error.Malformed;
+    }
+
+    fn checkColorLine(self: *Walk, ref: ColorLineRef) error{Malformed}!void {
+        const cl = try readColorLine(self.colr, ref);
+        var i: usize = 0;
+        while (i < cl.n_stops) : (i += 1) {
+            try self.checkPalette(readStop(self.colr, cl, i).palette);
+        }
+    }
+
+    /// Validate the subgraph at `off`; returns whether it is BOUNDED
+    /// (paints within a finite region) per the spec's rules.
+    fn walk(self: *Walk, off: usize, depth: usize) error{Malformed}!bool {
+        if (depth >= MAX_V1_DEPTH) return error.Malformed;
+        if (self.budget == 0) return error.Malformed;
+        self.budget -= 1;
+        for (self.stack[0..depth]) |seen| {
+            if (seen == off) return error.Malformed; // true cycle
+        }
+        self.stack[depth] = off;
+        switch (try readPaint(self.colr, off)) {
+            .layers => |l| {
+                if (@as(u64, l.first) + l.count > self.n_layer_paints) return error.Malformed;
+                var bounded = true;
+                var i: usize = 0;
+                while (i < l.count) : (i += 1) {
+                    const rec = self.layer_list + 4 + (@as(usize, l.first) + i) * 4;
+                    const rel = readU32(self.colr, rec).?;
+                    const abs = self.layer_list + rel;
+                    if (rel == 0 or abs >= self.colr.len) return error.Malformed;
+                    if (!try self.walk(abs, depth + 1)) bounded = false;
+                }
+                return bounded;
+            },
+            .solid => |s| {
+                try self.checkPalette(s.palette);
+                return false;
+            },
+            .linear => |g| {
+                try self.checkColorLine(g.color_line);
+                return false;
+            },
+            .radial => |g| {
+                try self.checkColorLine(g.color_line);
+                return false;
+            },
+            .sweep => |g| {
+                try self.checkColorLine(g.color_line);
+                return false;
+            },
+            .glyph => |g| {
+                // Glyph ids index the container's carried outlines.
+                if (g.glyph_id >= self.n_glyphs) return error.Malformed;
+                _ = try self.walk(g.child, depth + 1);
+                return true;
+            },
+            .colr_glyph => |g| {
+                const root = baseListFind(self.colr, self.base_list, self.n_base, g.glyph_id) orelse
+                    return error.Malformed;
+                return self.walk(root, depth + 1);
+            },
+            .transform => |t| return self.walk(t.child, depth + 1),
+            .composite => |cmp| {
+                if (cmp.mode > MAX_COMPOSITE_MODE) return error.Malformed;
+                const src = try self.walk(cmp.source, depth + 1);
+                const back = try self.walk(cmp.backdrop, depth + 1);
+                // Spec boundedness table (Porter-Duff region algebra):
+                // CLEAR always; SRC/SRC_OUT source; DEST/DEST_OUT
+                // backdrop; IN modes either; everything else both.
+                return switch (cmp.mode) {
+                    0 => true, // clear
+                    1, 7 => src, // src, src_out
+                    2, 8 => back, // dest, dest_out
+                    5, 6 => src or back, // src_in, dest_in
+                    9 => back, // src_atop confines to backdrop
+                    10 => src, // dest_atop confines to source
+                    else => src and back,
+                };
+            },
+        }
+    }
+};
+
+pub const Colr1DecodeError = error{ Malformed, OutOfMemory };
+
+/// Decode AND validate a colrv1 container: framing, CPAL, the v1
+/// header, and a full bounded walk of the base glyph's paint graph
+/// (offsets, formats, indices, colour lines, cycles, composite
+/// modes, boundedness). The base glyph is the BaseGlyphList record
+/// for GlyphId 0, defensively the first record. A root that is
+/// unbounded AND has no clip box is rejected — the spec forbids
+/// rendering it, so accepting it would only cache an invisible glyph.
+pub fn decodeColr1(allocator: std.mem.Allocator, data: []const u8) Colr1DecodeError!Colr1 {
+    const cont = try splitContainer(allocator, data);
+    const outlines = cont.outlines;
+    errdefer allocator.free(outlines);
+    const colr = cont.colr;
+    const cpal = parseCpal(cont.cpal) catch return error.Malformed;
+
+    // v1 header = the 14-byte v0 header + 5 Offset32s (base glyph
+    // list, layer list, clip list, var index map, item variation
+    // store). The v0 record fields may legally be zero.
+    if (colr.len < 34) return error.Malformed;
+    if (readU16(colr, 0).? != 1) return error.Malformed; // v0 table under fmt=colrv1
+    const base_list: usize = readU32(colr, 14).?;
+    const layer_list: usize = readU32(colr, 18).?;
+    const clip_list: usize = readU32(colr, 22).?;
+
+    if (base_list == 0 or base_list + 4 > colr.len) return error.Malformed;
+    const n_base = readU32(colr, base_list).?;
+    if (n_base == 0) return error.Malformed;
+    if (base_list + 4 + @as(u64, n_base) * 6 > colr.len) return error.Malformed;
+
+    var n_layer_paints: u32 = 0;
+    if (layer_list != 0) {
+        if (layer_list + 4 > colr.len) return error.Malformed;
+        n_layer_paints = readU32(colr, layer_list).?;
+        if (layer_list + 4 + @as(u64, n_layer_paints) * 4 > colr.len) return error.Malformed;
+    }
+
+    // Chosen base glyph: GlyphId 0, else the first record.
+    var chosen: usize = 0;
+    var bi: usize = 0;
+    while (bi < n_base) : (bi += 1) {
+        if (readU16(colr, base_list + 4 + bi * 6).? == 0) {
+            chosen = bi;
+            break;
+        }
+    }
+    const root_glyph_id = readU16(colr, base_list + 4 + chosen * 6).?;
+    const root_rel = readU32(colr, base_list + 4 + chosen * 6 + 2).?;
+    const root_paint = base_list + root_rel;
+    if (root_rel == 0 or root_paint >= colr.len) return error.Malformed;
+
+    // ClipList (optional): format 1, u32 count, records of
+    // {startGlyphID, endGlyphID, Offset24 clipBox} with offsets
+    // relative to the ClipList start. Validated whole; only the
+    // chosen base glyph's box is kept.
+    var clip_box: ?ClipBox = null;
+    if (clip_list != 0) {
+        if (clip_list + 5 > colr.len) return error.Malformed;
+        if (colr[clip_list] != 1) return error.Malformed;
+        const n_clips = readU32(colr, clip_list + 1).?;
+        if (clip_list + 5 + @as(u64, n_clips) * 7 > colr.len) return error.Malformed;
+        var ci: usize = 0;
+        while (ci < n_clips) : (ci += 1) {
+            const rec = clip_list + 5 + ci * 7;
+            const start_gid = readU16(colr, rec).?;
+            const end_gid = readU16(colr, rec + 2).?;
+            if (end_gid < start_gid) return error.Malformed;
+            const box_rel = readOffset24(colr, rec + 4).?;
+            const box_off = clip_list + box_rel;
+            if (box_rel == 0 or box_off + 9 > colr.len) return error.Malformed;
+            const box_format = colr[box_off];
+            // Format 2 (var) adds a varIndexBase we ignore.
+            if (box_format != 1 and box_format != 2) return error.Malformed;
+            if (box_format == 2 and box_off + 13 > colr.len) return error.Malformed;
+            if (root_glyph_id >= start_gid and root_glyph_id <= end_gid and clip_box == null) {
+                clip_box = .{
+                    .x_min = readI16(colr, box_off + 1).?,
+                    .y_min = readI16(colr, box_off + 3).?,
+                    .x_max = readI16(colr, box_off + 5).?,
+                    .y_max = readI16(colr, box_off + 7).?,
+                };
+            }
+        }
+    }
+
+    var w = Walk{
+        .colr = colr,
+        .n_glyphs = outlines.len,
+        .n_palette_entries = cpal.n_entries,
+        .base_list = base_list,
+        .n_base = n_base,
+        .layer_list = layer_list,
+        .n_layer_paints = n_layer_paints,
+    };
+    const bounded = w.walk(root_paint, 0) catch return error.Malformed;
+    if (!bounded and clip_box == null) return error.Malformed;
+
+    return .{
+        .outlines = outlines,
+        .colr = colr,
+        .cpal = cpal,
+        .base_list = base_list,
+        .n_base = n_base,
+        .layer_list = layer_list,
+        .n_layer_paints = n_layer_paints,
+        .root_paint = root_paint,
+        .clip_box = clip_box,
+        .uses_fg = w.uses_fg,
+    };
+}
+
+/// Register-time validation of a colrv1 container: `decodeColr1`
+/// already walks the whole paint graph, so this only adds the carried
+/// outlines through the glyf decoder (composite/hinted rejects keep
+/// their own reason codes, exactly like colrv0).
+pub fn validateColr1(allocator: std.mem.Allocator, data: []const u8) ?RegisterError {
+    var c1 = decodeColr1(allocator, data) catch |err| return switch (err) {
+        error.Malformed => .malformed_payload,
+        error.OutOfMemory => .payload_too_large,
+    };
+    defer c1.deinit(allocator);
+    for (c1.outlines) |o| {
+        if (validateGlyf(allocator, o)) |reason| return reason;
+    }
+    return null;
 }
 
 // ── tests (ported from Rio's glyph_protocol.rs / glyf_decode.rs) ──
@@ -811,11 +1440,11 @@ test "register: missing cp / empty cp are malformed" {
     }
 }
 
-test "register: unknown fmt (and unsupported colrv1) are dropped" {
+test "register: unknown fmt dropped; all three supported formats parse" {
     const a = testing.allocator;
     const payload = try b64(a, "x");
     defer a.free(payload);
-    for ([_][]const u8{ "svg", "colrv1", "COLRV0" }) |fmt| {
+    for ([_][]const u8{ "svg", "colrv2", "COLRV0", "COLRV1" }) |fmt| {
         const res = try parseFmt(a, "25a1;r;cp=E0A0;fmt={s};upm=1000;{s}", .{ fmt, payload });
         try testing.expectEqual(Result.malformed, res);
     }
@@ -830,6 +1459,12 @@ test "register: unknown fmt (and unsupported colrv1) are dropped" {
         defer freeResult(a, ok);
         try testing.expect(ok == .register);
         try testing.expectEqual(Format.colrv0, ok.register.fmt);
+    }
+    {
+        const ok = try parseFmt(a, "25a1;r;cp=E0A0;fmt=colrv1;upm=1000;{s}", .{payload});
+        defer freeResult(a, ok);
+        try testing.expect(ok == .register);
+        try testing.expectEqual(Format.colrv1, ok.register.fmt);
     }
     {
         // Omitted fmt defaults to glyf.
@@ -942,7 +1577,7 @@ test "unknown verb is malformed; unknown params on query ignored" {
 
 test "reply formatting matches Rio's wire strings" {
     var buf: [96]u8 = undefined;
-    try testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0\x1b\\", fmtSupport(&buf));
+    try testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0,colrv1\x1b\\", fmtSupport(&buf));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=\x1b\\", fmtQuery(&buf, 0xE0A0, false, false));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=system\x1b\\", fmtQuery(&buf, 0xE0A0, true, false));
     try testing.expectEqualStrings("\x1b_25a1;q;cp=e0a0;status=glossary\x1b\\", fmtQuery(&buf, 0xE0A0, false, true));
@@ -1275,7 +1910,7 @@ test "colrv0: 0xFFFF palette resolves as foreground, empty CPAL accepted" {
     try testing.expect(colr.uses_fg);
     try testing.expect(colr.layers[0].is_fg);
     try testing.expectEqual(@as(?RegisterError, null), validateColr(a, bytes));
-    try testing.expect(colrUsesForeground(a, bytes));
+    try testing.expect(colrUsesForeground(a, .colrv0, bytes));
 }
 
 test "colrv0: n_glyphs bounds" {
@@ -1434,6 +2069,581 @@ test "validatePayload dispatches by format" {
     try testing.expectEqual(@as(?RegisterError, null), validatePayload(a, .colrv0, bytes));
     // ...and a container is not a glyf record.
     try testing.expect(validatePayload(a, .glyf, bytes) != null);
+}
+
+// ── colrv1 test/smoke container builder ──────────────────────────
+
+pub const V1Stop = struct { offset: f32, palette: u16, alpha: f32 = 1.0 };
+
+/// Declarative paint-graph node for building test containers.
+/// `rotate` takes the raw F2Dot14 value (×180° per the spec).
+pub const V1Node = union(enum) {
+    layers: []const V1Node,
+    solid: struct { palette: u16, alpha: f32 = 1.0 },
+    linear: struct { extend: u8 = 0, stops: []const V1Stop, x0: i16, y0: i16, x1: i16, y1: i16, x2: i16, y2: i16 },
+    radial: struct { extend: u8 = 0, stops: []const V1Stop, x0: i16, y0: i16, r0: u16, x1: i16, y1: i16, r1: u16 },
+    sweep: struct { extend: u8 = 0, stops: []const V1Stop, cx: i16 = 0, cy: i16 = 0, start: f32 = 0, end: f32 = 1 },
+    glyph: struct { glyph_id: u16, child: *const V1Node },
+    colr_glyph: struct { glyph_id: u16 },
+    transform: struct { m: [6]f32, child: *const V1Node },
+    rotate: struct { angle: f32, child: *const V1Node },
+    composite: struct { source: *const V1Node, mode: u8, backdrop: *const V1Node },
+};
+
+fn v1CountLayers(node: *const V1Node) usize {
+    return switch (node.*) {
+        .layers => |ch| blk: {
+            var n: usize = ch.len;
+            for (ch) |*sub| n += v1CountLayers(sub);
+            break :blk n;
+        },
+        .glyph => |g| v1CountLayers(g.child),
+        .transform => |t| v1CountLayers(t.child),
+        .rotate => |r| v1CountLayers(r.child),
+        .composite => |cmp| v1CountLayers(cmp.source) + v1CountLayers(cmp.backdrop),
+        else => 0,
+    };
+}
+
+const V1Emit = struct {
+    buf: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+    /// LayerList Offset32 slots (relative to LayerList start),
+    /// assigned in reservation order.
+    layer_slots: []u32,
+    next_slot: usize = 0,
+    /// Absolute COLR-table offset where the paint region begins.
+    region_base: usize,
+    layer_list_off: usize,
+
+    fn u8w(self: *V1Emit, v: u8) !void {
+        try self.buf.append(self.allocator, v);
+    }
+    fn u16w(self: *V1Emit, v: u16) !void {
+        var tmp: [2]u8 = undefined;
+        std.mem.writeInt(u16, &tmp, v, .big);
+        try self.buf.appendSlice(self.allocator, &tmp);
+    }
+    fn i16w(self: *V1Emit, v: i16) !void {
+        try self.u16w(@bitCast(v));
+    }
+    fn f2dot14(self: *V1Emit, v: f32) !void {
+        try self.i16w(@intFromFloat(@round(v * 16384.0)));
+    }
+    fn fixed(self: *V1Emit, v: f32) !void {
+        var tmp: [4]u8 = undefined;
+        std.mem.writeInt(i32, &tmp, @intFromFloat(@round(v * 65536.0)), .big);
+        try self.buf.appendSlice(self.allocator, &tmp);
+    }
+    fn off24Placeholder(self: *V1Emit) !void {
+        try self.buf.appendSlice(self.allocator, &.{ 0, 0, 0 });
+    }
+    fn patch24(self: *V1Emit, at: usize, v: usize) void {
+        self.buf.items[at] = @truncate(v >> 16);
+        self.buf.items[at + 1] = @truncate(v >> 8);
+        self.buf.items[at + 2] = @truncate(v);
+    }
+
+    fn colorLine(self: *V1Emit, extend: u8, stops: []const V1Stop) !void {
+        try self.u8w(extend);
+        try self.u16w(@intCast(stops.len));
+        for (stops) |s| {
+            try self.f2dot14(s.offset);
+            try self.u16w(s.palette);
+            try self.f2dot14(s.alpha);
+        }
+    }
+
+    /// Serialize `node` at the current end; returns its start offset
+    /// within the paint region. Children land after their parent so
+    /// unsigned Offset24s always work.
+    fn emit(self: *V1Emit, node: *const V1Node) !usize {
+        const start = self.buf.items.len;
+        switch (node.*) {
+            .layers => |children| {
+                try self.u8w(1);
+                try self.u8w(@intCast(children.len));
+                var tmp: [4]u8 = undefined;
+                std.mem.writeInt(u32, &tmp, @intCast(self.next_slot), .big);
+                try self.buf.appendSlice(self.allocator, &tmp);
+                const first = self.next_slot;
+                self.next_slot += children.len;
+                for (children, 0..) |*child, i| {
+                    const child_start = try self.emit(child);
+                    self.layer_slots[first + i] =
+                        @intCast(self.region_base + child_start - self.layer_list_off);
+                }
+            },
+            .solid => |s| {
+                try self.u8w(2);
+                try self.u16w(s.palette);
+                try self.f2dot14(s.alpha);
+            },
+            .linear => |g| {
+                try self.u8w(4);
+                try self.off24Placeholder();
+                try self.i16w(g.x0);
+                try self.i16w(g.y0);
+                try self.i16w(g.x1);
+                try self.i16w(g.y1);
+                try self.i16w(g.x2);
+                try self.i16w(g.y2);
+                self.patch24(start + 1, self.buf.items.len - start);
+                try self.colorLine(g.extend, g.stops);
+            },
+            .radial => |g| {
+                try self.u8w(6);
+                try self.off24Placeholder();
+                try self.i16w(g.x0);
+                try self.i16w(g.y0);
+                try self.u16w(g.r0);
+                try self.i16w(g.x1);
+                try self.i16w(g.y1);
+                try self.u16w(g.r1);
+                self.patch24(start + 1, self.buf.items.len - start);
+                try self.colorLine(g.extend, g.stops);
+            },
+            .sweep => |g| {
+                try self.u8w(8);
+                try self.off24Placeholder();
+                try self.i16w(g.cx);
+                try self.i16w(g.cy);
+                try self.f2dot14(g.start);
+                try self.f2dot14(g.end);
+                self.patch24(start + 1, self.buf.items.len - start);
+                try self.colorLine(g.extend, g.stops);
+            },
+            .glyph => |g| {
+                try self.u8w(10);
+                try self.off24Placeholder();
+                try self.u16w(g.glyph_id);
+                const child_start = try self.emit(g.child);
+                self.patch24(start + 1, child_start - start);
+            },
+            .colr_glyph => |g| {
+                try self.u8w(11);
+                try self.u16w(g.glyph_id);
+            },
+            .transform => |t| {
+                try self.u8w(12);
+                try self.off24Placeholder(); // paint
+                try self.off24Placeholder(); // transform
+                self.patch24(start + 4, self.buf.items.len - start);
+                for (t.m) |v| try self.fixed(v);
+                const child_start = try self.emit(t.child);
+                self.patch24(start + 1, child_start - start);
+            },
+            .rotate => |r| {
+                try self.u8w(24);
+                try self.off24Placeholder();
+                try self.f2dot14(r.angle);
+                const child_start = try self.emit(r.child);
+                self.patch24(start + 1, child_start - start);
+            },
+            .composite => |cmp| {
+                try self.u8w(32);
+                try self.off24Placeholder(); // source
+                try self.u8w(cmp.mode);
+                try self.off24Placeholder(); // backdrop
+                const src_start = try self.emit(cmp.source);
+                const back_start = try self.emit(cmp.backdrop);
+                self.patch24(start + 1, src_start - start);
+                self.patch24(start + 5, back_start - start);
+            },
+        }
+        return start;
+    }
+};
+
+/// Test/smoke builder for a colrv1 container: one BaseGlyphPaint
+/// record for GlyphId 0 rooted at `root`, CPAL palette 0 with
+/// straight-RGBA `palette_colors` (empty = cpal_len 0), optional
+/// clip box `{x_min, y_min, x_max, y_max}` covering every glyph id.
+pub fn colr1ContainerBytes(
+    allocator: std.mem.Allocator,
+    outlines: []const []const u8,
+    root: V1Node,
+    palette_colors: []const u32,
+    clip_box: ?[4]i16,
+) ![]u8 {
+    const n_layers = v1CountLayers(&root);
+    const base_list_off: usize = 34;
+    const layer_list_off: usize = if (n_layers > 0) 44 else 0;
+    const layer_list_size: usize = if (n_layers > 0) 4 + 4 * n_layers else 0;
+    const clip_off: usize = if (clip_box != null) 44 + layer_list_size else 0;
+    const clip_size: usize = if (clip_box != null) 5 + 7 + 9 else 0;
+    const region_base: usize = 44 + layer_list_size + clip_size;
+
+    const layer_slots = try allocator.alloc(u32, n_layers);
+    defer allocator.free(layer_slots);
+    var emitter = V1Emit{
+        .allocator = allocator,
+        .layer_slots = layer_slots,
+        .region_base = region_base,
+        .layer_list_off = layer_list_off,
+    };
+    defer emitter.buf.deinit(allocator);
+    const root_start = try emitter.emit(&root);
+
+    var colr: std.ArrayList(u8) = .empty;
+    defer colr.deinit(allocator);
+    const w = struct {
+        fn u16be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u16) !void {
+            var tmp: [2]u8 = undefined;
+            std.mem.writeInt(u16, &tmp, v, .big);
+            try l.appendSlice(a, &tmp);
+        }
+        fn u32be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) !void {
+            var tmp: [4]u8 = undefined;
+            std.mem.writeInt(u32, &tmp, v, .big);
+            try l.appendSlice(a, &tmp);
+        }
+        fn i16be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: i16) !void {
+            try u16be(l, a, @bitCast(v));
+        }
+        fn u24be(l: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) !void {
+            try l.appendSlice(a, &.{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) });
+        }
+    };
+    // v1 header: v0 part zeroed, then the five Offset32s.
+    try w.u16be(&colr, allocator, 1); // version
+    try w.u16be(&colr, allocator, 0); // numBaseGlyphRecords
+    try w.u32be(&colr, allocator, 0); // baseGlyphRecordsOffset
+    try w.u32be(&colr, allocator, 0); // layerRecordsOffset
+    try w.u16be(&colr, allocator, 0); // numLayerRecords
+    try w.u32be(&colr, allocator, @intCast(base_list_off));
+    try w.u32be(&colr, allocator, @intCast(layer_list_off));
+    try w.u32be(&colr, allocator, @intCast(clip_off));
+    try w.u32be(&colr, allocator, 0); // varIndexMapOffset
+    try w.u32be(&colr, allocator, 0); // itemVariationStoreOffset
+    // BaseGlyphList: one record for GlyphId 0.
+    try w.u32be(&colr, allocator, 1);
+    try w.u16be(&colr, allocator, 0);
+    try w.u32be(&colr, allocator, @intCast(region_base + root_start - base_list_off));
+    if (n_layers > 0) {
+        try w.u32be(&colr, allocator, @intCast(n_layers));
+        for (layer_slots) |slot| try w.u32be(&colr, allocator, slot);
+    }
+    if (clip_box) |box| {
+        try colr.append(allocator, 1); // ClipList format
+        try w.u32be(&colr, allocator, 1); // numClips
+        try w.u16be(&colr, allocator, 0); // startGlyphID
+        try w.u16be(&colr, allocator, 0xFFFE); // endGlyphID
+        try w.u24be(&colr, allocator, 12); // clipBoxOffset (rel ClipList)
+        try colr.append(allocator, 1); // ClipBox format
+        for (box) |v| try w.i16be(&colr, allocator, v);
+    }
+    try colr.appendSlice(allocator, emitter.buf.items);
+
+    // Container framing + CPAL, same shape as colrContainerBytes.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try w.u16be(&out, allocator, @intCast(outlines.len));
+    for (outlines) |o| {
+        try w.u16be(&out, allocator, @intCast(o.len));
+        try out.appendSlice(allocator, o);
+    }
+    try w.u16be(&out, allocator, @intCast(colr.items.len));
+    try out.appendSlice(allocator, colr.items);
+    if (palette_colors.len == 0) {
+        try w.u16be(&out, allocator, 0);
+    } else {
+        const cpal_len: u16 = @intCast(12 + 2 + palette_colors.len * 4);
+        try w.u16be(&out, allocator, cpal_len);
+        try w.u16be(&out, allocator, 0); // version
+        try w.u16be(&out, allocator, @intCast(palette_colors.len)); // numPaletteEntries
+        try w.u16be(&out, allocator, 1); // numPalettes
+        try w.u16be(&out, allocator, @intCast(palette_colors.len)); // numColorRecords
+        try w.u32be(&out, allocator, 14); // colorRecordsArrayOffset
+        try w.u16be(&out, allocator, 0); // colorRecordIndices[0]
+        for (palette_colors) |rgba| {
+            try out.append(allocator, @truncate(rgba >> 8)); // B
+            try out.append(allocator, @truncate(rgba >> 16)); // G
+            try out.append(allocator, @truncate(rgba >> 24)); // R
+            try out.append(allocator, @truncate(rgba)); // A
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ── colrv1 tests ─────────────────────────────────────────────────
+
+test "colrv1: solid-under-glyph container decodes; fg detection walks the graph" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    // The 0xFFFF sentinel sits DEEP: glyph → rotate → solid. A layer-
+    // list-only scan would miss it.
+    const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+    const rot = V1Node{ .rotate = .{ .angle = 0.25, .child = &solid } };
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &rot },
+    }, &.{}, null);
+    defer a.free(bytes);
+    var c1 = try decodeColr1(a, bytes);
+    defer c1.deinit(a);
+    try testing.expect(c1.uses_fg);
+    try testing.expectEqual(@as(?RegisterError, null), validateColr1(a, bytes));
+    try testing.expect(colrUsesForeground(a, .colrv1, bytes));
+    // A fixed-palette variant is foreground-independent.
+    const solid2 = V1Node{ .solid = .{ .palette = 0 } };
+    const bytes2 = try colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid2 },
+    }, &.{0xFF0000FF}, null);
+    defer a.free(bytes2);
+    var c2 = try decodeColr1(a, bytes2);
+    defer c2.deinit(a);
+    try testing.expect(!c2.uses_fg);
+}
+
+test "colrv1: readPaint decodes gradients, layers, transforms, composite" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const stops = [_]V1Stop{
+        .{ .offset = 0.0, .palette = 0 },
+        .{ .offset = 1.0, .palette = 1 },
+    };
+    const lin = V1Node{ .linear = .{ .stops = &stops, .x0 = 0, .y0 = 0, .x1 = 1000, .y1 = 0, .x2 = 0, .y2 = 1000 } };
+    const g_lin = V1Node{ .glyph = .{ .glyph_id = 0, .child = &lin } };
+    const rad = V1Node{ .radial = .{ .extend = 2, .stops = &stops, .x0 = 500, .y0 = 500, .r0 = 0, .x1 = 500, .y1 = 500, .r1 = 400 } };
+    const g_rad = V1Node{ .glyph = .{ .glyph_id = 0, .child = &rad } };
+    const cmp = V1Node{ .composite = .{ .source = &g_lin, .mode = 12, .backdrop = &g_rad } };
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{ .layers = &.{cmp} }, &.{ 0xFF0000FF, 0x0000FFFF }, null);
+    defer a.free(bytes);
+    var c1 = try decodeColr1(a, bytes);
+    defer c1.deinit(a);
+    const root = try readPaint(c1.colr, c1.root_paint);
+    try testing.expect(root == .layers);
+    try testing.expectEqual(@as(u8, 1), root.layers.count);
+    try testing.expect(!c1.uses_fg);
+    try testing.expectEqual(@as(?RegisterError, null), validateColr1(a, bytes));
+    // Walk down: layer 0 is the composite.
+    const rec = c1.layer_list + 4;
+    const rel = std.mem.readInt(u32, c1.colr[rec..][0..4], .big);
+    const cmp_paint = try readPaint(c1.colr, c1.layer_list + rel);
+    try testing.expect(cmp_paint == .composite);
+    try testing.expectEqual(@as(u8, 12), cmp_paint.composite.mode);
+    const src = try readPaint(c1.colr, cmp_paint.composite.source);
+    try testing.expect(src == .glyph);
+    const src_lin = try readPaint(c1.colr, src.glyph.child);
+    try testing.expect(src_lin == .linear);
+    try testing.expectEqual(@as(f32, 1000), src_lin.linear.x1);
+    const cl = try readColorLine(c1.colr, src_lin.linear.color_line);
+    try testing.expectEqual(@as(u16, 2), cl.n_stops);
+    try testing.expectEqual(@as(u16, 1), readStop(c1.colr, cl, 1).palette);
+    const back = try readPaint(c1.colr, cmp_paint.composite.backdrop);
+    const back_rad = try readPaint(c1.colr, back.glyph.child);
+    try testing.expect(back_rad == .radial);
+    try testing.expectEqual(@as(f32, 400), back_rad.radial.r1);
+    const rcl = try readColorLine(c1.colr, back_rad.radial.color_line);
+    try testing.expectEqual(@as(u8, 2), rcl.extend);
+}
+
+test "colrv1: transform matrices fold with spec signs" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+    const g = V1Node{ .glyph = .{ .glyph_id = 0, .child = &solid } };
+    // 90° counter-clockwise (F2Dot14 0.5 × 180°).
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .rotate = .{ .angle = 0.5, .child = &g },
+    }, &.{}, null);
+    defer a.free(bytes);
+    var c1 = try decodeColr1(a, bytes);
+    defer c1.deinit(a);
+    const p = try readPaint(c1.colr, c1.root_paint);
+    try testing.expect(p == .transform);
+    const m = p.transform.m;
+    try testing.expectApproxEqAbs(@as(f32, 0), m[0], 1e-4); // cos 90
+    try testing.expectApproxEqAbs(@as(f32, 1), m[1], 1e-4); // sin 90 (yx)
+    try testing.expectApproxEqAbs(@as(f32, -1), m[2], 1e-4); // -sin (xy)
+    try testing.expectApproxEqAbs(@as(f32, 0), m[3], 1e-4);
+    // Explicit Affine2x3 round-trips through Fixed.
+    const bytes2 = try colr1ContainerBytes(a, &.{tri}, .{
+        .transform = .{ .m = .{ 2, 0.5, -0.5, 1, 30, -40 }, .child = &g },
+    }, &.{}, null);
+    defer a.free(bytes2);
+    var c2 = try decodeColr1(a, bytes2);
+    defer c2.deinit(a);
+    const p2 = try readPaint(c2.colr, c2.root_paint);
+    try testing.expectApproxEqAbs(@as(f32, 2), p2.transform.m[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), p2.transform.m[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), p2.transform.m[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 30), p2.transform.m[4], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -40), p2.transform.m[5], 1e-4);
+}
+
+test "colrv1: sweep angles carry the +180° bias" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const stops = [_]V1Stop{.{ .offset = 0, .palette = PALETTE_FOREGROUND }};
+    const sweep = V1Node{ .sweep = .{ .stops = &stops, .start = -1.0, .end = 0.5 } };
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &sweep },
+    }, &.{}, null);
+    defer a.free(bytes);
+    var c1 = try decodeColr1(a, bytes);
+    defer c1.deinit(a);
+    const g = try readPaint(c1.colr, c1.root_paint);
+    const sw = try readPaint(c1.colr, g.glyph.child);
+    try testing.expect(sw == .sweep);
+    try testing.expectApproxEqAbs(@as(f32, 0), sw.sweep.start_deg, 1e-3); // -1.0 → 0°
+    try testing.expectApproxEqAbs(@as(f32, 270), sw.sweep.end_deg, 1e-3); // 0.5 → 270°
+}
+
+test "colrv1: v0 table under fmt=colrv1 and v1 under fmt=colrv0 both reject" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const v0_bytes = try colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(v0_bytes);
+    try testing.expectEqual(RegisterError.malformed_payload, validateColr1(a, v0_bytes).?);
+    const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+    const v1_bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid },
+    }, &.{}, null);
+    defer a.free(v1_bytes);
+    try testing.expectEqual(RegisterError.malformed_payload, validateColr(a, v1_bytes).?);
+    // validatePayload dispatches each to its own decoder.
+    try testing.expectEqual(@as(?RegisterError, null), validatePayload(a, .colrv1, v1_bytes));
+    try testing.expect(validatePayload(a, .colrv1, tri) != null);
+}
+
+test "colrv1: truncation at every byte boundary is malformed" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const stops = [_]V1Stop{
+        .{ .offset = 0, .palette = 0 },
+        .{ .offset = 1, .palette = PALETTE_FOREGROUND },
+    };
+    const lin = V1Node{ .linear = .{ .stops = &stops, .x0 = 0, .y0 = 0, .x1 = 1000, .y1 = 0, .x2 = 0, .y2 = 1000 } };
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &lin },
+    }, &.{0xFF00FFFF}, .{ 0, 0, 1000, 1000 });
+    defer a.free(bytes);
+    var cut: usize = 0;
+    while (cut < bytes.len) : (cut += 1) {
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes[0..cut]));
+    }
+}
+
+test "colrv1: out-of-range indices reject" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    {
+        // PaintGlyph glyph id beyond the carried outline array.
+        const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .glyph = .{ .glyph_id = 1, .child = &solid },
+        }, &.{}, null);
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+    {
+        // Solid palette index beyond CPAL.
+        const solid = V1Node{ .solid = .{ .palette = 2 } };
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .glyph = .{ .glyph_id = 0, .child = &solid },
+        }, &.{0xFF0000FF}, null);
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+    {
+        // Gradient stop palette beyond CPAL.
+        const stops = [_]V1Stop{.{ .offset = 0, .palette = 9 }};
+        const lin = V1Node{ .linear = .{ .stops = &stops, .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 0, .x2 = 0, .y2 = 1 } };
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .glyph = .{ .glyph_id = 0, .child = &lin },
+        }, &.{0xFF0000FF}, null);
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+    {
+        // PaintColrGlyph referencing an absent base record.
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .colr_glyph = .{ .glyph_id = 7 },
+        }, &.{}, .{ 0, 0, 100, 100 });
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+    {
+        // Composite mode above the ceiling.
+        const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+        const g = V1Node{ .glyph = .{ .glyph_id = 0, .child = &solid } };
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .composite = .{ .source = &g, .mode = 28, .backdrop = &g },
+        }, &.{}, null);
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+}
+
+test "colrv1: self-referencing PaintColrGlyph cycle rejects" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    // The builder roots at GlyphId 0; a PaintColrGlyph back to 0 is a
+    // true cycle the walk stack must catch (not just the budget).
+    const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+        .colr_glyph = .{ .glyph_id = 0 },
+    }, &.{}, .{ 0, 0, 100, 100 });
+    defer a.free(bytes);
+    try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+}
+
+test "colrv1: unbounded root rejects; clip box or glyph wrap accepts" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+    {
+        // Bare solid root: unbounded, no clip box → rejected.
+        const bytes = try colr1ContainerBytes(a, &.{tri}, solid, &.{}, null);
+        defer a.free(bytes);
+        try testing.expectError(error.Malformed, decodeColr1(a, bytes));
+    }
+    {
+        // Same root with a clip box → accepted, box surfaced.
+        const bytes = try colr1ContainerBytes(a, &.{tri}, solid, &.{}, .{ 0, -200, 1000, 800 });
+        defer a.free(bytes);
+        var c1 = try decodeColr1(a, bytes);
+        defer c1.deinit(a);
+        try testing.expectEqual(@as(i16, -200), c1.clip_box.?.y_min);
+        try testing.expectEqual(@as(i16, 1000), c1.clip_box.?.x_max);
+    }
+    {
+        // PaintGlyph bounds it without a clip box.
+        const bytes = try colr1ContainerBytes(a, &.{tri}, .{
+            .glyph = .{ .glyph_id = 0, .child = &solid },
+        }, &.{}, null);
+        defer a.free(bytes);
+        var c1 = try decodeColr1(a, bytes);
+        defer c1.deinit(a);
+        try testing.expect(c1.clip_box == null);
+    }
+}
+
+test "colrv1: carried composite / hinted outline rejected with its own code" {
+    const a = testing.allocator;
+    const tri = try triangleBytes(a);
+    defer a.free(tri);
+    var comp: [10]u8 = @splat(0);
+    std.mem.writeInt(i16, comp[0..2], -1, .big);
+    const solid = V1Node{ .solid = .{ .palette = PALETTE_FOREGROUND } };
+    const bytes = try colr1ContainerBytes(a, &.{ tri, &comp }, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid },
+    }, &.{}, null);
+    defer a.free(bytes);
+    // Graph is fine (outline 1 unreferenced by any paint), but the
+    // carried composite still rejects at register time.
+    try testing.expectEqual(RegisterError.composite_unsupported, validateColr1(a, bytes).?);
 }
 
 test "validateGlyf maps decode errors to wire reasons" {

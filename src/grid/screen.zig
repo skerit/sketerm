@@ -5352,7 +5352,7 @@ test "glyph protocol: structural rejects — composite, hinted, malformed" {
     try std.testing.expectEqualStrings("\x1b_25a1;r;cp=e100;status=1;reason=composite_unsupported\x1b\\", GlyphTestSink.got());
 }
 
-test "glyph protocol: support advertises fmt=glyf,colrv0; clear replies; kitty still dispatches" {
+test "glyph protocol: support advertises all three formats; clear replies; kitty still dispatches" {
     GlyphTestSink.reset();
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -5360,7 +5360,7 @@ test "glyph protocol: support advertises fmt=glyf,colrv0; clear replies; kitty s
     defer s.deinit();
     s.sink = .{ .on_write_pty = GlyphTestSink.write };
     s.onApc("25a1;s");
-    try std.testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0\x1b\\", GlyphTestSink.got());
+    try std.testing.expectEqualStrings("\x1b_25a1;s;fmt=glyf,colrv0,colrv1\x1b\\", GlyphTestSink.got());
 
     GlyphTestSink.reset();
     const body = try glyphRegisterBody(std.testing.allocator, "cp=E100;reply=0");

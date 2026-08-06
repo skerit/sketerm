@@ -12,6 +12,9 @@
 //! v6: a format byte per glossary entry (glyf vs colrv0). A v5 peer
 //! gets glyf entries only — its tail has no format field, so colrv0
 //! payloads would be misread as glyf records.
+//! v7: no field changes — it marks colrv1 support. A v6 peer's
+//! `Format` enum has no tag 2, so its restore would reject the whole
+//! snapshot; colrv1 entries are withheld from v6 bodies instead.
 
 const std = @import("std");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -20,7 +23,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 6;
+pub const SNAPSHOT_VERSION = 7;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// v5: byte budget for the Glyph Protocol glossary tail. Newest
@@ -245,8 +248,11 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         var git = screen.glyphs.map.iterator();
         while (git.next()) |kv| {
             // A v5 tail has no format field; a colrv0 payload written
-            // there would restore as a glyf record and misrender.
+            // there would restore as a glyf record and misrender. A
+            // v6 peer knows format tags 0/1 only and rejects a body
+            // carrying tag 2 outright — withhold colrv1 entries.
             if (version < 6 and kv.value_ptr.fmt != .glyf) continue;
+            if (version < 7 and kv.value_ptr.fmt == .colrv1) continue;
             try entries.append(allocator, .{ .cp = kv.key_ptr.*, .e = kv.value_ptr.* });
         }
         std.mem.sort(GlyphEntry, entries.items, {}, struct {
@@ -969,6 +975,13 @@ test "snapshot: glyph glossary round-trips with FIFO stamps" {
     defer a.free(container);
     const p2 = try a.dupe(u8, container);
     try h.screen.glyphs.registerAdopt(0xF0100, p2, .colrv0, 2048, 2);
+    const solid = gp.V1Node{ .solid = .{ .palette = gp.PALETTE_FOREGROUND } };
+    const v1_container = try gp.colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid },
+    }, &.{}, null);
+    defer a.free(v1_container);
+    const p3 = try a.dupe(u8, v1_container);
+    try h.screen.glyphs.registerAdopt(0x100100, p3, .colrv1, 1024, 1);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -979,7 +992,11 @@ test "snapshot: glyph glossary round-trips with FIFO stamps" {
     const back = try restore(a, &pool2, buf.items);
     defer back.deinit();
 
-    try testing.expectEqual(@as(usize, 2), back.glyphs.count());
+    try testing.expectEqual(@as(usize, 3), back.glyphs.count());
+    const e3 = back.glyphs.get(0x100100).?;
+    try testing.expectEqual(gp.Format.colrv1, e3.fmt);
+    try testing.expectEqual(@as(u16, 1024), e3.upm);
+    try testing.expectEqualSlices(u8, v1_container, e3.payload);
     const e1 = back.glyphs.get(0xE100).?;
     try testing.expectEqualSlices(u8, tri, e1.payload);
     try testing.expectEqual(@as(u16, 1000), e1.upm);
@@ -1025,6 +1042,44 @@ test "snapshot: a v5 body carries only glyf entries (no format field to ride)" {
     try testing.expectEqual(@as(usize, 1), back.glyphs.count());
     try testing.expect(back.glyphs.contains(0xE100));
     try testing.expect(!back.glyphs.contains(0xF0100));
+}
+
+test "snapshot: a v6 body withholds colrv1 entries (v6 peers reject tag 2)" {
+    const a = testing.allocator;
+    const gp = @import("../parser/glyph_protocol.zig");
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+
+    const tri = try gp.triangleBytes(a);
+    defer a.free(tri);
+    const p1 = try a.dupe(u8, tri);
+    try h.screen.glyphs.registerAdopt(0xE100, p1, .glyf, 1000, 1);
+    const container = try gp.colrContainerBytes(a, &.{tri}, &.{
+        .{ .glyph = 0, .palette = gp.PALETTE_FOREGROUND },
+    }, &.{});
+    defer a.free(container);
+    const p2 = try a.dupe(u8, container);
+    try h.screen.glyphs.registerAdopt(0xF0100, p2, .colrv0, 1000, 1);
+    const solid = gp.V1Node{ .solid = .{ .palette = gp.PALETTE_FOREGROUND } };
+    const v1_container = try gp.colr1ContainerBytes(a, &.{tri}, .{
+        .glyph = .{ .glyph_id = 0, .child = &solid },
+    }, &.{}, null);
+    defer a.free(v1_container);
+    const p3 = try a.dupe(u8, v1_container);
+    try h.screen.glyphs.registerAdopt(0x100100, p3, .colrv1, 1000, 1);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serializeVersion(h.screen, &buf, a, 6);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, buf.items);
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 2), back.glyphs.count());
+    try testing.expect(back.glyphs.contains(0xE100));
+    try testing.expect(back.glyphs.contains(0xF0100));
+    try testing.expect(!back.glyphs.contains(0x100100));
 }
 
 test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {

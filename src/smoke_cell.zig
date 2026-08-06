@@ -1078,6 +1078,187 @@ pub fn main() !u8 {
             std.debug.print("smoke-cell: FAIL — 0xFFFF glyph reused the first foreground's pixels (Rio bug)\n", .{});
             return 51;
         }
+
+        // ── colrv1 stages ────────────────────────────────────────
+        // Paint-graph rasteriser proof: linear gradient direction,
+        // radial falloff, a real composite blend, the graph-deep
+        // 0xFFFF sentinel re-rasterising per foreground, and the
+        // documented sweep degradation.
+        const v1_helpers = struct {
+            fn registerV1Apc(a: std.mem.Allocator, cp: u32, container: []const u8) ![]u8 {
+                const enc = std.base64.standard.Encoder;
+                const b64 = try a.alloc(u8, enc.calcSize(container.len));
+                defer a.free(b64);
+                _ = enc.encode(b64, container);
+                return std.fmt.allocPrint(a, "\x1b_25a1;r;cp={x};fmt=colrv1;reply=0;{s}\x1b\\", .{ cp, b64 });
+            }
+        };
+
+        // Font-unit helpers: upm 1000, scale = chh/1000 px per unit.
+        const u_per_px: f32 = 1000.0 / @as(f32, @floatFromInt(chh));
+        const units = struct {
+            fn fromPx(px_v: f32, upp: f32) i16 {
+                return @intFromFloat(@round(px_v * upp));
+            }
+        };
+        const cw_units: i16 = units.fromPx(@floatFromInt(cw), u_per_px);
+        const ascent_px: f32 = @floatFromInt(atlas.?.ascent);
+        // Font-space y of the cell's vertical midline (y-up, baseline 0).
+        const ymid_units: i16 = units.fromPx(ascent_px - @as(f32, @floatFromInt(chh)) / 2.0, u_per_px);
+
+        // One rect outline that covers the whole cell after clipping.
+        const cover = try helpers.rectGlyf(allocator, -100, -700, 3000, 1500);
+        defer allocator.free(cover);
+
+        const gpv = @import("parser/glyph_protocol.zig");
+
+        // Stage I: linear gradient red→blue across the cell (+x).
+        const i_stops = [_]gpv.V1Stop{
+            .{ .offset = 0.0, .palette = 0 },
+            .{ .offset = 1.0, .palette = 1 },
+        };
+        const i_lin = gpv.V1Node{ .linear = .{
+            .stops = &i_stops,
+            .x0 = 0,
+            .y0 = 0,
+            .x1 = cw_units,
+            .y1 = 0,
+            .x2 = 0,
+            .y2 = 1000,
+        } };
+        const i_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &i_lin } };
+        const i_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, i_root, &.{ 0xFF0000FF, 0x0000FFFF }, null);
+        defer allocator.free(i_container);
+        const apc_i = try v1_helpers.registerV1Apc(allocator, 0xF0104, i_container);
+        defer allocator.free(apc_i);
+
+        // Stage J: radial red centre → blue rim, centred in the cell.
+        const j_cx: i16 = units.fromPx(@as(f32, @floatFromInt(cw)) / 2.0, u_per_px);
+        const j_r: u16 = @intCast(units.fromPx(@as(f32, @floatFromInt(chh)) / 2.0, u_per_px));
+        const j_rad = gpv.V1Node{ .radial = .{
+            .stops = &i_stops,
+            .x0 = j_cx,
+            .y0 = ymid_units,
+            .r0 = 0,
+            .x1 = j_cx,
+            .y1 = ymid_units,
+            .r1 = j_r,
+        } };
+        const j_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &j_rad } };
+        const j_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, j_root, &.{ 0xFF0000FF, 0x0000FFFF }, null);
+        defer allocator.free(j_container);
+        const apc_j = try v1_helpers.registerV1Apc(allocator, 0xF0105, j_container);
+        defer allocator.free(apc_j);
+
+        // Stage K: PaintComposite PLUS of a green source over a red
+        // backdrop — the overlap must be YELLOW (src-over would leave
+        // pure green, so this asserts the operator actually applied).
+        const k_red = gpv.V1Node{ .solid = .{ .palette = 0 } };
+        const k_green = gpv.V1Node{ .solid = .{ .palette = 1 } };
+        const k_back = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &k_red } };
+        const k_src = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &k_green } };
+        const k_root = gpv.V1Node{ .composite = .{ .source = &k_src, .mode = 12, .backdrop = &k_back } };
+        const k_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, k_root, &.{ 0xFF0000FF, 0x00FF00FF }, null);
+        defer allocator.free(k_container);
+        const apc_k = try v1_helpers.registerV1Apc(allocator, 0xF0106, k_container);
+        defer allocator.free(apc_k);
+
+        // Stage L: the 0xFFFF sentinel DEEP in a v1 graph (glyph →
+        // solid) — two SGR foregrounds must yield two pixel colours.
+        const l_solid = gpv.V1Node{ .solid = .{ .palette = gpv.PALETTE_FOREGROUND } };
+        const l_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &l_solid } };
+        const l_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, l_root, &.{}, null);
+        defer allocator.free(l_container);
+        const apc_l = try v1_helpers.registerV1Apc(allocator, 0xF0107, l_container);
+        defer allocator.free(apc_l);
+
+        // Stage M: sweep gradient — cairo has no sweep shader, so the
+        // documented degradation paints the FIRST stop (green) as a
+        // solid. No red (second stop) may appear, and no garbage.
+        const m_stops = [_]gpv.V1Stop{
+            .{ .offset = 0.0, .palette = 1 }, // green
+            .{ .offset = 1.0, .palette = 0 }, // red
+        };
+        const m_sweep = gpv.V1Node{ .sweep = .{ .stops = &m_stops, .cx = j_cx, .cy = ymid_units } };
+        const m_root = gpv.V1Node{ .glyph = .{ .glyph_id = 0, .child = &m_sweep } };
+        const m_container = try gpv.colr1ContainerBytes(allocator, &.{cover}, m_root, &.{ 0xFF0000FF, 0x00FF00FF }, null);
+        defer allocator.free(m_container);
+        const apc_m = try v1_helpers.registerV1Apc(allocator, 0xF0108, m_container);
+        defer allocator.free(apc_m);
+
+        // Register everything, lay the five rows out, render once.
+        parser.advance(apc_i, Emit.cb, @ptrCast(&ec));
+        parser.advance(apc_j, Emit.cb, @ptrCast(&ec));
+        parser.advance(apc_k, Emit.cb, @ptrCast(&ec));
+        parser.advance(apc_l, Emit.cb, @ptrCast(&ec));
+        parser.advance(apc_m, Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[0m\x1b[2J\x1b[H\u{F0104}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[2;1H\u{F0105}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[3;1H\u{F0106}", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[4;1H\x1b[38;2;255;0;0m\u{F0107}\x1b[4;3H\x1b[38;2;0;0;255m\u{F0107}\x1b[0m", Emit.cb, @ptrCast(&ec));
+        parser.advance("\x1b[5;1H\u{F0108}", Emit.cb, @ptrCast(&ec));
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+        try render(&cell_pass, screen, &pool, atlas.?, fb);
+
+        // Stage I assertions: colour varies across the cell in +x.
+        const i_y = padu + chh / 2;
+        const i_left = colr_helpers.px(fb, padu + 1, i_y);
+        const i_right = colr_helpers.px(fb, padu + cw - 2, i_y);
+        std.debug.print("smoke-cell: colrv1 linear left=({d},{d},{d}) right=({d},{d},{d})\n", .{ i_left[0], i_left[1], i_left[2], i_right[0], i_right[1], i_right[2] });
+        if (!(i_left[0] > 150 and i_left[0] > i_left[2] + 60)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 linear gradient left edge not red\n", .{});
+            return 52;
+        }
+        if (!(i_right[2] > 130 and i_right[2] > i_right[0] + 60)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 linear gradient does not shift to blue rightward\n", .{});
+            return 53;
+        }
+
+        // Stage J assertions: red centre, blue at the cell corner.
+        const j_center = colr_helpers.px(fb, padu + cw / 2, padu + chh + chh / 2);
+        const j_corner = colr_helpers.px(fb, padu + 1, padu + chh + 1);
+        std.debug.print("smoke-cell: colrv1 radial center=({d},{d},{d}) corner=({d},{d},{d})\n", .{ j_center[0], j_center[1], j_center[2], j_corner[0], j_corner[1], j_corner[2] });
+        if (!(j_center[0] > 150 and j_center[0] > j_center[2] + 60)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 radial centre not red\n", .{});
+            return 54;
+        }
+        if (!(j_corner[2] > 130 and j_corner[2] > j_corner[0] + 60)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 radial rim not blue\n", .{});
+            return 55;
+        }
+
+        // Stage K assertions: PLUS blend of red + green = yellow.
+        const k_px = colr_helpers.px(fb, padu + cw / 2, padu + 2 * chh + chh / 2);
+        std.debug.print("smoke-cell: colrv1 composite-plus center=({d},{d},{d})\n", .{ k_px[0], k_px[1], k_px[2] });
+        if (!(k_px[0] > 150 and k_px[1] > 150 and k_px[2] < 100)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 PLUS composite did not blend (want yellow)\n", .{});
+            return 56;
+        }
+
+        // Stage L assertions: per-foreground re-rasterisation.
+        const l_y = padu + 3 * chh + chh / 2;
+        const l_red = colr_helpers.px(fb, padu + cw / 2, l_y);
+        const l_blue = colr_helpers.px(fb, padu + 2 * cw + cw / 2, l_y);
+        std.debug.print("smoke-cell: colrv1 0xFFFF fg red-cell=({d},{d},{d}) blue-cell=({d},{d},{d})\n", .{ l_red[0], l_red[1], l_red[2], l_blue[0], l_blue[1], l_blue[2] });
+        if (!(l_red[0] > 150 and l_red[2] < 100)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 0xFFFF solid did not take the red foreground\n", .{});
+            return 57;
+        }
+        if (!(l_blue[2] > 150 and l_blue[0] < 100)) {
+            std.debug.print("smoke-cell: FAIL — colrv1 0xFFFF glyph reused the first foreground's pixels\n", .{});
+            return 58;
+        }
+
+        // Stage M assertions: sweep degrades to the first stop's
+        // green — some green must land, zero red anywhere in the cell.
+        const m_y0 = padu + 4 * chh;
+        const m_greens = colr_helpers.countColor(fb, padu, m_y0, cw, chh, 1, 0, 2);
+        const m_reds = colr_helpers.countColor(fb, padu, m_y0, cw, chh, 0, 1, 2);
+        std.debug.print("smoke-cell: colrv1 sweep greens={d} reds={d}\n", .{ m_greens, m_reds });
+        if (m_greens < 4 or m_reds != 0) {
+            std.debug.print("smoke-cell: FAIL — sweep degradation wrong (want first-stop green solid)\n", .{});
+            return 59;
+        }
     }
 
     std.debug.print("smoke-cell: PASS\n", .{});

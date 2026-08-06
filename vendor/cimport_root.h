@@ -88,6 +88,9 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #ifdef __linux__
+#include <malloc.h>      /* mallinfo2: C-heap leak assertions in tests
+                          * (cairo/freetype allocate via malloc, which
+                          * the Zig leak detector cannot see) */
 #include <sys/prctl.h>    /* satellite dies with its owning daemon */
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <sys/inotify.h> /* fsserve: live directory-view deltas */
