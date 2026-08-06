@@ -1,9 +1,10 @@
 //! Editor-document `atspi.Source`: the rope through `docview.zig`.
 //!
-//! Owns the one piece of state a document canvas needs that a terminal
-//! one does not — the byte<->character `Index` — and resolves the
-//! ACTIVE document through a callback, so this file never imports the
-//! editor (which imports the pane, which imports the bridge).
+//! Resolves the ACTIVE document through a callback, so this file never
+//! imports the editor (which imports the pane, which imports the
+//! bridge). Byte<->character conversion is the rope's own O(log n)
+//! aggregate descent (docview.byteToChar / charToByte), so no
+//! conversion state lives here.
 //!
 //! Everything here reads `Document.rope`. Inlay hints, diagnostics
 //! decorations, the caret's own glyph and every other display-only
@@ -26,7 +27,6 @@ const tr = @import("../editor/transaction.zig");
 /// "no document") and safe to `deinit`, so a face that dies before it
 /// builds its widgets needs no separate guard.
 pub const DocSource = struct {
-    index: docview.Index = .{ .allocator = std.heap.page_allocator },
     ctx: ?*anyopaque = null,
     /// Resolve the active document + selections; null when there is
     /// none (no tab open, or one still loading asynchronously).
@@ -44,7 +44,6 @@ pub const DocSource = struct {
         get: *const fn (ctx: *anyopaque) ?docview.Target,
     ) DocSource {
         return .{
-            .index = docview.Index.init(allocator),
             .ctx = ctx,
             .get = get,
             .allocator = allocator,
@@ -52,7 +51,7 @@ pub const DocSource = struct {
     }
 
     pub fn deinit(self: *DocSource) void {
-        self.index.deinit();
+        _ = self;
     }
 
     /// The Document edit-observer hook feeding `log` (slot 3; see
@@ -70,7 +69,7 @@ pub const DocSource = struct {
     pub fn takeChanges(self: *DocSource, out: []docview.CharChange) ?[]docview.CharChange {
         const get = self.get orelse return null;
         const t = get(self.ctx orelse return null) orelse return null;
-        return self.log.take(&self.index, t.doc, out) catch null;
+        return self.log.take(t.doc, out);
     }
 
     pub fn source(self: *DocSource) atspi.Source {
@@ -106,28 +105,28 @@ fn resolve(ctx: *anyopaque) ?struct { ds: *DocSource, t: docview.Target } {
 
 fn contents(ctx: *anyopaque, alloc: std.mem.Allocator, c0: u32, c1: u32) ?[]u8 {
     const r = resolve(ctx) orelse return null;
-    return docview.contents(&r.ds.index, r.t, alloc, c0, c1) catch null;
+    return docview.contents(r.t, alloc, c0, c1) catch null;
 }
 
 fn contentsAt(ctx: *anyopaque, alloc: std.mem.Allocator, off: u32, gran: atspi.Gran) ?atspi.Chunk {
     const r = resolve(ctx) orelse return null;
     const range = switch (gran) {
-        .character => docview.charRange(&r.ds.index, r.t, off) catch return null,
-        .word => docview.wordRange(&r.ds.index, r.t, alloc, off) catch return null,
-        .line => docview.lineRange(&r.ds.index, r.t, off) catch return null,
+        .character => docview.charRange(r.t, off),
+        .word => docview.wordRange(r.t, alloc, off),
+        .line => docview.lineRange(r.t, off),
     };
-    const text = docview.contents(&r.ds.index, r.t, alloc, range.start, range.end) catch return null;
+    const text = docview.contents(r.t, alloc, range.start, range.end) catch return null;
     return .{ .text = text, .start = range.start, .end = range.end };
 }
 
 fn caret(ctx: *anyopaque) u32 {
     const r = resolve(ctx) orelse return 0;
-    return docview.caret(&r.ds.index, r.t) catch 0;
+    return docview.caret(r.t);
 }
 
 fn selections(ctx: *anyopaque, alloc: std.mem.Allocator) []atspi.Range {
     const r = resolve(ctx) orelse return &.{};
-    const ranges = docview.selections(&r.ds.index, r.t, alloc) catch return &.{};
+    const ranges = docview.selections(r.t, alloc) catch return &.{};
     // docview.Range and atspi.Range are the same two u32 fields; the
     // duplication is the price of docview staying GTK-free.
     if (ranges.len == 0) return &.{};
@@ -142,6 +141,6 @@ fn selections(ctx: *anyopaque, alloc: std.mem.Allocator) []atspi.Range {
 
 fn region(ctx: *anyopaque, alloc: std.mem.Allocator) ?atspi.Region {
     const r = resolve(ctx) orelse return null;
-    const reg = (docview.region(&r.ds.index, r.t, alloc) catch return null) orelse return null;
+    const reg = (docview.region(r.t, alloc) catch return null) orelse return null;
     return .{ .text = reg.text, .char0 = reg.char0, .key = reg.key };
 }
