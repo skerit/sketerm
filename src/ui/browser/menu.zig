@@ -15,6 +15,7 @@ const copyToClip = @import("ops.zig").copyToClip;
 const countSelected = @import("nav.zig").countSelected;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
+const isCastName = @import("../../filebrowser/paths.zig").isCastName;
 const isImageName = @import("../../filebrowser/paths.zig").isImageName;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
@@ -457,6 +458,8 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
     if (isImageName(path))
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
+    if (isCastName(path))
+        m.itemIcon("Play in Sketerm", .{ .name = "media-playback-start-symbolic" }, &onMenuCastPlay, ctx);
     if (!ctx.is_dir) {
         // Two destinations, the same split the Viewer has: in the pane
         // you are looking at, or as the dedicated Sketerm Editor
@@ -1030,6 +1033,23 @@ pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const tab = ctx.tab;
     menuDone(ctx);
     self.launchViewer(tab, copied);
+}
+
+/// "Play in Sketerm": a `.cast` recording opens in a playback window
+/// of the terminal identity, spawned as its own process.
+pub fn onMenuCastPlay(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    // Format the spec BEFORE menuDone frees the ctx storage.
+    var spec_buf: [4300]u8 = undefined;
+    const spec = @import("../../filebrowser/paths.zig").formatSpec(&spec_buf, ctx.tab.hc.host, path);
+    var copy_buf: [4300]u8 = undefined;
+    if (spec.len > copy_buf.len) return menuDone(ctx);
+    @memcpy(copy_buf[0..spec.len], spec);
+    const copied = copy_buf[0..spec.len];
+    menuDone(ctx);
+    self.launchCastPlayer(copied);
 }
 
 pub fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

@@ -383,6 +383,46 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     }
 }
 
+/// Launch `sketerm play <spec>` for a terminal recording: a separate
+/// process, the way the Viewer item spawns one.
+///
+/// Unlike the Viewer and the Editor, playback has no sibling binary of
+/// its own — it is a subcommand of the TERMINAL identity, so argv[0]
+/// must be `sketerm`. Spawning our own exe blindly would be wrong in a
+/// `sketerm-files` process: that name makes the child parse `play` as a
+/// files spec. The sibling `sketerm` next to us is therefore preferred,
+/// with our own exe as the fallback (a build tree, or a browser pane
+/// living inside a terminal process, where the two are the same file).
+///
+/// `spec` is host-qualified (`local:/path` or `host:/path`), so a
+/// recording on a remote tab plays from that host's daemon.
+pub fn launchCastPlayer(self: *BrowserView, spec: []const u8) void {
+    var exe_buf: [4096:0]u8 = undefined;
+    const exe = platform.exePathZ(&exe_buf) orelse return;
+    var sibling_buf: [4096:0]u8 = undefined;
+    const binary: [*:0]const u8 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk exe.ptr;
+        const candidate = std.fmt.bufPrintZ(&sibling_buf, "{s}/sketerm", .{exe[0..slash]}) catch break :blk exe.ptr;
+        if (c.access(candidate.ptr, c.X_OK) != 0) break :blk exe.ptr;
+        break :blk candidate.ptr;
+    };
+    var spec_buf: [paths.SPEC_BUF_LEN:0]u8 = undefined;
+    const spec_z = std.fmt.bufPrintZ(&spec_buf, "{s}", .{spec}) catch return;
+    var argv: [4]?[*:0]u8 = .{
+        @constCast(binary),
+        @constCast(@as([*:0]const u8, "play")),
+        @constCast(@as([*:0]const u8, spec_z.ptr)),
+        null,
+    };
+    var gerr: [*c]c.GError = null;
+    if (c.g_spawn_async(null, @ptrCast(&argv), null, @intCast(c.G_SPAWN_DEFAULT), null, null, null, &gerr) == 0) {
+        if (gerr != null) c.g_error_free(gerr);
+        self.setStatus("could not launch the Sketerm cast player");
+        return;
+    }
+    self.setStatusFmt("playing {s} in Sketerm", .{std.fs.path.basename(spec)});
+}
+
 /// Heap context for one Open With popover; owned by the popover.
 pub const OpenWithCtx = struct {
     allocator: std.mem.Allocator,
