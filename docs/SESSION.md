@@ -14010,6 +14010,175 @@ seconds of pumping the display session while `screen-info` round-trips
 prove the GUI is still serving. A unit test cannot reach this; it needs
 a real widget lifecycle on a real frame clock. The stage fails (GUI
 SIGSEGV, first round) without the fix.
+## New capabilities, pass 1: the version fix and title templates
+
+The completion pass finished what sketerm already half-had; this one
+adds what it did not have at all. Two small things first.
+
+`TERM_PROGRAM_VERSION` was hardcoded `"0.1.0"` in `pty.zig`, so every
+terminal ever spawned advertised a version that was true only by
+coincidence. `.version` in `build.zig.zon` is the single source of
+truth and `pty.zig` compiles into a target that has `build_options`, so
+it takes `version.string` like everything else. Bumped to 0.1.1 in the
+same commit, and both binaries were asked rather than the source read:
+`sketerm --version` and `sketerm-mux --version` agree.
+
+Then title templates. Tab labels showed whatever OSC 0/2 last emitted
+and the window title never followed a pane at all. Both are now
+templates over a CLOSED placeholder set - Rio's six (`TITLE`,
+`PROGRAM`, `ABSOLUTE_PATH`, `RELATIVE_PATH`, `COLUMNS`, `LINES`) plus
+`index`, `session`, `profile` and `zoom` - with Rio's `{{ NAME }}`
+syntax and `||` fallback chains, so a Rio config transfers unchanged.
+Nothing Rio offers turned out to be structurally impossible here.
+
+Defaults preserve today's behaviour exactly: the tab template is
+`{{ TITLE }}` and the window template is empty, because a window title
+that suddenly began following the focused pane would be a visible
+regression rather than a feature.
+
+Two rules earn their place. An empty placeholder consumes one adjacent
+punctuation-only literal, so a missing fact cannot leave `nvim - `
+hanging; the tests caught two bugs in that rule before it shipped, one
+eating BOTH separators in `{{A}} - {{B}} - {{C}}` and one losing the
+closing paren of `{{PROGRAM}} ({{COLUMNS}}x{{LINES}})`. And an unknown
+placeholder is a parse error naming the valid set, not a silent blank:
+the set is closed, so `{{ TITEL }}` can only ever be a typo, and
+per-key fallback means the rest of the config still loads.
+
+`{{ PROGRAM }}` needed a fact nothing tracked - there was no
+`/proc/comm` read anywhere and `PaneInfo.pid` was hardcoded 0. The
+daemon samples `tcgetpgrp` + `/proc/<pgid>/comm` and pushes it on the
+existing `session_meta` JSON frame only when it changes, so no wire
+byte moved. Idle cost was the constraint, since this daemon holds
+durable sessions: sampling runs only from the PTY read drain, never a
+timer, rate-limited to 500ms, only while a client is attached, with one
+direct sample on attach so a fresh client is not blank until the next
+output.
+
+The loop hazard here is real and was closed by construction:
+`paneFacts` sources `title` from `Screen.last_title`, never from
+`adw_tab_page_get_title`. Reading the rendered label back would make
+`"{{ TITLE }} !"` append a `!` per render, forever.
+
+## The Glyph Protocol, all three formats
+
+Rio invented this in April 2026 and is still its only other
+implementation - twelve spec revisions in three weeks, and the spec and
+Rio's own code contradict each other in two places. Jelle's call was to
+follow the IMPLEMENTATION where they diverge, which matters most for
+`width`: the spec says it overrides UAX #11 and is authoritative for
+cursor advance, wrapping and selection, while Rio keeps layout on
+wcwidth and merely PAINTS across that many cells. The spec's reading
+has an ordering bug - a registration arriving after its codepoint is
+already on screen would retroactively change wrapping - and real client
+libraries are tested against Rio, not the prose.
+
+An application registers an outline at a Private Use Area codepoint and
+then emits that codepoint as ordinary text, so a TUI can ship its own
+icons without a patched font. The cell buffer stays authoritative:
+copy, select and search return the raw codepoint.
+
+Three things made this far cheaper than the survey implied. The parser
+needed NO state-machine change - `vt.zig` already accumulates whole APC
+bodies and `onApc` already drops anything not starting with `G`, which
+is exactly the ignore-it behaviour the spec demands. The live wire path
+needed no change either: `EventTag.apc` carries APC bodies losslessly
+and both the authoritative and the mirror `Screen` run the same
+handler, precisely as kitty graphics does, so a glossary replicates for
+free and only the SNAPSHOT grew a tail for clients attaching later. And
+the rasteriser already existed - the standalone `FT_Outline` API is in
+the translated bindings, and `glyf`'s quadratic contours map natively
+onto freetype's conic tags, implied midpoints and all, so no path
+walker was needed.
+
+Custom glyphs get their own atlas key space rather than joining the
+codepoint-keyed cache, because the Atlas is per WINDOW and shared by
+every pane while a glossary is per Screen: two panes may legally
+register different outlines at the same codepoint.
+
+The design was wrong in exactly one place and the pixel rig caught it.
+It said to rasterise and then Y-flip, since freetype bitmaps are Y-down
+while `glyf` is Y-up. Freetype performs that flip itself and returns a
+positive-pitch buffer, so the extra flip would have rendered every
+glyph upside down - a change that compiles, passes every unit test, and
+is visible only as two centroids in `smoke-cell` landing at the wrong
+heights.
+
+`colrv0` then made glyphs real multi-colour icons rather than
+foreground-tinted silhouettes: layers painted back to front with flat
+CPAL colours. Palette index `0xFFFF` means "the current foreground",
+which makes such a glyph's pixels depend on SGR state - and Rio has a
+bug there we deliberately did not inherit, since their atlas key omits
+the foreground, so one of their `0xFFFF` glyphs keeps whatever colour
+it was first drawn in forever. Ours keys those, and only those, by
+resolved foreground; everything else stays cached exactly once. The
+snapshot also needed a per-entry format byte, contradicting the design's
+claim that raw payload bytes would round-trip unchanged - without it a
+colrv0 payload restores as a glyf record and misrenders.
+
+`colrv1` is a paint graph rather than a layer list, and cairo is our
+tiny-skia: gradients with all three extend modes, affine transforms,
+clipping, and the full Porter-Duff and separable operator set. The v1
+table is decoded in pure Zig rather than by synthesising an in-memory
+sfnt for freetype's paint API, which keeps validation daemon-side with
+the rest of the container and avoids a second font object per glyph.
+Correctness budget, stated Rio-style at the code site: solid fills,
+linear and radial gradients, glyph clips, all ten transform forms,
+PaintColrLayers, PaintColrGlyph and all 28 composite modes are painted
+for real; sweep gradients degrade to their first stop, because neither
+cairo nor tiny-skia has a sweep shader; variation deltas are ignored,
+since the protocol cannot carry variation coordinates. Two places we
+beat the reference: stops outside [0,1] are remapped by moving the
+gradient geometry where Rio truncates, and the foreground keying above.
+
+C resources are invisible to Zig's leak detector, so a missed
+`cairo_surface_destroy` would grow on every repaint. `mallinfo2` joined
+the cimport set for a test that rasterises a gradient + composite +
+transform graph 300 times under a rotating foreground - a genuine cache
+miss each time - and asserts malloc-space stays flat.
+
+We also validate more than Rio does: they check only the framing and
+let the renderer meet whatever survives, while the daemon here
+validates COLR and CPAL structure, layer glyph ids, palette ranges and
+every carried outline before storing.
+
+## Per-platform config sections
+
+`[platform.linux]` / `[platform.macos]`, so one config file can behave
+differently per OS instead of forcing two.
+
+Not Rio's syntax. Rio puts a single `[platform]` table with dotted keys
+(`macos.window.opacity`) on top of TOML's nested tables; our keys
+already use dots for prefix families (`keybind.new_tab`,
+`hint.jira.regex`), so `macos.keybind.new_tab` would give one separator
+two meanings. A section header also lets EVERY key work inside, where
+Rio allows a fixed subset with per-struct merge rules.
+
+Sections apply inline, in file order - a conditional splice of the top
+level - because profile seeding already happens mid-parse and is
+already order-sensitive. Collect-and-replay would need a second,
+contradictory ordering rule and would silently miss profiles seeded
+earlier. So there is one rule to learn and it is the existing one; the
+consequence is that a section edits the Default bundle, and per-OS
+per-profile means placing the section BEFORE the `[profile.*]`
+sections, which is also the order the serialiser now emits.
+
+Keys for the platform you are not on are still validated, by applying
+them to a throwaway Config with its own scratch arena. A typo in the
+macOS block is reported on Linux with the message it would get at top
+level, instead of waiting to break on a machine you have not booted.
+
+One sharp edge, documented rather than hidden: a prefs save retains
+every platform section verbatim, but the CURRENT platform's values are
+flattened into the top level, because inline application leaves nothing
+downstream able to tell where a value came from. Undoing that needs
+per-key provenance through ~150 serialiser branches, which is
+disproportionate against a dialog that already destroys comments and
+ordering. `Config.save` warns on stderr when sections are present, and
+a test pins the exact flattening so changing it has to be deliberate.
+
+## Cursor trails
+
 Cursor trails landed. Rio's `[effects] trail-cursor` is a neovide port
 built on a critically-damped spring per corner of the cursor rect; the
 leading corners snap to the new cell while the trailing one lags, so
