@@ -242,6 +242,7 @@ comptime {
     _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
     _ = @import("ui/menu.zig");
+    _ = @import("wlapp.zig");
 }
 
 test {

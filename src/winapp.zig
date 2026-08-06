@@ -157,23 +157,26 @@ pub const WsHost = struct {
         /// pop-out / show-in-tab rows: a streamed window is always a
         /// floating toplevel, there is no embedded mode to leave.
         fn showHostMenu(win: *Win, x: f64, y: f64) void {
-            var rows: [4]wlapp.HostMenuRow = undefined;
+            var plan_buf: [wlapp.MAX_HOST_MENU_ROWS]wlapp.HostMenuItem = undefined;
+            // `embedded` / `can_embed` stay false: a streamed window is
+            // always a floating toplevel, there is no embedded mode to
+            // leave. `hostMenuPlan` therefore never yields the two
+            // embedding rows here — pinned by a unit test in wlapp.zig,
+            // since the skip below would otherwise drop them silently.
+            const plan = wlapp.hostMenuPlan(.{ .recording = win.rec.active() }, &plan_buf);
+            var rows: [wlapp.MAX_HOST_MENU_ROWS]wlapp.HostMenuRow = undefined;
             var n: usize = 0;
-            rows[n] = .{ .label = "Screenshot Window\u{2026}", .cb = &onMenuScreenshot, .ctx = win };
-            n += 1;
-            const recording = win.rec.active();
-            rows[n] = .{
-                .label = if (recording) "Stop Recording\u{2026}" else "Record Window (WebM)",
-                .cb = &onMenuRecordWebm,
-                .ctx = win,
-            };
-            n += 1;
-            if (!recording) {
-                rows[n] = .{ .label = "Record Window (GIF)", .cb = &onMenuRecordGif, .ctx = win };
+            for (plan) |item| {
+                const cb = switch (item) {
+                    .screenshot => &onMenuScreenshot,
+                    .record_webm, .stop_recording => &onMenuRecordWebm,
+                    .record_gif => &onMenuRecordGif,
+                    .pop_out, .show_in_tab => continue,
+                    .close => &onMenuClose,
+                };
+                rows[n] = .{ .label = wlapp.hostMenuLabel(item), .cb = cb, .ctx = win };
                 n += 1;
             }
-            rows[n] = .{ .label = "Close Window", .cb = &onMenuClose, .ctx = win };
-            n += 1;
             wlapp.popupHostMenu(win.picture, x, y, rows[0..n]);
         }
 
