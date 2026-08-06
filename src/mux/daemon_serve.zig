@@ -747,7 +747,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             if (rows == 0 or cols == 0 or rows > 1000 or cols > 1000) return;
             s.screen.resize(cols, rows) catch return;
             s.pty.setSize(rows, cols);
-            if (s.cast) |*rec| rec.resize(nowMs(), cols, rows);
+            if (s.cast_recorder) |*rec| rec.resize(nowMs(), cols, rows);
             // Geometry changed: every attached client needs a
             // fresh snapshot (event streams assume fixed grids).
             self.broadcastSnapshot(s);
@@ -797,9 +797,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 cl.queueErr("not attached");
                 return;
             };
-            if (s.cast) |*rec| {
+            if (s.cast_recorder) |*rec| {
                 rec.finish();
-                s.cast = null;
+                s.cast_recorder = null;
                 cl.queueJson(.ok, .{ .ok = true });
             } else cl.queueErr("session is not recording");
         },
@@ -1397,11 +1397,11 @@ pub fn handleRecStart(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("rec_start path must be absolute");
         return;
     }
-    if (s.cast) |*old| {
+    if (s.cast_recorder) |*old| {
         old.finish();
-        s.cast = null;
+        s.cast_recorder = null;
     }
-    s.cast = cast_rec.Rec.start(
+    s.cast_recorder = cast_rec.Rec.start(
         self.allocator,
         parsed.value.path,
         s.screen.cols,
