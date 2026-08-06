@@ -164,6 +164,7 @@ comptime {
     _ = @import("filebrowser/picker.zig");
     _ = @import("portal.zig");
     _ = @import("fsmount.zig");
+    _ = @import("mux/daemon_cast.zig");
     _ = @import("mux/daemon_debug.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

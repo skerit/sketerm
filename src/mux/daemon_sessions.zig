@@ -87,10 +87,11 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     }
     // Empty argv = "the daemon host's login shell" — remote
-    // clients can't know what's installed here. A display session
-    // is exempt: spawnSession substitutes the keeper argv.
+    // clients can't know what's installed here. Display sessions
+    // (keeper argv substituted) and cast playback (no child at all)
+    // are exempt.
     const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-    if (req.argv.len == 0 and !req.display) {
+    if (req.argv.len == 0 and !req.display and req.cast_path.len == 0) {
         req.argv = default_shell;
         req.login_shell = true;
     }
@@ -112,7 +113,7 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     cl.queueJson(.ok, .{
         .ok = true,
         .name = s.name,
-        .pid = s.pty.child_pid,
+        .pid = s.childPid(),
         // The session's environment: an external renderer must be
         // handed these, never left to derive a wl-w<pid> path.
         .wl_display = if (s.wl_display_path) |p| p else "",
@@ -183,7 +184,7 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     }
     const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-    if (req.argv.len == 0 and !req.display) {
+    if (req.argv.len == 0 and !req.display and req.cast_path.len == 0) {
         req.argv = default_shell;
         req.login_shell = true;
     }
@@ -550,6 +551,10 @@ pub fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_s
 pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
     const allocator = self.allocator;
 
+    // Cast playback: no child, no hubs, no PTY — its own spawn path.
+    // Works identically in monolith and (via runWorker) broker mode.
+    if (req_in.cast_path.len > 0) return self.spawnCastSession(req_in);
+
     // External display session: the child is OUR OWN binary in
     // `--keep` mode. Resolved daemon-side on purpose — a client
     // (possibly on another host, over SSH) cannot know this host's
@@ -777,7 +782,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
     s.* = .{
         .allocator = allocator,
         .name = try allocator.dupe(u8, req.name),
-        .pty = pty,
+        .source = .{ .pty = pty },
         .parser = Parser.init(allocator),
         .pool = pool,
         .screen = screen,
@@ -828,7 +833,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
     if (ws_gate.want) create_ws: {
         const w = allocator.create(WsSource) catch break :create_ws;
         if (ws_gate.use_sck) {
-            w.* = WsSource.initSck(allocator, s.pty.child_pid) catch |err| {
+            w.* = WsSource.initSck(allocator, s.childPid()) catch |err| {
                 log.warn("window capture init failed ({s}) — session '{s}' has no app streaming", .{ @errorName(err), req.name });
                 allocator.destroy(w);
                 break :create_ws;
@@ -842,7 +847,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
     log.info("session '{s}' spawned kind={s} child_pid={d} {d}x{d} wl={s} a11y={s}", .{
         req.name,
         if (req.app) "app" else "shell",
-        s.pty.child_pid,
+        s.childPid(),
         req.cols,
         req.rows,
         s.wl_display_path orelse "-",
@@ -904,6 +909,8 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         }
     }
     self.queueSnapshot(cl, s);
+    // Cast playback auto-starts once its first viewer arrives.
+    self.castOnAttach(s, nowMs());
     if (cl.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
     if (cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or cl.audio_channels) self.replayNativeChannels(cl, s);
     self.refreshVideoGates();

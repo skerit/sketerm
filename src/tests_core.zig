@@ -127,6 +127,7 @@ comptime {
     _ = @import("mux/icons.zig");
     _ = @import("mux/keep.zig");
     _ = @import("mux/kitty_inline.zig");
+    _ = @import("mux/daemon_cast.zig");
     _ = @import("mux/daemon_debug.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

@@ -31,6 +31,8 @@ const wlcomp = @import("../wlhost/compositor.zig");
 const wlkeymaps = @import("../wlhost/keymaps.zig");
 const a11yhub = @import("a11yhub.zig");
 const cast_rec = @import("cast.zig");
+const daemon_cast = @import("daemon_cast.zig");
+const kitty_image = @import("../parser/kitty_image.zig");
 const logring = @import("logring.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
@@ -175,6 +177,13 @@ pub const SpawnReq = struct {
     /// scope only lets ancestors trace. Set by headless automation
     /// (appdrive/MCP `launch_app`), never by interactive panes.
     debuggable: bool = false,
+    /// Asciicast playback session: replay this daemon-host file
+    /// (absolute or ~-relative) instead of spawning a child. argv/
+    /// cwd/env are ignored; the session has NO PTY, no child process
+    /// and no Wayland/audio hubs, its size comes from the cast
+    /// header, and client input/resize are rejected. "" = normal
+    /// PTY session.
+    cast_path: []const u8 = "",
 };
 
 pub const SpawnShellIntegration = struct {
@@ -285,9 +294,18 @@ pub const SessionInfo = struct {
 };
 
 pub const Session = struct {
+    /// What feeds this session's parser. `.pty` is the normal child
+    /// shell/app; `.cast` replays an asciicast file on a timer and
+    /// has NO child process — never assume `.pty` (use the helpers
+    /// below; `masterFd`/`childPid` degrade to -1 for casts).
+    pub const Source = union(enum) {
+        pty: Pty,
+        cast: *daemon_cast.CastPlayback,
+    };
+
     allocator: std.mem.Allocator,
     name: []u8,
-    pty: Pty,
+    source: Source,
     parser: Parser,
     pool: *Pool,
     screen: *Screen,
@@ -411,7 +429,12 @@ pub const Session = struct {
         }
         if (self.a11y) |*h| h.deinit();
         self.foreign.deinit();
-        if (self.pty.closeAndReap()) |code| self.exit_status = code;
+        switch (self.source) {
+            .pty => |*p| if (p.closeAndReap()) |code| {
+                self.exit_status = code;
+            },
+            .cast => |cp| cp.destroy(),
+        }
         self.parser.deinit();
         self.screen.deinit();
         self.pool.deinit();
@@ -421,9 +444,47 @@ pub const Session = struct {
     }
 
     /// Screen sink: DSR/DA replies go straight back to the child.
+    /// A cast session has no child — replies are safely discarded.
     pub fn sinkWritePty(ctx: ?*anyopaque, bytes: []const u8) void {
         const self: *Session = @ptrCast(@alignCast(ctx.?));
-        _ = self.pty.writeAll(bytes);
+        switch (self.source) {
+            .pty => |*p| _ = p.writeAll(bytes),
+            .cast => {},
+        }
+    }
+
+    pub fn ptyPtr(self: *Session) ?*Pty {
+        return switch (self.source) {
+            .pty => |*p| p,
+            .cast => null,
+        };
+    }
+
+    pub fn castPtr(self: *Session) ?*daemon_cast.CastPlayback {
+        return switch (self.source) {
+            .pty => null,
+            .cast => |cp| cp,
+        };
+    }
+
+    pub fn isCast(self: *const Session) bool {
+        return self.source == .cast;
+    }
+
+    /// -1 for cast sessions (nothing to poll).
+    pub fn masterFd(self: *const Session) c_int {
+        return switch (self.source) {
+            .pty => |p| p.master_fd,
+            .cast => -1,
+        };
+    }
+
+    /// -1 for cast sessions (mirrors a remote pty's "no child").
+    pub fn childPid(self: *const Session) c.pid_t {
+        return switch (self.source) {
+            .pty => |p| p.child_pid,
+            .cast => -1,
+        };
     }
 };
 
@@ -2357,6 +2418,8 @@ pub const Daemon = struct {
     /// One poll iteration. Exposed for tests.
     pub fn tick(self: *Daemon, timeout_ms: i32) !void {
         var poll_timeout = self.pulseTick(timeout_ms);
+        // Cast playback: deliver due events, clamp to the next deadline.
+        poll_timeout = self.castTick(poll_timeout);
         // Listing work pending: don't sleep on poll. The pump makes
         // bounded progress per tick, so this converges rather than
         // spins; usually POLLOUT re-wakes the loop anyway, but the
@@ -2385,7 +2448,7 @@ pub const Daemon = struct {
         const n_sessions_built = self.sessions.items.len;
         for (self.sessions.items) |s| {
             try fds.append(self.allocator, .{
-                .fd = if (s.exited) -1 else s.pty.master_fd,
+                .fd = if (s.exited) -1 else s.masterFd(),
                 .events = c.POLLIN,
                 .revents = 0,
             });
@@ -3476,6 +3539,12 @@ pub const Daemon = struct {
 
     // ── Session lifecycle + broker forwarding: split out to daemon_sessions.zig ──
     const daemon_sessions = @import("daemon_sessions.zig");
+    // ── Cast playback sessions: split out to daemon_cast.zig ──
+    pub const castTick = daemon_cast.castTick;
+    pub const castOnAttach = daemon_cast.castOnAttach;
+    pub const handlePlayControl = daemon_cast.handlePlayControl;
+    pub const spawnCastSession = daemon_cast.spawnCastSession;
+
     pub const isWorker = daemon_sessions.isWorker;
     pub const handleSpawn = daemon_sessions.handleSpawn;
     pub const spawnSession = daemon_sessions.spawnSession;
@@ -3974,11 +4043,16 @@ pub const Daemon = struct {
         // foreground program now rather than making it wait for the
         // session's next output.
         var fg_buf: [32]u8 = undefined;
-        const fg = platform.foregroundProgram(s.pty.master_fd, &fg_buf) orelse "";
+        const fg = if (s.ptyPtr()) |p|
+            platform.foregroundProgram(p.master_fd, &fg_buf) orelse ""
+        else
+            "";
         cl.queueJson(.session_meta, .{
-            .cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse "",
+            .cwd = cwdOfPid(s.childPid(), &cwd_buf) orelse "",
             .program = fg,
         });
+        // A cast viewer needs the playback state to render controls.
+        if (s.castPtr()) |cp| daemon_cast.queuePlayState(cl, cp);
     }
 
     /// Minimum gap between two foreground-program samples for one
@@ -3995,12 +4069,13 @@ pub const Daemon = struct {
     /// second, and the change check keeps the wire quiet — running
     /// `ls` in a loop re-reports `bash` once, not once per command.
     pub fn sampleForeground(self: *Daemon, s: *Session) void {
+        const pty = s.ptyPtr() orelse return;
         const now = nowMs();
         if (now - s.fg_sampled_ms < FG_SAMPLE_INTERVAL_MS) return;
         s.fg_sampled_ms = now;
 
         var buf: [32]u8 = undefined;
-        const name = platform.foregroundProgram(s.pty.master_fd, &buf) orelse "";
+        const name = platform.foregroundProgram(pty.master_fd, &buf) orelse "";
         const len: u8 = @intCast(@min(name.len, s.fg_program.len));
         if (len == s.fg_program_len and std.mem.eql(u8, s.fg_program[0..len], name[0..len])) return;
         @memcpy(s.fg_program[0..len], name[0..len]);
@@ -4061,7 +4136,7 @@ pub const Daemon = struct {
             }
             var cwd: []const u8 = "";
             var scratch: [4096]u8 = undefined;
-            if (cwdOfPid(s.pty.child_pid, &scratch)) |cw| {
+            if (cwdOfPid(s.childPid(), &scratch)) |cw| {
                 if (self.allocator.dupe(u8, cw)) |owned| {
                     cwd_bufs.append(self.allocator, owned) catch {};
                     cwd = owned;
@@ -4082,7 +4157,7 @@ pub const Daemon = struct {
                 .app = s.app,
                 .idle_ms = now - s.last_activity_ms,
                 .cwd = cwd,
-                .pid = s.pty.child_pid,
+                .pid = s.childPid(),
                 .audio = self.sessionAudioRunning(s, null),
                 .audio_streams = audio_streams,
                 .display = s.display,
@@ -4338,7 +4413,7 @@ pub const Daemon = struct {
             cl.queueErr("session is not a display session");
             return;
         }
-        if (parsed.value.expected_pid != 0 and parsed.value.expected_pid != s.pty.child_pid) {
+        if (parsed.value.expected_pid != 0 and parsed.value.expected_pid != s.childPid()) {
             cl.queueErr("display session identity changed");
             return;
         }
@@ -4461,24 +4536,35 @@ pub const Daemon = struct {
         }
     }
 
-    /// Read whatever the PTY has, parse, apply to the authoritative
-    /// Screen, and broadcast the serialized events to attached
-    /// clients in one EVENTS frame.
-    fn drainSession(self: *Daemon, s: *Session) void {
-        var chunk: [32768]u8 = undefined;
-        var total_events = EventCollector{
+    /// Start an ingestion batch for `s`: events applied to the
+    /// authoritative Screen and serialized for broadcast in one pass.
+    /// Shared by the PTY drain and cast playback — pair with
+    /// `ingestFinish`, feeding bytes via `ingestBytes` in between.
+    pub fn ingestBegin(self: *Daemon, s: *Session) EventCollector {
+        return .{
             .allocator = self.allocator,
             .screen = s.screen,
             .writer = wire.Writer.init(self.allocator),
             .ring = &s.log,
             .wall_ms = wallMs(),
+            // A cast file is untrusted content: kitty file/tempfile/
+            // shm APCs are dropped before they can read this host's
+            // filesystem (see EventCollector.emit).
+            .untrusted = s.isCast(),
         };
-        defer total_events.writer.deinit();
-        defer total_events.deinitMarkers();
+    }
+
+    /// Read whatever the PTY has, parse, apply to the authoritative
+    /// Screen, and broadcast the serialized events to attached
+    /// clients in one EVENTS frame.
+    fn drainSession(self: *Daemon, s: *Session) void {
+        const pty = s.ptyPtr() orelse return;
+        var chunk: [32768]u8 = undefined;
+        var total_events = self.ingestBegin(s);
 
         var rounds: u8 = 0;
         while (rounds < 8) : (rounds += 1) {
-            const n_raw = c.read(s.pty.master_fd, &chunk, chunk.len);
+            const n_raw = c.read(pty.master_fd, &chunk, chunk.len);
             if (n_raw < 0) {
                 // EAGAIN = drained; anything else (EIO) = child gone.
                 if (std.posix.errno(n_raw) != .AGAIN) self.sessionExited(s);
@@ -4490,12 +4576,23 @@ pub const Daemon = struct {
             }
             const n: usize = @intCast(n_raw);
             if (s.cast_recorder) |*rec| rec.output(nowMs(), chunk[0..n]);
-            s.parser.advance(chunk[0..n], EventCollector.emit, @ptrCast(&total_events));
+            ingestBytes(s, &total_events, chunk[0..n]);
             if (n < chunk.len) break;
         }
+        self.ingestFinish(s, &total_events, true);
+    }
+
+    /// Finish an ingestion batch: broadcast the collected events and
+    /// markers to attached clients (unless `broadcast` is false — the
+    /// silent seek-replay path applies to the Screen only) and always
+    /// release the collector.
+    pub fn ingestFinish(self: *Daemon, s: *Session, total_events: *EventCollector, broadcast: bool) void {
+        defer total_events.writer.deinit();
+        defer total_events.deinitMarkers();
 
         const n_events = total_events.count;
         if (n_events == 0 and total_events.markers.items.len == 0) return;
+        if (!broadcast) return;
         // Real terminal output this drain → the session is active now.
         s.last_activity_ms = nowMs();
         var any_attached = false;
@@ -4557,13 +4654,15 @@ pub const Daemon = struct {
         // "segfault exited 0"). Retry briefly; EOF implies the exit
         // already happened, so this converges in microseconds. The
         // bound only bites when a child closed its stdio and lives on.
-        var tries: u32 = 0;
-        while (tries < 50) : (tries += 1) {
-            if (s.pty.reap()) |code| {
-                s.exit_status = code;
-                break;
+        if (s.ptyPtr()) |pty| {
+            var tries: u32 = 0;
+            while (tries < 50) : (tries += 1) {
+                if (pty.reap()) |code| {
+                    s.exit_status = code;
+                    break;
+                }
+                _ = c.usleep(1000);
             }
-            _ = c.usleep(1000);
         }
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
@@ -4876,6 +4975,13 @@ pub const Daemon = struct {
     }
 };
 
+/// Feed raw terminal bytes into an ingestion batch (parser -> Screen
+/// + wire serialization). The cast playback engine calls this with
+/// decoded cast output; the PTY drain with PTY reads.
+pub fn ingestBytes(s: *Session, total_events: *EventCollector, bytes: []const u8) void {
+    s.parser.advance(bytes, EventCollector.emit, @ptrCast(total_events));
+}
+
 /// Per-drain context: applies each event to the Screen and
 /// serializes it for broadcast in the same pass.
 pub const EventCollector = struct {
@@ -4887,6 +4993,12 @@ pub const EventCollector = struct {
     ring: ?*logring.LogRing = null,
     /// Wall-clock stamp for lines committed during this drain.
     wall_ms: i64 = 0,
+    /// Untrusted content (cast playback): kitty file/tempfile/shm
+    /// APCs are DROPPED before they reach the Screen or the wire —
+    /// both `kitty_inline.rewrite` here and `grid/kitty_images.zig`
+    /// on apply would otherwise open (and for t=t DELETE) daemon-host
+    /// paths named by the file.
+    untrusted: bool = false,
     /// OSC 5522 markers seen this drain; drainSession pushes them to
     /// attached clients and frees the labels.
     markers: std.ArrayList(Marker) = .empty,
@@ -4948,12 +5060,20 @@ pub const EventCollector = struct {
         // host's filesystem — fetch and inline them so the client
         // (which can't read our disk) gets the data. Apply the
         // rewritten event locally too, keeping the authoritative
-        // screen identical to what clients see.
+        // screen identical to what clients see. UNTRUSTED input
+        // (cast playback) must not touch the filesystem at all:
+        // those media are dropped outright instead of rewritten.
         var fwd = ev;
         var owned: ?[]u8 = null;
         defer if (owned) |b| self.allocator.free(b);
         if (ev == .apc) {
-            if (@import("kitty_inline.zig").rewrite(self.allocator, ev.apc.bytes)) |nb| {
+            if (self.untrusted) {
+                if (kittyFileMedium(ev.apc.bytes)) {
+                    var mut = ev;
+                    mut.deinit(self.allocator);
+                    return;
+                }
+            } else if (@import("kitty_inline.zig").rewrite(self.allocator, ev.apc.bytes)) |nb| {
                 owned = nb;
                 fwd = .{ .apc = .{ .bytes = nb } };
             }
@@ -4975,6 +5095,16 @@ pub const EventCollector = struct {
     fn deinitMarkers(self: *EventCollector) void {
         for (self.markers.items) |m| self.allocator.free(m.label);
         self.markers.deinit(self.allocator);
+    }
+
+    /// True for a kitty graphics APC whose transmission medium reads
+    /// the daemon host's filesystem (t=f path, t=t tempfile, t=s shm).
+    fn kittyFileMedium(apc_bytes: []const u8) bool {
+        const cmd = kitty_image.parse(apc_bytes) catch return false;
+        return switch (cmd.medium) {
+            'f', 't', 's' => true,
+            else => false,
+        };
     }
 };
 

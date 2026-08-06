@@ -182,6 +182,8 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
     cl.attached = s;
     log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(req.kind), req.proto, req.video });
     self.queueSnapshot(cl, s);
+    // Cast playback auto-starts once its first viewer arrives.
+    self.castOnAttach(s, dmod.nowMs());
     if (req.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
     if (req.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or req.audio_channels) self.replayNativeChannels(cl, s);
     self.refreshVideoGates();
@@ -378,7 +380,7 @@ pub fn maybePushMeta(self: *Daemon) void {
 
     var cwd: []const u8 = "";
     var scratch: [4096]u8 = undefined;
-    if (cwdOfPid(s.pty.child_pid, &scratch)) |cw| cwd = cw;
+    if (cwdOfPid(s.childPid(), &scratch)) |cw| cwd = cw;
     const meta = WorkerMeta{
         .rows = s.screen.rows,
         .cols = s.screen.cols,
@@ -386,7 +388,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .exited = s.exited,
         .app = s.app,
         .activity = s.last_activity_ms,
-        .child_pid = s.pty.child_pid,
+        .child_pid = s.childPid(),
         // Bounded so one JSON datagram stays well under the broker's
         // recv buffer (an over-long datagram is truncated, and on Darwin
         // refused outright once it passes the socket buffer).
@@ -521,7 +523,7 @@ pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq,
     defer yaw.deinit();
     if (yaw.writer.writeByte('Y')) |_| {
         if (std.json.Stringify.value(WorkerReady{
-            .pid = s.pty.child_pid,
+            .pid = s.childPid(),
             .wl = if (s.wl_display_path) |p| p else "",
             .pa = if (s.pa_socket_path) |p| p else "",
             .rt = if (s.runtime_dir_path) |p| p else "",
@@ -716,6 +718,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // absence is exactly the "no server on this host"
                 // silent-degradation path the client already has.
                 .lsp = true,
+                // Cast-playback sessions (SpawnReq.cast_path +
+                // play_control). Capability, same reasoning as lsp:
+                // an old daemon would `.err` on the unknown frame.
+                .cast_playback = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -737,16 +743,21 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 cl.queueErr("not attached");
                 return;
             };
-            _ = s.pty.writeAll(frame.payload);
+            // Cast playback has no child to type at: drop silently.
+            const pty = s.ptyPtr() orelse return;
+            _ = pty.writeAll(frame.payload);
         },
         .resize => {
             const s = cl.attached orelse return;
+            // Client geometry must never overwrite a cast's recorded
+            // dimensions — only cast resize events change the grid.
+            const pty = s.ptyPtr() orelse return;
             if (frame.payload.len < 4) return;
             const rows = std.mem.readInt(u16, frame.payload[0..2], .little);
             const cols = std.mem.readInt(u16, frame.payload[2..4], .little);
             if (rows == 0 or cols == 0 or rows > 1000 or cols > 1000) return;
             s.screen.resize(cols, rows) catch return;
-            s.pty.setSize(rows, cols);
+            pty.setSize(rows, cols);
             if (s.cast_recorder) |*rec| rec.resize(nowMs(), cols, rows);
             // Geometry changed: every attached client needs a
             // fresh snapshot (event streams assume fixed grids).
@@ -786,6 +797,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .app_a11y => handleAppA11y(self, cl, frame.payload),
         .app_debug => self.handleAppDebug(cl, frame.payload),
         .rec_start => handleRecStart(self, cl, frame.payload),
+        .play_control => self.handlePlayControl(cl, frame.payload),
         .search => self.handleSearch(cl, frame.payload),
         .log_get => self.handleLogGet(cl, frame.payload),
         .forward_open => self.handleForward(cl, frame.payload),
@@ -1122,7 +1134,7 @@ pub fn handleFileOpen(self: *Daemon, cl: *Client, payload: []const u8) void {
     }
 
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+    const cwd = cwdOfPid(s.childPid(), &cwd_buf) orelse {
         fileReply(cl, xfer, "error", 0, "", "cannot determine session directory");
         return;
     };
@@ -1241,7 +1253,7 @@ pub fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
             return;
         };
         var cwd_buf: [4096]u8 = undefined;
-        const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+        const cwd = cwdOfPid(s.childPid(), &cwd_buf) orelse {
             fileReply(cl, xfer, "error", 0, "", "cannot determine session directory");
             return;
         };
@@ -1385,6 +1397,10 @@ pub fn handleRecStart(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("not attached");
         return;
     };
+    if (s.isCast()) {
+        cl.queueErr("cannot record a cast playback session");
+        return;
+    }
     const Req = struct { path: []const u8 };
     var parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{
         .ignore_unknown_fields = true,
@@ -1456,7 +1472,7 @@ pub fn handleFileList(self: *Daemon, cl: *Client, payload: []const u8) void {
     const dirpath: [:0]const u8 = blk: {
         if (req_path.len == 0 or req_path[0] != '/') {
             var cwd_buf: [4096]u8 = undefined;
-            const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+            const cwd = cwdOfPid(s.childPid(), &cwd_buf) orelse {
                 listingError(cl, xfer, "", "cannot determine session directory");
                 return;
             };
