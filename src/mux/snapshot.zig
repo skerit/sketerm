@@ -437,6 +437,10 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
         screen.alt = alt;
     }
     screen.use_alt = try src.boolean();
+    // The whole grid was just replaced under the cursor; anything
+    // interpolating from its old position (the cursor trail) must
+    // teleport rather than smear across content it never saw.
+    screen.viewport_epoch +%= 1;
 
     const sb_count = try src.int(u32);
     try screen.scrollback.ensureTotalCapacity(allocator, sb_count);

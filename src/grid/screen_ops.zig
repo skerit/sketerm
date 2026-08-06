@@ -757,6 +757,7 @@ pub fn eraseDisplay(self: *Screen, mode: u32) void {
         2 => {
             self.clearAllClusters();
             for (lines) |*l| l.clearStyled(fill);
+            self.viewport_epoch +%= 1;
         },
         3 => {
             // Mode 3 (xterm extension): clear screen + scrollback.
@@ -769,6 +770,7 @@ pub fn eraseDisplay(self: *Screen, mode: u32) void {
             // wrong once the ring fills again.
             self.scrollback_head = 0;
             self.view_offset = 0;
+            self.viewport_epoch +%= 1;
         },
         else => {},
     }
@@ -1193,6 +1195,7 @@ pub fn toggleAltScreen(self: *Screen, on: bool) void {
     } else {
         self.use_alt = false;
     }
+    self.viewport_epoch +%= 1;
     // Keyboard-protocol state is per-buffer: swap the active set with
     // the parked one so an app that enabled flags on the alt screen
     // cannot leave them enabled for the shell underneath.

@@ -291,6 +291,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.font_opts = fontOptsFor(self, s);
     pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
+    pane.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
     pane.setGraphicsOffload(self.config.graphics_offload);
     pane.app_view_tab = self.config.app_view == .tab;
     pane.line_pad_px = s.line_pad_px;
@@ -811,6 +812,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
             p.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         }
         p.restartBlinkTimer();
+        p.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
         // Padding.
         if (s.padding != old_s.padding) {
             p.grid_pass.pad = s.padding;

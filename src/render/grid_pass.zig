@@ -191,6 +191,12 @@ const Snapshot = struct {
 
     bell_at_us: i64 = 0,
 
+    /// Hash of the cursor-trail quad + alpha. The quad moves every
+    /// frame while the trail animates, so hashing it is what forces
+    /// the vbuf rebuild; it hashes to 0 when there is no trail, which
+    /// is also what schedules the frame that erases the last one.
+    trail_hash: u64 = 0,
+
     dim_fg: f32 = 1.0,
     dim_bg: f32 = 1.0,
     enable_url_underline: bool = true,
@@ -244,6 +250,13 @@ pub const GridPass = struct {
     /// Minimum WCAG contrast ratio enforced on overlay-row glyph fg
     /// vs the cell's effective bg. <= 1.0 disables.
     min_contrast: f32 = 1.0,
+    /// Cursor-trail quad in framebuffer pixels, TL/TR/BR/BL winding.
+    /// Owned by `Pane`, which re-points it every frame the trail is
+    /// in flight and clears it on the frame it settles. null draws
+    /// nothing — see `render/cursor_trail.zig` for the state machine.
+    trail_quad: ?[4][2]f32 = null,
+    /// Alpha the trail quad is filled at, in the cursor's colour.
+    trail_alpha: f32 = 0.45,
     /// Pane border, in framebuffer pixels. Drawn inside the pane's
     /// own rectangle; an alpha-0 colour draws nothing.
     border_width: f32 = 2.0,
@@ -845,6 +858,19 @@ pub const GridPass = struct {
             }
         }
 
+        // Cursor trail — the stretched quad spanning the four
+        // animated corners, drawn UNDER the cursor so the cursor
+        // itself stays crisp. `Pane` only sets it while the trail is
+        // in flight, and suppresses it in copy mode / on an unfocused
+        // pane; the view_off check mirrors the cursor's own, since a
+        // scrolled-back view doesn't show a cursor to trail from.
+        if (view_off == 0 and screen.cursor_visible) {
+            if (self.trail_quad) |q| {
+                const tc = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
+                try self.pushConvexQuad(q, .{ tc[0], tc[1], tc[2], self.trail_alpha });
+            }
+        }
+
         // Cursor.
         const blinking = switch (screen.cursor_shape) {
             .block_blink, .underline_blink, .bar_blink => true,
@@ -1069,6 +1095,14 @@ pub const GridPass = struct {
         if (screen.preedit_text) |t| {
             s.preedit_hash = std.hash.Wyhash.hash(0, t);
             s.preedit_len = t.len;
+        }
+        if (self.trail_quad) |q| {
+            // `| 1` keeps a live trail from ever hashing to the 0
+            // that means "no trail".
+            s.trail_hash = std.hash.Wyhash.hash(
+                @as(u64, @bitCast(@as(f64, self.trail_alpha))),
+                std.mem.asBytes(&q),
+            ) | 1;
         }
         if (screen.copy_cursor) |cc| {
             s.copy_cursor_on = true;
@@ -1366,6 +1400,24 @@ pub const GridPass = struct {
             .{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
             .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
         };
+        try self.vbuf.appendSlice(self.allocator, &verts);
+    }
+
+    /// Solid fill of an arbitrary convex quad given as TL, TR, BR, BL
+    /// — a triangle fan from the first point. Unlike `pushQuad` the
+    /// corners need not form an axis-aligned rectangle, which is the
+    /// whole point of the cursor trail.
+    fn pushConvexQuad(self: *GridPass, pts: [4][2]f32, color: [4]f32) !void {
+        const order = [_]usize{ 0, 1, 2, 0, 2, 3 };
+        var verts: [6]Vertex = undefined;
+        for (order, 0..) |src, i| {
+            verts[i] = .{
+                .pos = pts[src],
+                .uv = .{ 0, 0, 0 },
+                .color = color,
+                .is_glyph = 0.0,
+            };
+        }
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
 

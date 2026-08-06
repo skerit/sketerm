@@ -16,6 +16,7 @@ const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ShaderSource = @import("../render/shader_pass.zig").Source;
 const ShaderParamKV = @import("../render/shader_pass.zig").ParamKV;
+const CursorTrail = @import("../render/cursor_trail.zig").Trail;
 const gl_mod = @import("../render/gl.zig");
 const scrollbar = @import("../render/scrollbar.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
@@ -201,6 +202,28 @@ pub const Pane = struct {
     /// GLib timeout id driving the 200 ms bell-flash fade (0 = not
     /// running). One-shot burst per bell.
     bell_timer: c_uint = 0,
+    /// Cursor-trail animation state (see render/cursor_trail.zig).
+    /// GUI-side only: nothing about it reaches Screen or the daemon.
+    cursor_trail: CursorTrail = .{},
+    /// Config: whether the trail runs at all.
+    cursor_trail_on: bool = false,
+    /// GLib timeout id driving the trail at ~60 fps (0 = not
+    /// running). Like the bell fade this is a short self-terminating
+    /// burst on a timeout, NOT the frame-clock tick — see `tick_id`.
+    /// It stops itself the frame the trail settles, after one last
+    /// render that erases it.
+    trail_timer: c_uint = 0,
+    /// Monotonic microseconds at the previous trail integration, for
+    /// the variable dt the springs want. 0 = no previous frame.
+    trail_last_us: i64 = 0,
+    /// `screen.viewport_epoch` as of the last trail update; a change
+    /// means the grid was replaced under the cursor (clear, alt
+    /// screen, resize, reattach) and the trail teleports.
+    trail_epoch: u32 = 0,
+    /// Whether the trail was allowed to draw on the previous frame.
+    /// Regaining eligibility teleports rather than smearing from
+    /// wherever the cursor was when it went away.
+    trail_eligible: bool = false,
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
@@ -914,6 +937,7 @@ pub const Pane = struct {
         // (The frame-clock tick is widget-owned and dies with the
         // GtkGLArea; these g_timeout sources are not.)
         self.stopBlinkTimer();
+        self.stopTrailTimer();
         if (self.bell_timer != 0) {
             _ = c.g_source_remove(self.bell_timer);
             self.bell_timer = 0;
@@ -1487,6 +1511,119 @@ pub const Pane = struct {
         self.ensureBlinkTimer();
     }
 
+    /// Whether the cursor trail may draw at all right now.
+    ///
+    /// Suppressed on an unfocused pane (its cursor is a hollow
+    /// outline; a moving smear there advertises the wrong pane),
+    /// while scrolled back or in copy mode (the overlay pass hides
+    /// the live cursor in the first case and draws a separate amber
+    /// one in the second), and while DECSET 25 has the cursor
+    /// hidden.
+    fn trailEligible(self: *Pane) bool {
+        if (!self.cursor_trail_on) return false;
+        if (!self.is_focused) return false;
+        const screen = self.terminal.screen;
+        if (!screen.cursor_visible) return false;
+        if (screen.view_offset != 0) return false;
+        if (screen.copy_cursor != null) return false;
+        return true;
+    }
+
+    /// Retarget and integrate the cursor trail, and publish (or
+    /// clear) the quad the overlay pass draws.
+    ///
+    /// Runs from `onRender`, which is the right hook because every
+    /// cursor move already causes a render — that render starts the
+    /// animation, and `trail_timer` supplies the frames after it
+    /// until the trail settles. The frame it settles publishes a
+    /// null quad, which is what erases the last one, and drops the
+    /// timer in the same call: no timer and no tick survive an idle
+    /// cursor.
+    fn updateCursorTrail(self: *Pane) void {
+        const gp = &self.grid_pass;
+        const atlas = self.atlas;
+        if (!self.trailEligible() or atlas == null) {
+            gp.trail_quad = null;
+            if (self.trail_eligible) self.cursor_trail.snap();
+            self.trail_eligible = false;
+            self.stopTrailTimer();
+            return;
+        }
+
+        const screen = self.terminal.screen;
+        const cw: f32 = @floatFromInt(atlas.?.cell_w);
+        const ch: f32 = @floatFromInt(atlas.?.cell_h);
+
+        // Teleport instead of animating when the trail has just
+        // become eligible again, or when the grid was replaced under
+        // the cursor (full erase, alternate-screen swap, resize,
+        // reattach snapshot) — dragging a diagonal across a viewport
+        // whose content changed wholesale is smear, not motion.
+        if (!self.trail_eligible or screen.viewport_epoch != self.trail_epoch) {
+            self.cursor_trail.snap();
+            self.trail_last_us = 0;
+        }
+        self.trail_eligible = true;
+        self.trail_epoch = screen.viewport_epoch;
+
+        // KNOWN LIMITATIONS, both deliberate:
+        //  - logical column, not the bidi-resolved visual one the
+        //    cursor quad itself uses, so on an RTL row the trail
+        //    lands beside the cursor rather than under it. Resolving
+        //    bidi here means a second reorder pass per frame for a
+        //    decoration.
+        //  - one cell wide even when the cursor sits on a
+        //    double-width cell (the cursor quad doubles there). The
+        //    trail is a motion cue, not a cursor.
+        const x = gp.pad + @as(f32, @floatFromInt(screen.col)) * cw;
+        const y = gp.pad + @as(f32, @floatFromInt(screen.row)) * ch;
+        self.cursor_trail.setDestination(x, y, cw, ch);
+
+        const now = @import("../util/profile.zig").microTimestamp();
+        const dt: f32 = if (self.trail_last_us == 0)
+            0
+        else
+            @as(f32, @floatFromInt(now - self.trail_last_us)) / 1e6;
+        self.trail_last_us = now;
+
+        if (self.cursor_trail.advance(dt, cw, ch)) {
+            gp.trail_quad = self.cursor_trail.quad();
+            self.ensureTrailTimer();
+        } else {
+            gp.trail_quad = null;
+            self.stopTrailTimer();
+        }
+    }
+
+    /// Arm the ~60 fps trail timer. Like the bell fade this is a
+    /// GLib timeout and NOT the frame-clock tick: it asks one pane
+    /// for one frame at a time, so a sibling pane whose cursor is
+    /// still never repaints. See the `tick_id` field doc.
+    fn ensureTrailTimer(self: *Pane) void {
+        if (self.trail_timer != 0) return;
+        self.trail_timer = c.g_timeout_add(16, @ptrCast(&onTrailTimer), @ptrCast(self));
+    }
+
+    pub fn stopTrailTimer(self: *Pane) void {
+        if (self.trail_timer != 0) {
+            _ = c.g_source_remove(self.trail_timer);
+            self.trail_timer = 0;
+        }
+        self.trail_last_us = 0;
+    }
+
+    /// Config change — enable/disable and re-time the trail.
+    pub fn applyTrailConfig(self: *Pane, enabled: bool, duration_ms: u32) void {
+        self.cursor_trail_on = enabled;
+        self.cursor_trail.setDuration(@as(f32, @floatFromInt(duration_ms)) / 1000.0);
+        if (!enabled) {
+            self.stopTrailTimer();
+            self.cursor_trail.snap();
+            self.trail_eligible = false;
+            self.grid_pass.trail_quad = null;
+        }
+    }
+
     /// Toggle the GtkGraphicsOffload fast path (config
     /// `graphics_offload`). DISABLED falls back to normal GSK
     /// compositing — no Wayland subsurfaces, no dmabuf scanout.
@@ -2017,6 +2154,10 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     const t_cell_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.cell_pass.draw(atlas, phys_w, phys_h);
     if (profile.enabled) profile.record(.cell_draw, @intCast(profile.nanoTimestamp() - t_cell_draw));
+    // Cursor trail: retarget + integrate before the overlay pass
+    // builds its vertices, since the quad it publishes is one of
+    // that pass's inputs (and part of its snapshot hash).
+    self.updateCursorTrail();
     // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
     // border, scrollback indicator, preedit, bell, and any rows that
     // need bidi reorder or DH/DW per-line scaling.
@@ -2809,6 +2950,26 @@ fn onBellTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
         self.bell_timer = 0;
         return 0; // G_SOURCE_REMOVE (that render clears the flash)
     }
+    return 1; // G_SOURCE_CONTINUE
+}
+
+/// Cursor-trail timeout body — asks for the next frame while the
+/// trail is in flight. The integration itself lives in `onRender`
+/// (`updateCursorTrail`), which stops this timer the frame the trail
+/// settles, so this callback never has to decide when to quit; it
+/// only bails when the pane stops being drawn at all, since an
+/// unmapped GLArea would swallow every queued render and leave the
+/// timer spinning against a pane nobody sees.
+fn onTrailTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Pane, user);
+    if (c.gtk_widget_get_mapped(@ptrCast(self.area)) == 0) {
+        self.cursor_trail.snap();
+        self.grid_pass.trail_quad = null;
+        self.trail_timer = 0;
+        self.trail_last_us = 0;
+        return 0; // G_SOURCE_REMOVE
+    }
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
     return 1; // G_SOURCE_CONTINUE
 }
 
