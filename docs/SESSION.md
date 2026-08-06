@@ -14604,3 +14604,12 @@ binary; the `zig build test` wrapper trips a pre-existing tesseract
 leak flake on this host, also on clean master), `smoke-e2e`,
 `mux-portable` (+ aarch64-macos cross) green; `ldd sketerm-mux`
 still libc/libm only.
+
+Files surfaces it: a `.cast` entry's context menu grew "Play in
+Sketerm" next to the Viewer/Editor items (`paths.isCastName`,
+`menu.onMenuCastPlay`, `open.launchCastPlayer`), spawning `sketerm
+play <host-qualified spec>` as its own process - the sibling
+`sketerm` binary, never our own exe, because a `sketerm-files`
+argv[0] would parse `play` as a files spec. Double-click is
+unchanged: activation has no internal-viewer routing (not even for
+images), so a cast still opens in the system default handler.
