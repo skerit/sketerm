@@ -14613,3 +14613,76 @@ play <host-qualified spec>` as its own process - the sibling
 argv[0] would parse `play` as a files spec. Double-click is
 unchanged: activation has no internal-viewer routing (not even for
 images), so a cast still opens in the system default handler.
+
+## Cast playback inside the Sketerm Viewer
+
+Opening a `.cast` file with the Viewer (`sketerm view x.cast`,
+`sketerm-viewer x.cast`, viewer batches, the file picker's new
+"Recordings" filter) now plays it in place, with batch navigation
+intact. First step of the planned "Viewer = shell + content
+controllers" split.
+
+The playback core moved out of `castview.zig` into a shared
+component, `src/ui/castbox.zig` (`CastPlayerBox`): the Terminal
+(initRemote, passive sink policy), the fixed_grid TerminalSurface,
+the transport bar (play/pause, restart, seek slider with markers,
+speed dropdown), all play_state/seek-throttle/seek-guard logic, and
+the ephemeral-session lifecycle (connect -> cast_playback capability
+check -> spawn(cast_path) -> attach; destroy() kills the session).
+`CastView` is now a thin window shell: window + title + the
+standalone key bindings, zero transport or sink code of its own. The
+box exposes `surfaceWidget()` and `barWidget()` separately rather
+than one container so castview keeps the bar as a real Adw bottom
+bar (pixel-identical window) while the viewer stacks both in its
+content area. Hosts hand the box `on_title`/`on_state` callbacks;
+transport-bar signal handlers carry the raw box pointer with no
+destroy-notify, valid because both hosts guarantee the widgets die
+before `destroy()` runs (single teardown choke point).
+
+ViewerWindow grew a content boundary: `Content = union(enum) {
+image, cast: *CastPlayerBox }`. `.image` is the window-owned
+canvas/loader pipeline, which persists for the window's whole life
+exactly as before (zero behavior change; the payload-less tag is
+deliberate - moving the persistent canvas/LoadTarget pipeline into a
+per-item struct would have meant rebuilding it on every navigation).
+`.cast` is a per-item controller. `showCurrent` routes by
+`paths.isCastName` (landed by the Files work) BEFORE any image load
+starts, and cancels the image LoadTarget when showing a cast so a
+stale preview can't deliver into cast mode. Image-only header
+controls (zoom cluster, fit/fill/actual, rotate, animation
+play/pause, the hamburger) hide via visibility toggles; the status
+line shows recording title + position/duration where images show
+dimensions. Navigation teardown is synchronous and complete:
+severLive (timers + sinks fenced), widgets removed from the slot
+(their last ref), destroy() (session killed), then the image chrome
+returns. Window close severs on `destroy` and frees at finalize,
+castview-style.
+
+Keyboard policy (documented divergence): in the VIEWER, Left/Right
+stay batch navigation ALWAYS - mixed image+cast batches need
+consistent arrows - so cast seeking is `,`/`.` (5s) and `<`/`>`
+(30s), Space = play/pause (it was animation-only before, and casts
+never have an animated image loaded), R = RESTART the recording
+(images keep R = reload). The STANDALONE `sketerm play` window keeps
+its original bindings, arrows = seek 5s/30s. Remote casts ride the
+same `host:/path` spec plumbing as `sketerm play host:/path`
+(`mux_cli.muxConnect` inside the box).
+
+Registration: `data/dev.sker.sketerm.viewer.desktop` gained
+`application/x-asciicast` and a widened Comment/Keywords; the batch
+collector needed nothing (it is extension-agnostic). Files' "Open in
+Sketerm Viewer" menu exposure for casts was left alone (browser
+files off-limits this run) - follow-up if wanted.
+
+smoke-e2e grew `viewerCastStage`: `sketerm view <png> <cast>` into
+the display session, Right -> red+green blocks render in place, a
+read-only side attachment cross-checks Space pause/resume, Left ->
+the frame clears AND the ephemeral session vanishes from the daemon
+list (the no-leak invariant), Right again -> a fresh session
+renders, then a WM window close -> clean exit and the second
+session dies too. Exact-PID cleanup only.
+
+Verification: `zig build`, `zig build test` (tesseract flake noise
+unchanged, exit 0), `test-core`, `smoke-e2e` (viewer + cast +
+viewer-cast stages green), `mux-portable` + `ldd sketerm-mux` still
+libc/libm only (no daemon changes).
