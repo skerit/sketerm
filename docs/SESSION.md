@@ -14941,3 +14941,87 @@ Verification: `zig build`, `zig build test`, `test-core` and
 `mux-portable` all green on the merged tree. Each UI change was proven
 in a headless sketerm display session with screenshots rather than by
 compiling only.
+
+## 2026-08-07: animated sidebar previews, short-clip posters, a cast toggle race
+
+Follow-on wave to the papercut round above, plus two bugs the first
+wave's verification turned up.
+
+Animated GIFs autoplay in the file browser's information panel. An
+animated-capable LOCAL entry under an 8 MiB source cap now fetches its
+ORIGINAL bytes through chunked ranged reads instead of the daemon's
+512px still, decodes every frame on the existing thumb worker, and
+loops forever in the preview stage, which already auto-sizes to the
+image's aspect ratio. Over the cap, an entry whose decode fails, a
+video, or anything reached by a user previewer rule keeps today's
+still. No transport controls: the sidebar is an ambient preview and
+scrubbing is the Viewer's job.
+
+Two consequences were load-bearing. Animated results are never cached,
+because one animation outweighs the whole 12-entry texture cache, so
+the preloader must skip exactly the entries that would animate or a
+warmed still would shadow the animation forever after; both call sites
+share one predicate rather than restating the condition. And the
+sidebar `Session` had never held more than one frame, so `scheduleNext`
+always returned early and NO animation timer had ever existed there.
+Introducing one made stopping it a teardown obligation that nothing
+satisfied: hiding the panel left it ticking, and the destroy fences set
+`widgets_dead` without stopping it, so a tick could publish into a dead
+`GtkPicture`. `severPreviewAnimation` now detaches the canvas before
+clearing (so the stop publishes to nobody) and runs from both fences
+and from panel-hide.
+
+The animation is local-only, and that is the remote preview contract
+rather than a size worry: a remote entry fetches bounded codec bytes
+that persist in `remote-thumbs/`, so revisiting it costs no traffic at
+all, while an animation pulls the whole original and is deliberately
+uncached, so every re-selection would re-pull it over the link. A
+remote GIF still animates in the Viewer, one click away, where the user
+has asked for it.
+
+Videos shorter than the poster seek now produce a poster. `ffmpeg -ss 1`
+does not fail on a 0.5s clip: it exits 0 and writes no file at all, so
+the daemon reported success for a path that did not exist and the user
+got "cannot install thumbnail cache entry" from the install step much
+further downstream, which is why this was hard to attribute from the
+GUI. Exactly-1.0s clips were broken too, the seek landing at or past
+the last frame's PTS. `videoPosterPng` retries once without the seek
+when the output is missing or empty, which beats an ffprobe duration
+clamp because the thumbnail tier runs no probe today and a clamp would
+add a subprocess to every video on every scroll. Normal-length clips
+keep byte-identical argv, verified by sha256 across the x-large PNG and
+both wire-thumb tiers. `generateThumbPng` now also verifies its output
+has bytes before claiming success, as its docblock always promised.
+
+A cast play/pause toggle followed the daemon's last CONFIRMED state, so
+two quick presses could both send pause. Instrumenting the long-standing
+smoke-e2e failure showed the second Space reaching the key handler 65
+microseconds BEFORE the GUI read the first press's `play_state` frame
+off the socket; the toggle recomputed from the stale "playing" and sent
+pause again, the daemon folded the redundant pause into a no-op and
+re-broadcast "paused", and no resume ever came. This was a real user-
+reachable defect, not a rig artifact, and the standalone player has the
+same shape and passed only on scheduling luck. `CastPlayerBox` now
+remembers the kind its last command ASKED for and toggles against that
+until the daemon confirms it, with a 2s backstop for commands the
+daemon folds into something else (a pause mid-seek broadcasts
+"seeking").
+
+That unblocked the quick-look stage, which then failed for an unrelated
+rig reason: the driver's window-gone wait counted 200 per ITERATION
+rather than by wall clock, and because the daemon withholds app frames
+while a busy native stream drains, `pumpOnce` returned instantly and a
+nominal 10s wait burned in about 1s, right when the pending resync had
+not yet landed. `waitWindowGone` uses a wall-clock deadline plus
+`drainLive`, which pumps to the live head including a pending resync.
+
+Verification: `zig build`, `zig build test`, `test-core` and
+`mux-portable` green on the merged tree, `ldd sketerm-mux` still libc
+and libm only, and `zig build smoke-e2e` PASS twice back to back from a
+verified-clean process table, reaching both previously blocked stages.
+GIF motion was proven by a burst capture reading frames 0-5 in order
+with every frame differing from the last, and the over-cap GIF proven
+static by a change-watch that timed out. One intermittent remains,
+unreproduced in six of seven runs: `viewerCastStage` once failed to OCR
+restored text after navigating back; the OCR timeout path now dumps the
+screen and the recognized text for next time.
