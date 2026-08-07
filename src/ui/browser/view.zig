@@ -780,6 +780,7 @@ pub const BrowserView = struct {
     pub const markThumbFailed = @import("preview.zig").markThumbFailed;
     pub const clearThumbCache = @import("preview.zig").clearThumbCache;
     pub const clearPreviewContent = @import("preview.zig").clearPreviewContent;
+    pub const severPreviewAnimation = @import("preview.zig").severPreviewAnimation;
     pub const previewHostDied = @import("preview.zig").previewHostDied;
     pub const abandonPreviewRead = @import("preview.zig").abandonPreviewRead;
     pub const abandonPreload = @import("preview.zig").abandonPreload;
@@ -1018,6 +1019,7 @@ pub const BrowserView = struct {
     fn prepareDestroyCb(ctx: *anyopaque) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
         self.widgets_dead = true;
+        self.severPreviewAnimation();
     }
 
     fn focusCb(ctx: *anyopaque) void {
@@ -1852,6 +1854,7 @@ pub const BrowserView = struct {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         self.widgets_dead = true;
         self.root_destroyed = true;
+        self.severPreviewAnimation();
         if (self.bar_idle_src != 0) {
             _ = c.g_source_remove(self.bar_idle_src);
             self.bar_idle_src = 0;
