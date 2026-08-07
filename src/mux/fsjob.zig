@@ -878,6 +878,28 @@ fn cacheRootDir(buf: []u8) []const u8 {
     return "/tmp";
 }
 
+/// True when `path` is a file with bytes in it.
+fn fileHasBytes(path: [*:0]const u8) bool {
+    var st: c.struct_stat = undefined;
+    if (c.stat(path, &st) != 0) return false;
+    return st.st_size > 0;
+}
+
+/// Grab a video's poster frame into `raw`, one second in.
+///
+/// ffmpeg exits 0 when a seek lands past the end of a short clip and
+/// writes no output file at all, so success is decided by the OUTPUT,
+/// not by the exit status; a missing frame retries from the start.
+/// Retrying is cheaper than clamping the seek to a probed duration:
+/// it costs a second ffmpeg only for the rare sub-second clip, where
+/// a clamp would cost an ffprobe on every single video preview.
+fn videoPosterPng(source: [:0]const u8, raw: [:0]const u8, vf: [:0]const u8) bool {
+    const seek = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+    if (runArgv(&seek) and fileHasBytes(raw.ptr)) return true;
+    const start = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+    return runArgv(&start) and fileHasBytes(raw.ptr);
+}
+
 /// Generate a raw (uninstalled) thumbnail PNG for `src_path` at
 /// `raw`, bounded to `bound` px. @return false when no generator on
 /// this host could produce it.
@@ -917,14 +939,16 @@ fn generateThumbPng(allocator: std.mem.Allocator, src_path: []const u8, source: 
         else
             std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x{d}", .{ bound, bound }) catch return false;
         if (extIs(src_path, &video_exts)) {
-            const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
-            generated = runArgv(&argv);
+            generated = videoPosterPng(source, raw, vf);
         } else {
             const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-filter_complex", vf.ptr, "-frames:v", "1", raw.ptr, null };
             generated = runArgv(&argv);
         }
     }
-    return generated;
+    // Every generator above writes `raw`; a zero exit that produced no
+    // file is a failure, and reporting it as success hands the caller a
+    // path it cannot read.
+    return generated and fileHasBytes(raw.ptr);
 }
 
 /// Encode a host-local image into the receiver's best NON-PNG codec.
@@ -5397,6 +5421,42 @@ test "transportPreview serves PNG when jxl/webp cannot, refuses without any acce
     // A receiver accepting nothing usable gets a refusal, not a PNG.
     var out2: [4096:0]u8 = undefined;
     try t.expect(transportPreview(t.allocator, src, "", 512, &out2) == null);
+}
+
+test "fileHasBytes: absent and empty both read as no output" {
+    const t = std.testing;
+    var z: [128:0]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&z, "/tmp/.sketerm-test-fhb-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.unlink(p.ptr);
+    try t.expect(!fileHasBytes(p.ptr));
+    const fd = c.open(p.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    try t.expect(fd >= 0);
+    defer _ = c.unlink(p.ptr);
+    try t.expect(!fileHasBytes(p.ptr));
+    try t.expect(c.write(fd, "x", 1) == 1);
+    _ = c.close(fd);
+    try t.expect(fileHasBytes(p.ptr));
+}
+
+test "video poster: a clip shorter than the 1s seek still yields a frame" {
+    const t = std.testing;
+    if (!binaryExists("ffmpeg")) return;
+    var src_z: [128:0]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-poster-{d}.mp4", .{c.getpid()}) catch unreachable;
+    defer _ = c.unlink(src.ptr);
+    const make = [_:null]?[*:0]const u8{
+        "ffmpeg", "-y",                                          "-v", "error", "-f", "lavfi",
+        "-i",     "testsrc=duration=0.5:size=64x48:rate=30", src,  null,
+    };
+    // No lavfi/x264 on this host: nothing to assert about.
+    if (!runArgv(&make) or !fileHasBytes(src.ptr)) return;
+    var raw_z: [128:0]u8 = undefined;
+    const raw = std.fmt.bufPrintZ(&raw_z, "/tmp/.sketerm-test-poster-{d}.png", .{c.getpid()}) catch unreachable;
+    defer _ = c.unlink(raw.ptr);
+    var vf_z: [64:0]u8 = undefined;
+    const vf = std.fmt.bufPrintZ(&vf_z, "scale=128:128:force_original_aspect_ratio=decrease", .{}) catch unreachable;
+    try t.expect(videoPosterPng(src, raw, vf));
+    try t.expect(fileHasBytes(raw.ptr));
 }
 
 test "archive member validation rejects traversal and absolute paths" {
