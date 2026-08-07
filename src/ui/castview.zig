@@ -43,7 +43,7 @@ pub const CastView = struct {
             .on_title = &onBoxTitle,
         });
         self.box = box;
-        c.gtk_widget_set_tooltip_text(box.scale, "Seek (Left/Right: 5s, Shift: 30s)");
+        c.gtk_widget_set_tooltip_text(box.playbar.scale, "Seek (Left/Right: 5s, Shift: 30s)");
 
         const toolbar = c.adw_toolbar_view_new().?;
         const header = c.adw_header_bar_new().?;

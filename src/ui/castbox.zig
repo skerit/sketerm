@@ -14,11 +14,8 @@
 //! contract, in order: `severLive()` (fences every timer and sink),
 //! then let the widgets die (window destroy, or explicit removal from
 //! their containers), then `destroy()` — which kills the ephemeral
-//! session and frees the struct. The transport-bar signal handlers
-//! carry a raw *CastPlayerBox with no destroy-notify; that is safe
-//! because both hosts guarantee the widgets are gone before destroy()
-//! runs (mechanism 2 of the signal-lifetime rules: a single teardown
-//! choke point).
+//! session and frees the struct. The bar chrome is the shared
+//! `Playbar` widget (`playbar.zig`), which follows the same contract.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -30,13 +27,11 @@ const Terminal = @import("../terminal.zig").Terminal;
 const TerminalSurface = @import("terminal_surface.zig").TerminalSurface;
 const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
+const Playbar = @import("playbar.zig").Playbar;
 
 /// Session-name counter (names are `cast<pid>-<n>`, JSON-safe).
 var next_cast_id: u32 = 1;
 
-/// Playback speeds offered by the dropdown; index 2 = 1x default.
-const SPEEDS = [_]f64{ 0.25, 0.5, 1.0, 1.5, 2.0, 4.0 };
-const SPEED_LABELS = [_:null]?[*:0]const u8{ "0.25x", "0.5x", "1x", "1.5x", "2x", "4x", null };
 /// Minimum gap between seek frames while the slider is dragged — every
 /// seek is a full daemon-side replay, so a drag must not stream one
 /// per pixel.
@@ -63,21 +58,9 @@ pub const CastPlayerBox = struct {
     config: Config,
     callbacks: Callbacks,
 
-    play_button: *c.GtkWidget,
-    bar: *c.GtkWidget,
-    scale: *c.GtkWidget,
-    position_label: *c.GtkLabel,
-    speed_drop: *c.GtkWidget,
+    /// Shared transport-bar chrome; owns the throttle/guard machinery.
+    playbar: *Playbar,
 
-    /// Latest daemon-reported duration (0 = unknown, seek disabled).
-    duration_ms: u64 = 0,
-    /// Markers currently drawn on the scale (re-drawn on count change).
-    marker_count: usize = 0,
-    /// Monotonic µs of the last user slider interaction.
-    user_seek_us: i64 = 0,
-    /// Slider seek throttle: latest target, sent by `seek_timer`.
-    pending_seek: ?u64 = null,
-    seek_timer: c_uint = 0,
     /// True once severLive ran; makes it idempotent.
     severed: bool = false,
 
@@ -127,31 +110,21 @@ pub const CastPlayerBox = struct {
         const self = try allocator.create(CastPlayerBox);
         errdefer allocator.destroy(self);
 
-        // Transport bar.
-        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
-        c.gtk_widget_set_margin_start(bar, 10);
-        c.gtk_widget_set_margin_end(bar, 10);
-        c.gtk_widget_set_margin_top(bar, 6);
-        c.gtk_widget_set_margin_bottom(bar, 8);
-        const play_button = c.gtk_button_new_from_icon_name("media-playback-pause-symbolic").?;
-        c.gtk_widget_set_tooltip_text(play_button, "Play / Pause (Space)");
-        const restart_button = c.gtk_button_new_from_icon_name("media-skip-backward-symbolic").?;
-        c.gtk_widget_set_tooltip_text(restart_button, "Restart (R)");
-        const position_label = c.gtk_label_new("0:00 / --:--").?;
-        c.gtk_widget_add_css_class(position_label, "numeric");
-        const scale = c.gtk_scale_new_with_range(c.GTK_ORIENTATION_HORIZONTAL, 0, 1, 100).?;
-        c.gtk_scale_set_draw_value(@ptrCast(scale), 0);
-        c.gtk_widget_set_hexpand(scale, 1);
-        c.gtk_widget_set_sensitive(scale, 0); // until duration_ms is known
-        c.gtk_widget_set_tooltip_text(scale, "Seek");
-        const speed_drop = c.gtk_drop_down_new_from_strings(@ptrCast(@constCast(&SPEED_LABELS))).?;
-        c.gtk_drop_down_set_selected(@ptrCast(speed_drop), 2); // 1x
-        c.gtk_widget_set_tooltip_text(speed_drop, "Playback speed");
-        c.gtk_box_append(@ptrCast(bar), play_button);
-        c.gtk_box_append(@ptrCast(bar), restart_button);
-        c.gtk_box_append(@ptrCast(bar), scale);
-        c.gtk_box_append(@ptrCast(bar), @ptrCast(@alignCast(position_label)));
-        c.gtk_box_append(@ptrCast(bar), speed_drop);
+        // Transport bar: the shared Playbar with the cast policy —
+        // seeks are daemon replays, so throttle + guard are on.
+        const playbar = try Playbar.create(allocator, .{
+            .ctx = @ptrCast(self),
+            .toggle = &srcToggle,
+            .restart = &srcRestart,
+            .seek_to_ms = &srcSeekToMs,
+            .set_speed = &srcSetSpeed,
+        }, .{
+            .restart_button = true,
+            .speed_dropdown = true,
+            .seek_throttle_ms = SEEK_THROTTLE_MS,
+            .seek_guard_us = SEEK_GUARD_US,
+        });
+        errdefer playbar.destroy();
 
         self.* = .{
             .allocator = allocator,
@@ -159,11 +132,7 @@ pub const CastPlayerBox = struct {
             .surface = undefined,
             .config = Config.load(allocator),
             .callbacks = callbacks,
-            .play_button = play_button,
-            .bar = bar,
-            .scale = scale,
-            .position_label = @ptrCast(@alignCast(position_label)),
-            .speed_drop = speed_drop,
+            .playbar = playbar,
         };
         TerminalSurface.initInPlace(&self.surface, allocator, terminal);
         self.surface.geometry = .{ .fixed_grid = .{
@@ -200,13 +169,6 @@ pub const CastPlayerBox = struct {
         // Snapshot-restored image placements (a cast that finished
         // before we attached) replay into the freshly wired sink.
         terminal.replayRetainedImages();
-
-        _ = c.g_signal_connect_data(play_button, "clicked", @ptrCast(&onPlayClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(restart_button, "clicked", @ptrCast(&onRestartClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        // change-value fires on USER interaction only (set_value does
-        // not emit it), so no feedback-loop guard is needed here.
-        _ = c.g_signal_connect_data(scale, "change-value", @ptrCast(&onScaleChangeValue), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(speed_drop, "notify::selected", @ptrCast(&onSpeedChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         return self;
     }
 
@@ -225,7 +187,7 @@ pub const CastPlayerBox = struct {
 
     /// The transport bar (play/restart/seek/position/speed).
     pub fn barWidget(self: *CastPlayerBox) *c.GtkWidget {
-        return self.bar;
+        return self.playbar.widget();
     }
 
     /// Fence everything that can fire into widgets or this struct
@@ -233,10 +195,7 @@ pub const CastPlayerBox = struct {
     pub fn severLive(self: *CastPlayerBox) void {
         if (self.severed) return;
         self.severed = true;
-        if (self.seek_timer != 0) {
-            _ = c.g_source_remove(self.seek_timer);
-            self.seek_timer = 0;
-        }
+        self.playbar.sever();
         self.surface.stopVisualSources();
         self.terminal.clearSinks();
     }
@@ -245,6 +204,7 @@ pub const CastPlayerBox = struct {
     /// sends the kill). The widgets must already be dead.
     pub fn destroy(self: *CastPlayerBox) void {
         self.severLive();
+        self.playbar.destroy();
         self.surface.deinit();
         self.terminal.deinit();
         self.config.deinit();
@@ -294,62 +254,30 @@ pub const CastPlayerBox = struct {
 
     fn onPlayState(ctx: ?*anyopaque, st: Terminal.PlayState) void {
         const self = cast.userData(CastPlayerBox, ctx);
-        const playing = st.kind == .playing or st.kind == .seeking;
-        c.gtk_button_set_icon_name(
-            @ptrCast(self.play_button),
-            if (playing) "media-playback-pause-symbolic" else "media-playback-start-symbolic",
-        );
 
-        if (st.duration_ms) |d| {
-            const dur = @max(d, 1);
-            if (self.duration_ms != dur) {
-                self.duration_ms = dur;
-                c.gtk_range_set_range(@ptrCast(self.scale), 0, @floatFromInt(dur));
-                c.gtk_widget_set_sensitive(self.scale, 1);
-                self.redrawMarkers(st.markers);
-            }
-        }
-        if (st.markers.len != self.marker_count) self.redrawMarkers(st.markers);
-
-        // Keep the thumb off the user's fingers: right after a user
-        // seek, a THROTTLED position push (kind .playing) may still
-        // carry the pre-seek position — skip only those. Event-driven
-        // pushes (seeking/paused/finished — seek completions included)
-        // always carry the fresh position and must land, or the thumb
-        // sticks wherever the user left it.
-        const now = c.g_get_monotonic_time();
-        const guard = st.kind == .playing and now - self.user_seek_us < SEEK_GUARD_US;
-        if (self.duration_ms > 0 and !guard) {
-            c.gtk_range_set_value(@ptrCast(self.scale), @floatFromInt(st.position_ms));
+        // Markers first: a state push that brings duration + markers
+        // together must have the stored set before the bar's
+        // duration-change redraw runs.
+        if (st.markers.len != self.playbar.markerCount()) {
+            if (self.allocator.alloc(u64, st.markers.len)) |ms| {
+                defer self.allocator.free(ms);
+                for (st.markers, ms) |m, *slot| slot.* = m.ms;
+                self.playbar.setMarkers(ms);
+            } else |_| {}
         }
 
-        var buf: [64:0]u8 = undefined;
-        const text = if (st.kind == .seeking)
-            std.fmt.bufPrintZ(&buf, "seeking...", .{}) catch return
-        else if (st.duration_ms) |d|
-            std.fmt.bufPrintZ(&buf, "{d}:{d:0>2} / {d}:{d:0>2}", .{
-                st.position_ms / 60_000, (st.position_ms / 1000) % 60,
-                d / 60_000,              (d / 1000) % 60,
-            }) catch return
-        else
-            std.fmt.bufPrintZ(&buf, "{d}:{d:0>2} / --:--", .{
-                st.position_ms / 60_000, (st.position_ms / 1000) % 60,
-            }) catch return;
-        c.gtk_label_set_text(self.position_label, text.ptr);
+        self.playbar.setState(.{
+            .kind = switch (st.kind) {
+                .playing => .playing,
+                .paused => .paused,
+                .seeking => .seeking,
+                .finished => .finished,
+            },
+            .position_ms = st.position_ms,
+            .duration_ms = st.duration_ms,
+        });
 
         if (self.callbacks.on_state) |cb| cb(self.callbacks.ctx, st);
-    }
-
-    fn redrawMarkers(self: *CastPlayerBox, markers: []const Terminal.PlayState.Marker) void {
-        c.gtk_scale_clear_marks(@ptrCast(self.scale));
-        if (self.duration_ms == 0) {
-            self.marker_count = markers.len;
-            return;
-        }
-        for (markers) |m| {
-            c.gtk_scale_add_mark(@ptrCast(self.scale), @floatFromInt(m.ms), c.GTK_POS_BOTTOM, null);
-        }
-        self.marker_count = markers.len;
     }
 
     // ── transport controls ───────────────────────────────────────
@@ -373,59 +301,31 @@ pub const CastPlayerBox = struct {
         self.terminal.sendPlayControl(.restart, 0, 0);
     }
 
+    /// Keyboard seeks route through the playbar so its guard timestamp
+    /// keeps stale throttled play_state pushes off the thumb.
     pub fn seekRelative(self: *CastPlayerBox, delta_ms: i64) void {
-        const pos: i64 = if (self.terminal.last_play_state) |st| @intCast(st.position_ms) else 0;
-        var target = pos + delta_ms;
-        if (target < 0) target = 0;
-        self.user_seek_us = c.g_get_monotonic_time();
-        self.terminal.sendPlayControl(.seek, @intCast(target), 0);
+        self.playbar.seekRelative(delta_ms);
     }
 
-    fn onPlayClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(CastPlayerBox, user);
+    // ── playbar source vtable ────────────────────────────────────
+
+    fn srcToggle(ctx: ?*anyopaque) void {
+        const self = cast.userData(CastPlayerBox, ctx);
         self.togglePlay();
     }
 
-    fn onRestartClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(CastPlayerBox, user);
+    fn srcRestart(ctx: ?*anyopaque) void {
+        const self = cast.userData(CastPlayerBox, ctx);
         self.restart();
     }
 
-    fn onSpeedChanged(_: *c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(CastPlayerBox, user);
-        const idx = c.gtk_drop_down_get_selected(@ptrCast(self.speed_drop));
-        if (idx >= SPEEDS.len) return;
-        self.terminal.sendPlayControl(.speed, 0, SPEEDS[idx]);
+    fn srcSeekToMs(ctx: ?*anyopaque, target_ms: u64) void {
+        const self = cast.userData(CastPlayerBox, ctx);
+        self.terminal.sendPlayControl(.seek, target_ms, 0);
     }
 
-    /// Slider interaction: throttle to one seek per SEEK_THROTTLE_MS —
-    /// every seek is a full daemon replay from byte zero.
-    fn onScaleChangeValue(_: *c.GtkRange, _: c.GtkScrollType, value: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(CastPlayerBox, user);
-        if (self.duration_ms == 0) return 0;
-        const clamped = std.math.clamp(value, 0, @as(f64, @floatFromInt(self.duration_ms)));
-        self.user_seek_us = c.g_get_monotonic_time();
-        self.pending_seek = @intFromFloat(clamped);
-        if (self.seek_timer == 0) {
-            self.flushSeek();
-            self.seek_timer = c.g_timeout_add(SEEK_THROTTLE_MS, @ptrCast(&onSeekTimer), @ptrCast(self));
-        }
-        return 0; // let the range update visually
-    }
-
-    fn flushSeek(self: *CastPlayerBox) void {
-        const target = self.pending_seek orelse return;
-        self.pending_seek = null;
-        self.terminal.sendPlayControl(.seek, target, 0);
-    }
-
-    fn onSeekTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(CastPlayerBox, user);
-        if (self.pending_seek == null) {
-            self.seek_timer = 0;
-            return 0; // G_SOURCE_REMOVE
-        }
-        self.flushSeek();
-        return 1; // keep throttling while the drag continues
+    fn srcSetSpeed(ctx: ?*anyopaque, speed: f64) void {
+        const self = cast.userData(CastPlayerBox, ctx);
+        self.terminal.sendPlayControl(.speed, 0, speed);
     }
 };
