@@ -680,6 +680,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             } else |_| {}
             cl.queueJson(.welcome, .{
                 .proto = cl.proto,
+                .daemon_pid = c.getpid(),
                 .server_proto = wire.PROTO_VERSION,
                 .min_proto = wire.MIN_SERVER_PROTO,
                 .negotiation = @as(u8, 1),
