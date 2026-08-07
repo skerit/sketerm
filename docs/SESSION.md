@@ -14827,3 +14827,39 @@ wrapper trips on tesseract's atexit leak noise exactly as on clean
 master - re-baselined this session); `smoke-e2e` PASS including all
 pre-existing stages; `mux-portable` green; `ldd sketerm-mux` still
 libc/libm only. Net -548 lines in src/ui/browser.
+
+## 2026-08-07: doctor reports daemon and active MCP process PIDs
+
+`sketerm doctor` now prints the PID of the main daemon beside its
+version. New daemons include `daemon_pid` in additive welcome/list JSON;
+for the upgrade case that motivated this work, a new doctor also reads
+the connected Unix socket's peer PID, so an already-running old daemon
+which cannot know the new field is still identifiable. Linux uses
+SO_PEERCRED and Darwin uses LOCAL_PEERPID in `platform.unixPeerPid`.
+
+Active MCP servers have their own section. Every new `sketerm mcp`
+holds an exclusive flock under `$XDG_RUNTIME_DIR/sketerm/mcp-servers/`
+and atomically publishes its PID, mode, optional name/profile/log label,
+and mux socket. The flock, not `kill(pid, 0)` or a process-name scan, is
+the liveness predicate: normal exit removes the record and SIGKILL
+releases the lock so doctor can discard stale debris. Existing
+pre-registry `mcp-tmp-<pid>` instances are included through the old
+runtime-directory/PID convention and marked `[pre-registry]`, making the
+first doctor run after this upgrade useful without restarting assistants.
+
+Each row distinguishes a lazy MCP whose private mux has not started from
+a running mux, and reports that mux's PID plus live session/app counts.
+Doctor never autostarts an MCP daemon while inspecting it. Shared,
+isolated and durable modes use distinct colors; labels, healthy states,
+notes and warnings are also colored on a TTY. Piped output stays plain,
+and `NO_COLOR` or `TERM=dumb` disables ANSI output.
+
+Coverage: core tests pin flock liveness/stale cleanup, legacy discovery
+and Unix peer credentials; doctor tests pin color policy and plain/color
+row formatting. `smoke-mcp` proves a live server appears before its lazy
+mux starts, then shows the mux PID and session count after `term_open`,
+with no ANSI on captured stdout. `smoke-broker` proves `daemon_pid` is
+the broker PID rather than a worker. Verification: `zig build`,
+`test-core`, `smoke-mcp`, `smoke-broker`, `mux-portable`, and the full
+suite pass; the known tesseract atexit leak noise remains. `ldd` for the
+daemon remains libc/libm only.
