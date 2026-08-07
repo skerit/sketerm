@@ -70,6 +70,7 @@ comptime {
     _ = @import("filebrowser/registers.zig");
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/snapshots.zig");
+    _ = @import("filebrowser/diskusage.zig");
     _ = @import("filebrowser/picker.zig");
     _ = @import("portal.zig");
     _ = @import("filebrowser/viewmem.zig");
@@ -122,6 +123,7 @@ comptime {
     _ = @import("mux/display.zig");
     _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/drmdev.zig");
+    _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");
     _ = @import("mux/fsjournal.zig");
     _ = @import("mux/fsserve.zig");

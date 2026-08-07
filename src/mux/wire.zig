@@ -272,11 +272,13 @@ pub const FrameType = enum(u8) {
     /// Bulk bytes answering an fs_op read: [u32 req][u64 off][data].
     /// A terminating `fs_reply` carries size/eof.
     fs_data = 87,
-    /// Pushed job event (fs_op copy/delete_tree/hash verbs): JSON
+    /// Pushed job event (fs_op copy/delete_tree/hash/disk_usage verbs): JSON
     /// { job, ev:"progress"|"done"|"error", done, total, hash?,
-    /// resumed_from?, message?, state? }. Jobs are daemon-owned and
-    /// survive the requesting client — events flow to the owner while
-    /// it lives; job_list serves any client afterwards.
+    /// resumed_from?, message?, state? }. Durable jobs survive the
+    /// requesting client; events flow to the owner while it lives and
+    /// job_list serves any client afterwards. disk_usage adds
+    /// streaming `usage` records with path/kind/size/allocated/items/
+    /// errors/skipped/mtime_ms and remains ephemeral.
     fs_job = 88,
     /// Controller lease state for the client's session, pushed to
     /// EVERY attached client on every change (attach, release,

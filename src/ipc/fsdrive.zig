@@ -264,6 +264,10 @@ pub const JobEvent = struct {
     text: []const u8 = "",
     kind: []const u8 = "",
     size: u64 = 0,
+    allocated: u64 = 0,
+    items: u64 = 0,
+    errors: u64 = 0,
+    skipped: u64 = 0,
     mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
@@ -461,6 +465,10 @@ pub const Fs = struct {
             text: []const u8 = "",
             kind: []const u8 = "",
             size: u64 = 0,
+            allocated: u64 = 0,
+            items: u64 = 0,
+            errors: u64 = 0,
+            skipped: u64 = 0,
             mtime_ms: i64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
@@ -509,6 +517,10 @@ pub const Fs = struct {
             .text = parsed.text,
             .kind = parsed.kind,
             .size = parsed.size,
+            .allocated = parsed.allocated,
+            .items = parsed.items,
+            .errors = parsed.errors,
+            .skipped = parsed.skipped,
             .mtime_ms = parsed.mtime_ms,
             .matches = parsed.matches,
             .truncated = parsed.truncated,
@@ -1545,6 +1557,15 @@ pub const Fs = struct {
         return self.startJob("dir_size", .{ .path = path });
     }
 
+    /// Iterative host-side usage scan; set `all_filesystems` to cross
+    /// device boundaries instead of emitting skipped mount records.
+    pub fn startDiskUsage(self: *Fs, path: []const u8, all_filesystems: bool) Error!u64 {
+        return self.startJob("disk_usage", .{
+            .path = path,
+            .pattern = if (all_filesystems) "all-filesystems" else "",
+        });
+    }
+
     /// Recursive chmod/chown. mode 0 keeps modes; null uid/gid keep
     /// the current owner/group.
     pub fn startPermTree(self: *Fs, path: []const u8, mode: u32, uid: ?u32, gid: ?u32) Error!u64 {
@@ -1727,3 +1748,27 @@ pub const Fs = struct {
         }
     }
 };
+
+test "disk usage job fields survive the fsdrive event mirror" {
+    const t = std.testing;
+    var fs = Fs{ .allocator = t.allocator, .conn = undefined };
+    defer {
+        for (fs.job_events.items) |*event| event.deinit();
+        fs.job_events.deinit(t.allocator);
+    }
+    fs.stashJobEvent(
+        \\{"job":7,"ev":"usage","path":"/root/file","kind":"file","size":99,"allocated":512,"items":1,"errors":2,"skipped":3,"mtime_ms":456}
+    );
+    try t.expectEqual(@as(usize, 1), fs.job_events.items.len);
+    const event = &fs.job_events.items[0];
+    try t.expectEqual(@as(u64, 7), event.job);
+    try t.expectEqualStrings("usage", event.ev);
+    try t.expectEqualStrings("/root/file", event.path);
+    try t.expectEqualStrings("file", event.kind);
+    try t.expectEqual(@as(u64, 99), event.size);
+    try t.expectEqual(@as(u64, 512), event.allocated);
+    try t.expectEqual(@as(u64, 1), event.items);
+    try t.expectEqual(@as(u64, 2), event.errors);
+    try t.expectEqual(@as(u64, 3), event.skipped);
+    try t.expectEqual(@as(i64, 456), event.mtime_ms);
+}

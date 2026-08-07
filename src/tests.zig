@@ -108,6 +108,7 @@ comptime {
     _ = @import("ui/browser/conflict.zig");
     _ = @import("ui/browser/templates.zig");
     _ = @import("ui/browser/dnd.zig");
+    _ = @import("ui/browser/diskusage.zig");
     _ = @import("ui/file_transfers.zig");
     _ = @import("a11y/view.zig");
     _ = @import("a11y/docview.zig");
@@ -132,6 +133,7 @@ comptime {
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/fsserve.zig");
+    _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");
     _ = @import("mux/mediameta.zig");
     _ = @import("mux/mediameta_test.zig");
@@ -163,6 +165,7 @@ comptime {
     _ = @import("filebrowser/registers.zig");
     _ = @import("filebrowser/query.zig");
     _ = @import("filebrowser/snapshots.zig");
+    _ = @import("filebrowser/diskusage.zig");
     _ = @import("filebrowser/picker.zig");
     _ = @import("portal.zig");
     _ = @import("fsmount.zig");

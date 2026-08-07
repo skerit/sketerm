@@ -1773,7 +1773,7 @@ pub const FsView = struct {
 pub const DebugJob = @import("daemon_debug.zig").DebugJob;
 
 pub const FsJob = struct {
-    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete, git_diff };
+    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete, git_diff, disk_usage };
     pub const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -1797,6 +1797,11 @@ pub const FsJob = struct {
     /// find/grep: total matches streamed + cap-truncation flag.
     matches: u64 = 0,
     truncated: bool = false,
+    /// disk_usage final aggregate fields not shared by transfer jobs.
+    usage_items: u64 = 0,
+    usage_errors: u64 = 0,
+    usage_skipped: u64 = 0,
+    usage_mtime_ms: i64 = 0,
     /// panelize: output lines that named nothing on disk, and the
     /// command's own exit status (-1 = it died on a signal). A nonzero
     /// status is reported, not treated as a failed job.
@@ -1805,7 +1810,7 @@ pub const FsJob = struct {
     /// Entry the helper is working on RIGHT NOW, and how far through
     /// its entry count it is. The helper puts the path on the wire
     /// only when it changes, so this is sticky between updates.
-    cur_file: [512]u8 = undefined,
+    cur_file: [4096]u8 = undefined,
     cur_file_len: usize = 0,
     files_done: u64 = 0,
     files_total: u64 = 0,

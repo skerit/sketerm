@@ -1299,6 +1299,39 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
         if (!size_done) fail("dir_size never completed");
         if (size_bytes == 0 or size_entries < 3) fail("dir_size totals wrong");
 
+        // disk_usage keeps apparent and allocated bytes distinct and
+        // streams navigable details before its authoritative root total.
+        const usage_job = fs.startDiskUsage(sdir, false) catch failErr("start disk_usage", fs.lastErr());
+        var usage_done = false;
+        var usage_root = false;
+        var usage_file = false;
+        var usage_size: u64 = 0;
+        var usage_allocated: u64 = 0;
+        var usage_items: u64 = 0;
+        waited = 0;
+        while (!usage_done and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != usage_job) continue;
+                if (std.mem.eql(u8, e.ev, "usage")) {
+                    if (std.mem.eql(u8, e.path, sdir) and std.mem.eql(u8, e.kind, "dir")) usage_root = true;
+                    if (std.mem.endsWith(u8, e.path, "needle-alpha.txt") and std.mem.eql(u8, e.kind, "file")) usage_file = true;
+                } else if (std.mem.eql(u8, e.ev, "done")) {
+                    usage_size = e.size;
+                    usage_allocated = e.allocated;
+                    usage_items = e.items;
+                    if (!std.mem.eql(u8, e.path, sdir) or !std.mem.eql(u8, e.kind, "dir")) fail("disk_usage root identity");
+                    usage_done = true;
+                } else if (e.terminal()) fail("disk_usage job failed");
+            }
+            if (!usage_done) _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!usage_done) fail("disk_usage never completed");
+        if (!usage_root or !usage_file) fail("disk_usage omitted navigable detail");
+        if (usage_size == 0 or usage_allocated == 0 or usage_items < size_entries) fail("disk_usage totals wrong");
+
         // perm_tree applies recursively and never follows symlinks.
         const perm_job = fs.startPermTree(sdir, 0o700, null, null) catch failErr("start perm_tree", fs.lastErr());
         var perm_done = false;

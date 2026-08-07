@@ -103,6 +103,10 @@ fn onListingRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
 
 pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     if (self.widgets_dead) return;
+    if (tab.usage) |usage| {
+        usage.render();
+        return;
+    }
     // Every full render restamps the throttle window, whoever asked
     // for it — a socket render right after a click render is still a
     // back-to-back rebuild.

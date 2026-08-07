@@ -27,6 +27,7 @@ const thumbs = @import("../filebrowser/thumbs.zig");
 const gitstatus = @import("../filebrowser/gitstatus.zig");
 const gitdiff = @import("../editor/gitdiff.zig");
 const mediameta = @import("mediameta.zig");
+const disk_usage = @import("disk_usage.zig");
 const uniqueName = @import("../filebrowser/paths.zig").uniqueName;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -375,6 +376,8 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runLiveFind(allocator, spec)
     else if (std.mem.eql(u8, spec.op, "dir_size"))
         runDirSize(spec)
+    else if (std.mem.eql(u8, spec.op, "disk_usage"))
+        runDiskUsage(allocator, spec)
     else if (std.mem.eql(u8, spec.op, "perm_tree"))
         runPermTree(spec)
     else if (std.mem.eql(u8, spec.op, "thumbnail"))
@@ -4839,6 +4842,60 @@ fn runDirSize(spec: Spec) u8 {
         entries = 1;
     }
     emit(.{ .ev = "done", .done = bytes, .total = entries });
+    return 0;
+}
+
+fn emitDiskUsageEvent(_: ?*anyopaque, event: disk_usage.Event) void {
+    switch (event) {
+        .usage => |usage| emit(.{
+            .ev = "usage",
+            .path = usage.path,
+            .kind = @tagName(usage.kind),
+            .size = usage.size,
+            .allocated = usage.allocated,
+            .items = usage.items,
+            .errors = usage.errors,
+            .skipped = usage.skipped,
+            .mtime_ms = usage.mtime_ms,
+        }),
+        .progress => |progress| emit(.{
+            .ev = "progress",
+            .done = progress.done,
+            .total = progress.total,
+            .files_done = progress.files_done,
+            .file = progress.file,
+        }),
+    }
+}
+
+fn runDiskUsage(allocator: std.mem.Allocator, spec: Spec) u8 {
+    const result = disk_usage.scan(
+        allocator,
+        spec.src,
+        std.mem.eql(u8, spec.pattern, "all-filesystems"),
+        .{ .on_event = emitDiskUsageEvent },
+    ) catch |err| return switch (err) {
+        error.InvalidRoot => emitError("path must be an absolute directory"),
+        error.RootNotDirectory => emitError("disk usage root is not a directory"),
+        error.RootStatFailed => emitErrno("stat"),
+        error.RootOpenFailed => emitErrno("open"),
+        error.OutOfMemory => emitError("disk usage scanner out of memory"),
+    };
+    emit(.{
+        .ev = "done",
+        .path = spec.src,
+        .kind = "dir",
+        .done = result.totals.size,
+        .total = result.totals.allocated,
+        .size = result.totals.size,
+        .allocated = result.totals.allocated,
+        .items = result.totals.items,
+        .errors = result.totals.errors,
+        .skipped = result.totals.skipped,
+        .mtime_ms = result.mtime_ms,
+        .files_done = result.totals.items,
+        .truncated = result.truncated,
+    });
     return 0;
 }
 
