@@ -12,7 +12,7 @@
 //!
 //! The value is `<output>:<producer>`. Output is `text` or `image`.
 //! Producers are the built-ins (`thumbnail`, `head`, `hex`,
-//! `metadata`) or `host <command>`, which runs on the FILE's host as
+//! `metadata`, `cast`) or `host <command>`, which runs on the FILE's host as
 //! a daemon job -- so a remote file is previewed where it lives and
 //! only the result crosses the wire. A `text:host` command's STDOUT
 //! is the preview; an `image:host` command must write its image to
@@ -23,9 +23,10 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast_play = @import("../mux/cast_play.zig");
 const desktop = @import("desktop.zig");
 const globMatch = @import("emblems.zig").globMatch;
-const isPreviewMediaName = @import("paths.zig").isPreviewMediaName;
+const paths = @import("paths.zig");
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
@@ -44,6 +45,9 @@ pub const Builtin = enum {
     hex,
     /// No content fetch at all (directories).
     metadata,
+    /// The same ranged read, rendered as asciicast header metadata
+    /// (`renderCastMeta`) instead of the raw JSON.
+    cast,
 };
 
 pub const Producer = union(enum) {
@@ -93,15 +97,18 @@ fn matches(rule: Rule, name: []const u8, mime: []const u8) bool {
     return rule.glob.len > 0 and globMatch(rule.glob, name);
 }
 
-/// The built-in tail of the chain. Media goes to the daemon's
-/// generator (the same predicate that decides row thumbnails, so the
-/// two cannot drift); everything else takes the bounded head read,
-/// which is also what makes the hex view a fallback for any type
-/// nobody wrote a handler for.
+/// The built-in tail of the chain, keyed on `paths.classify` (the
+/// same oracle behind row thumbnails and the viewer's dispatch, so
+/// the three cannot drift). Media goes to the daemon's generator, a
+/// cast renders its header metadata, and everything else takes the
+/// bounded head read — which is also what makes the hex view a
+/// fallback for any type nobody wrote a handler for.
 fn builtinFor(name: []const u8) Handler {
-    if (isPreviewMediaName(name))
-        return .{ .output = .image, .producer = .{ .builtin = .thumbnail } };
-    return .{ .output = .text, .producer = .{ .builtin = .head } };
+    return switch (paths.classify(name)) {
+        .media => .{ .output = .image, .producer = .{ .builtin = .thumbnail } },
+        .cast => .{ .output = .text, .producer = .{ .builtin = .cast } },
+        .text => .{ .output = .text, .producer = .{ .builtin = .head } },
+    };
 }
 
 pub fn configPath(buf: []u8) ?[]const u8 {
@@ -181,7 +188,7 @@ fn parseHandler(arena: std.mem.Allocator, spec: []const u8) !?Handler {
     const builtin = std.meta.stringToEnum(Builtin, word) orelse return null;
     const wants: Output = switch (builtin) {
         .thumbnail => .image,
-        .head, .hex, .metadata => .text,
+        .head, .hex, .metadata, .cast => .text,
     };
     if (wants != output) return null;
     return .{ .output = output, .producer = .{ .builtin = builtin } };
@@ -254,6 +261,59 @@ pub fn hostScript(
     };
 }
 
+/// Append an untrusted header string with control bytes flattened to
+/// spaces; an invalid-UTF-8 value is dropped whole rather than handed
+/// to a GTK label.
+fn appendSanitized(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, value: []const u8) ?void {
+    if (!std.unicode.utf8ValidateSlice(value)) return;
+    out.appendSlice(allocator, label) catch return null;
+    for (value) |ch|
+        out.append(allocator, if (ch < 0x20) ' ' else ch) catch return null;
+}
+
+/// Render the head bytes of an asciicast file as readable metadata:
+/// version, terminal size, then whatever else the header carries.
+/// @return null when the first line does not parse as an asciicast
+/// header (or on allocation failure), so the caller falls back to the
+/// plain text renderer.
+pub fn renderCastMeta(allocator: std.mem.Allocator, bytes: []const u8) ?[]u8 {
+    const line_end = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    const line = std.mem.trimEnd(u8, bytes[0..line_end], "\r");
+    if (line.len == 0) return null;
+    var header = cast_play.parseHeader(allocator, line) catch return null;
+    defer cast_play.freeHeader(allocator, &header);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var buf: [128]u8 = undefined;
+    out.appendSlice(allocator, std.fmt.bufPrint(&buf, "Asciicast recording (v{d})\nTerminal: {d} x {d}", .{
+        header.version, header.cols, header.rows,
+    }) catch return null) catch return null;
+    if (header.title) |title|
+        appendSanitized(&out, allocator, "\nTitle: ", title) orelse return null;
+    if (header.timestamp) |ts| {
+        var t: c.time_t = std.math.cast(c.time_t, ts) orelse 0;
+        var tm: c.struct_tm = undefined;
+        if (t != 0 and c.localtime_r(&t, &tm) != null) {
+            var tbuf: [64]u8 = undefined;
+            const n = c.strftime(&tbuf, tbuf.len, "%Y-%m-%d %H:%M", &tm);
+            if (n > 0) {
+                out.appendSlice(allocator, "\nRecorded: ") catch return null;
+                out.appendSlice(allocator, tbuf[0..n]) catch return null;
+            }
+        }
+    }
+    if (header.term_type) |tt|
+        appendSanitized(&out, allocator, "\nTerm type: ", tt) orelse return null;
+    if (header.idle_time_limit_ms) |ms|
+        out.appendSlice(allocator, std.fmt.bufPrint(&buf, "\nIdle limit: {d}s", .{
+            @as(f64, @floatFromInt(ms)) / 1000.0,
+        }) catch return null) catch return null;
+    if (header.theme.palette != null or header.theme.fg != null or header.theme.bg != null)
+        out.appendSlice(allocator, "\nTheme: recorded") catch return null;
+    return allocator.dupe(u8, out.items) catch null;
+}
+
 test "resolve falls back to the head read and routes media to the generator" {
     const t = std.testing;
     const none: []const Rule = &.{};
@@ -268,6 +328,56 @@ test "resolve falls back to the head read and routes media to the generator" {
     // A directory never fetches content.
     const dir = resolve(none, "src", "inode/directory", true);
     try t.expectEqual(Builtin.metadata, dir.producer.builtin);
+    // A cast is neither a thumbnail nor raw JSON: it gets the header
+    // metadata renderer over the same head read.
+    const cast = resolve(none, "session.cast", "", false);
+    try t.expectEqual(Output.text, cast.output);
+    try t.expectEqual(Builtin.cast, cast.producer.builtin);
+}
+
+test "user rules may name the cast producer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rules = try parse(arena.allocator(), "*.rec = text:cast\n*.bad = image:cast\n");
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqual(Builtin.cast, rules[0].handler.producer.builtin);
+}
+
+test "renderCastMeta reads v2 and v3 headers and refuses non-casts" {
+    const t = std.testing;
+    const a = t.allocator;
+    const v2 = renderCastMeta(a,
+        \\{"version": 2, "width": 80, "height": 24, "title": "demo", "idle_time_limit": 2}
+        \\[0.1, "o", "hi"]
+        \\
+    ).?;
+    defer a.free(v2);
+    try t.expectEqualStrings("Asciicast recording (v2)\nTerminal: 80 x 24\nTitle: demo\nIdle limit: 2s", v2);
+    const v3 = renderCastMeta(a,
+        \\{"version": 3, "term": {"cols": 100, "rows": 30, "type": "xterm-256color", "theme": {"fg": "#ffffff"}}}
+        \\
+    ).?;
+    defer a.free(v3);
+    try t.expectEqualStrings("Asciicast recording (v3)\nTerminal: 100 x 30\nTerm type: xterm-256color\nTheme: recorded", v3);
+    // A recorded timestamp renders as a labelled local date.
+    const stamped = renderCastMeta(a,
+        \\{"version": 2, "width": 10, "height": 5, "timestamp": 1700000000}
+        \\
+    ).?;
+    defer a.free(stamped);
+    try t.expect(std.mem.indexOf(u8, stamped, "\nRecorded: 20") != null);
+    // Control bytes in an untrusted title are flattened, never shown.
+    const hostile = renderCastMeta(a,
+        "{\"version\": 2, \"width\": 4, \"height\": 2, \"title\": \"a\\u001bb\"}\n",
+    ).?;
+    defer a.free(hostile);
+    try t.expectEqualStrings("Asciicast recording (v2)\nTerminal: 4 x 2\nTitle: a b", hostile);
+    // Anything that is not an asciicast header falls back to the
+    // plain text renderer via null.
+    try t.expect(renderCastMeta(a, "not json at all\n") == null);
+    try t.expect(renderCastMeta(a, "{\"version\": 9}\n") == null);
+    try t.expect(renderCastMeta(a, "") == null);
+    try t.expect(renderCastMeta(a, "\n") == null);
 }
 
 test "parse reads globs, MIME rules and host commands" {
