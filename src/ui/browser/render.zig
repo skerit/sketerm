@@ -28,7 +28,8 @@ const FileColor = @import("types.zig").FileColor;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const copyZN = @import("../../filebrowser/format.zig").copyZN;
-const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
+const fbpaths = @import("../../filebrowser/paths.zig");
+const isPreviewMediaName = fbpaths.isPreviewMediaName;
 const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
@@ -1310,15 +1311,26 @@ fn guessContentType(name: []const u8) ?[*c]u8 {
 }
 
 /// The coarse Nemo-style Type cell ("Folder", "Image", "Program"...).
+/// The kind decision routes through `fbpaths.classify` (the same
+/// oracle behind previews and the viewer); glib only refines labels
+/// WITHIN a class, so a cast can never read "Binary" here while the
+/// preview plays it.
 pub fn coarseTypeZ(e: Entry, buf: *[256:0]u8) [*:0]const u8 {
     if (std.mem.eql(u8, e.kind, "dir")) return "Folder";
     if (std.mem.eql(u8, e.kind, "link")) return if (e.tdir) "Link to folder" else "Link";
     if (!std.mem.eql(u8, e.kind, "file")) return "Other";
+    const class = fbpaths.classify(e.name);
+    if (class == .cast) return "Asciicast recording";
     const ctype = guessContentType(e.name) orelse return "File";
     defer c.g_free(ctype);
     const ctype_s = std.mem.span(@as([*:0]const u8, @ptrCast(ctype)));
-    if (std.mem.eql(u8, ctype_s, "application/octet-stream"))
+    if (std.mem.eql(u8, ctype_s, "application/octet-stream")) {
+        // Media glib's database happens not to know (.jxl on older
+        // shared-mime-info, say) is still media, never "Binary".
+        if (class == .media)
+            return if (fbpaths.isImageName(e.name)) "Image" else "Media";
         return if (e.mode & 0o111 != 0) "Program" else "Binary";
+    }
     const icon = c.g_content_type_get_generic_icon_name(ctype);
     if (icon != null) {
         defer c.g_free(icon);
@@ -1336,6 +1348,9 @@ pub fn coarseTypeZ(e: Entry, buf: *[256:0]u8) [*:0]const u8 {
 fn contentTypeCellZ(e: Entry, raw_mime: bool, buf: *[256:0]u8) [*:0]const u8 {
     if (std.mem.eql(u8, e.kind, "dir")) return if (raw_mime) "inode/directory" else "Folder";
     if (std.mem.eql(u8, e.kind, "link") and !e.tdir and e.target == null) return "";
+    // Same oracle as coarseTypeZ: glib has no asciicast mapping.
+    if (std.mem.eql(u8, e.kind, "file") and fbpaths.classify(e.name) == .cast)
+        return if (raw_mime) "application/x-asciicast" else "Asciicast recording";
     const ctype = guessContentType(e.name) orelse return "";
     defer c.g_free(ctype);
     if (raw_mime) return copyZ(buf, std.mem.span(@as([*:0]const u8, @ptrCast(ctype))));
