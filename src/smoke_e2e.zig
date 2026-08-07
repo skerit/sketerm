@@ -999,7 +999,7 @@ pub fn main() u8 {
             // 6c-10. The same recording INSIDE the Sketerm Viewer, in
             // a mixed image+cast batch, navigated both directions.
             if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
-            say("viewer cast: played in place, paused, and batch navigation killed/rebuilt the ephemeral session without a leak");
+            say("viewer cast: played in place, paused, batch navigation killed/rebuilt the ephemeral session without a leak, and the text/hex fallback rendered");
         }
     }
 
@@ -2252,12 +2252,39 @@ fn castPlaybackStage(
     return null;
 }
 
+/// OCR the window and wait until `needle` appears in the recognized
+/// text. Also true (with a note) when tesseract is not installed, so
+/// hosts without OCR still run the stage's structural checks.
+fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, timeout_ms: i64) bool {
+    const ocr = @import("util/ocr.zig");
+    const png_util = @import("util/png.zig");
+    if (!ocr.available()) {
+        say("viewer text: tesseract unavailable; skipping the OCR content check");
+        return true;
+    }
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.pumpOnce(250);
+        const shot = app.snapshotRgba(win_id, null) catch continue;
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const scale: u32 = 2;
+        const px = png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+        const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{}) catch continue;
+        if (std.mem.indexOf(u8, res.text, needle) != null) return true;
+    }
+    return false;
+}
+
 /// Cast playback INSIDE the Sketerm Viewer: `sketerm view` on a mixed
-/// batch (image + cast), navigated both directions on a real seat.
-/// What only a live run can prove: the shared CastPlayerBox renders
-/// through the viewer's content slot, Space reaches the daemon as a
-/// pause, and BATCH NAVIGATION tears the ephemeral cast session down
-/// completely (no leaked session) and can rebuild a fresh one.
+/// batch (image + cast + text + binary), navigated both directions on
+/// a real seat. What only a live run can prove: the shared
+/// CastPlayerBox renders through the viewer's content slot, Space
+/// reaches the daemon as a pause, BATCH NAVIGATION tears the ephemeral
+/// cast session down completely (no leaked session) and can rebuild a
+/// fresh one, and the universal text fallback renders a .txt as text
+/// and an arbitrary binary as a hex dump.
 fn viewerCastStage(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -2297,6 +2324,31 @@ fn viewerCastStage(
         if (!ok) return "short write on the cast file";
     }
 
+    // The text and binary halves: the viewer's universal fallback.
+    // Distinct tokens (QUILL vs HEXPROOF) so one item's screen can
+    // never satisfy the other's OCR assertion.
+    var txt_path_buf: [512:0]u8 = undefined;
+    const txt_path = std.fmt.bufPrintZ(&txt_path_buf, "{s}/viewer-e2e-note.txt", .{rt}) catch return "text path too long";
+    {
+        const body = "SKETERM VIEWER TEXTMODE QUILL\n" ** 12;
+        const f = c.fopen(txt_path.ptr, "wb") orelse return "could not write the text file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the text file";
+    }
+    var bin_path_buf: [512:0]u8 = undefined;
+    const bin_path = std.fmt.bufPrintZ(&bin_path_buf, "{s}/viewer-e2e-data.bin", .{rt}) catch return "binary path too long";
+    {
+        // NULs trip the binary classifier; HEXPROOF lands in the hex
+        // dump's ASCII gutter.
+        const body = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f\x10\x11\x12" ++
+            "HEXPROOF" ++ "\x00\x01\x02\x03\x04\x05\x06\x07";
+        const f = c.fopen(bin_path.ptr, "wb") orelse return "could not write the binary file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the binary file";
+    }
+
     var known: [16]u32 = undefined;
     var n_known: usize = 0;
     for (app.windows.items) |w| {
@@ -2317,7 +2369,7 @@ fn viewerCastStage(
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, null };
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -2407,6 +2459,44 @@ fn viewerCastStage(
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
         return "re-navigating to the cast never rendered again";
+
+    // Right -> the TEXT item: the universal fallback renders the
+    // file's bytes, and the outgoing controller dies here too (the
+    // cast -> text teardown direction).
+    app.pressKey(vwin, "Right") catch return "injecting Right failed";
+    if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, false, 15_000))
+        return "navigating to the text item did not clear the cast frame";
+    {
+        var gone = false;
+        var t: u32 = 0;
+        while (t < 10_000) : (t += 250) {
+            var list_buf: [16384]u8 = undefined;
+            const listing = castListSessions(allocator, mux_sock, &list_buf);
+            if (std.mem.indexOf(u8, listing, "\"name\":\"cast") == null) {
+                gone = true;
+                break;
+            }
+            _ = c.usleep(250_000);
+        }
+        if (!gone) return "navigating cast -> text leaked the ephemeral cast session";
+    }
+    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000))
+        return "the text item's content never rendered (no QUILL in the OCR text)";
+
+    // Right -> the BINARY item: classic hexdump, ASCII gutter included.
+    app.pressKey(vwin, "Right") catch return "injecting Right failed";
+    if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000))
+        return "the binary item's hex dump never rendered (no HEXPROOF in the OCR text)";
+
+    // Left -> text again (the backwards direction into text).
+    app.pressKey(vwin, "Left") catch return "injecting Left failed";
+    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000))
+        return "navigating back to the text item did not restore its content";
+
+    // Left -> the cast: a fresh controller in the backwards direction.
+    app.pressKey(vwin, "Left") catch return "injecting Left failed";
+    if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
+        return "navigating text -> cast never rendered the recording";
 
     // WM close -> clean exit, and the second session dies too.
     app.closeWindow(vwin) catch return "closing the viewer window failed";
