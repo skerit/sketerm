@@ -286,7 +286,7 @@ fn validDim(d: u16) bool {
     return d >= 1 and d <= max_dim;
 }
 
-fn freeHeader(allocator: std.mem.Allocator, h: *Header) void {
+pub fn freeHeader(allocator: std.mem.Allocator, h: *Header) void {
     if (h.title) |s| allocator.free(s);
     if (h.term_type) |s| allocator.free(s);
     if (h.theme.fg) |s| allocator.free(s);
@@ -338,8 +338,9 @@ fn parseTheme(allocator: std.mem.Allocator, obj: std.json.ObjectMap) Error!Theme
     return theme;
 }
 
-/// Parse the header line. Owns every string it returns.
-fn parseHeader(allocator: std.mem.Allocator, line: []const u8) Error!Header {
+/// Parse the header line. Owns every string it returns (release with
+/// `freeHeader`).
+pub fn parseHeader(allocator: std.mem.Allocator, line: []const u8) Error!Header {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{}) catch

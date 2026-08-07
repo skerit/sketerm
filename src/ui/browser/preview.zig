@@ -229,6 +229,9 @@ pub const PreviewRead = struct {
     output: previewers.Output,
     /// Always render as hex, whatever the bytes look like.
     force_hex: bool = false,
+    /// Render the bytes as asciicast header metadata; falls back to
+    /// the plain text renderer when they do not parse as a cast.
+    cast_meta: bool = false,
     preload: bool,
     /// Generation allowed to paint this result; 0 for a preload.
     generation: u64,
@@ -1886,6 +1889,7 @@ fn startPreview(
         },
         .output = handler.output,
         .force_hex = handler.producer == .builtin and handler.producer.builtin == .hex,
+        .cast_meta = handler.producer == .builtin and handler.producer.builtin == .cast,
         .preload = preload,
         .generation = if (preload) 0 else self.preview_generation,
         .needs_transport = handler.producer == .host_command and handler.output == .image,
@@ -1898,7 +1902,7 @@ fn startPreview(
     switch (handler.producer) {
         .builtin => |b| switch (b) {
             .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
-            .head, .hex => {
+            .head, .hex, .cast => {
                 pr.phase = .read_file;
                 self.sendOp(hc, .{
                     .req = pr.req,
@@ -2203,10 +2207,18 @@ fn deliverRead(self: *BrowserView, pr: *PreviewRead) void {
         self.queuePreviewDecode(pr);
         return;
     }
-    const rendered = renderText(self.allocator, pr.buf.items, pr.force_hex) orelse {
-        self.allocator.free(key);
-        if (note) |n| self.allocator.free(n);
-        return;
+    // A cast renders its header as metadata; bytes that turn out not
+    // to be an asciicast after all fall back to the plain renderer.
+    const rendered: RenderedText = blk: {
+        if (pr.cast_meta) {
+            if (previewers.renderCastMeta(self.allocator, pr.buf.items)) |meta|
+                break :blk .{ .text = meta, .hex = false };
+        }
+        break :blk renderText(self.allocator, pr.buf.items, pr.force_hex) orelse {
+            self.allocator.free(key);
+            if (note) |n| self.allocator.free(n);
+            return;
+        };
     };
     const stored = self.preview_state.cachePut(self.allocator, .{
         .key = key,
@@ -2220,7 +2232,9 @@ fn deliverRead(self: *BrowserView, pr: *PreviewRead) void {
 /// Text preview bytes as the user should see them: as text when they
 /// read as text, as a bounded hex dump otherwise. This is what makes
 /// hex the fallback for any type without a handler.
-fn renderText(allocator: std.mem.Allocator, bytes: []const u8, force_hex: bool) ?struct { text: []u8, hex: bool } {
+const RenderedText = struct { text: []u8, hex: bool };
+
+fn renderText(allocator: std.mem.Allocator, bytes: []const u8, force_hex: bool) ?RenderedText {
     if (bytes.len == 0) {
         const empty = allocator.dupe(u8, "(empty file)") catch return null;
         return .{ .text = empty, .hex = false };
