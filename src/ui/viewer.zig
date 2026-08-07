@@ -592,7 +592,7 @@ pub const ViewerWindow = struct {
         const toolbar = c.adw_toolbar_view_new().?;
         const header = c.adw_header_bar_new().?;
         const open_button = c.gtk_button_new_from_icon_name("document-open-symbolic").?;
-        c.gtk_widget_set_tooltip_text(open_button, "Open Image");
+        c.gtk_widget_set_tooltip_text(open_button, "Open File");
         const prev_button = c.gtk_button_new_from_icon_name("go-previous-symbolic").?;
         c.gtk_widget_set_tooltip_text(prev_button, "Previous Image (Left)");
         const next_button = c.gtk_button_new_from_icon_name("go-next-symbolic").?;
@@ -1526,7 +1526,7 @@ fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         @ptrCast(@alignCast(self.window)),
         .{
             .mode = .open_file,
-            .title = "Open Image",
+            .title = "Open File",
             .filters = &.{
                 .{ .label = "Images", .patterns = &.{
                     "*.png",   "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
