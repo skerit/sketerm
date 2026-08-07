@@ -14692,3 +14692,67 @@ Verification: `zig build`, `zig build test` (tesseract flake noise
 unchanged, exit 0), `test-core`, `smoke-e2e` (viewer + cast +
 viewer-cast stages green), `mux-portable` + `ldd sketerm-mux` still
 libc/libm only (no daemon changes).
+
+## Viewer unification Phase A: universal text/hex content + host policy
+
+The Sketerm Viewer is becoming the one viewer shell (Phase B will put
+it behind Files' Quick Look Space), so it gained Quick Look's "preview
+ANY file" ability now. `Content` grew a third tag: `.text`, a
+window-lifetime read-only monospace GtkTextView in its own scroller
+slot, shown by `setContentMode` (now a three-way image/text/cast
+enum). Routing lives in the GTK-free model (`viewer.contentKind`):
+`.cast` -> cast player, anything `paths.isPreviewMediaName` covers
+(images plus pdf/video/audio, which the daemon preview codecs already
+rasterized before this change - routing those to text would have
+REGRESSED them, a deliberate deviation from "image extension only") ->
+the image pipeline, EVERYTHING ELSE -> text. Consequence: `sketerm
+view anything.txt` (or any unknown file) now displays instead of
+erroring - intended.
+
+Loading: `Variant` gained `.head`; `fetch` reads a bounded 256 KiB
+head (`HEAD_BYTES_MAX`) over the same ranged fsdrive reads, with NO
+size ceiling (a 10 GB binary still hex-dumps its head - the
+ORIGINAL_BYTES_MAX guard moved below the head branch). The head rides
+the window's MAIN LoadTarget, so an in-flight text load is fenced by
+the exact same generation discipline as an image load (navigation
+supersedes, showCast cancels, close() kills). `LoadResult.head`
+carries the raw bytes to the main thread; classification and rendering
+happen in `onHeadLoaded`: `hexdump.looksBinary` (the SAME shared
+GTK-free helper Files' preview uses, `src/filebrowser/hexdump.zig` -
+nothing was copied) decides text vs binary, text is sanitized with
+`g_utf8_make_valid` (Files parity, truncation can split a sequence),
+binary renders through `hexdump.write` (offset | 16 hex | ASCII
+gutter, identical conventions). Status line: "UTF-8 text 12.3 KiB" or
+"Binary (hex dump)  showing first 256.0 KiB of 4.2 MiB". Image header
+controls hide exactly as they do for casts; R reloads.
+
+Host policy: `ViewerWindow.open` now takes `ViewerWindow.Options` -
+`transient_for` (set on the window), `close_on_space` (Space CLOSES in
+every content mode; cast play/pause moves to K), `show_in_files_action`
+(false hides the hamburger row AND skips the context-menu row),
+`on_activate` + `activate_ctx` (Enter on the current item, receives
+the spec; ctx must OUTLIVE the window - no fence, safe because the
+callback only fires from the window's own key controller). Standalone
+invocation passes `.{}`: nothing user-visible changes for `sketerm
+view`/`sketerm-viewer`/`sketerm play`. Phase B consumes the struct.
+
+smoke-e2e: `viewerCastStage` grew to a 4-item batch (png, cast, txt,
+bin). After the existing cast checks: Right -> text item (cast frame
+clears, session-leak check in the cast->text direction, OCR asserts
+the file's QUILL token rendered), Right -> binary (OCR asserts
+HEXPROOF from the hex dump's ASCII gutter), Left -> text again, Left
+-> cast renders afresh, then the unchanged WM-close teardown. OCR uses
+util/ocr.zig (dlopen'd tesseract) and SKIPS with a note when
+unavailable, keeping the structural checks. Unit: `viewer.contentKind`
+routing test in BOTH roots (hexdump/classifier tests already were).
+
+Verification: `zig build`, `zig build test` 2024/0 (exit 0 direct;
+the build-step wrapper still trips on tesseract's leak noise exactly
+as on clean master - baselined), `test-core` 1690/0, `smoke-e2e` PASS
+including all pre-existing stages, `mux-portable` + `ldd sketerm-mux`
+libc/libm only.
+
+Follow-ups for Phase B: the viewer's Open picker still filters to
+images+recordings (no "All Files" filter yet); Files' isViewerName
+gate on "Open in Sketerm Viewer" still excludes plain files; no
+syntax highlighting (out of scope by design).
