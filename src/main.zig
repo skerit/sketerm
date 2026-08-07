@@ -835,7 +835,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 
     if (g_app.mode == .viewer) {
         var batch = takeViewerBatch();
-        if (@import("ui/viewer.zig").ViewerWindow.open(g_app.allocator, app, batch)) |_| {
+        if (@import("ui/viewer.zig").ViewerWindow.open(g_app.allocator, app, batch, .{})) |_| {
             // Ownership moved into the window.
         } else |err| {
             batch.deinit();
