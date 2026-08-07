@@ -368,6 +368,14 @@ pub const PREVIEW_HEAD_CAP: u64 = 4096;
 /// entry holds a decoded texture.
 pub const PREVIEW_CACHE_CAP: usize = 12;
 
+/// Tallest the info-panel preview stage may get. A portrait image is
+/// letterboxed sideways at this height rather than growing the panel.
+pub const PREVIEW_STAGE_MAX_H: c_int = 240;
+
+/// Stage width assumed before the panel has ever been allocated (the
+/// 220px panel minimum minus the inner box's 10px side margins).
+const PREVIEW_STAGE_FALLBACK_W: c_int = 200;
+
 /// Fixed lookahead around the current entry. The inventory's number
 /// one remote pain point is thumbnail storms, so this never grows
 /// with the directory: at most PRELOAD_QUEUE_CAP entries are queued
@@ -1222,6 +1230,7 @@ pub fn clearThumbCache(self: *BrowserView) void {
 
 pub fn clearPreviewContent(self: *BrowserView) void {
     self.preview_image.clear();
+    setStageHeight(self, null);
     showPanelPic(self, false);
     c.gtk_label_set_text(self.preview_text, "");
 }
@@ -1318,10 +1327,18 @@ pub fn buildInfoPanel(self: *BrowserView) *c.GtkWidget {
     c.gtk_widget_set_margin_top(inner, 10);
     c.gtk_widget_set_margin_bottom(inner, 10);
 
-    // The preview stage has a FIXED height: images scale into it, so
-    // selecting a huge photo can never change the panel's geometry.
+    // The preview stage is CAPPED at PREVIEW_STAGE_MAX_H: images scale
+    // into it, so selecting a huge photo can never blow the panel's
+    // geometry open. A decoded image then shrinks the stage to its
+    // aspect-fitted height (setStageHeight) so a wide picture does not
+    // sit between two slabs of canvas background.
     const stage = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    c.gtk_widget_set_size_request(stage, -1, 240);
+    c.gtk_widget_set_size_request(stage, -1, PREVIEW_STAGE_MAX_H);
+    // The stage's own height is the whole point, so it must not inherit
+    // its children's vexpand: an expanding stage swallows the panel's
+    // leftover height and the size request stops meaning anything.
+    c.gtk_widget_set_vexpand(stage, 0);
+    c.gtk_widget_set_valign(stage, c.GTK_ALIGN_START);
     self.preview_canvas = image_canvas.Canvas.init();
     const ppic = self.preview_canvas.?.widget();
     c.gtk_widget_set_vexpand(ppic, 1);
@@ -1692,6 +1709,39 @@ fn setPanelIconName(self: *BrowserView, name: [*:0]const u8) void {
 /// texture lands).
 fn setPanelIcon(self: *BrowserView, name: []const u8, is_dir: bool) void {
     setImageEntryIcon(self.preview_icon, name, is_dir);
+}
+
+/// Current stage width, read from the live allocation so a widened
+/// panel is honoured on the next paint without a size-allocate hook.
+fn stageWidth(self: *BrowserView) c_int {
+    if (c.gtk_widget_get_parent(self.preview_pic)) |stage| {
+        const w = c.gtk_widget_get_width(stage);
+        if (w > 0) return w;
+    }
+    const panel = c.gtk_widget_get_width(self.preview_box);
+    if (panel > 20) return panel - 20;
+    return PREVIEW_STAGE_FALLBACK_W;
+}
+
+/// Size the stage to the image's aspect-fitted height (capped at
+/// PREVIEW_STAGE_MAX_H) so a wide picture hugs its own bounds instead
+/// of floating in dark canvas background. Icon and text previews keep
+/// the full fixed stage, which is what stops the panel jumping.
+/// Called on EVERY paint: a cached texture repainted on re-selection
+/// must re-shrink the stage a text preview just reset.
+fn setStageHeight(self: *BrowserView, texture: ?*c.GdkTexture) void {
+    const stage = c.gtk_widget_get_parent(self.preview_pic) orelse return;
+    var h = PREVIEW_STAGE_MAX_H;
+    if (texture) |tex| {
+        const tw = c.gdk_texture_get_width(tex);
+        const th = c.gdk_texture_get_height(tex);
+        if (tw > 0 and th > 0) {
+            const fitted = @round(@as(f64, @floatFromInt(stageWidth(self))) *
+                @as(f64, @floatFromInt(th)) / @as(f64, @floatFromInt(tw)));
+            h = @intFromFloat(std.math.clamp(fitted, 1, @as(f64, @floatFromInt(PREVIEW_STAGE_MAX_H))));
+        }
+    }
+    c.gtk_widget_set_size_request(stage, -1, h);
 }
 
 /// Exactly one of texture/icon shows in the stage.
@@ -2336,6 +2386,7 @@ fn paintPreview(self: *BrowserView, item: *const CacheItem) void {
     @memcpy(z[0..n], body[0..n]);
     z[n] = 0;
     self.preview_image.setTexture(item.texture);
+    setStageHeight(self, item.texture);
     showPanelPic(self, item.texture != null);
     // A hex dump's columns only survive unwrapped (and scroll
     // sideways in their own card); prose still wraps into the panel.
