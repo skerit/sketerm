@@ -1995,22 +1995,30 @@ fn animatedPreviewName(name: []const u8) bool {
 /// True when the FOREGROUND preview of this entry would take the
 /// animated original-bytes path. The preloader must skip exactly
 /// these (a preloaded still cached under the same key would win the
-/// cache lookup and the entry would never animate).
-fn wouldAnimatePreview(name: []const u8, size: u64) bool {
-    return size > 0 and size <= PREVIEW_ANIM_CAP and animatedPreviewName(name);
+/// cache lookup and the entry would never animate), so both callers
+/// share this one predicate rather than restating its conditions.
+/// `local` is false for an entry on a remote host, whose bounded,
+/// disk-cached thumbnail contract the whole-original fetch would
+/// break.
+fn wouldAnimatePreview(name: []const u8, size: u64, local: bool) bool {
+    return local and size > 0 and size <= PREVIEW_ANIM_CAP and animatedPreviewName(name);
 }
 
-test "animated preview policy: gif under the cap only" {
+test "animated preview policy: local gif under the cap only" {
     const t = std.testing;
-    try t.expect(wouldAnimatePreview("clip.gif", 1024));
-    try t.expect(wouldAnimatePreview("CLIP.GIF", PREVIEW_ANIM_CAP));
-    try t.expect(!wouldAnimatePreview("clip.gif", PREVIEW_ANIM_CAP + 1));
-    try t.expect(!wouldAnimatePreview("clip.gif", 0)); // unknown size
-    try t.expect(!wouldAnimatePreview("photo.png", 1024));
-    try t.expect(!wouldAnimatePreview("clip.mkv", 1024)); // video is out of scope
+    try t.expect(wouldAnimatePreview("clip.gif", 1024, true));
+    try t.expect(wouldAnimatePreview("CLIP.GIF", PREVIEW_ANIM_CAP, true));
+    try t.expect(!wouldAnimatePreview("clip.gif", PREVIEW_ANIM_CAP + 1, true));
+    try t.expect(!wouldAnimatePreview("clip.gif", 0, true)); // unknown size
+    try t.expect(!wouldAnimatePreview("photo.png", 1024, true));
+    try t.expect(!wouldAnimatePreview("clip.mkv", 1024, true)); // video is out of scope
+    // A remote entry keeps its bounded, disk-cached still: the
+    // animated path pulls the whole original and is never cached, so
+    // every re-selection would re-pull it over the link.
+    try t.expect(!wouldAnimatePreview("clip.gif", 1024, false));
     // The glycin-gated set is environment-dependent; both outcomes
     // are legitimate, so only pin the coupling itself.
-    try t.expectEqual(image_decoder.glycinAvailable(), wouldAnimatePreview("anim.webp", 1024));
+    try t.expectEqual(image_decoder.glycinAvailable(), wouldAnimatePreview("anim.webp", 1024, true));
     try t.expect(!animatedPreviewName("still.apng")); // never reaches .media
 }
 
@@ -2096,13 +2104,15 @@ fn startPreview(
         return;
     }
 
-    // Animate only where it is cheap and correct: the entry's own
-    // bytes are small enough to pull whole, the default thumbnail
-    // handler applies (a user previewer rule always wins), and this
-    // is the foreground fetch (preloads never decode animations).
+    // Animate only where it is cheap and correct: the default
+    // thumbnail handler applies (a user previewer rule always wins),
+    // this is the foreground fetch (preloads never decode
+    // animations), and the entry itself qualifies -- local, sized,
+    // and an animated format. A remote animation stays one click
+    // away in the Viewer, where the user has asked for it.
     const animate = !preload and !is_dir and
         handler.producer == .builtin and handler.producer.builtin == .thumbnail and
-        wouldAnimatePreview(name, size);
+        wouldAnimatePreview(name, size, hc.host == null);
 
     const pr = self.allocator.create(PreviewRead) catch return;
     pr.* = .{
@@ -2730,7 +2740,7 @@ pub fn schedulePreload(self: *BrowserView, tab: *BTab, current: []const u8) void
         // every later selection. Decoding whole animations for
         // entries the user may never select is also exactly the
         // wasteful lookahead the bounded preloader exists to avoid.
-        if (wouldAnimatePreview(std.fs.path.basename(path), entry.size)) continue;
+        if (wouldAnimatePreview(std.fs.path.basename(path), entry.size, tab.hc.host == null)) continue;
         const key = cacheKey(&key_buf, tab.hc, path, entry.mtime_ms) orelse continue;
         if (previewCached(self, key)) continue;
         if (self.preview_state.preload_queue.items.len >= PRELOAD_QUEUE_CAP) break;
