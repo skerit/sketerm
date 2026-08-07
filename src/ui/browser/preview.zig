@@ -35,6 +35,7 @@ const previewers = @import("../../filebrowser/previewers.zig");
 const thumbs_mod = @import("../../filebrowser/thumbs.zig");
 const imagecodec = @import("../../util/imagecodec.zig");
 const image_canvas = @import("../image_canvas.zig");
+const image_decoder = @import("../image_decoder.zig");
 const viewer_ui = @import("../viewer.zig");
 const paths_mod = @import("../../filebrowser/paths.zig");
 
@@ -119,6 +120,10 @@ pub const ThumbReq = struct {
     /// remains path-only because each host owns a separate cache.
     cache_key: []u8,
     kind: ThumbKind = .row_thumb,
+    /// Preview-only: `data` is an ORIGINAL animated-capable image;
+    /// decode every frame (multi-frame handback) instead of one
+    /// bounded still.
+    animate: bool = false,
     /// The view generation allowed to DISPLAY this result; 0 means
     /// cache-only (a preload must never paint over a newer selection).
     preview_generation: u64 = 0,
@@ -138,6 +143,9 @@ pub const ThumbResult = struct {
     /// In-memory cache key ("path\x00mtime", owned by c_allocator).
     key: []u8,
     pixbuf: ?*c.GdkPixbuf,
+    /// Multi-frame decode of an animated preview (c_allocator-owned
+    /// raw RGBA; textures are minted on the main thread only).
+    animation: ?image_decoder.Decoded = null,
     rgba: ?[]u8 = null,
     width: u32 = 0,
     height: u32 = 0,
@@ -232,6 +240,13 @@ pub const PreviewRead = struct {
     /// Render the bytes as asciicast header metadata; falls back to
     /// the plain text renderer when they do not parse as a cast.
     cast_meta: bool = false,
+    /// This read fetches the ORIGINAL bytes of an animated-capable
+    /// image (chunked, capped at PREVIEW_ANIM_CAP) for a multi-frame
+    /// decode; its result bypasses the preview cache.
+    animate: bool = false,
+    /// Bytes buffered when the previous animate chunk was requested;
+    /// a chunk reply that grew nothing aborts instead of looping.
+    last_len: usize = 0,
     preload: bool,
     /// Generation allowed to paint this result; 0 for a preload.
     generation: u64,
@@ -359,6 +374,23 @@ pub const State = struct {
 /// so 2 MiB leaves ample framing/compression headroom.
 pub const PREVIEW_IMAGE_CAP: usize = 2 << 20;
 
+/// Source-byte cap under which an animated-capable image is fetched
+/// WHOLE (chunked ranged reads, no host-side generator job) so the
+/// sidebar can play it. 4x the transport image cap and the same
+/// figure as THUMB_FILE_CAP: real-world animated GIFs routinely pass
+/// 2 MiB, while an 8 MiB plain read is still only four MAX_READ
+/// round trips and no decode has started yet. Over the cap the entry
+/// keeps today's daemon-rendered 512px still exactly.
+pub const PREVIEW_ANIM_CAP: usize = 8 << 20;
+
+/// Per-frame pixel budget for the animated decode (the viewer's
+/// preview budget); one 4MP frame is 16 MiB of RGBA.
+const PREVIEW_ANIM_PIXELS: usize = 4 << 20;
+
+/// Total decoded-RGBA budget across all frames. Exceeding it falls
+/// back to a single still frame rather than failing the preview.
+const PREVIEW_ANIM_RGBA_CAP: usize = 64 << 20;
+
 pub const PREVIEW_TEXT_CAP: usize = 4096;
 
 /// Bytes fetched for the head/hex producers.
@@ -476,6 +508,7 @@ fn wirePixbuf(data: []const u8, kind: ThumbKind) ?*c.GdkPixbuf {
 pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     const a = std.heap.c_allocator;
     var pixbuf: ?*c.GdkPixbuf = null;
+    var animation: ?image_decoder.Decoded = null;
     var decoded_rgba: ?[]u8 = null;
     var decoded_width: u32 = 0;
     var decoded_height: u32 = 0;
@@ -505,6 +538,38 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             pixbuf = c.gdk_pixbuf_new_from_file_at_size(pp.ptr, 128, 128, null);
             if (pixbuf != null) thumbSaveLocal(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
         }
+    } else if (req.animate) {
+        // Original bytes of an animated-capable image: decode every
+        // frame. Runs on this worker exactly like the viewer's load
+        // thread runs decodeBytes -- glycin's load call is
+        // synchronous and thread-safe. Any failure (or an animation
+        // whose RGBA total busts the budget) degrades to a single
+        // bounded still instead of a failure note.
+        if (image_decoder.decodeBytes(a, req.data.?, .{
+            .max_pixels = PREVIEW_ANIM_PIXELS,
+            .max_animation_bytes = PREVIEW_ANIM_RGBA_CAP,
+        })) |decoded| {
+            var d = decoded;
+            if (d.frames.len > 1) {
+                animation = d;
+            } else if (wirePixbuf(req.data.?, .preview)) |pb| {
+                // A still after all: the bounded pixbuf decode keeps
+                // the cached texture small, like every other still.
+                pixbuf = pb;
+                d.deinit(a);
+            } else if (d.frames.len == 1) {
+                // No pixbuf loader for this codec; keep the decoded
+                // frame (ownership of the rgba moves out of `d`).
+                decoded_rgba = d.frames[0].rgba;
+                decoded_width = d.frames[0].width;
+                decoded_height = d.frames[0].height;
+                a.free(d.frames);
+            } else {
+                d.deinit(a);
+            }
+        } else |_| {
+            pixbuf = wirePixbuf(req.data.?, .preview);
+        }
     } else {
         // Wire images are bounded JXL/WebP transport data from remote
         // hosts, or plain PNG when the daemon is the local one.
@@ -521,12 +586,14 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     // Hand the result to the main thread.
     const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.cache_key, req.mtime_ms }) catch {
         if (pixbuf) |pb| c.g_object_unref(pb);
+        if (animation) |*anim| anim.deinit(a);
         if (decoded_rgba) |rgba| a.free(rgba);
         return;
     };
     const res = a.create(ThumbResult) catch {
         a.free(key);
         if (pixbuf) |pb| c.g_object_unref(pb);
+        if (animation) |*anim| anim.deinit(a);
         if (decoded_rgba) |rgba| a.free(rgba);
         return;
     };
@@ -534,6 +601,7 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
         .ctx = tc,
         .key = key,
         .pixbuf = pixbuf,
+        .animation = animation,
         .rgba = decoded_rgba,
         .width = decoded_width,
         .height = decoded_height,
@@ -541,6 +609,7 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             a.free(key);
             a.destroy(res);
             if (pixbuf) |pb| c.g_object_unref(pb);
+            if (animation) |*anim| anim.deinit(a);
             if (decoded_rgba) |rgba| a.free(rgba);
             return;
         },
@@ -582,6 +651,9 @@ pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     defer {
         a.free(res.key);
         a.free(res.path);
+        // Frames were copied into textures (or the result was
+        // dropped) by now; either way the raw RGBA dies here.
+        if (res.animation) |*anim| anim.deinit(a);
         if (res.rgba) |rgba| a.free(rgba);
         a.destroy(res);
         tc.unref();
@@ -1235,6 +1307,22 @@ pub fn clearPreviewContent(self: *BrowserView) void {
     c.gtk_label_set_text(self.preview_text, "");
 }
 
+/// The browser's widgets are gone but the view is not: stop the
+/// animated preview WITHOUT publishing into the dead widget tree.
+///
+/// An animated sidebar preview is the only thing here that ticks on a
+/// GLib timer, and `Session`'s timer holds a pointer into the view,
+/// which outlives the widgets -- so the pointer never dangles, but a
+/// tick landing after the GtkPicture's last reference dropped would
+/// call into freed GTK. Detaching the canvas first empties the
+/// publish list, so the clear that stops the timer touches nothing.
+/// Idempotent: every teardown path may call it, and `deinit` still
+/// stops the timer for the case where no widget teardown ran at all.
+pub fn severPreviewAnimation(self: *BrowserView) void {
+    if (self.preview_canvas) |*canvas| self.preview_image.detach(canvas);
+    self.preview_image.clear();
+}
+
 /// Drop everything this host owed the preview pipeline.
 pub fn previewHostDied(self: *BrowserView, hc: *HostConn) void {
     if (self.preview_read) |pr| {
@@ -1816,7 +1904,7 @@ fn showFolderSummary(self: *BrowserView, tab: *BTab) void {
     var items: [32]u8 = undefined;
     addInfoRow(self, "Items", fileicon.fmtItems(&items, @intCast(tab.root.entries.items.len)));
     addInfoRow(self, "Location", path);
-    startPreview(self, tab.hc, path, 0, true, false);
+    startPreview(self, tab.hc, path, 0, 0, true, false);
 }
 
 /// N entries selected: an aggregate, like Dolphin's "N items".
@@ -1875,7 +1963,7 @@ pub fn updatePreview(self: *BrowserView) void {
     fillEntryPanel(self, tab, path, entry);
 
     const is_dir = if (entry) |e| e.tdir else false;
-    startPreview(self, tab.hc, path, if (entry) |e| e.mtime_ms else 0, is_dir, false);
+    startPreview(self, tab.hc, path, if (entry) |e| e.mtime_ms else 0, if (entry) |e| e.size else 0, is_dir, false);
     self.schedulePreload(tab, path);
 }
 
@@ -1886,13 +1974,97 @@ fn userRules(self: *BrowserView) []const previewers.Rule {
     return self.preview_state.rules.?.list;
 }
 
+/// Sidebar animation POLICY, not a content class (paths.classify
+/// stays the type oracle): which names the panel fetches original
+/// bytes for so they loop in place. Without glycin only GIF
+/// qualifies -- the gdk-pixbuf fallback animates nothing else
+/// (usually no WebP/AVIF/JXL loader at all), and a failed animated
+/// decode would trade today's daemon still for a note. Every name
+/// here must ALSO be one `paths.classify` calls `.media`, or the
+/// entry never reaches the thumbnail producer in the first place --
+/// which is why bare `.apng` is absent (an animated PNG in the wild
+/// is named `.png`, and no extension can promise a PNG animates).
+fn animatedPreviewName(name: []const u8) bool {
+    if (std.ascii.endsWithIgnoreCase(name, ".gif")) return true;
+    if (!image_decoder.glycinAvailable()) return false;
+    const exts = [_][]const u8{ ".webp", ".avif", ".jxl" };
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    return false;
+}
+
+/// True when the FOREGROUND preview of this entry would take the
+/// animated original-bytes path. The preloader must skip exactly
+/// these (a preloaded still cached under the same key would win the
+/// cache lookup and the entry would never animate).
+fn wouldAnimatePreview(name: []const u8, size: u64) bool {
+    return size > 0 and size <= PREVIEW_ANIM_CAP and animatedPreviewName(name);
+}
+
+test "animated preview policy: gif under the cap only" {
+    const t = std.testing;
+    try t.expect(wouldAnimatePreview("clip.gif", 1024));
+    try t.expect(wouldAnimatePreview("CLIP.GIF", PREVIEW_ANIM_CAP));
+    try t.expect(!wouldAnimatePreview("clip.gif", PREVIEW_ANIM_CAP + 1));
+    try t.expect(!wouldAnimatePreview("clip.gif", 0)); // unknown size
+    try t.expect(!wouldAnimatePreview("photo.png", 1024));
+    try t.expect(!wouldAnimatePreview("clip.mkv", 1024)); // video is out of scope
+    // The glycin-gated set is environment-dependent; both outcomes
+    // are legitimate, so only pin the coupling itself.
+    try t.expectEqual(image_decoder.glycinAvailable(), wouldAnimatePreview("anim.webp", 1024));
+    try t.expect(!animatedPreviewName("still.apng")); // never reaches .media
+}
+
+/// What one `read` reply means for an in-flight animated original
+/// fetch. Pure so the loop's exit conditions are testable without a
+/// daemon: `fetch_more` asks for the next chunk, `demote` gives up on
+/// animating and falls back to the daemon's 512px still, `finish`
+/// hands the buffer to the shared completion path (which reports a
+/// failed read as a note like any other).
+const AnimateStep = enum { fetch_more, demote, finish };
+
+fn animateStep(ok: bool, eof: bool, size: u64, have: usize, last: usize) AnimateStep {
+    if (!ok) return .finish;
+    // The file outgrew the budget since it was statted, or read back
+    // empty: both are exactly the over-cap case.
+    if (size > PREVIEW_ANIM_CAP or have == 0) return .demote;
+    if (eof) return .finish;
+    // One daemon read caps at MAX_READ, so a non-eof reply means more
+    // to pull -- unless the chunk grew nothing (or overran the stated
+    // size), which would loop forever.
+    if (have <= last or have >= size) return .demote;
+    return .fetch_more;
+}
+
+test "animated preview chunk loop terminates" {
+    const t = std.testing;
+    const cap = PREVIEW_ANIM_CAP;
+    // 6 MiB file: two full MAX_READ chunks, then the tail.
+    try t.expectEqual(AnimateStep.fetch_more, animateStep(true, false, 6 << 20, 2 << 20, 0));
+    try t.expectEqual(AnimateStep.fetch_more, animateStep(true, false, 6 << 20, 4 << 20, 2 << 20));
+    try t.expectEqual(AnimateStep.finish, animateStep(true, true, 6 << 20, 6 << 20, 4 << 20));
+    // Single-chunk file.
+    try t.expectEqual(AnimateStep.finish, animateStep(true, true, 1024, 1024, 0));
+    // Grew past the cap between the stat and the read.
+    try t.expectEqual(AnimateStep.demote, animateStep(true, false, cap + 1, 2 << 20, 0));
+    // A chunk that delivered nothing must not re-request forever.
+    try t.expectEqual(AnimateStep.demote, animateStep(true, false, 6 << 20, 2 << 20, 2 << 20));
+    try t.expectEqual(AnimateStep.demote, animateStep(true, false, 1024, 0, 0));
+    // A reply that claims no eof yet already holds the whole file.
+    try t.expectEqual(AnimateStep.demote, animateStep(true, false, 1024, 1024, 512));
+    // A refused read goes to the shared failure path, not a demotion.
+    try t.expectEqual(AnimateStep.finish, animateStep(false, false, 0, 0, 0));
+}
+
 /// Start (or serve from cache) the preview of one entry. A preload
-/// only fills the cache; the foreground fetch also paints.
+/// only fills the cache; the foreground fetch also paints. `size` is
+/// the entry's byte size (0 = unknown), which gates the animated
+/// original-bytes path.
 fn startPreview(
     self: *BrowserView,
     hc: *HostConn,
     path: []const u8,
     mtime_ms: i64,
+    size: u64,
     is_dir: bool,
     preload: bool,
 ) void {
@@ -1924,6 +2096,14 @@ fn startPreview(
         return;
     }
 
+    // Animate only where it is cheap and correct: the entry's own
+    // bytes are small enough to pull whole, the default thumbnail
+    // handler applies (a user previewer rule always wins), and this
+    // is the foreground fetch (preloads never decode animations).
+    const animate = !preload and !is_dir and
+        handler.producer == .builtin and handler.producer.builtin == .thumbnail and
+        wouldAnimatePreview(name, size);
+
     const pr = self.allocator.create(PreviewRead) catch return;
     pr.* = .{
         .req = self.nextReq(),
@@ -1940,6 +2120,7 @@ fn startPreview(
         .output = handler.output,
         .force_hex = handler.producer == .builtin and handler.producer.builtin == .hex,
         .cast_meta = handler.producer == .builtin and handler.producer.builtin == .cast,
+        .animate = animate,
         .preload = preload,
         .generation = if (preload) 0 else self.preview_generation,
         .needs_transport = handler.producer == .host_command and handler.output == .image,
@@ -1951,7 +2132,19 @@ fn startPreview(
 
     switch (handler.producer) {
         .builtin => |b| switch (b) {
-            .thumbnail => self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
+            .thumbnail => if (pr.animate) {
+                // Original bytes instead of the 512px still; the
+                // daemon caps one read at MAX_READ, so feedReadSlot
+                // keeps pulling chunks until eof.
+                pr.phase = .read_file;
+                self.sendOp(hc, .{
+                    .req = pr.req,
+                    .op = "read",
+                    .path = pr.path,
+                    .off = @as(u64, 0),
+                    .len = @as(u64, PREVIEW_ANIM_CAP),
+                });
+            } else self.sendOp(hc, .{ .req = pr.req, .op = "preview", .path = pr.path, .image_codecs = wireImageCodecs(hc), .wire_cache = hc.host != null }),
             .head, .hex, .cast => {
                 pr.phase = .read_file;
                 self.sendOp(hc, .{
@@ -2096,7 +2289,8 @@ fn feedReadSlot(
         .fs_data => {
             if (payload.len < 12) return false;
             if (std.mem.readInt(u32, payload[0..4], .little) != pr.req) return false;
-            if (pr.buf.items.len < PREVIEW_IMAGE_CAP)
+            const byte_cap: usize = if (pr.animate) PREVIEW_ANIM_CAP else PREVIEW_IMAGE_CAP;
+            if (pr.buf.items.len < byte_cap)
                 pr.buf.appendSlice(self.allocator, payload[12..]) catch {};
             return true;
         },
@@ -2119,9 +2313,28 @@ fn feedReadSlot(
                     return true;
                 },
                 .read_file => {
+                    if (pr.animate) switch (animateStep(rep.ok, rep.eof, rep.size, pr.buf.items.len, pr.last_len)) {
+                        .fetch_more => {
+                            pr.last_len = pr.buf.items.len;
+                            pr.req = self.nextReq();
+                            self.sendOp(pr.hc, .{
+                                .req = pr.req,
+                                .op = "read",
+                                .path = pr.path,
+                                .off = @as(u64, pr.buf.items.len),
+                                .len = @as(u64, PREVIEW_ANIM_CAP - pr.buf.items.len),
+                            });
+                            return true;
+                        },
+                        .demote => {
+                            restartAsThumbnail(self, pr);
+                            return true;
+                        },
+                        .finish => {},
+                    };
                     if (!rep.ok or pr.buf.items.len == 0) {
                         failRead(self, pr, if (rep.@"error".len > 0) rep.@"error" else "the preview is empty");
-                    } else if (pr.output == .image and (!rep.eof or rep.size > PREVIEW_IMAGE_CAP)) {
+                    } else if (pr.output == .image and !pr.animate and (!rep.eof or rep.size > PREVIEW_IMAGE_CAP)) {
                         failRead(self, pr, "preview output exceeds the 2 MiB transfer limit");
                     } else {
                         deliverRead(self, pr);
@@ -2222,6 +2435,24 @@ fn feedReadSlot(
     }
 }
 
+/// Demote an in-flight animated original fetch to the ordinary
+/// daemon-rendered still (the "preview" job), reusing the same
+/// PreviewRead so the pipeline keeps exactly one foreground slot.
+fn restartAsThumbnail(self: *BrowserView, pr: *PreviewRead) void {
+    pr.animate = false;
+    pr.last_len = 0;
+    pr.phase = .job_start;
+    pr.req = self.nextReq();
+    pr.buf.clearRetainingCapacity();
+    self.sendOp(pr.hc, .{
+        .req = pr.req,
+        .op = "preview",
+        .path = pr.path,
+        .image_codecs = wireImageCodecs(pr.hc),
+        .wire_cache = pr.hc.host != null,
+    });
+}
+
 /// Release a finished read (its scratch file is already accounted
 /// for) and let the preloader take the freed slot.
 fn endSlot(self: *BrowserView, slot: *?*PreviewRead) void {
@@ -2248,6 +2479,14 @@ fn failRead(self: *BrowserView, pr: *PreviewRead, message: []const u8) void {
 /// The bytes arrived: text is rendered here, an image goes to the
 /// worker so no decode ever runs in the fd callback.
 fn deliverRead(self: *BrowserView, pr: *PreviewRead) void {
+    if (pr.animate and pr.buf.items.len > 0) {
+        // Animated originals go straight to the worker and their
+        // frames are NEVER cached: one animation can outweigh the
+        // whole 12-entry texture cache by an order of magnitude, so
+        // arrowing back re-fetches instead (see PREVIEW_CACHE_CAP).
+        self.queuePreviewDecode(pr);
+        return;
+    }
     const key = self.allocator.dupe(u8, pr.key) catch return;
     const note: ?[]u8 = if (pr.note.len > 0) (self.allocator.dupe(u8, pr.note) catch null) else null;
     if (pr.output == .image and pr.buf.items.len > 0) {
@@ -2332,6 +2571,7 @@ pub fn queuePreviewDecode(self: *BrowserView, pr: *PreviewRead) void {
         .mtime_ms = 0,
         .data = data,
         .kind = .preview,
+        .animate = pr.animate,
         .preview_generation = if (pr.preload) 0 else pr.generation,
     }) catch {
         a.free(path);
@@ -2345,6 +2585,29 @@ pub fn queuePreviewDecode(self: *BrowserView, pr: *PreviewRead) void {
 /// Worker handback for a preview decode: cache the texture, paint it
 /// when it still belongs to the entry on screen.
 fn storePreviewImage(self: *BrowserView, res: *ThumbResult) void {
+    if (res.animation) |*anim| {
+        // Animated: paint-only, never cached (the frames dwarf a
+        // cache entry). A stale generation means the user has moved
+        // on; the frames die in the handback's defer.
+        if (res.preview_generation == 0 or res.preview_generation != self.preview_generation)
+            return;
+        // The sidebar always loops: it is an ambient preview, and the
+        // file's own finite play count would leave a frozen last frame
+        // with no transport bar to restart it (that is the Viewer's
+        // job). Overridden on the Decoded, BEFORE setDecoded copies it
+        // into the session -- not on the session afterwards, where it
+        // would depend on the order setDecoded happens to assign in.
+        anim.plays = 0;
+        self.preview_image.setDecoded(self.allocator, anim) catch {
+            showPanelPic(self, false);
+            showPreviewNote(self, "(cannot decode preview image)");
+            return;
+        };
+        setStageHeight(self, self.preview_image.currentTexture());
+        showPanelPic(self, true);
+        c.gtk_label_set_text(self.preview_text, "");
+        return;
+    }
     // The worker's key is "<identity>\x00<mtime>" with mtime 0 for
     // previews; strip that suffix back to the read's cache key.
     const key_end = std.mem.lastIndexOfScalar(u8, res.key, 0) orelse res.key.len;
@@ -2423,6 +2686,9 @@ pub fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c)
     } else {
         self.abandonPreviewRead();
         self.clearPreloadQueue();
+        // A hidden panel must not keep an animation ticking into a
+        // widget nobody can see; re-showing rebuilds via updatePreview.
+        self.clearPreviewContent();
     }
 }
 
@@ -2458,6 +2724,13 @@ pub fn schedulePreload(self: *BrowserView, tab: *BTab, current: []const u8) void
         const path = list.at(@intCast(idx), &buf) orelse continue;
         const entry = entryForPath(tab, path) orelse continue;
         if (entry.tdir) continue;
+        // Neighbours that would ANIMATE are deliberately not warmed:
+        // the animated path bypasses the cache, and a preloaded still
+        // parked under the same key would shadow the animation on
+        // every later selection. Decoding whole animations for
+        // entries the user may never select is also exactly the
+        // wasteful lookahead the bounded preloader exists to avoid.
+        if (wouldAnimatePreview(std.fs.path.basename(path), entry.size)) continue;
         const key = cacheKey(&key_buf, tab.hc, path, entry.mtime_ms) orelse continue;
         if (previewCached(self, key)) continue;
         if (self.preview_state.preload_queue.items.len >= PRELOAD_QUEUE_CAP) break;
@@ -2488,7 +2761,7 @@ pub fn pumpPreload(self: *BrowserView) void {
         defer item.deinit(self.allocator);
         if (item.hc.state != .ready) continue;
         if (previewCached(self, item.key)) continue;
-        startPreview(self, item.hc, item.path, item.mtime_ms, false, true);
+        startPreview(self, item.hc, item.path, item.mtime_ms, 0, false, true);
         if (self.preview_state.preload_read != null) return;
     }
 }
