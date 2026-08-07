@@ -14,6 +14,7 @@ const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
+const Playbar = @import("playbar.zig").Playbar;
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -562,6 +563,9 @@ pub const ViewerWindow = struct {
     next_button: *c.GtkWidget,
     fullscreen: bool = false,
     content: Content = .image,
+    /// Transport bar under the canvas for animated images; hidden for
+    /// stills and in every non-image content mode.
+    anim_bar: *Playbar,
     /// Vertical box the cast surface + transport bar mount into;
     /// hidden (and empty) while an image is showing.
     cast_slot: *c.GtkWidget,
@@ -666,6 +670,18 @@ pub const ViewerWindow = struct {
         const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
         c.gtk_widget_set_vexpand(canvas.widget(), 1);
         c.gtk_box_append(@ptrCast(content), canvas.widget());
+        // Animated-image transport bar, mounted under the canvas like
+        // the cast bar mounts under its surface. Image seeks are local
+        // frame jumps, so no throttle and no guard.
+        const anim_bar = try Playbar.create(allocator, .{
+            .ctx = @ptrCast(self),
+            .toggle = &srcAnimToggle,
+            .restart = &srcAnimRestart,
+            .seek_to_ms = &srcAnimSeekToMs,
+        }, .{ .restart_button = true, .speed_dropdown = false });
+        errdefer anim_bar.destroy();
+        c.gtk_widget_set_visible(anim_bar.widget(), 0);
+        c.gtk_box_append(@ptrCast(content), anim_bar.widget());
         const cast_slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
         c.gtk_widget_set_vexpand(cast_slot, 1);
         c.gtk_widget_set_visible(cast_slot, 0);
@@ -725,6 +741,7 @@ pub const ViewerWindow = struct {
             .metadata_label = @ptrCast(@alignCast(metadata_label)),
             .prev_button = prev_button,
             .next_button = next_button,
+            .anim_bar = anim_bar,
             .cast_slot = cast_slot,
             .text_slot = text_slot,
             .text_view = @ptrCast(@alignCast(text_view)),
@@ -824,6 +841,7 @@ pub const ViewerWindow = struct {
         }
         if (self.pending_mount) |pending| pending.viewer = null;
         self.pending_mount = null;
+        self.anim_bar.destroy();
         self.open_target.close();
         self.target.close();
         self.session.deinit(self.allocator);
@@ -838,6 +856,7 @@ pub const ViewerWindow = struct {
 
     fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        self.anim_bar.sever();
         switch (self.content) {
             .cast => |box| box.severLive(),
             else => {},
@@ -849,6 +868,7 @@ pub const ViewerWindow = struct {
     fn setContentMode(self: *ViewerWindow, mode: Mode) void {
         const image = mode == .image;
         c.gtk_widget_set_visible(self.canvas.widget(), @intFromBool(image));
+        c.gtk_widget_set_visible(self.anim_bar.widget(), @intFromBool(image and self.session.animated()));
         c.gtk_widget_set_visible(self.cast_slot, @intFromBool(mode == .cast));
         c.gtk_widget_set_visible(self.text_slot, @intFromBool(mode == .text));
         for (self.image_controls) |w| c.gtk_widget_set_visible(w, @intFromBool(image));
@@ -891,7 +911,7 @@ pub const ViewerWindow = struct {
             return;
         };
         self.content = .{ .cast = box };
-        c.gtk_widget_set_tooltip_text(box.scale, "Seek (,/. 5s, </> 30s)");
+        c.gtk_widget_set_tooltip_text(box.playbar.scale, "Seek (,/. 5s, </> 30s)");
         c.gtk_box_append(@ptrCast(self.cast_slot), box.surfaceWidget());
         c.gtk_box_append(@ptrCast(self.cast_slot), box.barWidget());
         self.setContentMode(.cast);
@@ -1006,6 +1026,26 @@ pub const ViewerWindow = struct {
             "media-playback-pause-symbolic"
         else
             "media-playback-start-symbolic");
+        c.gtk_widget_set_visible(
+            self.anim_bar.widget(),
+            @intFromBool(animated and self.content == .image),
+        );
+        if (animated) self.syncAnimBar();
+    }
+
+    /// Push the animation session's current transport state into the
+    /// image playbar.
+    fn syncAnimBar(self: *ViewerWindow) void {
+        self.anim_bar.setState(.{
+            .kind = if (self.session.isPlaying())
+                .playing
+            else if (self.session.finished())
+                .finished
+            else
+                .paused,
+            .position_ms = self.session.positionMs(),
+            .duration_ms = self.session.durationMs(),
+        });
     }
 
     fn updateAccessibleState(self: *ViewerWindow) void {
@@ -1497,10 +1537,37 @@ fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
     c.gtk_label_set_text(self.status, text.ptr);
 }
 
-fn onSessionPlaybackChanged(user: ?*anyopaque) void {
+fn onSessionPlaybackChanged(user: ?*anyopaque, event: image_canvas.Session.PlaybackEvent) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
-    self.updatePlaybackButton();
-    self.updateAccessibleState();
+    switch (event) {
+        .state => {
+            self.updatePlaybackButton();
+            self.updateAccessibleState();
+        },
+        // Per-frame ticks and seeks only move the transport bar — the
+        // header button and accessible description track state
+        // transitions, not every frame.
+        .position => if (self.session.animated() and self.content == .image) self.syncAnimBar(),
+    }
+}
+
+// ── animated-image playbar source ────────────────────────────────
+
+fn srcAnimToggle(ctx: ?*anyopaque) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    self.session.togglePlayback();
+}
+
+fn srcAnimRestart(ctx: ?*anyopaque) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    if (!self.session.animated()) return;
+    self.session.seekToFrame(0);
+    if (!self.session.isPlaying()) self.session.togglePlayback();
+}
+
+fn srcAnimSeekToMs(ctx: ?*anyopaque, target_ms: u64) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    self.session.seekToMs(target_ms);
 }
 
 fn onCanvasNavigate(user: ?*anyopaque, delta: isize) void {

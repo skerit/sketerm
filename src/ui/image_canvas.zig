@@ -310,11 +310,16 @@ fn installCss(widget: *c.GtkWidget) void {
 }
 
 pub const Session = struct {
-    const AnimationFrame = struct {
+    pub const AnimationFrame = struct {
         texture: *c.GdkTexture,
         rotated: ?*c.GdkTexture = null,
         delay_ms: u32,
     };
+
+    /// What a playback notification is about: `.state` covers the
+    /// coarse transitions (decode landed, toggled, completed), while
+    /// `.position` fires on every frame advance and explicit seek.
+    pub const PlaybackEvent = enum { state, position };
 
     canvases: std.ArrayList(*Canvas) = .empty,
     frames: std.ArrayList(AnimationFrame) = .empty,
@@ -326,7 +331,9 @@ pub const Session = struct {
     plays: u32 = 1,
     completed_plays: u32 = 0,
     quarter_turns: u2 = 0,
-    on_playback: ?*const fn (?*anyopaque) void = null,
+    /// Total animation length, cached once per `setDecoded`.
+    total_ms: u64 = 0,
+    on_playback: ?*const fn (?*anyopaque, PlaybackEvent) void = null,
     playback_ctx: ?*anyopaque = null,
 
     pub fn attach(self: *Session, allocator: std.mem.Allocator, canvas: *Canvas) !void {
@@ -372,8 +379,10 @@ pub const Session = struct {
             for (self.frames.items) |*frame|
                 frame.delay_ms = std.math.clamp(frame.delay_ms, 10, 10_000);
         }
+        self.total_ms = timelineTotalMs(self.frames.items);
         self.publishCurrent();
         self.scheduleNext();
+        self.notifyPlayback(.state);
     }
 
     pub fn animated(self: *const Session) bool {
@@ -382,6 +391,24 @@ pub const Session = struct {
 
     pub fn isPlaying(self: *const Session) bool {
         return self.animated() and self.playing;
+    }
+
+    /// True when a finite play count has been exhausted (the animation
+    /// sits on its last frame until restarted).
+    pub fn finished(self: *const Session) bool {
+        return self.animated() and !self.playing and
+            self.plays != 0 and self.completed_plays >= self.plays;
+    }
+
+    /// Total animation length in ms (0 for stills).
+    pub fn durationMs(self: *const Session) u64 {
+        return if (self.animated()) self.total_ms else 0;
+    }
+
+    /// Timeline offset of the frame currently shown.
+    pub fn positionMs(self: *const Session) u64 {
+        if (!self.animated()) return 0;
+        return timelineStartMs(self.frames.items, self.frame_index);
     }
 
     pub fn togglePlayback(self: *Session) void {
@@ -398,10 +425,32 @@ pub const Session = struct {
         }
         self.next_deadline_us = 0;
         if (self.playing) self.scheduleNext() else self.stopTimer();
-        self.notifyPlayback();
+        self.notifyPlayback(.state);
     }
 
-    pub fn setPlaybackCallback(self: *Session, context: ?*anyopaque, callback: ?*const fn (?*anyopaque) void) void {
+    /// Jump to the frame covering `ms` on the cumulative timeline.
+    pub fn seekToMs(self: *Session, ms: u64) void {
+        if (!self.animated()) return;
+        self.seekToFrame(timelineIndexForMs(self.frames.items, ms));
+    }
+
+    /// Jump to `index` (clamped). Resets the tick deadline so a
+    /// playing animation resumes in sync from the new frame, and pulls
+    /// an exhausted finite play count back within bounds so resuming
+    /// does not snap to frame zero.
+    pub fn seekToFrame(self: *Session, index: usize) void {
+        if (!self.animated()) return;
+        const count = self.frames.items.len;
+        self.frame_index = if (index >= count) count - 1 else index;
+        if (self.plays != 0 and self.completed_plays >= self.plays)
+            self.completed_plays = self.plays - 1;
+        self.next_deadline_us = 0;
+        self.publishCurrent();
+        if (self.playing) self.scheduleNext();
+        self.notifyPlayback(.position);
+    }
+
+    pub fn setPlaybackCallback(self: *Session, context: ?*anyopaque, callback: ?*const fn (?*anyopaque, PlaybackEvent) void) void {
         self.playback_ctx = context;
         self.on_playback = callback;
     }
@@ -461,6 +510,7 @@ pub const Session = struct {
         self.next_deadline_us = 0;
         self.plays = 1;
         self.completed_plays = 0;
+        self.total_ms = 0;
     }
 
     fn publishCurrent(self: *Session) void {
@@ -504,7 +554,7 @@ pub const Session = struct {
                     self.playing = false;
                     self.next_deadline_us = 0;
                     self.publishCurrent();
-                    self.notifyPlayback();
+                    self.notifyPlayback(.state);
                     return 0;
                 }
             }
@@ -518,13 +568,73 @@ pub const Session = struct {
         }
         self.publishCurrent();
         self.scheduleNext();
+        self.notifyPlayback(.position);
         return 0;
     }
 
-    fn notifyPlayback(self: *Session) void {
-        if (self.on_playback) |callback| callback(self.playback_ctx);
+    fn notifyPlayback(self: *Session, event: PlaybackEvent) void {
+        if (self.on_playback) |callback| callback(self.playback_ctx, event);
     }
 };
+
+/// Sum of the (already clamped) frame delays.
+pub fn timelineTotalMs(frames: []const Session.AnimationFrame) u64 {
+    var total: u64 = 0;
+    for (frames) |frame| total += frame.delay_ms;
+    return total;
+}
+
+/// Cumulative start offset of `index` (clamped to the last frame).
+pub fn timelineStartMs(frames: []const Session.AnimationFrame, index: usize) u64 {
+    var start: u64 = 0;
+    for (frames, 0..) |frame, i| {
+        if (i >= index) break;
+        start += frame.delay_ms;
+    }
+    return start;
+}
+
+/// Frame whose [start, start + delay) interval covers `ms`; positions
+/// at or past the end clamp to the last frame. Zero-delay frames are
+/// skipped over (their interval is empty).
+pub fn timelineIndexForMs(frames: []const Session.AnimationFrame, ms: u64) usize {
+    if (frames.len == 0) return 0;
+    var start: u64 = 0;
+    for (frames, 0..) |frame, i| {
+        const end = start + frame.delay_ms;
+        if (ms < end) return i;
+        start = end;
+    }
+    return frames.len - 1;
+}
+
+test "animation timeline offsets, totals and frame lookup" {
+    const frames = [_]Session.AnimationFrame{
+        .{ .texture = undefined, .delay_ms = 100 },
+        .{ .texture = undefined, .delay_ms = 50 },
+        .{ .texture = undefined, .delay_ms = 200 },
+    };
+    try std.testing.expectEqual(@as(u64, 350), timelineTotalMs(&frames));
+    try std.testing.expectEqual(@as(u64, 0), timelineStartMs(&frames, 0));
+    try std.testing.expectEqual(@as(u64, 100), timelineStartMs(&frames, 1));
+    try std.testing.expectEqual(@as(u64, 150), timelineStartMs(&frames, 2));
+    // Out-of-range index clamps to the end of the timeline sum.
+    try std.testing.expectEqual(@as(u64, 350), timelineStartMs(&frames, 9));
+    try std.testing.expectEqual(@as(usize, 0), timelineIndexForMs(&frames, 0));
+    try std.testing.expectEqual(@as(usize, 0), timelineIndexForMs(&frames, 99));
+    try std.testing.expectEqual(@as(usize, 1), timelineIndexForMs(&frames, 100));
+    try std.testing.expectEqual(@as(usize, 2), timelineIndexForMs(&frames, 150));
+    try std.testing.expectEqual(@as(usize, 2), timelineIndexForMs(&frames, 349));
+    try std.testing.expectEqual(@as(usize, 2), timelineIndexForMs(&frames, 350));
+    try std.testing.expectEqual(@as(usize, 2), timelineIndexForMs(&frames, 100_000));
+    try std.testing.expectEqual(@as(usize, 0), timelineIndexForMs(&.{}, 5));
+    // A zero-delay frame's interval is empty and is stepped over.
+    const with_zero = [_]Session.AnimationFrame{
+        .{ .texture = undefined, .delay_ms = 0 },
+        .{ .texture = undefined, .delay_ms = 40 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), timelineIndexForMs(&with_zero, 0));
+}
 
 fn textureFromFrame(frame: decoder.Frame) ?*c.GdkTexture {
     const bytes = c.g_bytes_new(frame.rgba.ptr, frame.rgba.len) orelse return null;
