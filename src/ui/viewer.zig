@@ -7,6 +7,7 @@ const paths = @import("../filebrowser/paths.zig");
 const decoder = @import("image_decoder.zig");
 const image_canvas = @import("image_canvas.zig");
 const hostmount = @import("hostmount.zig");
+const hexdump = @import("../filebrowser/hexdump.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
@@ -14,8 +15,10 @@ const platform = @import("../util/platform.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 
-pub const Variant = enum { preview, original, external_copy };
+pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
+/// Bounded head fetched for text/hex content (`.head` loads).
+pub const HEAD_BYTES_MAX: usize = 256 << 10;
 const ORIGINAL_BYTES_MAX: usize = 128 << 20;
 const PREVIEW_PIXELS_MAX: usize = 4 * 1024 * 1024;
 const ORIGINAL_PIXELS_MAX: usize = 64 * 1024 * 1024;
@@ -25,6 +28,8 @@ const LOAD_TIMEOUT_MS: i64 = 120_000;
 pub const LoadResult = struct {
     variant: Variant,
     decoded: ?decoder.Decoded = null,
+    /// Raw head bytes for a `.head` load (c_allocator-owned).
+    head: ?[]u8 = null,
     source_bytes: usize = 0,
     message: [160]u8 = undefined,
     message_len: usize = 0,
@@ -49,6 +54,8 @@ pub const LoadResult = struct {
 
     fn deinit(self: *LoadResult) void {
         if (self.decoded) |*image| image.deinit(std.heap.c_allocator);
+        if (self.head) |bytes| std.heap.c_allocator.free(bytes);
+        self.head = null;
         if (self.materialized_len > 0) _ = c.unlink(&self.materialized);
     }
 };
@@ -295,6 +302,28 @@ fn fetch(work: *LoadWork) !FetchPayload {
     var probe_bytes: std.ArrayList(u8) = .empty;
     defer probe_bytes.deinit(std.heap.c_allocator);
     const source = try fs.read(resource.path, 0, 0, &probe_bytes);
+    if (variant == .head) {
+        // No size ceiling: a huge binary still gets its bounded head.
+        const allocator = std.heap.c_allocator;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        const cap: u64 = @min(@as(u64, HEAD_BYTES_MAX), source.size);
+        var offset: u64 = 0;
+        while (offset < cap) {
+            const before = out.items.len;
+            const requested: u32 = @intCast(@min(cap - offset, fsdrive.fsserve.MAX_READ));
+            const info = try fs.read(resource.path, offset, requested, &out);
+            const received = out.items.len - before;
+            if (received == 0) break;
+            offset += received;
+            if (info.eof) break;
+        }
+        if (out.items.len > HEAD_BYTES_MAX) out.shrinkRetainingCapacity(HEAD_BYTES_MAX);
+        return FetchPayload{
+            .source_size = @intCast(source.size),
+            .bytes = try out.toOwnedSlice(allocator),
+        };
+    }
     if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
     if (variant == .original or variant == .external_copy) {
         const bytes = try readAll(&fs, resource.path, ORIGINAL_BYTES_MAX);
@@ -323,26 +352,20 @@ fn loadThread(first: *LoadWork) void {
     while (true) {
         work.result = .{ .variant = work.variant };
         if (fetch(work)) |payload| {
-            defer allocator.free(payload.bytes);
             work.result.source_bytes = payload.source_size;
             work.result.metadata_len = payload.metadata_len;
             @memcpy(work.result.metadata[0..payload.metadata_len], payload.metadata[0..payload.metadata_len]);
             work.result.metadata[payload.metadata_len] = 0;
-            if (work.target.current(work.generation) and work.variant == .external_copy) {
-                materializeOpenCopy(work, payload.bytes, &work.result) catch |err| work.result.setError(err);
-            } else if (work.target.current(work.generation)) {
-                const max_pixels = if (work.variant == .preview) PREVIEW_PIXELS_MAX else ORIGINAL_PIXELS_MAX;
-                work.result.decoded = decoder.decodeBytes(allocator, payload.bytes, .{
-                    .max_pixels = max_pixels,
-                    .max_animation_bytes = if (work.variant == .preview) PREVIEW_PIXELS_MAX * 4 else ORIGINAL_ANIMATION_BYTES_MAX,
-                    .max_frames = if (work.variant == .preview) 1 else 240,
-                    .cancel_context = @ptrCast(work),
-                    .should_cancel = &decodeStillCurrent,
-                }) catch |err| blk: {
-                    work.result.setError(err);
-                    break :blk null;
-                };
-            } else work.result.setError(error.Canceled);
+            if (work.variant == .head) {
+                // The head bytes move into the result whole; the UI
+                // classifies and renders them on the main thread.
+                if (work.target.current(work.generation)) {
+                    work.result.head = payload.bytes;
+                } else {
+                    allocator.free(payload.bytes);
+                    work.result.setError(error.Canceled);
+                }
+            } else deliverImage(work, payload.bytes);
         } else |err| work.result.setError(err);
         allocator.free(work.spec);
         work.spec = &.{};
@@ -364,6 +387,28 @@ fn loadThread(first: *LoadWork) void {
         }
         work = next orelse return;
     }
+}
+
+/// Decode or materialize fetched image bytes into `work.result`
+/// (every non-`.head` variant).
+fn deliverImage(work: *LoadWork, bytes: []u8) void {
+    const allocator = std.heap.c_allocator;
+    defer allocator.free(bytes);
+    if (work.target.current(work.generation) and work.variant == .external_copy) {
+        materializeOpenCopy(work, bytes, &work.result) catch |err| work.result.setError(err);
+    } else if (work.target.current(work.generation)) {
+        const max_pixels = if (work.variant == .preview) PREVIEW_PIXELS_MAX else ORIGINAL_PIXELS_MAX;
+        work.result.decoded = decoder.decodeBytes(allocator, bytes, .{
+            .max_pixels = max_pixels,
+            .max_animation_bytes = if (work.variant == .preview) PREVIEW_PIXELS_MAX * 4 else ORIGINAL_ANIMATION_BYTES_MAX,
+            .max_frames = if (work.variant == .preview) 1 else 240,
+            .cancel_context = @ptrCast(work),
+            .should_cancel = &decodeStillCurrent,
+        }) catch |err| blk: {
+            work.result.setError(err);
+            break :blk null;
+        };
+    } else work.result.setError(error.Canceled);
 }
 
 fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) !void {
@@ -460,11 +505,14 @@ const VIEWER_QDATA = "sketerm-viewer-window";
 /// What the viewer window currently shows. `.image` routes to the
 /// window-owned canvas/loader pipeline, which persists across items
 /// (LoadTargets, canvas, session all live for the window's whole
-/// life); `.cast` carries a per-item playback controller that is torn
-/// down completely on every navigation (its ephemeral daemon session
-/// dies with it).
+/// life); `.text` routes to the window-owned text view fed by `.head`
+/// loads on the SAME LoadTarget, so navigation fencing is exactly the
+/// image discipline; `.cast` carries a per-item playback controller
+/// that is torn down completely on every navigation (its ephemeral
+/// daemon session dies with it).
 pub const Content = union(enum) {
     image,
+    text,
     cast: *castbox.CastPlayerBox,
 };
 
@@ -473,6 +521,29 @@ pub const Content = union(enum) {
 const IMAGE_CONTROL_COUNT = 10;
 
 pub const ViewerWindow = struct {
+    /// Host policy for an embedding shell (the Files Quick Look host in
+    /// particular). Standalone invocations pass `.{}`, which changes
+    /// nothing user-visible.
+    pub const Options = struct {
+        /// Parent window the viewer attaches to as a transient.
+        transient_for: ?*c.GtkWindow = null,
+        /// Space CLOSES the window (quick-look semantics) in every
+        /// content mode; cast play/pause moves to K.
+        close_on_space: bool = false,
+        /// Offer the "Show in Sketerm Files" action (hamburger row and
+        /// context-menu row both follow it).
+        show_in_files_action: bool = true,
+        /// Enter on the current item; receives the host-qualified spec.
+        /// `activate_ctx` must OUTLIVE the window — no fence exists,
+        /// which is safe because the callback only ever fires from the
+        /// window's own key controller and that dies with the window.
+        on_activate: ?*const fn (?*anyopaque, []const u8) void = null,
+        activate_ctx: ?*anyopaque = null,
+    };
+
+    /// Which content family owns the window chrome right now.
+    const Mode = enum { image, text, cast };
+
     allocator: std.mem.Allocator,
     window: *c.GtkWidget,
     batch: model.Batch,
@@ -494,6 +565,11 @@ pub const ViewerWindow = struct {
     /// Vertical box the cast surface + transport bar mount into;
     /// hidden (and empty) while an image is showing.
     cast_slot: *c.GtkWidget,
+    /// Scroller hosting the read-only text/hex view; hidden unless
+    /// text content is showing.
+    text_slot: *c.GtkWidget,
+    text_view: *c.GtkTextView,
+    options: Options,
     /// Header controls hidden while a cast is showing.
     image_controls: [IMAGE_CONTROL_COUNT]*c.GtkWidget,
     /// Latest recording title (cast header / OSC title / basename).
@@ -504,13 +580,14 @@ pub const ViewerWindow = struct {
     /// canvas owns it and frees it when the canvas dies.
     canvas_menu: ?*CanvasMenu = null,
 
-    pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, batch: model.Batch) !*ViewerWindow {
+    pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, batch: model.Batch, options: Options) !*ViewerWindow {
         const self = try allocator.create(ViewerWindow);
         errdefer allocator.destroy(self);
         const window = c.adw_application_window_new(app) orelse return error.OutOfMemory;
         errdefer c.gtk_window_destroy(@ptrCast(window));
         c.gtk_window_set_title(@ptrCast(window), model.APP_NAME);
         c.gtk_window_set_default_size(@ptrCast(window), 1100, 760);
+        if (options.transient_for) |parent| c.gtk_window_set_transient_for(@ptrCast(window), parent);
 
         const toolbar = c.adw_toolbar_view_new().?;
         const header = c.adw_header_bar_new().?;
@@ -568,6 +645,7 @@ pub const ViewerWindow = struct {
         const copy_button = actionButton(action_box, "Copy Image", "edit-copy-symbolic");
         const open_with_button = actionButton(action_box, "Open With...", "document-open-symbolic");
         const reveal_button = actionButton(action_box, "Show in Sketerm Files", "folder-open-symbolic");
+        if (!options.show_in_files_action) c.gtk_widget_set_visible(reveal_button, 0);
         const reload_button = actionButton(action_box, "Reload", "view-refresh-symbolic");
         c.gtk_popover_set_child(@ptrCast(action_popover), action_box);
         c.gtk_menu_button_set_popover(@ptrCast(menu_button), action_popover);
@@ -592,6 +670,21 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_vexpand(cast_slot, 1);
         c.gtk_widget_set_visible(cast_slot, 0);
         c.gtk_box_append(@ptrCast(content), cast_slot);
+        const text_slot = c.gtk_scrolled_window_new().?;
+        c.gtk_scrolled_window_set_policy(@ptrCast(text_slot), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
+        c.gtk_widget_set_vexpand(text_slot, 1);
+        c.gtk_widget_set_visible(text_slot, 0);
+        const text_view = c.gtk_text_view_new().?;
+        c.gtk_text_view_set_editable(@ptrCast(text_view), 0);
+        c.gtk_text_view_set_cursor_visible(@ptrCast(text_view), 0);
+        c.gtk_text_view_set_monospace(@ptrCast(text_view), 1);
+        c.gtk_text_view_set_wrap_mode(@ptrCast(text_view), c.GTK_WRAP_NONE);
+        c.gtk_text_view_set_left_margin(@ptrCast(text_view), 12);
+        c.gtk_text_view_set_right_margin(@ptrCast(text_view), 12);
+        c.gtk_text_view_set_top_margin(@ptrCast(text_view), 8);
+        c.gtk_text_view_set_bottom_margin(@ptrCast(text_view), 8);
+        c.gtk_scrolled_window_set_child(@ptrCast(text_slot), text_view);
+        c.gtk_box_append(@ptrCast(content), text_slot);
         const footer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10).?;
         c.gtk_widget_set_margin_start(footer, 12);
         c.gtk_widget_set_margin_end(footer, 12);
@@ -633,6 +726,9 @@ pub const ViewerWindow = struct {
             .prev_button = prev_button,
             .next_button = next_button,
             .cast_slot = cast_slot,
+            .text_slot = text_slot,
+            .text_view = @ptrCast(@alignCast(text_view)),
+            .options = options,
             .image_controls = .{
                 zoom_out,    @ptrCast(@alignCast(zoom_label)), zoom_in,     fit_button,
                 fill_button, actual_button,                    rotate_left, rotate_right,
@@ -680,7 +776,7 @@ pub const ViewerWindow = struct {
         // forwards to the header or hamburger button that already
         // implements it, so the menu adds no second copy of any
         // action and inherits each button's sensitivity.
-        self.canvas_menu = try attachCanvasMenu(allocator, self.canvas.widget(), &.{
+        const all_menu_items = [_]CanvasMenuItem{
             .{ .row = .{ .label = "Copy Image", .icon = "edit-copy-symbolic", .source = copy_button } },
             .{ .row = .{ .label = "Open With…", .icon = "document-open-symbolic", .source = open_with_button } },
             .{ .row = .{ .label = "Show in Sketerm Files", .icon = "folder-open-symbolic", .source = reveal_button } },
@@ -700,7 +796,17 @@ pub const ViewerWindow = struct {
             .{ .row = .{ .label = "Next Image", .icon = "go-next-symbolic", .source = next_button } },
             .{ .row = .{ .label = "View Full Resolution", .icon = "zoom-in-symbolic", .source = original } },
             .{ .row = .{ .label = "Fullscreen", .icon = "view-fullscreen-symbolic", .source = fullscreen_button } },
-        });
+        };
+        var menu_items: [all_menu_items.len]CanvasMenuItem = undefined;
+        var n_menu_items: usize = 0;
+        for (all_menu_items) |item| {
+            // A host that suppresses the Files action gets no dead
+            // context-menu row for it either.
+            if (!options.show_in_files_action and item == .row and item.row.source == reveal_button) continue;
+            menu_items[n_menu_items] = item;
+            n_menu_items += 1;
+        }
+        self.canvas_menu = try attachCanvasMenu(allocator, self.canvas.widget(), menu_items[0..n_menu_items]);
 
         self.showCurrent();
         c.gtk_window_present(@ptrCast(window));
@@ -714,7 +820,7 @@ pub const ViewerWindow = struct {
         // severed the timers/sinks when the window started dying).
         switch (self.content) {
             .cast => |box| box.destroy(),
-            .image => {},
+            else => {},
         }
         if (self.pending_mount) |pending| pending.viewer = null;
         self.pending_mount = null;
@@ -734,15 +840,17 @@ pub const ViewerWindow = struct {
         const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
         switch (self.content) {
             .cast => |box| box.severLive(),
-            .image => {},
+            else => {},
         }
     }
 
-    /// Show or hide the image-mode chrome (canvas + header controls)
-    /// against the cast slot.
-    fn setContentMode(self: *ViewerWindow, image: bool) void {
+    /// Show exactly one content surface and the header controls that
+    /// make sense for it (image controls hide for text and casts).
+    fn setContentMode(self: *ViewerWindow, mode: Mode) void {
+        const image = mode == .image;
         c.gtk_widget_set_visible(self.canvas.widget(), @intFromBool(image));
-        c.gtk_widget_set_visible(self.cast_slot, @intFromBool(!image));
+        c.gtk_widget_set_visible(self.cast_slot, @intFromBool(mode == .cast));
+        c.gtk_widget_set_visible(self.text_slot, @intFromBool(mode == .text));
         for (self.image_controls) |w| c.gtk_widget_set_visible(w, @intFromBool(image));
         if (!image) c.gtk_widget_set_visible(self.original_button, 0);
     }
@@ -754,7 +862,7 @@ pub const ViewerWindow = struct {
     fn closeCast(self: *ViewerWindow) void {
         const box = switch (self.content) {
             .cast => |b| b,
-            .image => return,
+            else => return,
         };
         self.content = .image;
         box.severLive();
@@ -762,7 +870,7 @@ pub const ViewerWindow = struct {
         c.gtk_box_remove(@ptrCast(self.cast_slot), box.barWidget());
         box.destroy();
         self.cast_title_len = 0;
-        self.setContentMode(true);
+        self.setContentMode(.image);
     }
 
     fn showCast(self: *ViewerWindow, resource: model.Resource) void {
@@ -786,17 +894,33 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_tooltip_text(box.scale, "Seek (,/. 5s, </> 30s)");
         c.gtk_box_append(@ptrCast(self.cast_slot), box.surfaceWidget());
         c.gtk_box_append(@ptrCast(self.cast_slot), box.barWidget());
-        self.setContentMode(false);
+        self.setContentMode(.cast);
+    }
+
+    /// Bounded universal fallback: any non-media, non-cast file shows
+    /// as UTF-8 text or a hex dump of its head. The `.head` load rides
+    /// the window's main LoadTarget, so navigating away supersedes it
+    /// by generation exactly like an image load.
+    fn showText(self: *ViewerWindow, resource: model.Resource) void {
+        self.target.cancel();
+        self.content = .text;
+        self.setContentMode(.text);
+        setTextViewContent(self, "");
+        c.gtk_label_set_text(self.metadata_label, "File contents (bounded head)");
+        c.gtk_label_set_text(self.status, "Loading file...");
+        if (!self.target.start(resource.spec, .head)) c.gtk_label_set_text(self.status, "Could not start the file loader");
     }
 
     fn showCurrent(self: *ViewerWindow) void {
         self.closeCast();
+        self.content = .image;
         self.session.clear();
         self.canvas.fit();
         c.gtk_widget_set_sensitive(self.play_button, 0);
         c.gtk_label_set_text(self.metadata_label, "Loading image metadata...");
         c.gtk_widget_set_visible(self.original_button, 0);
         const resource = self.current() orelse {
+            self.setContentMode(.image);
             c.gtk_label_set_text(self.status, "Open an image to begin");
             c.gtk_label_set_text(self.position, "");
             c.gtk_widget_set_sensitive(self.prev_button, 0);
@@ -813,7 +937,12 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_sensitive(self.prev_button, @intFromBool(self.index > 0));
         c.gtk_widget_set_sensitive(self.next_button, @intFromBool(self.index + 1 < self.batch.specs.len));
         // Route by classification BEFORE any image load starts.
-        if (paths.isCastName(resource.name())) return self.showCast(resource);
+        switch (model.contentKind(resource.name())) {
+            .cast => return self.showCast(resource),
+            .text => return self.showText(resource),
+            .image => {},
+        }
+        self.setContentMode(.image);
         c.gtk_label_set_text(self.status, "Loading preview...");
         self.canvas.setAccessible(resource.name(), "Loading preview", true);
         if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
@@ -1079,8 +1208,71 @@ fn actionButton(box: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8) *c
     return button;
 }
 
+fn setTextViewContent(self: *ViewerWindow, text: []const u8) void {
+    const buffer = c.gtk_text_view_get_buffer(self.text_view);
+    const ptr: [*c]const u8 = if (text.len == 0) "" else text.ptr;
+    c.gtk_text_buffer_set_text(buffer, ptr, @intCast(text.len));
+}
+
+/// Head bytes arrived for text content: classify (same heuristic as
+/// the Files preview) and render on the main thread.
+fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
+    // The generation fence already dropped stale deliveries; this only
+    // guards a head that raced a same-item mode change.
+    if (self.content != .text) return;
+    const head = result.head orelse {
+        var message: [256:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&message, "Unable to load the file: {s}", .{result.messageText()}) catch
+            "Unable to load the file";
+        c.gtk_label_set_text(self.status, text.ptr);
+        return;
+    };
+    const binary = hexdump.looksBinary(head);
+    if (head.len == 0) {
+        // An empty slice's pointer is not safe to hand to C.
+        setTextViewContent(self, "");
+    } else if (!binary) {
+        // Truncation can split a UTF-8 sequence; make_valid patches it
+        // (and stray invalid bytes) with U+FFFD, as Files does.
+        const valid = c.g_utf8_make_valid(head.ptr, @intCast(head.len));
+        defer c.g_free(valid);
+        setTextViewContent(self, std.mem.span(@as([*:0]const u8, @ptrCast(valid))));
+    } else {
+        var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer out.deinit();
+        hexdump.write(&out.writer, head, 0) catch {
+            c.gtk_label_set_text(self.status, "Unable to format the hex dump");
+            return;
+        };
+        const dump = out.toOwnedSlice() catch {
+            c.gtk_label_set_text(self.status, "Unable to format the hex dump");
+            return;
+        };
+        defer std.heap.c_allocator.free(dump);
+        setTextViewContent(self, dump);
+    }
+    c.gtk_label_set_text(self.metadata_label, if (binary) "Binary file (hex dump of the head)" else "Plain text file");
+    const kind: []const u8 = if (binary) "Binary (hex dump)" else "UTF-8 text";
+    var status_buf: [256:0]u8 = undefined;
+    var head_buf: [48]u8 = undefined;
+    var total_buf: [48]u8 = undefined;
+    const text = if (result.source_bytes > head.len)
+        std.fmt.bufPrintZ(&status_buf, "{s}  showing first {s} of {s}", .{
+            kind,
+            formatBytes(&head_buf, head.len),
+            formatBytes(&total_buf, result.source_bytes),
+        }) catch "File loaded"
+    else
+        std.fmt.bufPrintZ(&status_buf, "{s}  {s}", .{
+            kind,
+            formatBytes(&total_buf, result.source_bytes),
+        }) catch "File loaded";
+    c.gtk_label_set_text(self.status, text.ptr);
+}
+
 fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    if (result.variant == .head) return onHeadLoaded(self, result);
     const image = if (result.decoded) |*decoded_image| decoded_image else {
         if (result.variant == .preview) {
             if (self.current()) |resource| {
@@ -1378,6 +1570,21 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
         showCanvasMenuCentred(menu);
         return 1;
     }
+    // Host policy before content keys: Enter activates the current
+    // item, and quick-look Space closes in EVERY content mode (the
+    // cast/image Space bindings then never see it — play/pause is K).
+    if (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter) {
+        if (self.options.on_activate) |cb| {
+            if (self.current()) |resource| {
+                cb(self.options.activate_ctx, resource.spec);
+                return 1;
+            }
+        }
+    }
+    if (self.options.close_on_space and (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space)) {
+        c.gtk_window_close(@ptrCast(self.window));
+        return 1;
+    }
     // Cast content: Left/Right stay batch navigation (consistency in
     // mixed batches — the STANDALONE play window seeks with arrows);
     // seeking is ,/. (5s) and </> (30s), Space toggles, R restarts.
@@ -1387,11 +1594,23 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
                 c.GDK_KEY_Left => self.move(-1),
                 c.GDK_KEY_Right => self.move(1),
                 c.GDK_KEY_space, c.GDK_KEY_KP_Space => box.togglePlay(),
+                c.GDK_KEY_k, c.GDK_KEY_K => if (self.options.close_on_space) box.togglePlay() else return 0,
                 c.GDK_KEY_comma => box.seekRelative(-5_000),
                 c.GDK_KEY_period => box.seekRelative(5_000),
                 c.GDK_KEY_less => box.seekRelative(-30_000),
                 c.GDK_KEY_greater => box.seekRelative(30_000),
                 c.GDK_KEY_r, c.GDK_KEY_R => box.restart(),
+                c.GDK_KEY_F11 => toggleFullscreen(self),
+                c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
+                else => return 0,
+            }
+            return 1;
+        },
+        .text => {
+            switch (keyval) {
+                c.GDK_KEY_Left => self.move(-1),
+                c.GDK_KEY_Right => self.move(1),
+                c.GDK_KEY_r, c.GDK_KEY_R => self.showCurrent(),
                 c.GDK_KEY_F11 => toggleFullscreen(self),
                 c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
                 else => return 0,

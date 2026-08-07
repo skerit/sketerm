@@ -15,6 +15,19 @@ const MANIFEST_HEADER = MANIFEST_MAGIC.len + @sizeOf(u64);
 const MANIFEST_MAX_BYTES: usize = 64 << 20;
 pub const MANIFEST_PREFIX = "viewer-batch-";
 
+/// What the Viewer shows for a resource, decided by file name alone.
+/// Anything the daemon's preview codecs can rasterize (images, pdf,
+/// video, audio art) stays on the image pipeline; `.text` is the
+/// universal fallback (bounded UTF-8 head or hex dump), so any file
+/// opens instead of erroring.
+pub const ContentKind = enum { image, cast, text };
+
+pub fn contentKind(name: []const u8) ContentKind {
+    if (paths.isCastName(name)) return .cast;
+    if (paths.isPreviewMediaName(name)) return .image;
+    return .text;
+}
+
 pub const Resource = struct {
     spec: []const u8,
     host: ?[]const u8,
@@ -272,6 +285,18 @@ pub const Viewport = struct {
         return @max((old_scroll + anchor) * (new_zoom / old_zoom) - anchor, 0);
     }
 };
+
+test "viewer content routing: media to image, cast to cast, rest to text" {
+    const t = std.testing;
+    try t.expectEqual(ContentKind.image, contentKind("photo.PNG"));
+    try t.expectEqual(ContentKind.image, contentKind("scan.pdf"));
+    try t.expectEqual(ContentKind.image, contentKind("clip.mkv"));
+    try t.expectEqual(ContentKind.cast, contentKind("session.cast"));
+    try t.expectEqual(ContentKind.text, contentKind("notes.txt"));
+    try t.expectEqual(ContentKind.text, contentKind("a.out"));
+    try t.expectEqual(ContentKind.text, contentKind("Makefile"));
+    try t.expectEqual(ContentKind.text, contentKind("a.cast.gz"));
+}
 
 test "viewer invocation recognizes subcommand and installed alias" {
     try std.testing.expectEqual(@as(?usize, 2), invocationStart(&.{ "sketerm", "view", "a.png" }));
