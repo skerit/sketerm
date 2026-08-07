@@ -14863,3 +14863,81 @@ the broker PID rather than a worker. Verification: `zig build`,
 `test-core`, `smoke-mcp`, `smoke-broker`, `mux-portable`, and the full
 suite pass; the known tesseract atexit leak noise remains. `ldd` for the
 daemon remains libc/libm only.
+
+## 2026-08-07: preview/viewer/tab papercuts from a usage report
+
+Six fixes from one round of user feedback, each implemented in its own
+worktree and merged in sequence.
+
+`paths.classify(name) -> ContentClass{cast, media, text}` is now the
+single by-name content oracle. Three classifiers had drifted apart: the
+sidebar's Type row asked `g_content_type_guess`, the preview-handler
+picker used its own extension sets, and the viewer had `contentKind`.
+The visible symptom was an asciicast labelled "Binary" while it showed
+raw JSON in the sidebar and played fine under Space. All three now route
+through `classify`; `g_content_type_guess` survives only as a label
+refinement inside a class. A cast preview renders parsed v2/v3 header
+metadata (version, terminal size, title, recorded date, term type, idle
+limit) via a new `text:cast` builtin producer, users can name it in
+`previewers.conf`, and a file merely named `.cast` that is not one falls
+back to the text/hex renderer. Casts stay out of the image/thumbnail
+sets because the daemon still cannot thumbnail them. Sidebar metadata
+strings are sanitized before reaching a GTK label: control bytes
+flattened, invalid UTF-8 fields dropped.
+
+The preview stage no longer letterboxes. It requested a flat 240px
+height and the picture filled it, so a 16:9 image sat in a black band;
+now `setStageHeight` fits `min(240, width * h / w)` from the decoded
+texture on every paint, which matters because a cached preview is
+re-shown without a re-decode. The stage also had to stop inheriting
+`vexpand` from its children, or the size request was ignored entirely.
+Icon and text previews keep the full 240 so the panel does not jump
+while arrowing through a folder.
+
+Local images skip the thumbnail detour. Every image opened in the viewer
+started as a 512px daemon preview with a "View full resolution" button,
+with no size threshold and regardless of locality. Local decodable
+images now auto-chain to the original after the preview paints, so the
+button is what it was always meant to be: the bounded-transfer affordance
+for remote files. Local video/audio/pdf keep the daemon-rendered poster
+and now HIDE the button, which previously could only produce
+`DecodeFailed` since there is no client-side container decoder. The
+existing caps still bound the cost, and an over-cap image falls back to
+preview plus button.
+
+`src/ui/playbar.zig` is a shared transport bar (play/pause, restart,
+seek scale, position label, optional speed dropdown) behind a `Source`
+vtable, with the seek throttle and guard as per-source options. The cast
+player is now a consumer of it with no user-visible change, and animated
+images in the viewer get the same bar: GIF/APNG/WebP/AVIF/JXL can be
+paused, scrubbed and restarted, with the bar hidden for stills. To make
+that possible `image_canvas.Session` gained a cumulative timeline
+(`total_ms`, `timelineTotalMs/StartMs/IndexForMs`), `seekToMs`/
+`seekToFrame` that reset the deadline bookkeeping and pull an exhausted
+finite play count back so resume does not snap to frame 0, and a
+playback callback that carries position per frame instead of firing only
+on toggle.
+
+Leaving the editor face returns where it came from. "Edit in Sketerm
+Editor" converts a pane in place, and every way back raised the terminal,
+leaving an attached-but-hidden browser and no banner. `Pane` now records
+one `PrevFace` on an editor raise and restores it on hide, cleared in
+both detaches so a dead face cannot be resurrected; the editor's back
+button switches to a folder icon and "Back to the file browser" when
+that is the destination. The files context menu gained "Edit in a new
+Editor Tab" beside the existing in-pane and separate-window items.
+
+Unselected tabs paint their own background. They had none, only
+`opacity: 0.55`, so they showed the toolbar colour, which in files mode
+is the menubar colour sitting directly above them. `tabbar tab` now
+carries `rgba(0, 0, 0, 0.22)` plus an explicit `:hover` rule, since our
+provider runs at APPLICATION priority and would otherwise swallow the
+theme's hover background. A background was the right layer: the activity
+and inactivity washes are drawn inside the tab's snapshot on top of the
+CSS box, so they still composite correctly, and the existing opacity
+dimming is untouched.
+
+Verification: `zig build`, `zig build test`, `test-core` and
+`mux-portable` all green on the merged tree. Each UI change was proven
+in a headless sketerm display session with screenshots rather than by
+compiling only.
