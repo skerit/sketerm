@@ -1319,19 +1319,54 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
         if (image.animated()) "  Animated" else "",
     }) catch "Image loaded";
     c.gtk_label_set_text(self.status, text.ptr);
-    c.gtk_widget_set_visible(self.original_button, @intFromBool(result.variant == .preview));
+    const local_kind: LocalPreviewKind = if (result.variant != .preview) .not_local else if (self.current()) |resource|
+        localPreviewKind(resource)
+    else
+        .not_local;
+    // A local poster (video/audio/pdf) has no client-side decoder, so the
+    // full-resolution button would only ever error: hide it there.
+    c.gtk_widget_set_visible(
+        self.original_button,
+        @intFromBool(result.variant == .preview and local_kind != .poster_only),
+    );
     c.gtk_widget_set_sensitive(self.original_button, 1);
     self.updateAccessibleState();
-    if (result.variant == .preview) {
+    if (local_kind == .decodable) {
         if (self.current()) |resource| {
-            if (resource.host == null and mayAnimate(resource.name())) {
-                c.gtk_widget_set_sensitive(self.original_button, 0);
-                c.gtk_label_set_text(self.status, "Preview ready; loading animation and full resolution...");
-                if (self.target.start(resource.spec, .original)) return;
-                c.gtk_widget_set_sensitive(self.original_button, 1);
-            }
+            c.gtk_widget_set_sensitive(self.original_button, 0);
+            c.gtk_label_set_text(self.status, if (mayAnimate(resource.name()))
+                "Preview ready; loading animation and full resolution..."
+            else
+                "Preview ready; loading full resolution...");
+            if (self.target.start(resource.spec, .original)) return;
+            c.gtk_widget_set_sensitive(self.original_button, 1);
         }
     }
+}
+
+const LocalPreviewKind = enum {
+    /// Remote resource, or not a preview load: keep the button flow.
+    not_local,
+    /// Local file the client image decoder handles: auto-chain to `.original`.
+    decodable,
+    /// Local video/audio/pdf: the daemon poster is all we can ever show.
+    poster_only,
+};
+
+fn localPreviewKind(resource: model.Resource) LocalPreviewKind {
+    if (resource.host != null) return .not_local;
+    const name = resource.name();
+    if (paths.isImageName(name) or mayAnimate(name)) return .decodable;
+    return .poster_only;
+}
+
+test "localPreviewKind separates local images from posters and remotes" {
+    const t = std.testing;
+    try t.expectEqual(LocalPreviewKind.decodable, localPreviewKind(model.Resource.parse("/tmp/a.jpg")));
+    try t.expectEqual(LocalPreviewKind.decodable, localPreviewKind(model.Resource.parse("/tmp/a.apng")));
+    try t.expectEqual(LocalPreviewKind.poster_only, localPreviewKind(model.Resource.parse("/tmp/a.mp4")));
+    try t.expectEqual(LocalPreviewKind.poster_only, localPreviewKind(model.Resource.parse("/tmp/a.pdf")));
+    try t.expectEqual(LocalPreviewKind.not_local, localPreviewKind(model.Resource.parse("box:/tmp/a.jpg")));
 }
 
 fn onOpenCopyLoaded(user: ?*anyopaque, result: *LoadResult) void {
