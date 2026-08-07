@@ -23,9 +23,11 @@ pub const MANIFEST_PREFIX = "viewer-batch-";
 pub const ContentKind = enum { image, cast, text };
 
 pub fn contentKind(name: []const u8) ContentKind {
-    if (paths.isCastName(name)) return .cast;
-    if (paths.isPreviewMediaName(name)) return .image;
-    return .text;
+    return switch (paths.classify(name)) {
+        .cast => .cast,
+        .media => .image,
+        .text => .text,
+    };
 }
 
 pub const Resource = struct {

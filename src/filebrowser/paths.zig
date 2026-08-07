@@ -167,6 +167,22 @@ pub fn isViewerName(name: []const u8) bool {
     return isImageName(name) or isCastName(name);
 }
 
+/// The coarse content classes every by-name consumer agrees on.
+/// `.media` is anything the daemon's preview codecs can rasterize;
+/// `.cast` is a terminal recording (playable, never thumbnailable);
+/// `.text` is the universal fallback.
+pub const ContentClass = enum { cast, media, text };
+
+/// THE single by-name content oracle. The viewer's dispatch, the
+/// preview handler picker and the browser's Type labels all route
+/// through this so they can never disagree on what a file IS;
+/// g_content_type_guess only refines labels within a class.
+pub fn classify(name: []const u8) ContentClass {
+    if (isCastName(name)) return .cast;
+    if (isPreviewMediaName(name)) return .media;
+    return .text;
+}
+
 pub fn isWorkerImageName(name: []const u8) bool {
     const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff" };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
@@ -319,6 +335,19 @@ test "isCastName matches only the recording extension" {
     // A cast is not an image and never gets a thumbnail.
     try t.expect(!isImageName("a.cast"));
     try t.expect(!isPreviewMediaName("a.cast"));
+}
+
+test "classify is the single oracle: cast beats media beats text" {
+    const t = std.testing;
+    try t.expectEqual(ContentClass.cast, classify("session.cast"));
+    try t.expectEqual(ContentClass.cast, classify("SESSION.CAST"));
+    try t.expectEqual(ContentClass.media, classify("photo.JPG"));
+    try t.expectEqual(ContentClass.media, classify("manual.pdf"));
+    try t.expectEqual(ContentClass.media, classify("clip.mkv"));
+    try t.expectEqual(ContentClass.media, classify("album.flac"));
+    try t.expectEqual(ContentClass.text, classify("notes.txt"));
+    try t.expectEqual(ContentClass.text, classify("a.out"));
+    try t.expectEqual(ContentClass.text, classify("a.cast.gz"));
 }
 
 test "isViewerName covers images and casts but nothing else" {
