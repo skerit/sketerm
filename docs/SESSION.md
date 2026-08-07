@@ -15025,3 +15025,50 @@ static by a change-watch that timed out. One intermittent remains,
 unreproduced in six of seven runs: `viewerCastStage` once failed to OCR
 restored text after navigating back; the OCR timeout path now dumps the
 screen and the recognized text for next time.
+
+## 2026-08-07: remote-capable disk usage analyzer
+
+The file browser now opens a disk usage analyzer for its current folder
+or a selected directory from the main menu. The analyzer links a
+size-sorted hierarchy to a treemap, supports on-disk and apparent-byte
+metrics, drills into folders from either view, returns to parent folders,
+optionally crosses filesystem boundaries, and can cancel or rescan without
+leaving the tab. The same UI works for local and remote locations because
+the GUI never reads the filesystem.
+
+Scanning is a new ephemeral daemon file job. Its iterative walker does not
+follow descendant symlinks, follows a selected symlinked root once,
+deduplicates hard-linked files, detects repeated directory identities from
+same-filesystem bind aliases, reports unreadable and skipped content, and
+keeps exact aggregate totals. Retained detail is value-prioritized and
+bounded to 50,000 wire events plus two 4 MiB raw-path budgets, with half the
+event capacity reserved for reachable directories so large files cannot be
+starved by wide trees. Progress is paced to two updates per second and job
+cancellation remains daemon-authoritative while the GUI suppresses late
+progress repaint churn.
+
+The protocol reuses additive JSON fields on the existing `fs_job` frame;
+no frame number changed. `fsdrive.JobEvent`, the browser connection binder,
+and the per-tab analyzer own the new fields and lifecycle. Analyzer state is
+fenced across delayed render callbacks, widget-first teardown, tab closure,
+host loss, and remote reconnect. A completed remote result survives a later
+disconnect unchanged; only an interrupted scan asks for a rescan.
+
+Tests cover accounting, hard-link and directory-identity deduplication,
+sparse-file metrics, selected-root symlinks, retained count and path-byte
+bounds, model sorting, hidden remainder calculation, and treemap geometry.
+`smoke-fs` now verifies detail and final aggregate events through helper,
+daemon, wire, and `fsdrive` in both monolith and broker modes. The analyzer
+was also exercised in an isolated headless Files window: both metrics,
+table and treemap drill-down, parent navigation, rescan after a fixture
+change, and cancellation of a large root scan were driven through the real
+GTK UI.
+
+Verification: `zig build`, `zig build smoke-fs`, `mux`, native
+`mux-portable`, and `mux-portable -Dportable-target=aarch64-macos` pass;
+`ldd zig-out/bin/sketerm-mux` still shows only libc and libm. The direct
+full test executable reports 2050 passed, 6 skipped, 0 failed, and the
+direct core executable reports 1708 passed, 5 skipped, 0 failed. The two
+`zig build test*` listener wrappers still classify tesseract's known
+process-exit `ObjectCache` warnings as a failed command after those tests
+have passed.
