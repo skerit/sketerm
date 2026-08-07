@@ -39,6 +39,10 @@ const SEEK_THROTTLE_MS: c_uint = 250;
 /// After a user seek, ignore programmatic slider updates this long so
 /// a stale throttled play_state can't snap the thumb back.
 const SEEK_GUARD_US: i64 = 1_000_000;
+/// How long an unconfirmed transport command outranks the daemon's
+/// last pushed state (backstop for a command the daemon folds into
+/// something else, e.g. a pause landing mid-seek).
+const EXPECT_TRUST_US: i64 = 2_000_000;
 
 pub const CastPlayerBox = struct {
     /// Host hooks. `on_title` receives the recording title (cast/OSC
@@ -60,6 +64,12 @@ pub const CastPlayerBox = struct {
 
     /// Shared transport-bar chrome; owns the throttle/guard machinery.
     playbar: *Playbar,
+
+    /// Playback kind the last transport command asked the daemon for,
+    /// held until the daemon confirms it (see `playKind`).
+    expected_kind: ?Terminal.PlayState.Kind = null,
+    /// Monotonic µs of that command.
+    expected_us: i64 = 0,
 
     /// True once severLive ran; makes it idempotent.
     severed: bool = false,
@@ -255,6 +265,13 @@ pub const CastPlayerBox = struct {
     fn onPlayState(ctx: ?*anyopaque, st: Terminal.PlayState) void {
         const self = cast.userData(CastPlayerBox, ctx);
 
+        // The command this state confirms is no longer outstanding;
+        // an unrelated push (a throttled position, or the state of an
+        // EARLIER command) leaves the expectation standing.
+        if (self.expected_kind) |k| {
+            if (st.kind == k) self.expected_kind = null;
+        }
+
         // Markers first: a state push that brings duration + markers
         // together must have the stored set before the bar's
         // duration-change redraw runs.
@@ -283,21 +300,49 @@ pub const CastPlayerBox = struct {
     // ── transport controls ───────────────────────────────────────
 
     fn playKind(self: *CastPlayerBox) Terminal.PlayState.Kind {
+        // A command we already sent outranks the last state the daemon
+        // pushed until that command is confirmed: two Space presses a
+        // few ms apart both reach the key handler before the first
+        // one's play_state has been read off the socket, and a toggle
+        // computed from the stale state would send `pause` twice
+        // instead of pause/resume.
+        if (self.expected_kind) |k| {
+            if (c.g_get_monotonic_time() - self.expected_us < EXPECT_TRUST_US) return k;
+            self.expected_kind = null;
+        }
         // Sessions auto-play on first attach, so "no state yet" reads
         // as playing.
         const st = self.terminal.last_play_state orelse return .playing;
         return st.kind;
     }
 
+    /// Remember what the last transport command asked for, so the next
+    /// toggle reverses it even if the daemon's confirming push has not
+    /// been read off the socket yet.
+    fn expect(self: *CastPlayerBox, kind: Terminal.PlayState.Kind) void {
+        self.expected_kind = kind;
+        self.expected_us = c.g_get_monotonic_time();
+    }
+
     pub fn togglePlay(self: *CastPlayerBox) void {
         switch (self.playKind()) {
-            .playing, .seeking => self.terminal.sendPlayControl(.pause, 0, 0),
-            .paused => self.terminal.sendPlayControl(.play, 0, 0),
-            .finished => self.terminal.sendPlayControl(.restart, 0, 0),
+            .playing, .seeking => {
+                self.expect(.paused);
+                self.terminal.sendPlayControl(.pause, 0, 0);
+            },
+            .paused => {
+                self.expect(.playing);
+                self.terminal.sendPlayControl(.play, 0, 0);
+            },
+            .finished => {
+                self.expect(.playing);
+                self.terminal.sendPlayControl(.restart, 0, 0);
+            },
         }
     }
 
     pub fn restart(self: *CastPlayerBox) void {
+        self.expect(.playing);
         self.terminal.sendPlayControl(.restart, 0, 0);
     }
 

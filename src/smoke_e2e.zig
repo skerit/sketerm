@@ -2309,6 +2309,17 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         const px = png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
         const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{}) catch continue;
         if (std.mem.indexOf(u8, res.text, needle) != null) return true;
+        // Failure forensics: the last round before the deadline keeps
+        // what was actually on screen, so "the OCR never saw X" can be
+        // told apart from "the window showed something else".
+        if (clock.nowMs() + 300 >= deadline) {
+            const n = @min(res.text.len, 400);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: OCR timed out on '%.*s'; recognized: [%.*s]\n", @as(c_int, @intCast(needle.len)), needle.ptr, @as(c_int, @intCast(n)), res.text.ptr);
+            if (app.screenshotPng(win_id, 1024, null, 0)) |dbgshot| {
+                defer allocator.free(dbgshot.png);
+                writePng("/tmp/sketerm-e2e-ocr-fail.png", dbgshot.png);
+            } else |_| {}
+        }
     }
     return false;
 }
@@ -2465,7 +2476,10 @@ fn viewerCastStage(
         app.pressKey(vwin, "space") catch return "injecting space failed";
         if (!castWaitState(allocator, &side, "paused", 8_000, &st))
             return "space did not pause the cast inside the viewer";
-        // Resume so the teardown below kills a RUNNING playback.
+        // Resume so the teardown below kills a RUNNING playback. This
+        // second press deliberately lands the instant the daemon
+        // reports "paused" — before the GUI has necessarily read that
+        // push — so it also covers the toggle's stale-state race.
         app.pressKey(vwin, "space") catch return "injecting space failed";
         if (!castWaitState(allocator, &side, "playing", 8_000, &st))
             return "space did not resume the cast inside the viewer";
@@ -2570,6 +2584,30 @@ fn viewerCastStage(
     return null;
 }
 
+/// Wait until `win_id` is gone from the compositor roster.
+///
+/// Two things make this a WALL-CLOCK wait with `drainLive` in it
+/// rather than a `pumpOnce` loop counted in iterations. A destroyed
+/// toplevel usually reaches the driver only through a daemon RESYNC:
+/// while an app streams pixels faster than this process consumes them
+/// the daemon withholds its frames (`native_gap`) — the surface-destroy
+/// request among them — and replays the live mirror later, where the
+/// dead window simply no longer appears. And `pumpOnce` returns
+/// immediately whenever a frame is queued, so a loop that adds its
+/// timeout in fixed steps burns a nominal 10s in under a second
+/// exactly when frames ARE flowing, i.e. exactly when the resync has
+/// not landed yet.
+fn waitWindowGone(app: *appdrive.App, win_id: u32, timeout_ms: i64) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        if (app.winById(win_id) == null) return true;
+        _ = app.drainLive(500);
+        if (app.winById(win_id) == null) return true;
+        _ = app.pumpOnce(200);
+    }
+    return app.winById(win_id) == null;
+}
+
 /// Files' Quick Look, hosted by the shared Viewer. What only a live
 /// run can prove: Space in a real `sketerm files` window opens a
 /// ViewerWindow on the FOCUSED entry, the batch follows the rendered
@@ -2667,11 +2705,8 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
 
     // Space closes (quick-look semantics inside the shared viewer).
     app.pressKey(ql_win, "space") catch return "injecting the closing Space failed";
-    waited = 0;
-    while (waited < 10_000) : (waited += 200) {
-        _ = app.pumpOnce(200);
-        if (app.winById(ql_win) == null) break;
-    } else return "Space did not close the quick-look viewer";
+    if (!waitWindowGone(app, ql_win, 15_000))
+        return "Space did not close the quick-look viewer";
 
     // The browser survived AND its tracked pointer cleared: a second
     // Space must open a FRESH viewer (a stale pointer would make the
@@ -2686,11 +2721,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     // Let the fresh window finish mapping before keying into it.
     _ = app.waitVisualSettle(ql2, 300, 8_000, 0.002, null);
     app.pressKey(ql2, "space") catch return "injecting the second closing Space failed";
-    waited = 0;
-    while (waited < 10_000) : (waited += 200) {
-        _ = app.pumpOnce(200);
-        if (app.winById(ql2) == null) break;
-    } else {
+    if (!waitWindowGone(app, ql2, 15_000)) {
         dumpWindowRoster(app, "quick look: reopened viewer did not close");
         if (app.screenshotPng(ql2, 1024, null, 0)) |shot| {
             defer allocator.free(shot.png);
