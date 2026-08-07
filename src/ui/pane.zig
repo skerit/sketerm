@@ -50,6 +50,11 @@ pub const MenuAction = menu.Action;
 
 pub const FONT_CANDIDATES = @import("terminal_surface.zig").FONT_CANDIDATES;
 
+/// The face an editor face displaced when it was raised. The panel
+/// face is deliberately not tracked — it is never the thing an editor
+/// is opened on top of, so it folds into `terminal`.
+pub const PrevFace = enum { terminal, browser };
+
 pub const Pane = struct {
     /// Stable monotonic id for remote-control addressing. Assigned
     /// by Window before the PTY spawn so the child env can carry it.
@@ -201,6 +206,14 @@ pub const Pane = struct {
     editor_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     editor_deinit: ?*const fn (*anyopaque) void = null,
     editor_focus: ?*const fn (*anyopaque) void = null,
+    /// Which face the editor displaced when it was last raised, so
+    /// hiding it again returns there instead of always falling through
+    /// to the terminal ("Edit in Sketerm Editor" from the browser's
+    /// context menu converts the pane in place, and the browser has no
+    /// visible way back). ONE slot, not a history stack: it is written
+    /// only on a raise, and cleared by detachBrowser/detachEditor so a
+    /// dead face can never be resurrected.
+    editor_prev_face: PrevFace = .terminal,
 
     /// Panel face (src/ui/panel/view.zig, hosted by ui/panelhost.zig):
     /// a declarative document an assistant authored, rendered as real
@@ -836,6 +849,8 @@ pub const Pane = struct {
         self.browser_deinit = null;
         self.browser_focus = null;
         self.browser_widget = null;
+        // No browser face left to return to.
+        self.editor_prev_face = .terminal;
         if (ctx) |browser_ctx| {
             if (prepare_destroy_cb) |cb| cb(browser_ctx);
         }
@@ -883,9 +898,30 @@ pub const Pane = struct {
 
     /// Flip between the editor face and whatever else the pane shows
     /// (terminal, or a browser face — showing the editor hides both).
+    /// Hiding it returns to whichever face the raise displaced, so a
+    /// pane converted from the file browser goes back to the browser.
     pub fn setEditorVisible(self: *Pane, show: bool) void {
         const ew = self.editor_widget orelse return;
+        // Record the displaced face on the RAISE only. A raise over a
+        // visible browser is the interesting case; `terminal` is only
+        // recorded when the editor was actually down, so a redundant
+        // show (the attach path re-raising an existing face) cannot
+        // overwrite the memory. GTK4 widgets are visible by default,
+        // so a freshly appended face reads as visible here — hence the
+        // browser check comes first.
+        if (show) {
+            if (self.browserFaceVisible())
+                self.editor_prev_face = .browser
+            else if (c.gtk_widget_get_visible(ew) == 0)
+                self.editor_prev_face = .terminal;
+        }
         c.gtk_widget_set_visible(ew, if (show) @as(c_int, 1) else 0);
+        if (!show and self.editor_prev_face == .browser and self.hasBrowserFace()) {
+            // setBrowserVisible owns the rest: offload widget, banner
+            // and focus.
+            self.setBrowserVisible(true);
+            return;
+        }
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
             if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
@@ -901,6 +937,13 @@ pub const Pane = struct {
 
     pub fn hasEditorFace(self: *Pane) bool {
         return self.editor_widget != null;
+    }
+
+    /// True when hiding the editor face will raise the file browser
+    /// rather than the shell — the editor's "back" affordance names
+    /// its destination from this.
+    pub fn editorReturnsToBrowser(self: *Pane) bool {
+        return self.editor_prev_face == .browser and self.hasBrowserFace();
     }
 
     pub fn editorFaceVisible(self: *Pane) bool {
@@ -928,6 +971,7 @@ pub const Pane = struct {
         self.editor_deinit = null;
         self.editor_focus = null;
         self.editor_widget = null;
+        self.editor_prev_face = .terminal;
         if (ctx) |editor_ctx| {
             if (prepare_destroy_cb) |cb| cb(editor_ctx, self.widgets_dead);
         }

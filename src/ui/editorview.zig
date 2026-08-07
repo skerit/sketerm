@@ -1047,6 +1047,11 @@ pub const EditorView = struct {
 
     standalone_config: ?*const Config = null,
     toolbar_box: ?*c.GtkWidget = null,
+    /// The toolbar's "leave the editor" button. Its icon and tooltip
+    /// follow the pane's recorded previous face, so a pane converted
+    /// from the file browser says so instead of promising a shell.
+    /// Borrowed: owned by the toolbar box.
+    back_button: ?*c.GtkWidget = null,
     on_changed: ?*const fn (ctx: *anyopaque) void = null,
     changed_ctx: ?*anyopaque = null,
 
@@ -1920,8 +1925,24 @@ pub const EditorView = struct {
     /// which a headless/unfocused toplevel may never deliver.
     pub fn focusFace(self: *EditorView) void {
         if (self.widgets_dead) return;
+        self.syncBackButton();
         _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
         self.checkDisk();
+    }
+
+    /// Name the back button after where it actually goes. The pane
+    /// calls our focus callback every time it raises this face, which
+    /// is exactly when the recorded previous face can have changed.
+    fn syncBackButton(self: *EditorView) void {
+        const btn = self.back_button orelse return;
+        const pane = self.pane orelse return;
+        if (pane.editorReturnsToBrowser()) {
+            c.gtk_button_set_icon_name(@ptrCast(btn), "folder-symbolic");
+            c.gtk_widget_set_tooltip_text(btn, "Back to the file browser");
+        } else {
+            c.gtk_button_set_icon_name(@ptrCast(btn), "sketerm-terminal-symbolic");
+            c.gtk_widget_set_tooltip_text(btn, "Show this pane's shell");
+        }
     }
 
     pub fn deinit(self: *EditorView) void {
@@ -2006,7 +2027,7 @@ pub const EditorView = struct {
         const spacer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
         c.gtk_widget_set_hexpand(spacer, 1);
         c.gtk_box_append(@ptrCast(bar), spacer);
-        _ = self.barButton(bar, "sketerm-terminal-symbolic", "Show this pane's shell", &onTerminalClicked);
+        self.back_button = self.barButton(bar, "sketerm-terminal-symbolic", "Show this pane's shell", &onTerminalClicked);
         c.gtk_box_append(@ptrCast(vbox), bar);
         self.toolbar_box = bar;
 
@@ -2536,7 +2557,8 @@ pub const EditorView = struct {
             if (self.tabhost.currentPage()) |page| {
                 self.active = self.findTabByPage(page);
             }
-            // No documents left: hand the pane back to its shell.
+            // No documents left: hand the pane back to whichever face
+            // the editor displaced (its shell, or the file browser).
             if (self.tabs.items.len == 0) {
                 if (self.pane) |p| p.setEditorVisible(false);
             }
