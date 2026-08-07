@@ -73,6 +73,9 @@ var cast_pid: c.pid_t = -1;
 /// The viewer-cast GUI (`sketerm view` on a mixed image+cast batch,
 /// viewerCastStage), killed by EXACT pid.
 var vcast_pid: c.pid_t = -1;
+/// `sketerm files` window hosting the quick-look stage (its own app
+/// identity in the shared display session), killed by EXACT pid.
+var qlfiles_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -135,6 +138,10 @@ fn teardown() void {
     if (vcast_pid > 0) {
         reap(vcast_pid, c.SIGKILL, 0);
         vcast_pid = -1;
+    }
+    if (qlfiles_pid > 0) {
+        reap(qlfiles_pid, c.SIGKILL, 0);
+        qlfiles_pid = -1;
     }
     if (drive) |app| {
         // detach, not kill: the session is destroyed by name below, so
@@ -1000,6 +1007,13 @@ pub fn main() u8 {
             // a mixed image+cast batch, navigated both directions.
             if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
             say("viewer cast: played in place, paused, batch navigation killed/rebuilt the ephemeral session without a leak, and the text/hex fallback rendered");
+
+            // 6c-11. Files' Quick Look, which now HOSTS the shared
+            // Viewer: Space in a real Files window opens a
+            // ViewerWindow on the focused entry, arrows step the
+            // listing batch, Space closes it again.
+            if (quickLookStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("quick look: Space in a Files window opened the shared viewer on the focused file, Right stepped to the next entry, Space closed it, and the browser stayed healthy");
         }
     }
 
@@ -1869,6 +1883,28 @@ fn contextMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     return null;
 }
 
+/// One line per known surface on stderr — failure forensics only.
+fn dumpWindowRoster(app: *appdrive.App, why: []const u8) void {
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: %.*s; window roster:\n", @as(c_int, @intCast(why.len)), why.ptr);
+    for (app.windows.items) |w| {
+        const title: []const u8 = w.title orelse "-";
+        const app_id: []const u8 = w.app_id orelse "-";
+        _ = c.fprintf(
+            platform.stderr(),
+            "  id=%u popup=%d frames=%llu size=%dx%d title='%.*s' app_id='%.*s'\n",
+            w.id,
+            @as(c_int, @intFromBool(w.popup)),
+            @as(c_ulonglong, w.frames),
+            w.w,
+            w.h,
+            @as(c_int, @intCast(title.len)),
+            title.ptr,
+            @as(c_int, @intCast(app_id.len)),
+            app_id.ptr,
+        );
+    }
+}
+
 /// Ids of every non-popup surface currently known, so a newly mapped
 /// toplevel can be told from the ones already on screen.
 fn hasToplevelOtherThan(app: *appdrive.App, known: []const u32) ?u32 {
@@ -2530,6 +2566,143 @@ fn viewerCastStage(
         }
         if (!gone) return "closing the viewer did not kill the ephemeral cast session";
     }
+    _ = app.drainLive(2_000);
+    return null;
+}
+
+/// Files' Quick Look, hosted by the shared Viewer. What only a live
+/// run can prove: Space in a real `sketerm files` window opens a
+/// ViewerWindow on the FOCUSED entry, the batch follows the rendered
+/// listing (Right lands on the next file), Space closes the window
+/// through the viewer's own quick-look key handling, and the tracked
+/// pointer on the BrowserView really clears (a second Space reopens).
+fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const u8, wl: [*:0]const u8) ?[]const u8 {
+    _ = app.drainLive(2_000);
+
+    // Two text files with distinct OCR tokens, in a directory of their
+    // own so the display order is exactly known (aaa before bbb).
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/qlfiles", .{rt}) catch return "quick look dir path too long";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var path_buf: [560:0]u8 = undefined;
+    {
+        const first = std.fmt.bufPrintZ(&path_buf, "{s}/aaa-first.txt", .{dir}) catch return "quick look path too long";
+        const body = "SKETERM QUICKLOOK QLALPHA\n" ** 10;
+        const f = c.fopen(first.ptr, "wb") orelse return "could not write the first quick-look file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the first quick-look file";
+    }
+    {
+        const second = std.fmt.bufPrintZ(&path_buf, "{s}/bbb-second.txt", .{dir}) catch return "quick look path too long";
+        const body = "SKETERM QUICKLOOK QLBRAVO\n" ** 10;
+        const f = c.fopen(second.ptr, "wb") orelse return "could not write the second quick-look file";
+        const ok = c.fwrite(body.ptr, 1, body.len, f) == body.len;
+        _ = c.fclose(f);
+        if (!ok) return "short write on the second quick-look file";
+    }
+
+    var known: [16]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    const pid = c.fork();
+    if (pid < 0) return "fork for the files window failed";
+    if (pid == 0) {
+        dieWithParent();
+        // Its own app id (files mode appends its .files suffix), so it
+        // never joins the terminal instance in this session.
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eql", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    qlfiles_pid = pid;
+
+    var waited: u32 = 0;
+    const files_win = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "sketerm files never mapped a window";
+    _ = app.waitVisualSettle(files_win, 400, 15_000, 0.002, null);
+    if (n_known < known.len) {
+        known[n_known] = files_win;
+        n_known += 1;
+    }
+
+    // Focus the listing (a click on its empty lower half), then focus
+    // the first row via type-ahead. Escape clears the prefix so the
+    // Space that follows is a Quick Look toggle, not type-ahead input.
+    const fw = app.winById(files_win) orelse return "the files window vanished";
+    app.clickEx(files_win, @as(f64, @floatFromInt(fw.w)) * 0.55, @as(f64, @floatFromInt(fw.h)) * 0.6, 1, 60, 1) catch return "clicking the listing failed";
+    _ = app.pumpOnce(300);
+    app.pressKey(files_win, "a") catch return "injecting the type-ahead key failed";
+    _ = app.pumpOnce(300);
+    app.pressKey(files_win, "Escape") catch return "injecting Escape failed";
+    _ = app.pumpOnce(200);
+    app.pressKey(files_win, "space") catch return "injecting Space failed";
+
+    waited = 0;
+    const ql_win = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "Space did not open a quick-look viewer window";
+    _ = app.waitVisualSettle(ql_win, 400, 10_000, 0.002, null);
+    if (!viewerWaitOcr(allocator, app, ql_win, "QLALPHA", 25_000))
+        return "the quick-look viewer never showed the focused file's content";
+
+    // Right steps to the NEXT listing entry inside the viewer.
+    app.pressKey(ql_win, "Right") catch return "injecting Right failed";
+    if (!viewerWaitOcr(allocator, app, ql_win, "QLBRAVO", 25_000))
+        return "Right did not step the quick-look batch to the next file";
+
+    // Space closes (quick-look semantics inside the shared viewer).
+    app.pressKey(ql_win, "space") catch return "injecting the closing Space failed";
+    waited = 0;
+    while (waited < 10_000) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        if (app.winById(ql_win) == null) break;
+    } else return "Space did not close the quick-look viewer";
+
+    // The browser survived AND its tracked pointer cleared: a second
+    // Space must open a FRESH viewer (a stale pointer would make the
+    // toggle a silent no-op close instead).
+    if (app.winById(files_win) == null) return "the files window died with its quick-look viewer";
+    app.pressKey(files_win, "space") catch return "injecting the reopening Space failed";
+    waited = 0;
+    const ql2 = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        _ = app.pumpOnce(200);
+    } else return "a second Space did not reopen the quick-look viewer";
+    // Let the fresh window finish mapping before keying into it.
+    _ = app.waitVisualSettle(ql2, 300, 8_000, 0.002, null);
+    app.pressKey(ql2, "space") catch return "injecting the second closing Space failed";
+    waited = 0;
+    while (waited < 10_000) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        if (app.winById(ql2) == null) break;
+    } else {
+        dumpWindowRoster(app, "quick look: reopened viewer did not close");
+        if (app.screenshotPng(ql2, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-ql2-fail.png", shot.png);
+        } else |_| {}
+        return "the reopened quick-look viewer did not close";
+    }
+
+    _ = c.kill(qlfiles_pid, c.SIGKILL);
+    var qst: c_int = 0;
+    _ = c.waitpid(qlfiles_pid, &qst, 0);
+    qlfiles_pid = -1;
     _ = app.drainLive(2_000);
     return null;
 }
