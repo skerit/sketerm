@@ -161,6 +161,43 @@ fn fileExists(path: []const u8) bool {
     return c.access(p.ptr, c.F_OK) == 0;
 }
 
+/// Run `sketerm doctor` with stdout captured into `buf`.
+fn doctorOutput(exe: [*:0]const u8, buf: []u8) []const u8 {
+    var pipe: [2]c_int = undefined;
+    if (c.pipe(&pipe) != 0) fail("doctor pipe");
+    const pid = c.fork();
+    if (pid < 0) fail("doctor fork");
+    if (pid == 0) {
+        _ = c.dup2(pipe[1], 1);
+        _ = c.close(pipe[0]);
+        _ = c.close(pipe[1]);
+        var argv: [3:null]?[*:0]const u8 = .{ exe, "doctor", null };
+        _ = c.execv(exe, @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(pipe[1]);
+    defer _ = c.close(pipe[0]);
+    var used: usize = 0;
+    const deadline = nowMs() + 20_000;
+    while (used < buf.len) {
+        var pfd = c.struct_pollfd{ .fd = pipe[0], .events = c.POLLIN, .revents = 0 };
+        const ready = c.poll(&pfd, 1, 200);
+        if (ready > 0) {
+            const n = c.read(pipe[0], buf[used..].ptr, buf.len - used);
+            if (n == 0) break;
+            if (n > 0) used += @intCast(n);
+        }
+        if (nowMs() >= deadline) {
+            _ = c.kill(pid, c.SIGKILL);
+            _ = c.waitpid(pid, null, 0);
+            fail("doctor timed out");
+        }
+    }
+    var status: c_int = 0;
+    if (c.waitpid(pid, &status, 0) != pid or status != 0) fail("doctor failed");
+    return buf[0..used];
+}
+
 /// Locate `<state>/sketerm/mcp-casts/<any>/<name>` and read it.
 fn findCast(state_dir: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
     var base_buf: [4096]u8 = undefined;
@@ -324,6 +361,7 @@ pub fn main() u8 {
     // App/GUI socket auto-discovery must not find anything; keep the
     // env clean.
     _ = c.unsetenv("SKETERM_SOCKET");
+    _ = c.unsetenv("SKETERM_PANE_ID");
     // ...and the panel stage's SESSIONLESS calls must really have no
     // session: run from inside a sketerm pane, the inherited
     // $SKETERM_SESSION would scope them to that pane instead.
@@ -337,6 +375,18 @@ pub fn main() u8 {
     {
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
+        var doctor_buf: [64 * 1024]u8 = undefined;
+        const before_mux = doctorOutput(exe, &doctor_buf);
+        var pid_buf: [64]u8 = undefined;
+        const pid_text = std.fmt.bufPrint(&pid_buf, "pid {d}", .{m.pid}) catch unreachable;
+        if (std.mem.indexOf(u8, before_mux, "mcp       1 active server(s)") == null or
+            std.mem.indexOf(u8, before_mux, pid_text) == null or
+            std.mem.indexOf(u8, before_mux, "isolated") == null or
+            std.mem.indexOf(u8, before_mux, "mux not started") == null)
+            fail("doctor did not show the live lazy MCP server");
+        if (std.mem.indexOfScalar(u8, before_mux, 0x1b) != null)
+            fail("doctor emitted color while stdout was not a terminal");
+
         const tools = m.callTool("term_list", "{}"); // any term tool proves routing
         if (std.mem.indexOf(u8, tools, "error") != null and std.mem.indexOf(u8, tools, "[]") == null)
             fail("term_list did not return a list");
@@ -354,6 +404,13 @@ pub fn main() u8 {
         var shared_buf: [512]u8 = undefined;
         const shared = std.fmt.bufPrint(&shared_buf, "{s}/sketerm/mux.sock", .{rt}) catch unreachable;
         if (fileExists(shared)) fail("shared mux.sock was created (isolation breach)");
+
+        const after_mux = doctorOutput(exe, &doctor_buf);
+        if (std.mem.indexOf(u8, after_mux, pid_text) == null or
+            std.mem.indexOf(u8, after_mux, "mux pid ") == null or
+            std.mem.indexOf(u8, after_mux, "1 session(s), 0 app") == null or
+            std.mem.indexOf(u8, after_mux, "[pre-registry]") != null)
+            fail("doctor did not show the MCP private daemon and session count");
 
         const run = m.callTool("term_run", "{\"command\":\"echo SMOKE-MCP-OK\"}");
         if (std.mem.indexOf(u8, run, "SMOKE-MCP-OK") == null) fail("term_run did not capture output");

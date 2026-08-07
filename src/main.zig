@@ -172,8 +172,8 @@ const HELP_TEXT =
     \\                         portal-using app. OPT-IN: see docs/portal.md
     \\                         (portals.conf + the shipped .portal file);
     \\                         normally D-Bus-activated, not run by hand.
-    \\  sketerm doctor [host]  Health check: binary/daemon version skew,
-    \\                         socket liveness, terminfo, capabilities.
+    \\  sketerm doctor [host]  Health check: daemon PID/version skew,
+    \\                         active MCP servers, sockets, terminfo.
     \\                         With a host, also probes the REMOTE
     \\                         daemon (SSH/UDP) for skew.
     \\

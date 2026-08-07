@@ -28,6 +28,7 @@ pub const mcpassets = @import("mcpassets.zig");
 const cdp = @import("cdp.zig");
 pub const mcpfilter = @import("mcpfilter.zig");
 pub const panelstore = @import("panelstore.zig");
+const mcp_registry = @import("mcp_registry.zig");
 const paneldoc = @import("../ui/panel/doc.zig");
 pub const shellquote = @import("../util/shellquote.zig");
 pub const pattern = @import("../util/pattern.zig");
@@ -657,6 +658,29 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             return 1;
         };
     }
+
+    // Publish MCP-process liveness independently of its lazily started mux
+    // daemon. The held flock survives ordinary operation and is released by
+    // the kernel even after SIGKILL, so doctor never has to guess by name.
+    const shared_mux_sock = if (opts.shared)
+        @import("../mux/daemon.zig").defaultSocketPath(allocator) catch null
+    else
+        null;
+    defer if (shared_mux_sock) |path| allocator.free(path);
+    var registry_lease: ?mcp_registry.Lease = null;
+    const registry_sock = if (iso) |i| i.sock else shared_mux_sock orelse "";
+    if (mcp_registry.Lease.acquire(allocator, .{
+        .mode = if (opts.shared) .shared else if (opts.durable) .durable else .isolated,
+        .name = opts.name orelse "",
+        .profile = opts.profile orelse "",
+        .log_dir = opts.log_dir orelse "",
+        .mux_socket = registry_sock,
+    })) |lease| {
+        registry_lease = lease;
+    } else |_| {
+        _ = c.fputs("sketerm mcp: warning: cannot publish live-server metadata for `sketerm doctor`\n", platform.stderr());
+    }
+    defer if (registry_lease) |*lease| lease.deinit();
 
     // Terminal tools need a running GUI's socket. Shared mode resolves
     // it like `sketerm cli`; isolated mode only honors an EXPLICIT

@@ -357,7 +357,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .controller = if (w.controller) |p| p else "",
         }) catch return;
     }
-    cl.queueJson(.welcome, .{ .proto = cl.proto, .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
 }
 
 /// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`

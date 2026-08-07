@@ -102,6 +102,26 @@ pub fn socketpairCloexec(pair: *[2]c_int) c_int {
     return r;
 }
 
+/// PID on the other end of a connected Unix socket, when the OS exposes it.
+pub fn unixPeerPid(fd: c_int) ?c.pid_t {
+    if (is_linux) {
+        const Cred = extern struct { pid: c.pid_t, uid: c.uid_t, gid: c.gid_t };
+        var cred: Cred = undefined;
+        var len: c.socklen_t = @sizeOf(Cred);
+        if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, &cred, &len) != 0) return null;
+        return if (cred.pid > 0) cred.pid else null;
+    }
+    if (is_macos) {
+        // Darwin's LOCAL_PEERPID is stable but absent from Zig's bundled
+        // cross-target headers. SOL_LOCAL=0 and LOCAL_PEERPID=2 are the XNU ABI.
+        var pid: c.pid_t = 0;
+        var len: c.socklen_t = @sizeOf(c.pid_t);
+        if (c.getsockopt(fd, 0, 2, &pid, &len) != 0) return null;
+        return if (pid > 0) pid else null;
+    }
+    return null;
+}
+
 /// The handler slot of `struct sigaction` is a union whose name AND
 /// member spellings differ: glibc calls it `__sigaction_handler` with
 /// `.sa_handler`/`.sa_sigaction`, Darwin calls it `__sigaction_u` with
@@ -492,6 +512,14 @@ test "runtimeDir returns something usable" {
     const dir = runtimeDir();
     try std.testing.expect(dir.len > 0);
     try std.testing.expect(dir[0] == '/');
+}
+
+test "unixPeerPid identifies a Unix socket peer" {
+    var pair: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), socketpairCloexec(&pair));
+    defer _ = c.close(pair[0]);
+    defer _ = c.close(pair[1]);
+    try std.testing.expectEqual(@as(?c.pid_t, c.getpid()), unixPeerPid(pair[0]));
 }
 
 test "Wakeup signal/read round-trip" {

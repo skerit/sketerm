@@ -122,6 +122,7 @@ comptime {
     _ = @import("ipc/xkblayout.zig");
     _ = @import("ipc/mcpassets.zig");
     _ = @import("ipc/mcpfilter.zig");
+    _ = @import("ipc/mcp_registry.zig");
     _ = @import("ipc/panelstore.zig");
     _ = @import("util/template.zig");
     _ = @import("util/titlefmt.zig");
@@ -260,6 +261,7 @@ comptime {
     _ = @import("ui/panelwin.zig");
     _ = @import("ui/panelpicker.zig");
     _ = @import("wlapp.zig");
+    _ = @import("doctor.zig");
 }
 
 test {

@@ -116,6 +116,7 @@ fn attachAndEcho(allocator: std.mem.Allocator, sock_path: []const u8, name: []co
 
 const SessList = struct {
     proto: u32 = 0,
+    daemon_pid: c.pid_t = 0,
     sessions: []struct {
         name: []const u8 = "",
         rows: u16 = 0,
@@ -233,6 +234,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     waitForSocket(sock_path, allocator);
+    {
+        var initial = listSessions(allocator, sock_path);
+        defer initial.deinit();
+        if (initial.value.daemon_pid != bpid) fail("list: daemon_pid is not the broker PID");
+    }
+    std.debug.print("smoke-broker: daemon PID metadata ok\n", .{});
 
     // ── clean-exit reaping: a worker whose shell exits on its own must tear
     //    down and be reaped (no orphan, no stale `list` entry) — nobody kills
