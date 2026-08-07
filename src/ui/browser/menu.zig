@@ -242,6 +242,7 @@ pub fn showEntryMenu(
         const viewsec = m.section();
         viewsec.check("Show Hidden Files", tab.show_hidden, &onMenuToggleHidden, ctx);
         const term = m.section();
+        term.itemIcon("Analyze Disk Usage", .{ .name = "drive-harddisk-symbolic" }, &onMenuAnalyzeUsage, ctx);
         if (is_local) term.itemIcon("Open in Terminal", .{ .name = "sketerm-terminal-symbolic" }, &onMenuTerminalHere, ctx);
         if (self.on_host_term != null) term.item("Open Terminal Tab Here", &onMenuTermTab, ctx);
         const acts = m.section();
@@ -343,6 +344,8 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
     // hidden and there is no pane, so every one of these rows would
     // be a dead end.
     if (self.picker == null) {
+        const analysis = m.section();
+        analysis.itemIcon("Analyze Disk Usage", .{ .name = "drive-harddisk-symbolic" }, &onMenuAnalyzeUsage, ctx);
         const panes = m.section();
         panes.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &BrowserView.onNewTabClicked, @ptrCast(self));
         panes.item("Split Pane", &BrowserView.onSplitClicked, @ptrCast(self));
@@ -651,6 +654,7 @@ fn toolsApply(ctx: *MenuCtx, is_dir: bool, is_local: bool) bool {
 
 fn buildTools(ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool, is_local: bool) void {
     if (is_dir) {
+        p.item("Analyze Disk Usage", &onMenuAnalyzeUsage, ctx);
         p.item("Calculate Size", &onMenuCalcSize, ctx);
         p.item("Find Duplicates Here", &onMenuFindDups, ctx);
     }
@@ -1150,6 +1154,18 @@ pub fn onMenuCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const path = ctx.path orelse return menuDone(ctx);
     ctx.view.startDaemonJobKind(ctx.tab.hc, "find", path, "", "*", "calculate size", .{ .kind = .calc_size });
     menuDone(ctx);
+}
+
+pub fn onMenuAnalyzeUsage(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const tab = ctx.tab;
+    const path = ctx.path orelse tab.root.path;
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return menuDone(ctx);
+    @memcpy(buf[0..path.len], path);
+    const copy = buf[0..path.len];
+    menuDone(ctx);
+    @import("diskusage.zig").start(tab, copy);
 }
 
 pub fn onMenuFindDups(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

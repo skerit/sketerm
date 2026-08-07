@@ -223,7 +223,7 @@ fn restartFsJobFromJournal(self: *Daemon, cl: *Client, existing: *FsJob, client_
 /// with the requesting client. They report a view's decoration, not
 /// a mutation worth recovering.
 pub fn ephemeralOp(op: FsJob.Op) bool {
-    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff or op == .git_diff;
+    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff or op == .git_diff or op == .disk_usage;
 }
 
 /// Recursive-permission arguments; -1 keeps the current owner or
@@ -937,6 +937,26 @@ pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
     _ = self;
     const owner = job.owner orelse return;
     if (owner.dead) return;
+    if (job.op == .disk_usage and std.mem.eql(u8, ev, "done")) {
+        owner.queueJson(.fs_job, .{
+            .job = job.id,
+            .ev = ev,
+            .state = @tagName(job.state),
+            .path = job.done_path[0..job.done_path_len],
+            .kind = "dir",
+            .done = job.done,
+            .total = job.total,
+            .size = job.done,
+            .allocated = job.total,
+            .items = job.usage_items,
+            .errors = job.usage_errors,
+            .skipped = job.usage_skipped,
+            .mtime_ms = job.usage_mtime_ms,
+            .files_done = job.usage_items,
+            .truncated = job.truncated,
+        });
+        return;
+    }
     owner.queueJson(.fs_job, .{
         .job = job.id,
         .ev = ev,
@@ -993,6 +1013,10 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         text: []const u8 = "",
         kind: []const u8 = "",
         size: u64 = 0,
+        allocated: u64 = 0,
+        items: u64 = 0,
+        errors: u64 = 0,
+        skipped: u64 = 0,
         mtime_ms: i64 = 0,
         matches: u64 = 0,
         truncated: bool = false,
@@ -1042,6 +1066,23 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     }) catch return;
     defer parsed.deinit();
     const e = parsed.value;
+    if (std.mem.eql(u8, e.ev, "usage")) {
+        if (job.owner) |owner| {
+            if (!owner.dead) owner.queueJson(.fs_job, .{
+                .job = job.id,
+                .ev = e.ev,
+                .path = e.path,
+                .kind = e.kind,
+                .size = e.size,
+                .allocated = e.allocated,
+                .items = e.items,
+                .errors = e.errors,
+                .skipped = e.skipped,
+                .mtime_ms = e.mtime_ms,
+            });
+        }
+        return;
+    }
     if (std.mem.eql(u8, e.ev, "asset")) {
         job.done_path_len = @min(e.path.len, job.done_path.len);
         @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
@@ -1122,6 +1163,15 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     if (e.files_total > job.files_total) job.files_total = e.files_total;
     if (fsjournal.phaseRank(e.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len])) job.setPhase(e.phase);
     if (std.mem.eql(u8, e.ev, "done")) {
+        if (job.op == .disk_usage) {
+            job.done = e.size;
+            job.total = e.allocated;
+            job.files_done = e.items;
+            job.usage_items = e.items;
+            job.usage_errors = e.errors;
+            job.usage_skipped = e.skipped;
+            job.usage_mtime_ms = e.mtime_ms;
+        }
         job.matches = if (e.matches > 0) e.matches else job.matches;
         job.truncated = e.truncated;
         job.rejected = e.rejected;

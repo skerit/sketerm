@@ -1554,6 +1554,7 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         if (cmp.consumeJobEvent(hc, e)) return;
         if (cmp.consumeHashEvent(hc, e)) return;
     }
+    if (@import("diskusage.zig").consume(self, hc, e)) return;
     // Calculate Size scan.
     if (self.calc_job != 0 and e.job == self.calc_job and hc == self.calc_hc) {
         if (std.mem.eql(u8, e.ev, "match")) {

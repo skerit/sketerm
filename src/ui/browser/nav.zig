@@ -127,6 +127,7 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         .hc = hc,
         .root = dir,
         .page = page,
+        .listing_box = content,
         .colview = undefined,
         .tab_label = undefined,
         .scroller = scroller,
@@ -238,6 +239,7 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     while (i < self.pending.items.len) {
         if (self.pending.items[i].tab == tab) self.dropPending(i) else i += 1;
     }
+    @import("diskusage.zig").forget(tab);
     // Both of these must run while the page's widgets are still
     // alive: the tab's extra reference on the column view's sorter
     // must not outlive the view (BTab.releaseSorter), and fencing the
@@ -356,11 +358,13 @@ pub fn navigateSpecMode(self: *BrowserView, tab: *BTab, spec: []const u8, intent
 }
 
 pub fn goBack(self: *BrowserView, tab: *BTab) void {
+    if (@import("diskusage.zig").leave(tab)) return;
     if (tab.back.items.len == 0) return;
     self.navigateSpecMode(tab, tab.back.items[tab.back.items.len - 1], .{ .back = 1 });
 }
 
 pub fn goForward(self: *BrowserView, tab: *BTab) void {
+    if (tab.usage != null) return;
     if (tab.fwd.items.len == 0) return;
     self.navigateSpecMode(tab, tab.fwd.items[tab.fwd.items.len - 1], .{ .forward = 1 });
 }
@@ -409,6 +413,7 @@ fn freeNavigationState(req: u32, previous_host_ready: bool) FreeNavigationState 
 }
 
 pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
+    @import("diskusage.zig").forget(tab);
     if (tab.pending_reveal) |path| {
         const parent = std.fs.path.dirname(path) orelse "/";
         const reveal_host = tab.pending_reveal_host orelse "";
@@ -482,6 +487,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
 }
 
 pub fn goUp(self: *BrowserView, tab: *BTab) void {
+    if (tab.usage != null) {
+        _ = @import("diskusage.zig").goUp(tab);
+        return;
+    }
     const parent = std.fs.path.dirname(tab.root.path) orelse return;
     if (parent.len == 0) return;
     var buf: [4096]u8 = undefined;
@@ -843,6 +852,7 @@ fn chordTypeaheadBackspace(self: *BrowserView) bool {
 }
 
 fn chordTypeaheadReset(self: *BrowserView) bool {
+    if (self.currentTab()) |tab| if (@import("diskusage.zig").leave(tab)) return true;
     if (self.ta_len == 0) return false;
     self.typeaheadReset();
     return true;
@@ -1470,6 +1480,7 @@ test "entryForPath resolves flat rows, expanded subdirs and miller ancestors" {
         .hc = undefined,
         .root = &root,
         .page = undefined,
+        .listing_box = undefined,
         .colview = undefined,
         .tab_label = undefined,
     };

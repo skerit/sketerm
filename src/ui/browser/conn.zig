@@ -317,6 +317,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     for (self.tabs.items) |tab| {
         if (tab.hc == hc or tab.hc.state != .dead or !hostEq(tab.hc.host, hc.host)) continue;
         tab.hc = hc;
+        @import("diskusage.zig").rebind(tab, hc);
         tab.free_req = 0;
         tab.free_dirty = false;
         tab.free_bytes = null;
@@ -457,6 +458,7 @@ fn rememberRedispatch(self: *BrowserView, list: *std.ArrayList([]u8), token: []c
 }
 
 pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
+    @import("diskusage.zig").hostDied(self, hc);
     var redispatch: std.ArrayList([]u8) = .empty;
     defer {
         for (redispatch.items) |token| self.allocator.free(token);
@@ -1119,6 +1121,18 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 self.arch_job = rep.job;
                 self.arch_hc = hc;
             }
+            if (pj.kind == .disk_usage) {
+                const alive = if (pj.tab) |t|
+                    self.tabAlive(t) and @import("diskusage.zig").started(t, hc, rep.job)
+                else
+                    false;
+                if (!alive)
+                    self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = rep.job });
+                self.allocator.free(pj.label);
+                _ = self.pending_jobs.orderedRemove(i);
+                self.allocator.destroy(pj);
+                return false;
+            }
             const row = self.allocator.create(JobRow) catch {
                 if (pj.retry) |retry| {
                     if (self.transfer_service) |service| service.abandonMediated(retry.token);
@@ -1191,6 +1205,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 if (pj.tab) |t| {
                     if (self.tabAlive(t)) self.queryForget(t);
                 }
+            }
+            if (pj.kind == .disk_usage) {
+                if (pj.tab) |t| if (self.tabAlive(t))
+                    @import("diskusage.zig").startFailed(t, rep.@"error");
             }
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);

@@ -15,6 +15,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const TabQuery = @import("search.zig").TabQuery;
 const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
+const DiskUsageState = @import("diskusage.zig").State;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
 
@@ -159,6 +160,12 @@ pub const WireJobEv = struct {
     text: []const u8 = "",
     kind: []const u8 = "",
     size: u64 = 0,
+    /// disk_usage keeps logical and filesystem-allocated bytes
+    /// separate; `size` remains apparent bytes.
+    allocated: u64 = 0,
+    items: u64 = 0,
+    errors: u64 = 0,
+    skipped: u64 = 0,
     mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
@@ -630,11 +637,16 @@ pub const BTab = struct {
     /// open and updating at once, and closing the tab cancels its own
     /// job so no recursive watcher outlives the rows it feeds.
     query: ?*TabQuery = null,
+    /// Transient recursive usage analysis for this tab.
+    usage: ?*DiskUsageState = null,
     /// Grouping, zoom and the collapsed-group set (views.zig).
     vs: TabView = .{},
     /// Sticky-click flag and visual-mode anchor (selection.zig).
     sel: TabSel = .{},
     page: *c.GtkWidget,
+    /// The ordinary listing content, hidden while `usage` owns the
+    /// tab's presentation.
+    listing_box: *c.GtkWidget,
     /// The details/compact listing: ONE GtkColumnView owns the header
     /// and the rows (colview.zig), so their columns cannot disagree.
     colview: *c.GtkColumnView,
@@ -880,6 +892,7 @@ pub const BTab = struct {
         // Before anything else: a running query holds a host-side
         // recursive watcher, which must not outlive this tab.
         self.view.queryForget(self);
+        @import("diskusage.zig").forget(self);
         self.view.cancelPendingDir(self.root);
         self.view.closeViewOf(self.hc, self.root);
         for (self.subdirs.items) |d| {
@@ -1139,8 +1152,8 @@ pub const PendingJob = struct {
     label: []u8,
     batch_id: u64 = 0,
     batch_total: usize = 0,
-    kind: enum { normal, query, compare_left, compare_right, calc_size, dup_scan, archive_list } = .normal,
-    /// The tab whose query this job feeds (`.query` only). Validated
+    kind: enum { normal, query, compare_left, compare_right, calc_size, dup_scan, archive_list, disk_usage } = .normal,
+    /// The tab whose query or disk analysis this job feeds. Validated
     /// with `tabAlive` before use: a tab can close between the start
     /// request and its reply.
     tab: ?*BTab = null,

@@ -13,6 +13,19 @@ const c = @import("../c.zig").c;
 pub const is_linux = builtin.os.tag == .linux;
 pub const is_macos = builtin.os.tag == .macos;
 
+/// Clears libc's thread-local errno before an API whose sentinel is ambiguous.
+pub fn clearErrno() void {
+    if (is_linux)
+        c.__errno_location().* = 0
+    else
+        c.__error().* = 0;
+}
+
+/// Returns libc's current thread-local errno value.
+pub fn currentErrno() c_int {
+    return if (is_linux) c.__errno_location().* else c.__error().*;
+}
+
 pub const RenameNoReplaceResult = enum { ok, exists, cross_device, failed };
 
 /// Atomically install `old_path` at a destination that must not exist.

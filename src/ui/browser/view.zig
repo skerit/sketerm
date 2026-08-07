@@ -642,6 +642,7 @@ pub const BrowserView = struct {
     pub const onMenuTrashRestoreItem = @import("menu.zig").onMenuTrashRestoreItem;
     pub const onMenuUndo = @import("menu.zig").onMenuUndo;
     pub const onMenuCalcSize = @import("menu.zig").onMenuCalcSize;
+    pub const onMenuAnalyzeUsage = @import("menu.zig").onMenuAnalyzeUsage;
     pub const onMenuFindDups = @import("menu.zig").onMenuFindDups;
     pub const onMenuNewFolder = @import("menu.zig").onMenuNewFolder;
     pub const onMenuRename = @import("menu.zig").onMenuRename;
