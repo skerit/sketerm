@@ -1418,9 +1418,9 @@ pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    // Quick Look owns a path on the old tab's host. Close it rather than
-    // silently resolving that path against the newly selected host.
-    if (self.preview_state.ql != null) self.quickLookClose();
+    // Quick Look's batch was built from the old tab's listing. Close it
+    // rather than leaving a viewer aimed at another tab's host.
+    if (self.preview_state.quick_look != null) self.quickLookClose();
     // currentTab still reports the OLD page during switch-page;
     // defer to idle so path entry + render see the new one.
     if (self.switch_idle == 0)

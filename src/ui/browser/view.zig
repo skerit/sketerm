@@ -794,8 +794,6 @@ pub const BrowserView = struct {
     pub const quickLookToggle = @import("preview.zig").quickLookToggle;
     pub const quickLookOpen = @import("preview.zig").quickLookOpen;
     pub const quickLookClose = @import("preview.zig").quickLookClose;
-    pub const quickLookStep = @import("preview.zig").quickLookStep;
-    pub const quickLookActivate = @import("preview.zig").quickLookActivate;
 
     // props.zig -- Properties dialog, attributes, probes
     pub const endProbe = @import("props.zig").endProbe;
@@ -1244,6 +1242,11 @@ pub const BrowserView = struct {
 
     pub fn deinit(self: *BrowserView) void {
         @import("places.zig").unregisterView(self);
+        // Close the quick-look viewer FIRST: its destroy handler and
+        // activate callback carry a raw pointer to this view, and the
+        // choke-point contract (see preview.State.quick_look) is that
+        // the window never outlives the view.
+        self.quickLookClose();
         // The client-mediated transfers this view runs are recorded in
         // the durable ledger; hand them back before their Xfers die so
         // the next browser face -- or another process -- resumes them.
