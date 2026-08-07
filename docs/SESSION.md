@@ -14756,3 +14756,74 @@ Follow-ups for Phase B: the viewer's Open picker still filters to
 images+recordings (no "All Files" filter yet); Files' isViewerName
 gate on "Open in Sketerm Viewer" still excludes plain files; no
 syntax highlighting (out of scope by design).
+
+## 2026-08-07: viewer Phase B - Files' Quick Look hosts the shared Viewer
+
+Files' Quick Look is no longer its own window implementation: Space now
+opens the REAL `ViewerWindow` (src/ui/viewer.zig) in quick-look mode
+and the ~550-line duplicate in src/ui/browser/preview.zig (the
+`QuickLook` struct, its control strip + 19 signal handlers, keyboard
+dispatch, CSS, position label, private full-res LoadTarget) is deleted.
+Entry points unchanged: `quickLookToggle` keeps its name and the
+nav.zig chord / selection.zig capture-phase Space wiring is untouched;
+`quickLookStep`/`quickLookActivate` are gone (the viewer navigates
+itself; Enter is `Options.on_activate`).
+
+Batch: the tab's rendered listing in display order, EVERY non-directory
+entry (the viewer displays anything since Phase A). The per-view-mode
+walk was extracted from `launchViewer` into `open.collectListingSpecs`
++ `SpecWalk`, parameterized by a name predicate - launchViewer passes
+`paths.isViewerName`, quick look passes an accept-all - so the two
+sequences cannot drift. Focused row first (last-selected fallback,
+same semantics as before); specs host-qualified via
+`paths.formatSpecAlloc`; the ViewerWindow owns the Batch from open.
+
+Options: transient_for = the browser's toplevel, close_on_space,
+show_in_files_action=false, on_activate = copy the path out (the spec
+dies with the window), close, then `render.activatePath` - the same
+funnel a double-click takes, so picker/archive/collection modes keep
+their activation semantics.
+
+Lifetime: `preview.State.quick_look` tracks the open window. ONE
+mechanism: a plain `g_signal_connect_data(window, "destroy", ...)`
+with the BrowserView as user-data and NO notify/disconnect, correct
+because every path that frees the view destroys the window first -
+Space toggle, the tab-switch close in nav.onSwitchPage, and a new
+`quickLookClose()` at the top of BrowserView.deinit. A user-initiated
+close (Space inside the viewer, WM close) lands in the same destroy
+handler and clears the pointer, which the smoke stage proves by
+reopening.
+
+Fallout removed with the overlay: `previewTargetPath` no longer has a
+QL cursor branch, `updatePreview` lost the overlay header path (and
+with it `describeEntry`/`appendMediaLines`/`setPreviewMeta` - the
+panel's `preview_meta` label stays in the layout, now always empty),
+`paintPreview`/`showPreviewNote`/`startPreview` lost their QL mirrors,
+and `schedulePreload` only runs for the side panel now. `NavList`
+stays (preload ordering). Information panel and the thumbnail/preview
+pipeline untouched.
+
+Accepted behavior changes (deliberate, not regressions): loading goes
+through the Viewer's own daemon/LoadTarget path instead of the
+browser's HostConn preview pipeline (no preload-cache reuse, no
+browser-side preview cache hit); Viewer chrome replaces the minimal
+strip; casts now PLAY in quick look; navigation keys are the Viewer's
+(arrows no longer clamp against a selection-only NavList, and the
+browser's focused row no longer follows the viewer's cursor).
+
+smoke-e2e: new `quickLookStage` (6c-11) - a real `sketerm files`
+window (own SKETERM_APP_ID, exact-pid kill, teardown entry), two text
+files with distinct OCR tokens, click-to-focus + type-ahead 'a' +
+Escape, Space -> viewer window maps and OCR shows the focused file's
+token, Right -> next file's token, Space -> window gone, second Space
+-> REOPENS (the tracked pointer really cleared), closed again, files
+window still healthy. A `waitVisualSettle` before keying into the
+reopened window matters: keying into a just-mapped window raced once.
+Plus a `dumpWindowRoster` forensics helper for failure paths.
+
+Verification: `zig build`; `zig build test` 2024 passed/0 failed and
+`test-core` 1690/0 (both suites exit 0 run directly; the build-step
+wrapper trips on tesseract's atexit leak noise exactly as on clean
+master - re-baselined this session); `smoke-e2e` PASS including all
+pre-existing stages; `mux-portable` green; `ldd sketerm-mux` still
+libc/libm only. Net -548 lines in src/ui/browser.
