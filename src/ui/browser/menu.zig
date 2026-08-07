@@ -463,12 +463,16 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     if (isCastName(path))
         m.itemIcon("Play in Sketerm", .{ .name = "media-playback-start-symbolic" }, &onMenuCastPlay, ctx);
     if (!ctx.is_dir) {
-        // Two destinations, the same split the Viewer has: in the pane
-        // you are looking at, or as the dedicated Sketerm Editor
-        // application (own window, own taskbar entry). The in-pane item
-        // needs a pane, which the picker embed has not got.
+        // Three destinations, one more than the Viewer has: in the pane
+        // you are looking at (which converts it, so the browser goes
+        // away until you come back), in a NEW tab beside it (browser
+        // stays put), or as the dedicated Sketerm Editor application
+        // (own window, own taskbar entry). The first needs a pane and
+        // the second a window, neither of which the picker embed has.
         if (self.pane != null)
             m.itemIcon("Edit in Sketerm Editor", .{ .name = "document-edit-symbolic" }, &onMenuEditor, ctx);
+        if (self.ownerWindow() != null)
+            m.itemIcon("Edit in a new Editor Tab", .{ .name = "tab-new-symbolic" }, &onMenuEditorTab, ctx);
         m.itemIcon("Edit in a Sketerm Editor Window", .{ .name = "document-edit-symbolic" }, &onMenuEditorWindow, ctx);
     }
     var namez: [512:0]u8 = undefined;
@@ -1002,6 +1006,26 @@ pub fn onMenuEditor(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const pane = self.pane orelse return;
     const win = self.ownerWindow() orelse return;
     win.openEditorOn(pane, copied) catch return;
+}
+
+/// Open the clicked file in a NEW editor tab of this window, leaving
+/// the browser tab it was clicked in exactly as it was. Same
+/// host-qualified spec as onMenuEditor.
+pub fn onMenuEditorTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    const tab = ctx.tab;
+    // Format the spec BEFORE menuDone frees the ctx storage.
+    var spec_buf: [4300]u8 = undefined;
+    const spec = @import("../../filebrowser/paths.zig").formatSpec(&spec_buf, tab.hc.host, path);
+    var copy_buf: [4300]u8 = undefined;
+    if (spec.len > copy_buf.len) return menuDone(ctx);
+    @memcpy(copy_buf[0..spec.len], spec);
+    const copied = copy_buf[0..spec.len];
+    menuDone(ctx);
+    const win = self.ownerWindow() orelse return;
+    win.newEditorTabAt(copied) catch return;
 }
 
 /// "Edit in a Sketerm Editor Window": the dedicated editor identity,
