@@ -50,6 +50,8 @@ const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
 const guessMime = @import("open.zig").guessMime;
+const open_mod = @import("open.zig");
+const viewer_model = @import("../../viewer.zig");
 const render_mod = @import("render.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
 const isImageName = @import("../../filebrowser/paths.zig").isImageName;
@@ -300,12 +302,16 @@ pub const State = struct {
     preload_queue: std.ArrayList(PreloadItem) = .empty,
     /// The one preload fetch in flight, behind the foreground one.
     preload_read: ?*PreviewRead = null,
-    ql: ?*QuickLook = null,
+    /// The Quick Look host: a shared ViewerWindow opened on Space.
+    /// Cleared by the window's own destroy handler; every path that
+    /// frees the view closes the window FIRST (Space toggle, tab
+    /// switch, BrowserView.deinit), so the raw back-pointer in that
+    /// handler can never outlive the view.
+    quick_look: ?*viewer_ui.ViewerWindow = null,
     /// Nonce source for host-side scratch file names.
     temp_seq: u64 = 0,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
-        if (self.ql) |ql| ql.destroy();
         if (self.preload_read) |pr| pr.destroy(allocator);
         for (self.preload_queue.items) |*it| it.deinit(allocator);
         self.preload_queue.deinit(allocator);
@@ -1215,7 +1221,6 @@ pub fn clearPreviewContent(self: *BrowserView) void {
     self.preview_image.clear();
     showPanelPic(self, false);
     c.gtk_label_set_text(self.preview_text, "");
-    if (self.preview_state.ql) |ql| ql.clearContent();
 }
 
 /// Drop everything this host owed the preview pipeline.
@@ -1277,11 +1282,8 @@ pub fn shutdownTransfers(self: *BrowserView) void {
     self.remote_thumb_queue.clearRetainingCapacity();
 }
 
-/// The entry the preview is about: the Quick Look cursor when the
-/// overlay is open (it arrows independently of the list selection),
-/// otherwise the last-selected row.
-fn previewTargetPath(self: *BrowserView, tab: *BTab) ?[]const u8 {
-    if (self.preview_state.ql) |ql| return ql.path;
+/// The entry the preview is about: the last-selected row.
+fn previewTargetPath(tab: *BTab) ?[]const u8 {
     if (tab.selected.items.len == 0) return null;
     return tab.selected.items[tab.selected.items.len - 1];
 }
@@ -1292,24 +1294,6 @@ fn cacheKey(buf: []u8, hc: *HostConn, path: []const u8, mtime_ms: i64) ?[]const 
     return std.fmt.bufPrint(buf, "{s}\x00{s}\x00{d}", .{
         hc.host orelse "", path, mtime_ms,
     }) catch null;
-}
-
-/// The header block shown above every preview.
-fn describeEntry(buf: []u8, path: []const u8, entry: ?*Entry) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    w.print("{s}", .{std.fs.path.basename(path)}) catch {};
-    const e = entry orelse return w.buffered();
-    var sz: [48:0]u8 = undefined;
-    var tz: [40:0]u8 = undefined;
-    var mz: [16:0]u8 = undefined;
-    w.print("\n{s}", .{e.kind}) catch {};
-    if (!std.mem.eql(u8, e.kind, "dir"))
-        w.print("  {s}", .{fmtSize(&sz, e.size)}) catch {};
-    w.print("  {s}", .{std.mem.span(fmtModeZ(&mz, e.mode, e.tdir))}) catch {};
-    if (e.mtime_ms != 0) w.print("\n{s}", .{fmtTimeZ(&tz, e.mtime_ms)}) catch {};
-    if (e.target) |t| w.print("\n-> {s}", .{t}) catch {};
-    if (e.tags.len > 0) w.print("\ntags: {s}", .{e.tags}) catch {};
-    return w.buffered();
 }
 
 // ── the Information panel (Dolphin-style) ───────────────────────
@@ -1798,9 +1782,9 @@ fn showMultiSummary(self: *BrowserView, tab: *BTab, summary: SelectionSummary) v
     if (summary.missing > 0) addInfoRow(self, "Unavailable", std.fmt.bufPrint(&b, "{d} item(s)", .{summary.missing}) catch "some items");
 }
 
-/// Refresh the Information panel and the overlay from the current
-/// target. Every call is a new generation: results from the previous
-/// one are dropped rather than painted over the new entry.
+/// Refresh the Information panel from the current target. Every call
+/// is a new generation: results from the previous one are dropped
+/// rather than painted over the new entry.
 pub fn updatePreview(self: *BrowserView) void {
     // Every selection/navigation change funnels through here, so
     // the picker's selection hook rides it.
@@ -1808,9 +1792,9 @@ pub fn updatePreview(self: *BrowserView) void {
     // The sidebar card follows every selection change, even with the
     // full panel off; it is deliberately fetch-free.
     const selected_tab = self.currentTab();
-    const panel_visible = self.preview_on or self.preview_state.ql != null;
+    const panel_visible = self.preview_on;
     const multi_summary: ?SelectionSummary = if (selected_tab) |tab|
-        (if (tab.selected.items.len > 1 and (self.side_info or (panel_visible and self.preview_state.ql == null))) selectionSummary(tab) else null)
+        (if (tab.selected.items.len > 1 and (self.side_info or panel_visible)) selectionSummary(tab) else null)
     else
         null;
     if (self.side_info) if (selected_tab) |tab| updateSideCardSummary(self, tab, multi_summary);
@@ -1821,90 +1805,25 @@ pub fn updatePreview(self: *BrowserView) void {
     self.clearPreviewContent();
     clearInfoGrid(self);
     setPanelName(self, "");
-    setPreviewMeta(self, "");
     showPanelPic(self, false);
     setPanelIconName(self, "text-x-generic");
 
     const tab = self.currentTab() orelse return;
-    // A multi-selection gets an aggregate panel; the overlay is
-    // excluded because its cursor is always exactly one entry.
-    if (self.preview_state.ql == null and tab.selected.items.len > 1) {
+    // A multi-selection gets an aggregate panel.
+    if (tab.selected.items.len > 1) {
         showMultiSummary(self, tab, multi_summary orelse selectionSummary(tab));
         return;
     }
-    const path = previewTargetPath(self, tab) orelse {
+    const path = previewTargetPath(tab) orelse {
         showFolderSummary(self, tab);
         return;
     };
     const entry = entryForPath(tab, path);
     fillEntryPanel(self, tab, path, entry);
-    // The overlay header still rides the compact text form.
-    if (self.preview_state.ql != null) {
-        var meta_buf: [1024]u8 = undefined;
-        var described = describeEntry(&meta_buf, path, entry);
-        if (entry) |e| described = appendMediaLines(self, tab, path, e.mtime_ms, &meta_buf, described);
-        setPreviewMeta(self, described);
-    }
 
     const is_dir = if (entry) |e| e.tdir else false;
     startPreview(self, tab.hc, path, if (entry) |e| e.mtime_ms else 0, is_dir, false);
     self.schedulePreload(tab, path);
-}
-
-/// Append the media fields worth a glance to the panel header, as
-/// labelled lines. Only from what the media columns already cached:
-/// the full field set is one click away in Properties.
-fn appendMediaLines(
-    self: *BrowserView,
-    tab: *BTab,
-    path: []const u8,
-    mtime_ms: i64,
-    buf: []u8,
-    described: []const u8,
-) []const u8 {
-    const interesting = [_][]const u8{
-        "media.format",           "media.width", "media.height", "media.duration_ms",
-        "media.bitrate_kbps",     "tag.title",   "tag.artist",   "tag.album",
-        "exif.datetime_original", "exif.model",  "doc.pages",
-    };
-    const estimated = if (mediacols.lookup(self, tab.hc, path, mtime_ms, "media.duration_estimated")) |v|
-        std.mem.eql(u8, v, "1")
-    else
-        false;
-    var w = std.Io.Writer.fixed(buf[described.len..]);
-    var n: usize = 0;
-    for (interesting) |key| {
-        const raw = mediacols.lookup(self, tab.hc, path, mtime_ms, key) orelse continue;
-        var disp: [192]u8 = undefined;
-        w.print("\n{s}: {s}", .{
-            colkeys.label(key), colkeys.display(key, raw, estimated, false, &disp),
-        }) catch break;
-        n += 1;
-    }
-    if (n == 0) return described;
-    return buf[0 .. described.len + w.buffered().len];
-}
-
-fn setPreviewMeta(self: *BrowserView, text: []const u8) void {
-    var z: [1200:0]u8 = undefined;
-    const n = @min(text.len, z.len - 1);
-    @memcpy(z[0..n], text[0..n]);
-    z[n] = 0;
-    c.gtk_label_set_text(self.preview_meta, &z);
-    c.gtk_widget_set_visible(@ptrCast(@alignCast(self.preview_meta)), @intFromBool(n > 0));
-    if (self.preview_state.ql) |ql| {
-        // The overlay's header renders the name line and the details
-        // as two differently styled labels.
-        const name_end = std.mem.indexOfScalar(u8, z[0..n], '\n') orelse n;
-        var name_z: [512:0]u8 = undefined;
-        const name_n = @min(name_end, name_z.len - 1);
-        @memcpy(name_z[0..name_n], z[0..name_n]);
-        name_z[name_n] = 0;
-        c.gtk_label_set_text(ql.title, &name_z);
-        const rest: [*:0]const u8 = if (name_end < n) z[name_end + 1 ..].ptr else "";
-        c.gtk_label_set_text(ql.meta, rest);
-        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.meta)), @intFromBool(name_end < n));
-    }
 }
 
 /// The user's previewer rules, loaded once per view.
@@ -1975,7 +1894,6 @@ fn startPreview(
     endRead(self, slot);
     slot.* = pr;
     if (!preload) c.gtk_label_set_text(self.preview_text, "loading...");
-    if (self.preview_state.ql) |ql| if (!preload) c.gtk_label_set_text(ql.status, "loading...");
 
     switch (handler.producer) {
         .builtin => |b| switch (b) {
@@ -2414,34 +2332,6 @@ fn paintPreview(self: *BrowserView, item: *const CacheItem) void {
         c.GTK_POLICY_NEVER,
     );
     c.gtk_label_set_text(self.preview_text, &z);
-    if (self.preview_state.ql) |ql| {
-        c.gtk_widget_set_visible(ql.picture, @intFromBool(item.texture != null));
-        c.gtk_widget_set_visible(ql.full_button, @intFromBool(isImageName(ql.path)));
-        c.gtk_widget_set_sensitive(ql.full_button, 1);
-        // The code card is for CONTENT (text head, hexdump). A note
-        // (generator metadata, failure text) reads as a styled line
-        // under the stage instead of a text dump.
-        const card: []const u8 = item.text orelse "";
-        var cz: [@max(PREVIEW_TEXT_CAP, hexdump.renderedSize(hexdump.DEFAULT_CAP)) + 1:0]u8 = undefined;
-        const cn = @min(card.len, cz.len - 1);
-        @memcpy(cz[0..cn], card[0..cn]);
-        cz[cn] = 0;
-        c.gtk_label_set_text(ql.text, &cz);
-        c.gtk_widget_set_visible(ql.text_scroll, @intFromBool(cn > 0));
-        const note: []const u8 = if (item.text == null) (item.note orelse "") else "";
-        var nz: [2048:0]u8 = undefined;
-        const nn = @min(note.len, nz.len - 1);
-        @memcpy(nz[0..nn], note[0..nn]);
-        nz[nn] = 0;
-        c.gtk_label_set_text(ql.note, &nz);
-        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.note)), @intFromBool(nn > 0));
-        c.gtk_label_set_text(ql.status, if (item.failed) "preview unavailable" else "");
-        ql.canvas.setAccessible(
-            std.fs.path.basename(ql.path),
-            if (item.failed) "Preview unavailable" else "Preview image",
-            false,
-        );
-    }
 }
 
 /// A note with no content behind it (directory summary, disconnected
@@ -2452,16 +2342,6 @@ fn showPreviewNote(self: *BrowserView, note: []const u8) void {
     @memcpy(z[0..n], note[0..n]);
     z[n] = 0;
     c.gtk_label_set_text(self.preview_text, &z);
-    if (self.preview_state.ql) |ql| {
-        c.gtk_widget_set_visible(ql.picture, 0);
-        c.gtk_widget_set_visible(ql.full_button, @intFromBool(isImageName(ql.path)));
-        c.gtk_widget_set_sensitive(ql.full_button, 1);
-        c.gtk_widget_set_visible(ql.text_scroll, 0);
-        c.gtk_label_set_text(ql.text, "");
-        c.gtk_label_set_text(ql.note, &z);
-        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.note)), 1);
-        c.gtk_label_set_text(ql.status, "");
-    }
 }
 
 pub fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
@@ -2500,7 +2380,7 @@ pub fn clearPreloadQueue(self: *BrowserView) void {
 /// never leaves a growing tail of remote work behind it.
 pub fn schedulePreload(self: *BrowserView, tab: *BTab, current: []const u8) void {
     self.clearPreloadQueue();
-    if (!self.preview_on and self.preview_state.ql == null) return;
+    if (!self.preview_on) return;
     const list = NavList.of(tab);
     const at = list.indexOf(current) orelse return;
     var offset: isize = -@as(isize, PRELOAD_BEHIND);
@@ -2548,9 +2428,9 @@ pub fn pumpPreload(self: *BrowserView) void {
     }
 }
 
-/// The order Quick Look arrows through: the current multi-selection
-/// when there is one (the user picked those on purpose), otherwise
-/// the tab's visible listing.
+/// The order the preloader warms neighbours in: the current
+/// multi-selection when there is one (the user picked those on
+/// purpose), otherwise the tab's visible listing.
 const NavList = struct {
     tab: *BTab,
     selection: bool,
@@ -2596,66 +2476,13 @@ const NavList = struct {
     }
 };
 
-// ── Quick Look overlay ──────────────────────────────────────────
+// ── Quick Look (hosted shared Viewer) ───────────────────────────
 
-/// The large single-key preview. Its own window rather than a child
-/// of the browser box: it must survive the listing being rebuilt
-/// under it, and it owns its keys (arrows move without closing).
-pub const QuickLook = struct {
-    view: *BrowserView,
-    window: *c.GtkWidget,
-    title: *c.GtkLabel,
-    position: *c.GtkLabel,
-    /// Everything below the name line of the metadata block.
-    meta: *c.GtkLabel,
-    picture: *c.GtkWidget,
-    canvas: image_canvas.Canvas,
-    full_button: *c.GtkWidget,
-    play_button: *c.GtkWidget,
-    full_target: *viewer_ui.LoadTarget,
-    /// Generator metadata / summary line under the image (formatted
-    /// "Label: value" text, never the raw dump).
-    note: *c.GtkLabel,
-    text_scroll: *c.GtkWidget,
-    text: *c.GtkLabel,
-    status: *c.GtkLabel,
-    /// The entry on screen (owned); the preview target while open.
-    path: []u8,
-    /// Host owning `path`, copied independently of the selected tab.
-    host: ?[]u8,
-
-    fn clearContent(self: *QuickLook) void {
-        self.full_target.cancel();
-        c.gtk_widget_set_visible(self.picture, 0);
-        c.gtk_widget_set_visible(self.full_button, 0);
-        c.gtk_widget_set_sensitive(self.play_button, 0);
-        c.gtk_label_set_text(self.note, "");
-        c.gtk_widget_set_visible(@ptrCast(@alignCast(self.note)), 0);
-        c.gtk_label_set_text(self.text, "");
-        c.gtk_label_set_text(self.status, "");
-    }
-
-    /// Tear down the window and the struct. The view's pointer is
-    /// cleared first so the destroy handler does not recurse.
-    fn destroy(self: *QuickLook) void {
-        const view = self.view;
-        view.preview_state.ql = null;
-        view.preview_image.setPlaybackCallback(null, null);
-        self.full_target.close();
-        view.preview_image.detach(&self.canvas);
-        const window = self.window;
-        c.gtk_window_destroy(@ptrCast(@alignCast(window)));
-        view.allocator.free(self.path);
-        if (self.host) |host| view.allocator.free(host);
-        view.allocator.destroy(self);
-    }
-};
-
-/// Space on a focused entry. @return true when the overlay handled
-/// the key (opened or closed), false when there is nothing to show
-/// and the key belongs to type-ahead.
+/// Space on a focused entry. @return true when the toggle handled the
+/// key (opened or closed a viewer), false when there is nothing to
+/// show and the key belongs to type-ahead.
 pub fn quickLookToggle(self: *BrowserView) bool {
-    if (self.preview_state.ql != null) {
+    if (self.preview_state.quick_look != null) {
         self.quickLookClose();
         return true;
     }
@@ -2669,485 +2496,96 @@ pub fn quickLookToggle(self: *BrowserView) bool {
     return self.quickLookOpen(path);
 }
 
-/// One-time CSS for the overlay: an image "stage" backdrop so photos
-/// float on a quiet dark surface instead of the window background.
-var ql_css_installed = false;
-
-fn installQuickLookCss(any_widget: *c.GtkWidget) void {
-    if (ql_css_installed) return;
-    ql_css_installed = true;
-    const css =
-        \\picture.sketerm-ql-stage {
-        \\  background-color: alpha(black, 0.25);
-        \\  border-radius: 12px;
-        \\}
-        \\scrolledwindow.sketerm-ql-text {
-        \\  border-radius: 8px;
-        \\}
-    ;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    c.g_object_unref(@ptrCast(provider));
-}
-
-pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
-    const tab = self.currentTab() orelse return false;
-    const ql = self.allocator.create(QuickLook) catch return false;
-    const owned = self.allocator.dupe(u8, path) catch {
-        self.allocator.destroy(ql);
-        return false;
-    };
-    const host = if (tab.hc.host) |name| self.allocator.dupe(u8, name) catch {
-        self.allocator.free(owned);
-        self.allocator.destroy(ql);
-        return false;
-    } else null;
-
-    installQuickLookCss(self.root_box);
-    const window = c.gtk_window_new();
-    c.gtk_window_set_title(@ptrCast(window), "Preview");
-    var w = c.gtk_widget_get_width(self.root_box);
-    var h = c.gtk_widget_get_height(self.root_box);
-    if (w <= 200) w = 900;
-    if (h <= 200) h = 700;
-    if (c.gtk_widget_get_root(self.root_box)) |root| {
-        c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(@alignCast(root)));
-        // Never taller/wider than 90% of the monitor: the browser
-        // window is usually near-maximized, and a preview that fills
-        // the whole screen reads as a mode switch, not an overlay.
-        if (c.gtk_native_get_surface(@ptrCast(@alignCast(root)))) |surface| {
-            const display = c.gtk_widget_get_display(self.root_box);
-            if (c.gdk_display_get_monitor_at_surface(display, surface)) |monitor| {
-                var geo: c.GdkRectangle = undefined;
-                c.gdk_monitor_get_geometry(monitor, &geo);
-                w = @min(w, @divTrunc(geo.width * 9, 10));
-                h = @min(h, @divTrunc(geo.height * 9, 10));
-            }
-        }
-    }
-    c.gtk_window_set_default_size(@ptrCast(window), w, h);
-
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
-    c.gtk_widget_set_margin_start(box, 14);
-    c.gtk_widget_set_margin_end(box, 14);
-    c.gtk_widget_set_margin_top(box, 10);
-    c.gtk_widget_set_margin_bottom(box, 8);
-
-    // Header: the entry's name, then its details, dimmer and smaller.
-    const title = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(title), 0);
-    c.gtk_label_set_selectable(@ptrCast(title), 1);
-    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_MIDDLE);
-    c.gtk_widget_add_css_class(title, "title-4");
-    c.gtk_widget_set_hexpand(title, 1);
-    const title_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_box_append(@ptrCast(title_row), title);
-    const position = c.gtk_label_new("");
-    c.gtk_widget_add_css_class(position, "dim-label");
-    c.gtk_box_append(@ptrCast(title_row), position);
-    c.gtk_box_append(@ptrCast(box), title_row);
-
-    const meta = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(meta), 0);
-    c.gtk_label_set_selectable(@ptrCast(meta), 1);
-    c.gtk_widget_add_css_class(meta, "dim-label");
-    c.gtk_widget_add_css_class(meta, "caption");
-    c.gtk_widget_set_visible(meta, 0);
-    c.gtk_box_append(@ptrCast(box), meta);
-
-    var canvas = image_canvas.Canvas.init();
-    const picture = canvas.widget();
-    c.gtk_widget_set_hexpand(picture, 1);
-    c.gtk_widget_set_vexpand(picture, 1);
-    c.gtk_widget_set_visible(picture, 0);
-    c.gtk_widget_set_margin_top(picture, 4);
-    c.gtk_widget_add_css_class(canvas.picture, "sketerm-ql-stage");
-    c.gtk_box_append(@ptrCast(box), picture);
-
-    // Media/document metadata under the stage: formatted lines, not
-    // the generator's raw key=value dump in a code card.
-    const note = c.gtk_label_new("");
-    c.gtk_label_set_wrap(@ptrCast(note), 1);
-    c.gtk_label_set_justify(@ptrCast(note), c.GTK_JUSTIFY_CENTER);
-    c.gtk_label_set_selectable(@ptrCast(note), 1);
-    c.gtk_widget_set_halign(note, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_add_css_class(note, "dim-label");
-    c.gtk_widget_set_visible(note, 0);
-    c.gtk_box_append(@ptrCast(box), note);
-
-    const text_scroll = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(@ptrCast(text_scroll), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_widget_set_hexpand(text_scroll, 1);
-    c.gtk_widget_set_vexpand(text_scroll, 1);
-    c.gtk_widget_set_margin_top(text_scroll, 4);
-    c.gtk_widget_add_css_class(text_scroll, "card");
-    c.gtk_widget_add_css_class(text_scroll, "sketerm-ql-text");
-    const text = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(text), 0);
-    c.gtk_label_set_yalign(@ptrCast(text), 0);
-    // Never wrap: a hex dump's columns and a source file's
-    // indentation both depend on it, and the scroller handles width.
-    c.gtk_label_set_wrap(@ptrCast(text), 0);
-    c.gtk_label_set_selectable(@ptrCast(text), 1);
-    c.gtk_widget_add_css_class(text, "monospace");
-    c.gtk_widget_set_margin_start(text, 12);
-    c.gtk_widget_set_margin_end(text, 12);
-    c.gtk_widget_set_margin_top(text, 10);
-    c.gtk_widget_set_margin_bottom(text, 10);
-    c.gtk_scrolled_window_set_child(@ptrCast(text_scroll), text);
-    c.gtk_box_append(@ptrCast(box), text_scroll);
-
-    const status = c.gtk_label_new("");
-    c.gtk_label_set_xalign(@ptrCast(status), 0);
-    c.gtk_widget_add_css_class(status, "dim-label");
-    c.gtk_box_append(@ptrCast(box), status);
-
-    const controls = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-    c.gtk_widget_set_halign(controls, c.GTK_ALIGN_CENTER);
-    const zoom_out = c.gtk_button_new_from_icon_name("zoom-out-symbolic").?;
-    c.gtk_widget_set_tooltip_text(zoom_out, "Zoom Out (-)");
-    const zoom_in = c.gtk_button_new_from_icon_name("zoom-in-symbolic").?;
-    c.gtk_widget_set_tooltip_text(zoom_in, "Zoom In (+)");
-    const fit = c.gtk_button_new_from_icon_name("zoom-fit-best-symbolic").?;
-    c.gtk_widget_set_tooltip_text(fit, "Fit to Window (F)");
-    const fill = c.gtk_button_new_from_icon_name("view-fullscreen-symbolic").?;
-    c.gtk_widget_set_tooltip_text(fill, "Fill Window (C)");
-    const actual = c.gtk_button_new_from_icon_name("zoom-original-symbolic").?;
-    c.gtk_widget_set_tooltip_text(actual, "Actual Size (0)");
-    const rotate_left = c.gtk_button_new_from_icon_name("object-rotate-left-symbolic").?;
-    c.gtk_widget_set_tooltip_text(rotate_left, "Rotate View Left ([)");
-    const rotate_right = c.gtk_button_new_from_icon_name("object-rotate-right-symbolic").?;
-    c.gtk_widget_set_tooltip_text(rotate_right, "Rotate View Right (])");
-    const play = c.gtk_button_new_from_icon_name("media-playback-pause-symbolic").?;
-    c.gtk_widget_set_tooltip_text(play, "Pause or Resume Animation (P)");
-    c.gtk_widget_set_sensitive(play, 0);
-    const copy = c.gtk_button_new_from_icon_name("edit-copy-symbolic").?;
-    c.gtk_widget_set_tooltip_text(copy, "Copy Image");
-    const reload = c.gtk_button_new_from_icon_name("view-refresh-symbolic").?;
-    c.gtk_widget_set_tooltip_text(reload, "Reload Preview (R)");
-    for ([_]*c.GtkWidget{ zoom_out, zoom_in, fit, fill, actual, rotate_left, rotate_right, play, copy, reload }) |button|
-        c.gtk_box_append(@ptrCast(controls), button);
-    c.gtk_box_append(@ptrCast(box), controls);
-
-    const full_button = c.gtk_button_new_with_label("View full resolution");
-    c.gtk_widget_set_halign(full_button, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_visible(full_button, 0);
-    c.gtk_box_append(@ptrCast(box), full_button);
-
-    const hint = c.gtk_label_new("Space or Esc closes  \u{00b7}  arrows/swipe move  \u{00b7}  Enter opens");
-    c.gtk_widget_set_halign(hint, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_add_css_class(hint, "dim-label");
-    c.gtk_widget_add_css_class(hint, "caption");
-    c.gtk_box_append(@ptrCast(box), hint);
-
-    c.gtk_window_set_child(@ptrCast(window), box);
-
-    const full_target = viewer_ui.LoadTarget.create(&onQuickLookFullLoaded, @ptrCast(ql)) orelse {
-        if (host) |name| self.allocator.free(name);
-        self.allocator.free(owned);
-        self.allocator.destroy(ql);
-        c.gtk_window_destroy(@ptrCast(@alignCast(window)));
-        return false;
-    };
-    ql.* = .{
-        .view = self,
-        .window = window,
-        .title = @ptrCast(@alignCast(title)),
-        .position = @ptrCast(@alignCast(position)),
-        .meta = @ptrCast(@alignCast(meta)),
-        .picture = picture,
-        .canvas = canvas,
-        .full_button = full_button,
-        .play_button = play,
-        .full_target = full_target,
-        .note = @ptrCast(@alignCast(note)),
-        .text_scroll = text_scroll,
-        .text = @ptrCast(@alignCast(text)),
-        .status = @ptrCast(@alignCast(status)),
-        .path = owned,
-        .host = host,
-    };
-    ql.canvas.enableInput();
-    ql.canvas.on_navigate = &onQuickLookNavigate;
-    ql.canvas.navigate_ctx = @ptrCast(self);
-    ql.canvas.on_rotate = &onQuickLookRotateGesture;
-    ql.canvas.rotate_ctx = @ptrCast(self);
-    self.preview_image.attach(self.allocator, &ql.canvas) catch {
-        ql.full_target.close();
-        c.gtk_window_destroy(@ptrCast(@alignCast(window)));
-        if (host) |name| self.allocator.free(name);
-        self.allocator.free(owned);
-        self.allocator.destroy(ql);
-        return false;
-    };
-    self.preview_image.setPlaybackCallback(@ptrCast(ql), &onQuickLookPlaybackChanged);
-    self.preview_state.ql = ql;
-    updateQuickLookPosition(ql);
-
-    const keys = c.gtk_event_controller_key_new();
-    c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
-    _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onQuickLookKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    c.gtk_widget_add_controller(window, @ptrCast(keys));
-    _ = c.g_signal_connect_data(window, "close-request", @ptrCast(&onQuickLookCloseRequest), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(full_button, "clicked", @ptrCast(&onQuickLookFull), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(zoom_out, "clicked", @ptrCast(&onQuickLookZoomOut), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(zoom_in, "clicked", @ptrCast(&onQuickLookZoomIn), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(fit, "clicked", @ptrCast(&onQuickLookFit), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(fill, "clicked", @ptrCast(&onQuickLookFill), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(actual, "clicked", @ptrCast(&onQuickLookActual), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(rotate_left, "clicked", @ptrCast(&onQuickLookRotateLeft), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(rotate_right, "clicked", @ptrCast(&onQuickLookRotateRight), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(play, "clicked", @ptrCast(&onQuickLookPlay), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(copy, "clicked", @ptrCast(&onQuickLookCopy), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-    _ = c.g_signal_connect_data(reload, "clicked", @ptrCast(&onQuickLookReload), @ptrCast(ql), null, c.G_CONNECT_DEFAULT);
-
-    c.gtk_window_present(@ptrCast(window));
-    self.updatePreview();
+/// Every rendered non-directory entry belongs in the quick-look batch:
+/// the Viewer displays anything (image, cast, text, hexdump).
+fn anyEntryName(_: []const u8) bool {
     return true;
 }
 
+/// Open the shared ViewerWindow in quick-look mode on `path`, batched
+/// with the tab's rendered listing in display order.
+pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
+    const tab = self.currentTab() orelse return false;
+    const allocator = self.allocator;
+    var walk: open_mod.SpecWalk = .{};
+    open_mod.collectListingSpecs(self, tab, path, &anyEntryName, &walk);
+    if (!walk.found_current) {
+        const owned = paths_mod.formatSpecAlloc(allocator, tab.hc.host, path) catch {
+            walk.deinit(allocator);
+            return false;
+        };
+        walk.initial = walk.specs.items.len;
+        walk.specs.append(allocator, owned) catch {
+            allocator.free(owned);
+            walk.deinit(allocator);
+            return false;
+        };
+    }
+    const initial = walk.initial;
+    const specs = walk.specs.toOwnedSlice(allocator) catch {
+        walk.deinit(allocator);
+        return false;
+    };
+    // The ViewerWindow owns the batch from here (freed at finalize).
+    var batch = viewer_model.Batch{
+        .allocator = allocator,
+        .specs = specs,
+        .initial_index = initial,
+    };
+    const root: ?*c.GtkWindow = if (c.gtk_widget_get_root(self.root_box)) |r|
+        @ptrCast(@alignCast(r))
+    else
+        null;
+    const app = if (root) |r| c.gtk_window_get_application(r) else null;
+    const viewer = viewer_ui.ViewerWindow.open(allocator, app, batch, .{
+        .transient_for = root,
+        .close_on_space = true,
+        .show_in_files_action = false,
+        .on_activate = &onQuickLookActivate,
+        .activate_ctx = @ptrCast(self),
+    }) catch {
+        batch.deinit();
+        return false;
+    };
+    self.preview_state.quick_look = viewer;
+    // Plain connect, no destroy-notify and no disconnect: the window
+    // is ALWAYS destroyed before the view frees (Space toggle, tab
+    // switch and BrowserView.deinit each close it first), so this
+    // closure -- and the raw view pointer it carries -- cannot
+    // outlive the view. See State.quick_look.
+    _ = c.g_signal_connect_data(viewer.window, "destroy", @ptrCast(&onQuickLookDestroyed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    return true;
+}
+
+/// Close the quick-look viewer; its destroy handler clears the
+/// tracking pointer (Space/Enter/WM closes land there too).
 pub fn quickLookClose(self: *BrowserView) void {
-    const ql = self.preview_state.ql orelse return;
-    ql.destroy();
-    self.abandonPreviewRead();
-    self.clearPreloadQueue();
-    // The target reverts to the list selection.
-    self.updatePreview();
+    const viewer = self.preview_state.quick_look orelse return;
+    c.gtk_window_destroy(@ptrCast(@alignCast(viewer.window)));
 }
 
-/// Handle a window-manager close through the same ordered teardown path.
-pub fn onQuickLookCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
+fn onQuickLookDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    self.quickLookClose();
-    return 1;
+    self.preview_state.quick_look = null;
 }
 
-fn onQuickLookFull(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    const spec = paths_mod.formatSpecAlloc(ql.view.allocator, ql.host, ql.path) catch return;
-    defer ql.view.allocator.free(spec);
-    c.gtk_widget_set_sensitive(ql.full_button, 0);
-    c.gtk_label_set_text(ql.status, "loading full resolution through the file service...");
-    if (!ql.full_target.start(spec, .original)) {
-        c.gtk_widget_set_sensitive(ql.full_button, 1);
-        c.gtk_label_set_text(ql.status, "could not start full-resolution loader");
-    }
-}
-
-fn onQuickLookFullLoaded(user: ?*anyopaque, result: *viewer_ui.LoadResult) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    const decoded = if (result.decoded) |*image| image else {
-        var buf: [192:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "full resolution unavailable: {s}", .{result.messageText()}) catch "full resolution unavailable";
-        c.gtk_label_set_text(ql.status, text.ptr);
-        c.gtk_widget_set_sensitive(ql.full_button, 1);
-        return;
-    };
-    ql.view.preview_image.setDecoded(ql.view.allocator, decoded) catch {
-        c.gtk_label_set_text(ql.status, "full-resolution textures failed");
-        c.gtk_widget_set_sensitive(ql.full_button, 1);
-        return;
-    };
-    const first = decoded.first();
-    c.gtk_widget_set_sensitive(ql.play_button, @intFromBool(decoded.animated()));
-    c.gtk_button_set_icon_name(@ptrCast(ql.play_button), "media-playback-pause-symbolic");
-    var buf: [96:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "full resolution  {d} x {d}{s}", .{
-        first.width,
-        first.height,
-        if (decoded.animated()) "  animated" else "",
-    }) catch "full resolution";
-    c.gtk_label_set_text(ql.status, text.ptr);
-    c.gtk_widget_set_visible(ql.full_button, 0);
-    ql.canvas.setAccessible(std.fs.path.basename(ql.path), text, false);
-}
-
-pub fn onQuickLookKey(
-    _: *c.GtkEventControllerKey,
-    keyval: c_uint,
-    _: c_uint,
-    modifiers: c.GdkModifierType,
-    user: ?*anyopaque,
-) callconv(.c) c.gboolean {
+/// Enter inside the quick-look viewer: open the entry the way a
+/// double-click activation does, then close the viewer. The spec's
+/// memory dies with the window, so the path is copied out first.
+fn onQuickLookActivate(user: ?*anyopaque, spec: []const u8) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    switch (keyval) {
-        c.GDK_KEY_Escape, c.GDK_KEY_space, c.GDK_KEY_KP_Space => {
-            self.quickLookClose();
-            return 1;
-        },
-        c.GDK_KEY_Left, c.GDK_KEY_Up, c.GDK_KEY_Page_Up => {
-            self.quickLookStep(-1);
-            return 1;
-        },
-        c.GDK_KEY_Right, c.GDK_KEY_Down, c.GDK_KEY_Page_Down => {
-            self.quickLookStep(1);
-            return 1;
-        },
-        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
-            self.quickLookActivate();
-            return 1;
-        },
-        c.GDK_KEY_plus, c.GDK_KEY_equal, c.GDK_KEY_KP_Add => if (self.preview_state.ql) |ql| ql.canvas.zoomBy(1.2) else return 0,
-        c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => if (self.preview_state.ql) |ql| ql.canvas.zoomBy(1.0 / 1.2) else return 0,
-        c.GDK_KEY_0, c.GDK_KEY_KP_0 => if (self.preview_state.ql) |ql| ql.canvas.actual() else return 0,
-        c.GDK_KEY_f, c.GDK_KEY_F => if (self.preview_state.ql) |ql| ql.canvas.fit() else return 0,
-        c.GDK_KEY_c, c.GDK_KEY_C => {
-            if (modifiers & c.GDK_CONTROL_MASK != 0) {
-                if (self.preview_state.ql) |ql| quickLookCopy(ql) else return 0;
-            } else if (self.preview_state.ql) |ql| ql.canvas.fill() else return 0;
-        },
-        c.GDK_KEY_bracketleft => if (self.preview_state.ql) |ql| quickLookRotate(ql, -1) else return 0,
-        c.GDK_KEY_bracketright => if (self.preview_state.ql) |ql| quickLookRotate(ql, 1) else return 0,
-        c.GDK_KEY_p, c.GDK_KEY_P => if (self.preview_state.ql) |ql| quickLookTogglePlayback(ql) else return 0,
-        c.GDK_KEY_r, c.GDK_KEY_R => quickLookReload(self),
-        else => return 0,
-    }
-    return 1;
-}
-
-/// Move the overlay's cursor without closing it. Clamped at both
-/// ends: an arrow that runs off the list is a no-op, not a wrap.
-pub fn quickLookStep(self: *BrowserView, delta: isize) void {
-    const ql = self.preview_state.ql orelse return;
-    const tab = self.currentTab() orelse return;
-    const list = NavList.of(tab);
-    const at = list.indexOf(ql.path) orelse return;
-    const next = @as(isize, @intCast(at)) + delta;
-    if (next < 0) return;
+    const resource = viewer_model.Resource.parse(spec);
     var buf: [4096]u8 = undefined;
-    const path = list.at(@intCast(next), &buf) orelse return;
-    const owned = self.allocator.dupe(u8, path) catch return;
-    self.allocator.free(ql.path);
-    ql.path = owned;
-    updateQuickLookPosition(ql);
-    self.updatePreview();
-}
-
-fn updateQuickLookPosition(ql: *QuickLook) void {
-    const tab = ql.view.currentTab() orelse return;
-    const list = NavList.of(tab);
-    const at = list.indexOf(ql.path) orelse return;
-    var buf: [64:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{d} of {d}", .{ at + 1, list.count() }) catch "";
-    c.gtk_label_set_text(ql.position, text.ptr);
-}
-
-fn onQuickLookNavigate(user: ?*anyopaque, delta: isize) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    self.quickLookStep(delta);
-}
-
-fn onQuickLookRotateGesture(user: ?*anyopaque, delta: i8) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    if (self.preview_state.ql) |ql| quickLookRotate(ql, delta);
-}
-
-fn quickLookRotate(ql: *QuickLook, delta: i8) void {
-    ql.view.preview_image.rotate(delta);
-    var buf: [96:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "view rotation {d} degrees", .{ql.view.preview_image.rotationDegrees()}) catch "view rotated";
-    c.gtk_label_set_text(ql.status, text.ptr);
-    ql.canvas.setAccessible(std.fs.path.basename(ql.path), text, false);
-}
-
-fn quickLookTogglePlayback(ql: *QuickLook) void {
-    if (!ql.view.preview_image.animated()) return;
-    ql.view.preview_image.togglePlayback();
-}
-
-fn onQuickLookPlaybackChanged(user: ?*anyopaque) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    const playing = ql.view.preview_image.isPlaying();
-    c.gtk_button_set_icon_name(@ptrCast(ql.play_button), if (playing) "media-playback-pause-symbolic" else "media-playback-start-symbolic");
-    c.gtk_label_set_text(ql.status, if (playing) "animation playing" else "animation paused");
-    ql.canvas.setAccessible(std.fs.path.basename(ql.path), if (playing) "Animation playing" else "Animation paused", false);
-}
-
-fn quickLookCopy(ql: *QuickLook) void {
-    const texture = ql.view.preview_image.currentTexture() orelse return;
-    const clipboard = c.gtk_widget_get_clipboard(ql.window) orelse return;
-    c.gdk_clipboard_set_texture(clipboard, texture);
-    c.gtk_label_set_text(ql.status, "image copied to clipboard");
-}
-
-fn onQuickLookZoomOut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    ql.canvas.zoomBy(1.0 / 1.2);
-}
-
-fn onQuickLookZoomIn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    ql.canvas.zoomBy(1.2);
-}
-
-fn onQuickLookFit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    ql.canvas.fit();
-}
-
-fn onQuickLookFill(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    ql.canvas.fill();
-}
-
-fn onQuickLookActual(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    ql.canvas.actual();
-}
-
-fn onQuickLookRotateLeft(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    quickLookRotate(@ptrCast(@alignCast(user.?)), -1);
-}
-
-fn onQuickLookRotateRight(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    quickLookRotate(@ptrCast(@alignCast(user.?)), 1);
-}
-
-fn onQuickLookPlay(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    quickLookTogglePlayback(@ptrCast(@alignCast(user.?)));
-}
-
-fn onQuickLookCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    quickLookCopy(@ptrCast(@alignCast(user.?)));
-}
-
-fn onQuickLookReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ql: *QuickLook = @ptrCast(@alignCast(user.?));
-    quickLookReload(ql.view);
-}
-
-fn quickLookReload(self: *BrowserView) void {
-    const ql = self.preview_state.ql orelse return;
+    if (resource.path.len >= buf.len) return;
+    @memcpy(buf[0..resource.path.len], resource.path);
+    const path = buf[0..resource.path.len];
+    // Tab switches close the viewer, so the current tab is still the
+    // one the batch was built from (same host).
     const tab = self.currentTab() orelse return;
-    const entry = entryForPath(tab, ql.path);
-    var key_buf: [4700]u8 = undefined;
-    const key = cacheKey(&key_buf, tab.hc, ql.path, if (entry) |e| e.mtime_ms else 0) orelse return;
-    var i: usize = 0;
-    while (i < self.preview_state.cache.items.len) : (i += 1) {
-        if (!std.mem.eql(u8, self.preview_state.cache.items[i].key, key)) continue;
-        var dead = self.preview_state.cache.orderedRemove(i);
-        dead.deinit(self.allocator);
-        break;
-    }
-    ql.full_target.cancel();
-    self.preview_image.clear();
-    c.gtk_label_set_text(ql.status, "reloading preview...");
-    self.updatePreview();
+    self.quickLookClose();
+    render_mod.activatePath(tab, path, false);
 }
 
-/// Enter: open the entry in its default application and close.
-pub fn quickLookActivate(self: *BrowserView) void {
-    const ql = self.preview_state.ql orelse return;
-    var buf: [4096]u8 = undefined;
-    if (ql.path.len >= buf.len) return;
-    @memcpy(buf[0..ql.path.len], ql.path);
-    const path = buf[0..ql.path.len];
-    const hc = self.hostConnFor(ql.host) orelse return;
-    self.quickLookClose();
-    self.openPathOnHost(hc, path);
-}
 
 test "remote-thumb cache header round-trips and rejects foreign bytes" {
     const t = std.testing;

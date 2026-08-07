@@ -258,17 +258,70 @@ fn scheduleViewerManifestCleanup(path: []const u8) void {
         _ = cleanupViewerManifest(@ptrCast(cleanup));
 }
 
+/// Accumulator for one ordered spec walk over a tab's listing.
+pub const SpecWalk = struct {
+    specs: std.ArrayList([]u8) = .empty,
+    initial: usize = 0,
+    found_current: bool = false,
+
+    fn add(self: *SpecWalk, allocator: std.mem.Allocator, host: ?[]const u8, path: []const u8, current: []const u8) bool {
+        const is_current = std.mem.eql(u8, path, current);
+        const owned = paths.formatSpecAlloc(allocator, host, path) catch return true;
+        self.specs.append(allocator, owned) catch {
+            allocator.free(owned);
+            return false;
+        };
+        if (is_current) {
+            self.initial = self.specs.items.len - 1;
+            self.found_current = true;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *SpecWalk, allocator: std.mem.Allocator) void {
+        for (self.specs.items) |spec| allocator.free(spec);
+        self.specs.deinit(allocator);
+    }
+};
+
+/// Walk the tab's RENDERED listing in display order and append a
+/// host-qualified spec for every non-directory entry whose name
+/// `include` accepts. Shared by launchViewer (images/casts only) and
+/// the Quick Look host (every file).
+pub fn collectListingSpecs(
+    self: *BrowserView,
+    tab: *BTab,
+    current: []const u8,
+    include: *const fn ([]const u8) bool,
+    walk: *SpecWalk,
+) void {
+    const allocator = self.allocator;
+    switch (tab.view_mode) {
+        .icons => {
+            var path_buf: [4096]u8 = undefined;
+            for (tab.root.entries.items) |entry| {
+                if (entry.tdir or !views.entryVisible(tab, entry) or !include(entry.name)) continue;
+                const path = tab.root.fullPath(entry, &path_buf) orelse continue;
+                if (!walk.add(allocator, tab.hc.host, path, current)) break;
+            }
+        },
+        .details, .compact, .miller => {
+            var pos: c.guint = 0;
+            while (pos < colview.itemCount(tab)) : (pos += 1) {
+                const item = colview.itemDataAt(tab, pos) orelse continue;
+                if (item.kind != .entry or item.is_dir or !include(item.path)) continue;
+                if (!walk.add(allocator, tab.hc.host, item.path, current)) break;
+            }
+        },
+    }
+}
+
 /// Launch the internal Viewer with this tab's ordered viewable sequence
 /// (images and `.cast` recordings, which it plays in place) without FUSE.
 pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     const allocator = self.allocator;
-    var specs: std.ArrayList([]u8) = .empty;
-    defer {
-        for (specs.items) |spec| allocator.free(spec);
-        specs.deinit(allocator);
-    }
-    var initial: usize = 0;
-    var found_current = false;
+    var walk: SpecWalk = .{};
+    defer walk.deinit(allocator);
     const selected_only = tab.selected.items.len > 1 and blk: {
         for (tab.selected.items) |path| if (std.mem.eql(u8, path, current)) break :blk true;
         break :blk false;
@@ -276,56 +329,14 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     if (selected_only) {
         for (tab.selected.items) |path| {
             if (!paths.isViewerName(path)) continue;
-            const is_current = std.mem.eql(u8, path, current);
-            const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
-            specs.append(allocator, owned) catch {
-                allocator.free(owned);
-                break;
-            };
-            if (is_current) {
-                initial = specs.items.len - 1;
-                found_current = true;
-            }
+            if (!walk.add(allocator, tab.hc.host, path, current)) break;
         }
     } else {
-        switch (tab.view_mode) {
-            .icons => {
-                var path_buf: [4096]u8 = undefined;
-                for (tab.root.entries.items) |entry| {
-                    if (entry.tdir or !views.entryVisible(tab, entry) or !paths.isViewerName(entry.name)) continue;
-                    const path = tab.root.fullPath(entry, &path_buf) orelse continue;
-                    const is_current = std.mem.eql(u8, path, current);
-                    const owned = paths.formatSpecAlloc(allocator, tab.hc.host, path) catch continue;
-                    specs.append(allocator, owned) catch {
-                        allocator.free(owned);
-                        break;
-                    };
-                    if (is_current) {
-                        initial = specs.items.len - 1;
-                        found_current = true;
-                    }
-                }
-            },
-            .details, .compact, .miller => {
-                var pos: c.guint = 0;
-                while (pos < colview.itemCount(tab)) : (pos += 1) {
-                    const item = colview.itemDataAt(tab, pos) orelse continue;
-                    if (item.kind != .entry or item.is_dir or !paths.isViewerName(item.path)) continue;
-                    const is_current = std.mem.eql(u8, item.path, current);
-                    const owned = paths.formatSpecAlloc(allocator, tab.hc.host, item.path) catch continue;
-                    specs.append(allocator, owned) catch {
-                        allocator.free(owned);
-                        break;
-                    };
-                    if (is_current) {
-                        initial = specs.items.len - 1;
-                        found_current = true;
-                    }
-                }
-            },
-        }
+        collectListingSpecs(self, tab, current, &paths.isViewerName, &walk);
     }
-    if (!found_current) {
+    const specs = &walk.specs;
+    var initial: usize = walk.initial;
+    if (!walk.found_current) {
         const owned = paths.formatSpecAlloc(allocator, tab.hc.host, current) catch return;
         initial = specs.items.len;
         specs.append(allocator, owned) catch {
