@@ -1544,7 +1544,7 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
 }
 
 test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
-    // Fake ssh: answers -G, then captures stdin to a file and prints
+    // Fake ssh: answers -G, then captures one stdin line and prints
     // no announcement — connectUdpFor must fail SshTransportFailed
     // AFTER having already written "SKETERM-PUNCH <port>".
     var cap_buf: [128:0]u8 = undefined;
@@ -1555,7 +1555,7 @@ test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
     var script_buf: [512:0]u8 = undefined;
     const script = std.fmt.bufPrintZ(
         &script_buf,
-        "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'hostname 127.0.0.1\\n'; exit 0; fi\ncat > {s}\n",
+        "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then printf 'hostname 127.0.0.1\\n'; exit 0; fi\nIFS= read -r line\nprintf '%s\\n' \"$line\" > {s}\n",
         .{cap},
     ) catch unreachable;
     _ = c.fputs(script.ptr, f);
@@ -1569,7 +1569,7 @@ test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
 
     try std.testing.expectError(
         error.SshTransportFailed,
-        Conn.connectUdpFor(std.testing.allocator, "punch-test-host", null, 1_500),
+        Conn.connectUdpFor(std.testing.allocator, "punch-test-host", null, 1_000),
     );
 
     const cf = c.fopen(cap.ptr, "r") orelse return error.TestUnexpectedResult;
