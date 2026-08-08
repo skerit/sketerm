@@ -31,6 +31,16 @@ pub fn build(b: *std.Build) void {
     const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
     const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;
 
+    // LLVM spends minutes optimizing the monolithic test roots. Zig's
+    // self-hosted x86 backend compiles the same ReleaseFast suites in
+    // seconds; shipped artifacts still use LLVM. Keep an explicit parity
+    // switch for compiler-sensitive failures and unsupported hosts.
+    const test_llvm = b.option(
+        bool,
+        "test-llvm",
+        "compile unit tests with LLVM (slower; matches production codegen)",
+    ) orelse !(target.result.os.tag == .linux and target.result.cpu.arch == .x86_64);
+
     // Pre-translate the GTK+glib+freetype+stb C headers into a single
     // generated Zig module via a TranslateC step. In Zig 0.16 the
     // in-process `@cImport` on this header set crashes `zig build-exe`
@@ -878,7 +888,8 @@ pub fn build(b: *std.Build) void {
     addTreeSitter(b, tests_mod, tree_sitter);
     const tests = b.addTest(.{
         .root_module = tests_mod,
-        .use_lld = use_lld,
+        .use_llvm = test_llvm,
+        .use_lld = if (test_llvm) use_lld else false,
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -908,7 +919,8 @@ pub fn build(b: *std.Build) void {
     addTreeSitter(b, coretests_mod, tree_sitter);
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
-        .use_lld = use_lld,
+        .use_llvm = test_llvm,
+        .use_lld = if (test_llvm) use_lld else false,
     });
     const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
     core_test_step.dependOn(&b.addRunArtifact(coretests).step);

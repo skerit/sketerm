@@ -12,7 +12,13 @@ Two binaries ship: `sketerm` (the GUI, plus the `cli`/`ssh`/`mux` subcommands) a
 
 Zig **0.16**. The default optimize mode is `ReleaseFast` because **`Debug` builds fail to link on Arch + gcc 15** — Zig's bundled LLD can't handle gcc 15's `.sframe` section in `crt1.o`. `ReleaseSafe` currently fails in translate-c, so ReleaseFast is effectively the only mode.
 
-`use_lld = true` is set on every artifact for the same reason: the self-hosted linker chokes on `crt1.o`'s SFrame relocs.
+`use_lld = true` is set on shipped Linux artifacts for the same reason: the self-hosted linker chokes on `crt1.o`'s SFrame relocs.
+
+On x86_64 Linux, `zig build test` and `test-core` deliberately use Zig's
+self-hosted x86 backend + linker instead of LLVM. The monolithic test roots
+compile in seconds that way instead of minutes; shipped artifacts still use
+LLVM. Use `-Dtest-llvm=true` only for production-codegen parity or a suspected
+compiler-specific failure.
 
 ### Zig 0.16 std-library quirks (will cost you turns)
 
