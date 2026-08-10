@@ -15699,3 +15699,25 @@ tasks with a commit per piece:
 Known v1 limits (deliberate): 1x scale only, full-texture upload per
 damage batch (GL/ImagePass upgrade planned, damage rects already on the
 wire), no IME into pages yet, global keybinds win over the page.
+
+## 2026-08-10: browser identity + distro CEF (the codec risk collapsed)
+
+`sketerm-web` is now the GUI's browser IDENTITY hardlink (argv0
+dispatch, own app id / title / icon / desktop entry, http+https scheme
+handlers so it can be the default browser) exactly like
+`sketerm-files`; the CEF helper was renamed `sketerm-webengine` to free
+that name. Verified headless: app_id `dev.sker.sketerm.web` for both
+spellings, files/terminal identities unregressed.
+
+`makepkg -si` builds and installs the browser automatically, and does
+it by DEPENDING on the distro `cef` package rather than shipping
+Chromium. Measured, not assumed: Arch's cef 150.0.17 has
+proprietary_codecs ON — h264 and aac probe true (the upstream tarball
+has both false), and Widevine grants an avc1 key-system access once a
+CDM is seeded. That deletes the "build codec-enabled Chromium
+ourselves" workstream that looked like the feature's biggest risk, and
+keeps ~300MB out of the package. build.zig grew -Dcef-include /
+-Dcef-lib (split system layout) and -Dcef-runtime-dir (rpath +
+LD_PRELOAD target when the runtime lives elsewhere at install time);
+`zig build fetch-cef` remains the dev path and now checks a pinned
+SHA-256. All 8 smoke-web stages pass against the system CEF.
