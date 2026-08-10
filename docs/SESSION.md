@@ -15072,3 +15072,542 @@ direct core executable reports 1708 passed, 5 skipped, 0 failed. The two
 `zig build test*` listener wrappers still classify tesseract's known
 process-exit `ObjectCache` warnings as a failed command after those tests
 have passed.
+
+## 2026-08-08: MCP panels follow their mux session without --shared
+
+Live `ui_*` calls now prefer a panel-only connection to the panel's origin
+session, independently of the private daemon used by MCP app, terminal,
+file and browser tools. The session comes from the explicit tool argument
+then `SKETERM_SESSION`; `SKETERM_MUX_SOCKET` selects the exact daemon. When
+that variable is absent, compatibility connects only to the canonical
+default socket and never autostarts or discovers another daemon.
+
+`paneldrive.zig` keeps nonblocking, deadline-bounded connections keyed by
+daemon and session. Requests carry correlation IDs, stale replies are
+skipped, and uncertain delivery is surfaced without automatically
+resending a mutation. Sessionless calls and unsupported old daemons retain
+the explicit direct GUI socket path. `capabilities` now reports
+`gui_socket`, `panels`, and structured `panel_transport` state separately.
+Store-only behavior is unchanged. This relay-only step kept panel JSON opaque;
+the GUI-side remote-image hydration recorded in the next section builds on
+that boundary without teaching `paneldrive` about documents.
+
+Core tests cover stale IDs, repeated calls, session-keyed isolation and
+no-resend timeout behavior. `smoke-mcp` covers isolated origin routing,
+private app-daemon isolation, repeated event polling, live list/save,
+missing and unsupported daemons, no viewer, disconnect, timeout, direct
+fallback and capability reporting. `zig build test-core`, `zig build
+smoke-mcp`, and `git diff --check` pass.
+
+## 2026-08-08: remote mux panels hydrate images on the GUI host
+
+The panel relay now carries remote image panels end to end without adding a
+wire frame or linking image libraries into `sketerm-mux`. `paneldrive` keeps
+the document opaque. The selected GUI collects `image` and `image_compare`
+logical paths, issues bounded ranged `fs_op read` requests on the same
+Terminal connection that received the panel request, and stores successful
+bytes under their SHA-256 in `$XDG_CACHE_HOME/sketerm/panel-assets`. Decode
+and dimension validation remain GUI-only. Local mux and direct-socket panels
+keep their ordinary local-file path.
+
+The renderer owns a separate logical-path resolver, so the `Document` never
+contains cache names. `panel-get`, `ui_save`, and save/load round trips retain
+the remote path byte for byte. Rewriting a file at the same path produces a
+new content hash and refreshes both `image` and `image_compare` widgets.
+Failures commit explicit per-path placeholders and return structured
+`assets`/`asset_failures` reports through `ui_show`, `ui_show_files`, and
+`ui_patch` rather than silently drawing nothing.
+
+Show/patch is transactional and serialized per Terminal through hydration and
+deferred tab construction. A queued patch is prepared only after its
+predecessor commits, so it resolves the actual resulting document rather than
+stale paths. The bounds are 64 unique assets,
+16 MiB per asset, 64 MiB per operation, four ranged reads, and 30 seconds.
+The cache is capped at 256 MiB/2048 blobs per locked process-incarnation
+namespace; installs are staged, fsynced and atomically renamed, active hashes
+are leased across pruning, and a bounded startup sweep removes complete
+unlocked namespaces left by dead GUIs without confusing PID reuse.
+Remote reads reject non-regular paths, never block the daemon on a FIFO, and
+restat after each range to detect a one-chunk rewrite race. Transport loss
+cancels and generation-fences all uncommitted panel work while preserving
+already-mounted panels for reconnect.
+
+`smoke-panel-relay` now proves attached ranged reads while terminal events
+continue. `smoke-e2e` gives only the fake-SSH daemon an unlinked PNG on fd
+900, confirms the GUI did not inherit it, renders `/proc/self/fd/900`, rewrites
+that same remote-only path to a different color, and verifies the repaint plus
+logical-path preservation through `panel-get`, `ui_save`, and `ui_show load`.
+
+## 2026-08-08: panel relay review hardening
+
+The origin relay now carries both immutable ownership coordinates into every
+session child: `SKETERM_SESSION` remains the spawn-time name and
+`SKETERM_MUX_SOCKET` is the daemon's canonical absolute listener path. Session
+renames retain the origin and each intermediate name as live attachment aliases;
+aliases remain reserved against another session until teardown. Spawn, attach,
+list and session metadata expose `origin_name`, while `name` remains the current
+display identity. The same rules apply in monolith and broker workers.
+
+Panel requester sockets become nonblocking before connect. Connect, `SO_ERROR`
+validation, hello/welcome, panel-only attach, queued writes and reply receive all
+share one absolute deadline, and the central MCP watchdog can abort a descriptor
+created after the tool call began. `ui_wait_event` likewise starts one deadline
+before name resolution and passes only the remaining budget to each direct or
+relayed exchange and sleep.
+
+Transport selection is deterministic: an exact `SKETERM_MUX_SOCKET` origin,
+then an explicit GUI `--socket`, then connect-only canonical-default
+compatibility. A GUI socket found by discovery cannot redirect a sessionful
+panel mutation. An explicit GUI socket can recover an exact daemon's capability
+or attach failure only while delivery is proven not to have started; uncertain
+delivery never falls back. `capabilities` reports the direct GUI source separately from the
+selected panel source and state. A presenter reply with invalid JSON invalidates
+the pooled requester connection and is reported as uncertain delivery without a
+retry. Malformed or oversized envelopes whose route id is still readable remove
+the daemon route immediately and return the same no-resend guarantee instead of
+waiting for the generic route timeout.
+
+Panel-only clients no longer count as terminal viewers or TTL occupancy. Broker
+metadata pushes now change-detect and carry the explicit viewer count; newer
+clients use it while retaining `clients` as an old-daemon fallback. Direct GUI
+deadline reads also accept readable bytes delivered with `POLLHUP`, letting a
+one-request server close immediately after its newline reply.
+
+Panel-only teardown now sends `.gone`, and pooled identities consume lifecycle
+frames before reuse. Attach metadata must contain the full non-empty immutable
+`origin_name`; a missing, empty, or overlong value is malformed rather than
+falling back to the requested alias. Direct GUI and mux-relay writes track the
+first byte: pre-delivery failures report `mutation_may_have_applied:false` and
+`resend_safe:true`, while partial/full writes with a lost reply report uncertain
+delivery and are never retried. A lost `panel-events` reply explicitly warns
+that events may already have been drained. The direct request cap is 4 MiB while
+the panel document parser remains capped at exactly 1 MiB.
+
+Verification: core and full suites; `smoke-mcp`, `smoke-e2e`, `smoke-mux`, and
+`smoke-broker` PASS. The smoke coverage includes two daemons with the same
+session name, exact/explicit/default/discovered precedence, a safe default relay,
+an exact unsupported daemon with explicit direct fallback, an exact 1 MiB
+document over direct and relay paths, a long-lived uniquely named private app
+proved present only on its private daemon while alive and then closed exactly,
+malformed presenter JSON,
+multiple renames and inherited-origin attachment in both daemon modes. Native
+musl and aarch64-macOS portable mux builds pass.
+
+## 2026-08-08: panel lifetime identity, durable migration, and broker rename hardening
+
+Saved panels now follow one session lifetime rather than a reusable session
+name. Every monolith or broker-created session gets a random 128-bit
+`origin_id`; spawn/list/session metadata, worker handoff, panel-only attach and
+the child environment all carry the same value. The persistence key is now
+`(physical canonical daemon socket, origin_id, panel name)` under
+`by-origin-v2`, while `origin_name` remains immutable compatibility and
+migration metadata. A same-name reincarnation therefore starts with an empty
+store, and a rename retains the original store. Old clients ignore the
+additive metadata; new panel requesters reject missing or malformed IDs rather
+than silently substituting a reusable alias. Daemon-owned requesters also send
+their inherited ID as an attach fence, so a stale process cannot bind through
+a reused name to the replacement lifetime.
+
+Pre-ID exact daemons use a disjoint `by-legacy-origin-v1` namespace. First v2
+access can claim data from `by-origin-v1`, that pre-ID namespace, and the old
+global `by-session` layout. Claim/source identities are tagged,
+length-prefixed hashes; legacy writers and migrators share `flock` locks.
+Atomic publication now syncs files and every newly created ancestor before
+deleting a source, and syncs parents after publication, unlink and directory
+removal. Fault-injection and racing-writer tests cover the power-loss and
+concurrency boundaries. Canonical daemon paths now resolve symlinked existing
+parents while preserving nonexistent leaves, with journal migration from both
+raw and earlier lexical-only path hashes.
+
+Session rename accounting now caps every non-origin name, including the
+current one, while returning to an issued alias remains legal at the cap.
+Broker rename is a prepare/commit/final-ack transaction; a worker whose commit
+cannot be confirmed is killed by exact pid rather than left live with identity
+divergent from the broker, even if its control socket is backpressured.
+Presenter retirement classifies each route independently, so
+untouched queued requests remain pre-delivery and resend-safe. Relay-to-direct
+fallback now consumes one absolute call deadline instead of receiving a fresh
+timeout for each transport.
+
+Tests cover lifetime ID propagation and reincarnation isolation, all storage
+migrations, injective claim keys, ancestor fsync failures, migration/write
+races, physical socket equivalence, journal migration, alias-cap return,
+failed broker rename, per-route presenter outcomes, pre-panel store-only MCP,
+and the shared fallback deadline. `zig build`, `zig build test-core`, `zig
+build test`, `smoke-mcp`, `smoke-mux`, `smoke-broker`, `smoke-e2e`, native
+`mux-portable`, and aarch64-macOS `mux-portable` pass. The MCP and Wayland
+smokes assert the actual attached `origin_id` and same-name reincarnation
+isolation. `ldd zig-out/bin/sketerm-mux` remains libc/libm only.
+
+## 2026-08-09: panel release-gate hardening
+
+Panel RPC is now v2. Every panel-capable Terminal attachment in one GUI
+process carries the same random 128-bit endpoint token. A panel-only requester
+binds to one token on its first routed call and cannot silently fail over to a
+different GUI. Temporary absence returns structured, retry-safe
+`panel_endpoint_unavailable`; the same GUI token resumes after reconnect, and
+requester reconnect is the explicit endpoint-selection boundary. RPC v1 GUIs
+remain valid terminal viewers but are not compatible panel presenters.
+
+The broker shutdown path now queues graceful worker `K` controls, continues
+polling backpressured control sockets, and waits for worker control EOF after
+the worker flushes `.gone`. A 10-second absolute deadline is the force-retire
+backstop. Direct panels retain a liveness-fenced Terminal asset origin; after
+that Terminal is destroyed, new unresolved image paths are rejected before
+patch commit while non-image and already-resolved edits remain usable.
+
+`ui_wait_event` now distinguishes confirmed panel absence, pre-delivery
+unavailability with unknown open/closed and queue state, and uncertain delivery
+where events may already have drained. A current daemon with only RPC v1 GUI
+viewers reports `no_compatible_gui`; that proven pre-delivery state may use an
+explicit direct GUI socket, but selected-endpoint absence, identity mismatch,
+and uncertain delivery cannot fall back. Structured daemon failures retain the
+healthy requester connection and endpoint binding; partial requester writes
+still retire the connection.
+
+The final release audit tightened seven failure boundaries. Every `ui_*` tool
+rejects a present non-string `session` before environment fallback or side
+effects. A valid but unexpected origin ID is an identity mismatch, not malformed
+attach metadata, and remains ineligible for direct fallback. Expired absolute
+deadlines are checked before panel connect, hello/attach queueing, flush and
+request send, and before direct GUI mutations or event drains, so an already
+expired call dispatches no bytes. Migration now propagates source unlink,
+source-directory sync and removed-directory parent-sync failures while a retry
+preserves the canonical target-wins rule. `panel_endpoint_unavailable` stays a
+distinct code through RPC validation, pooled transport, MCP errors and
+capabilities, with `reconnect_same_gui_endpoint` and
+`reconnect_panel_requester` as machine-readable recovery actions. Finally, the
+relay smoke waits to observe the full `{total:4,guis:2,drivers:2}` roster under
+one deadline instead of assuming it appears in the first four metadata frames.
+
+Focused tests cover endpoint A/B stickiness and requester reconnect, queued
+broker shutdown under forced backpressure, event delivery-state wording, and
+requester connection retention. Audit regressions cover every invalid JSON
+session type across all eight `ui_*` tools, origin mismatch classification,
+zero-byte expired mux and direct dispatch, migration cleanup retry, endpoint
+error/capability recovery metadata, and complete peer-roster observation.
+`smoke-panel-relay` runs the endpoint contract in monolith and broker modes,
+`smoke-mcp` covers current-daemon plus legacy-GUI direct fallback, and
+`smoke-e2e` destroys a direct panel's source Terminal before an image patch.
+
+The final scope audit varies both registry coordinates independently: changing
+only the process endpoint or only `origin_id` creates a disjoint namespace,
+while exact duplicate attachments share one pointer-stable scope. The real GUI
+smoke attaches two panes from one process to one lifetime, shows through the
+oldest daemon-selected presenter, closes it, reads the same panel through the
+survivor, closes the last viewer, then reattaches the same endpoint and proves
+the old panel is gone. This churn exposed a separate context-menu lifetime bug:
+GTK closure destroy-notifies outlived `Pane.menu_arena`. Menu contexts are now
+allocated from their recorded allocator and owned only by those closures.
+
+Prepared images now have document-wide 32 MP and 128 MiB ceilings in addition
+to the existing per-image and encoded-operation limits. Unit tests inject all
+64 individually valid maximum-size image headers without allocating pixels,
+exercise rowstride-byte overflow independently of the pixel limit, and compose
+concurrent half-budget updates at the exact boundary. The excess mapping
+becomes an explicit failure, retains no cache lease, and leaves the live
+resolver at exactly the aggregate ceiling. Transport loss still preserves
+already-committed direct local hydration while canceling relay mutations;
+permanent origin teardown clears `panel_assets_live`, cancels the hydration,
+and rejects unresolved image patches before document commit.
+
+The GUI now also limits native panel hosts to 8 per exact relay scope and 32
+for the whole process, including direct-socket panels. Deferred tab creation
+reserves both slots before spawning its pane and releases them on every failed
+or canceled path; replacing an existing name consumes no slot. Relay show,
+patch and close operations share one scope lane through image hydration and
+deferred tab construction, so a close cannot acknowledge before an older show
+has committed and then let that show recreate the panel.
+
+Decoded panel images have a process-wide 128 MP/512 MiB ceiling. Header
+dimensions reserve that aggregate before the full pixbuf decode, decoded
+rowstride reconciles the reservation atomically, and failure/cancellation
+releases it. The charge then moves into the prepared-image lease shared by the
+resolver and widgets: GtkPicture qdata and image-compare sides retain that
+lease, so deferred GTK or accessibility widget references retain the process
+charge too.
+
+Closing one of several same-process viewers now rehosts its shared pane panel
+onto an empty surviving same-scope pane without changing the panel id, target,
+or pane tree. An occupied survivor is deliberately not evicted; if no empty
+survivor exists, the departing viewer's pane panel closes. The end-to-end
+assertions wait through only the explicit transient `panel_endpoint_unavailable`
+state while daemon presenter/controller handoff catches up.
+
+Verification: `zig build test` reports 2187 passed and 6 skipped; `zig build
+test-core` reports 1793 passed and 5 skipped. `smoke-mux`, `smoke-broker`,
+`smoke-mcp`, and the complete Wayland `smoke-e2e` pass. Native x86-64 musl and
+aarch64-macOS `mux-portable` builds pass, `git diff --check` is clean, and
+native daemon `ldd` lists only libc/libm plus the loader.
+
+## 2026-08-10: panel review fallout — delete the invented complexity
+
+A review of the whole uncommitted panel change set found the feature itself
+correct and end-to-end proven, and a large amount of hardening around it that
+nobody asked for and that made the product worse. This entry is the removal.
+
+**A GUI restart no longer wedges panels.** The daemon binds a panel requester
+to one GUI process token so a follow-up `ui_patch` cannot land on a different
+GUI than the `ui_show` did. That binding was only ever cleared on detach, and
+the MCP pool kept the connection alive across `panel_endpoint_unavailable` — so
+restarting sketerm left every later `ui_*` call failing forever, advising the
+model to "reconnect the panel requester", which it has no way to do. The pooled
+connection is now dropped on that exact failure. Nothing was delivered when it
+is reported, so the next call simply rebinds to whichever compatible GUI is
+attached. `smoke-mcp` proves the recovery with a second presenter process.
+
+**Panel persistence went from five namespaces to three.** `by-origin-v2`,
+`by-origin-v1`, `by-legacy-origin-v1`, two claim directories, two lock
+directories, `flock`-serialized migration, permanent length-prefixed-hash
+ownership records, fsync-of-every-created-ancestor, `renameNoReplace`
+publication and a `CommittedNotDurable` error class all existed to migrate
+between namespaces that had never shipped: `git show HEAD:src/ipc/panelstore.zig`
+knows only `by-session` and `no-session`. What remains is
+`by-origin/<sha256(socket)>/<origin_id>/` for a session reached through a known
+daemon, `by-session/<encoded>/` for a session without one, `no-session/` for no
+session at all, and nothing migrating between them. A panel document is cheap
+to re-save; a migration a crash can only leave half-done is not worth carrying.
+Writes are still staged and renamed, so a save either happened or did not.
+`OriginScope` lost `origin_name` and `legacy_session` (both migration-only) and
+gained a diagnostics-only `label`. 588 lines of tests for the deleted machinery
+went with it; the two that used compile-time fault injection were rewritten to
+use a real read-only directory instead.
+
+**The live-panel caps are gone.** `MAX_LIVE_PANELS_PER_RELAY_SCOPE = 8` and
+`MAX_LIVE_PANELS_PROCESS = 32`, plus the `PanelSlot` reserve/release
+transaction threaded through deferred tab construction, restricted a legitimate
+user action nobody had complained about — and asymmetrically, since direct
+control-socket panels were never scope-capped. The `smoke-e2e` stage that
+proved the refusal now proves the opposite: twelve panels across pane, tab and
+window targets coexist in one scope, same-name replacement reuses the panel in
+place, and all of them close. The image-memory budgets are unrelated and stay:
+those bound decoding untrusted files into RAM.
+
+**A bad presenter reply no longer costs a GUI its panels.** `retirePanelPresenter`
+set `panel_rpc = 0` on the attachment, so one malformed reply from one handler
+silently turned off panels for that whole GUI until the user reattached. It is
+now `failPanelPresenterRoutes`: in-flight routes still fail with their exact
+per-route delivery classification, and the presenter keeps its capability, so a
+handler bug surfaces on every call instead of hiding behind a dead feature.
+
+**Tool descriptions are edited, not rewritten at runtime.** `renderedToolsJson`
+chained ten `replaceAll` calls against exact legacy sentences and then reparsed
+and re-serialized the entire ~104-tool document to append a paragraph. It was
+fragile by construction, and it had already failed: `ui_show_files` says "start
+this server with --shared" while the replacement targeted "start the MCP server
+with --shared", so that tool advertised the removed requirement the whole time.
+The guidance now lives in the `TOOLS_JSON` literals. The `%..._DEF%` timing
+substitution stays — that one exists so the schema cannot drift from `Tuning`.
+
+**Eleven `SKETERM_TEST_*` fault-injection env hooks are gone from the shipped
+binary.** Zero existed before this work. Each was a live branch in a production
+path (image decode, local file read, cache init, panel-tab construction, picker
+IO, reconnect) whose only purpose was letting a smoke stage wedge a race. The
+`test_delay_ms` fields survive as plain fields that in-process unit tests set
+directly, which is where that kind of control belongs.
+
+**`CLAUDE.md`'s threading rule was false and is corrected.** The GUI is no
+longer single-threaded: panel transport setup, asset file reads and GdkPixbuf
+decode run on short-lived detached workers. The rule now states the actual
+contract — those workers touch no GTK or Screen state, hand back through
+`g_idle_add`, and only the idle handback frees the job.
+
+Also deduplicated along the way: the daemon's four near-identical panel-failure
+reply builders (one of which duplicated a whole struct literal just to add an
+optional field) collapsed into one `queuePanelFailure`, and `uiStoreScope`'s
+five repetitions of the same by-session fallback into one named value.
+
+Removing the hooks cost four smoke assertions that only held because of an
+injected stall — "the tab setup has not finished yet", "the decode overlapped
+the probe", "the picker IO overlapped", and a transport loss aimed at a
+worker's artificial delay. The surrounding probes are kept, because those
+measure the real invariant (the GTK loop answered a control request within
+600ms while the work ran) without needing the work to be artificially slow.
+The transport-loss sub-stage was dropped; the lifetime-fence sub-stage next to
+it now kills and respawns the session name directly, which needs no injection.
+The in-flight-decode-versus-teardown race became a straight teardown stage: the
+origin closes, a later patch into it is refused, and the GUI stays healthy.
+
+Verification: `zig build`, `test`, `test-core`, `mux-portable`,
+`mux-portable -Dportable-target=aarch64-macos`, `smoke-mux`, `smoke-broker`,
+`smoke-mcp` and the full Wayland `smoke-e2e` all pass; `git diff --check` is
+clean and `ldd zig-out/bin/sketerm-mux` still lists only libc/libm plus the
+loader. `smoke-e2e` is timing-sensitive under heavy parallel load — two runs
+during this work failed at unrelated late stages and passed on a quiet box.
+
+## 2026-08-10: panel review follow-up - safety, opacity, and scope cleanup
+
+A full line-read of the uncommitted panel work found nine issues; all are
+fixed here.
+
+**Tab adoption could write out of bounds.** `Window.adoptPane` used
+`appendAssumeCapacity` on the strength of a comment saying every foreign
+attach reserves first. Two paths do (`transferPageFrom`, `onCreateWindow`),
+but a page can also arrive by dragging between two tab OVERVIEWS, which
+reaches `onPageAttached` with nothing reserved - an out-of-bounds write in a
+ReleaseFast-only build. `adoptPane` now reserves for itself, before
+unhooking the source; the up-front reservations stay so a doomed move is
+still refused before libadwaita reparents anything.
+
+**`fs_op read` stopped answering for files that grow under it.** The
+second-`fstat` "file changed during read" check was added for panel assets
+but sits on the path behind MCP `file_read`, browser previews and ranged
+downloads, so reading a live log became an error. It is gone; the panel path
+already compares `size`/`mtime`/`ino` across replies itself
+(`Terminal.handleRemoteFileReply`). The `O_NONBLOCK` open and the regular-file
+check stay - a FIFO path must not park the daemon's poll loop.
+
+**The daemon no longer parses panel JSON at all.** It was calling
+`panelrpc.requestOp` on every request and `validateReply` on every reply,
+which meant a full JSON parse of up to 4 MiB inside the single-threaded poll
+loop, stalling every other session, and contradicted the documented
+relay-is-opaque invariant. Both are removed along with `PanelRoute.op`;
+the daemon inspects only the envelope. Reply validation was always duplicated
+on the MCP side, which is where it belongs and where it is tested.
+
+**Refusing to reconnect now says why.** A daemon older than session identity
+sends no lifetime id, and `transportLost` closed such panes permanently with
+a message that did not name the cause. It now states that the daemon reports
+no lifetime id and that restarting `sketerm-mux` is the fix.
+
+**Two thirds of the fs-journal migration was self-inflicted.** Introducing
+`canonicalSocketPath` changed the hash of every existing job directory, and
+three extra namespace migrations plus staged-copy/fsync/re-parse machinery
+were written to cover the break. Pre-release, that is not worth carrying:
+only the original pre-state-dir socket-sibling adoption remains, as rename
+with a staged-copy EXDEV fallback (~45 lines instead of ~200).
+
+**Relay scopes are freed again.** `RelayScope` was retained forever as an
+async-handback tombstone, so every session lifetime a GUI ever attached to
+leaked one. `releaseRelayScopeIfIdle` frees it once no viewer, hydration,
+queued operation, panel-tab job or registry entry can still name it.
+
+**`capabilities` is a preflight again.** It was opening a relay connection
+with a 40s budget and calling `panelstore.validateScope`, which CREATED the
+store directory and wrote a probe file - side effects in a read-only report.
+The probe now runs under its own 2s deadline, `validateScope` is deleted, and
+`panels_store` reports whether the scope RESOLVES. A filesystem that refuses
+the write is reported by `ui_save`, which already says so exactly.
+
+**Then the over-built layers came out.** The review flagged three of them as
+disproportionate to "show a panel through the daemon", and they are gone:
+
+- **Two image budgets became one.** A per-document 32MP/128MiB budget sat on
+  top of the process-wide 128MP/512MiB one, double-counting the same bytes and
+  threading `prepared_budget` through Hydration, CacheJob, Resolver and the
+  decode path. Only the process budget remains, still reserved from header
+  dimensions before decode and reconciled to the actual rowstride.
+- **Session alias history is gone.** A session answers to its current name and
+  to its immutable spawn name; nothing else. The bounded 16-entry history, its
+  cap arithmetic, `PreparedIdentity` and the reserved-forever semantics served
+  no request anyone made, and an unbounded set of names one session routes
+  under is a hazard rather than a feature.
+- **Broker rename is one authoritative step again.** The broker renames its
+  own record and sends the worker one `R`; a worker forwards an attached
+  client's request as `N` and answers from the broker's `n`. The
+  prepare/commit/abort transaction, transaction ids, retries, deadlines and
+  kill-the-worker-on-missing-ack are deleted. The broker's record is what
+  routes, so a worker that misses the `R` only shows a stale display name.
+- **The broker/worker control queue is gone.** `ControlOut`, POLLOUT wiring,
+  per-packet deadlines, graceful-termination bookkeeping and the shutdown
+  admission control were ~450 lines guarding a datagram socket that carries a
+  handful of small messages. Control sends are plain `sendmsg` again; the one
+  whose loss a client can actually see, the `A` client-fd handoff, now reports
+  the failure to that client instead of dropping the descriptor.
+
+`identity_first` was considered for removal and kept: without it there is a
+window between attach and the first `session_meta` in which a transport loss
+would close the pane permanently, so it earns its wire capability.
+
+Also: a dead `platform` import in `panelstore.zig`, and the retroactive
+"historical transport at this revision" amendments to older SESSION entries
+are reverted - this log is chronological, and superseding notes belong in the
+entry that supersedes.
+
+Verification: `zig build`, `test`, `test-core`, `mux-portable`,
+`mux-portable -Dportable-target=aarch64-macos`, `smoke-mux`, `smoke-broker`,
+`smoke-mcp` and `smoke-e2e` all RC=0; `ldd zig-out/bin/sketerm-mux` is still
+libc/libm; `git diff --check` clean. The daemon relay test now proves opacity
+directly (a non-JSON reply body is relayed byte for byte) and drives
+per-route delivery classification from a malformed ENVELOPE instead of an
+invalid document.
+
+## 2026-08-10: panel review round three - full residue sweep
+
+A four-way line-level audit of the entire uncommitted panel diff (mux daemon,
+GUI presenter, MCP/persistence, docs+tests) found ~45 pieces of residue the
+two earlier cleanup rounds missed, plus three latent defects. All fixed:
+
+Defects: session death/exit now clears the client's panel endpoint binding
+through one shared `clearClientAttachment` (removeSession/sessionExited had
+hand-rolled a subset that left `panel_endpoint_valid=true` on unattached
+clients); a rename requester dying before the broker's `n` reply no longer
+wedges the worker's rename slot (cleared in the dead-client sweep); an
+OOM-path relay scope orphan in `attachOrigin` now releases through
+`releaseRelayScopeIfIdle`.
+
+Dead code deleted: the unreachable `error.AliasLimit` branch and its
+"historical alias limit" message; `spawnCastSession` and
+`connectPanelRequesterFromEnv` (zero callers); panelstore's entire unscoped
+API (`save`/`load`/`exists`/`delete`/`list` and friends - production is
+`*Scoped`-only; tests ported); `panelrpc.requestOp` (relay replies are now
+validated once, in paneldrive, keyed by `opFromCommand`); the write-only
+per-document `prepared_info` chain; three never-set `test_delay_ms` fields
+and their dead branches; the revision fence `installAssetResolver` could
+never trip; the test-only `runPanelTabWorker` fn-pointer seam;
+`Pool.activeFd`; `RelayScope.attachments` (mirror of `viewers.items.len`);
+two dead test helpers; three tool-list asserts locking phrases that never
+existed.
+
+Dedup/simplification: hydration construction shares one
+`startHydrationOperation` (id wraparound written once); rename validation
+and the 64-byte name bound live in one `MAX_SESSION_NAME`; `workerShutdown`
+shared by the EOF and `K` paths; `fsJobsDirAlloc` canonicalizes internally
+again (the one path rule); `uiStoreScope` takes an explicit deadline
+(capabilities passes its 2s probe budget); store READ paths no longer create
+directories or write the origin marker (save-only, with a
+nothing-on-disk test); the unreachable `.legacy_daemon` arm collapsed; the
+`panel_endpoint_unavailable` error is prose like every other arm; session
+origin id validation moved to `wire.zig` so panelstore no longer imports the
+daemon; `deferredWindowFree` no longer busy-spins (completion-driven free);
+`closeEntry`'s `.window => unreachable` is a `return` (ReleaseFast UB);
+panelhost's GTK trampolines and `PreparedLease` now carry canary magic words
+like every other panel module.
+
+Docs/tests: the `CommittedNotDurable` paragraph (documented a deleted error),
+the `--shared`-requirement paragraph (a test asserts the opposite), and
+"serialized per Terminal" (it is per RelayScope) are corrected; the five
+smoke-e2e probes that only made sense with the deleted fault-injection
+stalls were rebuilt as real fences (overlapping liveness probes, a positive
+old-lifetime-gone fence plus held-refusal window, `waitPaneGone` plus exact
+dead-origin error codes, bounded panel-list polls instead of settle sleeps).
+
+## 2026-08-10: panel scope decision - endpoint identity out, cache and codes stay
+
+After the residue sweep, one more deliberate scope cut and two deliberate
+keeps, decided with Jelle:
+
+Removed: the per-GUI-process panel endpoint identity layer (32-hex endpoint
+tokens in attach metadata, requester-to-endpoint binding in the daemon, the
+`panel_endpoint_unavailable` failure code and the MCP invalidate-on-that-code
+recovery dance, the `(endpoint token, origin_id)` GUI registry key).
+PANEL_RPC_VERSION is back to 1; `PassedClient` shrank 45 -> 12 wire bytes.
+Replacement routing is stateless: the daemon delivers a panel request to THE
+panel-capable attachment of the session (earliest by client id when several
+exist); when it goes away the next request selects whoever is attached, and
+no candidate is a pre-delivery `no_compatible_gui`. The layer's only
+observable behavior was its failure mode (a restarted GUI left a stale
+binding that wedged every later ui_show until the recovery dance ran); the
+stateless rule makes that wedge impossible by construction and is the right
+base for panel mirroring (deliver to ALL attachments) if that is ever wanted.
+Renumbering exposed one silent test rot: the "legacy v1 viewer" smoke fixture
+had become a compatible presenter when v1 became current; it now attaches
+with no panel_rpc at all.
+
+Kept, deliberately (proposed for deletion, rejected on review): the on-disk
+content-addressed asset cache (real benefit for image re-shows over SSH and
+across GUI restarts; already built and proven) and the granular
+machine-readable panel failure codes (an assistant branching on `error_code`
+is more reliable than one parsing prose; already tested end to end). The
+line between these and the endpoint layer: the cache and the codes have a
+user; the endpoint binding only had a failure mode.

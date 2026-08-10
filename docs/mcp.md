@@ -127,7 +127,10 @@ programs that do not return to a shell prompt.
 the user's sketerm window: images, an A/B `image_compare` slider,
 headings, sliders, selects, progress bars, buttons. The assistant
 authors JSON; there is no raw HTML, CSS or script, and the component
-catalog in `src/ui/panel/doc.zig` is the entire vocabulary.
+catalog in `src/ui/panel/doc.zig` is the entire vocabulary. An image path
+belongs to the panel's session host. For a remote mux session the attached
+GUI fetches and validates the bytes before presenting the document; callers
+do not need to copy remote images to the GUI host first.
 
 | Tool | What it does |
 | --- | --- |
@@ -136,7 +139,7 @@ catalog in `src/ui/panel/doc.zig` is the entire vocabulary.
 | `ui_patch` | apply patch ops to a live panel, in place |
 | `ui_wait_event` | block until the user interacts (or the timeout) |
 | `ui_panels` | live panels **and** saved documents, separately |
-| `ui_save` | persist a document under `(session, name)` -- with no `document`, whatever the panel is showing right now |
+| `ui_save` | persist a document under its exact daemon origin and immutable session origin -- with no `document`, whatever the panel is showing right now |
 | `ui_close` | remove a live panel from the screen |
 | `ui_delete` | permanently delete a **saved** document |
 
@@ -186,6 +189,10 @@ ui_show_files {files: [{path, caption?} | "/abs/path"], name?, title?,
   the call is refused instead, because a panel made entirely of
   placeholders looks like a sketerm bug rather than a caller mistake.
   Either way the assistant can tell which it got.
+- **Remote paths are hydrated by the presenting GUI.** `unreadable` is the
+  MCP process's early host-side check; the final `assets` report says what
+  the GUI actually fetched and decoded. Each item carries its logical path,
+  byte count and SHA-256 on success, or a concrete error on failure.
 - **Cap: 64 files** (`doc.MAX_CHILDREN` is 128 and the heading takes
   one). Over it, the refusal states the cap and the count.
 
@@ -202,13 +209,22 @@ document back from the GUI (`panel-get`, which serializes the live
 server keeps no copy of what it showed, so this works against any panel
 on screen -- one another process opened, or one shown before the server
 started -- and it can never persist a stale document. That half needs a
-GUI socket; passing `document` explicitly does not.
+live panel transport (origin-session relay or direct GUI socket);
+passing `document` explicitly does not.
 
 ### Session scoping
 
-Panels are keyed by `(session, name)`. The session is resolved once per
-call: the explicit `session` argument, else `$SKETERM_SESSION` (which
-every pane exports), else NO SESSION -- which is a state, not a name.
+Live panels are keyed by `(session, name)`. Saved documents are keyed by
+`(exact canonical daemon socket, lifetime-unique origin_id, name)`, so a
+rename keeps the same documents and later sessions that reuse the same
+daemon/session name cannot overwrite or read one another. The store scope
+is `panelstore.OriginScope` = `{daemon_origin, origin_id, label}`; `label`
+is the session name and exists for diagnostics only -- it is never part of
+a path, so it can never be the storage identity. The session is
+resolved once per call: an explicitly present `session` argument, else
+`$SKETERM_SESSION` (which every pane exports), else NO SESSION -- which
+is a state, not a name. Explicit `session: ""` selects NO SESSION and
+never falls through to the environment.
 An `sketerm mcp` running outside any pane has no session, and its
 panels are filed apart from every session's rather than under some
 reserved session name that a real session could also be called. In
@@ -221,17 +237,40 @@ name REPLACES that panel's document in place -- same window, same
 `panel_id`, and an `image_compare` keeps its zoom, pan and split across
 the swap.
 
-Saved documents live in
+Saved documents live under the session's daemon and lifetime:
+
+    $XDG_STATE_HOME/sketerm/panels/by-origin/<sha256(canonical-socket)>/<origin_id>/<name>.json
+
+`origin_id` is a random 128-bit lowercase hex value minted for each session
+lifetime, so renaming a session keeps its documents while a later session that
+reuses the name gets a fresh, empty store. Beside the hash directory an
+`origin` file names the socket path it came from, purely so the directory is
+identifiable by hand. Panel names, which the caller chooses, are still
+rejected rather than sanitized. A caller with a session but no exact daemon --
+a direct GUI control socket, or a daemon too old to report a lifetime id --
+and a caller with no session at all use:
 
     $XDG_STATE_HOME/sketerm/panels/by-session/<session>/<name>.json
     $XDG_STATE_HOME/sketerm/panels/no-session/<name>.json
 
-Two parents, so the two sets share no directory and nothing can
-collide. The session is percent-encoded into that one directory
-component, because a session name is inherited from the daemon (which
-only length-checks it) and `my work` must not be unstorable. Panel
-names, which the caller chooses, are still rejected rather than
-sanitized.
+Nothing migrates between these three namespaces. A panel document is cheap to
+re-save, and a migration a crash can only ever leave half-done costs more than
+it is worth. Writes stage into `.<name>.<pid>.sketerm-part` and rename, so a
+save either happened or did not. Persistence runs where
+the MCP server runs: documents authored on a remote session host stay on
+that host. The local GUI picker lists local daemon-origin documents and
+reports that remote documents must be reopened through `ui_*` on their
+remote host.
+
+`ui_save.bytes` is the length of the canonical JSON actually written, not the
+length of the caller's authored JSON. Save and delete failures before rename or
+unlink use their ordinary store error (`PermissionDenied`,
+`ReadOnlyFileSystem`, `IoFailed`, and so on), plus
+`failure_class: "pre_commit"`, `mutation_state: "not_applied"`,
+`committed: false`, and `mutation_may_have_applied: false`. Because the
+staged write is only ever made visible by the final rename (and a delete by
+the unlink itself), that one classification covers every store failure: the
+mutation either happened or it did not.
 
 ### `ui_wait_event` polls; it never blocks the GUI
 
@@ -240,24 +279,157 @@ dispatched on the GLib main loop, and blocking there would freeze every
 window. The blocking semantics therefore live in the MCP server, which
 polls roughly every 100ms until an event arrives or the budget expires.
 `timeout_ms` is clamped to 120000 (the same cap the app and terminal
-waits use, under the 150s call watchdog).
+waits use, under the 150s call watchdog). One absolute deadline covers
+panel-name resolution, every request/reply exchange, and every sleep.
 
 Events are drained, not sampled, so an interaction that happened
 between calls is still delivered. If the panel's 64-event queue
 overflowed, the reply states how many older events were dropped -- a
 truncated interaction stream is never presented as the whole history. A
-panel the user closed ends the wait immediately and says so.
+panel the GUI confirms is absent ends the wait immediately and says so. A
+pre-delivery transport failure instead reports that open/closed state and
+queued events are unknown, with `events_may_have_been_drained: false` and
+`resend_safe: true`. If a direct or relayed `panel-events` request was written
+but its reply is lost, the error states that queued events may already have
+been drained and does not retry or claim that nothing was missed.
 
-### Requires a GUI socket
+### Live panel transport
 
-`sketerm mcp` is isolated by default and reaches the user's running GUI
-only with `--shared` (or an explicit `--socket`). Without one,
-`ui_show`, `ui_show_files`, `ui_patch`, `ui_wait_event` and `ui_close`
-return a described error naming `--shared`; `ui_panels`, `ui_delete` and `ui_save` *with* a
-`document` keep working, since they only touch the saved-document store.
-`ui_save` without one needs the socket to read the panel back, and says
-so. `capabilities`
-reports `panels` alongside `gui_socket`.
+Live `ui_*` calls do not require `--shared`. With a session origin, MCP
+attaches panel-only to that session on the exact daemon named by
+`$SKETERM_MUX_SOCKET`; the explicit tool `session` wins over
+`$SKETERM_SESSION`. Transport precedence is exact inherited daemon,
+explicit direct GUI `--socket`, then canonical per-user daemon
+compatibility. The compatibility path connects without autostarting or
+discovering another daemon. A discovered GUI socket is never allowed to
+redirect a sessionful panel mutation. The MCP private daemon used by app,
+terminal, file and browser tools is never selected by this path.
+When the exact daemon proves panel capability or panel-only attach is
+unsupported before sending a panel operation, or a current daemon has no
+compatible panel presenter, an explicitly supplied direct GUI `--socket` is
+an actionable legacy fallback. This covers a released GUI that remains a
+valid terminal viewer but never negotiated panel RPC. An unreachable origin,
+identity mismatch, uncertain operation delivery, or an auto-discovered GUI
+never uses that fallback.
+
+Connections are nonblocking and deadline-bounded, persistent per
+`(daemon socket, session, origin_id)`, and requests/replies carry correlation IDs.
+Before a cached identity is returned, pending lifecycle frames are drained;
+session `.gone`, EOF, or an error evicts the connection so name reuse cannot
+inherit the previous session's persistence origin. Panel-only attach succeeds
+only with a non-empty immutable `origin_name` and valid 128-bit `origin_id`;
+daemon-owned callers also send their inherited ID as an attach fence, so a
+reused name cannot bind them to a replacement lifetime. Missing or malformed
+metadata is never replaced with the requested alias.
+The daemon delivers each panel request to THE panel-capable attachment of the
+session -- the earliest still-attached one when several exist. There is no
+requester-to-presenter binding and no stickiness: when a presenter detaches
+or dies, the next call simply routes to whichever panel-capable attachment is
+present then, and an absent GUI is retry-safe `no_compatible_gui` --
+restarting sketerm must not wedge panels for the life of the MCP server.
+The GUI registry keys relayed panels by the session's immutable `origin_id`
+alone. Duplicate viewers in one GUI therefore address one
+panel namespace, routing-order changes do not change panel IDs, and closing one
+viewer leaves the scope alive until its permanent last-viewer teardown. If a
+shared `target: "pane"` panel was hosted on that viewer, its existing face is
+unparented and rehosted on an empty surviving same-scope pane; the pane-tree
+model is unchanged. A survivor that already hosts another panel is never
+evicted: when no empty survivor exists, the departing viewer's pane panel
+closes. The last viewer closes the panel normally.
+Stale IDs are skipped. A request whose delivery became uncertain is
+reported and never resent automatically, because replaying
+`panel-show`, `panel-patch` or `panel-close` could apply a mutation twice.
+Presenter replies are validated beyond JSON syntax: the top level must
+be an object, `ok` must be boolean, failures need a non-empty `error`,
+and successes require the operation result (`panel_id > 0`, `document`,
+`panels`, or `events` plus `dropped`). A presenter that answers badly fails
+every route already assigned to it, but keeps its panel capability: one broken
+reply is a bug in one handler, and silently demoting a GUI to "panels no longer
+work here" would hide it. A structured daemon failure keeps the correctly
+framed requester connection; partial requester writes, disconnects, and
+malformed daemon traffic retire the pooled connection. Post-delivery failures carry
+`failure_class: "uncertain_delivery"`,
+`mutation_may_have_applied: true`, and `resend_safe: false`; malformed
+shape/envelope and failures after the first presenter request byte use that
+classification. Failures before any request byte, including oversize,
+allocation, backpressure, disconnect, session close, and route deadline,
+carry `failure_class: "pre_delivery"`, `mutation_may_have_applied: false`,
+and `resend_safe: true`. The direct control request cap is 4 MiB, enough for
+an exactly 1 MiB valid panel document after JSON-string escaping and request
+metadata; the document parser cap remains exactly 1 MiB.
+
+Sessionless calls and daemons positively identified as predating panel relay
+retain the explicit direct `--socket` path. If neither live transport exists,
+the live tools fail honestly. Store-only calls remain available for
+sessionless, explicit direct, default compatibility, validated exact lifetime,
+and positively identified old-daemon scopes. An exact origin whose lifetime
+scope cannot be validated returns the identity failure instead of entering a
+reusable namespace. `ui_save` without a document also needs a live transport
+to read the current document back.
+
+`capabilities` reports `gui_socket`, `panels`, and `panels_store`
+independently, with structured `panel_transport` and `panel_store` states.
+It is a preflight: it probes the relay under a short deadline of its own and
+writes nothing. `panels_store: true` means the store SCOPE resolves (an exact
+origin has a daemon socket and a lifetime id, or the caller falls back to a
+session/sessionless scope); a filesystem that then refuses the write is
+reported by `ui_save` itself, with `error_code`, `mutation_may_have_applied:
+false` and `resend_safe: true`.
+
+### Remote panel images
+
+When the selected GUI reaches the panel session through SSH or UDP, it reads
+every `image.src` and both `image_compare` paths through ranged `fs_op read`
+requests on that Terminal's existing mux connection. The daemon only serves
+bytes; it never decodes images and `sketerm-mux` remains libc-only. Local mux
+sessions and direct GUI-socket panels continue to open ordinary local paths.
+
+The GUI stores successful bytes under their SHA-256 in a locked
+per-process-incarnation namespace below
+`$XDG_CACHE_HOME/sketerm/panel-assets` (or the usual `~/.cache` fallback),
+then validates dimensions and performs a real decode before committing the
+document and its resolver together. The document itself always retains the
+logical remote path. Consequently `panel-get`, `ui_save`, and a later
+`ui_show load=...` never expose or persist a GUI-private cache path. Reusing
+one logical path after rewriting the remote file fetches new bytes and swaps
+the rendered cache object.
+
+Show, patch and close are transactional and serialized per RPC v2
+presenter/session scope through hydration and deferred tab construction. Thus
+a close waits behind an older delivered show and that show cannot recreate the
+panel after close success. A direct panel close synchronously cancels its exact
+per-panel hydration lane before replying.
+Independent origins may progress together. Limits are 64 unique assets,
+16 MiB per asset, 64 MiB per operation, four concurrent ranged reads, and a
+30-second operation deadline. The cache is bounded to 256 MiB and 2048 blobs;
+active panel hashes are protected from pruning, writes are staged, fsynced,
+and atomically renamed, and a bounded startup sweep removes unlocked dead-GUI
+namespaces without touching a live owner's lock. Images over 8192 px
+on either axis or 32 megapixels are refused. Decoded panel pixbufs are charged
+against ONE budget, the GUI process's: 128 megapixels and 512 MiB. Header
+dimensions reserve conservative RGBA bytes before the full decoder is called,
+the reservation is atomically reconciled to the exact decoded rowstride, and
+over-budget paths become explicit asset errors. Every failure and cancellation
+releases it. The resulting
+charge belongs to a shared prepared-image lease: each GtkPicture internal ref
+has a matching widget qdata lease and each image-compare side retains the same
+lease directly. Closing a panel therefore cannot release process capacity while
+GTK or accessibility still holds a deferred widget reference; the charge ends
+only when the final retained GObject owner finalizes.
+
+An individual transfer or decode failure does not replace the user's current
+panel with a half-applied patch. The committed document gets an explicit
+placeholder for that logical path, while the `ui_show`, `ui_show_files`, or
+`ui_patch` result reports `assets`, `asset_failures`, and each path's error.
+Transport loss cancels every queued or deferred mutation and generation-fences
+tab handbacks; already-mounted panels remain while the Terminal reconnects.
+Committed direct local-file hydration is transport-independent and continues
+across that reconnect; permanent Terminal teardown still cancels it through
+the DrainHandle lifetime fence.
+For direct panels, the Terminal that supplied local image bytes is retained as
+a liveness-fenced asset origin. After that Terminal is destroyed, a patch that
+introduces an unresolved image path is rejected before document commit. Plain
+document edits and paths already resolved by that panel remain usable.
 
 A rejected document or patch comes back with `doc.Diag`'s own message,
 verbatim: it names the offending component id, and that text is what
