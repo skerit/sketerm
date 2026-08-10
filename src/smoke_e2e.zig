@@ -5501,8 +5501,22 @@ fn panelPickerStage(
     defer allocator.free(stale_get);
     if (std.mem.indexOf(u8, stale_get, "\"ok\":false") == null)
         return "ui_close left the detached panel id addressable";
-    app.pressKey(term_win, "Escape") catch return "canceling the panel tab close failed";
-    _ = app.pumpOnce(500);
+    // The confirm dialog maps asynchronously; an Escape that races it lands
+    // in the terminal instead and the ORPHANED MODAL then dims the window
+    // for every later pixel probe (found 2026-08-10 via a failure
+    // screenshot: the pane-face stage's exact-color check failed under the
+    // scrim while the panel had rendered perfectly). Settle until the
+    // dialog is up, then require the visual change of it closing.
+    _ = app.waitVisualSettle(term_win, 800, 10_000, 0.002, null);
+    var escapes: u32 = 0;
+    while (escapes < 3) : (escapes += 1) {
+        var dlg_ref = app.frameRef(term_win, true) orelse
+            return "no baseline frame for the close-confirm cancel";
+        defer dlg_ref.deinit(allocator);
+        app.pressKey(term_win, "Escape") catch return "canceling the panel tab close failed";
+        if (app.waitChangeSince(term_win, &dlg_ref, 3_000, 0.02, null)) break;
+    }
+    if (escapes == 3) return "the close-confirm dialog never visibly closed";
     if (!waitIdCount(allocator, sock_path, ids_before + 2, true, 3_000))
         return "canceling panel tab closure did not leave the shell tab mounted";
     var panel_screen_buf: [96]u8 = undefined;
@@ -5524,9 +5538,29 @@ fn panelPickerStage(
     const teardown_focus = roundtrip(allocator, sock_path, custom_focus_req) orelse
         return "focusing custom local pane before picker teardown failed";
     defer allocator.free(teardown_focus);
+    // Same race class as the close-confirm above: an Escape fired before
+    // the picker maps leaves the ORPHANED MODAL dimming every later pixel
+    // probe. Wait for the picker to visibly appear, close it, and require
+    // the visual change of it going away.
+    var picker_ref = app.frameRef(term_win, true) orelse
+        return "no baseline frame for the picker teardown";
+    defer picker_ref.deinit(allocator);
     app.pressKey(term_win, "ctrl+shift+F9") catch return "reopening picker for teardown failed";
-    _ = app.pumpOnce(150);
-    app.pressKey(term_win, "Escape") catch return "closing picker during list IO failed";
+    if (!app.waitChangeSince(term_win, &picker_ref, 10_000, 0.02, null))
+        return "the teardown picker never appeared";
+    // Settle the open animation BEFORE taking the reference frame: a ref
+    // captured mid-animation lets the animation itself satisfy the "it
+    // closed" check below while Escape lands before the dialog takes input.
+    _ = app.waitVisualSettle(term_win, 600, 8_000, 0.002, null);
+    var picker_up = app.frameRef(term_win, true) orelse
+        return "no mapped-picker frame for the teardown";
+    defer picker_up.deinit(allocator);
+    var picker_escapes: u32 = 0;
+    while (picker_escapes < 3) : (picker_escapes += 1) {
+        app.pressKey(term_win, "Escape") catch return "closing the teardown picker failed";
+        if (app.waitChangeSince(term_win, &picker_up, 3_000, 0.02, null)) break;
+    }
+    if (picker_escapes == 3) return "the teardown picker never visibly closed";
     var teardown_waited: u32 = 0;
     while (teardown_waited < 1_400) : (teardown_waited += 100) _ = app.pumpOnce(100);
     const after_teardown = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
@@ -5609,14 +5643,7 @@ fn panePanelLifetimeStage(
         "{{\"cmd\":\"panel-show\",\"name\":\"e2e-life\",\"session\":\"e2e-scope\"," ++
             "\"target\":\"pane\",\"pane\":1,\"document\":\"{{\\\"title\\\":\\\"Lifetime\\\"," ++
             "\\\"root\\\":\\\"c\\\",\\\"components\\\":{{\\\"c\\\":{{\\\"type\\\":\\\"column\\\"," ++
-            // The image sits FIRST in the column deliberately: the face
-            // lives in a scroller, and with the image last a short pane
-            // plus GTK's scroll-to-focus (button/slider below) could
-            // legitimately leave it below the fold — the pixel probe then
-            // failed while decode/install had provably succeeded (traced
-            // 2026-08-10: prepared lease installed, updateOne=true, no
-            // pixels). Top of the scroller is geometry-independent.
-            "\\\"children\\\":[\\\"img\\\",\\\"h\\\",\\\"b\\\",\\\"s\\\"]}}," ++
+            "\\\"children\\\":[\\\"h\\\",\\\"b\\\",\\\"s\\\",\\\"img\\\"]}}," ++
             "\\\"h\\\":{{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"On the pane\\\",\\\"level\\\":2}}," ++
             "\\\"b\\\":{{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Press\\\",\\\"action\\\":\\\"go\\\"}}," ++
             "\\\"s\\\":{{\\\"type\\\":\\\"slider\\\",\\\"min\\\":0,\\\"max\\\":10,\\\"value\\\":3}}," ++
@@ -5637,8 +5664,23 @@ fn panePanelLifetimeStage(
         // hands out none of the extra references that make the destroy
         // deferred in the first place.
         _ = app.waitVisualSettle(term_win, 400, 8_000, 0.002, null);
-        if (!waitForPanelColorAny(allocator, app, .{ 0x35, 0xa0, 0xe0 }, 12_000))
+        if (!waitForPanelColorAny(allocator, app, .{ 0x35, 0xa0, 0xe0 }, 12_000)) {
+            // Dump every window before failing: an exact-color probe can
+            // fail for reasons no assertion message can name (a leaked
+            // modal's scrim shifting every pixel was found this way).
+            for (app.windows.items, 0..) |window, wi| {
+                if (window.popup) continue;
+                const shot = app.screenshotPng(window.id, 0, null, 0) catch continue;
+                defer allocator.free(shot.png);
+                var name_buf: [96]u8 = undefined;
+                const name = std.fmt.bufPrintZ(&name_buf, "/tmp/e2e-paneface-fail-w{d}.png", .{wi}) catch continue;
+                const f = c.fopen(name.ptr, "wb") orelse continue;
+                _ = c.fwrite(shot.png.ptr, 1, shot.png.len, f);
+                _ = c.fclose(f);
+                std.debug.print("smoke-e2e: DIAG dumped {s}\n", .{name});
+            }
             return "pane panel image did not decode before deferred-finalization close";
+        }
 
         var buf: [128]u8 = undefined;
         const close_req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{id}) catch

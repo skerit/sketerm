@@ -15621,10 +15621,19 @@ destroyed secondary window's pane widgets - "GUI stopped serving after a
 secondary window was closed under a theme flip". Fixed structurally:
 `onWindowDestroyed` severs the process-global handlers immediately
 (idempotent with deinit's call), and `onThemeChanged` gained a `destroying`
-guard. (2) Test bug: the pane-face image probe asserted pixels of the LAST
-child in the face's scroller; a short pane plus GTK scroll-to-focus could
-leave it below the fold while decode/install had provably succeeded (traced:
-prepared lease installed, updateOne=true, zero pixels). The stage now puts
-the image first in the column, which is geometry-independent. Neither
-failure was the "known flaky stages" pattern - both attributions were wrong
-and both had real causes.
+guard. (2) Test bug, root-caused from a failure
+screenshot after a first geometry hypothesis proved wrong: the picker
+stage's close-confirm cancel pressed Escape without waiting for the
+AdwAlertDialog to map. When Escape raced the dialog, the ORPHANED MODAL's
+scrim dimmed the whole window for every later stage, shifting each pixel
+just enough that the pane-face stage's exact-color probe (>=400 exact
+matches) failed while the panel had rendered perfectly (traced: prepared
+lease installed, updateOne=true; screenshot showed the dialog over a
+correct panel). Two instances of the same
+race class were found and fenced: the close-confirm Escape and the
+teardown picker's Escape (fired 150ms after the chord, before the picker
+mapped). Both now wait for the modal to visibly appear, then require the
+visual change of it closing, retrying Escape; the pane-face probe dumps
+every window as PNG before failing so the next silent pixel mismatch
+names itself. Neither failure was the "known flaky stages"
+pattern - both attributions were wrong and both had real causes.
