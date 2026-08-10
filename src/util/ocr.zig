@@ -74,6 +74,7 @@ const Api = struct {
 extern fn dlopen(filename: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn dlclose(handle: ?*anyopaque) c_int;
+extern fn atexit(callback: ?*const fn () callconv(.c) void) c_int;
 
 const RTLD_LAZY: c_int = 0x1;
 var load_attempted = false;
@@ -83,6 +84,15 @@ var loaded_api: ?Api = null;
 var tess: ?*anyopaque = null;
 var tess_lang_buf: [64]u8 = undefined;
 var tess_lang_len: usize = 0;
+var cleanup_registered = false;
+
+fn cleanup() callconv(.c) void {
+    const t = tess orelse return;
+    const api = if (loaded_api) |*value| value else return;
+    api.end(t);
+    api.delete(t);
+    tess = null;
+}
 
 fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
     return @ptrCast(@alignCast(dlsym(handle, name) orelse return null));
@@ -153,6 +163,7 @@ fn ensureInit(api: *const Api, lang: []const u8) Error!*anyopaque {
     @memcpy(tess_lang_buf[0..lang.len], lang);
     tess_lang_len = lang.len;
     tess = t;
+    if (!cleanup_registered and atexit(cleanup) == 0) cleanup_registered = true;
     return t;
 }
 
