@@ -8,19 +8,41 @@
 //!   handshake, view-id allocation and event routing; faces register in
 //!   it and are found by view id.
 //! - `WebFace`: one pane face = one view id. Chrome (address entry,
-//!   back/forward/reload) plus a `GtkPicture` fed from the view's
-//!   memfd.
+//!   back/forward/reload) plus a `GtkGLArea` presenting the view's
+//!   memfd through `render/web_pass.zig`.
 //!
 //! ## Rendering
 //!
 //! `frame_buffer` hands over a memfd; we mmap it read-only and keep the
-//! mapping. Every `frame_damage` batch wraps that mapping in a `GBytes`
-//! WITHOUT copying it and builds a `GdkMemoryTexture` over the whole
-//! buffer — the damage rects are decoded but not yet exploited, because
-//! a `GtkPicture` is not a GL area and selective upload needs the
-//! ImagePass/GL path. That remains the follow-up: it would cut the
-//! per-frame texture UPLOAD (still whole-buffer, done by GTK) down to
-//! the damaged rects, which is the only copy left on this path.
+//! mapping. Every `frame_damage` batch writes ONLY its rects into a
+//! persistent GL texture (`glTexSubImage2D` straight out of the mmap,
+//! `GL_UNPACK_ROW_LENGTH` doing the striding, no staging copy) and asks
+//! the area to redraw.
+//!
+//! This replaced a `GtkPicture` fed a fresh `GdkMemoryTexture` over the
+//! WHOLE mapping per batch. That version decoded the damage rects and
+//! threw them away, so every frame cost a full-surface GPU upload plus
+//! a paintable swap: 33 MB at 3840x2160, ~2 GB/s at 60fps, which is
+//! what made the browser single-digit fps on a HiDPI 4K pane. It could
+//! not be fixed CPU-side — the copy was GTK's, not ours.
+//!
+//! No frame is ever QUEUED. The texture always holds the newest pixels,
+//! so several damage batches arriving between two draws collapse into
+//! one draw, and a draw can never present a frame older than the last
+//! batch taken off the socket. Combined with the pacer below — which
+//! only asks for a frame on the frame clock, i.e. at the rate GTK can
+//! actually present — the path has no backlog to build.
+//!
+//! There is deliberately no second GL stack here: shader compilation
+//! and API selection go through `render/gl.zig` exactly as every other
+//! pass does, and `WebPass` follows the same
+//! realize/forgetGL/releaseGL/draw contract as `ImagePass` and friends.
+//! The area is the face's own widget rather than the pane's terminal
+//! GtkGLArea because the two are never visible at once (`setWebVisible`
+//! hides the terminal's GraphicsOffload), the pane's area cannot live
+//! inside the web chrome's layout without a reparent that destroys the
+//! window's Atlas on every shell/web toggle, and `TerminalSurface` is
+//! by contract the terminal renderer.
 //!
 //! ## Frame pacing (who decides when the page paints)
 //!
@@ -39,7 +61,7 @@
 //!   on Wayland each empty cycle leaks a frame-callback object id per
 //!   offload subsurface until KWin's id space runs out and the process
 //!   dies. `stopTick` is not an optimisation, it is the crash guard.
-//! - ACTIVE: a tick on the picture widget paces requests at the CURRENT
+//! - ACTIVE: a tick on the GL area paces requests at the CURRENT
 //!   output's real refresh (from `gdk_frame_clock_get_refresh_info`),
 //!   clamped by `browser_max_fps`. Any input promotes here immediately,
 //!   so the first paint after a keystroke has no added latency.
@@ -48,25 +70,23 @@
 //!   G_SOURCE_REMOVE and zeroing `tick_id`), exactly like the terminal
 //!   surface's animation tick.
 //!
-//! A background tab's picture is unmapped: the face then sends
+//! A background tab's GL area is unmapped: the face then sends
 //! `view_hide` and stops asking altogether, so an off-screen page paints
 //! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
 //! aborts if a demoted face somehow kept its tick).
 //!
 //! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
-//! delivered frame rate and the time spent here. MEASURED on a 60fps
-//! animating page: with the old whole-buffer `g_bytes_new` copy this
-//! function cost ~143us/frame on a 1.8MiB buffer and ~1950us/frame on a
-//! 19MiB one (a 3000x1800 window); zero-copy it is ~40us and ~24us —
-//! i.e. the cost stopped scaling with the window at all.
+//! delivered frame rate, the time spent here and the bytes actually
+//! uploaded. MEASURED at 3840x2160 on a 60fps animating page whose
+//! spinner damages 64x64: 1787 MiB/s handed to GDK before, 2 MiB/s of
+//! damage rects after.
 //!
-//! Zero-copy has two consequences. The helper rewrites the buffer in
-//! place, so a texture GTK still holds can show a half-new frame: the
-//! benign tearing the protocol doc already accepts for v1. And the
-//! mapping must outlive every texture built over it, which is what
-//! `Mapping` refcounts — GTK keeps textures alive past the frame that
-//! set them (render nodes, its texture cache), so munmap-on-replace
-//! would be a use-after-free.
+//! The helper rewrites the buffer in place, so a rect can be read
+//! half-new: the benign tearing the protocol doc already accepts for
+//! v1. Nothing outside this file points into the mapping, so unmapping
+//! it on replacement is safe — the old `Mapping` refcount existed only
+//! because GDK kept memory textures borrowing it alive past the frame
+//! that set them.
 //!
 //! ## Scale (HiDPI)
 //!
@@ -75,7 +95,7 @@
 //! and the buffer that comes back is PHYSICAL. The scale comes from
 //! `gdk_surface_get_scale()` — `gtk_widget_get_scale_factor()` rounds
 //! 1.5 up to 2 and must not be used. A surface only exists once the
-//! picture is realized, so the face starts at 1.0, re-sends on realize,
+//! GL area is realized, so the face starts at 1.0, re-sends on realize,
 //! and watches `GdkSurface::notify::scale` so dragging the window to a
 //! differently scaled output re-renders crisply.
 //!
@@ -107,6 +127,8 @@ const input = @import("input.zig");
 const proto = @import("../web/protocol.zig");
 const pace = @import("../web/pace.zig");
 const clock = @import("../util/clock.zig");
+const gl_mod = @import("../render/gl.zig");
+const WebPass = @import("../render/web_pass.zig").WebPass;
 const Pane = @import("pane.zig").Pane;
 
 /// Helper binary name, looked up next to our own executable (the
@@ -128,46 +150,6 @@ const MISSING_MSG =
 
 const LOST_MSG = "The browser helper stopped. Reload to start it again.";
 const CRASH_MSG = "This page's renderer crashed. Reload to bring it back.";
-
-// ---------------------------------------------------------------------
-// Frame mapping
-// ---------------------------------------------------------------------
-
-/// A refcounted read-only mmap of one helper frame buffer.
-///
-/// The face holds one reference; every `GBytes` handed to GDK holds
-/// another and drops it from its free-func. Without that, replacing the
-/// buffer (a resize, a scale change) would munmap memory a live
-/// `GdkMemoryTexture` still points at — GTK keeps textures well past the
-/// frame that set them.
-const Mapping = struct {
-    allocator: std.mem.Allocator,
-    ptr: [*]align(std.heap.page_size_min) u8,
-    len: usize,
-    refs: u32,
-
-    fn create(allocator: std.mem.Allocator, ptr: [*]align(std.heap.page_size_min) u8, len: usize) ?*Mapping {
-        const m = allocator.create(Mapping) catch return null;
-        m.* = .{ .allocator = allocator, .ptr = ptr, .len = len, .refs = 1 };
-        return m;
-    }
-
-    fn ref(self: *Mapping) void {
-        self.refs += 1;
-    }
-
-    fn unref(self: *Mapping) void {
-        self.refs -= 1;
-        if (self.refs != 0) return;
-        _ = c.munmap(self.ptr, self.len);
-        self.allocator.destroy(self);
-    }
-};
-
-fn mappingUnrefCb(user: ?*anyopaque) callconv(.c) void {
-    const m: *Mapping = @ptrCast(@alignCast(user orelse return));
-    m.unref();
-}
 
 // ---------------------------------------------------------------------
 // Optional frame statistics (`SKETERM_WEB_STATS=1`)
@@ -412,7 +394,11 @@ pub const Client = struct {
         var dir_buf: [96:0]u8 = undefined;
         const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return null;
         _ = c.mkdir(dir.ptr, 0o700);
-        const p = std.fmt.bufPrint(&self.sock_path, "{s}/web-{d}.sock", .{ dir, c.getpid() }) catch return null;
+        const p = std.fmt.bufPrint(&self.sock_path, "{s}/{s}{d}.sock", .{
+            dir,
+            @import("../ipc/server.zig").WEB_SOCKET_PREFIX,
+            c.getpid(),
+        }) catch return null;
         self.sock_len = p.len;
         return p;
     }
@@ -798,7 +784,7 @@ pub const WebFace = struct {
     shell_btn: *c.GtkWidget = undefined,
     entry: *c.GtkWidget = undefined,
     overlay: *c.GtkWidget = undefined,
-    picture: *c.GtkWidget = undefined,
+    view_area: *c.GtkWidget = undefined,
     /// Input-transparent GtkDrawingArea filling the overlay: GTK4's
     /// only clean allocation-change hook (wlapp.zig precedent).
     sensor: *c.GtkWidget = undefined,
@@ -810,9 +796,16 @@ pub const WebFace = struct {
     signal_objs: [14]?*c.GObject = .{null} ** 14,
     signal_count: usize = 0,
 
-    /// Read-only mapping of the helper's frame memfd, refcounted so the
-    /// textures built over it can outlive the buffer's replacement.
-    mapping: ?*Mapping = null,
+    /// Read-only mapping of the helper's frame memfd. Nothing outside
+    /// this face ever points into it: every damage batch is copied into
+    /// the GL texture before `onDamage` returns, so unmapping on
+    /// replacement is safe (which it was NOT while GDK held textures
+    /// borrowing the mapping).
+    map_ptr: ?[*]align(std.heap.page_size_min) u8 = null,
+    map_len: usize = 0,
+    /// The frame's presentation: one persistent GL texture, written in
+    /// damage rects, drawn as a fullscreen quad.
+    web_pass: WebPass = .{},
     buf_id: u32 = 0,
     /// PHYSICAL geometry of the mapped buffer (the wire announces it).
     buf_w: u16 = 0,
@@ -823,7 +816,7 @@ pub const WebFace = struct {
     sent_w: u16 = 0,
     sent_h: u16 = 0,
     /// Last device scale handed to the helper, x1000. 1000 until the
-    /// picture is realized and a GdkSurface can be asked.
+    /// GL area is realized and a GdkSurface can be asked.
     sent_scale: u16 = 1000,
     /// The realized surface whose scale we watch, with a reference held
     /// (CLAUDE.md: a raw widget/surface pointer kept past the widget
@@ -838,7 +831,7 @@ pub const WebFace = struct {
     /// Adaptive frame pacing (see the header). Nothing this view shows
     /// is painted unless this decides to ask for it.
     pacer: pace.Pacer = .{},
-    /// GTK frame-clock tick id on `picture`, 0 when not installed. It
+    /// GTK frame-clock tick id on `view_area`, 0 when not installed. It
     /// exists ONLY while the page is actively repainting and removes
     /// itself the moment it is not — an idle tick is a KWin crash, not
     /// a waste (see the header and `terminal_surface.zig`'s `tick_id`).
@@ -847,7 +840,7 @@ pub const WebFace = struct {
     /// starting to move, and the reason no tick is needed to do so.
     /// Armed for the face's whole on-screen life.
     idle_timer: c.guint = 0,
-    /// Whether the picture is mapped. A background tab is unmapped: it
+    /// Whether the GL area is mapped. A background tab is unmapped: it
     /// gets `view_hide` and is never asked for a frame.
     on_screen: bool = false,
 
@@ -931,7 +924,7 @@ pub const WebFace = struct {
         self.widgets_dead = self.widgets_dead or widgets_dead;
         // Owned reference: safe from any teardown path, dead widgets
         // included, and the ONLY place the surface watch is severed
-        // besides the picture's own unrealize.
+        // besides the area's own unrealize.
         self.detachScaleWatch();
         // Same mechanism (2: sever at the single choke point) for the
         // two pacing sources, which carry this face as user-data and
@@ -973,7 +966,7 @@ pub const WebFace = struct {
             _ = c.gtk_widget_grab_focus(self.entry);
             return;
         }
-        _ = c.gtk_widget_grab_focus(self.picture);
+        _ = c.gtk_widget_grab_focus(self.view_area);
     }
 
     pub fn deinit(self: *WebFace) void {
@@ -1165,7 +1158,7 @@ pub const WebFace = struct {
     /// PNG of the PAGE as the user sees it, for `screenshot_pane` /
     /// `web_screenshot`. The pane's own screenshot path renders the
     /// terminal surface, which on a web pane is the hidden shell
-    /// underneath — so the face renders its picture widget instead,
+    /// underneath — so the face renders its GL area instead,
     /// with the same widget-paintable technique.
     pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
         if (self.widgets_dead) return null;
@@ -1173,7 +1166,7 @@ pub const WebFace = struct {
         // itself is of whatever was last painted, but going active now
         // keeps a burst of them from each being an idle-floor tick old.
         self.promote();
-        const w = self.picture;
+        const w = self.view_area;
         const width = c.gtk_widget_get_width(w);
         const height = c.gtk_widget_get_height(w);
         if (width <= 0 or height <= 0) return null;
@@ -1254,9 +1247,10 @@ pub const WebFace = struct {
     /// Drop OUR reference to the frame mapping; textures GDK still holds
     /// keep it alive until their `GBytes` die.
     fn dropMap(self: *WebFace) void {
-        if (self.mapping) |m| {
-            m.unref();
-            self.mapping = null;
+        if (self.map_ptr) |ptr| {
+            _ = c.munmap(ptr, self.map_len);
+            self.map_ptr = null;
+            self.map_len = 0;
         }
         self.buf_id = 0;
         self.buf_w = 0;
@@ -1291,7 +1285,7 @@ pub const WebFace = struct {
         if (self.widgets_dead or !self.on_screen) return;
         if (self.pacer.state != .active) return;
         self.tick_id = c.gtk_widget_add_tick_callback(
-            self.picture,
+            self.view_area,
             @ptrCast(&onTick),
             @ptrCast(self),
             null,
@@ -1300,7 +1294,7 @@ pub const WebFace = struct {
 
     fn stopTick(self: *WebFace) void {
         if (self.tick_id == 0) return;
-        if (!self.widgets_dead) c.gtk_widget_remove_tick_callback(self.picture, self.tick_id);
+        if (!self.widgets_dead) c.gtk_widget_remove_tick_callback(self.view_area, self.tick_id);
         self.tick_id = 0;
     }
 
@@ -1354,10 +1348,10 @@ pub const WebFace = struct {
     // ---- device scale ----------------------------------------------
 
     /// The output's fractional device scale x1000, or the last known one
-    /// while the picture has no surface yet.
+    /// while the area has no surface yet.
     fn currentScale(self: *WebFace) u16 {
         if (self.widgets_dead) return self.sent_scale;
-        const native = c.gtk_widget_get_native(self.picture) orelse return self.sent_scale;
+        const native = c.gtk_widget_get_native(self.view_area) orelse return self.sent_scale;
         const surface = c.gtk_native_get_surface(native) orelse return self.sent_scale;
         const s = c.gdk_surface_get_scale(surface);
         if (!(s > 0.0)) return 1000;
@@ -1368,7 +1362,7 @@ pub const WebFace = struct {
     /// scaled output re-renders at the new DPR.
     fn attachScaleWatch(self: *WebFace) void {
         if (self.widgets_dead) return;
-        const native = c.gtk_widget_get_native(self.picture) orelse return;
+        const native = c.gtk_widget_get_native(self.view_area) orelse return;
         const surface = c.gtk_native_get_surface(native) orelse return;
         if (self.scale_surface == surface) return;
         self.detachScaleWatch();
@@ -1474,23 +1468,33 @@ pub const WebFace = struct {
         c.gtk_widget_set_hexpand(self.overlay, 1);
         c.gtk_widget_set_vexpand(self.overlay, 1);
 
-        self.picture = c.gtk_picture_new();
-        c.gtk_picture_set_content_fit(@ptrCast(self.picture), c.GTK_CONTENT_FIT_FILL);
-        c.gtk_picture_set_can_shrink(@ptrCast(self.picture), 1);
-        c.gtk_widget_set_hexpand(self.picture, 1);
-        c.gtk_widget_set_vexpand(self.picture, 1);
-        c.gtk_widget_set_focusable(self.picture, 1);
+        // A GtkGLArea, not a GtkPicture: the frame is presented by
+        // `render/web_pass.zig` out of a PERSISTENT texture that only
+        // the damaged rects are written into. See the Rendering
+        // section at the top for why a paintable cannot do that.
+        self.view_area = c.gtk_gl_area_new();
+        gl_mod.requestArea(@ptrCast(self.view_area));
+        // auto_render=FALSE, exactly like the terminal surface: GTK
+        // must render only when a frame actually arrived. With TRUE it
+        // pumps a GL frame at the display refresh whether or not the
+        // page painted, which would undo the idle state the pacer
+        // exists to reach.
+        c.gtk_gl_area_set_auto_render(@ptrCast(self.view_area), 0);
+        c.gtk_widget_set_hexpand(self.view_area, 1);
+        c.gtk_widget_set_vexpand(self.view_area, 1);
+        c.gtk_widget_set_focusable(self.view_area, 1);
         // The GdkSurface only exists once realized, and reparenting a
         // pane unrealizes it — so every realize re-attaches the scale
-        // watch and re-reads the scale.
-        _ = c.g_signal_connect_data(@ptrCast(self.picture), "realize", @ptrCast(&onPictureRealize), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(self.picture), "unrealize", @ptrCast(&onPictureUnrealize), self, null, 0);
+        // watch, re-reads the scale AND rebuilds the GL state.
+        _ = c.g_signal_connect_data(@ptrCast(self.view_area), "realize", @ptrCast(&onAreaRealize), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.view_area), "unrealize", @ptrCast(&onAreaUnrealize), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.view_area), "render", @ptrCast(&onAreaRender), self, null, 0);
         // Map/unmap IS the on-screen signal: a background tab's pane is
         // unmapped, and a page nobody can see must not be painted.
-        _ = c.g_signal_connect_data(@ptrCast(self.picture), "map", @ptrCast(&onPictureMap), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(self.picture), "unmap", @ptrCast(&onPictureUnmap), self, null, 0);
-        self.track(self.picture);
-        c.gtk_overlay_set_child(@ptrCast(self.overlay), self.picture);
+        _ = c.g_signal_connect_data(@ptrCast(self.view_area), "map", @ptrCast(&onAreaMap), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.view_area), "unmap", @ptrCast(&onAreaUnmap), self, null, 0);
+        self.track(self.view_area);
+        c.gtk_overlay_set_child(@ptrCast(self.overlay), self.view_area);
         self.wireInput();
 
         self.sensor = c.gtk_drawing_area_new();
@@ -1524,31 +1528,31 @@ pub const WebFace = struct {
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onMotion), self, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(motion), "leave", @ptrCast(&onPointerLeave), self, null, 0);
-        c.gtk_widget_add_controller(self.picture, motion);
+        c.gtk_widget_add_controller(self.view_area, motion);
         self.track(motion);
 
         const click = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(click), 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPressed), self, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onReleased), self, null, 0);
-        c.gtk_widget_add_controller(self.picture, @ptrCast(click));
+        c.gtk_widget_add_controller(self.view_area, @ptrCast(click));
         self.track(click);
 
         const scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
         _ = c.g_signal_connect_data(@ptrCast(scroll), "scroll", @ptrCast(&onScroll), self, null, 0);
-        c.gtk_widget_add_controller(self.picture, scroll);
+        c.gtk_widget_add_controller(self.view_area, scroll);
         self.track(scroll);
 
         const key = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onKeyPressed), self, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onKeyReleased), self, null, 0);
-        c.gtk_widget_add_controller(self.picture, key);
+        c.gtk_widget_add_controller(self.view_area, key);
         self.track(key);
 
         const focus = c.gtk_event_controller_focus_new();
         _ = c.g_signal_connect_data(@ptrCast(focus), "enter", @ptrCast(&onFocusEnter), self, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(focus), "leave", @ptrCast(&onFocusLeave), self, null, 0);
-        c.gtk_widget_add_controller(self.picture, focus);
+        c.gtk_widget_add_controller(self.view_area, focus);
         self.track(focus);
     }
 
@@ -1632,60 +1636,76 @@ pub const WebFace = struct {
         const addr = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, fd, 0);
         if (addr == c.MAP_FAILED) return;
         const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-        const mapping = Mapping.create(self.allocator, bytes, size) orelse {
-            _ = c.munmap(bytes, size);
-            return;
-        };
         const old_id = self.buf_id;
         self.dropMap();
-        self.mapping = mapping;
+        self.map_ptr = bytes;
+        self.map_len = size;
         self.buf_id = fb.buf_id;
         self.buf_w = fb.w;
         self.buf_h = fb.h;
         self.buf_stride = fb.stride;
         if (old_id != 0) client().post(proto.FrameRelease{ .view = self.view, .buf_id = old_id });
+        // The texture is sized to the OLD buffer; reallocate it now so
+        // a resize is never briefly stretched.
+        self.uploadFull();
         // A fresh buffer holds nothing yet: ask for the repaint that
         // fills it rather than waiting for the idle floor.
         self.promote();
     }
 
+    /// True once the area is realized with a working context and the
+    /// pass is built, with that context made current for the caller.
+    fn glReady(self: *WebFace) bool {
+        if (self.widgets_dead) return false;
+        if (c.gtk_widget_get_realized(self.view_area) == 0) return false;
+        c.gtk_gl_area_make_current(@ptrCast(self.view_area));
+        if (c.gtk_gl_area_get_error(@ptrCast(self.view_area)) != null) return false;
+        return self.web_pass.program != 0;
+    }
+
+    /// Resize the texture to the mapped buffer and push all of it. Only
+    /// for the cases where nothing incremental is possible: a
+    /// re-realize (the old texture died with the context) and a buffer
+    /// replacement (resize / scale change).
+    fn uploadFull(self: *WebFace) void {
+        const base = self.map_ptr orelse return;
+        if (self.buf_w == 0 or self.buf_h == 0) return;
+        if (!self.glReady()) return;
+        _ = self.web_pass.ensureTexture(self.buf_w, self.buf_h);
+        self.web_pass.uploadRect(base, self.buf_stride, 0, 0, self.buf_w, self.buf_h);
+        c.gtk_gl_area_queue_render(@ptrCast(self.view_area));
+    }
+
+    /// Write the damaged rects into the persistent texture and ask for
+    /// a redraw. Nothing is queued: the texture IS the frame, so any
+    /// number of batches arriving between two draws collapse into the
+    /// one draw that follows, and a draw can never present pixels older
+    /// than the last batch we took off the socket.
     pub fn onDamage(self: *WebFace, dmg: proto.FrameDamage) void {
         if (self.widgets_dead) return;
         // A damage batch for a buffer we already replaced describes
         // pixels we no longer have; the new buffer repaints in full.
         if (dmg.buf_id != self.buf_id) return;
-        const mapping = self.mapping orelse return;
+        const base = self.map_ptr orelse return;
         const stats = g_stats.enabled();
         const t0 = if (stats) Stats.nowNs() else 0;
-        // The WHOLE buffer is presented per batch; dmg.rects is what a
-        // future GL/ImagePass path will upload selectively. The GBytes
-        // does NOT copy — it borrows the mapping and holds a reference
-        // for as long as GDK keeps the texture.
-        mapping.ref();
-        const gbytes = c.g_bytes_new_with_free_func(
-            mapping.ptr,
-            mapping.len,
-            mappingUnrefCb,
-            mapping,
-        ) orelse {
-            mapping.unref();
-            return;
-        };
-        defer c.g_bytes_unref(gbytes);
-        // Texture geometry is PHYSICAL; the picture draws it into its
-        // LOGICAL allocation, so device pixels land 1:1.
-        const tex = c.gdk_memory_texture_new(
-            @intCast(self.buf_w),
-            @intCast(self.buf_h),
-            c.GDK_MEMORY_B8G8R8A8,
-            gbytes,
-            @intCast(self.buf_stride),
-        ) orelse return;
-        defer c.g_object_unref(tex);
-        c.gtk_picture_set_paintable(@ptrCast(self.picture), @ptrCast(tex));
+        if (!self.glReady()) return;
+        var uploaded: usize = 0;
+        if (self.web_pass.ensureTexture(self.buf_w, self.buf_h)) {
+            // Fresh texture: its contents are undefined, so the rects
+            // alone would leave garbage around them.
+            self.web_pass.uploadRect(base, self.buf_stride, 0, 0, self.buf_w, self.buf_h);
+            uploaded = self.map_len;
+        } else {
+            for (dmg.rects) |r| {
+                self.web_pass.uploadRect(base, self.buf_stride, r.x, r.y, r.w, r.h);
+                uploaded += @as(usize, r.w) * @as(usize, r.h) * 4;
+            }
+        }
+        c.gtk_gl_area_queue_render(@ptrCast(self.view_area));
         self.notePaint();
         self.clearStatus();
-        if (stats) g_stats.note(Stats.nowNs() - t0, mapping.len);
+        if (stats) g_stats.note(Stats.nowNs() - t0, uploaded);
     }
 
     pub fn onTitle(self: *WebFace, title: []const u8) void {
@@ -1771,7 +1791,7 @@ pub const WebFace = struct {
             .ns_resize => "ns-resize",
             else => "default",
         };
-        c.gtk_widget_set_cursor_from_name(self.picture, name);
+        c.gtk_widget_set_cursor_from_name(self.view_area, name);
     }
 
     /// A popup (target=_blank, window.open) becomes a NEW web tab in
@@ -1867,7 +1887,7 @@ pub const WebFace = struct {
         const self = cast.userData(WebFace, user);
         const text = c.gtk_editable_get_text(@ptrCast(self.entry)) orelse return;
         self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(text))));
-        _ = c.gtk_widget_grab_focus(self.picture);
+        _ = c.gtk_widget_grab_focus(self.view_area);
     }
 
     /// A blank tab's address bar takes focus the moment it can.
@@ -1937,22 +1957,63 @@ pub const WebFace = struct {
         return 1; // G_SOURCE_CONTINUE
     }
 
-    fn onPictureMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         cast.userData(WebFace, user).setOnScreen(true);
     }
 
-    fn onPictureUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         cast.userData(WebFace, user).setOnScreen(false);
     }
 
-    fn onPictureRealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    /// Every realize is potentially a RE-realize: `gtk_widget_unparent`
+    /// unrealizes the area and destroys its GdkGLContext, so a split /
+    /// tab move hands us a brand new one. Cached shader and texture IDs
+    /// from the dead context would render black — CLAUDE.md's renderer
+    /// invariant, and the same shape as `terminal_surface.zig
+    /// onRealize`.
+    fn onAreaRealize(area: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         self.attachScaleWatch();
         self.syncScale();
+        c.gtk_gl_area_make_current(@ptrCast(area));
+        gl_mod.adoptAreaApi(@ptrCast(area));
+        if (c.gtk_gl_area_get_error(@ptrCast(area)) != null) return;
+        self.web_pass.forgetGL();
+        self.web_pass.realize() catch {
+            std.debug.print("webface: web_pass realize failed\n", .{});
+            return;
+        };
+        // The mapping survived the reparent; the texture did not.
+        self.uploadFull();
     }
 
-    fn onPictureUnrealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(WebFace, user).detachScaleWatch();
+    fn onAreaUnrealize(area: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        self.detachScaleWatch();
+        // Last chance to delete against the context that owned them.
+        c.gtk_gl_area_make_current(@ptrCast(area));
+        if (c.gtk_gl_area_get_error(@ptrCast(area)) != null) {
+            self.web_pass.forgetGL();
+            return;
+        }
+        self.web_pass.releaseGL();
+    }
+
+    /// Present whatever the texture currently holds. There is no frame
+    /// QUEUE anywhere on this path: damage is written into the texture
+    /// as it arrives, so a draw always shows the newest pixels and
+    /// several damage batches landing between two draws cost one draw,
+    /// not several.
+    fn onAreaRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        const w = c.gtk_widget_get_width(@ptrCast(area));
+        const h = c.gtk_widget_get_height(@ptrCast(area));
+        const scale = c.gtk_widget_get_scale_factor(@ptrCast(area));
+        c.glViewport(0, 0, w * scale, h * scale);
+        c.glClearColor(0, 0, 0, 0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        self.web_pass.draw();
+        return @intFromBool(true);
     }
 
     fn onSurfaceScale(_: ?*c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
@@ -1994,7 +2055,7 @@ pub const WebFace = struct {
 
     fn onPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
-        _ = c.gtk_widget_grab_focus(self.picture);
+        _ = c.gtk_widget_grab_focus(self.view_area);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
         self.sendPointer(.down, x, y, cefButton(btn), @intCast(@max(1, n_press)), modsOf(@ptrCast(gesture)));
     }
