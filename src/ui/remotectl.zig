@@ -541,8 +541,17 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "screenshot")) {
         const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "screenshot requires data (output .png path)");
         const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-        const bytes = pane.screenshotPng() orelse
-            return ipc_protocol.writeErr(out, allocator, "screenshot failed (pane not mapped/realized yet)");
+        // A pane showing a web page must be photographed as the PAGE:
+        // the terminal surface underneath it is the hidden shell.
+        const bytes = blk: {
+            if (pane.webFaceVisible()) {
+                if (@import("webface.zig").WebFace.fromPane(pane)) |wf| {
+                    if (wf.screenshotPng()) |png| break :blk png;
+                }
+            }
+            break :blk pane.screenshotPng() orelse
+                return ipc_protocol.writeErr(out, allocator, "screenshot failed (pane not mapped/realized yet)");
+        };
         defer c.g_bytes_unref(bytes);
         var sz: c.gsize = 0;
         const ptr = c.g_bytes_get_data(bytes, &sz);
@@ -833,9 +842,242 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         }
         winmod.dispatchAction(target, action);
         try ipc_protocol.writeOk(out, allocator, null, {});
+    } else if (std.mem.startsWith(u8, req.cmd, "web-")) {
+        try webCmd(self, req, out, allocator);
     } else {
         try ipc_protocol.writeErr(out, allocator, "unknown command");
     }
+}
+
+// ── web-* : the browser views the `web_*` MCP tools drive ──────────
+//
+// The semantic layer is a round trip to the helper and back, so these
+// commands NEVER wait: `web-request` starts one and answers with a
+// token, `web-result` reports whether it landed. The GLib main loop
+// keeps running between the two, which is the only way a reply can
+// arrive at all.
+
+const webface = @import("webface.zig");
+const web_proto = @import("../web/protocol.zig");
+
+/// One web view, as `web-list` reports it. The handle is the PANE id,
+/// so it addresses the same thing `list` does.
+const WebViewInfo = struct {
+    pane: u32,
+    view: u32,
+    url: []const u8,
+    title: []const u8,
+    loading: bool,
+    can_back: bool,
+    can_fwd: bool,
+    focused: bool,
+    visible: bool,
+};
+
+fn webFaceOf(self: *Window, req: ipc_protocol.Request) ?*webface.WebFace {
+    const pane = reqPaneExact(self, req) orelse return null;
+    return webface.WebFace.fromPane(pane);
+}
+
+fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const eql = std.mem.eql;
+
+    if (eql(u8, req.cmd, "web-list")) {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var views: std.ArrayList(WebViewInfo) = .empty;
+        const focused = activeOrSelf(self).focusedPane();
+        const wins = try liveWindows(arena, c.gtk_window_get_application(@ptrCast(self.app_window)));
+        const all: []const *Window = if (wins.len > 0) wins else &[_]*Window{self};
+        for (all) |win| {
+            for (win.panes.items) |p| {
+                const face = webface.WebFace.fromPane(p) orelse continue;
+                try views.append(arena, .{
+                    .pane = p.id,
+                    .view = face.view,
+                    .url = if (face.url) |u| try arena.dupe(u8, u) else "",
+                    .title = if (face.title) |t| try arena.dupe(u8, t) else "",
+                    .loading = face.loading,
+                    .can_back = face.can_back,
+                    .can_fwd = face.can_fwd,
+                    .focused = focused == p,
+                    .visible = p.webFaceVisible(),
+                });
+            }
+        }
+        const cl = webface.client();
+        return ipc_protocol.writeOkFlat(out, allocator, .{
+            .views = views.items,
+            .helper = @tagName(cl.state),
+            .helper_reason = cl.reason,
+        });
+    }
+
+    if (eql(u8, req.cmd, "web-open")) {
+        const where = req.target orelse "tab";
+        const win = activeOrSelf(self);
+        var host = win;
+        const before = win.panes.items.len;
+        if (eql(u8, where, "split")) {
+            try win.newWebSplit(c.GTK_ORIENTATION_HORIZONTAL);
+        } else if (eql(u8, where, "window")) {
+            host = try win.openWebWindow(&.{});
+        } else {
+            try win.newWebTabAt(null);
+        }
+        if (host == win and win.panes.items.len <= before)
+            return ipc_protocol.writeErr(out, allocator, "could not open a web view");
+        if (host.panes.items.len == 0)
+            return ipc_protocol.writeErr(out, allocator, "could not open a web view");
+        const pane = host.panes.items[host.panes.items.len - 1];
+        const face = webface.WebFace.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, "the new pane has no web face");
+        // SELECT the new tab. The point of these tools is that the
+        // assistant drives what the user is looking at; an unselected
+        // tab is also never allocated, so the view would lay out at
+        // its 800x600 default and could not be screenshotted at all.
+        if (host.last_created_page) |page| c.adw_tab_view_set_selected_page(host.tab_view, page);
+        c.gtk_window_present(@ptrCast(host.app_window));
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+        pane.setWebVisible(true);
+        if (req.data) |url| {
+            if (url.len > 0) face.navigate(url);
+        }
+        return ipc_protocol.writeOkFlat(out, allocator, .{ .pane = pane.id, .view = face.view });
+    }
+
+    const face = webFaceOf(self, req) orelse
+        return ipc_protocol.writeErr(out, allocator, "no web view on that pane (web_tabs lists them; web_open makes one)");
+
+    if (eql(u8, req.cmd, "web-navigate")) {
+        if (req.data) |url| {
+            if (url.len > 0) {
+                face.navigate(url);
+                return ipc_protocol.writeOkFlat(out, allocator, .{});
+            }
+        }
+        const act = req.action orelse
+            return ipc_protocol.writeErr(out, allocator, "web-navigate needs data=<url> or action=back|forward|reload|stop");
+        const nav: web_proto.NavAct = if (eql(u8, act, "back"))
+            .back
+        else if (eql(u8, act, "forward"))
+            .forward
+        else if (eql(u8, act, "reload"))
+            .reload
+        else if (eql(u8, act, "stop"))
+            .stop
+        else
+            return ipc_protocol.writeErr(out, allocator, "unknown navigation action");
+        face.navAction(nav);
+        return ipc_protocol.writeOkFlat(out, allocator, .{});
+    }
+
+    if (eql(u8, req.cmd, "web-scroll")) {
+        if (!face.autoScroll(req.dx orelse 0, req.dy orelse 0))
+            return ipc_protocol.writeErr(out, allocator, "the web view is not live yet");
+        return ipc_protocol.writeOkFlat(out, allocator, .{});
+    }
+
+    // A truncated eval result is paged from the GUI's copy: re-running
+    // the code to see the rest would run it twice.
+    if (eql(u8, req.cmd, "web-eval-text")) {
+        const text = face.lastEval() orelse
+            return ipc_protocol.writeErr(out, allocator, "no eval result to expand on this pane");
+        const off: usize = @min(req.offset orelse 0, text.len);
+        const len: usize = @min(req.length orelse 60_000, text.len - off);
+        return ipc_protocol.writeOkFlat(out, allocator, .{
+            .payload = text[off .. off + len],
+            .offset = off,
+            .total = text.len,
+        });
+    }
+
+    if (eql(u8, req.cmd, "web-result")) {
+        const token = req.token orelse
+            return ipc_protocol.writeErr(out, allocator, "web-result needs token");
+        if (face.autoTake(token)) |res| {
+            defer allocator.free(res.text);
+            return ipc_protocol.writeOkFlat(out, allocator, .{
+                .done = true,
+                .result_ok = res.ok,
+                .payload = res.text,
+                .doc_gen = res.meta.doc_gen,
+                .rev = res.meta.rev,
+                .snapshot_kind = if (res.meta.snap_kind == @intFromEnum(web_proto.SnapKind.delta))
+                    @as([]const u8, "delta")
+                else
+                    @as([]const u8, "full"),
+            });
+        }
+        if (face.autoPending(token))
+            return ipc_protocol.writeOkFlat(out, allocator, .{ .done = false });
+        return ipc_protocol.writeErr(out, allocator, "unknown token (already collected, or dropped when the helper restarted)");
+    }
+
+    if (!eql(u8, req.cmd, "web-request"))
+        return ipc_protocol.writeErr(out, allocator, "unknown command");
+
+    const op = req.op orelse
+        return ipc_protocol.writeErr(out, allocator, "web-request needs op");
+    const token: ?u32 = blk: {
+        if (eql(u8, op, "snapshot")) {
+            const mode: web_proto.SnapMode = if (req.mode) |m|
+                (if (eql(u8, m, "full")) .full else .auto)
+            else
+                .auto;
+            const detail: u8 = @intCast(@min(req.detail orelse 1, 2));
+            break :blk face.autoSnapshot(@intFromEnum(mode), detail, req.node orelse 0);
+        }
+        if (eql(u8, op, "act")) {
+            const id = req.node orelse
+                return ipc_protocol.writeErr(out, allocator, "act needs node=<snapshot id>");
+            const act = req.action orelse "click";
+            const semact: web_proto.SemAct = if (eql(u8, act, "click"))
+                .click
+            else if (eql(u8, act, "focus"))
+                .focus
+            else if (eql(u8, act, "set_value"))
+                .set_value
+            else if (eql(u8, act, "scroll_into_view"))
+                .scroll_into_view
+            else if (eql(u8, act, "hover"))
+                .hover
+            else
+                return ipc_protocol.writeErr(out, allocator, "unknown act action");
+            break :blk face.autoAct(id, @intFromEnum(semact), req.data orelse "");
+        }
+        if (eql(u8, op, "expand")) {
+            const id = req.node orelse
+                return ipc_protocol.writeErr(out, allocator, "expand needs node=<snapshot id>");
+            break :blk face.autoExpand(id, req.offset orelse 0, req.length orelse 4096);
+        }
+        if (eql(u8, op, "query")) {
+            const kind = req.action orelse "find_text";
+            const qk: web_proto.SemQuery = if (eql(u8, kind, "find_text"))
+                .find_text
+            else if (eql(u8, kind, "subtree"))
+                .subtree
+            else if (eql(u8, kind, "focused"))
+                .focused
+            else
+                return ipc_protocol.writeErr(out, allocator, "unknown query kind");
+            break :blk face.autoQuery(@intFromEnum(qk), req.data orelse "");
+        }
+        if (eql(u8, op, "read")) break :blk face.autoRead();
+        if (eql(u8, op, "eval")) {
+            const code = req.data orelse
+                return ipc_protocol.writeErr(out, allocator, "eval needs data=<javascript>");
+            break :blk face.autoEval(code, req.await_promise, req.timeout_ms orelse 10_000);
+        }
+        return ipc_protocol.writeErr(out, allocator, "unknown web-request op");
+    };
+    const t = token orelse return ipc_protocol.writeErr(
+        out,
+        allocator,
+        "the web view cannot take that request now (helper not connected, or one of the same kind is still in flight)",
+    );
+    return ipc_protocol.writeOkFlat(out, allocator, .{ .token = t });
 }
 
 /// Every tab of every window, each tagged with its window id. A

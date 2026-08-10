@@ -2060,7 +2060,6 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const id = appIdOf(app);
         const was_exited = app.exited;
         const status = app.exit_status;
-        mcp.browser_state.remove(id);
         _ = mcp.app_state.apps.swapRemove(id);
         // Wait for the daemon to ACK the kill: it tears the session
         // down by signalling the child's whole process group, so an

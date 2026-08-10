@@ -74,6 +74,7 @@ const cast = @import("../util/cast.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
 const proto = @import("../web/protocol.zig");
+const clock = @import("../util/clock.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// Helper binary name, looked up next to our own executable (the
@@ -602,6 +603,30 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onCrashed();
             },
+            .sem_snapshot => {
+                const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onSnapshot(ev);
+            },
+            .sem_act_result => {
+                const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.act, ev.ok != 0, ev.msg, .{});
+            },
+            .sem_expand_result => {
+                const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.expand, true, ev.text, .{});
+            },
+            .sem_query_result => {
+                const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.query, true, ev.payload.s, .{});
+            },
+            .sem_read_result => {
+                const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.read, true, ev.markdown.s, .{});
+            },
+            .sem_eval_result => {
+                const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onEvalResult(ev);
+            },
             else => {},
         }
     }
@@ -648,6 +673,51 @@ fn writeCandidate(buf: *[4096:0]u8, dir: []const u8, name: []const u8) ?[*:0]con
 // ---------------------------------------------------------------------
 // WebFace
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Automation (the `web_*` MCP tools ride this)
+// ---------------------------------------------------------------------
+
+/// One kind of semantic round trip. At most ONE of each kind may be in
+/// flight per view: the reply frames carry no request id (the protocol
+/// correlates by view), so two overlapping evals could not be told
+/// apart — and an awaited promise can settle out of order.
+pub const AutoKind = enum { snapshot, act, expand, query, read, eval };
+
+const AutoOp = struct {
+    token: u32,
+    kind: AutoKind,
+    /// A `mode:full` snapshot is not satisfied by a spontaneous delta.
+    want_full: bool = false,
+    started_ms: i64 = 0,
+};
+
+/// How long an unanswered request blocks its kind. A page that never
+/// answers (a wedged renderer, a promise that outlives its view) must
+/// not lock the kind out for the life of the tab.
+const AUTO_STALE_MS: i64 = 120_000;
+
+/// Extra fields a snapshot reply carries; zero for every other kind.
+pub const AutoMeta = struct {
+    doc_gen: u32 = 0,
+    rev: u32 = 0,
+    snap_kind: u8 = 0,
+};
+
+/// A finished round trip, waiting to be collected by `autoTake`. `text`
+/// is owned by the face until taken, then by the caller.
+pub const AutoResult = struct {
+    token: u32,
+    kind: AutoKind,
+    ok: bool,
+    text: []u8,
+    meta: AutoMeta = .{},
+};
+
+/// Completed results a face keeps before dropping the oldest. A caller
+/// that never collects is a caller that crashed; the cap keeps that
+/// from growing without bound.
+const MAX_AUTO_RESULTS = 16;
 
 pub const WebFace = struct {
     allocator: std.mem.Allocator,
@@ -712,6 +782,23 @@ pub const WebFace = struct {
 
     /// Where the pane's tab title comes from while this face lives.
     title: ?[]u8 = null,
+    can_back: bool = false,
+    can_fwd: bool = false,
+
+    /// Automation bookkeeping (see AutoKind): in-flight requests, their
+    /// finished results, the last snapshot as sent by the helper, and
+    /// the last eval result in full (what `web_expand [0]` pages).
+    auto_ops: std.ArrayList(AutoOp) = .empty,
+    auto_results: std.ArrayList(AutoResult) = .empty,
+    auto_next: u32 = 1,
+    last_snapshot: ?[]u8 = null,
+    last_snapshot_meta: AutoMeta = .{},
+    last_eval: ?[]u8 = null,
+    /// Deltas that arrived UNSOLICITED (the helper's mutation observer)
+    /// while nobody was waiting. Without this they were dropped, and
+    /// the caller's next snapshot honestly reported "nothing changed
+    /// since then" — having eaten the very change it was asking about.
+    pending_delta: std.ArrayList(u8) = .empty,
 
     // ---- attach / teardown ------------------------------------------
 
@@ -814,7 +901,260 @@ pub const WebFace = struct {
         if (self.pending_url) |u| self.allocator.free(u);
         if (self.url) |u| self.allocator.free(u);
         if (self.title) |t| self.allocator.free(t);
+        self.autoClear();
+        self.pending_delta.deinit(self.allocator);
+        self.auto_ops.deinit(self.allocator);
+        self.auto_results.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    // ---- automation -------------------------------------------------
+
+    fn autoClear(self: *WebFace) void {
+        for (self.auto_results.items) |r| self.allocator.free(r.text);
+        self.auto_results.clearRetainingCapacity();
+        self.auto_ops.clearRetainingCapacity();
+        if (self.last_snapshot) |s| self.allocator.free(s);
+        self.last_snapshot = null;
+        self.last_snapshot_meta = .{};
+        if (self.last_eval) |e| self.allocator.free(e);
+        self.last_eval = null;
+        self.pending_delta.clearAndFree(self.allocator);
+    }
+
+    fn autoBusy(self: *WebFace, kind: AutoKind) bool {
+        const now = clock.nowMs();
+        var i: usize = 0;
+        while (i < self.auto_ops.items.len) {
+            if (now - self.auto_ops.items[i].started_ms > AUTO_STALE_MS) {
+                _ = self.auto_ops.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        for (self.auto_ops.items) |op| {
+            if (op.kind == kind) return true;
+        }
+        return false;
+    }
+
+    /// Register an in-flight request; null when the view cannot serve
+    /// one right now, which the caller reports rather than hanging.
+    fn autoBegin(self: *WebFace, kind: AutoKind, want_full: bool) ?u32 {
+        if (!self.view_live) return null;
+        if (self.autoBusy(kind)) return null;
+        const token = self.auto_next;
+        self.auto_next +%= 1;
+        if (self.auto_next == 0) self.auto_next = 1;
+        self.auto_ops.append(self.allocator, .{
+            .token = token,
+            .kind = kind,
+            .want_full = want_full,
+            .started_ms = clock.nowMs(),
+        }) catch return null;
+        return token;
+    }
+
+    /// Satisfy the oldest in-flight request of `kind`, if any.
+    fn completeOp(self: *WebFace, kind: AutoKind, ok: bool, text: []const u8, meta: AutoMeta) void {
+        var idx: ?usize = null;
+        for (self.auto_ops.items, 0..) |op, i| {
+            if (op.kind != kind) continue;
+            if (kind == .snapshot and op.want_full and meta.snap_kind != 0) continue;
+            idx = i;
+            break;
+        }
+        const i = idx orelse return;
+        const op = self.auto_ops.orderedRemove(i);
+        const owned = self.allocator.dupe(u8, text) catch return;
+        if (self.auto_results.items.len >= MAX_AUTO_RESULTS) {
+            const old = self.auto_results.orderedRemove(0);
+            self.allocator.free(old.text);
+        }
+        self.auto_results.append(self.allocator, .{
+            .token = op.token,
+            .kind = kind,
+            .ok = ok,
+            .text = owned,
+            .meta = meta,
+        }) catch self.allocator.free(owned);
+    }
+
+    /// True while `token` is still waiting on the helper.
+    pub fn autoPending(self: *WebFace, token: u32) bool {
+        for (self.auto_ops.items) |op| {
+            if (op.token == token) return true;
+        }
+        return false;
+    }
+
+    /// Collect a finished result; the caller owns `text` from here.
+    pub fn autoTake(self: *WebFace, token: u32) ?AutoResult {
+        for (self.auto_results.items, 0..) |r, i| {
+            if (r.token == token) return self.auto_results.orderedRemove(i);
+        }
+        return null;
+    }
+
+    pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
+        const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
+        client().post(proto.SemSnapshotReq{
+            .view = self.view,
+            .mode = mode,
+            .detail = detail,
+            .scope = scope,
+        });
+        return token;
+    }
+
+    pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
+        const token = self.autoBegin(.act, false) orelse return null;
+        client().post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+        return token;
+    }
+
+    pub fn autoExpand(self: *WebFace, id: u32, off: u32, len: u32) ?u32 {
+        const token = self.autoBegin(.expand, false) orelse return null;
+        client().post(proto.SemExpand{ .view = self.view, .id = id, .off = off, .len = len });
+        return token;
+    }
+
+    pub fn autoQuery(self: *WebFace, kind: u8, arg: []const u8) ?u32 {
+        const token = self.autoBegin(.query, false) orelse return null;
+        client().post(proto.SemQueryReq{ .view = self.view, .kind = kind, .arg = arg });
+        return token;
+    }
+
+    pub fn autoRead(self: *WebFace) ?u32 {
+        const token = self.autoBegin(.read, false) orelse return null;
+        client().post(proto.SemRead{ .view = self.view });
+        return token;
+    }
+
+    pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32) ?u32 {
+        const token = self.autoBegin(.eval, false) orelse return null;
+        client().post(proto.SemEval{
+            .view = self.view,
+            .flags = if (want_await) proto.eval_flag_await else 0,
+            .timeout_ms = timeout_ms,
+            .code = .{ .s = code },
+        });
+        return token;
+    }
+
+    /// Wheel scrolling through the ORDINARY input path, at the last
+    /// pointer position — the same frame an interactive scroll sends.
+    pub fn autoScroll(self: *WebFace, dx: i32, dy: i32) bool {
+        if (!self.view_live) return false;
+        client().post(proto.InputScroll{
+            .view = self.view,
+            .x = self.last_x,
+            .y = self.last_y,
+            .dx = dx,
+            .dy = dy,
+            .mods = 0,
+        });
+        return true;
+    }
+
+    /// The last snapshot the helper sent, solicited or not.
+    pub fn lastSnapshot(self: *WebFace) ?[]const u8 {
+        return self.last_snapshot;
+    }
+
+    pub fn lastSnapshotMeta(self: *WebFace) AutoMeta {
+        return self.last_snapshot_meta;
+    }
+
+    /// The full text of the last eval result, which a truncated tool
+    /// reply pages through `web_expand [0]`.
+    pub fn lastEval(self: *WebFace) ?[]const u8 {
+        return self.last_eval;
+    }
+
+    /// PNG of the PAGE as the user sees it, for `screenshot_pane` /
+    /// `web_screenshot`. The pane's own screenshot path renders the
+    /// terminal surface, which on a web pane is the hidden shell
+    /// underneath — so the face renders its picture widget instead,
+    /// with the same widget-paintable technique.
+    pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
+        if (self.widgets_dead) return null;
+        const w = self.picture;
+        const width = c.gtk_widget_get_width(w);
+        const height = c.gtk_widget_get_height(w);
+        if (width <= 0 or height <= 0) return null;
+        const native = c.gtk_widget_get_native(w) orelse return null;
+        const renderer = c.gtk_native_get_renderer(native) orelse return null;
+        const paintable = c.gtk_widget_paintable_new(w) orelse return null;
+        defer c.g_object_unref(paintable);
+        const snapshot = c.gtk_snapshot_new();
+        c.gdk_paintable_snapshot(
+            @ptrCast(paintable),
+            @ptrCast(snapshot),
+            @floatFromInt(width),
+            @floatFromInt(height),
+        );
+        const node = c.gtk_snapshot_free_to_node(snapshot) orelse return null;
+        defer c.gsk_render_node_unref(node);
+        var bounds = c.graphene_rect_t{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
+        };
+        const texture = c.gsk_renderer_render_texture(renderer, node, &bounds) orelse return null;
+        defer c.g_object_unref(texture);
+        return c.gdk_texture_save_to_png_bytes(texture);
+    }
+
+    /// Deltas buffered for an absent reader before the buffer is
+    /// dropped. A page that animates must not grow it without bound.
+    const MAX_PENDING_DELTA = 64 * 1024;
+
+    pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot) void {
+        const meta: AutoMeta = .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .snap_kind = ev.kind };
+        if (self.allocator.dupe(u8, ev.payload.s)) |owned| {
+            if (self.last_snapshot) |old| self.allocator.free(old);
+            self.last_snapshot = owned;
+            self.last_snapshot_meta = meta;
+        } else |_| {}
+
+        const full = ev.kind == @intFromEnum(proto.SnapKind.full);
+        if (!self.snapshotWaiting()) {
+            // Nobody asked: keep the change until someone does.
+            if (full) self.pending_delta.clearRetainingCapacity();
+            if (self.pending_delta.items.len < MAX_PENDING_DELTA) {
+                self.pending_delta.appendSlice(self.allocator, ev.payload.s) catch {};
+            } else if (!std.mem.endsWith(u8, self.pending_delta.items, DELTA_OVERFLOW)) {
+                self.pending_delta.appendSlice(self.allocator, DELTA_OVERFLOW) catch {};
+            }
+            return;
+        }
+        if (full or self.pending_delta.items.len == 0) {
+            self.pending_delta.clearRetainingCapacity();
+            self.completeOp(.snapshot, true, ev.payload.s, meta);
+            return;
+        }
+        // Hand back everything that happened since the caller last
+        // looked, oldest first, then this reply.
+        self.pending_delta.appendSlice(self.allocator, ev.payload.s) catch {};
+        self.completeOp(.snapshot, true, self.pending_delta.items, meta);
+        self.pending_delta.clearRetainingCapacity();
+    }
+
+    const DELTA_OVERFLOW = "... earlier changes dropped (buffer full); ask for mode=full\n";
+
+    fn snapshotWaiting(self: *WebFace) bool {
+        for (self.auto_ops.items) |op| {
+            if (op.kind == .snapshot) return true;
+        }
+        return false;
+    }
+
+    pub fn onEvalResult(self: *WebFace, ev: proto.SemEvalResult) void {
+        if (self.allocator.dupe(u8, ev.json.s)) |owned| {
+            if (self.last_eval) |old| self.allocator.free(old);
+            self.last_eval = owned;
+        } else |_| {}
+        self.completeOp(.eval, ev.ok != 0, ev.json.s, .{});
     }
 
     /// Drop OUR reference to the frame mapping; textures GDK still holds
@@ -1046,6 +1386,9 @@ pub const WebFace = struct {
 
     /// A helper connection came up (first start, or after a Reload).
     pub fn onClientReady(self: *WebFace) void {
+        // Nothing in flight can be answered by a helper that just came
+        // up: drop the requests so their kinds are usable again.
+        self.auto_ops.clearRetainingCapacity();
         self.crashed = false;
         self.clearStatus();
         self.view_live = false;
@@ -1056,6 +1399,7 @@ pub const WebFace = struct {
     }
 
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
+        self.auto_ops.clearRetainingCapacity();
         self.view_live = false;
         self.dropMap();
         self.setStatus(reason, retryable);
@@ -1168,6 +1512,8 @@ pub const WebFace = struct {
         c.gtk_widget_set_sensitive(self.back_btn, if (ev.can_back != 0) @as(c_int, 1) else 0);
         c.gtk_widget_set_sensitive(self.fwd_btn, if (ev.can_fwd != 0) @as(c_int, 1) else 0);
         self.loading = ev.loading != 0;
+        self.can_back = ev.can_back != 0;
+        self.can_fwd = ev.can_fwd != 0;
         c.gtk_button_set_icon_name(
             @ptrCast(self.reload_btn),
             if (self.loading) "process-stop-symbolic" else "view-refresh-symbolic",
@@ -1274,7 +1620,7 @@ pub const WebFace = struct {
         cl.post(proto.Navigate{ .view = self.view, .url = url });
     }
 
-    fn navAction(self: *WebFace, action: proto.NavAct) void {
+    pub fn navAction(self: *WebFace, action: proto.NavAct) void {
         if (!self.view_live) return;
         client().post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
     }

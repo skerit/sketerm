@@ -15721,3 +15721,60 @@ keeps ~300MB out of the package. build.zig grew -Dcef-include /
 LD_PRELOAD target when the runtime lives elsewhere at install time);
 `zig build fetch-cef` remains the dev path and now checks a pinned
 SHA-256. All 8 smoke-web stages pass against the system CEF.
+
+## 2026-08-10: `web_*` MCP tools; the CDP `browser_*` family deleted
+
+Browser automation now drives the GUI's OWN web views instead of an
+external Chromium: MCP -> GUI control socket -> `src/ui/webface.zig` ->
+the one `sketerm-webengine` connection -> the view backing a pane. The
+handle is the PANE id, so it matches `list_terminals`; a click is real
+trusted input on the pixels the user is looking at.
+
+Twelve tools (`src/ipc/mcp_web.zig`): web_tabs, web_open, web_navigate,
+web_snapshot, web_act, web_expand, web_query, web_read, web_wait,
+web_scroll, web_eval, web_screenshot (the last one reuses
+`screenshot_pane`'s capture path, and the GUI's `screenshot` command
+now photographs a web-visible pane as the PAGE). `web_network` is
+deliberately absent until the 0x80 interception frames exist.
+
+Semantic operations are asynchronous and the control socket answers
+synchronously, so `web-request` returns a TOKEN and `web-result` polls
+it — the `ui_wait_event` shape, and for the same reason: the GLib loop
+must keep running for the helper's reply to arrive. One operation of
+each kind per view; in-flight ops are dropped on helper restart and
+expire after 120s. Unsolicited deltas from the mutation observer are
+BUFFERED in the face: dropping them made the next snapshot say
+"nothing changed" about the very change it was asked for.
+
+New protocol frames `sem_eval`/`sem_eval_result` (0xA0 block): the
+result is serialized in-page with graceful degradation (undefined,
+functions, symbols, cycles -> described placeholders; DOM elements ->
+`{semantic_id, role, name}`, rewritten helper-side from engine-local
+ids so they feed straight back into web_act), `await` resolves a
+promise inside the budget, an exception returns message AND stack, and
+a big result truncates with a `web_expand id=0` paging affordance.
+
+Nothing from the old set was dropped except `browser_path` (it named an
+external Chromium to launch — the thing this removes). The two
+capabilities worth naming: `browser_choose` became `web_act set_value`,
+which now picks a native `<select>` by option TEXT or value (including
+one inside an open shadow root) and drives a custom ARIA dropdown with
+a trusted click to open, a shadow-piercing poll for the appearing
+`[role=option]`, and a trusted click on the match; `browser_form_state`
+became ordinary snapshot content — the walk carries required, invalid
+(validity + aria-invalid), checked, disabled, readonly and the current
+value, with passwords reported as a LENGTH, never their content. The
+walk also descends open shadow roots now.
+
+Deleted: `src/ipc/mcp_browser.zig`, `src/ipc/cdp.zig`, the CDP session
+state in mcp.zig, and every `browser_*` name in TOOLS_JSON and
+`mcpfilter.TOOL_META` (the `browser` policy group stays and now selects
+the web tools). `capabilities` reports `web_helper` instead of a
+Chromium binary path.
+
+smoke-web grew stages 15-17 (eval, both dropdown kinds, form
+validation state) and is green on both the pinned CEF and the system
+one. The tools were also driven end to end through a real `sketerm mcp`
+process against a headless GUI: open -> snapshot -> trusted click (the
+page reported `isTrusted true`) -> delta -> eval -> read -> scroll ->
+wait -> screenshot.

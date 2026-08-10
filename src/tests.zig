@@ -126,8 +126,8 @@ comptime {
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/appdrive.zig");
-    _ = @import("ipc/cdp.zig");
     _ = @import("ipc/mcp.zig");
+    _ = @import("ipc/mcp_web.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");

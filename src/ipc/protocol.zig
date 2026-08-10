@@ -66,6 +66,34 @@ pub const Request = struct {
     /// panel-patch / panel-events / panel-close: the handle panel-show
     /// returned.
     panel_id: ?u32 = null,
+
+    // ---- web-* (browser views, src/ui/webface.zig) --------------------
+    //
+    // Every semantic round trip is ASYNCHRONOUS (the helper answers
+    // frames later), while this socket answers a request line at once:
+    // `web-request` starts one and hands back a token, `web-result`
+    // polls it. The MCP side owns the deadline, exactly like
+    // panel-events.
+    /// web-request operation: snapshot | act | expand | query | read | eval.
+    op: ?[]const u8 = null,
+    /// Sub-action: web-act action, web-query kind, web-navigate action.
+    action: ?[]const u8 = null,
+    /// Semantic node id — web-act/web-expand target, snapshot scope.
+    node: ?u32 = null,
+    /// The handle web-request returned.
+    token: ?u32 = null,
+    /// Snapshot mode ("auto" | "full") and detail level (0|1|2).
+    mode: ?[]const u8 = null,
+    detail: ?u32 = null,
+    /// web-expand window into a truncated node's text.
+    offset: ?u32 = null,
+    length: ?u32 = null,
+    /// web-eval: resolve a returned promise, bounded by timeout_ms.
+    await_promise: bool = false,
+    timeout_ms: ?u32 = null,
+    /// web-scroll wheel deltas, logical pixels, positive = right/down.
+    dx: ?i32 = null,
+    dy: ?i32 = null,
 };
 
 pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(Request) {

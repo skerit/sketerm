@@ -8,8 +8,11 @@
 //! with stable ids, mutation delta, trusted sem_act click, expand,
 //! cross-navigation id carrying, reader extraction, query), a hostile
 //! page that tries to forge semantic replies and hijack the command
-//! entry point, HiDPI (physical buffers, logical input), and a clean
-//! shutdown on disconnect.
+//! entry point, script evaluation (values, DOM refs, degradation,
+//! throws, awaited promises), dropdowns (native <select> by option
+//! text and a custom ARIA listbox, both driven with trusted clicks),
+//! form validation state in the walk, HiDPI (physical buffers, logical
+//! input), and a clean shutdown on disconnect.
 //!
 //! The HiDPI stage runs LAST on purpose: its scale changes leave the
 //! engine re-laying-out for a while, and running it mid-rig made the
@@ -79,6 +82,46 @@ const article_page =
     "<p>A second paragraph so the extractor has real text density.</p></article>" ++
     "</body></html>";
 
+/// Dropdowns: a native <select> and a hand-rolled ARIA combobox whose
+/// options only exist in the DOM while it is open. The old
+/// browser_choose handled both, so web_act set_value must too.
+const dropdown_page =
+    "data:text/html,<html><body>" ++
+    "<label%20for=cty>Country</label>" ++
+    "<select%20id=cty%20onchange=%22document.title='native:'+this.value%22>" ++
+    "<option%20value=be>Belgium</option><option%20value=nl>Netherlands</option>" ++
+    "<option%20value=fr>France</option></select>" ++
+    "<div%20id=combo%20role=combobox%20aria-expanded=false%20aria-haspopup=listbox%20tabindex=0" ++
+    "%20style=%22border:1px%20solid%20%23000;width:200px;height:30px%22>Pick%20a%20fruit</div>" ++
+    "<div%20id=list%20role=listbox%20style=%22display:none%22></div>" ++
+    "<p%20id=chosen>none</p>" ++
+    "<script>" ++
+    "var%20combo=document.getElementById('combo'),list=document.getElementById('list');" ++
+    "combo.addEventListener('click',function(ev){" ++
+    "if(!ev.isTrusted){document.title='UNTRUSTED';return;}" ++
+    "list.style.display='block';combo.setAttribute('aria-expanded','true');" ++
+    "list.innerHTML='';" ++
+    "['Apple','Banana','Cherry'].forEach(function(t){" ++
+    "var%20o=document.createElement('div');o.setAttribute('role','option');" ++
+    "o.style.height='24px';o.textContent=t;" ++
+    "o.addEventListener('click',function(e2){" ++
+    "if(!e2.isTrusted){document.title='UNTRUSTEDOPT';return;}" ++
+    "combo.textContent=t;document.getElementById('chosen').textContent=t;" ++
+    "list.style.display='none';combo.setAttribute('aria-expanded','false');" ++
+    "document.title='picked:'+t;});" ++
+    "list.appendChild(o);});});" ++
+    "</script></body></html>";
+
+/// Form validation state: required + empty (so :invalid holds), a
+/// disabled control, a checked box and a password with a value.
+const validation_page =
+    "data:text/html,<html><body><form>" ++
+    "<label%20for=em>Email</label><input%20id=em%20type=email%20required%20value=nope>" ++
+    "<label%20for=pw>Password</label><input%20id=pw%20type=password%20value=hunter22>" ++
+    "<label%20for=tos>Terms</label><input%20id=tos%20type=checkbox%20checked>" ++
+    "<button%20id=dis%20disabled>Submit</button>" ++
+    "</form></body></html>";
+
 /// A page that attacks the semantic layer from the inside: at parse
 /// time (before its own load event) and again after it, it hunts for
 /// any reachable transport, tries to post a forged snapshot through
@@ -145,6 +188,15 @@ fn fail(comptime msg: []const u8) noreturn {
     say("smoke-web: FAIL " ++ msg);
     cleanup();
     std.process.exit(1);
+}
+
+/// The whole snapshot line containing `needle`, for asserting on the
+/// states of ONE node rather than on the whole log.
+fn lineContaining(hay: []const u8, needle: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, hay, needle) orelse return null;
+    const start = if (std.mem.lastIndexOfScalar(u8, hay[0..at], '\n')) |i| i + 1 else 0;
+    const end = std.mem.indexOfScalarPos(u8, hay, at, '\n') orelse hay.len;
+    return hay[start..end];
 }
 
 fn pass(comptime msg: []const u8) void {
@@ -243,6 +295,11 @@ const Client = struct {
     query_out: [16 * 1024]u8 = @splat(0),
     query_len: usize = 0,
     query_seq: u32 = 0,
+
+    eval_json: [32 * 1024]u8 = @splat(0),
+    eval_len: usize = 0,
+    eval_ok: u8 = 0,
+    eval_seq: u32 = 0,
 
     fn deinit(self: *Client) void {
         self.unmap();
@@ -406,6 +463,13 @@ const Client = struct {
                 @memcpy(self.query_out[0..self.query_len], q.payload.s[0..self.query_len]);
                 self.query_seq += 1;
             },
+            .sem_eval_result => {
+                const e = proto.decode(proto.SemEvalResult, frame.payload) catch fail("sem_eval_result decode");
+                self.eval_ok = e.ok;
+                self.eval_len = @min(e.json.s.len, self.eval_json.len);
+                @memcpy(self.eval_json[0..self.eval_len], e.json.s[0..self.eval_len]);
+                self.eval_seq += 1;
+            },
             .sem_read_result => {
                 const r = proto.decode(proto.SemReadResult, frame.payload) catch fail("sem_read_result decode");
                 self.md_len = @min(r.markdown.s.len, self.md.len);
@@ -443,6 +507,23 @@ const Client = struct {
         const off = @as(usize, y) * @as(usize, fb.stride) + @as(usize, x) * 4;
         if (off + 4 > self.map.len) fail("pixel outside the mapped buffer");
         return .{ self.map[off], self.map[off + 1], self.map[off + 2], self.map[off + 3] };
+    }
+
+    fn evalPayload(self: *Client) []const u8 {
+        return self.eval_json[0..self.eval_len];
+    }
+
+    /// Evaluate `code` and wait for the answer; returns the raw JSON.
+    fn evalWait(self: *Client, code: []const u8, want_await: bool, timeout_ms: i64) []const u8 {
+        const seq = self.eval_seq;
+        self.send(proto.SemEval{
+            .view = view_id,
+            .flags = if (want_await) proto.eval_flag_await else 0,
+            .timeout_ms = 5000,
+            .code = .{ .s = code },
+        });
+        if (!self.waitSeq(&self.eval_seq, seq, timeout_ms)) fail("no sem_eval_result");
+        return self.evalPayload();
     }
 
     fn resetTitle(self: *Client) void {
@@ -929,7 +1010,168 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 14 hostile page (no transport, no forgery, no hijack)");
 
-    // ── Stage 15: HiDPI — physical buffer, logical input ────────────
+    // ── Stage 15: sem_eval ─────────────────────────────────────────
+    //
+    // The escape hatch, and the one tool whose whole value is that it
+    // degrades instead of failing: undefined, a cycle and a throw all
+    // have to come back as something a caller can read, and a DOM
+    // element has to come back addressable by web_act.
+    {
+        cl.navigate(form_page);
+        if (!cl.waitSem("button \"Go\"", 20_000)) fail("stage 15 eval: no snapshot of the form page");
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        if (!cl.waitSem("button \"Go\"", 20_000)) fail("stage 15 eval: no full snapshot");
+        const go_sid = cl.idOfLine("button \"Go\"") orelse fail("stage 15 eval: no id for the button");
+
+        if (std.mem.indexOf(u8, cl.evalWait("1+1", false, 20_000), "\"value\":2") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{cl.evalPayload()});
+            fail("stage 15 eval: a plain value did not come back");
+        }
+        if (cl.eval_ok != 1) fail("stage 15 eval: a plain value reported failure");
+
+        // A DOM element serializes to the STABLE id, so the result can
+        // be fed straight back into sem_act.
+        {
+            const json = cl.evalWait("document.getElementById('go')", false, 20_000);
+            var want: [64]u8 = undefined;
+            const needle = std.fmt.bufPrint(&want, "\"semantic_id\":{d}", .{go_sid}) catch unreachable;
+            if (std.mem.indexOf(u8, json, needle) == null or
+                std.mem.indexOf(u8, json, "\"role\":\"button\"") == null)
+            {
+                std.debug.print("smoke-web: eval said {s}\n", .{json});
+                fail("stage 15 eval: a DOM node did not serialize to its semantic id");
+            }
+        }
+
+        if (std.mem.indexOf(u8, cl.evalWait("undefined", false, 20_000), "\"__kind\":\"undefined\"") == null)
+            fail("stage 15 eval: undefined did not degrade to a placeholder");
+        if (std.mem.indexOf(u8, cl.evalWait("(function(){var a={};a.me=a;return a})()", false, 20_000), "\"__kind\":\"cyclic\"") == null)
+            fail("stage 15 eval: a cycle did not degrade to a placeholder");
+        {
+            const json = cl.evalWait("throw new TypeError('boom')", false, 20_000);
+            if (cl.eval_ok != 0) fail("stage 15 eval: a throw was reported as success");
+            if (std.mem.indexOf(u8, json, "boom") == null or std.mem.indexOf(u8, json, "\"stack\"") == null) {
+                std.debug.print("smoke-web: eval said {s}\n", .{json});
+                fail("stage 15 eval: the exception lost its message or stack");
+            }
+        }
+        {
+            const json = cl.evalWait(
+                "new Promise(function(r){setTimeout(function(){r(42)},50)})",
+                true,
+                20_000,
+            );
+            if (std.mem.indexOf(u8, json, "\"value\":42") == null) {
+                std.debug.print("smoke-web: eval said {s}\n", .{json});
+                fail("stage 15 eval: await did not resolve the promise");
+            }
+        }
+    }
+    pass("stage 15 sem_eval (values, DOM refs, degradation, throw, await)");
+
+    // ── Stage 16: dropdowns, native AND custom ─────────────────────
+    //
+    // browser_choose used to be a tool of its own for exactly this;
+    // set_value has to cover both or that capability was dropped.
+    {
+        cl.navigate(dropdown_page);
+        if (!cl.waitSem("combobox \"Country\"", 20_000)) {
+            cl.resetSem();
+            cl.snapshot(1, 1);
+            if (!cl.waitSem("combobox \"Country\"", 20_000)) {
+                std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+                fail("stage 16 dropdown: no snapshot of the dropdown page");
+            }
+        }
+        const native_id = cl.idOfLine("combobox \"Country\"") orelse
+            fail("stage 16 dropdown: no id for the native select");
+        const combo_id = cl.idOfLine("combobox \"Pick a fruit\"") orelse {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 16 dropdown: no id for the custom combobox");
+        };
+
+        // Native <select>, chosen by option TEXT (not value).
+        cl.resetTitle();
+        {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = native_id,
+                .action = @intFromEnum(proto.SemAct.set_value),
+                .arg = "Netherlands",
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 16 dropdown: no result for the native select");
+            if (cl.act_ok != 1) {
+                std.debug.print("smoke-web: act said \"{s}\"\n", .{cl.act_msg[0..cl.act_msg_len]});
+                fail("stage 16 dropdown: the native select was not set");
+            }
+        }
+        if (!cl.waitTitle("native:nl", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 16 dropdown: the native select fired no change event for the matching option");
+        }
+
+        // Custom ARIA dropdown: opened with a trusted click, its
+        // option polled for, then clicked — also trusted. The page
+        // reports UNTRUSTED/UNTRUSTEDOPT in its title if either was
+        // scripted.
+        cl.resetTitle();
+        {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = combo_id,
+                .action = @intFromEnum(proto.SemAct.set_value),
+                .arg = "Cherry",
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 16 dropdown: no result for the custom dropdown");
+            const msg = cl.act_msg[0..cl.act_msg_len];
+            if (cl.act_ok != 1 or std.mem.indexOf(u8, msg, "Cherry") == null) {
+                std.debug.print("smoke-web: act said \"{s}\"\n", .{msg});
+                fail("stage 16 dropdown: the custom dropdown did not report the picked option");
+            }
+        }
+        if (!cl.waitTitle("picked:Cherry", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 16 dropdown: the custom option was never clicked (or the click was not trusted)");
+        }
+    }
+    pass("stage 16 dropdowns (native select by text, custom ARIA listbox, both trusted)");
+
+    // ── Stage 17: form validation state in the walk ────────────────
+    //
+    // What browser_form_state used to answer, now carried by every
+    // snapshot: required/invalid/checked/disabled and the value —
+    // with a password reported as a LENGTH, never its content.
+    {
+        cl.navigate(validation_page);
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        if (!cl.waitSem("textbox \"Email\"", 20_000)) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 17 form state: no snapshot of the validation page");
+        }
+        const log = cl.semLog();
+        const email = lineContaining(log, "textbox \"Email\"") orelse fail("stage 17 form state: no email line");
+        if (std.mem.indexOf(u8, email, "required") == null or std.mem.indexOf(u8, email, "invalid") == null) {
+            std.debug.print("smoke-web: email line was: {s}\n", .{email});
+            fail("stage 17 form state: required/invalid are missing from the states");
+        }
+        const box = lineContaining(log, "checkbox \"Terms\"") orelse fail("stage 17 form state: no checkbox line");
+        if (std.mem.indexOf(u8, box, "checked") == null) fail("stage 17 form state: the checkbox is not reported checked");
+        const btn = lineContaining(log, "button \"Submit\"") orelse fail("stage 17 form state: no button line");
+        if (std.mem.indexOf(u8, btn, "disabled") == null) fail("stage 17 form state: the disabled button is not reported disabled");
+        const pw = lineContaining(log, "textbox \"Password\"") orelse fail("stage 17 form state: no password line");
+        if (std.mem.indexOf(u8, pw, "hunter22") != null) fail("stage 17 form state: a password VALUE reached the client");
+        if (std.mem.indexOf(u8, pw, "(8 chars)") == null) {
+            std.debug.print("smoke-web: password line was: {s}\n", .{pw});
+            fail("stage 17 form state: the password length is not reported");
+        }
+    }
+    pass("stage 17 form validation state (required/invalid/checked/disabled, masked password)");
+
+    // ── Stage 18: HiDPI — physical buffer, logical input ────────────
     //
     // The scale contract in docs/proposal-browser-protocol.md: w/h on
     // the wire stay LOGICAL, the announced buffer is
@@ -942,23 +1184,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const old_buf = cl.fb.?.buf_id;
         var seq = cl.fb_seq;
         cl.send(proto.ViewResize{ .view = view_id, .w = 400, .h = 300, .scale_x1000 = 2000 });
-        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer for scale 2");
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 18 hidpi: no frame_buffer for scale 2");
         {
             const fb = cl.fb.?;
-            if (fb.w != 800 or fb.h != 600) fail("stage 15 hidpi: 400x300 at 2x did not announce an 800x600 buffer");
-            if (fb.stride != 3200) fail("stage 15 hidpi: stride is not the physical width times 4");
+            if (fb.w != 800 or fb.h != 600) fail("stage 18 hidpi: 400x300 at 2x did not announce an 800x600 buffer");
+            if (fb.stride != 3200) fail("stage 18 hidpi: stride is not the physical width times 4");
         }
         cl.send(proto.FrameRelease{ .view = view_id, .buf_id = old_buf });
 
         cl.navigate(blue_page);
-        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 15 hidpi: the page never painted at 2x");
+        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 18 hidpi: the page never painted at 2x");
         {
             const fb = cl.fb.?;
             cl.mapBuffer();
             const far = cl.pixel(fb.w - 1, fb.h - 1);
             if (far[0] < 200 or far[1] > 64 or far[2] > 64) {
                 std.debug.print("smoke-web: far pixel was {any}\n", .{far});
-                fail("stage 15 hidpi: the paint did not cover the whole physical buffer");
+                fail("stage 18 hidpi: the paint did not cover the whole physical buffer");
             }
         }
 
@@ -966,7 +1208,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // the page as clientX/clientY 200,150 — physical coordinates
         // would land at 100,75.
         cl.navigate(click_page);
-        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 15 hidpi: the click page never painted");
+        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 18 hidpi: the click page never painted");
         cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
         cl.resetTitle();
         for ([_]proto.PointerKind{ .move, .down, .up }) |kind| {
@@ -982,28 +1224,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         if (!cl.waitTitle("result:trusted=true x=200 y=150", 15_000)) {
             std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
-            fail("stage 15 hidpi: input coordinates are not logical at 2x");
+            fail("stage 18 hidpi: input coordinates are not logical at 2x");
         }
 
         // A fractional scale (KWin/GNOME both do 1.5) rounds UP.
         seq = cl.fb_seq;
         cl.send(proto.ViewResize{ .view = view_id, .w = 101, .h = 100, .scale_x1000 = 1500 });
-        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer for scale 1.5");
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 18 hidpi: no frame_buffer for scale 1.5");
         {
             const fb = cl.fb.?;
-            if (fb.w != 152 or fb.h != 150) fail("stage 15 hidpi: 101x100 at 1.5x is not a 152x150 buffer");
+            if (fb.w != 152 or fb.h != 150) fail("stage 18 hidpi: 101x100 at 1.5x is not a 152x150 buffer");
         }
 
         // ... and back down to 1x, which is a scale change in the other
         // direction and must shrink the buffer again.
         seq = cl.fb_seq;
         cl.send(proto.ViewResize{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000 });
-        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer back at 1x");
-        if (cl.fb.?.w != 640 or cl.fb.?.h != 480) fail("stage 15 hidpi: the 1x buffer is not 640x480");
-        pass("stage 15 hidpi (physical buffer, logical input, fractional scale)");
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 18 hidpi: no frame_buffer back at 1x");
+        if (cl.fb.?.w != 640 or cl.fb.?.h != 480) fail("stage 18 hidpi: the 1x buffer is not 640x480");
+        pass("stage 18 hidpi (physical buffer, logical input, fractional scale)");
     }
 
-    // ── Stage 16: teardown ────────────────────────────────────────
+    // ── Stage 19: teardown ────────────────────────────────────────
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -1017,11 +1259,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             _ = c.usleep(50_000);
         }
-        if (!gone) fail("stage 16 teardown: helper did not exit within 10s of the disconnect");
+        if (!gone) fail("stage 19 teardown: helper did not exit within 10s of the disconnect");
         g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 16 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 16 teardown: helper exited nonzero");
-        pass("stage 16 teardown (helper exited 0 on disconnect)");
+        if (status & 0x7f != 0) fail("stage 19 teardown: helper died on a signal");
+        if ((status >> 8) & 0xff != 0) fail("stage 19 teardown: helper exited nonzero");
+        pass("stage 19 teardown (helper exited 0 on disconnect)");
     }
 
     cleanup();

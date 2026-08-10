@@ -217,7 +217,23 @@ const Pending = struct {
     arg: []u8 = &.{},
     off: u32 = 0,
 
-    const Kind = enum { snapshot, click, hover, act, set_value, commit, expand, read };
+    const Kind = enum {
+        snapshot,
+        click,
+        hover,
+        act,
+        set_value,
+        commit,
+        expand,
+        read,
+        eval,
+        /// A custom dropdown was clicked open; waiting for the option's
+        /// rect so the pick itself can be a trusted click too.
+        choose_pick,
+        /// The option was clicked; waiting for what the control reads
+        /// as now.
+        choose_done,
+    };
 };
 
 // ---------------------------------------------------------------------
@@ -727,6 +743,25 @@ pub const Host = struct {
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
     }
 
+    /// Evaluate script in the page's main world and answer with the
+    /// serialized result. The REPLY rides the authenticated bridge, so
+    /// a page cannot forge it; the code itself runs where page script
+    /// runs, so the RESULT is page-authored data like any other.
+    pub fn semEval(self: *Host, req: proto.SemEval) !void {
+        const v = self.find(req.view) orelse return;
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .eval });
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        cmd.writer.print("{{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"code\":", .{
+            rid,
+            if (req.flags & proto.eval_flag_await != 0) "true" else "false",
+            @min(req.timeout_ms, 120_000),
+        }) catch return;
+        jsonStr(&cmd.writer, req.code.s) catch return;
+        cmd.writer.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
+    }
+
     pub fn semRead(self: *Host, req: proto.SemRead) !void {
         const v = self.find(req.view) orelse return;
         const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read });
@@ -778,19 +813,37 @@ pub const Host = struct {
 
         if (std.mem.eql(u8, op, "rect")) {
             self.onRect(v, &p, json);
+        } else if (std.mem.eql(u8, op, "optrect")) {
+            self.onOptionRect(v, &p, json);
+        } else if (std.mem.eql(u8, op, "eval")) {
+            const E = struct { ok: u8 = 0, json: []const u8 = "" };
+            const e = std.json.parseFromSlice(E, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer e.deinit();
+            const rewritten = self.rewriteNodeRefs(v, e.value.json) catch null;
+            defer if (rewritten) |r| self.gpa.free(r);
+            self.post(proto.SemEvalResult{
+                .view = v.id,
+                .ok = e.value.ok,
+                .json = .{ .s = rewritten orelse e.value.json },
+            });
         } else if (std.mem.eql(u8, op, "setvalue")) {
             self.onSetValue(v, &p, json);
         } else if (std.mem.eql(u8, op, "ack")) {
             const Ack = struct { ok: u8 = 0, msg: []const u8 = "" };
             const a = std.json.parseFromSlice(Ack, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
             defer a.deinit();
-            var buf: [256]u8 = undefined;
-            const msg = if (p.kind == .commit)
-                std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
+            var buf: [512]u8 = undefined;
+            const msg = switch (p.kind) {
+                .commit => std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
                     a.value.msg[0..@min(a.value.msg.len, 128)],
-                }) catch a.value.msg
-            else
-                a.value.msg;
+                }) catch a.value.msg,
+                .choose_done => std.fmt.bufPrint(
+                    &buf,
+                    "custom dropdown: clicked option \"{s}\" (trusted); control now \"{s}\"",
+                    .{ p.arg[0..@min(p.arg.len, 128)], a.value.msg[0..@min(a.value.msg.len, 128)] },
+                ) catch a.value.msg,
+                else => a.value.msg,
+            };
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg });
         } else if (std.mem.eql(u8, op, "text")) {
             const Txt = struct { off: u32 = 0, text: []const u8 = "" };
@@ -869,15 +922,142 @@ pub const Host = struct {
         self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
     }
 
+    /// A custom dropdown's option, located after the trusted click that
+    /// opened the list: clicking it is trusted too, which is the whole
+    /// reason this is a round trip instead of `option.click()`.
+    fn onOptionRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
+        const R = struct {
+            ok: u8 = 0,
+            x: i32 = 0,
+            y: i32 = 0,
+            text: []const u8 = "",
+            seen: []const u8 = "",
+        };
+        const r = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer r.deinit();
+        var buf: [512]u8 = undefined;
+        if (r.value.ok == 0) {
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "no option matched \"{s}\" in the opened dropdown; options seen: {s}",
+                .{ p.arg[0..@min(p.arg.len, 96)], r.value.seen[0..@min(r.value.seen.len, 300)] },
+            ) catch "no matching option in the opened dropdown";
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg });
+            return;
+        }
+        var ev = cef.cef_mouse_event_t{ .x = r.value.x, .y = r.value.y, .modifiers = 0 };
+        withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
+
+        const picked = self.gpa.dupe(u8, r.value.text) catch return;
+        const eid = v.sem.eidFor(p.sid);
+        const rid = self.pushPending(v, .{
+            .req = nextReq(v),
+            .kind = .choose_done,
+            .sid = p.sid,
+            .arg = picked,
+        }) catch {
+            self.gpa.free(picked);
+            return;
+        };
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"chosen\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// Replace the script's `{"__kind":"node","eid":N,...}` markers with
+    /// PROTOCOL-facing `{"semantic_id":S,...}`, so an eval result that
+    /// returned an element can be fed straight back into `sem_act`. An
+    /// element the current tree does not hold answers null.
+    fn rewriteNodeRefs(self: *Host, v: *View, json: []const u8) !?[]u8 {
+        if (std.mem.indexOf(u8, json, "\"__kind\":\"node\"") == null) return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, json, .{}) catch return null;
+        defer parsed.deinit();
+        var root = parsed.value;
+        try rewriteValue(v, parsed.arena.allocator(), &root);
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        errdefer aw.deinit();
+        try std.json.Stringify.value(root, .{}, &aw.writer);
+        return try aw.toOwnedSlice();
+    }
+
+    fn rewriteValue(v: *View, arena: std.mem.Allocator, node: *std.json.Value) !void {
+        switch (node.*) {
+            .array => |*arr| for (arr.items) |*item| try rewriteValue(v, arena, item),
+            .object => |*obj| {
+                const kind = obj.get("__kind");
+                const eid_v = obj.get("eid");
+                if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "node") and
+                    eid_v != null and eid_v.? == .integer)
+                {
+                    const eid: u32 = if (eid_v.?.integer > 0) @intCast(eid_v.?.integer) else 0;
+                    const sid = if (eid != 0) v.sem.sidFor(eid) else 0;
+                    _ = obj.orderedRemove("__kind");
+                    _ = obj.orderedRemove("eid");
+                    try obj.put(arena, "semantic_id", if (sid != 0)
+                        std.json.Value{ .integer = @intCast(sid) }
+                    else
+                        std.json.Value{ .null = {} });
+                    if (sid == 0) try obj.put(
+                        arena,
+                        "note",
+                        .{ .string = "this element is not in the current snapshot; take a web_snapshot to act on it" },
+                    );
+                    return;
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| try rewriteValue(v, arena, entry.value_ptr);
+            },
+            else => {},
+        }
+    }
+
     /// Set-value: a typeable field is TYPED into with real key events;
-    /// anything else (select, range, colour, ...) can only be assigned
-    /// from script, and the reply says so rather than pretending.
+    /// a native select (including one in an open shadow root) picks the
+    /// matching option; a custom/ARIA dropdown is opened with a trusted
+    /// click here and its option picked in `onOptionRect`; anything
+    /// else can only be assigned from script, and the reply says so
+    /// rather than pretending.
     fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
-        const S = struct { ok: u8 = 0, typeable: u8 = 0, msg: []const u8 = "" };
+        const S = struct {
+            ok: u8 = 0,
+            typeable: u8 = 0,
+            custom: u8 = 0,
+            x: i32 = 0,
+            y: i32 = 0,
+            msg: []const u8 = "",
+        };
         const s = std.json.parseFromSlice(S, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer s.deinit();
         if (s.value.ok == 0) {
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = s.value.msg });
+            return;
+        }
+        if (s.value.custom != 0) {
+            // Open the list with a real click, then go looking for the
+            // option; both clicks are trusted, which is what a custom
+            // dropdown's own key handlers need to see.
+            var ev = cef.cef_mouse_event_t{ .x = s.value.x, .y = s.value.y, .modifiers = 0 };
+            withHostArgs(v, setFocus, .{@as(c_int, 1)});
+            withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
+            withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
+            withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
+            const want = self.gpa.dupe(u8, p.arg) catch return;
+            const rid = self.pushPending(v, .{
+                .req = nextReq(v),
+                .kind = .choose_pick,
+                .sid = p.sid,
+                .arg = want,
+            }) catch {
+                self.gpa.free(want);
+                return;
+            };
+            var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+            defer cmd.deinit();
+            cmd.writer.print("{{\"op\":\"pickoption\",\"req\":{d},\"timeout\":4000,\"arg\":", .{rid}) catch return;
+            jsonStr(&cmd.writer, p.arg) catch return;
+            cmd.writer.writeByte('}') catch return;
+            self.sendScript(v, cmd.written());
             return;
         }
         if (s.value.typeable == 0) {
@@ -885,7 +1065,10 @@ pub const Host = struct {
                 .view = v.id,
                 .id = p.sid,
                 .ok = 1,
-                .msg = "set-value applied by script (element is not typeable; input+change dispatched)",
+                .msg = if (s.value.msg.len > 0)
+                    s.value.msg
+                else
+                    "set-value applied by script (element is not typeable; input+change dispatched)",
             });
             return;
         }

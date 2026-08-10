@@ -157,19 +157,19 @@ pub const TOOL_META = [_]Meta{
     rw("port_forward_close", .net),
 
     // ── browser ────────────────────────────────────────────────────
-    rw("browser_open", .browser),
-    ro("browser_info", .browser),
-    rw("browser_navigate", .browser),
-    ro("browser_read", .browser),
-    ro("browser_elements", .browser),
-    rw("browser_click", .browser),
-    rw("browser_fill", .browser),
-    ro("browser_wait", .browser),
-    rw("browser_scroll", .browser),
-    rw("browser_eval", .browser),
-    ro("browser_form_state", .browser),
-    rw("browser_choose", .browser),
-    ro("browser_network", .browser),
+    ro("web_tabs", .browser),
+    rw("web_open", .browser),
+    rw("web_navigate", .browser),
+    ro("web_snapshot", .browser),
+    rw("web_act", .browser),
+    ro("web_expand", .browser),
+    ro("web_query", .browser),
+    ro("web_read", .browser),
+    ro("web_wait", .browser),
+    // Moves the page, and a scroll can trigger lazy loads.
+    rw("web_scroll", .browser),
+    rw("web_eval", .browser),
+    ro("web_screenshot", .browser),
 
     // ── ui: agent-authored panels ──────────────────────────────────
     rw("ui_show", .ui),

@@ -226,6 +226,7 @@ pub const Server = struct {
             .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),
             .sem_query => try self.host.semQuery(try proto.decode(proto.SemQueryReq, frame.payload)),
             .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
+            .sem_eval => try self.host.semEval(try proto.decode(proto.SemEval, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

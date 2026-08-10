@@ -35,7 +35,7 @@ Comma- or space-separated terms:
 
 Groups: `panes` (a running GUI's tabs/panes), `app` (forwarded Wayland
 apps), `term` (headless daemon terminals), `files`, `net` (port
-forwards), `browser` (CDP), `ui`, `core`.
+forwards), `browser` (the `web_*` tools driving the GUI's own browser views), `ui`, `core`.
 
 - Deny is absolute and order-independent; a spec cannot accidentally
   re-enable what it took away.

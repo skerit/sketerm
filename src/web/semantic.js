@@ -246,34 +246,68 @@
     if (title && title.trim()) return title.trim();
     if (role === "document") return (document.title || "").trim();
     if (TEXTY[role]) return textOf(el);
+    // Last resort for custom widgets (a div with role=combobox, a
+    // menu item, a switch): its own short text is what a user reads
+    // off it, and a nameless node is unusable to an agent.
+    if (ownText(el)) {
+        var own = textOf(el);
+        if (own && own.length <= 120) return own;
+    }
     return "";
   }
 
+  // A password's CURRENT VALUE never leaves the page: the agent-facing
+  // answer is its length, which is all a "did the fill land" check
+  // needs (the old browser_form_state made the same call).
   function valueOf(el) {
     var tag = el.tagName;
     if (tag === "INPUT") {
       var t = (el.getAttribute("type") || "text").toLowerCase();
       if (t === "checkbox" || t === "radio") return "";
+      if (t === "password") {
+        var n = String(el.value || "").length;
+        return n ? "(" + n + " chars)" : "";
+      }
       return String(el.value || "").slice(0, VALUE_CLAMP);
     }
     if (tag === "TEXTAREA") return String(el.value || "").slice(0, VALUE_CLAMP);
     if (tag === "SELECT") return String(el.value || "").slice(0, VALUE_CLAMP);
     if (tag === "PROGRESS" || tag === "METER") return String(el.value);
+    var vn = el.getAttribute && el.getAttribute("aria-valuenow");
+    if (vn) return String(vn).slice(0, VALUE_CLAMP);
     return "";
+  }
+
+  // Form-validation state travels in `states`, so one snapshot answers
+  // what the old browser_form_state tool answered: required, invalid,
+  // checked, disabled -- plus the ARIA spellings custom controls use,
+  // since a div-based widget has none of the DOM properties.
+  function aria(el, name) {
+    return (el.getAttribute && el.getAttribute(name)) || "";
+  }
+
+  function invalidOf(el) {
+    if (aria(el, "aria-invalid") === "true") return true;
+    try {
+      if (el.willValidate && el.validity && el.validity.valid === false) return true;
+    } catch (e) {}
+    return false;
   }
 
   function statesOf(el) {
     var out = [];
     if (document.activeElement === el) out.push("focused");
-    if (el.disabled) out.push("disabled");
-    if (el.checked) out.push("checked");
-    if (el.readOnly) out.push("readonly");
-    if (el.required) out.push("required");
-    if (el.selected) out.push("selected");
-    var exp = el.getAttribute && el.getAttribute("aria-expanded");
+    if (el.disabled || aria(el, "aria-disabled") === "true") out.push("disabled");
+    if (el.checked || aria(el, "aria-checked") === "true") out.push("checked");
+    if (aria(el, "aria-checked") === "mixed") out.push("mixed");
+    if (el.readOnly || aria(el, "aria-readonly") === "true") out.push("readonly");
+    if (el.required || aria(el, "aria-required") === "true") out.push("required");
+    if (el.selected || aria(el, "aria-selected") === "true") out.push("selected");
+    if (invalidOf(el)) out.push("invalid");
+    var exp = aria(el, "aria-expanded");
     if (exp === "true") out.push("expanded");
     if (exp === "false") out.push("collapsed");
-    var cur = el.getAttribute && el.getAttribute("aria-current");
+    var cur = aria(el, "aria-current");
     if (cur && cur !== "false") out.push("current");
     return out.join(",");
   }
@@ -323,8 +357,18 @@
       return id;
     }
 
+    // Open shadow roots are walked as part of the tree: a custom
+    // element's real controls live there, and a walk that stopped at
+    // the host would report a page of empty <pl-input> boxes.
     function descend(el, parent, depth) {
       if (out.length >= MAX_NODES || depth > 64) return;
+      var root = el.shadowRoot;
+      if (root && root.children) {
+        for (var s = 0; s < root.children.length; s++) {
+          visit(root.children[s], parent, depth + 1);
+          if (out.length >= MAX_NODES) return;
+        }
+      }
       for (var i = 0; i < el.children.length; i++) {
         visit(el.children[i], parent, depth + 1);
         if (out.length >= MAX_NODES) return;
@@ -429,12 +473,214 @@
     return !!TYPEABLE[t];
   }
 
+  // -- dropdowns (native <select> AND ARIA/custom listboxes) ----------
+  //
+  // Carries over what browser_choose did: a native select is picked by
+  // option TEXT or value, and a custom dropdown is opened with a
+  // trusted click (synthesized helper-side from the rect this file
+  // reports), its appearing [role=option] items polled for through open
+  // shadow roots, and the match clicked -- also trusted.
+
+  function collectDeep(root, sel, out) {
+    if (!root || !root.querySelectorAll) return;
+    var list = root.querySelectorAll(sel);
+    for (var i = 0; i < list.length; i++) out.push(list[i]);
+    var all = root.querySelectorAll("*");
+    for (var j = 0; j < all.length && out.length < 500; j++) {
+      if (all[j].shadowRoot) collectDeep(all[j].shadowRoot, sel, out);
+    }
+  }
+
+  function deepAll(sel) {
+    var out = [];
+    collectDeep(document, sel, out);
+    return out;
+  }
+
+  function norm(s) {
+    return String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  // Exact (case-insensitive) wins over prefix, prefix over substring:
+  // "Belgium" must not be beaten by "Belgium (BE) - shipping".
+  function bestMatch(items, want, textOf2) {
+    var w = norm(want);
+    if (!w) return null;
+    var pref = null;
+    var sub = null;
+    for (var i = 0; i < items.length; i++) {
+      var t = norm(textOf2(items[i]));
+      if (!t) continue;
+      if (t === w) return items[i];
+      if (!pref && t.indexOf(w) === 0) pref = items[i];
+      if (!sub && t.indexOf(w) >= 0) sub = items[i];
+    }
+    return pref || sub;
+  }
+
+  function optionTexts(items, cap) {
+    var out = [];
+    for (var i = 0; i < items.length && out.length < cap; i++) {
+      var t = textOf(items[i]) || items[i].getAttribute("aria-label") || "";
+      if (t) out.push(t.slice(0, 60));
+    }
+    return out;
+  }
+
+  function nativeSelect(el) {
+    if (el.tagName === "SELECT") return el;
+    if (el.shadowRoot && el.shadowRoot.querySelector) return el.shadowRoot.querySelector("select");
+    return null;
+  }
+
+  function chooseNative(req, sel, arg) {
+    var opts = [];
+    for (var i = 0; i < sel.options.length; i++) opts.push(sel.options[i]);
+    var hit =
+      bestMatch(opts, arg, function (o) {
+        return o.textContent;
+      }) ||
+      bestMatch(opts, arg, function (o) {
+        return o.value;
+      });
+    if (!hit) {
+      return send({
+        op: "setvalue",
+        req: req,
+        ok: 0,
+        typeable: 0,
+        msg: 'no option matches "' + arg + '"; visible options: ' + optionTexts(opts, 12).join(" | ")
+      });
+    }
+    try {
+      sel.focus();
+      sel.selectedIndex = hit.index;
+      sel.dispatchEvent(new Event("input", { bubbles: true }));
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) {
+      return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: String(e) });
+    }
+    send({
+      op: "setvalue",
+      req: req,
+      ok: 1,
+      typeable: 0,
+      msg:
+        'selected "' +
+        String(hit.textContent).replace(/\s+/g, " ").trim() +
+        '" (value "' +
+        hit.value +
+        '") in a native <select>'
+    });
+  }
+
+  // A control that opens a popup list rather than holding a value.
+  function listish(el) {
+    var r = norm(aria(el, "role"));
+    if (r === "combobox" || r === "listbox" || r === "menu" || r === "select") return true;
+    if (aria(el, "aria-haspopup")) return true;
+    if (el.getAttribute && el.hasAttribute("aria-expanded")) return true;
+    if (aria(el, "aria-controls") || aria(el, "aria-owns")) return true;
+    return false;
+  }
+
+  var OPTION_SEL = "[role=option],[role=menuitem],[role=menuitemradio],option,li[role]";
+
+  function visibleOptions() {
+    var all = deepAll(OPTION_SEL);
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (hidden(el)) continue;
+      var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  function optionText(el) {
+    return el.getAttribute("aria-label") || textOf(el) || el.getAttribute("data-value") || el.value || "";
+  }
+
+  // Poll for the options to appear: a custom dropdown animates open,
+  // so the first look after the click routinely sees nothing.
+  function pickOption(req, arg, budget) {
+    var deadline = Date.now() + (budget || 4000);
+    function attempt() {
+      var opts = visibleOptions();
+      var hit = bestMatch(opts, arg, optionText);
+      if (hit) {
+        try {
+          hit.scrollIntoView({ block: "center", inline: "center" });
+        } catch (e) {}
+        var r = hit.getBoundingClientRect();
+        return send({
+          op: "optrect",
+          req: req,
+          ok: 1,
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          text: String(optionText(hit)).replace(/\s+/g, " ").trim().slice(0, 120)
+        });
+      }
+      if (Date.now() < deadline) return setTimeout(attempt, 100);
+      send({
+        op: "optrect",
+        req: req,
+        ok: 0,
+        x: 0,
+        y: 0,
+        text: "",
+        seen: optionTexts(visibleOptions(), 12).join(" | ")
+      });
+    }
+    attempt();
+  }
+
+  // What the control reads as after a pick, for the act result.
+  function controlState(req, eid) {
+    var el = elFor(eid);
+    if (!el) return send({ op: "ack", req: req, ok: 1, msg: "" });
+    var v = valueOf(el);
+    if (!v) {
+      var owned = aria(el, "aria-activedescendant");
+      if (owned) {
+        var t = document.getElementById(owned);
+        if (t) v = textOf(t);
+      }
+    }
+    if (!v) v = textOf(el).slice(0, 120);
+    send({ op: "ack", req: req, ok: 1, msg: String(v).slice(0, 200) });
+  }
+
   function setValue(req, eid, arg) {
     var el = elFor(eid);
     if (!el) return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: "unknown id" });
     try {
       el.scrollIntoView({ block: "center", inline: "center" });
     } catch (e) {}
+    // A native select -- including one inside a custom element's open
+    // shadow root -- is picked by option text or value.
+    var sel = nativeSelect(el);
+    if (sel) return chooseNative(req, sel, arg);
+    if (!typeable(el) && listish(el)) {
+      var r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) {
+        return send({ op: "setvalue", req: req, ok: 0, typeable: 0, msg: "dropdown has no box to click" });
+      }
+      // The helper clicks HERE (trusted), then asks for the option.
+      return send({
+        op: "setvalue",
+        req: req,
+        ok: 1,
+        typeable: 0,
+        custom: 1,
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        msg: "custom dropdown"
+      });
+    }
     if (typeable(el)) {
       // The helper types the characters as real key events; all this
       // side does is focus and select what is there to be replaced.
@@ -585,6 +831,166 @@
     send({ op: "markdown", req: req, url: String(location.href), md: out.join("\n\n") + "\n" });
   }
 
+  // -- script evaluation ------------------------------------------------
+  //
+  // The escape hatch. Everything here degrades rather than fails: a
+  // getter that throws, a cyclic object, a function, `undefined` -- all
+  // become a described placeholder, because a caller debugging a page
+  // needs an answer far more than it needs a clean type.
+
+  var EVAL_MAXSTR = 4000;
+  var EVAL_MAXITEMS = 200;
+  var EVAL_MAXDEPTH = 6;
+
+  function nodeRef(el) {
+    var role = roleOf(el);
+    var known = ids.get(el);
+    // Only an id the CURRENT walk emitted can be fed back to web_act;
+    // eid 0 tells the helper to answer semantic_id null.
+    if (!known || !byId.has(known)) known = 0;
+    return { __kind: "node", eid: known, role: role, name: String(nameOf(el, role) || "").slice(0, 200) };
+  }
+
+  function encodeVal(v, depth, seen) {
+    var t = typeof v;
+    if (v === undefined) return { __kind: "undefined" };
+    if (v === null) return null;
+    if (t === "boolean") return v;
+    if (t === "number") return isFinite(v) ? v : { __kind: "number", text: String(v) };
+    if (t === "string") return v.length > EVAL_MAXSTR ? v.slice(0, EVAL_MAXSTR) : v;
+    if (t === "bigint") return { __kind: "bigint", text: String(v) };
+    if (t === "symbol") return { __kind: "symbol", text: String(v) };
+    if (t === "function") return { __kind: "function", name: String(v.name || "(anonymous)") };
+    if (t !== "object") return { __kind: "unknown", text: String(t) };
+    for (var s = 0; s < seen.length; s++) if (seen[s] === v) return { __kind: "cyclic" };
+    if (depth >= EVAL_MAXDEPTH) return { __kind: "truncated", note: "max depth " + EVAL_MAXDEPTH };
+    try {
+      if (v.nodeType === 1) return nodeRef(v);
+      if (v.nodeType) return { __kind: "node", node_type: v.nodeType, text: String(v.nodeValue || "").slice(0, 200) };
+      if (v instanceof Error) {
+        return { __kind: "error", message: String(v.message || v), stack: String(v.stack || "") };
+      }
+      if (v instanceof Date) return { __kind: "date", text: v.toISOString() };
+      if (v instanceof RegExp) return { __kind: "regexp", text: String(v) };
+    } catch (e) {}
+    seen.push(v);
+    try {
+      var arrayish =
+        Object.prototype.toString.call(v) === "[object Array]" ||
+        (typeof v.length === "number" && typeof v.item === "function");
+      if (arrayish) {
+        var arr = [];
+        var n = Math.min(v.length, EVAL_MAXITEMS);
+        for (var i = 0; i < n; i++) {
+          try {
+            arr.push(encodeVal(v[i], depth + 1, seen));
+          } catch (e2) {
+            arr.push({ __kind: "throwing", text: String(e2) });
+          }
+        }
+        if (v.length > n) arr.push({ __kind: "truncated", note: v.length - n + " more items" });
+        return arr;
+      }
+      var obj = {};
+      var keys;
+      try {
+        keys = Object.keys(v);
+      } catch (e3) {
+        keys = [];
+      }
+      var kn = Math.min(keys.length, EVAL_MAXITEMS);
+      for (var k = 0; k < kn; k++) {
+        try {
+          obj[keys[k]] = encodeVal(v[keys[k]], depth + 1, seen);
+        } catch (e4) {
+          obj[keys[k]] = { __kind: "throwing", text: String(e4) };
+        }
+      }
+      if (keys.length > kn) obj.__truncated = keys.length - kn + " more keys";
+      if (kn === 0 && keys.length === 0) {
+        var tag = Object.prototype.toString.call(v);
+        if (tag !== "[object Object]") return { __kind: "opaque", text: tag };
+      }
+      return obj;
+    } finally {
+      seen.pop();
+    }
+  }
+
+  function evalJson(payload) {
+    try {
+      return stringify(payload);
+    } catch (e) {
+      return '{"value":{"__kind":"unserializable","text":' + stringify(String(e)) + "}}";
+    }
+  }
+
+  function sendEvalOk(req, v) {
+    var body;
+    try {
+      body = { value: encodeVal(v, 0, []) };
+    } catch (e) {
+      body = { value: { __kind: "unserializable", text: String(e) } };
+    }
+    send({ op: "eval", req: req, ok: 1, json: evalJson(body) });
+  }
+
+  function sendEvalErr(req, e, note) {
+    var msg = "";
+    var stack = "";
+    try {
+      msg = String((e && e.message) || e);
+      stack = String((e && e.stack) || "");
+    } catch (e2) {
+      msg = "non-reportable exception";
+    }
+    send({
+      op: "eval",
+      req: req,
+      ok: 0,
+      json: evalJson({ error: msg, stack: stack.slice(0, 4000), note: note || "" })
+    });
+  }
+
+  function evaluate(req, code, wantAwait, timeout) {
+    var v;
+    try {
+      // Indirect eval: global scope, so `var` declarations and function
+      // hoisting behave the way a console user expects.
+      v = (0, eval)(code);
+    } catch (e) {
+      return sendEvalErr(req, e, "thrown while evaluating");
+    }
+    if (!wantAwait || !v || typeof v.then !== "function") return sendEvalOk(req, v);
+    var done = false;
+    var timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      sendEvalErr(req, new Error("await timed out after " + timeout + "ms"), "the promise never settled");
+    }, timeout);
+    try {
+      v.then(
+        function (r) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          sendEvalOk(req, r);
+        },
+        function (e) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          sendEvalErr(req, e, "the promise rejected");
+        }
+      );
+    } catch (e3) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sendEvalErr(req, e3, "thenable refused a callback");
+    }
+  }
+
   // -- command entry point ---------------------------------------------
 
   function handle(json) {
@@ -619,6 +1025,15 @@
         break;
       case "read":
         read(m.req);
+        break;
+      case "pickoption":
+        pickOption(m.req, m.arg || "", m.timeout || 4000);
+        break;
+      case "chosen":
+        controlState(m.req, m.eid);
+        break;
+      case "eval":
+        evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000);
         break;
       default:
         break;

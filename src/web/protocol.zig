@@ -68,6 +68,8 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
+    sem_eval = 0xA0,
+    sem_eval_result = 0xA1,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -479,6 +481,32 @@ pub const SemReadResult = struct {
     markdown: Text,
 };
 
+// -- script evaluation (0xA0 block, capability "semantic") ------------
+
+/// Evaluate `code` in the view's main frame. `flags` bit 0 = resolve a
+/// returned promise before answering; `timeout_ms` bounds that wait
+/// helper-side so a never-settling promise still produces one reply.
+pub const SemEval = struct {
+    pub const tag: Tag = .sem_eval;
+    view: u32,
+    flags: u8,
+    timeout_ms: u32,
+    code: Text,
+};
+
+/// `flags` bit of `SemEval`: await a thenable result.
+pub const eval_flag_await: u8 = 1;
+
+/// `ok = 0` means the page threw (or the await timed out): `json` is
+/// then `{"error":...,"stack":...}`. Otherwise `json` is the serialized
+/// value, always valid JSON — never raw JS.
+pub const SemEvalResult = struct {
+    pub const tag: Tag = .sem_eval_result;
+    view: u32,
+    ok: u8,
+    json: Text,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -805,6 +833,13 @@ test "round-trip: semantic layer frames" {
     try roundTrip(SemQueryResult, .{ .view = 7, .payload = .{ .s = "query subtree [4]\n" } });
     try roundTrip(SemRead, .{ .view = 7 });
     try roundTrip(SemReadResult, .{ .view = 7, .markdown = .{ .s = "# Heading\n\ntext\n" } });
+    try roundTrip(SemEval, .{
+        .view = 7,
+        .flags = eval_flag_await,
+        .timeout_ms = 5000,
+        .code = .{ .s = "document.title" },
+    });
+    try roundTrip(SemEvalResult, .{ .view = 7, .ok = 1, .json = .{ .s = "{\"value\":\"x\"}" } });
 }
 
 test "a text payload carries more than a str's u16 length" {
