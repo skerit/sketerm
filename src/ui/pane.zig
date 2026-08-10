@@ -223,7 +223,7 @@ pub const Pane = struct {
     panel_deinit: ?*const fn (*anyopaque) void = null,
     panel_focus: ?*const fn (*anyopaque) void = null,
     /// Web face (src/ui/webface.zig): a browser view rendered from the
-    /// `sketerm-web` helper. Same five-pointer contract and two-phase
+    /// `sketerm-webengine` helper. Same five-pointer contract and two-phase
     /// teardown as the editor and panel faces above.
     web_widget: ?*c.GtkWidget = null,
     web_ctx: ?*anyopaque = null,

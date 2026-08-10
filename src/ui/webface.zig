@@ -1,5 +1,5 @@
 //! WebFace — a real browser inside a pane, rendered by the optional
-//! `sketerm-web` helper (src/web/, docs/proposal-browser.md).
+//! `sketerm-webengine` helper (src/web/, docs/proposal-browser.md).
 //!
 //! Two objects live here:
 //!
@@ -56,7 +56,7 @@ const Pane = @import("pane.zig").Pane;
 
 /// Helper binary name, looked up next to our own executable (the
 /// `sketerm-mux` rule) before falling back to a dev build tree.
-const HELPER_NAME = "sketerm-web";
+const HELPER_NAME = "sketerm-webengine";
 
 /// How long the GUI waits for a freshly spawned helper to bind its
 /// socket. CEF's startup (zygote + GPU process) dominates this.
@@ -64,7 +64,7 @@ const CONNECT_INTERVAL_MS: c_uint = 100;
 const CONNECT_MAX_TRIES: u32 = 150;
 
 const MISSING_MSG =
-    \\The browser helper (sketerm-web) is not installed.
+    \\The browser helper (sketerm-webengine) is not installed.
     \\
     \\It is opt-in because it needs a CEF binary distribution:
     \\    zig build fetch-cef
@@ -496,7 +496,7 @@ pub fn client() *Client {
     return &g_client;
 }
 
-/// `sketerm-web` next to our own executable (installed layout and
+/// `sketerm-webengine` next to our own executable (installed layout and
 /// `zig build` trees both), then the dev build tree, then $PATH.
 /// `$SKETERM_WEB_BIN` pins it outright, which is what test rigs use.
 fn findHelperBinary(buf: *[4096:0]u8) ?[*:0]const u8 {

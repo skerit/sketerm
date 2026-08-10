@@ -73,6 +73,13 @@ pub const FILES_TITLE = "Sketerm Files";
 pub const FILES_ICON = "dev.sker.sketerm.files";
 pub const TERMINAL_ICON = "dev.sker.sketerm";
 
+/// Same for the browser identity (`sketerm web` / the `sketerm-web`
+/// hardlink). As with files, a web FACE in a terminal window is
+/// unrelated to this and never sets it.
+var web_identity: bool = false;
+pub const WEB_TITLE = "Sketerm Web";
+pub const WEB_ICON = "dev.sker.sketerm.web";
+
 /// Broadcast typing mode. Off / group / all — Terminator semantics.
 pub const GroupSend = enum { off, group, all };
 
@@ -414,6 +421,12 @@ pub const Window = struct {
         files_identity = true;
     }
 
+    /// Declare this PROCESS the dedicated browser (`sketerm web`).
+    /// Call before the first window; see `web_identity`.
+    pub fn setWebIdentity() void {
+        web_identity = true;
+    }
+
     /// True when this process IS the file manager (`sketerm files`).
     /// Read by the browser chrome for defaults that only make sense
     /// for a dedicated file manager (the places sidebar starts open).
@@ -559,7 +572,7 @@ pub const Window = struct {
             .config = if (config_override) |co| co else Config.load(allocator),
             .is_primary = is_primary,
             .id = next_window_id,
-            .title_base = if (files_identity) FILES_TITLE else "sketerm",
+            .title_base = if (files_identity) FILES_TITLE else if (web_identity) WEB_TITLE else "sketerm",
             .search_bar = search_bar,
             .search_entry = search_entry,
             .search_label = search_label,
@@ -578,9 +591,16 @@ pub const Window = struct {
         // icon name matters on X11 (_NET_WM_ICON); on Wayland the icon
         // follows the app id / prgname main.zig sets, which is why files
         // mode is its own GApplication rather than a window flag.
-        c.gtk_window_set_icon_name(@ptrCast(app_window), if (files_identity) FILES_ICON else TERMINAL_ICON);
+        c.gtk_window_set_icon_name(@ptrCast(app_window), if (files_identity)
+            FILES_ICON
+        else if (web_identity)
+            WEB_ICON
+        else
+            TERMINAL_ICON);
         if (files_identity) {
             c.gtk_window_set_title(@ptrCast(app_window), FILES_TITLE);
+        } else if (web_identity) {
+            c.gtk_window_set_title(@ptrCast(app_window), WEB_TITLE);
         }
 
         // Make this Zig Window reachable from its GtkWindow, so any
@@ -1260,7 +1280,7 @@ pub const Window = struct {
     }
 
     /// New tab whose pane wears the WEB face (src/ui/webface.zig): a
-    /// browser view served by the `sketerm-web` helper. The shell
+    /// browser view served by the `sketerm-webengine` helper. The shell
     /// session underneath stays one toolbar click away, exactly like
     /// the file-browser and editor faces.
     pub fn newWebTab(self: *Window) !void {

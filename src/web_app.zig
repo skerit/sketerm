@@ -35,12 +35,23 @@ pub const Request = struct {
 };
 
 /// Index of the first `sketerm web` argument, or null for another
-/// entry point. Unlike the file manager there is no dedicated binary
-/// name to match: `sketerm-web` is already the CEF helper this face
-/// talks to, so the subcommand word is the only spelling.
+/// entry point. Both spellings count, exactly like the file manager:
+/// the `sketerm-web` identity hardlink (argv0) and the subcommand
+/// word. The CEF helper is `sketerm-webengine` so this name is free.
 pub fn invocationStart(args: []const []const u8) ?usize {
+    if (args.len > 0 and invokedAsWeb(args[0])) return 1;
     if (args.len > 1 and std.mem.eql(u8, args[1], "web")) return 2;
     return null;
+}
+
+/// Whether argv0 is the `sketerm-web` identity hardlink (exact
+/// basename, like the file manager's `sketerm-files`).
+fn invokedAsWeb(argv0: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |s|
+        argv0[s + 1 ..]
+    else
+        argv0;
+    return std.mem.eql(u8, base, "sketerm-web");
 }
 
 /// Collect the addresses of a `sketerm web ...` invocation, or null
@@ -77,6 +88,15 @@ test "invocationStart only matches the web subcommand" {
     try std.testing.expectEqual(@as(?usize, 2), invocationStart(&.{ "/usr/bin/sketerm", "web", "example.com" }));
     try std.testing.expectEqual(@as(?usize, null), invocationStart(&.{ "sketerm", "files" }));
     try std.testing.expectEqual(@as(?usize, null), invocationStart(&.{"sketerm"}));
+}
+
+test "invocationStart matches the sketerm-web identity hardlink" {
+    try std.testing.expectEqual(@as(?usize, 1), invocationStart(&.{"sketerm-web"}));
+    try std.testing.expectEqual(@as(?usize, 1), invocationStart(&.{ "/usr/bin/sketerm-web", "example.com" }));
+    // Only the exact basename counts; the CEF helper rename must never
+    // be picked up, and neither must arbitrary prefixes.
+    try std.testing.expectEqual(@as(?usize, null), invocationStart(&.{"sketerm-webengine"}));
+    try std.testing.expectEqual(@as(?usize, null), invocationStart(&.{"my-sketerm-web-thing"}));
 }
 
 test "collect keeps positional urls in order and skips flags" {

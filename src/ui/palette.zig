@@ -112,7 +112,7 @@ const ENTRIES = [_]Entry{
     .{ .icon = "view-dual-symbolic", .title = "New Browser Pane (Split)",
        .desc = "Add a browser pane beside this one. Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
     .{ .icon = "web-browser-symbolic", .title = "New Web Tab",
-       .desc = "Open a web page in a pane (needs the opt-in sketerm-web helper: zig build fetch-cef && zig build web).", .action = .new_web_tab },
+       .desc = "Open a web page in a pane (needs the opt-in browser helper: zig build fetch-cef && zig build web).", .action = .new_web_tab },
     .{ .icon = "web-browser-symbolic", .title = "New Web Pane (Split)",
        .desc = "Add a web pane beside this one; the pane's shell stays one click away.", .action = .new_web_split },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",

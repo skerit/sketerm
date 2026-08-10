@@ -169,7 +169,7 @@ pub const Action = enum {
     /// how a dual-pane source/target layout is created.
     new_browser_split,
     /// Open a web tab (src/ui/webface.zig): a shell pane wearing the
-    /// browser-engine face served by the `sketerm-web` helper.
+    /// browser-engine face served by the `sketerm-webengine` helper.
     new_web_tab,
     /// Split the focused pane and give the new pane a web face.
     new_web_split,

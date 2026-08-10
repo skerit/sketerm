@@ -2,9 +2,9 @@
 Type=Application
 Name=Sketerm Web
 GenericName=Web Browser
-Comment=Web pages in sketerm tabs, rendered by the sketerm-web helper
-TryExec=sketerm
-Exec=sketerm web %U
+Comment=Web pages in sketerm tabs, rendered by an embedded Chromium engine
+TryExec=sketerm-web
+Exec=sketerm-web %U
 Icon=dev.sker.sketerm.web
 Categories=Network;WebBrowser;
 MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;application/xhtml+xml;
@@ -16,4 +16,4 @@ Actions=new-window;
 
 [Desktop Action new-window]
 Name=New Window
-Exec=sketerm web
+Exec=sketerm-web

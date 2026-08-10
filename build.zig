@@ -159,6 +159,11 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(
         &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-editor" }).step,
     );
+    // The browser identity is `sketerm-web`; the CEF helper it drives is
+    // `sketerm-webengine` precisely so this name stays free for it.
+    b.getInstallStep().dependOn(
+        &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-web" }).step,
+    );
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -939,7 +944,12 @@ pub fn build(b: *std.Build) void {
 /// Bumping CEF is this one line plus a `zig build fetch-cef`.
 const CEF_VERSION = "151.3.16+gbe1e15d+chromium-151.0.7922.109";
 
-/// Register the optional CEF acquisition step and the `sketerm-web`
+/// SHA-256 of the linux64 "minimal" tarball for CEF_VERSION, checked
+/// after download. Cross-checked once against the SHA-1 the CDN's
+/// index.json publishes for the same file; bump both together.
+const CEF_SHA256 = "eaeb313e6039de464855893d287c4d5eb4ec7126978ea83c6164bf4a23dc017a";
+
+/// Register the optional CEF acquisition step and the `sketerm-webengine`
 /// helper it feeds.
 ///
 /// Two hard rules shape this function. (1) A plain `zig build` must
@@ -971,9 +981,24 @@ fn addCef(
     const cef_root = b.option(
         []const u8,
         "cef-root",
-        "unpacked CEF binary distribution to build sketerm-web against (default: $XDG_CACHE_HOME/sketerm/cef/<pinned version>)",
+        "unpacked CEF binary distribution to build sketerm-webengine against (default: $XDG_CACHE_HOME/sketerm/cef/<pinned version>)",
     ) orelse default_root;
-    const release_dir = b.fmt("{s}/Release", .{cef_root});
+    // A downloaded distribution keeps headers and libraries in one
+    // tree (<root>/include, <root>/Release); a DISTRO-PACKAGED CEF
+    // splits them (/usr/include/cef, /usr/lib/cef). Both are supported
+    // by overriding the two halves independently — which is how the
+    // Arch package builds against `cef` instead of shipping 300MB of
+    // its own Chromium.
+    const include_root = b.option(
+        []const u8,
+        "cef-include",
+        "directory whose include/capi/*.h are the CEF headers (default: <cef-root>)",
+    ) orelse cef_root;
+    const release_dir = b.option(
+        []const u8,
+        "cef-lib",
+        "directory holding libcef.so and its .pak/icudtl.dat siblings (default: <cef-root>/Release)",
+    ) orelse b.fmt("{s}/Release", .{cef_root});
 
     // `+` is not URL-safe in a path segment; the CDN serves the encoded
     // form. Everything else in a CEF version string already is.
@@ -1008,6 +1033,10 @@ fn addCef(
         \\mkdir -p "$tmp"
         \\echo "cef: downloading $url"
         \\curl -fL --retry 3 -o "$tmp/cef.tar.bz2" "$url"
+        \\echo "$3  $tmp/cef.tar.bz2" | sha256sum -c - >/dev/null || {
+        \\  echo "cef: SHA-256 mismatch, refusing to unpack" >&2
+        \\  rm -rf "$tmp"; exit 1
+        \\}
         \\tar -xjf "$tmp/cef.tar.bz2" -C "$tmp" --strip-components=1
         \\rm -f "$tmp/cef.tar.bz2"
         \\# icudtl.dat, the .pak files and locales/ are looked up NEXT TO
@@ -1023,23 +1052,28 @@ fn addCef(
     });
     fetch.addArg(cef_root);
     fetch.addArg(url);
+    fetch.addArg(CEF_SHA256);
     // Produces no build output the graph can hash; without this the Run
     // step would be cached away and a deleted cache never re-fetched.
     fetch.has_side_effects = true;
     const fetch_step = b.step("fetch-cef", b.fmt("Download the pinned CEF binary distribution ({s}) into the build cache", .{CEF_VERSION}));
     fetch_step.dependOn(&fetch.step);
 
-    const web_step = b.step("web", "Build sketerm-web, the CEF browser helper (needs `zig build fetch-cef`)");
-    const smoke_web_step = b.step("smoke-web", "sketerm-web browser-helper end-to-end smoke (headless)");
+    const web_step = b.step("web", "Build sketerm-webengine, the CEF browser helper (needs `zig build fetch-cef`)");
+    const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
 
+    // Probe the two halves separately: a split system install has no
+    // Release dir at all, and a header-only hit would fail at link.
     const have_cef = blk: {
-        std.Io.Dir.accessAbsolute(b.graph.io, release_dir, .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/libcef.so", .{release_dir}), .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/include/capi/cef_app_capi.h", .{include_root}), .{}) catch break :blk false;
         break :blk true;
     };
     if (!have_cef) {
         const missing = b.addFail(b.fmt(
-            "no CEF binary distribution at {s} — run `zig build fetch-cef` (or pass -Dcef-root=<path>)",
-            .{cef_root},
+            "no usable CEF at {s} (libcef.so) + {s} (headers) — run `zig build fetch-cef`, " ++
+                "or point -Dcef-include=/-Dcef-lib= at a system install (e.g. /usr/include/cef and /usr/lib/cef)",
+            .{ release_dir, include_root },
         ));
         web_step.dependOn(&missing.step);
         smoke_web_step.dependOn(&missing.step);
@@ -1056,7 +1090,7 @@ fn addCef(
         .optimize = optimize,
         .link_libc = true,
     });
-    tc.addIncludePath(.{ .cwd_relative = cef_root });
+    tc.addIncludePath(.{ .cwd_relative = include_root });
     const cef_mod = tc.createModule();
 
     const web_mod = b.createModule(.{
@@ -1075,15 +1109,24 @@ fn addCef(
     // `cef_release_dir` is what the LD_PRELOAD re-exec points at — the
     // helper must preload the SAME libcef.so it linked against, so the
     // path belongs to the build, not to a runtime search.
+    // Where libcef.so will LIVE when the helper runs, which is not
+    // where it lives when the helper links: a package builds against
+    // the cached distribution and ships the runtime under /usr/lib.
+    // Both the rpath and the LD_PRELOAD path follow this one.
+    const runtime_dir = b.option(
+        []const u8,
+        "cef-runtime-dir",
+        "directory holding libcef.so at RUN time (packaging; default: the build-time Release dir)",
+    ) orelse release_dir;
     const web_opts = b.addOptions();
     web_opts.addOption([]const u8, "version", semver);
-    web_opts.addOption([]const u8, "cef_release_dir", release_dir);
+    web_opts.addOption([]const u8, "cef_release_dir", runtime_dir);
     web_mod.addImport("build_options", web_opts.createModule());
     web_mod.addLibraryPath(.{ .cwd_relative = release_dir });
     web_mod.linkSystemLibrary("cef", .{});
     // libcef.so is not on the loader's search path; the helper is not
     // relocatable anyway (it needs the .pak/icudtl.dat next to the lib).
-    web_mod.addRPath(.{ .cwd_relative = release_dir });
+    web_mod.addRPath(.{ .cwd_relative = runtime_dir });
     // KNOWN CONSTRAINT, harmless for this stub: Zig emits libc BEFORE
     // libcef in DT_NEEDED no matter the CLI order, and libcef's zygote
     // resolves dlsym(RTLD_NEXT, "close") — which then misses and aborts
@@ -1093,7 +1136,11 @@ fn addCef(
     // LD_PRELOAD=<Release>/libcef.so to fix the resolution order;
     // implementation comes with the helper.
     const web_exe = b.addExecutable(.{
-        .name = "sketerm-web",
+        // "sketerm-webengine", not "sketerm-web": the latter is the
+        // GUI's identity hardlink (Plasma groups taskbar entries by
+        // process, so `sketerm web` needs a distinct argv0 like
+        // `sketerm-files` has). The engine helper is internal.
+        .name = "sketerm-webengine",
         .root_module = web_mod,
         .use_lld = use_lld,
     });

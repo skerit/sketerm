@@ -160,7 +160,7 @@ const HELP_TEXT =
     \\                         window of web tabs, one per address, and
     \\                         a blank tab with the address bar focused
     \\                         when no address is given. Needs the
-    \\                         opt-in sketerm-web helper (zig build
+    \\                         opt-in browser helper (zig build
     \\                         fetch-cef && zig build web); without it
     \\                         the window still opens and says so.
     \\  sketerm play <file.cast> Play back an asciicast v2/v3 recording
@@ -521,6 +521,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         g_app.mode = .web;
         g_app.web_request = req;
+        Window.setWebIdentity();
     }
 
     // A leftover local daemon from before a binary upgrade keeps
@@ -660,6 +661,9 @@ fn editorRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?edi
     const args = allocator.alloc([]const u8, argv.len) catch return null;
     defer allocator.free(args);
     for (argv, 0..) |a, n| args[n] = std.mem.span(a);
+    // Same first-word-wins rule the file manager applies: under the
+    // `sketerm-web` identity, `edit` is a URL to open, not a mode.
+    if (web_app.invocationStart(args) != null) return null;
     var cwd_buf: [4096:0]u8 = undefined;
     const cwd: ?[]const u8 = if (c.getcwd(&cwd_buf, cwd_buf.len) != null)
         std.mem.span(@as([*:0]const u8, &cwd_buf))
@@ -681,6 +685,7 @@ fn viewerRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool
     const args = allocator.alloc([]const u8, argv.len) catch return false;
     defer allocator.free(args);
     for (argv, 0..) |arg, index| args[index] = std.mem.span(arg);
+    if (web_app.invocationStart(args) != null) return false;
     return viewer.invocationStart(args) != null;
 }
 
