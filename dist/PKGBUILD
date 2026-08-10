@@ -110,6 +110,11 @@ package() {
         "$pkgdir/usr/share/applications/dev.sker.sketerm.viewer.desktop"
     install -Dm644 data/dev.sker.sketerm.editor.desktop \
         "$pkgdir/usr/share/applications/dev.sker.sketerm.editor.desktop"
+    # Web mode has no dedicated binary name: `sketerm-web` is already
+    # the CEF helper, so this entry launches the subcommand and the
+    # GApplication id alone carries the identity.
+    install -Dm644 data/dev.sker.sketerm.web.desktop \
+        "$pkgdir/usr/share/applications/dev.sker.sketerm.web.desktop"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
 
@@ -121,6 +126,8 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.viewer.svg"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.editor.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.editor.svg"
+    install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.web.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.web.svg"
 
     # Bundled symbolic action icons (split left/right + top/bottom for
     # the context menu; rendering for the prefs page; terminal for the

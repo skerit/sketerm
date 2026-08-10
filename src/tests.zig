@@ -60,6 +60,7 @@ comptime {
     _ = @import("layout.zig");
     _ = @import("viewer.zig");
     _ = @import("editor_app.zig");
+    _ = @import("web_app.zig");
     _ = @import("shader_preset.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");

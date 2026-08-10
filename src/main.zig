@@ -27,9 +27,10 @@ const FILES_ID_SUFFIX = ".files";
 const VERSION = @import("version.zig").string;
 const files_entry = @import("filebrowser/entry.zig");
 const editor_app = @import("editor_app.zig");
+const web_app = @import("web_app.zig");
 
 const App = struct {
-    const Mode = enum { terminal, files, viewer, editor };
+    const Mode = enum { terminal, files, viewer, editor, web };
 
     allocator: std.mem.Allocator,
     /// The PRIMARY window of this process: it owns the control socket,
@@ -60,6 +61,8 @@ const App = struct {
     /// Documents (and optional caret) for the next standalone Editor
     /// window.
     editor_request: ?editor_app.Request = null,
+    /// Addresses for the next standalone Web window.
+    web_request: ?web_app.Request = null,
 };
 
 const HELP_TEXT =
@@ -151,6 +154,15 @@ const HELP_TEXT =
     \\                         in (--here) or a new tab of that pane's
     \\                         window (--tab), like `sketerm files`.
     \\                         Needs to be run from inside a pane.
+    \\  sketerm web [urls...]  Web browser as its OWN application
+    \\                         ("Sketerm Web", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.web): opens a
+    \\                         window of web tabs, one per address, and
+    \\                         a blank tab with the address bar focused
+    \\                         when no address is given. Needs the
+    \\                         opt-in sketerm-web helper (zig build
+    \\                         fetch-cef && zig build web); without it
+    \\                         the window still opens and says so.
     \\  sketerm play <file.cast> Play back an asciicast v2/v3 recording
     \\                         in a terminal-rendered window with a
     \\                         transport bar (pause/seek/speed).
@@ -496,6 +508,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         g_app.mode = .viewer;
     }
 
+    // `sketerm web [urls...]`: the dedicated browser identity. No
+    // --here/--tab twin — the palette's new_web_tab/new_web_split
+    // already put a web face in a terminal window, and this is only a
+    // wrapper around the same face.
+    if (webRequest(allocator, argv)) |parsed| {
+        var req = parsed;
+        if (req.help) {
+            req.deinit();
+            _ = c.fputs(HELP_TEXT, platform.stdout());
+            return 0;
+        }
+        g_app.mode = .web;
+        g_app.web_request = req;
+    }
+
     // A leftover local daemon from before a binary upgrade keeps
     // serving old code to every client forever. At process start —
     // before this GUI spawns any session of its own — a stale AND
@@ -523,7 +550,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var base: []const u8 = std.mem.span(APP_ID);
         if (c.getenv("SKETERM_APP_ID")) |raw| {
             const env = std.mem.span(raw);
-            const longest_suffix = @max(FILES_ID_SUFFIX.len, @max(viewer.ID_SUFFIX.len, editor_app.ID_SUFFIX.len));
+            const longest_suffix = @max(
+                FILES_ID_SUFFIX.len,
+                @max(viewer.ID_SUFFIX.len, @max(editor_app.ID_SUFFIX.len, web_app.ID_SUFFIX.len)),
+            );
             if (env.len > 0 and env.len < app_id_buf.len - longest_suffix) base = env;
         }
         const suffix: []const u8 = switch (g_app.mode) {
@@ -531,6 +561,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .files => FILES_ID_SUFFIX,
             .viewer => viewer.ID_SUFFIX,
             .editor => editor_app.ID_SUFFIX,
+            .web => web_app.ID_SUFFIX,
         };
         const id = std.fmt.bufPrintZ(&app_id_buf, "{s}{s}", .{ base, suffix }) catch break :blk APP_ID;
         break :blk id.ptr;
@@ -545,6 +576,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .files => "Sketerm Files",
         .viewer => viewer.APP_NAME,
         .editor => editor_app.APP_NAME,
+        .web => web_app.APP_NAME,
     });
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
@@ -612,6 +644,10 @@ fn filesRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?file
     const args = allocator.alloc([]const u8, argv.len) catch return null;
     defer allocator.free(args);
     for (argv, 0..) |a, n| args[n] = std.mem.span(a);
+    // `files_entry.parse` accepts a bare `files` ANYWHERE in argv, so a
+    // `sketerm web files` would otherwise start the file manager on top
+    // of the browser identity. The first word wins.
+    if (web_app.invocationStart(args) != null) return null;
     return files_entry.parse(args);
 }
 
@@ -630,6 +666,15 @@ fn editorRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?edi
     else
         null;
     return editor_app.collect(allocator, args, cwd) catch null;
+}
+
+/// Parse argv as a `sketerm web ...` invocation, or null when it is
+/// not one. The caller owns the returned request.
+fn webRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?web_app.Request {
+    const args = allocator.alloc([]const u8, argv.len) catch return null;
+    defer allocator.free(args);
+    for (argv, 0..) |a, n| args[n] = std.mem.span(a);
+    return (web_app.collect(allocator, args) catch null) orelse null;
 }
 
 fn viewerRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool {
@@ -738,6 +783,20 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             c.g_application_command_line_printerr_literal(cmdline, text.ptr);
             return 1;
         };
+    } else if (g_app.mode == .web) {
+        // A forwarded `sketerm web <url>` into the running browser
+        // identity: remember the addresses so activate opens a window
+        // on them. A terminal instance is left alone.
+        const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
+        defer g_app.allocator.free(args);
+        for (0..@intCast(argc)) |index| {
+            const raw = argv_raw[index] orelse break;
+            args[index] = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        }
+        if (web_app.collect(g_app.allocator, args) catch null) |parsed| {
+            if (g_app.web_request) |*old| old.deinit();
+            g_app.web_request = parsed;
+        }
     } else if (g_app.mode == .viewer) {
         const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
         defer g_app.allocator.free(args);
@@ -871,6 +930,11 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
             defer if (reveal) |s| g_app.allocator.free(s);
             _ = primary.openFilesWindow(spec, reveal) catch |err|
                 std.debug.print("sketerm: files window failed: {s}\n", .{@errorName(err)});
+        } else if (g_app.mode == .web) {
+            var req = takeWebRequest();
+            defer req.deinit();
+            _ = primary.openWebWindow(req.urls) catch |err|
+                std.debug.print("sketerm: web window failed: {s}\n", .{@errorName(err)});
         } else {
             _ = primary.openShellWindow() catch |err|
                 std.debug.print("sketerm: window failed: {s}\n", .{@errorName(err)});
@@ -895,14 +959,14 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     // belong to the terminal identity. So files mode neither saves nor
     // restores a layout; its own state (per-folder view memory,
     // registers, saved queries) is the browser's, and persists already.
-    window.save_on_close = !g_app.no_save and g_app.mode != .files;
+    window.save_on_close = !g_app.no_save and g_app.mode != .files and g_app.mode != .web;
     window.debug_images = g_app.debug_images;
     window.hold_override = g_app.hold;
     g_app.primary = window;
 
     var loaded = false;
-    if (g_app.mode == .files) {
-        // no layout in files mode -- see save_on_close above
+    if (g_app.mode == .files or g_app.mode == .web) {
+        // no layout in files/web mode -- see save_on_close above
     } else if (g_app.layout_path) |path| {
         loaded = window.loadLayoutFromPath(path) catch false;
     } else if (g_app.restore) {
@@ -921,6 +985,14 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         defer if (reveal) |s| g_app.allocator.free(s);
         window.newBrowserTabFromReveal(null, spec, reveal) catch |err| {
             std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    } else if (g_app.mode == .web) {
+        // The web tabs ARE the window's content: no stray shell tab.
+        var req = takeWebRequest();
+        defer req.deinit();
+        window.openWebTabs(req.urls) catch |err| {
+            std.debug.print("sketerm: web tab failed: {s}\n", .{@errorName(err)});
             return;
         };
     } else if (!loaded) {
@@ -946,6 +1018,12 @@ fn takeFilesReveal() ?[]const u8 {
     const value = g_app.files_reveal;
     g_app.files_reveal = null;
     return value;
+}
+
+fn takeWebRequest() web_app.Request {
+    const req = g_app.web_request orelse return web_app.Request.empty(g_app.allocator);
+    g_app.web_request = null;
+    return req;
 }
 
 fn takeEditorRequest() editor_app.Request {
@@ -992,6 +1070,8 @@ fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     freePlaySpecs();
     if (g_app.editor_request) |*req| req.deinit();
     g_app.editor_request = null;
+    if (g_app.web_request) |*req| req.deinit();
+    g_app.web_request = null;
     // The editor owns no panes, no daemon sessions and no layout: its
     // windows tear themselves down through their own destroy handlers.
     if (g_app.mode == .editor) return;

@@ -735,6 +735,13 @@ pub const WebFace = struct {
         c.gtk_widget_set_hexpand(self.entry, 1);
         c.gtk_entry_set_placeholder_text(@ptrCast(self.entry), "Enter an address");
         _ = c.g_signal_connect_data(@ptrCast(self.entry), "activate", @ptrCast(&onEntryActivate), self, null, 0);
+        // `attach` already asks for the blank tab's address bar through
+        // focusCb, but a face built before its window is presented
+        // cannot take focus yet (grab_focus on an unmapped widget is a
+        // no-op) — the first `sketerm web` tab is exactly that case.
+        // Re-asking on map is the fix; the "still blank" test keeps it
+        // from stealing focus from a page later on.
+        _ = c.g_signal_connect_data(@ptrCast(self.entry), "map", @ptrCast(&onEntryMap), self, null, 0);
         self.track(self.entry);
         c.gtk_box_append(@ptrCast(bar), self.entry);
 
@@ -956,7 +963,12 @@ pub const WebFace = struct {
             self.pending_url = null;
         }
         if (self.widgets_dead) return;
-        const z = self.allocator.dupeZ(u8, url) catch return;
+        // A blank page has no address to show: browsers leave the bar
+        // empty there, and writing "about:blank" into the bar of a tab
+        // that opens focused would land the user's typing in front of
+        // it.
+        const shown: []const u8 = if (std.mem.eql(u8, url, "about:blank")) "" else url;
+        const z = self.allocator.dupeZ(u8, shown) catch return;
         defer self.allocator.free(z);
         // Never fight the user's typing: only rewrite an unfocused bar.
         if (c.gtk_widget_has_focus(self.entry) == 0)
@@ -1085,6 +1097,14 @@ pub const WebFace = struct {
         const text = c.gtk_editable_get_text(@ptrCast(self.entry)) orelse return;
         self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(text))));
         _ = c.gtk_widget_grab_focus(self.picture);
+    }
+
+    /// A blank tab's address bar takes focus the moment it can.
+    fn onEntryMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        if (self.widgets_dead) return;
+        if (self.url != null or self.pending_url != null) return;
+        _ = c.gtk_widget_grab_focus(self.entry);
     }
 
     fn onResize(_: ?*c.GtkDrawingArea, w: c_int, h: c_int, user: ?*anyopaque) callconv(.c) void {

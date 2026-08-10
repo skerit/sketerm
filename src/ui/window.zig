@@ -1282,6 +1282,22 @@ pub const Window = struct {
         };
     }
 
+    /// Fill this window with the web tabs a `sketerm web [urls...]`
+    /// invocation asked for: one tab per address, or a single blank tab
+    /// (address entry focused) when none were given.
+    pub fn openWebTabs(self: *Window, urls: []const []u8) !void {
+        if (urls.len == 0) return self.newWebTabAt(null);
+        for (urls) |url| try self.newWebTabAt(url);
+    }
+
+    /// A repeat launch of the browser identity (`sketerm web` again):
+    /// another web window, the way a browser behaves.
+    pub fn openWebWindow(self: *Window, urls: []const []u8) !*Window {
+        const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
+        try win.openWebTabs(urls);
+        return win;
+    }
+
     /// Split the focused pane and give the new pane a web face.
     pub fn newWebSplit(self: *Window, orient: c_uint) !void {
         const before = self.panes.items.len;

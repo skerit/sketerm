@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Sketerm Web</title>
+  <defs>
+    <linearGradient id="bezel" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="globe" x1="64" y1="48" x2="64" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#b8d4fd"/>
+      <stop offset="1" stop-color="#74a0f0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Window body: same bezel as the terminal and files icons -->
+  <rect x="12" y="12" width="104" height="104" rx="20" ry="20" fill="url(#bezel)"/>
+
+  <!-- Title-bar dots -->
+  <circle cx="28" cy="28" r="3.5" fill="#ed5e5e"/>
+  <circle cx="40" cy="28" r="3.5" fill="#f9c74f"/>
+  <circle cx="52" cy="28" r="3.5" fill="#90be6d"/>
+
+  <!-- Globe. Only three graticule strokes: at 16px anything finer
+       turns into noise, while the blue disc still reads. -->
+  <circle cx="64" cy="78" r="30" fill="url(#globe)"/>
+  <g stroke="#2a4a7c" stroke-width="5" fill="none" stroke-linecap="round">
+    <!-- Equator + one northern parallel, chord-clipped to the disc -->
+    <path d="M 37 78 H 91"/>
+    <path d="M 41 62 H 87"/>
+    <!-- Meridian: the ellipse that makes the disc read as a sphere -->
+    <ellipse cx="64" cy="78" rx="12.5" ry="30"/>
+  </g>
+</svg>
