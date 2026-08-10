@@ -924,6 +924,179 @@ pub fn build(b: *std.Build) void {
     });
     const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
     core_test_step.dependOn(&b.addRunArtifact(coretests).step);
+
+    // Optional CEF browser helper — `zig build fetch-cef` / `zig build
+    // web`. Strictly opt-in: nothing below is reachable from the default
+    // step, the binary distribution is never downloaded unless the fetch
+    // step is asked for by name, and the CEF headers are only translated
+    // when that distribution is already on disk.
+    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod);
+}
+
+/// Pinned CEF binary distribution ("minimal" distro, linux64). SINGLE
+/// source of truth: the download URL, the cache directory, the
+/// translated bindings and the linked libcef.so all derive from it.
+/// Bumping CEF is this one line plus a `zig build fetch-cef`.
+const CEF_VERSION = "151.3.16+gbe1e15d+chromium-151.0.7922.109";
+
+/// Register the optional CEF acquisition step and the `sketerm-web`
+/// helper it feeds.
+///
+/// Two hard rules shape this function. (1) A plain `zig build` must
+/// never touch the network nor translate a CEF header, so the only
+/// unconditional work here is a directory `access()` — the download
+/// lives behind `fetch-cef`, and the TranslateC step + executable are
+/// only CONFIGURED when the distribution is already unpacked. (2) When
+/// it is absent, `zig build web` must still exist and say what to run,
+/// which is what the `addFail` branch is for; every other step is
+/// unaffected either way.
+fn addCef(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+    use_lld: bool,
+    core_cbindings_mod: *std.Build.Module,
+) void {
+    // Default cache location, XDG-correct: $XDG_CACHE_HOME/sketerm/cef/
+    // <version>/ (~/.cache/... when unset). Version-scoped so several
+    // pinned distributions can coexist and a bump never half-overwrites
+    // the previous one.
+    const default_root = if (b.graph.environ_map.get("XDG_CACHE_HOME")) |xdg|
+        b.fmt("{s}/sketerm/cef/{s}", .{ xdg, CEF_VERSION })
+    else if (b.graph.environ_map.get("HOME")) |home|
+        b.fmt("{s}/.cache/sketerm/cef/{s}", .{ home, CEF_VERSION })
+    else
+        b.fmt("{s}/.zig-cache/cef/{s}", .{ b.build_root.path orelse ".", CEF_VERSION });
+    const cef_root = b.option(
+        []const u8,
+        "cef-root",
+        "unpacked CEF binary distribution to build sketerm-web against (default: $XDG_CACHE_HOME/sketerm/cef/<pinned version>)",
+    ) orelse default_root;
+    const release_dir = b.fmt("{s}/Release", .{cef_root});
+
+    // `+` is not URL-safe in a path segment; the CDN serves the encoded
+    // form. Everything else in a CEF version string already is.
+    var url_version: std.ArrayList(u8) = .empty;
+    for (CEF_VERSION) |ch| {
+        if (ch == '+') {
+            url_version.appendSlice(b.allocator, "%2B") catch @panic("OOM");
+        } else {
+            url_version.append(b.allocator, ch) catch @panic("OOM");
+        }
+    }
+    const url = b.fmt(
+        "https://cef-builds.spotifycdn.com/cef_binary_{s}_linux64_minimal.tar.bz2",
+        .{url_version.items},
+    );
+
+    // curl + tar rather than Zig code: the fetch is a developer-invoked
+    // one-off, and shelling out keeps resume/retry/decompression out of
+    // build.zig. Unpacks to a sibling `.tmp` and renames, so an aborted
+    // download can never leave a half-distribution that later looks
+    // cached.
+    const fetch = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\root="$1"; url="$2"
+        \\if [ -e "$root/Release/libcef.so" ]; then
+        \\  echo "cef: already present at $root"
+        \\  exit 0
+        \\fi
+        \\tmp="$root.tmp"
+        \\rm -rf "$tmp"
+        \\mkdir -p "$tmp"
+        \\echo "cef: downloading $url"
+        \\curl -fL --retry 3 -o "$tmp/cef.tar.bz2" "$url"
+        \\tar -xjf "$tmp/cef.tar.bz2" -C "$tmp" --strip-components=1
+        \\rm -f "$tmp/cef.tar.bz2"
+        \\# icudtl.dat, the .pak files and locales/ are looked up NEXT TO
+        \\# libcef.so — CefSettings.resources_dir_path does NOT redirect
+        \\# the icudtl probe. Flattening Resources/* into Release/ is the
+        \\# standard CEF deploy layout and is required, not a shortcut.
+        \\cp -a "$tmp/Resources/." "$tmp/Release/"
+        \\rm -rf "$root"
+        \\mv "$tmp" "$root"
+        \\echo "cef: installed at $root"
+        ,
+        "sh",
+    });
+    fetch.addArg(cef_root);
+    fetch.addArg(url);
+    // Produces no build output the graph can hash; without this the Run
+    // step would be cached away and a deleted cache never re-fetched.
+    fetch.has_side_effects = true;
+    const fetch_step = b.step("fetch-cef", b.fmt("Download the pinned CEF binary distribution ({s}) into the build cache", .{CEF_VERSION}));
+    fetch_step.dependOn(&fetch.step);
+
+    const web_step = b.step("web", "Build sketerm-web, the CEF browser helper (needs `zig build fetch-cef`)");
+
+    const have_cef = blk: {
+        std.Io.Dir.accessAbsolute(b.graph.io, release_dir, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!have_cef) {
+        web_step.dependOn(&b.addFail(b.fmt(
+            "no CEF binary distribution at {s} — run `zig build fetch-cef` (or pass -Dcef-root=<path>)",
+            .{cef_root},
+        )).step);
+        return;
+    }
+
+    // The spike proved this header set translates clean, so unlike the
+    // GTK/core roots there is no sed fixup pass here. `-I` is the
+    // distribution root because CEF's headers include each other as
+    // "include/capi/...".
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/cef_root.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tc.addIncludePath(.{ .cwd_relative = cef_root });
+    const cef_mod = tc.createModule();
+
+    const web_mod = b.createModule(.{
+        .root_source_file = b.path("src/web/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    web_mod.addImport("cef", cef_mod);
+    // libc decls only (sockets, poll, mmap): the helper is GTK-free by
+    // the same rule the daemon follows, and the fribidi/stb declarations
+    // this module also carries are never referenced, so nothing extra
+    // links.
+    web_mod.addImport("cbindings", core_cbindings_mod);
+    // `cef_release_dir` is what the LD_PRELOAD re-exec points at — the
+    // helper must preload the SAME libcef.so it linked against, so the
+    // path belongs to the build, not to a runtime search.
+    const web_opts = b.addOptions();
+    web_opts.addOption([]const u8, "version", semver);
+    web_opts.addOption([]const u8, "cef_release_dir", release_dir);
+    web_mod.addImport("build_options", web_opts.createModule());
+    web_mod.addLibraryPath(.{ .cwd_relative = release_dir });
+    web_mod.linkSystemLibrary("cef", .{});
+    // libcef.so is not on the loader's search path; the helper is not
+    // relocatable anyway (it needs the .pak/icudtl.dat next to the lib).
+    web_mod.addRPath(.{ .cwd_relative = release_dir });
+    // KNOWN CONSTRAINT, harmless for this stub: Zig emits libc BEFORE
+    // libcef in DT_NEEDED no matter the CLI order, and libcef's zygote
+    // resolves dlsym(RTLD_NEXT, "close") — which then misses and aborts
+    // with SIGTRAP "close symbol missing". It only bites once a browser
+    // process is actually spawned, so the stub (which merely reads the
+    // API hash) runs fine. The helper will re-exec itself with
+    // LD_PRELOAD=<Release>/libcef.so to fix the resolution order;
+    // implementation comes with the helper.
+    const web_exe = b.addExecutable(.{
+        .name = "sketerm-web",
+        .root_module = web_mod,
+        .use_lld = use_lld,
+    });
+    // Installed by the `web` step only — never by `b.installArtifact`,
+    // which would drag CEF into the default build.
+    web_step.dependOn(&b.addInstallArtifact(web_exe, .{}).step);
 }
 
 /// Set up the out-of-process TranslateC step that turns
