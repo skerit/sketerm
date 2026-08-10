@@ -15611,3 +15611,20 @@ machine-readable panel failure codes (an assistant branching on `error_code`
 is more reliable than one parsing prose; already tested end to end). The
 line between these and the endpoint layer: the cache and the codes have a
 user; the endpoint binding only had a failure mode.
+
+## 2026-08-10: two e2e reds root-caused - one product race, one test geometry
+
+The recurring smoke-e2e failures were not load flake. (1) Real race: the
+deferred window free (gated behind pending page-detach idles) extended the
+window in which the AdwStyleManager theme handler could fire into a
+destroyed secondary window's pane widgets - "GUI stopped serving after a
+secondary window was closed under a theme flip". Fixed structurally:
+`onWindowDestroyed` severs the process-global handlers immediately
+(idempotent with deinit's call), and `onThemeChanged` gained a `destroying`
+guard. (2) Test bug: the pane-face image probe asserted pixels of the LAST
+child in the face's scroller; a short pane plus GTK scroll-to-focus could
+leave it below the fold while decode/install had provably succeeded (traced:
+prepared lease installed, updateOne=true, zero pixels). The stage now puts
+the image first in the column, which is geometry-independent. Neither
+failure was the "known flaky stages" pattern - both attributions were wrong
+and both had real causes.
