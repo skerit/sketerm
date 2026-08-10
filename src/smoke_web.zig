@@ -273,6 +273,7 @@ const Client = struct {
     ack_proto: u32 = 0,
     ack_shm: bool = false,
     ack_semantic: bool = false,
+    ack_dmabuf: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -281,6 +282,15 @@ const Client = struct {
 
     dmg_buf: u32 = 0,
     dmg_seq: u32 = 0,
+
+    /// Last GPU frame and how many arrived. `dma_ids` records the
+    /// DISTINCT pool buffer ids seen, which is how the rig checks that
+    /// the helper reports buffer identity rather than a fresh id per
+    /// paint (the whole point of caching an import).
+    dma: ?proto.FrameDmabuf = null,
+    dma_seq: u32 = 0,
+    dma_ids: [16]u32 = @splat(0),
+    dma_nids: usize = 0,
 
     /// Frame pacing. The helper runs its browsers with external begin
     /// frames, so NOTHING paints unless this rig asks: every wait loop
@@ -398,7 +408,7 @@ const Client = struct {
         const start = nowMs();
         const end = start + duration_ms;
         const req0 = self.req_count;
-        const dmg0 = self.dmg_seq;
+        const dmg0 = self.paintCount();
         const gap: i64 = if (target_fps <= 0) std.math.maxInt(i64) else @divTrunc(1_000_000, target_fps);
         while (nowMs() < end) {
             if (target_fps > 0) self.frameRequest(gap);
@@ -406,9 +416,16 @@ const Client = struct {
         }
         return .{
             .requests = self.req_count - req0,
-            .paints = self.dmg_seq - dmg0,
+            .paints = self.paintCount() - dmg0,
             .ms = nowMs() - start,
         };
+    }
+
+    /// Paints seen on EITHER frame family: the software path reports
+    /// `frame_damage`, the GPU path `frame_dmabuf`, and the pacing
+    /// assertions care only that pixels happened.
+    fn paintCount(self: *const Client) u32 {
+        return self.dmg_seq +% self.dma_seq;
     }
 
     /// Read whatever is available (up to `timeout_ms`) and fold it into
@@ -488,6 +505,7 @@ const Client = struct {
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
                 }
             },
             .frame_buffer => {
@@ -498,6 +516,29 @@ const Client = struct {
                 self.fb_fd = fd;
                 self.fb = fb;
                 self.fb_seq += 1;
+            },
+            .frame_dmabuf => {
+                const f = proto.FrameDmabuf.decodeFrom(frame.payload) catch fail("frame_dmabuf decode");
+                // One descriptor per plane, and each must name a real
+                // object: a frame whose fds do not survive the trip is
+                // a leak on one side and a black pane on the other.
+                var i: usize = 0;
+                while (i < f.nplanes) : (i += 1) {
+                    const fd = self.takeFd();
+                    var st: c.struct_stat = undefined;
+                    if (c.fstat(fd, &st) != 0) fail("frame_dmabuf: a plane descriptor is not a live object");
+                    _ = c.close(fd);
+                }
+                self.dma = f;
+                self.dma_seq += 1;
+                var known = false;
+                for (self.dma_ids[0..self.dma_nids]) |id| {
+                    if (id == f.buf_id) known = true;
+                }
+                if (!known and self.dma_nids < self.dma_ids.len) {
+                    self.dma_ids[self.dma_nids] = f.buf_id;
+                    self.dma_nids += 1;
+                }
             },
             .frame_damage => {
                 const d = proto.FrameDamage.decodeAlloc(frame.payload, self.gpa) catch fail("frame_damage decode");
@@ -804,6 +845,51 @@ fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
     fail("timed out connecting to the helper");
 }
 
+/// Fork+exec one helper. `extra` is a single additional argv entry (the
+/// ozone pin, or "--disable-gpu"), and `no_gpu` sets the environment
+/// switch that makes the helper refuse the GPU path outright.
+fn spawnHelper(
+    exe: [*:0]const u8,
+    sock: [*:0]const u8,
+    cache: [*:0]const u8,
+    extra: ?[*:0]const u8,
+    no_gpu: bool,
+) c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) fail("fork");
+    if (pid != 0) return pid;
+    if (no_gpu) _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+    var vec: [7:null]?[*:0]const u8 = @splat(null);
+    vec[0] = exe;
+    vec[1] = "--socket";
+    vec[2] = sock;
+    vec[3] = "--cache-dir";
+    vec[4] = cache;
+    if (extra) |e| vec[5] = e;
+    _ = c.execv(exe, @ptrCast(@constCast(&vec)));
+    c._exit(127);
+    unreachable;
+}
+
+/// Bring a helper down by EXACT pid after its client disconnected.
+fn reapHelper(pid: c.pid_t, what: []const u8) void {
+    const deadline = nowMs() + 10_000;
+    var status: c_int = 0;
+    while (nowMs() < deadline) {
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
+            g_pid = -1;
+            if (status & 0x7f != 0) {
+                say(what);
+                fail("helper died on a signal");
+            }
+            return;
+        }
+        _ = c.usleep(50_000);
+    }
+    say(what);
+    fail("helper did not exit within 10s of the disconnect");
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
     const argv = init.args.vector;
@@ -830,22 +916,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache", .{dir}) catch fail("cache path");
 
     // ── Spawn the helper ──────────────────────────────────────────
-    const pid = c.fork();
-    if (pid < 0) fail("fork");
-    if (pid == 0) {
-        var vec: [7:null]?[*:0]const u8 = @splat(null);
-        vec[0] = exe;
-        vec[1] = "--socket";
-        vec[2] = sock.ptr;
-        vec[3] = "--cache-dir";
-        vec[4] = cache.ptr;
-        // The helper no longer disables the GPU by itself (that forced
-        // SwiftShader on every visible pane); the rig asks for it so a
-        // CI-ish run rasterizes deterministically in software.
-        vec[5] = "--disable-gpu";
-        _ = c.execv(exe, @ptrCast(@constCast(&vec)));
-        c._exit(127);
-    }
+    //
+    // Pinned to headless software rendering: 22 of the stages below
+    // assert on pixels in the memfd, and the GPU path delivers dma-buf
+    // planes instead. The GPU path gets its own helper in stage 24.
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", false);
     g_pid = pid;
 
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -1458,6 +1533,105 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (status & 0x7f != 0) fail("stage 23 teardown: helper died on a signal");
         if ((status >> 8) & 0xff != 0) fail("stage 23 teardown: helper exited nonzero");
         pass("stage 23 teardown (helper exited 0 on disconnect)");
+    }
+
+    // ── Stage 24: GPU frames, or the fallback that replaces them ───
+    //
+    // A SECOND helper, this time with nothing pinned, so it makes the
+    // same runtime decision the GUI's helper makes: a reachable Wayland
+    // compositor plus a render node buys `--ozone-platform=wayland` and
+    // dma-buf frames, anything else stays headless and software. BOTH
+    // outcomes are asserted here — the point of the stage is that the
+    // client gets working frames either way, which is what a CI box
+    // with no compositor must also prove.
+    {
+        var sock2_buf: [96]u8 = undefined;
+        const sock2 = std.fmt.bufPrintZ(&sock2_buf, "{s}/g.sock", .{dir}) catch fail("socket path");
+        const gpu_pid = spawnHelper(exe, sock2.ptr, cache.ptr, null, false);
+        g_pid = gpu_pid;
+        var gc = Client{ .gpa = gpa, .fd = connectWithRetry(sock2.ptr, sock2.len) };
+        gc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-gpu" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (gc.ack_proto == 0 and nowMs() < deadline) gc.pump(100);
+        }
+        if (gc.ack_proto != proto.PROTO_VERSION) fail("stage 24 gpu: no hello_ack from the auto-mode helper");
+        if (!gc.ack_shm) fail("stage 24 gpu: frames-shm must stay advertised even in GPU mode");
+
+        // 640x480 logical at 1.5 = 960x720 physical, which is also the
+        // scale contract the GPU path has to reproduce THROUGH a
+        // different mechanism (browser zoom instead of the screen
+        // info's device scale factor).
+        gc.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1500, .context = 0 });
+        gc.have_view = true;
+        gc.send(proto.Navigate{ .view = view_id, .url = anim_page });
+        _ = gc.drive(3000, 120);
+        const run = gc.drive(2000, 120);
+
+        if (gc.ack_dmabuf) {
+            std.debug.print(
+                "smoke-web: MEASURED gpu mode: {d} dma-buf frames, {d} memfd frames, {d} distinct pool buffers, fourcc 0x{x} modifier 0x{x} planes {d}\n",
+                .{ gc.dma_seq, gc.dmg_seq, gc.dma_nids, gc.dma.?.fourcc, gc.dma.?.modifier, gc.dma.?.nplanes },
+            );
+            if (gc.dma_seq == 0) fail("stage 24 gpu: frames-dmabuf advertised but no dma-buf frame ever arrived");
+            const f = gc.dma.?;
+            if (f.w != 960 or f.h != 720) {
+                std.debug.print("smoke-web: dma-buf was {d}x{d}\n", .{ f.w, f.h });
+                fail("stage 24 gpu: the GPU frame is not the PHYSICAL size (the scale contract)");
+            }
+            if (f.nplanes == 0 or f.nplanes > proto.MAX_PLANES) fail("stage 24 gpu: implausible plane count");
+            if (f.planes[0].stride < @as(u32, f.w) * 4) fail("stage 24 gpu: plane 0 cannot hold a row of pixels");
+            if (f.fourcc == 0) fail("stage 24 gpu: no DRM format on the wire");
+            if (run.paints == 0) fail("stage 24 gpu: the animating page produced no frames");
+            // Pool identity: several frames out of a handful of
+            // buffers. One id per paint would mean the client cannot
+            // cache its import at all.
+            if (gc.dma_seq > 8 and gc.dma_nids >= gc.dma_seq) {
+                fail("stage 24 gpu: every frame announced a new buffer id, so the pool is not identified");
+            }
+            pass("stage 24 gpu frames (dma-buf planes, physical geometry, identified pool)");
+        } else {
+            if (gc.dma_seq != 0) fail("stage 24 gpu: dma-buf frames without the capability");
+            if (run.paints == 0) fail("stage 24 gpu: no GPU here and the software fallback painted nothing");
+            if (gc.fb == null) fail("stage 24 gpu: the software fallback announced no memfd buffer");
+            if (gc.fb.?.w != 960 or gc.fb.?.h != 720) fail("stage 24 gpu: the fallback buffer is not physical");
+            pass("stage 24 gpu frames (no GPU available: automatic software fallback, memfd frames)");
+        }
+        gc.have_view = false;
+        gc.send(proto.ViewDestroy{ .view = view_id });
+        gc.deinit();
+        reapHelper(gpu_pid, "stage 24 gpu");
+    }
+
+    // ── Stage 25: the GPU path can be refused ─────────────────────
+    //
+    // `SKETERM_WEB_GPU=0` is the escape hatch for a driver quirk no
+    // fallback caught: same binary, same host, no shared textures, no
+    // capability, and the memfd path serving pixels as before.
+    {
+        var sock3_buf: [96]u8 = undefined;
+        const sock3 = std.fmt.bufPrintZ(&sock3_buf, "{s}/s.sock", .{dir}) catch fail("socket path");
+        const sw_pid = spawnHelper(exe, sock3.ptr, cache.ptr, null, true);
+        g_pid = sw_pid;
+        var sc = Client{ .gpa = gpa, .fd = connectWithRetry(sock3.ptr, sock3.len) };
+        sc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-sw" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (sc.ack_proto == 0 and nowMs() < deadline) sc.pump(100);
+        }
+        if (sc.ack_proto != proto.PROTO_VERSION) fail("stage 25 forced software: no hello_ack");
+        if (sc.ack_dmabuf) fail("stage 25 forced software: frames-dmabuf advertised despite SKETERM_WEB_GPU=0");
+        sc.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        sc.have_view = true;
+        sc.send(proto.Navigate{ .view = view_id, .url = red_page });
+        const run = sc.drive(4000, 120);
+        if (sc.dma_seq != 0) fail("stage 25 forced software: a dma-buf frame arrived anyway");
+        if (run.paints == 0 or sc.fb == null) fail("stage 25 forced software: nothing painted into a memfd");
+        pass("stage 25 forced software (no capability, no GPU frames, memfd path intact)");
+        sc.have_view = false;
+        sc.send(proto.ViewDestroy{ .view = view_id });
+        sc.deinit();
+        reapHelper(sw_pid, "stage 25 forced software");
     }
 
     cleanup();

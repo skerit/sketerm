@@ -13,18 +13,37 @@
 //!
 //! ## Rendering
 //!
-//! `frame_buffer` hands over a memfd; we mmap it read-only and keep the
-//! mapping. Every `frame_damage` batch writes ONLY its rects into a
-//! persistent GL texture (`glTexSubImage2D` straight out of the mmap,
-//! `GL_UNPACK_ROW_LENGTH` doing the striding, no staging copy) and asks
-//! the area to redraw.
+//! ONE presentation path, TWO frame families. Both must keep working
+//! for the whole life of a connection — the engine drops from one to the
+//! other on its own when GPU compositing goes away — and both end up as
+//! a texture drawn by `render/web_pass.zig` on the face's own
+//! `GtkGLArea`:
 //!
-//! This replaced a `GtkPicture` fed a fresh `GdkMemoryTexture` over the
-//! WHOLE mapping per batch. That version decoded the damage rects and
-//! threw them away, so every frame cost a full-surface GPU upload plus
-//! a paintable swap: 33 MB at 3840x2160, ~2 GB/s at 60fps, which is
-//! what made the browser single-digit fps on a HiDPI 4K pane. It could
-//! not be fixed CPU-side — the copy was GTK's, not ours.
+//! - GPU (`frame_dmabuf`, cap "frames-dmabuf"): the engine's dma-buf
+//!   planes, imported by `src/ui/webdmabuf.zig` as an EGLImage bound to
+//!   a GL texture IN THIS AREA'S OWN CONTEXT, which `WebPass` then draws
+//!   directly. No pixel ever enters this process and no pixel is ever
+//!   copied. Imports are cached per pool buffer id, so a steady 100fps
+//!   costs two or three imports in total.
+//! - memfd (`frame_buffer` + `frame_damage`, cap "frames-shm"): mmap it
+//!   read-only and keep the mapping; every damage batch writes ONLY its
+//!   rects into a persistent GL texture (`glTexSubImage2D` straight out
+//!   of the mmap, `GL_UNPACK_ROW_LENGTH` doing the striding, no staging
+//!   copy). This is the path X11 sessions, headless runs and any driver
+//!   without dma-buf import take, and it is not a legacy branch.
+//!
+//! Both replaced a `GtkPicture` fed a fresh `GdkMemoryTexture` over the
+//! WHOLE mapping per batch: 33 MB at 3840x2160, ~2 GB/s at 60fps, which
+//! is what made the browser single-digit fps on a HiDPI 4K pane. It
+//! could not be fixed CPU-side — the copy was GTK's, not ours.
+//!
+//! MEASURED at 3840x2160 physical on real GPU hardware. Uploads:
+//! whole-surface rebuild 7.86 ms/frame vs 0.094 ms for a 64x64 damage
+//! rect (84x). End to end, SCROLLING a heavy page — the case that
+//! provoked all of this — memfd 44 fps at 1.93 ms and 1244 MiB/s of
+//! CPU-copied pixels, dma-buf ~100 fps at 0.2 us and ZERO bytes copied,
+//! every frame imported. An animating page: memfd 80 fps at 23 MiB/s,
+//! dma-buf ~100 fps at 0 MiB/s.
 //!
 //! No frame is ever QUEUED. The texture always holds the newest pixels,
 //! so several damage batches arriving between two draws collapse into
@@ -75,11 +94,28 @@
 //! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
 //! aborts if a demoted face somehow kept its tick).
 //!
+//! Client pacing was RE-MEASURED against CEF's own scheduler on both
+//! frame families before the GPU path shipped; `externalPacingWins` in
+//! `src/web/cefhost.zig` carries the table. Short version: the presented
+//! rate is the same either way because the compositor sets it, and
+//! CEF's scheduler simply paints twice as often and throws half of it
+//! away — including into a window the compositor is not presenting at
+//! all, which measured 250 MiB/s of uploads for zero frames on screen —
+//! and it leaves `browser_max_fps` meaning nothing.
+//!
 //! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
-//! delivered frame rate, the time spent here and the bytes actually
-//! uploaded. MEASURED at 3840x2160 on a 60fps animating page whose
-//! spinner damages 64x64: 1787 MiB/s handed to GDK before, 2 MiB/s of
-//! damage rects after.
+//! delivered frame rate, the time spent here, the bytes actually
+//! uploaded, the GPU imports, and the REQUESTS and TICKS behind them.
+//! MEASURED at 3840x2160 on a 60fps animating page whose spinner damages
+//! 64x64: 1787 MiB/s handed to GDK before, 2 MiB/s of damage rects
+//! after, and 0 MiB/s once the frame is a dma-buf import.
+//!
+//! Read the `ticks` number first when the browser looks slow. It is the
+//! rate the COMPOSITOR is willing to present at, and everything else is
+//! capped by it: a window straddling the gap between two monitors gets
+//! zero ticks, and GSK's Vulkan renderer driving a 4K GtkGLArea measured
+//! 11 ticks/s against `ngl`'s 140. Neither is an engine problem and no
+//! engine-side change moves either.
 //!
 //! The helper rewrites the buffer in place, so a rect can be read
 //! half-new: the benign tearing the protocol doc already accepts for
@@ -129,6 +165,7 @@ const pace = @import("../web/pace.zig");
 const clock = @import("../util/clock.zig");
 const gl_mod = @import("../render/gl.zig");
 const WebPass = @import("../render/web_pass.zig").WebPass;
+const webdmabuf = @import("webdmabuf.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// Helper binary name, looked up next to our own executable (the
@@ -163,6 +200,20 @@ const Stats = struct {
     on: bool = false,
     checked: bool = false,
     frames: u32 = 0,
+    /// GPU frames whose dma-buf GDK imported, and those that had to be
+    /// mapped and read by the CPU instead. A nonzero `copies` is the
+    /// visible symptom of a driver that cannot import what the engine
+    /// allocates — the path is still correct, just no longer free.
+    gpu_imports: u32 = 0,
+    gpu_copies: u32 = 0,
+    /// Frame requests sent and frame-clock ticks taken in this window.
+    /// They are what separates "the engine is slow" from "the compositor
+    /// is not running our frame clock" — a pane whose ticks are near
+    /// zero is being throttled by the compositor (occluded, on no
+    /// output, or on a monitor that is asleep) and no engine-side change
+    /// can move it. That distinction cost an evening once.
+    reqs: u32 = 0,
+    ticks: u32 = 0,
     ns_total: u64 = 0,
     ns_max: u64 = 0,
     bytes: u64 = 0,
@@ -199,8 +250,8 @@ const Stats = struct {
         const mbps = @as(f64, @floatFromInt(self.bytes)) * 1e9 /
             @as(f64, @floatFromInt(span)) / (1024.0 * 1024.0);
         std.debug.print(
-            "webface stats: {d:.1} fps, onDamage avg {d:.1} us max {d:.1} us, {d:.0} MiB/s\n",
-            .{ fps, avg_us, @as(f64, @floatFromInt(self.ns_max)) / 1000.0, mbps },
+            "webface stats: {d:.1} fps, frame avg {d:.1} us max {d:.1} us, {d:.0} MiB/s, gpu {d} imported / {d} copied, {d} reqs {d} ticks\n",
+            .{ fps, avg_us, @as(f64, @floatFromInt(self.ns_max)) / 1000.0, mbps, self.gpu_imports, self.gpu_copies, self.reqs, self.ticks },
         );
         self.* = .{ .on = true, .checked = true, .window_start_ns = now };
     }
@@ -568,11 +619,19 @@ pub const Client = struct {
                 if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS and
                     @as(usize, @intCast(hdr.cmsg_len)) >= hdr_size + @sizeOf(c_int))
                 {
-                    var passed: c_int = undefined;
-                    @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size..][0..@sizeOf(c_int)]);
-                    self.fds.append(self.gpa, passed) catch {
-                        _ = c.close(passed);
-                    };
+                    // ONE control message can carry several descriptors:
+                    // a memfd frame attaches one, a dma-buf frame one
+                    // per plane. Reading only the first would leak the
+                    // rest into this process forever.
+                    const bytes = @as(usize, @intCast(hdr.cmsg_len)) - hdr_size;
+                    var off: usize = 0;
+                    while (off + @sizeOf(c_int) <= bytes and hdr_size + off + @sizeOf(c_int) <= cbuf.len) : (off += @sizeOf(c_int)) {
+                        var passed: c_int = undefined;
+                        @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size + off ..][0..@sizeOf(c_int)]);
+                        self.fds.append(self.gpa, passed) catch {
+                            _ = c.close(passed);
+                        };
+                    }
                 }
             }
             self.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch return false;
@@ -602,6 +661,14 @@ pub const Client = struct {
         return fd;
     }
 
+    /// Pop the `n` descriptors a frame announced, into `out`. All or
+    /// nothing: a partial set is a desynchronised stream, not a frame.
+    fn takeFds(self: *Client, n: usize, out: []c_int) ?[]c_int {
+        if (n == 0 or n > out.len or self.fds.items.len < n) return null;
+        for (out[0..n]) |*fd| fd.* = self.fds.orderedRemove(0);
+        return out[0..n];
+    }
+
     fn dispatch(self: *Client, frame: proto.Frame) void {
         switch (frame.tag) {
             .hello_ack => {
@@ -617,6 +684,16 @@ pub const Client = struct {
                     return;
                 };
                 face.adoptBuffer(fb, fd);
+            },
+            .frame_dmabuf => {
+                const f = proto.FrameDmabuf.decodeFrom(frame.payload) catch return;
+                var buf: [proto.MAX_PLANES]c_int = undefined;
+                const fds = self.takeFds(f.nplanes, &buf) orelse return;
+                const face = self.findFace(f.view) orelse {
+                    for (fds) |fd| _ = c.close(fd);
+                    return;
+                };
+                face.onDmabuf(f, fds);
             },
             .frame_damage => {
                 const dmg = proto.FrameDamage.decodeAlloc(frame.payload, self.gpa) catch return;
@@ -811,6 +888,11 @@ pub const WebFace = struct {
     buf_w: u16 = 0,
     buf_h: u16 = 0,
     buf_stride: u32 = 0,
+
+    /// Imported GPU frames, keyed on the helper's pool buffer id. Empty
+    /// on the memfd path and cleared whenever the geometry changes.
+    dmabuf_cache: webdmabuf.Cache = .{},
+    dmabuf_stats: webdmabuf.Stats = .{},
 
     /// Last size handed to the helper, in logical pixels.
     sent_w: u16 = 0,
@@ -1244,13 +1326,27 @@ pub const WebFace = struct {
         self.completeOp(.eval, ev.ok != 0, ev.json.s, .{});
     }
 
-    /// Drop OUR reference to the frame mapping; textures GDK still holds
-    /// keep it alive until their `GBytes` die.
+    /// Drop OUR reference to the frame mapping, and every GPU import
+    /// keyed on the geometry it described.
     fn dropMap(self: *WebFace) void {
         if (self.map_ptr) |ptr| {
             _ = c.munmap(ptr, self.map_len);
             self.map_ptr = null;
             self.map_len = 0;
+        }
+        // GPU frames are keyed on the same geometry: a replaced buffer
+        // retires the imported textures too. Deleting them needs the
+        // area's context; without one they died with it already and
+        // `forgetGL` is what must happen instead.
+        if (self.glReady()) {
+            self.dmabuf_cache.clear();
+            // The imports are gone; what is left to draw is whatever the
+            // memfd path last uploaded, at the geometry it was uploaded
+            // at — which is still the CURRENT one until the lines below
+            // forget it.
+            self.showSoftwareFrame();
+        } else {
+            self.dmabuf_cache.forgetGL();
         }
         self.buf_id = 0;
         self.buf_w = 0;
@@ -1263,6 +1359,7 @@ pub const WebFace = struct {
     fn requestFrame(self: *WebFace) void {
         if (!self.view_live or !self.on_screen) return;
         client().post(proto.FrameRequest{ .view = self.view, .flags = 0 });
+        if (g_stats.enabled()) g_stats.reqs += 1;
         self.pacer.noteRequest(c.g_get_monotonic_time());
     }
 
@@ -1333,6 +1430,7 @@ pub const WebFace = struct {
         if (self.on_screen == on) return;
         self.on_screen = on;
         if (on) {
+            if (paceLogging()) std.debug.print("webface pace: view {d} on screen\n", .{self.view});
             if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
             self.startIdleTimer();
             // A tab coming forward must show its current content at
@@ -1347,14 +1445,44 @@ pub const WebFace = struct {
 
     // ---- device scale ----------------------------------------------
 
-    /// The output's fractional device scale x1000, or the last known one
-    /// while the area has no surface yet.
+    /// The output's fractional device scale x1000.
+    ///
+    /// `gdk_surface_get_scale` is the only source that reports a REAL
+    /// fractional scale (`gtk_widget_get_scale_factor` rounds 1.5 up to
+    /// 2), and it needs a realized surface. Before realize there is
+    /// none, and answering 1.0 there is how the FIRST buffer of every
+    /// browser window came back 2.25x too few pixels on a 1.5x desktop —
+    /// so an unrealized face asks a MONITOR instead, which is the same
+    /// number for the overwhelmingly common single-scale desktop and a
+    /// far better guess than 1.0 for the rest. The surface's own value
+    /// replaces it at realize, `notify::scale` after that.
     fn currentScale(self: *WebFace) u16 {
         if (self.widgets_dead) return self.sent_scale;
-        const native = c.gtk_widget_get_native(self.view_area) orelse return self.sent_scale;
-        const surface = c.gtk_native_get_surface(native) orelse return self.sent_scale;
-        const s = c.gdk_surface_get_scale(surface);
-        if (!(s > 0.0)) return 1000;
+        if (c.gtk_widget_get_native(self.view_area)) |native| {
+            if (c.gtk_native_get_surface(native)) |surface| {
+                const s = c.gdk_surface_get_scale(surface);
+                if (s > 0.0) return clampScale(s);
+            }
+        }
+        return self.monitorScale();
+    }
+
+    /// The scale of a monitor this widget's display actually has, for
+    /// the pre-realize window. Falls back to the last value sent, which
+    /// starts at 1.0 only when the display has no monitor at all.
+    fn monitorScale(self: *WebFace) u16 {
+        const display = c.gtk_widget_get_display(self.view_area) orelse return self.sent_scale;
+        const monitors = c.gdk_display_get_monitors(display) orelse return self.sent_scale;
+        const n = c.g_list_model_get_n_items(monitors);
+        if (n == 0) return self.sent_scale;
+        const item = c.g_list_model_get_item(monitors, 0) orelse return self.sent_scale;
+        defer c.g_object_unref(item);
+        const s = c.gdk_monitor_get_scale(@ptrCast(item));
+        if (!(s > 0.0)) return self.sent_scale;
+        return clampScale(s);
+    }
+
+    fn clampScale(s: f64) u16 {
         return @intFromFloat(std.math.clamp(@round(s * 1000.0), 250.0, 8000.0));
     }
 
@@ -1598,8 +1726,16 @@ pub const WebFace = struct {
     fn ensureView(self: *WebFace) void {
         const cl = client();
         if (cl.state != .ready or self.view_live) return;
-        const w: u16 = if (self.sent_w != 0) self.sent_w else 800;
-        const h: u16 = if (self.sent_h != 0) self.sent_h else 600;
+        // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
+        // CURRENT allocation is the truth whenever it has one; the
+        // 800x600 below is for a face whose widget has never been laid
+        // out at all — an MCP-opened tab nobody selected, which has no
+        // size to be right about but still has to load and answer
+        // semantic queries. `onResize` corrects it the moment such a tab
+        // is shown.
+        const alloc = self.allocationSize();
+        const w: u16 = if (alloc.w != 0) alloc.w else if (self.sent_w != 0) self.sent_w else 800;
+        const h: u16 = if (alloc.h != 0) alloc.h else if (self.sent_h != 0) self.sent_h else 600;
         self.sent_w = w;
         self.sent_h = h;
         self.sent_scale = self.currentScale();
@@ -1627,6 +1763,57 @@ pub const WebFace = struct {
         }
     }
 
+    /// Report a new buffer's geometry against the widget's, under
+    /// `SKETERM_WEB_STATS=1`. Buffers are rare (creation, resize, scale
+    /// change), so this is a handful of lines per session and it is the
+    /// only place the "is the FIRST frame already the right size"
+    /// question is answerable — the defect it exists for corrects itself
+    /// on the next interaction and is invisible afterwards.
+    fn noteBufferGeometry(self: *WebFace, pw: u16, ph: u16) void {
+        if (!g_stats.enabled()) return;
+        const alloc = self.allocationSize();
+        const lw = logicalOf(pw, self.sent_scale);
+        const lh = logicalOf(ph, self.sent_scale);
+        const fits = alloc.w == 0 or (lw == alloc.w and lh == alloc.h);
+        std.debug.print(
+            "webface geometry: buffer {d}x{d} phys = {d}x{d} logical at scale {d}, area {d}x{d} logical, match={s}\n",
+            .{ pw, ph, lw, lh, self.sent_scale, alloc.w, alloc.h, if (fits) "yes" else "NO" },
+        );
+    }
+
+    /// A PHYSICAL extent back in logical pixels. Rounded to nearest so
+    /// an exact-fit frame stays an exact fit (1707 * 1500 / 1000 = 2560
+    /// must come back as 1707, not 1706).
+    fn logicalOf(physical: u16, scale_x1000: u16) u16 {
+        if (scale_x1000 == 0) return physical;
+        const n = (@as(u32, physical) * 1000 + scale_x1000 / 2) / scale_x1000;
+        return @intCast(@min(n, std.math.maxInt(u16)));
+    }
+
+    /// Draw the software (memfd) texture, sized by the buffer geometry
+    /// it was last filled from.
+    fn showSoftwareFrame(self: *WebFace) void {
+        self.web_pass.showOwned(
+            true,
+            logicalOf(self.buf_w, self.sent_scale),
+            logicalOf(self.buf_h, self.sent_scale),
+        );
+    }
+
+    /// The GL area's LOGICAL size, or 0x0 when it has never been laid
+    /// out. `gtk_widget_get_width` reports the allocation, which exists
+    /// from the first size-allocate — well before the first render.
+    fn allocationSize(self: *WebFace) struct { w: u16, h: u16 } {
+        if (self.widgets_dead) return .{ .w = 0, .h = 0 };
+        const w = c.gtk_widget_get_width(self.view_area);
+        const h = c.gtk_widget_get_height(self.view_area);
+        if (w <= 0 or h <= 0) return .{ .w = 0, .h = 0 };
+        return .{
+            .w = @intCast(@min(w, std.math.maxInt(u16))),
+            .h = @intCast(@min(h, std.math.maxInt(u16))),
+        };
+    }
+
     /// A fresh frame buffer for this view: map it, drop the previous
     /// one, and tell the helper the old buffer is ours no more.
     pub fn adoptBuffer(self: *WebFace, fb: proto.FrameBuffer, fd: c_int) void {
@@ -1645,6 +1832,7 @@ pub const WebFace = struct {
         self.buf_h = fb.h;
         self.buf_stride = fb.stride;
         if (old_id != 0) client().post(proto.FrameRelease{ .view = self.view, .buf_id = old_id });
+        self.noteBufferGeometry(fb.w, fb.h);
         // The texture is sized to the OLD buffer; reallocate it now so
         // a resize is never briefly stretched.
         self.uploadFull();
@@ -1673,7 +1861,84 @@ pub const WebFace = struct {
         if (!self.glReady()) return;
         _ = self.web_pass.ensureTexture(self.buf_w, self.buf_h);
         self.web_pass.uploadRect(base, self.buf_stride, 0, 0, self.buf_w, self.buf_h);
+        // Deliberately NOT `showOwned`: in GPU mode the helper still
+        // allocates a memfd it never paints into, and switching the
+        // drawn texture to it here would flash an empty buffer over a
+        // perfectly good imported frame. The software path takes the
+        // texture back in `onDamage`, which only ever runs when the
+        // engine really is painting into the mapping.
         c.gtk_gl_area_queue_render(@ptrCast(self.view_area));
+    }
+
+    /// A GPU frame: import the engine's dma-buf into THIS AREA'S GL
+    /// context and draw it. Nothing is copied and nothing is mapped.
+    ///
+    /// The descriptors are ours from here on and are closed before this
+    /// returns, whichever path showed the frame — EGL borrows them only
+    /// for the duration of the import, and the mapping outlives the
+    /// descriptor it was made from. A frame out of a pool buffer that is
+    /// already imported costs one `close` per plane and a texture
+    /// rebind, which is what makes a steady 100fps cost two or three
+    /// imports in total.
+    ///
+    /// A driver that cannot import the buffer falls back to MAPPING it
+    /// and uploading through the same `WebPass` texture the memfd path
+    /// fills, so the pane degrades to software speed rather than to
+    /// black.
+    pub fn onDmabuf(self: *WebFace, f: proto.FrameDmabuf, fds: []const c_int) void {
+        defer for (fds) |fd| {
+            _ = c.close(fd);
+        };
+        if (self.widgets_dead or !self.glReady()) return;
+        const stats = g_stats.enabled();
+        const t0 = if (stats) Stats.nowNs() else 0;
+
+        // Geometry changes retire the whole pool: a cached import is the
+        // old size, and the ids start over. The memfd mapping (if any)
+        // describes the old geometry too.
+        if (f.w != self.buf_w or f.h != self.buf_h) {
+            self.dmabuf_cache.clear();
+            self.buf_w = f.w;
+            self.buf_h = f.h;
+        }
+
+        if (self.dmabuf_cache.acquire(f, fds)) |tex| {
+            // Zero copy: the pass samples the engine's own buffer.
+            self.web_pass.showExternal(tex, false, logicalOf(f.w, self.sent_scale), logicalOf(f.h, self.sent_scale));
+            self.dmabuf_stats.imported += 1;
+            if (stats) {
+                g_stats.gpu_imports += 1;
+                g_stats.note(Stats.nowNs() - t0, 0);
+            }
+        } else if (self.uploadDmabufMapped(f, fds)) {
+            self.dmabuf_stats.copied += 1;
+            if (stats) {
+                g_stats.gpu_copies += 1;
+                g_stats.note(Stats.nowNs() - t0, @as(usize, f.planes[0].stride) * f.h);
+            }
+        } else {
+            // Neither path could show this frame; the last one stays up
+            // rather than a black pane, and the next frame tries again.
+            return;
+        }
+        c.gtk_gl_area_queue_render(@ptrCast(self.view_area));
+        self.notePaint();
+        self.clearStatus();
+    }
+
+    /// The GPU path's fallback: map the dma-buf itself (linear and
+    /// single-plane, which is what CEF produces) and push it through the
+    /// same `WebPass` texture the memfd path fills. The mapping lives
+    /// only for the upload — the engine writes into that buffer again a
+    /// few frames later.
+    fn uploadDmabufMapped(self: *WebFace, f: proto.FrameDmabuf, fds: []const c_int) bool {
+        if (fds.len == 0 or f.w == 0 or f.h == 0) return false;
+        const m = webdmabuf.mapLinear(f, fds[0]) orelse return false;
+        defer m.unmap();
+        _ = self.web_pass.ensureTexture(f.w, f.h);
+        self.web_pass.uploadRect(m.pixels, m.stride, 0, 0, f.w, f.h);
+        self.web_pass.showOwned(m.bgra, logicalOf(f.w, self.sent_scale), logicalOf(f.h, self.sent_scale));
+        return true;
     }
 
     /// Write the damaged rects into the persistent texture and ask for
@@ -1702,6 +1967,10 @@ pub const WebFace = struct {
                 uploaded += @as(usize, r.w) * @as(usize, r.h) * 4;
             }
         }
+        // A software frame after GPU frames means the engine dropped
+        // back to software compositing under us (a GPU process crash, a
+        // driver reset). Take the drawn texture back from the import.
+        self.showSoftwareFrame();
         c.gtk_gl_area_queue_render(@ptrCast(self.view_area));
         self.notePaint();
         self.clearStatus();
@@ -1913,6 +2182,7 @@ pub const WebFace = struct {
         // Pace against the CURRENT output: dragging the window from the
         // 60Hz panel to the 165Hz one changes this with no config
         // change and no reconnect.
+        if (g_stats.enabled()) g_stats.ticks += 1;
         self.pacer.display_fps = refreshFps(frame_clock, self.pacer.display_fps);
         if (self.pacer.dueAt(c.g_get_monotonic_time())) self.requestFrame();
         if (self.pacer.demoteDue()) {
@@ -1979,11 +2249,16 @@ pub const WebFace = struct {
         gl_mod.adoptAreaApi(@ptrCast(area));
         if (c.gtk_gl_area_get_error(@ptrCast(area)) != null) return;
         self.web_pass.forgetGL();
+        // The imported dma-bufs belonged to the dead context too, and
+        // their names may already name somebody else's objects here.
+        self.dmabuf_cache.forgetGL();
         self.web_pass.realize() catch {
             std.debug.print("webface: web_pass realize failed\n", .{});
             return;
         };
-        // The mapping survived the reparent; the texture did not.
+        // The mapping survived the reparent; the texture did not. A GPU
+        // pane has nothing to re-upload and simply waits for the next
+        // frame, which re-imports into the fresh context.
         self.uploadFull();
     }
 
@@ -1994,8 +2269,10 @@ pub const WebFace = struct {
         c.gtk_gl_area_make_current(@ptrCast(area));
         if (c.gtk_gl_area_get_error(@ptrCast(area)) != null) {
             self.web_pass.forgetGL();
+            self.dmabuf_cache.forgetGL();
             return;
         }
+        self.dmabuf_cache.clear();
         self.web_pass.releaseGL();
     }
 
@@ -2010,9 +2287,19 @@ pub const WebFace = struct {
         const h = c.gtk_widget_get_height(@ptrCast(area));
         const scale = c.gtk_widget_get_scale_factor(@ptrCast(area));
         c.glViewport(0, 0, w * scale, h * scale);
-        c.glClearColor(0, 0, 0, 0);
+        // WHITE, not transparent black: `draw` places the frame 1:1 and
+        // leaves the rest of the viewport showing this, and what a
+        // browser shows where it has not painted is a blank page.
+        c.glClearColor(1, 1, 1, 1);
         c.glClear(c.GL_COLOR_BUFFER_BIT);
-        self.web_pass.draw();
+        // LOGICAL allocation: `web_pass` compares the frame against it in
+        // logical space, because the GL framebuffer here is at GTK's
+        // INTEGER scale factor while the engine renders at the surface's
+        // real fractional one.
+        self.web_pass.draw(
+            @intCast(@max(0, @min(w, std.math.maxInt(u16)))),
+            @intCast(@max(0, @min(h, std.math.maxInt(u16)))),
+        );
         return @intFromBool(true);
     }
 

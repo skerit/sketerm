@@ -20,6 +20,11 @@ pub const PROTO_VERSION: u32 = 1;
 /// Capabilities a v1 helper advertises. Reserved-but-unimplemented
 /// names live in docs/proposal-browser-protocol.md, not here.
 pub const CAP_FRAMES_SHM = "frames-shm";
+/// Frames delivered as dma-buf planes (`frame_dmabuf`) instead of a
+/// memfd of pixels. Advertised only when the helper actually got a GPU
+/// process; a client must keep handling `frame_damage` regardless,
+/// because the engine falls back to software compositing on its own.
+pub const CAP_FRAMES_DMABUF = "frames-dmabuf";
 pub const CAP_INPUT = "input";
 pub const CAP_NAVIGATION = "navigation";
 pub const CAP_SEMANTIC = "semantic";
@@ -50,6 +55,7 @@ pub const Tag = enum(u8) {
     frame_damage = 0x31,
     frame_release = 0x32,
     frame_request = 0x33,
+    frame_dmabuf = 0x34,
     ev_load = 0x40,
     ev_load_error = 0x41,
     ev_title = 0x42,
@@ -360,6 +366,90 @@ pub const FrameRequest = struct {
     /// Reserved, must be 0. Room for future per-request hints (force a
     /// full repaint, "this one is a resize settle", …) without a tag.
     flags: u8,
+};
+
+/// Max planes in a `frame_dmabuf`; matches CEF's
+/// kAcceleratedPaintMaxPlanes and DRM's own limit.
+pub const MAX_PLANES = 4;
+
+/// One dma-buf plane: where it sits in the object its fd names.
+pub const Plane = struct { stride: u32, offset: u32 };
+
+/// A GPU frame: the planes of a dma-buf the engine just rendered into,
+/// with one SCM_RIGHTS descriptor per plane attached to the frame.
+///
+/// `buf_id` identifies the underlying BUFFER, not the paint: the engine
+/// renders into a small pool and cycles through it, so a client that
+/// caches its imported texture per `buf_id` imports each pool member
+/// once instead of once per frame. The descriptors are sent every time
+/// anyway (a stateless sender is worth four `dup`s a frame); a client
+/// that already has the buffer just closes them.
+///
+/// There are deliberately no damage rects: the import is zero-copy, so
+/// there is nothing for the client to upload selectively. `gen` is the
+/// same monotonic per-view paint counter `frame_damage` carries.
+///
+/// Buffer contents are NOT owned by the client: the engine writes into
+/// the pool again as soon as it comes round, which is the same benign
+/// tearing the memfd path documents.
+pub const FrameDmabuf = struct {
+    pub const tag: Tag = .frame_dmabuf;
+    view: u32,
+    buf_id: u32,
+    gen: u32,
+    /// PHYSICAL pixels, like `frame_buffer`'s w/h.
+    w: u16,
+    h: u16,
+    /// DRM FourCC (`DRM_FORMAT_ARGB8888` and friends), not a CEF enum.
+    fourcc: u32,
+    /// DRM format modifier; 0 is LINEAR.
+    modifier: u64,
+    nplanes: u8,
+    planes: [MAX_PLANES]Plane,
+
+    pub fn encodeTo(self: FrameDmabuf, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.buf_id);
+        try putU32(gpa, out, self.gen);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putU32(gpa, out, self.fourcc);
+        try putU32(gpa, out, @truncate(self.modifier));
+        try putU32(gpa, out, @truncate(self.modifier >> 32));
+        try putU8(gpa, out, self.nplanes);
+        for (self.planes[0..self.nplanes]) |p| {
+            try putU32(gpa, out, p.stride);
+            try putU32(gpa, out, p.offset);
+        }
+    }
+
+    /// Not `decodeAlloc`: the plane count is bounded, so the frame
+    /// decodes into a fixed array and needs no allocator.
+    pub fn decodeFrom(payload: []const u8) !FrameDmabuf {
+        var cur = Cur{ .buf = payload };
+        var out: FrameDmabuf = .{
+            .view = try cur.readU32(),
+            .buf_id = try cur.readU32(),
+            .gen = try cur.readU32(),
+            .w = try cur.readU16(),
+            .h = try cur.readU16(),
+            .fourcc = try cur.readU32(),
+            .modifier = 0,
+            .nplanes = 0,
+            .planes = @splat(.{ .stride = 0, .offset = 0 }),
+        };
+        const lo = try cur.readU32();
+        const hi = try cur.readU32();
+        out.modifier = @as(u64, lo) | (@as(u64, hi) << 32);
+        const n = try cur.readU8();
+        if (n == 0 or n > MAX_PLANES) return error.BadPlaneCount;
+        out.nplanes = n;
+        for (out.planes[0..n]) |*p| {
+            p.stride = try cur.readU32();
+            p.offset = try cur.readU32();
+        }
+        return out;
+    }
 };
 
 pub const EvLoad = struct {
@@ -699,10 +789,29 @@ pub const Reader = struct {
 // Outbox
 // ---------------------------------------------------------------------
 
-/// One queued message: encoded frame bytes plus at most one file
-/// descriptor to attach (SCM_RIGHTS, the `frames-shm` capability).
-/// Pure data — the fd is an integer here; sending it is the server's job.
-pub const Message = struct { bytes: []u8, fd: ?i32 };
+/// One queued message: encoded frame bytes plus the descriptors to
+/// attach with it (SCM_RIGHTS — one memfd for `frames-shm`, one per
+/// plane for `frames-dmabuf`). Pure data: the fds are integers here and
+/// sending them is the server's job.
+pub const Message = struct {
+    bytes: []u8,
+    fds: [MAX_PLANES]i32 = @splat(-1),
+    nfds: u8 = 0,
+
+    pub fn one(bytes: []u8, fd: ?i32) Message {
+        var m = Message{ .bytes = bytes };
+        if (fd) |f| {
+            m.fds[0] = f;
+            m.nfds = 1;
+        }
+        return m;
+    }
+
+    /// The descriptors still attached, as a slice.
+    pub fn fdSlice(self: *const Message) []const i32 {
+        return self.fds[0..self.nfds];
+    }
+};
 
 /// FIFO of messages awaiting transmission, with a partial-write cursor.
 ///
@@ -725,24 +834,43 @@ pub const Outbox = struct {
 
     /// Queue `value` as a frame, optionally carrying `fd`.
     pub fn post(self: *Outbox, value: anytype, fd: ?i32) !void {
+        return self.postFds(value, if (fd) |f| &[_]i32{f} else &.{});
+    }
+
+    /// Queue `value` carrying every descriptor in `fds` (SCM_RIGHTS
+    /// takes them as one array, so they ride the same message).
+    pub fn postFds(self: *Outbox, value: anytype, fds: []const i32) !void {
+        if (fds.len > MAX_PLANES) return error.TooManyFds;
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.gpa);
         try encode(self.gpa, &buf, value);
-        try self.queue.append(self.gpa, .{
-            .bytes = try buf.toOwnedSlice(self.gpa),
-            .fd = fd,
-        });
+        var m = Message{ .bytes = try buf.toOwnedSlice(self.gpa), .nfds = @intCast(fds.len) };
+        for (fds, 0..) |f, i| m.fds[i] = f;
+        try self.queue.append(self.gpa, m);
     }
 
     pub fn empty(self: *const Outbox) bool {
         return self.head >= self.queue.items.len;
     }
 
+    /// Messages still awaiting transmission — the backpressure signal
+    /// for a producer whose frames pin descriptors.
+    pub fn pending(self: *const Outbox) usize {
+        return self.queue.items.len - self.head;
+    }
+
     /// The unsent remainder of the front message, or null when drained.
+    /// Descriptors ride the FIRST write only; a partial write must not
+    /// send them twice.
     pub fn front(self: *const Outbox) ?Message {
         if (self.empty()) return null;
         const m = self.queue.items[self.head];
-        return .{ .bytes = m.bytes[self.sent..], .fd = if (self.sent == 0) m.fd else null };
+        var out = Message{ .bytes = m.bytes[self.sent..] };
+        if (self.sent == 0) {
+            out.fds = m.fds;
+            out.nfds = m.nfds;
+        }
+        return out;
     }
 
     /// Record `n` bytes of the front message as written.
@@ -985,13 +1113,83 @@ test "outbox drains in order with partial writes" {
     try std.testing.expect(!ob.empty());
 
     const first = ob.front().?;
-    try std.testing.expectEqual(@as(?i32, null), first.fd);
+    try std.testing.expectEqual(@as(u8, 0), first.nfds);
     ob.advance(1);
     try std.testing.expectEqual(first.bytes.len - 1, ob.front().?.bytes.len);
     ob.advance(first.bytes.len - 1);
 
     const second = ob.front().?;
-    try std.testing.expectEqual(@as(?i32, 7), second.fd);
+    try std.testing.expectEqualSlices(i32, &[_]i32{7}, second.fdSlice());
     ob.advance(second.bytes.len);
     try std.testing.expect(ob.empty());
+}
+
+test "a dma-buf frame round-trips its planes" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const sent = FrameDmabuf{
+        .view = 3,
+        .buf_id = 9,
+        .gen = 1234,
+        .w = 3840,
+        .h = 2160,
+        .fourcc = 0x34325241, // DRM_FORMAT_ARGB8888
+        .modifier = 0x0100000000000005,
+        .nplanes = 2,
+        .planes = .{
+            .{ .stride = 15360, .offset = 0 },
+            .{ .stride = 7680, .offset = 33_177_600 },
+            .{ .stride = 0, .offset = 0 },
+            .{ .stride = 0, .offset = 0 },
+        },
+    };
+    try encode(gpa, &buf, sent);
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.frame_dmabuf, frame.tag);
+    const got = try FrameDmabuf.decodeFrom(frame.payload);
+    try std.testing.expectEqual(sent.modifier, got.modifier);
+    try std.testing.expectEqual(sent.fourcc, got.fourcc);
+    try std.testing.expectEqual(@as(u8, 2), got.nplanes);
+    try std.testing.expectEqual(@as(u32, 15360), got.planes[0].stride);
+    try std.testing.expectEqual(@as(u32, 33_177_600), got.planes[1].offset);
+    try std.testing.expectEqual(@as(u16, 2160), got.h);
+}
+
+test "a dma-buf frame with an impossible plane count is refused" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, FrameDmabuf{
+        .view = 1,
+        .buf_id = 1,
+        .gen = 1,
+        .w = 8,
+        .h = 8,
+        .fourcc = 0,
+        .modifier = 0,
+        .nplanes = 1,
+        .planes = @splat(.{ .stride = 32, .offset = 0 }),
+    });
+    // The plane count sits right after the 8 modifier bytes.
+    const n_off = 4 + 1 + 4 + 4 + 4 + 2 + 2 + 4 + 8;
+    buf.items[n_off] = 7;
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectError(error.BadPlaneCount, FrameDmabuf.decodeFrom(frame.payload));
+}
+
+test "one message carries a descriptor per plane, and only on the first write" {
+    const gpa = std.testing.allocator;
+    var ob = Outbox.init(gpa);
+    defer ob.deinit();
+    try ob.postFds(EvCrashed{ .view = 1 }, &[_]i32{ 11, 12, 13 });
+    const m = ob.front().?;
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 11, 12, 13 }, m.fdSlice());
+    ob.advance(2);
+    try std.testing.expectEqual(@as(u8, 0), ob.front().?.nfds);
+    ob.advance(m.bytes.len - 2);
+    try std.testing.expect(ob.empty());
+    try std.testing.expectError(error.TooManyFds, ob.postFds(EvCrashed{ .view = 1 }, &[_]i32{ 1, 2, 3, 4, 5 }));
 }

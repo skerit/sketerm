@@ -47,7 +47,7 @@ pub const Server = struct {
         // Undelivered messages may still carry a memfd; nobody else
         // will close them.
         while (self.out.front()) |m| {
-            if (m.fd) |fd| _ = c.close(fd);
+            for (m.fdSlice()) |fd| _ = c.close(fd);
             self.out.advance(m.bytes.len);
         }
         self.out.deinit();
@@ -195,17 +195,27 @@ pub const Server = struct {
             .hello => {
                 const req = try proto.decode(proto.Hello, frame.payload);
                 if (req.proto != proto.PROTO_VERSION) return error.ProtocolMismatch;
-                const caps = [_][]const u8{
+                // `frames-shm` is unconditional even in GPU mode: the
+                // engine drops back to software compositing on its own
+                // when the GPU goes away, and the client must be ready
+                // for the memfd frames that follow.
+                var caps: [5][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
                     proto.CAP_SEMANTIC,
+                    undefined,
                 };
+                var ncaps: usize = 4;
+                if (cefhost.isAccelerated()) {
+                    caps[ncaps] = proto.CAP_FRAMES_DMABUF;
+                    ncaps += 1;
+                }
                 try self.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
                     .engine_version = cefhost.engineVersion(),
-                    .caps = &caps,
+                    .caps = caps[0..ncaps],
                 }, null);
                 self.greeted = true;
             },
@@ -247,13 +257,17 @@ pub const Server = struct {
                 if (e == c.EINTR) continue;
                 return false;
             }
-            if (m.fd) |fd| _ = c.close(fd);
+            for (m.fdSlice()) |fd| _ = c.close(fd);
             self.out.advance(@intCast(n));
         }
         return true;
     }
 
-    /// sendmsg with at most one SCM_RIGHTS descriptor attached.
+    /// sendmsg with the message's SCM_RIGHTS descriptors attached — one
+    /// memfd for a `frame_buffer`, one per plane for a `frame_dmabuf`.
+    /// They must travel as ONE control message: several SCM_RIGHTS
+    /// headers on one sendmsg is not portable and a receiver reading a
+    /// single cmsg would drop the rest on the floor.
     fn sendMsg(self: *Server, m: proto.Message) isize {
         var iov = c.struct_iovec{
             .iov_base = @constCast(m.bytes.ptr),
@@ -262,16 +276,18 @@ pub const Server = struct {
         var mh = std.mem.zeroes(c.struct_msghdr);
         mh.msg_iov = @ptrCast(&iov);
         mh.msg_iovlen = 1;
-        var cbuf: [32]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([32]u8);
-        if (m.fd) |fd| {
+        var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
+        const fds = m.fdSlice();
+        if (fds.len != 0) {
             const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+            const payload = fds.len * @sizeOf(c_int);
             const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-            cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
+            cmsg.cmsg_len = @intCast(hdr_size + payload);
             cmsg.cmsg_level = c.SOL_SOCKET;
             cmsg.cmsg_type = c.SCM_RIGHTS;
-            @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
+            @memcpy(cbuf[hdr_size..][0..payload], std.mem.sliceAsBytes(fds));
             mh.msg_control = &cbuf;
-            mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + @sizeOf(c_int), 8));
+            mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + payload, 8));
         }
         return c.sendmsg(self.client_fd, &mh, 0);
     }

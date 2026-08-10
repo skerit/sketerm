@@ -49,23 +49,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     }
 
-    // (3) Headless by construction: no display is ever required, so the
-    // helper runs identically under a GUI session and under MCP-only
-    // automation. This argv must be handed to cef_execute_process TOO,
-    // not just cef_initialize: Chromium's global command line is
-    // initialized by whichever runs first, and switches missing there
-    // are silently ignored (a browser process that keeps its GPU
-    // process paints EMPTY frames in windowless mode).
-    var argv_buf: [64][*c]u8 = undefined;
-    const cef_argv = buildCefArgv(argv, &argv_buf);
-
-    // (4) CEF subprocess passthrough (renderer, gpu, zygote, ...).
-    if (cefhost.executeProcess(@intCast(cef_argv.len), cef_argv.ptr)) |code| return code;
-
-    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-
+    // (3) OUR OWN ARGUMENTS, COPIED, BEFORE CEF EVER SEES ARGV.
+    //
+    // Chromium rewrites the process's argv BLOCK in place — switches
+    // first, positional arguments after — as soon as its command line
+    // contains a switch it has to act on early (an explicit
+    // `--ozone-platform=` is one). `--socket /path` then reads back as
+    // `--socket --cache-dir`, the helper binds a socket called
+    // "--cache-dir" in its working directory, and the client waits
+    // forever for a socket that will never appear. Parsing after
+    // `cef_execute_process` was therefore always a latent bug; it only
+    // stayed hidden while every switch we appended lived in .rodata
+    // rather than in the argv block.
+    var sock_buf: [4096]u8 = undefined;
+    var cache_buf: [4096]u8 = undefined;
     var socket_path: ?[]const u8 = null;
     var cache_dir: ?[]const u8 = null;
     var i: usize = 1;
@@ -73,10 +70,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const a = std.mem.span(argv[i]);
         if (std.mem.eql(u8, a, "--socket") and i + 1 < argv.len) {
             i += 1;
-            socket_path = std.mem.span(argv[i]);
+            socket_path = copyArg(&sock_buf, std.mem.span(argv[i]));
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
-            cache_dir = std.mem.span(argv[i]);
+            cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
         } else if (std.mem.eql(u8, a, "--keep")) {
             // Defensive: a daemon that ever spawns /proc/self/exe as a
             // session keeper must not get a browser helper instead.
@@ -86,6 +83,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 0;
         }
     }
+
+    // (4) The argv handed to CEF must go to cef_execute_process TOO,
+    // not just cef_initialize: Chromium's global command line is
+    // initialized by whichever runs first, and switches missing there
+    // are silently ignored (a browser process that keeps its GPU
+    // process paints EMPTY frames in windowless mode).
+    var argv_buf: [64][*c]u8 = undefined;
+    const cef_argv = buildCefArgv(argv, &argv_buf);
+
+    // (5) CEF subprocess passthrough (renderer, gpu, zygote, ...).
+    if (cefhost.executeProcess(@intCast(cef_argv.len), cef_argv.ptr)) |code| return code;
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
     const sock = socket_path orelse {
         std.debug.print("sketerm-web: --socket PATH is required\n{s}", .{USAGE});
         return 2;
@@ -136,48 +149,130 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
     _ = c.execv(path.ptr, @ptrCast(&vec));
 }
 
-/// The argv handed to CEF: ours plus the headless switches when the
-/// caller did not already supply them. Written into `buf` (no
-/// allocator: this runs before one exists) and truncated rather than
-/// overflowed, since Chromium ignores what it never sees anyway.
+/// The argv handed to CEF: ours plus the ozone platform switch when the
+/// caller did not already supply one. Written into `buf` (no allocator:
+/// this runs before one exists) and truncated rather than overflowed,
+/// since Chromium ignores what it never sees anyway.
 ///
-/// `--ozone-platform=headless` is unconditional: the helper is always
-/// offscreen and must never need a display. `--disable-gpu` is no
-/// longer forced on every launch, but it is passed through when the
-/// caller supplies it — which is how the smoke rig keeps its runs
-/// deterministic.
+/// THE OZONE PLATFORM IS THE WHOLE GPU DECISION, and it is a runtime one
+/// because the helper must keep working with no display at all (headless
+/// CI, the smoke rig, a future remote helper). MEASURED 2026-08-10 on
+/// Arch with CEF 150, an animating page at 3840x2160 physical:
 ///
-/// MEASURED (2026-08-10, Arch, CEF 151, animating page, OSR): dropping
-/// the switch changes NOTHING observable. With and without it the helper
-/// spawns no `--type=gpu-process` at all, paints at exactly the
-/// windowless cap (60/s at 800x600 and at 3840x2160), burns the same CPU
-/// (~17 jiffies/8s), and produces byte-identical pixels. Headless ozone
-/// has no GL surface to render into, so Chromium composites in software
-/// either way. The switch is kept conditional because forcing it is
-/// wrong in principle and would block a future non-headless/dma-buf
-/// path, NOT because it bought any measured speed here.
+///   --ozone-platform=headless   no `--type=gpu-process` is EVER
+///                               spawned — not with --enable-gpu, not
+///                               with --ignore-gpu-blocklist, not with
+///                               --use-angle=gl-egl/vulkan (those make
+///                               the GPU process start and immediately
+///                               exit: "Requested GL implementation not
+///                               found in allowed implementations").
+///                               Everything composites in software and
+///                               `on_accelerated_paint` cannot fire.
+///   --ozone-platform=x11        a GPU process appears and holds a
+///                               render node, but paints still arrive
+///                               through `on_paint`: no shared textures.
+///   --ozone-platform=wayland    a GPU process appears, holds
+///                               /dev/dri/renderD*, and
+///                               `on_accelerated_paint` delivers
+///                               single-plane BGRA dma-bufs. THE path.
+///
+/// The catch is that wayland ozone is not optional-with-fallback inside
+/// Chromium: with no reachable compositor, `cef_initialize` fails and
+/// the process exits 1. Hence `waylandReachable` — a real connect() to
+/// the socket — decides BEFORE CEF starts, and anything short of a
+/// working compositor plus a render node picks headless.
+///
+/// `--disable-gpu` and an explicit `--ozone-platform=` are passed
+/// through untouched: that is how the smoke rig pins a mode.
 fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
-    const extra = [_][*:0]const u8{"--ozone-platform=headless"};
     var n: usize = 0;
     for (argv) |a| {
         if (n == buf.len) break;
         buf[n] = @constCast(@ptrCast(a));
         n += 1;
     }
-    for (extra) |e| {
-        if (n == buf.len) break;
-        const want = std.mem.span(e);
-        const head = if (std.mem.indexOfScalar(u8, want, '=')) |eq| want[0 .. eq + 1] else want;
-        var present = false;
-        for (argv) |a| {
-            const s = std.mem.span(a);
-            if (std.mem.eql(u8, s, want) or std.mem.startsWith(u8, s, head)) present = true;
-        }
-        if (present) continue;
-        buf[n] = @constCast(@ptrCast(e));
-        n += 1;
+    // A CEF subprocess is this binary re-executed with Chromium's own
+    // command line, which already carries the platform the browser
+    // process chose — so the probe below runs exactly once, in the
+    // browser process, and every child inherits its answer.
+    var chosen: ?[]const u8 = null;
+    for (argv) |a| {
+        const s = std.mem.span(a);
+        if (std.mem.startsWith(u8, s, "--ozone-platform=")) chosen = s["--ozone-platform=".len ..];
     }
+    if (chosen == null) {
+        const want: [*:0]const u8 = if (gpuWanted() and waylandReachable() and renderNodePresent())
+            "--ozone-platform=wayland"
+        else
+            "--ozone-platform=headless";
+        if (n < buf.len) {
+            buf[n] = @constCast(@ptrCast(want));
+            n += 1;
+        }
+        chosen = std.mem.span(want)["--ozone-platform=".len ..];
+    }
+    // Only a real ozone platform ever produces a GPU process here, and
+    // only wayland was measured to deliver shared textures.
+    cefhost.setAccelerated(std.mem.eql(u8, chosen.?, "wayland"));
     return buf[0..n];
+}
+
+/// Copy one argv value out of the argv block, which Chromium is free to
+/// rewrite from under us the moment it parses the command line.
+fn copyArg(buf: []u8, value: []const u8) ?[]const u8 {
+    if (value.len > buf.len) return null;
+    @memcpy(buf[0..value.len], value);
+    return buf[0..value.len];
+}
+
+/// `SKETERM_WEB_GPU=0` (or `off`/`no`) forces the software path. The
+/// escape hatch for a driver quirk no fallback caught, and what the GUI
+/// sets when the user turns GPU frames off.
+fn gpuWanted() bool {
+    const v = c.getenv("SKETERM_WEB_GPU") orelse return true;
+    const s = std.mem.span(v);
+    return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
+}
+
+/// Whether a Wayland compositor is actually reachable — a connect(),
+/// not a getenv: `WAYLAND_DISPLAY` outlives the compositor that set it,
+/// and a wrong answer here costs the whole process (cef_initialize
+/// exits rather than falling back).
+fn waylandReachable() bool {
+    var path: [108]u8 = undefined;
+    const disp = if (c.getenv("WAYLAND_DISPLAY")) |d| std.mem.span(d) else "wayland-0";
+    const full = if (disp.len != 0 and disp[0] == '/')
+        std.fmt.bufPrintZ(&path, "{s}", .{disp}) catch return false
+    else blk: {
+        const dir = c.getenv("XDG_RUNTIME_DIR") orelse return false;
+        break :blk std.fmt.bufPrintZ(&path, "{s}/{s}", .{ std.mem.span(dir), disp }) catch return false;
+    };
+
+    var addr = std.mem.zeroes(c.struct_sockaddr_un);
+    if (full.len + 1 > @sizeOf(@TypeOf(addr.sun_path))) return false;
+    addr.sun_family = c.AF_UNIX;
+    @memcpy(addr.sun_path[0..full.len], full);
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0;
+}
+
+/// Whether any DRM render node can be opened. Without one the GPU
+/// process starts and dies, which costs a second of startup and lands
+/// in software anyway.
+fn renderNodePresent() bool {
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) {
+        var path: [64]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&path, "/dev/dri/renderD{d}", .{128 + @as(u16, i)}) catch return false;
+        const fd = c.open(p.ptr, c.O_RDWR | c.O_CLOEXEC);
+        if (fd >= 0) {
+            _ = c.close(fd);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// $XDG_STATE_HOME/sketerm/web-cache, else ~/.local/state/... — the

@@ -132,19 +132,47 @@ const MFD_CLOEXEC: c_uint = 1;
 
 /// Cap on damage rects forwarded per paint; beyond it a single
 /// full-view rect is cheaper than the bookkeeping.
+///
+/// Raising it to 128 was MEASURED to change nothing for a scrolling page
+/// at 3840x2160 (1.14 GB/s either way): Chromium reports full-viewport
+/// damage there, it is not the cap collapsing a long list.
 const max_rects = 32;
 
 /// `sem_expand_result` carries a `str`, so one expand cannot exceed
 /// what a u16 length can describe.
 const max_expand: u32 = 60_000;
 
-/// `windowless_frame_rate` is CEF's INTERNAL scheduler, capped at 60 and
-/// therefore unable to follow a 120/165Hz output. Every browser here is
-/// created with `external_begin_frame_enabled`, which replaces that
-/// scheduler with `send_external_begin_frame` — one call, one frame — so
-/// this value is ignored. It is still set so a build that ever loses the
-/// external path degrades to 60 rather than to CEF's choppy default 30.
-const windowless_fps: c_int = 60;
+/// `windowless_frame_rate` means two different things on the two paths,
+/// and getting that wrong costs half the frame rate.
+///
+/// On the SOFTWARE path it is CEF's internal scheduler, which
+/// `external_begin_frame_enabled` replaces outright — one
+/// `send_external_begin_frame`, one paint — so the value is ignored
+/// there and only matters if a build ever loses the external path.
+///
+/// On the ACCELERATED path it ALSO sets the minimum capture period of
+/// the frame-sink video capturer that produces the shared textures, and
+/// that ceiling applies to externally driven frames too. MEASURED at
+/// 3840x2160: 60 gives 59.7 dma-buf paints/s however fast the client
+/// asks; 240 gives 150. So it is set well above any real display and the
+/// client's pacing stays the only limit, which is the whole point of
+/// `src/web/pace.zig`.
+const windowless_fps: c_int = 240;
+
+/// Whether the browsers this process creates are driven by the CLIENT's
+/// `frame_request`s (`external_begin_frame_enabled`) or by CEF's own
+/// windowless scheduler. Decided per MODE at creation, because it is
+/// fixed per browser and the two modes measured opposite ways.
+///
+/// `SKETERM_WEB_EXTERNAL_BEGINFRAME=1`/`=0` forces it either way; that
+/// is the switch the measurements below were taken with.
+fn externalPacingDefault() bool {
+    if (c.getenv("SKETERM_WEB_EXTERNAL_BEGINFRAME")) |v| {
+        const s = std.mem.span(v);
+        return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
+    }
+    return externalPacingWins();
+}
 
 /// How long a view may go without a client `frame_request` before the
 /// helper begins pacing it itself.
@@ -161,6 +189,111 @@ const windowless_fps: c_int = 60;
 /// is 1000/250 = 4fps: alive, obviously degraded, and cheap enough to
 /// leave running under a wedged client forever.
 const watchdog_ms: i64 = 250;
+
+// ---------------------------------------------------------------------
+// GPU (accelerated / dma-buf) mode
+// ---------------------------------------------------------------------
+
+/// Whether this process runs its browsers with `shared_texture_enabled`,
+/// i.e. whether `on_accelerated_paint` can fire at all. Decided ONCE at
+/// startup by `main.zig` (the ozone platform is a process-wide
+/// command-line choice) and read from here by everything that has to
+/// behave differently.
+///
+/// MEASURED (2026-08-10, CEF 150, Arch, hybrid-GPU laptop):
+///   `--ozone-platform=headless` spawns no GPU process at all, whatever
+///   else is passed, so accelerated paints are impossible there;
+///   `--ozone-platform=wayland` gets a GPU process that holds
+///   /dev/dri render nodes and delivers 1-plane BGRA dma-bufs.
+var accelerated: bool = false;
+
+/// Called by `main.zig` before `Host.install`.
+pub fn setAccelerated(on: bool) void {
+    accelerated = on;
+}
+
+pub fn isAccelerated() bool {
+    return accelerated;
+}
+
+/// Whether CLIENT-driven begin frames beat CEF's own scheduler in the
+/// mode this process runs in. The answer is YES IN BOTH MODES, and it is
+/// a function rather than a constant because it was an open question
+/// that had to be settled per mode with numbers.
+///
+/// MEASURED 2026-08-11 on the real display, a browser pane at 3840x2160
+/// physical (2514x1275 logical at scale 1.5), GSK's `ngl` renderer,
+/// comparing `SKETERM_WEB_EXTERNAL_BEGINFRAME=1` against `=0`. Every row
+/// verified to have painted at the pane's real size — an earlier
+/// version of this table was measured while the first buffer came back
+/// at a placeholder size, which is a different (and much cheaper)
+/// workload.
+///
+///   animating page      delivered  presented  per-frame  uploaded
+///     GPU     external    98-106      ~180/s     0.2 us    0 MiB/s
+///     GPU     internal       240      ~120/s     2.0 us    0 MiB/s
+///     memfd   external     79- 82      ~100/s     101 us   23 MiB/s
+///     memfd   internal        90         8/s      100 us   35 MiB/s
+///
+///   scrolling a heavy page
+///     GPU     external    73-110      ~130/s     0.2 us    0 MiB/s
+///     GPU     internal       240      ~120/s     0.2 us    0 MiB/s
+///     memfd   external        44        46/s     1.93 ms 1244 MiB/s
+///     memfd   internal      8-9          0/s      109 ms  250 MiB/s
+///
+/// Read the PRESENTED column, not the delivered one: it is the
+/// compositor's frame callbacks that decide what a user sees, and it is
+/// the same in every row that got presented at all. Internal pacing just
+/// paints `windowless_frame_rate` times a second and throws the excess
+/// away — and the two `memfd internal` rows are the cost of that in its
+/// purest form: a window the compositor was NOT presenting still had 35
+/// and 250 MiB/s of pixels uploaded into it.
+///
+/// It also makes the client's cap meaningless. Forced off, `smoke-web`
+/// stage 19 measures 209 paints/s for a client asking for 30, and fails.
+///
+/// The earlier observation that external pacing was SLOWER (20-39 fps
+/// erratic against a steady 60) reproduces only when the GUI's frame
+/// clock is being throttled — a window on no output, or GSK's Vulkan
+/// renderer at 4K, both of which drop the tick rate to ~11/s and take
+/// the request rate with it. That is a presentation problem, not a
+/// pacing one; the `reqs`/`ticks` counters in `webface`'s stats line
+/// exist to tell the two apart.
+fn externalPacingWins() bool {
+    return true;
+}
+
+/// How the engine is told what DPR to lay out at.
+///
+/// The protocol's scale contract (docs/proposal-browser-protocol.md) is
+/// "view rect LOGICAL, buffers PHYSICAL, DPR from `get_screen_info`".
+/// That works exactly as documented under headless ozone, and NOT under
+/// any real ozone platform: MEASURED under `--ozone-platform=wayland`,
+/// `get_screen_info`'s `device_scale_factor` is ignored outright — the
+/// page reports `devicePixelRatio === 1` and the engine renders the view
+/// rect one buffer pixel per DIP, i.e. at logical resolution. That is
+/// the "why is the browser blurry" bug all over again, and no
+/// combination of `--force-device-scale-factor` moves it.
+///
+/// So in accelerated mode the same contract is honoured through a
+/// different lever: `get_view_rect` reports PHYSICAL pixels and the
+/// browser's ZOOM LEVEL carries the scale (Chromium's zoom multiplies
+/// `devicePixelRatio` and divides the layout viewport, which is exactly
+/// a device scale factor). MEASURED at logical 1280x720 scale 1.5:
+/// dpr 1.5, innerWidth 1280, dma-buf 1920x1080 — the contract, intact.
+///
+/// Everything the client sees is unchanged: wire sizes stay logical,
+/// buffers stay physical. Only input needs a conversion, because CEF's
+/// mouse coordinates live in view-rect space — see `viewPoint`.
+fn scaleViaZoom() bool {
+    return accelerated;
+}
+
+/// CEF's zoom LEVEL for a device scale factor: zoom factor = 1.2^level.
+fn zoomLevelFor(scale_x1000: u16) f64 {
+    const f = @as(f64, @floatFromInt(scale_x1000)) / 1000.0;
+    return @log(f) / @log(@as(f64, 1.2));
+}
 
 /// Monotonic milliseconds (`std.time.milliTimestamp` is gone in 0.16).
 pub fn nowMs() i64 {
@@ -208,6 +341,9 @@ pub const View = struct {
     /// Monotonic milliseconds of the last begin frame issued for this
     /// view, whoever asked for it. Drives the watchdog.
     last_begin_ms: i64 = 0,
+    /// Whether this browser was created with external begin frames, so
+    /// the client is the frame source. See `externalPacingWins`.
+    external_pacing: bool = false,
     /// Last address CEF reported, owned; the `ev_nav_state` payload.
     url: []u8 = &.{},
 
@@ -222,10 +358,51 @@ pub const View = struct {
     sem_next_req: u32 = 1,
     pending: std.ArrayList(Pending) = .empty,
 
+    /// dma-buf pool identity (accelerated mode only). The engine renders
+    /// into a handful of buffers and cycles through them, handing the
+    /// same underlying object back under a fresh descriptor every time;
+    /// keying on the object's inode turns that into a stable `buf_id`,
+    /// which is what lets the client import each pool member ONCE
+    /// instead of once per frame.
+    pool: [max_pool]PoolEntry = @splat(.{}),
+    next_buf_id: u32 = 0,
+
+    const PoolEntry = struct { ino: u64 = 0, id: u32 = 0, seen: u64 = 0 };
+
     fn stride(self: *const View) u32 {
         return @as(u32, self.pw) * 4;
     }
+
+    /// Stable id for the dma-buf object behind `ino`, minting one on
+    /// first sight and evicting the least recently used entry when the
+    /// pool table is full (a resize retires a whole generation).
+    fn poolId(self: *View, ino: u64, now: u64) u32 {
+        var lru: usize = 0;
+        for (&self.pool, 0..) |*e, i| {
+            if (e.ino == ino and e.id != 0) {
+                e.seen = now;
+                return e.id;
+            }
+            if (e.seen < self.pool[lru].seen) lru = i;
+        }
+        self.next_buf_id +%= 1;
+        if (self.next_buf_id == 0) self.next_buf_id = 1;
+        self.pool[lru] = .{ .ino = ino, .id = self.next_buf_id, .seen = now };
+        return self.next_buf_id;
+    }
+
+    fn forgetPool(self: *View) void {
+        self.pool = @splat(.{});
+    }
 };
+
+/// Pool entries tracked per view. Chromium's OSR pool is 2-3 deep; 8
+/// leaves room for a resize's overlap without ever growing.
+const max_pool = 8;
+
+/// Queued messages past which a GPU frame is dropped rather than
+/// enqueued — see `Host.postDmabuf`.
+const max_frame_backlog = 8;
 
 /// One in-flight round trip to the injected script.
 ///
@@ -343,7 +520,14 @@ pub const Host = struct {
         // page cost nothing. It is fixed at browser creation and cannot
         // be toggled per frame, so ALL adaptive behaviour lives in how
         // often somebody asks (client pacing + the watchdog below).
-        winfo.external_begin_frame_enabled = 1;
+        v.external_pacing = externalPacingDefault();
+        winfo.external_begin_frame_enabled = if (v.external_pacing) 1 else 0;
+        // GPU frames. Fixed at browser creation like the flag above, and
+        // only ever honoured when the process got a GPU: with it set and
+        // no GPU compositing available, Chromium simply keeps calling
+        // `on_paint`, which is the software path this helper already
+        // has. That is the whole fallback — no probe, no timeout.
+        winfo.shared_texture_enabled = if (accelerated) 1 else 0;
         winfo.runtime_style = cef.CEF_RUNTIME_STYLE_ALLOY;
 
         var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
@@ -367,6 +551,7 @@ pub const Host = struct {
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
+        applyZoom(v);
         // A view without a frame buffer is invisible and unfixable, so
         // the whole view goes rather than leaving a stranded browser.
         self.allocBuffer(v) catch |e| {
@@ -460,7 +645,13 @@ pub const Host = struct {
         const buffer_changed = pw != v.pw or ph != v.ph;
         v.pw = pw;
         v.ph = ph;
-        if (buffer_changed) try self.allocBuffer(v);
+        if (buffer_changed) {
+            // The old dma-buf pool is retired with the old geometry; its
+            // ids must not be reused for differently sized buffers.
+            v.forgetPool();
+            try self.allocBuffer(v);
+        }
+        if (scale_changed) applyZoom(v);
         if (scale_changed) withHost(v, struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.notify_screen_info_changed) |ns| ns(host);
@@ -507,7 +698,14 @@ pub const Host = struct {
     }
 
     fn issueBeginFrame(v: *View) void {
+        // The timestamp is recorded either way: it is what keeps the
+        // watchdog quiet for a client that IS asking.
         v.last_begin_ms = nowMs();
+        // Without external begin frames CEF drives its own scheduler and
+        // `send_external_begin_frame` is out of contract — the request
+        // has already done its real job (promoting the view out of
+        // hidden state, above).
+        if (!v.external_pacing) return;
         withHost(v, struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.send_external_begin_frame) |bf| bf(host);
@@ -555,9 +753,10 @@ pub const Host = struct {
 
     pub fn pointer(self: *Host, req: proto.InputPointer) void {
         const v = self.find(req.view) orelse return;
+        const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
-            .x = req.x,
-            .y = req.y,
+            .x = pt.x,
+            .y = pt.y,
             .modifiers = keymap.eventFlags(req.mods),
         };
         const button: cef.cef_mouse_button_type_t = switch (req.button) {
@@ -577,13 +776,16 @@ pub const Host = struct {
 
     pub fn scroll(self: *Host, req: proto.InputScroll) void {
         const v = self.find(req.view) orelse return;
+        const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
-            .x = req.x,
-            .y = req.y,
+            .x = pt.x,
+            .y = pt.y,
             .modifiers = keymap.eventFlags(req.mods),
         };
         // Protocol dy is positive DOWN; CEF's wheel delta is positive UP.
-        withHostArgs(v, sendWheel, .{ &ev, req.dx, -req.dy });
+        // The deltas live in view-rect space too, so they scale with it.
+        const d = viewPoint(v, req.dx, req.dy);
+        withHostArgs(v, sendWheel, .{ &ev, d.x, -d.y });
     }
 
     pub fn key(self: *Host, req: proto.InputKey) void {
@@ -978,7 +1180,8 @@ pub const Host = struct {
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = "element has no box" });
             return;
         }
-        var ev = cef.cef_mouse_event_t{ .x = r.value.x, .y = r.value.y, .modifiers = 0 };
+        const pt = viewPoint(v, r.value.x, r.value.y);
+        var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
         withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
         var buf: [128]u8 = undefined;
         if (p.kind == .hover) {
@@ -1016,7 +1219,8 @@ pub const Host = struct {
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg });
             return;
         }
-        var ev = cef.cef_mouse_event_t{ .x = r.value.x, .y = r.value.y, .modifiers = 0 };
+        const pt = viewPoint(v, r.value.x, r.value.y);
+        var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
         withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
@@ -1108,7 +1312,8 @@ pub const Host = struct {
             // Open the list with a real click, then go looking for the
             // option; both clicks are trusted, which is what a custom
             // dropdown's own key handlers need to see.
-            var ev = cef.cef_mouse_event_t{ .x = s.value.x, .y = s.value.y, .modifiers = 0 };
+            const pt = viewPoint(v, s.value.x, s.value.y);
+            var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
             withHostArgs(v, setFocus, .{@as(c_int, 1)});
             withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
             withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
@@ -1158,6 +1363,24 @@ pub const Host = struct {
     /// missed event must never take the helper down.
     fn post(self: *Host, value: anytype) void {
         self.out.post(value, null) catch {};
+    }
+
+    /// Post a GPU frame with its plane descriptors, or drop it.
+    ///
+    /// Dropping matters here in a way it does not for the memfd path: a
+    /// queued dma-buf frame pins BOTH a descriptor per plane and the
+    /// buffer behind it, so a client that stops reading would otherwise
+    /// exhaust this process's fd table and starve the engine's pool at
+    /// the same time. A dropped frame costs nothing — the next one is a
+    /// full buffer, not a delta.
+    fn postDmabuf(self: *Host, value: proto.FrameDmabuf, fds: []const i32) void {
+        if (self.out.pending() >= max_frame_backlog) {
+            for (fds) |fd| _ = c.close(fd);
+            return;
+        }
+        self.out.postFds(value, fds) catch {
+            for (fds) |fd| _ = c.close(fd);
+        };
     }
 
     fn setUrl(self: *Host, v: *View, url: []const u8) void {
@@ -1435,6 +1658,13 @@ fn installHandlers() void {
     render_handler.get_view_rect = onGetViewRect;
     render_handler.get_screen_info = onGetScreenInfo;
     render_handler.on_paint = onPaint;
+    // BOTH are installed, always. Which one Chromium calls is its own
+    // decision per frame: with shared textures off it is `on_paint`, and
+    // with them on it is `on_accelerated_paint` right up until GPU
+    // compositing goes away under it (a GPU process crash, a driver
+    // reset), at which point it silently goes back to `on_paint`. The
+    // client handles both frame families for the same reason.
+    render_handler.on_accelerated_paint = onAcceleratedPaint;
 
     display_handler = std.mem.zeroes(cef.cef_display_handler_t);
     display_handler.base = staticBase(cef.cef_display_handler_t);
@@ -1502,8 +1732,11 @@ fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     return host.pending;
 }
 
-/// The view rect is LOGICAL (DIP) and must stay so: CEF multiplies it
-/// by `get_screen_info`'s device_scale_factor to get the paint size.
+/// The view rect the engine renders: LOGICAL (DIP) in software mode,
+/// where CEF multiplies it by `get_screen_info`'s device_scale_factor to
+/// get the paint size, and PHYSICAL in accelerated mode, where that
+/// factor is ignored and the zoom level carries the scale instead. See
+/// `scaleViaZoom`.
 fn onGetViewRect(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -1513,11 +1746,20 @@ fn onGetViewRect(
         rect.* = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
         return;
     };
-    rect.* = .{ .x = 0, .y = 0, .width = v.w, .height = v.h };
+    rect.* = viewRect(v);
+}
+
+fn viewRect(v: *const View) cef.cef_rect_t {
+    if (scaleViaZoom()) return .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph };
+    return .{ .x = 0, .y = 0, .width = v.w, .height = v.h };
 }
 
 /// The DPR the PAGE lays out at (and picks 2x images / hints text for).
-/// `rect`/`available_rect` are DIP like the view rect.
+/// `rect`/`available_rect` are in the same space as the view rect.
+///
+/// In accelerated mode the factor is deliberately 1: the engine ignores
+/// it there, and reporting the real scale as well as zooming would
+/// double-apply it on any build that ever started honouring it again.
 fn onGetScreenInfo(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -1526,12 +1768,38 @@ fn onGetScreenInfo(
     const v = viewOf(browser) orelse return 0;
     info.* = std.mem.zeroes(cef.cef_screen_info_t);
     info.*.size = @sizeOf(cef.cef_screen_info_t);
-    info.*.device_scale_factor = @as(f32, @floatFromInt(v.scale_x1000)) / 1000.0;
+    info.*.device_scale_factor = if (scaleViaZoom())
+        1.0
+    else
+        @as(f32, @floatFromInt(v.scale_x1000)) / 1000.0;
     info.*.depth = 32;
     info.*.depth_per_component = 8;
-    info.*.rect = .{ .x = 0, .y = 0, .width = v.w, .height = v.h };
+    info.*.rect = viewRect(v);
     info.*.available_rect = info.*.rect;
     return 1;
+}
+
+/// Put the view's device scale into the browser's zoom level, which is
+/// where it lives in accelerated mode. A no-op otherwise.
+///
+/// Chromium resets zoom per navigation, so this runs on every load start
+/// as well as at creation and on a scale change.
+fn applyZoom(v: *View) void {
+    if (!scaleViaZoom()) return;
+    const host = browserHost(v) orelse return;
+    defer release(&host.base);
+    if (host.set_zoom_level) |sz| sz(host, zoomLevelFor(v.scale_x1000));
+}
+
+/// Convert LOGICAL wire coordinates into the engine's view-rect space.
+/// The two differ exactly when the view rect is physical.
+fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
+    if (!scaleViaZoom()) return .{ .x = x, .y = y };
+    const s: i64 = @intCast(v.scale_x1000);
+    return .{
+        .x = @intCast(@divTrunc(@as(i64, x) * s, 1000)),
+        .y = @intCast(@divTrunc(@as(i64, y) * s, 1000)),
+    };
 }
 
 fn onPaint(
@@ -1587,6 +1855,95 @@ fn onPaint(
         .gen = v.gen,
         .rects = list[0..n],
     });
+}
+
+/// A GPU frame: hand the engine's dma-buf planes straight to the client.
+///
+/// The descriptors in `info` are valid ONLY inside this call and the
+/// buffer goes back to the engine's pool the moment it returns, so every
+/// plane is `dup`'d here — a dup keeps the underlying dma-buf object
+/// alive while the pool keeps its own reference, which is exactly the
+/// sharing dma-bufs exist for. The CONTENTS are not preserved: the pool
+/// cycles and the engine renders into this buffer again a few frames
+/// later, the same benign tearing the memfd path already documents.
+///
+/// Nothing is copied and nothing is mapped in this process: the whole
+/// point is that the pixels never enter an address space at all.
+fn onAcceleratedPaint(
+    _: [*c]cef.cef_render_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    ptype: cef.cef_paint_element_type_t,
+    _: usize,
+    _: [*c]const cef.cef_rect_t,
+    info: [*c]const cef.cef_accelerated_paint_info_t,
+) callconv(.c) void {
+    if (ptype != cef.PET_VIEW) return;
+    const host = g_host orelse return;
+    const v = viewOf(browser) orelse return;
+    // `[*c]` field access leaks back into C-pointer land (`&x.*.planes`
+    // is a pointer to the whole array), so bind a real Zig pointer once.
+    const inf: *const cef.cef_accelerated_paint_info_t = @ptrCast(info orelse return);
+    const n = inf.plane_count;
+    if (n <= 0 or n > proto.MAX_PLANES) return;
+
+    // A frame for the pre-resize geometry, dropped exactly like its
+    // software counterpart: the resize brings its own full repaint.
+    const coded = inf.extra.coded_size;
+    if (coded.width != @as(c_int, v.pw) or coded.height != @as(c_int, v.ph)) return;
+
+    var fds: [proto.MAX_PLANES]i32 = @splat(-1);
+    var planes: [proto.MAX_PLANES]proto.Plane = @splat(.{ .stride = 0, .offset = 0 });
+    var got: u8 = 0;
+    errdefer {}
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(n))) : (i += 1) {
+        const p = inf.planes[i];
+        const dup = c.fcntl(p.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+        if (dup < 0) break;
+        fds[got] = dup;
+        planes[got] = .{ .stride = p.stride, .offset = @truncate(p.offset) };
+        got += 1;
+    }
+    if (got != @as(u8, @intCast(n))) {
+        for (fds[0..got]) |fd| _ = c.close(fd);
+        return;
+    }
+
+    v.gen +%= 1;
+    host.postDmabuf(proto.FrameDmabuf{
+        .view = v.id,
+        .buf_id = v.poolId(inodeOf(fds[0]), @intCast(v.gen)),
+        .gen = v.gen,
+        .w = v.pw,
+        .h = v.ph,
+        .fourcc = fourccOf(inf.format),
+        .modifier = inf.modifier,
+        .nplanes = got,
+        .planes = planes,
+    }, fds[0..got]);
+}
+
+/// The dma-buf object's inode: its identity across the engine's pool,
+/// and the only thing that distinguishes "the buffer from three frames
+/// ago, back again" from "a new buffer". 0 when it cannot be read, which
+/// simply costs the client a re-import.
+fn inodeOf(fd: i32) u64 {
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) return 0;
+    return @intCast(st.st_ino);
+}
+
+/// CEF's colour type as a DRM FourCC — the wire is engine-agnostic, and
+/// a FourCC is what every importer on this platform actually wants.
+fn fourccOf(format: cef.cef_color_type_t) u32 {
+    return switch (format) {
+        cef.CEF_COLOR_TYPE_RGBA_8888 => fourcc('A', 'B', '2', '4'), // DRM_FORMAT_ABGR8888
+        else => fourcc('A', 'R', '2', '4'), // DRM_FORMAT_ARGB8888 (BGRA bytes)
+    };
+}
+
+fn fourcc(a: u8, b: u8, c0: u8, d: u8) u32 {
+    return @as(u32, a) | (@as(u32, b) << 8) | (@as(u32, c0) << 16) | (@as(u32, d) << 24);
 }
 
 /// Copy one BGRA rect (device pixels) out of CEF's full-view buffer
@@ -1759,6 +2116,10 @@ fn onLoadStart(
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    // Chromium's zoom is per origin and resets across a navigation; in
+    // accelerated mode the zoom IS the device scale factor, so a page
+    // that lost it would render at logical resolution.
+    applyZoom(v);
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.started),
