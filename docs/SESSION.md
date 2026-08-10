@@ -15668,3 +15668,34 @@ Verification: 10/10 consecutive smoke-e2e passes at loads 2.4-19.3. The one
 genuinely load-sensitive stage is the OCR hex dump, which fails above load
 ~50 because tesseract cannot finish inside its deadline; unrelated runaway
 processes on the box were the cause both times that appeared.
+
+## 2026-08-10: integrated browser, phase 1 - CEF helper + web pane face
+
+The browser feature (design: untracked docs/proposal-browser*.md; engine
+decision CEF after a six-item spike proved Zig binding, headless OSR,
+trusted input, Widevine key-system access, and per-request-context SOCKS
+egress) landed its first vertical slice, orchestrated as reviewed agent
+tasks with a commit per piece:
+
+- `zig build fetch-cef` caches the pinned prebuilt CEF distro (default
+  build never touches it or the network); `zig build web` builds
+  `sketerm-web`, a single-threaded windowless-CEF helper speaking an
+  engine-agnostic protocol v1 (src/web/protocol.zig, append-only tags,
+  memfd+SCM_RIGHTS frames, XKB keysyms on the wire). The LD_PRELOAD
+  re-exec inside main works around Zig's DT_NEEDED order breaking
+  libcef's RTLD_NEXT close lookup (SIGTRAP otherwise). cef_api_hash
+  must be the first libcef call - it configures the API version, and
+  without it cef_execute_process spins forever with zero syscalls.
+- `zig build smoke-web`: eight-stage rig (handshake, pixel-checked
+  paint, trusted click, typing, resize buffer swap, popup-request
+  event, history, teardown) that speaks protocol.zig itself.
+- new_web_tab/new_web_split: a web pane face (src/ui/webface.zig) -
+  chrome bar + GtkPicture over the helper's frames, one lazily-spawned
+  helper per GUI, popups become new web tabs, missing helper degrades
+  to a hint label, helper death to a Reload overlay. Proven headless:
+  example.com render, link click, two concurrent views, crash-restart
+  cycle, exact channel order via an orange test page.
+
+Known v1 limits (deliberate): 1x scale only, full-texture upload per
+damage batch (GL/ImagePass upgrade planned, damage rects already on the
+wire), no IME into pages yet, global keybinds win over the page.
