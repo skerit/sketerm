@@ -138,6 +138,21 @@ const max_rects = 32;
 /// what a u16 length can describe.
 const max_expand: u32 = 60_000;
 
+/// Paints per second CEF is allowed to produce for a windowless browser.
+/// 60 is the practical ceiling of the OSR path without wiring external
+/// begin-frame (`external_begin_frame_enabled` + `send_external_begin_frame`),
+/// which would be needed to follow a 120/165Hz output and is a separate
+/// change. CEF's own default is 30, which is visibly choppy on those
+/// displays.
+const windowless_fps: c_int = 60;
+
+/// Physical pixels for `logical` at `scale_x1000`, per the protocol's
+/// scale contract: `ceil(logical * scale)`, never 0.
+fn physicalOf(logical: u16, scale_x1000: u16) u16 {
+    const n = (@as(u32, logical) * @as(u32, scale_x1000) + 999) / 1000;
+    return @intCast(std.math.clamp(n, 1, std.math.maxInt(u16)));
+}
+
 // ---------------------------------------------------------------------
 // Per-view state
 // ---------------------------------------------------------------------
@@ -149,9 +164,17 @@ pub const View = struct {
     cef_id: c_int = 0,
     /// Owned reference from create_browser_sync; released on destroy.
     browser: ?*cef.cef_browser_t = null,
+    /// LOGICAL (DIP) size: what `get_view_rect` reports, what input
+    /// coordinates are in, and what the client sends on the wire.
     w: u16,
     h: u16,
+    /// Device scale factor x1000, reported to the engine through
+    /// `get_screen_info` so the PAGE lays out at that DPR.
     scale_x1000: u16,
+    /// PHYSICAL size: the frame buffer's real pixel dimensions, what
+    /// `frame_buffer` announces, and the size CEF's OnPaint delivers.
+    pw: u16,
+    ph: u16,
     buf_id: u32 = 0,
     /// Writable mapping of the memfd announced by `frame_buffer`. The
     /// fd itself is handed to the client and closed by the sender: a
@@ -174,7 +197,7 @@ pub const View = struct {
     pending: std.ArrayList(Pending) = .empty,
 
     fn stride(self: *const View) u32 {
-        return @as(u32, self.w) * 4;
+        return @as(u32, self.pw) * 4;
     }
 };
 
@@ -254,11 +277,16 @@ pub const Host = struct {
         if (req.view == 0 or self.find(req.view) != null) return;
         const v = try self.gpa.create(View);
         errdefer self.gpa.destroy(v);
+        const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
+        const lw = @max(req.w, 1);
+        const lh = @max(req.h, 1);
         v.* = .{
             .id = req.view,
-            .w = @max(req.w, 1),
-            .h = @max(req.h, 1),
-            .scale_x1000 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000,
+            .w = lw,
+            .h = lh,
+            .scale_x1000 = scale,
+            .pw = physicalOf(lw, scale),
+            .ph = physicalOf(lh, scale),
             .sem = semantic.View.init(self.gpa),
         };
         try self.views.append(self.gpa, v);
@@ -271,7 +299,7 @@ pub const Host = struct {
 
         var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
         bsettings.size = @sizeOf(cef.cef_browser_settings_t);
-        bsettings.windowless_frame_rate = 30;
+        bsettings.windowless_frame_rate = windowless_fps;
 
         var url = std.mem.zeroes(cef.cef_string_t);
         setStr("about:blank", &url);
@@ -331,13 +359,14 @@ pub const Host = struct {
     ///
     /// The memfd is handed to the client through the outbox and closed
     /// by the sender; the write mapping made here survives that close.
-    /// v1 stride is exactly w*4 — no padding, per the spec.
+    /// The buffer is PHYSICAL: stride is exactly pw*4 — no padding, per
+    /// the spec — and the announced w/h are pw/ph.
     fn allocBuffer(self: *Host, v: *View) !void {
         if (v.map.len != 0) {
             _ = c.munmap(v.map.ptr, v.map.len);
             v.map = &.{};
         }
-        const size: usize = v.stride() * @as(usize, v.h);
+        const size: usize = v.stride() * @as(usize, v.ph);
         const fd = memfd_create("sketerm-web-view", MFD_CLOEXEC);
         if (fd < 0) return error.MemfdFailed;
         var keep_fd = false;
@@ -355,22 +384,39 @@ pub const Host = struct {
         try self.out.post(proto.FrameBuffer{
             .view = v.id,
             .buf_id = v.buf_id,
-            .w = v.w,
-            .h = v.h,
+            .w = v.pw,
+            .h = v.ph,
             .stride = v.stride(),
         }, fd);
         keep_fd = true;
     }
 
+    /// A resize OR a scale change (the window moved to a differently
+    /// scaled output). A scale change must reach the engine through
+    /// `notify_screen_info_changed` BEFORE `was_resized`, or the page
+    /// re-lays out at the old DPR and the next paint arrives at the old
+    /// physical size — which the paint guard then drops.
     pub fn resizeView(self: *Host, req: proto.ViewResize) !void {
         const v = self.find(req.view) orelse return;
         const w = @max(req.w, 1);
         const h = @max(req.h, 1);
-        v.scale_x1000 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
-        if (v.w == w and v.h == h) return;
+        const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
+        const scale_changed = scale != v.scale_x1000;
+        if (v.w == w and v.h == h and !scale_changed) return;
         v.w = w;
         v.h = h;
-        try self.allocBuffer(v);
+        v.scale_x1000 = scale;
+        const pw = physicalOf(w, scale);
+        const ph = physicalOf(h, scale);
+        const buffer_changed = pw != v.pw or ph != v.ph;
+        v.pw = pw;
+        v.ph = ph;
+        if (buffer_changed) try self.allocBuffer(v);
+        if (scale_changed) withHost(v, struct {
+            fn f(host: *cef.cef_browser_host_t) void {
+                if (host.notify_screen_info_changed) |ns| ns(host);
+            }
+        }.f);
         withHost(v, struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.was_resized) |wr| wr(host);
@@ -1202,6 +1248,8 @@ fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     return host.pending;
 }
 
+/// The view rect is LOGICAL (DIP) and must stay so: CEF multiplies it
+/// by `get_screen_info`'s device_scale_factor to get the paint size.
 fn onGetViewRect(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -1214,6 +1262,8 @@ fn onGetViewRect(
     rect.* = .{ .x = 0, .y = 0, .width = v.w, .height = v.h };
 }
 
+/// The DPR the PAGE lays out at (and picks 2x images / hints text for).
+/// `rect`/`available_rect` are DIP like the view rect.
 fn onGetScreenInfo(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -1245,8 +1295,13 @@ fn onPaint(
     const v = viewOf(browser) orelse return;
     if (v.map.len == 0) return;
     // A paint for the pre-resize geometry: the resize triggers its own
-    // full repaint, so dropping this one loses nothing.
-    if (width != @as(c_int, v.w) or height != @as(c_int, v.h)) return;
+    // full repaint, so dropping this one loses nothing. The comparison
+    // is against the PHYSICAL size — OnPaint's width/height and its
+    // dirty rects are device pixels, i.e. the view rect times the screen
+    // info's device_scale_factor. Comparing them with the LOGICAL size
+    // is what forced the v1 scale pin (every paint at scale != 1 was
+    // dropped and the view stayed black).
+    if (width != @as(c_int, v.pw) or height != @as(c_int, v.ph)) return;
     const src: [*]const u8 = @ptrCast(buffer orelse return);
     const stride: usize = v.stride();
 
@@ -1255,15 +1310,15 @@ fn onPaint(
     const collapse = count == 0 or count > max_rects;
     const src_rects = if (rects == null) &[_]cef.cef_rect_t{} else rects[0..count];
     if (collapse) {
-        copyRect(v, src, stride, 0, 0, v.w, v.h);
-        list[0] = .{ .x = 0, .y = 0, .w = v.w, .h = v.h };
+        copyRect(v, src, stride, 0, 0, v.pw, v.ph);
+        list[0] = .{ .x = 0, .y = 0, .w = v.pw, .h = v.ph };
         n = 1;
     } else {
         for (src_rects) |r| {
-            const x: u16 = @intCast(std.math.clamp(r.x, 0, @as(c_int, v.w)));
-            const y: u16 = @intCast(std.math.clamp(r.y, 0, @as(c_int, v.h)));
-            const w: u16 = @intCast(std.math.clamp(r.width, 0, @as(c_int, v.w) - @as(c_int, x)));
-            const h: u16 = @intCast(std.math.clamp(r.height, 0, @as(c_int, v.h) - @as(c_int, y)));
+            const x: u16 = @intCast(std.math.clamp(r.x, 0, @as(c_int, v.pw)));
+            const y: u16 = @intCast(std.math.clamp(r.y, 0, @as(c_int, v.ph)));
+            const w: u16 = @intCast(std.math.clamp(r.width, 0, @as(c_int, v.pw) - @as(c_int, x)));
+            const h: u16 = @intCast(std.math.clamp(r.height, 0, @as(c_int, v.ph) - @as(c_int, y)));
             if (w == 0 or h == 0) continue;
             copyRect(v, src, stride, x, y, w, h);
             list[n] = .{ .x = x, .y = y, .w = w, .h = h };
@@ -1280,7 +1335,8 @@ fn onPaint(
     });
 }
 
-/// Copy one BGRA rect out of CEF's full-view buffer into the memfd.
+/// Copy one BGRA rect (device pixels) out of CEF's full-view buffer
+/// into the memfd; both are pw x ph with the same stride.
 fn copyRect(v: *View, src: [*]const u8, stride: usize, x: u16, y: u16, w: u16, h: u16) void {
     var row: usize = y;
     while (row < @as(usize, y) + h) : (row += 1) {

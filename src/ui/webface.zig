@@ -11,24 +11,46 @@
 //!   back/forward/reload) plus a `GtkPicture` fed from the view's
 //!   memfd.
 //!
-//! ## Rendering (v1)
+//! ## Rendering
 //!
 //! `frame_buffer` hands over a memfd; we mmap it read-only and keep the
-//! mapping. Every `frame_damage` batch rebuilds a `GdkMemoryTexture`
-//! over the WHOLE buffer and sets it on the picture — the damage rects
-//! are decoded but not yet exploited. That is a deliberate v1
-//! simplification: the planned upgrade is uploading only the damaged
-//! rects into an ImagePass/GL texture, which is why the protocol
-//! carries them at all.
+//! mapping. Every `frame_damage` batch wraps that mapping in a `GBytes`
+//! WITHOUT copying it and builds a `GdkMemoryTexture` over the whole
+//! buffer — the damage rects are decoded but not yet exploited, because
+//! a `GtkPicture` is not a GL area and selective upload needs the
+//! ImagePass/GL path. That remains the follow-up: it would cut the
+//! per-frame texture UPLOAD (still whole-buffer, done by GTK) down to
+//! the damaged rects, which is the only copy left on this path.
 //!
-//! ## Scale (v1)
+//! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
+//! delivered frame rate and the time spent here. MEASURED on a 60fps
+//! animating page: with the old whole-buffer `g_bytes_new` copy this
+//! function cost ~143us/frame on a 1.8MiB buffer and ~1950us/frame on a
+//! 19MiB one (a 3000x1800 window); zero-copy it is ~40us and ~24us —
+//! i.e. the cost stopped scaling with the window at all.
 //!
-//! The view is created at the widget's LOGICAL pixel size with
-//! `scale_x1000 = 1000`. The helper hands CEF the same rect as view
-//! rect and buffer size, so a device scale factor != 1 would make CEF
-//! paint at a size the helper drops. Pointer coordinates are therefore
-//! widget-local logical pixels, 1:1 with the view. HiDPI (a 2x buffer
-//! with a 1x view rect) is a helper-side change, not a face-side one.
+//! Zero-copy has two consequences. The helper rewrites the buffer in
+//! place, so a texture GTK still holds can show a half-new frame: the
+//! benign tearing the protocol doc already accepts for v1. And the
+//! mapping must outlive every texture built over it, which is what
+//! `Mapping` refcounts — GTK keeps textures alive past the frame that
+//! set them (render nodes, its texture cache), so munmap-on-replace
+//! would be a use-after-free.
+//!
+//! ## Scale (HiDPI)
+//!
+//! Per docs/proposal-browser-protocol.md "Scale contract": w/h on the
+//! wire are LOGICAL, `scale_x1000` is the real fractional device scale,
+//! and the buffer that comes back is PHYSICAL. The scale comes from
+//! `gdk_surface_get_scale()` — `gtk_widget_get_scale_factor()` rounds
+//! 1.5 up to 2 and must not be used. A surface only exists once the
+//! picture is realized, so the face starts at 1.0, re-sends on realize,
+//! and watches `GdkSurface::notify::scale` so dragging the window to a
+//! differently scaled output re-renders crisply.
+//!
+//! Input coordinates stay LOGICAL: CEF's `cef_mouse_event_t` is in DIP
+//! and applies the screen info's device_scale_factor itself (verified
+//! at 2x by the smoke rig's HiDPI click assertion).
 //!
 //! ## Lifetimes (CLAUDE.md "three mechanisms", one per allocation)
 //!
@@ -73,6 +95,103 @@ const MISSING_MSG =
 
 const LOST_MSG = "The browser helper stopped. Reload to start it again.";
 const CRASH_MSG = "This page's renderer crashed. Reload to bring it back.";
+
+// ---------------------------------------------------------------------
+// Frame mapping
+// ---------------------------------------------------------------------
+
+/// A refcounted read-only mmap of one helper frame buffer.
+///
+/// The face holds one reference; every `GBytes` handed to GDK holds
+/// another and drops it from its free-func. Without that, replacing the
+/// buffer (a resize, a scale change) would munmap memory a live
+/// `GdkMemoryTexture` still points at — GTK keeps textures well past the
+/// frame that set them.
+const Mapping = struct {
+    allocator: std.mem.Allocator,
+    ptr: [*]align(std.heap.page_size_min) u8,
+    len: usize,
+    refs: u32,
+
+    fn create(allocator: std.mem.Allocator, ptr: [*]align(std.heap.page_size_min) u8, len: usize) ?*Mapping {
+        const m = allocator.create(Mapping) catch return null;
+        m.* = .{ .allocator = allocator, .ptr = ptr, .len = len, .refs = 1 };
+        return m;
+    }
+
+    fn ref(self: *Mapping) void {
+        self.refs += 1;
+    }
+
+    fn unref(self: *Mapping) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        _ = c.munmap(self.ptr, self.len);
+        self.allocator.destroy(self);
+    }
+};
+
+fn mappingUnrefCb(user: ?*anyopaque) callconv(.c) void {
+    const m: *Mapping = @ptrCast(@alignCast(user orelse return));
+    m.unref();
+}
+
+// ---------------------------------------------------------------------
+// Optional frame statistics (`SKETERM_WEB_STATS=1`)
+// ---------------------------------------------------------------------
+
+/// Per-second stderr line with the delivered frame rate and the time
+/// spent turning a damage batch into a paintable. Off unless the
+/// environment variable is set; it is the measurement harness for the
+/// rendering path and deliberately left in.
+const Stats = struct {
+    on: bool = false,
+    checked: bool = false,
+    frames: u32 = 0,
+    ns_total: u64 = 0,
+    ns_max: u64 = 0,
+    bytes: u64 = 0,
+    window_start_ns: u64 = 0,
+
+    fn enabled(self: *Stats) bool {
+        if (!self.checked) {
+            self.checked = true;
+            self.on = c.getenv("SKETERM_WEB_STATS") != null;
+        }
+        return self.on;
+    }
+
+    fn nowNs() u64 {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    }
+
+    fn note(self: *Stats, ns: u64, payload: usize) void {
+        self.frames += 1;
+        self.ns_total += ns;
+        if (ns > self.ns_max) self.ns_max = ns;
+        self.bytes += payload;
+        const now = nowNs();
+        if (self.window_start_ns == 0) {
+            self.window_start_ns = now;
+            return;
+        }
+        const span = now - self.window_start_ns;
+        if (span < 1_000_000_000) return;
+        const fps = @as(f64, @floatFromInt(self.frames)) * 1e9 / @as(f64, @floatFromInt(span));
+        const avg_us = @as(f64, @floatFromInt(self.ns_total)) / @as(f64, @floatFromInt(self.frames)) / 1000.0;
+        const mbps = @as(f64, @floatFromInt(self.bytes)) * 1e9 /
+            @as(f64, @floatFromInt(span)) / (1024.0 * 1024.0);
+        std.debug.print(
+            "webface stats: {d:.1} fps, onDamage avg {d:.1} us max {d:.1} us, {d:.0} MiB/s\n",
+            .{ fps, avg_us, @as(f64, @floatFromInt(self.ns_max)) / 1000.0, mbps },
+        );
+        self.* = .{ .on = true, .checked = true, .window_start_ns = now };
+    }
+};
+
+var g_stats: Stats = .{};
 
 // ---------------------------------------------------------------------
 // Client — one helper process per GUI process
@@ -555,12 +674,14 @@ pub const WebFace = struct {
 
     /// Objects carrying signals whose user-data is this face. All are
     /// disconnected at the teardown choke point.
-    signal_objs: [12]?*c.GObject = .{null} ** 12,
+    signal_objs: [14]?*c.GObject = .{null} ** 14,
     signal_count: usize = 0,
 
-    /// Read-only mapping of the helper's frame memfd.
-    map: []align(std.heap.page_size_min) u8 = &.{},
+    /// Read-only mapping of the helper's frame memfd, refcounted so the
+    /// textures built over it can outlive the buffer's replacement.
+    mapping: ?*Mapping = null,
     buf_id: u32 = 0,
+    /// PHYSICAL geometry of the mapped buffer (the wire announces it).
     buf_w: u16 = 0,
     buf_h: u16 = 0,
     buf_stride: u32 = 0,
@@ -568,6 +689,14 @@ pub const WebFace = struct {
     /// Last size handed to the helper, in logical pixels.
     sent_w: u16 = 0,
     sent_h: u16 = 0,
+    /// Last device scale handed to the helper, x1000. 1000 until the
+    /// picture is realized and a GdkSurface can be asked.
+    sent_scale: u16 = 1000,
+    /// The realized surface whose scale we watch, with a reference held
+    /// (CLAUDE.md: a raw widget/surface pointer kept past the widget
+    /// tree's lifetime must own one) plus its handler id.
+    scale_surface: ?*c.GdkSurface = null,
+    scale_handler: c.gulong = 0,
     /// Last pointer position in view coordinates — scroll events carry
     /// no coordinates of their own.
     last_x: i32 = 0,
@@ -633,6 +762,10 @@ pub const WebFace = struct {
     fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
         const self: *WebFace = @ptrCast(@alignCast(ctx));
         self.widgets_dead = self.widgets_dead or widgets_dead;
+        // Owned reference: safe from any teardown path, dead widgets
+        // included, and the ONLY place the surface watch is severed
+        // besides the picture's own unrealize.
+        self.detachScaleWatch();
         // Mechanism 2: one disconnect for every widget/controller that
         // carries this face as user-data, at the single choke point.
         // Nothing here owns a GDestroyNotify — combining the two would
@@ -676,6 +809,7 @@ pub const WebFace = struct {
         const cl = client();
         if (self.view_live) cl.post(proto.ViewDestroy{ .view = self.view });
         cl.unregister(self);
+        self.detachScaleWatch();
         self.dropMap();
         if (self.pending_url) |u| self.allocator.free(u);
         if (self.url) |u| self.allocator.free(u);
@@ -683,14 +817,75 @@ pub const WebFace = struct {
         self.allocator.destroy(self);
     }
 
+    /// Drop OUR reference to the frame mapping; textures GDK still holds
+    /// keep it alive until their `GBytes` die.
     fn dropMap(self: *WebFace) void {
-        if (self.map.len != 0) {
-            _ = c.munmap(self.map.ptr, self.map.len);
-            self.map = &.{};
+        if (self.mapping) |m| {
+            m.unref();
+            self.mapping = null;
         }
         self.buf_id = 0;
         self.buf_w = 0;
         self.buf_h = 0;
+    }
+
+    // ---- device scale ----------------------------------------------
+
+    /// The output's fractional device scale x1000, or the last known one
+    /// while the picture has no surface yet.
+    fn currentScale(self: *WebFace) u16 {
+        if (self.widgets_dead) return self.sent_scale;
+        const native = c.gtk_widget_get_native(self.picture) orelse return self.sent_scale;
+        const surface = c.gtk_native_get_surface(native) orelse return self.sent_scale;
+        const s = c.gdk_surface_get_scale(surface);
+        if (!(s > 0.0)) return 1000;
+        return @intFromFloat(std.math.clamp(@round(s * 1000.0), 250.0, 8000.0));
+    }
+
+    /// Watch the realized surface's scale so a drag to a differently
+    /// scaled output re-renders at the new DPR.
+    fn attachScaleWatch(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        const native = c.gtk_widget_get_native(self.picture) orelse return;
+        const surface = c.gtk_native_get_surface(native) orelse return;
+        if (self.scale_surface == surface) return;
+        self.detachScaleWatch();
+        _ = c.g_object_ref(@ptrCast(surface));
+        self.scale_surface = surface;
+        self.scale_handler = c.g_signal_connect_data(
+            @ptrCast(surface),
+            "notify::scale",
+            @ptrCast(&onSurfaceScale),
+            self,
+            null,
+            0,
+        );
+    }
+
+    fn detachScaleWatch(self: *WebFace) void {
+        const surface = self.scale_surface orelse return;
+        if (self.scale_handler != 0) {
+            c.g_signal_handler_disconnect(@ptrCast(surface), self.scale_handler);
+            self.scale_handler = 0;
+        }
+        c.g_object_unref(@ptrCast(surface));
+        self.scale_surface = null;
+    }
+
+    /// Re-send the view's geometry when the scale actually moved. The
+    /// helper answers with a replacement buffer at the new physical
+    /// size; the logical size is unchanged.
+    fn syncScale(self: *WebFace) void {
+        const scale = self.currentScale();
+        if (scale == self.sent_scale) return;
+        self.sent_scale = scale;
+        if (!self.view_live or self.sent_w == 0 or self.sent_h == 0) return;
+        client().post(proto.ViewResize{
+            .view = self.view,
+            .w = self.sent_w,
+            .h = self.sent_h,
+            .scale_x1000 = scale,
+        });
     }
 
     // ---- UI ---------------------------------------------------------
@@ -763,6 +958,12 @@ pub const WebFace = struct {
         c.gtk_widget_set_hexpand(self.picture, 1);
         c.gtk_widget_set_vexpand(self.picture, 1);
         c.gtk_widget_set_focusable(self.picture, 1);
+        // The GdkSurface only exists once realized, and reparenting a
+        // pane unrealizes it — so every realize re-attaches the scale
+        // watch and re-reads the scale.
+        _ = c.g_signal_connect_data(@ptrCast(self.picture), "realize", @ptrCast(&onPictureRealize), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.picture), "unrealize", @ptrCast(&onPictureUnrealize), self, null, 0);
+        self.track(self.picture);
         c.gtk_overlay_set_child(@ptrCast(self.overlay), self.picture);
         self.wireInput();
 
@@ -867,12 +1068,14 @@ pub const WebFace = struct {
         const h: u16 = if (self.sent_h != 0) self.sent_h else 600;
         self.sent_w = w;
         self.sent_h = h;
+        self.sent_scale = self.currentScale();
         cl.post(proto.ViewCreate{
             .view = self.view,
+            // LOGICAL size; the buffer comes back physical. See the
+            // scale note at the top.
             .w = w,
             .h = h,
-            // v1 renders at 1x; see the scale note at the top.
-            .scale_x1000 = 1000,
+            .scale_x1000 = self.sent_scale,
             .context = 0,
         });
         self.view_live = true;
@@ -891,10 +1094,14 @@ pub const WebFace = struct {
         if (size == 0) return;
         const addr = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, fd, 0);
         if (addr == c.MAP_FAILED) return;
+        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
+        const mapping = Mapping.create(self.allocator, bytes, size) orelse {
+            _ = c.munmap(bytes, size);
+            return;
+        };
         const old_id = self.buf_id;
         self.dropMap();
-        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-        self.map = bytes[0..size];
+        self.mapping = mapping;
         self.buf_id = fb.buf_id;
         self.buf_w = fb.w;
         self.buf_h = fb.h;
@@ -906,11 +1113,27 @@ pub const WebFace = struct {
         if (self.widgets_dead) return;
         // A damage batch for a buffer we already replaced describes
         // pixels we no longer have; the new buffer repaints in full.
-        if (dmg.buf_id != self.buf_id or self.map.len == 0) return;
-        // v1 presents the WHOLE buffer per batch; dmg.rects is what a
-        // future GL/ImagePass path will upload selectively.
-        const gbytes = c.g_bytes_new(self.map.ptr, self.map.len) orelse return;
+        if (dmg.buf_id != self.buf_id) return;
+        const mapping = self.mapping orelse return;
+        const stats = g_stats.enabled();
+        const t0 = if (stats) Stats.nowNs() else 0;
+        // The WHOLE buffer is presented per batch; dmg.rects is what a
+        // future GL/ImagePass path will upload selectively. The GBytes
+        // does NOT copy — it borrows the mapping and holds a reference
+        // for as long as GDK keeps the texture.
+        mapping.ref();
+        const gbytes = c.g_bytes_new_with_free_func(
+            mapping.ptr,
+            mapping.len,
+            mappingUnrefCb,
+            mapping,
+        ) orelse {
+            mapping.unref();
+            return;
+        };
         defer c.g_bytes_unref(gbytes);
+        // Texture geometry is PHYSICAL; the picture draws it into its
+        // LOGICAL allocation, so device pixels land 1:1.
         const tex = c.gdk_memory_texture_new(
             @intCast(self.buf_w),
             @intCast(self.buf_h),
@@ -921,6 +1144,7 @@ pub const WebFace = struct {
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(self.picture), @ptrCast(tex));
         self.clearStatus();
+        if (stats) g_stats.note(Stats.nowNs() - t0, mapping.len);
     }
 
     pub fn onTitle(self: *WebFace, title: []const u8) void {
@@ -1107,14 +1331,30 @@ pub const WebFace = struct {
         _ = c.gtk_widget_grab_focus(self.entry);
     }
 
+    fn onPictureRealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        self.attachScaleWatch();
+        self.syncScale();
+    }
+
+    fn onPictureUnrealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).detachScaleWatch();
+    }
+
+    fn onSurfaceScale(_: ?*c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).syncScale();
+    }
+
     fn onResize(_: ?*c.GtkDrawingArea, w: c_int, h: c_int, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         if (w <= 0 or h <= 0) return;
         const nw: u16 = @intCast(@min(w, std.math.maxInt(u16)));
         const nh: u16 = @intCast(@min(h, std.math.maxInt(u16)));
-        if (nw == self.sent_w and nh == self.sent_h and self.view_live) return;
+        const scale = self.currentScale();
+        if (nw == self.sent_w and nh == self.sent_h and scale == self.sent_scale and self.view_live) return;
         self.sent_w = nw;
         self.sent_h = nh;
+        self.sent_scale = scale;
         if (!self.view_live) {
             self.ensureView();
             return;
@@ -1123,7 +1363,7 @@ pub const WebFace = struct {
             .view = self.view,
             .w = nw,
             .h = nh,
-            .scale_x1000 = 1000,
+            .scale_x1000 = scale,
         });
     }
 

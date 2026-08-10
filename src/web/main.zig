@@ -140,8 +140,24 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 /// caller did not already supply them. Written into `buf` (no
 /// allocator: this runs before one exists) and truncated rather than
 /// overflowed, since Chromium ignores what it never sees anyway.
+///
+/// `--ozone-platform=headless` is unconditional: the helper is always
+/// offscreen and must never need a display. `--disable-gpu` is no
+/// longer forced on every launch, but it is passed through when the
+/// caller supplies it — which is how the smoke rig keeps its runs
+/// deterministic.
+///
+/// MEASURED (2026-08-10, Arch, CEF 151, animating page, OSR): dropping
+/// the switch changes NOTHING observable. With and without it the helper
+/// spawns no `--type=gpu-process` at all, paints at exactly the
+/// windowless cap (60/s at 800x600 and at 3840x2160), burns the same CPU
+/// (~17 jiffies/8s), and produces byte-identical pixels. Headless ozone
+/// has no GL surface to render into, so Chromium composites in software
+/// either way. The switch is kept conditional because forcing it is
+/// wrong in principle and would block a future non-headless/dma-buf
+/// path, NOT because it bought any measured speed here.
 fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
-    const extra = [_][*:0]const u8{ "--ozone-platform=headless", "--disable-gpu" };
+    const extra = [_][*:0]const u8{"--ozone-platform=headless"};
     var n: usize = 0;
     for (argv) |a| {
         if (n == buf.len) break;

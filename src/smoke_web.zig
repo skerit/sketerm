@@ -8,7 +8,12 @@
 //! with stable ids, mutation delta, trusted sem_act click, expand,
 //! cross-navigation id carrying, reader extraction, query), a hostile
 //! page that tries to forge semantic replies and hijack the command
-//! entry point, and a clean shutdown on disconnect.
+//! entry point, HiDPI (physical buffers, logical input), and a clean
+//! shutdown on disconnect.
+//!
+//! The HiDPI stage runs LAST on purpose: its scale changes leave the
+//! engine re-laying-out for a while, and running it mid-rig made the
+//! popup stage's click miss often enough to matter.
 //!
 //! Headless by construction: the helper runs CEF with
 //! `--ozone-platform=headless`, so no display is needed. No network is
@@ -203,6 +208,12 @@ const Client = struct {
     nav_back: u8 = 0,
     nav_fwd: u8 = 0,
     nav_seq: u32 = 0,
+
+    /// Main-frame load-finished counter. Waiting on a paint alone is
+    /// not a settle: a repaint still queued from the PREVIOUS page (a
+    /// resize, a scale change) satisfies it immediately, and the stage
+    /// then drives input at a document that has not loaded yet.
+    load_seq: u32 = 0,
 
     // Semantic layer. `sem_log` accumulates every payload since the
     // last reset (snapshots arrive unsolicited too, from the mutation
@@ -401,6 +412,10 @@ const Client = struct {
                 @memcpy(self.md[0..self.md_len], r.markdown.s[0..self.md_len]);
                 self.md_seq += 1;
             },
+            .ev_load => {
+                const l = proto.decode(proto.EvLoad, frame.payload) catch fail("ev_load decode");
+                if (l.state == @intFromEnum(proto.LoadState.finished)) self.load_seq += 1;
+            },
             .ev_nav_state => {
                 const s = proto.decode(proto.EvNavState, frame.payload) catch fail("ev_nav_state decode");
                 self.nav_back = s.can_back;
@@ -588,12 +603,15 @@ const Client = struct {
         if (!self.waitSeq(&self.sem_seq, seq, 20_000)) fail("no sem_snapshot for the request");
     }
 
-    /// Navigate and wait for the paint that follows.
+    /// Navigate, wait for the main frame to finish loading, then for a
+    /// paint of it.
     fn navigate(self: *Client, url: []const u8) void {
-        const seq = self.dmg_seq;
+        const load = self.load_seq;
+        const dmg = self.dmg_seq;
         self.resetTitle();
         self.send(proto.Navigate{ .view = view_id, .url = url });
-        if (!self.waitDamageAfter(seq, 20_000)) fail("no paint after navigate");
+        if (!self.waitSeq(&self.load_seq, load, 20_000)) fail("no load-finished after navigate");
+        if (!self.waitDamageAfter(dmg, 20_000)) fail("no paint after navigate");
     }
 };
 
@@ -646,12 +664,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const pid = c.fork();
     if (pid < 0) fail("fork");
     if (pid == 0) {
-        var vec: [6:null]?[*:0]const u8 = @splat(null);
+        var vec: [7:null]?[*:0]const u8 = @splat(null);
         vec[0] = exe;
         vec[1] = "--socket";
         vec[2] = sock.ptr;
         vec[3] = "--cache-dir";
         vec[4] = cache.ptr;
+        // The helper no longer disables the GPU by itself (that forced
+        // SwiftShader on every visible pane); the rig asks for it so a
+        // CI-ish run rasterizes deterministically in software.
+        vec[5] = "--disable-gpu";
         _ = c.execv(exe, @ptrCast(@constCast(&vec)));
         c._exit(127);
     }
@@ -907,7 +929,81 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 14 hostile page (no transport, no forgery, no hijack)");
 
-    // ── Stage 15: teardown ────────────────────────────────────────
+    // ── Stage 15: HiDPI — physical buffer, logical input ────────────
+    //
+    // The scale contract in docs/proposal-browser-protocol.md: w/h on
+    // the wire stay LOGICAL, the announced buffer is
+    // ceil(logical * scale), and the ENGINE must actually paint into
+    // all of it. v1 pinned the scale to 1000 precisely because a
+    // mismatched paint size made the helper drop every paint, so a
+    // solid-colour page has to fill the far corner, not just the
+    // logical-sized top-left quadrant.
+    {
+        const old_buf = cl.fb.?.buf_id;
+        var seq = cl.fb_seq;
+        cl.send(proto.ViewResize{ .view = view_id, .w = 400, .h = 300, .scale_x1000 = 2000 });
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer for scale 2");
+        {
+            const fb = cl.fb.?;
+            if (fb.w != 800 or fb.h != 600) fail("stage 15 hidpi: 400x300 at 2x did not announce an 800x600 buffer");
+            if (fb.stride != 3200) fail("stage 15 hidpi: stride is not the physical width times 4");
+        }
+        cl.send(proto.FrameRelease{ .view = view_id, .buf_id = old_buf });
+
+        cl.navigate(blue_page);
+        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 15 hidpi: the page never painted at 2x");
+        {
+            const fb = cl.fb.?;
+            cl.mapBuffer();
+            const far = cl.pixel(fb.w - 1, fb.h - 1);
+            if (far[0] < 200 or far[1] > 64 or far[2] > 64) {
+                std.debug.print("smoke-web: far pixel was {any}\n", .{far});
+                fail("stage 15 hidpi: the paint did not cover the whole physical buffer");
+            }
+        }
+
+        // Input stays LOGICAL: a click at the logical centre must reach
+        // the page as clientX/clientY 200,150 — physical coordinates
+        // would land at 100,75.
+        cl.navigate(click_page);
+        if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 15 hidpi: the click page never painted");
+        cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
+        cl.resetTitle();
+        for ([_]proto.PointerKind{ .move, .down, .up }) |kind| {
+            cl.send(proto.InputPointer{
+                .view = view_id,
+                .kind = @intFromEnum(kind),
+                .x = 200,
+                .y = 150,
+                .button = 0,
+                .clicks = if (kind == .move) 0 else 1,
+                .mods = 0,
+            });
+        }
+        if (!cl.waitTitle("result:trusted=true x=200 y=150", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 15 hidpi: input coordinates are not logical at 2x");
+        }
+
+        // A fractional scale (KWin/GNOME both do 1.5) rounds UP.
+        seq = cl.fb_seq;
+        cl.send(proto.ViewResize{ .view = view_id, .w = 101, .h = 100, .scale_x1000 = 1500 });
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer for scale 1.5");
+        {
+            const fb = cl.fb.?;
+            if (fb.w != 152 or fb.h != 150) fail("stage 15 hidpi: 101x100 at 1.5x is not a 152x150 buffer");
+        }
+
+        // ... and back down to 1x, which is a scale change in the other
+        // direction and must shrink the buffer again.
+        seq = cl.fb_seq;
+        cl.send(proto.ViewResize{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000 });
+        if (!cl.waitBufferAfter(seq, 20_000)) fail("stage 15 hidpi: no frame_buffer back at 1x");
+        if (cl.fb.?.w != 640 or cl.fb.?.h != 480) fail("stage 15 hidpi: the 1x buffer is not 640x480");
+        pass("stage 15 hidpi (physical buffer, logical input, fractional scale)");
+    }
+
+    // ── Stage 16: teardown ────────────────────────────────────────
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -921,11 +1017,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             _ = c.usleep(50_000);
         }
-        if (!gone) fail("stage 15 teardown: helper did not exit within 10s of the disconnect");
+        if (!gone) fail("stage 16 teardown: helper did not exit within 10s of the disconnect");
         g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 15 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 15 teardown: helper exited nonzero");
-        pass("stage 15 teardown (helper exited 0 on disconnect)");
+        if (status & 0x7f != 0) fail("stage 16 teardown: helper died on a signal");
+        if ((status >> 8) & 0xff != 0) fail("stage 16 teardown: helper exited nonzero");
+        pass("stage 16 teardown (helper exited 0 on disconnect)");
     }
 
     cleanup();
