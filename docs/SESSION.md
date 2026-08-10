@@ -15637,3 +15637,34 @@ visual change of it closing, retrying Escape; the pane-face probe dumps
 every window as PNG before failing so the next silent pixel mismatch
 names itself. Neither failure was the "known flaky stages"
 pattern - both attributions were wrong and both had real causes.
+
+## 2026-08-10: the "flaky" e2e stages were four real bugs
+
+Runs that had been written off as load flake were chased to root cause with
+failure screenshots, core-dump capture and a pid-aware fuse. Four distinct
+causes, none of them flake:
+
+1. The close-tab confirm's Escape raced the AdwAlertDialog's asynchronous
+   presentation. The orphaned modal's scrim then dimmed every later window,
+   which broke the pane-face stage's exact-color probe -- that is what the
+   wandering "pane panel image did not decode" red always was.
+2. The teardown picker's Escape had the same race (fired 150ms after the
+   chord). Both sites now wait for the modal to appear, settle its open
+   animation, and require the visual change of it closing.
+3. The theme-flip stage identified its detached window by diffing a window
+   snapshot taken BEFORE it forked the theme GUI. The control socket exists
+   before the toplevel reaches the hub, so the GUI's own primary window
+   could qualify as the "secondary" -- and closing a primary quits the
+   application (a clean exit: no core, no panic, socket gone). The stage now
+   pins both windows by the app_id that instance sets for exactly this
+   purpose, polling for each rather than assuming announcement order.
+4. A genuine product hazard found while chasing 3: the deferred window free
+   can be gated behind pending page-detach idles, leaving the destroyed
+   window's AdwStyleManager handler connected. Severing global signals at
+   destroy (idempotent with deinit) fixed it -- real, though not the cause
+   of 3.
+
+Verification: 10/10 consecutive smoke-e2e passes at loads 2.4-19.3. The one
+genuinely load-sensitive stage is the OCR hex dump, which fails above load
+~50 because tesseract cannot finish inside its deadline; unrelated runaway
+processes on the box were the cause both times that appeared.

@@ -5737,12 +5737,10 @@ fn themeSingletonStage(
 ) ?[]const u8 {
     const app = maybe_app orelse return null;
 
-    // Windows already on the hub belong to the other instances; only
-    // ids that appear after this fork are ours.
+    // This GUI's windows are found by app_id below, not by diffing a
+    // snapshot: its control socket appears before its toplevel reaches
+    // the hub, so no pre-fork baseline can be trusted here.
     _ = app.drainLive(500);
-    var pre: std.ArrayList(u32) = .empty;
-    defer pre.deinit(allocator);
-    for (app.windows.items) |w| pre.append(allocator, w.id) catch return "alloc";
 
     const pid = c.fork();
     if (pid < 0) return "fork for the theme GUI failed";
@@ -5777,6 +5775,29 @@ fn themeSingletonStage(
     }
     _ = app.drainLive(3_000);
 
+    // Identify this GUI's windows by app_id, never by "appeared after a
+    // snapshot": the control socket exists BEFORE the toplevel reaches the
+    // hub, so a time-based baseline can miss the theme GUI's own primary
+    // and then pick it as the "secondary". Closing that primary quits the
+    // application (onWindowDestroyed -> g_application_quit) — a clean exit,
+    // no core, no panic, which is exactly what the rare red here was.
+    const theme_app_id = "dev.sker.sketerm.e2e.theme";
+    var primary_id: u32 = 0;
+    var primary_waited: u32 = 0;
+    while (primary_waited < 15_000) : (primary_waited += 100) {
+        _ = app.pumpOnce(100);
+        var count: u32 = 0;
+        for (app.windows.items) |w| {
+            if (w.popup) continue;
+            const id = w.app_id orelse continue;
+            if (!std.mem.eql(u8, id, theme_app_id)) continue;
+            count += 1;
+            primary_id = w.id;
+        }
+        if (count == 1) break;
+    }
+    if (primary_id == 0) return "the theme GUI's own window never reached the display session";
+
     // A second tab, selected, so `detach_tab` moves a SINGLE-pane tab:
     // one pane means the confirm-close policy lets the window go
     // without putting a dialog up. A tab created over IPC is not
@@ -5803,11 +5824,28 @@ fn themeSingletonStage(
     // Let the new toplevel map and paint: an unrealized window has not
     // handed out the references that make its teardown deferred.
     _ = app.drainLive(2_000);
+    // The detached window is the theme GUI's OTHER window: same app_id,
+    // different id from the primary we pinned above. Poll for it instead
+    // of assuming it has been announced by now.
     var secondary: u32 = 0;
-    for (app.windows.items) |w| {
-        if (w.popup) continue;
-        if (std.mem.indexOfScalar(u32, pre.items, w.id) != null) continue;
-        secondary = w.id;
+    var detach_waited: u32 = 0;
+    while (detach_waited < 15_000) : (detach_waited += 100) {
+        _ = app.pumpOnce(100);
+        var found: u32 = 0;
+        var candidate: u32 = 0;
+        for (app.windows.items) |w| {
+            if (w.popup) continue;
+            const id = w.app_id orelse continue;
+            if (!std.mem.eql(u8, id, theme_app_id)) continue;
+            if (w.id == primary_id) continue;
+            found += 1;
+            candidate = w.id;
+        }
+        if (found == 1) {
+            secondary = candidate;
+            break;
+        }
+        if (found > 1) return "detach_tab produced more than one new theme window";
     }
     if (secondary == 0) return "detach_tab produced no new window on the display session";
 
@@ -5826,8 +5864,20 @@ fn themeSingletonStage(
     var alive_waited: u32 = 0;
     while (alive_waited < 5_000) : (alive_waited += 250) {
         _ = app.pumpOnce(250);
-        const alive = roundtrip(allocator, sock, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
-            return "the GUI stopped serving after a secondary window was closed under a theme flip";
+        // A single failed connect is NOT proof the GUI died: this rig runs
+        // on a loaded box and the control socket can refuse a connection
+        // while the main loop is mid-frame. Only a REAPED child (or a
+        // sustained refusal) is the crash this stage is a fuse for.
+        var attempt: u32 = 0;
+        const alive = while (attempt < 4) : (attempt += 1) {
+            if (roundtrip(allocator, sock, "{\"cmd\":\"screen-info\",\"pane\":1}\n")) |resp| break resp;
+            var status: c_int = 0;
+            if (c.waitpid(theme_pid, &status, c.WNOHANG) == theme_pid) {
+                theme_pid = 0;
+                return "the GUI EXITED after a secondary window was closed under a theme flip";
+            }
+            _ = app.pumpOnce(250);
+        } else return "the GUI stopped serving after a secondary window was closed under a theme flip";
         defer allocator.free(alive);
         if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
             return "the GUI went unhealthy after a secondary window was closed under a theme flip";
