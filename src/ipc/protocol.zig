@@ -7,9 +7,11 @@
 
 const std = @import("std");
 
-/// Maximum accepted request line. Generous for send-text payloads,
-/// small enough that a garbage client can't balloon memory.
-pub const MAX_LINE = 1 << 20;
+/// Maximum accepted request line. A valid panel document may itself occupy
+/// 1 MiB; wrapping that JSON as the `document` string can nearly double it.
+/// Four MiB accepts the full document boundary plus request metadata while
+/// keeping newline-less clients and ordinary control requests bounded.
+pub const MAX_LINE = 4 << 20;
 
 pub const Request = struct {
     cmd: []const u8 = "",

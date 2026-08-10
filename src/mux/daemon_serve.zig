@@ -45,10 +45,20 @@ const wallMs = dmod.wallMs;
 // control message is one datagram: [opcode][payload], with at most one
 // fd in SCM_RIGHTS. A non-positive recv means the channel is gone —
 // test `n <= 0`, never `n == 0`, since Darwin reports a closed peer as
-// -1/ECONNRESET. Opcodes: 'A' attach (payload
-// [proto][video][kind][native_state_max][snapshot][audio][winstream]
-// + the client fd),
-// 'K' kill. (list/rename/metadata join in B3.)
+// -1/ECONNRESET. Worker-handled opcodes (workerOnControl): 'A' attach
+// (payload is PassedClient's append-only byte encoding + the client fd),
+// 'K' kill, 'R' broker-authoritative rename, 'n' result of a rename this
+// worker forwarded. Broker-handled opcodes (brokerOnWorkerControl):
+// 'Y' ready, 'E' spawn-failure reason, 'M' metadata push, 'N' an attached
+// client's rename forwarded by the worker.
+
+/// Graceful worker stop, shared by the broker's 'K' and control EOF: close
+/// panel scopes, tell live clients it is intentional, and leave the loop.
+fn workerShutdown(self: *Daemon) void {
+    for (self.sessions.items) |s| self.panelSessionClosed(s);
+    for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
+    self.running = false;
+}
 
 /// Worker side: drain one control datagram and act on it.
 pub fn workerOnControl(self: *Daemon) void {
@@ -58,77 +68,83 @@ pub fn workerOnControl(self: *Daemon) void {
     if (n <= 0) {
         // Broker closed the control channel — no supervisor left; exit.
         if (passed >= 0) _ = c.close(passed);
-        self.running = false;
+        workerShutdown(self);
         return;
     }
     switch (buf[0]) {
         'A' => {
             if (passed < 0) return;
-            const proto: u32 = if (n >= 2) buf[1] else 1;
-            const video: bool = n >= 3 and buf[2] != 0;
-            // Byte 3 (newer brokers): the client's attach kind.
-            // Without it an MCP client reads as .unknown in the
-            // worker and the whole per-kind native backlog policy
-            // (gap + live-mirror resync) silently never engages —
-            // the stale-screenshot bug in broker (= `sketerm mcp`
-            // isolation) mode while monolith tested clean.
-            const kind: Client.Kind = if (n >= 4)
-                std.enums.fromInt(Client.Kind, buf[3]) orelse .unknown
-            else
-                .unknown;
-            const native_state_max: u8 = if (n >= 5)
-                buf[4]
-            else if (proto >= wire.NATIVE_STATE_PROTO_VERSION)
-                wire.NATIVE_STATE_VERSION
-            else if (proto >= 5)
-                wire.LEGACY_NATIVE_STATE_VERSION
-            else
-                0;
-            const snapshot_version: u8 = if (n >= 6)
-                buf[5]
-            else if (proto >= 6)
-                snapshot.SNAPSHOT_VERSION
-            else
-                snapshot.LEGACY_SNAPSHOT_VERSION;
-            const audio_channels = if (n >= 7) buf[6] != 0 else proto >= 5;
-            const winstream_channels = if (n >= 8) buf[7] != 0 else proto >= wire.WINSTREAM_PROTO_VERSION;
-            // Bytes 8/9 (controller lease): absent = the historical
-            // "every viewer drives" request, i.e. take a free lease
-            // and never force a takeover.
-            const read_only = n >= 9 and buf[8] != 0;
-            const want_control = n >= 10 and buf[9] != 0;
-            addPassedClient(self, passed, .{
-                .proto = proto,
-                .video = video,
-                .kind = kind,
-                .native_state_max = native_state_max,
-                .snapshot_version = snapshot_version,
-                .audio_channels = audio_channels,
-                .winstream_channels = winstream_channels,
-                .read_only = read_only,
-                .want_control = want_control,
-            });
+            addPassedClient(self, passed, PassedClient.decode(buf[1..@intCast(n)]));
         },
-        'K' => {
-            for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
-            self.running = false;
-        },
+        'K' => workerShutdown(self),
         'R' => {
-            // Rename our session to match the broker's new authoritative
-            // name (keeps the worker's own state consistent; the broker is
-            // the routing authority). Payload after 'R' is the raw name.
             if (passed >= 0) _ = c.close(passed);
-            if (n > 1 and self.sessions.items.len > 0) {
-                const new_name = buf[1..@intCast(n)];
-                if (self.allocator.dupe(u8, new_name)) |fresh| {
-                    self.allocator.free(self.sessions.items[0].name);
-                    self.sessions.items[0].name = fresh;
-                } else |_| {}
-            }
+            workerApplyRename(self, buf[0..@intCast(n)]);
+        },
+        'n' => {
+            if (passed >= 0) _ = c.close(passed);
+            workerRenameResult(self, buf[0..@intCast(n)]);
         },
         else => if (passed >= 0) {
             _ = c.close(passed);
         },
+    }
+}
+
+/// The broker is the routing authority: it has already renamed its own record
+/// and is telling us the new name. Nothing to negotiate.
+fn workerApplyRename(self: *Daemon, payload: []const u8) void {
+    if (payload.len <= 1 or self.sessions.items.len == 0) return;
+    const session = self.sessions.items[0];
+    session.renameTo(payload[1..]) catch return;
+    self.broadcastSessionIdentity(session);
+}
+
+/// Forward an attached client's rename to the broker and answer that client
+/// when the broker reports back.
+pub fn workerRequestRename(self: *Daemon, cl: *Client, new_name: []const u8) void {
+    if (self.worker_rename_request != null) {
+        cl.queueErr("session rename already in progress");
+        return;
+    }
+    if (self.sessions.items.len == 0) {
+        cl.queueErr("no such session");
+        return;
+    }
+    const session = self.sessions.items[0];
+    if (std.mem.eql(u8, session.name, new_name)) {
+        cl.queueJson(.ok, .{ .ok = true, .name = session.name });
+        return;
+    }
+    const request_id = self.next_worker_rename_request;
+    self.next_worker_rename_request +%= 1;
+    if (self.next_worker_rename_request == 0) self.next_worker_rename_request = 1;
+    var msg: [9 + dmod.MAX_SESSION_NAME]u8 = undefined;
+    msg[0] = 'N';
+    std.mem.writeInt(u64, msg[1..9], request_id, .little);
+    @memcpy(msg[9..][0..new_name.len], new_name);
+    if (!controlSend(self.control_fd, msg[0 .. 9 + new_name.len], -1)) {
+        cl.queueErr("session rename could not reach the broker");
+        return;
+    }
+    self.worker_rename_request = .{ .request_id = request_id, .requester_id = cl.id };
+}
+
+fn workerRenameResult(self: *Daemon, payload: []const u8) void {
+    if (payload.len < 10) return;
+    const request_id = std.mem.readInt(u64, payload[1..9], .little);
+    const pending = self.worker_rename_request orelse return;
+    if (pending.request_id != request_id) return;
+    self.worker_rename_request = null;
+    const ok = payload[9] != 0;
+    const detail = payload[10..];
+    for (self.clients.items) |candidate| {
+        if (candidate.id != pending.requester_id or candidate.dead) continue;
+        if (ok)
+            candidate.queueJson(.ok, .{ .ok = true, .name = detail })
+        else
+            candidate.queueErr(if (detail.len > 0) detail else "broker refused session rename");
+        return;
     }
 }
 
@@ -147,7 +163,98 @@ pub const PassedClient = struct {
     winstream_channels: bool,
     read_only: bool = false,
     want_control: bool = false,
+    panel_only: bool = false,
+    panel_rpc: u8 = 0,
+    identity_first: bool = false,
+
+    pub const WIRE_SIZE: usize = 12;
+
+    /// Append-only broker handoff encoding; old workers ignore tail bytes.
+    pub fn encode(self: PassedClient) [WIRE_SIZE]u8 {
+        var out: [WIRE_SIZE]u8 = @splat(0);
+        out[0] = @truncate(self.proto);
+        out[1] = @intFromBool(self.video);
+        out[2] = @intFromEnum(self.kind);
+        out[3] = self.native_state_max;
+        out[4] = self.snapshot_version;
+        out[5] = @intFromBool(self.audio_channels);
+        out[6] = @intFromBool(self.winstream_channels);
+        out[7] = @intFromBool(self.read_only);
+        out[8] = @intFromBool(self.want_control);
+        out[9] = @intFromBool(self.panel_only);
+        out[10] = self.panel_rpc;
+        out[11] = @intFromBool(self.identity_first);
+        return out;
+    }
+
+    /// Decode every historical prefix and default only fields not present.
+    pub fn decode(bytes: []const u8) PassedClient {
+        const proto: u32 = if (bytes.len >= 1) bytes[0] else 1;
+        return .{
+            .proto = proto,
+            .video = bytes.len >= 2 and bytes[1] != 0,
+            .kind = if (bytes.len >= 3) std.enums.fromInt(Client.Kind, bytes[2]) orelse .unknown else .unknown,
+            .native_state_max = if (bytes.len >= 4)
+                bytes[3]
+            else if (proto >= wire.NATIVE_STATE_PROTO_VERSION)
+                wire.NATIVE_STATE_VERSION
+            else if (proto >= 5)
+                wire.LEGACY_NATIVE_STATE_VERSION
+            else
+                0,
+            .snapshot_version = if (bytes.len >= 5)
+                bytes[4]
+            else if (proto >= 6)
+                snapshot.SNAPSHOT_VERSION
+            else
+                snapshot.LEGACY_SNAPSHOT_VERSION,
+            .audio_channels = if (bytes.len >= 6) bytes[5] != 0 else proto >= 5,
+            .winstream_channels = if (bytes.len >= 7) bytes[6] != 0 else proto >= wire.WINSTREAM_PROTO_VERSION,
+            .read_only = bytes.len >= 8 and bytes[7] != 0,
+            .want_control = bytes.len >= 9 and bytes[8] != 0,
+            .panel_only = bytes.len >= 10 and bytes[9] != 0,
+            .panel_rpc = if (bytes.len >= 11) @min(bytes[10], wire.PANEL_RPC_VERSION) else 0,
+            .identity_first = bytes.len >= 12 and bytes[11] != 0,
+        };
+    }
 };
+
+test "broker attach handoff preserves panel-only capability fields" {
+    const t = std.testing;
+    const original = PassedClient{
+        .proto = wire.PROTO_VERSION,
+        .video = true,
+        .kind = .gui,
+        .native_state_max = wire.NATIVE_STATE_VERSION,
+        .snapshot_version = snapshot.SNAPSHOT_VERSION,
+        .audio_channels = true,
+        .winstream_channels = true,
+        .read_only = true,
+        .want_control = true,
+        .panel_only = true,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+        .identity_first = true,
+    };
+    const encoded = original.encode();
+    const decoded = PassedClient.decode(&encoded);
+    try t.expectEqual(original.proto, decoded.proto);
+    try t.expectEqual(original.video, decoded.video);
+    try t.expectEqual(original.kind, decoded.kind);
+    try t.expectEqual(original.native_state_max, decoded.native_state_max);
+    try t.expectEqual(original.snapshot_version, decoded.snapshot_version);
+    try t.expectEqual(original.audio_channels, decoded.audio_channels);
+    try t.expectEqual(original.winstream_channels, decoded.winstream_channels);
+    try t.expectEqual(original.read_only, decoded.read_only);
+    try t.expectEqual(original.want_control, decoded.want_control);
+    try t.expectEqual(original.panel_only, decoded.panel_only);
+    try t.expectEqual(original.panel_rpc, decoded.panel_rpc);
+    try t.expectEqual(original.identity_first, decoded.identity_first);
+
+    const historical = PassedClient.decode(encoded[0..9]);
+    try t.expect(!historical.panel_only);
+    try t.expectEqual(@as(u8, 0), historical.panel_rpc);
+    try t.expect(!historical.identity_first);
+}
 
 /// Worker side: adopt a broker-passed client fd as a client attached to
 /// our one session, and send it the attach snapshot.
@@ -170,7 +277,10 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         .winstream_channels = req.winstream_channels,
         .video = req.video,
         .kind = req.kind,
-        .read_only = req.read_only,
+        .read_only = req.read_only or req.panel_only,
+        .panel_rpc_support = req.panel_rpc,
+        .panel_rpc = req.panel_rpc,
+        .panel_only = req.panel_only,
     };
     self.next_client_id += 1;
     self.clients.append(self.allocator, cl) catch {
@@ -179,8 +289,24 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
     };
     if (self.sessions.items.len == 0) return;
     const s = self.sessions.items[0];
+    cl.resetAttachmentStreamState();
     cl.attached = s;
-    log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(req.kind), req.proto, req.video });
+    log.info("client attached session='{s}' kind={s} proto={d} video={} panel_only={} panel_rpc={d} (worker handoff)", .{
+        s.name, @tagName(req.kind), req.proto, req.video, req.panel_only, req.panel_rpc,
+    });
+    if (req.panel_only) {
+        cl.queueJson(.ok, .{
+            .ok = true,
+            .panel_only = true,
+            .name = s.name,
+            .origin_name = s.origin_name,
+            .origin_id = &s.origin_id,
+        });
+        self.broadcastPeerInfo(s);
+        return;
+    }
+    if (req.identity_first and req.panel_rpc > 0 and req.kind == .gui)
+        self.queueAttachIdentity(cl, s);
     self.queueSnapshot(cl, s);
     // Cast playback auto-starts once its first viewer arrives.
     self.castOnAttach(s, dmod.nowMs());
@@ -216,9 +342,13 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
     }
     switch (buf[0]) {
         'Y' => {
-            w.ready = true;
-            if (n > 1) applyWorkerReady(self, w, buf[1..@intCast(n)]);
-            replyPendingSpawn(self, w, true);
+            const ready_ok = if (n > 1) applyWorkerReady(self, w, buf[1..@intCast(n)]) else true;
+            w.ready = ready_ok;
+            replyPendingSpawn(self, w, ready_ok);
+            if (!ready_ok) {
+                _ = c.kill(w.pid, c.SIGKILL);
+                w.dead = true;
+            }
         },
         'E' => {
             // Spawn-failure reason; the control EOF that follows
@@ -273,6 +403,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.setOwned(&w.x_display, m.x);
             w.setOwned(&w.xauthority, m.xa);
         },
+        'N' => self.brokerWorkerRename(w, buf[0..@intCast(n)]),
         else => {},
     }
 }
@@ -281,13 +412,20 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
 /// form is current, a bare decimal pid is what pre-JSON workers
 /// sent, and anything else leaves the record untouched (a spawn
 /// still succeeds — only the returned paths would be missing).
-pub fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) void {
+pub fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) bool {
     if (payload.len > 0 and payload[0] == '{') {
         var parsed = std.json.parseFromSlice(WorkerReady, self.allocator, payload, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
-        }) catch return;
+        }) catch return false;
         defer parsed.deinit();
+        if (parsed.value.origin_id.len > 0 and
+            (!dmod.validSessionOriginId(parsed.value.origin_id) or
+                !std.mem.eql(u8, parsed.value.origin_id, &w.origin_id)))
+        {
+            w.setOwned(&w.spawn_err, "worker session origin identity mismatch");
+            return false;
+        }
         w.child_pid = parsed.value.pid;
         w.setOwned(&w.wl_display, parsed.value.wl);
         w.setOwned(&w.pulse_server, parsed.value.pa);
@@ -298,9 +436,10 @@ pub fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) void {
         w.gpu = parsed.value.gpu;
         w.output_width = parsed.value.output_width;
         w.output_height = parsed.value.output_height;
-        return;
+        return true;
     }
     w.child_pid = std.fmt.parseInt(i32, payload, 10) catch 0;
+    return true;
 }
 
 /// Resolve a worker's deferred spawn reply. `ok` = session up (`.ok`),
@@ -315,6 +454,8 @@ pub fn replyPendingSpawn(self: *Daemon, w: *Worker, ok: bool) void {
                 c2.queueJson(.ok, .{
                     .ok = true,
                     .name = w.name,
+                    .origin_name = w.origin_name,
+                    .origin_id = &w.origin_id,
                     .pid = w.child_pid,
                     .wl_display = if (w.wl_display) |p| p else "",
                     .pulse_server = if (w.pulse_server) |p| p else "",
@@ -349,6 +490,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         if (!cl.dead) n_clients += 1;
     }
     const title: []const u8 = if (s.screen.last_title) |t| t else "";
+    const viewers = self.viewerCount(s);
     const th = std.hash.Wyhash.hash(0, title);
     var ctrl_buf: [32]u8 = undefined;
     const controller = self.controllerLabel(s, &ctrl_buf);
@@ -367,6 +509,7 @@ pub fn maybePushMeta(self: *Daemon) void {
     }
     const structural = !self.wpush.inited or
         n_clients != self.wpush.clients or
+        viewers != self.wpush.viewers or
         s.exited != self.wpush.exited or
         s.screen.rows != self.wpush.rows or
         s.screen.cols != self.wpush.cols or
@@ -400,7 +543,7 @@ pub fn maybePushMeta(self: *Daemon) void {
         .output_width = s.output_width,
         .output_height = s.output_height,
         .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
-        .viewers = n_clients,
+        .viewers = viewers,
         .controller = controller,
         .audio = audio,
         .audio_streams = audio_streams,
@@ -414,11 +557,12 @@ pub fn maybePushMeta(self: *Daemon) void {
     defer aw.deinit();
     aw.writer.writeByte('M') catch return;
     std.json.Stringify.value(meta, .{}, &aw.writer) catch return;
-    controlSend(self.control_fd, aw.written(), -1);
+    _ = controlSend(self.control_fd, aw.written(), -1);
 
     self.wpush = .{
         .inited = true,
         .clients = n_clients,
+        .viewers = viewers,
         .exited = s.exited,
         .rows = s.screen.rows,
         .cols = s.screen.cols,
@@ -458,8 +602,10 @@ pub fn controlRecv(fd: c_int, buf: []u8, fd_out: *c_int) isize {
     return n;
 }
 
-/// Broker side: send a control datagram (+ optional fd) to a worker.
-pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) void {
+/// Send one broker/worker control datagram (+ optional fd). Returns false if
+/// the kernel refused it, which for the client-fd handoff is the one case the
+/// caller must report rather than swallow.
+pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) bool {
     var iov = c.struct_iovec{ .iov_base = @constCast(bytes.ptr), .iov_len = bytes.len };
     var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
     var mh = std.mem.zeroes(c.struct_msghdr);
@@ -476,7 +622,9 @@ pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) void {
         const space = (cmsg.cmsg_len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
         mh.msg_controllen = @intCast(space);
     }
-    _ = c.sendmsg(fd, &mh, 0);
+    var flags: c_int = 0;
+    if (comptime @hasDecl(c, "MSG_NOSIGNAL")) flags |= c.MSG_NOSIGNAL;
+    return c.sendmsg(fd, &mh, flags) == @as(isize, @intCast(bytes.len));
 }
 
 /// Construct a worker-mode daemon (no listen socket; clients arrive over
@@ -499,7 +647,14 @@ pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []c
 
 /// Worker process entry: own one session (from `req`), serve clients the
 /// broker hands over `control_fd`, until killed or the broker goes away.
-pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq, base_dir: []const u8, broker_sock: []const u8) !void {
+pub fn runWorker(
+    allocator: std.mem.Allocator,
+    control_fd: c_int,
+    req: SpawnReq,
+    origin_id: dmod.SessionOriginId,
+    base_dir: []const u8,
+    broker_sock: []const u8,
+) !void {
     const self = try initWorker(allocator, control_fd, base_dir, broker_sock);
     defer self.deinit();
     // If spawnSession fails, report WHY over the control channel ('E' +
@@ -508,10 +663,10 @@ pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq,
     // failed". Then the caller `_exit`s → control EOF → `.err` sent.
     // On success, signal 'Y' (ready) so the broker sends the spawn
     // `.ok` only once the session truly exists.
-    const s = self.spawnSession(req) catch |err| {
+    const s = self.spawnSessionWithOrigin(req, origin_id) catch |err| {
         var ebuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&ebuf, "E{s}", .{@errorName(err)}) catch "E?";
-        controlSend(control_fd, msg, -1);
+        _ = controlSend(control_fd, msg, -1);
         return err;
     };
     try self.sessions.append(allocator, s);
@@ -533,10 +688,11 @@ pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq,
             .gpu = s.gpu,
             .output_width = s.output_width,
             .output_height = s.output_height,
+            .origin_id = &s.origin_id,
         }, .{}, &yaw.writer)) |_| {
-            controlSend(control_fd, yaw.written(), -1);
-        } else |_| controlSend(control_fd, "Y", -1);
-    } else |_| controlSend(control_fd, "Y", -1);
+            _ = controlSend(control_fd, yaw.written(), -1);
+        } else |_| _ = controlSend(control_fd, "Y", -1);
+    } else |_| _ = controlSend(control_fd, "Y", -1);
     try self.run();
 }
 
@@ -591,11 +747,18 @@ pub fn clientWritable(self: *Daemon, cl: *Client) void {
         return;
     }
     const n: usize = @intCast(n_raw);
+    if (n > 0) {
+        cl.write_frame_started = true;
+        if (cl.write_lane == .normal) cl.normal_bytes_written +|= n;
+    }
     const remaining = out.items.len - n;
     std.mem.copyForwards(u8, out.items[0..remaining], out.items[n..]);
     out.shrinkRetainingCapacity(remaining);
     cl.write_frame_left -= n;
-    if (cl.write_frame_left == 0) cl.write_lane = .none;
+    if (cl.write_frame_left == 0) {
+        cl.write_lane = .none;
+        cl.write_frame_started = false;
+    }
     // A snapshot/replay burst can leave a many-MB high-water
     // capacity pinned forever; release it once fully drained.
     if (remaining == 0 and out.capacity > (4 << 20))
@@ -620,6 +783,7 @@ pub fn clientWritable(self: *Daemon, cl: *Client) void {
     if (fully_drained and cl.needs_native_resync) {
         cl.needs_native_resync = false;
         if (cl.attached) |s| {
+            if (!Daemon.terminalViewer(cl, s)) return;
             log.debug("native resync toward drained mcp client (session '{s}')", .{s.name});
             // A rebuilt replica has no video reference frames.
             for (self.channels.items) |ch| {
@@ -630,14 +794,23 @@ pub fn clientWritable(self: *Daemon, cl: *Client) void {
                 }
             }
             self.replayNativeChannels(cl, s);
+            if (!cl.dead and Daemon.terminalViewer(cl, s)) cl.queueFrame(.native_sync, "");
         }
-        if (!cl.dead) cl.queueFrame(.native_sync, "");
     }
 }
 
 pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
-    if (cl.proto == 0 and frame.ftype != .hello and frame.ftype != .list) {
+    if (cl.proto == 0 and frame.ftype != .hello and frame.ftype != .list and
+        !(cl.panel_rpc_support > 0 and (frame.ftype == .attach or frame.ftype == .detach or
+            frame.ftype == .panel_request or frame.ftype == .panel_reply)))
+    {
         cl.queueErr("no shared terminal profile; daemon and sessions preserved");
+        return;
+    }
+    if (cl.panel_only and frame.ftype != .hello and frame.ftype != .detach and
+        frame.ftype != .panel_request and frame.ftype != .panel_reply)
+    {
+        cl.queueErr("panel-only attachment accepts panel RPC only");
         return;
     }
     switch (frame.ftype) {
@@ -651,6 +824,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 audio: bool = false,
                 winstream: bool = false,
                 video: bool = false,
+                panel_rpc: u8 = 0,
             };
             if (std.json.parseFromSlice(HelloReq, self.allocator, frame.payload, .{
                 .ignore_unknown_fields = true,
@@ -676,6 +850,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 cl.audio_channels = cl.proto != 0 and if (negotiated) p.value.audio else cl.proto >= 5;
                 cl.winstream_channels = cl.proto != 0 and if (negotiated) p.value.winstream else cl.proto >= wire.WINSTREAM_PROTO_VERSION;
                 cl.video = p.value.video;
+                cl.panel_rpc_support = @min(p.value.panel_rpc, wire.PANEL_RPC_VERSION);
                 p.deinit();
             } else |_| {}
             cl.queueJson(.welcome, .{
@@ -723,23 +898,22 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // play_control). Capability, same reasoning as lsp:
                 // an old daemon would `.err` on the unknown frame.
                 .cast_playback = true,
+                // Correlated native-panel relay. Independent of the
+                // terminal profile: future clients may share this feature
+                // even when no snapshot/event profile overlaps.
+                .panel_rpc = wire.PANEL_RPC_VERSION,
+                .attach_identity = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
         .attach => self.handleAttach(cl, frame.payload),
         .detach => {
-            const was = cl.attached;
-            cl.attached = null;
+            self.detachClientAttachment(cl, "panel presenter detached after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
             cl.queueJson(.ok, .{ .ok = true });
-            if (was) |s| {
-                // Detach BEFORE the release so the handover scan
-                // cannot pick this client again.
-                if (self.releaseControl(s, cl)) self.broadcastControlState(s);
-                self.broadcastPeerInfo(s);
-            }
         },
         .control_req => self.handleControlReq(cl, frame.payload),
         .input => {
+            if (cl.panel_only) return;
             const s = cl.attached orelse {
                 cl.queueErr("not attached");
                 return;
@@ -749,6 +923,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             _ = pty.writeAll(frame.payload);
         },
         .resize => {
+            if (cl.panel_only) return;
             const s = cl.attached orelse return;
             // Client geometry must never overwrite a cast's recorded
             // dimensions — only cast resize events change the grid.
@@ -780,7 +955,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             // even though we're about to stop).
             if (self.is_broker) {
                 for (self.workers.items) |w| {
-                    if (!w.dead) controlSend(w.control_fd, "K", -1);
+                    if (!w.dead) _ = controlSend(w.control_fd, "K", -1);
                 }
             }
             cl.queueJson(.ok, .{ .ok = true });
@@ -799,6 +974,8 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .app_debug => self.handleAppDebug(cl, frame.payload),
         .rec_start => handleRecStart(self, cl, frame.payload),
         .play_control => self.handlePlayControl(cl, frame.payload),
+        .panel_request => self.handlePanelRequest(cl, frame.payload),
+        .panel_reply => self.handlePanelReply(cl, frame.payload),
         .search => self.handleSearch(cl, frame.payload),
         .log_get => self.handleLogGet(cl, frame.payload),
         .forward_open => self.handleForward(cl, frame.payload),
@@ -2286,11 +2463,15 @@ pub fn fsStat(self: *Daemon, cl: *Client, r: FsOpReq) void {
 pub fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
     var z: [4096]u8 = undefined;
     const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
-    const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC);
+    // The path is remote-controlled input. O_NONBLOCK prevents a FIFO from
+    // parking the daemon's single poll loop before fstat can reject it; it has
+    // no effect on ordinary regular files.
+    const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
     if (fd < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(fd));
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
     if (c.fstat(fd, &st) != 0) return fsReplyErr(cl, r.req, "fstat failed");
+    if ((st.st_mode & c.S_IFMT) != c.S_IFREG) return fsReplyErr(cl, r.req, "path is not a regular file");
     const size: u64 = if (st.st_size > 0) @intCast(st.st_size) else 0;
 
     const want: usize = @min(@as(usize, r.len), fsserve.MAX_READ);
@@ -2306,6 +2487,11 @@ pub fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
         if (n == 0) break;
         got += @intCast(n);
     }
+    // Deliberately NO second stat: a file growing under the reader (a live
+    // log is the common case) must still answer with the bytes that were
+    // read. Callers that need one identity across a MULTI-range read compare
+    // the mtime/ino below themselves — panel asset hydration does exactly
+    // that in Terminal.handleRemoteFileReply.
     cl.queueFrame(.fs_data, buf[0 .. 12 + got]);
     cl.queueJson(.fs_reply, .{
         .req = r.req,

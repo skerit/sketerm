@@ -955,8 +955,7 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
         const version = awaitDmabufGlobal(allocator, app_fd);
         // v4 feedback rides its own object; check it before the v3
         // import script below re-uses id 3 for a v3 bind.
-        if (version >= 4) feedbackStage(allocator, app_fd) else
-            std.debug.print("smoke-mux: linux-dmabuf v3 (no DRM render node) — feedback stage skipped\n", .{});
+        if (version >= 4) feedbackStage(allocator, app_fd) else std.debug.print("smoke-mux: linux-dmabuf v3 (no DRM render node) — feedback stage skipped\n", .{});
     }
 
     var stream: std.ArrayList(u8) = .empty;
@@ -2446,6 +2445,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // also run against a real broker by smoke-broker).
     @import("smoke_display.zig").run(allocator, sock_path);
 
+    // Correlated native-panel relay + panel-only attach isolation. The
+    // shared broker run proves the capability fields survive fd handoff.
+    @import("smoke_panel_relay.zig").run(allocator, sock_path);
+
     // UDP connection-ticket brokering (shared stage, also run against
     // a real broker by smoke-broker — the worker-served mint differs).
     @import("smoke_ticket.zig").run(allocator, sock_path);
@@ -2459,16 +2462,34 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.indexOf(u8, lst.payload, "\"smoke\"") == null) fail("list missing session");
     lst.deinit(allocator);
 
-    // Rename: duplicate name rejected, fresh name confirmed and
-    // visible in LIST (under the new name only).
+    // Rename: duplicate name rejected, fresh name confirmed as the current
+    // list identity while the immutable spawn identity remains explicit.
     conn2.sendJson(.rename, .{ .name = "smoke", .new_name = "" }) catch fail("rename send");
     (conn2.recvExpect(&.{.err}) catch fail("rename empty not rejected")).deinit(allocator);
     conn2.sendJson(.rename, .{ .name = "smoke", .new_name = "smoke2" }) catch fail("rename send");
     (conn2.recvExpect(&.{.ok}) catch fail("rename ok")).deinit(allocator);
     conn2.sendFrame(.list, "") catch fail("list send");
     const lst2 = conn2.recvExpect(&.{.welcome}) catch fail("list after rename");
-    if (std.mem.indexOf(u8, lst2.payload, "\"smoke2\"") == null) fail("rename missing in list");
-    if (std.mem.indexOf(u8, lst2.payload, "\"smoke\",") != null) fail("old name still listed");
+    const RenamedList = struct {
+        sessions: []const struct {
+            name: []const u8 = "",
+            origin_name: []const u8 = "",
+        } = &.{},
+    };
+    var renamed_list = std.json.parseFromSlice(RenamedList, allocator, lst2.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch fail("renamed list parse");
+    defer renamed_list.deinit();
+    var saw_renamed = false;
+    for (renamed_list.value.sessions) |session| {
+        if (std.mem.eql(u8, session.name, "smoke")) fail("old name remained the current list identity");
+        if (std.mem.eql(u8, session.name, "smoke2")) {
+            saw_renamed = true;
+            if (!std.mem.eql(u8, session.origin_name, "smoke"))
+                fail("rename lost the immutable spawn identity");
+        }
+    }
+    if (!saw_renamed) fail("rename missing in list");
     lst2.deinit(allocator);
     conn2.sendJson(.rename, .{ .name = "nosuch", .new_name = "other" }) catch fail("rename send");
     (conn2.recvExpect(&.{.err}) catch fail("rename ghost not rejected")).deinit(allocator);

@@ -65,6 +65,11 @@ pub fn debugOn() bool {
     return g.debug_on;
 }
 
+/// Return the append-only descriptor workers intentionally inherit.
+pub fn inheritedFd() c_int {
+    return g.fd;
+}
+
 /// Anomalies: stderr + file.
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("sketerm-mux: " ++ fmt ++ "\n", args);

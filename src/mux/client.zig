@@ -180,6 +180,69 @@ fn udpMemoClear(host: []const u8) void {
     _ = c.unlink(path.ptr);
 }
 
+/// Additive attach properties shared by terminal viewers, future GUI panel
+/// presenters, and panel-only requesters.
+pub const AttachOptions = struct {
+    kind: []const u8 = "",
+    origin_id: []const u8 = "",
+    read_only: bool = false,
+    control: bool = false,
+    panel_only: bool = false,
+    panel_rpc: u8 = 0,
+};
+
+pub const AttachIdentity = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    origin_name_buf: [64]u8 = undefined,
+    origin_name_len: u8 = 0,
+    origin_id: daemon.SessionOriginId = undefined,
+    valid: bool = false,
+
+    pub fn name(self: *const AttachIdentity) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn originName(self: *const AttachIdentity) []const u8 {
+        return self.origin_name_buf[0..self.origin_name_len];
+    }
+
+    pub fn originId(self: *const AttachIdentity) []const u8 {
+        return if (self.valid) &self.origin_id else "";
+    }
+
+    fn parse(allocator: std.mem.Allocator, payload: []const u8) !AttachIdentity {
+        const Meta = struct {
+            name: []const u8 = "",
+            origin_name: []const u8 = "",
+            origin_id: []const u8 = "",
+        };
+        var parsed = std.json.parseFromSlice(Meta, allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedAttachIdentity;
+        defer parsed.deinit();
+        const meta = parsed.value;
+        if (meta.name.len == 0 or meta.name.len > 64 or
+            meta.origin_name.len == 0 or meta.origin_name.len > 64 or
+            !daemon.validSessionOriginId(meta.origin_id))
+            return error.MalformedAttachIdentity;
+        var identity = AttachIdentity{};
+        identity.name_len = @intCast(meta.name.len);
+        @memcpy(identity.name_buf[0..meta.name.len], meta.name);
+        identity.origin_name_len = @intCast(meta.origin_name.len);
+        @memcpy(identity.origin_name_buf[0..meta.origin_name.len], meta.origin_name);
+        @memcpy(&identity.origin_id, meta.origin_id);
+        identity.valid = true;
+        return identity;
+    }
+};
+
+/// GUI presenter replies share the terminal connection with ordinary traffic.
+/// Keep this well below the daemon's 64 MiB relay ceiling so a stalled daemon
+/// cannot turn correlated panel replies into a process-sized GTK backlog.
+pub const GUI_PANEL_REPLY_BACKLOG: usize = 8 << 20;
+pub const DEFAULT_WRITE_TIMEOUT_MS: c_int = 30_000;
+
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
@@ -197,7 +260,7 @@ pub const Conn = struct {
     /// Bound on how long sendFrame waits for a full socket buffer to
     /// drain before failing (a wedged daemon must cost an error, not
     /// a hung caller).
-    write_timeout_ms: c_int = 30_000,
+    write_timeout_ms: c_int = DEFAULT_WRITE_TIMEOUT_MS,
     /// Why an `.auto` connection came up on SSH instead of UDP. Null
     /// on a UDP connection, on a forced transport, and on local
     /// sockets. Callers surface it so a downgrade names its cause
@@ -233,6 +296,18 @@ pub const Conn = struct {
     /// play_control frames). Gates both — an old daemon would spawn a
     /// login shell for the request and `.err` on the control frame.
     cast_playback: bool = false,
+    /// Independent panel relay capability advertised by the daemon.
+    panel_rpc: u8 = 0,
+    /// The daemon can put immutable session identity before the initial GUI
+    /// snapshot when explicitly requested by a panel-capable attachment.
+    attach_identity: bool = false,
+    attach_identity_pending: bool = false,
+    /// Immutable spawn name returned for legacy migration/display metadata.
+    panel_origin_name: [64]u8 = undefined,
+    panel_origin_name_len: usize = 0,
+    /// Lifetime-unique immutable session incarnation returned by attach.
+    panel_origin_id: daemon.SessionOriginId = undefined,
+    panel_origin_id_valid: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -344,8 +419,8 @@ pub const Conn = struct {
         return conn;
     }
 
-    fn sendHello(self: *Conn) !void {
-        try self.sendJson(.hello, .{
+    fn hello(self: *Conn, comptime queue_only: bool, deadline_ms: ?i64) !void {
+        const value = .{
             .proto = wire.PROTO_VERSION,
             .min_proto = @as(u32, 1),
             .negotiation = @as(u8, 1),
@@ -354,7 +429,20 @@ pub const Conn = struct {
             .audio = true,
             .winstream = true,
             .video = @import("build_options").video,
-        });
+            .panel_rpc = wire.PANEL_RPC_VERSION,
+        };
+        if (queue_only)
+            try self.queueJsonUntil(.hello, value, deadline_ms.?)
+        else
+            try self.sendJson(.hello, value);
+    }
+
+    fn sendHello(self: *Conn) !void {
+        try self.hello(false, null);
+    }
+
+    fn queueHelloUntil(self: *Conn, deadline_ms: i64) !void {
+        try self.hello(true, deadline_ms);
     }
 
     fn applyWelcome(self: *Conn, allocator: std.mem.Allocator, payload: []const u8) void {
@@ -368,6 +456,9 @@ pub const Conn = struct {
         self.display_v2 = false;
         self.lsp_support = false;
         self.cast_playback = false;
+        self.panel_rpc = 0;
+        self.attach_identity = false;
+        self.attach_identity_pending = false;
         self.server_build_len = 0;
         const Probe = struct {
             proto: u32 = 1,
@@ -381,6 +472,8 @@ pub const Conn = struct {
             display_v2: bool = false,
             lsp: bool = false,
             cast_playback: bool = false,
+            panel_rpc: u8 = 0,
+            attach_identity: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -400,6 +493,8 @@ pub const Conn = struct {
             self.display_v2 = parsed.value.display_v2;
             self.lsp_support = parsed.value.lsp;
             self.cast_playback = parsed.value.cast_playback;
+            self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
+            self.attach_identity = parsed.value.attach_identity;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
@@ -1115,7 +1210,9 @@ pub const Conn = struct {
     /// behind it and only the nonblocking flush runs; the upload pump
     /// (or a later flushQueuedFor) finishes the delivery.
     pub fn sendFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
-        if (self.proto == 0 and ftype != .hello and ftype != .list)
+        if (self.proto == 0 and ftype != .hello and ftype != .list and
+            !(self.panel_rpc > 0 and (ftype == .attach or ftype == .detach or
+                ftype == .panel_request or ftype == .panel_reply)))
             return error.NoSharedTerminalProfile;
         const had_backlog = self.wbuf.items.len > 0;
         try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
@@ -1126,7 +1223,9 @@ pub const Conn = struct {
     /// Queue one complete frame and write only what the nonblocking fd
     /// accepts immediately. Partial writes remain resumable in `wbuf`.
     pub fn queueFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
-        if (self.proto == 0 and ftype != .hello and ftype != .list)
+        if (self.proto == 0 and ftype != .hello and ftype != .list and
+            !(self.panel_rpc > 0 and (ftype == .attach or ftype == .detach or
+                ftype == .panel_request or ftype == .panel_reply)))
             return error.NoSharedTerminalProfile;
         try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
         try self.flushQueued();
@@ -1169,6 +1268,23 @@ pub const Conn = struct {
         }
     }
 
+    /// Drain queued frames against one absolute deadline.
+    fn flushQueuedUntil(self: *Conn, deadline_ms: i64) !void {
+        while (true) {
+            if (self.wbuf.items.len == 0) return;
+            if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+            try self.flushQueued();
+            if (self.wbuf.items.len == 0) return;
+            const remain = deadline_ms - monotonicMs();
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
+            const r = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            if (r < 0 or pfd.revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0)
+                return error.WriteFailed;
+        }
+    }
+
     pub fn sendJson(self: *Conn, ftype: wire.FrameType, value: anytype) !void {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -1183,6 +1299,141 @@ pub const Conn = struct {
         defer aw.deinit();
         try std.json.Stringify.value(value, .{}, &aw.writer);
         try self.queueFrame(ftype, aw.written());
+    }
+
+    fn queueFrameUntil(self: *Conn, ftype: wire.FrameType, payload: []const u8, deadline_ms: i64) !void {
+        if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+        if (self.proto == 0 and ftype != .hello and ftype != .list and
+            !(self.panel_rpc > 0 and (ftype == .attach or ftype == .detach or
+                ftype == .panel_request or ftype == .panel_reply)))
+            return error.NoSharedTerminalProfile;
+        try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
+        try self.flushQueuedUntil(deadline_ms);
+    }
+
+    fn queueJsonUntil(self: *Conn, ftype: wire.FrameType, value: anytype, deadline_ms: i64) !void {
+        if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try std.json.Stringify.value(value, .{}, &aw.writer);
+        try self.queueFrameUntil(ftype, aw.written(), deadline_ms);
+    }
+
+    /// Send an attach request with explicit additive capabilities.
+    pub fn sendAttach(self: *Conn, name: []const u8, opts: AttachOptions) !void {
+        if (opts.panel_rpc > self.panel_rpc) return error.PanelRpcUnsupported;
+        if (opts.panel_only and opts.panel_rpc == 0) return error.PanelRpcUnsupported;
+        const identity_first = self.attach_identity and !opts.panel_only and
+            opts.panel_rpc > 0 and std.mem.eql(u8, opts.kind, "gui");
+        try self.sendJson(.attach, .{
+            .name = name,
+            .origin_id = opts.origin_id,
+            .kind = opts.kind,
+            .read_only = opts.read_only,
+            .control = opts.control,
+            .panel_only = opts.panel_only,
+            .panel_rpc = opts.panel_rpc,
+            .identity_first = identity_first,
+        });
+        self.attach_identity_pending = identity_first;
+    }
+
+    /// Send one correlated panel request; JSON remains opaque to this layer.
+    pub fn sendPanelRequest(self: *Conn, id: u64, json: []const u8) !void {
+        try self.sendPanelEnvelope(.panel_request, id, json);
+    }
+
+    /// Send one panel request under the caller's existing absolute deadline.
+    pub fn sendPanelRequestUntil(self: *Conn, id: u64, json: []const u8, deadline_ms: i64) !void {
+        if (self.panel_rpc == 0) return error.PanelRpcUnsupported;
+        if (self.wbuf.items.len != 0) return error.PanelSendPreDelivery;
+        if (deadline_ms - monotonicMs() <= 0) return error.PanelSendPreDelivery;
+
+        // Build the complete frame before touching the socket. Size and
+        // allocation failures are therefore provably safe to report as
+        // pre-delivery rather than being collapsed into a resend-unsafe write.
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try wire.appendPanelEnvelope(&payload, self.allocator, id, json);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(self.allocator);
+        try wire.appendFrame(&frame, self.allocator, .panel_request, payload.items);
+
+        var sent: usize = 0;
+        while (sent < frame.items.len) {
+            if (deadline_ms - monotonicMs() <= 0)
+                return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
+            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+                c.send(self.fd, frame.items.ptr + sent, frame.items.len - sent, c.MSG_NOSIGNAL)
+            else
+                c.write(self.fd, frame.items.ptr + sent, frame.items.len - sent);
+            if (n > 0) {
+                sent += @intCast(n);
+                continue;
+            }
+            const e = std.posix.errno(n);
+            if (e == .INTR) continue;
+            if (e != .AGAIN)
+                return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
+            const remain = deadline_ms - monotonicMs();
+            if (remain <= 0)
+                return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
+            const polled = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (polled < 0 and std.posix.errno(polled) == .INTR) continue;
+            if (polled < 0 or pfd.revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0)
+                return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
+        }
+    }
+
+    /// Send one correlated presenter reply; JSON remains opaque here too.
+    pub fn sendPanelReply(self: *Conn, id: u64, json: []const u8) !void {
+        try self.sendPanelEnvelope(.panel_reply, id, json);
+    }
+
+    /// Queue one correlated presenter reply without waiting for socket space.
+    pub fn queuePanelReply(self: *Conn, id: u64, json: []const u8) !void {
+        const frame_bytes = 5 +| wire.PANEL_ENVELOPE_HEADER +| json.len;
+        if (self.wbuf.items.len +| frame_bytes > GUI_PANEL_REPLY_BACKLOG)
+            return error.PanelReplyBackpressure;
+        try self.queuePanelEnvelope(.panel_reply, id, json);
+    }
+
+    pub fn panelOrigin(self: *const Conn) []const u8 {
+        return self.panel_origin_name[0..self.panel_origin_name_len];
+    }
+
+    pub fn panelOriginId(self: *const Conn) []const u8 {
+        return if (self.panel_origin_id_valid) &self.panel_origin_id else "";
+    }
+
+    /// Return the exact canonical Unix listener path this local connection
+    /// reached; custom local daemons must never be mistaken for the default.
+    pub fn localDaemonOrigin(self: *const Conn, allocator: std.mem.Allocator) ![]u8 {
+        if (self.transport != .local or self.fd < 0) return error.NotLocal;
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        var addr_len: c.socklen_t = @sizeOf(c.struct_sockaddr_un);
+        if (c.getpeername(self.fd, @ptrCast(&addr), &addr_len) != 0) return error.PeerUnavailable;
+        if (addr.sun_family != c.AF_UNIX) return error.NotLocal;
+        const path = std.mem.sliceTo(addr.sun_path[0..], 0);
+        if (path.len == 0 or path[0] != '/') return error.BadPath;
+        return allocator.dupe(u8, path);
+    }
+
+    fn sendPanelEnvelope(self: *Conn, ftype: wire.FrameType, id: u64, json: []const u8) !void {
+        if (self.panel_rpc == 0) return error.PanelRpcUnsupported;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try wire.appendPanelEnvelope(&payload, self.allocator, id, json);
+        try self.sendFrame(ftype, payload.items);
+    }
+
+    fn queuePanelEnvelope(self: *Conn, ftype: wire.FrameType, id: u64, json: []const u8) !void {
+        if (self.panel_rpc == 0) return error.PanelRpcUnsupported;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try wire.appendPanelEnvelope(&payload, self.allocator, id, json);
+        try self.queueFrame(ftype, payload.items);
     }
 
     /// Spawn `argv` with both stdio ends on one socketpair fd,
@@ -1234,6 +1485,42 @@ pub const Conn = struct {
             allocator.free(self.payload);
         }
     };
+
+    pub const GuiAttachResult = struct {
+        snapshot: OwnedFrame,
+        identity: AttachIdentity = .{},
+    };
+
+    /// Receive a GUI attach, requiring identity before the snapshot only when
+    /// the negotiated daemon capability and sent attach request selected it.
+    pub fn recvGuiAttach(self: *Conn) !GuiAttachResult {
+        const identity_first = self.attach_identity_pending;
+        self.attach_identity_pending = false;
+        if (!identity_first) return .{ .snapshot = try self.recvExpect(&.{.snapshot}) };
+        const meta = try self.recvExpect(&.{.session_meta});
+        defer meta.deinit(self.allocator);
+        const identity = try AttachIdentity.parse(self.allocator, meta.payload);
+        return .{
+            .snapshot = try self.recvExpect(&.{.snapshot}),
+            .identity = identity,
+        };
+    }
+
+    /// Deadline-aware identity-first GUI attach under one absolute timeout.
+    pub fn recvGuiAttachFor(self: *Conn, timeout_ms: i64) !GuiAttachResult {
+        const identity_first = self.attach_identity_pending;
+        self.attach_identity_pending = false;
+        const deadline = monotonicMs() + timeout_ms;
+        if (!identity_first)
+            return .{ .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - monotonicMs(), 1)) };
+        const meta = try self.recvExpectFor(&.{.session_meta}, @max(deadline - monotonicMs(), 1));
+        defer meta.deinit(self.allocator);
+        const identity = try AttachIdentity.parse(self.allocator, meta.payload);
+        return .{
+            .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - monotonicMs(), 1)),
+            .identity = identity,
+        };
+    }
 
     pub fn recvFrame(self: *Conn) !OwnedFrame {
         while (true) {
@@ -1409,6 +1696,380 @@ pub const Conn = struct {
         return self.last_err[0..self.last_err_len];
     }
 };
+
+/// Connect to one exact daemon and complete the panel-only handshake against
+/// one absolute deadline; this path never autostarts or replaces a daemon.
+fn connectPanelRequesterUntil(
+    allocator: std.mem.Allocator,
+    sock_path: []const u8,
+    session: []const u8,
+    deadline_ms: i64,
+    active_fd: ?*std.atomic.Value(c_int),
+) !Conn {
+    return connectPanelRequesterUntilExpected(allocator, sock_path, session, "", deadline_ms, active_fd);
+}
+
+/// Panel-only attach with an optional immutable lifetime fence.
+pub fn connectPanelRequesterUntilExpected(
+    allocator: std.mem.Allocator,
+    sock_path: []const u8,
+    session: []const u8,
+    expected_origin_id: []const u8,
+    deadline_ms: i64,
+    active_fd: ?*std.atomic.Value(c_int),
+) !Conn {
+    if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+    const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    var fd_owned = true;
+    errdefer {
+        if (fd_owned) _ = c.close(fd);
+    }
+    if (active_fd) |slot| slot.store(fd, .release);
+    errdefer if (active_fd) |slot| slot.store(-1, .release);
+
+    const flags = c.fcntl(fd, c.F_GETFL);
+    if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
+        return error.NonBlockingFailed;
+    var addr: c.struct_sockaddr_un = undefined;
+    try daemon.fillSockaddrUn(&addr, sock_path);
+    if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+    const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
+    if (rc != 0) {
+        const connect_errno = std.posix.errno(rc);
+        if (connect_errno != .INPROGRESS and connect_errno != .AGAIN and connect_errno != .ALREADY)
+            return error.ConnectFailed;
+        while (true) {
+            const remain = deadline_ms - monotonicMs();
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+            const polled = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (polled < 0 and std.posix.errno(polled) == .INTR) continue;
+            if (polled < 0) return error.ConnectFailed;
+            if (polled == 0) continue;
+            break;
+        }
+    }
+    // POLLOUT only means connect completed, not that it succeeded.
+    var socket_error: c_int = 0;
+    var socket_error_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &socket_error, &socket_error_len) != 0 or socket_error != 0)
+        return error.ConnectFailed;
+
+    var conn = Conn{ .allocator = allocator, .fd = fd };
+    fd_owned = false;
+    errdefer conn.deinit();
+    try conn.queueHelloUntil(deadline_ms);
+    var remain = deadline_ms - monotonicMs();
+    if (remain <= 0) return error.Timeout;
+    const welcome = try conn.recvExpectFor(&.{.welcome}, remain);
+    defer welcome.deinit(allocator);
+    conn.applyWelcome(allocator, welcome.payload);
+    const identity_support = panelIdentitySupport(allocator, welcome.payload) catch
+        return error.MalformedPanelWelcome;
+    if (identity_support == .legacy) return error.LegacyPanelIdentityUnsupported;
+    if (identity_support == .unsupported) return error.PanelRpcUnsupported;
+    try conn.queueJsonUntil(.attach, .{
+        .name = session,
+        .origin_id = expected_origin_id,
+        .kind = "mcp",
+        .read_only = true,
+        .control = false,
+        .panel_only = true,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+    }, deadline_ms);
+    remain = deadline_ms - monotonicMs();
+    if (remain <= 0) return error.Timeout;
+    const ok = conn.recvExpectFor(&.{.ok}, remain) catch |err| {
+        if (err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
+            return error.SessionOriginMismatch;
+        return err;
+    };
+    defer ok.deinit(allocator);
+    const Attached = struct {
+        ok: bool = false,
+        panel_only: bool = false,
+        origin_name: ?[]const u8 = null,
+        origin_id: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Attached, allocator, ok.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.MalformedPanelAttachMetadata;
+    defer parsed.deinit();
+    const origin_name = parsed.value.origin_name orelse return error.MalformedPanelAttachMetadata;
+    const origin_id = parsed.value.origin_id orelse return error.MalformedPanelAttachMetadata;
+    if (!parsed.value.ok or !parsed.value.panel_only or origin_name.len == 0 or
+        origin_name.len > conn.panel_origin_name.len or !daemon.validSessionOriginId(origin_id))
+        return error.MalformedPanelAttachMetadata;
+    if (expected_origin_id.len > 0 and !std.mem.eql(u8, expected_origin_id, origin_id))
+        return error.SessionOriginMismatch;
+    conn.panel_origin_name_len = origin_name.len;
+    @memcpy(conn.panel_origin_name[0..conn.panel_origin_name_len], origin_name);
+    @memcpy(&conn.panel_origin_id, origin_id);
+    conn.panel_origin_id_valid = true;
+    return conn;
+}
+
+const PanelIdentitySupport = enum { current, legacy, unsupported };
+
+/// Classify a valid daemon welcome without treating malformed capability data as legacy.
+fn panelIdentitySupport(allocator: std.mem.Allocator, payload: []const u8) !PanelIdentitySupport {
+    const Welcome = struct {
+        proto: ?u32 = null,
+        panel_rpc: ?u8 = null,
+        attach_identity: ?bool = null,
+    };
+    var parsed = try std.json.parseFromSlice(Welcome, allocator, payload, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    if (parsed.value.proto == null) return error.MalformedPanelWelcome;
+    const panel_rpc = parsed.value.panel_rpc orelse 0;
+    if (panel_rpc >= wire.PANEL_RPC_VERSION) return .current;
+    if (!(parsed.value.attach_identity orelse false)) return .legacy;
+    return .unsupported;
+}
+
+test "panel identity support requires a valid positive capability classification" {
+    const t = std.testing;
+    try t.expectEqual(
+        PanelIdentitySupport.legacy,
+        try panelIdentitySupport(t.allocator, "{\"proto\":6,\"server_proto\":6,\"negotiation\":1}"),
+    );
+    try t.expectEqual(
+        PanelIdentitySupport.unsupported,
+        try panelIdentitySupport(t.allocator, "{\"proto\":6,\"panel_rpc\":0,\"attach_identity\":true}"),
+    );
+    try t.expectEqual(
+        PanelIdentitySupport.current,
+        try panelIdentitySupport(t.allocator, "{\"proto\":6,\"panel_rpc\":1,\"attach_identity\":true}"),
+    );
+    try t.expectEqual(
+        PanelIdentitySupport.current,
+        try panelIdentitySupport(t.allocator, "{\"proto\":6,\"panel_rpc\":2,\"attach_identity\":true}"),
+    );
+    try t.expectError(error.MalformedPanelWelcome, panelIdentitySupport(t.allocator, "{}"));
+    try t.expectError(error.SyntaxError, panelIdentitySupport(t.allocator, "not-json"));
+}
+
+/// Relative-time convenience wrapper for non-MCP callers.
+pub fn connectPanelRequester(allocator: std.mem.Allocator, sock_path: []const u8, session: []const u8, timeout_ms: i64) !Conn {
+    var active: std.atomic.Value(c_int) = .init(-1);
+    const conn = try connectPanelRequesterUntil(allocator, sock_path, session, monotonicMs() + @max(timeout_ms, 0), &active);
+    active.store(-1, .release);
+    return conn;
+}
+
+test "panel requester connect, hello, and attach share one absolute deadline" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-connect-deadline-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    try t.expect(listener >= 0);
+    defer _ = c.close(listener);
+    var addr: c.struct_sockaddr_un = undefined;
+    try daemon.fillSockaddrUn(&addr, path);
+    try t.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)));
+    try t.expectEqual(@as(c_int, 0), c.listen(listener, 1));
+
+    const Stall = struct {
+        fd: c_int,
+        fn run(self: @This()) void {
+            const accepted = c.accept(self.fd, null, null);
+            if (accepted < 0) return;
+            defer _ = c.close(accepted);
+            var buf: [256]u8 = undefined;
+            _ = c.read(accepted, &buf, buf.len);
+            _ = c.usleep(250_000);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Stall.run, .{Stall{ .fd = listener }});
+    defer thread.join();
+    var active: std.atomic.Value(c_int) = .init(-1);
+    const start = monotonicMs();
+    try t.expectError(
+        error.Timeout,
+        connectPanelRequesterUntil(t.allocator, path, "session", start + 75, &active),
+    );
+    try t.expect(monotonicMs() - start < 500);
+    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+}
+
+test "expired panel deadlines cannot connect flush or send initial bytes" {
+    const t = std.testing;
+    var active: std.atomic.Value(c_int) = .init(-1);
+    try t.expectError(
+        error.Timeout,
+        connectPanelRequesterUntil(t.allocator, "/tmp/expired-panel.sock", "session", monotonicMs() - 1, &active),
+    );
+    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    defer _ = c.close(pair[1]);
+    var conn = Conn{
+        .allocator = t.allocator,
+        .fd = pair[0],
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+    };
+    defer conn.deinit();
+    conn.setNonBlocking();
+
+    try wire.appendFrame(&conn.wbuf, t.allocator, .hello, "queued-before-expiry");
+    try t.expectError(error.Timeout, conn.flushQueuedUntil(monotonicMs() - 1));
+    var pfd = c.struct_pollfd{ .fd = pair[1], .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+    conn.wbuf.clearRetainingCapacity();
+
+    try t.expectError(
+        error.PanelSendPreDelivery,
+        conn.sendPanelRequestUntil(7, "{\"cmd\":\"panel-events\"}", monotonicMs() - 1),
+    );
+    pfd.revents = 0;
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+}
+
+const PanelAttachReplyScript = struct {
+    listener: c_int,
+    reply: []const u8,
+
+    fn run(self: PanelAttachReplyScript) void {
+        const accepted = c.accept(self.listener, null, null);
+        if (accepted < 0) return;
+        var peer = Conn{ .allocator = std.heap.c_allocator, .fd = accepted };
+        defer peer.deinit();
+        const hello = peer.recvExpect(&.{.hello}) catch return;
+        hello.deinit(peer.allocator);
+        peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":2}") catch return;
+        const attach = peer.recvExpect(&.{.attach}) catch return;
+        attach.deinit(peer.allocator);
+        peer.sendFrame(.ok, self.reply) catch return;
+    }
+};
+
+fn panelAttachListener(path: [:0]const u8) !c_int {
+    const listener = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (listener < 0) return error.SocketFailed;
+    errdefer _ = c.close(listener);
+    var addr: c.struct_sockaddr_un = undefined;
+    try daemon.fillSockaddrUn(&addr, path);
+    if (c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0)
+        return error.BindFailed;
+    if (c.listen(listener, 1) != 0) return error.ListenFailed;
+    return listener;
+}
+
+test "panel-only attach rejects missing empty and truncated immutable origin metadata" {
+    const t = std.testing;
+    const replies = [_][]const u8{
+        "{\"ok\":true,\"panel_only\":true}",
+        "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"valid\"}",
+        "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"\",\"origin_id\":\"00000000000000000000000000000001\"}",
+        "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"origin_id\":\"00000000000000000000000000000001\"}",
+        "{\"ok\":true,\"panel_only\":false,\"origin_name\":\"valid\",\"origin_id\":\"00000000000000000000000000000001\"}",
+    };
+    for (replies, 0..) |reply, i| {
+        var path_buf: [256:0]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-metadata-{d}-{d}.sock", .{ c.getpid(), i });
+        _ = c.unlink(path.ptr);
+        defer _ = c.unlink(path.ptr);
+        const listener = try panelAttachListener(path);
+        defer _ = c.close(listener);
+        const thread = try std.Thread.spawn(.{}, PanelAttachReplyScript.run, .{PanelAttachReplyScript{
+            .listener = listener,
+            .reply = reply,
+        }});
+        var active: std.atomic.Value(c_int) = .init(-1);
+        try t.expectError(
+            error.MalformedPanelAttachMetadata,
+            connectPanelRequesterUntil(t.allocator, path, "requested-alias", monotonicMs() + 2_000, &active),
+        );
+        thread.join();
+        try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    }
+}
+
+test "panel-only attach reports a valid unexpected origin id as an identity mismatch" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-id-mismatch-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try panelAttachListener(path);
+    defer _ = c.close(listener);
+    const thread = try std.Thread.spawn(.{}, PanelAttachReplyScript.run, .{PanelAttachReplyScript{
+        .listener = listener,
+        .reply = "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"replacement\",\"origin_id\":\"20000000000000000000000000000002\"}",
+    }});
+    var active: std.atomic.Value(c_int) = .init(-1);
+    try t.expectError(
+        error.SessionOriginMismatch,
+        connectPanelRequesterUntilExpected(
+            t.allocator,
+            path,
+            "reused",
+            "10000000000000000000000000000001",
+            monotonicMs() + 2_000,
+            &active,
+        ),
+    );
+    thread.join();
+    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+}
+
+test "panel-only attach preserves an exact maximum-length immutable origin" {
+    const t = std.testing;
+    const reply = "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"origin_id\":\"00000000000000000000000000000001\"}";
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-metadata-max-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try panelAttachListener(path);
+    defer _ = c.close(listener);
+    const thread = try std.Thread.spawn(.{}, PanelAttachReplyScript.run, .{PanelAttachReplyScript{
+        .listener = listener,
+        .reply = reply,
+    }});
+    var conn = try connectPanelRequester(t.allocator, path, "requested-alias", 2_000);
+    defer conn.deinit();
+    thread.join();
+    try t.expectEqual(@as(usize, 64), conn.panelOrigin().len);
+    try t.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", conn.panelOrigin());
+    try t.expectEqualStrings("00000000000000000000000000000001", conn.panelOriginId());
+}
+
+test "local daemon origin is the exact connected listener, never a default guess" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-peer-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    try t.expect(listener >= 0);
+    defer _ = c.close(listener);
+    var addr: c.struct_sockaddr_un = undefined;
+    try daemon.fillSockaddrUn(&addr, path);
+    try t.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)));
+    try t.expectEqual(@as(c_int, 0), c.listen(listener, 1));
+
+    var conn = try Conn.connect(t.allocator, path);
+    defer conn.deinit();
+    const accepted = c.accept(listener, null, null);
+    try t.expect(accepted >= 0);
+    defer _ = c.close(accepted);
+    const origin = try conn.localDaemonOrigin(t.allocator);
+    defer t.allocator.free(origin);
+    try t.expectEqualStrings(path, origin);
+
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var unnamed = Conn{ .allocator = t.allocator, .fd = pair[0] };
+    defer unnamed.deinit();
+    defer _ = c.close(pair[1]);
+    try t.expectError(error.BadPath, unnamed.localDaemonOrigin(t.allocator));
+}
 
 test "transport fd is close-on-exec so it cannot leak into a later child" {
     // Regression: socketpair() without SOCK_CLOEXEC handed every transport
@@ -1609,6 +2270,14 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expect(conn.copy_no_replace);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
+    try std.testing.expectEqual(@as(u8, 0), conn.panel_rpc);
+    conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1,\"panel_rpc\":1,\"attach_identity\":true}");
+    try std.testing.expectEqual(@as(u32, 0), conn.proto);
+    try std.testing.expectEqual(@as(u8, 1), conn.panel_rpc);
+    try std.testing.expect(conn.attach_identity);
+    conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1,\"panel_rpc\":2,\"attach_identity\":true}");
+    try std.testing.expectEqual(wire.PANEL_RPC_VERSION, conn.panel_rpc);
+    try std.testing.expect(conn.attach_identity);
     conn.applyWelcome(a, "{\"proto\":9}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
@@ -1616,6 +2285,74 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expectError(error.NoSharedTerminalProfile, conn.queueFrame(.kill, "{}"));
     conn.applyWelcome(a, "{");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
+}
+
+test "identity-first GUI attach survives loss before trailing metadata and fences reincarnation" {
+    const t = std.testing;
+    const a = t.allocator;
+    const origin_id = "10000000000000000000000000000001";
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
+    var conn = Conn{
+        .allocator = a,
+        .fd = pair[0],
+        .proto = wire.PROTO_VERSION,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+        .attach_identity = true,
+        .attach_identity_pending = true,
+    };
+    defer conn.deinit();
+    var peer = Conn{ .allocator = a, .fd = pair[1], .proto = wire.PROTO_VERSION };
+    try peer.sendFrame(.session_meta, "{\"name\":\"renamed\",\"origin_name\":\"same\",\"origin_id\":\"10000000000000000000000000000001\"}");
+    try peer.sendFrame(.snapshot, "snapshot-before-loss");
+    // This is the audited failure point: the ordinary post-snapshot metadata
+    // never arrives, but the lifetime fence was already received.
+    peer.deinit();
+    const attached = try conn.recvGuiAttach();
+    defer attached.snapshot.deinit(a);
+    try t.expectEqualStrings("snapshot-before-loss", attached.snapshot.payload);
+    try t.expectEqualStrings("renamed", attached.identity.name());
+    try t.expectEqualStrings("same", attached.identity.originName());
+    try t.expectEqualStrings(origin_id, attached.identity.originId());
+
+    var reconnect_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&reconnect_pair));
+    var reconnect = Conn{
+        .allocator = a,
+        .fd = reconnect_pair[0],
+        .proto = wire.PROTO_VERSION,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+        .attach_identity = true,
+    };
+    defer reconnect.deinit();
+    var replacement = Conn{ .allocator = a, .fd = reconnect_pair[1], .proto = wire.PROTO_VERSION };
+    defer replacement.deinit();
+    try reconnect.sendAttach("same", .{
+        .kind = "gui",
+        .origin_id = attached.identity.originId(),
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+    });
+    const request = try replacement.recvExpectFor(&.{.attach}, 1_000);
+    defer request.deinit(a);
+    var parsed = try std.json.parseFromSlice(daemon.AttachReq, a, request.payload, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings(origin_id, parsed.value.origin_id);
+    try t.expect(parsed.value.identity_first);
+    try t.expect(!std.mem.eql(u8, parsed.value.origin_id, "20000000000000000000000000000002"));
+}
+
+test "GUI panel reply queue refuses its bounded backlog before appending" {
+    const a = std.testing.allocator;
+    var conn = Conn{ .allocator = a, .fd = -1, .panel_rpc = wire.PANEL_RPC_VERSION };
+    defer conn.wbuf.deinit(a);
+    const frame_bytes = 5 + wire.PANEL_ENVELOPE_HEADER + 2;
+    try conn.wbuf.resize(a, GUI_PANEL_REPLY_BACKLOG - frame_bytes + 1);
+    const before = conn.wbuf.items.len;
+    try std.testing.expectError(
+        error.PanelReplyBackpressure,
+        conn.queuePanelReply(1, "{}"),
+    );
+    try std.testing.expectEqual(before, conn.wbuf.items.len);
 }
 
 /// Pull the `error` string out of a daemon err payload (`{"error":"…"}`)

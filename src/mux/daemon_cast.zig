@@ -140,7 +140,7 @@ fn baseName(path: []const u8) []const u8 {
 /// Spawn a cast-playback session: validate the header EAGERLY (a bad
 /// file is a spawn error back to the client, never a dead session),
 /// size the Screen from the recorded dims, start PAUSED at 0.
-pub fn spawnCastSession(self: *Daemon, req: SpawnReq) !*Session {
+pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.SessionOriginId) !*Session {
     const allocator = self.allocator;
     if (req.display) return error.CastSessionCannotBeDisplay;
 
@@ -209,9 +209,15 @@ pub fn spawnCastSession(self: *Daemon, req: SpawnReq) !*Session {
 
     const s = try allocator.create(Session);
     errdefer allocator.destroy(s);
+    const session_name = try allocator.dupe(u8, req.name);
+    errdefer allocator.free(session_name);
+    const origin_name = try allocator.dupe(u8, req.name);
+    errdefer allocator.free(origin_name);
     s.* = .{
         .allocator = allocator,
-        .name = try allocator.dupe(u8, req.name),
+        .name = session_name,
+        .origin_name = origin_name,
+        .origin_id = origin_id,
         .source = .{ .cast = cp },
         .parser = Parser.init(allocator),
         .pool = pool,
@@ -642,7 +648,7 @@ pub fn queuePlayState(cl: *Client, cp: *const CastPlayback) void {
 pub fn broadcastPlayState(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) void {
     cp.last_push_ms = now;
     for (self.clients.items) |cl| {
-        if (cl.attached == s and !cl.dead) queuePlayState(cl, cp);
+        if (Daemon.terminalViewer(cl, s)) queuePlayState(cl, cp);
     }
 }
 
@@ -816,6 +822,42 @@ test "cast spawn: header validated eagerly, screen sized from it, paused at 0" {
         error.CastPathNotAbsolute,
         d.spawnSession(.{ .name = "b", .cast_path = "relative.cast" }),
     );
+}
+
+test "identity-first attach is capability-gated and preserves legacy snapshot order" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, simple_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "identity-order");
+    const legacy = try newTestClient(d, s);
+    legacy.attached = null;
+    legacy.kind = .unknown;
+    legacy.panel_rpc_support = wire.PANEL_RPC_VERSION;
+    daemon_serve.handleFrame(d, legacy, .{
+        .ftype = .attach,
+        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":1}",
+    });
+    var first = (try wire.peelFrame(legacy.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(wire.FrameType.snapshot, first.frame.ftype);
+
+    const current = try newTestClient(d, s);
+    current.attached = null;
+    current.kind = .unknown;
+    current.panel_rpc_support = wire.PANEL_RPC_VERSION;
+    daemon_serve.handleFrame(d, current, .{
+        .ftype = .attach,
+        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":1,\"identity_first\":true}",
+    });
+    first = (try wire.peelFrame(current.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(wire.FrameType.session_meta, first.frame.ftype);
+    const second = (try wire.peelFrame(current.wbuf.items[first.consumed..])) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(wire.FrameType.snapshot, second.frame.ftype);
+    try testing.expect(std.mem.indexOf(u8, first.frame.payload, "\"origin_id\"") != null);
 }
 
 test "playback: timed events reach a subscribed client in order; EOF retains screen" {
@@ -1176,5 +1218,3 @@ test "seek replays deterministically: same grid as linear play" {
         try testing.expect(countFrames(frames.items, .play_state) >= 1);
     }
 }
-
-

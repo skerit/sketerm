@@ -66,9 +66,14 @@ const MUX_HELP =
 
 pub const SessionInfo = struct {
     name: []const u8,
+    origin_name: []const u8 = "",
+    origin_id: []const u8 = "",
     rows: u16 = 0,
     cols: u16 = 0,
     clients: u32 = 0,
+    /// Explicit terminal viewers from new daemons; absent means the old
+    /// daemon's clients count is the only available approximation.
+    viewers: ?u32 = null,
     exited: bool = false,
     title: []const u8 = "",
     app: bool = false,
@@ -81,7 +86,22 @@ pub const SessionInfo = struct {
     /// older daemon) — how "what is making that sound?" gets answered.
     audio: bool = false,
     audio_streams: []pulse.AudioInfo = &.{},
+
+    pub fn viewerCount(self: SessionInfo) u32 {
+        return self.viewers orelse self.clients;
+    }
 };
+
+test "session metadata prefers explicit viewers and falls back for old daemons" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const old = try std.json.parseFromSliceLeaky(SessionInfo, arena, "{\"name\":\"old\",\"clients\":3}", .{});
+    try t.expectEqual(@as(u32, 3), old.viewerCount());
+    const current = try std.json.parseFromSliceLeaky(SessionInfo, arena, "{\"name\":\"new\",\"clients\":4,\"viewers\":1}", .{});
+    try t.expectEqual(@as(u32, 1), current.viewerCount());
+}
 
 /// Human-readable activity for the `idle_ms` a session reports. Recent output
 /// reads as "active"; otherwise a coarse age ("idle 5m", "idle 2h13m").
@@ -165,7 +185,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
                 @as([*:0]const u8, if (s.app) "app" else "shell"),
                 @as(c_uint, s.cols),
                 @as(c_uint, s.rows),
-                @as(c_uint, s.clients),
+                @as(c_uint, s.viewerCount()),
                 fmtIdle(&idle_buf, s.idle_ms).ptr,
                 @as([*:0]const u8, if (s.exited) " [exited]" else if (s.audio) " [audio]" else ""),
                 @as(c_int, @intCast(s.cwd.len)),
@@ -683,10 +703,10 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
             _ = c.fprintf(
                 platform.stderr(),
                 "sketerm mux: cannot reach %.*s using %.*s transport policy\n" ++
-                "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
-                "  common causes: sketerm-mux not installed there; binary built\n" ++
-                "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
-                "  key/agent auth not set up; or UDP filtered when forced\n",
+                    "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
+                    "  common causes: sketerm-mux not installed there; binary built\n" ++
+                    "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
+                    "  key/agent auth not set up; or UDP filtered when forced\n",
                 @as(c_int, @intCast(remote.host.len)),
                 remote.host.ptr,
                 @as(c_int, @intCast(mode_name.len)),
@@ -951,7 +971,7 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
             @as([*:0]const u8, if (s.app) "\x1b[35m[gui app]\x1b[39m " else ""),
             @as(c_uint, s.cols),
             @as(c_uint, s.rows),
-            @as(c_uint, s.clients),
+            @as(c_uint, s.viewerCount()),
             @as([*:0]const u8, if (active) "\x1b[32m" else "\x1b[2m"),
             fmtIdle(&idle_buf, s.idle_ms).ptr,
             @as([*:0]const u8, if (s.exited) " [exited]" else if (s.audio) " \x1b[33m[audio]\x1b[39m" else ""),

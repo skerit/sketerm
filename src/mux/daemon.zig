@@ -194,6 +194,9 @@ pub const SpawnShellIntegration = struct {
 
 pub const AttachReq = struct {
     name: []const u8 = "",
+    /// Optional lifetime fence: current panel clients send the inherited ID so
+    /// a reused name can never attach them to a replacement session.
+    origin_id: []const u8 = "",
     /// Client self-identification for the peer roster: "gui", "cli",
     /// "mcp" (headless assistant driver) or "" (unknown).
     kind: []const u8 = "",
@@ -204,6 +207,15 @@ pub const AttachReq = struct {
     /// Force the controller lease on attach, evicting whoever holds it.
     /// Without this an attach only acquires a FREE lease.
     control: bool = false,
+    /// Attach for correlated panel RPC only: no snapshot, terminal events,
+    /// native channels, audio, controller lease, or viewer occupancy.
+    panel_only: bool = false,
+    /// Panel presenter/requester capability for this attachment. It is
+    /// clamped to the independently negotiated hello capability.
+    panel_rpc: u8 = 0,
+    /// Request identity metadata before the initial snapshot. Honored only for
+    /// panel-capable GUI attachments, preserving legacy snapshot-first order.
+    identity_first: bool = false,
 };
 
 pub const KillReq = struct {
@@ -245,6 +257,13 @@ pub const RenameReq = struct {
 
 pub const SessionInfo = struct {
     name: []const u8,
+    /// Immutable spawn-time name retained as display/legacy metadata. It may
+    /// remain an attach alias after `name` changes, but is not persistence
+    /// identity because a later same-name session can reuse it.
+    origin_name: []const u8 = "",
+    /// Lifetime-unique immutable persistence identity. Added compatibly: old
+    /// clients ignore it and old daemons omit it.
+    origin_id: []const u8 = "",
     rows: u16,
     cols: u16,
     clients: u32,
@@ -293,6 +312,78 @@ pub const SessionInfo = struct {
     controller: []const u8 = "",
 };
 
+/// A session answers to its current mutable name and to the immutable name it
+/// was spawned under, so a child that captured `$SKETERM_SESSION` before a
+/// rename can still attach. There is deliberately no history beyond that: an
+/// unbounded set of names a session answers to is a routing hazard, not a
+/// feature anyone asked for.
+fn identityMatches(current: []const u8, origin: []const u8, candidate: []const u8) bool {
+    return std.mem.eql(u8, current, candidate) or std.mem.eql(u8, origin, candidate);
+}
+
+pub const SESSION_ORIGIN_ID_BYTES = wire.SESSION_ORIGIN_ID_BYTES;
+pub const SESSION_ORIGIN_ID_LEN = wire.SESSION_ORIGIN_ID_LEN;
+pub const SessionOriginId = wire.SessionOriginId;
+pub const validSessionOriginId = wire.validSessionOriginId;
+
+/// Mint a process-independent session incarnation identity.
+pub fn newSessionOriginId() !SessionOriginId {
+    var random: [SESSION_ORIGIN_ID_BYTES]u8 = undefined;
+    if (c.getentropy(&random, random.len) != 0) return error.RandomFailed;
+    return std.fmt.bytesToHex(random, .lower);
+}
+
+/// Upper bound on session names; also sizes the fixed broker/worker
+/// rename control datagrams ('R'/'N' buffers).
+pub const MAX_SESSION_NAME: usize = 64;
+
+/// True when a rename target fits the control-channel name bound.
+pub fn validSessionName(name: []const u8) bool {
+    return name.len >= 1 and name.len <= MAX_SESSION_NAME;
+}
+
+/// Replace the mutable name. The immutable origin name and id never move.
+fn renameIdentity(allocator: std.mem.Allocator, current: *[]u8, new_name: []const u8) error{OutOfMemory}!void {
+    if (std.mem.eql(u8, current.*, new_name)) return;
+    const fresh = try allocator.dupe(u8, new_name);
+    allocator.free(current.*);
+    current.* = fresh;
+}
+
+test "session origin IDs are valid and unique across same-name lifetimes" {
+    const first = try newSessionOriginId();
+    const second = try newSessionOriginId();
+    try std.testing.expect(validSessionOriginId(&first));
+    try std.testing.expect(validSessionOriginId(&second));
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+}
+
+test "a renamed session still answers to its immutable spawn name" {
+    const t = std.testing;
+    var current = try t.allocator.dupe(u8, "spawn-name");
+    defer t.allocator.free(current);
+    const origin = "spawn-name";
+    try renameIdentity(t.allocator, &current, "current-name");
+    try t.expect(identityMatches(current, origin, "spawn-name"));
+    try t.expect(identityMatches(current, origin, "current-name"));
+    try t.expect(!identityMatches(current, origin, "unrelated"));
+}
+
+test "a dead rename requester frees the pending worker rename slot" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.clients.deinit(a);
+    const cl = try a.create(Client);
+    cl.* = .{ .allocator = a, .fd = -1, .id = 7, .dead = true };
+    try d.clients.append(a, cl);
+    d.worker_rename_request = .{ .request_id = 3, .requester_id = 7 };
+    d.reap();
+    try t.expect(d.worker_rename_request == null);
+    try t.expectEqual(@as(usize, 0), d.clients.items.len);
+}
+
 pub const Session = struct {
     /// What feeds this session's parser. `.pty` is the normal child
     /// shell/app; `.cast` replays an asciicast file on a timer and
@@ -305,6 +396,10 @@ pub const Session = struct {
 
     allocator: std.mem.Allocator,
     name: []u8,
+    /// Immutable spawn name exported as SKETERM_SESSION for legacy addressing.
+    origin_name: []u8,
+    /// Immutable lifetime-unique session incarnation identity.
+    origin_id: SessionOriginId,
     source: Source,
     parser: Parser,
     pool: *Pool,
@@ -440,6 +535,7 @@ pub const Session = struct {
         self.pool.deinit();
         self.allocator.destroy(self.pool);
         self.allocator.free(self.name);
+        self.allocator.free(self.origin_name);
         self.allocator.destroy(self);
     }
 
@@ -486,6 +582,14 @@ pub const Session = struct {
             .cast => -1,
         };
     }
+
+    pub fn matchesName(self: *const Session, candidate: []const u8) bool {
+        return identityMatches(self.name, self.origin_name, candidate);
+    }
+
+    pub fn renameTo(self: *Session, new_name: []const u8) !void {
+        try renameIdentity(self.allocator, &self.name, new_name);
+    }
 };
 
 /// Broker-side record of a forked session worker. The broker holds no Screen;
@@ -494,6 +598,8 @@ pub const Session = struct {
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     name: []u8,
+    origin_name: []u8,
+    origin_id: SessionOriginId,
     pid: c.pid_t,
     /// Broker end of the broker↔worker control socketpair. Carries passed
     /// client fds (SCM_RIGHTS), kill/rename control bytes, and metadata pushes.
@@ -548,6 +654,7 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         self.allocator.free(self.name);
+        self.allocator.free(self.origin_name);
         if (self.title) |t| self.allocator.free(t);
         if (self.cwd) |cw| self.allocator.free(cw);
         if (self.spawn_err) |e| self.allocator.free(e);
@@ -559,6 +666,14 @@ pub const Worker = struct {
         if (self.controller) |p| self.allocator.free(p);
         self.freeAudioInfos(self.audio_streams);
         self.allocator.destroy(self);
+    }
+
+    pub fn matchesName(self: *const Worker, candidate: []const u8) bool {
+        return identityMatches(self.name, self.origin_name, candidate);
+    }
+
+    pub fn renameTo(self: *Worker, new_name: []const u8) !void {
+        try renameIdentity(self.allocator, &self.name, new_name);
     }
 
     /// Replace an owned optional string field with a copy of `val`
@@ -619,6 +734,12 @@ pub const Worker = struct {
     }
 };
 
+/// Worker-side record of an attached client's rename, forwarded to the broker.
+pub const WorkerRenameRequest = struct {
+    request_id: u64,
+    requester_id: u32,
+};
+
 /// Worker→broker 'Y' ready datagram (JSON). Older workers sent a bare
 /// decimal pid; `parseWorkerReady` accepts both.
 pub const WorkerReady = struct {
@@ -632,6 +753,9 @@ pub const WorkerReady = struct {
     gpu: bool = false,
     output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
     output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// Repeated from the worker so a broker never acknowledges a mismatched
+    /// fork-time identity.
+    origin_id: []const u8 = "",
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).
@@ -676,6 +800,7 @@ pub const WorkerMeta = struct {
 pub const WorkerPush = struct {
     inited: bool = false,
     clients: u32 = 0,
+    viewers: u32 = 0,
     exited: bool = false,
     rows: u16 = 0,
     cols: u16 = 0,
@@ -711,6 +836,13 @@ pub const Client = struct {
     /// interleaved with another lane. At the next frame boundary audio wins.
     write_lane: WriteLane = .none,
     write_frame_left: usize = 0,
+    /// Whether bytes from the selected frame have reached the socket. A role
+    /// transition may discard an unstarted frame, but must finish a partial
+    /// one to preserve wire framing.
+    write_frame_started: bool = false,
+    /// Bytes removed from the normal output stream by successful writes.
+    /// Panel routes use this to distinguish queued-only from flushed bytes.
+    normal_bytes_written: u64 = 0,
     attached: ?*Session = null,
     dead: bool = false,
     /// Negotiated core protocol, capped to this daemon's newest profile.
@@ -758,6 +890,22 @@ pub const Client = struct {
     /// rebuilds its replicas from the live mirrors and `native_sync`
     /// closes the replay.
     needs_native_resync: bool = false,
+    /// Panel RPC support negotiated in hello, independent of the core
+    /// terminal protocol profile.
+    panel_rpc_support: u8 = 0,
+    /// Current attachment's presenter/requester capability, where zero means
+    /// the attachment is not panel-compatible.
+    panel_rpc: u8 = 0,
+    /// Session-scoped RPC attachment with no terminal/viewer semantics.
+    panel_only: bool = false,
+
+    /// Reset gap state whose meaning is confined to one attachment/session.
+    /// Audio subscription survives normal same-connection reattach; queued
+    /// old audio is discarded and audioViewer gates panel-only roles.
+    pub fn resetAttachmentStreamState(self: *Client) void {
+        self.needs_resync = false;
+        self.needs_native_resync = false;
+    }
 
     pub fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -819,6 +967,7 @@ pub const Client = struct {
             return false;
         }
         self.write_frame_left = frame_len;
+        self.write_frame_started = false;
         return true;
     }
 
@@ -835,6 +984,19 @@ pub const Client = struct {
     pub fn queueErr(self: *Client, msg: []const u8) void {
         self.queueJson(.err, .{ .@"error" = msg });
     }
+};
+
+/// One daemon-owned correlation rewrite between a panel-only requester and
+/// the single compatible GUI selected for its session.
+pub const PanelRoute = struct {
+    route_id: u64,
+    caller_id: u64,
+    requester: *Client,
+    presenter: *Client,
+    session: *Session,
+    deadline_ms: i64,
+    presenter_stream_start: u64,
+    presenter_stream_len: usize,
 };
 
 test "client audio lane preempts normal traffic only at frame boundaries" {
@@ -1654,6 +1816,138 @@ pub fn fillSockaddrUn(addr: *c.struct_sockaddr_un, path: []const u8) error{BadPa
     @memcpy(addr.sun_path[0..path.len], path);
 }
 
+/// Absolute (cwd-joined) but otherwise verbatim spelling of a socket path,
+/// length-checked against sockaddr_un; `canonicalSocketPath`'s first step,
+/// which still has to resolve the dots and symlinks preserved here.
+fn absoluteSocketSpelling(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0) return error.BadPath;
+    const absolute = if (path[0] == '/')
+        try allocator.dupe(u8, path)
+    else blk: {
+        var cwd_buf: [4096]u8 = undefined;
+        if (c.getcwd(&cwd_buf, cwd_buf.len) == null) return error.BadPath;
+        const cwd = std.mem.sliceTo(&cwd_buf, 0);
+        break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path });
+    };
+    errdefer allocator.free(absolute);
+    var addr: c.struct_sockaddr_un = undefined;
+    try fillSockaddrUn(&addr, absolute);
+    return absolute;
+}
+
+/// Resolve equivalent listener spellings to one physical path while allowing
+/// the socket leaf itself not to exist yet.
+pub fn canonicalSocketPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const absolute = try absoluteSocketSpelling(allocator, path);
+    defer allocator.free(absolute);
+
+    const leaf_slash = std.mem.lastIndexOfScalar(u8, absolute, '/') orelse return error.BadPath;
+    const leaf = absolute[leaf_slash + 1 ..];
+    if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, ".."))
+        return error.BadPath;
+    const parent = if (leaf_slash == 0) absolute[0..1] else absolute[0..leaf_slash];
+
+    // Resolve the parent with its original component order. In particular,
+    // realpath("link/..") must walk to the symlink target and only then go up;
+    // lexically deleting both components first changes POSIX path semantics.
+    var prefix_end = parent.len;
+    while (prefix_end > 0) {
+        var prefix_z_buf: [4096]u8 = undefined;
+        const prefix_z = pathZ(&prefix_z_buf, parent[0..prefix_end]) catch return error.BadPath;
+        var real_buf: [4096]u8 = undefined;
+        if (c.realpath(prefix_z, &real_buf)) |resolved_z| {
+            const resolved = std.mem.span(resolved_z);
+            const suffix = parent[prefix_end..];
+            const unresolved_parent = if (std.mem.eql(u8, resolved, "/"))
+                try std.fmt.allocPrint(allocator, "/{s}", .{std.mem.trimStart(u8, suffix, "/")})
+            else
+                try std.fmt.allocPrint(allocator, "{s}{s}", .{ resolved, suffix });
+            defer allocator.free(unresolved_parent);
+
+            // Components after the deepest existing prefix cannot be
+            // symlinks yet, so lexical normalization is safe only here.
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(allocator);
+            var it = std.mem.splitScalar(u8, unresolved_parent, '/');
+            while (it.next()) |part| {
+                if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+                if (std.mem.eql(u8, part, "..")) {
+                    if (parts.items.len > 0) _ = parts.pop();
+                    continue;
+                }
+                try parts.append(allocator, part);
+            }
+            var canonical_list: std.ArrayList(u8) = .empty;
+            defer canonical_list.deinit(allocator);
+            for (parts.items) |part| {
+                try canonical_list.append(allocator, '/');
+                try canonical_list.appendSlice(allocator, part);
+            }
+            try canonical_list.append(allocator, '/');
+            try canonical_list.appendSlice(allocator, leaf);
+            const canonical = try canonical_list.toOwnedSlice(allocator);
+            errdefer allocator.free(canonical);
+            var addr: c.struct_sockaddr_un = undefined;
+            try fillSockaddrUn(&addr, canonical);
+            return canonical;
+        }
+        const slash = std.mem.lastIndexOfScalar(u8, parent[0..prefix_end], '/') orelse return error.BadPath;
+        prefix_end = if (slash == 0) 1 else slash;
+        if (prefix_end == 1) {
+            var root_buf: [4096]u8 = undefined;
+            if (c.realpath("/", &root_buf) == null) return error.BadPath;
+        }
+    }
+    return error.BadPath;
+}
+
+test "daemon listener paths are canonicalized before bind and export" {
+    const t = std.testing;
+    var cwd_buf: [4096]u8 = undefined;
+    try t.expect(c.getcwd(&cwd_buf, cwd_buf.len) != null);
+    const cwd = std.mem.sliceTo(&cwd_buf, 0);
+    const relative = "relative-runtime/mux.sock";
+    const absolute = try canonicalSocketPath(t.allocator, relative);
+    defer t.allocator.free(absolute);
+    const expected = try std.fmt.allocPrint(t.allocator, "{s}/{s}", .{ cwd, relative });
+    defer t.allocator.free(expected);
+    try t.expectEqualStrings(expected, absolute);
+    try t.expect(absolute[0] == '/');
+    var addr: c.struct_sockaddr_un = undefined;
+    try fillSockaddrUn(&addr, absolute);
+}
+
+test "equivalent dot and symlinked socket spellings share one physical identity" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const real_rel = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/real", .{&tmp.sub_path});
+    defer t.allocator.free(real_rel);
+    const alias_rel = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/alias", .{&tmp.sub_path});
+    defer t.allocator.free(alias_rel);
+    var real_z_buf: [4096]u8 = undefined;
+    var alias_z_buf: [4096]u8 = undefined;
+    try t.expect(c.mkdir(try pathZ(&real_z_buf, real_rel), 0o700) == 0);
+    const child_rel = try std.fmt.allocPrint(t.allocator, "{s}/child", .{real_rel});
+    defer t.allocator.free(child_rel);
+    var child_z_buf: [4096]u8 = undefined;
+    try t.expect(c.mkdir(try pathZ(&child_z_buf, child_rel), 0o700) == 0);
+    try t.expect(c.symlink("real/child", try pathZ(&alias_z_buf, alias_rel)) == 0);
+
+    const through_real = try std.fmt.allocPrint(t.allocator, "{s}/mux.sock", .{real_rel});
+    defer t.allocator.free(through_real);
+    const through_alias = try std.fmt.allocPrint(t.allocator, "{s}/../mux.sock", .{alias_rel});
+    defer t.allocator.free(through_alias);
+    const canonical_real = try canonicalSocketPath(t.allocator, through_real);
+    defer t.allocator.free(canonical_real);
+    const canonical_alias = try canonicalSocketPath(t.allocator, through_alias);
+    defer t.allocator.free(canonical_alias);
+    try t.expectEqualStrings(canonical_real, canonical_alias);
+    try t.expect(std.mem.endsWith(u8, canonical_alias, "/real/mux.sock"));
+    var addr: c.struct_sockaddr_un = undefined;
+    try fillSockaddrUn(&addr, canonical_alias);
+}
+
 /// An in-flight file upload from a client. The client streams bytes
 /// (file_data frames); we write them straight into a file opened in
 /// the session shell's working directory. Lives only for the duration
@@ -2055,6 +2349,10 @@ pub const Daemon = struct {
     /// these are pure observation with a single reply, so a dead
     /// requester means the job is finished and dropped, not orphaned.
     debug_jobs: std.ArrayList(*DebugJob) = .empty,
+    /// In-flight correlated panel relays. Payload bytes live only in client
+    /// write queues; this table owns no panel document and interprets none.
+    panel_routes: std.ArrayList(PanelRoute) = .empty,
+    next_panel_route_id: u64 = 1 << 63,
     /// Atomic job records live beside the daemon socket and survive a
     /// daemon restart independently of any GUI client.
     fs_job_dir: []u8 = &.{},
@@ -2086,6 +2384,10 @@ pub const Daemon = struct {
     is_broker: bool = false,
     /// Broker only: forked session workers, by session name.
     workers: std.ArrayList(*Worker) = .empty,
+    /// Worker only: an attached client's rename forwarded to the broker (the
+    /// routing authority), awaiting its result.
+    worker_rename_request: ?WorkerRenameRequest = null,
+    next_worker_rename_request: u64 = 1,
     /// Worker only: last metadata signature pushed to the broker, so
     /// `maybePushMeta` only sends on a real change (and throttles activity).
     wpush: WorkerPush = .{},
@@ -2141,10 +2443,14 @@ pub const Daemon = struct {
     /// not the runtime dir, so an interrupted transfer's staged data
     /// (and a completed-but-uncleaned move's quarantine identity) can
     /// still be found after a reboot clears $XDG_RUNTIME_DIR. Keyed by
-    /// a hash of the socket path so isolated instances never share a
-    /// journal namespace (job ids are per-daemon counters).
+    /// a hash of the CANONICAL socket path — canonicalized here, so any
+    /// spelling of one listener (relative, dotted, symlinked) maps to
+    /// one journal namespace and external callers (smoke_fs) can pass
+    /// the path exactly as they would to `init`.
     pub fn fsJobsDirAlloc(allocator: std.mem.Allocator, sock_path: []const u8) ![]u8 {
-        const h = std.hash.Fnv1a_64.hash(sock_path);
+        const canonical = try canonicalSocketPath(allocator, sock_path);
+        defer allocator.free(canonical);
+        const h = std.hash.Fnv1a_64.hash(canonical);
         var state_buf: [4096]u8 = undefined;
         const state: ?[]const u8 = blk: {
             if (std.c.getenv("XDG_STATE_HOME")) |sh| {
@@ -2158,17 +2464,18 @@ pub const Daemon = struct {
         const base = state orelse {
             // No resolvable state dir: fall back to the socket-sibling
             // location (pre-relocation behavior, reboot-fragile).
-            const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
-            return std.fmt.allocPrint(allocator, "{s}/fsjobs", .{sock_path[0..dir_end]});
+            const dir_end = std.mem.lastIndexOfScalar(u8, canonical, '/') orelse return error.BadPath;
+            return std.fmt.allocPrint(allocator, "{s}/fsjobs", .{canonical[0..dir_end]});
         };
         return std.fmt.allocPrint(allocator, "{s}/fsjobs/{x:0>16}", .{ base, h });
     }
 
-    /// One-time adoption of journals from the pre-relocation
-    /// socket-sibling directory. rename first; the runtime dir is
-    /// usually a different filesystem, so EXDEV falls back to a byte
-    /// copy. Best effort — a record that cannot move stays where the
-    /// old code would still have found nothing anyway.
+    /// One-time adoption of journals from the pre-relocation socket-sibling
+    /// directory. rename first; the runtime dir is usually a different
+    /// filesystem, so EXDEV falls back to a staged copy plus rename, which a
+    /// crash can only ever leave behind as a discardable `.part` file.
+    /// Best effort: a record that cannot move stays where the old code would
+    /// still have found nothing anyway.
     fn migrateLegacyFsJournals(sock_dir: []const u8, new_dir: []const u8) void {
         var legacy_buf: [4096:0]u8 = undefined;
         const legacy = std.fmt.bufPrintZ(&legacy_buf, "{s}/fsjobs", .{sock_dir}) catch return;
@@ -2185,39 +2492,52 @@ pub const Daemon = struct {
             }
             var from_buf: [4096:0]u8 = undefined;
             var to_buf: [4096:0]u8 = undefined;
+            var stage_buf: [4096:0]u8 = undefined;
             const from = std.fmt.bufPrintZ(&from_buf, "{s}/{s}", .{ legacy, name }) catch continue;
             const to = std.fmt.bufPrintZ(&to_buf, "{s}/{s}", .{ new_dir, name }) catch continue;
             if (c.rename(from.ptr, to.ptr) == 0) continue;
-            const in = c.fopen(from.ptr, "rb") orelse continue;
-            defer _ = c.fclose(in);
-            const out = c.fopen(to.ptr, "wb") orelse continue;
-            var ok = true;
-            var buf: [16 * 1024]u8 = undefined;
-            while (true) {
-                const n = c.fread(&buf, 1, buf.len, in);
-                if (n == 0) break;
-                if (c.fwrite(&buf, 1, n, out) != n) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (c.fclose(out) != 0) ok = false;
-            if (ok) _ = c.unlink(from.ptr) else _ = c.unlink(to.ptr);
+            const stage = std.fmt.bufPrintZ(&stage_buf, "{s}/.{s}.{d}.part", .{ new_dir, name, c.getpid() }) catch continue;
+            if (copyJournalFile(from.ptr, stage.ptr) and c.rename(stage.ptr, to.ptr) == 0) {
+                _ = c.unlink(from.ptr);
+            } else _ = c.unlink(stage.ptr);
         }
     }
 
+    /// Byte copy into a staging path; false means nothing usable was written.
+    fn copyJournalFile(from: [*:0]const u8, stage: [*:0]const u8) bool {
+        _ = c.unlink(stage);
+        const in = c.fopen(from, "rb") orelse return false;
+        defer _ = c.fclose(in);
+        const out = c.fopen(stage, "wb") orelse return false;
+        var ok = true;
+        var buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            const n = c.fread(&buf, 1, buf.len, in);
+            if (n == 0) break;
+            if (c.fwrite(&buf, 1, n, out) != n) {
+                ok = false;
+                break;
+            }
+        }
+        if (c.fclose(out) != 0) ok = false;
+        return ok;
+    }
+
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
-        const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
+        const absolute_path = try canonicalSocketPath(allocator, sock_path);
+        var path_owned = true;
+        errdefer if (path_owned) allocator.free(absolute_path);
+        const dir_end = std.mem.lastIndexOfScalar(u8, absolute_path, '/') orelse return error.BadPath;
         // mkdir -p the parent (one level is enough in practice:
         // $XDG_RUNTIME_DIR exists; we create the sketerm dir).
         var z_buf: [4096]u8 = undefined;
-        _ = c.mkdir(try pathZ(&z_buf, sock_path[0..dir_end]), 0o700);
+        _ = c.mkdir(try pathZ(&z_buf, absolute_path[0..dir_end]), 0o700);
 
         // Serialize stale-socket recovery. Without this lock, two starters can
         // both observe the same stale inode and one can unlink the other's new
         // listener between its bind and listen calls.
         var lock_buf: [4096:0]u8 = undefined;
-        const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{sock_path}) catch return error.BadPath;
+        const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{absolute_path}) catch return error.BadPath;
         const lock_fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
         if (lock_fd < 0) return error.LockFailed;
         defer _ = c.close(lock_fd);
@@ -2230,13 +2550,13 @@ pub const Daemon = struct {
         if (fd < 0) return error.SocketFailed;
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;
-        try fillSockaddrUn(&addr, sock_path);
+        try fillSockaddrUn(&addr, absolute_path);
         bindSocket(fd, &addr) catch |err| switch (err) {
-            error.AlreadyRunning => switch (socketPathState(sock_path)) {
+            error.AlreadyRunning => switch (socketPathState(absolute_path)) {
                 .live, .unknown => return error.AlreadyRunning,
                 .stale => {
                     var st: c.struct_stat = undefined;
-                    const path = try pathZ(&z_buf, sock_path);
+                    const path = try pathZ(&z_buf, absolute_path);
                     if (c.lstat(path, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFSOCK)
                         return error.BindFailed;
                     if (c.unlink(path) != 0 and std.posix.errno(-1) != .NOENT)
@@ -2248,22 +2568,24 @@ pub const Daemon = struct {
         };
         if (c.listen(fd, 8) != 0) return error.ListenFailed;
         var bound_st: c.struct_stat = undefined;
-        if (c.lstat(try pathZ(&z_buf, sock_path), &bound_st) != 0) return error.StatFailed;
+        if (c.lstat(try pathZ(&z_buf, absolute_path), &bound_st) != 0) return error.StatFailed;
 
+        const job_dir = try fsJobsDirAlloc(allocator, absolute_path);
+        errdefer allocator.free(job_dir);
         const self = try allocator.create(Daemon);
-        const job_dir = try fsJobsDirAlloc(allocator, sock_path);
         self.* = .{
             .allocator = allocator,
             .listen_fd = fd,
-            .sock_path = try allocator.dupe(u8, sock_path),
+            .sock_path = absolute_path,
             .sock_dev = @intCast(bound_st.st_dev),
             .sock_ino = @intCast(bound_st.st_ino),
             .fs_job_dir = job_dir,
         };
+        path_owned = false;
         // No eager ensureDir: journal saves create the directory on
         // first use, so short-lived isolated daemons leave no empty
         // per-socket litter under the user's state dir.
-        migrateLegacyFsJournals(sock_path[0..dir_end], job_dir);
+        migrateLegacyFsJournals(absolute_path[0..dir_end], job_dir);
         return self;
     }
 
@@ -2275,6 +2597,7 @@ pub const Daemon = struct {
             j.deinit();
         }
         self.debug_jobs.deinit(self.allocator);
+        self.panel_routes.deinit(self.allocator);
         for (self.fs_views.items) |v| v.deinit();
         self.fs_views.deinit(self.allocator);
         for (self.fs_listings.items) |l| l.deinit();
@@ -2422,6 +2745,8 @@ pub const Daemon = struct {
 
     /// One poll iteration. Exposed for tests.
     pub fn tick(self: *Daemon, timeout_ms: i32) !void {
+        const tick_now = nowMs();
+        self.panelRoutesTick(tick_now);
         var poll_timeout = self.pulseTick(timeout_ms);
         // Cast playback: deliver due events, clamp to the next deadline.
         poll_timeout = self.castTick(poll_timeout);
@@ -2569,6 +2894,7 @@ pub const Daemon = struct {
         // A debugger job that never speaks still has to hit its
         // deadline, so don't sleep the loop out past it.
         if (self.debug_jobs.items.len > 0 and (poll_timeout < 0 or poll_timeout > 250)) poll_timeout = 250;
+        if (self.panel_routes.items.len > 0 and (poll_timeout < 0 or poll_timeout > 250)) poll_timeout = 250;
 
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), poll_timeout);
         if (pr < 0) return; // EINTR etc — next tick retries
@@ -2740,11 +3066,11 @@ pub const Daemon = struct {
     const PassedClient = daemon_serve.PassedClient;
     const addPassedClient = daemon_serve.addPassedClient;
     const brokerOnWorkerControl = daemon_serve.brokerOnWorkerControl;
+    const workerRequestRename = daemon_serve.workerRequestRename;
     const applyWorkerReady = daemon_serve.applyWorkerReady;
     const replyPendingSpawn = daemon_serve.replyPendingSpawn;
     const maybePushMeta = daemon_serve.maybePushMeta;
     const controlRecv = daemon_serve.controlRecv;
-    const controlSend = daemon_serve.controlSend;
     const clientReadable = daemon_serve.clientReadable;
     const pumpFsListings = daemon_serve.pumpFsListings;
     const clientWritable = daemon_serve.clientWritable;
@@ -3196,13 +3522,132 @@ pub const Daemon = struct {
     }
 
     pub fn nativeViewer(cl: *const Client, s: *const Session) bool {
-        return cl.attached == s and !cl.dead and
+        return terminalViewer(cl, s) and
             cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION and
             cl.native_state_max >= s.native_state_min;
     }
 
     pub fn audioViewer(cl: *const Client, s: *const Session) bool {
-        return cl.attached == s and !cl.dead and cl.audio_channels;
+        return terminalViewer(cl, s) and cl.audio_channels;
+    }
+
+    pub fn terminalViewer(cl: *const Client, s: *const Session) bool {
+        return cl.attached == s and !cl.dead and !cl.panel_only;
+    }
+
+    fn attachmentStreamFrame(self: *const Daemon, s: *const Session, frame: wire.Frame) bool {
+        return switch (frame.ftype) {
+            .snapshot,
+            .events,
+            .exit,
+            .gone,
+            .peer_info,
+            .app_a11y_tree,
+            .search_hits,
+            .log_data,
+            .marker,
+            .native_gap,
+            .native_sync,
+            .control_state,
+            .session_meta,
+            .app_debug_data,
+            .play_state,
+            .panel_request,
+            .panel_reply,
+            => true,
+            .chan_open => if (wire.decodeChanOpen(frame.payload)) |opened|
+                opened.kind == .wayland_native or opened.kind == .winstream or opened.kind == .audio
+            else
+                false,
+            .chan_data, .chan_close => blk: {
+                const id = wire.decodeChanId(frame.payload) orelse break :blk false;
+                for (self.channels.items) |ch| {
+                    if (ch.id == id) break :blk ch.session == s;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn discardQueuedAttachmentFrames(
+        self: *Daemon,
+        s: *Session,
+        out: *std.ArrayList(u8),
+        active_prefix: usize,
+    ) void {
+        var read_at = @min(active_prefix, out.items.len);
+        var write_at = read_at;
+        while (read_at < out.items.len) {
+            const peeled = wire.peelFrame(out.items[read_at..]) catch {
+                // Daemon-produced queues should always be valid. Preserve an
+                // unexpected tail rather than corrupting unrelated traffic.
+                const tail = out.items[read_at..];
+                std.mem.copyForwards(u8, out.items[write_at..][0..tail.len], tail);
+                write_at += tail.len;
+                break;
+            } orelse {
+                const tail = out.items[read_at..];
+                std.mem.copyForwards(u8, out.items[write_at..][0..tail.len], tail);
+                write_at += tail.len;
+                break;
+            };
+            if (!self.attachmentStreamFrame(s, peeled.frame)) {
+                const bytes = out.items[read_at..][0..peeled.consumed];
+                std.mem.copyForwards(u8, out.items[write_at..][0..bytes.len], bytes);
+                write_at += bytes.len;
+            }
+            read_at += peeled.consumed;
+        }
+        out.shrinkRetainingCapacity(write_at);
+    }
+
+    /// Clear one client's attachment-scoped identity. Every teardown path
+    /// (voluntary detach, session kill, session exit) ends here rather than
+    /// hand-rolling the field list.
+    fn clearClientAttachment(cl: *Client) void {
+        cl.attached = null;
+        cl.panel_only = false;
+        cl.panel_rpc = 0;
+        cl.resetAttachmentStreamState();
+    }
+
+    /// End one attachment without letting its queued replicas cross into the
+    /// next role; unrelated connection-scoped replies remain in FIFO order.
+    pub fn detachClientAttachment(self: *Daemon, cl: *Client, presenter_error: []const u8) void {
+        const was = cl.attached;
+        self.panelClientDetached(cl, presenter_error);
+        if (was) |s| {
+            if (cl.write_lane == .audio) {
+                if (cl.write_frame_started) {
+                    cl.audio_wbuf.shrinkRetainingCapacity(@min(cl.write_frame_left, cl.audio_wbuf.items.len));
+                } else {
+                    cl.write_lane = .none;
+                    cl.write_frame_left = 0;
+                    cl.write_frame_started = false;
+                    cl.audio_wbuf.clearRetainingCapacity();
+                }
+            } else {
+                cl.audio_wbuf.clearRetainingCapacity();
+            }
+
+            if (cl.write_lane == .normal and !cl.write_frame_started) {
+                cl.write_lane = .none;
+                cl.write_frame_left = 0;
+            }
+            const active_prefix = if (cl.write_lane == .normal and cl.write_frame_started)
+                @min(cl.write_frame_left, cl.wbuf.items.len)
+            else
+                0;
+            self.discardQueuedAttachmentFrames(s, &cl.wbuf, active_prefix);
+        }
+        clearClientAttachment(cl);
+        if (was) |s| {
+            // Clear attachment first so controller handover cannot select it.
+            if (self.releaseControl(s, cl)) self.broadcastControlState(s);
+            self.broadcastPeerInfo(s);
+            self.refreshVideoGates();
+        }
     }
 
     /// Per-viewer outbound backlog above which the native commit path
@@ -3548,11 +3993,12 @@ pub const Daemon = struct {
     pub const castTick = daemon_cast.castTick;
     pub const castOnAttach = daemon_cast.castOnAttach;
     pub const handlePlayControl = daemon_cast.handlePlayControl;
-    pub const spawnCastSession = daemon_cast.spawnCastSession;
+    pub const spawnCastSessionWithOrigin = daemon_cast.spawnCastSessionWithOrigin;
 
     pub const isWorker = daemon_sessions.isWorker;
     pub const handleSpawn = daemon_sessions.handleSpawn;
     pub const spawnSession = daemon_sessions.spawnSession;
+    pub const spawnSessionWithOrigin = daemon_sessions.spawnSessionWithOrigin;
     pub const handleAttach = daemon_sessions.handleAttach;
     const findSession = daemon_sessions.findSession;
     const brokerFindWorker = daemon_sessions.brokerFindWorker;
@@ -3562,6 +4008,7 @@ pub const Daemon = struct {
     const brokerList = daemon_sessions.brokerList;
     const brokerKill = daemon_sessions.brokerKill;
     const brokerRename = daemon_sessions.brokerRename;
+    pub const brokerWorkerRename = daemon_sessions.brokerWorkerRename;
     const WaylandHub = daemon_sessions.WaylandHub;
     const runtimeBaseDir = daemon_sessions.runtimeBaseDir;
     const setupWaylandHub = daemon_sessions.setupWaylandHub;
@@ -3588,10 +4035,10 @@ pub const Daemon = struct {
         return std.fmt.bufPrint(buf, "{s}#{d}", .{ @tagName(cl.kind), cl.id }) catch "?";
     }
 
-    fn viewerCount(self: *const Daemon, s: *const Session) u32 {
+    pub fn viewerCount(self: *const Daemon, s: *const Session) u32 {
         var n: u32 = 0;
         for (self.clients.items) |cl| {
-            if (!cl.dead and cl.attached == s) n += 1;
+            if (terminalViewer(cl, s)) n += 1;
         }
         return n;
     }
@@ -3605,7 +4052,7 @@ pub const Daemon = struct {
         const label = self.controllerLabel(s, &buf);
         const viewers = self.viewerCount(s);
         for (self.clients.items) |cl| {
-            if (cl.dead or cl.attached != s) continue;
+            if (!terminalViewer(cl, s)) continue;
             cl.queueJson(.control_state, .{
                 .controller = s.controller == cl,
                 .read_only = cl.read_only,
@@ -3625,7 +4072,7 @@ pub const Daemon = struct {
     /// true when the lease CHANGED hands (caller broadcasts).
     pub fn acquireControl(self: *Daemon, s: *Session, cl: *Client, force: bool) bool {
         _ = self;
-        if (cl.read_only) return false;
+        if (cl.read_only or cl.panel_only) return false;
         if (s.controller == cl) return false;
         if (s.controller != null and !force) return false;
         s.controller = cl;
@@ -3649,7 +4096,7 @@ pub const Daemon = struct {
         // swapRemove'd, so its ORDER says nothing about age.
         var next: ?*Client = null;
         for (self.clients.items) |other| {
-            if (other == holder or other.dead or other.attached != s or other.read_only) continue;
+            if (other == holder or !terminalViewer(other, s) or other.read_only) continue;
             if (next == null or other.id < next.?.id) next = other;
         }
         if (next) |n| {
@@ -3662,6 +4109,10 @@ pub const Daemon = struct {
     }
 
     pub fn handleControlReq(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (cl.panel_only) {
+            cl.queueErr("panel-only attachments cannot control a session");
+            return;
+        }
         const s = cl.attached orelse {
             cl.queueErr("not attached");
             return;
@@ -3707,8 +4158,383 @@ pub const Daemon = struct {
             }
         }
         for (self.clients.items) |cl| {
-            if (cl.dead or cl.attached != s) continue;
+            if (!terminalViewer(cl, s)) continue;
             cl.queueJson(.peer_info, .{ .total = total, .guis = guis, .drivers = drivers });
+        }
+    }
+
+    // ── correlated panel relay ─────────────────────────────────────
+
+    pub const PANEL_MAX_PENDING_PER_REQUESTER: usize = 8;
+    pub const PANEL_MAX_PENDING: usize = 128;
+    pub const PANEL_ROUTE_TIMEOUT_MS: i64 = 125_000;
+    /// A presenter/requester that already has this much unsent data is not
+    /// allowed to accumulate another multi-megabyte panel call.
+    pub const PANEL_RELAY_BACKLOG: usize = 64 << 20;
+
+    /// Select THE panel-capable attachment of `s`: the earliest still-attached
+    /// one by client id. There is no requester-to-presenter binding — when a
+    /// presenter detaches or dies, the next request simply selects whichever
+    /// panel-capable attachment is present then.
+    fn panelPresenter(self: *Daemon, s: *Session) ?*Client {
+        var selected: ?*Client = null;
+        for (self.clients.items) |candidate| {
+            if (!terminalViewer(candidate, s) or candidate.kind != .gui or
+                candidate.panel_rpc < wire.PANEL_RPC_VERSION)
+                continue;
+            if (selected == null or candidate.id < selected.?.id) selected = candidate;
+        }
+        return selected;
+    }
+
+    fn panelRouteIdInUse(self: *const Daemon, id: u64) bool {
+        for (self.panel_routes.items) |route| if (route.route_id == id) return true;
+        return false;
+    }
+
+    fn allocPanelRouteId(self: *Daemon) u64 {
+        while (true) {
+            const id = self.next_panel_route_id;
+            self.next_panel_route_id +%= 1;
+            if (self.next_panel_route_id == 0) self.next_panel_route_id = 1;
+            if (id != 0 and !self.panelRouteIdInUse(id)) return id;
+        }
+    }
+
+    fn queuePanelEnvelope(self: *Daemon, cl: *Client, ftype: wire.FrameType, id: u64, json: []const u8) !u64 {
+        if (cl.dead) return error.ClientGone;
+        if (json.len == 0) return error.EmptyJson;
+        if (json.len > wire.PANEL_JSON_MAX) return error.TooLong;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try wire.appendPanelEnvelope(&payload, self.allocator, id, json);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(self.allocator);
+        try wire.appendFrame(&frame, self.allocator, ftype, payload.items);
+        if (cl.queuedBytes() +| frame.items.len > PANEL_RELAY_BACKLOG)
+            return error.Backpressure;
+        const stream_start = cl.normal_bytes_written +| cl.wbuf.items.len;
+        try cl.wbuf.appendSlice(self.allocator, frame.items);
+        return stream_start;
+    }
+
+    /// How much a failed panel route tells the caller about delivery.
+    const PanelFailure = enum {
+        /// Nothing reached the presenter: retrying cannot double-apply.
+        pre_delivery,
+        /// The request was on the wire when it failed. A resend could apply
+        /// a mutation twice, so the caller is told never to do it blindly.
+        uncertain,
+    };
+
+    fn queuePanelFailure(
+        self: *Daemon,
+        cl: *Client,
+        caller_id: u64,
+        class: PanelFailure,
+        message: []const u8,
+        error_code: []const u8,
+    ) void {
+        if (cl.dead) return;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        blk: {
+            w.writeAll("{\"ok\":false,\"error\":") catch break :blk;
+            std.json.Stringify.value(message, .{}, w) catch break :blk;
+            if (error_code.len > 0) {
+                w.writeAll(",\"error_code\":") catch break :blk;
+                std.json.Stringify.value(error_code, .{}, w) catch break :blk;
+            }
+            switch (class) {
+                .pre_delivery => w.writeAll(
+                    ",\"failure_class\":\"pre_delivery\",\"mutation_may_have_applied\":false,\"resend_safe\":true",
+                ) catch break :blk,
+                .uncertain => w.writeAll(
+                    ",\"failure_class\":\"uncertain_delivery\",\"mutation_may_have_applied\":true,\"resend_safe\":false",
+                ) catch break :blk,
+            }
+            w.writeAll("}") catch break :blk;
+            _ = self.queuePanelEnvelope(cl, .panel_reply, caller_id, aw.written()) catch {};
+        }
+    }
+
+    fn queuePanelPreDelivery(self: *Daemon, cl: *Client, caller_id: u64, message: []const u8) void {
+        self.queuePanelFailure(cl, caller_id, .pre_delivery, message, "");
+    }
+
+    fn queuePanelPreDeliveryCode(self: *Daemon, cl: *Client, caller_id: u64, message: []const u8, error_code: []const u8) void {
+        self.queuePanelFailure(cl, caller_id, .pre_delivery, message, error_code);
+    }
+
+    fn queuePanelUncertain(self: *Daemon, cl: *Client, caller_id: u64, message: []const u8) void {
+        self.queuePanelFailure(cl, caller_id, .uncertain, message, "");
+    }
+
+    /// Remove a route whose complete frame is still provably unsent.
+    fn cancelQueuedPanelRoute(self: *Daemon, route: PanelRoute) bool {
+        const presenter = route.presenter;
+        if (presenter.normal_bytes_written > route.presenter_stream_start) return false;
+        const relative_u64 = route.presenter_stream_start - presenter.normal_bytes_written;
+        const relative = std.math.cast(usize, relative_u64) orelse return false;
+        const end = std.math.add(usize, relative, route.presenter_stream_len) catch return false;
+        if (end > presenter.wbuf.items.len) return false;
+        const peeled = (wire.peelFrame(presenter.wbuf.items[relative..end]) catch return false) orelse return false;
+        if (peeled.consumed != route.presenter_stream_len or peeled.frame.ftype != .panel_request) return false;
+        const envelope = wire.decodePanelEnvelope(peeled.frame.payload) catch return false;
+        if (envelope.id != route.route_id) return false;
+
+        if (relative == 0 and presenter.write_lane == .normal) {
+            if (presenter.write_frame_started) return false;
+            presenter.write_lane = .none;
+            presenter.write_frame_left = 0;
+            presenter.write_frame_started = false;
+        }
+        const tail = presenter.wbuf.items[end..];
+        std.mem.copyForwards(u8, presenter.wbuf.items[relative..][0..tail.len], tail);
+        presenter.wbuf.shrinkRetainingCapacity(presenter.wbuf.items.len - route.presenter_stream_len);
+
+        // Absolute starts are coordinates in the shrinking normal stream.
+        for (self.panel_routes.items) |*other| {
+            if (other.presenter == presenter and other.presenter_stream_start > route.presenter_stream_start)
+                other.presenter_stream_start -= route.presenter_stream_len;
+        }
+        return true;
+    }
+
+    /// Fail every route belonging to a presenter that answered badly,
+    /// classified from each route's own stream offset. A reply ID proves that
+    /// one route was delivered even if a synthetic/test transport did not
+    /// advance counters.
+    ///
+    /// The presenter KEEPS its panel capability: one malformed reply is a bug
+    /// in one handler, and silently demoting the user's GUI to "panels no
+    /// longer work here" until they reattach hides it instead of surfacing it.
+    /// Each subsequent call fails on its own with its own message.
+    fn failPanelPresenterRoutes(
+        self: *Daemon,
+        presenter: *Client,
+        proven_route_id: ?u64,
+        message: []const u8,
+    ) void {
+        var i: usize = 0;
+        while (i < self.panel_routes.items.len) {
+            const route = self.panel_routes.items[i];
+            if (route.presenter != presenter) {
+                i += 1;
+                continue;
+            }
+            const proven = proven_route_id != null and proven_route_id.? == route.route_id;
+            const canceled = !proven and self.cancelQueuedPanelRoute(route);
+            _ = self.panel_routes.swapRemove(i);
+            if (!canceled)
+                self.queuePanelUncertain(route.requester, route.caller_id, message)
+            else
+                self.queuePanelPreDelivery(
+                    route.requester,
+                    route.caller_id,
+                    "the panel presenter failed before this route's first request byte; safe to resend",
+                );
+        }
+    }
+
+    pub fn handlePanelRequest(self: *Daemon, requester: *Client, payload: []const u8) void {
+        if (!requester.panel_only or requester.panel_rpc < wire.PANEL_RPC_VERSION) {
+            requester.queueErr("panel_request requires a panel-only attachment");
+            return;
+        }
+        const s = requester.attached orelse {
+            requester.queueErr("not attached");
+            return;
+        };
+        const envelope = wire.decodePanelEnvelope(payload) catch |err| {
+            if (wire.decodePanelEnvelopeId(payload)) |caller_id| {
+                self.queuePanelPreDelivery(requester, caller_id, if (err == error.TooLong)
+                    "panel request is too large before delivery"
+                else
+                    "bad panel request envelope before delivery");
+            } else requester.queueErr(if (err == error.TooLong)
+                "panel request is too large"
+            else
+                "bad panel request envelope");
+            return;
+        };
+        if (self.panel_routes.items.len >= PANEL_MAX_PENDING) {
+            self.queuePanelPreDelivery(requester, envelope.id, "daemon panel route limit reached before request delivery");
+            return;
+        }
+        var requester_pending: usize = 0;
+        for (self.panel_routes.items) |route| {
+            if (route.requester == requester) requester_pending += 1;
+        }
+        if (requester_pending >= PANEL_MAX_PENDING_PER_REQUESTER) {
+            self.queuePanelPreDelivery(requester, envelope.id, "requester panel route limit reached before request delivery");
+            return;
+        }
+        const presenter = self.panelPresenter(s) orelse {
+            self.queuePanelPreDeliveryCode(
+                requester,
+                envelope.id,
+                "no compatible GUI is attached to this session",
+                "no_compatible_gui",
+            );
+            return;
+        };
+        if (presenter.queuedBytes() +| payload.len +| 5 > PANEL_RELAY_BACKLOG) {
+            self.queuePanelPreDelivery(requester, envelope.id, "panel presenter is backpressured before request delivery");
+            return;
+        }
+        self.panel_routes.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.queuePanelPreDelivery(requester, envelope.id, "daemon could not allocate a panel route before delivery");
+            return;
+        };
+        const route_id = self.allocPanelRouteId();
+        const stream_start = self.queuePanelEnvelope(presenter, .panel_request, route_id, envelope.json) catch |err| {
+            self.queuePanelPreDelivery(requester, envelope.id, switch (err) {
+                error.TooLong => "panel request is too large before presenter delivery",
+                error.OutOfMemory => "daemon could not allocate panel delivery before any bytes were sent",
+                error.Backpressure => "panel presenter is backpressured before request delivery",
+                else => "panel presenter disconnected before request delivery",
+            });
+            return;
+        };
+        self.panel_routes.appendAssumeCapacity(.{
+            .route_id = route_id,
+            .caller_id = envelope.id,
+            .requester = requester,
+            .presenter = presenter,
+            .session = s,
+            .deadline_ms = nowMs() + PANEL_ROUTE_TIMEOUT_MS,
+            .presenter_stream_start = stream_start,
+            .presenter_stream_len = payload.len + 5,
+        });
+    }
+
+    pub fn handlePanelReply(self: *Daemon, presenter: *Client, payload: []const u8) void {
+        if (presenter.panel_only or presenter.kind != .gui or presenter.panel_rpc < wire.PANEL_RPC_VERSION) {
+            presenter.queueErr("panel_reply requires a presenter attachment");
+            return;
+        }
+        const envelope = wire.decodePanelEnvelope(payload) catch |err| {
+            const message = if (err == error.TooLong)
+                "panel presenter returned an oversized reply after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent"
+            else
+                "panel presenter returned a malformed reply after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent";
+            const route_id = wire.decodePanelEnvelopeId(payload) orelse {
+                presenter.queueErr("bad panel reply envelope");
+                self.failPanelPresenterRoutes(presenter, null, message);
+                return;
+            };
+            for (self.panel_routes.items) |route| {
+                if (route.route_id != route_id) continue;
+                if (route.presenter != presenter or presenter.attached != route.session) {
+                    presenter.queueErr("malformed panel reply came from the wrong presenter");
+                    self.failPanelPresenterRoutes(presenter, route_id, message);
+                    return;
+                }
+                presenter.queueErr(if (err == error.TooLong)
+                    "oversized panel reply rejected"
+                else
+                    "malformed panel reply rejected");
+                self.failPanelPresenterRoutes(presenter, route_id, message);
+                return;
+            }
+            presenter.queueErr("unknown or expired panel route");
+            self.failPanelPresenterRoutes(presenter, route_id, message);
+            return;
+        };
+        var i: usize = 0;
+        while (i < self.panel_routes.items.len) : (i += 1) {
+            const route = self.panel_routes.items[i];
+            if (route.route_id != envelope.id) continue;
+            if (route.presenter != presenter or presenter.attached != route.session) {
+                presenter.queueErr("panel reply came from the wrong presenter");
+                return;
+            }
+            _ = self.panel_routes.swapRemove(i);
+            if (!route.requester.dead and route.requester.attached == route.session)
+                _ = self.queuePanelEnvelope(route.requester, .panel_reply, route.caller_id, envelope.json) catch {};
+            return;
+        }
+        presenter.queueErr("unknown or expired panel route");
+    }
+
+    /// Remove requester routes and fail routes whose selected presenter left.
+    pub fn panelClientDetached(self: *Daemon, cl: *Client, presenter_error: []const u8) void {
+        var i: usize = 0;
+        while (i < self.panel_routes.items.len) {
+            const route = self.panel_routes.items[i];
+            if (route.requester == cl) {
+                _ = self.cancelQueuedPanelRoute(route);
+                _ = self.panel_routes.swapRemove(i);
+                continue;
+            }
+            if (route.presenter == cl) {
+                const canceled = self.cancelQueuedPanelRoute(route);
+                _ = self.panel_routes.swapRemove(i);
+                if (!canceled)
+                    self.queuePanelUncertain(route.requester, route.caller_id, presenter_error)
+                else
+                    self.queuePanelPreDelivery(route.requester, route.caller_id, "panel presenter disconnected before request delivery; safe to resend");
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn panelSessionClosed(self: *Daemon, s: *Session) void {
+        var i: usize = 0;
+        while (i < self.panel_routes.items.len) {
+            const route = self.panel_routes.items[i];
+            if (route.session != s) {
+                i += 1;
+                continue;
+            }
+            const canceled = self.cancelQueuedPanelRoute(route);
+            _ = self.panel_routes.swapRemove(i);
+            if (!canceled)
+                self.queuePanelUncertain(route.requester, route.caller_id, "session closed after panel request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent")
+            else
+                self.queuePanelPreDelivery(route.requester, route.caller_id, "session closed before panel request delivery; safe to resend");
+        }
+    }
+
+    pub fn panelRoutesTick(self: *Daemon, now: i64) void {
+        var i: usize = 0;
+        while (i < self.panel_routes.items.len) {
+            const route = self.panel_routes.items[i];
+            if (route.requester.dead or route.requester.attached != route.session or
+                !route.requester.panel_only or route.requester.panel_rpc < wire.PANEL_RPC_VERSION)
+            {
+                _ = self.cancelQueuedPanelRoute(route);
+                _ = self.panel_routes.swapRemove(i);
+                continue;
+            }
+            const message: ?[]const u8 = if (route.session.exited)
+                "session closed"
+            else if (route.presenter.dead or route.presenter.attached != route.session or
+                route.presenter.panel_only or route.presenter.kind != .gui or
+                route.presenter.panel_rpc < wire.PANEL_RPC_VERSION)
+                "panel presenter disconnected"
+            else if (now >= route.deadline_ms)
+                "panel request timed out"
+            else
+                null;
+            if (message) |msg| {
+                const canceled = self.cancelQueuedPanelRoute(route);
+                _ = self.panel_routes.swapRemove(i);
+                if (!canceled) {
+                    var buf: [256]u8 = undefined;
+                    const uncertain = std.fmt.bufPrint(&buf, "{s} after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent", .{msg}) catch msg;
+                    self.queuePanelUncertain(route.requester, route.caller_id, uncertain);
+                } else {
+                    var buf: [160]u8 = undefined;
+                    const safe = std.fmt.bufPrint(&buf, "{s} before request delivery; safe to resend", .{msg}) catch msg;
+                    self.queuePanelPreDelivery(route.requester, route.caller_id, safe);
+                }
+                continue;
+            }
+            i += 1;
         }
     }
 
@@ -3718,6 +4544,7 @@ pub const Daemon = struct {
     /// serialized protocol state. Windows reappear with current
     /// pixels (durable GUI apps, multi-viewer).
     pub fn replayNativeChannels(self: *Daemon, cl: *Client, s: *Session) void {
+        if (!terminalViewer(cl, s)) return;
         // A full replay makes the client current — any pending
         // withheld-frames state is superseded by it.
         cl.needs_native_resync = false;
@@ -3933,7 +4760,7 @@ pub const Daemon = struct {
             const chs = ch.session orelse continue;
             const ws = chs.winstream orelse continue;
             const cl = ch.client orelse continue;
-            if (cl.dead) continue;
+            if (!terminalViewer(cl, chs)) continue;
             // Backpressure: a slow link must not balloon the client
             // write buffer — skip frame production until it drains
             // (the source keeps streaming; only emission pauses).
@@ -4022,7 +4849,16 @@ pub const Daemon = struct {
         self.queueLogData(cl, s, req);
     }
 
+    pub fn queueAttachIdentity(_: *Daemon, cl: *Client, s: *Session) void {
+        cl.queueJson(.session_meta, .{
+            .name = s.name,
+            .origin_name = s.origin_name,
+            .origin_id = &s.origin_id,
+        });
+    }
+
     pub fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
+        if (!terminalViewer(cl, s)) return;
         // A full snapshot supersedes any withheld events — whatever
         // triggered it (attach, resize, resync), the client is current
         // again once this lands.
@@ -4055,6 +4891,9 @@ pub const Daemon = struct {
         cl.queueJson(.session_meta, .{
             .cwd = cwdOfPid(s.childPid(), &cwd_buf) orelse "",
             .program = fg,
+            .name = s.name,
+            .origin_name = s.origin_name,
+            .origin_id = &s.origin_id,
         });
         // A cast viewer needs the playback state to render controls.
         if (s.castPtr()) |cp| daemon_cast.queuePlayState(cl, cp);
@@ -4087,14 +4926,26 @@ pub const Daemon = struct {
         s.fg_program_len = len;
 
         for (self.clients.items) |cl| {
-            if (cl.attached != s or cl.dead) continue;
+            if (!terminalViewer(cl, s)) continue;
             cl.queueJson(.session_meta, .{ .program = s.fg_program[0..len] });
         }
     }
 
     pub fn broadcastSnapshot(self: *Daemon, s: *Session) void {
         for (self.clients.items) |cl| {
-            if (cl.attached == s and !cl.dead) self.queueSnapshot(cl, s);
+            if (terminalViewer(cl, s)) self.queueSnapshot(cl, s);
+        }
+    }
+
+    /// Publish mutable display identity without changing the snapshot format.
+    pub fn broadcastSessionIdentity(self: *Daemon, s: *Session) void {
+        for (self.clients.items) |cl| {
+            if (!terminalViewer(cl, s)) continue;
+            cl.queueJson(.session_meta, .{
+                .name = s.name,
+                .origin_name = s.origin_name,
+                .origin_id = &s.origin_id,
+            });
         }
     }
 
@@ -4126,7 +4977,7 @@ pub const Daemon = struct {
         for (self.sessions.items) |s| {
             var n_clients: u32 = 0;
             for (self.clients.items) |c2| {
-                if (c2.attached == s) n_clients += 1;
+                if (!c2.dead and c2.attached == s) n_clients += 1;
             }
             var controller: []const u8 = "";
             {
@@ -4154,6 +5005,8 @@ pub const Daemon = struct {
             };
             infos.append(self.allocator, .{
                 .name = s.name,
+                .origin_name = s.origin_name,
+                .origin_id = &s.origin_id,
                 .rows = s.screen.rows,
                 .cols = s.screen.cols,
                 .clients = n_clients,
@@ -4176,7 +5029,7 @@ pub const Daemon = struct {
                 .pulse_server = if (s.pa_socket_path) |p| p else "",
                 .runtime_dir = if (s.runtime_dir_path) |p| p else "",
                 .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
-                .viewers = n_clients,
+                .viewers = self.viewerCount(s),
                 .controller = controller,
             }) catch return;
         }
@@ -4442,7 +5295,7 @@ pub const Daemon = struct {
         };
         defer parsed.deinit();
         const req = parsed.value;
-        if (req.new_name.len == 0 or req.new_name.len > 64) {
+        if (!validSessionName(req.new_name)) {
             cl.queueErr("rename needs a name (1-64 chars)");
             return;
         }
@@ -4456,21 +5309,25 @@ pub const Daemon = struct {
                 return;
             }
         }
-        const fresh = self.allocator.dupe(u8, req.new_name) catch {
+        if (self.isWorker()) {
+            self.workerRequestRename(cl, req.new_name);
+            return;
+        }
+        s.renameTo(req.new_name) catch {
             cl.queueErr("oom");
             return;
         };
-        self.allocator.free(s.name);
-        s.name = fresh;
+        self.broadcastSessionIdentity(s);
         cl.queueJson(.ok, .{ .ok = true, .name = s.name });
     }
 
     pub fn removeSession(self: *Daemon, s: *Session) void {
         s.controller = null;
+        self.panelSessionClosed(s);
         for (self.clients.items) |cl| {
             if (cl.attached == s) {
-                cl.attached = null;
                 cl.queueJson(.gone, .{ .reason = "session closed" });
+                clearClientAttachment(cl);
             }
         }
         for (self.channels.items) |ch| {
@@ -4602,7 +5459,7 @@ pub const Daemon = struct {
         s.last_activity_ms = nowMs();
         var any_attached = false;
         for (self.clients.items) |cl| {
-            if (cl.attached == s and !cl.dead) {
+            if (terminalViewer(cl, s)) {
                 any_attached = true;
                 break;
             }
@@ -4617,7 +5474,7 @@ pub const Daemon = struct {
             payload.appendSlice(self.allocator, &hdr) catch return;
             payload.appendSlice(self.allocator, total_events.writer.buf.items) catch return;
             for (self.clients.items) |cl| {
-                if (cl.attached != s or cl.dead) continue;
+                if (!terminalViewer(cl, s)) continue;
                 // Backpressure: a client this far behind (flooding
                 // session, consumer idle between MCP tool calls) stops
                 // receiving events — clientWritable resyncs it with a
@@ -4637,7 +5494,7 @@ pub const Daemon = struct {
         // viewer stashes "the app right now" against them).
         for (total_events.markers.items) |m| {
             for (self.clients.items) |cl| {
-                if (cl.attached == s and !cl.dead)
+                if (terminalViewer(cl, s))
                     cl.queueJson(.marker, .{ .id = m.id, .label = m.label, .t = total_events.wall_ms, .after = m.after });
             }
             log.debug("marker #{d} '{s}' after={d} (session '{s}')", .{ m.id, m.label, m.after, s.name });
@@ -4651,6 +5508,7 @@ pub const Daemon = struct {
         // Nothing will ever drive this session again; keeping the
         // pointer would only risk a dangle past the client reap.
         s.controller = null;
+        self.panelSessionClosed(s);
         log.info("session '{s}' exited", .{s.name});
         // We reach here on PTY EOF/EIO: the child has exited but may
         // not be waitpid-able for another scheduler tick, and a single
@@ -4680,6 +5538,11 @@ pub const Daemon = struct {
         for (self.clients.items) |cl| {
             if (cl.attached == s) {
                 if (!cl.dead) {
+                    if (cl.panel_only) {
+                        cl.queueJson(.gone, .{ .reason = "session exited" });
+                        clearClientAttachment(cl);
+                        continue;
+                    }
                     // A backlogged client had events withheld; clients
                     // stop pumping after `.exit`, so the resync snapshot
                     // (the FINAL screen — the crash post-mortem) must go
@@ -4690,7 +5553,7 @@ pub const Daemon = struct {
                     self.queueLogData(cl, s, .{ .tail = 300, .max_chars = 1000 });
                     cl.queueFrame(.exit, &st);
                 }
-                cl.attached = null;
+                clearClientAttachment(cl);
             }
         }
     }
@@ -4706,7 +5569,7 @@ pub const Daemon = struct {
             if (s.ttl_ms == 0 or s.exited) continue;
             var occupied = false;
             for (self.clients.items) |cl| {
-                if (!cl.dead and cl.attached == s) {
+                if (terminalViewer(cl, s)) {
                     occupied = true;
                     break;
                 }
@@ -4882,6 +5745,14 @@ pub const Daemon = struct {
                 }
                 const was = cl.attached;
                 if (was) |s| log.info("client gone (session '{s}')", .{s.name});
+                self.panelClientDetached(cl, "panel presenter disconnected after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
+                // A pending broker rename whose requester died must free
+                // the slot, or every later rename on this worker fails
+                // "already in progress" (the 'n' reply would find no live
+                // requester to answer anyway).
+                if (self.worker_rename_request) |pending| {
+                    if (pending.requester_id == cl.id) self.worker_rename_request = null;
+                }
                 // Release BEFORE the client is freed and removed: the
                 // handover scan compares against this pointer, and
                 // s.controller would otherwise dangle.

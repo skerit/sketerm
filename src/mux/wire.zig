@@ -199,6 +199,9 @@ pub const FrameType = enum(u8) {
     /// sent when the welcome advertises `cast_playback:true`. Answered
     /// by a `play_state` broadcast, never ok/err.
     play_control = 30,
+    /// Correlated native-panel RPC request with [u64 id little-endian]
+    /// [opaque JSON], rewritten to a daemon route id for one presenter.
+    panel_request = 31,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -315,6 +318,9 @@ pub const FrameType = enum(u8) {
     /// "finished", position_ms, duration_ms (null until EOF is known),
     /// speed, markers:[[ms,"label"],...] }. Sent once per attach.
     play_state = 94,
+    /// Correlated native-panel RPC result accepted only from the selected
+    /// presenter and restored to the requester's original caller id.
+    panel_reply = 95,
     _,
 };
 
@@ -373,6 +379,79 @@ pub fn decodeChanId(payload: []const u8) ?u32 {
 }
 
 pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
+
+/// Independent capability version for panel RPC; it does not alter the
+/// terminal snapshot/event profile selected by PROTO_VERSION.
+pub const PANEL_RPC_VERSION: u8 = 1;
+
+/// Lifetime-unique session incarnation identity as it appears on the wire:
+/// 32 lowercase hex digits. Minting lives daemon-side (needs entropy);
+/// validation lives here so stores and clients need no daemon import.
+pub const SESSION_ORIGIN_ID_BYTES: usize = 16;
+pub const SESSION_ORIGIN_ID_LEN: usize = SESSION_ORIGIN_ID_BYTES * 2;
+pub const SessionOriginId = [SESSION_ORIGIN_ID_LEN]u8;
+
+pub fn validSessionOriginId(id: []const u8) bool {
+    if (id.len != SESSION_ORIGIN_ID_LEN) return false;
+    for (id) |ch| switch (ch) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+test "session origin id validation accepts exactly 32 lowercase hex digits" {
+    try std.testing.expect(validSessionOriginId("00000000000000000000000000000001"));
+    try std.testing.expect(!validSessionOriginId("0000000000000000000000000000001")); // 31
+    try std.testing.expect(!validSessionOriginId("0000000000000000000000000000000A")); // uppercase
+    try std.testing.expect(!validSessionOriginId(""));
+}
+/// Panel documents can be 1 MiB and outer JSON escaping may expand them.
+/// The envelope remains comfortably below MAX_FRAME, including its tag.
+pub const PANEL_JSON_MAX: usize = 4 << 20;
+pub const PANEL_ENVELOPE_HEADER: usize = @sizeOf(u64);
+pub const PANEL_ENVELOPE_MAX: usize = PANEL_ENVELOPE_HEADER + PANEL_JSON_MAX;
+
+comptime {
+    if (PANEL_ENVELOPE_MAX + 1 >= MAX_FRAME)
+        @compileError("panel envelope must remain below MAX_FRAME");
+}
+
+pub const PanelEnvelope = struct {
+    id: u64,
+    json: []const u8,
+};
+
+pub const PanelEnvelopeError = error{ Truncated, EmptyJson, TooLong };
+
+/// Decode only the correlation id, including from an otherwise malformed or
+/// oversized envelope so the daemon can fail its live route immediately.
+pub fn decodePanelEnvelopeId(payload: []const u8) ?u64 {
+    if (payload.len < PANEL_ENVELOPE_HEADER) return null;
+    return std.mem.readInt(u64, payload[0..PANEL_ENVELOPE_HEADER], .little);
+}
+
+/// Validate and split a panel RPC envelope without interpreting its JSON.
+pub fn decodePanelEnvelope(payload: []const u8) PanelEnvelopeError!PanelEnvelope {
+    if (payload.len < PANEL_ENVELOPE_HEADER) return error.Truncated;
+    const json = payload[PANEL_ENVELOPE_HEADER..];
+    if (json.len == 0) return error.EmptyJson;
+    if (json.len > PANEL_JSON_MAX) return error.TooLong;
+    return .{
+        .id = decodePanelEnvelopeId(payload).?,
+        .json = json,
+    };
+}
+
+/// Append one validated panel envelope to `out`.
+pub fn appendPanelEnvelope(out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u64, json: []const u8) !void {
+    if (json.len == 0) return error.EmptyJson;
+    if (json.len > PANEL_JSON_MAX) return error.TooLong;
+    var header: [PANEL_ENVELOPE_HEADER]u8 = undefined;
+    std.mem.writeInt(u64, &header, id, .little);
+    try out.appendSlice(allocator, &header);
+    try out.appendSlice(allocator, json);
+}
 
 /// Drop `consumed` leading bytes from a stream buffer, sliding the
 /// unread tail down in place (capacity retained).
@@ -762,6 +841,36 @@ test "wire: frame peel handles partial + complete + unknown type" {
     // Zero-length frame is malformed.
     const zero = [_]u8{ 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.Malformed, peelFrame(&zero));
+}
+
+test "wire: append-only frame and event values include panel RPC" {
+    try std.testing.expectEqual(@as(u8, 30), @intFromEnum(FrameType.play_control));
+    try std.testing.expectEqual(@as(u8, 31), @intFromEnum(FrameType.panel_request));
+    try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
+    try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));
+    try std.testing.expectEqual(@as(u8, 95), @intFromEnum(FrameType.panel_reply));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(EventTag.print));
+    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(EventTag.parse_error));
+}
+
+test "wire: panel envelope is little-endian, opaque, and bounded" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPanelEnvelope(&bytes, a, 0x0807060504030201, "{\"document\":\"opaque\"}");
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, bytes.items[0..8]);
+    const decoded = try decodePanelEnvelope(bytes.items);
+    try std.testing.expectEqual(@as(u64, 0x0807060504030201), decoded.id);
+    try std.testing.expectEqualStrings("{\"document\":\"opaque\"}", decoded.json);
+
+    try std.testing.expectError(error.Truncated, decodePanelEnvelope("short"));
+    try std.testing.expectEqual(@as(?u64, null), decodePanelEnvelopeId("short"));
+    try std.testing.expectError(error.EmptyJson, decodePanelEnvelope(&([_]u8{0} ** 8)));
+    const too_large = try a.alloc(u8, PANEL_ENVELOPE_MAX + 1);
+    defer a.free(too_large);
+    try std.testing.expectError(error.TooLong, decodePanelEnvelope(too_large));
+    try std.testing.expectError(error.EmptyJson, appendPanelEnvelope(&bytes, a, 1, ""));
+    try std.testing.expectError(error.TooLong, appendPanelEnvelope(&bytes, a, 1, too_large));
 }
 
 test "partialInfo reports expected-vs-buffered for a half frame" {

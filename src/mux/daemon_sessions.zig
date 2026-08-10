@@ -4,6 +4,7 @@
 //! into Daemon.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
@@ -27,9 +28,12 @@ const pathZ = @import("../util/pathz.zig").pathZ;
 const removeTreeBestEffort = dmod.removeTreeBestEffort;
 const SessionInfo = dmod.SessionInfo;
 const RenameReq = dmod.RenameReq;
-const controlSend = @import("daemon_serve.zig").controlSend;
-const WORKER_META_BUF = @import("daemon_serve.zig").WORKER_META_BUF;
-const runWorker = @import("daemon_serve.zig").runWorker;
+const SessionOriginId = dmod.SessionOriginId;
+const daemon_serve = @import("daemon_serve.zig");
+const controlSend = daemon_serve.controlSend;
+const PassedClient = daemon_serve.PassedClient;
+const WORKER_META_BUF = daemon_serve.WORKER_META_BUF;
+const runWorker = daemon_serve.runWorker;
 const version = @import("../version.zig");
 const a11yhub = @import("a11yhub.zig");
 const fillSockaddrUn = dmod.fillSockaddrUn;
@@ -43,7 +47,7 @@ const xwayland = @import("xwayland.zig");
 
 pub fn findSession(self: *Daemon, name: []const u8) ?*Session {
     for (self.sessions.items) |s| {
-        if (std.mem.eql(u8, s.name, name)) return s;
+        if (s.matchesName(name)) return s;
     }
     return null;
 }
@@ -113,6 +117,8 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     cl.queueJson(.ok, .{
         .ok = true,
         .name = s.name,
+        .origin_name = s.origin_name,
+        .origin_id = &s.origin_id,
         .pid = s.childPid(),
         // The session's environment: an external renderer must be
         // handed these, never left to derive a wl-w<pid> path.
@@ -130,9 +136,17 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
 
 pub fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
     for (self.workers.items) |w| {
-        if (!w.dead and std.mem.eql(u8, w.name, name)) return w;
+        if (!w.dead and w.matchesName(name)) return w;
     }
     return null;
+}
+
+fn brokerNameInUse(self: *Daemon, name: []const u8, except: ?*Worker) bool {
+    for (self.workers.items) |w| {
+        if (w.dead or w == except) continue;
+        if (w.matchesName(name)) return true;
+    }
+    return false;
 }
 
 /// Apply per-worker resource limits in the freshly forked child, before it
@@ -163,6 +177,36 @@ pub fn applyWorkerLimits() void {
     _ = S.setrlimit(RLIMIT_AS, &rl);
 }
 
+fn workerKeepsFd(fd: c_int, control_fd: c_int, scan_fd: c_int) bool {
+    return fd <= 2 or fd == control_fd or fd == log.inheritedFd() or fd == scan_fd;
+}
+
+/// Close every descriptor except the worker control channel, stdio, and log.
+pub fn closeInheritedBrokerFds(self: *Daemon, control_fd: c_int) void {
+    _ = self;
+    if (comptime builtin.os.tag == .linux) {
+        if (c.opendir("/proc/self/fd")) |dir| {
+            defer _ = c.closedir(dir);
+            const scan_fd = c.dirfd(dir);
+            while (c.readdir(dir)) |ent| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+                const fd = std.fmt.parseInt(c_int, name, 10) catch continue;
+                if (!workerKeepsFd(fd, control_fd, scan_fd)) _ = c.close(fd);
+            }
+            return;
+        }
+    }
+    const raw_max = c.sysconf(c._SC_OPEN_MAX);
+    const max_fd: c_int = if (raw_max > 3 and raw_max <= std.math.maxInt(c_int))
+        @intCast(raw_max)
+    else
+        65_536;
+    var fd: c_int = 3;
+    while (fd < max_fd) : (fd += 1) {
+        if (!workerKeepsFd(fd, control_fd, -1)) _ = c.close(fd);
+    }
+}
+
 /// Broker side of spawn: fork a worker process that owns this session.
 /// fork-without-exec — the child runs `runWorker` against an inherited
 /// (COW) copy of the SpawnReq; it first drops every broker fd it inherited.
@@ -188,10 +232,14 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         req.argv = default_shell;
         req.login_shell = true;
     }
-    if (brokerFindWorker(self, req.name) != null) {
+    if (brokerFindWorker(self, req.name) != null or brokerNameInUse(self, req.name, null)) {
         queueNameExists(cl, req.name);
         return;
     }
+    const origin_id = dmod.newSessionOriginId() catch {
+        cl.queueErr("spawn failed: session origin entropy unavailable");
+        return;
+    };
 
     // A datagram channel, so each control message (and its SCM_RIGHTS
     // fd) stays one clean unit on the broker↔worker channel — sized to
@@ -214,18 +262,14 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         // single-session worker. `req` is valid here via COW; we _exit
         // before the parent's `defer parsed.deinit()` matters to us.
         _ = c.close(sp[0]);
-        if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
-        for (self.clients.items) |cc| _ = c.close(cc.fd);
-        for (self.workers.items) |w| {
-            if (w.control_fd >= 0) _ = c.close(w.control_fd);
-        }
+        closeInheritedBrokerFds(self, sp[1]);
         _ = c.setsid();
         applyWorkerLimits();
         // Hand the worker the broker's socket dir so its Wayland display /
         // isolated-rt sockets land in the right runtime dir (the worker has
         // no listen socket of its own to derive it from). COW-valid here.
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse self.sock_path.len;
-        runWorker(self.allocator, sp[1], req, self.sock_path[0..dir_end], self.sock_path) catch {};
+        runWorker(self.allocator, sp[1], req, origin_id, self.sock_path[0..dir_end], self.sock_path) catch {};
         c._exit(0);
     }
     // Broker parent.
@@ -236,8 +280,15 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("oom");
         return;
     };
+    const origin_owned = self.allocator.dupe(u8, req.name) catch {
+        self.allocator.free(name_owned);
+        _ = c.close(sp[0]);
+        cl.queueErr("oom");
+        return;
+    };
     const w = self.allocator.create(Worker) catch {
         self.allocator.free(name_owned);
+        self.allocator.free(origin_owned);
         _ = c.close(sp[0]);
         cl.queueErr("oom");
         return;
@@ -245,6 +296,8 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     w.* = .{
         .allocator = self.allocator,
         .name = name_owned,
+        .origin_name = origin_owned,
+        .origin_id = origin_id,
         .pid = pid,
         .control_fd = sp[0],
         .app = req.app,
@@ -268,6 +321,121 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     // (spawnSession failed). The client is blocked in recvExpect(.ok).
 }
 
+test "new workers close every broker descriptor and release stale listeners" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-worker-fds-{d}", .{c.getpid()});
+    _ = c.mkdir(dir.ptr, 0o700);
+    defer dmod.removeTreeBestEffort(dir);
+    var path_buf: [160]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "{s}/mux.sock", .{dir});
+    const broker = try Daemon.init(a, socket_path);
+    broker.is_broker = true;
+    defer broker.deinit();
+
+    var client_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&client_pair));
+    defer {
+        if (client_pair[1] >= 0) _ = c.close(client_pair[1]);
+    }
+    const client = try a.create(Client);
+    client.* = .{ .allocator = a, .fd = client_pair[0] };
+    try broker.clients.append(a, client);
+
+    var worker_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&worker_pair, 4096));
+    defer {
+        if (worker_pair[1] >= 0) _ = c.close(worker_pair[1]);
+    }
+    const worker = try a.create(Worker);
+    worker.* = Worker{
+        .allocator = a,
+        .name = try a.dupe(u8, "existing"),
+        .origin_name = try a.dupe(u8, "existing"),
+        .origin_id = "10000000000000000000000000000001".*,
+        .pid = 1,
+        .control_fd = worker_pair[0],
+    };
+    try broker.workers.append(a, worker);
+
+    const udp_fd = platform.socketCloexec(c.AF_INET, c.SOCK_DGRAM, 0);
+    try t.expect(udp_fd >= 0);
+    var udp_addr = std.mem.zeroes(c.struct_sockaddr_in);
+    if (@hasField(c.struct_sockaddr_in, "sin_len")) udp_addr.sin_len = @sizeOf(c.struct_sockaddr_in);
+    udp_addr.sin_family = c.AF_INET;
+    udp_addr.sin_addr.s_addr = c.htonl(c.INADDR_LOOPBACK);
+    try t.expectEqual(@as(c_int, 0), c.bind(udp_fd, @ptrCast(&udp_addr), @sizeOf(c.struct_sockaddr_in)));
+    var udp_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+    try t.expectEqual(@as(c_int, 0), c.getsockname(udp_fd, @ptrCast(&udp_addr), &udp_len));
+
+    var pipe_server: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.pipe(&pipe_server));
+    defer {
+        if (pipe_server[0] >= 0) _ = c.close(pipe_server[0]);
+    }
+
+    var child_control: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&child_control, 4096));
+    defer {
+        if (child_control[0] >= 0) _ = c.close(child_control[0]);
+    }
+    defer {
+        if (child_control[1] >= 0) _ = c.close(child_control[1]);
+    }
+
+    const pid = c.fork();
+    try t.expect(pid >= 0);
+    if (pid == 0) {
+        _ = c.close(child_control[0]);
+        closeInheritedBrokerFds(broker, child_control[1]);
+        var marker: u8 = 1;
+        _ = c.send(child_control[1], &marker, 1, 0);
+        _ = c.recv(child_control[1], &marker, 1, 0);
+        c._exit(0);
+    }
+    var child_live = true;
+    defer if (child_live) {
+        _ = c.kill(pid, c.SIGKILL);
+        _ = c.waitpid(pid, null, 0);
+    };
+    _ = c.close(child_control[1]);
+    child_control[1] = -1;
+    var marker: u8 = 0;
+    try t.expectEqual(@as(isize, 1), c.recv(child_control[0], &marker, 1, 0));
+
+    _ = c.close(broker.listen_fd);
+    broker.listen_fd = -1;
+    _ = c.close(client.fd);
+    client.fd = -1;
+    _ = c.close(worker.control_fd);
+    worker.control_fd = -1;
+    _ = c.close(udp_fd);
+    _ = c.close(pipe_server[1]);
+    pipe_server[1] = -1;
+
+    for ([_]c_int{ client_pair[1], worker_pair[1], pipe_server[0] }) |peer_fd| {
+        var pfd = c.struct_pollfd{ .fd = peer_fd, .events = c.POLLIN | c.POLLHUP, .revents = 0 };
+        try t.expect(c.poll(&pfd, 1, 1_000) > 0);
+        try t.expectEqual(@as(isize, 0), c.read(peer_fd, &marker, 1));
+    }
+
+    const rebound_udp = platform.socketCloexec(c.AF_INET, c.SOCK_DGRAM, 0);
+    try t.expect(rebound_udp >= 0);
+    defer _ = c.close(rebound_udp);
+    try t.expectEqual(@as(c_int, 0), c.bind(rebound_udp, @ptrCast(&udp_addr), @sizeOf(c.struct_sockaddr_in)));
+
+    // The pathname survived the simulated broker crash, but no worker keeps
+    // its listening socket live, so normal stale-socket recovery can replace it.
+    const replacement = try Daemon.init(a, socket_path);
+    defer replacement.deinit();
+
+    try t.expectEqual(@as(isize, 1), c.send(child_control[0], &marker, 1, 0));
+    var status: c_int = 0;
+    try t.expectEqual(pid, c.waitpid(pid, &status, 0));
+    child_live = false;
+}
+
 /// Broker side of attach: hand the client's socket fd to the session's
 /// worker (SCM_RIGHTS) and drop our copy — the worker serves it directly.
 pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
@@ -278,10 +446,26 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     };
     defer parsed.deinit();
+    if (!parsed.value.panel_only and (cl.proto == 0 or cl.snapshot_version == 0)) {
+        cl.queueErr("no shared terminal profile; session preserved");
+        return;
+    }
+    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
+    if (parsed.value.panel_only and panel_rpc < wire.PANEL_RPC_VERSION) {
+        cl.queueErr("panel-only attach requires panel_rpc capability");
+        return;
+    }
     const w = brokerFindWorker(self, parsed.value.name) orelse {
         cl.queueErr("no such session");
         return;
     };
+    if (parsed.value.origin_id.len > 0 and
+        (!dmod.validSessionOriginId(parsed.value.origin_id) or
+            !std.mem.eql(u8, parsed.value.origin_id, &w.origin_id)))
+    {
+        cl.queueErr("session origin identity changed");
+        return;
+    }
     const kind: Client.Kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
         .gui
     else if (std.mem.eql(u8, parsed.value.kind, "cli"))
@@ -290,22 +474,30 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .mcp
     else
         .unknown;
-    const msg = [_]u8{
-        'A',
-        @truncate(cl.proto),
-        @intFromBool(cl.video),
-        @intFromEnum(kind),
-        cl.native_state_max,
-        cl.snapshot_version,
-        @intFromBool(cl.audio_channels),
-        @intFromBool(cl.winstream_channels),
-        // Controller-lease intent. The worker owns the lease (it
-        // owns the session), so these MUST ride the handoff — the
-        // broker's own Client is discarded a few lines below.
-        @intFromBool(parsed.value.read_only),
-        @intFromBool(parsed.value.control),
-    };
-    controlSend(w.control_fd, &msg, cl.fd);
+    const encoded = (PassedClient{
+        .proto = cl.proto,
+        .video = cl.video,
+        .kind = kind,
+        .native_state_max = cl.native_state_max,
+        .snapshot_version = cl.snapshot_version,
+        .audio_channels = cl.audio_channels,
+        .winstream_channels = cl.winstream_channels,
+        .read_only = parsed.value.read_only,
+        .want_control = parsed.value.control,
+        .panel_only = parsed.value.panel_only,
+        .panel_rpc = panel_rpc,
+        .identity_first = parsed.value.identity_first and panel_rpc > 0 and kind == .gui and
+            !parsed.value.panel_only,
+    }).encode();
+    var msg: [1 + PassedClient.WIRE_SIZE]u8 = undefined;
+    msg[0] = 'A';
+    @memcpy(msg[1..], &encoded);
+    // The one control datagram whose loss the client can see: without it the
+    // attach silently never lands. Report it instead of dropping the fd.
+    if (!controlSend(w.control_fd, &msg, cl.fd)) {
+        cl.queueErr("session worker did not accept the client handoff");
+        return;
+    }
     // Handed off: the kernel duplicated the fd into the worker. Drop our
     // copy + the Client (reap closes the broker's fd; the worker's stays).
     //
@@ -329,6 +521,8 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
         if (w.dead) continue;
         infos.append(self.allocator, .{
             .name = w.name,
+            .origin_name = w.origin_name,
+            .origin_id = &w.origin_id,
             .rows = w.rows,
             .cols = w.cols,
             .clients = w.n_clients,
@@ -360,10 +554,8 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
     cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
 }
 
-/// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`
-/// to its clients and exits) and mark it dead so the name frees at once.
-/// The buffered 'K' datagram is delivered to the worker even though reap
-/// closes the broker's control end this tick.
+/// Broker side of kill: send the worker a graceful 'K', stop routing its name,
+/// and keep polling it until it flushes `.gone` and closes the control channel.
 pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(KillReq, self.allocator, payload, .{
         .ignore_unknown_fields = true,
@@ -390,14 +582,68 @@ pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("display session identity changed");
         return;
     }
-    controlSend(w.control_fd, "K", -1);
+    _ = controlSend(w.control_fd, "K", -1);
     w.dead = true;
     cl.queueJson(.ok, .{ .ok = true });
 }
 
-/// Broker side of rename: the broker is the routing authority, so update
-/// `Worker.name` here, and forward an 'R' to the worker so its own session
-/// state stays consistent.
+/// Answer whoever asked for a rename: a broker client directly, or the worker
+/// that forwarded one of its attached clients' requests.
+fn replyBrokerRename(
+    self: *Daemon,
+    w: *Worker,
+    requester_id: u32,
+    worker_request_id: u64,
+    ok: bool,
+    message: []const u8,
+    name: []const u8,
+) void {
+    if (worker_request_id != 0) {
+        var msg: [10 + 192]u8 = undefined;
+        msg[0] = 'n';
+        std.mem.writeInt(u64, msg[1..9], worker_request_id, .little);
+        msg[9] = @intFromBool(ok);
+        const detail = if (ok) name else message;
+        const n = @min(detail.len, msg.len - 10);
+        @memcpy(msg[10..][0..n], detail[0..n]);
+        _ = controlSend(w.control_fd, msg[0 .. 10 + n], -1);
+        return;
+    }
+    for (self.clients.items) |candidate| {
+        if (candidate.id != requester_id or candidate.dead) continue;
+        if (ok)
+            candidate.queueJson(.ok, .{ .ok = true, .name = name })
+        else
+            candidate.queueErr(message);
+        return;
+    }
+}
+
+/// The broker owns routing, so it renames its own record and tells the worker.
+/// A worker that never receives the 'R' keeps serving the same session under
+/// its old display name; nothing routes by that name any more.
+fn applyBrokerRename(
+    self: *Daemon,
+    w: *Worker,
+    new_name: []const u8,
+    requester_id: u32,
+    worker_request_id: u64,
+) void {
+    if (brokerNameInUse(self, new_name, w)) {
+        replyBrokerRename(self, w, requester_id, worker_request_id, false, "session name already exists", "");
+        return;
+    }
+    w.renameTo(new_name) catch {
+        replyBrokerRename(self, w, requester_id, worker_request_id, false, "oom", "");
+        return;
+    };
+    var msg: [1 + dmod.MAX_SESSION_NAME]u8 = undefined;
+    msg[0] = 'R';
+    @memcpy(msg[1..][0..new_name.len], new_name);
+    _ = controlSend(w.control_fd, msg[0 .. 1 + new_name.len], -1);
+    replyBrokerRename(self, w, requester_id, worker_request_id, true, "", w.name);
+}
+
 pub fn brokerRename(self: *Daemon, cl: *Client, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
         .ignore_unknown_fields = true,
@@ -407,7 +653,7 @@ pub fn brokerRename(self: *Daemon, cl: *Client, payload: []const u8) void {
     };
     defer parsed.deinit();
     const req = parsed.value;
-    if (req.new_name.len == 0 or req.new_name.len > 64) {
+    if (!dmod.validSessionName(req.new_name)) {
         cl.queueErr("rename needs a name (1-64 chars)");
         return;
     }
@@ -415,23 +661,97 @@ pub fn brokerRename(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no such session");
         return;
     };
-    if (brokerFindWorker(self, req.new_name)) |other| {
-        if (other != w) {
-            cl.queueErr("session name already exists");
-            return;
-        }
-    }
-    const fresh = self.allocator.dupe(u8, req.new_name) catch {
-        cl.queueErr("oom");
+    applyBrokerRename(self, w, req.new_name, cl.id, 0);
+}
+
+/// Broker side of an attached-client rename request from the owning worker.
+pub fn brokerWorkerRename(self: *Daemon, w: *Worker, payload: []const u8) void {
+    if (payload.len < 9) return;
+    const request_id = std.mem.readInt(u64, payload[1..9], .little);
+    if (request_id == 0) return;
+    const new_name = payload[9..];
+    if (!dmod.validSessionName(new_name)) {
+        replyBrokerRename(self, w, 0, request_id, false, "rename needs a name (1-64 chars)", "");
         return;
+    }
+    if (w.dead) {
+        replyBrokerRename(self, w, 0, request_id, false, "session worker is no longer routable", "");
+        return;
+    }
+    applyBrokerRename(self, w, new_name, 0, request_id);
+}
+
+test "broker rename renames the worker record and forwards one authoritative name" {
+    const t = std.testing;
+    const a = t.allocator;
+    var control: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&control, 4096));
+    defer _ = c.close(control[1]);
+
+    var empty: [0]u8 = .{};
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .is_broker = true };
+    defer broker.clients.deinit(a);
+    defer broker.workers.deinit(a);
+    var requester = Client{ .allocator = a, .fd = -1, .id = 77 };
+    defer requester.rbuf.deinit(a);
+    defer requester.wbuf.deinit(a);
+    defer requester.audio_wbuf.deinit(a);
+    try broker.clients.append(a, &requester);
+
+    const worker = try a.create(Worker);
+    worker.* = .{
+        .allocator = a,
+        .name = try a.dupe(u8, "current"),
+        .origin_name = try a.dupe(u8, "origin"),
+        .origin_id = "70000000000000000000000000000007".*,
+        .pid = 123,
+        .control_fd = control[0],
+        .ready = true,
     };
-    self.allocator.free(w.name);
-    w.name = fresh;
-    var msg: [1 + 64]u8 = undefined;
-    msg[0] = 'R';
-    @memcpy(msg[1..][0..req.new_name.len], req.new_name);
-    controlSend(w.control_fd, msg[0 .. 1 + req.new_name.len], -1);
-    cl.queueJson(.ok, .{ .ok = true, .name = w.name });
+    defer worker.deinit();
+    try broker.workers.append(a, worker);
+
+    brokerRename(&broker, &requester, "{\"name\":\"current\",\"new_name\":\"fresh\"}");
+    try t.expectEqualStrings("fresh", worker.name);
+    // The immutable spawn name still resolves, so a child that captured it
+    // before the rename can still attach.
+    try t.expect(worker.matchesName("origin"));
+    try t.expect(worker.matchesName("fresh"));
+    try t.expect(!worker.matchesName("current"));
+    const reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "fresh") != null);
+
+    var buf: [128]u8 = undefined;
+    var passed: c_int = -1;
+    const n = daemon_serve.controlRecv(control[1], &buf, &passed);
+    try t.expect(n > 1);
+    try t.expectEqual(@as(u8, 'R'), buf[0]);
+    try t.expectEqualStrings("fresh", buf[1..@intCast(n)]);
+
+    // A name another worker already answers to is refused outright.
+    var other_control: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&other_control, 4096));
+    defer _ = c.close(other_control[1]);
+    const other = try a.create(Worker);
+    other.* = .{
+        .allocator = a,
+        .name = try a.dupe(u8, "taken"),
+        .origin_name = try a.dupe(u8, "taken"),
+        .origin_id = "80000000000000000000000000000008".*,
+        .pid = 124,
+        .control_fd = other_control[0],
+        .ready = true,
+    };
+    defer other.deinit();
+    try broker.workers.append(a, other);
+
+    requester.wbuf.clearRetainingCapacity();
+    brokerRename(&broker, &requester, "{\"name\":\"fresh\",\"new_name\":\"taken\"}");
+    try t.expectEqualStrings("fresh", worker.name);
+    const refusal = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.err, refusal.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, refusal.frame.payload, "already exists") != null);
 }
 
 pub const WaylandHub = struct {
@@ -549,11 +869,15 @@ pub fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_s
 }
 
 pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
+    return spawnSessionWithOrigin(self, req_in, try dmod.newSessionOriginId());
+}
+
+pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: SessionOriginId) !*Session {
     const allocator = self.allocator;
 
     // Cast playback: no child, no hubs, no PTY — its own spawn path.
     // Works identically in monolith and (via runWorker) broker mode.
-    if (req_in.cast_path.len > 0) return self.spawnCastSession(req_in);
+    if (req_in.cast_path.len > 0) return self.spawnCastSessionWithOrigin(req_in, origin_id);
 
     // External display session: the child is OUR OWN binary in
     // `--keep` mode. Resolved daemon-side on purpose — a client
@@ -702,6 +1026,19 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
     // stable SKETERM_SESSION identity — no plumbing through the client.
     const name_z: ?[:0]u8 = if (req.name.len > 0) allocator.dupeZ(u8, req.name) catch null else null;
     defer if (name_z) |z| allocator.free(z);
+    const origin_id_z = try allocator.dupeZ(u8, &origin_id);
+    defer allocator.free(origin_id_z);
+    const owning_mux_socket = if (self.sock_path.len > 0)
+        self.sock_path
+    else if (self.broker_sock) |path|
+        path
+    else
+        "";
+    const mux_socket_z: ?[:0]u8 = if (owning_mux_socket.len > 0)
+        allocator.dupeZ(u8, owning_mux_socket) catch null
+    else
+        null;
+    defer if (mux_socket_z) |z| allocator.free(z);
     const term_z: ?[:0]u8 = if (req.term.len > 0) allocator.dupeZ(u8, req.term) catch null else null;
     defer if (term_z) |z| allocator.free(z);
     const cterm_z: ?[:0]u8 = if (req.color_term.len > 0) allocator.dupeZ(u8, req.color_term) catch null else null;
@@ -745,6 +1082,8 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         .pane_id = req.pane_id,
         .socket_path = if (sock_z) |z| z.ptr else null,
         .session_name = if (name_z) |z| z.ptr else null,
+        .session_origin_id = origin_id_z.ptr,
+        .mux_socket_path = if (mux_socket_z) |z| z.ptr else null,
         .shell_integration = shell_integration,
         .wayland_display = if (wl_disp_z) |z| z.ptr else null,
         .pulse_server = if (pa_env_z) |z| z.ptr else null,
@@ -779,9 +1118,15 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
 
     const s = try allocator.create(Session);
     errdefer allocator.destroy(s);
+    const session_name = try allocator.dupe(u8, req.name);
+    errdefer allocator.free(session_name);
+    const origin_name = try allocator.dupe(u8, req.name);
+    errdefer allocator.free(origin_name);
     s.* = .{
         .allocator = allocator,
-        .name = try allocator.dupe(u8, req.name),
+        .name = session_name,
+        .origin_name = origin_name,
+        .origin_id = origin_id,
         .source = .{ .pty = pty },
         .parser = Parser.init(allocator),
         .pool = pool,
@@ -857,10 +1202,6 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
 }
 
 pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
-    if (cl.proto == 0 or cl.snapshot_version == 0) {
-        cl.queueErr("no shared terminal profile; session preserved");
-        return;
-    }
     if (self.is_broker) return brokerAttach(self, cl, payload);
     var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
         .ignore_unknown_fields = true,
@@ -869,6 +1210,15 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     };
     defer parsed.deinit();
+    if (!parsed.value.panel_only and (cl.proto == 0 or cl.snapshot_version == 0)) {
+        cl.queueErr("no shared terminal profile; session preserved");
+        return;
+    }
+    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
+    if (parsed.value.panel_only and panel_rpc < wire.PANEL_RPC_VERSION) {
+        cl.queueErr("panel-only attach requires panel_rpc capability");
+        return;
+    }
     // A REFUSED attach used to log nothing at all, which made the log
     // unable to answer the one question a GUI post-mortem needs: did the
     // client even get as far as asking? Log both refusals.
@@ -877,6 +1227,13 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no such session");
         return;
     };
+    if (parsed.value.origin_id.len > 0 and
+        (!dmod.validSessionOriginId(parsed.value.origin_id) or
+            !std.mem.eql(u8, parsed.value.origin_id, &s.origin_id)))
+    {
+        cl.queueErr("session origin identity changed");
+        return;
+    }
     if (s.exited) {
         // The corpse only lingers until the next reap; attaching
         // to it would wedge the client on a dead screen.
@@ -884,10 +1241,7 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("session has exited");
         return;
     }
-    cl.attached = s;
-    log.info("client attach session='{s}' kind={s} proto={d}", .{ s.name, parsed.value.kind, cl.proto });
-    cl.read_only = parsed.value.read_only;
-    cl.kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
+    const kind: Client.Kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
         .gui
     else if (std.mem.eql(u8, parsed.value.kind, "cli"))
         .cli
@@ -895,6 +1249,28 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .mcp
     else
         .unknown;
+    self.detachClientAttachment(cl, "panel presenter reattached after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
+    cl.attached = s;
+    cl.panel_only = parsed.value.panel_only;
+    cl.panel_rpc = panel_rpc;
+    cl.read_only = parsed.value.read_only or parsed.value.panel_only;
+    cl.kind = kind;
+    log.info("client attach session='{s}' kind={s} proto={d} panel_only={} panel_rpc={d}", .{
+        s.name, parsed.value.kind, cl.proto, cl.panel_only, cl.panel_rpc,
+    });
+    if (cl.panel_only) {
+        cl.queueJson(.ok, .{
+            .ok = true,
+            .panel_only = true,
+            .name = s.name,
+            .origin_name = s.origin_name,
+            .origin_id = &s.origin_id,
+        });
+        self.broadcastPeerInfo(s);
+        return;
+    }
+    if (parsed.value.identity_first and panel_rpc > 0 and cl.kind == .gui)
+        self.queueAttachIdentity(cl, s);
     // A (re)attaching client has no prior video reference frames, so
     // force the next video tile on every live surface to be a
     // keyframe. No-op unless video is active (vstate is otherwise

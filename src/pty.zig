@@ -43,6 +43,13 @@ pub const SpawnOpts = struct {
     /// never goes stale across a GUI restart/reattach. This is what
     /// `sketerm cli --pane self` / `sketerm mux` resolve "my pane" by.
     session_name: ?[*:0]const u8 = null,
+    /// Lifetime-unique immutable daemon session identity used by panel
+    /// persistence. Old daemons omit it; callers then use the disjoint legacy
+    /// origin store rather than guessing from the reusable session name.
+    session_origin_id: ?[*:0]const u8 = null,
+    /// Exact externally connectable owning mux socket, which in broker mode
+    /// is the broker listener rather than the worker's private control socket.
+    mux_socket_path: ?[*:0]const u8 = null,
     /// Auto shell-integration (OSC 7/133 marks without rc edits).
     /// null = off / unsupported shell.
     shell_integration: ?ShellIntegration = null,
@@ -207,6 +214,8 @@ pub const Pty = struct {
             } else |_| {}
         }
         if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1);
+        if (opts.session_origin_id) |id| _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", id, 1);
+        if (opts.mux_socket_path) |sp| _ = c.setenv("SKETERM_MUX_SOCKET", sp, 1);
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
         if (opts.wayland_display) |wd| {
             _ = c.setenv("WAYLAND_DISPLAY", wd, 1);

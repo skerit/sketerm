@@ -283,17 +283,25 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     attachAndEcho(allocator, sock_path, "beta", "BETA-ECHO-99");
     std.debug.print("smoke-broker: attach + input echo via worker ok\n", .{});
 
-    // ── rename ──
+    // ── rename from an ATTACHED client. Its fd is worker-owned, so the worker
+    // forwards 'N' to the broker, which owns the name table and answers 'n';
+    // the rename is broker-authoritative and single-step. ──
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("rename connect");
         defer conn.deinit();
         helloOk(allocator, &conn);
+        conn.sendJson(.attach, .{ .name = "alpha", .kind = "gui" }) catch fail("rename attach");
+        (conn.recvExpect(&.{.snapshot}) catch fail("rename snapshot")).deinit(allocator);
         conn.sendJson(.rename, .{ .name = "alpha", .new_name = "alpha2" }) catch fail("rename send");
         (conn.recvExpect(&.{.ok}) catch fail("rename ok")).deinit(allocator);
+        conn.sendJson(.rename, .{ .name = "alpha2", .new_name = "beta" }) catch fail("duplicate rename send");
+        (conn.recvExpect(&.{.err}) catch fail("duplicate rename not refused")).deinit(allocator);
     }
     if (hasSession(sock_path, allocator, "alpha")) fail("rename: old name still present");
     if (!hasSession(sock_path, allocator, "alpha2")) fail("rename: new name missing");
-    std.debug.print("smoke-broker: rename ok\n", .{});
+    if (!hasSession(sock_path, allocator, "beta")) fail("rename: duplicate refusal disturbed sibling");
+    attachAndEcho(allocator, sock_path, "alpha2", "RENAMED-RECONNECT-17");
+    std.debug.print("smoke-broker: attached-client broker-authoritative rename + reconnect ok\n", .{});
 
     // ── graceful kill ──
     {
@@ -358,6 +366,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // silently broken while the monolith stage passes. ──
     @import("smoke_display.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: display sessions + controller lease via worker ok\n", .{});
+
+    // ── correlated native-panel relay THROUGH THE BROKER. Both
+    // panel_only and panel_rpc ride the append-only 'A' fd handoff. ──
+    @import("smoke_panel_relay.zig").run(allocator, sock_path);
+    std.debug.print("smoke-broker: panel relay + panel-only attach via worker ok\n", .{});
 
     // ── UDP connection tickets THROUGH THE BROKER: an attached
     // client's mint is served by the WORKER, whose Daemon has an
