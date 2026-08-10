@@ -12,7 +12,16 @@
 //! throws, awaited promises), dropdowns (native <select> by option
 //! text and a custom ARIA listbox, both driven with trusted clicks),
 //! form validation state in the walk, HiDPI (physical buffers, logical
-//! input), and a clean shutdown on disconnect.
+//! input), adaptive frame pacing (paints above the old 60fps ceiling, a
+//! honoured cap, an idle page costing zero paints, the helper's
+//! watchdog, input-to-paint latency), and a clean shutdown on
+//! disconnect.
+//!
+//! EVERY stage drives frames: the helper's browsers run with external
+//! begin frames, so a client that never sends `frame_request` sees only
+//! the helper's 4fps watchdog. `Client.pump` therefore paces ~120
+//! requests a second while it waits, which is what the GUI's frame-clock
+//! tick does.
 //!
 //! The HiDPI stage runs LAST on purpose: its scale changes leave the
 //! engine re-laying-out for a while, and running it mid-rig made the
@@ -47,6 +56,23 @@ const popup_page =
     "data:text/html,<body%20style=%22margin:0%22>" ++
     "<div%20style=%22width:100vw;height:100vh%22%20" ++
     "onclick=%22window.open('https://example.invalid/x')%22></div></body>";
+
+/// Repaints on every animation frame, i.e. on every begin frame the
+/// rig drives — the page whose achieved rate measures the ceiling.
+const anim_page =
+    "data:text/html,<body%20style=%22margin:0%22><div%20id=d%20style=%22width:100vw;height:100vh%22></div>" ++
+    "<script>var%20i=0;function%20f(){i=(i+7)%25256;" ++
+    "d.style.background='rgb('+i+',0,0)';requestAnimationFrame(f)}requestAnimationFrame(f);</script></body>";
+
+/// No script, no animation, no caret: once it has painted it must never
+/// paint again, however many frames are requested.
+const static_page = "data:text/html,<body%20style=%22margin:0;background:%23336699%22>static</body>";
+
+/// Static until it is clicked, then repaints once: the input-to-paint
+/// latency probe.
+const click_paint_page =
+    "data:text/html,<body%20style=%22margin:0;background:%2300ff00%22%20" ++
+    "onmousedown=%22document.body.style.background='%23ff00ff'%22>click</body>";
 
 /// Long enough to be clamped at detail=1 (160 chars) so the truncation
 /// marker and `sem_expand` have something to work on.
@@ -209,6 +235,12 @@ fn nowMs() i64 {
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
 }
 
+fn nowUs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1_000_000 + @divTrunc(ts.tv_nsec, 1_000);
+}
+
 /// `rm -rf` by subprocess: the cache dir is a Chromium profile, and a
 /// hand-rolled recursive unlink buys nothing in a test rig.
 fn removeTree(path: [*:0]const u8) void {
@@ -249,6 +281,14 @@ const Client = struct {
 
     dmg_buf: u32 = 0,
     dmg_seq: u32 = 0,
+
+    /// Frame pacing. The helper runs its browsers with external begin
+    /// frames, so NOTHING paints unless this rig asks: every wait loop
+    /// drives requests while it waits, exactly as the GUI's frame-clock
+    /// tick does.
+    have_view: bool = false,
+    last_req_us: i64 = 0,
+    req_count: u32 = 0,
 
     title: [1024]u8 = @splat(0),
     title_len: usize = 0,
@@ -328,11 +368,54 @@ const Client = struct {
         }
     }
 
-    /// Read whatever is available (up to `timeout_ms`) and fold it into
-    /// the observed state.
+    /// Ask the helper for one frame, at most `min_gap_us` after the
+    /// previous request.
+    fn frameRequest(self: *Client, min_gap_us: i64) void {
+        if (!self.have_view) return;
+        const now = nowUs();
+        if (now - self.last_req_us < min_gap_us) return;
+        self.last_req_us = now;
+        self.req_count += 1;
+        self.send(proto.FrameRequest{ .view = view_id, .flags = 0 });
+    }
+
+    /// Wait for helper output while driving frames at ~120Hz — what the
+    /// GUI's active tick does, and what every stage below needs in
+    /// order to see any paint at all.
     fn pump(self: *Client, timeout_ms: c_int) void {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            self.frameRequest(8_000);
+            const left = deadline - nowMs();
+            const slice: c_int = @intCast(std.math.clamp(left, 0, 8));
+            if (self.pumpRaw(slice) or nowMs() >= deadline) return;
+        }
+    }
+
+    /// Drive begin frames at `target_fps` for `duration_ms` and report
+    /// what came back. The measurement primitive of the pacing stages.
+    fn drive(self: *Client, duration_ms: i64, target_fps: i64) struct { requests: u32, paints: u32, ms: i64 } {
+        const start = nowMs();
+        const end = start + duration_ms;
+        const req0 = self.req_count;
+        const dmg0 = self.dmg_seq;
+        const gap: i64 = if (target_fps <= 0) std.math.maxInt(i64) else @divTrunc(1_000_000, target_fps);
+        while (nowMs() < end) {
+            if (target_fps > 0) self.frameRequest(gap);
+            _ = self.pumpRaw(1);
+        }
+        return .{
+            .requests = self.req_count - req0,
+            .paints = self.dmg_seq - dmg0,
+            .ms = nowMs() - start,
+        };
+    }
+
+    /// Read whatever is available (up to `timeout_ms`) and fold it into
+    /// the observed state. Sends nothing.
+    fn pumpRaw(self: *Client, timeout_ms: c_int) bool {
         var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(@ptrCast(&pfd), 1, timeout_ms) <= 0) return;
+        if (c.poll(@ptrCast(&pfd), 1, timeout_ms) <= 0) return false;
 
         var buf: [64 * 1024]u8 = undefined;
         var iov = c.struct_iovec{ .iov_base = &buf, .iov_len = buf.len };
@@ -347,7 +430,7 @@ const Client = struct {
         if (n == 0) fail("helper closed the socket");
         if (n < 0) {
             const e = std.c._errno().*;
-            if (e == c.EINTR or e == c.EAGAIN) return;
+            if (e == c.EINTR or e == c.EAGAIN) return false;
             fail("recvmsg");
         }
         self.harvestFds(&cbuf, @intCast(mh.msg_controllen));
@@ -361,6 +444,7 @@ const Client = struct {
             std.mem.copyForwards(u8, self.in.items[0..rest], self.in.items[used..]);
             self.in.shrinkRetainingCapacity(rest);
         }
+        return true;
     }
 
     /// Walk the control buffer by hand — CMSG_* are macros translate-c
@@ -559,6 +643,10 @@ const Client = struct {
             if (nowMs() > deadline) return false;
             self.pump(50);
         }
+    }
+
+    fn sawPopup(self: *Client, needle: []const u8) bool {
+        return std.mem.indexOf(u8, self.popup_url[0..self.popup_len], needle) != null;
     }
 
     fn waitPopup(self: *Client, needle: []const u8, timeout_ms: i64) bool {
@@ -774,6 +862,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── Stage 2: paint into the shared memfd ──────────────────────
     cl.send(proto.ViewCreate{ .view = view_id, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 2 paint: no frame_buffer for the new view");
     if (cl.fb.?.w != 800 or cl.fb.?.h != 600) fail("stage 2 paint: frame_buffer geometry is not 800x600");
     cl.navigate(red_page);
@@ -822,7 +911,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 6: popup request is reported, never opened ───────────
     cl.navigate(popup_page);
     cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
-    cl.clickCenter();
+    // The click is RETRIED: a page whose first compositor frame has not
+    // landed yet swallows input, and this stage has always been the one
+    // that notices (the HiDPI stage was moved to the end for the same
+    // reason). One click plus a settle is a race; five is not.
+    {
+        var tries: u8 = 0;
+        while (tries < 5 and !cl.sawPopup("example.invalid")) : (tries += 1) {
+            cl.clickCenter();
+            _ = cl.drive(400, 120);
+        }
+    }
     if (!cl.waitPopup("example.invalid", 15_000)) fail("stage 6 popup: no ev_popup_request for the opened url");
     if (cl.popup_view != view_id) fail("stage 6 popup: ev_popup_request carried the wrong opener view");
     pass("stage 6 popup request");
@@ -1245,7 +1344,102 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         pass("stage 18 hidpi (physical buffer, logical input, fractional scale)");
     }
 
-    // ── Stage 19: teardown ────────────────────────────────────────
+    // ── Stage 19: paints above the old 60fps ceiling ───────────────
+    //
+    // CEF's windowless scheduler clamps `windowless_frame_rate` at 60,
+    // which is what external begin frames replace. Driving requests
+    // faster than that has to produce paints faster than that, or the
+    // whole change bought nothing.
+    {
+        cl.navigate(anim_page);
+        _ = cl.drive(500, 240); // let the animation get going
+        const hot = cl.drive(2000, 240);
+        const req_fps = @divTrunc(@as(i64, hot.requests) * 1000, @max(hot.ms, 1));
+        const paint_fps = @divTrunc(@as(i64, hot.paints) * 1000, @max(hot.ms, 1));
+        std.debug.print(
+            "smoke-web: MEASURED uncapped: {d} begin-frames ({d}/s), {d} paints ({d}/s) over {d} ms\n",
+            .{ hot.requests, req_fps, hot.paints, paint_fps, hot.ms },
+        );
+        if (req_fps <= 60) fail("stage 19 fps: the rig itself never drove above 60 begin-frames/s");
+        if (paint_fps <= 65) fail("stage 19 fps: paints did not exceed the old 60fps windowless ceiling");
+
+        // ... and a cap is honoured: at 30 requests/s the engine paints
+        // about 30 times a second, not 60 and not 240.
+        const capped = cl.drive(2000, 30);
+        const cap_fps = @divTrunc(@as(i64, capped.paints) * 1000, @max(capped.ms, 1));
+        std.debug.print(
+            "smoke-web: MEASURED capped at 30: {d} begin-frames, {d} paints ({d}/s) over {d} ms\n",
+            .{ capped.requests, capped.paints, cap_fps, capped.ms },
+        );
+        if (cap_fps < 20 or cap_fps > 40) fail("stage 19 fps: a 30/s request rate did not produce ~30 paints/s");
+    }
+    pass("stage 19 frame rate (above 60fps uncapped, ~30fps when the request rate caps it)");
+
+    // ── Stage 20: an idle page paints nothing ──────────────────────
+    //
+    // The other half of the deal: asking for frames is not the same as
+    // producing them, so a page with nothing to show must cost zero
+    // paints no matter how hard it is driven.
+    {
+        cl.navigate(static_page);
+        _ = cl.drive(1000, 120); // let the load's own paints finish
+        const quiet = cl.drive(3000, 120);
+        std.debug.print(
+            "smoke-web: MEASURED static page: {d} begin-frames, {d} paints over {d} ms\n",
+            .{ quiet.requests, quiet.paints, quiet.ms },
+        );
+        if (quiet.requests < 200) fail("stage 20 idle: the rig did not actually drive frames");
+        if (quiet.paints != 0) fail("stage 20 idle: a static page painted while nothing changed");
+    }
+    pass("stage 20 idle page (hundreds of begin-frames, zero paints)");
+
+    // ── Stage 21: the helper's watchdog ────────────────────────────
+    //
+    // External begin frames make the CLIENT the frame source, so a GUI
+    // that stalls would otherwise freeze the page for good. The helper
+    // keeps a slow floor under it: alive, obviously degraded.
+    {
+        cl.navigate(anim_page);
+        _ = cl.drive(300, 120);
+        const abandoned = cl.drive(1500, 0);
+        std.debug.print(
+            "smoke-web: MEASURED watchdog: {d} paints in {d} ms with ZERO client requests\n",
+            .{ abandoned.paints, abandoned.ms },
+        );
+        if (abandoned.requests != 0) fail("stage 21 watchdog: the rig kept asking for frames");
+        if (abandoned.paints == 0) fail("stage 21 watchdog: the page froze once the client stopped asking");
+        if (abandoned.paints > 20) fail("stage 21 watchdog: the self-paced floor is not a floor");
+    }
+    pass("stage 21 watchdog (page stays alive at a few fps with no client)");
+
+    // ── Stage 22: input paints immediately ─────────────────────────
+    {
+        cl.navigate(click_paint_page);
+        _ = cl.drive(700, 120);
+        const settled = cl.drive(300, 120);
+        if (settled.paints != 0) fail("stage 22 promotion: the probe page was not quiet before the click");
+
+        const before = cl.dmg_seq;
+        const t0 = nowMs();
+        cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
+        cl.clickCenter();
+        var latency: i64 = -1;
+        while (nowMs() - t0 < 2000) {
+            cl.frameRequest(8_000);
+            _ = cl.pumpRaw(1);
+            if (cl.dmg_seq > before) {
+                latency = nowMs() - t0;
+                break;
+            }
+        }
+        if (latency < 0) fail("stage 22 promotion: a click on a static page produced no paint");
+        std.debug.print("smoke-web: MEASURED click-to-paint latency: {d} ms\n", .{latency});
+        if (latency > 150) fail("stage 22 promotion: the paint after a click took more than 150 ms");
+    }
+    pass("stage 22 input promotion (click paints within a frame or two)");
+
+    // ── Stage 23: teardown ────────────────────────────────────────
+    cl.have_view = false;
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -1259,11 +1453,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             _ = c.usleep(50_000);
         }
-        if (!gone) fail("stage 19 teardown: helper did not exit within 10s of the disconnect");
+        if (!gone) fail("stage 23 teardown: helper did not exit within 10s of the disconnect");
         g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 19 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 19 teardown: helper exited nonzero");
-        pass("stage 19 teardown (helper exited 0 on disconnect)");
+        if (status & 0x7f != 0) fail("stage 23 teardown: helper died on a signal");
+        if ((status >> 8) & 0xff != 0) fail("stage 23 teardown: helper exited nonzero");
+        pass("stage 23 teardown (helper exited 0 on disconnect)");
     }
 
     cleanup();

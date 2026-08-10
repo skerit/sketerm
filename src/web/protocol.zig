@@ -49,6 +49,7 @@ pub const Tag = enum(u8) {
     frame_buffer = 0x30,
     frame_damage = 0x31,
     frame_release = 0x32,
+    frame_request = 0x33,
     ev_load = 0x40,
     ev_load_error = 0x41,
     ev_title = 0x42,
@@ -342,6 +343,23 @@ pub const FrameRelease = struct {
     pub const tag: Tag = .frame_release;
     view: u32,
     buf_id: u32,
+};
+
+/// Ask the engine to produce ONE frame ("external begin frame"). The
+/// client's request rate IS the view's frame rate, so a client that
+/// stops asking gets a still page — see the helper's watchdog, which
+/// keeps a self-paced floor under exactly that case.
+///
+/// There is deliberately no per-request acknowledgement: whether a
+/// request produced pixels is already observable as a `frame_damage`
+/// for the view, and an ack frame would double the socket traffic of
+/// the whole path to say something the client can count.
+pub const FrameRequest = struct {
+    pub const tag: Tag = .frame_request;
+    view: u32,
+    /// Reserved, must be 0. Room for future per-request hints (force a
+    /// full repaint, "this one is a resize settle", …) without a tag.
+    flags: u8,
 };
 
 pub const EvLoad = struct {
@@ -800,6 +818,7 @@ test "round-trip: scalar and string frames" {
     try roundTrip(InputFocus, .{ .view = 7, .focused = 1 });
     try roundTrip(FrameBuffer, .{ .view = 7, .buf_id = 3, .w = 800, .h = 600, .stride = 3200 });
     try roundTrip(FrameRelease, .{ .view = 7, .buf_id = 2 });
+    try roundTrip(FrameRequest, .{ .view = 7, .flags = 0 });
     try roundTrip(EvLoad, .{ .view = 7, .state = 2, .url = "about:blank" });
     try roundTrip(EvLoadError, .{ .view = 7, .code = -105, .url = "http://x/", .msg = "NAME_NOT_RESOLVED" });
     try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });

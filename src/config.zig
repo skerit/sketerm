@@ -1142,6 +1142,15 @@ pub const Config = struct {
     /// minimum-contrast.
     minimum_contrast: f32 = 1.0,
 
+    /// Ceiling on how often a browser pane (src/ui/webface.zig) asks
+    /// the web helper for a frame. 0 = follow whatever output the
+    /// window is on, which is the default and the point: the engine's
+    /// own windowless scheduler cannot go past 60, so a 120/165Hz
+    /// panel needs the client to drive. App-level like every other
+    /// rendering flag, and a CEILING only — an idle page still paints
+    /// nothing at all, and no cap can make a view exceed its display.
+    browser_max_fps: u16 = 0,
+
     /// Colour space glyph coverage is blended in (see TextBlending).
     /// App-level, like every other rendering flag: it changes the GL
     /// target every pane in the window draws into, and a per-profile
@@ -1688,6 +1697,7 @@ pub const Config = struct {
         if (!self.bidi) try w.writeAll("bidi = false\n");
         if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
         if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
+        if (self.browser_max_fps != 0) try w.print("browser_max_fps = {d}\n", .{self.browser_max_fps});
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -2806,6 +2816,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bidi = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_theme")) {
         cfg.auto_theme = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "browser_max_fps")) {
+        const n = try parseU32(value);
+        if (n != 0 and (n < 5 or n > 1000)) return error.BadBrowserMaxFps;
+        cfg.browser_max_fps = @intCast(n);
     } else if (std.mem.eql(u8, key, "graphics_offload")) {
         cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {

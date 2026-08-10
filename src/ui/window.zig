@@ -579,6 +579,9 @@ pub const Window = struct {
         };
         next_window_id += 1;
 
+        // Browser frame cap: app-level like the IM strategy below, and
+        // module-level in webface, which owns the one helper client.
+        @import("webface.zig").setMaxFps(self.config.browser_max_fps);
         // IM strategy is an app-level key; every face reads it at
         // construction time (imhost.resolve).
         @import("imhost.zig").setPreference(switch (self.config.input_method) {

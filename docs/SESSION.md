@@ -15778,3 +15778,62 @@ one. The tools were also driven end to end through a real `sketerm mcp`
 process against a headless GUI: open -> snapshot -> trusted click (the
 page reported `isTrusted true`) -> delta -> eval -> read -> scroll ->
 wait -> screenshot.
+
+## 2026-08-10: adaptive browser frame pacing — the client drives the frames
+
+CEF's windowless (OSR) path schedules its own paints and clamps
+`windowless_frame_rate` at 60, so a browser pane could never follow a
+120Hz or 165Hz output, and an idle page still got a 60Hz scheduler
+running behind it. Every helper browser is now created with
+`external_begin_frame_enabled`: the engine paints exactly once per
+`send_external_begin_frame` and never on its own. The flag is fixed at
+browser creation, so all adaptivity lives in how often somebody asks.
+
+Asking is the GUI's job. `src/web/pace.zig` is the (GTK-free,
+unit-tested) state machine and `src/ui/webface.zig` the GTK half:
+
+- IDLE — a 5Hz GLib timeout, and NO frame-clock tick. That is the KWin
+  crash guard from `terminal_surface.zig`'s `tick_id` doc, not an
+  optimisation: an installed tick cycles GDK's frame clock at monitor
+  refresh even when nothing is drawn, leaking a Wayland object id per
+  offload subsurface per cycle.
+- ACTIVE — a tick on the picture widget, paced from
+  `gdk_frame_clock_get_refresh_info` (so it follows the output the
+  window is actually on) and clamped by the new app-level
+  `browser_max_fps` config key (0 = follow the display).
+- Any input, navigation, resize or automation call promotes instantly;
+  ~250ms of requests that produced no paint demotes, and the tick then
+  REMOVES ITSELF exactly like the terminal surface's animation tick.
+- A background tab's picture is unmapped, which now sends `view_hide`
+  (the face never sent it before) and stops the pacing entirely.
+
+New wire frame `frame_request` (0x33, client -> helper). There is
+deliberately no per-request ack: "did this produce pixels" is already
+observable as a `frame_damage`, and an ack would double the socket
+traffic of the whole path. WATCHDOG: a client that stops asking would
+freeze its pages indefinitely, so the helper self-paces any visible view
+that has gone 250ms without a begin frame — 4fps, alive and obviously
+degraded. The GUI's idle floor is faster on purpose, so a live GUI is
+always the pacer.
+
+MEASURED (Arch, CEF 151, software raster). smoke-web, animating page at
+640x480: 228 paints in 2.00s = **114 fps** driven at 227 requests/s
+(before: exactly 60, the cap); at a 30/s request rate, 29 paints/s.
+Static page: 354 begin frames, **0 paints** over 3s. Watchdog with zero
+client requests: 6 paints in 1.5s. Click-to-paint: 11-29ms. Isolated
+GUI (private mux display session, 60Hz virtual output), background tab
+holding an animating page over 10s: **before** 60fps of frames
+delivered for a tab nobody can see, 98 jiffies of helper CPU and
+110MiB/s of buffer traffic; **after** zero frames, 7 jiffies. Idle
+static page is unchanged at ~0 (0-1 GUI jiffies, 6-9 helper jiffies per
+10s — headless OSR was already cheap when nothing damaged). Foreground
+animating page at 60Hz costs slightly MORE helper CPU than before (146
+vs 113 jiffies/10s): externalising the frame source adds a socket
+wakeup per frame. `SKETERM_WEB_PACE=1` logs every transition and aborts
+if an idle face ever holds a tick — verified over 131 idle intervals in
+the isolated GUI, all `tick_id=0`.
+
+smoke-web grew stages 19-22 (frame rate uncapped + capped, idle page
+costs zero paints, watchdog, input-to-paint latency) and every stage now
+drives begin frames while it waits; stage 6's click is retried, since a
+page whose first compositor frame has not landed swallows input.

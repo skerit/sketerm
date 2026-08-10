@@ -142,6 +142,9 @@ pub const Server = struct {
                 return;
             }
         }
+        // Nothing paints without a begin frame: keep a floor under every
+        // visible view in case the client stopped asking for them.
+        self.host.watchdog(cefhost.nowMs());
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
         if (!self.flush()) self.disconnect();
@@ -221,6 +224,7 @@ pub const Server = struct {
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.
             .frame_release => _ = try proto.decode(proto.FrameRelease, frame.payload),
+            .frame_request => self.host.beginFrame(try proto.decode(proto.FrameRequest, frame.payload)),
             .sem_snapshot_req => try self.host.semSnapshot(try proto.decode(proto.SemSnapshotReq, frame.payload)),
             .sem_act => try self.host.semAct(try proto.decode(proto.SemAction, frame.payload)),
             .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),

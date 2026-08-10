@@ -138,13 +138,36 @@ const max_rects = 32;
 /// what a u16 length can describe.
 const max_expand: u32 = 60_000;
 
-/// Paints per second CEF is allowed to produce for a windowless browser.
-/// 60 is the practical ceiling of the OSR path without wiring external
-/// begin-frame (`external_begin_frame_enabled` + `send_external_begin_frame`),
-/// which would be needed to follow a 120/165Hz output and is a separate
-/// change. CEF's own default is 30, which is visibly choppy on those
-/// displays.
+/// `windowless_frame_rate` is CEF's INTERNAL scheduler, capped at 60 and
+/// therefore unable to follow a 120/165Hz output. Every browser here is
+/// created with `external_begin_frame_enabled`, which replaces that
+/// scheduler with `send_external_begin_frame` — one call, one frame — so
+/// this value is ignored. It is still set so a build that ever loses the
+/// external path degrades to 60 rather than to CEF's choppy default 30.
 const windowless_fps: c_int = 60;
+
+/// How long a view may go without a client `frame_request` before the
+/// helper begins pacing it itself.
+///
+/// THE WATCHDOG, and the answer to "what if the GUI stalls": external
+/// begin frames make the CLIENT the frame source, so a client that stops
+/// asking freezes the page — no animation, no rAF, no video, and no way
+/// for the user to tell that apart from a hung renderer. Past this
+/// deadline the helper issues its own begin frames, so the worst case is
+/// a visibly slow page rather than a dead one. The
+/// deadline is deliberately LONGER than the GUI's idle interval (5Hz),
+/// so a live GUI is always the pacer and this never fires. Once it does
+/// fire it keeps firing at this same spacing, i.e. the self-paced floor
+/// is 1000/250 = 4fps: alive, obviously degraded, and cheap enough to
+/// leave running under a wedged client forever.
+const watchdog_ms: i64 = 250;
+
+/// Monotonic milliseconds (`std.time.milliTimestamp` is gone in 0.16).
+pub fn nowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+}
 
 /// Physical pixels for `logical` at `scale_x1000`, per the protocol's
 /// scale contract: `ceil(logical * scale)`, never 0.
@@ -182,6 +205,9 @@ pub const View = struct {
     map: []align(std.heap.page_size_min) u8 = &.{},
     gen: u32 = 0,
     hidden: bool = false,
+    /// Monotonic milliseconds of the last begin frame issued for this
+    /// view, whoever asked for it. Drives the watchdog.
+    last_begin_ms: i64 = 0,
     /// Last address CEF reported, owned; the `ev_nav_state` payload.
     url: []u8 = &.{},
 
@@ -311,6 +337,13 @@ pub const Host = struct {
         var winfo = std.mem.zeroes(cef.cef_window_info_t);
         winfo.size = @sizeOf(cef.cef_window_info_t);
         winfo.windowless_rendering_enabled = 1;
+        // The frame source: with this set, Chromium produces a frame
+        // per `send_external_begin_frame` and never on its own, which
+        // is what lifts the 60fps ceiling AND what makes an untouched
+        // page cost nothing. It is fixed at browser creation and cannot
+        // be toggled per frame, so ALL adaptive behaviour lives in how
+        // often somebody asks (client pacing + the watchdog below).
+        winfo.external_begin_frame_enabled = 1;
         winfo.runtime_style = cef.CEF_RUNTIME_STYLE_ALLOY;
 
         var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
@@ -438,11 +471,18 @@ pub const Host = struct {
                 if (host.was_resized) |wr| wr(host);
             }
         }.f);
+        // Nothing repaints without a begin frame, and a resize that
+        // waits for the client's next one shows a stale/black buffer in
+        // the meantime.
+        if (!v.hidden) issueBeginFrame(v);
     }
 
     pub fn showView(self: *Host, id: u32, show: bool) void {
         const v = self.find(id) orelse return;
         v.hidden = !show;
+        // A view coming back needs the invalidate below to land on a
+        // frame; a view going away is simply never asked again.
+        defer if (show) issueBeginFrame(v);
         withHost(v, if (show) struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.was_hidden) |wh| wh(host, 0);
@@ -453,6 +493,37 @@ pub const Host = struct {
                 if (host.was_hidden) |wh| wh(host, 1);
             }
         }.f);
+    }
+
+    // -- frame pacing --------------------------------------------------
+
+    /// One client-requested frame. A hidden view is not painted at all:
+    /// nobody can see it, and the whole point of external begin frames
+    /// is that nothing is rendered unless somebody asks.
+    pub fn beginFrame(self: *Host, req: proto.FrameRequest) void {
+        const v = self.find(req.view) orelse return;
+        if (v.hidden) return;
+        issueBeginFrame(v);
+    }
+
+    fn issueBeginFrame(v: *View) void {
+        v.last_begin_ms = nowMs();
+        withHost(v, struct {
+            fn f(host: *cef.cef_browser_host_t) void {
+                if (host.send_external_begin_frame) |bf| bf(host);
+            }
+        }.f);
+    }
+
+    /// Keep every visible view alive when the client stops asking (see
+    /// `watchdog_ms`). Called once per poll iteration; a client pacing
+    /// at anything above 4Hz never reaches the deadline.
+    pub fn watchdog(self: *const Host, now_ms: i64) void {
+        for (self.views.items) |v| {
+            if (v.hidden) continue;
+            if (now_ms - v.last_begin_ms < watchdog_ms) continue;
+            issueBeginFrame(v);
+        }
     }
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {

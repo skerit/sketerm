@@ -22,6 +22,37 @@
 //! per-frame texture UPLOAD (still whole-buffer, done by GTK) down to
 //! the damaged rects, which is the only copy left on this path.
 //!
+//! ## Frame pacing (who decides when the page paints)
+//!
+//! The helper's browsers run with `external_begin_frame_enabled`, so the
+//! engine paints EXACTLY as often as somebody asks it to and never on
+//! its own. That is what lifts CEF's 60fps windowless ceiling on a
+//! 120/165Hz output, and what makes an untouched page cost nothing.
+//!
+//! Asking is this file's job, through `src/web/pace.zig`:
+//!
+//! - IDLE: a 5Hz GLib timeout asks for a frame, so a page that starts
+//!   moving on its own is still noticed. NO frame-clock tick exists in
+//!   this state — see the `tick_id` docblock in
+//!   `src/ui/terminal_surface.zig`: an installed tick keeps GDK's frame
+//!   clock cycling at monitor refresh even when nothing is drawn, and
+//!   on Wayland each empty cycle leaks a frame-callback object id per
+//!   offload subsurface until KWin's id space runs out and the process
+//!   dies. `stopTick` is not an optimisation, it is the crash guard.
+//! - ACTIVE: a tick on the picture widget paces requests at the CURRENT
+//!   output's real refresh (from `gdk_frame_clock_get_refresh_info`),
+//!   clamped by `browser_max_fps`. Any input promotes here immediately,
+//!   so the first paint after a keystroke has no added latency.
+//! - Back to IDLE after ~250ms of requests that produced no paint, at
+//!   which point the tick REMOVES ITSELF (`onTick` returning
+//!   G_SOURCE_REMOVE and zeroing `tick_id`), exactly like the terminal
+//!   surface's animation tick.
+//!
+//! A background tab's picture is unmapped: the face then sends
+//! `view_hide` and stops asking altogether, so an off-screen page paints
+//! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
+//! aborts if a demoted face somehow kept its tick).
+//!
 //! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
 //! delivered frame rate and the time spent here. MEASURED on a 60fps
 //! animating page: with the old whole-buffer `g_bytes_new` copy this
@@ -74,6 +105,7 @@ const cast = @import("../util/cast.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
 const proto = @import("../web/protocol.zig");
+const pace = @import("../web/pace.zig");
 const clock = @import("../util/clock.zig");
 const Pane = @import("pane.zig").Pane;
 
@@ -193,6 +225,37 @@ const Stats = struct {
 };
 
 var g_stats: Stats = .{};
+
+// ---------------------------------------------------------------------
+// Pace logging (`SKETERM_WEB_PACE=1`)
+// ---------------------------------------------------------------------
+
+var g_pace_log: struct { on: bool = false, checked: bool = false } = .{};
+
+fn paceLogging() bool {
+    if (!g_pace_log.checked) {
+        g_pace_log.checked = true;
+        g_pace_log.on = c.getenv("SKETERM_WEB_PACE") != null;
+    }
+    return g_pace_log.on;
+}
+
+// ---------------------------------------------------------------------
+// App-level frame cap
+// ---------------------------------------------------------------------
+
+/// `browser_max_fps` from the config; 0 = follow the display. App-level
+/// like the other rendering flags, and module-level like the client it
+/// paces — every face reads the same number.
+var g_max_fps: u16 = 0;
+
+/// Push the configured cap (0 = follow the display) into every live
+/// face. Called from `applyConfigChange` and at window construction, the
+/// same shape as `imhost.setPreference`.
+pub fn setMaxFps(fps: u16) void {
+    g_max_fps = fps;
+    for (g_client.faces.items) |f| f.pacer.cap_fps = fps;
+}
 
 // ---------------------------------------------------------------------
 // Client — one helper process per GUI process
@@ -772,6 +835,22 @@ pub const WebFace = struct {
     last_x: i32 = 0,
     last_y: i32 = 0,
 
+    /// Adaptive frame pacing (see the header). Nothing this view shows
+    /// is painted unless this decides to ask for it.
+    pacer: pace.Pacer = .{},
+    /// GTK frame-clock tick id on `picture`, 0 when not installed. It
+    /// exists ONLY while the page is actively repainting and removes
+    /// itself the moment it is not — an idle tick is a KWin crash, not
+    /// a waste (see the header and `terminal_surface.zig`'s `tick_id`).
+    tick_id: c_uint = 0,
+    /// Slow GLib timeout (5Hz): the idle floor that notices a page
+    /// starting to move, and the reason no tick is needed to do so.
+    /// Armed for the face's whole on-screen life.
+    idle_timer: c.guint = 0,
+    /// Whether the picture is mapped. A background tab is unmapped: it
+    /// gets `view_hide` and is never asked for a frame.
+    on_screen: bool = false,
+
     /// Address to open once the view exists (attach-time URL).
     pending_url: ?[]u8 = null,
     /// Current address, as last reported by the helper. Owned.
@@ -815,6 +894,7 @@ pub const WebFace = struct {
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator };
         self.pane = pane;
+        self.pacer.cap_fps = g_max_fps;
         if (url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
 
         self.buildUi();
@@ -853,6 +933,10 @@ pub const WebFace = struct {
         // included, and the ONLY place the surface watch is severed
         // besides the picture's own unrealize.
         self.detachScaleWatch();
+        // Same mechanism (2: sever at the single choke point) for the
+        // two pacing sources, which carry this face as user-data and
+        // are not signals, so the disconnect loop below misses them.
+        self.stopPacing();
         // Mechanism 2: one disconnect for every widget/controller that
         // carries this face as user-data, at the single choke point.
         // Nothing here owns a GDestroyNotify — combining the two would
@@ -897,6 +981,7 @@ pub const WebFace = struct {
         if (self.view_live) cl.post(proto.ViewDestroy{ .view = self.view });
         cl.unregister(self);
         self.detachScaleWatch();
+        self.stopPacing();
         self.dropMap();
         if (self.pending_url) |u| self.allocator.free(u);
         if (self.url) |u| self.allocator.free(u);
@@ -998,6 +1083,7 @@ pub const WebFace = struct {
 
     pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
         const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
+        self.promote();
         client().post(proto.SemSnapshotReq{
             .view = self.view,
             .mode = mode,
@@ -1010,6 +1096,9 @@ pub const WebFace = struct {
     pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.act, false) orelse return null;
         client().post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+        // The helper synthesizes real input for this; the paints it
+        // causes still need somebody asking for frames.
+        self.promote();
         return token;
     }
 
@@ -1054,6 +1143,7 @@ pub const WebFace = struct {
             .dy = dy,
             .mods = 0,
         });
+        self.promote();
         return true;
     }
 
@@ -1079,6 +1169,10 @@ pub const WebFace = struct {
     /// with the same widget-paintable technique.
     pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
         if (self.widgets_dead) return null;
+        // Automation looking at the page counts as activity: the shot
+        // itself is of whatever was last painted, but going active now
+        // keeps a burst of them from each being an idle-floor tick old.
+        self.promote();
         const w = self.picture;
         const width = c.gtk_widget_get_width(w);
         const height = c.gtk_widget_get_height(w);
@@ -1167,6 +1261,94 @@ pub const WebFace = struct {
         self.buf_id = 0;
         self.buf_w = 0;
         self.buf_h = 0;
+    }
+
+    // ---- frame pacing ------------------------------------------------
+
+    /// Ask the helper for one frame, now.
+    fn requestFrame(self: *WebFace) void {
+        if (!self.view_live or !self.on_screen) return;
+        client().post(proto.FrameRequest{ .view = self.view, .flags = 0 });
+        self.pacer.noteRequest(c.g_get_monotonic_time());
+    }
+
+    /// Go active: what every input, navigation and geometry change does.
+    /// Idempotent and cheap, so callers never check state first.
+    fn promote(self: *WebFace) void {
+        const was_idle = self.pacer.promote();
+        if (was_idle and paceLogging())
+            std.debug.print("webface pace: view {d} idle -> active ({d} fps)\n", .{ self.view, self.pacer.effectiveFps() });
+        self.ensureTick();
+    }
+
+    /// Install the frame-clock tick if it is not already running, and
+    /// only while there is something on screen to pace. Modelled on
+    /// `TerminalSurface.ensureTickRunning`; the counterpart that takes
+    /// it away is `onTick` returning G_SOURCE_REMOVE, plus `stopTick`
+    /// for the paths that end the pacing outright.
+    fn ensureTick(self: *WebFace) void {
+        if (self.tick_id != 0) return;
+        if (self.widgets_dead or !self.on_screen) return;
+        if (self.pacer.state != .active) return;
+        self.tick_id = c.gtk_widget_add_tick_callback(
+            self.picture,
+            @ptrCast(&onTick),
+            @ptrCast(self),
+            null,
+        );
+    }
+
+    fn stopTick(self: *WebFace) void {
+        if (self.tick_id == 0) return;
+        if (!self.widgets_dead) c.gtk_widget_remove_tick_callback(self.picture, self.tick_id);
+        self.tick_id = 0;
+    }
+
+    /// Arm the idle floor. One 200ms timeout for the face's whole life;
+    /// it is what notices a page starting to animate on its own, and it
+    /// is deliberately NOT a tick.
+    fn startIdleTimer(self: *WebFace) void {
+        if (self.idle_timer != 0) return;
+        const ms: c_uint = @intCast(@divTrunc(pace.Pacer.idleIntervalUs(), 1000));
+        self.idle_timer = c.g_timeout_add(ms, @ptrCast(&onIdleTimer), @ptrCast(self));
+    }
+
+    /// End all pacing: tick gone, timeout gone, state reset. Idempotent,
+    /// and safe to call with the widgets already finalized.
+    fn stopPacing(self: *WebFace) void {
+        self.stopTick();
+        if (self.idle_timer != 0) {
+            _ = c.g_source_remove(self.idle_timer);
+            self.idle_timer = 0;
+        }
+        self.pacer.stop();
+    }
+
+    /// A paint landed: keep the view active, and wake it if the page
+    /// started moving while nobody was touching it.
+    fn notePaint(self: *WebFace) void {
+        if (self.pacer.notePaint() and paceLogging())
+            std.debug.print("webface pace: view {d} idle -> active (paint)\n", .{self.view});
+        self.ensureTick();
+    }
+
+    /// The page went on or off screen (tab switch, pane teardown). An
+    /// off-screen page is not painted at all: `view_hide` stops the
+    /// helper's own watchdog too, so nothing anywhere renders it.
+    fn setOnScreen(self: *WebFace, on: bool) void {
+        if (self.on_screen == on) return;
+        self.on_screen = on;
+        if (on) {
+            if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
+            self.startIdleTimer();
+            // A tab coming forward must show its current content at
+            // once, not at the next idle tick.
+            self.promote();
+            return;
+        }
+        if (self.view_live) client().post(proto.ViewHide{ .view = self.view });
+        self.stopPacing();
+        if (paceLogging()) std.debug.print("webface pace: view {d} off screen (tick={d})\n", .{ self.view, self.tick_id });
     }
 
     // ---- device scale ----------------------------------------------
@@ -1303,6 +1485,10 @@ pub const WebFace = struct {
         // watch and re-reads the scale.
         _ = c.g_signal_connect_data(@ptrCast(self.picture), "realize", @ptrCast(&onPictureRealize), self, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(self.picture), "unrealize", @ptrCast(&onPictureUnrealize), self, null, 0);
+        // Map/unmap IS the on-screen signal: a background tab's pane is
+        // unmapped, and a page nobody can see must not be painted.
+        _ = c.g_signal_connect_data(@ptrCast(self.picture), "map", @ptrCast(&onPictureMap), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.picture), "unmap", @ptrCast(&onPictureUnmap), self, null, 0);
         self.track(self.picture);
         c.gtk_overlay_set_child(@ptrCast(self.overlay), self.picture);
         self.wireInput();
@@ -1423,6 +1609,13 @@ pub const WebFace = struct {
             .context = 0,
         });
         self.view_live = true;
+        // A view is created visible; tell the helper at once when this
+        // face is on a background tab (a helper restart can rebuild a
+        // view whose pane nobody is looking at).
+        if (!self.on_screen) cl.post(proto.ViewHide{ .view = self.view });
+        // The first load has to paint promptly, and nothing paints
+        // unless somebody asks.
+        self.promote();
         if (self.pending_url) |u| {
             cl.post(proto.Navigate{ .view = self.view, .url = u });
         } else if (self.url) |u| {
@@ -1451,6 +1644,9 @@ pub const WebFace = struct {
         self.buf_h = fb.h;
         self.buf_stride = fb.stride;
         if (old_id != 0) client().post(proto.FrameRelease{ .view = self.view, .buf_id = old_id });
+        // A fresh buffer holds nothing yet: ask for the repaint that
+        // fills it rather than waiting for the idle floor.
+        self.promote();
     }
 
     pub fn onDamage(self: *WebFace, dmg: proto.FrameDamage) void {
@@ -1487,6 +1683,7 @@ pub const WebFace = struct {
         ) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(self.picture), @ptrCast(tex));
+        self.notePaint();
         self.clearStatus();
         if (stats) g_stats.note(Stats.nowNs() - t0, mapping.len);
     }
@@ -1546,6 +1743,8 @@ pub const WebFace = struct {
     }
 
     pub fn onLoad(self: *WebFace, ev: proto.EvLoad) void {
+        // A document changing state is about to paint.
+        self.promote();
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
             self.crashed = false;
             self.clearStatus();
@@ -1618,11 +1817,13 @@ pub const WebFace = struct {
             return;
         }
         cl.post(proto.Navigate{ .view = self.view, .url = url });
+        self.promote();
     }
 
     pub fn navAction(self: *WebFace, action: proto.NavAct) void {
         if (!self.view_live) return;
         client().post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
+        self.promote();
     }
 
     // ---- widget callbacks ------------------------------------------
@@ -1677,6 +1878,73 @@ pub const WebFace = struct {
         _ = c.gtk_widget_grab_focus(self.entry);
     }
 
+    /// Frame-clock tick: one frame request per refresh, capped.
+    ///
+    /// SELF-REMOVING, and that is the load-bearing property — see the
+    /// header. It leaves whenever there is nothing to pace (page gone
+    /// quiet, view off screen, widgets dying), zeroing `tick_id` on the
+    /// way out exactly like `terminal_surface.zig`'s tick does.
+    fn onTick(_: *c.GtkWidget, frame_clock: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        if (self.widgets_dead or !self.on_screen or !self.view_live or self.pacer.state != .active) {
+            self.tick_id = 0;
+            return 0; // G_SOURCE_REMOVE
+        }
+        // Pace against the CURRENT output: dragging the window from the
+        // 60Hz panel to the 165Hz one changes this with no config
+        // change and no reconnect.
+        self.pacer.display_fps = refreshFps(frame_clock, self.pacer.display_fps);
+        if (self.pacer.dueAt(c.g_get_monotonic_time())) self.requestFrame();
+        if (self.pacer.demoteDue()) {
+            self.pacer.demote();
+            self.tick_id = 0;
+            if (paceLogging())
+                std.debug.print("webface pace: view {d} active -> idle\n", .{self.view});
+            return 0; // G_SOURCE_REMOVE
+        }
+        return 1; // G_SOURCE_CONTINUE
+    }
+
+    /// The idle floor: a few requests a second so a page that starts
+    /// moving on its own is noticed. Runs for the face's whole life and
+    /// does nothing at all while the tick is pacing.
+    fn onIdleTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        if (self.widgets_dead) {
+            self.idle_timer = 0;
+            return 0; // G_SOURCE_REMOVE
+        }
+        if (self.pacer.state == .idle) {
+            // THE KWIN-CRASH GUARD, checked from outside the tick's own
+            // callback so it observes what actually happened: an idle
+            // face must hold no frame-clock tick. An explicit branch,
+            // not std.debug.assert — this project builds ReleaseFast,
+            // where that compiles away.
+            if (paceLogging()) {
+                std.debug.print("webface pace: view {d} idle, tick_id={d}\n", .{ self.view, self.tick_id });
+                if (self.tick_id != 0) @panic("webface: idle with a frame-clock tick still installed");
+            }
+            self.requestFrame();
+            return 1; // G_SOURCE_CONTINUE
+        }
+        // Active, but the tick has not asked for anything in an idle
+        // interval: the frame clock is not running (an occluded or
+        // unredirected surface stops it). The tick being the ONLY
+        // requester would freeze the page here, so the floor applies in
+        // both states — it just never fires while the tick delivers.
+        if (c.g_get_monotonic_time() - self.pacer.last_req_us >= pace.Pacer.idleIntervalUs())
+            self.requestFrame();
+        return 1; // G_SOURCE_CONTINUE
+    }
+
+    fn onPictureMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).setOnScreen(true);
+    }
+
+    fn onPictureUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).setOnScreen(false);
+    }
+
     fn onPictureRealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         self.attachScaleWatch();
@@ -1711,6 +1979,7 @@ pub const WebFace = struct {
             .h = nh,
             .scale_x1000 = scale,
         });
+        self.promote();
     }
 
     fn onMotion(ctrl: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1749,6 +2018,7 @@ pub const WebFace = struct {
             .dy = @intFromFloat(@round(dy * 120.0)),
             .mods = modsOf(@ptrCast(ctrl)),
         });
+        self.promote();
         return 1;
     }
 
@@ -1795,6 +2065,7 @@ pub const WebFace = struct {
         const self = cast.userData(WebFace, user);
         if (!self.view_live) return;
         client().post(proto.InputFocus{ .view = self.view, .focused = 1 });
+        self.promote();
     }
 
     fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -1818,6 +2089,9 @@ pub const WebFace = struct {
             .clicks = clicks,
             .mods = mods,
         });
+        // ANY input goes active immediately, so the paint it causes has
+        // no pacing latency added to it.
+        self.promote();
     }
 
     fn sendKey(
@@ -1847,9 +2121,29 @@ pub const WebFace = struct {
             .mods = mods,
             .text = text,
         });
+        self.promote();
         return 1;
     }
 };
+
+/// The refresh rate of the output this frame clock drives, or `fallback`
+/// when GDK does not know one yet (an unmapped or just-realized
+/// surface). `gdk_frame_clock_get_refresh_info` reports the interval in
+/// microseconds; clamped to a sane band so a nonsense value cannot turn
+/// into a request storm.
+fn refreshFps(frame_clock: *c.GdkFrameClock, fallback: u16) u16 {
+    var interval_us: i64 = 0;
+    var presentation_us: i64 = 0;
+    c.gdk_frame_clock_get_refresh_info(
+        frame_clock,
+        c.gdk_frame_clock_get_frame_time(frame_clock),
+        &interval_us,
+        &presentation_us,
+    );
+    if (interval_us <= 0) return fallback;
+    const fps = @divTrunc(@as(i64, 1_000_000), interval_us);
+    return @intCast(std.math.clamp(fps, 1, @as(i64, pace.max_cap_fps)));
+}
 
 /// GDK button number (1 left, 2 middle, 3 right) to the protocol's
 /// CEF-shaped byte.

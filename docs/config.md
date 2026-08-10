@@ -349,6 +349,20 @@ that framebuffer and costs nothing extra.
 | `inactive_darken` | float | `0.2` | Clamped 0..1. Uniform darken of an unfocused pane's final composited image, so colour relations are preserved. |
 | `inactive_desaturate` | float | `0.0` | Clamped 0..1. Blend an unfocused pane toward luma. |
 | `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances. Applies to whichever shader a pane resolves to. |
+| `browser_max_fps` | int | `0` | Ceiling on how often a browser pane asks the web helper for a frame. `0` = follow the output the window is on. Anything else must be `5`..`1000`; out of range is a parse error. |
+
+`browser_max_fps` is a CEILING, not a target. A browser pane paints
+nothing at all while its page is unchanged, and a background tab's page
+is not painted at all, so lowering this saves nothing on an idle page —
+it only limits an animating one (video, canvas, a scrolling feed).
+
+The default follows the display because the engine cannot: CEF's own
+windowless scheduler tops out at 60fps, so a 120Hz or 165Hz panel needs
+the client to drive the frames, which is what sketerm does. Dragging a
+window between differently refreshing outputs re-paces it with no config
+change. Set a number here to cap a browser pane below the display (a
+battery-minded `30`), never to raise it above one — no cap can make a
+view exceed its own output's refresh.
 
 `inactive_fg_dim` and `inactive_bg_dim` are retired per-cell dim keys.
 They are still accepted and ignored, so old files do not warn; use
