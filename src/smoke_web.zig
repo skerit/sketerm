@@ -6,8 +6,9 @@
 //! click, keyboard text entry, resize (new buffer), popup requests,
 //! back/forward navigation state, the whole semantic layer (snapshot
 //! with stable ids, mutation delta, trusted sem_act click, expand,
-//! cross-navigation id carrying, reader extraction, query) and a clean
-//! shutdown on disconnect.
+//! cross-navigation id carrying, reader extraction, query), a hostile
+//! page that tries to forge semantic replies and hijack the command
+//! entry point, and a clean shutdown on disconnect.
 //!
 //! Headless by construction: the helper runs CEF with
 //! `--ozone-platform=headless`, so no display is needed. No network is
@@ -72,6 +73,45 @@ const article_page =
     "<article><h1>Article Heading</h1><p>" ++ long_text ++ "</p>" ++
     "<p>A second paragraph so the extractor has real text density.</p></article>" ++
     "</body></html>";
+
+/// A page that attacks the semantic layer from the inside: at parse
+/// time (before its own load event) and again after it, it hunts for
+/// any reachable transport, tries to post a forged snapshot through
+/// every one it finds, and tries to overwrite the command entry point.
+/// It reports what it managed through the title; the real DOM below it
+/// is what a snapshot must still show.
+const attack_page =
+    "data:text/html,<html><body><h1>Attack%20Page</h1><p%20id=truth>REALCONTENT</p><script>" ++
+    "(function(){" ++
+    "var%20names=[\"__sketermSemPost\",\"__sketermSem\",\"__sketermSemCmd\",\"sketermSem\",\"semPost\"];" ++
+    // The marker is assembled from halves so that the page's own URL,
+    // which every snapshot header echoes, cannot match the assertion.
+    "var%20mark=\"FORGED\"+\"MARKER\";" ++
+    "var%20forged='{\"op\":\"tree\",\"req\":REQ,\"doc\":424242,\"url\":\"about:'+'forged\",\"nodes\":" ++
+    "[{\"id\":1,\"parent\":0,\"role\":\"document\",\"name\":\"'+mark+'\",\"value\":\"\",\"states\":\"\"," ++
+    "\"x\":0,\"y\":0,\"w\":0,\"h\":0,\"full\":12}]}';" ++
+    "function%20attack(){" ++
+    "var%20hit=0,posted=0,slots=0,ovr=0;" ++
+    "for(var%20i=0;i<names.length;i++){" ++
+    "var%20f=window[names[i]];" ++
+    "if(typeof%20f!==\"undefined\")hit++;" ++
+    "if(typeof%20f===\"function\"){try{f(forged.replace(\"REQ\",\"0\"));posted++;}catch(e){}}" ++
+    "if(f&&typeof%20f.cmd===\"function\"){try{f.cmd(forged.replace(\"REQ\",\"0\"));posted++;}catch(e){}}}" ++
+    "var%20own=Object.getOwnPropertyNames(window);" ++
+    "for(var%20k=0;k<own.length;k++){" ++
+    "var%20n=own[k];" ++
+    "if(!/^[0-9a-f]{32}$/.test(n))continue;" ++
+    "var%20g=window[n];" ++
+    "if(typeof%20g!==\"function\")continue;" ++
+    "slots++;" ++
+    "for(var%20r=0;r<4;r++){try{g(forged.replace(\"REQ\",String(r)));}catch(e){}}" ++
+    "try{window[n]=function(){};}catch(e){}" ++
+    "try{Object.defineProperty(window,n,{value:function(){}});}catch(e){}" ++
+    "if(window[n]!==g)ovr++;}" ++
+    "return%20\"hit=\"+hit+\"%20posted=\"+posted+\"%20slots=\"+slots+\"%20ovr=\"+ovr;}" ++
+    "var%20early=attack();" ++
+    "setTimeout(function(){document.title=\"attack%20early:\"+early+\"%20late:\"+attack();},50);" ++
+    "})();</script></body></html>";
 
 // Cleanup state: `fail` may fire from anywhere, and the helper must
 // never be left running nor the temp dir behind. Killed by EXACT pid.
@@ -828,7 +868,46 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 13 sem_query");
 
-    // ── Stage 14: teardown ────────────────────────────────────────
+    // ── Stage 14: a hostile page cannot forge or hijack ────────────
+    {
+        cl.navigate(attack_page);
+        if (!cl.waitTitle("attack ", 15_000)) fail("stage 14 hostile page: the page never reported its attempts");
+        const report = cl.titleSlice();
+        const want = [_][]const u8{
+            "early:hit=0 posted=0 slots=1 ovr=0",
+            "late:hit=0 posted=0 slots=1 ovr=0",
+        };
+        for (want) |needle| {
+            if (std.mem.indexOf(u8, report, needle) == null) {
+                std.debug.print("smoke-web: the page reported \"{s}\"\n", .{report});
+                fail("stage 14 hostile page: the page reached something it must not");
+            }
+        }
+        // The true tree must still come back, with nothing of the page's
+        // forgery in it.
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        if (!cl.waitSem("REALCONTENT", 20_000)) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 14 hostile page: the real DOM did not come back");
+        }
+        if (std.mem.indexOf(u8, cl.semLog(), "FORGEDMARKER") != null or
+            std.mem.indexOf(u8, cl.semLog(), "about:forged") != null)
+        {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 14 hostile page: a forged reply reached the client");
+        }
+        // ... and the helper is still answering.
+        const seq = cl.md_seq;
+        cl.send(proto.SemRead{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 14 hostile page: the helper stopped answering");
+        if (std.mem.indexOf(u8, cl.md[0..cl.md_len], "Attack Page") == null) {
+            fail("stage 14 hostile page: sem_read did not return the real page");
+        }
+    }
+    pass("stage 14 hostile page (no transport, no forgery, no hijack)");
+
+    // ── Stage 15: teardown ────────────────────────────────────────
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -842,11 +921,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             _ = c.usleep(50_000);
         }
-        if (!gone) fail("stage 14 teardown: helper did not exit within 10s of the disconnect");
+        if (!gone) fail("stage 15 teardown: helper did not exit within 10s of the disconnect");
         g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 14 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 14 teardown: helper exited nonzero");
-        pass("stage 14 teardown (helper exited 0 on disconnect)");
+        if (status & 0x7f != 0) fail("stage 15 teardown: helper died on a signal");
+        if ((status >> 8) & 0xff != 0) fail("stage 15 teardown: helper exited nonzero");
+        pass("stage 15 teardown (helper exited 0 on disconnect)");
     }
 
     cleanup();

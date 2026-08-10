@@ -23,16 +23,16 @@
 //! the render-process half lives in this file too and is reached only
 //! through `app.get_render_process_handler`. A command travels
 //!   browser: Host.sendScript -> frame.execute_java_script ->
-//!            window.__sketermSem.cmd(json)
+//!            window[<slot>](json)
 //! and a reply travels back
-//!   render : semantic.js -> __sketermSemPost(json) -> onSemPost
-//!            (the V8 extension's native binding) ->
-//!            frame.send_process_message(PID_BROWSER)
+//!   render : semantic.js -> post(<nonce> + json) -> onSemPost (the
+//!            transport, held in a CLOSURE and unpublished from the
+//!            page) -> frame.send_process_message(PID_BROWSER)
 //!   browser: onProcessMessage -> Host.onScriptMessage -> semantic.zig.
 //! Only the REPLY direction needs a process message, because
 //! `execute_java_script` already works browser-side. Both halves are
 //! single-threaded within their own process; nothing is shared between
-//! them but the JSON strings.
+//! them but the JSON strings and the two secrets (see `Secret`).
 
 const std = @import("std");
 const cef = @import("cef");
@@ -41,11 +41,13 @@ const proto = @import("protocol.zig");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
 
-/// The content script, injected into every document of every view.
+/// The content script — a function expression, called with the two
+/// secrets and the transport (see `onContextCreated`).
 const semantic_js = @embedFile("semantic.js");
 
-/// The V8 extension that publishes the script's ONLY native binding: a
-/// plain global function (no `window` — see `onWebKitInitialized`).
+/// The V8 extension that publishes the transport: a plain global
+/// function (no `window` — see `onWebKitInitialized`). The injected
+/// script captures it and unpublishes it before any page script runs.
 const sem_bridge_js =
     \\function __sketermSemPost(json) {
     \\  native function semPost();
@@ -53,9 +55,63 @@ const sem_bridge_js =
     \\}
 ;
 
+/// Everything a subframe gets: the transport, taken away. Commands only
+/// ever go to the main frame, so a subframe has no use for it and no
+/// business posting anything.
+const disarm_js = "window.__sketermSemPost=undefined;";
+
 /// Process-message name carrying a script REPLY (render -> browser);
 /// the payload is always a single JSON string argument.
 const sem_msg = "sketerm.sem";
+
+/// Command-line switch carrying `<nonce>:<slot>` to the renderer.
+const sem_switch = "sketerm-sem-secret";
+
+/// The two per-process secrets of the semantic layer, minted in the
+/// browser process and handed to the renderer on its command line.
+///
+/// They exist because the injected script shares its global scope with
+/// the PAGE: without `nonce` a hostile page could post forged replies
+/// (fabricated snapshots, invented act results) at an agent reading
+/// them, and with a guessable command name it could replace the command
+/// handler. Neither name is derived from the other — `slot` is a
+/// property name page script can enumerate, `nonce` never appears in
+/// any name.
+const Secret = struct {
+    /// Prefix every reply must carry; hex, so it survives JSON.
+    nonce: [32]u8 = @splat(0),
+    /// Random global name the command entry point is installed under.
+    slot: [32]u8 = @splat(0),
+    ok: bool = false,
+};
+
+var sem_secret: Secret = .{};
+
+/// Mint the secrets; a failure leaves the semantic layer OFF rather
+/// than unauthenticated.
+fn mintSecret() void {
+    var raw: [32]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) != 0) return;
+    hexInto(raw[0..16], &sem_secret.nonce);
+    hexInto(raw[16..32], &sem_secret.slot);
+    sem_secret.ok = true;
+}
+
+fn hexInto(raw: []const u8, out: []u8) void {
+    const digits = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0xf];
+    }
+}
+
+/// Length-checked compare that does not stop at the first difference.
+fn secretEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
 
 // The event-flag values keymap.zig hardcodes to stay CEF-free.
 comptime {
@@ -477,20 +533,22 @@ pub const Host = struct {
     // -- semantic layer ------------------------------------------------
 
     /// Hand one JSON command to the view's main frame, as a call into
-    /// `window.__sketermSem.cmd`.
+    /// the script's command entry point (`window[<slot>]`).
     ///
     /// `execute_java_script` works straight from the browser process
     /// (CEF routes it to the frame's renderer), which is why the
     /// command direction needs no process message and no V8 call at
     /// all — only the REPLY direction does.
     fn sendScript(self: *Host, v: *View, json: []const u8) void {
+        if (!sem_secret.ok) return;
         const b = v.browser orelse return;
         const gf = b.get_main_frame orelse return;
         const frame: *cef.cef_frame_t = gf(b) orelse return;
         defer release(&frame.base);
         var code: std.Io.Writer.Allocating = .init(self.gpa);
         defer code.deinit();
-        code.writer.writeAll("window.__sketermSem&&window.__sketermSem.cmd(") catch return;
+        const slot: []const u8 = &sem_secret.slot;
+        code.writer.print("window[\"{s}\"]&&window[\"{s}\"](", .{ slot, slot }) catch return;
         jsonStr(&code.writer, json) catch return;
         code.writer.writeByte(')') catch return;
         runJs(frame, code.written());
@@ -645,8 +703,18 @@ pub const Host = struct {
         self.sendScript(v, cmd);
     }
 
-    /// One JSON reply from the injected script.
-    fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
+    /// One reply from the injected script: `<nonce><json>`.
+    ///
+    /// The nonce gate is the whole reason the render side has a secret.
+    /// A page cannot reach the native reply function, but if it ever
+    /// did, an unprefixed message buys it nothing: everything below is
+    /// reached only by a message that carries the browser's own nonce,
+    /// and only for a request id the browser is actually waiting on.
+    fn onScriptMessage(self: *Host, v: *View, raw: []const u8) void {
+        if (!sem_secret.ok) return;
+        if (raw.len <= sem_secret.nonce.len) return;
+        if (!secretEql(raw[0..sem_secret.nonce.len], &sem_secret.nonce)) return;
+        const json = raw[sem_secret.nonce.len..];
         const Head = struct { op: []const u8 = "", req: u32 = 0 };
         const head = std.json.parseFromSlice(Head, self.gpa, json, .{
             .ignore_unknown_fields = true,
@@ -701,6 +769,10 @@ pub const Host = struct {
     /// dropped when nothing actually changed.
     fn onTree(self: *Host, v: *View, rid: u32, json: []const u8) void {
         const pend = self.takePending(v, rid);
+        // A named request id that nothing is waiting on was either
+        // answered already or never asked for; only the observer's
+        // unsolicited id 0 may arrive without a pending entry.
+        if (rid != 0 and pend == null) return;
         defer if (pend) |p| {
             if (p.arg.len != 0) self.gpa.free(p.arg);
         };
@@ -1009,6 +1081,26 @@ var pump_delay_ms: i64 = -1;
 
 fn onScheduleMessagePumpWork(_: [*c]cef.cef_browser_process_handler_t, delay: i64) callconv(.c) void {
     pump_delay_ms = delay;
+}
+
+/// Hand the semantic-layer secrets to every child process; the renderer
+/// picks them back up in `onWebKitInitialized`.
+fn onBeforeChildProcessLaunch(
+    _: [*c]cef.cef_browser_process_handler_t,
+    command_line: [*c]cef.cef_command_line_t,
+) callconv(.c) void {
+    if (!sem_secret.ok) return;
+    const cl: *cef.cef_command_line_t = command_line orelse return;
+    const add = cl.append_switch_with_value orelse return;
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr(sem_switch, &name);
+    defer cef.cef_string_utf16_clear(&name);
+    var buf: [96]u8 = undefined;
+    const joined = std.fmt.bufPrint(&buf, "{s}:{s}", .{ &sem_secret.nonce, &sem_secret.slot }) catch return;
+    var value = std.mem.zeroes(cef.cef_string_t);
+    setStr(joined, &value);
+    defer cef.cef_string_utf16_clear(&value);
+    add(cl, &name, &value);
 }
 
 fn getBrowserProcessHandler(_: [*c]cef.cef_app_t) callconv(.c) [*c]cef.cef_browser_process_handler_t {
@@ -1378,10 +1470,8 @@ fn onLoadEnd(
         .state = @intFromEnum(proto.LoadState.finished),
         .url = v.url,
     });
-    // The content script goes in once per document, and any semantic
-    // command queued after it is ordered behind it by the frame's own
-    // script queue.
-    if (frame) |f| runJs(f, semantic_js);
+    // The content script is already in: it goes in at context creation,
+    // before any page script, so by load end it is only re-armed.
     host.semRearm(v);
 }
 
@@ -1444,29 +1534,111 @@ fn getRenderProcessHandler(_: [*c]cef.cef_app_t) callconv(.c) [*c]cef.cef_render
     return &rp_handler;
 }
 
-/// Register the reply bridge as a V8 extension, once per render
-/// process.
+/// Register the transport as a V8 extension and read the secrets the
+/// browser process appended to this renderer's command line.
 ///
 /// A V8 extension is CEF's documented way to publish a NATIVE function
-/// to every frame, and it is the ONLY part of the semantic layer that
-/// needs V8 at all. Two hard constraints learned the expensive way on
-/// this CEF build, both of which kill the renderer SILENTLY (a black
-/// view and an `ev_crashed`, no log line):
-///   - extension code must not touch `window` in any way, not even
-///     `typeof window` -- it is evaluated before the DOM global exists;
-///   - `on_context_created` + `set_value_bykey` on the context global,
-///     the "obvious" injection route, dies the same way.
-/// So the extension declares a plain global function and nothing else,
-/// and `semantic.js` itself is injected per document with
-/// `execute_java_script`.
+/// to every frame, and it is the only route left: extension code must
+/// not touch `window` in any way (not even `typeof` — the DOM global
+/// does not exist yet and the renderer dies silently), so the extension
+/// declares a plain global and `onContextCreated` takes it away again
+/// before the page can see it. Without the secrets nothing is injected
+/// at all: an unauthenticated semantic layer is worse than none.
 fn onWebKitInitialized(_: [*c]cef.cef_render_process_handler_t) callconv(.c) void {
+    var ext_name = std.mem.zeroes(cef.cef_string_t);
+    setStr("v8/sketerm-semantic", &ext_name);
+    defer cef.cef_string_utf16_clear(&ext_name);
+    var ext_code = std.mem.zeroes(cef.cef_string_t);
+    setStr(sem_bridge_js, &ext_code);
+    defer cef.cef_string_utf16_clear(&ext_code);
+    _ = cef.cef_register_extension(&ext_name, &ext_code, &v8_handler);
+
+    const cl: *cef.cef_command_line_t = cef.cef_command_line_get_global() orelse return;
+    defer release(&cl.base);
+    const gv = cl.get_switch_value orelse return;
     var name = std.mem.zeroes(cef.cef_string_t);
-    setStr("v8/sketerm-semantic", &name);
+    setStr(sem_switch, &name);
     defer cef.cef_string_utf16_clear(&name);
+    const raw = gv(cl, &name);
+    if (raw == null) return;
+    defer cef.cef_string_userfree_utf16_free(raw);
+    var val = Utf8.init(raw);
+    defer val.free();
+    const s = val.slice();
+    if (s.len != sem_secret.nonce.len + 1 + sem_secret.slot.len) return;
+    if (s[sem_secret.nonce.len] != ':') return;
+    @memcpy(&sem_secret.nonce, s[0..sem_secret.nonce.len]);
+    @memcpy(&sem_secret.slot, s[sem_secret.nonce.len + 1 ..]);
+    sem_secret.ok = true;
+}
+
+/// Inject the content script into a fresh main-frame V8 context.
+///
+/// This runs BEFORE any page script of the document, which is the whole
+/// security argument: the script captures the transport (the extension
+/// global `__sketermSemPost`) and unpublishes it while the page still
+/// has no code running, so page script never gets to call it, wrap it,
+/// or see the reply channel at all. Injecting at `on_load_end` instead
+/// — as the first revision did — loses that race by construction: the
+/// probe page reported `typeof __sketermSemPost === "function"` and no
+/// injected script at parse time.
+///
+/// The call is baked into the evaluated SOURCE rather than made through
+/// `execute_function`, because calling a V8 function from this callback
+/// kills the renderer SILENTLY (black view, `ev_crashed`, nothing in
+/// cef.log) — verified with a function body as small as `return 1`.
+/// Two more routes die the same way and must not come back:
+///   - `set_value_bykey` on the context global, the "obvious" injection;
+///   - extension code touching `window` in any way, even `typeof`.
+/// `cef_v8_context_t::eval` is the one thing that works here.
+fn onContextCreated(
+    _: [*c]cef.cef_render_process_handler_t,
+    _: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    context: [*c]cef.cef_v8_context_t,
+) callconv(.c) void {
+    const ctx: *cef.cef_v8_context_t = context orelse return;
+    // Subframes get the transport taken away and nothing else: commands
+    // only ever go to the main frame, so an injected subframe could only
+    // post unsolicited walks of ITS document into the shadow tree.
+    if (!isMainFrame(frame)) {
+        evalJs(ctx, disarm_js);
+        return;
+    }
+    if (!sem_secret.ok) return;
+    evalJs(ctx, injectSource() orelse return);
+}
+
+/// The content script wrapped into its own call, built once per render
+/// process because the secrets only arrive at `on_web_kit_initialized`.
+fn injectSource() ?[]const u8 {
+    const State = struct {
+        var buf: [semantic_js.len + 128]u8 = undefined;
+        var built: []const u8 = &.{};
+    };
+    if (State.built.len != 0) return State.built;
+    State.built = std.fmt.bufPrint(
+        &State.buf,
+        "({s})(\"{s}\",\"{s}\",__sketermSemPost);",
+        .{ semantic_js, &sem_secret.nonce, &sem_secret.slot },
+    ) catch return null;
+    return State.built;
+}
+
+/// Evaluate a script in an already-created V8 context.
+fn evalJs(ctx: *cef.cef_v8_context_t, source: []const u8) void {
+    const ev = ctx.eval orelse return;
     var code = std.mem.zeroes(cef.cef_string_t);
-    setStr(sem_bridge_js, &code);
+    setStr(source, &code);
     defer cef.cef_string_utf16_clear(&code);
-    _ = cef.cef_register_extension(&name, &code, &v8_handler);
+    var url = std.mem.zeroes(cef.cef_string_t);
+    setStr("sketerm://semantic.js", &url);
+    defer cef.cef_string_utf16_clear(&url);
+    var retval: [*c]cef.cef_v8_value_t = null;
+    var exc: [*c]cef.cef_v8_exception_t = null;
+    _ = ev(ctx, &code, &url, 0, &retval, &exc);
+    if (retval) |r| release(&r.*.base);
+    if (exc) |e| release(&e.*.base);
 }
 
 /// Run a script in a frame's main world.
@@ -1481,7 +1653,7 @@ fn runJs(frame: *cef.cef_frame_t, code: []const u8) void {
     exec(frame, &js, &url, 0);
 }
 
-/// `window.__sketermSemPost(json)`: forward the string to the browser
+/// The script's `post(nonce + json)`: forward the string to the browser
 /// process untouched.
 fn onSemPost(
     _: [*c]cef.cef_v8_handler_t,
@@ -1539,12 +1711,14 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
     bp_handler = std.mem.zeroes(cef.cef_browser_process_handler_t);
     bp_handler.base = staticBase(cef.cef_browser_process_handler_t);
     bp_handler.on_schedule_message_pump_work = onScheduleMessagePumpWork;
+    bp_handler.on_before_child_process_launch = onBeforeChildProcessLaunch;
     v8_handler = std.mem.zeroes(cef.cef_v8_handler_t);
     v8_handler.base = staticBase(cef.cef_v8_handler_t);
     v8_handler.execute = onSemPost;
     rp_handler = std.mem.zeroes(cef.cef_render_process_handler_t);
     rp_handler.base = staticBase(cef.cef_render_process_handler_t);
     rp_handler.on_web_kit_initialized = onWebKitInitialized;
+    rp_handler.on_context_created = onContextCreated;
 
     app = std.mem.zeroes(cef.cef_app_t);
     app.base = staticBase(cef.cef_app_t);
@@ -1560,6 +1734,9 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
 
 /// Bring CEF up in windowless mode with a private cache directory.
 pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file: []const u8) bool {
+    // Browser process only: `executeProcess` never returns in a child,
+    // so a renderer never mints and only ever reads what it was given.
+    mintSecret();
     const args = cef.cef_main_args_t{ .argc = argc, .argv = argv };
     var settings = std.mem.zeroes(cef.cef_settings_t);
     settings.size = @sizeOf(cef.cef_settings_t);

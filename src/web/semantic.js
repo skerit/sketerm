@@ -1,25 +1,61 @@
 // Semantic-layer content script for sketerm-web.
 //
-// cefhost's render-process handler evaluates this in the V8 context of
-// EVERY frame, right after installing the native function
-// __sketermSemPost. Everything here is engine-agnostic DOM work: the
-// script walks the document, assigns per-document engine-local ids
-// (WeakMap + counter) and answers commands. It owns NO stable ids and
-// computes NO deltas -- those live in src/web/semantic.zig, which diffs
-// the full walks this script emits.
+// This file is a FUNCTION EXPRESSION, not a statement: cefhost's
+// render-process handler evaluates it in the V8 context of every main
+// frame (on_context_created) and calls the resulting function with the
+// two per-process secrets and the native reply function. Everything
+// here is engine-agnostic DOM work: the script walks the document,
+// assigns per-document engine-local ids (WeakMap + counter) and answers
+// commands. It owns NO stable ids and computes NO deltas -- those live
+// in src/web/semantic.zig, which diffs the full walks this script
+// emits.
 //
-// Transport: JSON strings both ways. Out through __sketermSemPost, a
-// global function published by cefhost's V8 extension, which turns the
-// string into a cef_process_message aimed at the browser process; in
-// through __sketermSem.cmd, which the browser process calls with
-// cef_frame_t::execute_java_script. This file is injected per document
-// (execute_java_script) rather than being the extension itself,
-// because extension code may not touch `window` at all.
+// Transport: JSON strings both ways. Out through `post`, the V8
+// extension's global handed in as an argument here and unpublished
+// immediately below, so page script has no reply channel; in through
+// the command entry point, installed under the random name SLOT because
+// the browser process can only reach a frame by evaluating source in
+// it. Every reply is prefixed with NONCE, which the browser checks and
+// without which the reply is dropped.
+//
+// SECURITY: this runs at context creation, BEFORE any page script, so
+// the capture below wins the race and the intrinsics captured are the
+// pristine ones. Page script can still lie about its OWN DOM (that is
+// not defensible from inside the page), but it cannot forge, alter or
+// observe a reply.
 
-(function () {
-  if (typeof window === "undefined" || window.__sketermSem) return;
-  if (typeof __sketermSemPost !== "function") return;
-  var post = __sketermSemPost;
+(function (NONCE, SLOT, post) {
+  if (typeof window === "undefined") return;
+  if (typeof post !== "function") return;
+  if (window[SLOT]) return;
+
+  // Unpublish the transport. `delete` is tried first and fails on a
+  // global function declaration (non-configurable); the assignment is
+  // what actually bites, and the redefine is there for a future
+  // transport declared some other way. Whichever wins, page script must
+  // find nothing callable -- smoke-web stage 14 asserts exactly that.
+  try {
+    delete window.__sketermSemPost;
+  } catch (e) {}
+  if (typeof window.__sketermSemPost !== "undefined") {
+    try {
+      window.__sketermSemPost = undefined;
+    } catch (e2) {}
+  }
+  if (typeof window.__sketermSemPost !== "undefined") {
+    try {
+      Object.defineProperty(window, "__sketermSemPost", {
+        value: undefined,
+        writable: false,
+        configurable: false
+      });
+    } catch (e3) {}
+  }
+
+  // Captured while they are still the originals: a page that later
+  // patches JSON.stringify must not get to rewrite our replies.
+  var stringify = JSON.stringify;
+  var parseJson = JSON.parse;
 
   // Per-context token: a fresh document means a fresh script instance,
   // which is exactly how the helper detects a navigation.
@@ -36,9 +72,11 @@
   var observer = null;
   var quiesce = null;
 
+  // Replies carry the browser's nonce as a bare prefix; concatenation
+  // of two primitives is the one step no page patch can intercept.
   function send(obj) {
     try {
-      post(JSON.stringify(obj));
+      post(NONCE + stringify(obj));
     } catch (e) {}
   }
 
@@ -552,7 +590,7 @@
   function handle(json) {
     var m;
     try {
-      m = JSON.parse(json);
+      m = parseJson(json);
     } catch (e) {
       return;
     }
@@ -587,5 +625,19 @@
     }
   }
 
-  window.__sketermSem = { cmd: handle, doc: DOC };
-})();
+  // The one page-reachable name, and only because a browser-process
+  // command can reach a frame ONLY by evaluating source in it. It is
+  // random per process, non-writable and takes commands, never replies:
+  // the worst a page that finds it can do is ask for a walk of its own
+  // document.
+  try {
+    Object.defineProperty(window, SLOT, {
+      value: handle,
+      writable: false,
+      configurable: false,
+      enumerable: false
+    });
+  } catch (e) {
+    window[SLOT] = handle;
+  }
+})
