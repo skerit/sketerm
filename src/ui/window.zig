@@ -4224,6 +4224,11 @@ fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         if (app != null) c.g_application_quit(@ptrCast(@alignCast(app)));
         return;
     }
+    // Sever the process-global handlers NOW, not in the deferred deinit:
+    // the free can be gated behind pending page-detach idles, and a theme
+    // flip in that window would walk this window's already-destroyed pane
+    // widgets. Idempotent with deinit's own call.
+    self.detachGlobalSignals();
     _ = c.g_idle_add(@ptrCast(&deferredWindowFree), @ptrCast(self));
 }
 

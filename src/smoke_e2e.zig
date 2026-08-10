@@ -5609,7 +5609,14 @@ fn panePanelLifetimeStage(
         "{{\"cmd\":\"panel-show\",\"name\":\"e2e-life\",\"session\":\"e2e-scope\"," ++
             "\"target\":\"pane\",\"pane\":1,\"document\":\"{{\\\"title\\\":\\\"Lifetime\\\"," ++
             "\\\"root\\\":\\\"c\\\",\\\"components\\\":{{\\\"c\\\":{{\\\"type\\\":\\\"column\\\"," ++
-            "\\\"children\\\":[\\\"h\\\",\\\"b\\\",\\\"s\\\",\\\"img\\\"]}}," ++
+            // The image sits FIRST in the column deliberately: the face
+            // lives in a scroller, and with the image last a short pane
+            // plus GTK's scroll-to-focus (button/slider below) could
+            // legitimately leave it below the fold — the pixel probe then
+            // failed while decode/install had provably succeeded (traced
+            // 2026-08-10: prepared lease installed, updateOne=true, no
+            // pixels). Top of the scroller is geometry-independent.
+            "\\\"children\\\":[\\\"img\\\",\\\"h\\\",\\\"b\\\",\\\"s\\\"]}}," ++
             "\\\"h\\\":{{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"On the pane\\\",\\\"level\\\":2}}," ++
             "\\\"b\\\":{{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Press\\\",\\\"action\\\":\\\"go\\\"}}," ++
             "\\\"s\\\":{{\\\"type\\\":\\\"slider\\\",\\\"min\\\":0,\\\"max\\\":10,\\\"value\\\":3}}," ++

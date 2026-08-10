@@ -1348,6 +1348,9 @@ pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker
 /// not just fg/bg).
 pub fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    // A window in destroy still has its panes listed until the deferred
+    // teardown idles run; their widgets are already dead.
+    if (self.destroying) return;
     if (!self.config.auto_theme) return;
     for (self.panes.items) |p| {
         pushPaneColors(self, p, self.config.profileSettings(p.active_profile orelse ""));
