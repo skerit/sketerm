@@ -1,0 +1,766 @@
+//! sketerm-web wire protocol v1: framing plus payload (de)serialization.
+//!
+//! THE compatibility surface between the GUI and a browser helper, and
+//! deliberately engine-agnostic: no CEF type, id or enum may ever appear
+//! here, so a future Servo/Ladybird helper can speak it unchanged. Rules
+//! (same as src/mux/wire.zig, whose discipline this follows):
+//!   - little-endian, length-prefixed frames and payloads
+//!   - tag values are APPEND-ONLY; readers skip unknown frames
+//!   - optional features are new frames gated by capabilities, never a
+//!     version bump
+//!
+//! Pure code: std only, no CEF, no GTK, no sockets. Unit-tested headless
+//! in both test roots.
+
+const std = @import("std");
+
+/// Protocol revision carried by `hello`/`hello_ack`.
+pub const PROTO_VERSION: u32 = 1;
+
+/// Capabilities a v1 helper advertises. Reserved-but-unimplemented
+/// names live in docs/proposal-browser-protocol.md, not here.
+pub const CAP_FRAMES_SHM = "frames-shm";
+pub const CAP_INPUT = "input";
+pub const CAP_NAVIGATION = "navigation";
+
+/// Refuse to buffer a frame larger than this; a peer claiming more is
+/// desynchronised, not ambitious.
+pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
+
+/// Frame tags, allocated in per-family blocks (see the spec's reserved
+/// ranges). Non-exhaustive because an unknown tag must be a value, not
+/// a decode failure.
+pub const Tag = enum(u8) {
+    hello = 0x01,
+    hello_ack = 0x02,
+    view_create = 0x10,
+    view_destroy = 0x11,
+    view_resize = 0x12,
+    view_show = 0x13,
+    view_hide = 0x14,
+    navigate = 0x18,
+    nav_action = 0x19,
+    input_pointer = 0x20,
+    input_scroll = 0x21,
+    input_key = 0x22,
+    input_ime = 0x23,
+    input_focus = 0x24,
+    frame_buffer = 0x30,
+    frame_damage = 0x31,
+    frame_release = 0x32,
+    ev_load = 0x40,
+    ev_load_error = 0x41,
+    ev_title = 0x42,
+    ev_favicon = 0x43,
+    ev_nav_state = 0x44,
+    ev_popup_request = 0x45,
+    ev_cursor = 0x46,
+    ev_console = 0x47,
+    ev_crashed = 0x48,
+    _,
+
+    /// Whether this build knows the frame; unknown tags are skipped.
+    pub fn known(self: Tag) bool {
+        return switch (self) {
+            _ => false,
+            else => true,
+        };
+    }
+};
+
+/// `nav_action` action byte.
+pub const NavAct = enum(u8) {
+    back = 0,
+    forward = 1,
+    reload = 2,
+    stop = 3,
+    reload_no_cache = 4,
+    _,
+};
+
+/// `input_pointer` kind byte.
+pub const PointerKind = enum(u8) { move = 0, down = 1, up = 2, leave = 3, _ };
+
+/// `input_key` kind byte.
+pub const KeyKind = enum(u8) { down = 0, up = 1, _ };
+
+/// `input_ime` kind byte.
+pub const ImeKind = enum(u8) { compose = 0, commit = 1, cancel = 2, _ };
+
+/// `ev_load` state byte.
+pub const LoadState = enum(u8) { started = 0, committed = 1, finished = 2, failed = 3 };
+
+/// `ev_popup_request` disposition byte.
+pub const Disposition = enum(u8) { new_tab = 0, new_window = 1, popup = 2 };
+
+/// `ev_cursor` cursor byte: a deliberately small CSS-cursor subset;
+/// anything else resolves to `default`.
+pub const Cursor = enum(u8) {
+    default = 0,
+    pointer = 1,
+    text = 2,
+    wait = 3,
+    crosshair = 4,
+    not_allowed = 5,
+    grab = 6,
+    grabbing = 7,
+    ew_resize = 8,
+    ns_resize = 9,
+};
+
+/// Modifier bits shared by every input frame.
+pub const mod_shift: u32 = 1;
+pub const mod_ctrl: u32 = 2;
+pub const mod_alt: u32 = 4;
+pub const mod_super: u32 = 8;
+pub const mod_capslock: u32 = 16;
+pub const mod_numlock: u32 = 32;
+
+pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
+
+// ---------------------------------------------------------------------
+// Frame payload types. Field ORDER is the wire order; every type carries
+// its tag. Slice fields borrow from the decoded payload buffer.
+// ---------------------------------------------------------------------
+
+pub const Hello = struct {
+    pub const tag: Tag = .hello;
+    proto: u32,
+    client_name: []const u8,
+};
+
+pub const HelloAck = struct {
+    pub const tag: Tag = .hello_ack;
+    proto: u32,
+    engine_name: []const u8,
+    engine_version: []const u8,
+    caps: []const []const u8,
+
+    pub fn encodeTo(self: HelloAck, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.proto);
+        try putStr(gpa, out, self.engine_name);
+        try putStr(gpa, out, self.engine_version);
+        try putU16(gpa, out, @intCast(self.caps.len));
+        for (self.caps) |cap| try putStr(gpa, out, cap);
+    }
+
+    /// Caller owns the returned `caps` slice (the strings themselves
+    /// still borrow from `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !HelloAck {
+        var cur = Cur{ .buf = payload };
+        const proto = try cur.readU32();
+        const name = try cur.readStr();
+        const ver = try cur.readStr();
+        const n = try cur.readU16();
+        const caps = try gpa.alloc([]const u8, n);
+        errdefer gpa.free(caps);
+        for (caps) |*cap| cap.* = try cur.readStr();
+        return .{ .proto = proto, .engine_name = name, .engine_version = ver, .caps = caps };
+    }
+};
+
+pub const ViewCreate = struct {
+    pub const tag: Tag = .view_create;
+    view: u32,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+    context: u32,
+};
+
+pub const ViewDestroy = struct {
+    pub const tag: Tag = .view_destroy;
+    view: u32,
+};
+
+pub const ViewResize = struct {
+    pub const tag: Tag = .view_resize;
+    view: u32,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+};
+
+pub const ViewShow = struct {
+    pub const tag: Tag = .view_show;
+    view: u32,
+};
+
+pub const ViewHide = struct {
+    pub const tag: Tag = .view_hide;
+    view: u32,
+};
+
+pub const Navigate = struct {
+    pub const tag: Tag = .navigate;
+    view: u32,
+    url: []const u8,
+};
+
+pub const NavAction = struct {
+    pub const tag: Tag = .nav_action;
+    view: u32,
+    action: u8,
+};
+
+pub const InputPointer = struct {
+    pub const tag: Tag = .input_pointer;
+    view: u32,
+    kind: u8,
+    x: i32,
+    y: i32,
+    button: u8,
+    clicks: u8,
+    mods: u32,
+};
+
+pub const InputScroll = struct {
+    pub const tag: Tag = .input_scroll;
+    view: u32,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    mods: u32,
+};
+
+pub const InputKey = struct {
+    pub const tag: Tag = .input_key;
+    view: u32,
+    kind: u8,
+    keyval: u32,
+    keycode: u32,
+    mods: u32,
+    text: []const u8,
+};
+
+pub const InputIme = struct {
+    pub const tag: Tag = .input_ime;
+    view: u32,
+    kind: u8,
+    text: []const u8,
+    cursor: i32,
+};
+
+pub const InputFocus = struct {
+    pub const tag: Tag = .input_focus;
+    view: u32,
+    focused: u8,
+};
+
+pub const FrameBuffer = struct {
+    pub const tag: Tag = .frame_buffer;
+    view: u32,
+    buf_id: u32,
+    w: u16,
+    h: u16,
+    stride: u32,
+};
+
+pub const FrameDamage = struct {
+    pub const tag: Tag = .frame_damage;
+    view: u32,
+    buf_id: u32,
+    gen: u32,
+    rects: []const Rect,
+
+    pub fn encodeTo(self: FrameDamage, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.buf_id);
+        try putU32(gpa, out, self.gen);
+        try putU16(gpa, out, @intCast(self.rects.len));
+        for (self.rects) |r| {
+            try putU16(gpa, out, r.x);
+            try putU16(gpa, out, r.y);
+            try putU16(gpa, out, r.w);
+            try putU16(gpa, out, r.h);
+        }
+    }
+
+    /// Caller owns the returned `rects` slice.
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !FrameDamage {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const buf_id = try cur.readU32();
+        const gen = try cur.readU32();
+        const n = try cur.readU16();
+        const rects = try gpa.alloc(Rect, n);
+        errdefer gpa.free(rects);
+        for (rects) |*r| {
+            r.x = try cur.readU16();
+            r.y = try cur.readU16();
+            r.w = try cur.readU16();
+            r.h = try cur.readU16();
+        }
+        return .{ .view = view, .buf_id = buf_id, .gen = gen, .rects = rects };
+    }
+};
+
+pub const FrameRelease = struct {
+    pub const tag: Tag = .frame_release;
+    view: u32,
+    buf_id: u32,
+};
+
+pub const EvLoad = struct {
+    pub const tag: Tag = .ev_load;
+    view: u32,
+    state: u8,
+    url: []const u8,
+};
+
+pub const EvLoadError = struct {
+    pub const tag: Tag = .ev_load_error;
+    view: u32,
+    code: i32,
+    url: []const u8,
+    msg: []const u8,
+};
+
+pub const EvTitle = struct {
+    pub const tag: Tag = .ev_title;
+    view: u32,
+    title: []const u8,
+};
+
+pub const EvFavicon = struct {
+    pub const tag: Tag = .ev_favicon;
+    view: u32,
+    url: []const u8,
+};
+
+pub const EvNavState = struct {
+    pub const tag: Tag = .ev_nav_state;
+    view: u32,
+    can_back: u8,
+    can_fwd: u8,
+    loading: u8,
+    url: []const u8,
+};
+
+pub const EvPopupRequest = struct {
+    pub const tag: Tag = .ev_popup_request;
+    view: u32,
+    url: []const u8,
+    disposition: u8,
+};
+
+pub const EvCursor = struct {
+    pub const tag: Tag = .ev_cursor;
+    view: u32,
+    cursor: u8,
+};
+
+pub const EvConsole = struct {
+    pub const tag: Tag = .ev_console;
+    view: u32,
+    level: u8,
+    msg: []const u8,
+};
+
+pub const EvCrashed = struct {
+    pub const tag: Tag = .ev_crashed;
+    view: u32,
+};
+
+// ---------------------------------------------------------------------
+// Primitive writers
+// ---------------------------------------------------------------------
+
+fn putU8(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u8) !void {
+    try out.append(gpa, v);
+}
+
+fn putU16(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u16) !void {
+    try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u16, v)));
+}
+
+fn putU32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
+    try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, v)));
+}
+
+fn putI32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: i32) !void {
+    try putU32(gpa, out, @bitCast(v));
+}
+
+fn putStr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    if (s.len > std.math.maxInt(u16)) return error.StringTooLong;
+    try putU16(gpa, out, @intCast(s.len));
+    try out.appendSlice(gpa, s);
+}
+
+// ---------------------------------------------------------------------
+// Primitive reader
+// ---------------------------------------------------------------------
+
+/// Payload cursor. Every accessor fails with `error.Truncated` rather
+/// than reading past the frame, so a malformed peer cannot walk memory.
+pub const Cur = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn readU8(self: *Cur) !u8 {
+        if (self.pos + 1 > self.buf.len) return error.Truncated;
+        defer self.pos += 1;
+        return self.buf[self.pos];
+    }
+
+    pub fn readU16(self: *Cur) !u16 {
+        if (self.pos + 2 > self.buf.len) return error.Truncated;
+        defer self.pos += 2;
+        return std.mem.readInt(u16, self.buf[self.pos..][0..2], .little);
+    }
+
+    pub fn readU32(self: *Cur) !u32 {
+        if (self.pos + 4 > self.buf.len) return error.Truncated;
+        defer self.pos += 4;
+        return std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
+    }
+
+    pub fn readI32(self: *Cur) !i32 {
+        return @bitCast(try self.readU32());
+    }
+
+    pub fn readStr(self: *Cur) ![]const u8 {
+        const n = try self.readU16();
+        if (self.pos + n > self.buf.len) return error.Truncated;
+        defer self.pos += n;
+        return self.buf[self.pos..][0..n];
+    }
+};
+
+// ---------------------------------------------------------------------
+// Generic frame (de)serialization
+// ---------------------------------------------------------------------
+
+/// Append one complete frame ([len:u32][tag:u8][payload]) for `value`.
+pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !void {
+    const T = @TypeOf(value);
+    const start = out.items.len;
+    try out.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
+    try putU8(gpa, out, @intFromEnum(T.tag));
+    if (@hasDecl(T, "encodeTo")) {
+        try value.encodeTo(gpa, out);
+    } else {
+        inline for (std.meta.fields(T)) |f| {
+            const v = @field(value, f.name);
+            switch (f.type) {
+                u8 => try putU8(gpa, out, v),
+                u16 => try putU16(gpa, out, v),
+                u32 => try putU32(gpa, out, v),
+                i32 => try putI32(gpa, out, v),
+                []const u8 => try putStr(gpa, out, v),
+                else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
+            }
+        }
+    }
+    const len = out.items.len - start - 4;
+    if (len > MAX_FRAME) return error.FrameTooLarge;
+    std.mem.writeInt(u32, out.items[start..][0..4], @intCast(len), .little);
+}
+
+/// Decode a payload into `T`. String fields BORROW from `payload`.
+/// Types with list fields provide `decodeAlloc` instead.
+pub fn decode(comptime T: type, payload: []const u8) !T {
+    if (@hasDecl(T, "decodeAlloc")) @compileError(@typeName(T) ++ " needs decodeAlloc");
+    var cur = Cur{ .buf = payload };
+    var out: T = undefined;
+    inline for (std.meta.fields(T)) |f| {
+        @field(out, f.name) = switch (f.type) {
+            u8 => try cur.readU8(),
+            u16 => try cur.readU16(),
+            u32 => try cur.readU32(),
+            i32 => try cur.readI32(),
+            []const u8 => try cur.readStr(),
+            else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
+        };
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------
+// Stream framing
+// ---------------------------------------------------------------------
+
+pub const Frame = struct { tag: Tag, payload: []const u8 };
+
+/// Length-prefix framer over an accumulated byte stream.
+///
+/// `next` returns null when the buffer holds no COMPLETE frame yet, and
+/// silently drops frames whose tag this build does not know (the
+/// append-only rule: a newer peer's extra frames must cost nothing).
+pub const Reader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(buf: []const u8) Reader {
+        return .{ .buf = buf };
+    }
+
+    pub fn next(self: *Reader) !?Frame {
+        while (true) {
+            if (self.pos + 4 > self.buf.len) return null;
+            const len = std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
+            if (len == 0 or len > MAX_FRAME) return error.BadFrame;
+            if (self.pos + 4 + len > self.buf.len) return null;
+            const tag: Tag = @enumFromInt(self.buf[self.pos + 4]);
+            const payload = self.buf[self.pos + 5 ..][0 .. len - 1];
+            self.pos += 4 + len;
+            if (!tag.known()) continue;
+            return .{ .tag = tag, .payload = payload };
+        }
+    }
+
+    /// Bytes consumed so far — what the caller may drop from its
+    /// accumulation buffer.
+    pub fn consumed(self: Reader) usize {
+        return self.pos;
+    }
+};
+
+// ---------------------------------------------------------------------
+// Outbox
+// ---------------------------------------------------------------------
+
+/// One queued message: encoded frame bytes plus at most one file
+/// descriptor to attach (SCM_RIGHTS, the `frames-shm` capability).
+/// Pure data — the fd is an integer here; sending it is the server's job.
+pub const Message = struct { bytes: []u8, fd: ?i32 };
+
+/// FIFO of messages awaiting transmission, with a partial-write cursor.
+///
+/// It owns the bytes and, until sent, the fd: `deinit` closes nothing,
+/// so a caller that abandons an outbox with pending fds must drain them.
+pub const Outbox = struct {
+    gpa: std.mem.Allocator,
+    queue: std.ArrayList(Message) = .empty,
+    head: usize = 0,
+    sent: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator) Outbox {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Outbox) void {
+        for (self.queue.items[self.head..]) |m| self.gpa.free(m.bytes);
+        self.queue.deinit(self.gpa);
+    }
+
+    /// Queue `value` as a frame, optionally carrying `fd`.
+    pub fn post(self: *Outbox, value: anytype, fd: ?i32) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.gpa);
+        try encode(self.gpa, &buf, value);
+        try self.queue.append(self.gpa, .{
+            .bytes = try buf.toOwnedSlice(self.gpa),
+            .fd = fd,
+        });
+    }
+
+    pub fn empty(self: *const Outbox) bool {
+        return self.head >= self.queue.items.len;
+    }
+
+    /// The unsent remainder of the front message, or null when drained.
+    pub fn front(self: *const Outbox) ?Message {
+        if (self.empty()) return null;
+        const m = self.queue.items[self.head];
+        return .{ .bytes = m.bytes[self.sent..], .fd = if (self.sent == 0) m.fd else null };
+    }
+
+    /// Record `n` bytes of the front message as written.
+    pub fn advance(self: *Outbox, n: usize) void {
+        if (self.empty()) return;
+        const m = self.queue.items[self.head];
+        self.sent += n;
+        if (self.sent < m.bytes.len) return;
+        self.gpa.free(m.bytes);
+        self.sent = 0;
+        self.head += 1;
+        if (self.empty()) {
+            self.queue.clearRetainingCapacity();
+            self.head = 0;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+fn roundTrip(comptime T: type, value: T) !void {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, value);
+
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(T.tag, frame.tag);
+    try std.testing.expectEqual(buf.items.len, r.consumed());
+    const got = try decode(T, frame.payload);
+    inline for (std.meta.fields(T)) |f| {
+        if (f.type == []const u8) {
+            try std.testing.expectEqualStrings(@field(value, f.name), @field(got, f.name));
+        } else {
+            try std.testing.expectEqual(@field(value, f.name), @field(got, f.name));
+        }
+    }
+}
+
+test "round-trip: scalar and string frames" {
+    try roundTrip(Hello, .{ .proto = 1, .client_name = "sketerm-gui" });
+    try roundTrip(ViewCreate, .{ .view = 7, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
+    try roundTrip(ViewDestroy, .{ .view = 7 });
+    try roundTrip(ViewResize, .{ .view = 7, .w = 1024, .h = 768, .scale_x1000 = 1500 });
+    try roundTrip(ViewShow, .{ .view = 7 });
+    try roundTrip(ViewHide, .{ .view = 7 });
+    try roundTrip(Navigate, .{ .view = 7, .url = "https://example.com/" });
+    try roundTrip(NavAction, .{ .view = 7, .action = 2 });
+    try roundTrip(InputPointer, .{
+        .view = 7,
+        .kind = 1,
+        .x = -3,
+        .y = 400,
+        .button = 0,
+        .clicks = 2,
+        .mods = mod_ctrl | mod_shift,
+    });
+    try roundTrip(InputScroll, .{ .view = 7, .x = 10, .y = 20, .dx = 0, .dy = -120, .mods = 0 });
+    try roundTrip(InputKey, .{
+        .view = 7,
+        .kind = 0,
+        .keyval = 0xff0d,
+        .keycode = 36,
+        .mods = 0,
+        .text = "",
+    });
+    try roundTrip(InputIme, .{ .view = 7, .kind = 1, .text = "ê", .cursor = 1 });
+    try roundTrip(InputFocus, .{ .view = 7, .focused = 1 });
+    try roundTrip(FrameBuffer, .{ .view = 7, .buf_id = 3, .w = 800, .h = 600, .stride = 3200 });
+    try roundTrip(FrameRelease, .{ .view = 7, .buf_id = 2 });
+    try roundTrip(EvLoad, .{ .view = 7, .state = 2, .url = "about:blank" });
+    try roundTrip(EvLoadError, .{ .view = 7, .code = -105, .url = "http://x/", .msg = "NAME_NOT_RESOLVED" });
+    try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });
+    try roundTrip(EvFavicon, .{ .view = 7, .url = "http://x/favicon.ico" });
+    try roundTrip(EvNavState, .{ .view = 7, .can_back = 1, .can_fwd = 0, .loading = 0, .url = "http://x/" });
+    try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 0 });
+    try roundTrip(EvCursor, .{ .view = 7, .cursor = 1 });
+    try roundTrip(EvConsole, .{ .view = 7, .level = 2, .msg = "boom" });
+    try roundTrip(EvCrashed, .{ .view = 7 });
+}
+
+test "round-trip: hello_ack capability list" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const caps = [_][]const u8{ CAP_FRAMES_SHM, CAP_INPUT, CAP_NAVIGATION };
+    try encode(gpa, &buf, HelloAck{
+        .proto = PROTO_VERSION,
+        .engine_name = "cef",
+        .engine_version = "151",
+        .caps = &caps,
+    });
+
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.hello_ack, frame.tag);
+    const got = try HelloAck.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.caps);
+    try std.testing.expectEqual(PROTO_VERSION, got.proto);
+    try std.testing.expectEqualStrings("cef", got.engine_name);
+    try std.testing.expectEqualStrings("151", got.engine_version);
+    try std.testing.expectEqual(@as(usize, 3), got.caps.len);
+    try std.testing.expectEqualStrings(CAP_INPUT, got.caps[1]);
+}
+
+test "round-trip: frame_damage rect list" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const rects = [_]Rect{ .{ .x = 0, .y = 0, .w = 800, .h = 600 }, .{ .x = 4, .y = 8, .w = 16, .h = 32 } };
+    try encode(gpa, &buf, FrameDamage{ .view = 1, .buf_id = 5, .gen = 42, .rects = &rects });
+
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    const got = try FrameDamage.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.rects);
+    try std.testing.expectEqual(@as(u32, 42), got.gen);
+    try std.testing.expectEqual(@as(usize, 2), got.rects.len);
+    try std.testing.expectEqual(@as(u16, 32), got.rects[1].h);
+}
+
+test "reader skips unknown tags" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, EvTitle{ .view = 1, .title = "a" });
+    // A frame from a newer peer: reserved semantic-layer block.
+    try buf.appendSlice(gpa, &[_]u8{ 3, 0, 0, 0, 0x60, 0xAA, 0xBB });
+    try encode(gpa, &buf, EvCrashed{ .view = 2 });
+
+    var r = Reader.init(buf.items);
+    const first = (try r.next()).?;
+    try std.testing.expectEqual(Tag.ev_title, first.tag);
+    const second = (try r.next()).?;
+    try std.testing.expectEqual(Tag.ev_crashed, second.tag);
+    try std.testing.expectEqual(@as(u32, 2), (try decode(EvCrashed, second.payload)).view);
+    try std.testing.expectEqual(@as(?Frame, null), try r.next());
+    try std.testing.expectEqual(buf.items.len, r.consumed());
+}
+
+test "reader holds back partial frames" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, Navigate{ .view = 1, .url = "https://example.com/" });
+
+    // Every prefix short of the whole frame yields nothing and consumes
+    // nothing, so the caller keeps accumulating.
+    var cut: usize = 0;
+    while (cut < buf.items.len) : (cut += 1) {
+        var r = Reader.init(buf.items[0..cut]);
+        try std.testing.expectEqual(@as(?Frame, null), try r.next());
+        try std.testing.expectEqual(@as(usize, 0), r.consumed());
+    }
+    var full = Reader.init(buf.items);
+    try std.testing.expect((try full.next()) != null);
+}
+
+test "truncated payload is an error, not a read past the frame" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, Navigate{ .view = 1, .url = "https://example.com/" });
+    // Claim a 4-byte payload for a frame that needs far more.
+    var short: [9]u8 = undefined;
+    std.mem.writeInt(u32, short[0..4], 5, .little);
+    short[4] = @intFromEnum(Tag.navigate);
+    @memcpy(short[5..9], buf.items[9..13]);
+    var r = Reader.init(&short);
+    const frame = (try r.next()).?;
+    try std.testing.expectError(error.Truncated, decode(Navigate, frame.payload));
+
+    var bad = Reader.init(&[_]u8{ 0, 0, 0, 0, 1 });
+    try std.testing.expectError(error.BadFrame, bad.next());
+}
+
+test "outbox drains in order with partial writes" {
+    const gpa = std.testing.allocator;
+    var ob = Outbox.init(gpa);
+    defer ob.deinit();
+    try ob.post(EvTitle{ .view = 1, .title = "one" }, null);
+    try ob.post(EvCrashed{ .view = 2 }, 7);
+    try std.testing.expect(!ob.empty());
+
+    const first = ob.front().?;
+    try std.testing.expectEqual(@as(?i32, null), first.fd);
+    ob.advance(1);
+    try std.testing.expectEqual(first.bytes.len - 1, ob.front().?.bytes.len);
+    ob.advance(first.bytes.len - 1);
+
+    const second = ob.front().?;
+    try std.testing.expectEqual(@as(?i32, 7), second.fd);
+    ob.advance(second.bytes.len);
+    try std.testing.expect(ob.empty());
+}

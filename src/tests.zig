@@ -17,6 +17,11 @@ comptime {
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/clock.zig");
+    // sketerm-web protocol + keymap: pure std, no CEF — the helper
+    // itself is opt-in (`zig build web`) but its wire format and key
+    // mapping are testable everywhere.
+    _ = @import("web/protocol.zig");
+    _ = @import("web/keymap.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");
