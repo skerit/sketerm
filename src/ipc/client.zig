@@ -573,6 +573,10 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         // "multiple instances" (or worse, pick it) just because a file
         // browser is open. Reachable with an explicit --socket.
         if (std.mem.startsWith(u8, name, @import("server.zig").FILES_SOCKET_PREFIX)) continue;
+        // The browser helper binds here too and speaks the browser
+        // protocol; counting it made a bare `sketerm cli` fail with
+        // "multiple instances" whenever a web tab was open.
+        if (std.mem.startsWith(u8, name, @import("server.zig").WEB_SOCKET_PREFIX)) continue;
         const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch return null;
         // A GUI crash (SIGSEGV) orphans its socket file — counting it
         // would wrongly trip "multiple instances". Only a socket with a

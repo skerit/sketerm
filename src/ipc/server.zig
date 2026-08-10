@@ -45,6 +45,13 @@ pub fn defaultSocketPath(allocator: std.mem.Allocator, files_identity: bool) ![:
 /// client.zig's discovery so the two can never disagree.
 pub const FILES_SOCKET_PREFIX = "files-";
 
+/// Socket-name prefix of the `sketerm-webengine` helper, which binds
+/// in the SAME directory (see `webface.zig makeSocketPath`). It speaks
+/// the browser protocol, not the remote-control one, so discovery must
+/// skip it exactly as it skips `mux.sock` — otherwise having a browser
+/// tab open makes every bare `sketerm cli` answer "multiple instances".
+pub const WEB_SOCKET_PREFIX = "web-";
+
 /// Create the socket dir (0700), bind, and start listening. The
 /// returned Server owns `path`.
 pub fn start(
