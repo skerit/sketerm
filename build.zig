@@ -1030,16 +1030,19 @@ fn addCef(
     fetch_step.dependOn(&fetch.step);
 
     const web_step = b.step("web", "Build sketerm-web, the CEF browser helper (needs `zig build fetch-cef`)");
+    const smoke_web_step = b.step("smoke-web", "sketerm-web browser-helper end-to-end smoke (headless)");
 
     const have_cef = blk: {
         std.Io.Dir.accessAbsolute(b.graph.io, release_dir, .{}) catch break :blk false;
         break :blk true;
     };
     if (!have_cef) {
-        web_step.dependOn(&b.addFail(b.fmt(
+        const missing = b.addFail(b.fmt(
             "no CEF binary distribution at {s} — run `zig build fetch-cef` (or pass -Dcef-root=<path>)",
             .{cef_root},
-        )).step);
+        ));
+        web_step.dependOn(&missing.step);
+        smoke_web_step.dependOn(&missing.step);
         return;
     }
 
@@ -1097,6 +1100,27 @@ fn addCef(
     // Installed by the `web` step only — never by `b.installArtifact`,
     // which would drag CEF into the default build.
     web_step.dependOn(&b.addInstallArtifact(web_exe, .{}).step);
+
+    // Browser-helper smoke — `zig build smoke-web` (headless). Spawns
+    // the helper on a private short socket and drives the v1 protocol
+    // as a client: handshake, memfd paint, trusted click, typing,
+    // resize, popup request, history, clean shutdown. CEF-gated like
+    // everything else here, and never reachable from the default step.
+    const smoke_web_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_web.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_web_mod.addImport("cbindings", core_cbindings_mod);
+    const smoke_web = b.addExecutable(.{
+        .name = "sketerm-smoke-web",
+        .root_module = smoke_web_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_web_run = b.addRunArtifact(smoke_web);
+    smoke_web_run.addArtifactArg(web_exe);
+    smoke_web_step.dependOn(&smoke_web_run.step);
 }
 
 /// Set up the out-of-process TranslateC step that turns
