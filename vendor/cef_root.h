@@ -21,4 +21,11 @@
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_request_context_capi.h"
 #include "include/capi/cef_values_capi.h"
+// Semantic layer: the render-process side runs in the SAME binary (CEF
+// re-execs it as its own renderer subprocess), so the V8 and
+// process-message APIs belong to this translation unit too.
+#include "include/capi/cef_render_process_handler_capi.h"
+#include "include/capi/cef_process_message_capi.h"
+#include "include/capi/cef_v8_capi.h"
+#include "include/capi/cef_frame_capi.h"
 #include "include/cef_version.h"

@@ -4,7 +4,10 @@
 //! helper on a short private socket with an isolated cache dir and
 //! drives it through: handshake, painting into a memfd, a trusted
 //! click, keyboard text entry, resize (new buffer), popup requests,
-//! back/forward navigation state, and a clean shutdown on disconnect.
+//! back/forward navigation state, the whole semantic layer (snapshot
+//! with stable ids, mutation delta, trusted sem_act click, expand,
+//! cross-navigation id carrying, reader extraction, query) and a clean
+//! shutdown on disconnect.
 //!
 //! Headless by construction: the helper runs CEF with
 //! `--ozone-platform=headless`, so no display is needed. No network is
@@ -35,6 +38,40 @@ const popup_page =
     "data:text/html,<body%20style=%22margin:0%22>" ++
     "<div%20style=%22width:100vw;height:100vh%22%20" ++
     "onclick=%22window.open('https://example.invalid/x')%22></div></body>";
+
+/// Long enough to be clamped at detail=1 (160 chars) so the truncation
+/// marker and `sem_expand` have something to work on.
+const long_text =
+    "Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu " ++
+    "nu xi omicron pi rho sigma tau upsilon phi chi psi omega and then " ++
+    "some more filler so that the clamp certainly bites before the end " ++
+    "of this paragraph is reached ENDOFLONG";
+
+/// A small form: heading, nav, labelled field, button that mutates one
+/// paragraph and reports whether its click was trusted.
+const form_page =
+    "data:text/html,<html><body>" ++
+    "<h1>Semantic Form</h1>" ++
+    "<nav><a href=%23a>Alpha</a><a href=%23b>Beta</a><a href=%23c>Gamma</a></nav>" ++
+    "<form><label for=n>Name</label><input id=n>" ++
+    "<button id=go onclick=\"document.title='clicked:trusted='+event.isTrusted;" ++
+    "document.getElementById('lbl').textContent='after'\">Go</button></form>" ++
+    "<p id=lbl>before</p><p id=long>" ++ long_text ++ "</p></body></html>";
+
+/// Two pages sharing a byte-identical nav block: the cross-navigation
+/// fingerprint match must carry that block's ids.
+const shared_nav =
+    "<nav><a href=%23one>One</a><a href=%23two>Two</a><a href=%23three>Three</a>" ++
+    "<a href=%23four>Four</a><a href=%23five>Five</a><a href=%23six>Six</a></nav>";
+const nav_page_a = "data:text/html,<html><body>" ++ shared_nav ++ "<h1>Alpha Page</h1></body></html>";
+const nav_page_b = "data:text/html,<html><body>" ++ shared_nav ++ "<h1>Beta Page</h1></body></html>";
+
+const article_page =
+    "data:text/html,<html><head><title>Journal</title></head><body>" ++
+    "<nav><a href=%23x>Nav One</a><a href=%23y>Nav Two</a></nav>" ++
+    "<article><h1>Article Heading</h1><p>" ++ long_text ++ "</p>" ++
+    "<p>A second paragraph so the extractor has real text density.</p></article>" ++
+    "</body></html>";
 
 // Cleanup state: `fail` may fire from anywhere, and the helper must
 // never be left running nor the temp dir behind. Killed by EXACT pid.
@@ -106,6 +143,7 @@ const Client = struct {
 
     ack_proto: u32 = 0,
     ack_shm: bool = false,
+    ack_semantic: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -125,6 +163,35 @@ const Client = struct {
     nav_back: u8 = 0,
     nav_fwd: u8 = 0,
     nav_seq: u32 = 0,
+
+    // Semantic layer. `sem_log` accumulates every payload since the
+    // last reset (snapshots arrive unsolicited too, from the mutation
+    // observer), while `sem_last` is the most recent one on its own —
+    // which is what a "and NOT the siblings" assertion needs.
+    sem_log: [64 * 1024]u8 = @splat(0),
+    sem_log_len: usize = 0,
+    sem_last: [16 * 1024]u8 = @splat(0),
+    sem_last_len: usize = 0,
+    sem_kind: u8 = 0,
+    sem_seq: u32 = 0,
+
+    act_id: u32 = 0,
+    act_ok: u8 = 0,
+    act_seq: u32 = 0,
+    act_msg: [512]u8 = @splat(0),
+    act_msg_len: usize = 0,
+
+    exp_text: [8192]u8 = @splat(0),
+    exp_len: usize = 0,
+    exp_seq: u32 = 0,
+
+    md: [32 * 1024]u8 = @splat(0),
+    md_len: usize = 0,
+    md_seq: u32 = 0,
+
+    query_out: [16 * 1024]u8 = @splat(0),
+    query_len: usize = 0,
+    query_seq: u32 = 0,
 
     fn deinit(self: *Client) void {
         self.unmap();
@@ -228,6 +295,7 @@ const Client = struct {
                 self.ack_proto = ack.proto;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
                 }
             },
             .frame_buffer => {
@@ -255,6 +323,43 @@ const Client = struct {
                 self.popup_view = p.view;
                 self.popup_len = @min(p.url.len, self.popup_url.len);
                 @memcpy(self.popup_url[0..self.popup_len], p.url[0..self.popup_len]);
+            },
+            .sem_snapshot => {
+                const s = proto.decode(proto.SemSnapshot, frame.payload) catch fail("sem_snapshot decode");
+                self.sem_kind = s.kind;
+                self.sem_last_len = @min(s.payload.s.len, self.sem_last.len);
+                @memcpy(self.sem_last[0..self.sem_last_len], s.payload.s[0..self.sem_last_len]);
+                const room = self.sem_log.len - self.sem_log_len;
+                const n = @min(s.payload.s.len, room);
+                @memcpy(self.sem_log[self.sem_log_len..][0..n], s.payload.s[0..n]);
+                self.sem_log_len += n;
+                self.sem_seq += 1;
+            },
+            .sem_act_result => {
+                const r = proto.decode(proto.SemActResult, frame.payload) catch fail("sem_act_result decode");
+                self.act_id = r.id;
+                self.act_ok = r.ok;
+                self.act_msg_len = @min(r.msg.len, self.act_msg.len);
+                @memcpy(self.act_msg[0..self.act_msg_len], r.msg[0..self.act_msg_len]);
+                self.act_seq += 1;
+            },
+            .sem_expand_result => {
+                const e = proto.decode(proto.SemExpandResult, frame.payload) catch fail("sem_expand_result decode");
+                self.exp_len = @min(e.text.len, self.exp_text.len);
+                @memcpy(self.exp_text[0..self.exp_len], e.text[0..self.exp_len]);
+                self.exp_seq += 1;
+            },
+            .sem_query_result => {
+                const q = proto.decode(proto.SemQueryResult, frame.payload) catch fail("sem_query_result decode");
+                self.query_len = @min(q.payload.s.len, self.query_out.len);
+                @memcpy(self.query_out[0..self.query_len], q.payload.s[0..self.query_len]);
+                self.query_seq += 1;
+            },
+            .sem_read_result => {
+                const r = proto.decode(proto.SemReadResult, frame.payload) catch fail("sem_read_result decode");
+                self.md_len = @min(r.markdown.s.len, self.md.len);
+                @memcpy(self.md[0..self.md_len], r.markdown.s[0..self.md_len]);
+                self.md_seq += 1;
             },
             .ev_nav_state => {
                 const s = proto.decode(proto.EvNavState, frame.payload) catch fail("ev_nav_state decode");
@@ -375,6 +480,72 @@ const Client = struct {
     fn typeKey(self: *Client, keysym: u32, text: []const u8) void {
         self.send(proto.InputKey{ .view = view_id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = keysym, .keycode = 0, .mods = 0, .text = text });
         self.send(proto.InputKey{ .view = view_id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = keysym, .keycode = 0, .mods = 0, .text = "" });
+    }
+
+    fn resetSem(self: *Client) void {
+        self.sem_log_len = 0;
+        self.sem_last_len = 0;
+    }
+
+    fn semLog(self: *Client) []const u8 {
+        return self.sem_log[0..self.sem_log_len];
+    }
+
+    fn semLast(self: *Client) []const u8 {
+        return self.sem_last[0..self.sem_last_len];
+    }
+
+    fn queryPayload(self: *Client) []const u8 {
+        return self.query_out[0..self.query_len];
+    }
+
+    /// Wait until some snapshot payload received since the last reset
+    /// contains `needle`.
+    fn waitSem(self: *Client, needle: []const u8, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (std.mem.indexOf(u8, self.semLog(), needle) != null) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
+    }
+
+    fn waitSeq(self: *Client, which: *u32, seq: u32, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (which.* > seq) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
+    }
+
+    /// Stable id of the node whose rendered line contains `needle`.
+    fn idOfLine(self: *Client, needle: []const u8) ?u32 {
+        const hay = self.semLog();
+        const at = std.mem.indexOf(u8, hay, needle) orelse return null;
+        var i = at;
+        while (i > 0) : (i -= 1) {
+            if (hay[i] == '[') break;
+        }
+        if (hay[i] != '[') return null;
+        const end = std.mem.indexOfScalarPos(u8, hay, i, ']') orelse return null;
+        return std.fmt.parseInt(u32, hay[i + 1 .. end], 10) catch null;
+    }
+
+    /// Stable id named by a truncation marker, i.e. `expand [N]`.
+    fn idOfExpandMarker(self: *Client) ?u32 {
+        const hay = self.semLog();
+        const at = std.mem.indexOf(u8, hay, "chars, expand [") orelse return null;
+        const open = at + "chars, expand [".len;
+        const end = std.mem.indexOfScalarPos(u8, hay, open, ']') orelse return null;
+        return std.fmt.parseInt(u32, hay[open..end], 10) catch null;
+    }
+
+    /// Ask for a snapshot and wait for the payload it produces.
+    fn snapshot(self: *Client, mode: u8, detail: u8) void {
+        const seq = self.sem_seq;
+        self.send(proto.SemSnapshotReq{ .view = view_id, .mode = mode, .detail = detail, .scope = 0 });
+        if (!self.waitSeq(&self.sem_seq, seq, 20_000)) fail("no sem_snapshot for the request");
     }
 
     /// Navigate and wait for the paint that follows.
@@ -520,7 +691,144 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (!cl.waitCanForward(20_000)) fail("stage 7 nav_action: no ev_nav_state with can_fwd=1 after going back");
     pass("stage 7 nav_action back");
 
-    // ── Stage 8: teardown ─────────────────────────────────────────
+    // ── Stage 8: semantic snapshot, ids stable across two requests ─
+    if (!cl.ack_semantic) fail("stage 8 semantic: hello_ack lacks the semantic capability");
+    cl.navigate(form_page);
+    cl.resetSem();
+    cl.snapshot(1, 1);
+    {
+        const want = [_][]const u8{
+            "heading \"Semantic Form\"",
+            "link \"Alpha\"",
+            "textbox \"Name\"",
+            "button \"Go\"",
+        };
+        for (want) |needle| {
+            if (!cl.waitSem(needle, 20_000)) {
+                std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+                fail("stage 8 semantic: the snapshot is missing an expected node");
+            }
+        }
+    }
+    const go_id = cl.idOfLine("button \"Go\"") orelse fail("stage 8 semantic: no id on the button line");
+    const lbl_id = cl.idOfLine("paragraph \"before\"") orelse fail("stage 8 semantic: no id on the label line");
+    const long_id = cl.idOfExpandMarker() orelse fail("stage 8 semantic: the long paragraph was not truncated");
+    {
+        // A second FULL snapshot must reuse the same ids.
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        if (!cl.waitSem("button \"Go\"", 20_000)) fail("stage 8 semantic: no second snapshot");
+        const again = cl.idOfLine("button \"Go\"") orelse fail("stage 8 semantic: no id on the second button line");
+        if (again != go_id) fail("stage 8 semantic: the button's stable id changed between snapshots");
+    }
+    pass("stage 8 semantic snapshot (roles, names, stable ids)");
+
+    // ── Stage 9: trusted sem_act click and the delta it causes ─────
+    cl.resetTitle();
+    cl.resetSem();
+    {
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{
+            .view = view_id,
+            .id = go_id,
+            .action = @intFromEnum(proto.SemAct.click),
+            .arg = "",
+        });
+        if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 9 sem_act: no sem_act_result");
+        if (cl.act_ok != 1 or cl.act_id != go_id) fail("stage 9 sem_act: the act failed");
+        if (!cl.waitTitle("clicked:trusted=true", 15_000)) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 9 sem_act: the click was not trusted");
+        }
+    }
+    if (!cl.waitSem("~ [", 20_000)) fail("stage 9 delta: no changed-node line arrived");
+    if (!cl.waitSem("after", 20_000)) fail("stage 9 delta: the changed label is missing");
+    {
+        var mark: [64]u8 = undefined;
+        const changed = std.fmt.bufPrint(&mark, "~ [{d}]", .{lbl_id}) catch fail("bufPrint");
+        if (std.mem.indexOf(u8, cl.semLog(), changed) == null) {
+            std.debug.print("smoke-web: delta was:\n{s}\n", .{cl.semLog()});
+            fail("stage 9 delta: the label's own id is not marked changed");
+        }
+        if (cl.sem_kind != @intFromEnum(proto.SnapKind.delta)) fail("stage 9 delta: the snapshot was not a delta");
+        if (std.mem.indexOf(u8, cl.semLast(), "Semantic Form") != null) {
+            std.debug.print("smoke-web: delta was:\n{s}\n", .{cl.semLast()});
+            fail("stage 9 delta: unchanged siblings leaked into the delta");
+        }
+    }
+    pass("stage 9 sem_act trusted click + delta");
+
+    // ── Stage 10: expand a truncated paragraph ─────────────────────
+    {
+        const seq = cl.exp_seq;
+        cl.send(proto.SemExpand{ .view = view_id, .id = long_id, .off = 0, .len = 4096 });
+        if (!cl.waitSeq(&cl.exp_seq, seq, 20_000)) fail("stage 10 sem_expand: no sem_expand_result");
+        const text = cl.exp_text[0..cl.exp_len];
+        if (std.mem.indexOf(u8, text, "ENDOFLONG") == null) {
+            std.debug.print("smoke-web: expand returned \"{s}\"\n", .{text});
+            fail("stage 10 sem_expand: the expansion did not reach the end of the paragraph");
+        }
+    }
+    pass("stage 10 sem_expand");
+
+    // ── Stage 11: cross-navigation id carrying ─────────────────────
+    cl.navigate(nav_page_a);
+    cl.resetSem();
+    cl.snapshot(1, 1);
+    if (!cl.waitSem("link \"Three\"", 20_000)) fail("stage 11 cross-nav: no snapshot of the first page");
+    const three_id = cl.idOfLine("link \"Three\"") orelse fail("stage 11 cross-nav: no id for a nav link");
+    cl.resetSem();
+    cl.navigate(nav_page_b);
+    if (!cl.waitSem("carried [", 20_000)) {
+        std.debug.print("smoke-web: post-navigation payload was:\n{s}\n", .{cl.semLog()});
+        fail("stage 11 cross-nav: the navigation did not carry any ids");
+    }
+    cl.resetSem();
+    cl.snapshot(1, 1);
+    if (!cl.waitSem("link \"Three\"", 20_000)) fail("stage 11 cross-nav: no snapshot of the second page");
+    {
+        const carried = cl.idOfLine("link \"Three\"") orelse fail("stage 11 cross-nav: no id after the navigation");
+        if (carried != three_id) fail("stage 11 cross-nav: the shared nav link did not keep its id");
+    }
+    pass("stage 11 cross-navigation id carrying");
+
+    // ── Stage 12: reader-mode extraction ───────────────────────────
+    cl.navigate(article_page);
+    {
+        const seq = cl.md_seq;
+        cl.send(proto.SemRead{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 12 sem_read: no sem_read_result");
+        const markdown = cl.md[0..cl.md_len];
+        if (std.mem.indexOf(u8, markdown, "# Article Heading") == null) {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12 sem_read: the article heading is missing from the markdown");
+        }
+        if (std.mem.indexOf(u8, markdown, "second paragraph") == null) {
+            fail("stage 12 sem_read: the article body is missing from the markdown");
+        }
+    }
+    pass("stage 12 sem_read");
+
+    // ── Stage 13: query the shadow tree ────────────────────────────
+    // (covered by unit tests too; here it proves the frame round-trips)
+    {
+        cl.resetSem();
+        cl.snapshot(1, 1);
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{
+            .view = view_id,
+            .kind = @intFromEnum(proto.SemQuery.find_text),
+            .arg = "Article",
+        });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 13 sem_query: no sem_query_result");
+        if (std.mem.indexOf(u8, cl.queryPayload(), "Article Heading") == null) {
+            std.debug.print("smoke-web: query result was:\n{s}\n", .{cl.queryPayload()});
+            fail("stage 13 sem_query: the heading was not found in the shadow tree");
+        }
+    }
+    pass("stage 13 sem_query");
+
+    // ── Stage 14: teardown ────────────────────────────────────────
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -534,11 +842,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             _ = c.usleep(50_000);
         }
-        if (!gone) fail("stage 8 teardown: helper did not exit within 10s of the disconnect");
+        if (!gone) fail("stage 14 teardown: helper did not exit within 10s of the disconnect");
         g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 8 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 8 teardown: helper exited nonzero");
-        pass("stage 8 teardown (helper exited 0 on disconnect)");
+        if (status & 0x7f != 0) fail("stage 14 teardown: helper died on a signal");
+        if ((status >> 8) & 0xff != 0) fail("stage 14 teardown: helper exited nonzero");
+        pass("stage 14 teardown (helper exited 0 on disconnect)");
     }
 
     cleanup();

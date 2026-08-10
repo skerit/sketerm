@@ -17,12 +17,45 @@
 //! may never free; it is NOT a general pattern. Objects CEF hands US
 //! (browser, host, frame) are returned with a reference held, and every
 //! one of them is released here after use.
+//!
+//! SEMANTIC LAYER PROCESS FLOW: `sketerm-web` is also its own CEF
+//! RENDERER subprocess (cef_execute_process re-enters this binary), so
+//! the render-process half lives in this file too and is reached only
+//! through `app.get_render_process_handler`. A command travels
+//!   browser: Host.sendScript -> frame.execute_java_script ->
+//!            window.__sketermSem.cmd(json)
+//! and a reply travels back
+//!   render : semantic.js -> __sketermSemPost(json) -> onSemPost
+//!            (the V8 extension's native binding) ->
+//!            frame.send_process_message(PID_BROWSER)
+//!   browser: onProcessMessage -> Host.onScriptMessage -> semantic.zig.
+//! Only the REPLY direction needs a process message, because
+//! `execute_java_script` already works browser-side. Both halves are
+//! single-threaded within their own process; nothing is shared between
+//! them but the JSON strings.
 
 const std = @import("std");
 const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const keymap = @import("keymap.zig");
+const semantic = @import("semantic.zig");
+
+/// The content script, injected into every document of every view.
+const semantic_js = @embedFile("semantic.js");
+
+/// The V8 extension that publishes the script's ONLY native binding: a
+/// plain global function (no `window` — see `onWebKitInitialized`).
+const sem_bridge_js =
+    \\function __sketermSemPost(json) {
+    \\  native function semPost();
+    \\  return semPost(json);
+    \\}
+;
+
+/// Process-message name carrying a script REPLY (render -> browser);
+/// the payload is always a single JSON string argument.
+const sem_msg = "sketerm.sem";
 
 // The event-flag values keymap.zig hardcodes to stay CEF-free.
 comptime {
@@ -44,6 +77,10 @@ const MFD_CLOEXEC: c_uint = 1;
 /// Cap on damage rects forwarded per paint; beyond it a single
 /// full-view rect is cheaper than the bookkeeping.
 const max_rects = 32;
+
+/// `sem_expand_result` carries a `str`, so one expand cannot exceed
+/// what a u16 length can describe.
+const max_expand: u32 = 60_000;
 
 // ---------------------------------------------------------------------
 // Per-view state
@@ -69,9 +106,39 @@ pub const View = struct {
     /// Last address CEF reported, owned; the `ev_nav_state` payload.
     url: []u8 = &.{},
 
+    /// Semantic-layer state: the shadow tree plus the requests waiting
+    /// on a reply from the injected script.
+    sem: semantic.View = undefined,
+    /// Set once the client asked for a snapshot; from then on mutation
+    /// batches keep arriving and turn into unsolicited deltas.
+    sem_observing: bool = false,
+    /// Detail level of the last request, replayed after a navigation.
+    sem_detail: u8 = 1,
+    sem_next_req: u32 = 1,
+    pending: std.ArrayList(Pending) = .empty,
+
     fn stride(self: *const View) u32 {
         return @as(u32, self.w) * 4;
     }
+};
+
+/// One in-flight round trip to the injected script.
+///
+/// Actions are multi-step on purpose: a click first asks the script
+/// where the element IS, and the click itself is then synthesized
+/// through the ordinary input path so the page sees `isTrusted`.
+const Pending = struct {
+    req: u32,
+    kind: Kind,
+    sid: u32 = 0,
+    mode: u8 = 0,
+    detail: u8 = 0,
+    scope: u32 = 0,
+    /// Owned copy of a `sem_act` argument (the text to type).
+    arg: []u8 = &.{},
+    off: u32 = 0,
+
+    const Kind = enum { snapshot, click, hover, act, set_value, commit, expand, read };
 };
 
 // ---------------------------------------------------------------------
@@ -136,6 +203,7 @@ pub const Host = struct {
             .w = @max(req.w, 1),
             .h = @max(req.h, 1),
             .scale_x1000 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000,
+            .sem = semantic.View.init(self.gpa),
         };
         try self.views.append(self.gpa, v);
         errdefer _ = self.views.pop();
@@ -195,6 +263,11 @@ pub const Host = struct {
         if (v.browser) |b| release(&b.base);
         if (v.map.len != 0) _ = c.munmap(v.map.ptr, v.map.len);
         if (v.url.len != 0) self.gpa.free(v.url);
+        for (v.pending.items) |p| {
+            if (p.arg.len != 0) self.gpa.free(p.arg);
+        }
+        v.pending.deinit(self.gpa);
+        v.sem.deinit();
         self.gpa.destroy(v);
     }
 
@@ -401,6 +474,312 @@ pub const Host = struct {
         withHostArgs(v, setFocus, .{@as(c_int, if (req.focused != 0) 1 else 0)});
     }
 
+    // -- semantic layer ------------------------------------------------
+
+    /// Hand one JSON command to the view's main frame, as a call into
+    /// `window.__sketermSem.cmd`.
+    ///
+    /// `execute_java_script` works straight from the browser process
+    /// (CEF routes it to the frame's renderer), which is why the
+    /// command direction needs no process message and no V8 call at
+    /// all — only the REPLY direction does.
+    fn sendScript(self: *Host, v: *View, json: []const u8) void {
+        const b = v.browser orelse return;
+        const gf = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = gf(b) orelse return;
+        defer release(&frame.base);
+        var code: std.Io.Writer.Allocating = .init(self.gpa);
+        defer code.deinit();
+        code.writer.writeAll("window.__sketermSem&&window.__sketermSem.cmd(") catch return;
+        jsonStr(&code.writer, json) catch return;
+        code.writer.writeByte(')') catch return;
+        runJs(frame, code.written());
+    }
+
+    /// Queue a request; the oldest is dropped when a page stops
+    /// answering, so a dead script cannot grow the list without bound.
+    fn pushPending(self: *Host, v: *View, p: Pending) !u32 {
+        if (v.pending.items.len >= 32) {
+            const old = v.pending.orderedRemove(0);
+            if (old.arg.len != 0) self.gpa.free(old.arg);
+        }
+        try v.pending.append(self.gpa, p);
+        return p.req;
+    }
+
+    fn takePending(self: *Host, v: *View, req: u32) ?Pending {
+        _ = self;
+        if (req == 0) return null;
+        for (v.pending.items, 0..) |p, i| {
+            if (p.req == req) return v.pending.orderedRemove(i);
+        }
+        return null;
+    }
+
+    fn nextReq(v: *View) u32 {
+        const r = v.sem_next_req;
+        v.sem_next_req +%= 1;
+        if (v.sem_next_req == 0) v.sem_next_req = 1;
+        return r;
+    }
+
+    pub fn semSnapshot(self: *Host, req: proto.SemSnapshotReq) !void {
+        const v = self.find(req.view) orelse return;
+        v.sem_detail = req.detail;
+        const rid = try self.pushPending(v, .{
+            .req = nextReq(v),
+            .kind = .snapshot,
+            .mode = req.mode,
+            .detail = req.detail,
+            .scope = req.scope,
+        });
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(
+            &buf,
+            "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
+            .{ rid, req.detail },
+        ) catch return;
+        self.sendScript(v, cmd);
+        if (!v.sem_observing) {
+            v.sem_observing = true;
+            self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
+        }
+    }
+
+    pub fn semAct(self: *Host, req: proto.SemAction) !void {
+        const v = self.find(req.view) orelse return;
+        const eid = v.sem.eidFor(req.id);
+        if (eid == 0) {
+            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "unknown id" });
+            return;
+        }
+        var buf: [512]u8 = undefined;
+        switch (@as(proto.SemAct, @enumFromInt(req.action))) {
+            .click, .hover => {
+                const kind: Pending.Kind = if (req.action == @intFromEnum(proto.SemAct.click)) .click else .hover;
+                const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = kind, .sid = req.id });
+                const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"locate\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
+                self.sendScript(v, cmd);
+            },
+            .focus, .scroll_into_view => {
+                const what = if (req.action == @intFromEnum(proto.SemAct.focus)) "focus" else "scroll";
+                const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .act, .sid = req.id });
+                const cmd = std.fmt.bufPrint(
+                    &buf,
+                    "{{\"op\":\"act\",\"req\":{d},\"eid\":{d},\"action\":\"{s}\"}}",
+                    .{ rid, eid, what },
+                ) catch return;
+                self.sendScript(v, cmd);
+            },
+            .set_value => {
+                const arg = try self.gpa.dupe(u8, req.arg);
+                errdefer self.gpa.free(arg);
+                const rid = try self.pushPending(v, .{
+                    .req = nextReq(v),
+                    .kind = .set_value,
+                    .sid = req.id,
+                    .arg = arg,
+                });
+                var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+                defer cmd.deinit();
+                cmd.writer.print("{{\"op\":\"setvalue\",\"req\":{d},\"eid\":{d},\"arg\":", .{ rid, eid }) catch return;
+                jsonStr(&cmd.writer, req.arg) catch return;
+                cmd.writer.writeByte('}') catch return;
+                self.sendScript(v, cmd.written());
+            },
+            _ => self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "unknown action" }),
+        }
+    }
+
+    pub fn semExpand(self: *Host, req: proto.SemExpand) !void {
+        const v = self.find(req.view) orelse return;
+        const eid = v.sem.eidFor(req.id);
+        if (eid == 0) {
+            self.post(proto.SemExpandResult{ .view = v.id, .id = req.id, .off = req.off, .text = "" });
+            return;
+        }
+        const rid = try self.pushPending(v, .{
+            .req = nextReq(v),
+            .kind = .expand,
+            .sid = req.id,
+            .off = req.off,
+        });
+        var buf: [160]u8 = undefined;
+        const cmd = std.fmt.bufPrint(
+            &buf,
+            "{{\"op\":\"expand\",\"req\":{d},\"eid\":{d},\"off\":{d},\"len\":{d}}}",
+            .{ rid, eid, req.off, @min(req.len, max_expand) },
+        ) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// Queries are answered from the shadow tree, never by a fresh DOM
+    /// walk: a spot-check must not cost a traversal and must not invent
+    /// ids the client has never been told about.
+    pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
+        const v = self.find(req.view) orelse return;
+        const text = v.sem.query(req.kind, req.arg) catch return;
+        defer self.gpa.free(text);
+        self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
+    }
+
+    pub fn semRead(self: *Host, req: proto.SemRead) !void {
+        const v = self.find(req.view) orelse return;
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read });
+        var buf: [64]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d}}}", .{rid}) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// Re-arm a fresh document: a navigation builds a new V8 context,
+    /// so the observer and the first walk have to be asked for again.
+    fn semRearm(self: *Host, v: *View) void {
+        if (!v.sem_observing) return;
+        self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(
+            &buf,
+            "{{\"op\":\"snapshot\",\"req\":0,\"detail\":{d}}}",
+            .{v.sem_detail},
+        ) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// One JSON reply from the injected script.
+    fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
+        const Head = struct { op: []const u8 = "", req: u32 = 0 };
+        const head = std.json.parseFromSlice(Head, self.gpa, json, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer head.deinit();
+        const op = head.value.op;
+        const rid = head.value.req;
+
+        if (std.mem.eql(u8, op, "tree")) {
+            self.onTree(v, rid, json);
+            return;
+        }
+        var p = self.takePending(v, rid) orelse return;
+        defer if (p.arg.len != 0) self.gpa.free(p.arg);
+
+        if (std.mem.eql(u8, op, "rect")) {
+            self.onRect(v, &p, json);
+        } else if (std.mem.eql(u8, op, "setvalue")) {
+            self.onSetValue(v, &p, json);
+        } else if (std.mem.eql(u8, op, "ack")) {
+            const Ack = struct { ok: u8 = 0, msg: []const u8 = "" };
+            const a = std.json.parseFromSlice(Ack, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer a.deinit();
+            var buf: [256]u8 = undefined;
+            const msg = if (p.kind == .commit)
+                std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
+                    a.value.msg[0..@min(a.value.msg.len, 128)],
+                }) catch a.value.msg
+            else
+                a.value.msg;
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg });
+        } else if (std.mem.eql(u8, op, "text")) {
+            const Txt = struct { off: u32 = 0, text: []const u8 = "" };
+            const t = std.json.parseFromSlice(Txt, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer t.deinit();
+            self.post(proto.SemExpandResult{
+                .view = v.id,
+                .id = p.sid,
+                .off = t.value.off,
+                .text = t.value.text[0..@min(t.value.text.len, max_expand)],
+            });
+        } else if (std.mem.eql(u8, op, "markdown")) {
+            const Md = struct { md: []const u8 = "" };
+            const m = std.json.parseFromSlice(Md, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer m.deinit();
+            self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = m.value.md } });
+        }
+    }
+
+    /// A full DOM walk: the shadow tree turns it into a snapshot or a
+    /// delta. An unsolicited batch (req 0, the MutationObserver) is
+    /// dropped when nothing actually changed.
+    fn onTree(self: *Host, v: *View, rid: u32, json: []const u8) void {
+        const pend = self.takePending(v, rid);
+        defer if (pend) |p| {
+            if (p.arg.len != 0) self.gpa.free(p.arg);
+        };
+        const parsed = semantic.parseTree(self.gpa, json) catch return;
+        defer parsed.deinit();
+        const force_full = if (pend) |p| p.mode == @intFromEnum(proto.SnapMode.full) else false;
+        const up = v.sem.apply(parsed.value, force_full) catch return;
+        defer self.gpa.free(up.text);
+        if (pend == null and up.changes == 0) return;
+
+        var scoped: ?[]u8 = null;
+        defer if (scoped) |s| self.gpa.free(s);
+        if (pend) |p| {
+            if (p.scope != 0) scoped = v.sem.renderScoped(p.scope) catch null;
+        }
+        self.post(proto.SemSnapshot{
+            .view = v.id,
+            .doc_gen = up.doc_gen,
+            .rev = up.rev,
+            .kind = if (scoped != null) @intFromEnum(proto.SnapKind.full) else @intFromEnum(up.kind),
+            .payload = .{ .s = scoped orelse up.text },
+        });
+    }
+
+    /// The script located an element: the click or hover is synthesized
+    /// HERE, through the same input path a human uses, which is the
+    /// whole reason `element.click()` is not an option.
+    fn onRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
+        const R = struct { ok: u8 = 0, x: i32 = 0, y: i32 = 0, w: i32 = 0, h: i32 = 0 };
+        const r = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer r.deinit();
+        if (r.value.ok == 0) {
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = "element has no box" });
+            return;
+        }
+        var ev = cef.cef_mouse_event_t{ .x = r.value.x, .y = r.value.y, .modifiers = 0 };
+        withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
+        var buf: [128]u8 = undefined;
+        if (p.kind == .hover) {
+            const msg = std.fmt.bufPrint(&buf, "hover at {d},{d}", .{ r.value.x, r.value.y }) catch "hover";
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
+            return;
+        }
+        withHostArgs(v, setFocus, .{@as(c_int, 1)});
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
+        const msg = std.fmt.bufPrint(&buf, "click at {d},{d}", .{ r.value.x, r.value.y }) catch "click";
+        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
+    }
+
+    /// Set-value: a typeable field is TYPED into with real key events;
+    /// anything else (select, range, colour, ...) can only be assigned
+    /// from script, and the reply says so rather than pretending.
+    fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
+        const S = struct { ok: u8 = 0, typeable: u8 = 0, msg: []const u8 = "" };
+        const s = std.json.parseFromSlice(S, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer s.deinit();
+        if (s.value.ok == 0) {
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = s.value.msg });
+            return;
+        }
+        if (s.value.typeable == 0) {
+            self.post(proto.SemActResult{
+                .view = v.id,
+                .id = p.sid,
+                .ok = 1,
+                .msg = "set-value applied by script (element is not typeable; input+change dispatched)",
+            });
+            return;
+        }
+        withHostArgs(v, setFocus, .{@as(c_int, 1)});
+        typeText(v, p.arg);
+        const eid = v.sem.eidFor(p.sid);
+        const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .commit, .sid = p.sid }) catch return;
+        var buf: [128]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"commit\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
+        self.sendScript(v, cmd);
+    }
+
     // -- outbound ------------------------------------------------------
 
     /// Post an event, dropping it if the outbox is out of memory: a
@@ -539,6 +918,53 @@ fn imeCancel(host: *cef.cef_browser_host_t) void {
     if (host.ime_cancel_composition) |f| f(host);
 }
 
+/// Type `text` into whatever has focus as CHAR events — the same path
+/// `input_key` uses, so the page cannot tell a semantic set-value from
+/// a human at the keyboard.
+fn typeText(v: *View, text: []const u8) void {
+    var ev = std.mem.zeroes(cef.cef_key_event_t);
+    ev.size = @sizeOf(cef.cef_key_event_t);
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+    while (it.nextCodepoint()) |cp| Host.charEvent(v, ev, cp);
+}
+
+/// Append `s` as a JSON string literal, quotes included.
+fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
+    };
+    try w.writeByte('"');
+}
+
+/// The single JSON string argument of a `sketerm.sem` process message,
+/// or null when the message is not ours. Caller frees with `free`.
+fn semPayload(message: [*c]cef.cef_process_message_t) ?Utf8 {
+    const msg: *cef.cef_process_message_t = message orelse return null;
+    const gn = msg.get_name orelse return null;
+    const raw = gn(msg);
+    if (raw == null) return null;
+    var name = Utf8.init(raw);
+    defer name.free();
+    cef.cef_string_userfree_utf16_free(raw);
+    if (!std.mem.eql(u8, name.slice(), sem_msg)) return null;
+
+    const gal = msg.get_argument_list orelse return null;
+    const args: *cef.cef_list_value_t = gal(msg) orelse return null;
+    defer release(&args.base);
+    const gs = args.get_string orelse return null;
+    const sraw = gs(args, 0);
+    if (sraw == null) return null;
+    const out = Utf8.init(sraw);
+    cef.cef_string_userfree_utf16_free(sraw);
+    return out;
+}
+
 // ---------------------------------------------------------------------
 // Static handler set
 // ---------------------------------------------------------------------
@@ -575,6 +1001,8 @@ var life_span_handler: cef.cef_life_span_handler_t = undefined;
 var load_handler: cef.cef_load_handler_t = undefined;
 var request_handler: cef.cef_request_handler_t = undefined;
 var bp_handler: cef.cef_browser_process_handler_t = undefined;
+var rp_handler: cef.cef_render_process_handler_t = undefined;
+var v8_handler: cef.cef_v8_handler_t = undefined;
 
 /// Milliseconds until CEF next wants `pump()`; -1 = nothing scheduled.
 var pump_delay_ms: i64 = -1;
@@ -647,6 +1075,26 @@ fn installHandlers() void {
     client.get_life_span_handler = getLifeSpanHandler;
     client.get_load_handler = getLoadHandler;
     client.get_request_handler = getRequestHandler;
+    client.on_process_message_received = onProcessMessage;
+}
+
+/// Browser-process end of the semantic bridge.
+fn onProcessMessage(
+    _: [*c]cef.cef_client_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    _: cef.cef_process_id_t,
+    message: [*c]cef.cef_process_message_t,
+) callconv(.c) c_int {
+    // Subframes are injected but idle: only the main frame's walk maps
+    // onto a view's shadow tree (iframe traversal is a later feature).
+    if (!isMainFrame(frame)) return 0;
+    const host = g_host orelse return 0;
+    const v = viewOf(browser) orelse return 0;
+    var payload = semPayload(message) orelse return 0;
+    defer payload.free();
+    host.onScriptMessage(v, payload.slice());
+    return 1;
 }
 
 /// Resolve the view a callback's browser belongs to. During
@@ -930,6 +1378,11 @@ fn onLoadEnd(
         .state = @intFromEnum(proto.LoadState.finished),
         .url = v.url,
     });
+    // The content script goes in once per document, and any semantic
+    // command queued after it is ordered behind it by the frame's own
+    // script queue.
+    if (frame) |f| runJs(f, semantic_js);
+    host.semRearm(v);
 }
 
 fn onLoadError(
@@ -979,6 +1432,98 @@ fn isMainFrame(frame: [*c]cef.cef_frame_t) bool {
 }
 
 // ---------------------------------------------------------------------
+// Render process: the semantic content script and its transport
+// ---------------------------------------------------------------------
+//
+// Everything below runs in a DIFFERENT PROCESS from the Host above —
+// CEF re-executes this same binary as its renderer, and
+// `cef_execute_process` never returns there. The two halves share only
+// the JSON strings that cross as process messages.
+
+fn getRenderProcessHandler(_: [*c]cef.cef_app_t) callconv(.c) [*c]cef.cef_render_process_handler_t {
+    return &rp_handler;
+}
+
+/// Register the reply bridge as a V8 extension, once per render
+/// process.
+///
+/// A V8 extension is CEF's documented way to publish a NATIVE function
+/// to every frame, and it is the ONLY part of the semantic layer that
+/// needs V8 at all. Two hard constraints learned the expensive way on
+/// this CEF build, both of which kill the renderer SILENTLY (a black
+/// view and an `ev_crashed`, no log line):
+///   - extension code must not touch `window` in any way, not even
+///     `typeof window` -- it is evaluated before the DOM global exists;
+///   - `on_context_created` + `set_value_bykey` on the context global,
+///     the "obvious" injection route, dies the same way.
+/// So the extension declares a plain global function and nothing else,
+/// and `semantic.js` itself is injected per document with
+/// `execute_java_script`.
+fn onWebKitInitialized(_: [*c]cef.cef_render_process_handler_t) callconv(.c) void {
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr("v8/sketerm-semantic", &name);
+    defer cef.cef_string_utf16_clear(&name);
+    var code = std.mem.zeroes(cef.cef_string_t);
+    setStr(sem_bridge_js, &code);
+    defer cef.cef_string_utf16_clear(&code);
+    _ = cef.cef_register_extension(&name, &code, &v8_handler);
+}
+
+/// Run a script in a frame's main world.
+fn runJs(frame: *cef.cef_frame_t, code: []const u8) void {
+    const exec = frame.execute_java_script orelse return;
+    var js = std.mem.zeroes(cef.cef_string_t);
+    setStr(code, &js);
+    defer cef.cef_string_utf16_clear(&js);
+    var url = std.mem.zeroes(cef.cef_string_t);
+    setStr("sketerm://semantic.js", &url);
+    defer cef.cef_string_utf16_clear(&url);
+    exec(frame, &js, &url, 0);
+}
+
+/// `window.__sketermSemPost(json)`: forward the string to the browser
+/// process untouched.
+fn onSemPost(
+    _: [*c]cef.cef_v8_handler_t,
+    _: [*c]const cef.cef_string_t,
+    _: [*c]cef.cef_v8_value_t,
+    argc: usize,
+    argv: [*c]const [*c]cef.cef_v8_value_t,
+    _: [*c][*c]cef.cef_v8_value_t,
+    _: [*c]cef.cef_string_t,
+) callconv(.c) c_int {
+    if (argc < 1 or argv == null) return 0;
+    const arg: *cef.cef_v8_value_t = argv[0] orelse return 0;
+    const gs = arg.get_string_value orelse return 0;
+    const raw = gs(arg);
+    if (raw == null) return 0;
+    defer cef.cef_string_userfree_utf16_free(raw);
+
+    const ctx: *cef.cef_v8_context_t = cef.cef_v8_context_get_current_context() orelse return 0;
+    defer release(&ctx.base);
+    const gf = ctx.get_frame orelse return 0;
+    const frame: *cef.cef_frame_t = gf(ctx) orelse return 0;
+    defer release(&frame.base);
+
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr(sem_msg, &name);
+    defer cef.cef_string_utf16_clear(&name);
+    const msg: *cef.cef_process_message_t = cef.cef_process_message_create(&name) orelse return 0;
+    var sent = false;
+    defer if (!sent) release(&msg.base);
+    const gal = msg.get_argument_list orelse return 0;
+    const args: *cef.cef_list_value_t = gal(msg) orelse return 0;
+    defer release(&args.base);
+    if (args.set_size) |ss| _ = ss(args, 1);
+    if (args.set_string) |ss| _ = ss(args, 0, raw);
+    const send = frame.send_process_message orelse return 0;
+    send(frame, cef.PID_BROWSER, msg);
+    sent = true;
+    return 1;
+}
+
+
+// ---------------------------------------------------------------------
 // Process bootstrap (the only CEF entry points main.zig needs)
 // ---------------------------------------------------------------------
 
@@ -994,9 +1539,19 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
     bp_handler = std.mem.zeroes(cef.cef_browser_process_handler_t);
     bp_handler.base = staticBase(cef.cef_browser_process_handler_t);
     bp_handler.on_schedule_message_pump_work = onScheduleMessagePumpWork;
+    v8_handler = std.mem.zeroes(cef.cef_v8_handler_t);
+    v8_handler.base = staticBase(cef.cef_v8_handler_t);
+    v8_handler.execute = onSemPost;
+    rp_handler = std.mem.zeroes(cef.cef_render_process_handler_t);
+    rp_handler.base = staticBase(cef.cef_render_process_handler_t);
+    rp_handler.on_web_kit_initialized = onWebKitInitialized;
+
     app = std.mem.zeroes(cef.cef_app_t);
     app.base = staticBase(cef.cef_app_t);
     app.get_browser_process_handler = getBrowserProcessHandler;
+    // Reached only in CEF's renderer subprocess, which is THIS binary
+    // re-executed; the browser process never calls it.
+    app.get_render_process_handler = getRenderProcessHandler;
     const args = cef.cef_main_args_t{ .argc = argc, .argv = argv };
     const code = cef.cef_execute_process(&args, &app, null);
     if (code < 0) return null;

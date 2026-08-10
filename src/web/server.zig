@@ -196,6 +196,7 @@ pub const Server = struct {
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
+                    proto.CAP_SEMANTIC,
                 };
                 try self.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
@@ -220,6 +221,11 @@ pub const Server = struct {
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.
             .frame_release => _ = try proto.decode(proto.FrameRelease, frame.payload),
+            .sem_snapshot_req => try self.host.semSnapshot(try proto.decode(proto.SemSnapshotReq, frame.payload)),
+            .sem_act => try self.host.semAct(try proto.decode(proto.SemAction, frame.payload)),
+            .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),
+            .sem_query => try self.host.semQuery(try proto.decode(proto.SemQueryReq, frame.payload)),
+            .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

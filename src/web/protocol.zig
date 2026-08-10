@@ -22,6 +22,7 @@ pub const PROTO_VERSION: u32 = 1;
 pub const CAP_FRAMES_SHM = "frames-shm";
 pub const CAP_INPUT = "input";
 pub const CAP_NAVIGATION = "navigation";
+pub const CAP_SEMANTIC = "semantic";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -57,6 +58,16 @@ pub const Tag = enum(u8) {
     ev_cursor = 0x46,
     ev_console = 0x47,
     ev_crashed = 0x48,
+    sem_snapshot_req = 0x60,
+    sem_snapshot = 0x61,
+    sem_act = 0x62,
+    sem_act_result = 0x63,
+    sem_expand = 0x64,
+    sem_expand_result = 0x65,
+    sem_query = 0x66,
+    sem_query_result = 0x67,
+    sem_read = 0x68,
+    sem_read_result = 0x69,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -117,6 +128,35 @@ pub const mod_capslock: u32 = 16;
 pub const mod_numlock: u32 = 32;
 
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
+
+/// A u32-length payload, distinct from a `str` (u16) because a semantic
+/// snapshot of a real page routinely exceeds 64KB. Wrapped in a struct
+/// so the generic encoder can tell the two apart by field TYPE.
+pub const Text = struct { s: []const u8 };
+
+/// `sem_snapshot_req` mode byte.
+pub const SnapMode = enum(u8) { auto = 0, full = 1, _ };
+
+/// `sem_snapshot_req` detail byte.
+pub const SnapDetail = enum(u8) { minimal = 0, normal = 1, full_text = 2, _ };
+
+/// `sem_snapshot` kind byte; mirrors `semantic.Kind`.
+pub const SnapKind = enum(u8) { full = 0, delta = 1, _ };
+
+/// `sem_act` action byte. `click` and `hover` are synthesized through
+/// the ORDINARY input path at the element centre, never scripted, so
+/// the page sees `isTrusted`.
+pub const SemAct = enum(u8) {
+    click = 0,
+    focus = 1,
+    set_value = 2,
+    scroll_into_view = 3,
+    hover = 4,
+    _,
+};
+
+/// `sem_query` kind byte.
+pub const SemQuery = enum(u8) { find_text = 0, subtree = 1, focused = 2, _ };
 
 // ---------------------------------------------------------------------
 // Frame payload types. Field ORDER is the wire order; every type carries
@@ -363,6 +403,82 @@ pub const EvCrashed = struct {
     view: u32,
 };
 
+// -- semantic layer (capability "semantic") ---------------------------
+
+pub const SemSnapshotReq = struct {
+    pub const tag: Tag = .sem_snapshot_req;
+    view: u32,
+    mode: u8,
+    detail: u8,
+    /// 0 = whole document, else the stable id of a subtree root.
+    scope: u32,
+};
+
+pub const SemSnapshot = struct {
+    pub const tag: Tag = .sem_snapshot;
+    view: u32,
+    doc_gen: u32,
+    rev: u32,
+    kind: u8,
+    payload: Text,
+};
+
+pub const SemAction = struct {
+    pub const tag: Tag = .sem_act;
+    view: u32,
+    id: u32,
+    action: u8,
+    arg: []const u8,
+};
+
+pub const SemActResult = struct {
+    pub const tag: Tag = .sem_act_result;
+    view: u32,
+    id: u32,
+    ok: u8,
+    msg: []const u8,
+};
+
+pub const SemExpand = struct {
+    pub const tag: Tag = .sem_expand;
+    view: u32,
+    id: u32,
+    off: u32,
+    len: u32,
+};
+
+pub const SemExpandResult = struct {
+    pub const tag: Tag = .sem_expand_result;
+    view: u32,
+    id: u32,
+    off: u32,
+    text: []const u8,
+};
+
+pub const SemQueryReq = struct {
+    pub const tag: Tag = .sem_query;
+    view: u32,
+    kind: u8,
+    arg: []const u8,
+};
+
+pub const SemQueryResult = struct {
+    pub const tag: Tag = .sem_query_result;
+    view: u32,
+    payload: Text,
+};
+
+pub const SemRead = struct {
+    pub const tag: Tag = .sem_read;
+    view: u32,
+};
+
+pub const SemReadResult = struct {
+    pub const tag: Tag = .sem_read_result;
+    view: u32,
+    markdown: Text,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -387,6 +503,12 @@ fn putStr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void 
     if (s.len > std.math.maxInt(u16)) return error.StringTooLong;
     try putU16(gpa, out, @intCast(s.len));
     try out.appendSlice(gpa, s);
+}
+
+fn putText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), t: Text) !void {
+    if (t.s.len > MAX_FRAME) return error.FrameTooLarge;
+    try putU32(gpa, out, @intCast(t.s.len));
+    try out.appendSlice(gpa, t.s);
 }
 
 // ---------------------------------------------------------------------
@@ -427,6 +549,13 @@ pub const Cur = struct {
         defer self.pos += n;
         return self.buf[self.pos..][0..n];
     }
+
+    pub fn readText(self: *Cur) !Text {
+        const n = try self.readU32();
+        if (self.pos + n > self.buf.len) return error.Truncated;
+        defer self.pos += n;
+        return .{ .s = self.buf[self.pos..][0..n] };
+    }
 };
 
 // ---------------------------------------------------------------------
@@ -450,6 +579,7 @@ pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !
                 u32 => try putU32(gpa, out, v),
                 i32 => try putI32(gpa, out, v),
                 []const u8 => try putStr(gpa, out, v),
+                Text => try putText(gpa, out, v),
                 else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
             }
         }
@@ -472,6 +602,7 @@ pub fn decode(comptime T: type, payload: []const u8) !T {
             u32 => try cur.readU32(),
             i32 => try cur.readI32(),
             []const u8 => try cur.readStr(),
+            Text => try cur.readText(),
             else => @compileError("unsupported wire field type " ++ @typeName(f.type)),
         };
     }
@@ -602,6 +733,8 @@ fn roundTrip(comptime T: type, value: T) !void {
     inline for (std.meta.fields(T)) |f| {
         if (f.type == []const u8) {
             try std.testing.expectEqualStrings(@field(value, f.name), @field(got, f.name));
+        } else if (f.type == Text) {
+            try std.testing.expectEqualStrings(@field(value, f.name).s, @field(got, f.name).s);
         } else {
             try std.testing.expectEqual(@field(value, f.name), @field(got, f.name));
         }
@@ -650,6 +783,50 @@ test "round-trip: scalar and string frames" {
     try roundTrip(EvCrashed, .{ .view = 7 });
 }
 
+test "round-trip: semantic layer frames" {
+    try roundTrip(SemSnapshotReq, .{ .view = 7, .mode = 1, .detail = 2, .scope = 0 });
+    try roundTrip(SemSnapshot, .{
+        .view = 7,
+        .doc_gen = 3,
+        .rev = 12,
+        .kind = @intFromEnum(SnapKind.delta),
+        .payload = .{ .s = "delta rev 11->12\n~ [4] button \"Go\"\n" },
+    });
+    try roundTrip(SemAction, .{
+        .view = 7,
+        .id = 4,
+        .action = @intFromEnum(SemAct.set_value),
+        .arg = "hello",
+    });
+    try roundTrip(SemActResult, .{ .view = 7, .id = 4, .ok = 1, .msg = "click at 40,20" });
+    try roundTrip(SemExpand, .{ .view = 7, .id = 4, .off = 160, .len = 4096 });
+    try roundTrip(SemExpandResult, .{ .view = 7, .id = 4, .off = 160, .text = "the rest of it" });
+    try roundTrip(SemQueryReq, .{ .view = 7, .kind = @intFromEnum(SemQuery.subtree), .arg = "4" });
+    try roundTrip(SemQueryResult, .{ .view = 7, .payload = .{ .s = "query subtree [4]\n" } });
+    try roundTrip(SemRead, .{ .view = 7 });
+    try roundTrip(SemReadResult, .{ .view = 7, .markdown = .{ .s = "# Heading\n\ntext\n" } });
+}
+
+test "a text payload carries more than a str's u16 length" {
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, 200_000);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, SemSnapshot{
+        .view = 1,
+        .doc_gen = 1,
+        .rev = 1,
+        .kind = 0,
+        .payload = .{ .s = big },
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    const got = try decode(SemSnapshot, frame.payload);
+    try std.testing.expectEqual(big.len, got.payload.s.len);
+}
+
 test "round-trip: hello_ack capability list" {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -695,8 +872,8 @@ test "reader skips unknown tags" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     try encode(gpa, &buf, EvTitle{ .view = 1, .title = "a" });
-    // A frame from a newer peer: reserved semantic-layer block.
-    try buf.appendSlice(gpa, &[_]u8{ 3, 0, 0, 0, 0x60, 0xAA, 0xBB });
+    // A frame from a newer peer: the still-reserved a11y block.
+    try buf.appendSlice(gpa, &[_]u8{ 3, 0, 0, 0, 0x70, 0xAA, 0xBB });
     try encode(gpa, &buf, EvCrashed{ .view = 2 });
 
     var r = Reader.init(buf.items);
