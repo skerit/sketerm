@@ -1259,6 +1259,41 @@ pub const Window = struct {
         if (reveal) |target| bv.queueReveal(target);
     }
 
+    /// New tab whose pane wears the WEB face (src/ui/webface.zig): a
+    /// browser view served by the `sketerm-web` helper. The shell
+    /// session underneath stays one toolbar click away, exactly like
+    /// the file-browser and editor faces.
+    pub fn newWebTab(self: *Window) !void {
+        try self.newWebTabAt(null);
+    }
+
+    /// Web tab opening `url`; null = an empty address bar. Also the
+    /// landing point for a page's popup request (target=_blank).
+    pub fn newWebTabAt(self: *Window, url: ?[]const u8) !void {
+        // Same appended-pane rule as newBrowserTabFromReveal: focus
+        // does not reliably sit on the fresh pane.
+        const before = self.panes.items.len;
+        try self.newShellTab("Web");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attach(self.allocator, pane, url) catch |err| {
+            logActionError("new_web_tab attach", err);
+            return err;
+        };
+    }
+
+    /// Split the focused pane and give the new pane a web face.
+    pub fn newWebSplit(self: *Window, orient: c_uint) !void {
+        const before = self.panes.items.len;
+        try self.splitFocused(orient);
+        if (self.panes.items.len <= before) return error.SplitFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attach(self.allocator, pane, null) catch |err| {
+            logActionError("new_web_split attach", err);
+            return err;
+        };
+    }
+
     /// New tab whose pane wears the text-editor face (the shell
     /// session underneath stays one toolbar click away).
     pub fn newEditorTab(self: *Window) !void {
@@ -3415,6 +3450,8 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
+        .new_web_tab => self.newWebTab() catch |err| logActionError("new_web_tab", err),
+        .new_web_split => self.newWebSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_web_split", err),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

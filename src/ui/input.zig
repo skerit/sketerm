@@ -168,6 +168,11 @@ pub const Action = enum {
     /// Split the focused pane and give the new pane a browser face:
     /// how a dual-pane source/target layout is created.
     new_browser_split,
+    /// Open a web tab (src/ui/webface.zig): a shell pane wearing the
+    /// browser-engine face served by the `sketerm-web` helper.
+    new_web_tab,
+    /// Split the focused pane and give the new pane a web face.
+    new_web_split,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -395,6 +400,8 @@ pub fn actionName(a: Action) []const u8 {
         .new_durable_tab => "new_durable_tab",
         .new_browser_tab => "new_browser_tab",
         .new_browser_split => "new_browser_split",
+        .new_web_tab => "new_web_tab",
+        .new_web_split => "new_web_split",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -482,6 +489,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_durable_tab => "New durable tab (mux)",
         .new_browser_tab => "New file browser tab",
         .new_browser_split => "Split into a second file browser pane",
+        .new_web_tab => "New web tab (browser engine)",
+        .new_web_split => "Split into a web pane (browser engine)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",

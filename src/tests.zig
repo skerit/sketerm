@@ -87,6 +87,7 @@ comptime {
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced
     // here by name. Proven with a deliberately failing canary.
+    _ = @import("ui/webface.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/browser/view.zig");
     _ = @import("ui/browser/types.zig");

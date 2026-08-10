@@ -222,6 +222,14 @@ pub const Pane = struct {
     panel_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     panel_deinit: ?*const fn (*anyopaque) void = null,
     panel_focus: ?*const fn (*anyopaque) void = null,
+    /// Web face (src/ui/webface.zig): a browser view rendered from the
+    /// `sketerm-web` helper. Same five-pointer contract and two-phase
+    /// teardown as the editor and panel faces above.
+    web_widget: ?*c.GtkWidget = null,
+    web_ctx: ?*anyopaque = null,
+    web_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
+    web_deinit: ?*const fn (*anyopaque) void = null,
+    web_focus: ?*const fn (*anyopaque) void = null,
     /// True only while the pane-wide teardown choke point is detaching faces.
     /// Panelhost uses it to distinguish viewer loss from an explicit close.
     severing_faces: bool = false,
@@ -608,14 +616,14 @@ pub const Pane = struct {
         return menu.popupAt(@ptrCast(self.surface.area), at.x, at.y);
     }
 
-    /// True while a face (editor/browser) covers the grid. The pane
+    /// True while a face (editor/browser/web) covers the grid. The pane
     /// menu's gesture lives on the GLArea, which is UNMAPPED then, so
     /// the only paths that can still reach it are the titlebar and the
     /// keyboard sink — and neither is about the terminal any more.
     /// Popping it would offer Reset Terminal over an editor, against a
     /// widget that is not on screen.
     pub fn nonTerminalFaceVisible(self: *Pane) bool {
-        return self.editorFaceVisible() or self.browserFaceVisible();
+        return self.editorFaceVisible() or self.browserFaceVisible() or self.webFaceVisible();
     }
 
     /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
@@ -732,6 +740,7 @@ pub const Pane = struct {
         self.detachBrowser();
         self.detachEditor();
         self.detachPanel();
+        self.detachWeb();
         self.detachAppHost();
         // AT-SPI bridge: drop the Terminal back-pointer and cancel the
         // coalescing timer before the Terminal can die. The area's own
@@ -798,9 +807,10 @@ pub const Pane = struct {
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
         if (show) {
             // Faces are exclusive: raising the browser hides an
-            // editor or panel face too.
+            // editor, panel or web face too.
             if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
             if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
+            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
         }
         if (self.offload_widget) |ow|
             c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
@@ -927,6 +937,7 @@ pub const Pane = struct {
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
             if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
+            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
             if (self.editor_focus) |focus| {
                 if (self.editor_ctx) |ctx| focus(ctx);
@@ -1032,6 +1043,7 @@ pub const Pane = struct {
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
             if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
+            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
             if (self.panel_focus) |focus| {
                 if (self.panel_ctx) |ctx| focus(ctx);
@@ -1082,6 +1094,85 @@ pub const Pane = struct {
         }
         if (ctx) |panel_ctx| {
             if (deinit_cb) |cb| cb(panel_ctx);
+        }
+    }
+
+    /// Attach a web face (src/ui/webface.zig): the widget joins the
+    /// pane's wrapper box as another face; the terminal stays alive
+    /// underneath. Identical ownership contract to attachPanel.
+    pub fn attachWeb(
+        self: *Pane,
+        face: *c.GtkWidget,
+        ctx: *anyopaque,
+        prepare_destroy_cb: *const fn (*anyopaque, widgets_dead: bool) void,
+        deinit_cb: *const fn (*anyopaque) void,
+        focus_cb: *const fn (*anyopaque) void,
+    ) bool {
+        const wrap = self.wrapper_box orelse return false;
+        self.detachWeb();
+        self.web_widget = face;
+        self.web_ctx = ctx;
+        self.web_prepare_destroy = prepare_destroy_cb;
+        self.web_deinit = deinit_cb;
+        self.web_focus = focus_cb;
+        c.gtk_widget_set_vexpand(face, 1);
+        c.gtk_widget_set_hexpand(face, 1);
+        c.gtk_box_append(@ptrCast(wrap), face);
+        self.setWebVisible(true);
+        return true;
+    }
+
+    /// Flip between the web face and whatever else the pane shows
+    /// (terminal, browser, editor or panel — showing it hides them all).
+    pub fn setWebVisible(self: *Pane, show: bool) void {
+        const ww = self.web_widget orelse return;
+        c.gtk_widget_set_visible(ww, if (show) @as(c_int, 1) else 0);
+        if (show) {
+            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
+            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
+            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
+            if (self.web_focus) |focus| {
+                if (self.web_ctx) |ctx| focus(ctx);
+            }
+        } else {
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
+        }
+    }
+
+    pub fn hasWebFace(self: *Pane) bool {
+        return self.web_widget != null;
+    }
+
+    pub fn webFaceVisible(self: *Pane) bool {
+        const ww = self.web_widget orelse return false;
+        return c.gtk_widget_get_visible(ww) != 0;
+    }
+
+    /// Two-phase web teardown, tolerant of dead widgets — mirror of
+    /// detachPanel. Reached from `severFaces`, never from a call site.
+    pub fn detachWeb(self: *Pane) void {
+        const ctx = self.web_ctx;
+        const prepare_destroy_cb = self.web_prepare_destroy;
+        const deinit_cb = self.web_deinit;
+        const face = self.web_widget;
+        self.web_ctx = null;
+        self.web_prepare_destroy = null;
+        self.web_deinit = null;
+        self.web_focus = null;
+        self.web_widget = null;
+        if (ctx) |web_ctx| {
+            if (prepare_destroy_cb) |cb| cb(web_ctx, self.widgets_dead);
+        }
+        if (face) |ww| {
+            if (!self.widgets_dead) {
+                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), ww);
+                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            }
+        }
+        if (ctx) |web_ctx| {
+            if (deinit_cb) |cb| cb(web_ctx);
         }
     }
 
