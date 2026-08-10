@@ -28,6 +28,8 @@ pub const mcpassets = @import("mcpassets.zig");
 const cdp = @import("cdp.zig");
 pub const mcpfilter = @import("mcpfilter.zig");
 pub const panelstore = @import("panelstore.zig");
+const paneldrive = @import("paneldrive.zig");
+const panelrpc = @import("../mux/panelrpc.zig");
 const mcp_registry = @import("mcp_registry.zig");
 const paneldoc = @import("../ui/panel/doc.zig");
 pub const shellquote = @import("../util/shellquote.zig");
@@ -60,6 +62,11 @@ const MCP_HELP =
     \\--shared (then $SKETERM_SOCKET / the single *.sock under
     \\$XDG_RUNTIME_DIR/sketerm/). Isolated mode without --socket
     \\leaves them disabled with a clear error.
+    \\
+    \\Live ui_* panels are independent of --shared: from a pane they
+    \\follow SKETERM_SESSION to the exact SKETERM_MUX_SOCKET and relay
+    \\to a compatible attached GUI. Sessionless/legacy use may pass an
+    \\explicit --socket. App tools stay on the private MCP daemon.
     \\
     \\  --log DIR      trace everything to DIR: each session gets its
     \\                 own datetime subfolder DIR/YYYYMMDD-HHMMSS/
@@ -130,8 +137,21 @@ pub const Backend = struct {
     /// One JSON request line to the GUI socket → the JSON response
     /// line (caller frees). The line has no trailing newline.
     talk: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8) anyerror![]u8,
+    /// The same exchange under a caller-owned remaining-time budget, with
+    /// enough write-phase state to decide whether retrying could duplicate it.
+    talkFor: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, timeout_ms: i64) DirectTalkResult,
     sleepMs: *const fn (ctx: *anyopaque, ms: u32) void,
     nowMs: *const fn (ctx: *anyopaque) i64,
+};
+
+const DirectTalkFailure = struct {
+    err: anyerror,
+    delivery: enum { pre_delivery, uncertain_delivery },
+};
+
+const DirectTalkResult = union(enum) {
+    reply: []u8,
+    failure: DirectTalkFailure,
 };
 
 /// Parsed `sketerm mcp` flags. Pure so flag combos unit-test.
@@ -446,6 +466,7 @@ pub const Watchdog = struct {
     /// cannot close fds, and normal calls finish far under the cap.
     var fds: [128]c_int = undefined;
     var fd_count: usize = 0;
+    var dynamic_fd: std.atomic.Value(c_int) = .init(-1);
     pub var fired: std.atomic.Value(bool) = .init(false);
     pub var hard_ms: i64 = 150_000;
 
@@ -453,8 +474,14 @@ pub const Watchdog = struct {
         _ = c.pthread_mutex_lock(&mu);
         defer _ = c.pthread_mutex_unlock(&mu);
         fd_count = 0;
+        dynamic_fd.store(-1, .release);
         for (app_state.apps.values()) |a| addFd(a.conn.fd);
         for (term_state.terms.values()) |t| addFd(t.conn.fd);
+        if (panel_pool) |pool| {
+            var panel_fds: [32]c_int = undefined;
+            const count = pool.fds(&panel_fds);
+            for (panel_fds[0..count]) |fd| addFd(fd);
+        }
         for (forward_state.forwards.values()) |f| addFd(f.term.conn.fd);
         for (browser_state.sessions.values()) |s| {
             if (s.client.fd >= 0) addFd(s.client.fd);
@@ -485,6 +512,11 @@ pub const Watchdog = struct {
             if (overdue) {
                 fired.store(true, .release);
                 for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
+                // A panel socket may have been created after begin() and can
+                // still be in connect/hello/attach. Pool exposes that call's
+                // fd atomically so the watchdog covers establishment too.
+                const dynamic = dynamic_fd.load(.acquire);
+                if (dynamic >= 0) _ = c.shutdown(dynamic, c.SHUT_RDWR);
             }
             _ = c.pthread_mutex_unlock(&mu);
             if (overdue) {
@@ -695,14 +727,23 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const backend = if (sock_path != null) Backend{
         .ctx = @ptrCast(&real),
         .talk = RealBackend.talk,
+        .talkFor = RealBackend.talkFor,
         .sleepMs = RealBackend.sleepMs,
         .nowMs = RealBackend.nowMs,
     } else Backend{
         .ctx = @ptrCast(&stub),
         .talk = StubBackend.talk,
+        .talkFor = StubBackend.talkFor,
         .sleepMs = RealBackend.sleepMs,
         .nowMs = RealBackend.nowMs,
     };
+    var live_panel_pool = paneldrive.Pool.init(allocator);
+    live_panel_pool.setWatchdogFd(&Watchdog.dynamic_fd);
+    panel_pool = &live_panel_pool;
+    defer {
+        panel_pool = null;
+        live_panel_pool.deinit();
+    }
     app_state = .{
         .allocator = allocator,
         .mux_sock = if (iso) |i| i.sock else null,
@@ -729,6 +770,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer browser_state.deinit();
     srv_mode = if (opts.shared) "shared" else if (iso != null and iso.?.durable) "durable" else "isolated";
     srv_gui_socket = sock_path != null;
+    srv_gui_socket_source = if (sock_path == null)
+        .none
+    else if (opts.socket != null)
+        .explicit
+    else
+        .discovered;
 
     // Named/durable instance: pick up app sessions still running on
     // the private daemon from a previous run.
@@ -833,6 +880,10 @@ const StubBackend = struct {
         _ = line;
         return error.NoGuiSocket;
     }
+
+    fn talkFor(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: i64) DirectTalkResult {
+        return .{ .failure = .{ .err = error.NoGuiSocket, .delivery = .pre_delivery } };
+    }
 };
 
 const RealBackend = struct {
@@ -875,6 +926,97 @@ const RealBackend = struct {
         }
         defer c.g_free(resp);
         return allocator.dupe(u8, resp[0..rlen]);
+    }
+
+    fn pollUntil(fd: c_int, events: c_short, deadline_ms: i64) !void {
+        while (true) {
+            const remain = deadline_ms - monoMs();
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = fd, .events = events, .revents = 0 };
+            const rc = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
+            if (rc > 0 and pfd.revents & events != 0) return;
+            if (rc < 0 or pfd.revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0)
+                return error.Disconnected;
+        }
+    }
+
+    /// Millisecond-deadline direct GUI exchange used by ui_wait_event.
+    fn talkFor(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, timeout_ms: i64) DirectTalkResult {
+        const self: *RealBackend = @ptrCast(@alignCast(ctx));
+        const deadline = monoMs() + @max(timeout_ms, 0);
+        if (deadline - monoMs() <= 0) return directFailure(error.Timeout, false);
+        const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) return directFailure(error.SocketFailed, false);
+        defer _ = c.close(fd);
+        const flags = c.fcntl(fd, c.F_GETFL);
+        if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
+            return directFailure(error.NonBlockingFailed, false);
+        var addr: c.struct_sockaddr_un = undefined;
+        @import("../mux/daemon.zig").fillSockaddrUn(&addr, self.sock_path) catch |err|
+            return directFailure(err, false);
+        if (deadline - monoMs() <= 0) return directFailure(error.Timeout, false);
+        const connected = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
+        if (connected != 0) {
+            const e = std.posix.errno(connected);
+            if (e != .INPROGRESS and e != .AGAIN and e != .ALREADY)
+                return directFailure(error.ConnectFailed, false);
+            pollUntil(fd, c.POLLOUT, deadline) catch |err| return directFailure(err, false);
+        }
+        var so_error: c_int = 0;
+        var so_len: c.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_error, &so_len) != 0 or so_error != 0)
+            return directFailure(error.ConnectFailed, false);
+
+        const request = std.fmt.allocPrint(allocator, "{s}\n", .{line}) catch |err|
+            return directFailure(err, false);
+        defer allocator.free(request);
+        var sent: usize = 0;
+        while (sent < request.len) {
+            if (deadline - monoMs() <= 0) return directFailure(error.Timeout, sent > 0);
+            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+                c.send(fd, request.ptr + sent, request.len - sent, c.MSG_NOSIGNAL)
+            else
+                c.write(fd, request.ptr + sent, request.len - sent);
+            if (n > 0) {
+                sent += @intCast(n);
+                continue;
+            }
+            const e = std.posix.errno(n);
+            if (e == .INTR) continue;
+            if (e != .AGAIN) return directFailure(error.WriteFailed, sent > 0);
+            pollUntil(fd, c.POLLOUT, deadline) catch |err| return directFailure(err, sent > 0);
+        }
+
+        var response: std.ArrayList(u8) = .empty;
+        defer response.deinit(allocator);
+        while (true) {
+            if (std.mem.indexOfScalar(u8, response.items, '\n')) |end| {
+                const owned = allocator.dupe(u8, response.items[0..end]) catch |err|
+                    return directFailure(err, true);
+                return .{ .reply = owned };
+            }
+            if (response.items.len >= (16 << 20)) return directFailure(error.ResponseTooLarge, true);
+            var buf: [16 << 10]u8 = undefined;
+            const n = c.read(fd, &buf, buf.len);
+            if (n > 0) {
+                response.appendSlice(allocator, buf[0..@intCast(n)]) catch |err|
+                    return directFailure(err, true);
+                continue;
+            }
+            if (n == 0) return directFailure(error.NoResponse, true);
+            const e = std.posix.errno(n);
+            if (e == .INTR) continue;
+            if (e != .AGAIN) return directFailure(error.NoResponse, true);
+            pollUntil(fd, c.POLLIN, deadline) catch |err| return directFailure(err, true);
+        }
+    }
+
+    fn directFailure(err: anyerror, started: bool) DirectTalkResult {
+        return .{ .failure = .{
+            .err = err,
+            .delivery = if (started) .uncertain_delivery else .pre_delivery,
+        } };
     }
 
     fn sleepMs(_: *anyopaque, ms: u32) void {
@@ -1196,15 +1338,15 @@ const TOOLS_JSON_RAW =
     \\{"name":"file_media_info","description":"Media metadata for MANY files in ONE daemon-side batch: image/video dimensions, JPEG EXIF (camera, lens, orientation, DateTimeOriginal, exposure, GPS), audio tags (ID3v1/v2, Vorbis, MP4 ilst), duration and bitrate. Extraction runs on the host that owns the files and is cached there keyed on path+mtime+size, so re-asking is nearly free and no file bytes cross the network. Values are flat key=value pairs in a stable namespace (media.*, tag.*, exif.*, image.*, doc.*); a duration marked estimated was derived from a bitrate, not read from a header. Files that are not media are answered with an empty field list rather than an error.","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Absolute file paths (max 128 per call)"}},"required":["paths"]}},
     \\{"name":"file_jobs","description":"List file jobs (running + recently finished): id, op, state, progress. Jobs survive client disconnects.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"file_job","description":"Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).","inputSchema":{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}},
-    \\{"name":"ui_show","description":"Show the user a real native UI PANEL in their sketerm window: a declarative document you author, rendered as GTK widgets — not text, not a screenshot. Use it to present what a terminal cannot: an image set, an A/B before/after comparison slider, a training dashboard, an approve/reject button. The user interacts and you read the interactions back with ui_wait_event. Panels are keyed by (session, name): re-showing a name REPLACES that panel's document IN PLACE (same window, same panel_id, compare sliders keep their zoom/pan/split), which is what makes a repeated 'here is epoch 42' cheap. Pass EITHER 'document' (the panel itself) OR 'load' (the name of a document stored earlier with ui_save) — exactly one. Needs a running sketerm GUI (start the MCP server with --shared; `capabilities` reports `panels`). DOCUMENT FORMAT: {\"title\":\"Epoch 41\",\"root\":\"main\",\"components\":{\"main\":{\"type\":\"column\",\"children\":[\"h\",\"cmp\"]},...}} — a FLAT map of components keyed by id and referenced BY ID, never nested. Types and their props: column/row {children:[ids]}; heading {text,level 1-4}; text {text}; image {src,caption} (src = ABSOLUTE local path, no '..'); image_compare {left:{src,label},right:{src,label}} = the A/B slider; button {text,action} (action is the value the click event carries); slider {min,max,step,value}; select {options:[...],value}; progress {value,label,indeterminate}; separator; spacer {size} (0 = expand). Any component may carry \"class\":[...] from: dim accent success warning error card monospace center end expand. There is deliberately no raw HTML, CSS or script — this catalog is the whole vocabulary. Limits: 512 components, 1MB, ids [A-Za-z0-9_.-]. A rejected document comes back with the parser's own message naming the offending component id — fix that and re-send.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name, unique per session. Re-using it replaces that panel's document in place."},"document":{"description":"The panel document (a JSON object, or a JSON string). Mutually exclusive with 'load'."},"load":{"type":"string","description":"Show a document saved earlier with ui_save, by its saved name. Mutually exclusive with 'document'."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Where it goes: 'tab' (default) = a new tab in the user's window; 'pane' = takes over the calling pane (its shell comes back when the panel closes); 'window' = a standalone panel window."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION — your own pane). Panels are invisible to other sessions."}},"required":["name"]}},
-    \\{"name":"ui_show_files","description":"FAST PATH for \"show me these images\": hand it a list of local image files and it builds the panel document for you and shows it — ONE call instead of hand-authoring a ui_show document. Reach for ui_show only when the panel needs more than pictures and captions (buttons, sliders, progress, mixed layout); everything else about it is identical, and what it makes IS a normal panel — ui_patch, ui_save, ui_close and ui_wait_event all work on it. 'files' is [{\"path\":\"/abs/img.png\",\"caption\":\"epoch 41\"}]; a bare \"/abs/path\" string is accepted too, and a missing caption falls back to the file's basename. LAYOUT: with compare:true and EXACTLY two files you get an image_compare — the A/B slider, with each file's caption as its side label (this is the before/after review component). compare:true with any other number of files is REFUSED. Otherwise you get a heading (only when you pass 'title') plus one image per file, stacked in a scrolling column, in the order given. PATHS must be absolute and free of \"..\" (a bad one is refused, naming it). Readability is checked first: files that cannot be read are still shown — the renderer draws an explicit placeholder rather than failing the panel — and every one of them is named back to you in \"unreadable\", but if NOT ONE file can be read the call is refused instead of showing a panel of placeholders. Max 64 files. 'name' defaults to \"files\", and re-showing the same name REPLACES that panel in place (same window, same panel_id), so \"here is the next epoch\" is the same one-line call again. Needs a running sketerm GUI (start this server with --shared; `capabilities` reports `panels`).","inputSchema":{"type":"object","properties":{"files":{"type":"array","description":"1..64 images: {\"path\":\"/abs/path.png\",\"caption\":\"...\"} objects, or plain absolute-path strings. Caption defaults to the basename.","items":{}},"name":{"type":"string","description":"Panel name, unique per session. Default \"files\"; re-using it replaces that panel in place."},"title":{"type":"string","description":"Panel title. When given it is also drawn as a heading above the images."},"compare":{"type":"boolean","description":"Two files only: draw the A/B comparison slider instead of stacking them. The captions become the side labels."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Same as ui_show: 'tab' (default), 'pane' (takes over the calling pane), 'window'."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION)."}},"required":["files"]}},
+    \\{"name":"ui_show","description":"Show the user a real native UI PANEL in their sketerm window: a declarative document you author, rendered as GTK widgets — not text, not a screenshot. Use it to present what a terminal cannot: an image set, an A/B before/after comparison slider, a training dashboard, an approve/reject button. The user interacts and you read the interactions back with ui_wait_event. Live panels are keyed by (session, name); saved documents are keyed by the session's daemon and lifetime id: re-showing a name REPLACES that panel's document IN PLACE (same window, same panel_id, compare sliders keep their zoom/pan/split), which is what makes a repeated 'here is epoch 42' cheap. Pass EITHER 'document' (the panel itself) OR 'load' (the name of a document stored earlier with ui_save) — exactly one. Needs a compatible sketerm GUI attached to the panel's session; with a session, ui_* relays through that session's own mux daemon, so no special server flag is needed. Without a session it falls back to a direct GUI control socket. `capabilities` reports `panels` and which transport is in use. DOCUMENT FORMAT: {\"title\":\"Epoch 41\",\"root\":\"main\",\"components\":{\"main\":{\"type\":\"column\",\"children\":[\"h\",\"cmp\"]},...}} — a FLAT map of components keyed by id and referenced BY ID, never nested. Types and their props: column/row {children:[ids]}; heading {text,level 1-4}; text {text}; image {src,caption} (src = ABSOLUTE path on the session's host, no '..'; a remote path is fetched through that daemon and decoded by the GUI, and the document keeps the original path); image_compare {left:{src,label},right:{src,label}} = the A/B slider; button {text,action} (action is the value the click event carries); slider {min,max,step,value}; select {options:[...],value}; progress {value,label,indeterminate}; separator; spacer {size} (0 = expand). Any component may carry \"class\":[...] from: dim accent success warning error card monospace center end expand. There is deliberately no raw HTML, CSS or script — this catalog is the whole vocabulary. Limits: 512 components, 1MB, ids [A-Za-z0-9_.-]. A rejected document comes back with the parser's own message naming the offending component id — fix that and re-send.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name, unique per session. Re-using it replaces that panel's document in place."},"document":{"description":"The panel document (a JSON object, or a JSON string). Mutually exclusive with 'load'."},"load":{"type":"string","description":"Show a document saved earlier with ui_save, by its saved name. Mutually exclusive with 'document'."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Where it goes: 'tab' (default) = a new tab in the user's window; 'pane' = takes over the calling pane (its shell comes back when the panel closes); 'window' = a standalone panel window."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION — your own pane). Panels are invisible to other sessions."}},"required":["name"]}},
+    \\{"name":"ui_show_files","description":"FAST PATH for \"show me these images\": hand it a list of image files on the session's host and it builds the panel document for you and shows it — ONE call instead of hand-authoring a ui_show document. Reach for ui_show only when the panel needs more than pictures and captions (buttons, sliders, progress, mixed layout); everything else about it is identical, and what it makes IS a normal panel — ui_patch, ui_save, ui_close and ui_wait_event all work on it. 'files' is [{\"path\":\"/abs/img.png\",\"caption\":\"epoch 41\"}]; a bare \"/abs/path\" string is accepted too, and a missing caption falls back to the file's basename. LAYOUT: with compare:true and EXACTLY two files you get an image_compare — the A/B slider, with each file's caption as its side label (this is the before/after review component). compare:true with any other number of files is REFUSED. Otherwise you get a heading (only when you pass 'title') plus one image per file, stacked in a scrolling column, in the order given. PATHS must be absolute and free of \"..\" (a bad one is refused, naming it). Readability is checked first: files that cannot be read are still shown — the renderer draws an explicit placeholder rather than failing the panel — and every one of them is named back to you in \"unreadable\", but if NOT ONE file can be read the call is refused instead of showing a panel of placeholders. Max 64 files. 'name' defaults to \"files\", and re-showing the same name REPLACES that panel in place (same window, same panel_id), so \"here is the next epoch\" is the same one-line call again. Needs a compatible sketerm GUI attached to the panel's session; with a session, ui_* relays through that session's own mux daemon, so no special server flag is needed. `capabilities` reports `panels`.","inputSchema":{"type":"object","properties":{"files":{"type":"array","description":"1..64 images: {\"path\":\"/abs/path.png\",\"caption\":\"...\"} objects, or plain absolute-path strings. Caption defaults to the basename.","items":{}},"name":{"type":"string","description":"Panel name, unique per session. Default \"files\"; re-using it replaces that panel in place."},"title":{"type":"string","description":"Panel title. When given it is also drawn as a heading above the images."},"compare":{"type":"boolean","description":"Two files only: draw the A/B comparison slider instead of stacking them. The captions become the side labels."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Same as ui_show: 'tab' (default), 'pane' (takes over the calling pane), 'window'."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION)."}},"required":["files"]}},
     \\{"name":"ui_patch","description":"Update a live panel WITHOUT rebuilding it: a JSON array of ops applied as one transaction (all or nothing). Leaf changes update the widget in place — label text, slider value, progress fraction, a new image on either side of an image_compare — so the compare keeps its zoom, pan and split position across an epoch swap, and the user's scroll position survives. Ops: {\"op\":\"set\",\"id\":\"<id>\",\"component\":{...}} (add or replace a component), {\"op\":\"remove\",\"id\":\"<id>\"}, {\"op\":\"title\",\"value\":\"...\"}, {\"op\":\"root\",\"id\":\"<id>\"}, {\"op\":\"data\",\"key\":\"k\",\"value\":<scalar|null>}. Max 256 ops. A patch that names a component that does not exist is REFUSED with the parser's message and the panel is left exactly as it was. Address the panel by 'name' (preferred — stable) or by 'panel_id'.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"patch":{"description":"JSON array of ops (or a JSON string of one)"},"session":{"type":"string"}},"required":["patch"]}},
-    \\{"name":"ui_wait_event","description":"BLOCK until the user interacts with a panel, then return the queued interactions: button clicks (value = the button's action), slider/select changes (value = the new value), each with the component id and a monotonic ms timestamp. This is how a panel becomes a conversation — show an approve/reject panel, wait here, act on the answer. Returns as soon as anything is queued, including interactions that happened BEFORE the call (the queue is drained, never sampled), so no click can be missed between calls. On timeout it says so plainly rather than pretending nothing was clicked. timeout_ms is clamped to 120000 (120s, under the MCP call watchdog); the default is 30000. If the queue overflowed (64 events) the reply reports how many were dropped — a truncated interaction stream is stated, never hidden. A panel closed by the user ends the wait immediately and says so.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"timeout_ms":{"type":"integer","description":"Wait budget, default 30000, clamped to 120000"},"session":{"type":"string"}}}},
-    \\{"name":"ui_panels","description":"Inventory of panels in a session, in two clearly separate lists: LIVE panels (on screen right now — panel_id, name, title, target) and SAVED documents (stored on disk by ui_save — name, title, size, mtime, and whether the stored file still parses). A saved panel is not showing; a live panel is not saved. Panels are session-scoped, so this lists YOURS and never another assistant's.","inputSchema":{"type":"object","properties":{"session":{"type":"string","description":"Default $SKETERM_SESSION"}}}},
-    \\{"name":"ui_save","description":"Persist a panel document to disk under (session, name) so a later ui_show can bring it back with load=<name>. With 'document' it saves that document; without one it saves the panel's CURRENT live document, read back from the GUI — every ui_patch included, and it works for any panel on screen no matter which process showed it (that half needs a GUI socket). Saving does not close or change anything on screen. The document is validated first: an invalid one is refused with the parser's message and nothing is written, and the write is atomic (staged + renamed), so a saved panel is never half-written. Session-scoped: another assistant cannot see or overwrite your saved panels. Cap: 64 panels per session.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Saved name, 1..64 chars of [A-Za-z0-9._-]"},"document":{"description":"Document to save (object or JSON string). Omit to save the LIVE panel of that name, read back from the GUI as it is right now."},"panel_id":{"type":"integer","description":"Address the live panel by handle instead of by 'name' when omitting 'document'; it is still saved under 'name'."},"session":{"type":"string"}},"required":["name"]}},
+    \\{"name":"ui_wait_event","description":"BLOCK until the user interacts with a panel, then return the queued interactions: button clicks (value = the button's action), slider/select changes (value = the new value), each with the component id and a monotonic ms timestamp. This is how a panel becomes a conversation — show an approve/reject panel, wait here, act on the answer. Returns as soon as anything is queued, including interactions that happened BEFORE the call (the queue is drained, never sampled), so no click is lost merely between calls. If a delivered drain request loses its REPLY, the error instead says events may already have been drained and the request is NOT retried. On timeout it says so plainly rather than pretending nothing was clicked. timeout_ms is clamped to 120000 (120s, under the MCP call watchdog); the default is 30000. If the queue overflowed (64 events) the reply reports how many were dropped — a truncated interaction stream is stated, never hidden. A panel closed by the user ends the wait immediately and says so.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"timeout_ms":{"type":"integer","description":"Wait budget, default 30000, clamped to 120000"},"session":{"type":"string"}}}},
+    \\{"name":"ui_panels","description":"Inventory of panels in a session, in two clearly separate lists: LIVE panels (on screen right now — panel_id, name, title, target) and SAVED documents (stored on disk by ui_save — name, title, size, mtime, and whether the stored file still parses). A saved panel is not showing; a live panel is not saved. Panels are session-scoped, so this lists YOURS and never another assistant's. Saved documents are additionally scoped to the session's lifetime, so a reused session name stays separate.","inputSchema":{"type":"object","properties":{"session":{"type":"string","description":"Default $SKETERM_SESSION"}}}},
+    \\{"name":"ui_save","description":"Persist a panel document to disk under the session's daemon origin and lifetime id so a later ui_show can bring it back with load=<name>. With 'document' it saves that document; without one it saves the panel's CURRENT live document, read back from the GUI — every ui_patch included, and it works for any panel on screen no matter which process showed it (that half needs a live panel transport: the session relay, or a direct GUI socket). Saving does not close or change anything on screen. The document is validated first: an invalid one is refused with the parser's message and nothing is written, and the write is atomic (staged + renamed), so a saved panel is never half-written. Scoped to this session's lifetime: another assistant, another daemon, or a later session that reuses the name cannot see or overwrite it, and renaming the session keeps it. Cap: 64 panels per session.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Saved name, 1..64 chars of [A-Za-z0-9._-]"},"document":{"description":"Document to save (object or JSON string). Omit to save the LIVE panel of that name, read back from the GUI as it is right now."},"panel_id":{"type":"integer","description":"Address the live panel by handle instead of by 'name' when omitting 'document'; it is still saved under 'name'."},"session":{"type":"string"}},"required":["name"]}},
     \\{"name":"ui_close","description":"Close a LIVE panel: it disappears from the user's screen. Nothing on disk is touched — a document saved with ui_save stays saved and can be shown again with ui_show load=<name>. (To delete the saved document instead, that is ui_delete — a different, destructive tool.) A pane-target panel gives the pane back to its shell; a tab-target panel takes its tab with it. Closing an already-closed panel is a plain refusal, not an error state.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"session":{"type":"string"}}}},
     \\{"name":"ui_delete","description":"DESTRUCTIVE: permanently delete a SAVED panel document from disk. This is not how you close a panel — closing what is on screen is ui_close, and it keeps the saved copy. There is no undo and no trash: the file is unlinked. It does not affect a panel currently on screen; that keeps rendering until ui_close. Use it only when the user asked to get rid of a stored panel.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Saved panel name to delete"},"session":{"type":"string"}},"required":["name"]}},
-    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a sketerm GUI window's socket is attached (gui_socket — needed only by GUI-targeting terminal tools; false does NOT mean GUI apps can't run), OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"browser_navigate","description":"Navigate a browser_open app: a URL (https:// assumed when schemeless), or \"back\"/\"forward\"/\"reload\". Waits for document readyState complete (bounded) and returns the landed URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"url":{"type":"string"},"timeout_ms":{"type":"integer","description":"Load wait, default 20000"}},"required":["url"]}},
@@ -1385,16 +1527,23 @@ fn ipc(arena: std.mem.Allocator, backend: Backend, req: protocol.Request) ![]u8 
     return backend.talk(backend.ctx, arena, line);
 }
 
+const IpcDelivery = enum { ordinary, pre_delivery, uncertain_delivery };
+
 const IpcReply = struct {
     ok: bool,
     /// Parsed response object (arena-owned).
     value: std.json.Value,
     /// Error message when !ok.
     err: []const u8,
+    delivery: IpcDelivery = .ordinary,
 };
 
 fn ipcParsed(arena: std.mem.Allocator, backend: Backend, req: protocol.Request) !IpcReply {
     const resp = try ipc(arena, backend, req);
+    return parseIpcReply(arena, resp);
+}
+
+fn parseIpcReply(arena: std.mem.Allocator, resp: []const u8) IpcReply {
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, resp, .{}) catch
         return .{ .ok = false, .value = .null, .err = "bad IPC response" };
     if (v != .object) return .{ .ok = false, .value = .null, .err = "bad IPC response" };
@@ -1403,7 +1552,14 @@ fn ipcParsed(arena: std.mem.Allocator, backend: Backend, req: protocol.Request) 
         (if (e == .string) e.string else "unknown error")
     else
         "unknown error";
-    return .{ .ok = ok, .value = v, .err = err };
+    var delivery: IpcDelivery = .ordinary;
+    if (v.object.get("failure_class")) |failure_class| {
+        if (failure_class == .string) {
+            if (std.mem.eql(u8, failure_class.string, "pre_delivery")) delivery = .pre_delivery;
+            if (std.mem.eql(u8, failure_class.string, "uncertain_delivery")) delivery = .uncertain_delivery;
+        }
+    }
+    return .{ .ok = ok, .value = v, .err = err, .delivery = delivery };
 }
 
 fn paneFromArgs(args: std.json.Value) ?u32 {
@@ -1536,6 +1692,11 @@ var fs_state: FsState = .{ .allocator = undefined };
 /// Server mode facts for the `capabilities` preflight tool.
 var srv_mode: []const u8 = "isolated";
 var srv_gui_socket: bool = false;
+const GuiSocketSource = enum { none, explicit, discovered };
+var srv_gui_socket_source: GuiSocketSource = .none;
+/// Independent from app_state: live panels follow their owning mux session,
+/// while app tools keep using the MCP instance's private daemon.
+var panel_pool: ?*paneldrive.Pool = null;
 
 /// Automatic asciicast recording of every headless terminal the MCP
 /// server spawns (term_open, new_tab fallback, transfer/forward
@@ -2416,8 +2577,8 @@ pub fn needsLiveApp(name: []const u8) bool {
         "app_perform_action", "app_set_value",     "app_wait_for_element",
         "app_a11y_tree",      "app_record_start",  "close_app_window",
         "app_read_text",      "app_wait_text",     "app_find_image",
-        "app_wait_image",     "app_macro_run",
-        "app_hover_map",      "app_backtrace",     "app_watch",
+        "app_wait_image",     "app_macro_run",     "app_hover_map",
+        "app_backtrace",      "app_watch",
     };
     for (live) |l| {
         if (std.mem.eql(u8, name, l)) return true;
@@ -3095,7 +3256,7 @@ pub fn applyDebugWrap(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8)
     var note: []const u8 = undefined;
     if (eql(u8, dm, "gdb")) {
         try wrapped.appendSlice(arena, &.{
-            "gdb",  "-q",                                 "-batch",
+            "gdb",                                "-q",                                 "-batch",
             // Batch mode runs these in order and quits after the last
             // one. That makes NUISANCE SIGNALS fatal to the whole
             // exercise: a threaded app that takes a SIGPIPE or one of
@@ -3104,21 +3265,17 @@ pub fn applyDebugWrap(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8)
             // gdb exits long before the crash under investigation.
             // Passing them through is what makes a backtrace show up
             // reliably rather than roughly one run in five.
-            "-ex",  "handle SIGPIPE nostop noprint pass",
-            "-ex",  "handle SIG32 nostop noprint pass",
-            "-ex",  "handle SIG33 nostop noprint pass",
-            "-ex",  "handle SIG34 nostop noprint pass",
-            "-ex",  "handle SIGCHLD nostop noprint pass",
-            "-ex",  "set pagination off",
-            "-ex",  "set confirm off",
-            "-ex",  "set print thread-events off",
-            "-ex",  "run",
+            "-ex",                                "handle SIGPIPE nostop noprint pass", "-ex",
+            "handle SIG32 nostop noprint pass",   "-ex",                                "handle SIG33 nostop noprint pass",
+            "-ex",                                "handle SIG34 nostop noprint pass",   "-ex",
+            "handle SIGCHLD nostop noprint pass", "-ex",                                "set pagination off",
+            "-ex",                                "set confirm off",                    "-ex",
+            "set print thread-events off",        "-ex",                                "run",
             // The faulting thread is often NOT the one gdb selects, and
             // a worker-thread crash is exactly the case a single
             // `bt full` reports uselessly.
-            "-ex",  "thread apply all bt full",
-            "-ex",  "info threads",
-            "-ex",  "info registers",
+            "-ex",                                "thread apply all bt full",           "-ex",
+            "info threads",                       "-ex",                                "info registers",
         });
         var n_extra: usize = 0;
         if (args == .object) if (args.object.get("gdb_commands")) |gc| {
@@ -3149,8 +3306,6 @@ pub fn applyDebugWrap(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8)
     try argv.appendSlice(arena, wrapped.items);
     return .{ .note = note };
 }
-
-
 
 // ── Capabilities preflight ────────────────────────────────────────
 
@@ -3190,26 +3345,100 @@ pub fn findBrowserBinary(arena: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
-fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
+fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     // headless_gui is what launch_app actually depends on (the mux
     // daemon), and it is effectively always true. gui_socket was once
     // reported bare and read as "no GUI here", steering assistants
     // back to Xvfb — hence the explicit hints on both fields.
-    try w.print("{{\"mode\":\"{s}\",\"headless_gui\":{},\"headless_gui_hint\":\"launch_app runs GUI (Wayland) apps headlessly against the mux daemon — no display, X server or sketerm window needed; this is independent of gui_socket\",\"gui_socket\":{},\"gui_socket_hint\":\"whether a running sketerm GUI WINDOW is attached (needed only by the terminal tools that target the GUI); false does NOT mean GUI apps can't run\",\"headless_terminals\":{},\"transfers_and_forwards\":{}", .{
-        srv_mode, app_state.ready, srv_gui_socket, term_state.mux_sock != null, term_state.mux_sock != null,
+    try w.print("{{\"mode\":\"{s}\",\"headless_gui\":{},\"headless_gui_hint\":\"launch_app runs GUI (Wayland) apps headlessly against the mux daemon — no display, X server or sketerm window needed; this is independent of gui_socket\",\"gui_socket\":{},\"gui_socket_source\":\"{s}\",\"gui_socket_hint\":\"whether a direct sketerm GUI control socket is attached (used by GUI-targeting terminal tools and sessionless panels); false does NOT mean headless GUI apps or mux-relayed panels are unavailable\",\"headless_terminals\":{},\"transfers_and_forwards\":{}", .{
+        srv_mode, app_state.ready, srv_gui_socket, @tagName(srv_gui_socket_source), term_state.mux_sock != null, term_state.mux_sock != null,
     });
     if (!std.mem.eql(u8, srv_mode, "shared"))
         try w.writeAll(",\"mode_hint\":\"this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)\"");
-    // Panels (ui_*): the live half needs the GUI socket, the saved half
-    // never does — a bare `panels:false` would read as "no panels here"
-    // and hide ui_save/ui_panels/ui_delete, which do work.
-    try w.print(",\"panels\":{}", .{srv_gui_socket});
-    try w.writeAll(if (srv_gui_socket)
-        ",\"panels_hint\":\"ui_show renders a declarative document as native widgets in the user's window and ui_wait_event reads their clicks back; panels are scoped to (session, name)\""
+    // Panel delivery is independent of gui_socket: an isolated MCP can
+    // relay to the GUI attached to its inherited origin session.
+    const panel_session = panelstore.resolveSession(.absent);
+    var panel_transport = UiTransport.init(arena, backend, panel_session);
+    defer panel_transport.deinit();
+    // A preflight must stay cheap and must not write anything: probe the
+    // relay under a short deadline of its own, and report the store by
+    // whether its scope RESOLVES. Whether the state dir is writable is the
+    // business of the call that actually writes (ui_save says so exactly).
+    const panel_reply = panel_transport.talkFor(.{
+        .cmd = "panel-list",
+        .session = uiWireSession(panel_session),
+    }, UI_CAPABILITY_PROBE_MS);
+    const panels_ready = panel_reply.ok;
+    const panel_store = uiStoreScope(&panel_transport, UI_CAPABILITY_PROBE_MS);
+    const panel_store_ready = panel_store.err.len == 0;
+    const panel_store_scope_name: []const u8 = if (panel_store.err.len > 0)
+        "unavailable"
+    else switch (panel_store.scope) {
+        .sessionless => "sessionless",
+        .session => "session",
+        .origin => "origin",
+    };
+    const panel_state_name: []const u8 = if (panels_ready)
+        "ready"
+    else if (panel_transport.failure) |failure|
+        switch (failure.kind) {
+            .legacy_daemon => "legacy_daemon",
+            .unsupported => "unsupported_daemon",
+            .no_compatible_gui => "no_compatible_gui",
+            .origin_unreachable => "origin_unreachable",
+            .origin_timeout => "origin_timeout",
+            .attach_failed => "session_unavailable",
+            .identity_mismatch => "identity_mismatch",
+            .malformed_attach => "malformed_attach_metadata",
+            .malformed_welcome => "malformed_daemon_welcome",
+            .request_too_large => "request_too_large",
+            .allocation_failed => "pre_delivery_allocation_failed",
+            .send_pre_delivery => "send_pre_delivery",
+            .delivery_uncertain => "delivery_uncertain",
+            .reply_timeout => "viewer_timeout",
+            .disconnected => "viewer_disconnected",
+            .malformed_reply => "malformed_reply",
+        }
+    else if (std.mem.indexOf(u8, panel_reply.err, "no compatible GUI") != null)
+        "no_compatible_gui"
+    else if (panel_session == null and !srv_gui_socket)
+        "no_session_origin"
     else
-        ",\"panels_hint\":\"ui_show/ui_patch/ui_wait_event/ui_close need a running sketerm GUI window — start this server with --shared (or --socket <path>). ui_save/ui_panels/ui_delete work on the saved-document store either way.\"");
+        "unavailable";
+    try w.print(",\"panels\":{},\"panels_store\":{},\"panel_store\":{{\"state\":\"{s}\",\"scope\":\"{s}\"", .{
+        panels_ready,
+        panel_store_ready,
+        if (panel_store_ready) "ready" else "unavailable",
+        panel_store_scope_name,
+    });
+    if (!panel_store_ready) {
+        try w.writeAll(",\"error\":");
+        try std.json.Stringify.value(panel_store.err, .{}, w);
+        try w.writeAll(",\"reason\":\"identity_validation_failed\"");
+    }
+    try w.writeAll("},\"panel_transport\":{\"selected\":");
+    try std.json.Stringify.value(panel_transport.selected(), .{}, w);
+    try w.writeAll(",\"source\":");
+    try std.json.Stringify.value(panel_transport.source(), .{}, w);
+    try w.writeAll(",\"state\":");
+    try std.json.Stringify.value(panel_state_name, .{}, w);
+    try w.writeAll(",\"session\":");
+    try std.json.Stringify.value(panel_session, .{}, w);
+    if (!panels_ready) {
+        try w.writeAll(",\"error\":");
+        try std.json.Stringify.value(panel_reply.err, .{}, w);
+    }
+    try w.writeAll("}");
+    try w.writeAll(if (panels_ready)
+        ",\"panels_hint\":\"live ui_* calls are routed to the GUI attached to this panel session; remote image paths are hydrated over the same mux attachment before presentation; gui_socket is independent and only describes direct GUI control IPC\""
+    else
+        ",\"panels_hint\":\"live ui_* calls need either an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon fallback) or an explicit direct GUI socket. Store-only ui_save/ui_panels/ui_delete are available only when panels_store is true; panel_store reports their independently validated state.\"");
+    try w.writeAll(if (panel_store_ready)
+        ",\"panel_store_hint\":\"saved-panel persistence has a resolved scope: exact origins key on daemon socket plus session lifetime id, and direct/default/sessionless callers use their compatibility scopes. A filesystem that refuses the write is reported by ui_save itself\""
+    else
+        ",\"panel_store_hint\":\"saved-panel persistence is unavailable because the exact origin identity could not be resolved; ui_save/ui_delete return the same failure and ui_panels reports saved_error. Exact origins never downgrade to reusable session storage\"");
     const ocr_ok = ocr.available();
     try w.print(",\"ocr\":{}", .{ocr_ok});
     if (!ocr_ok) try w.writeAll(",\"ocr_hint\":\"app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine\"");
@@ -3285,7 +3514,6 @@ fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
     });
     return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
 }
-
 
 // ── file_* tools (fsdrive against the app daemon) ─────────────────
 
@@ -3537,9 +3765,9 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
 
 // ── ui_*: agent-authored UI panels ────────────────────────────────
 //
-// Live panels are RENDERED BY THE GUI: every one of these tools is a
-// thin adapter over the `panel-*` control-socket commands
-// (src/ui/panelhost.zig), plus `panelstore.zig` for the saved half.
+// Live panels are RENDERED BY THE GUI. The same `panel-*` JSON commands
+// reach it through either the owning mux session's panel relay or the
+// legacy direct control socket; panelstore.zig remains the saved half.
 // Two invariants hold it together:
 //
 // - **Poll here, never block there.** `panel-events` answers
@@ -3569,21 +3797,26 @@ const UI_POLL_MS: u32 = 100;
 
 const UI_WAIT_DEFAULT_MS: i64 = 30_000;
 
-const UI_NEEDS_GUI =
-    "panels are drawn by a running sketerm GUI window, and this MCP server has no GUI socket. " ++
-    "`sketerm mcp` is ISOLATED by default: it drives its own private daemon, which has no window. " ++
-    "Restart it with `--shared` (join the user's running GUI) or with `--socket <path>` for a specific instance. " ++
-    "A retry cannot fix this — it is a startup decision. `capabilities` reports `panels` and `gui_socket`. " ++
-    "ui_save / ui_panels / ui_delete still work: they only touch the saved-document store.";
+const UI_NEEDS_TRANSPORT =
+    "no live panel transport is available. From a sketerm pane, preserve SKETERM_SESSION and " ++
+    "SKETERM_MUX_SOCKET so ui_* can relay through that exact mux session; sessionless/legacy callers " ++
+    "can use an explicit --socket <GUI path>. The MCP app tools remain on their private daemon. " ++
+    "ui_save with a document, ui_panels' saved half, and ui_delete still work without a live viewer.";
 
 /// `ui_save` with no document reads the panel back from the GUI
 /// (`panel-get`), which is why this server keeps no document state of
 /// its own.
-const UI_SAVE_NEEDS_GUI =
+const UI_SAVE_NEEDS_TRANSPORT =
     "ui_save without 'document' reads the panel's CURRENT document back from the sketerm GUI, " ++
-    "and this MCP server has no GUI socket. Either pass 'document' explicitly (the store half works without a GUI), " ++
-    "or restart with `--shared` (join the user's running GUI) or `--socket <path>`. " ++
-    "`capabilities` reports `panels` and `gui_socket`.";
+    "but no live panel transport is available. Either pass 'document' explicitly, run with the originating " ++
+    "SKETERM_SESSION + SKETERM_MUX_SOCKET, or use an explicit --socket for a sessionless/legacy GUI. " ++
+    "`capabilities` reports `panels`, `panel_transport`, and `gui_socket` separately.";
+
+const UI_RELAY_CALL_MS: i64 = 40_000;
+
+/// `capabilities` is a preflight: its liveness probe must cost a moment, not
+/// a whole tool call's budget.
+const UI_CAPABILITY_PROBE_MS: i64 = 2_000;
 
 /// Cap on `ui_show_files`. Well under doc.MAX_CHILDREN (128, and the
 /// heading takes one), and past a few dozen images a scrolling column
@@ -3654,8 +3887,14 @@ fn uiFilesDocument(
 /// The session a ui_* call is scoped to — `null` when there is none.
 /// Resolved ONCE per call and passed explicitly to both halves, so a
 /// live panel and its saved document cannot land under different keys.
-fn uiSession(args: std.json.Value) ?[]const u8 {
-    return panelstore.resolveSession(argStr(args, "session"));
+fn uiSession(args: std.json.Value) error{InvalidSessionType}!?[]const u8 {
+    if (args == .object) {
+        if (args.object.get("session")) |value| {
+            if (value == .string) return panelstore.resolveSession(.{ .explicit = value.string });
+            return error.InvalidSessionType;
+        }
+    }
+    return panelstore.resolveSession(.absent);
 }
 
 /// The scope as the control socket spells it: an EMPTY `session`
@@ -3663,6 +3902,403 @@ fn uiSession(args: std.json.Value) ?[]const u8 {
 /// with an absent field (= scope me to the requesting pane).
 fn uiWireSession(session: ?[]const u8) []const u8 {
     return session orelse "";
+}
+
+const UiStoreScope = struct {
+    scope: panelstore.Scope = .sessionless,
+    err: []const u8 = "",
+};
+
+const UiTransport = struct {
+    arena: std.mem.Allocator,
+    backend: Backend,
+    session: ?[]const u8,
+    mode: enum { auto, mux_relay, gui_socket, none },
+    origin: ?paneldrive.Origin = null,
+    failure: ?paneldrive.Failure = null,
+    validated_store_scope: ?panelstore.Scope = null,
+
+    fn init(arena: std.mem.Allocator, backend: Backend, session: ?[]const u8) UiTransport {
+        const exact_origin = session != null and paneldrive.hasEnvironmentSocket();
+        return .{
+            .arena = arena,
+            .backend = backend,
+            .session = session,
+            .mode = if (exact_origin)
+                if (panel_pool != null) .auto else .none
+            else if (srv_gui_socket_source == .explicit)
+                .gui_socket
+            else if (session != null and panel_pool != null)
+                .auto
+            else if (srv_gui_socket)
+                .gui_socket
+            else
+                .none,
+        };
+    }
+
+    fn deinit(self: *UiTransport) void {
+        if (self.origin) |*origin| origin.deinit(self.arena);
+        self.origin = null;
+    }
+
+    fn selected(self: *const UiTransport) []const u8 {
+        return switch (self.mode) {
+            .auto, .mux_relay => "mux_relay",
+            .gui_socket => "gui_socket",
+            .none => "none",
+        };
+    }
+
+    fn source(self: *const UiTransport) []const u8 {
+        return switch (self.mode) {
+            .gui_socket => switch (srv_gui_socket_source) {
+                .explicit => "gui_socket_explicit",
+                .discovered => "gui_socket_discovered",
+                .none => "none",
+            },
+            .auto, .mux_relay => if (self.origin) |origin| switch (origin.source) {
+                .environment => "SKETERM_MUX_SOCKET",
+                .default_compat => "default_socket_connect_only",
+            } else "none",
+            .none => "none",
+        };
+    }
+
+    fn talk(self: *UiTransport, req: protocol.Request) IpcReply {
+        return self.talkFor(req, UI_RELAY_CALL_MS);
+    }
+
+    fn talkFor(self: *UiTransport, req: protocol.Request, timeout_ms: i64) IpcReply {
+        const deadline_ms = clock.nowMs() + @max(timeout_ms, 0);
+        switch (self.mode) {
+            .gui_socket => return self.directUntil(req, deadline_ms),
+            .none => return .{ .ok = false, .value = .null, .err = UI_NEEDS_TRANSPORT },
+            .mux_relay, .auto => return self.relayUntil(req, deadline_ms),
+        }
+    }
+
+    fn directUntil(self: *UiTransport, req: protocol.Request, deadline_ms: i64) IpcReply {
+        const remain = deadline_ms - clock.nowMs();
+        if (remain <= 0) return .{
+            .ok = false,
+            .value = .null,
+            .err = "the shared panel deadline expired before direct fallback delivery; failure_class=pre_delivery, mutation_may_have_applied=false, resend_safe=true",
+            .delivery = .pre_delivery,
+        };
+        const line = reqLine(self.arena, req) catch
+            return .{ .ok = false, .value = .null, .err = "could not encode the panel request" };
+        const response = switch (self.backend.talkFor(self.backend.ctx, self.arena, line, remain)) {
+            .reply => |reply| reply,
+            .failure => |failure| return .{
+                .ok = false,
+                .value = .null,
+                .err = directFailureMessage(self.arena, req.cmd, failure),
+                .delivery = switch (failure.delivery) {
+                    .pre_delivery => .pre_delivery,
+                    .uncertain_delivery => .uncertain_delivery,
+                },
+            },
+        };
+        const meta = panelrpc.validateReply(self.arena, panelrpc.opFromCommand(req.cmd), response) catch |err| return .{
+            .ok = false,
+            .value = .null,
+            .err = std.fmt.allocPrint(
+                self.arena,
+                "the direct GUI presenter returned an invalid {s} reply after request delivery ({s}); delivery is uncertain, the mutation may have applied, and the request was NOT resent",
+                .{ req.cmd, @errorName(err) },
+            ) catch "the direct GUI presenter returned an invalid reply after uncertain delivery; the request was not resent",
+            .delivery = .uncertain_delivery,
+        };
+        const parsed = parseIpcReply(self.arena, response);
+        if (meta.uncertain_delivery) return .{
+            .ok = false,
+            .value = .null,
+            .err = std.fmt.allocPrint(
+                self.arena,
+                "the direct GUI presenter reported failure_class=uncertain_delivery ({s}); delivery is uncertain, the mutation may have applied, and it was NOT resent automatically. Do not resend it automatically",
+                .{parsed.err},
+            ) catch "the direct GUI presenter reported uncertain delivery; the mutation may have applied and it was not resent",
+            .delivery = .uncertain_delivery,
+        };
+        return parsed;
+    }
+
+    fn direct(self: *UiTransport, req: protocol.Request, timeout_ms: i64) IpcReply {
+        return self.directUntil(req, clock.nowMs() + @max(timeout_ms, 0));
+    }
+
+    /// Validate and retain persistence identity before a live request can fail.
+    fn prepareStoreScopeUntil(
+        self: *UiTransport,
+        origin: paneldrive.Origin,
+        deadline_ms: i64,
+    ) ?paneldrive.Failure {
+        if (self.validated_store_scope != null) return null;
+        if (origin.source == .environment) switch (paneldrive.environmentIdentity(origin.session)) {
+            .exact => |origin_id| {
+                self.validated_store_scope = .{ .origin = .{
+                    .daemon_origin = origin.socket,
+                    .origin_id = origin_id,
+                    .label = origin.session,
+                } };
+                return null;
+            },
+            .malformed => return .{
+                .kind = .malformed_attach,
+                .detail = "MalformedInheritedOriginId",
+            },
+            .none => {},
+        };
+        const pool = panel_pool orelse return .{
+            .kind = .unsupported,
+            .detail = "PanelRelayUnavailable",
+        };
+        const outcome = pool.identifyUntil(self.arena, origin, deadline_ms) catch return .{
+            .kind = .allocation_failed,
+            .detail = "OutOfMemory",
+        };
+        switch (outcome) {
+            .identity => |identity| {
+                self.validated_store_scope = .{ .origin = .{
+                    .daemon_origin = identity.daemon_origin,
+                    .origin_id = identity.origin_id,
+                    .label = origin.session,
+                } };
+                return null;
+            },
+            .failure => |failure| {
+                // A daemon with no lifetime id cannot key an exact scope, so
+                // the session name is the best identity available. Anything
+                // else leaves the scope unresolved rather than guessing.
+                if (failure.kind == .legacy_daemon or origin.source == .default_compat)
+                    self.validated_store_scope = .{ .session = origin.session };
+                return failure;
+            },
+        }
+    }
+
+    fn relayUntil(self: *UiTransport, req: protocol.Request, deadline_ms: i64) IpcReply {
+        if (self.origin == null) {
+            self.origin = paneldrive.Origin.resolve(self.arena, self.session) catch {
+                self.mode = .none;
+                return .{ .ok = false, .value = .null, .err = UI_NEEDS_TRANSPORT };
+            };
+        }
+        const origin = self.origin.?;
+        const line = reqLine(self.arena, req) catch
+            return .{ .ok = false, .value = .null, .err = "could not encode the panel request" };
+        const pool = panel_pool orelse {
+            self.mode = .none;
+            return .{ .ok = false, .value = .null, .err = UI_NEEDS_TRANSPORT };
+        };
+        if (self.prepareStoreScopeUntil(origin, deadline_ms)) |failure| {
+            if (self.canFallbackDirect(origin, failure)) {
+                self.failure = failure;
+                self.mode = .gui_socket;
+                return self.directUntil(req, deadline_ms);
+            }
+            self.failure = failure;
+            self.mode = .mux_relay;
+            return .{
+                .ok = false,
+                .value = .null,
+                .err = relayFailure(self.arena, origin, failure),
+                .delivery = .pre_delivery,
+            };
+        }
+        // The relay validated this reply against the same op on the way in:
+        // `panelrpc.validateReply` runs once, in paneldrive, and a bad shape
+        // arrives here as a failure rather than as a reply to re-check.
+        const outcome = pool.callUntil(self.arena, origin, panelrpc.opFromCommand(req.cmd), line, deadline_ms) catch
+            return .{ .ok = false, .value = .null, .err = "panel relay ran out of memory" };
+        switch (outcome) {
+            .reply => |reply| {
+                self.mode = .mux_relay;
+                const parsed = parseIpcReply(self.arena, reply.json);
+                if (reply.pre_delivery and !parsed.ok) return .{
+                    .ok = false,
+                    .value = parsed.value,
+                    .err = std.fmt.allocPrint(
+                        self.arena,
+                        "{s}; failure_class=pre_delivery, mutation_may_have_applied=false, resend_safe=true",
+                        .{parsed.err},
+                    ) catch parsed.err,
+                    .delivery = .pre_delivery,
+                };
+                return parsed;
+            },
+            .failure => |failure| {
+                if (self.canFallbackDirect(origin, failure)) {
+                    self.failure = failure;
+                    self.mode = .gui_socket;
+                    return self.directUntil(req, deadline_ms);
+                }
+                self.failure = failure;
+                self.mode = .mux_relay;
+                return .{
+                    .ok = false,
+                    .value = .null,
+                    .err = relayFailure(self.arena, origin, failure),
+                    .delivery = if (failure.uncertain()) .uncertain_delivery else .pre_delivery,
+                };
+            },
+        }
+    }
+
+    fn canFallbackDirect(_: *const UiTransport, origin: paneldrive.Origin, failure: paneldrive.Failure) bool {
+        if (origin.source != .environment or srv_gui_socket_source != .explicit) return false;
+        return switch (failure.kind) {
+            .legacy_daemon, .unsupported, .no_compatible_gui, .attach_failed, .malformed_attach => true,
+            else => false,
+        };
+    }
+};
+
+/// Resolve the saved-panel scope, spending at most `budget_ms` on the
+/// identity probe it may have to make.
+fn uiStoreScope(transport: *UiTransport, budget_ms: i64) UiStoreScope {
+    const session = transport.session orelse return .{ .scope = .sessionless };
+    // With no exact daemon to key on, the session name is the whole identity.
+    const by_session = UiStoreScope{ .scope = .{ .session = session } };
+
+    if (transport.mode == .gui_socket and transport.origin == null and !paneldrive.hasEnvironmentSocket())
+        return by_session;
+    if (transport.origin == null) {
+        transport.origin = paneldrive.Origin.resolve(transport.arena, session) catch |err| {
+            if (!paneldrive.hasEnvironmentSocket()) return by_session;
+            return .{ .err = std.fmt.allocPrint(
+                transport.arena,
+                "could not canonicalize the exact SKETERM_MUX_SOCKET persistence origin ({s}); refusing reusable (socket,session) storage",
+                .{@errorName(err)},
+            ) catch "could not canonicalize the exact persistence origin; refusing reusable storage" };
+        };
+    }
+    const origin = transport.origin.?;
+    if (transport.validated_store_scope) |scope| return .{ .scope = scope };
+    if (origin.source == .default_compat and (panel_pool == null or transport.mode == .none))
+        return by_session;
+
+    // An inherited $SKETERM_MUX_SOCKET names one exact daemon. If its lifetime
+    // identity cannot be established, say so instead of silently writing into
+    // the (socket, session) namespace a later same-name session would share.
+    const failure = transport.failure orelse
+        transport.prepareStoreScopeUntil(origin, clock.nowMs() + @max(budget_ms, 0));
+    if (transport.validated_store_scope) |scope| return .{ .scope = scope };
+    if (origin.source != .environment) return by_session;
+    if (failure) |f| return .{ .err = uiStoreFailure(transport.arena, origin, f) };
+    return .{
+        .err = "exact saved-panel identity validation completed without a scope; refusing to downgrade to reusable (socket,session) storage",
+    };
+}
+
+fn uiStoreFailure(arena: std.mem.Allocator, origin: paneldrive.Origin, failure: paneldrive.Failure) []const u8 {
+    const reason: []const u8 = switch (failure.kind) {
+        // A legacy daemon always retains a by-session scope in
+        // `prepareStoreScopeUntil`, so it can only reach this switch as the
+        // same "no compatible exact identity" story `unsupported` tells.
+        .legacy_daemon, .unsupported => "the daemon cannot expose a compatible exact lifetime identity",
+        .no_compatible_gui => "no compatible GUI was available before exact identity validation",
+        .origin_unreachable => "the exact daemon is unreachable",
+        .origin_timeout => "exact daemon identity validation timed out",
+        .attach_failed => "the exact session attach failed",
+        .identity_mismatch => "the session lifetime identity does not match",
+        .malformed_attach => "the inherited or attached session lifetime identity is malformed",
+        .malformed_welcome => "the daemon capability welcome is malformed",
+        .request_too_large => "identity validation reported an impossible oversized request",
+        .allocation_failed => "identity validation ran out of memory",
+        .send_pre_delivery => "identity validation transport failed before delivery",
+        .delivery_uncertain => "identity validation delivery is uncertain",
+        .reply_timeout => "identity validation reply timed out after delivery",
+        .disconnected => "identity validation disconnected after delivery",
+        .malformed_reply => "identity validation received a malformed reply after delivery",
+    };
+    return std.fmt.allocPrint(
+        arena,
+        "saved-panel persistence scope for exact origin {s} session {s} is unavailable: {s} ({s}: {s}); refusing to downgrade to reusable (socket,session) storage",
+        .{ origin.socket, origin.session, reason, @tagName(failure.kind), failure.detail },
+    ) catch "saved-panel exact persistence identity is unavailable; refusing reusable (socket,session) storage";
+}
+
+fn relayFailure(arena: std.mem.Allocator, origin: paneldrive.Origin, failure: paneldrive.Failure) []const u8 {
+    return switch (failure.kind) {
+        .legacy_daemon, .unsupported => std.fmt.allocPrint(
+            arena,
+            "the origin daemon does not support panel relay ({s}); update it, or use an explicit direct GUI --socket for legacy operation",
+            .{failure.detail},
+        ) catch "the origin daemon does not support panel relay",
+        .no_compatible_gui => std.fmt.allocPrint(
+            arena,
+            "no compatible GUI is attached to origin session {s}; the request failed before presenter delivery",
+            .{origin.session},
+        ) catch "no compatible GUI is attached to the origin session",
+        .origin_unreachable => std.fmt.allocPrint(
+            arena,
+            "the origin mux daemon at {s} is unavailable ({s}). It was selected exactly and was not autostarted or replaced, so the MCP private app daemon remains isolated",
+            .{ origin.socket, failure.detail },
+        ) catch "the origin mux daemon is unavailable",
+        .origin_timeout => std.fmt.allocPrint(
+            arena,
+            "the origin mux daemon at {s} did not complete identity negotiation before the deadline ({s}); it was selected exactly and no replacement was used",
+            .{ origin.socket, failure.detail },
+        ) catch "the exact origin mux daemon identity negotiation timed out",
+        .attach_failed => std.fmt.allocPrint(
+            arena,
+            "the origin daemon refused a panel-only attachment to session {s} ({s}); the session may have ended",
+            .{ origin.session, failure.detail },
+        ) catch "the origin daemon refused the panel attachment",
+        .identity_mismatch => std.fmt.allocPrint(
+            arena,
+            "the origin daemon refused session {s} because its lifetime identity changed ({s}); this is a same-name replacement and direct GUI fallback is forbidden",
+            .{ origin.session, failure.detail },
+        ) catch "the origin session lifetime identity changed; direct fallback is forbidden",
+        .malformed_attach => std.fmt.allocPrint(
+            arena,
+            "the exact origin has malformed inherited or panel-only attachment identity ({s}); immutable origin_name plus lifetime-unique origin_id are required and no requested-alias substitute was used",
+            .{failure.detail},
+        ) catch "the exact origin has malformed lifetime identity metadata",
+        .malformed_welcome => std.fmt.allocPrint(
+            arena,
+            "the origin daemon returned malformed capability negotiation ({s}); it was not classified as a legacy daemon and no fallback identity was assumed",
+            .{failure.detail},
+        ) catch "the origin daemon returned malformed capability negotiation",
+        .request_too_large, .allocation_failed, .send_pre_delivery => std.fmt.allocPrint(
+            arena,
+            "the mux panel request failed before any request bytes were delivered ({s}: {s}); failure_class=pre_delivery, mutation_may_have_applied=false, resend_safe=true",
+            .{ @tagName(failure.kind), failure.detail },
+        ) catch "the mux panel request failed before delivery; resend_safe=true",
+        .delivery_uncertain, .reply_timeout, .disconnected, .malformed_reply => std.fmt.allocPrint(
+            arena,
+            "the mux panel request failed after delivery became uncertain ({s}: {s}); the mutation may have applied and it was NOT resent automatically. Do not resend it automatically",
+            .{ @tagName(failure.kind), failure.detail },
+        ) catch "the mux panel request failed after uncertain delivery; the mutation may have applied and it was not resent",
+    };
+}
+
+fn directFailureMessage(arena: std.mem.Allocator, command: []const u8, failure: DirectTalkFailure) []const u8 {
+    if (failure.delivery == .pre_delivery) return std.fmt.allocPrint(
+        arena,
+        "the direct GUI request failed before any request bytes were written ({s}); failure_class=pre_delivery, mutation_may_have_applied=false, resend_safe=true",
+        .{@errorName(failure.err)},
+    ) catch "the direct GUI request failed before delivery; resend_safe=true";
+    if (std.mem.eql(u8, command, "panel-events")) return std.fmt.allocPrint(
+        arena,
+        "the direct GUI panel-events request was partially or fully written but its reply was lost ({s}); failure_class=uncertain_delivery, events_may_have_been_drained=true, resend_safe=false. Events may have been drained by the lost reply; the request was NOT retried automatically",
+        .{@errorName(failure.err)},
+    ) catch "the direct GUI event reply was lost; events may have been drained and the request was not retried";
+    const mutation = std.mem.eql(u8, command, "panel-show") or
+        std.mem.eql(u8, command, "panel-patch") or
+        std.mem.eql(u8, command, "panel-close");
+    if (mutation) return std.fmt.allocPrint(
+        arena,
+        "the direct GUI mutation was partially or fully written but its reply was lost ({s}); failure_class=uncertain_delivery, mutation_may_have_applied=true, resend_safe=false. The request was NOT retried automatically",
+        .{@errorName(failure.err)},
+    ) catch "the direct GUI mutation reply was lost after delivery became uncertain; the request was not retried";
+    return std.fmt.allocPrint(
+        arena,
+        "the direct GUI request was partially or fully written but its reply was lost ({s}); failure_class=uncertain_delivery, resend_safe=false. The request was NOT retried automatically",
+        .{@errorName(failure.err)},
+    ) catch "the direct GUI reply was lost after delivery became uncertain; the request was not retried";
 }
 
 /// An argument that may be given either as a JSON value (the natural
@@ -3685,16 +4321,8 @@ fn uiJsonArg(arena: std.mem.Allocator, args: std.json.Value, key: []const u8) !?
 /// One IPC round-trip whose transport failure is a described error
 /// rather than a JSON-RPC fault — a GUI that went away mid-flow is a
 /// normal thing for an assistant to be told about.
-fn uiTalk(arena: std.mem.Allocator, backend: Backend, req: protocol.Request) IpcReply {
-    return ipcParsed(arena, backend, req) catch |err| .{
-        .ok = false,
-        .value = .null,
-        .err = std.fmt.allocPrint(
-            arena,
-            "the sketerm GUI socket did not answer ({s}) — the window may have closed. `capabilities` reports `gui_socket`.",
-            .{@errorName(err)},
-        ) catch "the sketerm GUI socket did not answer",
-    };
+fn uiTalk(transport: *UiTransport, req: protocol.Request) IpcReply {
+    return transport.talk(req);
 }
 
 const UiResolved = struct {
@@ -3708,9 +4336,19 @@ const UiResolved = struct {
 /// back and what the control socket speaks.
 fn uiResolve(
     arena: std.mem.Allocator,
-    backend: Backend,
+    transport: *UiTransport,
     args: std.json.Value,
     session: ?[]const u8,
+) UiResolved {
+    return uiResolveFor(arena, transport, args, session, UI_RELAY_CALL_MS);
+}
+
+fn uiResolveFor(
+    arena: std.mem.Allocator,
+    transport: *UiTransport,
+    args: std.json.Value,
+    session: ?[]const u8,
+    timeout_ms: i64,
 ) UiResolved {
     if (argInt(args, "panel_id")) |pid| {
         if (pid <= 0 or pid > std.math.maxInt(u32))
@@ -3720,7 +4358,8 @@ fn uiResolve(
     const name = argStr(args, "name") orelse
         return .{ .err = "address the panel by 'name' (stable, preferred) or by 'panel_id'" };
 
-    const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = uiWireSession(session) });
+    if (timeout_ms <= 0) return .{ .err = "ui_wait_event's deadline expired while resolving the panel" };
+    const reply = transport.talkFor(.{ .cmd = "panel-list", .session = uiWireSession(session) }, timeout_ms);
     if (!reply.ok) return .{ .err = reply.err };
     const panels = reply.value.object.get("panels") orelse
         return .{ .err = "malformed panel-list reply" };
@@ -3745,16 +4384,32 @@ fn uiResolve(
 /// including one another process showed, or one shown before this
 /// server started.
 fn uiLiveDocument(
-    arena: std.mem.Allocator,
-    backend: Backend,
+    transport: *UiTransport,
     id: u32,
+    session: ?[]const u8,
 ) struct { json: []const u8 = "", err: []const u8 = "" } {
-    const reply = uiTalk(arena, backend, .{ .cmd = "panel-get", .panel_id = id });
+    const reply = uiTalk(transport, .{
+        .cmd = "panel-get",
+        .panel_id = id,
+        .session = uiWireSession(session),
+    });
     if (!reply.ok) return .{ .err = reply.err };
     const dv = reply.value.object.get("document") orelse
         return .{ .err = "panel-get answered without a document" };
     if (dv != .string) return .{ .err = "panel-get answered with a malformed document" };
     return .{ .json = dv.string };
+}
+
+fn writeUiAssetReport(w: *std.Io.Writer, reply: IpcReply) !void {
+    const report = reply.value.object.get("assets") orelse return;
+    if (report != .array) return;
+    try w.writeAll(",\"assets\":");
+    try std.json.Stringify.value(report, .{}, w);
+    const failures = reply.value.object.get("asset_failures");
+    if (failures != null and failures.? == .integer)
+        try w.print(",\"asset_failures\":{d}", .{failures.?.integer});
+    if (failures != null and failures.? == .integer and failures.?.integer > 0)
+        try w.writeAll(",\"asset_warning\":\"one or more remote images could not be hydrated; the native panel shows explicit placeholders and each failed logical path is reported in assets\"");
 }
 
 /// panelstore failure → the store's own diagnostic (which names the
@@ -3778,16 +4433,43 @@ fn uiStoreErr(
     return appErr(arena, msg);
 }
 
+fn uiStoreMutationErr(
+    arena: std.mem.Allocator,
+    err: panelstore.Error,
+    diag: *const paneldoc.Diag,
+    what: []const u8,
+    mutation: []const u8,
+) ![]const u8 {
+    const detail = if (diag.len > 0) diag.msg() else @errorName(err);
+    const hint: []const u8 = switch (err) {
+        error.NotFound => " — `ui_panels` lists the saved documents in this session",
+        error.Invalid => " — fix the document and re-send; nothing was written",
+        error.TooMany => " — delete one with ui_delete",
+        else => "",
+    };
+    const message = std.fmt.allocPrint(arena, "{s}: {s}{s}", .{ what, detail, hint }) catch
+        return error.OutOfMemory;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{\"error\":");
+    try std.json.Stringify.value(message, .{}, w);
+    try w.writeAll(",\"error_code\":");
+    try std.json.Stringify.value(@errorName(err), .{}, w);
+    // Store mutations are staged then renamed, so a failure never leaves a
+    // partial document: it either happened or it did not.
+    try w.writeAll(",\"failure_class\":\"pre_commit\",\"mutation_state\":\"not_applied\",\"mutation_may_have_applied\":false,\"committed\":false,\"resend_safe\":true");
+    try w.writeAll(",\"mutation\":");
+    try std.json.Stringify.value(mutation, .{}, w);
+    try w.writeAll(",\"recoverable_state_preserved\":true}");
+    return toolResult(arena, aw.written(), true) orelse error.OutOfMemory;
+}
+
 fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
-    const session = uiSession(args);
-
-    // The store-only tools work with or without a GUI; everything that
-    // touches a live panel needs the socket, and says so once.
-    const needs_gui = eql(u8, name, "ui_show") or eql(u8, name, "ui_show_files") or
-        eql(u8, name, "ui_patch") or
-        eql(u8, name, "ui_wait_event") or eql(u8, name, "ui_close");
-    if (needs_gui and !srv_gui_socket) return appErr(arena, UI_NEEDS_GUI);
+    const session = uiSession(args) catch
+        return appErr(arena, "'session' must be a string when present; omit it to use SKETERM_SESSION, or pass an explicit empty string for sessionless scope");
+    var transport = UiTransport.init(arena, backend, session);
+    defer transport.deinit();
 
     if (eql(u8, name, "ui_show")) {
         const panel_name = argStr(args, "name") orelse
@@ -3801,12 +4483,14 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const document = inline_doc orelse blk: {
             const saved = load_name orelse
                 return appErr(arena, "ui_show requires 'document' (the panel to render) or 'load' (the name of a document saved with ui_save)");
-            break :blk panelstore.loadJson(arena, session, saved, &diag) catch |err|
+            const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+            if (store.err.len > 0) return appErr(arena, store.err);
+            break :blk panelstore.loadJsonScoped(arena, store.scope, saved, &diag) catch |err|
                 return uiStoreErr(arena, err, &diag, "ui_show could not load the saved panel");
         };
 
         const target = argStr(args, "target") orelse "tab";
-        const reply = uiTalk(arena, backend, .{
+        const reply = uiTalk(&transport, .{
             .cmd = "panel-show",
             .name = panel_name,
             .session = uiWireSession(session),
@@ -3829,6 +4513,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         try std.json.Stringify.value(session, .{}, w);
         try w.writeAll(",\"target\":");
         try std.json.Stringify.value(target, .{}, w);
+        try writeUiAssetReport(w, reply);
         try w.writeAll(",\"showing\":true,\"note\":\"the panel is on the user's screen; ui_wait_event returns their interactions, ui_patch updates it in place\"}");
         return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
@@ -3967,7 +4652,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
 
         const panel_name = argStr(args, "name") orelse UI_FILES_NAME;
         const target = argStr(args, "target") orelse "tab";
-        const reply = uiTalk(arena, backend, .{
+        const reply = uiTalk(&transport, .{
             .cmd = "panel-show",
             .name = panel_name,
             .session = uiWireSession(session),
@@ -3990,6 +4675,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
             files.len,
             if (compare) "image_compare" else "stacked_images",
         });
+        try writeUiAssetReport(w, reply);
         if (unreadable.items.len > 0) {
             try w.writeAll(",\"unreadable\":");
             try std.json.Stringify.value(unreadable.items, .{}, w);
@@ -4005,32 +4691,69 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
     if (eql(u8, name, "ui_patch")) {
         const patch = (try uiJsonArg(arena, args, "patch")) orelse
             return appErr(arena, "ui_patch requires 'patch' (a JSON array of ops)");
-        const target = uiResolve(arena, backend, args, session);
+        const target = uiResolve(arena, &transport, args, session);
         if (target.err.len > 0) return appErr(arena, target.err);
-        const reply = uiTalk(arena, backend, .{ .cmd = "panel-patch", .panel_id = target.id, .patch = patch });
+        const reply = uiTalk(&transport, .{
+            .cmd = "panel-patch",
+            .panel_id = target.id,
+            .patch = patch,
+            .session = uiWireSession(session),
+        });
         if (!reply.ok) return appErr(arena, reply.err);
-        const msg = std.fmt.allocPrint(arena, "{{\"panel_id\":{d},\"patched\":true}}", .{target.id}) catch
-            return error.OutOfMemory;
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try aw.writer.print("{{\"panel_id\":{d},\"patched\":true", .{target.id});
+        try writeUiAssetReport(&aw.writer, reply);
+        try aw.writer.writeByte('}');
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
 
     if (eql(u8, name, "ui_wait_event")) {
         const asked: i64 = argInt(args, "timeout_ms") orelse UI_WAIT_DEFAULT_MS;
         const timeout_ms = @min(@max(asked, 0), WAIT_CAP_MS);
-        const target = uiResolve(arena, backend, args, session);
+        // One budget includes name resolution, every poll round trip, and
+        // sleeps. A slow presenter cannot multiply timeout_ms by poll count.
+        const start = backend.nowMs(backend.ctx);
+        const deadline = start + timeout_ms;
+        const target = uiResolveFor(arena, &transport, args, session, deadline - backend.nowMs(backend.ctx));
         if (target.err.len > 0) return appErr(arena, target.err);
 
         // The GUI answers panel-events immediately (it runs on the main
         // loop and must never block), so the WAIT is ours: poll until
         // something is queued or the budget runs out.
-        const start = backend.nowMs(backend.ctx);
         var dropped_total: i64 = 0;
         while (true) {
-            const reply = uiTalk(arena, backend, .{ .cmd = "panel-events", .panel_id = target.id });
+            const before_poll = backend.nowMs(backend.ctx);
+            const remain = deadline - before_poll;
+            if (remain <= 0) {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                try aw.writer.print("{{\"panel_id\":{d},\"waited_ms\":{d},\"events\":[],\"dropped\":{d},\"timed_out\":true,\"note\":\"no interaction within {d}ms — the panel is still showing; wait again or ui_patch it\"}}", .{ target.id, before_poll - start, dropped_total, timeout_ms });
+                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+            }
+            const reply = transport.talkFor(.{
+                .cmd = "panel-events",
+                .panel_id = target.id,
+                .session = uiWireSession(session),
+            }, remain);
             if (!reply.ok) {
+                if (reply.delivery == .uncertain_delivery) {
+                    const msg = std.fmt.allocPrint(
+                        arena,
+                        "the panel-events request may have drained queued interactions before its reply was lost ({s}). Events may have been drained; failure_class=uncertain_delivery, events_may_have_been_drained=true, resend_safe=false. The poll was NOT retried automatically",
+                        .{reply.err},
+                    ) catch return error.OutOfMemory;
+                    return appErr(arena, msg);
+                }
+                if (reply.delivery == .pre_delivery) {
+                    const msg = std.fmt.allocPrint(
+                        arena,
+                        "the panel-events poll was unavailable before presenter delivery ({s}); failure_class=pre_delivery, events_may_have_been_drained=false, resend_safe=true. The panel's open/closed state and queued events are UNKNOWN; retry when a compatible GUI is attached",
+                        .{reply.err},
+                    ) catch return error.OutOfMemory;
+                    return appErr(arena, msg);
+                }
                 const msg = std.fmt.allocPrint(
                     arena,
-                    "the panel is gone ({s}) — the user closed it, or it was never open. Nothing was missed: a closed panel ends the wait immediately.",
+                    "the GUI presenter confirmed that this panel is not live ({s}); it may have been closed by the user or the id may never have existed",
                     .{reply.err},
                 ) catch return error.OutOfMemory;
                 return appErr(arena, msg);
@@ -4054,7 +4777,9 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 try w.writeAll("}");
                 return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
             }
-            backend.sleepMs(backend.ctx, UI_POLL_MS);
+            const sleep_remain = deadline - backend.nowMs(backend.ctx);
+            if (sleep_remain > 0)
+                backend.sleepMs(backend.ctx, @intCast(@min(@as(i64, UI_POLL_MS), sleep_remain)));
         }
     }
 
@@ -4065,25 +4790,24 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         try std.json.Stringify.value(session, .{}, w);
 
         try w.writeAll(",\"live\":");
-        if (!srv_gui_socket) {
+        const reply = uiTalk(&transport, .{ .cmd = "panel-list", .session = uiWireSession(session) });
+        if (!reply.ok) {
             try w.writeAll("null,\"live_note\":");
-            try std.json.Stringify.value(UI_NEEDS_GUI, .{}, w);
+            try std.json.Stringify.value(reply.err, .{}, w);
         } else {
-            const reply = uiTalk(arena, backend, .{ .cmd = "panel-list", .session = uiWireSession(session) });
-            if (reply.ok) {
-                const panels = reply.value.object.get("panels");
-                if (panels != null and panels.? == .array)
-                    try std.json.Stringify.value(panels.?, .{}, w)
-                else
-                    try w.writeAll("[]");
-            } else {
-                try w.writeAll("null,\"live_error\":");
-                try std.json.Stringify.value(reply.err, .{}, w);
-            }
+            const panels = reply.value.object.get("panels");
+            if (panels != null and panels.? == .array)
+                try std.json.Stringify.value(panels.?, .{}, w)
+            else
+                try w.writeAll("[]");
         }
 
         try w.writeAll(",\"saved\":");
-        if (panelstore.list(arena, session)) |entries| {
+        const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+        if (store.err.len > 0) {
+            try w.writeAll("null,\"saved_error\":");
+            try std.json.Stringify.value(store.err, .{}, w);
+        } else if (panelstore.listScoped(arena, store.scope)) |entries| {
             try w.writeAll("[");
             for (entries, 0..) |e, i| {
                 if (i > 0) try w.writeAll(",");
@@ -4110,29 +4834,35 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         // for ANY panel on screen — including one another process
         // showed — because the GUI's registry is the only copy.
         const document = (try uiJsonArg(arena, args, "document")) orelse blk: {
-            if (!srv_gui_socket) return appErr(arena, UI_SAVE_NEEDS_GUI);
-            const target = uiResolve(arena, backend, args, session);
+            if (transport.mode == .none) return appErr(arena, UI_SAVE_NEEDS_TRANSPORT);
+            const target = uiResolve(arena, &transport, args, session);
             if (target.err.len > 0) return appErr(arena, target.err);
-            const live = uiLiveDocument(arena, backend, target.id);
+            const live = uiLiveDocument(&transport, target.id, session);
             if (live.err.len > 0) return appErr(arena, live.err);
             break :blk live.json;
         };
-        panelstore.saveJson(arena, session, panel_name, document, &diag) catch |err|
-            return uiStoreErr(arena, err, &diag, "ui_save refused to store the panel");
+        const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+        if (store.err.len > 0) return appErr(arena, store.err);
+        const canonical_bytes = panelstore.saveJsonScoped(arena, store.scope, panel_name, document, &diag) catch |err|
+            return uiStoreMutationErr(arena, err, &diag, "ui_save refused to store the panel", "save");
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("{\"saved\":");
         try std.json.Stringify.value(panel_name, .{}, w);
         try w.writeAll(",\"session\":");
         try std.json.Stringify.value(session, .{}, w);
-        try w.print(",\"bytes\":{d},\"note\":\"stored on disk; show it again with ui_show load=<name>. Nothing on screen changed.\"}}", .{document.len});
+        try w.print(",\"bytes\":{d},\"note\":\"stored on disk; bytes is the canonical JSON length actually stored. Show it again with ui_show load=<name>. Nothing on screen changed.\"}}", .{canonical_bytes});
         return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
 
     if (eql(u8, name, "ui_close")) {
-        const target = uiResolve(arena, backend, args, session);
+        const target = uiResolve(arena, &transport, args, session);
         if (target.err.len > 0) return appErr(arena, target.err);
-        const reply = uiTalk(arena, backend, .{ .cmd = "panel-close", .panel_id = target.id });
+        const reply = uiTalk(&transport, .{
+            .cmd = "panel-close",
+            .panel_id = target.id,
+            .session = uiWireSession(session),
+        });
         if (!reply.ok) return appErr(arena, reply.err);
         const msg = std.fmt.allocPrint(
             arena,
@@ -4146,8 +4876,10 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const panel_name = argStr(args, "name") orelse
             return appErr(arena, "ui_delete requires 'name' (the SAVED panel to delete)");
         var diag = paneldoc.Diag{};
-        panelstore.delete(arena, session, panel_name, &diag) catch |err|
-            return uiStoreErr(arena, err, &diag, "ui_delete could not delete the saved panel");
+        const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+        if (store.err.len > 0) return appErr(arena, store.err);
+        panelstore.deleteScoped(arena, store.scope, panel_name, &diag) catch |err|
+            return uiStoreMutationErr(arena, err, &diag, "ui_delete could not delete the saved panel", "delete");
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("{\"deleted\":");
@@ -4189,7 +4921,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         return uiTool(arena, backend, name, args);
     }
     if (eql(u8, name, "capabilities")) {
-        return capabilitiesTool(arena);
+        return capabilitiesTool(arena, backend);
     }
 
     const pane = paneFromArgs(args);
@@ -4364,6 +5096,11 @@ const FakeBackend = struct {
     /// recorded for assertions.
     responses: []const []const u8,
     requests: std.ArrayList([]u8) = .empty,
+    timeouts: std.ArrayList(i64) = .empty,
+    /// Optional fake time consumed by each deadline-aware exchange.
+    talk_delays_ms: []const i64 = &.{},
+    /// Optional direct-transport failures aligned with `responses`.
+    talk_failures: []const ?DirectTalkFailure = &.{},
     idx: usize = 0,
     clock_ms: i64 = 0,
     allocator: std.mem.Allocator,
@@ -4377,6 +5114,34 @@ const FakeBackend = struct {
         return allocator.dupe(u8, r);
     }
 
+    fn talkFor(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, timeout_ms: i64) DirectTalkResult {
+        const self: *FakeBackend = @ptrCast(@alignCast(ctx));
+        const call_index = self.timeouts.items.len;
+        self.timeouts.append(self.allocator, timeout_ms) catch
+            return .{ .failure = .{ .err = error.OutOfMemory, .delivery = .pre_delivery } };
+        if (call_index < self.talk_delays_ms.len)
+            self.clock_ms += self.talk_delays_ms[call_index];
+        const recorded = self.allocator.dupe(u8, line) catch
+            return .{ .failure = .{ .err = error.OutOfMemory, .delivery = .pre_delivery } };
+        self.requests.append(self.allocator, recorded) catch {
+            self.allocator.free(recorded);
+            return .{ .failure = .{ .err = error.OutOfMemory, .delivery = .pre_delivery } };
+        };
+        if (self.idx < self.talk_failures.len) {
+            if (self.talk_failures[self.idx]) |failure| {
+                self.idx += 1;
+                return .{ .failure = failure };
+            }
+        }
+        if (self.idx >= self.responses.len)
+            return .{ .failure = .{ .err = error.NoResponse, .delivery = .pre_delivery } };
+        const response = self.responses[self.idx];
+        self.idx += 1;
+        const owned = allocator.dupe(u8, response) catch
+            return .{ .failure = .{ .err = error.OutOfMemory, .delivery = .uncertain_delivery } };
+        return .{ .reply = owned };
+    }
+
     fn sleepMs(ctx: *anyopaque, ms: u32) void {
         const self: *FakeBackend = @ptrCast(@alignCast(ctx));
         self.clock_ms += ms;
@@ -4388,12 +5153,13 @@ const FakeBackend = struct {
     }
 
     fn backend(self: *FakeBackend) Backend {
-        return .{ .ctx = @ptrCast(self), .talk = talk, .sleepMs = sleepMs, .nowMs = nowMs };
+        return .{ .ctx = @ptrCast(self), .talk = talk, .talkFor = talkFor, .sleepMs = sleepMs, .nowMs = nowMs };
     }
 
     fn deinit(self: *FakeBackend) void {
         for (self.requests.items) |r| self.allocator.free(r);
         self.requests.deinit(self.allocator);
+        self.timeouts.deinit(self.allocator);
     }
 };
 
@@ -4411,6 +5177,59 @@ const DelayedExit = struct {
         _ = c.write(self.fd, &frame, frame.len);
     }
 };
+
+const DirectDropScript = struct {
+    const Mode = enum { after_prefix, after_line };
+
+    listener: c_int,
+    mode: Mode,
+
+    fn run(self: DirectDropScript) void {
+        const accepted = c.accept(self.listener, null, null);
+        if (accepted < 0) return;
+        defer _ = c.close(accepted);
+        var buf: [16 << 10]u8 = undefined;
+        switch (self.mode) {
+            .after_prefix => {
+                _ = c.read(accepted, &buf, buf.len);
+            },
+            .after_line => while (true) {
+                const n = c.read(accepted, &buf, buf.len);
+                if (n <= 0) return;
+                if (std.mem.indexOfScalar(u8, buf[0..@intCast(n)], '\n') != null) return;
+            },
+        }
+    }
+};
+
+const LegacyPanelDaemonScript = struct {
+    listener: c_int,
+    delay_us: u32,
+
+    fn run(self: LegacyPanelDaemonScript) void {
+        const accepted = c.accept(self.listener, null, null);
+        if (accepted < 0) return;
+        var conn = muxclient.Conn{ .allocator = std.heap.c_allocator, .fd = accepted };
+        defer conn.deinit();
+        const hello = conn.recvExpect(&.{.hello}) catch return;
+        hello.deinit(conn.allocator);
+        _ = c.usleep(self.delay_us);
+        // Exact pre-panel daemon: normal mux negotiation, no panel_rpc.
+        conn.sendFrame(.welcome, "{\"proto\":6,\"server_proto\":6,\"negotiation\":1}") catch return;
+    }
+};
+
+fn directDropListener(path: [:0]const u8) !c_int {
+    const listener = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (listener < 0) return error.SocketFailed;
+    errdefer _ = c.close(listener);
+    var addr: c.struct_sockaddr_un = undefined;
+    try @import("../mux/daemon.zig").fillSockaddrUn(&addr, path);
+    if (c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0)
+        return error.BindFailed;
+    if (c.listen(listener, 1) != 0) return error.ListenFailed;
+    return listener;
+}
 
 fn testActionApp(a: std.mem.Allocator, with_window: bool) !struct { app: *appdrive.App, peer: c_int } {
     var fds: [2]c_int = undefined;
@@ -4829,20 +5648,28 @@ test "the advertised tool list is well-formed JSON" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const saved_policy = policy;
+    policy = .unrestricted;
+    defer policy = saved_policy;
     const rendered = try renderedToolsJson(arena);
     // MCP stdio framing is one JSON object per line.
     try std.testing.expect(std.mem.indexOfScalar(u8, rendered, '\n') == null);
     // Every %..._DEF% placeholder must have been substituted.
     try std.testing.expect(std.mem.indexOf(u8, rendered, "_DEF%") == null);
+    // Panels do not require --shared any more; no ui_ description may ask
+    // for it, and none may be left describing a GUI socket as mandatory.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "--shared") == null);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, rendered, .{});
     try std.testing.expect(parsed == .array);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(std.testing.allocator);
+    var ui_count: usize = 0;
     for (parsed.array.items) |t| {
         try std.testing.expect(t == .object);
         const nm = t.object.get("name") orelse return error.MissingName;
         try std.testing.expect(nm == .string);
         try std.testing.expect(t.object.get("description") != null);
+        if (std.mem.startsWith(u8, nm.string, "ui_")) ui_count += 1;
         const schema = t.object.get("inputSchema") orelse return error.MissingSchema;
         try std.testing.expect(schema == .object);
         try std.testing.expect(schema.object.get("properties") != null);
@@ -4850,6 +5677,10 @@ test "the advertised tool list is well-formed JSON" {
         try std.testing.expect(!seen.contains(nm.string));
         try seen.put(std.testing.allocator, nm.string, {});
     }
+    try std.testing.expectEqual(@as(usize, 8), ui_count);
+    try std.testing.expect(seen.contains("ui_show"));
+    try std.testing.expect(seen.contains("ui_show_files"));
+    try std.testing.expect(seen.contains("ui_save"));
     try std.testing.expect(seen.contains("app_wait_log"));
 }
 
@@ -4968,6 +5799,7 @@ const UiScratch = struct {
     buf: [128]u8 = undefined,
     len: usize = 0,
     saved_gui: bool = false,
+    saved_source: GuiSocketSource = .none,
 
     fn init(self: *UiScratch, tag: []const u8, gui: bool) !void {
         self.* = .{};
@@ -4977,11 +5809,14 @@ const UiScratch = struct {
         _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.buf), 1);
         _ = c.unsetenv("SKETERM_SESSION");
         self.saved_gui = srv_gui_socket;
+        self.saved_source = srv_gui_socket_source;
         srv_gui_socket = gui;
+        srv_gui_socket_source = if (gui) .explicit else .none;
     }
 
     fn deinit(self: *UiScratch) void {
         srv_gui_socket = self.saved_gui;
+        srv_gui_socket_source = self.saved_source;
         _ = c.unsetenv("XDG_STATE_HOME");
         var cmd: [256]u8 = undefined;
         const z = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}) catch return;
@@ -5051,8 +5886,8 @@ test "ui_show sends the document to the GUI, and ui_save reads the live one back
     try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[4], "\"cmd\":\"panel-get\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[4], "\"panel_id\":7") != null);
-    try std.testing.expect(panelstore.exists(arena, "s1", "train"));
-    var loaded = try panelstore.load(arena, "s1", "train", null);
+    try std.testing.expect(panelstore.existsScoped(arena, .{ .session = "s1" }, "train"));
+    var loaded = try panelstore.loadScoped(arena, .{ .session = "s1" }, "train", null);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("Epoch 42", loaded.title);
 
@@ -5061,7 +5896,7 @@ test "ui_show sends the document to the GUI, and ui_save reads the live one back
     var live = try paneldoc.Document.parse(arena, LIVE_DOC, null);
     defer live.deinit();
     const want = try live.toJson(arena);
-    const on_disk = try panelstore.loadJson(arena, "s1", "train", null);
+    const on_disk = try panelstore.loadJsonScoped(arena, .{ .session = "s1" }, "train", null);
     try std.testing.expectEqualStrings(want, on_disk);
 }
 
@@ -5089,7 +5924,7 @@ test "ui_save persists a panel this server never showed" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"theirs","session":"s9"}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
-    var loaded = try panelstore.load(arena, "s9", "theirs", null);
+    var loaded = try panelstore.loadScoped(arena, .{ .session = "s9" }, "theirs", null);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("Theirs", loaded.title);
 
@@ -5107,7 +5942,38 @@ test "ui_save persists a panel this server never showed" {
     try std.testing.expect(std.mem.indexOf(u8, missing, "ghost") != null);
 }
 
-test "ui_save without a document needs the GUI and says so" {
+test "ui_save reports the canonical byte count actually stored" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("canonical-bytes", false);
+    defer scratch.deinit();
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+
+    const authored =
+        \\  {
+        \\    "components": { "t": { "text": "saved", "type": "text" } },
+        \\    "root": "t",
+        \\    "title": "Canonical"
+        \\  }
+    ;
+    var request: std.Io.Writer.Allocating = .init(arena);
+    try request.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_save\",\"arguments\":{\"name\":\"canonical\",\"session\":\"\",\"document\":");
+    try std.json.Stringify.value(authored, .{}, &request.writer);
+    try request.writer.writeAll("}}}");
+    const response = handleMessage(arena, fake.backend(), request.written()).?;
+    try t.expect(std.mem.indexOf(u8, response, "isError") == null);
+
+    const stored = try panelstore.loadJsonScoped(arena, .sessionless, "canonical", null);
+    try t.expect(stored.len < authored.len);
+    const byte_field = try std.fmt.allocPrint(arena, "\\\"bytes\\\":{d}", .{stored.len});
+    try t.expect(std.mem.indexOf(u8, response, byte_field) != null);
+}
+
+test "ui_save without a document needs a live panel transport" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5122,11 +5988,86 @@ test "ui_save without a document needs the GUI and says so" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"p","session":"s1"}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, resp, "isError") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "--shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "live panel transport") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "'document'") != null);
     // Nothing was attempted on the socket, and nothing was written.
     try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
-    try std.testing.expect(!panelstore.exists(arena, "s1", "p"));
+    try std.testing.expect(!panelstore.existsScoped(arena, .{ .session = "s1" }, "p"));
+}
+
+test "an explicit empty ui session overrides SKETERM_SESSION for live and saved panels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("explicit-empty", true);
+    defer scratch.deinit();
+    _ = c.setenv("SKETERM_SESSION", "environment-session", 1);
+    defer _ = c.unsetenv("SKETERM_SESSION");
+
+    var fake = FakeBackend{
+        .responses = &.{"{\"ok\":true,\"panel_id\":17}"},
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+    const shown = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"sessionless","session":"","document":{"root":"t","components":{"t":{"type":"text","text":"x"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, shown, "isError") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "\\\"session\\\":null") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"session\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "environment-session") == null);
+
+    const saved = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"sessionless","session":"","document":{"root":"t","components":{"t":{"type":"text","text":"saved"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, saved, "isError") == null);
+    try std.testing.expect(panelstore.existsScoped(arena, .sessionless, "sessionless"));
+    try std.testing.expect(!panelstore.existsScoped(arena, .{ .session = "environment-session" }, "sessionless"));
+}
+
+test "every ui tool rejects a present non-string session without fallback or side effects" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("session-types", false);
+    defer scratch.deinit();
+    _ = c.setenv("SKETERM_SESSION", "environment-session", 1);
+    defer _ = c.unsetenv("SKETERM_SESSION");
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    const tools = [_][]const u8{
+        "ui_show",   "ui_show_files", "ui_patch", "ui_wait_event",
+        "ui_panels", "ui_save",       "ui_close", "ui_delete",
+    };
+    const invalid = [_][]const u8{ "null", "0", "1.5", "{}", "[]", "true", "false" };
+    var id: usize = 1;
+    for (tools) |tool| {
+        for (invalid) |value| {
+            const request = try std.fmt.allocPrint(
+                arena,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{{\"session\":{s}}}}}}}",
+                .{ id, tool, value },
+            );
+            id += 1;
+            const response = handleMessage(arena, fake.backend(), request).?;
+            try t.expect(std.mem.indexOf(u8, response, "isError") != null);
+            try t.expect(std.mem.indexOf(u8, response, "must be a string when present") != null);
+            try t.expect(std.mem.indexOf(u8, response, "environment-session") == null);
+        }
+    }
+    try t.expectEqual(@as(usize, 0), fake.requests.items.len);
+    try t.expect(!panelstore.existsScoped(arena, .{ .session = "environment-session" }, "ui-invalid"));
+
+    const absent = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"inherited","document":{"root":"t","components":{"t":{"type":"text","text":"saved"}}}}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, absent, "isError") == null);
+    try t.expect(panelstore.existsScoped(arena, .{ .session = "environment-session" }, "inherited"));
 }
 
 test "ui_show refuses a bad document with the parser's own message" {
@@ -5157,6 +6098,41 @@ test "ui_show refuses a bad document with the parser's own message" {
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, both, "not both") != null);
     try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
+}
+
+test "ui presenter protocol shapes cannot fabricate panel success" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("bad-presenter-shape", true);
+    defer scratch.deinit();
+
+    var fake = FakeBackend{
+        .responses = &.{
+            "[]",
+            "{}",
+            "{\"ok\":\"yes\"}",
+            "{\"ok\":true}",
+            "{\"ok\":true,\"panel_id\":0}",
+            "{\"ok\":false}",
+            "{\"ok\":false,\"error\":\"presenter disconnected\",\"failure_class\":\"uncertain_delivery\",\"mutation_may_have_applied\":true,\"resend_safe\":false}",
+        },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+    for (0..7) |i| {
+        const request = try std.fmt.allocPrint(
+            arena,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"ui_show\",\"arguments\":{{\"name\":\"shape\",\"session\":\"s1\",\"document\":{{\"root\":\"t\",\"components\":{{\"t\":{{\"type\":\"text\",\"text\":\"x\"}}}}}}}}}}}}",
+            .{i + 1},
+        );
+        const response = handleMessage(arena, fake.backend(), request).?;
+        try std.testing.expect(std.mem.indexOf(u8, response, "isError") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "delivery is uncertain") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "NOT resent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\\\"showing\\\":true") == null);
+    }
 }
 
 /// Create an empty file so ui_show_files' readability check passes.
@@ -5358,6 +6334,590 @@ test "ui_show_files refuses bad arity, bad paths and an all-missing set" {
     try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
 }
 
+test "panel transport precedence is exact origin, explicit GUI, then default compatibility" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    var pool = paneldrive.Pool.init(t.allocator);
+    defer pool.deinit();
+
+    const old_pool = panel_pool;
+    const old_gui = srv_gui_socket;
+    const old_source = srv_gui_socket_source;
+    const old_socket = if (c.getenv("SKETERM_MUX_SOCKET")) |value|
+        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
+    else
+        null;
+    defer {
+        panel_pool = old_pool;
+        srv_gui_socket = old_gui;
+        srv_gui_socket_source = old_source;
+        if (old_socket) |value| {
+            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
+            defer t.allocator.free(z);
+            _ = c.setenv("SKETERM_MUX_SOCKET", z.ptr, 1);
+            t.allocator.free(value);
+        } else _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    }
+    panel_pool = &pool;
+    srv_gui_socket = true;
+    srv_gui_socket_source = .explicit;
+
+    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact.sock", 1);
+    var exact = UiTransport.init(arena, fake.backend(), "same");
+    defer exact.deinit();
+    try t.expect(exact.mode == .auto);
+    exact.origin = try paneldrive.Origin.resolve(arena, "same");
+    try t.expectEqualStrings("SKETERM_MUX_SOCKET", exact.source());
+
+    _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    var explicit = UiTransport.init(arena, fake.backend(), "same");
+    defer explicit.deinit();
+    try t.expect(explicit.mode == .gui_socket);
+    try t.expectEqualStrings("gui_socket_explicit", explicit.source());
+    switch (uiStoreScope(&explicit, UI_RELAY_CALL_MS).scope) {
+        .session => |session| try t.expectEqualStrings("same", session),
+        else => return error.TestUnexpectedResult,
+    }
+
+    srv_gui_socket_source = .discovered;
+    var compat = UiTransport.init(arena, fake.backend(), "same");
+    defer compat.deinit();
+    try t.expect(compat.mode == .auto);
+    compat.origin = try paneldrive.Origin.resolve(arena, "same");
+    try t.expectEqualStrings("default_socket_connect_only", compat.source());
+
+    var sessionless = UiTransport.init(arena, fake.backend(), null);
+    defer sessionless.deinit();
+    try t.expect(sessionless.mode == .gui_socket);
+    try t.expectEqualStrings("gui_socket_discovered", sessionless.source());
+    try t.expect(uiStoreScope(&sessionless, UI_RELAY_CALL_MS).scope == .sessionless);
+
+    // Without an exact inherited daemon or a live default-daemon probe, a
+    // legacy caller retains the historical by-session namespace.
+    var unavailable = UiTransport.init(arena, fake.backend(), "legacy");
+    defer unavailable.deinit();
+    unavailable.mode = .none;
+    switch (uiStoreScope(&unavailable, UI_RELAY_CALL_MS).scope) {
+        .session => |session| try t.expectEqualStrings("legacy", session),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "a daemon with no lifetime id falls back to by-session storage" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-store-legacy-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try directDropListener(path);
+    defer _ = c.close(listener);
+    const server = try std.Thread.spawn(.{}, LegacyPanelDaemonScript.run, .{LegacyPanelDaemonScript{
+        .listener = listener,
+        .delay_us = 0,
+    }});
+    defer server.join();
+
+    const old_pool = panel_pool;
+    var pool = paneldrive.Pool.init(t.allocator);
+    defer pool.deinit();
+    panel_pool = &pool;
+    defer panel_pool = old_pool;
+    _ = c.setenv("SKETERM_MUX_SOCKET", path.ptr, 1);
+    _ = c.setenv("SKETERM_SESSION", "old-session", 1);
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    defer _ = c.unsetenv("SKETERM_SESSION");
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    var transport = UiTransport.init(arena_state.allocator(), fake.backend(), "old-session");
+    defer transport.deinit();
+    const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+    try t.expectEqualStrings("", store.err);
+    switch (store.scope) {
+        .session => |session| try t.expectEqualStrings("old-session", session),
+        else => return error.TestUnexpectedResult,
+    }
+    try t.expect(transport.failure == null);
+}
+
+test "exact persistence failures never select reusable legacy storage" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-failure.sock", 1);
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+
+    const cases = [_]struct {
+        kind: paneldrive.FailureKind,
+        needle: []const u8,
+    }{
+        .{ .kind = .attach_failed, .needle = "attach failed" },
+        .{ .kind = .origin_unreachable, .needle = "unreachable" },
+        .{ .kind = .malformed_attach, .needle = "identity is malformed" },
+        .{ .kind = .malformed_welcome, .needle = "welcome is malformed" },
+        .{ .kind = .identity_mismatch, .needle = "does not match" },
+        .{ .kind = .origin_timeout, .needle = "timed out" },
+        .{ .kind = .no_compatible_gui, .needle = "no compatible GUI" },
+        .{ .kind = .delivery_uncertain, .needle = "delivery is uncertain" },
+        .{ .kind = .reply_timeout, .needle = "reply timed out" },
+        .{ .kind = .disconnected, .needle = "disconnected" },
+        .{ .kind = .malformed_reply, .needle = "malformed reply" },
+    };
+    for (cases) |case| {
+        var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+        defer fake.deinit();
+        var transport = UiTransport{
+            .arena = arena,
+            .backend = fake.backend(),
+            .session = "exact-session",
+            .mode = .mux_relay,
+            .origin = .{
+                .socket = try arena.dupe(u8, "/tmp/exact-store-failure.sock"),
+                .session = "exact-session",
+                .source = .environment,
+            },
+            .failure = .{ .kind = case.kind, .detail = "fixture" },
+        };
+        defer transport.deinit();
+        const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+        try t.expect(store.err.len > 0);
+        try t.expect(std.mem.indexOf(u8, store.err, case.needle) != null);
+        try t.expect(std.mem.indexOf(u8, store.err, "refusing to downgrade") != null);
+    }
+}
+
+test "exact persistence retains a previously validated lifetime scope after every failure class" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-retained.sock", 1);
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+
+    const failures = [_]paneldrive.FailureKind{
+        .attach_failed,
+        .origin_unreachable,
+        .malformed_attach,
+        .malformed_welcome,
+        .identity_mismatch,
+        .origin_timeout,
+        .no_compatible_gui,
+        .delivery_uncertain,
+        .reply_timeout,
+        .disconnected,
+        .malformed_reply,
+    };
+    for (failures) |kind| {
+        var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+        defer fake.deinit();
+        var transport = UiTransport{
+            .arena = arena,
+            .backend = fake.backend(),
+            .session = "exact-session",
+            .mode = .mux_relay,
+            .origin = .{
+                .socket = try arena.dupe(u8, "/tmp/exact-store-retained.sock"),
+                .session = "exact-session",
+                .source = .environment,
+            },
+            .failure = .{ .kind = kind, .detail = "fixture" },
+            .validated_store_scope = .{ .origin = .{
+                .daemon_origin = "/tmp/exact-store-retained.sock",
+                .origin_id = "10000000000000000000000000000001",
+                .label = "exact-session",
+            } },
+        };
+        defer transport.deinit();
+        const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+        try t.expectEqualStrings("", store.err);
+        switch (store.scope) {
+            .origin => |exact| {
+                try t.expectEqualStrings("10000000000000000000000000000001", exact.origin_id);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "malformed inherited exact identity is an error rather than old-daemon evidence" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-malformed.sock", 1);
+    _ = c.setenv("SKETERM_SESSION", "exact-session", 1);
+    _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", "not-an-origin-id", 1);
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    defer _ = c.unsetenv("SKETERM_SESSION");
+    defer _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    var transport = UiTransport{
+        .arena = arena,
+        .backend = fake.backend(),
+        .session = "exact-session",
+        .mode = .mux_relay,
+        .origin = .{
+            .socket = try arena.dupe(u8, "/tmp/exact-store-malformed.sock"),
+            .session = "exact-session",
+            .source = .environment,
+        },
+    };
+    defer transport.deinit();
+    const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
+    try t.expect(std.mem.indexOf(u8, store.err, "identity is malformed") != null);
+    try t.expect(std.mem.indexOf(u8, store.err, "refusing to downgrade") != null);
+}
+
+test "exact origin falls back only to an explicit GUI after proven pre-delivery attach failure" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const old_source = srv_gui_socket_source;
+    defer srv_gui_socket_source = old_source;
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    var transport = UiTransport{
+        .arena = arena_state.allocator(),
+        .backend = fake.backend(),
+        .session = "session",
+        .mode = .mux_relay,
+    };
+    const exact = paneldrive.Origin{
+        .socket = @constCast("/tmp/exact-origin.sock"),
+        .session = "session",
+        .source = .environment,
+    };
+    srv_gui_socket_source = .explicit;
+    for ([_]paneldrive.FailureKind{ .legacy_daemon, .unsupported, .no_compatible_gui, .attach_failed, .malformed_attach }) |kind|
+        try t.expect(transport.canFallbackDirect(exact, .{ .kind = kind, .detail = "pre" }));
+    for ([_]paneldrive.FailureKind{ .identity_mismatch, .origin_unreachable, .origin_timeout, .malformed_welcome, .delivery_uncertain, .reply_timeout, .disconnected, .malformed_reply }) |kind|
+        try t.expect(!transport.canFallbackDirect(exact, .{ .kind = kind, .detail = "unsafe" }));
+    srv_gui_socket_source = .discovered;
+    try t.expect(!transport.canFallbackDirect(exact, .{ .kind = .unsupported, .detail = "legacy" }));
+}
+
+test "a relayed uncertain-delivery verdict still reaches the tool result as uncertain" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const origin = paneldrive.Origin{
+        .socket = @constCast("/tmp/origin.sock"),
+        .session = "session",
+        .source = .environment,
+    };
+    // paneldrive is the single validator now: a presenter reply carrying
+    // failure_class=uncertain_delivery arrives here already classified, and
+    // the tool-visible message must still say so and forbid a resend.
+    const message = relayFailure(arena_state.allocator(), origin, .{
+        .kind = .delivery_uncertain,
+        .detail = "daemon reported failure_class=uncertain_delivery",
+        .connection_usable = true,
+    });
+    try t.expect(std.mem.indexOf(u8, message, "delivery became uncertain") != null);
+    try t.expect(std.mem.indexOf(u8, message, "mutation may have applied") != null);
+    try t.expect(std.mem.indexOf(u8, message, "NOT resent automatically") != null);
+    try t.expect(paneldrive.Failure.uncertain(.{ .kind = .malformed_reply, .detail = "InvalidPanelId" }));
+}
+
+test "relay to explicit direct fallback shares one deadline for ui_wait_event" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var scratch: UiScratch = undefined;
+    try scratch.init("fallback-deadline", true);
+    defer scratch.deinit();
+
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-legacy-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try directDropListener(path);
+    defer _ = c.close(listener);
+    const server = try std.Thread.spawn(.{}, LegacyPanelDaemonScript.run, .{LegacyPanelDaemonScript{
+        .listener = listener,
+        .delay_us = 90_000,
+    }});
+    defer server.join();
+
+    const old_pool = panel_pool;
+    var pool = paneldrive.Pool.init(t.allocator);
+    defer pool.deinit();
+    panel_pool = &pool;
+    defer panel_pool = old_pool;
+    _ = c.setenv("SKETERM_MUX_SOCKET", path.ptr, 1);
+    _ = c.setenv("SKETERM_SESSION", "legacy-session", 1);
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    defer _ = c.unsetenv("SKETERM_SESSION");
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+
+    var fake = FakeBackend{
+        .responses = &.{"{\"ok\":true,\"events\":[{\"component\":\"ok\",\"kind\":\"click\",\"value\":\"yes\",\"ts\":1}],\"dropped\":0}"},
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+    const response = handleMessage(arena_state.allocator(), fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":250}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, response, "yes") != null);
+    try t.expectEqual(@as(usize, 1), fake.timeouts.items.len);
+    try t.expect(fake.timeouts.items[0] > 0);
+    try t.expect(fake.timeouts.items[0] < 210);
+}
+
+test "direct GUI write and reply loss preserve delivery phase" {
+    const t = std.testing;
+    var missing_buf: [256:0]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_buf, "/tmp/sketerm-direct-missing-{d}.sock", .{c.getpid()});
+    _ = c.unlink(missing.ptr);
+    var unavailable = RealBackend{ .sock_path = missing };
+    switch (RealBackend.talkFor(@ptrCast(&unavailable), t.allocator, "{}", 250)) {
+        .failure => |failure| try t.expectEqual(.pre_delivery, failure.delivery),
+        .reply => |reply| {
+            t.allocator.free(reply);
+            return error.UnexpectedReply;
+        },
+    }
+
+    const cases = [_]struct {
+        suffix: []const u8,
+        mode: DirectDropScript.Mode,
+        bytes: usize,
+    }{
+        .{ .suffix = "partial", .mode = .after_prefix, .bytes = 2 << 20 },
+        .{ .suffix = "full", .mode = .after_line, .bytes = 16 },
+    };
+    for (cases) |case| {
+        var path_buf: [256:0]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-direct-{s}-{d}.sock", .{ case.suffix, c.getpid() });
+        _ = c.unlink(path.ptr);
+        defer _ = c.unlink(path.ptr);
+        const listener = try directDropListener(path);
+        defer _ = c.close(listener);
+        const thread = try std.Thread.spawn(.{}, DirectDropScript.run, .{DirectDropScript{
+            .listener = listener,
+            .mode = case.mode,
+        }});
+        const line = try t.allocator.alloc(u8, case.bytes);
+        defer t.allocator.free(line);
+        @memset(line, 'x');
+        var backend = RealBackend{ .sock_path = path };
+        const result = RealBackend.talkFor(@ptrCast(&backend), t.allocator, line, 2_000);
+        switch (result) {
+            .failure => |failure| try t.expectEqual(.uncertain_delivery, failure.delivery),
+            .reply => |reply| {
+                t.allocator.free(reply);
+                return error.UnexpectedReply;
+            },
+        }
+        thread.join();
+    }
+}
+
+test "expired direct deadlines dispatch neither mutations nor event drains" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    var transport = UiTransport{
+        .arena = arena_state.allocator(),
+        .backend = fake.backend(),
+        .session = "s",
+        .mode = .gui_socket,
+    };
+    const expired = clock.nowMs() - 1;
+    for ([_]protocol.Request{
+        .{ .cmd = "panel-patch", .panel_id = 1, .patch = "[]" },
+        .{ .cmd = "panel-events", .panel_id = 1 },
+    }) |request_value| {
+        const reply = transport.directUntil(request_value, expired);
+        try t.expect(!reply.ok);
+        try t.expectEqual(IpcDelivery.pre_delivery, reply.delivery);
+        try t.expect(std.mem.indexOf(u8, reply.err, "resend_safe=true") != null);
+    }
+    try t.expectEqual(@as(usize, 0), fake.requests.items.len);
+
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-direct-expired-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try directDropListener(path);
+    defer _ = c.close(listener);
+    var backend = RealBackend{ .sock_path = path };
+    switch (RealBackend.talkFor(@ptrCast(&backend), t.allocator, "mutation", 0)) {
+        .failure => |failure| try t.expectEqual(.pre_delivery, failure.delivery),
+        .reply => |response| {
+            t.allocator.free(response);
+            return error.UnexpectedReply;
+        },
+    }
+    var pfd = c.struct_pollfd{ .fd = listener, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+}
+
+test "direct mutation and event-drain reply loss are never described as missed-nothing" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const failures = [_]?DirectTalkFailure{
+        .{ .err = error.NoResponse, .delivery = .uncertain_delivery },
+        .{ .err = error.NoResponse, .delivery = .uncertain_delivery },
+        .{ .err = error.ConnectFailed, .delivery = .pre_delivery },
+    };
+    var fake = FakeBackend{
+        .responses = &.{},
+        .talk_failures = &failures,
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+    var transport = UiTransport{
+        .arena = arena_state.allocator(),
+        .backend = fake.backend(),
+        .session = "s",
+        .mode = .gui_socket,
+    };
+    const mutation = transport.direct(.{ .cmd = "panel-patch", .panel_id = 1, .patch = "[]" }, 1_000);
+    try t.expect(!mutation.ok);
+    try t.expect(std.mem.indexOf(u8, mutation.err, "mutation_may_have_applied=true") != null);
+    try t.expect(std.mem.indexOf(u8, mutation.err, "resend_safe=false") != null);
+    const events = transport.direct(.{ .cmd = "panel-events", .panel_id = 1 }, 1_000);
+    try t.expect(!events.ok);
+    try t.expect(std.mem.indexOf(u8, events.err, "events_may_have_been_drained=true") != null);
+    try t.expect(std.mem.indexOf(u8, events.err, "Nothing was missed") == null);
+    const safe = transport.direct(.{ .cmd = "panel-show", .document = "{}" }, 1_000);
+    try t.expect(!safe.ok);
+    try t.expect(std.mem.indexOf(u8, safe.err, "failure_class=pre_delivery") != null);
+    try t.expect(std.mem.indexOf(u8, safe.err, "mutation_may_have_applied=false") != null);
+}
+
+test "ui_wait_event reports that a lost direct reply may already have drained events" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var scratch: UiScratch = undefined;
+    try scratch.init("event-loss", true);
+    defer scratch.deinit();
+    const failures = [_]?DirectTalkFailure{
+        .{ .err = error.NoResponse, .delivery = .uncertain_delivery },
+    };
+    var fake = FakeBackend{
+        .responses = &.{},
+        .talk_failures = &failures,
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+    const response = handleMessage(arena_state.allocator(), fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"session":"","timeout_ms":5000}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, response, "isError") != null);
+    try t.expect(std.mem.indexOf(u8, response, "events_may_have_been_drained=true") != null);
+    try t.expect(std.mem.indexOf(u8, response, "Events may have been drained") != null);
+    try t.expect(std.mem.indexOf(u8, response, "Nothing was missed") == null);
+    try t.expectEqual(@as(usize, 1), fake.requests.items.len);
+}
+
+test "ui_wait_event distinguishes pre-delivery unavailability from confirmed closure" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var scratch: UiScratch = undefined;
+    try scratch.init("event-delivery-state", true);
+    defer scratch.deinit();
+
+    const failures = [_]?DirectTalkFailure{
+        .{ .err = error.ConnectFailed, .delivery = .pre_delivery },
+    };
+    var unavailable = FakeBackend{
+        .responses = &.{},
+        .talk_failures = &failures,
+        .allocator = t.allocator,
+    };
+    defer unavailable.deinit();
+    const unknown = handleMessage(arena_state.allocator(), unavailable.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"session":"","timeout_ms":5000}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, unknown, "isError") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "failure_class=pre_delivery") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "events_may_have_been_drained=false") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "resend_safe=true") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "UNKNOWN") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "confirmed") == null);
+    try t.expect(std.mem.indexOf(u8, unknown, "Nothing was missed") == null);
+
+    var closed = FakeBackend{
+        .responses = &.{"{\"ok\":false,\"error\":\"no such panel\"}"},
+        .allocator = t.allocator,
+    };
+    defer closed.deinit();
+    const confirmed = handleMessage(arena_state.allocator(), closed.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"session":"","timeout_ms":5000}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, confirmed, "isError") != null);
+    try t.expect(std.mem.indexOf(u8, confirmed, "confirmed") != null);
+    try t.expect(std.mem.indexOf(u8, confirmed, "not live") != null);
+    try t.expect(std.mem.indexOf(u8, confirmed, "UNKNOWN") == null);
+}
+
+test "maximum panel document crosses the direct GUI request boundary intact" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prefix = "{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"ok\"}},\"padding\":\"";
+    const suffix = "\"}";
+    const document = try arena.alloc(u8, paneldoc.MAX_JSON_BYTES);
+    @memcpy(document[0..prefix.len], prefix);
+    const body = document[prefix.len .. document.len - suffix.len];
+    var i: usize = 0;
+    while (i + 1 < body.len) : (i += 2) {
+        body[i] = '\\';
+        body[i + 1] = '"';
+    }
+    if (i < body.len) body[i] = 'x';
+    @memcpy(document[document.len - suffix.len ..], suffix);
+    var parsed_doc = try paneldoc.Document.parse(arena, document, null);
+    defer parsed_doc.deinit();
+
+    var fake = FakeBackend{
+        .responses = &.{"{\"ok\":true,\"panel_id\":17}"},
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+    var transport = UiTransport{
+        .arena = arena,
+        .backend = fake.backend(),
+        .session = "boundary-session",
+        .mode = .gui_socket,
+    };
+    const reply = transport.direct(.{
+        .cmd = "panel-show",
+        .session = "boundary-session",
+        .name = "boundary",
+        .target = "tab",
+        .document = document,
+    }, 5_000);
+    try t.expect(reply.ok);
+    try t.expectEqual(@as(usize, 1), fake.requests.items.len);
+    const sent = fake.requests.items[0];
+    try t.expect(sent.len > (1 << 20));
+    try t.expect(sent.len <= protocol.MAX_LINE);
+    var parsed = try protocol.parseRequest(arena, sent);
+    defer parsed.deinit();
+    try t.expectEqual(document.len, parsed.value.document.?.len);
+    try t.expectEqualStrings(document, parsed.value.document.?);
+}
+
 test "ui_wait_event polls instead of blocking the GUI, and reports drops" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5389,6 +6949,7 @@ test "ui_wait_event polls instead of blocking the GUI, and reports drops" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "dropped_note") != null);
     // Two poll ticks were slept, not spun.
     try std.testing.expectEqual(@as(i64, 2 * UI_POLL_MS), fake.clock_ms);
+    try std.testing.expectEqualSlices(i64, &.{ 5000, 4900, 4800 }, fake.timeouts.items);
 }
 
 test "ui_wait_event times out honestly and clamps the budget" {
@@ -5409,6 +6970,7 @@ test "ui_wait_event times out honestly and clamps the budget" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "timed_out") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "still showing") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+    try std.testing.expectEqualSlices(i64, &.{ 250, 150, 50 }, fake.timeouts.items);
 
     // A wait longer than the watchdog allows is clamped, not promised.
     var bufs2: [1][]const u8 = @splat("{\"ok\":true,\"events\":[{\"component\":\"s\",\"kind\":\"change\",\"value\":3,\"ts\":1}],\"dropped\":0}");
@@ -5427,10 +6989,40 @@ test "ui_wait_event times out honestly and clamps the budget" {
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":60000}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, gone, "isError") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gone, "panel is gone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "confirmed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "not live") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone, "UNKNOWN") == null);
 }
 
-test "ui_* tools that need the GUI say so, and the store-only ones still work" {
+test "ui_wait_event includes name resolution and every exchange in one deadline" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("whole-deadline", true);
+    defer scratch.deinit();
+
+    var fake = FakeBackend{
+        .responses = &.{
+            "{\"ok\":true,\"panels\":[{\"panel_id\":9,\"name\":\"slow\"}]}",
+            "{\"ok\":true,\"events\":[],\"dropped\":0}",
+        },
+        .talk_delays_ms = &.{ 120, 80 },
+        .allocator = t.allocator,
+    };
+    defer fake.deinit();
+    const response = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"name":"slow","timeout_ms":250}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, response, "timed_out") != null);
+    try t.expect(std.mem.indexOf(u8, response, "isError") == null);
+    try t.expectEqual(@as(i64, 250), fake.clock_ms);
+    try t.expectEqualSlices(i64, &.{ 250, 130 }, fake.timeouts.items);
+    try t.expectEqual(@as(usize, 2), fake.requests.items.len);
+}
+
+test "ui_* tools need live transport while store-only behavior remains" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5451,7 +7043,7 @@ test "ui_* tools that need the GUI say so, and the store-only ones still work" {
     }) |msg| {
         const resp = handleMessage(arena, fake.backend(), msg).?;
         try std.testing.expect(std.mem.indexOf(u8, resp, "isError") != null);
-        try std.testing.expect(std.mem.indexOf(u8, resp, "--shared") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "panel transport") != null);
     }
     // Nothing was even attempted on the socket.
     try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
@@ -5466,7 +7058,7 @@ test "ui_* tools that need the GUI say so, and the store-only ones still work" {
         \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ui_panels","arguments":{"session":"s2"}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, listed, "\\\"live\\\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "--shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "panel transport") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "kept") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "Kept") != null);
 
@@ -5474,7 +7066,7 @@ test "ui_* tools that need the GUI say so, and the store-only ones still work" {
         \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ui_delete","arguments":{"name":"kept","session":"s2"}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, deleted, "isError") == null);
-    try std.testing.expect(!panelstore.exists(arena, "s2", "kept"));
+    try std.testing.expect(!panelstore.existsScoped(arena, .{ .session = "s2" }, "kept"));
 
     // Deleting what is not there names the panel and the session.
     const again = handleMessage(arena, fake.backend(),
@@ -5482,6 +7074,44 @@ test "ui_* tools that need the GUI say so, and the store-only ones still work" {
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, again, "isError") != null);
     try std.testing.expect(std.mem.indexOf(u8, again, "kept") != null);
+}
+
+test "store-only panel tools refuse an unidentified exact daemon environment" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var scratch: UiScratch = undefined;
+    try scratch.init("pre-panel-store", false);
+    defer scratch.deinit();
+    const old_pool = panel_pool;
+    panel_pool = null;
+    defer panel_pool = old_pool;
+    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-pre-panel/mux.sock", 1);
+    _ = c.setenv("SKETERM_SESSION", "old-session", 1);
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    defer _ = c.unsetenv("SKETERM_SESSION");
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    const saved = handleMessage(arena_state.allocator(), fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"offline","document":{"title":"Offline","root":"r","components":{"r":{"type":"text","text":"saved"}}}}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, saved, "isError") != null);
+    try t.expect(std.mem.indexOf(u8, saved, "refusing to downgrade") != null);
+    const listed = handleMessage(arena_state.allocator(), fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_panels","arguments":{}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, listed, "saved_error") != null);
+    try t.expect(std.mem.indexOf(u8, listed, "refusing to downgrade") != null);
+    const deleted = handleMessage(arena_state.allocator(), fake.backend(),
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ui_delete","arguments":{"name":"offline"}}}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, deleted, "isError") != null);
+    try t.expect(std.mem.indexOf(u8, deleted, "refusing to downgrade") != null);
+    try t.expectEqual(@as(usize, 0), fake.requests.items.len);
+
+    try t.expect(!panelstore.existsScoped(t.allocator, .{ .session = "old-session" }, "offline"));
 }
 
 test "ui panels are session-scoped, including a session with a space" {
@@ -5511,6 +7141,33 @@ test "ui panels are session-scoped, including a session with a space" {
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, mine, "Mine") != null);
     try std.testing.expect(std.mem.indexOf(u8, mine, "Theirs") == null);
+}
+
+test "explicit empty ui session selects sessionless despite inherited session" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: UiScratch = undefined;
+    try scratch.init("explicit-empty", false);
+    defer scratch.deinit();
+    _ = c.setenv("SKETERM_SESSION", "inherited-session", 1);
+    defer _ = c.unsetenv("SKETERM_SESSION");
+
+    var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
+    defer fake.deinit();
+    const explicit_empty = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"empty","session":"","document":{"root":"t","components":{"t":{"type":"text","text":"none"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, explicit_empty, "isError") == null);
+    try std.testing.expect(panelstore.existsScoped(arena, .sessionless, "empty"));
+    try std.testing.expect(!panelstore.existsScoped(arena, .{ .session = "inherited-session" }, "empty"));
+
+    const absent = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_save","arguments":{"name":"inherited","document":{"root":"t","components":{"t":{"type":"text","text":"env"}}}}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, absent, "isError") == null);
+    try std.testing.expect(panelstore.existsScoped(arena, .{ .session = "inherited-session" }, "inherited"));
+    try std.testing.expect(!panelstore.existsScoped(arena, .sessionless, "inherited"));
 }
 
 test "read_screen last_command extracts the OSC 133 zone" {
@@ -5884,8 +7541,7 @@ test "buildLaunchArgv: args array appends; string command + args = bare executab
     {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
-        const r = try buildLaunchArgv(arena, &argv, parse(arena,
-            "{\"command\":\"/opt/game/bin\",\"args\":[\"/data/dir\",\"-w\",\"-nobink\"]}"));
+        const r = try buildLaunchArgv(arena, &argv, parse(arena, "{\"command\":\"/opt/game/bin\",\"args\":[\"/data/dir\",\"-w\",\"-nobink\"]}"));
         try t.expect(r == .ok and r.ok.argv_form);
         try t.expectEqual(@as(usize, 4), argv.items.len);
         try t.expectEqualStrings("/opt/game/bin", argv.items[0]);
@@ -5896,8 +7552,7 @@ test "buildLaunchArgv: args array appends; string command + args = bare executab
     {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
-        const r = try buildLaunchArgv(arena, &argv, parse(arena,
-            "{\"command\":[\"/opt/game/bin\",\"-w\"],\"args\":[\"-nobink\"]}"));
+        const r = try buildLaunchArgv(arena, &argv, parse(arena, "{\"command\":[\"/opt/game/bin\",\"-w\"],\"args\":[\"-nobink\"]}"));
         try t.expect(r == .ok and r.ok.argv_form);
         try t.expectEqual(@as(usize, 3), argv.items.len);
         try t.expectEqualStrings("-nobink", argv.items[2]);
@@ -5934,8 +7589,7 @@ test "applyDebugWrap: gdb_commands become crash-point -ex args before --args" {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
         try argv.appendSlice(arena, &.{ "/opt/app", "-w" });
-        const r = try applyDebugWrap(arena, &argv, parse(arena,
-            "{\"debug\":\"gdb\",\"gdb_commands\":[\"frame 3\",\"p *ctx\"]}"));
+        const r = try applyDebugWrap(arena, &argv, parse(arena, "{\"debug\":\"gdb\",\"gdb_commands\":[\"frame 3\",\"p *ctx\"]}"));
         try t.expect(r == .note);
         const has = struct {
             fn go(items: []const []const u8, needle: []const u8) bool {

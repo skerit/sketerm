@@ -1,4 +1,4 @@
-//! Named, session-scoped persistence for declarative panel documents.
+//! Origin-qualified persistence for declarative panel documents.
 //!
 //! A third store in the style of `mcpassets.zig`, but with the opposite
 //! sharing rule: templates and macros are deliberately shared across
@@ -10,14 +10,22 @@
 //!
 //! On disk (falling back to `$HOME/.local/state`):
 //!
+//!     $XDG_STATE_HOME/sketerm/panels/by-origin/<socket-sha256>/<origin-id>/<name>.json
 //!     $XDG_STATE_HOME/sketerm/panels/by-session/<encoded>/<name>.json
 //!     $XDG_STATE_HOME/sketerm/panels/no-session/<name>.json
 //!
-//! Two PARENT directories, not one namespace with a reserved name in
-//! it: a caller with no session (an `sketerm mcp` outside any pane) is
-//! a different shape, not a session called something special, so there
-//! is nothing for a real session name to collide with no matter what
-//! the daemon called it. In code that difference is `?[]const u8` —
+//! `by-origin` is the exact scope: a caller that reached its session
+//! through a known daemon keys on that daemon's canonical socket plus
+//! the session's lifetime-unique `origin_id`, so a session rename keeps
+//! its documents and a later same-name session cannot inherit them.
+//! `by-session` is for callers with a session but no exact daemon (a
+//! direct GUI control socket).
+//!
+//! Separate PARENT directories, not one namespace with a reserved name
+//! in it: a caller with no session (an `sketerm mcp` outside any pane)
+//! is a different shape, not a session called something special, so
+//! there is nothing for a real session name to collide with no matter
+//! what the daemon called it. In code that difference is `?[]const u8` —
 //! `null` is "no session", and no string value means it.
 //!
 //! Files hold the CANONICAL form produced by
@@ -37,6 +45,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
+const wire = @import("../mux/wire.zig");
 const doc = @import("../ui/panel/doc.zig");
 
 pub const Document = doc.Document;
@@ -51,6 +60,8 @@ pub const Error = error{
     /// A `null` (or empty) session is not an error: it is the
     /// sessionless bucket.
     BadSession,
+    /// A daemon origin must be an exact canonical absolute socket path.
+    BadOrigin,
     NotFound,
     /// Document larger than `MAX_BYTES`.
     TooBig,
@@ -62,6 +73,8 @@ pub const Error = error{
     /// The STORED bytes no longer parse — the file exists but the panel
     /// cannot be opened.
     Corrupt,
+    PermissionDenied,
+    ReadOnlyFileSystem,
     IoFailed,
     OutOfMemory,
 };
@@ -69,17 +82,23 @@ pub const Error = error{
 /// 1 MiB — the same ceiling `doc.parse` enforces on input, so a
 /// document that parses always fits and the cap can only trip on a
 /// hostile/corrupt file rather than on legitimate authoring.
-pub const MAX_BYTES: usize = doc.MAX_JSON_BYTES;
+const MAX_BYTES: usize = doc.MAX_JSON_BYTES;
 
 /// Panels stored per session. An assistant in a save loop hits this
 /// (reported as `TooMany`, naming the cap) instead of the user's disk.
-pub const MAX_PANELS: usize = 64;
+const MAX_PANELS: usize = 64;
 
 pub const MAX_NAME: usize = 64;
 pub const MAX_SESSION: usize = 64;
+const MAX_ORIGIN: usize = 4096;
 
 /// Parent of every real session's panel directory.
 pub const BY_SESSION_DIR: []const u8 = "by-session";
+
+/// Exact lifetime identities. The daemon component is SHA-256 of its exact
+/// canonical socket path, with an `origin` file beside it naming the path
+/// the hash came from so the directory is identifiable by hand.
+pub const BY_ORIGIN_DIR: []const u8 = "by-origin";
 
 /// Where panels land when the caller has no session: `sketerm mcp` can
 /// run outside any pane, and refusing to save at all there would make
@@ -87,6 +106,29 @@ pub const BY_SESSION_DIR: []const u8 = "by-session";
 /// `BY_SESSION_DIR`, never a directory inside it, so no session name —
 /// encoded or not — can address it.
 pub const NO_SESSION_DIR: []const u8 = "no-session";
+
+/// A session addressed through the exact daemon that owns it.
+const OriginScope = struct {
+    /// Canonical absolute path of that daemon's listening socket.
+    daemon_origin: []const u8,
+    /// The session's lifetime-unique immutable id. Rename does not move it,
+    /// and a later same-name session gets a different one.
+    origin_id: []const u8,
+    /// Session name, for diagnostics only. Never part of a path.
+    label: []const u8 = "",
+};
+
+pub const Scope = union(enum) {
+    sessionless,
+    /// A session with no exact daemon (a direct GUI control socket).
+    session: []const u8,
+    origin: OriginScope,
+};
+
+pub fn sessionScope(session: ?[]const u8) Scope {
+    const s = norm(session) orelse return .sessionless;
+    return .{ .session = s };
+}
 
 /// The one place "no session" is decided. `null` is the shape callers
 /// should use; the empty string is accepted as the same thing because
@@ -104,6 +146,14 @@ fn norm(session: ?[]const u8) ?[]const u8 {
 /// name, so it must never render as one.
 pub fn sessionLabel(session: ?[]const u8) []const u8 {
     return norm(session) orelse "(no session)";
+}
+
+fn scopeLabel(scope: Scope) []const u8 {
+    return switch (scope) {
+        .sessionless => "(no session)",
+        .session => |session| session,
+        .origin => |origin| if (origin.label.len > 0) origin.label else origin.origin_id,
+    };
 }
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
@@ -129,7 +179,7 @@ fn validComponent(s: []const u8, max: usize) bool {
 /// Panel names are file names: no separators, no dotfiles, no bytes
 /// that need quoting. Rejected, never sanitized — an assistant that
 /// asked for `../../x` gets told so.
-pub fn validName(name: []const u8) bool {
+fn validName(name: []const u8) bool {
     return validComponent(name, MAX_NAME);
 }
 
@@ -139,13 +189,13 @@ pub fn validName(name: []const u8) bool {
 /// Rejecting it on charset would make panels unusable from that pane
 /// with nothing the user could do about it, so only the length rule
 /// is a rejection here; everything else is encoded (`encodeSession`).
-pub fn validSession(session: []const u8) bool {
+fn validSession(session: []const u8) bool {
     return session.len > 0 and session.len <= MAX_SESSION;
 }
 
 /// Longest encoded session directory name: every byte may expand to
 /// `%XX`.
-pub const MAX_SESSION_DIR: usize = MAX_SESSION * 3;
+const MAX_SESSION_DIR: usize = MAX_SESSION * 3;
 
 fn hexDigit(n: u4) u8 {
     return "0123456789ABCDEF"[n];
@@ -162,7 +212,7 @@ fn hexDigit(n: u4) u8 {
 /// are no reserved names to steer around: sessionless panels live
 /// under a different parent entirely. Writes into `buf`, which must
 /// hold `MAX_SESSION_DIR`.
-pub fn encodeSession(buf: []u8, session: []const u8) Error![]u8 {
+fn encodeSession(buf: []u8, session: []const u8) Error![]u8 {
     if (!validSession(session)) return Error.BadSession;
     var n: usize = 0;
     for (session, 0..) |ch, i| {
@@ -186,14 +236,17 @@ pub fn encodeSession(buf: []u8, session: []const u8) Error![]u8 {
     return buf[0..n];
 }
 
-/// The session a caller should use: an explicit one when given, else
-/// `$SKETERM_SESSION`, else NONE. `null` is a real answer, not a
-/// fallback name — the sessionless bucket is a different directory,
-/// not a session called something. The result borrows from `explicit`
-/// or from the environment; it is never allocated.
-pub fn resolveSession(explicit: ?[]const u8) ?[]const u8 {
-    if (norm(explicit)) |s| return s;
-    return getenv("SKETERM_SESSION");
+const SessionArg = union(enum) {
+    absent,
+    explicit: []const u8,
+};
+
+/// Resolve the session argument without collapsing absent and explicit empty.
+pub fn resolveSession(arg: SessionArg) ?[]const u8 {
+    return switch (arg) {
+        .absent => getenv("SKETERM_SESSION"),
+        .explicit => |session| norm(session),
+    };
 }
 
 fn checkSession(session: ?[]const u8, diag: ?*Diag) Error!void {
@@ -204,8 +257,29 @@ fn checkSession(session: ?[]const u8, diag: ?*Diag) Error!void {
     }
 }
 
-fn checkKey(session: ?[]const u8, name: []const u8, diag: ?*Diag) Error!void {
-    try checkSession(session, diag);
+fn checkScope(scope: Scope, diag: ?*Diag) Error!void {
+    switch (scope) {
+        .sessionless => {},
+        .session => |session| try checkSession(session, diag),
+        .origin => |origin| {
+            try checkDaemonOrigin(origin.daemon_origin, diag);
+            if (!wire.validSessionOriginId(origin.origin_id)) {
+                if (diag) |d| d.set("invalid panel session origin id: expected {d} lowercase hex digits", .{wire.SESSION_ORIGIN_ID_LEN});
+                return Error.BadOrigin;
+            }
+        },
+    }
+}
+
+fn checkDaemonOrigin(origin: []const u8, diag: ?*Diag) Error!void {
+    if (origin.len == 0 or origin.len > MAX_ORIGIN or origin[0] != '/') {
+        if (diag) |d| d.set("invalid panel daemon origin: expected an exact canonical absolute socket path", .{});
+        return Error.BadOrigin;
+    }
+}
+
+fn checkScopedKey(scope: Scope, name: []const u8, diag: ?*Diag) Error!void {
+    try checkScope(scope, diag);
     if (!validName(name)) {
         if (diag) |d| d.set("invalid panel name \"{s}\": 1..{d} chars of [A-Za-z0-9._-], no leading \".\"", .{ name, MAX_NAME });
         return Error.BadName;
@@ -241,20 +315,70 @@ pub fn sessionDir(allocator: std.mem.Allocator, session: ?[]const u8) Error![]u8
     return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ root, BY_SESSION_DIR, enc }) catch Error.OutOfMemory;
 }
 
-fn panelPath(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8, diag: ?*Diag) Error![]u8 {
-    try checkKey(session, name, diag);
-    const dir = try sessionDir(allocator, session);
+fn originHash(origin: []const u8) [64]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(origin, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Directory for a complete persistence scope. Exact paths use the immutable
+/// lifetime ID, so session rename cannot change them.
+pub fn scopeDir(allocator: std.mem.Allocator, scope: Scope) Error![]u8 {
+    try checkScope(scope, null);
+    return switch (scope) {
+        .sessionless => sessionDir(allocator, null),
+        .session => |session| sessionDir(allocator, session),
+        .origin => |origin| blk: {
+            const root = try panelsRoot(allocator);
+            defer allocator.free(root);
+            const hash = originHash(origin.daemon_origin);
+            break :blk std.fmt.allocPrint(allocator, "{s}/{s}/{s}/{s}", .{
+                root, BY_ORIGIN_DIR, &hash, origin.origin_id,
+            }) catch Error.OutOfMemory;
+        },
+    };
+}
+
+/// Name the socket path a hash directory came from, so `panels/by-origin`
+/// is readable by a human. Best effort and never read back: it is a label,
+/// not a validation record, and a failure to write it must not fail a save.
+fn noteOriginPath(allocator: std.mem.Allocator, origin: OriginScope) void {
+    const root = panelsRoot(allocator) catch return;
+    defer allocator.free(root);
+    const hash = originHash(origin.daemon_origin);
+    const marker = std.fmt.allocPrint(allocator, "{s}/{s}/{s}/origin", .{
+        root, BY_ORIGIN_DIR, &hash,
+    }) catch return;
+    defer allocator.free(marker);
+    if (fileExists(marker)) return;
+    const stage = std.fmt.allocPrint(allocator, "{s}.{d}.sketerm-part", .{ marker, c.getpid() }) catch return;
+    defer allocator.free(stage);
+    writeAtomic(stage, marker, origin.daemon_origin, true) catch {};
+}
+
+fn panelPathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8, diag: ?*Diag) Error![]u8 {
+    try checkScopedKey(scope, name, diag);
+    const dir = try scopeDir(allocator, scope);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, name }) catch Error.OutOfMemory;
 }
 
-fn stagePath(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8) Error![]u8 {
-    const dir = try sessionDir(allocator, session);
+fn stagePathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8) Error![]u8 {
+    const dir = try scopeDir(allocator, scope);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.sketerm-part", .{ dir, name, c.getpid() }) catch Error.OutOfMemory;
 }
 
 // ─── write / read primitives ────────────────────────────────────
+
+fn errnoError(err: std.posix.E) Error {
+    return switch (err) {
+        .NOENT => Error.NotFound,
+        .ACCES, .PERM => Error.PermissionDenied,
+        .ROFS => Error.ReadOnlyFileSystem,
+        else => Error.IoFailed,
+    };
+}
 
 /// Stage `bytes` next to `path` and, when `commit`, rename it over
 /// `path`. `commit = false` exists for the atomicity test: it is
@@ -264,7 +388,7 @@ fn writeAtomic(stage: []const u8, path: []const u8, bytes: []const u8, commit: b
     var szbuf: [4096]u8 = undefined;
     const stage_z = pathz.pathZ(&szbuf, stage) catch return Error.IoFailed;
     {
-        const f = c.fopen(stage_z, "wb") orelse return Error.IoFailed;
+        const f = c.fopen(stage_z, "wb") orelse return errnoError(std.posix.errno(@as(c_int, -1)));
         var closed = false;
         errdefer if (!closed) {
             _ = c.fclose(f);
@@ -290,15 +414,16 @@ fn writeAtomic(stage: []const u8, path: []const u8, bytes: []const u8, commit: b
         return Error.IoFailed;
     };
     if (c.rename(stage_z, path_z) != 0) {
+        const err = errnoError(std.posix.errno(@as(c_int, -1)));
         _ = c.unlink(stage_z);
-        return Error.IoFailed;
+        return err;
     }
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) Error![]u8 {
     var zbuf: [4096]u8 = undefined;
     const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
-    const f = c.fopen(z, "rb") orelse return Error.NotFound;
+    const f = c.fopen(z, "rb") orelse return errnoError(std.posix.errno(@as(c_int, -1)));
     defer _ = c.fclose(f);
     if (c.fseek(f, 0, c.SEEK_END) != 0) return Error.IoFailed;
     const len: usize = @intCast(@max(0, c.ftell(f)));
@@ -312,85 +437,89 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) Error![]u8 {
 
 // ─── public API ─────────────────────────────────────────────────
 
-/// Persist `document` under `(session, name)`, replacing any previous
+/// Persist `document` under `(scope, name)`, replacing any previous
 /// panel of that name. The canonical serialization is what lands on
-/// disk, so `save` is idempotent byte-for-byte.
-pub fn save(
+/// disk, so a save is idempotent byte-for-byte.
+pub fn saveScoped(
     allocator: std.mem.Allocator,
-    session: ?[]const u8,
+    scope: Scope,
     name: []const u8,
     document: *const Document,
     diag: ?*Diag,
-) Error!void {
-    try checkKey(session, name, diag);
+) Error!usize {
+    try checkScopedKey(scope, name, diag);
+    // Only a WRITE may create anything: a read of a never-used scope must
+    // leave the state directory exactly as it found it.
+    if (scope == .origin) noteOriginPath(allocator, scope.origin);
     const bytes = document.toJson(allocator) catch |err| switch (err) {
         error.OutOfMemory => return Error.OutOfMemory,
         else => return Error.Corrupt,
     };
     defer allocator.free(bytes);
-    return saveBytes(allocator, session, name, bytes, diag);
+    return saveBytesScoped(allocator, scope, name, bytes, diag);
 }
 
 /// Validate `json_text` as a panel document and persist it. This is
 /// the entry point for an MCP tool holding agent-authored JSON: an
 /// invalid document is rejected with `diag` explaining why and nothing
 /// is written.
-pub fn saveJson(
+pub fn saveJsonScoped(
     allocator: std.mem.Allocator,
-    session: ?[]const u8,
+    scope: Scope,
     name: []const u8,
     json_text: []const u8,
     diag: ?*Diag,
-) Error!void {
-    try checkKey(session, name, diag);
+) Error!usize {
+    try checkScopedKey(scope, name, diag);
     var parsed = Document.parse(allocator, json_text, diag) catch |err| switch (err) {
         error.OutOfMemory => return Error.OutOfMemory,
         error.TooBig => return Error.TooBig,
         else => return Error.Invalid,
     };
     defer parsed.deinit();
-    return save(allocator, session, name, &parsed, diag);
+    return saveScoped(allocator, scope, name, &parsed, diag);
 }
 
-fn saveBytes(
+fn saveBytesScoped(
     allocator: std.mem.Allocator,
-    session: ?[]const u8,
+    scope: Scope,
     name: []const u8,
     bytes: []const u8,
     diag: ?*Diag,
-) Error!void {
+) Error!usize {
     if (bytes.len > MAX_BYTES) {
         if (diag) |d| d.set("panel \"{s}\" is {d} bytes, over the {d}-byte cap", .{ name, bytes.len, MAX_BYTES });
         return Error.TooBig;
     }
-    const path = try panelPath(allocator, session, name, diag);
+    const path = try panelPathScoped(allocator, scope, name, diag);
     defer allocator.free(path);
 
     // The cap counts DISTINCT panels: overwriting an existing name is
     // always allowed, so an assistant updating one panel never trips it.
     if (!fileExists(path)) {
-        const n = try countPanels(allocator, session);
+        const n = try countPanelsScoped(allocator, scope);
         if (n >= MAX_PANELS) {
-            if (diag) |d| d.set("session {s} already holds {d} panels (cap {d}); delete one first", .{ sessionLabel(session), n, MAX_PANELS });
+            if (diag) |d| d.set("scope {s} already holds {d} panels (cap {d}); delete one first", .{ scopeLabel(scope), n, MAX_PANELS });
             return Error.TooMany;
         }
     }
 
-    const stage = try stagePath(allocator, session, name);
+    const stage = try stagePathScoped(allocator, scope, name);
     defer allocator.free(stage);
-    return writeAtomic(stage, path, bytes, true);
+    try writeAtomic(stage, path, bytes, true);
+    return bytes.len;
 }
 
 /// Parse a stored panel. `Corrupt` (with `diag` set by the parser)
 /// means the file exists but no longer describes a valid document —
 /// never a crash and never a silently empty panel.
-pub fn load(
+pub fn loadScoped(
     allocator: std.mem.Allocator,
-    session: ?[]const u8,
+    scope: Scope,
     name: []const u8,
     diag: ?*Diag,
 ) Error!Document {
-    const bytes = try loadJson(allocator, session, name, diag);
+    const bytes = try loadJsonScoped(allocator, scope, name, diag);
     defer allocator.free(bytes);
     return Document.parse(allocator, bytes, diag) catch |err| switch (err) {
         error.OutOfMemory => return Error.OutOfMemory,
@@ -405,36 +534,42 @@ pub fn load(
 
 /// Raw stored bytes (canonical JSON). Caller frees. No parse — use
 /// this only to hand the document straight back to a client.
-pub fn loadJson(
+pub fn loadJsonScoped(
     allocator: std.mem.Allocator,
-    session: ?[]const u8,
+    scope: Scope,
     name: []const u8,
     diag: ?*Diag,
 ) Error![]u8 {
-    const path = try panelPath(allocator, session, name, diag);
+    const path = try panelPathScoped(allocator, scope, name, diag);
     defer allocator.free(path);
     return readFile(allocator, path) catch |err| {
         if (err == Error.NotFound) {
-            if (diag) |d| d.set("no panel \"{s}\" saved in session {s}", .{ name, sessionLabel(session) });
+            if (diag) |d| d.set("no panel \"{s}\" saved in scope {s}", .{ name, scopeLabel(scope) });
         }
         return err;
     };
 }
 
-pub fn exists(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8) bool {
-    const path = panelPath(allocator, session, name, null) catch return false;
+pub fn existsScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8) bool {
+    const path = panelPathScoped(allocator, scope, name, null) catch return false;
     defer allocator.free(path);
     return fileExists(path);
 }
 
-pub fn delete(allocator: std.mem.Allocator, session: ?[]const u8, name: []const u8, diag: ?*Diag) Error!void {
-    const path = try panelPath(allocator, session, name, diag);
+pub fn deleteScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8, diag: ?*Diag) Error!void {
+    const path = try panelPathScoped(allocator, scope, name, diag);
     defer allocator.free(path);
     var zbuf: [4096]u8 = undefined;
     const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
     if (c.unlink(z) != 0) {
-        if (diag) |d| d.set("no panel \"{s}\" saved in session {s}", .{ name, sessionLabel(session) });
-        return Error.NotFound;
+        const err = errnoError(std.posix.errno(@as(c_int, -1)));
+        if (diag) |d| switch (err) {
+            Error.NotFound => d.set("no panel \"{s}\" saved in scope {s}", .{ name, scopeLabel(scope) }),
+            Error.PermissionDenied => d.set("permission denied deleting panel \"{s}\" from scope {s}", .{ name, scopeLabel(scope) }),
+            Error.ReadOnlyFileSystem => d.set("cannot delete panel \"{s}\" from scope {s}: the filesystem is read-only", .{ name, scopeLabel(scope) }),
+            else => d.set("I/O failure deleting panel \"{s}\" from scope {s}", .{ name, scopeLabel(scope) }),
+        };
+        return err;
     }
 }
 
@@ -453,11 +588,11 @@ pub const Entry = struct {
     ok: bool,
 };
 
-/// Every panel stored for `session`, sorted by name. Free with
-/// `freeList`. An unknown or never-used session lists empty rather
+/// Every panel stored in `scope`, sorted by name. Free with
+/// `freeList`. An unknown or never-used scope lists empty rather
 /// than erroring — "no panels yet" is not a failure.
-pub fn list(allocator: std.mem.Allocator, session: ?[]const u8) Error![]Entry {
-    const dir = try sessionDir(allocator, session);
+pub fn listScoped(allocator: std.mem.Allocator, scope: Scope) Error![]Entry {
+    const dir = try scopeDir(allocator, scope);
     defer allocator.free(dir);
 
     var entries: std.ArrayList(Entry) = .empty;
@@ -544,7 +679,11 @@ fn dirNames(allocator: std.mem.Allocator, dir: []const u8) Error!std.ArrayList([
     }
     var zbuf: [4096]u8 = undefined;
     const z = pathz.pathZ(&zbuf, dir) catch return Error.IoFailed;
-    const d = c.opendir(z) orelse return out; // never-used session
+    const d = c.opendir(z) orelse {
+        const err = errnoError(std.posix.errno(@as(c_int, -1)));
+        if (err == Error.NotFound) return out; // never-used session
+        return err;
+    };
     defer _ = c.closedir(d);
     while (c.readdir(d)) |ent| {
         const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
@@ -560,8 +699,8 @@ fn dirNames(allocator: std.mem.Allocator, dir: []const u8) Error!std.ArrayList([
     return out;
 }
 
-fn countPanels(allocator: std.mem.Allocator, session: ?[]const u8) Error!usize {
-    const dir = try sessionDir(allocator, session);
+fn countPanelsScoped(allocator: std.mem.Allocator, scope: Scope) Error!usize {
+    const dir = try scopeDir(allocator, scope);
     defer allocator.free(dir);
     var names = try dirNames(allocator, dir);
     defer {
@@ -697,13 +836,13 @@ test "a hostile panel name is rejected; a hostile session is encoded" {
     var diag = Diag{};
 
     // The panel NAME is supplied by the caller: rejected, never sanitized.
-    try t.expectError(Error.BadName, saveJson(t.allocator, "s1", "../../evil", DOC, &diag));
+    try t.expectError(Error.BadName, saveJsonScoped(t.allocator, .{ .session = "s1" }, "../../evil", DOC, &diag));
     try t.expect(std.mem.indexOf(u8, diag.msg(), "panel name") != null);
-    try t.expectError(Error.BadName, load(t.allocator, "s1", "a/b", null));
+    try t.expectError(Error.BadName, loadScoped(t.allocator, .{ .session = "s1" }, "a/b", null));
 
     // The SESSION is inherited: it must work, and must stay inside the
     // panels root as one encoded directory.
-    try saveJson(t.allocator, "../../etc", "p", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "../../etc" }, "p", DOC, null);
     const dir = try sessionDir(t.allocator, "../../etc");
     defer t.allocator.free(dir);
     const root = try panelsRoot(t.allocator);
@@ -717,25 +856,25 @@ test "a hostile panel name is rejected; a hostile session is encoded" {
 
     // A session with a space and one with a slash both round-trip, and
     // stay isolated from each other.
-    try saveJson(t.allocator, "my work", "p", DOC, null);
-    try saveJson(t.allocator, "my/work", "p",
+    _ = try saveJsonScoped(t.allocator, .{ .session = "my work" }, "p", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "my/work" }, "p",
         \\{"root":"r","title":"Slashed","components":{"r":{"type":"text","text":"s"}}}
     , null);
-    var spaced = try load(t.allocator, "my work", "p", null);
+    var spaced = try loadScoped(t.allocator, .{ .session = "my work" }, "p", null);
     defer spaced.deinit();
     try t.expectEqualStrings("VSR compare", spaced.title);
-    var slashed = try load(t.allocator, "my/work", "p", null);
+    var slashed = try loadScoped(t.allocator, .{ .session = "my/work" }, "p", null);
     defer slashed.deinit();
     try t.expectEqualStrings("Slashed", slashed.title);
-    const spaced_list = try list(t.allocator, "my work");
+    const spaced_list = try listScoped(t.allocator, .{ .session = "my work" });
     defer freeList(t.allocator, spaced_list);
     try t.expectEqual(@as(usize, 1), spaced_list.len);
 
     // An over-long session is still refused, with the reason.
     diag = Diag{};
-    try t.expectError(Error.BadSession, saveJson(t.allocator, "x" ** 65, "p", DOC, &diag));
+    try t.expectError(Error.BadSession, saveJsonScoped(t.allocator, .{ .session = "x" ** 65 }, "p", DOC, &diag));
     try t.expect(std.mem.indexOf(u8, diag.msg(), "session") != null);
-    try t.expectError(Error.BadSession, delete(t.allocator, "x" ** 65, "p", null));
+    try t.expectError(Error.BadSession, deleteScoped(t.allocator, .{ .session = "x" ** 65 }, "p", null));
 }
 
 test "the sessionless bucket shares no namespace with any session" {
@@ -744,13 +883,13 @@ test "the sessionless bucket shares no namespace with any session" {
     defer scratch.deinit();
 
     // The full sessionless lifecycle works without a session at all.
-    try saveJson(t.allocator, null, "p", DOC, null);
-    var loaded = try load(t.allocator, null, "p", null);
+    _ = try saveJsonScoped(t.allocator, .sessionless, "p", DOC, null);
+    var loaded = try loadScoped(t.allocator, .sessionless, "p", null);
     defer loaded.deinit();
     try t.expectEqualStrings("VSR compare", loaded.title);
-    try t.expect(exists(t.allocator, null, "p"));
+    try t.expect(existsScoped(t.allocator, .sessionless, "p"));
     {
-        const listed = try list(t.allocator, null);
+        const listed = try listScoped(t.allocator, .sessionless);
         defer freeList(t.allocator, listed);
         try t.expectEqual(@as(usize, 1), listed.len);
         try t.expectEqualStrings("p", listed[0].name);
@@ -759,23 +898,23 @@ test "the sessionless bucket shares no namespace with any session" {
     // A session LITERALLY named `_no-session` (the old sentinel) is an
     // ordinary session: its panels are somewhere else entirely, and
     // neither side can see or overwrite the other's.
-    try saveJson(t.allocator, "_no-session", "p",
+    _ = try saveJsonScoped(t.allocator, .{ .session = "_no-session" }, "p",
         \\{"root":"r","title":"Impostor","components":{"r":{"type":"text","text":"i"}}}
     , null);
-    var impostor = try load(t.allocator, "_no-session", "p", null);
+    var impostor = try loadScoped(t.allocator, .{ .session = "_no-session" }, "p", null);
     defer impostor.deinit();
     try t.expectEqualStrings("Impostor", impostor.title);
-    var sessionless = try load(t.allocator, null, "p", null);
+    var sessionless = try loadScoped(t.allocator, .sessionless, "p", null);
     defer sessionless.deinit();
     try t.expectEqualStrings("VSR compare", sessionless.title);
 
     // Same for the directory name the bucket happens to use, and for
     // the parent every real session lives under.
     for ([_][]const u8{ NO_SESSION_DIR, BY_SESSION_DIR }) |spoof| {
-        try saveJson(t.allocator, spoof, "p",
+        _ = try saveJsonScoped(t.allocator, .{ .session = spoof }, "p",
             \\{"root":"r","title":"Spoof","components":{"r":{"type":"text","text":"s"}}}
         , null);
-        var spoofed = try load(t.allocator, spoof, "p", null);
+        var spoofed = try loadScoped(t.allocator, .{ .session = spoof }, "p", null);
         defer spoofed.deinit();
         try t.expectEqualStrings("Spoof", spoofed.title);
         const dir = try sessionDir(t.allocator, spoof);
@@ -786,21 +925,21 @@ test "the sessionless bucket shares no namespace with any session" {
     }
     {
         // ...and the sessionless bucket still holds exactly its own one.
-        const listed = try list(t.allocator, null);
+        const listed = try listScoped(t.allocator, .sessionless);
         defer freeList(t.allocator, listed);
         try t.expectEqual(@as(usize, 1), listed.len);
     }
 
     // Deleting the sessionless panel touches nothing else.
-    try delete(t.allocator, null, "p", null);
-    try t.expect(!exists(t.allocator, null, "p"));
-    try t.expect(exists(t.allocator, "_no-session", "p"));
+    try deleteScoped(t.allocator, .sessionless, "p", null);
+    try t.expect(!existsScoped(t.allocator, .sessionless, "p"));
+    try t.expect(existsScoped(t.allocator, .{ .session = "_no-session" }, "p"));
 
     // The string-typed edges spell "no session" as the empty string,
     // which is not a session name in any layer — same bucket, and an
     // explicit "" is never a session of its own.
-    try saveJson(t.allocator, "", "empty", DOC, null);
-    try t.expect(exists(t.allocator, null, "empty"));
+    _ = try saveJsonScoped(t.allocator, .{ .session = "" }, "empty", DOC, null);
+    try t.expect(existsScoped(t.allocator, .sessionless, "empty"));
 }
 
 test "save/load round-trip keeps the document byte-stable" {
@@ -808,9 +947,9 @@ test "save/load round-trip keeps the document byte-stable" {
     try scratch.init("roundtrip");
     defer scratch.deinit();
 
-    try saveJson(t.allocator, "s1", "vsr-compare", DOC, null);
+    const canonical_len = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", DOC, null);
 
-    var loaded = try load(t.allocator, "s1", "vsr-compare", null);
+    var loaded = try loadScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null);
     defer loaded.deinit();
     try t.expectEqualStrings("VSR compare", loaded.title);
     try t.expectEqualStrings("main", loaded.root);
@@ -818,18 +957,19 @@ test "save/load round-trip keeps the document byte-stable" {
     try t.expectEqualStrings("PSNR +0.4 dB", loaded.get("note").?.props.text.text);
 
     // Re-saving the parsed document must produce the same bytes.
-    const first = try loadJson(t.allocator, "s1", "vsr-compare", null);
+    const first = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null);
     defer t.allocator.free(first);
-    try save(t.allocator, "s1", "vsr-compare", &loaded, null);
-    const second = try loadJson(t.allocator, "s1", "vsr-compare", null);
+    try t.expectEqual(first.len, canonical_len);
+    _ = try saveScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", &loaded, null);
+    const second = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null);
     defer t.allocator.free(second);
     try t.expectEqualStrings(first, second);
 
-    try t.expect(exists(t.allocator, "s1", "vsr-compare"));
-    try delete(t.allocator, "s1", "vsr-compare", null);
-    try t.expect(!exists(t.allocator, "s1", "vsr-compare"));
-    try t.expectError(Error.NotFound, load(t.allocator, "s1", "vsr-compare", null));
-    try t.expectError(Error.NotFound, delete(t.allocator, "s1", "vsr-compare", null));
+    try t.expect(existsScoped(t.allocator, .{ .session = "s1" }, "vsr-compare"));
+    try deleteScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null);
+    try t.expect(!existsScoped(t.allocator, .{ .session = "s1" }, "vsr-compare"));
+    try t.expectError(Error.NotFound, loadScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null));
+    try t.expectError(Error.NotFound, deleteScoped(t.allocator, .{ .session = "s1" }, "vsr-compare", null));
 }
 
 test "listing is session-isolated and carries metadata" {
@@ -837,13 +977,13 @@ test "listing is session-isolated and carries metadata" {
     try scratch.init("sessions");
     defer scratch.deinit();
 
-    try saveJson(t.allocator, "alpha", "shared-name", DOC, null);
-    try saveJson(t.allocator, "alpha", "zulu", DOC, null);
-    try saveJson(t.allocator, "beta", "shared-name",
+    _ = try saveJsonScoped(t.allocator, .{ .session = "alpha" }, "shared-name", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "alpha" }, "zulu", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "beta" }, "shared-name",
         \\{"root":"r","title":"Beta's panel","components":{"r":{"type":"text","text":"b"}}}
     , null);
 
-    const a_list = try list(t.allocator, "alpha");
+    const a_list = try listScoped(t.allocator, .{ .session = "alpha" });
     defer freeList(t.allocator, a_list);
     try t.expectEqual(@as(usize, 2), a_list.len);
     try t.expectEqualStrings("shared-name", a_list[0].name);
@@ -853,20 +993,140 @@ test "listing is session-isolated and carries metadata" {
     try t.expect(a_list[0].bytes > 0);
     try t.expect(a_list[0].mtime > 0);
 
-    const b_list = try list(t.allocator, "beta");
+    const b_list = try listScoped(t.allocator, .{ .session = "beta" });
     defer freeList(t.allocator, b_list);
     try t.expectEqual(@as(usize, 1), b_list.len);
     try t.expectEqualStrings("Beta's panel", b_list[0].title);
 
     // Same name, different content: neither session can see the other's.
-    var from_beta = try load(t.allocator, "beta", "shared-name", null);
+    var from_beta = try loadScoped(t.allocator, .{ .session = "beta" }, "shared-name", null);
     defer from_beta.deinit();
     try t.expectEqualStrings("Beta's panel", from_beta.title);
 
     // A never-used session lists empty rather than erroring.
-    const empty = try list(t.allocator, "gamma");
+    const empty = try listScoped(t.allocator, .{ .session = "gamma" });
     defer freeList(t.allocator, empty);
     try t.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "reading an unused store creates nothing on disk" {
+    var scratch: Scratch = undefined;
+    try scratch.init("read-only-reads");
+    defer scratch.deinit();
+
+    const scope = Scope{ .origin = .{
+        .daemon_origin = "/tmp/untouched/mux.sock",
+        .origin_id = "30000000000000000000000000000003",
+        .label = "untouched",
+    } };
+    const dir = try scopeDir(t.allocator, scope);
+    defer t.allocator.free(dir);
+    const root = try panelsRoot(t.allocator);
+    defer t.allocator.free(root);
+
+    // Every read path, on a store nothing ever wrote to.
+    const listed = try listScoped(t.allocator, scope);
+    defer freeList(t.allocator, listed);
+    try t.expectEqual(@as(usize, 0), listed.len);
+    try t.expect(!existsScoped(t.allocator, scope, "p"));
+    try t.expectError(Error.NotFound, loadJsonScoped(t.allocator, scope, "p", null));
+    try t.expectError(Error.NotFound, deleteScoped(t.allocator, scope, "p", null));
+
+    // Not the scope directory, not its daemon-hash parent, not even the
+    // `origin` marker: only a save may create any of them.
+    try t.expect(!fileExists(dir));
+    const marker = try std.fmt.allocPrint(t.allocator, "{s}/{s}", .{ dir[0..std.mem.lastIndexOfScalar(u8, dir, '/').?], "origin" });
+    defer t.allocator.free(marker);
+    try t.expect(!fileExists(marker));
+    try t.expect(!fileExists(root));
+
+    // The very same scope, once written to, has all of it.
+    _ = try saveJsonScoped(t.allocator, scope, "p", DOC, null);
+    try t.expect(fileExists(dir));
+    try t.expect(fileExists(marker));
+}
+
+test "origin-qualified stores isolate daemons and survive session rename" {
+    var scratch: Scratch = undefined;
+    try scratch.init("origins");
+    defer scratch.deinit();
+
+    const origin_a = Scope{ .origin = .{
+        .daemon_origin = "/tmp/daemon-a/mux.sock",
+        .origin_id = "00000000000000000000000000000001",
+        .label = "spawn-name",
+    } };
+    const origin_b = Scope{ .origin = .{
+        .daemon_origin = "/tmp/daemon-b/mux.sock",
+        .origin_id = "00000000000000000000000000000001",
+        .label = "spawn-name",
+    } };
+    _ = try saveJsonScoped(t.allocator, origin_a, "same",
+        \\{"root":"r","title":"Daemon A","components":{"r":{"type":"text","text":"a"}}}
+    , null);
+    _ = try saveJsonScoped(t.allocator, origin_b, "same",
+        \\{"root":"r","title":"Daemon B","components":{"r":{"type":"text","text":"b"}}}
+    , null);
+
+    var from_a = try loadScoped(t.allocator, origin_a, "same", null);
+    defer from_a.deinit();
+    var from_b = try loadScoped(t.allocator, origin_b, "same", null);
+    defer from_b.deinit();
+    try t.expectEqualStrings("Daemon A", from_a.title);
+    try t.expectEqualStrings("Daemon B", from_b.title);
+    const dir_a = try scopeDir(t.allocator, origin_a);
+    defer t.allocator.free(dir_a);
+    const dir_b = try scopeDir(t.allocator, origin_b);
+    defer t.allocator.free(dir_b);
+    try t.expect(!std.mem.eql(u8, dir_a, dir_b));
+
+    // The mutable alias does not participate in the path: only the label
+    // differs here, and it must resolve to daemon A's very directory.
+    const renamed = Scope{ .origin = .{
+        .daemon_origin = "/tmp/daemon-a/mux.sock",
+        .origin_id = "00000000000000000000000000000001",
+        .label = "renamed-alias",
+    } };
+    const renamed_dir = try scopeDir(t.allocator, renamed);
+    defer t.allocator.free(renamed_dir);
+    try t.expectEqualStrings(dir_a, renamed_dir);
+    var after_rename = try loadScoped(t.allocator, renamed, "same", null);
+    defer after_rename.deinit();
+    try t.expectEqualStrings("Daemon A", after_rename.title);
+}
+
+test "same-name session reincarnations have isolated lifetime stores" {
+    var scratch: Scratch = undefined;
+    try scratch.init("reincarnation");
+    defer scratch.deinit();
+
+    const first = Scope{ .origin = .{
+        .daemon_origin = "/tmp/reincarnation/mux.sock",
+        .origin_id = "10000000000000000000000000000001",
+        .label = "reused-name",
+    } };
+    const second = Scope{ .origin = .{
+        .daemon_origin = "/tmp/reincarnation/mux.sock",
+        .origin_id = "20000000000000000000000000000002",
+        .label = "reused-name",
+    } };
+    _ = try saveJsonScoped(t.allocator, first, "same",
+        \\{"root":"r","title":"First lifetime","components":{"r":{"type":"text","text":"one"}}}
+    , null);
+    _ = try saveJsonScoped(t.allocator, second, "same",
+        \\{"root":"r","title":"Second lifetime","components":{"r":{"type":"text","text":"two"}}}
+    , null);
+    var first_doc = try loadScoped(t.allocator, first, "same", null);
+    defer first_doc.deinit();
+    var second_doc = try loadScoped(t.allocator, second, "same", null);
+    defer second_doc.deinit();
+    try t.expectEqualStrings("First lifetime", first_doc.title);
+    try t.expectEqualStrings("Second lifetime", second_doc.title);
+    const first_dir = try scopeDir(t.allocator, first);
+    defer t.allocator.free(first_dir);
+    const second_dir = try scopeDir(t.allocator, second);
+    defer t.allocator.free(second_dir);
+    try t.expect(!std.mem.eql(u8, first_dir, second_dir));
 }
 
 test "a crash between write and rename leaves no partial document" {
@@ -874,36 +1134,59 @@ test "a crash between write and rename leaves no partial document" {
     try scratch.init("atomic");
     defer scratch.deinit();
 
-    try saveJson(t.allocator, "s1", "keeper", DOC, null);
-    const before = try loadJson(t.allocator, "s1", "keeper", null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", DOC, null);
+    const before = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(before);
 
     // Exactly what a kill between fwrite and rename leaves behind.
-    const path = try panelPath(t.allocator, "s1", "keeper", null);
+    const path = try panelPathScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(path);
-    const stage = try stagePath(t.allocator, "s1", "keeper");
+    const stage = try stagePathScoped(t.allocator, .{ .session = "s1" }, "keeper");
     defer t.allocator.free(stage);
     try writeAtomic(stage, path, "{ truncated garba", false);
 
     // The old document is intact and still parses...
-    const after = try loadJson(t.allocator, "s1", "keeper", null);
+    const after = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(after);
     try t.expectEqualStrings(before, after);
-    var still = try load(t.allocator, "s1", "keeper", null);
+    var still = try loadScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     still.deinit();
 
     // ...and the abandoned staging file is invisible to the store.
     try t.expect(fileExists(stage));
-    const entries = try list(t.allocator, "s1");
+    const entries = try listScoped(t.allocator, .{ .session = "s1" });
     defer freeList(t.allocator, entries);
     try t.expectEqual(@as(usize, 1), entries.len);
     try t.expectEqualStrings("keeper", entries[0].name);
 
     // The next real save commits and clears nothing else.
-    try saveJson(t.allocator, "s1", "keeper", DOC, null);
-    const again = try loadJson(t.allocator, "s1", "keeper", null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", DOC, null);
+    const again = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(again);
     try t.expectEqualStrings(before, again);
+}
+
+test "delete distinguishes a missing panel from an undeletable one" {
+    var scratch: Scratch = undefined;
+    try scratch.init("delete-errno");
+    defer scratch.deinit();
+
+    var missing = Diag{};
+    try t.expectError(Error.NotFound, deleteScoped(t.allocator, .{ .session = "mapped" }, "never-saved", &missing));
+    try t.expect(std.mem.indexOf(u8, missing.msg(), "no panel") != null);
+
+    _ = try saveJsonScoped(t.allocator, .{ .session = "mapped" }, "kept", DOC, null);
+    const dir = try sessionDir(t.allocator, "mapped");
+    defer t.allocator.free(dir);
+    var z_buf: [4096]u8 = undefined;
+    const dir_z = try pathz.pathZ(&z_buf, dir);
+    try t.expect(c.chmod(dir_z, 0o500) == 0);
+    defer _ = c.chmod(dir_z, 0o700);
+
+    var denied = Diag{};
+    try t.expectError(Error.PermissionDenied, deleteScoped(t.allocator, .{ .session = "mapped" }, "kept", &denied));
+    try t.expect(std.mem.indexOf(u8, denied.msg(), "permission denied") != null);
+    try t.expect(existsScoped(t.allocator, .{ .session = "mapped" }, "kept"));
 }
 
 test "a corrupt stored file reports a diagnostic" {
@@ -911,26 +1194,26 @@ test "a corrupt stored file reports a diagnostic" {
     try scratch.init("corrupt");
     defer scratch.deinit();
 
-    try saveJson(t.allocator, "s1", "broken", DOC, null);
-    const path = try panelPath(t.allocator, "s1", "broken", null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "broken", DOC, null);
+    const path = try panelPathScoped(t.allocator, .{ .session = "s1" }, "broken", null);
     defer t.allocator.free(path);
-    const stage = try stagePath(t.allocator, "s1", "broken");
+    const stage = try stagePathScoped(t.allocator, .{ .session = "s1" }, "broken");
     defer t.allocator.free(stage);
     try writeAtomic(stage, path, "{\"root\":\"gone\",\"components\":{}}", true);
 
     var diag = Diag{};
-    try t.expectError(Error.Corrupt, load(t.allocator, "s1", "broken", &diag));
+    try t.expectError(Error.Corrupt, loadScoped(t.allocator, .{ .session = "s1" }, "broken", &diag));
     try t.expect(diag.len > 0);
     try t.expect(std.mem.indexOf(u8, diag.msg(), "gone") != null);
 
     // Not JSON at all is the same story, not a crash.
     try writeAtomic(stage, path, "\x00\xffnot json", true);
     diag = Diag{};
-    try t.expectError(Error.Corrupt, load(t.allocator, "s1", "broken", &diag));
+    try t.expectError(Error.Corrupt, loadScoped(t.allocator, .{ .session = "s1" }, "broken", &diag));
     try t.expect(diag.len > 0);
 
     // Listing still works and flags it.
-    const entries = try list(t.allocator, "s1");
+    const entries = try listScoped(t.allocator, .{ .session = "s1" });
     defer freeList(t.allocator, entries);
     try t.expectEqual(@as(usize, 1), entries.len);
     try t.expect(!entries[0].ok);
@@ -939,9 +1222,9 @@ test "a corrupt stored file reports a diagnostic" {
     // An invalid document is refused BEFORE anything is written, and
     // is reported as Invalid (bad input), not Corrupt (bad file).
     diag = Diag{};
-    try t.expectError(Error.Invalid, saveJson(t.allocator, "s1", "never", "{\"nope\":1}", &diag));
+    try t.expectError(Error.Invalid, saveJsonScoped(t.allocator, .{ .session = "s1" }, "never", "{\"nope\":1}", &diag));
     try t.expect(diag.len > 0);
-    try t.expect(!exists(t.allocator, "s1", "never"));
+    try t.expect(!existsScoped(t.allocator, .{ .session = "s1" }, "never"));
 }
 
 test "caps trip and say what happened" {
@@ -953,37 +1236,38 @@ test "caps trip and say what happened" {
     while (i < MAX_PANELS) : (i += 1) {
         var namebuf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&namebuf, "p{d:0>3}", .{i});
-        try saveJson(t.allocator, "s1", name, DOC, null);
+        _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, name, DOC, null);
     }
     var diag = Diag{};
-    try t.expectError(Error.TooMany, saveJson(t.allocator, "s1", "one-too-many", DOC, &diag));
+    try t.expectError(Error.TooMany, saveJsonScoped(t.allocator, .{ .session = "s1" }, "one-too-many", DOC, &diag));
     try t.expect(std.mem.indexOf(u8, diag.msg(), "cap") != null);
-    try t.expect(!exists(t.allocator, "s1", "one-too-many"));
+    try t.expect(!existsScoped(t.allocator, .{ .session = "s1" }, "one-too-many"));
 
     // Overwriting an existing panel is never blocked by the count cap.
-    try saveJson(t.allocator, "s1", "p000", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "p000", DOC, null);
     // A different session has its own budget.
-    try saveJson(t.allocator, "s2", "one-too-many", DOC, null);
+    _ = try saveJsonScoped(t.allocator, .{ .session = "s2" }, "one-too-many", DOC, null);
 
     // Oversize documents are refused by the parser's own ceiling.
     const big = try t.allocator.alloc(u8, MAX_BYTES + 1);
     defer t.allocator.free(big);
     @memset(big, 'x');
     diag = Diag{};
-    try t.expectError(Error.TooBig, saveJson(t.allocator, "s1", "huge", big, &diag));
-    try t.expect(!exists(t.allocator, "s1", "huge"));
+    try t.expectError(Error.TooBig, saveJsonScoped(t.allocator, .{ .session = "s1" }, "huge", big, &diag));
+    try t.expect(!existsScoped(t.allocator, .{ .session = "s1" }, "huge"));
 }
 
 test "resolveSession prefers explicit, then env, else there is no session" {
     _ = c.unsetenv("SKETERM_SESSION");
     // Not a fallback NAME: the absence is the answer, and the type says so.
-    try t.expectEqual(@as(?[]const u8, null), resolveSession(null));
-    try t.expectEqual(@as(?[]const u8, null), resolveSession(""));
-    try t.expectEqualStrings("explicit", resolveSession("explicit").?);
+    try t.expectEqual(@as(?[]const u8, null), resolveSession(.absent));
+    try t.expectEqual(@as(?[]const u8, null), resolveSession(.{ .explicit = "" }));
+    try t.expectEqualStrings("explicit", resolveSession(.{ .explicit = "explicit" }).?);
     _ = c.setenv("SKETERM_SESSION", "pane-7", 1);
     defer _ = c.unsetenv("SKETERM_SESSION");
-    try t.expectEqualStrings("pane-7", resolveSession(null).?);
-    try t.expectEqualStrings("explicit", resolveSession("explicit").?);
+    try t.expectEqualStrings("pane-7", resolveSession(.absent).?);
+    try t.expectEqual(@as(?[]const u8, null), resolveSession(.{ .explicit = "" }));
+    try t.expectEqualStrings("explicit", resolveSession(.{ .explicit = "explicit" }).?);
     try t.expectEqualStrings("(no session)", sessionLabel(null));
     try t.expectEqualStrings("(no session)", sessionLabel(""));
     try t.expectEqualStrings("pane-7", sessionLabel("pane-7"));

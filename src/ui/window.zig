@@ -297,6 +297,16 @@ pub const Window = struct {
     /// --hold: per-invocation exit_action override. Lives outside
     /// Config so a SIGUSR1 config reload can't clear it.
     hold_override: bool = false,
+    /// Set before deinit starts so lifecycle helpers do not enqueue GTK work
+    /// carrying this Window beyond its final teardown.
+    destroying: bool = false,
+    /// `page-detached` decisions hold a raw Window until their idle runs.
+    /// Secondary finalization waits for this count rather than freeing under
+    /// one of those callbacks.
+    pending_page_detaches: usize = 0,
+    /// Secondary finalize handed off to the last page-detach idle (see
+    /// `deferredWindowFree`); never set while `pending_page_detaches` is 0.
+    free_after_detaches: bool = false,
     config: Config = .{},
     /// GFileMonitor on config.conf (`config_auto_reload`). Null when
     /// the key is off or no monitor could be created.
@@ -581,6 +591,8 @@ pub const Window = struct {
         // Drag-a-tab-out-of-the-strip → new window.
         self.tabbar.detach_ctx = @ptrCast(self);
         self.tabbar.on_detach = onTabDetach;
+        self.tabbar.transfer_ctx = @ptrCast(self);
+        self.tabbar.on_transfer = onTabTransfer;
         // Right-click-a-tab → context menu.
         self.tabbar.context_ctx = @ptrCast(self);
         self.tabbar.on_context = tabchrome_mod.onTabContextMenu;
@@ -836,6 +848,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        self.destroying = true;
         self.detachGlobalSignals();
         // Teardown order matters. Steps:
         //
@@ -860,6 +873,28 @@ pub const Window = struct {
         // Before anything else: a pending debounce timer would fire
         // into a half-torn-down window.
         @import("configwatch.zig").uninstall(self);
+        // Relay-origin cleanup may close panel tabs and therefore mutate the
+        // pane/terminal arrays. Finish it before iterating those arrays for
+        // terminal teardown.
+        while (true) {
+            var origin: ?*Terminal = null;
+            for (self.terminals.items) |terminal| {
+                if (terminal.on_panel_origin_close != null) {
+                    origin = terminal;
+                    break;
+                }
+            }
+            if (origin == null) {
+                for (self.app_sessions.items) |app_session| {
+                    if (app_session.terminal.on_panel_origin_close != null) {
+                        origin = app_session.terminal;
+                        break;
+                    }
+                }
+            }
+            const terminal = origin orelse break;
+            terminal.closePanelOrigin();
+        }
         for (self.panes.items) |p| p.detachAppHost();
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
@@ -1755,8 +1790,7 @@ pub const Window = struct {
         } else null;
 
         var conn = try self.muxConnect(null);
-        const Owned = @TypeOf(try conn.recvFrame());
-        var snap: Owned = undefined;
+        var attached: @import("../mux/client.zig").Conn.GuiAttachResult = undefined;
         {
             errdefer conn.deinit();
             // Local GUI-owned pane: let its child GUI apps render on
@@ -1783,13 +1817,13 @@ pub const Window = struct {
                 .host_wayland_display = host_wl,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-            try conn.sendJson(.attach, .{ .name = name, .kind = "gui" });
-            snap = try conn.recvExpect(&.{.snapshot});
+            try conn.sendAttach(name, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+            attached = try conn.recvGuiAttach();
         }
-        defer snap.deinit(self.allocator);
+        defer attached.snapshot.deinit(self.allocator);
         // Pass the pre-allocated id so it isn't double-allocated (keeps pane
         // ids contiguous + matches the env-exported SKETERM_PANE_ID).
-        const pane = try self.makeRemotePaneFromSnap(conn, name, null, snap.payload, pane_id, false, false);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, null, attached.snapshot.payload, attached.identity, pane_id, false, false, true);
         if (pane.terminal.remote) |r| {
             r.ephemeral = true; // GUI-owned → close kills the session (no leak)
             r.predictor.force = .never;
@@ -1811,6 +1845,11 @@ pub const Window = struct {
     /// child-exit on a remote pane means "session ended / connection
     /// lost" and detaches to a local shell instead of exit_action).
     pub fn wirePaneSinks(self: *Window, pane: *Pane) void {
+        pane.terminal.on_panel_request = onPanePanelRequest;
+        pane.terminal.on_panel_origin_close = @import("panelhost.zig").closeOrigin;
+        pane.terminal.on_panel_origin_renamed = @import("panelhost.zig").renameOrigin;
+        pane.terminal.on_panel_work_cancel = @import("panelhost.zig").cancelPanelWork;
+        @import("panelhost.zig").attachOrigin(pane.terminal, pane);
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = termsinks_mod.onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
@@ -1843,6 +1882,20 @@ pub const Window = struct {
         pane.win_on_geometry = termsinks_mod.onPaneGeometryChanged;
         pane.win_session_rename_ctx = @ptrCast(self);
         pane.win_on_session_renamed = termsinks_mod.onTermSessionRenamed;
+    }
+
+    fn onPanePanelRequest(
+        ctx: ?*anyopaque,
+        terminal: *Terminal,
+        request_id: u64,
+        request: []const u8,
+    ) void {
+        const pane = cast.userData(Pane, ctx);
+        const owner: *Window = if (pane.win_clip_ctx) |win| @ptrCast(@alignCast(win)) else {
+            terminal.replyPanelRequest(request_id, "{\"ok\":false,\"error\":\"panel pane has no window\"}");
+            return;
+        };
+        @import("panelhost.zig").dispatchRelay(owner, terminal, pane, request_id, request);
     }
 
     /// Drop every window-level pointer into a pane (search / hints /
@@ -1930,7 +1983,8 @@ pub const Window = struct {
     fn detachCurrentTab(self: *Window) void {
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
         const win = self.spawnSecondaryWindow() orelse return;
-        c.adw_tab_view_transfer_page(self.tab_view, page, win.tab_view, 0);
+        if (!win.transferPageFrom(self.tab_view, page, 0))
+            c.gtk_window_destroy(@ptrCast(win.app_window));
     }
 
     /// Take ownership of a pane that arrived from another Window via
@@ -1940,9 +1994,18 @@ pub const Window = struct {
         const src_any = pane.win_clip_ctx orelse return;
         const src: *Window = @ptrCast(@alignCast(src_any));
         if (src == self) return;
+        // Reserve here, before unhooking the source. transferPageFrom and
+        // onCreateWindow reserve up front so a doomed move is refused before
+        // libadwaita reparents anything, but a page can also arrive through a
+        // path neither of them sees (dragging between two tab OVERVIEWS), so
+        // this must never assume the capacity is already there.
+        self.reserveAdoptionCapacity(1) catch {
+            showToast(self, "Could not move the tab: out of memory");
+            return;
+        };
         src.disownPane(pane);
-        self.panes.append(self.allocator, pane) catch return;
-        self.terminals.append(self.allocator, pane.terminal) catch {};
+        self.panes.appendAssumeCapacity(pane);
+        self.terminals.appendAssumeCapacity(pane.terminal);
         self.wirePaneSinks(pane);
         if (@import("browser.zig").BrowserView.fromPane(pane)) |bv| self.installBrowserHooks(bv);
         // Re-point active_profile off the SOURCE window's config arena
@@ -1980,6 +2043,43 @@ pub const Window = struct {
         while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch)) {
             self.adoptPanesInTree(ch);
         }
+    }
+
+    fn foreignPaneCount(self: *Window, w: *c.GtkWidget) usize {
+        if (c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-pane")) |data| {
+            const pane: *Pane = @ptrCast(@alignCast(data));
+            const src_any = pane.win_clip_ctx orelse return 0;
+            const src: *Window = @ptrCast(@alignCast(src_any));
+            return @intFromBool(src != self);
+        }
+        var count: usize = 0;
+        var child = c.gtk_widget_get_first_child(w);
+        while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch))
+            count += self.foreignPaneCount(ch);
+        return count;
+    }
+
+    fn reserveAdoptionCapacity(self: *Window, count: usize) !void {
+        if (count == 0) return;
+        try self.panes.ensureUnusedCapacity(self.allocator, count);
+        try self.terminals.ensureUnusedCapacity(self.allocator, count);
+    }
+
+    /// Reserve ownership before libadwaita reparents the page.
+    fn transferPageFrom(
+        self: *Window,
+        source: *c.AdwTabView,
+        page: *c.AdwTabPage,
+        position: c_int,
+    ) bool {
+        const child = c.adw_tab_page_get_child(page) orelse return false;
+        const count = self.foreignPaneCount(@ptrCast(child));
+        self.reserveAdoptionCapacity(count) catch {
+            showToast(self, "Could not move the tab: out of memory");
+            return false;
+        };
+        c.adw_tab_view_transfer_page(source, page, self.tab_view, position);
+        return true;
     }
 
     pub const PaneConfigOpts = struct {
@@ -3095,9 +3195,7 @@ pub const Window = struct {
         // to the GL context which GTK tears down on unparent.
         // Defer the actual `Pane.deinit` / `Terminal.deinit` to a
         // `g_idle_add` so the trailing widget-destroy chain can fire
-        // its controller / signal-closure cleanups (which dereference
-        // `pane.menu_arena` via the click-context GDestroyNotify)
-        // BEFORE we tear `menu_arena` down.
+        // its controller / signal-closure cleanups before Pane teardown.
         // Mirror the collapse in the tab's tree model.
         var focus_hint: ?*Pane = null;
         if (tree_page) |page| {
@@ -3988,6 +4086,7 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     };
     _ = c.g_object_ref(@ptrCast(@alignCast(page)));
     pending.* = .{ .win = self, .page = page };
+    self.pending_page_detaches += 1;
     _ = c.g_idle_add(@ptrCast(&onPageDetachedIdle), @ptrCast(pending));
 }
 
@@ -4001,8 +4100,12 @@ fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = pending.win;
     const page = pending.page;
     defer {
+        self.pending_page_detaches -|= 1;
         c.g_object_unref(@ptrCast(@alignCast(page)));
         std.heap.c_allocator.destroy(pending);
+        // The destroyed toplevel's deferred free bowed out while this
+        // detach was pending; the last one runs it.
+        if (self.free_after_detaches and self.pending_page_detaches == 0) self.deinit();
     }
 
     const child = c.adw_tab_page_get_child(page);
@@ -4026,6 +4129,11 @@ fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             self.freeTabTree(page);
         }
     }
+
+    // The toplevel can be destroyed after page-detached queued this idle but
+    // before it runs. Its GtkWidget pointer is no longer a valid object then;
+    // the finalizer below is already waiting on our pending count.
+    if (self.destroying) return 0;
 
     // Window-alive bookkeeping. Bail if the window died or the
     // tab_view has been finalised in the meantime (visible as
@@ -4069,7 +4177,18 @@ fn onPageAttached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
 fn onTabDetach(ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void {
     const self = cast.userData(Window, ctx);
     const win = self.spawnSecondaryWindow() orelse return;
-    c.adw_tab_view_transfer_page(view, page, win.tab_view, 0);
+    if (!win.transferPageFrom(view, page, 0))
+        c.gtk_window_destroy(@ptrCast(win.app_window));
+}
+
+fn onTabTransfer(
+    ctx: ?*anyopaque,
+    source: *c.AdwTabView,
+    page: *c.AdwTabPage,
+    position: c_int,
+) bool {
+    const self = cast.userData(Window, ctx);
+    return self.transferPageFrom(source, page, position);
 }
 
 /// AdwTabView "create-window": a tab is being dragged out of every
@@ -4078,7 +4197,18 @@ fn onTabDetach(ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void 
 fn onCreateWindow(_: *c.AdwTabView, user: ?*anyopaque) callconv(.c) ?*c.AdwTabView {
     const self = cast.userData(Window, user);
     const win = self.spawnSecondaryWindow() orelse return null;
+    reserveNativeDragDestination(self, win) catch {
+        showToast(self, "Could not move the tab: out of memory");
+        c.gtk_window_destroy(@ptrCast(win.app_window));
+        return null;
+    };
     return win.tab_view;
+}
+
+/// `create-window` does not identify the dragged page, so reserve for the
+/// largest page the source can provide before libadwaita attaches anything.
+fn reserveNativeDragDestination(source: *Window, destination: *Window) !void {
+    try destination.reserveAdoptionCapacity(source.panes.items.len);
 }
 
 /// GTK destroy of the toplevel. Primary: quit the whole app (it owns
@@ -4088,8 +4218,9 @@ fn onCreateWindow(_: *c.AdwTabView, user: ?*anyopaque) callconv(.c) ?*c.AdwTabVi
 /// unmapped path in onPageDetached.
 fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    self.destroying = true;
     if (self.is_primary) {
-        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        const app = c.g_application_get_default();
         if (app != null) c.g_application_quit(@ptrCast(@alignCast(app)));
         return;
     }
@@ -4098,6 +4229,12 @@ fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn deferredWindowFree(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
+    if (self.pending_page_detaches != 0) {
+        // Hand the free to the last page-detach idle instead of spinning
+        // this source until the count drains.
+        self.free_after_detaches = true;
+        return 0; // G_SOURCE_REMOVE
+    }
     self.deinit();
     return 0; // G_SOURCE_REMOVE
 }
@@ -4113,10 +4250,8 @@ const PendingPaneFree = struct {
 /// `g_idle_add` callback — runs after the current main-loop iteration
 /// unwinds, so the widget destroy chain has fully fired its
 /// controller / signal-closure cleanups before we tear our own
-/// per-Pane state down. Without this defer, `Pane.deinit` deinits
-/// `menu_arena` while GTK is still mid-destroy on the same widget
-/// subtree, and the trailing `freeClickCtx` GDestroyNotify lands on
-/// a dead arena → segfault in `ArenaAllocator.free`.
+/// per-Pane state down. Without this defer, callbacks from the same
+/// widget subtree can still observe partially torn-down Pane state.
 fn deferredPaneTeardown(user: ?*anyopaque) callconv(.c) c.gboolean {
     const holder = cast.userData(PendingPaneFree, user);
     holder.term.deinit();
@@ -4141,6 +4276,19 @@ fn schedulePaneTeardown(pane: *Pane, term: *Terminal) void {
 fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
     // Walk the widget tree under `root` (Box / Paned / GLArea), find
     // matching Panes by their .widget(), and free them + their Terminal.
+    // Closing a relay origin may itself close a panel tab and mutate these
+    // arrays, so retire all origins under this root before index iteration.
+    while (true) {
+        var origin: ?*Terminal = null;
+        for (self.panes.items) |pane| {
+            if (widgetIsAncestor(root, pane.widget()) and pane.terminal.on_panel_origin_close != null) {
+                origin = pane.terminal;
+                break;
+            }
+        }
+        const terminal = origin orelse break;
+        terminal.closePanelOrigin();
+    }
     var i: usize = 0;
     while (i < self.panes.items.len) {
         const pane = self.panes.items[i];
@@ -4185,4 +4333,35 @@ pub fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
         if (x == ancestor) return true;
     }
     return false;
+}
+
+test "fresh native drag window reserve failure leaves ownership unchanged" {
+    const a = std.testing.allocator;
+    var pane: Pane = undefined;
+    var terminal: Terminal = undefined;
+
+    var source: Window = undefined;
+    source.allocator = a;
+    source.panes = .empty;
+    source.terminals = .empty;
+    defer source.panes.deinit(a);
+    defer source.terminals.deinit(a);
+    try source.panes.append(a, &pane);
+    try source.terminals.append(a, &terminal);
+
+    for ([_]usize{ 0, 1 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        var destination: Window = undefined;
+        destination.allocator = failing.allocator();
+        destination.panes = .empty;
+        destination.terminals = .empty;
+        defer destination.panes.deinit(destination.allocator);
+        defer destination.terminals.deinit(destination.allocator);
+
+        try std.testing.expectError(error.OutOfMemory, reserveNativeDragDestination(&source, &destination));
+        try std.testing.expectEqualSlices(*Pane, &.{&pane}, source.panes.items);
+        try std.testing.expectEqualSlices(*Terminal, &.{&terminal}, source.terminals.items);
+        try std.testing.expectEqual(@as(usize, 0), destination.panes.items.len);
+        try std.testing.expectEqual(@as(usize, 0), destination.terminals.items.len);
+    }
 }

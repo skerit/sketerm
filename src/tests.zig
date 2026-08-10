@@ -120,6 +120,7 @@ comptime {
     _ = @import("ipc/appdrive.zig");
     _ = @import("ipc/cdp.zig");
     _ = @import("ipc/mcp.zig");
+    _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
     _ = @import("ipc/mcpassets.zig");
@@ -176,6 +177,7 @@ comptime {
     _ = @import("mux/pulse.zig");
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/opuscodec.zig");
+    _ = @import("mux/panel_relay_test.zig");
     _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/drmdev.zig");
     _ = @import("mux/snapshot.zig");
@@ -259,6 +261,7 @@ comptime {
     _ = @import("ui/palette.zig");
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
+    _ = @import("ui/panel/assets.zig");
     _ = @import("ui/panel/events.zig");
     _ = @import("ui/panel/view.zig");
     _ = @import("ui/panelhost.zig");

@@ -609,7 +609,7 @@ fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cl
     var subtitle_buf: [896:0]u8 = undefined;
     const kind = if (session.app) "Application" else "Shell";
     const cwd = if (session.cwd.len > 0) session.cwd else "working directory unavailable";
-    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.clients }) catch "Available mux session";
+    const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.viewerCount() }) catch "Available mux session";
     const entry = appendRow(self, .available, title, subtitle, null, if (session.app) "application-x-executable-symbolic" else "utilities-terminal-symbolic", false) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, true);
@@ -1224,7 +1224,8 @@ fn listingFingerprint(sessions: []const mux_cli.SessionInfo) u64 {
         hash = std.hash.Wyhash.hash(hash, session.name);
         hash = std.hash.Wyhash.hash(hash, session.title);
         hash = std.hash.Wyhash.hash(hash, session.cwd);
-        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&session.clients));
+        const viewers = session.viewerCount();
+        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&viewers));
         hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&session.exited));
         hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&session.app));
         hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&session.audio));
@@ -1312,6 +1313,7 @@ const Attach = struct {
     reuse: ?mux_client.Conn = null,
     conn: ?mux_client.Conn = null,
     snapshot: ?mux_client.Conn.OwnedFrame = null,
+    identity: mux_client.AttachIdentity = .{},
 
     fn destroy(self: *Attach) void {
         const allocator = std.heap.c_allocator;
@@ -1369,8 +1371,10 @@ fn startAttach(self: *Switcher, target: SessionTarget) void {
 }
 
 fn attachOnConn(ctx: *Attach, conn: *mux_client.Conn) bool {
-    conn.sendJson(.attach, .{ .name = ctx.session, .kind = "gui", .read_only = false, .control = false }) catch return false;
-    ctx.snapshot = conn.recvExpectFor(&.{.snapshot}, 20_000) catch return false;
+    conn.sendAttach(ctx.session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc }) catch return false;
+    const attached = conn.recvGuiAttachFor(20_000) catch return false;
+    ctx.snapshot = attached.snapshot;
+    ctx.identity = attached.identity;
     return true;
 }
 
@@ -1420,6 +1424,7 @@ fn onAttachIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             ctx.session,
             if (ctx.host) |host| host else null,
             snapshot.payload,
+            ctx.identity,
             null,
             null,
             .default,

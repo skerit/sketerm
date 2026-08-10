@@ -35,10 +35,12 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const Doc = @import("doc.zig");
+const assets = @import("assets.zig");
 const events = @import("events.zig");
 const canary = @import("canary.zig");
 
 const COMPARE_QDATA = "sketerm-panel-compare";
+const PICTURE_LEASE_QDATA = "sketerm-panel-picture-lease";
 
 /// Per-class rendering: CSS class to add (null = handled as an
 /// alignment/expansion flag in applyClasses). Order mirrors
@@ -84,6 +86,7 @@ pub const PanelView = struct {
     magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     doc: ?Doc.Document = null,
+    asset_resolver: assets.Resolver,
     queue: events.Queue,
     /// The widget the host parents. Vertical box holding the scroller.
     root_box: *c.GtkWidget,
@@ -123,6 +126,7 @@ pub const PanelView = struct {
         const scroller = c.gtk_scrolled_window_new() orelse return error.OutOfMemory;
         self.* = .{
             .allocator = allocator,
+            .asset_resolver = assets.Resolver.init(allocator, null),
             .queue = events.Queue.init(),
             .root_box = root,
             .scroller = scroller,
@@ -167,6 +171,7 @@ pub const PanelView = struct {
         self.clearBuilt();
         if (self.doc) |*d| d.deinit();
         self.doc = null;
+        self.asset_resolver.deinit();
         // Sever the last-resort fence BEFORE dropping the reference.
         // Our ref keeps the widget alive, but it is not necessarily the
         // LAST one: on a pane face the host unparents the widget and GTK
@@ -243,12 +248,25 @@ pub const PanelView = struct {
     /// Replace the whole document (full widget rebuild). On error the
     /// previous document and widgets stay untouched.
     pub fn setDocument(self: *PanelView, json_text: []const u8, diag: ?*Doc.Diag) Doc.Error!void {
+        var resolver = assets.Resolver.init(self.allocator, null);
+        defer resolver.deinit();
+        return self.setDocumentResolved(json_text, &resolver, diag);
+    }
+
+    /// Replace the document and logical-path resolver as one visible commit.
+    pub fn setDocumentResolved(
+        self: *PanelView,
+        json_text: []const u8,
+        resolver: *assets.Resolver,
+        diag: ?*Doc.Diag,
+    ) Doc.Error!void {
         var fresh = try Doc.Document.parse(self.allocator, json_text, diag);
         if (self.doc) |*old| {
             fresh.revision = old.revision + 1;
             old.deinit();
         }
         self.doc = fresh;
+        self.asset_resolver.replaceFrom(resolver);
         if (!self.widgets_dead) {
             self.applying = true;
             defer self.applying = false;
@@ -261,12 +279,32 @@ pub const PanelView = struct {
     /// level; widget updates are in-place where the change is a leaf
     /// property, wholesale otherwise.
     pub fn applyPatch(self: *PanelView, json_text: []const u8, diag: ?*Doc.Diag) Doc.Error!void {
+        return self.applyPatchInternal(json_text, null, diag);
+    }
+
+    /// Commit a validated remote resolver only after the patch itself succeeds.
+    pub fn applyPatchResolved(
+        self: *PanelView,
+        json_text: []const u8,
+        resolver: *assets.Resolver,
+        diag: ?*Doc.Diag,
+    ) Doc.Error!void {
+        return self.applyPatchInternal(json_text, resolver, diag);
+    }
+
+    fn applyPatchInternal(
+        self: *PanelView,
+        json_text: []const u8,
+        resolver: ?*assets.Resolver,
+        diag: ?*Doc.Diag,
+    ) Doc.Error!void {
         if (self.doc == null) {
             if (diag) |d| d.set("no document to patch (setDocument first)", .{});
             return Doc.Error.Malformed;
         }
         var applied = try self.doc.?.applyPatch(json_text, diag);
         defer applied.deinit();
+        if (resolver) |prepared| self.asset_resolver.replaceFrom(prepared);
         if (!self.widgets_dead) {
             self.applying = true;
             defer self.applying = false;
@@ -279,7 +317,11 @@ pub const PanelView = struct {
                     }
                 }
             }
-            if (rebuild) self.rebuildAll();
+            if (rebuild) {
+                self.rebuildAll();
+            } else if (resolver != null) {
+                self.refreshImages();
+            }
         }
         if (applied.title_changed) self.notifyChanged();
     }
@@ -296,6 +338,46 @@ pub const PanelView = struct {
     pub fn title(self: *const PanelView) []const u8 {
         const d = &(self.doc orelse return "");
         return d.title;
+    }
+
+    /// Clone one live asset mapping into a transactional candidate resolver.
+    pub fn copyAssetResolution(self: *const PanelView, target: *assets.Resolver, logical: []const u8) !bool {
+        return target.copyFrom(&self.asset_resolver, logical);
+    }
+
+    pub fn assetCache(self: *const PanelView) ?*assets.Cache {
+        return self.asset_resolver.cache;
+    }
+
+    /// Install a worker-prepared resolver as the live mapping set.
+    pub fn installAssetResolver(self: *PanelView, resolver: *assets.Resolver) void {
+        self.asset_resolver.replaceFrom(resolver);
+        if (!self.widgets_dead) {
+            self.applying = true;
+            defer self.applying = false;
+            self.refreshImages();
+        }
+    }
+
+    /// Merge completed path refreshes into the latest document, preserving
+    /// later non-image edits and every untouched live mapping.
+    pub fn mergeAssetResolver(self: *PanelView, updates: *const assets.Resolver) !void {
+        const document = &(self.doc orelse return);
+        var paths = try assets.collectPaths(self.allocator, document);
+        defer paths.deinit();
+        var candidate = try assets.composeResolver(
+            self.allocator,
+            updates.cache orelse self.asset_resolver.cache,
+            paths.items,
+            &self.asset_resolver,
+            updates,
+        );
+        self.asset_resolver.replaceFrom(&candidate);
+        if (!self.widgets_dead) {
+            self.applying = true;
+            defer self.applying = false;
+            self.refreshImages();
+        }
     }
 
     fn notifyChanged(self: *PanelView) void {
@@ -396,7 +478,7 @@ pub const PanelView = struct {
                 c.gtk_widget_set_hexpand(area, 1);
                 c.gtk_widget_set_vexpand(area, 1);
                 c.gtk_widget_set_size_request(area, -1, 280);
-                const cmp = Compare.create(self.allocator, area, ic) catch
+                const cmp = Compare.create(self.allocator, area, ic, &self.asset_resolver) catch
                     break :blk errorLabel("panel: out of memory");
                 built.compare = cmp;
                 break :blk area;
@@ -494,26 +576,48 @@ pub const PanelView = struct {
     }
 
     fn setImageWidgets(self: *PanelView, pic: *c.GtkWidget, cap: *c.GtkWidget, img: Doc.Props.Image) void {
-        const a = self.allocator;
-        const pathz = a.dupeZ(u8, img.src) catch return;
-        defer a.free(pathz);
-        const readable = c.access(pathz.ptr, c.R_OK) == 0;
-        c.gtk_picture_set_filename(@ptrCast(pic), if (readable) pathz.ptr else null);
-        if (!readable) {
-            var buf: [Doc.MAX_PATH + 32]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "cannot read: {s}", .{img.src}) catch "cannot read image";
+        const resolution = self.asset_resolver.get(img.src);
+        if (resolution) |resolved| if (resolved.failure) |why| {
+            setPicturePrepared(pic, null);
+            var buf: [Doc.MAX_PATH + 256]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&buf, "remote asset unavailable: {s}: {s}", .{ img.src, why }) catch
+                "remote asset unavailable";
             c.gtk_label_set_text(@ptrCast(cap), msg.ptr);
             c.gtk_widget_add_css_class(cap, "error");
             c.gtk_widget_set_visible(cap, 1);
             return;
-        }
-        c.gtk_widget_remove_css_class(cap, "error");
-        if (img.caption.len > 0) {
-            setLabelText(cap, img.caption);
-            c.gtk_widget_set_visible(cap, 1);
-        } else {
-            c.gtk_widget_set_visible(cap, 0);
-        }
+        };
+        if (resolution) |resolved| if (resolved.prepared_lease) |lease| {
+            setPicturePrepared(pic, lease);
+            c.gtk_widget_remove_css_class(cap, "error");
+            if (img.caption.len > 0) {
+                setLabelText(cap, img.caption);
+                c.gtk_widget_set_visible(cap, 1);
+            } else {
+                c.gtk_widget_set_visible(cap, 0);
+            }
+            return;
+        };
+        // Every image is prepared off the GTK thread before commit — remote
+        // entries by the relay pipeline, path-backed ones by panelhost's
+        // bounded local workers. Never fall back to GtkPicture filename
+        // loading (filesystem + decoder work on GTK) if that invariant fails.
+        setPicturePrepared(pic, null);
+        c.gtk_label_set_text(@ptrCast(cap), if (resolution != null)
+            "remote asset was not prepared"
+        else
+            "panel asset was not prepared");
+        c.gtk_widget_add_css_class(cap, "error");
+        c.gtk_widget_set_visible(cap, 1);
+    }
+
+    fn refreshImages(self: *PanelView) void {
+        const d = &(self.doc orelse return);
+        var it = d.components.iterator();
+        while (it.next()) |entry| switch (entry.value_ptr.kind()) {
+            .image, .image_compare => _ = self.updateOne(entry.key_ptr.*),
+            else => {},
+        };
     }
 
     // ---- incremental patching ----------------------------------------
@@ -547,7 +651,7 @@ pub const PanelView = struct {
             },
             .image_compare => |ic| {
                 const cmp = entry.compare orelse return false;
-                cmp.setSides(ic);
+                cmp.setSides(ic, &self.asset_resolver);
             },
             .button => |b| {
                 var zbuf: [Doc.MAX_TEXT + 1]u8 = undefined;
@@ -705,6 +809,36 @@ pub const PanelView = struct {
     }
 };
 
+/// Pair GtkPicture's internal pixbuf ref with the same residency lease.
+fn setPicturePrepared(pic: *c.GtkWidget, lease: ?*assets.PreparedLease) void {
+    if (lease) |prepared| {
+        c.gtk_picture_set_pixbuf(
+            @ptrCast(pic),
+            @ptrCast(@alignCast(prepared.prepared)),
+        );
+        setPreparedLeaseData(@ptrCast(@alignCast(pic)), prepared);
+    } else {
+        // Drop the pixbuf first; only then may the paired process charge go.
+        c.gtk_picture_set_pixbuf(@ptrCast(pic), null);
+        setPreparedLeaseData(@ptrCast(@alignCast(pic)), null);
+    }
+}
+
+fn setPreparedLeaseData(object: *c.GObject, lease: ?*assets.PreparedLease) void {
+    if (lease) |prepared| prepared.retain();
+    c.g_object_set_data_full(
+        @ptrCast(object),
+        PICTURE_LEASE_QDATA,
+        if (lease) |prepared| @ptrCast(prepared) else null,
+        if (lease != null) @ptrCast(&releasePreparedLease) else null,
+    );
+}
+
+fn releasePreparedLease(user: ?*anyopaque) callconv(.c) void {
+    const lease = canary.live(assets.PreparedLease, user) orelse return;
+    lease.release();
+}
+
 // ─── shared widget helpers ──────────────────────────────────────
 
 fn headingClass(level: u8) [*:0]const u8 {
@@ -784,6 +918,14 @@ fn applyClasses(widget: *c.GtkWidget, classes: []const []u8) void {
 // resets zoom/pan. NEAREST filtering kicks in past 3x effective
 // scale so pixel-peeping shows pixels, not mush.
 
+fn replaceZ(allocator: std.mem.Allocator, target: *[:0]u8, text: []const u8) ?void {
+    if (allocator.dupeZ(u8, text)) |copy| {
+        allocator.free(target.*);
+        target.* = copy;
+        return {};
+    } else |_| return null;
+}
+
 const Compare = struct {
     pub const MAGIC: u32 = 0x434D5052; // "CMPR"
     /// Detector only (canary.zig): the qdata destroy-notify owns this
@@ -794,10 +936,12 @@ const Compare = struct {
     magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     area: *c.GtkWidget,
-    left_pix: ?*c.GdkPixbuf = null,
-    right_pix: ?*c.GdkPixbuf = null,
+    left_lease: ?*assets.PreparedLease = null,
+    right_lease: ?*assets.PreparedLease = null,
     left_path: [:0]u8,
     right_path: [:0]u8,
+    left_error: [:0]u8,
+    right_error: [:0]u8,
     left_label: [:0]u8,
     right_label: [:0]u8,
     split: f64 = 0.5,
@@ -815,7 +959,12 @@ const Compare = struct {
     const SPLIT_GRAB_PX: f64 = 16;
     const MAX_ZOOM: f64 = 32;
 
-    fn create(allocator: std.mem.Allocator, area: *c.GtkWidget, ic: Doc.Props.ImageCompare) !*Compare {
+    fn create(
+        allocator: std.mem.Allocator,
+        area: *c.GtkWidget,
+        ic: Doc.Props.ImageCompare,
+        resolver: *const assets.Resolver,
+    ) !*Compare {
         const self = try allocator.create(Compare);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -823,6 +972,8 @@ const Compare = struct {
             .area = area,
             .left_path = try allocator.dupeZ(u8, ""),
             .right_path = try allocator.dupeZ(u8, ""),
+            .left_error = try allocator.dupeZ(u8, ""),
+            .right_error = try allocator.dupeZ(u8, ""),
             .left_label = try allocator.dupeZ(u8, ""),
             .right_label = try allocator.dupeZ(u8, ""),
         };
@@ -850,16 +1001,18 @@ const Compare = struct {
         _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area, @ptrCast(@alignCast(click)));
 
-        self.setSides(ic);
+        self.setSides(ic, resolver);
         return self;
     }
 
     fn freeCompare(user: ?*anyopaque) callconv(.c) void {
         if (canary.live(Compare, user)) |self| {
-            if (self.left_pix) |p| c.g_object_unref(@ptrCast(p));
-            if (self.right_pix) |p| c.g_object_unref(@ptrCast(p));
+            if (self.left_lease) |lease| lease.release();
+            if (self.right_lease) |lease| lease.release();
             self.allocator.free(self.left_path);
             self.allocator.free(self.right_path);
+            self.allocator.free(self.left_error);
+            self.allocator.free(self.right_error);
             self.allocator.free(self.left_label);
             self.allocator.free(self.right_label);
             canary.poison(self);
@@ -870,35 +1023,54 @@ const Compare = struct {
     /// (Re)load both sides. Zoom/pan/split are deliberately KEPT: a
     /// training loop patching in the next epoch's frames while the
     /// user is zoomed onto an artifact must not reset the viewport.
-    fn setSides(self: *Compare, ic: Doc.Props.ImageCompare) void {
-        self.loadSide(&self.left_pix, &self.left_path, &self.left_label, ic.left);
-        self.loadSide(&self.right_pix, &self.right_path, &self.right_label, ic.right);
+    fn setSides(self: *Compare, ic: Doc.Props.ImageCompare, resolver: *const assets.Resolver) void {
+        self.loadSide(&self.left_lease, &self.left_path, &self.left_error, &self.left_label, ic.left, resolver);
+        self.loadSide(&self.right_lease, &self.right_path, &self.right_error, &self.right_label, ic.right, resolver);
         c.gtk_widget_queue_draw(self.area);
     }
 
-    fn loadSide(self: *Compare, pix: *?*c.GdkPixbuf, path: *[:0]u8, label: *[:0]u8, side: Doc.Side) void {
+    fn loadSide(
+        self: *Compare,
+        retained: *?*assets.PreparedLease,
+        path: *[:0]u8,
+        error_text: *[:0]u8,
+        label: *[:0]u8,
+        side: Doc.Side,
+        resolver: *const assets.Resolver,
+    ) void {
         const a = self.allocator;
         if (a.dupeZ(u8, side.label)) |lz| {
             a.free(label.*);
             label.* = lz;
         } else |_| {}
-        if (!std.mem.eql(u8, path.*, side.src)) {
-            if (a.dupeZ(u8, side.src)) |pz| {
-                a.free(path.*);
-                path.* = pz;
-            } else |_| return;
+        replaceZ(a, path, side.src) orelse return;
+        const resolved = resolver.get(side.src);
+        const failure = if (resolved) |entry| entry.failure orelse "" else "";
+        replaceZ(a, error_text, failure) orelse return;
+        // ALWAYS refresh even for an unchanged logical path so a reset adopts
+        // the newly prepared worker result.
+        var next: ?*assets.PreparedLease = null;
+        if (resolved) |entry| {
+            next = entry.prepared_lease;
+            if (next) |lease| lease.retain();
+            if (next == null and error_text.*.len == 0)
+                replaceZ(a, error_text, "remote asset was not prepared") orelse {};
+        } else if (error_text.*.len == 0) {
+            replaceZ(a, error_text, "panel asset was not prepared") orelse {};
         }
-        // ALWAYS reload, even for an unchanged path: the training-loop
-        // pattern overwrites the same file each epoch and re-sets the
-        // component to say "look again".
-        if (pix.*) |old| c.g_object_unref(@ptrCast(old));
-        pix.* = c.gdk_pixbuf_new_from_file(path.*.ptr, null);
+        if (retained.*) |old| old.release();
+        retained.* = next;
+    }
+
+    fn pixbuf(lease: ?*assets.PreparedLease) ?*c.GdkPixbuf {
+        const retained = lease orelse return null;
+        return @ptrCast(@alignCast(retained.prepared));
     }
 
     // ---- drawing -----------------------------------------------------
 
     fn baseScale(self: *const Compare, w: f64, h: f64) ?struct { iw: f64, ih: f64, es: f64 } {
-        const pix = self.right_pix orelse self.left_pix orelse return null;
+        const pix = pixbuf(self.right_lease) orelse pixbuf(self.left_lease) orelse return null;
         const iw: f64 = @floatFromInt(c.gdk_pixbuf_get_width(pix));
         const ih: f64 = @floatFromInt(c.gdk_pixbuf_get_height(pix));
         if (iw <= 0 or ih <= 0) return null;
@@ -914,14 +1086,17 @@ const Compare = struct {
         c.cairo_set_source_rgb(ctx, 0.10, 0.10, 0.11);
         c.cairo_paint(ctx);
 
+        const split_x = std.math.clamp(self.split, 0, 1) * w;
         const base = self.baseScale(w, h) orelse {
-            self.drawMessage(ctx, w, h, "no image could be loaded");
+            // Render each side's path-specific failure even when neither side
+            // decoded; the old generic message discarded both diagnostics.
+            self.drawSide(ctx, null, 1, w, h, 0, split_x, self.left_path, self.left_error);
+            self.drawSide(ctx, null, 1, w, h, split_x, w - split_x, self.right_path, self.right_error);
             return;
         };
-        const split_x = std.math.clamp(self.split, 0, 1) * w;
 
-        self.drawSide(ctx, self.left_pix, base.es, w, h, 0, split_x, self.left_path);
-        self.drawSide(ctx, self.right_pix, base.es, w, h, split_x, w - split_x, self.right_path);
+        self.drawSide(ctx, pixbuf(self.left_lease), base.es, w, h, 0, split_x, self.left_path, self.left_error);
+        self.drawSide(ctx, pixbuf(self.right_lease), base.es, w, h, split_x, w - split_x, self.right_path, self.right_error);
 
         // Split line + handle.
         c.cairo_set_source_rgba(ctx, 0, 0, 0, 0.5);
@@ -970,6 +1145,7 @@ const Compare = struct {
         clip_x: f64,
         clip_w: f64,
         path: [:0]const u8,
+        error_text: [:0]const u8,
     ) void {
         if (clip_w <= 0) return;
         c.cairo_save(ctx);
@@ -979,13 +1155,17 @@ const Compare = struct {
         const pix = pix_o orelse {
             c.cairo_set_source_rgb(ctx, 0.2, 0.12, 0.12);
             c.cairo_paint(ctx);
-            var buf: [Doc.MAX_PATH + 24]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "cannot load {s}", .{path}) catch "cannot load image";
             c.cairo_select_font_face(ctx, "Sans", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
             c.cairo_set_font_size(ctx, 12);
             c.cairo_set_source_rgba(ctx, 1, 0.75, 0.75, 0.9);
-            c.cairo_move_to(ctx, clip_x + 10, h / 2);
-            c.cairo_show_text(ctx, msg.ptr);
+            var path_buf: [Doc.MAX_PATH + 32]u8 = undefined;
+            const path_msg = sidePathErrorText(&path_buf, path);
+            c.cairo_move_to(ctx, clip_x + 10, h / 2 - 8);
+            c.cairo_show_text(ctx, path_msg.ptr);
+            var reason_buf: [280]u8 = undefined;
+            const reason_msg = sideReasonErrorText(&reason_buf, error_text);
+            c.cairo_move_to(ctx, clip_x + 10, h / 2 + 12);
+            c.cairo_show_text(ctx, reason_msg.ptr);
             return;
         };
         const iw: f64 = @floatFromInt(c.gdk_pixbuf_get_width(pix));
@@ -1151,7 +1331,16 @@ const Compare = struct {
     }
 };
 
-// ─── tests (pure helpers only — no GTK init in unit tests) ──────
+fn sidePathErrorText(buf: []u8, path: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "cannot load {s}", .{path}) catch "cannot load image";
+}
+
+fn sideReasonErrorText(buf: []u8, error_text: []const u8) [:0]const u8 {
+    const reason = if (error_text.len > 0) error_text else "cannot decode or read image";
+    return std.fmt.bufPrintZ(buf, "{s}", .{reason}) catch "cannot decode or read image";
+}
+
+// ─── tests (no GTK widget initialization) ───────────────────────
 
 test "every renderer decl type-checks" {
     // Zig analyzes lazily: without this, a signature error in a
@@ -1180,6 +1369,7 @@ test "a poisoned PanelView makes the face trampolines bail" {
     // poisoned call must not even get that far.
     var view = PanelView{
         .allocator = std.testing.allocator,
+        .asset_resolver = assets.Resolver.init(std.testing.allocator, null),
         .queue = events.Queue.init(),
         .root_box = undefined,
         .scroller = undefined,
@@ -1226,4 +1416,61 @@ test "optionsHash tracks option-list identity" {
     try std.testing.expectEqual(optionsHash(&opts1), optionsHash(&opts2));
     // The separator keeps "one","two" distinct from "onet","wo".
     try std.testing.expect(optionsHash(&opts1) != optionsHash(&opts3));
+}
+
+test "image compare preserves both path-specific decode failures" {
+    var left_buf: [256]u8 = undefined;
+    var right_buf: [256]u8 = undefined;
+    var left_reason_buf: [256]u8 = undefined;
+    var right_reason_buf: [256]u8 = undefined;
+    const left = sidePathErrorText(&left_buf, "/remote/left.png");
+    const right = sidePathErrorText(&right_buf, "/remote/right.png");
+    const left_reason = sideReasonErrorText(&left_reason_buf, "left decoder error");
+    const right_reason = sideReasonErrorText(&right_reason_buf, "right decoder error");
+    try std.testing.expect(std.mem.indexOf(u8, left, "/remote/left.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, right, "/remote/right.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, left_reason, "left decoder error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, right_reason, "right decoder error") != null);
+    try std.testing.expect(!std.mem.eql(u8, left, right));
+    try std.testing.expect(!std.mem.eql(u8, left_reason, right_reason));
+}
+
+test "deferred GObject finalization keeps prepared residency charged" {
+    const a = std.testing.allocator;
+    const before = assets.processPreparedUsage();
+    const image = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, 2, 2) orelse
+        return error.OutOfMemory;
+    const info = assets.PreparedInfo{
+        .pixels = 4,
+        .bytes = @intCast(c.gdk_pixbuf_get_rowstride(image) * c.gdk_pixbuf_get_height(image)),
+    };
+    var reservation = assets.ProcessPreparedReservation.reserve(info) catch |err| {
+        c.g_object_unref(@ptrCast(image));
+        return err;
+    };
+    const lease = assets.PreparedLease.adoptReserved(a, @ptrCast(image), &reservation) catch |err| {
+        reservation.release();
+        c.g_object_unref(@ptrCast(image));
+        return err;
+    };
+
+    // This plain GObject models a widget's lease qdata without requiring GTK
+    // initialization. Its extra ref is the deferred toolkit/finalizer owner.
+    const holder = c.gdk_pixbuf_new(c.GDK_COLORSPACE_RGB, 1, 8, 1, 1) orelse {
+        lease.release();
+        return error.OutOfMemory;
+    };
+    _ = c.g_object_ref(@ptrCast(holder));
+    setPreparedLeaseData(@ptrCast(@alignCast(holder)), lease);
+    lease.release();
+    try std.testing.expectEqual(before.pixels + info.pixels, assets.processPreparedUsage().pixels);
+    try std.testing.expectEqual(before.bytes + info.bytes, assets.processPreparedUsage().bytes);
+
+    // Dropping the panel/widget-tree owner is not finalization: the process
+    // charge remains paired with the holder's last GObject reference.
+    c.g_object_unref(@ptrCast(holder));
+    try std.testing.expectEqual(before.pixels + info.pixels, assets.processPreparedUsage().pixels);
+    try std.testing.expectEqual(before.bytes + info.bytes, assets.processPreparedUsage().bytes);
+    c.g_object_unref(@ptrCast(holder));
+    try std.testing.expectEqual(before, assets.processPreparedUsage());
 }

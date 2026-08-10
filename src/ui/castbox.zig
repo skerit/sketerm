@@ -112,7 +112,7 @@ pub const CastPlayerBox = struct {
         const snap = conn.recvExpect(&.{.snapshot}) catch return error.AttachFailed;
         defer snap.deinit(allocator);
 
-        const terminal = try Terminal.initRemote(allocator, conn, name, snap.payload, loc.host, "", false, false);
+        const terminal = try Terminal.initRemote(allocator, conn, name, snap.payload, .{}, loc.host, "", false, false);
         conn_owned = false; // moved into the Terminal
         errdefer terminal.deinit();
         if (terminal.remote) |r| r.ephemeral = true; // destroying the box kills the session

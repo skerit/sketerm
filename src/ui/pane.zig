@@ -73,8 +73,6 @@ pub const Pane = struct {
     ax_selfcheck_done: bool = false,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
-    /// Arena holding menu's per-pane closure ctxs. Deinit frees all.
-    menu_arena: std.heap.ArenaAllocator,
     /// External sink for menu actions (set by Window).
     menu_sink: ?menu.Sink = null,
     menu_sink_ctx: ?*anyopaque = null,
@@ -224,6 +222,9 @@ pub const Pane = struct {
     panel_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     panel_deinit: ?*const fn (*anyopaque) void = null,
     panel_focus: ?*const fn (*anyopaque) void = null,
+    /// True only while the pane-wide teardown choke point is detaching faces.
+    /// Panelhost uses it to distinguish viewer loss from an explicit close.
+    severing_faces: bool = false,
     /// "File browser hidden - click to show it" strip, shown on the
     /// TERMINAL face while a browser face exists on this pane. Without
     /// it the browser is unreachable once hidden: only its own toolbar
@@ -294,7 +295,6 @@ pub const Pane = struct {
         self.* = .{
             .surface = undefined,
             .terminal = terminal,
-            .menu_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
         };
         TerminalSurface.initInPlace(&self.surface, allocator, terminal);
@@ -464,9 +464,9 @@ pub const Pane = struct {
         _ = c.g_signal_connect_data(drag, "drag-end", @ptrCast(&onDragEnd), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drag));
 
-        // Right-click → context menu. Allocations go into menu_arena
-        // so they're freed when the pane is destroyed.
-        try menu.attachWithPrePopup(area_widget, self.menu_arena.allocator(), paneMenuSink, @ptrCast(self), paneMenuPrePopup, @ptrCast(self));
+        // Right-click context allocations are owned by their GTK closures and
+        // may be released after Pane teardown while the widget tree unwinds.
+        try menu.attachWithPrePopup(area_widget, allocator, paneMenuSink, @ptrCast(self), paneMenuPrePopup, @ptrCast(self));
 
         // Mouse reporting (DECSET 1006). Click controller covers
         // press / release for any button; emits the SGR sequence
@@ -699,7 +699,7 @@ pub const Pane = struct {
                     0,
                     0,
                     null,
-                    @constCast(@ptrCast(&onWrapperDestroy)),
+                    @ptrCast(@constCast(&onWrapperDestroy)),
                     @ptrCast(self),
                 );
             }
@@ -709,7 +709,6 @@ pub const Pane = struct {
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
         self.freeSpawnArgv();
-        self.menu_arena.deinit();
         self.allocator.destroy(self);
     }
 
@@ -726,6 +725,9 @@ pub const Pane = struct {
     /// only from the deferred `Pane.deinit`, i.e. against widgets GTK
     /// had already finalized.
     pub fn severFaces(self: *Pane) void {
+        const was_severing = self.severing_faces;
+        self.severing_faces = true;
+        defer self.severing_faces = was_severing;
         self.detachIm();
         self.detachBrowser();
         self.detachEditor();
@@ -998,8 +1000,8 @@ pub const Pane = struct {
         prepare_destroy_cb: *const fn (*anyopaque, widgets_dead: bool) void,
         deinit_cb: *const fn (*anyopaque) void,
         focus_cb: *const fn (*anyopaque) void,
-    ) void {
-        const wrap = self.wrapper_box orelse return;
+    ) bool {
+        const wrap = self.wrapper_box orelse return false;
         self.detachPanel();
         self.panel_widget = face;
         self.panel_ctx = ctx;
@@ -1010,6 +1012,16 @@ pub const Pane = struct {
         c.gtk_widget_set_hexpand(face, 1);
         c.gtk_box_append(@ptrCast(wrap), face);
         self.setPanelVisible(true);
+        return true;
+    }
+
+    pub fn canAdoptPanelFace(self: *const Pane) bool {
+        return !self.widgets_dead and !self.severing_faces and
+            self.wrapper_box != null and self.panel_ctx == null;
+    }
+
+    pub fn isSeveringFaces(self: *const Pane) bool {
+        return self.severing_faces;
     }
 
     /// Flip between the panel face and whatever else the pane shows
@@ -1290,8 +1302,6 @@ pub const Pane = struct {
             c.gtk_widget_add_css_class(tb, "sketerm-titlebar-inactive");
         }
     }
-
-
 };
 
 // ── TerminalSurface host hooks ───────────────────────────────────
@@ -1745,7 +1755,6 @@ fn setAppBanner(self: *Pane, show: bool) void {
         c.gtk_widget_set_visible(b, 0);
     }
 }
-
 
 /// Attach roster changed: show/hide the "assistant is driving"
 /// indicator — an accent border on the pane, plus the AI badge on
@@ -2214,7 +2223,7 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
                 if (mods & c.GDK_ALT_MASK != 0) base += 8;
                 if (mods & c.GDK_CONTROL_MASK != 0) base += 16;
             }
-            writeMouseEvent(self,32 + base, @as(u32, @intCast(cell.col + 1)), @as(u32, @intCast(cell.row + 1)), x, y, true);
+            writeMouseEvent(self, 32 + base, @as(u32, @intCast(cell.col + 1)), @as(u32, @intCast(cell.row + 1)), x, y, true);
         }
     }
 
@@ -2470,7 +2479,7 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
     }
     const cell = self.surface.cellAt(x, y);
     if (cell.row < 0 or cell.col < 0) return;
-    writeMouseEvent(self,@intCast(xterm_button), @intCast(cell.col + 1), @intCast(cell.row + 1), x, y, press);
+    writeMouseEvent(self, @intCast(xterm_button), @intCast(cell.col + 1), @intCast(cell.row + 1), x, y, press);
 }
 
 /// Encode a single mouse event using the screen's currently-active
@@ -2507,10 +2516,8 @@ fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, 
             const cx_clamp: u32 = @min(col_1 + 32, 255);
             const cy_clamp: u32 = @min(row_1 + 32, 255);
             const out = [_]u8{
-                0x1B, '[', 'M',
-                @intCast(@min(cb_val, 0xFF)),
-                @intCast(cx_clamp),
-                @intCast(cy_clamp),
+                0x1B,                         '[',                'M',
+                @intCast(@min(cb_val, 0xFF)), @intCast(cx_clamp), @intCast(cy_clamp),
             };
             self.terminal.writeRaw(&out);
         },
@@ -2682,7 +2689,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
         const ch_px: f64 = if (self.surface.cellPixelSize()) |cs| @floatFromInt(cs.h) else 0.0;
         const px = @as(f64, @floatFromInt(col)) * cw_px;
         const py = @as(f64, @floatFromInt(row)) * ch_px;
-        writeMouseEvent(self,button, @as(u32, @intCast(col + 1)), @as(u32, @intCast(row + 1)), px, py, true);
+        writeMouseEvent(self, button, @as(u32, @intCast(col + 1)), @as(u32, @intCast(row + 1)), px, py, true);
         return 1;
     }
 

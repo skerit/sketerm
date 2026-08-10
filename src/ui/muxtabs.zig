@@ -231,6 +231,7 @@ pub fn attachMuxApp(
     name: []const u8,
     host: ?[]const u8,
     snap_payload: []const u8,
+    identity: @import("../mux/client.zig").AttachIdentity,
     read_only: bool,
     want_control: bool,
 ) !void {
@@ -242,6 +243,7 @@ pub fn attachMuxApp(
             conn,
             name,
             snap_payload,
+            identity,
             host,
             self.config.mux_udp_port_range,
             read_only,
@@ -262,6 +264,11 @@ pub fn attachMuxApp(
     term.on_connection_state = appSessionConnectionState;
     term.on_peers = appSessionPeers;
     term.on_app_view = appSessionAppView;
+    term.on_panel_request = appSessionPanelRequest;
+    term.on_panel_origin_close = @import("panelhost.zig").closeOrigin;
+    term.on_panel_origin_renamed = @import("panelhost.zig").renameOrigin;
+    term.on_panel_work_cancel = @import("panelhost.zig").cancelPanelWork;
+    @import("panelhost.zig").attachOrigin(term, null);
 }
 
 /// A tabless app session ended. Normal quit (a window was shown)
@@ -332,7 +339,7 @@ pub fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
         }
     }
     self.allocator.destroy(as);
-    term.clearSinks();
+    term.clearSinksForRewire();
     // Clear host callbacks still pointing at the freed AppSession;
     // the pane re-wires its own (adoptAppHost) after.
     if (term.remote) |r| {
@@ -345,8 +352,12 @@ pub fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
     pane.id = self.allocPaneId();
     self.wirePaneSinks(pane);
     self.applyPaneConfig(pane, .{});
-    self.panes.append(self.allocator, pane) catch {};
-    self.terminals.append(self.allocator, term) catch {};
+    registerPane(self, pane, term) catch {
+        pane.deinit();
+        term.deinit();
+        return null;
+    };
+    @import("panelhost.zig").adoptTerminalOwner(term, pane, self);
     term.replayRetainedImages();
 
     var title_buf: [160:0]u8 = undefined;
@@ -405,6 +416,7 @@ pub fn makeRemotePaneFromSnap(
     name: []const u8,
     host: ?[]const u8,
     snap_payload: []const u8,
+    identity: @import("../mux/client.zig").AttachIdentity,
     // Pre-allocated pane id, or null to allocate one. Daemon-backed local
     // panes pre-allocate so they can export SKETERM_PANE_ID into the child
     // env at spawn time; passing it here keeps that id (no double-alloc,
@@ -412,15 +424,23 @@ pub fn makeRemotePaneFromSnap(
     pane_id: ?u32,
     read_only: bool,
     want_control: bool,
+    ephemeral: bool,
 ) !*Pane {
     var conn = conn_in;
     const term = blk: {
-        errdefer conn.deinit();
+        errdefer {
+            if (ephemeral) {
+                conn.setNonBlocking();
+                conn.queueJson(.kill, .{ .name = name }) catch {};
+            }
+            conn.deinit();
+        }
         break :blk try Terminal.initRemote(
             self.allocator,
             conn,
             name,
             snap_payload,
+            identity,
             host,
             self.config.mux_udp_port_range,
             read_only,
@@ -428,6 +448,10 @@ pub fn makeRemotePaneFromSnap(
         );
     };
     errdefer term.deinit();
+    // Set this before Pane construction: if any later allocation fails,
+    // Terminal.deinit must kill a GUI-owned session rather than detach and
+    // leave it running without a tab.
+    if (term.remote) |remote| remote.ephemeral = ephemeral;
     term.debug_to_stderr = self.debug_events;
     const pane = try self.makePane(term);
     pane.id = pane_id orelse self.allocPaneId();
@@ -437,12 +461,19 @@ pub fn makeRemotePaneFromSnap(
     // pane-creation path gets. Must happen before the widget
     // enters the tree (realize builds the atlas from pane state).
     self.applyPaneConfig(pane, .{});
-    try self.panes.append(self.allocator, pane);
-    try self.terminals.append(self.allocator, term);
+    try registerPane(self, pane, term);
     // Pane sinks are wired — push snapshot-restored image
     // placements into the ImageStore.
     term.replayRetainedImages();
     return pane;
+}
+
+/// Reserve both owner lists before publishing either pointer.
+fn registerPane(self: *Window, pane: *Pane, term: *Terminal) !void {
+    try self.panes.ensureUnusedCapacity(self.allocator, 1);
+    try self.terminals.ensureUnusedCapacity(self.allocator, 1);
+    self.panes.appendAssumeCapacity(pane);
+    self.terminals.appendAssumeCapacity(term);
 }
 
 /// Layout restore for a durable mux pane: attach when the
@@ -456,14 +487,15 @@ pub fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
 
     const Owned = @TypeOf(try conn.recvFrame());
     var snap: Owned = undefined;
+    var identity: @import("../mux/client.zig").AttachIdentity = .{};
     {
         errdefer conn.deinit();
-        try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
-        const reply = try conn.recvExpect(&.{ .snapshot, .err });
-        if (reply.ftype == .snapshot) {
-            snap = reply;
-        } else {
-            reply.deinit(self.allocator);
+        try conn.sendAttach(spec.mux_session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+        if (conn.recvGuiAttach()) |attached| {
+            snap = attached.snapshot;
+            identity = attached.identity;
+        } else |attach_err| {
+            if (attach_err != error.DaemonError) return attach_err;
             // The explicit remote launcher also works with old daemons.
             const argv: []const []const u8 = if (host != null)
                 &@import("../mux/shell.zig").remote_login_argv
@@ -498,12 +530,14 @@ pub fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
                 .kb_layout = self.config.app_keyboard_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-            try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
-            snap = try conn.recvExpect(&.{.snapshot});
+            try conn.sendAttach(spec.mux_session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+            const attached = try conn.recvGuiAttach();
+            snap = attached.snapshot;
+            identity = attached.identity;
         }
     }
     defer snap.deinit(self.allocator);
-    const pane = try makeRemotePaneFromSnap(self, conn, spec.mux_session, host, snap.payload, null, false, false);
+    const pane = try makeRemotePaneFromSnap(self, conn, spec.mux_session, host, snap.payload, identity, null, false, false, false);
     const profile = self.findProfile(spec.profile);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = spec.font_size });
@@ -531,6 +565,7 @@ pub const MuxRestoreJob = struct {
     /// Thread results — set before g_idle_add, read after.
     conn: ?@import("../mux/client.zig").Conn = null,
     snap: ?[]u8 = null,
+    identity: @import("../mux/client.zig").AttachIdentity = .{},
     err_name: []const u8 = "unknown",
     /// Main-thread only: window torn down; idle must not touch it.
     canceled: bool = false,
@@ -678,12 +713,12 @@ pub fn muxRestoreConnect(job: *MuxRestoreJob) !void {
     setRecvTimeout(conn.fd, 30);
     defer setRecvTimeout(conn.fd, 0);
 
-    try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
-    const reply = try conn.recvExpect(&.{ .snapshot, .err });
-    if (reply.ftype == .snapshot) {
-        job.snap = reply.payload;
-    } else {
-        reply.deinit(job.allocator);
+    try conn.sendAttach(job.session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+    if (conn.recvGuiAttach()) |attached| {
+        job.snap = attached.snapshot.payload;
+        job.identity = attached.identity;
+    } else |attach_err| {
+        if (attach_err != error.DaemonError) return attach_err;
         // Session gone: recreate through the old-daemon-compatible
         // account-shell launcher under the same durable name.
         var remote_shell_buf: [512]u8 = undefined;
@@ -707,9 +742,10 @@ pub fn muxRestoreConnect(job: *MuxRestoreJob) !void {
             .kb_layout = job.kb_layout,
         });
         (try conn.recvExpect(&.{.ok})).deinit(job.allocator);
-        try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
-        const snap2 = try conn.recvExpect(&.{.snapshot});
-        job.snap = snap2.payload;
+        try conn.sendAttach(job.session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+        const attached = try conn.recvGuiAttach();
+        job.snap = attached.snapshot.payload;
+        job.identity = attached.identity;
     }
     job.conn = conn;
 }
@@ -756,7 +792,7 @@ pub fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
     const remote = @import("../mux/client.zig").RemoteSpec.parse(job.host);
     const used_ssh_fallback = remote.mode == .auto and conn.transport == .ssh;
     job.conn = null; // ownership moves to makeRemotePaneFromSnap
-    const pane = makeRemotePaneFromSnap(win, conn, job.session, job.host, job.snap.?, null, false, false) catch |err| {
+    const pane = makeRemotePaneFromSnap(win, conn, job.session, job.host, job.snap.?, job.identity, null, false, false, false) catch |err| {
         std.debug.print(
             "sketerm: mux restore '{s}' @ {s}: pane build failed ({s})\n",
             .{ job.session, job.host, @errorName(err) },
@@ -777,7 +813,6 @@ pub fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
     }
     return 0;
 }
-
 
 /// Controller-lease intent for one attach (see mux_cli.Lease).
 pub const Lease = enum { default, read_only, control };
@@ -801,13 +836,13 @@ pub fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn,
         // default (it only lands if free); the daemon answers with
         // a control_state frame either way, so a viewer that did
         // not get it finds out.
-        try conn.sendJson(.attach, .{
-            .name = name,
+        try conn.sendAttach(name, .{
             .kind = "gui",
             .read_only = lease == .read_only,
             .control = lease == .control,
+            .panel_rpc = conn.panel_rpc,
         });
-        break :blk conn.recvExpect(&.{.snapshot}) catch |err| {
+        break :blk conn.recvGuiAttach() catch |err| {
             // Stash the daemon's reason while `conn` is still alive
             // (the errdefer below frees it) so the caller surfaces it.
             const m = conn.lastErr();
@@ -817,13 +852,13 @@ pub fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn,
             return err;
         };
     };
-    defer snap.deinit(self.allocator);
+    defer snap.snapshot.deinit(self.allocator);
 
-    return attachMuxPrepared(self, conn, name, host, snap.payload, takeover, profile, lease);
+    return attachMuxPrepared(self, conn, name, host, snap.snapshot.payload, snap.identity, takeover, profile, lease);
 }
 
 /// Finish an attach whose transport handshake and snapshot ran off-thread.
-pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
+pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, identity: @import("../mux/client.zig").AttachIdentity, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
     var conn = conn_in;
 
     // App sessions in window view mode attach TABLESS (their
@@ -836,11 +871,11 @@ pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Co
         return error.BadSnapshot;
     };
     if (takeover == null and self.config.app_view == .window and envelope.app) {
-        return attachMuxApp(self, conn, name, host, snapshot_payload, lease == .read_only, lease == .control);
+        return attachMuxApp(self, conn, name, host, snapshot_payload, identity, lease == .read_only, lease == .control);
     }
 
     crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
-    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, null, lease == .read_only, lease == .control);
+    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease == .read_only, lease == .control, false);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile });
 
@@ -912,6 +947,16 @@ pub fn appSessionPeers(ctx: ?*anyopaque) void {
     for (remote.napps.items) |na| na.host.setDriven(t.peer_drivers > 0);
 }
 
+pub fn appSessionPanelRequest(
+    ctx: ?*anyopaque,
+    terminal: *Terminal,
+    request_id: u64,
+    request: []const u8,
+) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    @import("panelhost.zig").dispatchRelay(as.window, terminal, null, request_id, request);
+}
+
 /// New app host on a tabless session: offer "Show in Tab" via the
 /// host menu (materializes a tab, then embeds).
 pub fn appSessionAppView(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
@@ -933,4 +978,22 @@ pub fn appSessionRequestEmbed(ctx: ?*anyopaque) void {
     const remote = term.remote orelse return;
     if (remote.napps.items.len > 0)
         pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));
+}
+
+test "pane registration publishes neither pointer when terminal reserve fails" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var window: Window = undefined;
+    window.allocator = failing.allocator();
+    window.panes = .empty;
+    window.terminals = .empty;
+    defer window.panes.deinit(window.allocator);
+    defer window.terminals.deinit(window.allocator);
+    var pane: Pane = undefined;
+    var terminal: Terminal = undefined;
+
+    try std.testing.expectError(error.OutOfMemory, registerPane(&window, &pane, &terminal));
+    try std.testing.expect(window.panes.capacity > 0);
+    try std.testing.expectEqual(@as(usize, 0), window.panes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), window.terminals.items.len);
 }

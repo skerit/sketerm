@@ -102,12 +102,17 @@ comptime {
     _ = @import("ipc/mcp_registry.zig");
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/panelstore.zig");
+    _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/xkblayout.zig");
-    // ui/panel data layer: under ui/ by home, but GTK-free by contract.
+    // ui/panel data layer: under ui/ by home. canary/doc/events are GTK-free by
+    // contract; assets.zig is GTK-free by BUILD GATE — its gdk-pixbuf work sits
+    // behind `comptime build_options.glib`, and the test that needs it returns
+    // error.SkipZigTest in this root.
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
+    _ = @import("ui/panel/assets.zig");
     _ = @import("ui/panel/events.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
@@ -137,6 +142,7 @@ comptime {
     _ = @import("mux/mediameta.zig");
     _ = @import("mux/mediameta_test.zig");
     _ = @import("mux/opuscodec.zig");
+    _ = @import("mux/panel_relay_test.zig");
     _ = @import("mux/predict.zig");
     _ = @import("mux/pulse.zig");
     _ = @import("mux/client.zig");

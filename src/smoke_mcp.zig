@@ -10,6 +10,10 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const muxclient = @import("mux/client.zig");
+const wire = @import("mux/wire.zig");
+const panelstore = @import("ipc/panelstore.zig");
+const protocol = @import("ipc/protocol.zig");
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -113,6 +117,14 @@ const Mcp = struct {
         self.id += 1;
         var buf: [4096]u8 = undefined;
         const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ self.id, name, args_json }) catch fail("req too long");
+        self.send(req);
+    }
+
+    fn sendToolAllocated(self: *Mcp, name: []const u8, args_json: []const u8) void {
+        self.id += 1;
+        const req = std.fmt.allocPrint(self.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ self.id, name, args_json }) catch
+            fail("large request allocation");
+        defer self.allocator.free(req);
         self.send(req);
     }
 
@@ -330,13 +342,147 @@ const FakeGui = struct {
         return gui_req[0..gui_req_len];
     }
 
+    fn expectNoConnection(self: *FakeGui, timeout_ms: i64) void {
+        var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, @intCast(timeout_ms)) > 0)
+            fail("fake gui received a request despite lower transport precedence");
+    }
+
+    /// Socket discovery proves liveness with one connect that sends no JSON.
+    fn acceptDiscoveryProbe(self: *FakeGui, timeout_ms: i64) void {
+        var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, @intCast(timeout_ms)) <= 0)
+            fail("fake gui received no socket-discovery liveness probe");
+        const conn = c.accept(self.fd, null, null);
+        if (conn < 0) fail("fake gui could not accept discovery probe");
+        defer _ = c.close(conn);
+        var peer = c.struct_pollfd{ .fd = conn, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&peer, 1, 250) > 0) {
+            var byte: [1]u8 = undefined;
+            if (c.read(conn, &byte, 1) > 0)
+                fail("socket-discovery liveness probe unexpectedly sent a request");
+        }
+    }
+
     fn deinit(self: *FakeGui) void {
         _ = c.close(self.fd);
     }
 };
 
-var gui_req: [1 << 18]u8 = undefined;
+var gui_req: [4 << 20]u8 = undefined;
 var gui_req_len: usize = 0;
+
+/// An old daemon that answers hello/welcome without panel_rpc.
+const FakeLegacyMux = struct {
+    fd: c_int,
+
+    fn listen(path: [:0]const u8) FakeLegacyMux {
+        _ = c.unlink(path.ptr);
+        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) fail("fake mux: socket");
+        var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
+        addr.sun_family = c.AF_UNIX;
+        if (path.len >= addr.sun_path.len) fail("fake mux: socket path too long");
+        @memcpy(addr.sun_path[0..path.len], path);
+        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("fake mux: bind");
+        if (c.listen(fd, 4) != 0) fail("fake mux: listen");
+        return .{ .fd = fd };
+    }
+
+    fn serveProbe(self: *FakeLegacyMux, timeout_ms: i64) void {
+        const deadline = nowMs() + timeout_ms;
+        var accepted: c_int = -1;
+        while (nowMs() < deadline) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 100) <= 0) continue;
+            accepted = c.accept(self.fd, null, null);
+            if (accepted >= 0) break;
+        }
+        if (accepted < 0) fail("fake mux: no probe connection");
+        var conn = muxclient.Conn{ .allocator = std.heap.c_allocator, .fd = accepted };
+        defer conn.deinit();
+        conn.setNonBlocking();
+        (conn.recvExpectFor(&.{.hello}, 2_000) catch fail("fake mux: no hello")).deinit(std.heap.c_allocator);
+        conn.sendFrame(.welcome, "{\"proto\":1,\"server_proto\":1,\"negotiation\":1}") catch
+            fail("fake mux: welcome write");
+    }
+
+    fn deinit(self: *FakeLegacyMux) void {
+        _ = c.close(self.fd);
+    }
+};
+
+const PanelCall = struct {
+    id: u64,
+    json: []u8,
+
+    fn deinit(self: PanelCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.json);
+    }
+};
+
+fn attachPanelPresenter(allocator: std.mem.Allocator, socket: []const u8, session: []const u8) muxclient.Conn {
+    var conn = muxclient.Conn.connectProbed(allocator, socket) catch fail("panel presenter connect");
+    conn.setNonBlocking();
+    if (conn.panel_rpc != wire.PANEL_RPC_VERSION) fail("origin daemon lacks panel_rpc");
+    conn.sendAttach(session, .{
+        .kind = "gui",
+        .read_only = true,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
+    }) catch fail("panel presenter attach send");
+    (conn.recvExpectFor(&.{.snapshot}, 5_000) catch fail("panel presenter attach reply")).deinit(allocator);
+    return conn;
+}
+
+/// A released GUI predating panel_rpc: a real terminal viewer, never a
+/// compatible panel presenter.
+fn attachLegacyPanelViewer(allocator: std.mem.Allocator, socket: []const u8, session: []const u8) muxclient.Conn {
+    var conn = muxclient.Conn.connectProbed(allocator, socket) catch fail("legacy panel viewer connect");
+    conn.setNonBlocking();
+    conn.sendAttach(session, .{
+        .kind = "gui",
+        .read_only = true,
+    }) catch fail("legacy panel viewer attach send");
+    (conn.recvExpectFor(&.{.snapshot}, 5_000) catch fail("legacy panel viewer attach reply")).deinit(allocator);
+    return conn;
+}
+
+fn recvPanelCall(allocator: std.mem.Allocator, presenter: *muxclient.Conn, timeout_ms: i64) PanelCall {
+    const frame = presenter.recvExpectFor(&.{.panel_request}, timeout_ms) catch
+        fail("panel presenter received no request");
+    defer frame.deinit(allocator);
+    const envelope = wire.decodePanelEnvelope(frame.payload) catch
+        fail("panel presenter received a malformed envelope");
+    return .{
+        .id = envelope.id,
+        .json = allocator.dupe(u8, envelope.json) catch fail("panel request copy oom"),
+    };
+}
+
+fn replyPanel(presenter: *muxclient.Conn, call: PanelCall, json: []const u8) void {
+    presenter.sendPanelReply(call.id, json) catch fail("panel presenter reply failed");
+}
+
+fn expectNoPanelCall(presenter: *muxclient.Conn, timeout_ms: i64) void {
+    if (presenter.recvExpectFor(&.{.panel_request}, timeout_ms)) |frame| {
+        frame.deinit(presenter.allocator);
+        fail("lower-precedence mux presenter received a panel request");
+    } else |err| {
+        if (err != error.Timeout) fail("lower-precedence mux presenter disconnected");
+    }
+}
+
+fn sessionCount(allocator: std.mem.Allocator, owner: *muxclient.Conn) usize {
+    owner.sendFrame(.list, "") catch fail("origin list send");
+    const frame = owner.recvExpectFor(&.{.welcome}, 5_000) catch fail("origin list reply");
+    defer frame.deinit(allocator);
+    const Listing = struct { sessions: []const std.json.Value = &.{} };
+    var parsed = std.json.parseFromSlice(Listing, allocator, frame.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch fail("origin list parse");
+    defer parsed.deinit();
+    return parsed.value.sessions.len;
+}
 
 pub fn main() u8 {
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -366,10 +512,13 @@ pub fn main() u8 {
     // session: run from inside a sketerm pane, the inherited
     // $SKETERM_SESSION would scope them to that pane instead.
     _ = c.unsetenv("SKETERM_SESSION");
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
     defer killDaemonsUnderRt(rt, allocator);
 
     const exe = "zig-out/bin/sketerm";
     if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
+    _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
+    defer _ = c.unsetenv("SKETERM_MUX_BIN");
 
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
@@ -425,7 +574,7 @@ pub fn main() u8 {
         const idle_probe = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-RUN-IDLE\",\"wait_for\":\"command\"}");
         if (std.mem.indexOf(u8, idle_probe, "\\\"command_sent\\\":false") == null or
             std.mem.indexOf(u8, idle_probe, "outside command mode") == null)
-            {
+        {
             std.debug.print("DEBUG idle_run: {s}\n", .{idle_run});
             std.debug.print("DEBUG idle_probe: {s}\n", .{idle_probe});
             fail("term_run idle mode waited for command completion");
@@ -793,9 +942,9 @@ pub fn main() u8 {
     }
 
     // ── Stage 5: the ui_* panel tools under a `ui` policy ─────────
-    // No GUI here on purpose: this proves the group is reachable on its
-    // own, that the live-panel half refuses HONESTLY (naming --shared)
-    // instead of hanging or lying, and that the saved half works
+    // No session origin or direct GUI here on purpose: this proves the
+    // group is reachable on its own, that the live-panel half refuses
+    // honestly instead of hanging, and that the saved half works
     // regardless — including for a session name with a space in it,
     // which the store used to reject outright.
     {
@@ -806,7 +955,12 @@ pub fn main() u8 {
 
         const listed = m.listTools();
         if (!std.mem.endsWith(u8, listed, "}")) fail("tools/list reply truncated");
-        for ([_][]const u8{ "ui_show", "ui_patch", "ui_wait_event", "ui_panels", "ui_save", "ui_close", "ui_delete" }) |tool| {
+        // Panels no longer need --shared, so nothing may still ask for it.
+        if (std.mem.indexOf(u8, listed, "--shared") != null or
+            std.mem.indexOf(u8, listed, "relays through that session's own mux daemon") == null or
+            std.mem.indexOf(u8, listed, "decoded by the GUI") == null)
+            fail("ui tool descriptions do not describe the session relay and remote image hydration");
+        for ([_][]const u8{ "ui_show", "ui_show_files", "ui_patch", "ui_wait_event", "ui_panels", "ui_save", "ui_close", "ui_delete" }) |tool| {
             var nb: [64]u8 = undefined;
             const quoted = std.fmt.bufPrint(&nb, "\"{s}\"", .{tool}) catch unreachable;
             if (std.mem.indexOf(u8, listed, quoted) == null) fail("tools/list dropped a ui tool under --tools ui");
@@ -823,12 +977,30 @@ pub fn main() u8 {
         if (std.mem.indexOf(u8, refused, "opened headless terminal") != null)
             fail("a withheld terminal tool RAN under --tools ui");
 
-        // The live half: no GUI socket, so a described refusal naming
-        // the flag that would fix it — never a hang.
+        // A present session is type-strict for every ui tool. None may treat
+        // null or another JSON type as absence and inherit SKETERM_SESSION.
+        for ([_][]const u8{ "ui_show", "ui_show_files", "ui_patch", "ui_wait_event", "ui_panels", "ui_save", "ui_close", "ui_delete" }) |tool| {
+            for ([_][]const u8{ "null", "0", "1.5", "{}", "[]", "true", "false" }) |bad_session| {
+                var args_buf: [96]u8 = undefined;
+                const arguments = std.fmt.bufPrint(&args_buf, "{{\"session\":{s}}}", .{bad_session}) catch
+                    fail("invalid-session smoke arguments too long");
+                const invalid_session = m.callTool(tool, arguments);
+                if (std.mem.indexOf(u8, invalid_session, "isError") == null or
+                    std.mem.indexOf(u8, invalid_session, "must be a string when present") == null)
+                    fail("a ui tool accepted a present non-string session");
+            }
+        }
+
+        // The live half: no origin daemon or GUI socket, so a described
+        // refusal naming the missing transport -- never a hang.
         const no_gui = m.callTool("ui_show", "{\"name\":\"p\",\"session\":\"smoke ui\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
         if (std.mem.indexOf(u8, no_gui, "isError") == null or
-            std.mem.indexOf(u8, no_gui, "--shared") == null)
-            fail("ui_show without a GUI socket did not explain that panels need --shared");
+            std.mem.indexOf(u8, no_gui, "origin mux daemon") == null)
+            fail("ui_show without a panel origin did not explain the missing transport");
+        const no_session = m.callTool("ui_show", "{\"name\":\"anon-live\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"hi\"}}}}");
+        if (std.mem.indexOf(u8, no_session, "isError") == null or
+            std.mem.indexOf(u8, no_session, "no live panel transport") == null)
+            fail("sessionless ui_show without a direct socket was not refused honestly");
 
         // The saved half works anyway, under a session with a space.
         const saved = m.callTool("ui_save", "{\"name\":\"vsr\",\"session\":\"smoke ui\",\"document\":{\"title\":\"Epoch 41\",\"root\":\"c\",\"components\":{\"c\":{\"type\":\"column\",\"children\":[\"h\"]},\"h\":{\"type\":\"heading\",\"text\":\"Epoch 41\",\"level\":2}}}}");
@@ -861,7 +1033,7 @@ pub fn main() u8 {
         const panels = m.callTool("ui_panels", "{\"session\":\"smoke ui\"}");
         if (std.mem.indexOf(u8, panels, "Epoch 41") == null or
             std.mem.indexOf(u8, panels, "\\\"live\\\":null") == null or
-            std.mem.indexOf(u8, panels, "--shared") == null)
+            std.mem.indexOf(u8, panels, "origin mux daemon") == null)
             fail("ui_panels did not separate the saved list from the unavailable live list");
         const other = m.callTool("ui_panels", "{\"session\":\"someone-else\"}");
         if (std.mem.indexOf(u8, other, "Epoch 41") != null)
@@ -875,7 +1047,10 @@ pub fn main() u8 {
 
         const caps = m.callTool("capabilities", "{}");
         if (std.mem.indexOf(u8, caps, "\\\"panels\\\":false") == null or
-            std.mem.indexOf(u8, caps, "panels_hint") == null or
+            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":true") == null or
+            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"sessionless\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"state\\\":\\\"no_session_origin\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
             std.mem.indexOf(u8, caps, "\\\"ui\\\"") == null)
             fail("capabilities does not report panel availability + the ui group");
 
@@ -886,7 +1061,692 @@ pub fn main() u8 {
         say("smoke-mcp: ui_* panel tools ok");
     }
 
-    // ── Stage 6: ui_show_files, against a stand-in GUI socket ─────
+    // ── Stage 6: isolated MCP relays panels to its origin session ─
+    {
+        var origin_dir_buf: [320]u8 = undefined;
+        const origin_dir = std.fmt.bufPrintZ(&origin_dir_buf, "{s}/panel-origin", .{rt}) catch return 1;
+        _ = c.mkdir(origin_dir.ptr, 0o700);
+        var origin_sock_buf: [360]u8 = undefined;
+        const origin_sock = std.fmt.bufPrintZ(&origin_sock_buf, "{s}/mux.sock", .{origin_dir}) catch return 1;
+        var owner = muxclient.Conn.connectLocalAutostartAt(allocator, origin_sock) catch
+            fail("could not start origin mux daemon");
+        defer owner.deinit();
+        owner.setNonBlocking();
+        owner.sendJson(.spawn, .{
+            .name = "panel-origin",
+            .argv = [_][]const u8{ "sleep", "60" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("origin session spawn send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("origin session spawn reply")).deinit(allocator);
+        var presenter = attachPanelPresenter(allocator, origin_sock, "panel-origin");
+        var presenter_live = true;
+        defer if (presenter_live) presenter.deinit();
+        var identity_probe = muxclient.connectPanelRequester(allocator, origin_sock, "panel-origin", 5_000) catch
+            fail("could not read panel origin identity");
+        defer identity_probe.deinit();
+        const origin_id = allocator.dupeZ(u8, identity_probe.panelOriginId()) catch
+            fail("could not retain panel origin identity");
+        defer allocator.free(origin_id);
+        if (origin_id.len != 32) fail("panel attach did not expose a valid lifetime origin_id");
+
+        _ = c.setenv("SKETERM_SESSION", "panel-origin", 1);
+        _ = c.setenv("SKETERM_MUX_SOCKET", origin_sock.ptr, 1);
+        _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", origin_id.ptr, 1);
+        defer _ = c.unsetenv("SKETERM_SESSION");
+        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        defer _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+
+        // Capability probing itself uses a read-only panel-list relay and
+        // must distinguish it from the absent direct GUI socket.
+        m.sendTool("capabilities", "{}");
+        const cap_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, cap_call.json, "\"cmd\":\"panel-list\"") == null)
+            fail("capabilities did not probe the panel relay");
+        replyPanel(&presenter, cap_call, "{\"ok\":true,\"panels\":[]}");
+        cap_call.deinit(allocator);
+        const caps = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null or
+            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":true") == null or
+            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"origin\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
+            std.mem.indexOf(u8, caps, "\\\"selected\\\":\\\"mux_relay\\\"") == null or
+            std.mem.indexOf(u8, caps, "SKETERM_MUX_SOCKET") == null)
+            fail("capabilities did not separate relay panels from gui_socket");
+
+        // A store the filesystem refuses is reported by the call that
+        // actually writes, exactly and without a partial document. The
+        // preflight deliberately does not probe it: `capabilities` must stay
+        // cheap and must not create or write anything.
+        const origin_scope = panelstore.Scope{ .origin = .{
+            .daemon_origin = origin_sock,
+            .origin_id = origin_id,
+        } };
+        const capability_dir = panelstore.scopeDir(allocator, origin_scope) catch
+            fail("could not resolve capability panel scope");
+        defer allocator.free(capability_dir);
+        // The preflight above must not have created the store it reports on.
+        if (fileExists(capability_dir))
+            fail("capabilities created the panel store scope directory");
+        var cap_dir_z: [4096]u8 = undefined;
+        const cap_dir_path = std.fmt.bufPrintZ(&cap_dir_z, "{s}", .{capability_dir}) catch
+            fail("capability panel scope path too long");
+        // One real save creates the scope on disk and proves the ordinary
+        // path; the store is then made read-only under the server's feet.
+        const stored = m.callTool(
+            "ui_save",
+            "{\"name\":\"writable\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}",
+        );
+        if (std.mem.indexOf(u8, stored, "isError") != null)
+            fail("a writable origin-qualified panel store refused an ordinary save");
+        if (c.chmod(cap_dir_path.ptr, 0o500) != 0)
+            fail("could not make the capability panel scope read-only");
+        const refused = m.callTool(
+            "ui_save",
+            "{\"name\":\"unwritable\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}",
+        );
+        _ = c.chmod(cap_dir_path.ptr, 0o700);
+        if (std.mem.indexOf(u8, refused, "isError") == null or
+            std.mem.indexOf(u8, refused, "PermissionDenied") == null or
+            std.mem.indexOf(u8, refused, "\\\"mutation_may_have_applied\\\":false") == null or
+            std.mem.indexOf(u8, refused, "\\\"resend_safe\\\":true") == null)
+            fail("an unwritable panel store was not reported by the write itself");
+
+        // Default isolated MCP, no --shared and no --socket: ui_show must
+        // reach the presenter attached to the inherited origin session.
+        m.sendTool("ui_show", "{\"name\":\"relayed\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"through mux\"}}}}");
+        const show_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, show_call.json, "\"cmd\":\"panel-show\"") == null or
+            std.mem.indexOf(u8, show_call.json, "\"session\":\"panel-origin\"") == null or
+            std.mem.indexOf(u8, show_call.json, "through mux") == null)
+            fail("isolated ui_show did not route through the origin mux session");
+        replyPanel(&presenter, show_call, "{\"ok\":true,\"panel_id\":41}");
+        show_call.deinit(allocator);
+        const shown = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, shown, "isError") != null or
+            std.mem.indexOf(u8, shown, "\\\"panel_id\\\":41") == null)
+            fail("relayed ui_show did not return the presenter result");
+
+        // Both mixed live/store operations use the same chosen relay.
+        m.sendTool("ui_panels", "{}");
+        const list_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, list_call.json, "\"cmd\":\"panel-list\"") == null)
+            fail("ui_panels did not use the origin relay");
+        replyPanel(&presenter, list_call, "{\"ok\":true,\"panels\":[{\"panel_id\":41,\"name\":\"relayed\",\"title\":\"Relay\",\"target\":\"tab\"}]}");
+        list_call.deinit(allocator);
+        const listed_live = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, listed_live, "relayed") == null or
+            std.mem.indexOf(u8, listed_live, "\\\"live\\\":[") == null)
+            fail("ui_panels did not return the relayed live inventory");
+
+        m.sendTool("ui_save", "{\"name\":\"relayed\",\"panel_id\":41}");
+        const get_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, get_call.json, "\"cmd\":\"panel-get\"") == null)
+            fail("ui_save without document did not use the origin relay");
+        replyPanel(&presenter, get_call, "{\"ok\":true,\"document\":\"{\\\"title\\\":\\\"Relay live\\\",\\\"root\\\":\\\"t\\\",\\\"components\\\":{\\\"t\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"through mux\\\"}}}\"}");
+        get_call.deinit(allocator);
+        const saved_live = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, saved_live, "isError") != null or
+            std.mem.indexOf(u8, saved_live, "\\\"saved\\\":\\\"relayed\\\"") == null)
+            fail("ui_save without document did not persist the relayed live document");
+        var origin_saved_buf: [1024]u8 = undefined;
+        const origin_saved = std.fmt.bufPrint(&origin_saved_buf, "{s}/relayed.json", .{capability_dir}) catch
+            fail("origin-qualified panel path too long");
+        if (!fileExists(origin_saved)) fail("relayed ui_save did not use the origin-qualified store");
+        var legacy_saved_buf: [512]u8 = undefined;
+        const legacy_saved = std.fmt.bufPrint(&legacy_saved_buf, "{s}/sketerm/panels/by-session/panel-origin/relayed.json", .{rt}) catch unreachable;
+        if (fileExists(legacy_saved)) fail("relayed ui_save also wrote the legacy session-only namespace");
+
+        // Rename changes only display identity. An explicit new alias must
+        // attach to the same immutable origin and load the same saved file.
+        owner.sendJson(.rename, .{ .name = "panel-origin", .new_name = "panel-renamed" }) catch
+            fail("origin session rename send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("origin session rename reply")).deinit(allocator);
+        m.sendTool("ui_show", "{\"name\":\"after-rename\",\"session\":\"panel-renamed\",\"load\":\"relayed\"}");
+        const renamed_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, renamed_call.json, "Relay live") == null)
+            fail("renamed session did not retain its origin-qualified saved panel");
+        replyPanel(&presenter, renamed_call, "{\"ok\":true,\"panel_id\":42}");
+        renamed_call.deinit(allocator);
+        const renamed_show = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, renamed_show, "\\\"panel_id\\\":42") == null or
+            std.mem.indexOf(u8, renamed_show, "isError") != null)
+            fail("renamed session could not show its saved panel");
+
+        // Repeated event polls reuse the same panel-only connection. The
+        // first empty reply must not lose the event returned by the next.
+        m.sendTool("ui_wait_event", "{\"panel_id\":41,\"timeout_ms\":2000}");
+        const poll1 = recvPanelCall(allocator, &presenter, 15_000);
+        replyPanel(&presenter, poll1, "{\"ok\":true,\"events\":[],\"dropped\":1}");
+        poll1.deinit(allocator);
+        const poll2 = recvPanelCall(allocator, &presenter, 15_000);
+        replyPanel(&presenter, poll2, "{\"ok\":true,\"events\":[{\"component\":\"t\",\"kind\":\"click\",\"value\":\"ok\",\"ts\":42}],\"dropped\":0}");
+        poll2.deinit(allocator);
+        const waited = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, waited, "\\\"value\\\":\\\"ok\\\"") == null or
+            std.mem.indexOf(u8, waited, "\\\"dropped\\\":1") == null)
+            fail("repeated relayed ui_wait_event polls lost state");
+
+        // The daemon can correlate an envelope whose opaque JSON is invalid;
+        // MCP must call that uncertain delivery explicitly and never resend.
+        m.sendTool("ui_patch", "{\"panel_id\":41,\"patch\":[{\"op\":\"title\",\"value\":\"bad-json\"}]}");
+        const invalid_json_call = recvPanelCall(allocator, &presenter, 15_000);
+        replyPanel(&presenter, invalid_json_call, "not-json");
+        invalid_json_call.deinit(allocator);
+        const invalid_json = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, invalid_json, "isError") == null or
+            std.mem.indexOf(u8, invalid_json, "uncertain") == null or
+            std.mem.indexOf(u8, invalid_json, "NOT resent automatically") == null or
+            std.mem.indexOf(u8, invalid_json, "mutation may have applied") == null)
+            fail("invalid presenter JSON did not report uncertain no-resend semantics");
+
+        // Valid JSON can still violate the presenter protocol. A missing
+        // panel id must invalidate the pooled requester and cannot become
+        // success.
+        presenter.deinit();
+        presenter = attachPanelPresenter(allocator, origin_sock, "panel-renamed");
+        m.sendTool("ui_show", "{\"name\":\"missing-id\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"missing\"}}}}");
+        const missing_call = recvPanelCall(allocator, &presenter, 15_000);
+        replyPanel(&presenter, missing_call, "{\"ok\":true}");
+        missing_call.deinit(allocator);
+        const missing_result = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, missing_result, "isError") == null or
+            std.mem.indexOf(u8, missing_result, "mutation may have applied") == null or
+            std.mem.indexOf(u8, missing_result, "NOT resent automatically") == null or
+            std.mem.indexOf(u8, missing_result, "\\\"showing\\\":true") != null)
+            fail("missing panel_id presenter success was not rejected as uncertain delivery");
+
+        // Zero is invalid for the same operation-specific field.
+        presenter.deinit();
+        presenter = attachPanelPresenter(allocator, origin_sock, "panel-renamed");
+        m.sendTool("ui_show", "{\"name\":\"zero\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"zero\"}}}}");
+        const zero_call = recvPanelCall(allocator, &presenter, 15_000);
+        replyPanel(&presenter, zero_call, "{\"ok\":true,\"panel_id\":0}");
+        zero_call.deinit(allocator);
+        const zero_result = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, zero_result, "isError") == null or
+            std.mem.indexOf(u8, zero_result, "mutation may have applied") == null or
+            std.mem.indexOf(u8, zero_result, "NOT resent automatically") == null or
+            std.mem.indexOf(u8, zero_result, "\\\"showing\\\":true") != null)
+            fail("panel_id 0 presenter success was not rejected as uncertain delivery");
+
+        // The invalid reply retired both daemon presenter and MCP pool entry;
+        // a fresh presenter and fresh request must recover normally.
+        presenter.deinit();
+        presenter = attachPanelPresenter(allocator, origin_sock, "panel-renamed");
+        m.sendTool("ui_show", "{\"name\":\"recovered\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"fresh-route\"}}}}");
+        const recovered_call = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, recovered_call.json, "fresh-route") == null)
+            fail("pooled panel relay was not replaced after invalid presenter reply");
+        replyPanel(&presenter, recovered_call, "{\"ok\":true,\"panel_id\":43}");
+        recovered_call.deinit(allocator);
+        const recovered = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, recovered, "\\\"panel_id\\\":43") == null)
+            fail("fresh pooled panel relay did not recover");
+
+        // A real long-lived app tool still starts the MCP private daemon, not
+        // the panel origin. Inspect it while alive so a fast /bin/true cannot
+        // make the isolation assertion pass after all state has disappeared.
+        const app = m.callTool("launch_app", "{\"command\":[\"/bin/sh\",\"-c\",\"sleep 30\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}");
+        if (std.mem.indexOf(u8, app, "\\\"app\\\":1") == null or
+            std.mem.indexOf(u8, app, "\\\"pid\\\"") == null or
+            std.mem.indexOf(u8, app, "\\\"exited\\\":true") != null)
+            fail("long-lived private launch_app probe was not alive");
+        const live_apps = m.callTool("list_apps", "{}");
+        if (std.mem.indexOf(u8, live_apps, "\\\"app\\\":1") == null or
+            std.mem.indexOf(u8, live_apps, "\\\"pid\\\"") == null or
+            std.mem.indexOf(u8, live_apps, "\\\"exited\\\":true") != null)
+            fail("list_apps could not inspect the private app while alive");
+        var private_buf: [512]u8 = undefined;
+        const private_sock = std.fmt.bufPrint(&private_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
+        if (!fileExists(private_sock)) fail("app tool did not start the MCP private daemon");
+        if (sessionCount(allocator, &owner) != 1)
+            fail("app tool leaked its session onto the panel origin daemon");
+        const closed_app = m.callTool("close_app", "{\"app\":1}");
+        if (std.mem.indexOf(u8, closed_app, "isError") != null)
+            fail("long-lived private app cleanup failed");
+
+        // Losing the GUI is reported honestly and nothing is delivered: with
+        // no presenter binding to fall back on, an absent GUI is simply
+        // `no_compatible_gui`, pre-delivery and resend-safe.
+        presenter.deinit();
+        presenter_live = false;
+        _ = c.usleep(300_000);
+        const no_viewer = m.callTool("ui_show", "{\"name\":\"none\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}");
+        if (std.mem.indexOf(u8, no_viewer, "isError") == null or
+            std.mem.indexOf(u8, no_viewer, "no compatible GUI") == null or
+            std.mem.indexOf(u8, no_viewer, "before presenter delivery") == null)
+            fail("missing GUI was not reported honestly");
+        // The store half must stay usable throughout.
+        const absent_caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, absent_caps, "\\\"state\\\":\\\"no_compatible_gui\\\"") == null or
+            std.mem.indexOf(u8, absent_caps, "\\\"panels\\\":false") == null or
+            std.mem.indexOf(u8, absent_caps, "\\\"panels_store\\\":true") == null or
+            std.mem.indexOf(u8, absent_caps, "\\\"scope\\\":\\\"origin\\\"") == null)
+            fail("capabilities did not report the panel transport honestly after the GUI left");
+
+        // Restarting the GUI is an ordinary thing to do. A NEW GUI process
+        // must be picked up by the very next call, with no invalidate dance:
+        // the daemon simply routes to whichever presenter is attached now.
+        var restarted = attachPanelPresenter(allocator, origin_sock, "panel-renamed");
+        m.sendTool("ui_show", "{\"name\":\"after-restart\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"rebound\"}}}}");
+        const restart_call = recvPanelCall(allocator, &restarted, 15_000);
+        if (std.mem.indexOf(u8, restart_call.json, "rebound") == null)
+            fail("a restarted GUI never received the rebound panel request");
+        replyPanel(&restarted, restart_call, "{\"ok\":true,\"panel_id\":51}");
+        restart_call.deinit(allocator);
+        const rebound = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, rebound, "\\\"panel_id\\\":51") == null)
+            fail("the panel requester did not reach a restarted GUI");
+        // Leave exactly one presenter for the stages below, which each attach
+        // their own and rely on being the only compatible candidate.
+        restarted.deinit();
+        _ = c.usleep(300_000);
+
+        // Presenter disconnect after receiving a mutation is a correlated
+        // error, not a retry through another transport.
+        var disconnecting = attachPanelPresenter(allocator, origin_sock, "panel-origin");
+        m.sendTool("ui_patch", "{\"panel_id\":41,\"patch\":[{\"op\":\"title\",\"value\":\"once\"}]}");
+        const disconnect_call = recvPanelCall(allocator, &disconnecting, 15_000);
+        disconnect_call.deinit(allocator);
+        disconnecting.deinit();
+        const disconnected = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, disconnected, "isError") == null or
+            std.mem.indexOf(u8, disconnected, "mutation may have applied") == null or
+            std.mem.indexOf(u8, disconnected, "NOT resent automatically") == null)
+            fail("viewer disconnect did not report post-delivery uncertainty");
+
+        // A silent viewer hits the client deadline. The response must say
+        // delivery was uncertain and that the mutating call was not resent.
+        var silent = attachPanelPresenter(allocator, origin_sock, "panel-origin");
+        m.sendTool("ui_show", "{\"name\":\"timeout\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"once\"}}}}");
+        const silent_call = recvPanelCall(allocator, &silent, 15_000);
+        silent_call.deinit(allocator);
+        // Remote image hydration gives live panel calls a 40s budget; wait
+        // beyond that here so this intentionally silent presenter reaches the
+        // MCP deadline rather than the smoke harness's shorter read deadline.
+        const timed_out = m.recvLine(45_000);
+        if (std.mem.indexOf(u8, timed_out, "isError") == null or
+            std.mem.indexOf(u8, timed_out, "NOT resent automatically") == null or
+            std.mem.indexOf(u8, timed_out, "reply_timeout") == null)
+            fail("viewer timeout did not report uncertain no-resend semantics");
+        silent.deinit();
+        _ = c.usleep(300_000);
+
+        const no_viewer_caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, no_viewer_caps, "\\\"panels\\\":false") == null or
+            std.mem.indexOf(u8, no_viewer_caps, "no_compatible_gui") == null)
+            fail("capabilities hid the missing compatible GUI");
+
+        m.closeStdinWait();
+        owner.sendJson(.kill, .{ .name = "panel-renamed" }) catch fail("origin cleanup kill send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("origin cleanup kill reply")).deinit(allocator);
+
+        // Reusing the spawn name creates a different storage identity and
+        // cannot inherit the previous lifetime's saved panel.
+        owner.sendJson(.spawn, .{
+            .name = "panel-origin",
+            .argv = [_][]const u8{ "sleep", "60" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("reincarnated origin session spawn send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("reincarnated origin session spawn reply")).deinit(allocator);
+        var fenced_active: std.atomic.Value(c_int) = .init(-1);
+        if (muxclient.connectPanelRequesterUntilExpected(
+            allocator,
+            origin_sock,
+            "panel-origin",
+            origin_id,
+            nowMs() + 5_000,
+            &fenced_active,
+        )) |wrong_lifetime| {
+            var unexpected = wrong_lifetime;
+            unexpected.deinit();
+            fail("old origin_id attached to a same-name reincarnation");
+        } else |err| if (err != error.SessionOriginMismatch) {
+            fail("same-name reincarnation origin fence failed unexpectedly");
+        }
+        var reincarnated = muxclient.connectPanelRequester(allocator, origin_sock, "panel-origin", 5_000) catch
+            fail("could not attach to reincarnated origin session");
+        defer reincarnated.deinit();
+        const reincarnated_id = reincarnated.panelOriginId();
+        if (reincarnated_id.len != 32 or std.mem.eql(u8, reincarnated_id, origin_id))
+            fail("same-name reincarnation reused its panel origin_id");
+        const reincarnated_scope = panelstore.Scope{ .origin = .{
+            .daemon_origin = origin_sock,
+            .origin_id = reincarnated_id,
+        } };
+        if (panelstore.existsScoped(allocator, reincarnated_scope, "relayed"))
+            fail("same-name reincarnation inherited the prior lifetime's saved panel");
+        owner.sendJson(.kill, .{ .name = "panel-origin" }) catch fail("reincarnated origin cleanup kill send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("reincarnated origin cleanup kill reply")).deinit(allocator);
+        say("smoke-mcp: isolated origin-session panel relay ok");
+    }
+
+    // ── Stage 7: exact missing and unsupported origin handling ─────
+    {
+        _ = c.setenv("SKETERM_SESSION", "missing-origin", 1);
+        var missing_buf: [320]u8 = undefined;
+        const missing = std.fmt.bufPrintZ(&missing_buf, "{s}/missing-origin.sock", .{rt}) catch return 1;
+        _ = c.unlink(missing.ptr);
+        _ = c.setenv("SKETERM_MUX_SOCKET", missing.ptr, 1);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const result = m.callTool("ui_show", "{\"name\":\"x\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}");
+        if (std.mem.indexOf(u8, result, "origin mux daemon") == null or
+            std.mem.indexOf(u8, result, "not autostarted") == null or
+            fileExists(missing))
+            fail("missing exact origin was autostarted, redirected, or poorly reported");
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "origin_unreachable") == null or
+            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":false") == null or
+            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"unavailable\\\"") == null or
+            std.mem.indexOf(u8, caps, "refusing to downgrade") == null)
+            fail("capabilities hid the missing origin daemon");
+        const store_only = m.callTool("ui_save", "{\"name\":\"must-not-downgrade\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}");
+        if (std.mem.indexOf(u8, store_only, "isError") == null or
+            std.mem.indexOf(u8, store_only, "refusing to downgrade") == null)
+            fail("store-only exact missing origin silently selected reusable storage");
+        m.closeStdinWait();
+        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = c.unsetenv("SKETERM_SESSION");
+    }
+
+    {
+        var legacy_buf: [320]u8 = undefined;
+        const legacy_sock = std.fmt.bufPrintZ(&legacy_buf, "{s}/legacy-mux.sock", .{rt}) catch return 1;
+        var legacy = FakeLegacyMux.listen(legacy_sock);
+        defer legacy.deinit();
+        _ = c.setenv("SKETERM_SESSION", "legacy", 1);
+        _ = c.setenv("SKETERM_MUX_SOCKET", legacy_sock.ptr, 1);
+        defer _ = c.unsetenv("SKETERM_SESSION");
+        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+
+        // No direct GUI: unsupported stays an honest failure.
+        var old = Mcp.spawn(allocator, exe, &.{});
+        old.initialize();
+        old.sendTool("ui_show", "{\"name\":\"old\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"old\"}}}}");
+        legacy.serveProbe(15_000);
+        const unsupported = old.recvLine(15_000);
+        if (std.mem.indexOf(u8, unsupported, "does not support panel relay") == null)
+            fail("unsupported origin daemon was not reported");
+        old.sendTool("ui_save", "{\"name\":\"old-daemon-scope\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"old\"}}}}");
+        legacy.serveProbe(15_000);
+        const legacy_saved = old.recvLine(15_000);
+        if (std.mem.indexOf(u8, legacy_saved, "isError") != null)
+            fail("positively identified pre-ID daemon did not receive disjoint legacy-origin storage");
+        old.sendTool("ui_delete", "{\"name\":\"old-daemon-scope\"}");
+        legacy.serveProbe(15_000);
+        const legacy_deleted = old.recvLine(15_000);
+        if (std.mem.indexOf(u8, legacy_deleted, "isError") != null)
+            fail("positively identified pre-ID daemon legacy-origin cleanup failed");
+        old.closeStdinWait();
+
+        // Exact origin is still tried first, but an unsupported capability is
+        // proven pre-delivery. Only the explicitly named GUI may then serve as
+        // the requested legacy fallback.
+        var gui_buf: [320]u8 = undefined;
+        const gui_sock = std.fmt.bufPrintZ(&gui_buf, "{s}/legacy-gui.sock", .{rt}) catch return 1;
+        var gui = FakeGui.listen(gui_sock);
+        defer gui.deinit();
+        var exact = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
+        exact.initialize();
+        exact.sendTool("ui_show", "{\"name\":\"legacy\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"exact\"}}}}");
+        legacy.serveProbe(15_000);
+        const fallback_sent = gui.serveOne("{\"ok\":true,\"panel_id\":76}", 15_000);
+        const exact_result = exact.recvLine(15_000);
+        if (std.mem.indexOf(u8, fallback_sent, "\"cmd\":\"panel-show\"") == null or
+            std.mem.indexOf(u8, fallback_sent, "\"session\":\"legacy\"") == null or
+            std.mem.indexOf(u8, exact_result, "\\\"panel_id\\\":76") == null or
+            std.mem.indexOf(u8, exact_result, "isError") != null)
+            fail("unsupported exact origin did not recover through the explicit direct GUI socket");
+        exact.closeStdinWait();
+
+        // Without an exact environment socket, explicit GUI control wins
+        // before the canonical-default compatibility probe.
+        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        var direct = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
+        direct.initialize();
+        direct.sendTool("capabilities", "{}");
+        const cap_sent = gui.serveOne("{\"ok\":true,\"panels\":[]}", 15_000);
+        if (std.mem.indexOf(u8, cap_sent, "\"cmd\":\"panel-list\"") == null)
+            fail("explicit GUI capability probe did not use direct IPC");
+        const direct_caps = direct.recvLine(15_000);
+        if (std.mem.indexOf(u8, direct_caps, "gui_socket_explicit") == null)
+            fail("capabilities hid the explicit GUI transport source");
+        direct.sendTool("ui_show", "{\"name\":\"legacy\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"direct\"}}}}");
+        const sent = gui.serveOne("{\"ok\":true,\"panel_id\":77}", 15_000);
+        if (std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") == null)
+            fail("explicit direct socket did not receive panel-show");
+        const result = direct.recvLine(15_000);
+        if (std.mem.indexOf(u8, result, "\\\"panel_id\\\":77") == null or std.mem.indexOf(u8, result, "isError") != null) {
+            std.debug.print("smoke-mcp: explicit direct result: {s}\n", .{result});
+            fail("explicit direct transport did not return its result");
+        }
+        direct.closeStdinWait();
+        say("smoke-mcp: missing/unsupported exact origin + explicit precedence ok");
+    }
+
+    // A current daemon can still have only pre-panel_rpc GUI viewers.
+    // That is a proven pre-delivery incompatibility, so an explicitly named
+    // direct GUI socket is the one permitted mixed-version fallback.
+    {
+        var mixed_dir_buf: [320]u8 = undefined;
+        const mixed_dir = std.fmt.bufPrintZ(&mixed_dir_buf, "{s}/panel-mixed", .{rt}) catch return 1;
+        _ = c.mkdir(mixed_dir.ptr, 0o700);
+        var mixed_sock_buf: [360]u8 = undefined;
+        const mixed_sock = std.fmt.bufPrintZ(&mixed_sock_buf, "{s}/mux.sock", .{mixed_dir}) catch return 1;
+        var owner = muxclient.Conn.connectLocalAutostartAt(allocator, mixed_sock) catch
+            fail("could not start mixed-version mux daemon");
+        defer owner.deinit();
+        owner.setNonBlocking();
+        owner.sendJson(.spawn, .{
+            .name = "mixed-version",
+            .argv = [_][]const u8{ "sleep", "60" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("mixed-version session spawn send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("mixed-version session spawn reply")).deinit(allocator);
+        var legacy_viewer = attachLegacyPanelViewer(allocator, mixed_sock, "mixed-version");
+
+        var gui_buf: [320]u8 = undefined;
+        const gui_sock = std.fmt.bufPrintZ(&gui_buf, "{s}/mixed-version-gui.sock", .{rt}) catch return 1;
+        var gui = FakeGui.listen(gui_sock);
+        defer gui.deinit();
+        _ = c.setenv("SKETERM_SESSION", "mixed-version", 1);
+        _ = c.setenv("SKETERM_MUX_SOCKET", mixed_sock.ptr, 1);
+        defer _ = c.unsetenv("SKETERM_SESSION");
+        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+
+        var m = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
+        m.initialize();
+        m.sendTool("ui_show", "{\"name\":\"mixed\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"mixed fallback\"}}}}");
+        const sent = gui.serveOne("{\"ok\":true,\"panel_id\":78}", 15_000);
+        const result = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") == null or
+            std.mem.indexOf(u8, sent, "\"session\":\"mixed-version\"") == null or
+            std.mem.indexOf(u8, result, "\\\"panel_id\\\":78") == null or
+            std.mem.indexOf(u8, result, "isError") != null)
+            fail("current daemon with only a legacy GUI did not use explicit direct fallback");
+        expectNoPanelCall(&legacy_viewer, 250);
+        m.closeStdinWait();
+        legacy_viewer.deinit();
+        owner.sendJson(.kill, .{ .name = "mixed-version" }) catch fail("mixed-version cleanup send");
+        (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("mixed-version cleanup reply")).deinit(allocator);
+        say("smoke-mcp: current daemon + legacy GUI explicit fallback ok");
+    }
+
+    // ── Stage 8: exact/default/discovered transport collision ─────
+    {
+        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = c.setenv("SKETERM_SESSION", "panel-collision", 1);
+        defer _ = c.unsetenv("SKETERM_SESSION");
+
+        // Two real daemons deliberately own the same session name. One is the
+        // canonical default; the other is the exact inherited origin.
+        var default_owner = muxclient.Conn.connectLocalAutostart(allocator) catch fail("default mux start");
+        defer default_owner.deinit();
+        default_owner.setNonBlocking();
+        default_owner.sendJson(.spawn, .{
+            .name = "panel-collision",
+            .argv = [_][]const u8{ "sleep", "60" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("default collision session spawn");
+        (default_owner.recvExpectFor(&.{.ok}, 5_000) catch fail("default collision spawn reply")).deinit(allocator);
+        var default_sock_buf: [320]u8 = undefined;
+        const default_sock = std.fmt.bufPrint(&default_sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch unreachable;
+        var default_presenter = attachPanelPresenter(allocator, default_sock, "panel-collision");
+        defer default_presenter.deinit();
+        var default_identity = muxclient.connectPanelRequester(allocator, default_sock, "panel-collision", 5_000) catch
+            fail("default collision identity attach");
+        defer default_identity.deinit();
+
+        var exact_dir_buf: [320]u8 = undefined;
+        const exact_dir = std.fmt.bufPrintZ(&exact_dir_buf, "{s}/panel-exact", .{rt}) catch return 1;
+        _ = c.mkdir(exact_dir.ptr, 0o700);
+        var exact_sock_buf: [360]u8 = undefined;
+        const exact_sock = std.fmt.bufPrintZ(&exact_sock_buf, "{s}/mux.sock", .{exact_dir}) catch return 1;
+        var exact_owner = muxclient.Conn.connectLocalAutostartAt(allocator, exact_sock) catch fail("exact mux start");
+        defer exact_owner.deinit();
+        exact_owner.setNonBlocking();
+        exact_owner.sendJson(.spawn, .{
+            .name = "panel-collision",
+            .argv = [_][]const u8{ "sleep", "60" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("exact collision session spawn");
+        (exact_owner.recvExpectFor(&.{.ok}, 5_000) catch fail("exact collision spawn reply")).deinit(allocator);
+        var exact_presenter = attachPanelPresenter(allocator, exact_sock, "panel-collision");
+        defer exact_presenter.deinit();
+        var exact_identity = muxclient.connectPanelRequester(allocator, exact_sock, "panel-collision", 5_000) catch
+            fail("exact collision identity attach");
+        defer exact_identity.deinit();
+
+        _ = c.setenv("SKETERM_MUX_SOCKET", exact_sock.ptr, 1);
+        var exact_mcp = Mcp.spawn(allocator, exe, &.{});
+        exact_mcp.initialize();
+        exact_mcp.sendTool("ui_show", "{\"name\":\"exact\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"exact-daemon\"}}}}");
+        const exact_call = recvPanelCall(allocator, &exact_presenter, 15_000);
+        if (std.mem.indexOf(u8, exact_call.json, "exact-daemon") == null) fail("exact daemon received wrong panel JSON");
+        replyPanel(&exact_presenter, exact_call, "{\"ok\":true,\"panel_id\":81}");
+        exact_call.deinit(allocator);
+        const exact_reply = exact_mcp.recvLine(15_000);
+        if (std.mem.indexOf(u8, exact_reply, "\\\"panel_id\\\":81") == null)
+            fail("exact same-name daemon did not answer the panel call");
+        const exact_saved = exact_mcp.callTool("ui_save", "{\"name\":\"same-name\",\"document\":{\"title\":\"Exact origin\",\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"exact\"}}}}");
+        if (std.mem.indexOf(u8, exact_saved, "isError") != null)
+            fail("exact daemon origin save failed");
+        expectNoPanelCall(&default_presenter, 250);
+        exact_mcp.sendTool("capabilities", "{}");
+        const exact_cap_call = recvPanelCall(allocator, &exact_presenter, 15_000);
+        replyPanel(&exact_presenter, exact_cap_call, "{\"ok\":true,\"panels\":[]}");
+        exact_cap_call.deinit(allocator);
+        const exact_caps = exact_mcp.recvLine(15_000);
+        if (std.mem.indexOf(u8, exact_caps, "SKETERM_MUX_SOCKET") == null)
+            fail("capabilities hid exact-origin source in a same-name collision");
+        exact_mcp.closeStdinWait();
+
+        // No exact socket and no explicit GUI: connect-only canonical default
+        // compatibility is safe and succeeds without autostarting anything.
+        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        var compat = Mcp.spawn(allocator, exe, &.{});
+        compat.initialize();
+        compat.sendTool("capabilities", "{}");
+        const compat_cap_call = recvPanelCall(allocator, &default_presenter, 15_000);
+        replyPanel(&default_presenter, compat_cap_call, "{\"ok\":true,\"panels\":[]}");
+        compat_cap_call.deinit(allocator);
+        const compat_caps = compat.recvLine(15_000);
+        if (std.mem.indexOf(u8, compat_caps, "default_socket_connect_only") == null)
+            fail("capabilities hid canonical-default compatibility source");
+        compat.sendTool("ui_show", "{\"name\":\"default\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"default-daemon\"}}}}");
+        const default_call = recvPanelCall(allocator, &default_presenter, 15_000);
+        replyPanel(&default_presenter, default_call, "{\"ok\":true,\"panel_id\":82}");
+        default_call.deinit(allocator);
+        const default_reply = compat.recvLine(15_000);
+        if (std.mem.indexOf(u8, default_reply, "\\\"panel_id\\\":82") == null)
+            fail("canonical-default panel relay failed");
+        const default_saved = compat.callTool("ui_save", "{\"name\":\"same-name\",\"document\":{\"title\":\"Default origin\",\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"default\"}}}}");
+        if (std.mem.indexOf(u8, default_saved, "isError") != null)
+            fail("default daemon origin save failed");
+        compat.closeStdinWait();
+
+        // Identical `(session,name)` values on two exact daemons are distinct
+        // persistence scopes and cannot read or overwrite one another.
+        const exact_scope = panelstore.Scope{ .origin = .{
+            .daemon_origin = exact_sock,
+            .origin_id = exact_identity.panelOriginId(),
+        } };
+        const default_scope = panelstore.Scope{ .origin = .{
+            .daemon_origin = default_sock,
+            .origin_id = default_identity.panelOriginId(),
+        } };
+        var exact_doc = panelstore.loadScoped(allocator, exact_scope, "same-name", null) catch
+            fail("exact origin saved panel could not be loaded");
+        defer exact_doc.deinit();
+        var default_doc = panelstore.loadScoped(allocator, default_scope, "same-name", null) catch
+            fail("default origin saved panel could not be loaded");
+        defer default_doc.deinit();
+        if (!std.mem.eql(u8, exact_doc.title, "Exact origin") or
+            !std.mem.eql(u8, default_doc.title, "Default origin"))
+            fail("same session/name persistence collided across daemon origins");
+
+        // Shared-mode discovery yields a GUI socket for terminal tools, but a
+        // sessionful panel still uses the canonical daemon and cannot mutate a
+        // same-named session in whichever GUI happened to be discovered.
+        var discovered_buf: [360]u8 = undefined;
+        const discovered_sock = std.fmt.bufPrintZ(&discovered_buf, "{s}/sketerm/77777.sock", .{rt}) catch return 1;
+        var discovered_gui = FakeGui.listen(discovered_sock);
+        defer discovered_gui.deinit();
+        var discovered = Mcp.spawn(allocator, exe, &.{"--shared"});
+        discovered_gui.acceptDiscoveryProbe(5_000);
+        discovered.initialize();
+        discovered.sendTool("capabilities", "{}");
+        const discovered_cap_call = recvPanelCall(allocator, &default_presenter, 15_000);
+        replyPanel(&default_presenter, discovered_cap_call, "{\"ok\":true,\"panels\":[]}");
+        discovered_cap_call.deinit(allocator);
+        const discovered_caps = discovered.recvLine(15_000);
+        if (std.mem.indexOf(u8, discovered_caps, "default_socket_connect_only") == null or
+            std.mem.indexOf(u8, discovered_caps, "\\\"gui_socket_source\\\":\\\"discovered\\\"") == null)
+            fail("capabilities confused discovered GUI and default panel transports");
+        discovered.sendTool("ui_show", "{\"name\":\"discovered\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"must-use-default\"}}}}");
+        const discovered_show = recvPanelCall(allocator, &default_presenter, 15_000);
+        if (std.mem.indexOf(u8, discovered_show.json, "must-use-default") == null)
+            fail("discovered GUI displaced the canonical panel relay");
+        replyPanel(&default_presenter, discovered_show, "{\"ok\":true,\"panel_id\":83}");
+        discovered_show.deinit(allocator);
+        const discovered_show_reply = discovered.recvLine(15_000);
+        if (std.mem.indexOf(u8, discovered_show_reply, "\\\"panel_id\\\":83") == null)
+            fail("session mutation did not complete through canonical panel relay");
+        discovered_gui.expectNoConnection(250);
+        discovered.closeStdinWait();
+
+        // An explicitly requested GUI socket has higher precedence than the
+        // default compatibility daemon when no exact environment origin is
+        // present, and capabilities names that decision.
+        var explicit = Mcp.spawn(allocator, exe, &.{ "--socket", discovered_sock });
+        explicit.initialize();
+        explicit.sendTool("capabilities", "{}");
+        const explicit_cap_call = discovered_gui.serveOne("{\"ok\":true,\"panels\":[]}", 15_000);
+        if (std.mem.indexOf(u8, explicit_cap_call, "\"cmd\":\"panel-list\"") == null)
+            fail("explicit GUI did not receive capability panel-list");
+        const explicit_caps = explicit.recvLine(15_000);
+        if (std.mem.indexOf(u8, explicit_caps, "gui_socket_explicit") == null)
+            fail("capabilities did not name explicit GUI precedence");
+        expectNoPanelCall(&default_presenter, 250);
+        explicit.closeStdinWait();
+
+        exact_owner.sendJson(.kill, .{ .name = "panel-collision" }) catch fail("exact collision cleanup send");
+        (exact_owner.recvExpectFor(&.{.ok}, 5_000) catch fail("exact collision cleanup reply")).deinit(allocator);
+        default_owner.sendJson(.kill, .{ .name = "panel-collision" }) catch fail("default collision cleanup send");
+        (default_owner.recvExpectFor(&.{.ok}, 5_000) catch fail("default collision cleanup reply")).deinit(allocator);
+        say("smoke-mcp: exact/default/discovered collision precedence ok");
+    }
+
+    // ── Stage 9: ui_show_files, against a stand-in GUI socket ─────
     // ui_show_files is a document GENERATOR over ui_show's path, so the
     // load-bearing assertion is what it SENDS: a stand-in socket
     // answers panel-show and the stage reads the document off the wire.
@@ -975,6 +1835,40 @@ pub fn main() u8 {
         if (std.mem.indexOf(u8, sent3, "\"name\":\"plain\"") == null)
             fail("ui_show stopped working after ui_show_files refusals");
         _ = m.recvLine(15_000);
+
+        // Exactly 1 MiB remains the document parser boundary, while the
+        // direct control request is larger because the document becomes an
+        // escaped JSON string. Exercise the real Unix socket, not just codecs.
+        const doc_prefix = "{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"ok\"}},\"padding\":\"";
+        const doc_suffix = "\"}";
+        const max_doc = allocator.alloc(u8, 1 << 20) catch fail("maximum direct document allocation");
+        defer allocator.free(max_doc);
+        @memcpy(max_doc[0..doc_prefix.len], doc_prefix);
+        const max_body = max_doc[doc_prefix.len .. max_doc.len - doc_suffix.len];
+        var max_i: usize = 0;
+        while (max_i + 1 < max_body.len) : (max_i += 2) {
+            max_body[max_i] = '\\';
+            max_body[max_i + 1] = '"';
+        }
+        if (max_i < max_body.len) max_body[max_i] = 'x';
+        @memcpy(max_doc[max_doc.len - doc_suffix.len ..], doc_suffix);
+        const max_args = std.fmt.allocPrint(allocator, "{{\"name\":\"max-boundary\",\"session\":\"vsr\",\"document\":{s}}}", .{max_doc}) catch
+            fail("maximum direct arguments allocation");
+        defer allocator.free(max_args);
+        m.sendToolAllocated("ui_show", max_args);
+        const max_sent = gui.serveOne("{\"ok\":true,\"panel_id\":7}", 30_000);
+        if (max_sent.len <= (1 << 20) or max_sent.len > protocol.MAX_LINE)
+            fail("maximum direct request did not cross the expanded bounded transport");
+        var max_parsed = protocol.parseRequest(allocator, std.mem.trimEnd(u8, max_sent, "\n")) catch
+            fail("maximum direct GUI request did not parse");
+        defer max_parsed.deinit();
+        if (max_parsed.value.document == null or max_parsed.value.document.?.len != max_doc.len or
+            !std.mem.eql(u8, max_parsed.value.document.?, max_doc))
+            fail("maximum direct panel document changed across GUI IPC");
+        const max_result = m.recvLine(30_000);
+        if (std.mem.indexOf(u8, max_result, "\\\"panel_id\\\":7") == null or
+            std.mem.indexOf(u8, max_result, "isError") != null)
+            fail("maximum direct panel request did not complete");
 
         m.closeStdinWait();
         say("smoke-mcp: ui_show_files ok");

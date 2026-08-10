@@ -24,6 +24,7 @@ const platform = @import("util/platform.zig");
 const predict_mod = @import("mux/predict.zig");
 const cell_mod = @import("grid/cell.zig");
 const profile_util = @import("util/profile.zig");
+const clock = @import("util/clock.zig");
 
 fn nextReconnectDelay(delay_ms: u32) u32 {
     return @min(delay_ms * 2, 30_000);
@@ -45,6 +46,9 @@ fn nextReconnectDelay(delay_ms: u32) u32 {
 /// `terminal` (nulled in deinit).
 pub const DrainHandle = struct {
     alive: std.atomic.Value(bool) = .{ .raw = true },
+    /// Cleared when permanent pane teardown begins; transport loss leaves it
+    /// set so already-committed local panel hydration can survive reconnect.
+    panel_assets_live: std.atomic.Value(bool) = .{ .raw = true },
     /// Borrowed; nulled in deinit.
     terminal: ?*Terminal = null,
 };
@@ -167,6 +171,21 @@ pub const Terminal = struct {
     /// Cast-playback state (play_state frames from a cast session).
     /// `st.markers` is valid only for the duration of the callback.
     on_play_state: ?*const fn (ctx: ?*anyopaque, st: PlayState) void = null,
+    /// GTK-main-loop dispatch for a daemon-forwarded native panel request.
+    /// Asset-bearing calls may reply later through `replyPanelRequest`.
+    on_panel_request: ?*const fn (ctx: ?*anyopaque, terminal: *Terminal, request_id: u64, request: []const u8) void = null,
+    /// Close every panel owned by this stable Terminal origin before its
+    /// attachment is permanently torn down. Rewiring preserves this hook.
+    on_panel_origin_close: ?*const fn (terminal: *Terminal) void = null,
+    /// Refresh mutable panel display/store metadata while confinement keeps
+    /// using this Terminal's immutable origin. Rewiring preserves this hook.
+    on_panel_origin_renamed: ?*const fn (terminal: *Terminal, name: []const u8) void = null,
+    /// Cancel queued or deferred panel mutations when a transport drops;
+    /// already-mounted panels survive while this Terminal reconnects.
+    on_panel_work_cancel: ?*const fn (terminal: *Terminal) void = null,
+    /// GUI-owned relay-scope attachment, erased to keep Terminal GTK-free.
+    /// It survives sink rewiring and is released by `closePanelOrigin`.
+    panel_scope_ctx: ?*anyopaque = null,
     /// Latest play_state, markers stripped (they are callback-scoped).
     last_play_state: ?PlayState = null,
 
@@ -268,6 +287,11 @@ pub const Terminal = struct {
     pub const Remote = struct {
         conn: mux_client.Conn,
         session: []u8,
+        /// Immutable spawn-time identity advertised by session_meta. This is
+        /// never rewritten by rename; old daemons fall back to the attach name.
+        origin_name: []u8,
+        /// Lifetime-unique session incarnation; empty for an old daemon.
+        origin_id: []u8 = &.{},
         /// Transport host string (bare auto, forced "udp:"/"ssh:") or null for
         /// the local daemon. Owned for reconnect and layout persistence.
         host: ?[]u8 = null,
@@ -293,6 +317,7 @@ pub const Terminal = struct {
         pending_ticket_cb: ?*const fn (ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void = null,
         pending_ticket_ctx: ?*anyopaque = null,
         watch_id: c_uint = 0,
+        write_watch_id: c_uint = 0,
         idle_kick_id: c_uint = 0,
         /// ── Connection state axes (orthogonal, see predicates below) ──
         /// `connected` = transport attached (`conn` valid). False while
@@ -308,6 +333,9 @@ pub const Terminal = struct {
         upgrade_job_active: bool = false,
         reconnect_timer: c_uint = 0,
         reconnect_generation: u64 = 0,
+        /// Bumped only when the attached connection is lost. Deferred panel
+        /// work captures this value so a later reconnect cannot revive it.
+        panel_generation: u64 = 1,
         retry_delay_ms: u32 = 1000,
         pending_rows: u16 = 0,
         pending_cols: u16 = 0,
@@ -349,6 +377,10 @@ pub const Terminal = struct {
         upload_next_id: u32 = 1,
         /// Active file download (one at a time), null = none.
         download: ?*Download = null,
+        /// Correlated asynchronous ranged reads used by remote panel assets.
+        fs_reads: std.ArrayList(*RemoteFileRead) = .empty,
+        fs_next_req: u32 = 0x80000000,
+        fs_read_timer: c_uint = 0,
         /// xfer id of the most recent directory-list request; a listing
         /// with a different id is stale (we navigated away) and ignored.
         list_xfer: u32 = 0,
@@ -382,6 +414,11 @@ pub const Terminal = struct {
             self.reconnect_generation +%= 1;
             if (self.reconnect_generation == 0) self.reconnect_generation = 1;
         }
+
+        fn bumpPanelGeneration(self: *Remote) void {
+            self.panel_generation +%= 1;
+            if (self.panel_generation == 0) self.panel_generation = 1;
+        }
     };
 
     const ReconnectJob = struct {
@@ -390,6 +427,7 @@ pub const Terminal = struct {
         host: ?[]u8,
         port_range: []u8,
         session: []u8,
+        origin_id: []u8,
         pending_rename: ?[]u8,
         read_only: bool,
         control: bool,
@@ -397,6 +435,7 @@ pub const Terminal = struct {
         conn: ?mux_client.Conn = null,
         snapshot: ?[]u8 = null,
         session_missing: bool = false,
+        identity_mismatch: bool = false,
         rename_applied: bool = false,
 
         fn destroy(self: *ReconnectJob) void {
@@ -406,6 +445,7 @@ pub const Terminal = struct {
             if (self.host) |host| a.free(host);
             if (self.port_range.len > 0) a.free(self.port_range);
             a.free(self.session);
+            if (self.origin_id.len > 0) a.free(self.origin_id);
             if (self.pending_rename) |name| a.free(name);
             a.destroy(self);
         }
@@ -478,6 +518,50 @@ pub const Terminal = struct {
         recv: u64 = 0, // bytes written locally
     };
 
+    pub const RemoteFileResult = union(enum) {
+        success: struct {
+            /// Owned by the callback, allocated with `terminal.allocator`.
+            bytes: []u8,
+            size: u64,
+            mtime_ns: i64,
+            ino: u64,
+        },
+        failure: []const u8,
+    };
+
+    pub const RemoteFileCallback = *const fn (
+        ctx: ?*anyopaque,
+        terminal: *Terminal,
+        token: u32,
+        result: RemoteFileResult,
+    ) void;
+
+    const RemoteFileRead = struct {
+        terminal: *Terminal,
+        token: u32,
+        path: []u8,
+        max_bytes: usize,
+        deadline_ms: i64,
+        ctx: ?*anyopaque,
+        callback: RemoteFileCallback,
+        data: std.ArrayList(u8) = .empty,
+        identity_set: bool = false,
+        size: u64 = 0,
+        mtime_ns: i64 = 0,
+        ino: u64 = 0,
+        received_data: bool = false,
+
+        fn deinit(self: *RemoteFileRead) void {
+            const allocator = self.terminal.allocator;
+            self.data.deinit(allocator);
+            allocator.free(self.path);
+            allocator.destroy(self);
+        }
+    };
+
+    const REMOTE_FILE_READ_MAX: usize = 4;
+    const REMOTE_FILE_READ_CHUNK: u32 = 256 << 10;
+
     /// Attach to an existing sketerm-mux session. `conn` must have
     /// already completed ATTACH and received the first SNAPSHOT
     /// (passed as `snap_payload`, seq header included) — that keeps
@@ -488,6 +572,7 @@ pub const Terminal = struct {
         conn: mux_client.Conn,
         session_name: []const u8,
         snap_payload: []const u8,
+        initial_identity: mux_client.AttachIdentity,
         host: ?[]const u8,
         port_range: []const u8,
         read_only: bool,
@@ -509,8 +594,17 @@ pub const Terminal = struct {
         // only clean up what we allocated here.
         const remote = try allocator.create(Remote);
         errdefer allocator.destroy(remote);
-        const session_owned = try allocator.dupe(u8, session_name);
+        const acknowledged_name = if (initial_identity.valid) initial_identity.name() else session_name;
+        const acknowledged_origin = if (initial_identity.valid) initial_identity.originName() else session_name;
+        const session_owned = try allocator.dupe(u8, acknowledged_name);
         errdefer allocator.free(session_owned);
+        const origin_name_owned = try allocator.dupe(u8, acknowledged_origin);
+        errdefer allocator.free(origin_name_owned);
+        const origin_id_owned: []u8 = if (initial_identity.valid)
+            try allocator.dupe(u8, initial_identity.originId())
+        else
+            &.{};
+        errdefer if (origin_id_owned.len > 0) allocator.free(origin_id_owned);
         const host_owned: ?[]u8 = if (host) |h| try allocator.dupe(u8, h) else null;
         errdefer if (host_owned) |h| allocator.free(h);
         const port_range_owned: []u8 = if (port_range.len > 0) try allocator.dupe(u8, port_range) else &.{};
@@ -518,6 +612,8 @@ pub const Terminal = struct {
         remote.* = .{
             .conn = conn,
             .session = session_owned,
+            .origin_name = origin_name_owned,
+            .origin_id = origin_id_owned,
             .host = host_owned,
             .port_range = port_range_owned,
             .read_only = read_only,
@@ -603,6 +699,161 @@ pub const Terminal = struct {
         remote.idle_kick_id = c.g_idle_add(@ptrCast(&remoteIdleKick), @ptrCast(self.drain));
     }
 
+    fn armRemoteWriteWatch(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (!remote.canSend() or remote.write_watch_id != 0 or remote.conn.wbuf.items.len == 0) return;
+        remote.write_watch_id = c.g_unix_fd_add(
+            remote.conn.fd,
+            c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&remoteWriteCb),
+            @ptrCast(self.drain),
+        );
+    }
+
+    fn remoteWriteCb(_: c_int, _: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const drain: *DrainHandle = @ptrCast(@alignCast(user.?));
+        if (!drain.alive.load(.acquire)) return 0;
+        const self = drain.terminal orelse return 0;
+        const remote = self.remote orelse return 0;
+        remote.conn.flushQueued() catch {
+            remote.write_watch_id = 0;
+            self.transportLost("queued mux write failed");
+            return 0;
+        };
+        if (remote.conn.wbuf.items.len == 0) {
+            remote.write_watch_id = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    /// Begin one non-blocking ranged read over this attached mux connection.
+    pub fn beginRemoteFileRead(
+        self: *Terminal,
+        path: []const u8,
+        max_bytes: usize,
+        timeout_ms: i64,
+        ctx: ?*anyopaque,
+        callback: RemoteFileCallback,
+    ) !u32 {
+        const remote = self.remote orelse return error.NotRemote;
+        if (!remote.canSend()) return error.NotConnected;
+        if (path.len == 0 or path.len > 1024 or path[0] != '/') return error.BadPath;
+        if (max_bytes == 0) return error.TooBig;
+        if (remote.fs_reads.items.len >= REMOTE_FILE_READ_MAX) return error.Busy;
+
+        const read = try self.allocator.create(RemoteFileRead);
+        errdefer self.allocator.destroy(read);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const token = self.nextRemoteFileReq();
+        read.* = .{
+            .terminal = self,
+            .token = token,
+            .path = owned_path,
+            .max_bytes = max_bytes,
+            .deadline_ms = clock.nowMs() + @max(timeout_ms, 1),
+            .ctx = ctx,
+            .callback = callback,
+        };
+        try remote.fs_reads.append(self.allocator, read);
+        errdefer {
+            _ = remote.fs_reads.pop();
+            read.deinit();
+        }
+        try self.sendRemoteFileRange(read);
+        if (remote.fs_read_timer == 0) {
+            remote.fs_read_timer = c.g_timeout_add(
+                100,
+                @ptrCast(&remoteFileReadTick),
+                @ptrCast(self.drain),
+            );
+        }
+        return token;
+    }
+
+    fn nextRemoteFileReq(self: *Terminal) u32 {
+        const remote = self.remote.?;
+        while (true) {
+            const req = remote.fs_next_req;
+            remote.fs_next_req +%= 1;
+            if (remote.fs_next_req < 0x80000000) remote.fs_next_req = 0x80000000;
+            if (req == 0) continue;
+            var used = false;
+            for (remote.fs_reads.items) |read| if (read.token == req) {
+                used = true;
+                break;
+            };
+            if (!used) return req;
+        }
+    }
+
+    fn sendRemoteFileRange(self: *Terminal, read: *RemoteFileRead) !void {
+        const remote = self.remote orelse return error.NotConnected;
+        if (!remote.canSend()) return error.NotConnected;
+        const remaining = read.max_bytes -| read.data.items.len;
+        if (remaining == 0) return error.TooBig;
+        const len: u32 = @intCast(@min(remaining, REMOTE_FILE_READ_CHUNK));
+        read.received_data = false;
+        try remote.conn.queueJson(.fs_op, .{
+            .req = read.token,
+            .op = "read",
+            .path = read.path,
+            .off = @as(u64, @intCast(read.data.items.len)),
+            .len = len,
+        });
+        self.armRemoteWriteWatch();
+    }
+
+    fn remoteFileReadTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const drain: *DrainHandle = @ptrCast(@alignCast(user.?));
+        if (!drain.alive.load(.acquire)) return 0;
+        const self = drain.terminal orelse return 0;
+        const remote = self.remote orelse return 0;
+        const now = clock.nowMs();
+        var i: usize = 0;
+        while (i < remote.fs_reads.items.len) {
+            if (now < remote.fs_reads.items[i].deadline_ms) {
+                i += 1;
+                continue;
+            }
+            self.finishRemoteFileRead(i, .{ .failure = "remote asset read timed out" });
+        }
+        if (remote.fs_reads.items.len == 0) {
+            remote.fs_read_timer = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    /// Cancel a pending ranged read without invoking its callback.
+    pub fn cancelRemoteFileRead(self: *Terminal, token: u32) void {
+        const remote = self.remote orelse return;
+        for (remote.fs_reads.items, 0..) |read, i| {
+            if (read.token != token) continue;
+            _ = remote.fs_reads.orderedRemove(i);
+            read.deinit();
+            self.stopRemoteFileReadTimerIfIdle();
+            return;
+        }
+    }
+
+    fn cancelRemoteFileReads(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        while (remote.fs_reads.items.len > 0) {
+            const read = remote.fs_reads.pop().?;
+            read.deinit();
+        }
+        self.stopRemoteFileReadTimerIfIdle();
+    }
+
+    fn stopRemoteFileReadTimerIfIdle(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.fs_reads.items.len != 0 or remote.fs_read_timer == 0) return;
+        _ = c.g_source_remove(remote.fs_read_timer);
+        remote.fs_read_timer = 0;
+    }
+
     /// Preserve the pane and frozen screen while reattaching its durable session.
     fn transportLost(self: *Terminal, reason: []const u8) void {
         const remote = self.remote orelse return;
@@ -612,19 +863,40 @@ pub const Terminal = struct {
             _ = c.g_source_remove(remote.watch_id);
             remote.watch_id = 0;
         }
+        if (remote.write_watch_id != 0) {
+            _ = c.g_source_remove(remote.write_watch_id);
+            remote.write_watch_id = 0;
+        }
         if (remote.idle_kick_id != 0) {
             _ = c.g_source_remove(remote.idle_kick_id);
             remote.idle_kick_id = 0;
         }
+        remote.bumpPanelGeneration();
+        if (self.on_panel_work_cancel) |cancel| cancel(self);
         remote.conn.deinit();
         remote.pending_record = 0;
         self.failPendingTicket();
+        self.cancelRemoteFileReads();
         self.cancelUploads();
         self.cancelDownload();
         self.destroyAllChans();
         remote.predictor.pending.clearRetainingCapacity();
         remote.predictor.overlay.clearRetainingCapacity();
         self.syncPredictions();
+        // Without a lifetime id there is no way to tell this session apart
+        // from a later one that reused its name, so reattaching could silently
+        // hand the pane a different shell. Only a daemon older than session
+        // identity omits it; say that, since restarting it is the fix.
+        if (!@import("mux/daemon.zig").validSessionOriginId(remote.origin_id)) {
+            self.notifyConnectionState(.unavailable, 0);
+            std.debug.print(
+                "sketerm: mux session '{s}': {s}; this daemon reports no session lifetime id, " ++
+                    "so reattaching cannot prove it is the same session - restart sketerm-mux to reconnect\n",
+                .{ remote.session, reason },
+            );
+            self.remoteClosed("daemon predates session lifetime identity; reattach cannot be proven safe", true);
+            return;
+        }
         std.debug.print("sketerm: mux session '{s}': {s}; reconnecting\n", .{ remote.session, reason });
         self.notifyConnectionState(.lost, 0);
         self.startReconnectAttempt();
@@ -671,6 +943,7 @@ pub const Terminal = struct {
 
     fn makeReconnectJob(self: *Terminal, upgrade: bool) ?*ReconnectJob {
         const remote = self.remote orelse return null;
+        if (!@import("mux/daemon.zig").validSessionOriginId(remote.origin_id)) return null;
         const a = std.heap.c_allocator;
         const job = a.create(ReconnectJob) catch return null;
         const session = a.dupe(u8, remote.session) catch {
@@ -688,7 +961,15 @@ pub const Terminal = struct {
             a.destroy(job);
             return null;
         } else &.{};
+        const origin_id: []u8 = if (remote.origin_id.len > 0) a.dupe(u8, remote.origin_id) catch {
+            if (port_range.len > 0) a.free(port_range);
+            if (host) |h| a.free(h);
+            a.free(session);
+            a.destroy(job);
+            return null;
+        } else &.{};
         const pending_rename: ?[]u8 = if (remote.pending_rename) |name| a.dupe(u8, name) catch {
+            if (origin_id.len > 0) a.free(origin_id);
             if (port_range.len > 0) a.free(port_range);
             if (host) |h| a.free(h);
             a.free(session);
@@ -701,6 +982,7 @@ pub const Terminal = struct {
             .host = host,
             .port_range = port_range,
             .session = session,
+            .origin_id = origin_id,
             .pending_rename = pending_rename,
             .read_only = remote.read_only,
             .control = self.has_control or remote.force_control,
@@ -719,12 +1001,14 @@ pub const Terminal = struct {
         var conn_owned = true;
         defer if (conn_owned) conn.deinit();
         const attach_control = job.control and !job.upgrade;
-        const snapshot = reconnectAttach(&conn, job.session, job.read_only, attach_control) catch |err| blk: {
+        const snapshot = reconnectAttach(&conn, job.session, job.origin_id, job.read_only, attach_control) catch |err| blk: {
             if (err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "no such session")) {
                 if (job.pending_rename) |name| {
-                    const renamed = reconnectAttach(&conn, name, job.read_only, attach_control) catch |rename_err| {
+                    const renamed = reconnectAttach(&conn, name, job.origin_id, job.read_only, attach_control) catch |rename_err| {
                         if (rename_err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "no such session"))
                             job.session_missing = true;
+                        if (rename_err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
+                            job.identity_mismatch = true;
                         return reconnectHandback(job);
                     };
                     job.rename_applied = true;
@@ -732,6 +1016,8 @@ pub const Terminal = struct {
                 }
                 job.session_missing = true;
             }
+            if (err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
+                job.identity_mismatch = true;
             return reconnectHandback(job);
         };
         job.snapshot = snapshot.payload;
@@ -746,9 +1032,16 @@ pub const Terminal = struct {
         return mux_client.Conn.connectRemote(a, host, if (job.port_range.len > 0) job.port_range else null);
     }
 
-    fn reconnectAttach(conn: *mux_client.Conn, session: []const u8, read_only: bool, control: bool) !mux_client.Conn.OwnedFrame {
-        try conn.sendJson(.attach, .{ .name = session, .kind = "gui", .read_only = read_only, .control = control });
-        return conn.recvExpectFor(&.{.snapshot}, 30_000);
+    fn reconnectAttach(conn: *mux_client.Conn, session: []const u8, origin_id: []const u8, read_only: bool, control: bool) !mux_client.Conn.OwnedFrame {
+        if (!@import("mux/daemon.zig").validSessionOriginId(origin_id)) return error.MissingOriginId;
+        try conn.sendAttach(session, .{
+            .origin_id = origin_id,
+            .kind = "gui",
+            .read_only = read_only,
+            .control = control,
+            .panel_rpc = conn.panel_rpc,
+        });
+        return (try conn.recvGuiAttachFor(30_000)).snapshot;
     }
 
     fn reconnectHandback(job: *ReconnectJob) void {
@@ -768,9 +1061,12 @@ pub const Terminal = struct {
         if (job.upgrade) remote.upgrade_job_active = false else remote.reconnect_job_active = false;
         if (job.upgrade) return self.finishTransportUpgrade(job);
         if (!remote.awaitingReconnect()) return 0;
-        if (job.session_missing) {
+        if (job.session_missing or job.identity_mismatch) {
             self.notifyConnectionState(.unavailable, 0);
-            std.debug.print("sketerm: mux session '{s}': no longer available\n", .{remote.session});
+            std.debug.print("sketerm: mux session '{s}': {s}\n", .{
+                remote.session,
+                if (job.identity_mismatch) "lifetime identity changed; refusing same-name replacement" else "no longer available",
+            });
             return 0;
         }
         if (job.conn == null) {
@@ -800,7 +1096,12 @@ pub const Terminal = struct {
         remote.pending_rename = null;
         self.allocator.free(remote.session);
         remote.session = renamed;
-        if (self.on_session_renamed) |f| f(self.user_ctx, renamed);
+        self.notifySessionRenamed(renamed);
+    }
+
+    fn notifySessionRenamed(self: *Terminal, name: []const u8) void {
+        if (self.on_panel_origin_renamed) |f| f(self, name);
+        if (self.on_session_renamed) |f| f(self.user_ctx, name);
     }
 
     /// Shared reattach epilogue: install the job's connection, commit or
@@ -1049,9 +1350,13 @@ pub const Terminal = struct {
                 }
                 const pending = remote.pending_rename orelse return;
                 remote.pending_rename = null;
-                self.allocator.free(remote.session);
-                remote.session = pending;
-                if (self.on_session_renamed) |f| f(self.user_ctx, pending);
+                if (std.mem.eql(u8, remote.session, pending)) {
+                    self.allocator.free(pending);
+                } else {
+                    self.allocator.free(remote.session);
+                    remote.session = pending;
+                    self.notifySessionRenamed(pending);
+                }
             },
             .err => {
                 const remote = self.remote orelse return;
@@ -1074,14 +1379,47 @@ pub const Terminal = struct {
             .peer_info => self.handlePeerInfo(frame.payload),
             .control_state => self.handleControlState(frame.payload),
             .play_state => self.handlePlayState(frame.payload),
+            .panel_request => self.handlePanelRequest(frame.payload),
+            .fs_data => self.handleRemoteFileData(frame.payload),
+            .fs_reply => self.handleRemoteFileReply(frame.payload),
             .session_meta => {
-                const Meta = struct { cwd: []const u8 = "", program: []const u8 = "" };
+                const Meta = struct {
+                    cwd: []const u8 = "",
+                    program: []const u8 = "",
+                    name: []const u8 = "",
+                    origin_name: []const u8 = "",
+                    origin_id: []const u8 = "",
+                };
                 var parsed = std.json.parseFromSlice(Meta, self.allocator, frame.payload, .{
                     .ignore_unknown_fields = true,
                 }) catch return;
                 defer parsed.deinit();
                 if (parsed.value.cwd.len > 0) self.setCwd(parsed.value.cwd);
                 if (parsed.value.program.len > 0) self.setProgram(parsed.value.program);
+                const remote = self.remote orelse return;
+                if (parsed.value.origin_name.len > 0 and
+                    !std.mem.eql(u8, remote.origin_name, parsed.value.origin_name))
+                {
+                    const origin = self.allocator.dupe(u8, parsed.value.origin_name) catch return;
+                    self.allocator.free(remote.origin_name);
+                    remote.origin_name = origin;
+                }
+                if (@import("mux/daemon.zig").validSessionOriginId(parsed.value.origin_id)) {
+                    if (remote.origin_id.len == 0) {
+                        remote.origin_id = self.allocator.dupe(u8, parsed.value.origin_id) catch return;
+                    } else if (!std.mem.eql(u8, remote.origin_id, parsed.value.origin_id)) {
+                        self.transportLost("session lifetime identity changed");
+                        return;
+                    }
+                }
+                if (parsed.value.name.len > 0 and
+                    !std.mem.eql(u8, remote.session, parsed.value.name))
+                {
+                    const name = self.allocator.dupe(u8, parsed.value.name) catch return;
+                    self.allocator.free(remote.session);
+                    remote.session = name;
+                    self.notifySessionRenamed(name);
+                }
             },
             .file_data => self.downloadData(frame.payload),
             .udp_ticket => {
@@ -1102,6 +1440,134 @@ pub const Terminal = struct {
             },
             else => {},
         }
+    }
+
+    fn handlePanelRequest(self: *Terminal, payload: []const u8) void {
+        const envelope = mux_wire.decodePanelEnvelope(payload) catch return;
+        const remote = self.remote orelse return;
+        if (!remote.canSend()) return;
+        if (self.on_panel_request) |dispatch| {
+            dispatch(self.user_ctx, self, envelope.id, envelope.json);
+        } else {
+            self.replyPanelRequest(envelope.id, "{\"ok\":false,\"error\":\"receiving GUI attachment cannot host panels\"}");
+        }
+    }
+
+    /// Queue one correlated panel response without blocking the GTK loop.
+    pub fn replyPanelRequest(self: *Terminal, request_id: u64, response: []const u8) void {
+        const remote = self.remote orelse return;
+        if (!remote.canSend()) return;
+        const json = std.mem.trimEnd(u8, response, "\r\n");
+        if (json.len == 0) return;
+        remote.conn.queuePanelReply(request_id, json) catch {
+            self.transportLost("panel reply write failed");
+            return;
+        };
+        self.armRemoteWriteWatch();
+    }
+
+    fn remoteFileReadIndex(self: *Terminal, token: u32) ?usize {
+        const remote = self.remote orelse return null;
+        for (remote.fs_reads.items, 0..) |read, i| if (read.token == token) return i;
+        return null;
+    }
+
+    fn handleRemoteFileData(self: *Terminal, payload: []const u8) void {
+        if (payload.len < 12) return;
+        const token = std.mem.readInt(u32, payload[0..4], .little);
+        const index = self.remoteFileReadIndex(token) orelse return;
+        const remote = self.remote.?;
+        const read = remote.fs_reads.items[index];
+        const off = std.mem.readInt(u64, payload[4..12], .little);
+        const chunk = payload[12..];
+        if (off != read.data.items.len or chunk.len > REMOTE_FILE_READ_CHUNK or
+            chunk.len > read.max_bytes -| read.data.items.len)
+        {
+            self.finishRemoteFileRead(index, .{ .failure = "malformed remote asset data" });
+            return;
+        }
+        read.data.appendSlice(self.allocator, chunk) catch {
+            self.finishRemoteFileRead(index, .{ .failure = "out of memory receiving remote asset" });
+            return;
+        };
+        read.received_data = true;
+    }
+
+    fn handleRemoteFileReply(self: *Terminal, payload: []const u8) void {
+        const Reply = struct {
+            req: u32 = 0,
+            ok: bool = false,
+            @"error": []const u8 = "",
+            size: u64 = 0,
+            eof: bool = false,
+            mtime_ns: i64 = 0,
+            ino: u64 = 0,
+        };
+        var parsed = std.json.parseFromSlice(Reply, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        const reply = parsed.value;
+        const index = self.remoteFileReadIndex(reply.req) orelse return;
+        const remote = self.remote.?;
+        const read = remote.fs_reads.items[index];
+        if (!reply.ok) {
+            self.finishRemoteFileRead(index, .{ .failure = if (reply.@"error".len > 0) reply.@"error" else "remote asset read failed" });
+            return;
+        }
+        if (reply.size > read.max_bytes) {
+            self.finishRemoteFileRead(index, .{ .failure = "remote asset exceeds the per-file byte limit" });
+            return;
+        }
+        if (!read.identity_set) {
+            read.identity_set = true;
+            read.size = reply.size;
+            read.mtime_ns = reply.mtime_ns;
+            read.ino = reply.ino;
+        } else if (read.size != reply.size or read.mtime_ns != reply.mtime_ns or read.ino != reply.ino) {
+            self.finishRemoteFileRead(index, .{ .failure = "remote asset changed while it was being read" });
+            return;
+        }
+        if (read.data.items.len > read.size) {
+            self.finishRemoteFileRead(index, .{ .failure = "remote asset size changed while it was being read" });
+            return;
+        }
+        if (reply.eof or read.data.items.len == read.size) {
+            if (read.data.items.len != read.size) {
+                self.finishRemoteFileRead(index, .{ .failure = "remote asset ended before its advertised size" });
+                return;
+            }
+            const bytes = read.data.toOwnedSlice(self.allocator) catch {
+                self.finishRemoteFileRead(index, .{ .failure = "out of memory finalizing remote asset" });
+                return;
+            };
+            self.finishRemoteFileRead(index, .{ .success = .{
+                .bytes = bytes,
+                .size = read.size,
+                .mtime_ns = read.mtime_ns,
+                .ino = read.ino,
+            } });
+            return;
+        }
+        if (!read.received_data) {
+            self.finishRemoteFileRead(index, .{ .failure = "remote asset read made no progress" });
+            return;
+        }
+        self.sendRemoteFileRange(read) catch {
+            self.finishRemoteFileRead(index, .{ .failure = "could not request the next remote asset range" });
+        };
+    }
+
+    fn finishRemoteFileRead(self: *Terminal, index: usize, result: RemoteFileResult) void {
+        const remote = self.remote orelse return;
+        if (index >= remote.fs_reads.items.len) return;
+        const read = remote.fs_reads.orderedRemove(index);
+        const callback = read.callback;
+        const ctx = read.ctx;
+        const token = read.token;
+        read.deinit();
+        self.stopRemoteFileReadTimerIfIdle();
+        callback(ctx, self, token, result);
     }
 
     fn applyRemoteSnapshot(self: *Terminal, payload: []const u8) !void {
@@ -1157,7 +1623,9 @@ pub const Terminal = struct {
         const remote = self.remote orelse return;
         if (remote.closed) return;
         remote.closed = true;
+        self.closePanelOrigin();
         self.failPendingTicket();
+        self.cancelRemoteFileReads();
         self.cancelUploads();
         self.cancelDownload();
         self.destroyAllChans();
@@ -2435,6 +2903,13 @@ pub const Terminal = struct {
     /// Used by Window.deinit to fence the terminals before tearing
     /// down the panes that own the sink targets.
     pub fn clearSinks(self: *Terminal) void {
+        self.closePanelOrigin();
+        self.clearSinksForRewire();
+    }
+
+    /// Fence callbacks while ownership moves from a tabless AppSession to a
+    /// Pane, without treating the still-live mux attachment as torn down.
+    pub fn clearSinksForRewire(self: *Terminal) void {
         self.user_ctx = null;
         self.on_title = null;
         self.on_cwd_changed = null;
@@ -2484,8 +2959,58 @@ pub const Terminal = struct {
         }
         self.on_cmd_status = null;
         self.on_play_state = null;
+        self.on_panel_request = null;
         self.broadcast_sink = null;
         self.broadcast_ctx = null;
+    }
+
+    /// Stop daemon routing before the GUI registry exposes a surviving viewer.
+    fn retireAttachmentForTeardown(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.closed or remote.destroying) return;
+        remote.destroying = true;
+        if (remote.watch_id != 0) {
+            _ = c.g_source_remove(remote.watch_id);
+            remote.watch_id = 0;
+        }
+        if (remote.write_watch_id != 0) {
+            _ = c.g_source_remove(remote.write_watch_id);
+            remote.write_watch_id = 0;
+        }
+        if (remote.idle_kick_id != 0) {
+            _ = c.g_source_remove(remote.idle_kick_id);
+            remote.idle_kick_id = 0;
+        }
+        if (!remote.connected) return;
+
+        // Preserve stream framing when possible. If an older queued frame is
+        // stuck, closing the transport is still an immediate daemon-side
+        // presenter retirement and is safer than discarding a partial frame.
+        remote.conn.flushQueuedFor(remote.conn.write_timeout_ms) catch {};
+        if (remote.conn.wbuf.items.len == 0) {
+            if (remote.ephemeral) {
+                var kbuf: [128]u8 = undefined;
+                if (std.fmt.bufPrint(&kbuf, "{{\"name\":\"{s}\"}}", .{remote.session})) |payload| {
+                    remote.conn.sendFrame(.kill, payload) catch {};
+                } else |_| {}
+            } else {
+                remote.conn.sendFrame(.detach, "") catch {};
+            }
+        }
+        remote.conn.deinit();
+        remote.connected = false;
+    }
+
+    /// Permanently retire this Terminal's relay origin exactly once.
+    pub fn closePanelOrigin(self: *Terminal) void {
+        self.retireAttachmentForTeardown();
+        self.drain.panel_assets_live.store(false, .release);
+        if (self.on_panel_work_cancel) |cancel| cancel(self);
+        self.on_panel_work_cancel = null;
+        self.on_panel_origin_renamed = null;
+        const close = self.on_panel_origin_close orelse return;
+        self.on_panel_origin_close = null;
+        close(self);
     }
 
     /// Send user input bytes (keystrokes, paste, etc) to the PTY,
@@ -2567,15 +3092,18 @@ pub const Terminal = struct {
     }
 
     pub fn deinit(self: *Terminal) void {
+        self.closePanelOrigin();
         if (self.remote) |remote| {
             // Detach, don't kill: the session keeps running in the
             // daemon — that's the entire point.
-            remote.destroying = true;
             self.failPendingTicket();
             self.drain.terminal = null;
             self.drain.alive.store(false, .release);
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
+            if (remote.write_watch_id != 0) _ = c.g_source_remove(remote.write_watch_id);
             if (remote.idle_kick_id != 0) _ = c.g_source_remove(remote.idle_kick_id);
+            self.cancelRemoteFileReads();
+            remote.fs_reads.deinit(self.allocator);
             if (remote.reconnect_timer != 0) _ = c.g_source_remove(remote.reconnect_timer);
             if (remote.expire_timer != 0) _ = c.g_source_remove(remote.expire_timer);
             self.cancelUploads();
@@ -2586,28 +3114,13 @@ pub const Terminal = struct {
             remote.wsapps.deinit(self.allocator);
             remote.aapps.deinit(self.allocator);
             remote.predictor.deinit();
-            if (remote.canSend()) {
-                // A stalled upload can leave queued frames in conn.wbuf;
-                // the kill/detach below must not silently queue behind
-                // them and die with the fd. Bounded, best-effort drain.
-                remote.conn.flushQueuedFor(remote.conn.write_timeout_ms) catch {};
-                if (remote.ephemeral) {
-                    // GUI-owned session: kill it so a closed tab doesn't
-                    // leak a daemon session. Session names are GUI-minted
-                    // (`s<pid>-<n>`), so the inline JSON is safe.
-                    var kbuf: [128]u8 = undefined;
-                    if (std.fmt.bufPrint(&kbuf, "{{\"name\":\"{s}\"}}", .{remote.session})) |payload| {
-                        remote.conn.sendFrame(.kill, payload) catch {};
-                    } else |_| {}
-                } else {
-                    remote.conn.sendFrame(.detach, "") catch {};
-                }
-            }
             if (remote.connected) remote.conn.deinit();
             if (remote.host) |h| self.allocator.free(h);
             if (remote.port_range.len > 0) self.allocator.free(remote.port_range);
             if (remote.pending_rename) |p| self.allocator.free(p);
             self.allocator.free(remote.session);
+            self.allocator.free(remote.origin_name);
+            if (remote.origin_id.len > 0) self.allocator.free(remote.origin_id);
             self.allocator.destroy(remote);
             self.screen.deinit();
             self.pool.deinit();
@@ -2658,6 +3171,8 @@ test "nappOpen appends before firing on_app_view (empty-list deref regression)" 
     term.remote = &remote;
     term.peer_drivers = 0;
     term.on_app_window = null;
+    term.on_panel_origin_close = null;
+    term.on_panel_work_cancel = null;
     term.user_ctx = &cap;
     term.on_app_view = Cb.onView;
 
@@ -2769,11 +3284,15 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     remote.pending_ticket_cb = null;
     remote.pending_ticket_ctx = null;
 
+    var drain = DrainHandle{};
     var term: Terminal = undefined;
+    term.drain = &drain;
     term.allocator = alloc;
     term.remote = &remote;
     term.peer_drivers = 0;
     term.on_app_window = null;
+    term.on_panel_origin_close = null;
+    term.on_panel_work_cancel = null;
     term.user_ctx = &cap;
     term.on_app_view = Cb.onView;
 
@@ -2789,6 +3308,65 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     remote.napps.deinit(alloc);
     remote.wsapps.deinit(alloc);
     remote.aapps.deinit(alloc);
+}
+
+test "clearSinks retires the mux presenter before closing its GUI origin" {
+    const a = std.testing.allocator;
+    var pair: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+
+    var peer = mux_client.Conn{
+        .allocator = a,
+        .fd = pair[1],
+        .proto = mux_wire.PROTO_VERSION,
+        .panel_rpc = mux_wire.PANEL_RPC_VERSION,
+    };
+    defer peer.deinit();
+    var session = [_]u8{ 'r', 'e', 't', 'i', 'r', 'e' };
+    var remote = Terminal.Remote{
+        .conn = .{
+            .allocator = a,
+            .fd = pair[0],
+            .proto = mux_wire.PROTO_VERSION,
+            .panel_rpc = mux_wire.PANEL_RPC_VERSION,
+        },
+        .session = &session,
+        .origin_name = &session,
+        .predictor = undefined,
+    };
+
+    const Captured = struct {
+        peer: *mux_client.Conn,
+        saw_detach: bool = false,
+        transport_retired: bool = false,
+
+        fn close(terminal: *Terminal) void {
+            const self: *@This() = @ptrCast(@alignCast(terminal.user_ctx.?));
+            const r = terminal.remote.?;
+            self.transport_retired = r.destroying and !r.connected and r.conn.fd == -1;
+            const frame = self.peer.recvFrame() catch return;
+            defer frame.deinit(self.peer.allocator);
+            self.saw_detach = frame.ftype == .detach;
+        }
+    };
+    var captured = Captured{ .peer = &peer };
+    var drain = DrainHandle{};
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.drain = &drain;
+    term.panel_scope_ctx = null;
+    term.user_ctx = &captured;
+    term.on_panel_origin_close = Captured.close;
+    term.on_panel_work_cancel = null;
+    term.on_panel_origin_renamed = null;
+    term.on_panel_request = null;
+    drain.terminal = &term;
+
+    term.clearSinks();
+    try std.testing.expect(captured.transport_retired);
+    try std.testing.expect(captured.saw_detach);
+    try std.testing.expectEqual(@as(?*anyopaque, null), term.user_ctx);
 }
 
 /// True for `?*const fn (...) ...` field types (the external-sink shape).
@@ -2876,7 +3454,9 @@ test "clearSinks nulls every on_* callback (reflection drift guard)" {
     // listed there, so a late session_meta frame dispatched it with a nulled
     // user_ctx and cast.userData crashed. Reflection covers any future sink
     // automatically -- never hand-maintain a second list of field names.
+    var drain = DrainHandle{};
     var term: Terminal = undefined;
+    term.drain = &drain;
     term.remote = null; // failPendingTicket + the napp loop bail out
 
     const fields = @typeInfo(Terminal).@"struct".fields;
@@ -2885,6 +3465,10 @@ test "clearSinks nulls every on_* callback (reflection drift guard)" {
             @field(term, fld.name) = @ptrFromInt(0x1000);
         }
     }
+    // clearSinks invokes these lifecycle callbacks before nulling them; the
+    // other on_* fields are passive sinks and can carry the drift sentinel.
+    term.on_panel_origin_close = null;
+    term.on_panel_work_cancel = null;
 
     term.clearSinks();
 
@@ -2896,4 +3480,250 @@ test "clearSinks nulls every on_* callback (reflection drift guard)" {
             }
         }
     }
+}
+
+test "panel request dispatch returns a correlated reply on the same connection" {
+    const a = std.testing.allocator;
+    var pair: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+
+    var session = [_]u8{ 'r', 'e', 'l', 'a', 'y' };
+    var remote = Terminal.Remote{
+        .conn = .{
+            .allocator = a,
+            .fd = pair[0],
+            .proto = mux_wire.PROTO_VERSION,
+            .panel_rpc = mux_wire.PANEL_RPC_VERSION,
+        },
+        .session = &session,
+        .origin_name = &session,
+        .predictor = undefined,
+    };
+    defer remote.conn.deinit();
+    remote.conn.setNonBlocking();
+
+    var peer = mux_client.Conn{
+        .allocator = a,
+        .fd = pair[1],
+        .proto = mux_wire.PROTO_VERSION,
+        .panel_rpc = mux_wire.PANEL_RPC_VERSION,
+    };
+    defer peer.deinit();
+
+    const Captured = struct {
+        called: bool = false,
+        terminal: ?*Terminal = null,
+        request_ok: bool = false,
+
+        fn dispatch(
+            ctx: ?*anyopaque,
+            terminal: *Terminal,
+            request_id: u64,
+            request: []const u8,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.called = true;
+            self.terminal = terminal;
+            self.request_ok = std.mem.eql(u8, request, "{\"cmd\":\"panel-list\"}");
+            terminal.replyPanelRequest(request_id, "{\"ok\":true,\"panels\":[]}\n");
+        }
+    };
+    var captured = Captured{};
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.user_ctx = &captured;
+    term.on_panel_request = Captured.dispatch;
+
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(a);
+    try mux_wire.appendPanelEnvelope(&request, a, 0x1234, "{\"cmd\":\"panel-list\"}");
+    term.handleRemoteFrame(.{ .ftype = .panel_request, .payload = request.items });
+
+    try std.testing.expect(captured.called);
+    try std.testing.expectEqual(&term, captured.terminal.?);
+    try std.testing.expect(captured.request_ok);
+    const frame = try peer.recvExpectFor(&.{.panel_reply}, 1_000);
+    defer frame.deinit(a);
+    const envelope = try mux_wire.decodePanelEnvelope(frame.payload);
+    try std.testing.expectEqual(@as(u64, 0x1234), envelope.id);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"panels\":[]}", envelope.json);
+}
+
+test "session metadata separates immutable origin from mutable display rename" {
+    const a = std.testing.allocator;
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = a, .fd = -1 },
+        .session = try a.dupe(u8, "attach-alias"),
+        .origin_name = try a.dupe(u8, "attach-alias"),
+        .predictor = undefined,
+    };
+    defer a.free(remote.session);
+    defer a.free(remote.origin_name);
+    defer if (remote.origin_id.len > 0) a.free(remote.origin_id);
+
+    const Capture = struct {
+        var renamed: u32 = 0;
+        fn panelRename(_: *Terminal, _: []const u8) void {
+            renamed += 1;
+        }
+    };
+    Capture.renamed = 0;
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.on_panel_origin_renamed = Capture.panelRename;
+    term.on_session_renamed = null;
+    term.handleRemoteFrame(.{
+        .ftype = .session_meta,
+        .payload = "{\"name\":\"display-now\",\"origin_name\":\"spawn-origin\",\"origin_id\":\"00000000000000000000000000000001\"}",
+    });
+    try std.testing.expectEqualStrings("display-now", remote.session);
+    try std.testing.expectEqualStrings("spawn-origin", remote.origin_name);
+    try std.testing.expectEqualStrings("00000000000000000000000000000001", remote.origin_id);
+    try std.testing.expectEqual(@as(u32, 1), Capture.renamed);
+
+    term.handleRemoteFrame(.{
+        .ftype = .session_meta,
+        .payload = "{\"name\":\"display-later\",\"origin_name\":\"spawn-origin\",\"origin_id\":\"00000000000000000000000000000001\"}",
+    });
+    try std.testing.expectEqualStrings("display-later", remote.session);
+    try std.testing.expectEqualStrings("spawn-origin", remote.origin_name);
+    try std.testing.expectEqual(@as(u32, 2), Capture.renamed);
+}
+
+test "reconnect rename commits terminal and panel metadata exactly once" {
+    const a = std.testing.allocator;
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = a, .fd = -1 },
+        .session = try a.dupe(u8, "before"),
+        .origin_name = @constCast("spawn-origin"),
+        .pending_rename = try a.dupe(u8, "after"),
+        .predictor = undefined,
+    };
+    defer a.free(remote.session);
+
+    const Capture = struct {
+        panel: u32 = 0,
+        terminal: u32 = 0,
+        panel_name: []const u8 = "",
+        terminal_name: []const u8 = "",
+
+        fn panelRenamed(term: *Terminal, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(term.user_ctx.?));
+            self.panel += 1;
+            self.panel_name = name;
+        }
+
+        fn sessionRenamed(ctx: ?*anyopaque, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.terminal += 1;
+            self.terminal_name = name;
+        }
+    };
+    var capture = Capture{};
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.user_ctx = &capture;
+    term.on_panel_origin_renamed = Capture.panelRenamed;
+    term.on_session_renamed = Capture.sessionRenamed;
+
+    term.commitReattachRename(&remote);
+    try std.testing.expectEqualStrings("after", remote.session);
+    try std.testing.expectEqual(@as(?[]u8, null), remote.pending_rename);
+    try std.testing.expectEqual(@as(u32, 1), capture.panel);
+    try std.testing.expectEqual(@as(u32, 1), capture.terminal);
+    try std.testing.expectEqualStrings("after", capture.panel_name);
+    try std.testing.expectEqualStrings("after", capture.terminal_name);
+
+    term.commitReattachRename(&remote);
+    try std.testing.expectEqual(@as(u32, 1), capture.panel);
+    try std.testing.expectEqual(@as(u32, 1), capture.terminal);
+}
+
+test "clearSinks retires a panel origin exactly once" {
+    const Capture = struct {
+        var calls: u32 = 0;
+        fn close(_: *Terminal) void {
+            calls += 1;
+        }
+    };
+    Capture.calls = 0;
+    var drain = DrainHandle{};
+    var term: Terminal = undefined;
+    term.drain = &drain;
+    term.remote = null;
+    term.on_panel_origin_close = Capture.close;
+    term.on_panel_work_cancel = null;
+    term.clearSinks();
+    term.clearSinks();
+    try std.testing.expectEqual(@as(u32, 1), Capture.calls);
+    try std.testing.expectEqual(@as(?*const fn (*Terminal) void, null), term.on_panel_origin_close);
+    try std.testing.expect(!drain.panel_assets_live.load(.acquire));
+}
+
+test "canceling an asynchronous remote file read ignores late frames" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var pair: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+
+    var remote = Terminal.Remote{
+        .conn = .{
+            .allocator = allocator,
+            .fd = pair[0],
+            .proto = mux_wire.PROTO_VERSION,
+        },
+        .session = @constCast("cancel-read"),
+        .origin_name = @constCast("cancel-read"),
+        .predictor = undefined,
+    };
+    defer {
+        remote.fs_reads.deinit(allocator);
+        remote.conn.deinit();
+    }
+    remote.conn.setNonBlocking();
+    var peer = mux_client.Conn{
+        .allocator = allocator,
+        .fd = pair[1],
+        .proto = mux_wire.PROTO_VERSION,
+    };
+    defer peer.deinit();
+
+    const Capture = struct {
+        called: bool = false,
+        fn done(ctx: ?*anyopaque, _: *Terminal, _: u32, result: Terminal.RemoteFileResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.called = true;
+            if (result == .success) testing.allocator.free(result.success.bytes);
+        }
+    };
+    var capture = Capture{};
+    var drain = DrainHandle{};
+    var term: Terminal = undefined;
+    term.allocator = allocator;
+    term.remote = &remote;
+    term.drain = &drain;
+    drain.terminal = &term;
+
+    const token = try term.beginRemoteFileRead("/remote/image.png", 1024, 5_000, &capture, Capture.done);
+    const request = try peer.recvExpectFor(&.{.fs_op}, 1_000);
+    request.deinit(allocator);
+    term.cancelRemoteFileRead(token);
+    try testing.expectEqual(@as(usize, 0), remote.fs_reads.items.len);
+
+    var data: [16]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], token, .little);
+    std.mem.writeInt(u64, data[4..12], 0, .little);
+    @memcpy(data[12..], "late");
+    term.handleRemoteFrame(.{ .ftype = .fs_data, .payload = &data });
+    var reply_buf: [128]u8 = undefined;
+    const reply = try std.fmt.bufPrint(
+        &reply_buf,
+        "{{\"req\":{d},\"ok\":true,\"size\":4,\"eof\":true,\"mtime_ns\":1,\"ino\":2}}",
+        .{token},
+    );
+    term.handleRemoteFrame(.{ .ftype = .fs_reply, .payload = reply });
+    try testing.expect(!capture.called);
 }

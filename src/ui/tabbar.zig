@@ -298,6 +298,13 @@ pub const TabBar = struct {
     tick_id: c.guint = 0,
     detach_ctx: ?*anyopaque = null,
     on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void = null,
+    transfer_ctx: ?*anyopaque = null,
+    on_transfer: ?*const fn (
+        ctx: ?*anyopaque,
+        source: *c.AdwTabView,
+        page: *c.AdwTabPage,
+        position: c_int,
+    ) bool = null,
     reorder: ?Reorder = null,
     /// Config read by the tab effects (which gates fire, thresholds). Points
     /// at the owning Window's `config` once wired; a static default keeps it
@@ -990,7 +997,11 @@ fn onDrop(_: ?*anyopaque, _: ?*anyopaque, x: f64, _: f64, user: ?*anyopaque) cal
         if (pos < 0) pos = 0;
         _ = c.adw_tab_view_reorder_page(self.view, src.page, pos);
     } else {
-        c.adw_tab_view_transfer_page(src.view, src.page, self.view, idx);
+        if (self.on_transfer) |transfer| {
+            if (!transfer(self.transfer_ctx, src.view, src.page, idx)) return 0;
+        } else {
+            c.adw_tab_view_transfer_page(src.view, src.page, self.view, idx);
+        }
     }
     return 1;
 }
