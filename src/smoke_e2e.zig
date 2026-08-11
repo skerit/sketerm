@@ -25,6 +25,7 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const protocol = @import("ipc/protocol.zig");
+const version = @import("version.zig");
 const display_cli = @import("mux/display.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const muxclient = @import("mux/client.zig");
@@ -4195,7 +4196,7 @@ const McpChild = struct {
     fn initialize(self: *McpChild) bool {
         self.id += 1;
         var buf: [512]u8 = undefined;
-        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"smoke-e2e\",\"version\":\"0\"}}}}}}", .{self.id}) catch return false;
+        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"smoke-e2e\",\"version\":\"0\"}}}}}}", .{ self.id, version.mcp_protocol }) catch return false;
         if (!self.send(req)) return false;
         return self.recv(20_000) != null;
     }

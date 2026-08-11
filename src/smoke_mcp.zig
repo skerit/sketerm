@@ -14,6 +14,7 @@ const muxclient = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
 const protocol = @import("ipc/protocol.zig");
+const version = @import("version.zig");
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -140,7 +141,7 @@ const Mcp = struct {
     fn initialize(self: *Mcp) void {
         self.id += 1;
         var buf: [512]u8 = undefined;
-        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"smoke\",\"version\":\"0\"}}}}}}", .{self.id}) catch unreachable;
+        const req = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"smoke\",\"version\":\"0\"}}}}}}", .{ self.id, version.mcp_protocol }) catch unreachable;
         self.send(req);
         _ = self.recvLine(10_000);
     }
