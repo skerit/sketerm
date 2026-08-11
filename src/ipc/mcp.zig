@@ -5796,6 +5796,50 @@ test "tools/call send_keys routes to IPC send-keys" {
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "ctrl+c enter") != null);
 }
 
+/// One environment variable saved, cleared and put back, without an
+/// allocator (a test helper must not perturb `std.testing.allocator`'s
+/// leak accounting). A value longer than the buffer is refused rather
+/// than truncated: silently restoring a different value is worse than
+/// failing the test that clobbered it.
+const EnvSave = struct {
+    name: [*:0]const u8 = "",
+    buf: [512]u8 = undefined,
+    had: bool = false,
+
+    fn take(self: *EnvSave, name: [*:0]const u8) !void {
+        self.* = .{ .name = name };
+        if (c.getenv(name)) |raw| {
+            const value = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+            if (value.len >= self.buf.len) return error.EnvValueTooLong;
+            @memcpy(self.buf[0..value.len], value);
+            self.buf[value.len] = 0;
+            self.had = true;
+        }
+        _ = c.unsetenv(name);
+    }
+
+    fn restore(self: *EnvSave) void {
+        if (self.name[0] == 0) return;
+        if (self.had) {
+            _ = c.setenv(self.name, @ptrCast(&self.buf), 1);
+        } else {
+            _ = c.unsetenv(self.name);
+        }
+    }
+};
+
+/// Every environment variable that can steer a ui_* call away from the
+/// injected `FakeBackend`. `SKETERM_MUX_SOCKET` is the load-bearing one:
+/// `UiTransport.init` treats a session plus an environment socket as an
+/// EXACT origin and takes the mux relay, so a suite run from inside a
+/// live sketerm pane would talk to the developer's real daemon instead
+/// of the fake, and the ui_* tests would fail on that machine only.
+const UI_ISOLATED_ENV = [_][*:0]const u8{
+    "SKETERM_SESSION",
+    "SKETERM_MUX_SOCKET",
+    "SKETERM_SESSION_ORIGIN_ID",
+};
+
 /// XDG_STATE_HOME pointed at a scratch dir, plus a GUI socket the
 /// ui_* tools will believe in. Every panelstore path derives from the
 /// state dir, so without this the tests would write into the
@@ -5805,14 +5849,17 @@ const UiScratch = struct {
     len: usize = 0,
     saved_gui: bool = false,
     saved_source: GuiSocketSource = .none,
+    saved_state_home: EnvSave = .{},
+    saved_env: [UI_ISOLATED_ENV.len]EnvSave = @splat(.{}),
 
     fn init(self: *UiScratch, tag: []const u8, gui: bool) !void {
         self.* = .{};
+        try self.saved_state_home.take("XDG_STATE_HOME");
+        for (&self.saved_env, UI_ISOLATED_ENV) |*slot, name| try slot.take(name);
         const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-mcp-ui-{s}-{d}", .{ tag, c.getpid() });
         self.len = p.len;
         _ = c.mkdir(@ptrCast(&self.buf), 0o755);
         _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.buf), 1);
-        _ = c.unsetenv("SKETERM_SESSION");
         self.saved_gui = srv_gui_socket;
         self.saved_source = srv_gui_socket_source;
         srv_gui_socket = gui;
@@ -5822,7 +5869,12 @@ const UiScratch = struct {
     fn deinit(self: *UiScratch) void {
         srv_gui_socket = self.saved_gui;
         srv_gui_socket_source = self.saved_source;
-        _ = c.unsetenv("XDG_STATE_HOME");
+        var i = self.saved_env.len;
+        while (i > 0) {
+            i -= 1;
+            self.saved_env[i].restore();
+        }
+        self.saved_state_home.restore();
         var cmd: [256]u8 = undefined;
         const z = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}) catch return;
         _ = c.system(z.ptr);
