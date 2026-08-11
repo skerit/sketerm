@@ -451,8 +451,11 @@ fn addHistoryRow(self: *List, hit: webstore.HistoryHit) void {
 
     // The row OWNS its per-row context (mechanism 1): the button's
     // closure dies with the row, so a re-list can never leave a handler
-    // pointing at a row that is gone.
-    _ = iconButton(box, "user-trash-symbolic", "Forget this page", &onDeleteRow, rowCtx(self, row));
+    // pointing at a row that is gone. A row that could not get one is
+    // still listed, just without the verbs that would resolve through
+    // a null pointer.
+    if (rowCtx(self, row)) |ctx|
+        _ = iconButton(box, "user-trash-symbolic", "Forget this page", &onDeleteRow, ctx);
     c.gtk_list_box_append(@ptrCast(self.listbox), row);
 }
 
@@ -466,8 +469,10 @@ fn addBookmarkRow(self: *List, mark: webstore.BookmarkEntry, flat_index: usize) 
     c.g_object_set_data(@ptrCast(@alignCast(row)), KEY_ID, @ptrFromInt(@as(usize, @intCast(mark.id))));
     c.g_object_set_data(@ptrCast(@alignCast(row)), KEY_INDEX, @ptrFromInt(flat_index));
 
-    _ = iconButton(box, "tab-new-symbolic", "Open in a new tab", &onOpenNewTabRow, rowCtx(self, row));
-    _ = iconButton(box, "user-trash-symbolic", "Delete this bookmark", &onDeleteRow, rowCtx(self, row));
+    if (rowCtx(self, row)) |ctx| {
+        _ = iconButton(box, "tab-new-symbolic", "Open in a new tab", &onOpenNewTabRow, ctx);
+        _ = iconButton(box, "user-trash-symbolic", "Delete this bookmark", &onDeleteRow, ctx);
+    }
     c.gtk_list_box_append(@ptrCast(self.listbox), row);
 }
 
