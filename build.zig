@@ -674,6 +674,32 @@ pub fn build(b: *std.Build) void {
         smoke_atspi_step.dependOn(&smoke_atspi_run.step);
     }
 
+    // Web-page AT-SPI projection smoke — `zig build smoke-webax`.
+    // No CEF and no GUI: wire frames feed the mirrored AX tree, the
+    // pure-Zig projection embeds it on a private a11y bus, and the
+    // daemon's own AT-SPI client walks the registry and asserts roles,
+    // names, extents and incremental updates. SKIPs where the bus
+    // tooling is absent.
+    if (!native_macos) {
+        const smoke_webax_mod = b.createModule(.{
+            .root_source_file = b.path("src/smoke_webax.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureSysDeps(b, smoke_webax_mod, cbindings_mod);
+        smoke_webax_mod.addImport("build_options", glib_opts_mod);
+        const smoke_webax = b.addExecutable(.{
+            .name = "sketerm-smoke-webax",
+            .root_module = smoke_webax_mod,
+            .use_lld = use_lld,
+        });
+        const smoke_webax_run = b.addRunArtifact(smoke_webax);
+        smoke_webax_run.setCwd(b.path("."));
+        const smoke_webax_step = b.step("smoke-webax", "Web-page AT-SPI projection smoke on a private a11y bus (no CEF, no GUI)");
+        smoke_webax_step.dependOn(&smoke_webax_run.step);
+    }
+
     // macOS NSAccessibility smoke — `zig build smoke-a11y`. Drives a
     // real SketermTermView through the AX selectors VoiceOver uses and
     // asserts they match a known screen (incl. an astral char, so the
