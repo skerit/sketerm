@@ -229,7 +229,7 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                     .loading = v.loading,
                     .can_back = v.can_back,
                     .can_fwd = v.can_fwd,
-                    .focused = false,
+                    .focused = v.id == e.current,
                     .visible = false,
                 });
             }
@@ -720,6 +720,9 @@ pub fn webTool(
     // Everything below addresses an existing view.
     const vs = views orelse return helperErr(drv, arena, views);
     const view = viewFor(vs, handle_u) orelse return helperErr(drv, arena, views);
+    // Whatever a call addresses becomes what the NEXT handle-less call
+    // means. GUI mode takes focus from the GUI, which owns it.
+    if (drv == .headless) drv.headless.setCurrent(view.pane);
 
     if (eql(u8, name, "web_navigate")) {
         const url = mcp.argStr(args, "url");

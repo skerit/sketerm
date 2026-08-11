@@ -169,6 +169,13 @@ pub const Engine = struct {
     rx_fds: std.ArrayList(c_int) = .empty,
     next_view: u32 = 1,
     views: std.ArrayList(*View) = .empty,
+    /// The view a handle-less tool call means. Headless has no window
+    /// manager to own focus, so "current" is last-touched: opening or
+    /// addressing a view makes it current. Without this the fallback
+    /// was the OLDEST view, so a second `web_open` returned a correctly
+    /// navigated view that every following call then ignored — which
+    /// reads exactly like `web_open` dropping its url.
+    current: u32 = 0,
     cap_shm: bool = false,
     cap_semantic: bool = false,
 
@@ -401,6 +408,13 @@ pub const Engine = struct {
         return null;
     }
 
+    /// Make `id` what a handle-less call resolves to. Called whenever a
+    /// tool addresses a view, so "current" tracks what the caller is
+    /// actually working on rather than what it opened first.
+    pub fn setCurrent(self: *Engine, id: u32) void {
+        if (self.findView(id) != null) self.current = id;
+    }
+
     /// Create a headless view; `url` may be empty for a blank page.
     pub fn openView(self: *Engine, url: []const u8, w: u16, h: u16) !*View {
         if (!self.ensure()) return error.Unavailable;
@@ -422,6 +436,7 @@ pub const Engine = struct {
         if (url.len > 0) {
             self.send(proto.Navigate{ .view = v.id, .url = url }) catch return error.Unavailable;
         }
+        self.current = v.id;
         return v;
     }
 
@@ -432,6 +447,8 @@ pub const Engine = struct {
             v.deinit(self.gpa);
             self.gpa.destroy(v);
             _ = self.views.orderedRemove(i);
+            if (self.current == id)
+                self.current = if (self.views.items.len > 0) self.views.items[self.views.items.len - 1].id else 0;
             return;
         }
     }
@@ -866,4 +883,39 @@ test "a full-mode wait is not satisfied by a spontaneous delta" {
     const parked = v.inbox[@intFromEnum(OpKind.snapshot)].?;
     try std.testing.expectEqualStrings("[1] document\n", parked.text);
     try std.testing.expectEqual(@as(u8, @intFromEnum(proto.SnapKind.full)), parked.snap_kind);
+}
+
+test "the current view is the last one touched, not the oldest" {
+    const gpa = std.testing.allocator;
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    defer {
+        eng.state = .idle; // no child to reap
+        eng.deinit();
+    }
+    // Two views, as two `web_open` calls would leave them. openView
+    // itself needs a live helper, so mint them the way it does.
+    for ([_]u32{ 1, 2 }) |id| {
+        const v = try gpa.create(View);
+        v.* = .{ .id = id, .w = 100, .h = 100 };
+        try eng.views.append(gpa, v);
+        eng.current = id;
+    }
+    // A handle-less call means the newest, not views.items[0]: the
+    // oldest-view fallback made a second web_open look like it had
+    // dropped its url, because every later call still read view 1.
+    try std.testing.expectEqual(@as(u32, 2), eng.current);
+
+    // Addressing one explicitly moves "current" onto it.
+    eng.setCurrent(1);
+    try std.testing.expectEqual(@as(u32, 1), eng.current);
+
+    // An unknown id must not strand `current` on a view that is gone.
+    eng.setCurrent(99);
+    try std.testing.expectEqual(@as(u32, 1), eng.current);
+
+    // Closing the current view hands it to the newest survivor.
+    eng.closeView(1);
+    try std.testing.expectEqual(@as(u32, 2), eng.current);
+    eng.closeView(2);
+    try std.testing.expectEqual(@as(u32, 0), eng.current);
 }
