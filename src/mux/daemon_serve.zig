@@ -2850,7 +2850,10 @@ pub const WebOpReq = struct {
     max: u32 = 0,
     /// bookmark_remove/bookmark_update target.
     id: u64 = 0,
-    folder: []const u8 = "",
+    /// Absent = leave a bookmark's folder alone; "" moves it back to
+    /// the top level. Optional rather than "" -meaning-unchanged so
+    /// that "no folder" stays expressible.
+    folder: ?[]const u8 = null,
     /// bookmark_update reorder destination.
     index: ?u32 = null,
     origin: []const u8 = "",
@@ -2907,7 +2910,7 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         store.clearHistory() catch return webReplyErr(cl, r.req, "history write failed");
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "bookmark_add")) {
-        const id = store.bookmarkAdd(r.url, r.title, r.folder) catch
+        const id = store.bookmarkAdd(r.url, r.title, r.folder orelse "") catch
             return webReplyErr(cl, r.req, "bookmark write failed");
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
     } else if (std.mem.eql(u8, r.op, "bookmark_remove")) {
@@ -2915,13 +2918,15 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             return webReplyErr(cl, r.req, "bookmark write failed");
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .removed = removed });
     } else if (std.mem.eql(u8, r.op, "bookmark_update")) {
-        // Empty strings mean "leave unchanged" on this verb — a
-        // bookmark's url/title/folder are cleared by removing it, not
-        // by blanking fields.
+        // An empty url/title means "leave unchanged" — a bookmark with
+        // neither is cleared by removing it, not by blanking fields.
+        // `folder` is the exception: an ABSENT folder is unchanged and
+        // an empty one is the top level, which a bookmark must be able
+        // to move back to.
         const found = store.bookmarkUpdate(r.id, .{
             .url = if (r.url.len > 0) r.url else null,
             .title = if (r.title.len > 0) r.title else null,
-            .folder = if (r.folder.len > 0) r.folder else null,
+            .folder = r.folder,
             .index = if (r.index) |i| i else null,
         }) catch return webReplyErr(cl, r.req, "bookmark write failed");
         if (!found) return webReplyErr(cl, r.req, "no such bookmark");

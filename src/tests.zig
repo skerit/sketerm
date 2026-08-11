@@ -101,6 +101,7 @@ comptime {
     // here by name. Proven with a deliberately failing canary.
     _ = @import("ui/webface.zig");
     _ = @import("ui/webreader.zig");
+    _ = @import("ui/webstore.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/browser/view.zig");
     _ = @import("ui/browser/types.zig");

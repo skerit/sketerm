@@ -12,6 +12,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const mux_webstore = @import("../mux/webstore.zig");
+const proto = @import("../web/protocol.zig");
 
 pub const originOf = mux_webstore.originOf;
 
@@ -256,6 +257,29 @@ pub fn bookmarkRemove(gpa: std.mem.Allocator, id: u64) void {
     _ = send(gpa, .{ .req = nextReq(), .op = "bookmark_remove", .id = id });
 }
 
+/// Retitle / re-folder / reorder one bookmark. An empty url or title
+/// and a null index mean "leave that field alone" (the daemon's rule);
+/// `folder` is optional instead, because an EMPTY folder is meaningful
+/// — it moves the bookmark back to the top level.
+pub fn bookmarkUpdate(
+    gpa: std.mem.Allocator,
+    id: u64,
+    url: []const u8,
+    title: []const u8,
+    folder: ?[]const u8,
+    index: ?u32,
+) void {
+    _ = send(gpa, .{
+        .req = nextReq(),
+        .op = "bookmark_update",
+        .id = id,
+        .url = url,
+        .title = title,
+        .folder = folder,
+        .index = index,
+    });
+}
+
 /// Reply via `cb`; parse with `parseBookmarks`.
 pub fn bookmarkList(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback) bool {
     return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "bookmark_list" });
@@ -271,12 +295,111 @@ pub fn siteSetZoom(gpa: std.mem.Allocator, origin: []const u8, zoom_x100: i32) v
     _ = send(gpa, .{ .req = nextReq(), .op = "site_set", .origin = origin, .zoom_x100 = zoom_x100 });
 }
 
+/// Persist one origin's popup override; "" restores the app default.
+pub fn siteSetPopup(gpa: std.mem.Allocator, origin: []const u8, popup: []const u8) void {
+    _ = send(gpa, .{ .req = nextReq(), .op = "site_set", .origin = origin, .popup = popup });
+}
+
+/// Persist one origin's content-blocking override; null clears it back
+/// to "follow the global default".
+pub fn siteSetBlock(gpa: std.mem.Allocator, origin: []const u8, block: ?bool) void {
+    if (block) |b| {
+        _ = send(gpa, .{ .req = nextReq(), .op = "site_set", .origin = origin, .block = b });
+    } else {
+        _ = send(gpa, .{ .req = nextReq(), .op = "site_set", .origin = origin, .block_clear = true });
+    }
+}
+
+/// Persist one permission decision for an origin. `decision` is
+/// "allow" / "deny"; "" (or "default") forgets it.
+pub fn siteSetPerm(gpa: std.mem.Allocator, origin: []const u8, perm: []const u8, decision: []const u8) void {
+    _ = send(gpa, .{
+        .req = nextReq(),
+        .op = "site_set",
+        .origin = origin,
+        .perm = perm,
+        .decision = decision,
+    });
+}
+
+// ── permission bitmask <-> store key ────────────────────────────
+
+/// The store keys permissions by NAME, the engine by bitmask, and a
+/// prompt may carry several bits at once (camera+microphone is the
+/// common one). The key is therefore the '+'-joined names in bit
+/// order, which round-trips exactly — matching a remembered decision
+/// is on the exact bit set, so an approximate key would answer the
+/// wrong prompt.
+const perm_names = [_]struct { bit: u32, name: []const u8 }{
+    .{ .bit = proto.perm_geolocation, .name = "geolocation" },
+    .{ .bit = proto.perm_notifications, .name = "notifications" },
+    .{ .bit = proto.perm_camera, .name = "camera" },
+    .{ .bit = proto.perm_microphone, .name = "microphone" },
+    .{ .bit = proto.perm_midi, .name = "midi" },
+    .{ .bit = proto.perm_clipboard, .name = "clipboard" },
+    .{ .bit = proto.perm_pointer_lock, .name = "pointer_lock" },
+    .{ .bit = proto.perm_idle_detection, .name = "idle_detection" },
+    .{ .bit = proto.perm_storage_access, .name = "storage_access" },
+    .{ .bit = proto.perm_window_management, .name = "window_management" },
+    .{ .bit = proto.perm_protected_media, .name = "protected_media" },
+    .{ .bit = proto.perm_local_fonts, .name = "local_fonts" },
+    .{ .bit = proto.perm_file_system, .name = "file_system" },
+    .{ .bit = proto.perm_downloads, .name = "downloads" },
+    .{ .bit = proto.perm_sensors, .name = "sensors" },
+    .{ .bit = proto.perm_vr, .name = "vr" },
+    .{ .bit = proto.perm_other, .name = "other" },
+};
+
+/// Null for an empty mask or one carrying a bit this build cannot
+/// name — a decision that cannot be read back must not be written.
+pub fn permKey(buf: []u8, types: u32) ?[]const u8 {
+    if (types == 0) return null;
+    var covered: u32 = 0;
+    var len: usize = 0;
+    for (perm_names) |p| {
+        if (types & p.bit == 0) continue;
+        covered |= p.bit;
+        if (len > 0) {
+            if (len + 1 > buf.len) return null;
+            buf[len] = '+';
+            len += 1;
+        }
+        if (len + p.name.len > buf.len) return null;
+        @memcpy(buf[len .. len + p.name.len], p.name);
+        len += p.name.len;
+    }
+    if (covered != types) return null;
+    return buf[0..len];
+}
+
+/// Inverse of `permKey`; null when any component is unknown.
+pub fn permTypes(key: []const u8) ?u32 {
+    if (key.len == 0) return null;
+    var types: u32 = 0;
+    var it = std.mem.splitScalar(u8, key, '+');
+    while (it.next()) |part| {
+        const bit = for (perm_names) |p| {
+            if (std.mem.eql(u8, p.name, part)) break p.bit;
+        } else return null;
+        types |= bit;
+    }
+    return types;
+}
+
 // ── reply parsing ───────────────────────────────────────────────
+
+pub const PermEntry = struct {
+    /// A `permKey` string.
+    name: []const u8 = "",
+    /// "allow" | "deny" (anything else is ignored).
+    decision: []const u8 = "",
+};
 
 pub const SiteInfo = struct {
     zoom_x100: i32 = 0,
     popup: []const u8 = "",
     block: ?bool = null,
+    perms: []const PermEntry = &.{},
 };
 
 pub const SiteReply = struct {
@@ -334,4 +457,62 @@ pub fn parseBookmarks(arena: std.mem.Allocator, payload: []const u8) []const Boo
     }) catch return &.{};
     if (!parsed.ok) return &.{};
     return parsed.bookmarks;
+}
+
+// ── tests ───────────────────────────────────────────────────────
+
+test "webstore: permission keys round-trip, including combinations" {
+    const t = std.testing;
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("geolocation", permKey(&buf, proto.perm_geolocation).?);
+    try t.expectEqualStrings("camera+microphone", permKey(&buf, proto.perm_camera | proto.perm_microphone).?);
+    // Bit order, not argument order.
+    try t.expectEqualStrings("camera+microphone", permKey(&buf, proto.perm_microphone | proto.perm_camera).?);
+    try t.expectEqualStrings("other", permKey(&buf, proto.perm_other).?);
+
+    try t.expectEqual(@as(?u32, proto.perm_geolocation), permTypes("geolocation"));
+    try t.expectEqual(
+        @as(?u32, proto.perm_camera | proto.perm_microphone),
+        permTypes("camera+microphone"),
+    );
+    // An unnamed bit is never written, so it can never be misread.
+    try t.expectEqual(@as(?[]const u8, null), permKey(&buf, 1 << 20));
+    try t.expectEqual(@as(?[]const u8, null), permKey(&buf, proto.perm_camera | (1 << 20)));
+    try t.expectEqual(@as(?[]const u8, null), permKey(&buf, 0));
+    try t.expectEqual(@as(?u32, null), permTypes("teleportation"));
+    try t.expectEqual(@as(?u32, null), permTypes("camera+teleportation"));
+    try t.expectEqual(@as(?u32, null), permTypes(""));
+
+    // A buffer too small fails rather than truncating into a key that
+    // would name a different permission set.
+    var tiny: [6]u8 = undefined;
+    try t.expectEqual(@as(?[]const u8, null), permKey(&tiny, proto.perm_camera | proto.perm_microphone));
+}
+
+test "webstore: site_get replies parse their perms" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const payload =
+        \\{"req":3,"ok":true,"origin":"https://a.com",
+        \\"site":{"zoom_x100":200,"popup":"block","block":true,
+        \\"perms":[{"name":"geolocation","decision":"deny"}]}}
+    ;
+    const rep = parseSite(arena.allocator(), payload).?;
+    try t.expect(rep.ok);
+    const site = rep.site.?;
+    try t.expectEqual(@as(i32, 200), site.zoom_x100);
+    try t.expectEqualStrings("block", site.popup);
+    try t.expectEqual(@as(?bool, true), site.block);
+    try t.expectEqual(@as(usize, 1), site.perms.len);
+    try t.expectEqualStrings("deny", site.perms[0].decision);
+    try t.expectEqual(@as(?u32, proto.perm_geolocation), permTypes(site.perms[0].name));
+
+    // An origin with nothing stored: `site` is null, not an error.
+    const none = parseSite(
+        arena.allocator(),
+        "{\"req\":4,\"ok\":true,\"origin\":\"https://b.com\",\"site\":null}",
+    ).?;
+    try t.expect(none.ok);
+    try t.expect(none.site == null);
 }
