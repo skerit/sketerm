@@ -34,6 +34,14 @@ pub const CAP_SEMANTIC = "semantic";
 /// two documents (about:blank, then the page) and lets a settle that
 /// watches "some url loaded" answer for the blank one.
 pub const CAP_VIEW_CREATE_URL = "view-create-url";
+/// The helper accepts `find`/`find_stop` and answers with
+/// `ev_find_result`.
+pub const CAP_FIND = "find";
+/// The helper accepts `set_zoom` (user zoom, on top of any DPR zoom).
+pub const CAP_ZOOM = "zoom";
+/// The helper suppresses the engine's own context menu and posts
+/// `ev_context_menu` instead.
+pub const CAP_CONTEXT_MENU = "context-menu";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -83,6 +91,11 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
+    find = 0x50,
+    find_stop = 0x51,
+    set_zoom = 0x52,
+    ev_find_result = 0x53,
+    ev_context_menu = 0x54,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     _,
@@ -564,6 +577,70 @@ pub const EvCrashed = struct {
     view: u32,
 };
 
+// -- find / zoom / context menu (0x50 block, caps "find"/"zoom"/
+//    "context-menu") --------------------------------------------------
+
+/// Find-in-page. `find_next = 0` starts a NEW search for `text`
+/// (highlighting every match and selecting the first); `find_next = 1`
+/// steps through the current search's matches in `forward` direction.
+pub const Find = struct {
+    pub const tag: Tag = .find;
+    view: u32,
+    forward: u8,
+    match_case: u8,
+    find_next: u8,
+    text: []const u8,
+};
+
+/// End the search. `clear_selection = 1` also drops the highlight the
+/// active match left behind.
+pub const FindStop = struct {
+    pub const tag: Tag = .find_stop;
+    view: u32,
+    clear_selection: u8,
+};
+
+/// USER zoom for a view, as the engine's log-scale zoom LEVEL x100:
+/// factor = 1.2 ^ (level_x100 / 100), so +100 is one conventional
+/// browser zoom step (120%) and 0 resets. Distinct from the DPR zoom
+/// the helper applies internally in accelerated mode — the helper adds
+/// the two, so the client only ever speaks user intent.
+pub const SetZoom = struct {
+    pub const tag: Tag = .set_zoom;
+    view: u32,
+    level_x100: i32,
+};
+
+/// Match count for the current search. Several non-final updates may
+/// precede the `final = 1` one as the engine keeps counting.
+pub const EvFindResult = struct {
+    pub const tag: Tag = .ev_find_result;
+    view: u32,
+    /// Total matches found so far.
+    count: i32,
+    /// 1-based ordinal of the active match, 0 when there is none.
+    active: i32,
+    final: u8,
+};
+
+/// `ev_context_menu` flags bit: the hit test found a link, and
+/// `link_url` carries it.
+pub const ctx_flag_link: u8 = 1;
+/// `ev_context_menu` flags bit: the hit test is an editable field.
+pub const ctx_flag_editable: u8 = 2;
+
+/// The page asked for a context menu (the engine's own menu is
+/// suppressed). x/y are LOGICAL view coordinates, same space as
+/// `input_pointer`.
+pub const EvContextMenu = struct {
+    pub const tag: Tag = .ev_context_menu;
+    view: u32,
+    x: i32,
+    y: i32,
+    flags: u8,
+    link_url: []const u8,
+};
+
 // -- semantic layer (capability "semantic") ---------------------------
 
 pub const SemSnapshotReq = struct {
@@ -1016,6 +1093,17 @@ test "round-trip: scalar and string frames" {
     try roundTrip(EvCursor, .{ .view = 7, .cursor = 1 });
     try roundTrip(EvConsole, .{ .view = 7, .level = 2, .msg = "boom" });
     try roundTrip(EvCrashed, .{ .view = 7 });
+    try roundTrip(Find, .{ .view = 7, .forward = 1, .match_case = 0, .find_next = 0, .text = "needle" });
+    try roundTrip(FindStop, .{ .view = 7, .clear_selection = 1 });
+    try roundTrip(SetZoom, .{ .view = 7, .level_x100 = -300 });
+    try roundTrip(EvFindResult, .{ .view = 7, .count = 12, .active = 3, .final = 1 });
+    try roundTrip(EvContextMenu, .{
+        .view = 7,
+        .x = 40,
+        .y = 220,
+        .flags = ctx_flag_link,
+        .link_url = "https://example.com/a",
+    });
 }
 
 test "round-trip: semantic layer frames" {

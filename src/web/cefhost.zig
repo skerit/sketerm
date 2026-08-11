@@ -386,6 +386,10 @@ pub const View = struct {
     external_pacing: bool = false,
     /// Last address CEF reported, owned; the `ev_nav_state` payload.
     url: []u8 = &.{},
+    /// USER zoom (`set_zoom`), as the engine's log-scale level x100.
+    /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
+    /// every load start because Chromium resets zoom per navigation.
+    user_zoom_x100: i32 = 0,
 
     /// Semantic-layer state: the shadow tree plus the requests waiting
     /// on a reply from the injected script.
@@ -850,6 +854,43 @@ pub const Host = struct {
             .reload_no_cache => if (b.reload_ignore_cache) |f| f(b),
             _ => {},
         }
+    }
+
+    /// Find-in-page (capability "find"): straight onto the engine's own
+    /// find API; results come back through `onFindResult`.
+    pub fn findInPage(self: *Host, req: proto.Find) void {
+        const v = self.find(req.view) orelse return;
+        var text = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.text, &text);
+        defer cef.cef_string_utf16_clear(&text);
+        withHostArgs(v, struct {
+            fn f(host: *cef.cef_browser_host_t, t: *const cef.cef_string_t, fw: c_int, mc: c_int, next: c_int) void {
+                if (host.find) |ff| ff(host, t, fw, mc, next);
+            }
+        }.f, .{
+            &text,
+            @as(c_int, if (req.forward != 0) 1 else 0),
+            @as(c_int, if (req.match_case != 0) 1 else 0),
+            @as(c_int, if (req.find_next != 0) 1 else 0),
+        });
+    }
+
+    pub fn findStop(self: *Host, req: proto.FindStop) void {
+        const v = self.find(req.view) orelse return;
+        withHostArgs(v, struct {
+            fn f(host: *cef.cef_browser_host_t, clear: c_int) void {
+                if (host.stop_finding) |sf| sf(host, clear);
+            }
+        }.f, .{@as(c_int, if (req.clear_selection != 0) 1 else 0)});
+    }
+
+    /// `set_zoom` (capability "zoom"): remember the user level and push
+    /// the combined zoom (see `applyZoom` for why the DPR rides along).
+    pub fn setZoom(self: *Host, req: proto.SetZoom) void {
+        const v = self.find(req.view) orelse return;
+        if (v.user_zoom_x100 == req.level_x100) return;
+        v.user_zoom_x100 = req.level_x100;
+        applyZoom(v);
     }
 
     // -- input ---------------------------------------------------------
@@ -1735,6 +1776,8 @@ var display_handler: cef.cef_display_handler_t = undefined;
 var life_span_handler: cef.cef_life_span_handler_t = undefined;
 var load_handler: cef.cef_load_handler_t = undefined;
 var request_handler: cef.cef_request_handler_t = undefined;
+var find_handler: cef.cef_find_handler_t = undefined;
+var context_menu_handler: cef.cef_context_menu_handler_t = undefined;
 var bp_handler: cef.cef_browser_process_handler_t = undefined;
 var rp_handler: cef.cef_render_process_handler_t = undefined;
 var v8_handler: cef.cef_v8_handler_t = undefined;
@@ -1791,6 +1834,12 @@ fn getLoadHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_load_handler
 fn getRequestHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_request_handler_t {
     return &request_handler;
 }
+fn getFindHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_find_handler_t {
+    return &find_handler;
+}
+fn getContextMenuHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_context_menu_handler_t {
+    return &context_menu_handler;
+}
 
 fn installHandlers() void {
     render_handler = std.mem.zeroes(cef.cef_render_handler_t);
@@ -1830,6 +1879,15 @@ fn installHandlers() void {
     request_handler.base = staticBase(cef.cef_request_handler_t);
     request_handler.on_render_process_terminated = onRenderProcessTerminated;
 
+    find_handler = std.mem.zeroes(cef.cef_find_handler_t);
+    find_handler.base = staticBase(cef.cef_find_handler_t);
+    find_handler.on_find_result = onFindResult;
+
+    context_menu_handler = std.mem.zeroes(cef.cef_context_menu_handler_t);
+    context_menu_handler.base = staticBase(cef.cef_context_menu_handler_t);
+    context_menu_handler.on_before_context_menu = onBeforeContextMenu;
+    context_menu_handler.run_context_menu = onRunContextMenu;
+
     client = std.mem.zeroes(cef.cef_client_t);
     client.base = staticBase(cef.cef_client_t);
     client.get_render_handler = getRenderHandler;
@@ -1837,6 +1895,8 @@ fn installHandlers() void {
     client.get_life_span_handler = getLifeSpanHandler;
     client.get_load_handler = getLoadHandler;
     client.get_request_handler = getRequestHandler;
+    client.get_find_handler = getFindHandler;
+    client.get_context_menu_handler = getContextMenuHandler;
     client.on_process_message_received = onProcessMessage;
 }
 
@@ -1919,16 +1979,19 @@ fn onGetScreenInfo(
     return 1;
 }
 
-/// Put the view's device scale into the browser's zoom level, which is
-/// where it lives in accelerated mode. A no-op otherwise.
+/// Put the view's zoom into the browser: the device scale (which lives
+/// in the zoom level in accelerated mode — see `scaleViaZoom`) plus the
+/// client's user zoom (`set_zoom`, log-scale level x100). The two ADD,
+/// because Chromium zoom levels are logarithmic (factor = 1.2^level).
 ///
 /// Chromium resets zoom per navigation, so this runs on every load start
-/// as well as at creation and on a scale change.
+/// as well as at creation, on a scale change and on `set_zoom`.
 fn applyZoom(v: *View) void {
-    if (!scaleViaZoom()) return;
+    const base: f64 = if (scaleViaZoom()) zoomLevelFor(v.scale_x1000) else 0.0;
+    const user: f64 = @as(f64, @floatFromInt(v.user_zoom_x100)) / 100.0;
     const host = browserHost(v) orelse return;
     defer release(&host.base);
-    if (host.set_zoom_level) |sz| sz(host, zoomLevelFor(v.scale_x1000));
+    if (host.set_zoom_level) |sz| sz(host, base + user);
 }
 
 /// Convert LOGICAL wire coordinates into the engine's view-rect space.
@@ -1940,6 +2003,97 @@ fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
         .x = @intCast(@divTrunc(@as(i64, x) * s, 1000)),
         .y = @intCast(@divTrunc(@as(i64, y) * s, 1000)),
     };
+}
+
+/// The inverse of `viewPoint`: view-rect coordinates (what the engine's
+/// hit tests report) back into LOGICAL wire coordinates.
+fn logicalPoint(v: *const View, x: c_int, y: c_int) struct { x: i32, y: i32 } {
+    if (!scaleViaZoom()) return .{ .x = x, .y = y };
+    const s: i64 = @intCast(@max(@as(i64, v.scale_x1000), 1));
+    return .{
+        .x = @intCast(@divTrunc(@as(i64, x) * 1000, s)),
+        .y = @intCast(@divTrunc(@as(i64, y) * 1000, s)),
+    };
+}
+
+fn onFindResult(
+    _: [*c]cef.cef_find_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    _: c_int,
+    count: c_int,
+    _: [*c]const cef.cef_rect_t,
+    active_match_ordinal: c_int,
+    final_update: c_int,
+) callconv(.c) void {
+    const host = g_host orelse return;
+    const v = viewOf(browser) orelse return;
+    host.post(proto.EvFindResult{
+        .view = v.id,
+        .count = count,
+        .active = active_match_ordinal,
+        .final = if (final_update != 0) 1 else 0,
+    });
+}
+
+/// Clear the engine's default menu so nothing of it survives even on a
+/// build that would display one.
+fn onBeforeContextMenu(
+    _: [*c]cef.cef_context_menu_handler_t,
+    _: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    _: [*c]cef.cef_context_menu_params_t,
+    model: [*c]cef.cef_menu_model_t,
+) callconv(.c) void {
+    const m: *cef.cef_menu_model_t = model orelse return;
+    if (m.clear) |cl| _ = cl(m);
+}
+
+/// The context menu is the CLIENT's: report the hit test (position,
+/// link, editability) as `ev_context_menu`, cancel the engine's own
+/// display outright, and return "handled".
+fn onRunContextMenu(
+    _: [*c]cef.cef_context_menu_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    params: [*c]cef.cef_context_menu_params_t,
+    _: [*c]cef.cef_menu_model_t,
+    callback: [*c]cef.cef_run_context_menu_callback_t,
+) callconv(.c) c_int {
+    if (callback) |cb| {
+        if (cb.*.cancel) |cancel| cancel(cb);
+    }
+    const host = g_host orelse return 1;
+    const v = viewOf(browser) orelse return 1;
+    const p: *cef.cef_context_menu_params_t = params orelse return 1;
+
+    var x: c_int = 0;
+    var y: c_int = 0;
+    if (p.get_xcoord) |gx| x = gx(p);
+    if (p.get_ycoord) |gy| y = gy(p);
+    const pt = logicalPoint(v, x, y);
+
+    var flags: u8 = 0;
+    var link = Utf8{ .s = std.mem.zeroes(cef.cef_string_utf8_t) };
+    defer link.free();
+    if (p.get_link_url) |gl| {
+        const raw = gl(p);
+        if (raw != null) {
+            link = Utf8.init(raw);
+            cef.cef_string_userfree_utf16_free(raw);
+            if (link.slice().len != 0) flags |= proto.ctx_flag_link;
+        }
+    }
+    if (p.is_editable) |ie| {
+        if (ie(p) != 0) flags |= proto.ctx_flag_editable;
+    }
+    host.post(proto.EvContextMenu{
+        .view = v.id,
+        .x = pt.x,
+        .y = pt.y,
+        .flags = flags,
+        .link_url = link.slice(),
+    });
+    return 1;
 }
 
 fn onPaint(

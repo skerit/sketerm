@@ -165,6 +165,8 @@ const proto = @import("../web/protocol.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
 const clock = @import("../util/clock.zig");
+const classicmenu = @import("browser/classicmenu.zig");
+const clipboard = @import("clipboard.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -764,6 +766,14 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvPopupRequest, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onPopup(ev.url);
             },
+            .ev_find_result => {
+                const ev = proto.decode(proto.EvFindResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onFindResult(ev);
+            },
+            .ev_context_menu => {
+                const ev = proto.decode(proto.EvContextMenu, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onContextMenu(ev);
+            },
             .ev_crashed => {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onCrashed();
@@ -943,10 +953,15 @@ pub const WebFace = struct {
     tex_prev_is_shm: bool = false,
     status_box: *c.GtkWidget = undefined,
     status_label: *c.GtkWidget = undefined,
+    /// Find-in-page bar (Ctrl+F): hidden until opened. Built by hand —
+    /// this tree has no shared findbar helper yet.
+    find_bar: *c.GtkWidget = undefined,
+    find_entry: *c.GtkWidget = undefined,
+    find_count: *c.GtkWidget = undefined,
 
     /// Objects carrying signals whose user-data is this face. All are
     /// disconnected at the teardown choke point.
-    signal_objs: [16]?*c.GObject = .{null} ** 16,
+    signal_objs: [24]?*c.GObject = .{null} ** 24,
     signal_count: usize = 0,
 
     /// Refcounted read-only mapping of the helper's frame memfd. Each
@@ -1028,6 +1043,12 @@ pub const WebFace = struct {
     title: ?[]u8 = null,
     can_back: bool = false,
     can_fwd: bool = false,
+
+    /// USER zoom as the engine's log-scale level x100 (`set_zoom`):
+    /// one Ctrl+= / Ctrl+- step is 100 (a 1.2x factor, the conventional
+    /// browser step), Ctrl+0 resets to 0. Kept here so a helper restart
+    /// re-applies it in `ensureView`.
+    zoom_x100: i32 = 0,
 
     /// Automation bookkeeping (see AutoKind): in-flight requests, their
     /// finished results, the last snapshot as sent by the helper, and
@@ -1699,6 +1720,50 @@ pub const WebFace = struct {
 
         c.gtk_box_append(@ptrCast(self.root_box), bar);
 
+        // Find-in-page bar (Ctrl+F), hidden until opened. Same toolbar
+        // styling as the address bar above it.
+        self.find_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        c.gtk_widget_add_css_class(self.find_bar, "toolbar");
+        c.gtk_widget_set_margin_start(self.find_bar, 4);
+        c.gtk_widget_set_margin_end(self.find_bar, 4);
+        c.gtk_widget_set_margin_bottom(self.find_bar, 4);
+
+        self.find_entry = c.gtk_search_entry_new();
+        c.gtk_widget_set_hexpand(self.find_entry, 1);
+        c.gtk_search_entry_set_placeholder_text(@ptrCast(self.find_entry), "Find in page");
+        _ = c.g_signal_connect_data(@ptrCast(self.find_entry), "search-changed", @ptrCast(&onFindChanged), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.find_entry), "activate", @ptrCast(&onFindActivate), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.find_entry), "next-match", @ptrCast(&onFindNextSig), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.find_entry), "previous-match", @ptrCast(&onFindPrevSig), self, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(self.find_entry), "stop-search", @ptrCast(&onFindStopSig), self, null, 0);
+        self.track(self.find_entry);
+        c.gtk_box_append(@ptrCast(self.find_bar), self.find_entry);
+
+        self.find_count = c.gtk_label_new("");
+        c.gtk_widget_add_css_class(self.find_count, "dim-label");
+        c.gtk_box_append(@ptrCast(self.find_bar), self.find_count);
+
+        const find_prev = c.gtk_button_new_from_icon_name("go-up-symbolic");
+        c.gtk_widget_set_tooltip_text(find_prev, "Previous match");
+        _ = c.g_signal_connect_data(@ptrCast(find_prev), "clicked", @ptrCast(&onFindPrevClicked), self, null, 0);
+        self.track(find_prev);
+        c.gtk_box_append(@ptrCast(self.find_bar), find_prev);
+
+        const find_next = c.gtk_button_new_from_icon_name("go-down-symbolic");
+        c.gtk_widget_set_tooltip_text(find_next, "Next match");
+        _ = c.g_signal_connect_data(@ptrCast(find_next), "clicked", @ptrCast(&onFindNextClicked), self, null, 0);
+        self.track(find_next);
+        c.gtk_box_append(@ptrCast(self.find_bar), find_next);
+
+        const find_close = c.gtk_button_new_from_icon_name("window-close-symbolic");
+        c.gtk_widget_set_tooltip_text(find_close, "Close find bar");
+        _ = c.g_signal_connect_data(@ptrCast(find_close), "clicked", @ptrCast(&onFindCloseClicked), self, null, 0);
+        self.track(find_close);
+        c.gtk_box_append(@ptrCast(self.find_bar), find_close);
+
+        c.gtk_widget_set_visible(self.find_bar, 0);
+        c.gtk_box_append(@ptrCast(self.root_box), self.find_bar);
+
         self.overlay = c.gtk_overlay_new();
         c.gtk_widget_set_hexpand(self.overlay, 1);
         c.gtk_widget_set_vexpand(self.overlay, 1);
@@ -1797,6 +1862,15 @@ pub const WebFace = struct {
         _ = c.g_signal_connect_data(@ptrCast(focus), "leave", @ptrCast(&onFocusLeave), self, null, 0);
         c.gtk_widget_add_controller(self.view_area, focus);
         self.track(focus);
+
+        // File drag & drop -> navigate to the file's URI (a dropped
+        // text is treated as an address). Mirrors pane.zig's target.
+        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
+        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onFileDrop), self, null, 0);
+        c.gtk_widget_add_controller(self.view_area, @ptrCast(drop));
+        self.track(drop);
     }
 
     fn setStatus(self: *WebFace, text: []const u8, retryable: bool) void {
@@ -1867,6 +1941,9 @@ pub const WebFace = struct {
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
         self.syncMaxFps();
+        // A fresh helper knows no user zoom either.
+        if (self.zoom_x100 != 0)
+            cl.post(proto.SetZoom{ .view = self.view, .level_x100 = self.zoom_x100 });
         // A view is created visible; tell the helper at once when this
         // face is on a background tab (a helper restart can rebuild a
         // view whose pane nobody is looking at).
@@ -2374,6 +2451,197 @@ pub const WebFace = struct {
         self.promote();
     }
 
+    // ---- find-in-page ----------------------------------------------
+
+    fn openFind(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        c.gtk_widget_set_visible(self.find_bar, 1);
+        _ = c.gtk_widget_grab_focus(self.find_entry);
+    }
+
+    fn closeFind(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        c.gtk_widget_set_visible(self.find_bar, 0);
+        c.gtk_label_set_text(@ptrCast(self.find_count), "");
+        if (self.view_live)
+            client().post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
+        _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
+    /// The find entry's current text (borrowed from the widget).
+    fn findQuery(self: *WebFace) []const u8 {
+        const t = c.gtk_editable_get_text(@ptrCast(self.find_entry)) orelse return "";
+        return std.mem.span(@as([*:0]const u8, @ptrCast(t)));
+    }
+
+    /// A NEW search for the entry's text; an emptied entry ends the
+    /// search instead (matching every browser's find bar).
+    fn findStart(self: *WebFace) void {
+        if (self.widgets_dead or !self.view_live) return;
+        const q = self.findQuery();
+        if (q.len == 0) {
+            c.gtk_label_set_text(@ptrCast(self.find_count), "");
+            client().post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
+            return;
+        }
+        client().post(proto.Find{
+            .view = self.view,
+            .forward = 1,
+            .match_case = 0,
+            .find_next = 0,
+            .text = q,
+        });
+        self.promote();
+    }
+
+    /// Step through the current search's matches.
+    fn findStep(self: *WebFace, forward: bool) void {
+        if (self.widgets_dead or !self.view_live) return;
+        const q = self.findQuery();
+        if (q.len == 0) return;
+        client().post(proto.Find{
+            .view = self.view,
+            .forward = if (forward) 1 else 0,
+            .match_case = 0,
+            .find_next = 1,
+            .text = q,
+        });
+        self.promote();
+    }
+
+    pub fn onFindResult(self: *WebFace, ev: proto.EvFindResult) void {
+        if (self.widgets_dead) return;
+        if (c.gtk_widget_get_visible(self.find_bar) == 0) return;
+        var buf: [64]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&buf, "{d}/{d}", .{ ev.active, ev.count }) catch return;
+        c.gtk_label_set_text(@ptrCast(self.find_count), z.ptr);
+    }
+
+    // ---- zoom -------------------------------------------------------
+
+    /// Zoom bounds in level x100: 1.2^-7 (~28%) to 1.2^8 (~430%),
+    /// Chromium's own preset range.
+    const zoom_min_x100: i32 = -700;
+    const zoom_max_x100: i32 = 800;
+
+    fn zoomStep(self: *WebFace, dir: i32) void {
+        self.setZoomLevel(std.math.clamp(self.zoom_x100 + dir * 100, zoom_min_x100, zoom_max_x100));
+    }
+
+    fn zoomReset(self: *WebFace) void {
+        self.setZoomLevel(0);
+    }
+
+    fn setZoomLevel(self: *WebFace, level_x100: i32) void {
+        if (level_x100 == self.zoom_x100) return;
+        self.zoom_x100 = level_x100;
+        if (!self.view_live) return;
+        client().post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
+        self.promote();
+    }
+
+    /// Face-local chords, tried after the window bindings and before
+    /// the page: Ctrl+F (find), Ctrl+=/-/0 (zoom). A page never sees
+    /// these — the same trade every browser makes.
+    fn faceChord(self: *WebFace, keyval: c.guint, state: c.GdkModifierType) bool {
+        const s: c_int = @intCast(state);
+        if (s & c.GDK_CONTROL_MASK == 0 or s & c.GDK_ALT_MASK != 0) return false;
+        switch (c.gdk_keyval_to_lower(keyval)) {
+            c.GDK_KEY_f => self.openFind(),
+            c.GDK_KEY_equal, c.GDK_KEY_plus, c.GDK_KEY_KP_Add => self.zoomStep(1),
+            c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => self.zoomStep(-1),
+            c.GDK_KEY_0, c.GDK_KEY_KP_0 => self.zoomReset(),
+            else => return false,
+        }
+        return true;
+    }
+
+    // ---- context menu ----------------------------------------------
+
+    /// Per-popup state for the context menu's rows; owned by the menu
+    /// Root (freed when the popover dies), never by the rows.
+    const MenuCtx = struct {
+        allocator: std.mem.Allocator,
+        face: *WebFace,
+        page: ?[]u8 = null,
+        link: ?[]u8 = null,
+    };
+
+    fn freeMenuCtx(user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.page) |p| ctx.allocator.free(p);
+        if (ctx.link) |l| ctx.allocator.free(l);
+        ctx.allocator.destroy(ctx);
+    }
+
+    /// The helper suppressed the engine's menu and reported the hit
+    /// test; show ours at the reported page position.
+    pub fn onContextMenu(self: *WebFace, ev: proto.EvContextMenu) void {
+        if (self.widgets_dead) return;
+        const root = classicmenu.Root.create(self.allocator) orelse return;
+        const ctx = self.allocator.create(MenuCtx) catch {
+            root.destroy();
+            return;
+        };
+        ctx.* = .{ .allocator = self.allocator, .face = self };
+        if (self.url) |u| ctx.page = self.allocator.dupe(u8, u) catch null;
+        if (ev.flags & proto.ctx_flag_link != 0 and ev.link_url.len != 0)
+            ctx.link = self.allocator.dupe(u8, ev.link_url) catch null;
+        root.own(freeMenuCtx, ctx);
+
+        const m = root.top();
+        m.itemIconEnabled("Back", .{ .name = "go-previous-symbolic" }, self.can_back, &onMenuBack, ctx);
+        m.itemIconEnabled("Forward", .{ .name = "go-next-symbolic" }, self.can_fwd, &onMenuForward, ctx);
+        m.itemIcon("Reload", .{ .name = "view-refresh-symbolic" }, &onMenuReload, ctx);
+        if (ctx.link != null) {
+            const links = m.section();
+            links.item("Open Link in New Tab", &onMenuOpenLink, ctx);
+            links.item("Copy Link URL", &onMenuCopyLink, ctx);
+        }
+        const page = m.section();
+        page.itemIconEnabled("Copy Page URL", .none, ctx.page != null, &onMenuCopyUrl, ctx);
+
+        const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
+        const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
+        _ = root.popup(self.view_area, x, y);
+    }
+
+    fn copyText(self: *WebFace, text: []const u8) void {
+        if (self.widgets_dead) return;
+        const z = self.allocator.dupeZ(u8, text) catch return;
+        defer self.allocator.free(z);
+        clipboard.copyToClipboard(self.root_box, z);
+    }
+
+    fn onMenuBack(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.navAction(.back);
+    }
+
+    fn onMenuForward(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.navAction(.forward);
+    }
+
+    fn onMenuReload(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.navAction(.reload);
+    }
+
+    fn onMenuCopyUrl(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.page) |p| ctx.face.copyText(p);
+    }
+
+    fn onMenuCopyLink(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.link) |l| ctx.face.copyText(l);
+    }
+
+    fn onMenuOpenLink(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        const link = ctx.link orelse return;
+        const win = ctx.face.ownerWindow() orelse return;
+        win.newWebTabAt(link) catch {};
+    }
+
     // ---- widget callbacks ------------------------------------------
 
     fn onBack(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -2416,6 +2684,66 @@ pub const WebFace = struct {
         const text = c.gtk_editable_get_text(@ptrCast(self.entry)) orelse return;
         self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(text))));
         _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
+    fn onFindChanged(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStart();
+    }
+
+    fn onFindActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStep(true);
+    }
+
+    fn onFindNextSig(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStep(true);
+    }
+
+    fn onFindPrevSig(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStep(false);
+    }
+
+    /// Escape in the entry (GtkSearchEntry's stop-search).
+    fn onFindStopSig(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).closeFind();
+    }
+
+    fn onFindPrevClicked(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStep(false);
+    }
+
+    fn onFindNextClicked(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).findStep(true);
+    }
+
+    fn onFindCloseClicked(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).closeFind();
+    }
+
+    /// A dropped file navigates to its URI; dropped text is treated as
+    /// an address (pane.zig's target shape, different verb).
+    fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
+            const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
+            // get_files is transfer-container: free the list, not the GFiles.
+            const files = c.gdk_file_list_get_files(flist);
+            defer c.g_slist_free(files);
+            if (files == null) return 0;
+            // One page per view: the FIRST dropped file is the one opened.
+            const gfile: ?*c.GFile = @ptrCast(files.*.data);
+            const uri_c = c.g_file_get_uri(gfile);
+            if (uri_c == null) return 0;
+            defer c.g_free(uri_c);
+            self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(uri_c))));
+            return 1;
+        }
+        if (c.g_type_check_value_holds(value, c.G_TYPE_STRING) != 0) {
+            const s = c.g_value_get_string(value);
+            if (s == null) return 0;
+            self.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(s))));
+            return 1;
+        }
+        return 0;
     }
 
     /// A blank tab's address bar takes focus the moment it can.
@@ -2641,6 +2969,15 @@ pub const WebFace = struct {
     fn onScroll(ctrl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(WebFace, user);
         if (!self.view_live) return 0;
+        // Ctrl+wheel is zoom, not scroll — the page never sees it.
+        if (modsOf(@ptrCast(ctrl)) & proto.mod_ctrl != 0) {
+            if (dy < 0) {
+                self.zoomStep(1);
+            } else if (dy > 0) {
+                self.zoomStep(-1);
+            }
+            return 1;
+        }
         // GTK reports wheel notches (1.0 per click); Chromium's unit is
         // 120 per notch.
         client().post(proto.InputScroll{
@@ -2679,6 +3016,7 @@ pub const WebFace = struct {
                 }
             }
         }
+        if (self.faceChord(keyval, state)) return 1;
         return self.sendKey(.down, keyval, keycode, state);
     }
 
