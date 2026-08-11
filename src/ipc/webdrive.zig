@@ -91,11 +91,6 @@ const Sem = struct {
     snap_kind: u8 = 0,
 };
 
-/// Unsolicited deltas buffered for an absent reader before the buffer
-/// is dropped (same bound and overflow marker as webface.zig).
-const MAX_PENDING_DELTA = 64 * 1024;
-const DELTA_OVERFLOW = "... earlier changes dropped (buffer full); ask for mode=full\n";
-
 pub const View = struct {
     id: u32,
     w: u16,
@@ -131,9 +126,9 @@ pub const View = struct {
     // called synchronously, so a parked reply per kind suffices.
     inbox: [N_KINDS]?Sem = @splat(null),
     waiting: [N_KINDS]bool = @splat(false),
-    /// A mode:full snapshot is not satisfied by a spontaneous delta.
+    /// A mode:full snapshot is not satisfied by a delta (a stray push
+    /// from a pre-coalescing helper).
     want_full: bool = false,
-    pending_delta: std.ArrayList(u8) = .empty,
     /// The full text of the last eval result (what `web_expand [0]`
     /// pages), mirroring the GUI face.
     last_eval: ?[]u8 = null,
@@ -147,7 +142,6 @@ pub const View = struct {
             if (slot.*) |s| gpa.free(s.text);
             slot.* = null;
         }
-        self.pending_delta.deinit(gpa);
     }
 };
 
@@ -809,30 +803,17 @@ pub const Engine = struct {
         }
     }
 
-    /// Mirrors webface.onSnapshot: unsolicited deltas are buffered so
-    /// the caller's next snapshot carries every change since it last
-    /// looked, oldest first, instead of eating them.
+    /// Mirrors webface.onSnapshot: every `sem_snapshot` frame answers a
+    /// request now (the helper coalesces spontaneous mutations into its
+    /// shadow tree and pushes nothing for them), so a frame nobody is
+    /// waiting on — a stray push from a pre-coalescing helper — is
+    /// dropped, never buffered.
     fn onSnapshot(self: *Engine, v: *View, ev: proto.SemSnapshot) void {
         const full = ev.kind == @intFromEnum(proto.SnapKind.full);
         const ki = @intFromEnum(OpKind.snapshot);
         const waiting = v.waiting[ki] and v.inbox[ki] == null;
-        if (!waiting or (v.want_full and !full)) {
-            if (full) v.pending_delta.clearRetainingCapacity();
-            if (v.pending_delta.items.len < MAX_PENDING_DELTA) {
-                v.pending_delta.appendSlice(self.gpa, ev.payload.s) catch {};
-            } else if (!std.mem.endsWith(u8, v.pending_delta.items, DELTA_OVERFLOW)) {
-                v.pending_delta.appendSlice(self.gpa, DELTA_OVERFLOW) catch {};
-            }
-            return;
-        }
-        if (full or v.pending_delta.items.len == 0) {
-            v.pending_delta.clearRetainingCapacity();
-            self.park(v, .snapshot, true, ev.payload.s, ev.doc_gen, ev.rev, ev.kind);
-            return;
-        }
-        v.pending_delta.appendSlice(self.gpa, ev.payload.s) catch {};
-        self.park(v, .snapshot, true, v.pending_delta.items, ev.doc_gen, ev.rev, ev.kind);
-        v.pending_delta.clearRetainingCapacity();
+        if (!waiting or (v.want_full and !full)) return;
+        self.park(v, .snapshot, true, ev.payload.s, ev.doc_gen, ev.rev, ev.kind);
     }
 };
 
@@ -840,7 +821,7 @@ pub const Engine = struct {
 // Tests (pure bookkeeping; no helper is spawned)
 // ---------------------------------------------------------------------
 
-test "unsolicited deltas are buffered and merged into the next awaited snapshot" {
+test "a snapshot reply is exactly the helper's coalesced answer; strays are dropped" {
     const gpa = std.testing.allocator;
     var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
     defer {
@@ -851,19 +832,20 @@ test "unsolicited deltas are buffered and merged into the next awaited snapshot"
     v.* = .{ .id = 1, .w = 100, .h = 100 };
     try eng.views.append(gpa, v);
 
-    // Nobody waiting: a delta is stashed, not delivered.
+    // Nobody waiting: the frame is dropped, never buffered — the helper
+    // owns "what changed since the caller last looked" now, so text
+    // concatenated client-side could only duplicate or contradict it.
     eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 2, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [4] changed\n" } });
     try std.testing.expect(v.inbox[@intFromEnum(OpKind.snapshot)] == null);
-    try std.testing.expectEqualStrings("~ [4] changed\n", v.pending_delta.items);
 
-    // A waiting caller gets the stash plus the fresh reply, in order.
+    // A waiting caller gets the reply verbatim: ONE delta, not a
+    // concatenation with anything that arrived earlier.
     v.waiting[@intFromEnum(OpKind.snapshot)] = true;
     v.want_full = false;
-    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 3, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [5] more\n" } });
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 3, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "delta rev 2->3\n~ [5] more\n" } });
     const parked = v.inbox[@intFromEnum(OpKind.snapshot)].?;
-    try std.testing.expectEqualStrings("~ [4] changed\n~ [5] more\n", parked.text);
+    try std.testing.expectEqualStrings("delta rev 2->3\n~ [5] more\n", parked.text);
     try std.testing.expectEqual(@as(u32, 3), parked.rev);
-    try std.testing.expectEqual(@as(usize, 0), v.pending_delta.items.len);
 }
 
 test "a full-mode wait is not satisfied by a spontaneous delta" {

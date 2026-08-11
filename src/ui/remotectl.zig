@@ -1023,7 +1023,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
     const token: ?u32 = blk: {
         if (eql(u8, op, "snapshot")) {
             const mode: web_proto.SnapMode = if (req.mode) |m|
-                (if (eql(u8, m, "full")) .full else .auto)
+                (if (eql(u8, m, "full")) .full else if (eql(u8, m, "history")) .history else .auto)
             else
                 .auto;
             const detail: u8 = @intCast(@min(req.detail orelse 1, 2));

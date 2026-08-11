@@ -1043,11 +1043,6 @@ pub const WebFace = struct {
     last_snapshot: ?[]u8 = null,
     last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
-    /// Deltas that arrived UNSOLICITED (the helper's mutation observer)
-    /// while nobody was waiting. Without this they were dropped, and
-    /// the caller's next snapshot honestly reported "nothing changed
-    /// since then" — having eaten the very change it was asking about.
-    pending_delta: std.ArrayList(u8) = .empty,
 
     // ---- attach / teardown ------------------------------------------
 
@@ -1157,7 +1152,6 @@ pub const WebFace = struct {
         if (self.url) |u| self.allocator.free(u);
         if (self.title) |t| self.allocator.free(t);
         self.autoClear();
-        self.pending_delta.deinit(self.allocator);
         self.auto_ops.deinit(self.allocator);
         self.auto_results.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -1174,7 +1168,6 @@ pub const WebFace = struct {
         self.last_snapshot_meta = .{};
         if (self.last_eval) |e| self.allocator.free(e);
         self.last_eval = null;
-        self.pending_delta.clearAndFree(self.allocator);
     }
 
     fn autoBusy(self: *WebFace, kind: AutoKind) bool {
@@ -1369,10 +1362,11 @@ pub const WebFace = struct {
         return c.gdk_texture_save_to_png_bytes(texture);
     }
 
-    /// Deltas buffered for an absent reader before the buffer is
-    /// dropped. A page that animates must not grow it without bound.
-    const MAX_PENDING_DELTA = 64 * 1024;
-
+    /// Every `sem_snapshot` frame answers a request now: the helper
+    /// coalesces spontaneous mutations into its shadow tree and pushes
+    /// nothing for them (semantic.View.consume), so the old client-side
+    /// delta-buffering is gone. `completeOp`'s want_full guard still
+    /// drops a stray delta from a pre-coalescing helper.
     pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot) void {
         const meta: AutoMeta = .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .snap_kind = ev.kind };
         if (self.allocator.dupe(u8, ev.payload.s)) |owned| {
@@ -1380,37 +1374,7 @@ pub const WebFace = struct {
             self.last_snapshot = owned;
             self.last_snapshot_meta = meta;
         } else |_| {}
-
-        const full = ev.kind == @intFromEnum(proto.SnapKind.full);
-        if (!self.snapshotWaiting()) {
-            // Nobody asked: keep the change until someone does.
-            if (full) self.pending_delta.clearRetainingCapacity();
-            if (self.pending_delta.items.len < MAX_PENDING_DELTA) {
-                self.pending_delta.appendSlice(self.allocator, ev.payload.s) catch {};
-            } else if (!std.mem.endsWith(u8, self.pending_delta.items, DELTA_OVERFLOW)) {
-                self.pending_delta.appendSlice(self.allocator, DELTA_OVERFLOW) catch {};
-            }
-            return;
-        }
-        if (full or self.pending_delta.items.len == 0) {
-            self.pending_delta.clearRetainingCapacity();
-            self.completeOp(.snapshot, true, ev.payload.s, meta);
-            return;
-        }
-        // Hand back everything that happened since the caller last
-        // looked, oldest first, then this reply.
-        self.pending_delta.appendSlice(self.allocator, ev.payload.s) catch {};
-        self.completeOp(.snapshot, true, self.pending_delta.items, meta);
-        self.pending_delta.clearRetainingCapacity();
-    }
-
-    const DELTA_OVERFLOW = "... earlier changes dropped (buffer full); ask for mode=full\n";
-
-    fn snapshotWaiting(self: *WebFace) bool {
-        for (self.auto_ops.items) |op| {
-            if (op.kind == .snapshot) return true;
-        }
-        return false;
+        self.completeOp(.snapshot, true, ev.payload.s, meta);
     }
 
     pub fn onEvalResult(self: *WebFace, ev: proto.SemEvalResult) void {

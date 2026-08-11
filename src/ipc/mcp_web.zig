@@ -279,7 +279,12 @@ fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms:
             if (eql(u8, op.op, "snapshot")) {
                 req.kind = .snapshot;
                 req.mode = if (op.mode) |m|
-                    (if (eql(u8, m, "full")) @intFromEnum(web_proto.SnapMode.full) else @intFromEnum(web_proto.SnapMode.auto))
+                    (if (eql(u8, m, "full"))
+                        @intFromEnum(web_proto.SnapMode.full)
+                    else if (eql(u8, m, "history"))
+                        @intFromEnum(web_proto.SnapMode.history)
+                    else
+                        @intFromEnum(web_proto.SnapMode.auto))
                 else
                     @intFromEnum(web_proto.SnapMode.auto);
                 req.detail = @intCast(@min(op.detail, 2));
@@ -749,7 +754,13 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_snapshot")) {
-        const mode = mcp.argStr(args, "mode") orelse "auto";
+        // `history: true` is sugar for mode "history" — the per-revision
+        // replay of everything since the last snapshot, for debugging
+        // pages whose changes appear and vanish between calls.
+        const mode = if (mcp.argBool(args, "history"))
+            "history"
+        else
+            mcp.argStr(args, "mode") orelse "auto";
         const detail: u32 = blk: {
             const d = mcp.argInt(args, "detail") orelse 1;
             break :blk @intCast(std.math.clamp(d, 0, 2));
