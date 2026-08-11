@@ -75,6 +75,12 @@ pub const CAP_PERMISSIONS = "permissions";
 /// sees a download at all (the engine cancels them without a handler),
 /// which is the pre-downloads behaviour.
 pub const CAP_DOWNLOADS = "downloads";
+/// The helper accepts `a11y_enable` and, for a view it was enabled on,
+/// streams the engine's accessibility tree as `ev_a11y_tree` /
+/// `ev_a11y_loc` / `ev_a11y_event` frames (the 0x70 block). Nothing is
+/// streamed for a view that never asked: engine-side accessibility is
+/// not free, and an unsolicited stream would break the backlog rule.
+pub const CAP_A11Y = "a11y";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -134,6 +140,10 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
+    a11y_enable = 0x70,
+    ev_a11y_tree = 0x71,
+    ev_a11y_loc = 0x72,
+    ev_a11y_event = 0x73,
     ev_download_offer = 0x78,
     download_decide = 0x79,
     ev_download_progress = 0x7A,
@@ -894,6 +904,273 @@ pub const DownloadCancel = struct {
     pub const tag: Tag = .download_cancel;
     view: u32,
     id: u32,
+};
+
+// -- accessibility (0x70 block, capability "a11y") --------------------
+//
+// The engine's accessibility tree, streamed to the client so a
+// PLATFORM projection (AT-SPI on Linux, NSAccessibility on macOS) can
+// re-expose the page to a screen reader. Shape rules:
+//
+//   - Nothing flows until the client sends `a11y_enable` for a view;
+//     engine-side accessibility costs real CPU and the stream would
+//     otherwise violate the backlog rule.
+//   - `ev_a11y_tree` is an INCREMENTAL update, mirroring how engines
+//     produce them: a list of nodes that changed (with their full new
+//     content and child lists), not a restatement of the whole tree.
+//     The first update after enabling restates everything reachable.
+//   - Node ids are engine-assigned, stable for the lifetime of a
+//     document, and only unique WITHIN a view. Only the root frame's
+//     tree is streamed in v1; child-frame (iframe) trees are dropped,
+//     so a child id naming a node that never arrives must be treated
+//     as an absent child, not an error.
+//   - Roles are lowercase tokens: the WAI-ARIA role name where one
+//     exists ("button", "heading", "link", "checkbox", ...), plus a
+//     small documented extension set ("text" for a static text run,
+//     "document" for the root, "generic" for a plain container).
+//     Unknown roles must be presented as a generic node, not dropped.
+
+/// Enable (1) or disable (0) accessibility streaming for a view.
+/// Idempotent; disabling also stops the engine-side tree production.
+pub const A11yEnable = struct {
+    pub const tag: Tag = .a11y_enable;
+    view: u32,
+    enabled: u8,
+};
+
+/// One incremental tree update. `nodes` is a sequence of
+/// `A11yNode`-encoded records (see `A11yNodeWriter`/`A11yNodeIter`).
+/// `node_id_to_clear` names a node whose CHILDREN should be dropped
+/// before applying the node list (0 = none); `root_id` is the current
+/// root node id; `focus_id` the currently focused node (0 = none).
+pub const EvA11yTree = struct {
+    pub const tag: Tag = .ev_a11y_tree;
+    view: u32,
+    root_id: u32,
+    node_id_to_clear: u32,
+    focus_id: u32,
+    nodes: Text,
+};
+
+/// Pure geometry deltas (scrolling, layout shifts): a sequence of
+/// `A11yLoc` records (see `putA11yLoc`/`A11yLocIter`). Split from
+/// `ev_a11y_tree` because scrolling produces them at frame rate and a
+/// client that only mirrors structure may skip them cheaply.
+pub const EvA11yLoc = struct {
+    pub const tag: Tag = .ev_a11y_loc;
+    view: u32,
+    locs: Text,
+};
+
+/// A discrete accessibility event on one node. `event` is a lowercase
+/// token from a deliberately small set ("focus", "load-complete");
+/// helpers map their engine's vocabulary onto it and DROP what has no
+/// mapping, so unknown tokens are new protocol, not engine leakage.
+pub const EvA11yEvent = struct {
+    pub const tag: Tag = .ev_a11y_event;
+    view: u32,
+    id: u32,
+    event: []const u8,
+};
+
+/// `A11yNode.state` bits — OUR numbering, engine enums never cross the
+/// wire. Append-only: a bit once assigned is never reused.
+pub const ax_focusable: u64 = 1 << 0;
+pub const ax_focused: u64 = 1 << 1;
+pub const ax_disabled: u64 = 1 << 2;
+pub const ax_editable: u64 = 1 << 3;
+pub const ax_checked: u64 = 1 << 4;
+pub const ax_checked_mixed: u64 = 1 << 5;
+pub const ax_selected: u64 = 1 << 6;
+pub const ax_expanded: u64 = 1 << 7;
+pub const ax_collapsed: u64 = 1 << 8;
+pub const ax_invisible: u64 = 1 << 9;
+pub const ax_ignored: u64 = 1 << 10;
+pub const ax_required: u64 = 1 << 11;
+pub const ax_readonly: u64 = 1 << 12;
+pub const ax_busy: u64 = 1 << 13;
+pub const ax_modal: u64 = 1 << 14;
+pub const ax_multiline: u64 = 1 << 15;
+pub const ax_protected: u64 = 1 << 16;
+pub const ax_hovered: u64 = 1 << 17;
+pub const ax_default: u64 = 1 << 18;
+pub const ax_visited: u64 = 1 << 19;
+pub const ax_multiselectable: u64 = 1 << 20;
+pub const ax_autofill_available: u64 = 1 << 21;
+
+/// One node of an `ev_a11y_tree` payload as the decoder yields it.
+/// Rect coordinates are CSS pixels RELATIVE to `offset_container`
+/// (0 = the tree root / no container); child ids and attribute pairs
+/// stay in their raw encoded form so decoding allocates nothing.
+pub const A11yNode = struct {
+    id: u32,
+    state: u64,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    offset_container: u32,
+    role: []const u8,
+    name: []const u8,
+    value: []const u8,
+    description: []const u8,
+    nchildren: u16,
+    child_bytes: []const u8,
+    nattrs: u16,
+    attr_bytes: []const u8,
+
+    pub fn childAt(self: *const A11yNode, i: usize) u32 {
+        return std.mem.readInt(u32, self.child_bytes[i * 4 ..][0..4], .little);
+    }
+
+    pub fn attrs(self: *const A11yNode) A11yAttrIter {
+        return .{ .cur = .{ .buf = self.attr_bytes }, .left = self.nattrs };
+    }
+};
+
+pub const A11yAttr = struct { key: []const u8, value: []const u8 };
+
+pub const A11yAttrIter = struct {
+    cur: Cur,
+    left: u16,
+
+    pub fn next(self: *A11yAttrIter) !?A11yAttr {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const k = try self.cur.readStr();
+        const v = try self.cur.readStr();
+        return .{ .key = k, .value = v };
+    }
+};
+
+/// What a producer hands `A11yNodeWriter.put` — same fields as
+/// `A11yNode`, with the lists as real slices.
+pub const A11yNodeSpec = struct {
+    id: u32,
+    state: u64 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+    w: i32 = 0,
+    h: i32 = 0,
+    offset_container: u32 = 0,
+    role: []const u8 = "",
+    name: []const u8 = "",
+    value: []const u8 = "",
+    description: []const u8 = "",
+    children: []const u32 = &.{},
+    attributes: []const A11yAttr = &.{},
+};
+
+/// Appends `A11yNode` records to a buffer that becomes an
+/// `EvA11yTree.nodes` payload. Shared by the helper and the tests so
+/// the encoding cannot fork.
+pub const A11yNodeWriter = struct {
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    count: u32 = 0,
+
+    pub fn put(self: *A11yNodeWriter, n: A11yNodeSpec) !void {
+        if (n.children.len > std.math.maxInt(u16)) return error.TooManyChildren;
+        if (n.attributes.len > std.math.maxInt(u16)) return error.TooManyAttrs;
+        try putU32(self.gpa, self.buf, n.id);
+        try putU64(self.gpa, self.buf, n.state);
+        try putI32(self.gpa, self.buf, n.x);
+        try putI32(self.gpa, self.buf, n.y);
+        try putI32(self.gpa, self.buf, n.w);
+        try putI32(self.gpa, self.buf, n.h);
+        try putU32(self.gpa, self.buf, n.offset_container);
+        try putStr(self.gpa, self.buf, n.role);
+        try putStr(self.gpa, self.buf, n.name);
+        try putStr(self.gpa, self.buf, n.value);
+        try putStr(self.gpa, self.buf, n.description);
+        try putU16(self.gpa, self.buf, @intCast(n.children.len));
+        for (n.children) |id| try putU32(self.gpa, self.buf, id);
+        try putU16(self.gpa, self.buf, @intCast(n.attributes.len));
+        for (n.attributes) |a| {
+            try putStr(self.gpa, self.buf, a.key);
+            try putStr(self.gpa, self.buf, a.value);
+        }
+        self.count += 1;
+    }
+};
+
+/// Walks an `EvA11yTree.nodes` payload. Slices borrow from the
+/// payload; nothing allocates.
+pub const A11yNodeIter = struct {
+    cur: Cur,
+
+    pub fn init(payload: []const u8) A11yNodeIter {
+        return .{ .cur = .{ .buf = payload } };
+    }
+
+    pub fn next(self: *A11yNodeIter) !?A11yNode {
+        if (self.cur.pos >= self.cur.buf.len) return null;
+        var n: A11yNode = undefined;
+        n.id = try self.cur.readU32();
+        n.state = try self.cur.readU64();
+        n.x = try self.cur.readI32();
+        n.y = try self.cur.readI32();
+        n.w = try self.cur.readI32();
+        n.h = try self.cur.readI32();
+        n.offset_container = try self.cur.readU32();
+        n.role = try self.cur.readStr();
+        n.name = try self.cur.readStr();
+        n.value = try self.cur.readStr();
+        n.description = try self.cur.readStr();
+        n.nchildren = try self.cur.readU16();
+        const cb = @as(usize, n.nchildren) * 4;
+        if (self.cur.pos + cb > self.cur.buf.len) return error.Truncated;
+        n.child_bytes = self.cur.buf[self.cur.pos..][0..cb];
+        self.cur.pos += cb;
+        n.nattrs = try self.cur.readU16();
+        const attr_start = self.cur.pos;
+        var i: u16 = 0;
+        while (i < n.nattrs) : (i += 1) {
+            _ = try self.cur.readStr();
+            _ = try self.cur.readStr();
+        }
+        n.attr_bytes = self.cur.buf[attr_start..self.cur.pos];
+        return n;
+    }
+};
+
+/// One geometry delta of an `ev_a11y_loc` payload.
+pub const A11yLoc = struct {
+    id: u32,
+    offset_container: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+};
+
+pub fn putA11yLoc(gpa: std.mem.Allocator, out: *std.ArrayList(u8), l: A11yLoc) !void {
+    try putU32(gpa, out, l.id);
+    try putU32(gpa, out, l.offset_container);
+    try putI32(gpa, out, l.x);
+    try putI32(gpa, out, l.y);
+    try putI32(gpa, out, l.w);
+    try putI32(gpa, out, l.h);
+}
+
+pub const A11yLocIter = struct {
+    cur: Cur,
+
+    pub fn init(payload: []const u8) A11yLocIter {
+        return .{ .cur = .{ .buf = payload } };
+    }
+
+    pub fn next(self: *A11yLocIter) !?A11yLoc {
+        if (self.cur.pos >= self.cur.buf.len) return null;
+        return .{
+            .id = try self.cur.readU32(),
+            .offset_container = try self.cur.readU32(),
+            .x = try self.cur.readI32(),
+            .y = try self.cur.readI32(),
+            .w = try self.cur.readI32(),
+            .h = try self.cur.readI32(),
+        };
+    }
 };
 
 // -- semantic layer (capability "semantic") ---------------------------
@@ -1764,6 +2041,105 @@ test "round-trip: semantic layer frames" {
     try roundTrip(SemEvalResult, .{ .view = 7, .ok = 1, .json = .{ .s = "{\"value\":\"x\"}" } });
 }
 
+test "round-trip: a11y frames" {
+    try roundTrip(A11yEnable, .{ .view = 7, .enabled = 1 });
+    try roundTrip(EvA11yTree, .{
+        .view = 7,
+        .root_id = 1,
+        .node_id_to_clear = 0,
+        .focus_id = 4,
+        .nodes = .{ .s = "" },
+    });
+    try roundTrip(EvA11yLoc, .{ .view = 7, .locs = .{ .s = "" } });
+    try roundTrip(EvA11yEvent, .{ .view = 7, .id = 4, .event = "focus" });
+}
+
+test "a11y node list round-trips through writer and iterator" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var w = A11yNodeWriter{ .gpa = gpa, .buf = &buf };
+    try w.put(.{
+        .id = 1,
+        .state = ax_busy,
+        .x = 0,
+        .y = 0,
+        .w = 800,
+        .h = 600,
+        .role = "document",
+        .name = "Example page",
+        .children = &[_]u32{ 2, 3 },
+    });
+    try w.put(.{
+        .id = 2,
+        .state = 0,
+        .x = 8,
+        .y = 8,
+        .w = 200,
+        .h = 32,
+        .offset_container = 1,
+        .role = "heading",
+        .name = "Hello",
+        .attributes = &[_]A11yAttr{.{ .key = "level", .value = "1" }},
+    });
+    try w.put(.{
+        .id = 3,
+        .state = ax_focusable | ax_focused,
+        .x = 8,
+        .y = 48,
+        .w = 80,
+        .h = 24,
+        .offset_container = 1,
+        .role = "button",
+        .name = "Go",
+        .value = "",
+        .description = "submits the form",
+    });
+    try std.testing.expectEqual(@as(u32, 3), w.count);
+
+    var it = A11yNodeIter.init(buf.items);
+    const n1 = (try it.next()).?;
+    try std.testing.expectEqual(@as(u32, 1), n1.id);
+    try std.testing.expectEqualStrings("document", n1.role);
+    try std.testing.expectEqual(@as(u16, 2), n1.nchildren);
+    try std.testing.expectEqual(@as(u32, 2), n1.childAt(0));
+    try std.testing.expectEqual(@as(u32, 3), n1.childAt(1));
+    const n2 = (try it.next()).?;
+    try std.testing.expectEqualStrings("heading", n2.role);
+    try std.testing.expectEqualStrings("Hello", n2.name);
+    var attrs = n2.attrs();
+    const a = (try attrs.next()).?;
+    try std.testing.expectEqualStrings("level", a.key);
+    try std.testing.expectEqualStrings("1", a.value);
+    try std.testing.expectEqual(@as(?A11yAttr, null), try attrs.next());
+    const n3 = (try it.next()).?;
+    try std.testing.expectEqual(ax_focusable | ax_focused, n3.state);
+    try std.testing.expectEqualStrings("submits the form", n3.description);
+    try std.testing.expectEqual(@as(u32, 1), n3.offset_container);
+    try std.testing.expectEqual(@as(?A11yNode, null), try it.next());
+
+    // A truncated payload is an error, never a read past the buffer.
+    var short = A11yNodeIter.init(buf.items[0 .. buf.items.len - 3]);
+    _ = try short.next();
+    _ = try short.next();
+    try std.testing.expectError(error.Truncated, short.next());
+}
+
+test "a11y location list round-trips" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try putA11yLoc(gpa, &buf, .{ .id = 4, .offset_container = 1, .x = -2, .y = 300, .w = 80, .h = 24 });
+    try putA11yLoc(gpa, &buf, .{ .id = 5, .offset_container = 0, .x = 0, .y = 0, .w = 800, .h = 600 });
+    var it = A11yLocIter.init(buf.items);
+    const l1 = (try it.next()).?;
+    try std.testing.expectEqual(@as(i32, -2), l1.x);
+    try std.testing.expectEqual(@as(u32, 1), l1.offset_container);
+    const l2 = (try it.next()).?;
+    try std.testing.expectEqual(@as(u32, 5), l2.id);
+    try std.testing.expectEqual(@as(?A11yLoc, null), try it.next());
+}
+
 test "round-trip: interception frames" {
     try roundTrip(InterceptSet, .{ .view = 0, .enabled = 0 });
     try roundTrip(InterceptSet, .{ .view = 7, .enabled = 1 });
@@ -1922,8 +2298,8 @@ test "reader skips unknown tags" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     try encode(gpa, &buf, EvTitle{ .view = 1, .title = "a" });
-    // A frame from a newer peer: the still-reserved a11y block.
-    try buf.appendSlice(gpa, &[_]u8{ 3, 0, 0, 0, 0x70, 0xAA, 0xBB });
+    // A frame from a newer peer: an unassigned tag in the a11y block.
+    try buf.appendSlice(gpa, &[_]u8{ 3, 0, 0, 0, 0x77, 0xAA, 0xBB });
     try encode(gpa, &buf, EvCrashed{ .view = 2 });
 
     var r = Reader.init(buf.items);
