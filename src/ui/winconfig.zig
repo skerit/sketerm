@@ -899,8 +899,9 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         p.mouse_autohide = self.config.mouse_autohide;
         p.middle_click_action = self.config.mouse_middle_click;
         p.right_click_action = self.config.mouse_right_click;
-        // Per-pane titlebar visibility (never in files identity).
-        p.setTitlebarVisible(self.config.show_titlebar and !Window.filesIdentity());
+        // Per-pane titlebar visibility (never in the files or web
+        // identities -- their faces' own bars already name the pane).
+        p.setTitlebarVisible(self.config.show_titlebar and !Window.filesIdentity() and !Window.webIdentity());
         // Inactive-pane dimming.
         p.surface.inactive_darken = self.config.inactive_darken;
         p.surface.inactive_desaturate = self.config.inactive_desaturate;

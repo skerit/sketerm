@@ -434,6 +434,13 @@ pub const Window = struct {
         return files_identity;
     }
 
+    /// True when this process IS the dedicated browser (`sketerm
+    /// web`). Like the files identity, the per-pane titlebar is
+    /// suppressed here: the URL toolbar already names the pane.
+    pub fn webIdentity() bool {
+        return web_identity;
+    }
+
     pub fn initWithConfig(
         allocator: std.mem.Allocator,
         app: ?*c.GtkApplication,
@@ -1759,11 +1766,11 @@ pub const Window = struct {
         pane.surface.grid_pass.min_contrast = self.config.minimum_contrast;
         pane.surface.cell_pass.min_contrast = self.config.minimum_contrast;
         pane.surface.grid_pass.enable_url_underline = self.config.auto_url_detect;
-        // Per-pane titlebar visibility. The file-manager identity never
-        // shows it: a Files window's panes wear a browser face whose own
-        // location bar already names the pane, so the strip under the tab
-        // bar is pure redundancy there.
-        pane.setTitlebarVisible(self.config.show_titlebar and !files_identity);
+        // Per-pane titlebar visibility. The file-manager and browser
+        // identities never show it: their panes wear a face whose own
+        // location/URL bar already names the pane, so the strip under
+        // the tab bar is pure redundancy there.
+        pane.setTitlebarVisible(self.config.show_titlebar and !files_identity and !web_identity);
         // Inactive-pane dimming factors.
         pane.surface.inactive_darken = self.config.inactive_darken;
         pane.surface.inactive_desaturate = self.config.inactive_desaturate;
