@@ -16318,3 +16318,43 @@ decoding as "gesture". New smoke stage 22f drives a REAL self-signed
 `openssl s_server` on loopback: held request, cancel -> load error,
 error again (a denial is remembered by nobody), proceed -> page loads.
 The stage skips instead of failing where openssl is absent.
+## 2026-08-11: web DevTools and print-to-PDF (and what CEF refuses)
+
+Two new verbs on a web pane, both as context-menu rows (greyed out, not
+hidden, when the helper is too old) and both as palette actions
+(`web_devtools`, `web_print_pdf`):
+
+- **Print to PDF…** — a save dialog (the native picker, `local_only`,
+  defaulting to `<page title>.pdf`), then `print_pdf` (0xA4, cap
+  `print-pdf`) to the helper, which renders the page itself and answers
+  `ev_print_pdf_done` (0xA5). A toast reports the result and carries an
+  **Open** button that hands the file to the desktop. The helper writes
+  the file, so a pick on another host is refused in the dialog.
+- **Open DevTools** — `devtools_show` (0xA2, cap `devtools`) asks for
+  the inspector as ANOTHER windowless view; `ev_devtools_view` (0xA3)
+  answers with a helper-minted view id, and the GUI splits the pane and
+  gives the new one a web face ATTACHED to that existing view
+  (`WebFace.attachView` / `Window.openDevToolsSplit`) — one helper
+  process, one socket, no second connection. No debugging port exists
+  anywhere in the design.
+
+**CEF 151 refuses the windowless inspector** — measured identically on
+the Arch `cef` package and the pinned upstream build: `show_dev_tools`
+logs "Windowless rendering is not supported for this DevTools window"
+and hands back a WINDOWED browser (`is_window_rendering_disabled() ==
+0`). The helper therefore keeps that browser owned (so `cef_shutdown`
+finds nothing open — leaving it unowned killed the helper on a signal)
+and answers `devtools = 0, reason = "windowed"`; the GUI toasts
+"DevTools opened in its own window". The in-a-pane path is written,
+reachable and tested for the answer shape, and runs the day an engine
+honours the request. Details in `src/web/CLAUDE.md`.
+
+Verification: `zig build`, `zig build web`, `zig build test`,
+`zig build test-core` green; `zig build smoke-web` green against BOTH
+CEF builds, with a new stage 22d (a real 18 KB PDF on disk, plus an
+unwritable path and an unknown view both answered as failures) and
+stage 22e (DevTools: asserts the view path when the engine gives one,
+the window fallback otherwise, and that either way every request is
+answered and the inspected page survives). The GUI split was not
+exercised on a live display — no engine here produces the view it
+needs.
