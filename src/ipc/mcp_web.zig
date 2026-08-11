@@ -1042,6 +1042,7 @@ pub fn webTool(
 
     if (eql(u8, name, "web_scroll")) return scrollTool(drv, arena, args, view);
     if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view);
+    if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
 
     if (eql(u8, name, "web_screenshot")) {
         switch (drv) {
@@ -1151,6 +1152,133 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
         "compare before/after: equal y means nothing moved (already at the end, or a scroll container the page owns rather than the window)",
     );
     return mcp.toolResult(arena, try out.finish(), false) orelse error.OutOfMemory;
+}
+
+const NetCounters = struct { enabled: bool, blocked: i64, total: i64, rules: i64 };
+
+/// Apply a toggle / read counters. `action` is enable|disable|toggle|
+/// status. Returns the counters after the change.
+fn netToggle(drv: Driver, arena: std.mem.Allocator, handle: u32, action: []const u8) !union(enum) { done: NetCounters, err: []const u8 } {
+    switch (drv) {
+        .gui => |backend| {
+            const r = mcp.ipcParsed(arena, backend, .{
+                .cmd = "web-network",
+                .pane = handle,
+                .action = action,
+            }) catch |e| return .{ .err = try std.fmt.allocPrint(arena, "the sketerm GUI did not answer ({s})", .{@errorName(e)}) };
+            if (!r.ok) return .{ .err = r.err };
+            const o = r.value.object;
+            return .{ .done = .{
+                .enabled = if (o.get("enabled")) |v| (v == .bool and v.bool) else false,
+                .blocked = if (o.get("blocked")) |v| (if (v == .integer) v.integer else 0) else 0,
+                .total = if (o.get("total")) |v| (if (v == .integer) v.integer else 0) else 0,
+                .rules = if (o.get("rules")) |v| (if (v == .integer) v.integer else 0) else 0,
+            } };
+        },
+        .headless => |e| {
+            const eql = std.mem.eql;
+            if (eql(u8, action, "enable")) {
+                e.setNetwork(handle, true) catch |err| return .{ .err = try headlessErrText(arena, e, err) };
+            } else if (eql(u8, action, "disable")) {
+                e.setNetwork(handle, false) catch |err| return .{ .err = try headlessErrText(arena, e, err) };
+            } else if (eql(u8, action, "toggle")) {
+                const cur = e.findView(handle) orelse return .{ .err = "no web view with that id" };
+                e.setNetwork(handle, !cur.net_enabled) catch |err| return .{ .err = try headlessErrText(arena, e, err) };
+            }
+            const st = e.networkStatus(handle, 300) catch |err| return .{ .err = try headlessErrText(arena, e, err) };
+            return .{ .done = .{
+                .enabled = st.enabled,
+                .blocked = st.blocked,
+                .total = st.total,
+                .rules = st.rules,
+            } };
+        },
+    }
+}
+
+/// Pull the recent request log as a JSON object string.
+fn netLog(drv: Driver, arena: std.mem.Allocator, handle: u32, since: u32, max: u16, budget: i64) !union(enum) { json: []const u8, err: []const u8 } {
+    switch (drv) {
+        .gui => |backend| {
+            const started = mcp.ipcParsed(arena, backend, .{
+                .cmd = "web-network",
+                .pane = handle,
+                .offset = since,
+                .length = max,
+            }) catch |e| return .{ .err = try std.fmt.allocPrint(arena, "the sketerm GUI did not answer ({s})", .{@errorName(e)}) };
+            if (!started.ok) return .{ .err = started.err };
+            const tok_v = started.value.object.get("token") orelse return .{ .err = "the GUI returned no token for the network log" };
+            if (tok_v != .integer) return .{ .err = "the GUI returned a malformed token" };
+            const token: u32 = @intCast(tok_v.integer);
+            const deadline = backend.nowMs(backend.ctx) + budget;
+            while (true) {
+                const r = mcp.ipcParsed(arena, backend, .{ .cmd = "web-result", .pane = handle, .token = token }) catch |e|
+                    return .{ .err = try std.fmt.allocPrint(arena, "the sketerm GUI stopped answering ({s})", .{@errorName(e)}) };
+                if (!r.ok) return .{ .err = r.err };
+                const done = r.value.object.get("done");
+                if (done != null and done.? == .bool and done.?.bool) {
+                    const p = r.value.object.get("payload");
+                    return .{ .json = if (p) |v| (if (v == .string) v.string else "{}") else "{}" };
+                }
+                if (backend.nowMs(backend.ctx) >= deadline) return .{ .err = "the network log pull did not answer in time" };
+                backend.sleepMs(backend.ctx, POLL_MS);
+            }
+        },
+        .headless => |e| {
+            const json = e.networkLog(arena, handle, since, max, budget) catch |err|
+                return .{ .err = try headlessErrText(arena, e, err) };
+            return .{ .json = json };
+        },
+    }
+}
+
+fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const action = mcp.argStr(args, "action");
+    if (action) |act| {
+        const eql = std.mem.eql;
+        if (!eql(u8, act, "enable") and !eql(u8, act, "disable") and
+            !eql(u8, act, "toggle") and !eql(u8, act, "status"))
+            return mcp.appErr(arena, "web_network action must be enable, disable, toggle or status");
+        switch (try netToggle(drv, arena, view.pane, act)) {
+            .err => |e| return mcp.appErr(arena, e),
+            .done => |st| {
+                var out = try Out.init(arena, drv, view);
+                try out.flag("blocking_enabled", st.enabled);
+                try out.field("blocked", st.blocked);
+                try out.field("total_requests", st.total);
+                try out.field("rules_loaded", st.rules);
+                try out.field("hint", "call web_network with no action to see the recent request log");
+                return mcp.toolResult(arena, try out.finish(), false) orelse error.OutOfMemory;
+            },
+        }
+    }
+
+    // Log view: counters first (also proves the toggle state), then the
+    // recent entries pulled from the helper's bounded ring.
+    const counters = switch (try netToggle(drv, arena, view.pane, "status")) {
+        .err => |e| return mcp.appErr(arena, e),
+        .done => |st| st,
+    };
+    const since: u32 = @intCast(@max(mcp.argInt(args, "since") orelse 0, 0));
+    const max: u16 = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 50, 1, 128));
+    switch (try netLog(drv, arena, view.pane, since, max, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+        .err => |e| return mcp.appErr(arena, e),
+        .json => |json| {
+            var out = try Out.init(arena, drv, view);
+            try out.flag("blocking_enabled", counters.enabled);
+            try out.field("blocked", counters.blocked);
+            try out.field("total_requests", counters.total);
+            try out.field("rules_loaded", counters.rules);
+            // `json` is `{"next_seq":N,"entries":[...]}`; splice its
+            // fields in so the caller sees one flat object.
+            try out.raw("log", json);
+            try out.field(
+                "paging",
+                "entries come from a bounded per-view ring newest-last; pass since=<next_seq from a previous call> to get only newer ones, max caps the count (<=128)",
+            );
+            return mcp.toolResult(arena, try out.finish(), false) orelse error.OutOfMemory;
+        },
+    }
 }
 
 fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {

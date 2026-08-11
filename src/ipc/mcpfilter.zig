@@ -170,6 +170,7 @@ pub const TOOL_META = [_]Meta{
     rw("web_scroll", .browser),
     rw("web_eval", .browser),
     ro("web_screenshot", .browser),
+    rw("web_network", .browser),
 
     // ── ui: agent-authored panels ──────────────────────────────────
     rw("ui_show", .ui),

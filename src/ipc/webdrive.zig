@@ -133,10 +133,25 @@ pub const View = struct {
     /// pages), mirroring the GUI face.
     last_eval: ?[]u8 = null,
 
+    // Request interception (capability "intercept"). Counters come from
+    // `intercept_status`; the log is PULLED on demand (`intercept_log`),
+    // never streamed, per the MCP backlog rule.
+    net_enabled: bool = true,
+    net_blocked: u32 = 0,
+    net_total: u32 = 0,
+    net_rules: u32 = 0,
+    /// Next seq to pull; advances as the log is drained.
+    net_next_seq: u32 = 0,
+    /// A parked `intercept_log` reply (owned JSON), awaited by
+    /// `networkLog`.
+    net_log: ?[]u8 = null,
+    net_log_waiting: bool = false,
+
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
         if (self.last_eval) |e| gpa.free(e);
+        if (self.net_log) |e| gpa.free(e);
         if (self.buf_fd >= 0) _ = c.close(self.buf_fd);
         for (&self.inbox) |*slot| {
             if (slot.*) |s| gpa.free(s.text);
@@ -181,6 +196,8 @@ pub const Engine = struct {
     /// The helper can create a view directly at a url, so a view opened
     /// with one never holds a blank document first.
     cap_view_url: bool = false,
+    /// The helper runs the in-process content-blocking filter engine.
+    cap_intercept: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8) !Engine {
         const owned_dir = try gpa.dupe(u8, dir);
@@ -506,6 +523,67 @@ pub const Engine = struct {
         return v.last_eval;
     }
 
+    // ---- request interception ---------------------------------------
+
+    /// Enable/disable blocking; `id` 0 is the process-wide default.
+    pub fn setNetwork(self: *Engine, id: u32, enabled: bool) !void {
+        if (!self.ensure()) return error.Unavailable;
+        self.send(proto.InterceptSet{ .view = id, .enabled = if (enabled) 1 else 0 }) catch return error.Unavailable;
+    }
+
+    /// Reload the filter set (seed + config dir + `paths`).
+    pub fn reloadLists(self: *Engine, paths: []const []const u8) !void {
+        if (!self.ensure()) return error.Unavailable;
+        self.send(proto.InterceptLists{ .paths = paths }) catch return error.Unavailable;
+    }
+
+    /// Current per-view counters (freshened by a status_req + pump).
+    pub fn networkStatus(self: *Engine, id: u32, budget_ms: i64) !struct {
+        enabled: bool,
+        blocked: u32,
+        total: u32,
+        rules: u32,
+    } {
+        if (!self.ensure()) return error.Unavailable;
+        const v = self.findView(id) orelse return error.NoView;
+        self.send(proto.InterceptStatusReq{ .view = id }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        // One short settle so a just-updated count lands; the counters
+        // are pushed unsolicited too, so this rarely waits.
+        while (clock.nowMs() < deadline) {
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(40);
+            break;
+        }
+        return .{ .enabled = v.net_enabled, .blocked = v.net_blocked, .total = v.net_total, .rules = v.net_rules };
+    }
+
+    /// Pull recent log entries as one JSON object; caller's arena owns
+    /// the returned copy.
+    pub fn networkLog(self: *Engine, arena: std.mem.Allocator, id: u32, since: u32, max: u16, budget_ms: i64) ![]const u8 {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.cap_intercept) return error.NoIntercept;
+        const v = self.findView(id) orelse return error.NoView;
+        if (v.net_log) |old| {
+            self.gpa.free(old);
+            v.net_log = null;
+        }
+        v.net_log_waiting = true;
+        self.send(proto.InterceptLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        while (clock.nowMs() < deadline) {
+            if (self.findView(id)) |vv| {
+                if (vv.net_log) |json| {
+                    vv.net_log_waiting = false;
+                    return arena.dupe(u8, json);
+                }
+            } else return error.NoView;
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(40);
+        }
+        return error.Timeout;
+    }
+
     // ---- semantic round trips ---------------------------------------
 
     /// Wait, bounded, for the view's FIRST composited frame.
@@ -771,6 +849,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
                 }
             },
             .frame_buffer => {
@@ -861,6 +940,25 @@ pub const Engine = struct {
                     self.setOwned(&v.last_eval, ev.json.s);
                     self.park(v, .eval, ev.ok != 0, ev.json.s, 0, 0, 0);
                 }
+            },
+            .intercept_status => {
+                const ev = proto.decode(proto.InterceptStatus, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    v.net_enabled = ev.enabled != 0;
+                    v.net_blocked = ev.blocked;
+                    v.net_total = ev.total;
+                    v.net_rules = ev.rules;
+                }
+            },
+            .intercept_log => {
+                const ev = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entries);
+                const v = self.findView(ev.view) orelse return;
+                v.net_next_seq = ev.next_seq;
+                const json = proto.netLogJson(self.gpa, ev.next_seq, ev.entries) catch return;
+                if (v.net_log) |old| self.gpa.free(old);
+                v.net_log = json;
+                v.net_log_waiting = false;
             },
             else => {},
         }

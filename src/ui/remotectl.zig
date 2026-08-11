@@ -999,6 +999,42 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         });
     }
 
+    // Content blocking. A toggle (`action`) is applied synchronously and
+    // the current counters are returned; a log PULL is a round trip to
+    // the helper, so it hands back a token and `web-result` polls it,
+    // exactly like the semantic ops (the reply JSON becomes the result
+    // payload).
+    if (eql(u8, req.cmd, "web-network")) {
+        if (req.action) |act| {
+            if (eql(u8, act, "enable")) {
+                face.setNetwork(true);
+            } else if (eql(u8, act, "disable")) {
+                face.setNetwork(false);
+            } else if (eql(u8, act, "toggle")) {
+                face.setNetwork(!face.net_enabled);
+            } else if (!eql(u8, act, "status")) {
+                return ipc_protocol.writeErr(out, allocator, "web-network action must be enable|disable|toggle|status");
+            }
+            const st = face.netCounters();
+            return ipc_protocol.writeOkFlat(out, allocator, .{
+                .enabled = st.enabled,
+                .blocked = st.blocked,
+                .total = st.total,
+                .rules = st.rules,
+            });
+        }
+        const token = face.autoNetworkLog(req.offset orelse 0, @intCast(@min(req.length orelse 128, 128))) orelse
+            return ipc_protocol.writeErr(out, allocator, "the web view cannot take that request now (helper not connected, or a network log pull is still in flight)");
+        const st = face.netCounters();
+        return ipc_protocol.writeOkFlat(out, allocator, .{
+            .token = token,
+            .enabled = st.enabled,
+            .blocked = st.blocked,
+            .total = st.total,
+            .rules = st.rules,
+        });
+    }
+
     if (eql(u8, req.cmd, "web-result")) {
         const token = req.token orelse
             return ipc_protocol.writeErr(out, allocator, "web-result needs token");
