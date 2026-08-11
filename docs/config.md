@@ -353,6 +353,7 @@ that framebuffer and costs nothing extra.
 | `web_discard_minutes` | int | `30` | Minutes a web pane may stay off screen before its page is discarded outright (the browser is destroyed and the pane keeps its last frame, dimmed). `0` = never. |
 | `web_popup_policy` | enum | `block-gestureless` | What a browser pane does with a popup a page asks for: `block-gestureless`, `allow`, `block-all`. Anything else is a parse error. |
 | `web_download_ask` | bool | `true` | Whether a browser pane's download raises a save dialog. `false` auto-accepts into `~/Downloads` under the page's suggested name (uniquified on collision). The save dialog can also pick a `host:` location: the file downloads locally first, then hands off to that host's daemon as an ordinary transfer. |
+| `web_search_engine` | string | `https://duckduckgo.com/?q={q}` | Search-engine URL template for address-bar input that is not a URL. `{q}` is replaced by the percent-encoded query. Must be an http(s) URL containing `{q}`; anything else is a parse error. |
 
 `browser_max_fps` is a CEILING, not a target. A browser pane paints
 nothing at all while its page is unchanged, and a background tab's page
@@ -387,6 +388,19 @@ palette (action `web_discard_background`) does the same thing on
 demand, whatever this key says. A helper too old to advertise `discard`
 never receives the frame, and every web pane then behaves exactly as it
 did before this key existed.
+
+`web_search_engine` is used whenever address-bar input is neither an
+explicit URL nor something that looks like a host: the query is
+percent-encoded and substituted for `{q}`. Examples:
+
+```
+web_search_engine = https://www.google.com/search?q={q}
+web_search_engine = https://www.startpage.com/sp/search?query={q}
+```
+
+A template that lacks `{q}` or does not start with `http://`/`https://`
+is rejected as a bad line (default kept), so a typo cannot turn every
+search into a broken navigation.
 
 `inactive_fg_dim` and `inactive_bg_dim` are retired per-cell dim keys.
 They are still accepted and ignored, so old files do not warn; use

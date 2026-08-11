@@ -17,6 +17,11 @@ pub const titlefmt = @import("util/titlefmt.zig");
 /// Historical tab-label behaviour: the OSC 0/2 title, verbatim.
 pub const default_tab_title = "{{ TITLE }}";
 
+/// One source of truth with the suggestion framework's fallback, so a
+/// config that never mentions the key and a template that fails to
+/// instantiate land on the same engine.
+pub const default_web_search_engine = @import("util/suggest.zig").default_search_template;
+
 /// One `[lsp.<name>]` section. The record lives in src/lsp/servers.zig
 /// (with the built-in table and the matching rules) so the LSP client
 /// does not have to import the config layer to know what a server is.
@@ -1183,6 +1188,11 @@ pub const Config = struct {
     /// page that opens windows on its own is the case it exists for.
     /// App-level, like the frame cap: one helper client, one policy.
     web_popup_policy: WebPopupPolicy = .block_gestureless,
+    /// Search-engine URL template for address-bar input that is not a
+    /// URL: `{q}` is replaced by the percent-encoded query. Must be an
+    /// http(s) URL containing `{q}`. App-level, like the popup policy:
+    /// one helper client, one engine.
+    web_search_engine: []const u8 = default_web_search_engine,
 
     /// Colour space glyph coverage is blended in (see TextBlending).
     /// App-level, like every other rendering flag: it changes the GL
@@ -1339,6 +1349,7 @@ pub const Config = struct {
             });
         }
         out.background_image = try arena.dupe(u8, self.background_image);
+        out.web_search_engine = try arena.dupe(u8, self.web_search_engine);
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
         out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
@@ -1740,6 +1751,8 @@ pub const Config = struct {
                 .block_all => "block-all",
             },
         });
+        if (!std.mem.eql(u8, self.web_search_engine, default_web_search_engine))
+            try w.print("web_search_engine = {s}\n", .{self.web_search_engine});
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -2876,6 +2889,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
             .block_all
         else
             return error.BadWebPopupPolicy;
+    } else if (std.mem.eql(u8, key, "web_search_engine")) {
+        // An engine that cannot take a query, or is not a web URL at
+        // all, would turn every search into a broken navigation.
+        if (std.mem.indexOf(u8, value, "{q}") == null or
+            !(std.mem.startsWith(u8, value, "https://") or
+                std.mem.startsWith(u8, value, "http://")))
+            return error.BadWebSearchEngine;
+        cfg.web_search_engine = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "graphics_offload")) {
         cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {
@@ -4972,4 +4993,45 @@ test "config: the prefs save path keeps platform sections and flattens this plat
     try std.testing.expect(std.mem.indexOf(u8, text, "font_size = 10") == null);
     const hdr_at = std.mem.indexOf(u8, text, "[platform.") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, text[0..hdr_at], "font_size = 20") != null);
+}
+
+test "config: web_search_engine parses, validates, round-trips and clones" {
+    var cfg = try Config.loadFromBytes(
+        std.testing.allocator,
+        "web_search_engine = https://www.startpage.com/sp/search?query={q}\n",
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings(
+        "https://www.startpage.com/sp/search?query={q}",
+        cfg.web_search_engine,
+    );
+
+    var saved: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&saved);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        w.buffered(),
+        "web_search_engine = https://www.startpage.com/sp/search?query={q}",
+    ) != null);
+
+    var cloned = try cfg.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqualStrings(cfg.web_search_engine, cloned.web_search_engine);
+
+    // A template without {q}, or a non-http(s) one, is a bad line:
+    // warned, skipped, default kept.
+    var bad = try Config.loadFromBytes(
+        std.testing.allocator,
+        "web_search_engine = https://example.com/search\nweb_search_engine = javascript:alert({q})\n",
+    );
+    defer bad.deinit();
+    try std.testing.expectEqualStrings(default_web_search_engine, bad.web_search_engine);
+
+    // The default is never emitted.
+    var dflt = try Config.loadFromBytes(std.testing.allocator, "");
+    defer dflt.deinit();
+    var w2 = std.Io.Writer.fixed(&saved);
+    try dflt.serialise(&w2);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "web_search_engine") == null);
 }

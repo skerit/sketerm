@@ -605,6 +605,7 @@ pub const Window = struct {
             .allow => .allow,
             .block_all => .block_all,
         });
+        @import("webface.zig").setSearchEngine(self.config.web_search_engine);
         // IM strategy is an app-level key; every face reads it at
         // construction time (imhost.resolve).
         @import("imhost.zig").setPreference(switch (self.config.input_method) {
