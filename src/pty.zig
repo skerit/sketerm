@@ -358,8 +358,8 @@ pub const Pty = struct {
     }
 
     /// Decode a raw `waitpid` status into the WEXITSTATUS-style code
-    /// (or -signo for fatal signals). Same convention as the GUI's
-    /// `Terminal.reapStatus` — keep the two in lockstep.
+    /// (or -signo for fatal signals). Same convention the wire uses for
+    /// a session's exit status — keep the two in lockstep.
     pub fn decodeStatus(status: c_int) i32 {
         if ((status & 0x7F) == 0) return @intCast((status >> 8) & 0xFF); // WIFEXITED
         return -@as(i32, @intCast(status & 0x7F)); // WIFSIGNALED → -signo

@@ -104,7 +104,7 @@ it is loaded, because breaking one is how each was learned:
     EGL/GLES/libdrm, gdk-pixbuf or libopus into it. `ldd` after touching its
     dep graph; `zig build mux-portable` is the musl check.
   - Nothing in `src/ui` touches `terminal.pty`. Remote terminals have
-    `child_pid = -1`; `Terminal.reapStatus`'s `child_pid <= 0` guard must stay
+    `child_pid = -1`; the `child_pid <= 0` guard in `Pty.reap`/`Pty.closeAndReap` must stay
     or the exit poller reaps arbitrary GUI children.
   - Any process hosting a `Daemon` must answer `--keep` (display keepers are
     spawned as the daemon's own `/proc/self/exe`).
