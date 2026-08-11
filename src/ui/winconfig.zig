@@ -1160,8 +1160,8 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\tabbar tab:hover {{ background-color: rgba(0, 0, 0, 0.08); }}
         \\tabbar tabbox tab:selected {{
         \\    opacity: 1.0;
-        \\    box-shadow: inset 0 -3px 0 0 #3584e4;
-        \\    background-color: rgba(53, 132, 228, 0.18);
+        \\    box-shadow: inset 0 -3px 0 0 @theme_selected_bg_color;
+        \\    background-color: alpha(@theme_selected_bg_color, 0.18);
         \\}}
         \\
         \\/* Split-pane separator — solid 4-px #353535 line.
@@ -1201,7 +1201,7 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\paned.vertical > separator:active,
         \\paned.horizontal > separator.wide:active,
         \\paned.vertical > separator.wide:active {{
-        \\    background-color: #5a5a5a;
+        \\    background-color: alpha(currentColor, 0.4);
         \\    box-shadow: none;
         \\}}
     , .{

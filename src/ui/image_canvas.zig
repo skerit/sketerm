@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const Viewport = @import("../viewer.zig").Viewport;
 const decoder = @import("image_decoder.zig");
+const cssutil = @import("cssutil.zig");
 
 pub const Canvas = struct {
     root: *c.GtkWidget,
@@ -289,24 +290,16 @@ pub const Canvas = struct {
     }
 };
 
-var css_installed = false;
-
 fn installCss(widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider,
+    cssutil.install("image_canvas", widget,
         \\scrolledwindow.sketerm-image-canvas,
         \\scrolledwindow.sketerm-image-canvas > viewport {
-        \\  background: #17151b;
+        \\  background: @view_bg_color;
         \\}
         \\picture.sketerm-image-picture {
-        \\  background: #17151b;
+        \\  background: @view_bg_color;
         \\}
     );
-    const display = c.gtk_widget_get_display(widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    c.g_object_unref(@ptrCast(provider));
 }
 
 pub const Session = struct {

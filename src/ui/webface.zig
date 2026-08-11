@@ -160,6 +160,7 @@ const cast = @import("../util/cast.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
+const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
@@ -853,24 +854,13 @@ pub const AutoResult = struct {
 /// from growing without bound.
 const MAX_AUTO_RESULTS = 16;
 
-/// White page background for the view area (what a browser shows where
-/// nothing painted; also the gutter during a live resize). One
-/// app-wide CSS provider, added on first use.
-var g_webview_css_added: bool = false;
-
+/// Page background for the view area (what a browser shows where
+/// nothing painted; also the gutter during a live resize). Theme's view
+/// background rather than white, so a dark theme does not flash: a page
+/// that paints its own background covers this anyway.
 fn webviewCss(widget: *c.GtkWidget) void {
     c.gtk_widget_add_css_class(widget, "sketerm-webview");
-    if (g_webview_css_added) return;
-    g_webview_css_added = true;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, ".sketerm-webview { background: #ffffff; }");
-    const display = c.gtk_widget_get_display(widget);
-    c.gtk_style_context_add_provider_for_display(
-        display,
-        @ptrCast(provider),
-        c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-    c.g_object_unref(provider);
+    cssutil.install("webface", widget, ".sketerm-webview { background: @view_bg_color; }");
 }
 
 /// Refcounted mmap of a frame memfd. `GBytes` built over it hold a
