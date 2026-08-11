@@ -16761,3 +16761,36 @@ the proven `forward_open` path). Known limitation: daemon-side DNS is
 blocking on the poll loop; the GUI egress bridge connect happens on a
 worker thread and degrades to refused connections if the host is
 unreachable.
+
+## 2026-08-12: browser roadmap wave 2 — integration notes
+
+The six features above (tree tabs, containers+egress, downloads,
+history/bookmarks UI, omnibox, a11y) were built in parallel worktrees
+and merged one at a time, each gated on `zig build` + `zig build web`
+(+ `mux-portable` and `ldd` for the container branch, which is the only
+one that touched the daemon). What the integration cost, so the next
+parallel wave can pre-empt it:
+
+- The `hello_ack` capability list in `src/web/server.zig` is a FIXED-SIZE
+  array with a separate count (`var caps: [N]` + `ncaps`, plus a
+  conditional dmabuf slot). Three branches each appended one capability;
+  a textual union merges the entries but NOT the size or the count, and
+  the result compiles only if both are corrected by hand. It is now
+  `[18]` / `17` advertising downloads, a11y and contexts. A list that
+  carried its own length would not have this failure mode.
+- Two branches independently discovered that the post-disconnect drain's
+  fixed pump count hangs `cef_shutdown`, and each added its own live
+  browser counter (`open_browsers`/`openBrowserCount` vs
+  `g_open_browsers`/`openBrowsers`). Merged to ONE counter; the comment
+  names both causes (a cancelled download's cleanup, an a11y-enabled
+  renderer's teardown IPC) because either alone re-motivates it.
+- Two branches minted the same smoke stage label "22j"; the a11y stage
+  is now 22k (`src/web/CLAUDE.md` and this log follow). Stage labels are
+  a flat namespace across a file no single agent owns — grep before
+  naming.
+- Both-added struct definitions that share a closing brace (`Dl` and
+  `Ctx` in `cefhost.zig`) are the one shape a union resolution silently
+  corrupts: it keeps both bodies and one `};`. Every conflicted file was
+  re-read after resolution, and the tag enum was checked for duplicate
+  values (70 tags, none duplicated — the pre-assigned per-agent ranges
+  held).
