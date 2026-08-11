@@ -38,6 +38,9 @@ pub const Server = struct {
     in: std.ArrayList(u8) = .empty,
     out: proto.Outbox,
     host: cefhost.Host = undefined,
+    /// Root cache dir (the `--cache-dir`), under which per-context caches
+    /// are minted; handed to the host before `run`.
+    profile_dir: []const u8 = "",
     /// Set once the client's `hello` is answered.
     greeted: bool = false,
 
@@ -84,6 +87,7 @@ pub const Server = struct {
     /// tear every view down. Returns when the client is gone.
     pub fn run(self: *Server) !void {
         self.host = cefhost.Host.init(self.gpa, &self.out);
+        self.host.profile_dir = self.profile_dir;
         defer self.host.deinit();
         self.host.install();
         // Load the seed list + config filters dir before any view
@@ -219,7 +223,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [17][]const u8 = .{
+                var caps: [18][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -236,9 +240,10 @@ pub const Server = struct {
                     proto.CAP_PRINT_PDF,
                     proto.CAP_DOWNLOADS,
                     proto.CAP_A11Y,
+                    proto.CAP_CONTEXTS,
                     undefined,
                 };
-                var ncaps: usize = 16;
+                var ncaps: usize = 17;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -251,6 +256,8 @@ pub const Server = struct {
                 }, null);
                 self.greeted = true;
             },
+            .context_create => self.host.contextCreate(try proto.decode(proto.ContextCreate, frame.payload)),
+            .context_destroy => self.host.contextDestroy((try proto.decode(proto.ContextDestroy, frame.payload)).id),
             .view_create => try self.host.createView(try proto.decode(proto.ViewCreate, frame.payload)),
             .view_create_url => try self.host.createViewUrl(try proto.decode(proto.ViewCreateUrl, frame.payload)),
             .view_destroy => self.host.destroyView((try proto.decode(proto.ViewDestroy, frame.payload)).view),

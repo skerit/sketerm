@@ -413,6 +413,10 @@ pub const View = struct {
     /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
     /// every load start because Chromium resets zoom per navigation.
     user_zoom_x100: i32 = 0,
+    /// Identity context this view was created in (0 = shared default).
+    /// Kept so a post-discard revival re-uses the same request context
+    /// and its cookie jar / egress; resolved to a pointer per spawn.
+    context: u32 = 0,
 
     /// The client asked for accessibility streaming (`a11y_enable`).
     /// Survives a discard: the revived browser re-enables engine-side
@@ -618,6 +622,14 @@ pub const Host = struct {
     /// view's entries when the browser goes.
     downloads: std.ArrayList(Dl) = .empty,
 
+    /// Per-tab identity contexts (`context_create`). A view names one by
+    /// id; id 0 is the shared default (a null request context) and never
+    /// appears here.
+    contexts: std.ArrayList(Ctx) = .empty,
+    /// Root cache directory (the `--cache-dir`), under which a persistent
+    /// context's own cache dir is minted. Set by the server before `run`.
+    profile_dir: []const u8 = "",
+
     /// One `print_pdf` in flight.
     const Print = struct { view: u32, path: []u8 };
 
@@ -670,6 +682,14 @@ pub const Host = struct {
         }
     };
 
+    /// A live identity context: our owned reference to the engine's
+    /// request context, keyed by the client's id.
+    const Ctx = struct {
+        id: u32,
+        rc: *cef.cef_request_context_t,
+        ephemeral: bool,
+    };
+
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
         return .{ .gpa = gpa, .out = out };
     }
@@ -683,7 +703,68 @@ pub const Host = struct {
         // per-view entries; whatever is left never named a live view.
         for (self.downloads.items) |*d| d.releaseCbs();
         self.downloads.deinit(self.gpa);
+        for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
+        self.contexts.deinit(self.gpa);
         if (g_host == self) g_host = null;
+    }
+
+    fn lookupContext(self: *Host, id: u32) ?*cef.cef_request_context_t {
+        if (id == 0) return null;
+        for (self.contexts.items) |ctx| {
+            if (ctx.id == id) return ctx.rc;
+        }
+        return null;
+    }
+
+    /// Mint a per-tab identity context (its own cookie jar / cache),
+    /// optionally routed through a proxy exactly as the spike proved:
+    /// `set_preference("proxy", {mode:"fixed_servers", server:<url>})`
+    /// on the context's base preference manager. An ephemeral context
+    /// gets an EMPTY cache path — CEF's in-memory incognito store, wiped
+    /// with the context, so nothing has to be scrubbed off disk.
+    pub fn contextCreate(self: *Host, req: proto.ContextCreate) void {
+        if (req.id == 0 or self.lookupContext(req.id) != null) return;
+
+        var settings = std.mem.zeroes(cef.cef_request_context_settings_t);
+        settings.size = @sizeOf(cef.cef_request_context_settings_t);
+        // Persistent context: a distinct cache dir UNDER the profile dir
+        // (CEF requires cache_path to be a subdir of root_cache_path),
+        // keyed by the sanitized name so cookies follow a named
+        // container across helper restarts. Ephemeral leaves it empty.
+        var path_buf: [1024]u8 = undefined;
+        var name_buf: [256]u8 = undefined;
+        if (req.ephemeral == 0 and self.profile_dir.len != 0) {
+            const dir_key = sanitizeContextName(req.name, req.id, &name_buf);
+            const path = std.fmt.bufPrint(&path_buf, "{s}/contexts/{s}", .{ self.profile_dir, dir_key }) catch return;
+            setStr(path, &settings.cache_path);
+        }
+        defer cef.cef_string_utf16_clear(&settings.cache_path);
+
+        const rc: *cef.cef_request_context_t = cef.cef_request_context_create_context(&settings, null) orelse return;
+
+        if (req.proxy.len != 0) applyProxy(rc, req.proxy);
+
+        self.contexts.append(self.gpa, .{
+            .id = req.id,
+            .rc = rc,
+            .ephemeral = req.ephemeral != 0,
+        }) catch {
+            release(&rc.base.base);
+            return;
+        };
+    }
+
+    /// Drop our reference to a context. Live browsers on it keep their
+    /// own references, so their pages survive; no NEW view may name the
+    /// id afterwards. An ephemeral (in-memory) context's storage is
+    /// released once the last reference goes.
+    pub fn contextDestroy(self: *Host, id: u32) void {
+        for (self.contexts.items, 0..) |ctx, i| {
+            if (ctx.id != id) continue;
+            release(&ctx.rc.base.base);
+            _ = self.contexts.swapRemove(i);
+            return;
+        }
     }
 
     /// Publish this host to the CEF callbacks and build the handler set.
@@ -746,6 +827,7 @@ pub const Host = struct {
             .scale_x1000 = scale,
             .pw = physicalOf(lw, scale),
             .ph = physicalOf(lh, scale),
+            .context = req.context,
             .sem = semantic.View.init(self.gpa),
         };
         try self.views.append(self.gpa, v);
@@ -778,7 +860,7 @@ pub const Host = struct {
             &url,
             &bsettings,
             null,
-            null,
+            self.lookupContext(v.context),
         );
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
@@ -3028,6 +3110,54 @@ fn release(base: *cef.cef_base_ref_counted_t) void {
 
 fn setStr(utf8: []const u8, out: *cef.cef_string_t) void {
     _ = cef.cef_string_utf8_to_utf16(utf8.ptr, utf8.len, out);
+}
+
+/// Sanitize a container name into ONE safe path component so a
+/// persistent context's cache dir follows the name. Anything outside
+/// `[A-Za-z0-9._-]` becomes `_`; an empty result falls back to the id,
+/// so the dir is always non-empty and never escapes its parent.
+fn sanitizeContextName(name: []const u8, id: u32, buf: *[256]u8) []const u8 {
+    var n: usize = 0;
+    for (name) |ch| {
+        if (n >= buf.len - 24) break;
+        const ok = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
+            (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-';
+        buf[n] = if (ok) ch else '_';
+        n += 1;
+    }
+    if (n == 0) return std.fmt.bufPrint(buf, "ctx-{d}", .{id}) catch "ctx";
+    // Disambiguate names colliding after sanitization by appending the id.
+    const tail = std.fmt.bufPrint(buf[n..], "-{d}", .{id}) catch return buf[0..n];
+    return buf[0 .. n + tail.len];
+}
+
+/// Point a request context at a fixed-server proxy, exactly as the
+/// browser spike proved: `set_preference("proxy", {mode:"fixed_servers",
+/// server:<url>})` on the context's base preference manager. A socks5
+/// url makes the engine resolve DNS at the proxy end — the "browse via
+/// server X" property. Failure is logged to CEF's log, never fatal.
+fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) void {
+    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return;
+    var k = std.mem.zeroes(cef.cef_string_t);
+    var v = std.mem.zeroes(cef.cef_string_t);
+    setStr("mode", &k);
+    setStr("fixed_servers", &v);
+    _ = (dict.set_string orelse return)(dict, &k, &v);
+    cef.cef_string_utf16_clear(&k);
+    cef.cef_string_utf16_clear(&v);
+    setStr("server", &k);
+    setStr(proxy_url, &v);
+    _ = (dict.set_string orelse return)(dict, &k, &v);
+    cef.cef_string_utf16_clear(&v);
+
+    const val: *cef.cef_value_t = cef.cef_value_create() orelse return;
+    _ = (val.set_dictionary orelse return)(val, dict);
+    setStr("proxy", &k);
+    var err = std.mem.zeroes(cef.cef_string_t);
+    const base: *cef.cef_preference_manager_t = &rc.base;
+    _ = (base.set_preference orelse return)(base, &k, val, &err);
+    cef.cef_string_utf16_clear(&k);
+    cef.cef_string_utf16_clear(&err);
 }
 
 /// Borrowed UTF-8 view of a CEF string; `free` releases it.

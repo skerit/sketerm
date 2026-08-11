@@ -123,6 +123,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer cefhost.shutdown();
 
     var srv = server.Server.init(gpa, sock);
+    srv.profile_dir = cache;
     defer srv.deinit();
     srv.listen() catch |e| {
         std.debug.print("sketerm-web: listen on {s} failed: {s}\n", .{ sock, @errorName(e) });

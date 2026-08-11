@@ -81,6 +81,12 @@ pub const CAP_DOWNLOADS = "downloads";
 /// streamed for a view that never asked: engine-side accessibility is
 /// not free, and an unsolicited stream would break the backlog rule.
 pub const CAP_A11Y = "a11y";
+/// The helper accepts `context_create`/`context_destroy`: per-tab
+/// identity contexts (separate cookie jars / caches), each optionally
+/// pointed at a proxy. A view's `context` field then selects one
+/// (0 = the shared default context). A client without this capability
+/// keeps sending `context = 0` and every view shares one jar.
+pub const CAP_CONTEXTS = "contexts";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -154,6 +160,8 @@ pub const Tag = enum(u8) {
     intercept_status = 0x83,
     intercept_log_req = 0x84,
     intercept_log = 0x85,
+    context_create = 0x90,
+    context_destroy = 0x91,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     devtools_show = 0xA2,
@@ -1556,6 +1564,43 @@ pub const EvPrintPdfDone = struct {
     path: []const u8,
 };
 
+// -- containers / identity contexts (0x90 block, capability "contexts") --
+
+/// Create a per-tab identity context: its own cookie jar and cache,
+/// optionally routed through `proxy`. A view created with a matching
+/// `context` id then lives entirely inside it — cookies, storage and
+/// egress are isolated from every other context.
+///
+/// `id` is CLIENT-allocated (like a view id) and must be nonzero;
+/// context 0 is the shared default and is never created or destroyed.
+/// Re-creating a live id is a no-op.
+///
+/// `ephemeral = 1` gives the context a throwaway cache directory wiped
+/// when the context is destroyed (or the helper exits) — the "incognito"
+/// shape. `ephemeral = 0` persists under the profile dir keyed by `name`,
+/// so a named container's cookies survive a helper restart.
+///
+/// `proxy` is empty for a direct connection, or a fixed-server proxy url
+/// the engine understands ("socks5://127.0.0.1:19180", "http://host:port").
+/// A socks5 url makes the engine resolve DNS at the proxy end, which is
+/// what "browse via server X" needs.
+pub const ContextCreate = struct {
+    pub const tag: Tag = .context_create;
+    id: u32,
+    ephemeral: u8,
+    name: []const u8,
+    proxy: []const u8,
+};
+
+/// Destroy a context and everything it held. Views still bound to it
+/// keep their live browsers (CEF holds its own reference) but no new
+/// view may name the id afterwards; an ephemeral context's cache dir is
+/// wiped here. Destroying an unknown id is a no-op.
+pub const ContextDestroy = struct {
+    pub const tag: Tag = .context_destroy;
+    id: u32,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -2008,6 +2053,17 @@ test "an ev_popup_request without the trailing gesture byte still decodes" {
     try std.testing.expectEqualStrings("http://x/p", got.url);
     try std.testing.expectEqual(@as(u8, 1), got.disposition);
     try std.testing.expectEqual(@as(u8, 1), got.user_gesture);
+}
+
+test "round-trip: container/context frames" {
+    try roundTrip(ContextCreate, .{
+        .id = 3,
+        .ephemeral = 1,
+        .name = "Work",
+        .proxy = "socks5://127.0.0.1:19180",
+    });
+    try roundTrip(ContextCreate, .{ .id = 4, .ephemeral = 0, .name = "", .proxy = "" });
+    try roundTrip(ContextDestroy, .{ .id = 3 });
 }
 
 test "round-trip: semantic layer frames" {
