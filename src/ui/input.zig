@@ -183,6 +183,8 @@ pub const Action = enum {
     /// Open a text-editor tab (src/ui/editorview.zig): a shell pane
     /// wearing the editor face.
     new_editor_tab,
+    /// Split the focused pane and give the new pane an editor face.
+    new_editor_split,
     /// Flip the focused pane between its editor face and its
     /// terminal face. Dispatched locally like toggle_browser_face.
     toggle_editor_face,
@@ -448,6 +450,7 @@ pub fn actionName(a: Action) []const u8 {
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
+        .new_editor_split => "new_editor_split",
         .toggle_editor_face => "toggle_editor_face",
         .panel_open => "panel_open",
         .panel_close => "panel_close",
@@ -537,6 +540,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",
+        .new_editor_split => "Split into a text editor pane",
         .toggle_editor_face => "Show the text editor / show the shell (this pane)",
         .panel_open => "Open a saved panel (this session's stored documents)…",
         .panel_close => "Close the panel on this pane, its tab, or the window's only one",

@@ -2029,6 +2029,7 @@ pub const EditorView = struct {
         const spacer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
         c.gtk_widget_set_hexpand(spacer, 1);
         c.gtk_box_append(@ptrCast(bar), spacer);
+        _ = self.barButton(bar, "view-dual-symbolic", "Split", "Split into a second editor pane", &onSplitClicked);
         self.back_button = self.barButton(bar, "sketerm-terminal-symbolic", "Shell", "Show this pane's shell", &onTerminalClicked);
         c.gtk_box_append(@ptrCast(vbox), bar);
         self.toolbar_box = bar;
@@ -4945,6 +4946,21 @@ pub const EditorView = struct {
     fn onSaveAsClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
         if (self.active) |tab| self.saveTabAs(tab);
+    }
+
+    /// Split into a second editor pane. The pane binding table owns
+    /// what a split IS (it can differ per profile), so this forwards
+    /// the action rather than reimplementing it.
+    fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorView, user);
+        const pane = self.pane orelse return;
+        const ictx = pane.input_ctx orelse return;
+        // splitFocused acts on the WINDOW's focused pane; a toolbar
+        // click does not focus anything (the buttons are out of the
+        // focus chain), so focus is pointed here first or the action
+        // silently hits whichever pane last had it.
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        _ = input.runAction(ictx, .new_editor_split);
     }
 
     fn onTerminalClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

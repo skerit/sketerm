@@ -1360,6 +1360,22 @@ pub const Window = struct {
         };
     }
 
+    /// Split the focused pane and give the new pane an editor face,
+    /// on the same empty Untitled buffer `new_editor_tab` starts from.
+    pub fn newEditorSplit(self: *Window, orient: c_uint) !void {
+        // Take the pane the split APPENDED: focus may still sit on the
+        // source pane, and attaching there would turn an existing pane
+        // into an editor instead of the new one.
+        const before = self.panes.items.len;
+        try self.splitFocused(orient);
+        if (self.panes.items.len <= before) return error.SplitFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("editorview.zig").EditorView.attach(self.allocator, pane, null) catch |err| {
+            logActionError("new_editor_split attach", err);
+            return err;
+        };
+    }
+
     /// Put an editor face on `pane` itself (the browser's "Edit in
     /// Sketerm Editor"). A pane already wearing one gains a document
     /// tab instead (attach handles that).
@@ -3504,6 +3520,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // than let the action look broken.
         .toggle_browser_face => showToast(self, "This pane has no file browser. Use New File Browser Tab."),
         .new_editor_tab => self.newEditorTab() catch |err| logActionError("new_editor_tab", err),
+        .new_editor_split => self.newEditorSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_editor_split", err),
         // Only reached when the focused pane has NO editor face.
         .toggle_editor_face => showToast(self, "This pane has no editor. Use New Editor Tab."),
         .panel_open => @import("panelpicker.zig").open(self),
