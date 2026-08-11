@@ -200,6 +200,7 @@ const classicmenu = @import("browser/classicmenu.zig");
 const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
+const webstore = @import("webstore.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -1377,6 +1378,14 @@ pub const WebFace = struct {
     /// re-applies it in `ensureView`.
     zoom_x100: i32 = 0,
 
+    /// Origin of the current page (owned) — the per-site-settings key.
+    /// Changes on committed navigation; a change triggers a stored-zoom
+    /// lookup in the daemon web store.
+    nav_origin: ?[]u8 = null,
+    /// URL whose visit was recorded but whose title is still pending;
+    /// the first matching title event files a history_title update.
+    visit_url: ?[]u8 = null,
+
     /// Automation bookkeeping (see AutoKind): in-flight requests, their
     /// finished results, the last snapshot as sent by the helper, and
     /// the last eval result in full (what `web_expand [0]` pages).
@@ -1607,6 +1616,9 @@ pub const WebFace = struct {
         const cl = client();
         if (self.view_live) cl.post(proto.ViewDestroy{ .view = self.view });
         cl.unregister(self);
+        // Web-store replies resolve through this face: the deinit
+        // choke point drops every pending callback (CLAUDE.md rule 2).
+        webstore.cancelFor(@ptrCast(self));
         self.detachScaleWatch();
         self.stopPacing();
         if (self.reader) |r| {
@@ -1627,6 +1639,8 @@ pub const WebFace = struct {
         self.perm_queue.deinit(self.allocator);
         for (self.site_settings.items) |s| self.allocator.free(s.origin);
         self.site_settings.deinit(self.allocator);
+        if (self.nav_origin) |o| self.allocator.free(o);
+        if (self.visit_url) |u| self.allocator.free(u);
         self.autoClear();
         self.auto_ops.deinit(self.allocator);
         self.auto_results.deinit(self.allocator);
@@ -3299,6 +3313,16 @@ pub const WebFace = struct {
     pub fn onTitle(self: *WebFace, title: []const u8) void {
         if (self.title) |t| self.allocator.free(t);
         self.title = self.allocator.dupe(u8, title) catch null;
+        // The visit was recorded at navigation commit; the first title
+        // for that page completes its history entry (no extra count).
+        if (self.visit_url) |vu| {
+            const matches = if (self.url) |u| std.mem.eql(u8, vu, u) else false;
+            if (matches and title.len > 0) {
+                webstore.recordTitle(self.allocator, vu, title);
+                self.allocator.free(vu);
+                self.visit_url = null;
+            }
+        }
         self.applyTabTitle();
         self.applyPaneFaceTitle();
     }
@@ -3348,6 +3372,7 @@ pub const WebFace = struct {
             self.allocator.free(u);
             self.pending_url = null;
         }
+        self.noteNavigation(url);
         if (self.widgets_dead) return;
         // A blank page has no address to show: browsers leave the bar
         // empty there, and writing "about:blank" into the bar of a tab
@@ -3359,6 +3384,54 @@ pub const WebFace = struct {
         // Never fight the user's typing: only rewrite an unfocused bar.
         if (c.gtk_widget_has_focus(self.entry) == 0)
             c.gtk_editable_set_text(@ptrCast(self.entry), z.ptr);
+    }
+
+    // ---- web store (daemon-side history + per-site settings) --------
+
+    /// Bookkeeping on a committed navigation: record the visit in the
+    /// daemon web store and, when the origin changed, fetch its stored
+    /// per-site zoom.
+    fn noteNavigation(self: *WebFace, url: []const u8) void {
+        if (!recordableUrl(url)) return;
+        webstore.recordVisit(self.allocator, url, "");
+        if (self.visit_url) |u| self.allocator.free(u);
+        self.visit_url = self.allocator.dupe(u8, url) catch null;
+
+        var obuf: [512]u8 = undefined;
+        const origin = webstore.originOf(&obuf, url) orelse return;
+        if (self.nav_origin) |o| {
+            if (std.mem.eql(u8, o, origin)) return;
+            self.allocator.free(o);
+        }
+        self.nav_origin = self.allocator.dupe(u8, origin) catch null;
+        _ = webstore.siteGet(self.allocator, origin, @ptrCast(self), &onSiteReply);
+    }
+
+    /// Only real documents make history; about:/data:/chrome-error
+    /// noise never does.
+    fn recordableUrl(url: []const u8) bool {
+        return std.mem.startsWith(u8, url, "http://") or
+            std.mem.startsWith(u8, url, "https://") or
+            std.mem.startsWith(u8, url, "file://");
+    }
+
+    /// site_get answer: apply the origin's stored zoom to the view
+    /// WITHOUT writing it back (only the user path stores).
+    fn onSiteReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
+        const self = cast.userData(WebFace, ctx);
+        if (!ok) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const rep = webstore.parseSite(arena.allocator(), payload) orelse return;
+        if (!rep.ok) return;
+        // Stale reply: the face navigated elsewhere meanwhile.
+        const cur = self.nav_origin orelse return;
+        if (!std.ascii.eqlIgnoreCase(cur, rep.origin)) return;
+        const zoom: i32 = if (rep.site) |site| site.zoom_x100 else 0;
+        if (zoom == self.zoom_x100) return;
+        self.zoom_x100 = zoom;
+        if (self.view_live)
+            client().post(proto.SetZoom{ .view = self.view, .level_x100 = zoom });
     }
 
     pub fn onLoad(self: *WebFace, ev: proto.EvLoad) void {
@@ -3955,6 +4028,9 @@ pub const WebFace = struct {
         // A zoom rescales every hint rect; stale labels would lie.
         if (self.hints_active) self.cancelHints();
         self.zoom_x100 = level_x100;
+        // A user-chosen zoom is a per-site setting: persist it on the
+        // daemon so the origin comes back at this zoom (0 clears).
+        if (self.nav_origin) |o| webstore.siteSetZoom(self.allocator, o, level_x100);
         if (!self.view_live) return;
         client().post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
         self.promote();
