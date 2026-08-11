@@ -143,6 +143,19 @@ H.264/AAC) while the distro build enables them.
   is the worked example of the rule: the initial url had to be a NEW
   frame, because adding a field to `view_create` would have changed an
   existing frame's layout.
+- **`view_discard` destroys the BROWSER, never the view.** The record
+  (id, geometry, scale, fps cap, user zoom, url) survives so the client
+  sees a reload and nothing else; `dropBrowser` is the shared teardown
+  and `spawnBrowser` the shared (re)creation, which is what keeps a
+  revived view identical to a fresh one. Two consequences that are
+  accepted, not bugs: the NAVIGATION HISTORY is gone (a fresh browser
+  has none, and keeping it would mean keeping the browser), and a
+  discarded view must ANSWER every request it cannot serve —
+  `discarded_msg` for the semantic frames, an empty final
+  `ev_find_result` for find — because a client waiting on a reply frame
+  has no other way out. Only show/navigate/nav-action/input revive; a
+  resize records the new geometry and a `frame_request` is ignored, so
+  a background pane cannot resurrect itself.
 - **A view opened at a url must not hold about:blank first.**
   `view_create` + `navigate` mints TWO documents, and the blank one
   finishes loading immediately — any client settling on "a url is loaded

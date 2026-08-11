@@ -16224,3 +16224,47 @@ carry the READER as user-data, so the face's signal-disconnect loop
 cannot reach them — `Reader.sever` is called from the face's
 prepare-destroy (the same choke point, mechanism 2) and `Reader.destroy`
 from `WebFace.deinit`.
+## Web faces: real tab discard (`view_discard`, cap `discard`)
+
+A hidden web pane used to keep its whole browser: `view_hide` stops the
+painting and nothing else. It can now be let go entirely.
+
+- Wire: `view_discard` = **0x17** (view id), capability `discard`.
+  Append-only as always; a helper without the capability never receives
+  the frame and every pane behaves exactly as before.
+- Helper (`cefhost.zig`): the frame destroys the browser (force-close),
+  unmaps the frame buffer, drops the pending script requests and the
+  semantic shadow tree, and clears the CEF id so a late callback from
+  the dying browser resolves to nobody — while the VIEW RECORD (id,
+  logical geometry, scale, fps cap, user zoom, url) stays. `view_show`,
+  `navigate`, `nav_action` and every input frame revive it through
+  `findWake`/`reviveAt`, which re-enters the same `spawnBrowser` a
+  first creation uses, so the revived view is identical but for one
+  thing: **the navigation history is gone** (documented on the frame,
+  in `src/web/CLAUDE.md` and in `docs/config.md`). A resize only
+  records the new geometry and `frame_request` is ignored, so a
+  background pane cannot resurrect itself.
+- A discarded view ANSWERS what it cannot serve — one explanatory
+  `discarded_msg` for every semantic frame, an empty final
+  `ev_find_result` for find — because a client waiting on a reply frame
+  has no other way out. `webdrive`'s screenshot path was already
+  bounded and returns the last buffer it holds.
+- GUI (`webface.zig`): a face unmapped for `web_discard_minutes`
+  (config, default 30, 0 = never) sends the frame. The pane KEEPS the
+  last delivered frame, dimmed through a `sketerm-web-discarded` class
+  installed with the rest of the webview CSS via `cssutil`; map, focus,
+  navigation and any automation request revive it. The countdown is a
+  one-shot GLib timeout severed at `prepareDestroyCb` and `deinit`, the
+  same mechanism the pacing timers use.
+- Palette: **Discard Background Web Tabs** (`web_discard_background`)
+  does it to every off-screen face now, with a toast counting them.
+
+Verification: `zig build`, `zig build web` green; `zig build smoke-web`
+green including a new stage 22d that creates a view at a titled green
+page, discards it, proves a semantic request against the discarded view
+is ANSWERED (not left to time out) and that no buffer is announced
+while it is gone, then shows it and asserts a fresh frame buffer, the
+same title and the same green centre pixel. `zig build test-core` fails
+at the build-step level on this machine — identically on the base
+commit, with the test binary itself reporting 1813 passed / 0 failed
+when run directly, so pre-existing.

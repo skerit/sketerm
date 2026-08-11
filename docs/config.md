@@ -350,6 +350,7 @@ that framebuffer and costs nothing extra.
 | `inactive_desaturate` | float | `0.0` | Clamped 0..1. Blend an unfocused pane toward luma. |
 | `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances. Applies to whichever shader a pane resolves to. |
 | `browser_max_fps` | int | `0` | Ceiling on how often a browser pane's page repaints. `0` = follow the output the window is on. Anything else must be `5`..`1000`; out of range is a parse error. |
+| `web_discard_minutes` | int | `30` | Minutes a web pane may stay off screen before its page is discarded outright (the browser is destroyed and the pane keeps its last frame, dimmed). `0` = never. |
 
 `browser_max_fps` is a CEILING, not a target. A browser pane paints
 nothing at all while its page is unchanged, and a background tab's page
@@ -364,6 +365,26 @@ between differently refreshing outputs re-paces it with no config
 change. Set a number here to cap a browser pane below the display (a
 battery-minded `30`), never to raise it above one — no cap can make a
 view exceed its own output's refresh.
+
+`web_discard_minutes` is about MEMORY, not about painting. A web pane
+that is not on screen already paints nothing at all — but the browser
+engine behind it still holds its renderer process, its JavaScript heap
+and its decoded images. Past this many minutes off screen, sketerm asks
+the helper to destroy that browser entirely (`view_discard`, helper
+capability `discard`). The pane keeps showing the LAST frame it
+received, dimmed, and the page comes back the moment the tab is shown,
+focused or navigated.
+
+The price is a RELOAD: the revived page starts a fresh session at the
+same address, so its navigation history (back/forward) and anything
+typed into a form but not submitted are gone. That is why the default
+is a conservative 30 minutes rather than a couple, and why `0` (never
+discard) is a reasonable choice for anyone who leaves half-filled forms
+in background tabs. The **Discard Background Web Tabs** command in the
+palette (action `web_discard_background`) does the same thing on
+demand, whatever this key says. A helper too old to advertise `discard`
+never receives the frame, and every web pane then behaves exactly as it
+did before this key existed.
 
 `inactive_fg_dim` and `inactive_bg_dim` are retired per-cell dim keys.
 They are still accepted and ignored, so old files do not warn; use
@@ -566,6 +587,9 @@ apply_profile show_scrollback new_durable_tab new_browser_tab
 new_browser_split new_web_tab new_web_split web_reader
 close_pane toggle_browser_face new_editor_tab
 new_editor_split toggle_editor_face mux_detach paste_clipboard
+new_browser_split close_pane toggle_browser_face new_editor_tab
+new_editor_split toggle_editor_face web_discard_background
+mux_detach paste_clipboard
 copy_selection
 copy_screen copy_scrollback copy_command_output
 select_command_output interrupt_or_copy clear_and_scrollback

@@ -43,6 +43,8 @@ const view_id: u32 = 1;
 const url_view_id: u32 = 2;
 /// The stage-22c view: a page with NO background of its own.
 const bare_view_id: u32 = 3;
+/// The stage-22d view: discarded and revived.
+const discard_view_id: u32 = 4;
 
 /// Pages under test. `#` MUST be percent-encoded inside a data: URL —
 /// a raw one starts the fragment and truncates the document.
@@ -80,6 +82,12 @@ const hints_page =
     "<button%20disabled>Dead</button>" ++
     "<a%20href=%22https://example.com/far%22%20style=%22position:absolute;top:9000px%22>Far%20Link</a>" ++
     "</body></html>";
+/// Stage 22e: both a checkable TITLE and a checkable COLOUR, so a
+/// revived view can be shown to have loaded the SAME url again rather
+/// than merely to have produced some pixels.
+const discard_page =
+    "data:text/html,<html><head><title>discard-me</title></head>" ++
+    "<body%20style=%22margin:0;background:%2300ff00%22></body></html>";
 
 /// Repaints on every animation frame, i.e. on every begin frame the
 /// rig drives — the page whose achieved rate measures the ceiling.
@@ -330,6 +338,7 @@ const Client = struct {
     ack_semantic: bool = false,
     ack_dmabuf: bool = false,
     ack_view_url: bool = false,
+    ack_discard: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -581,6 +590,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.ack_discard = true;
                 }
             },
             .frame_buffer => {
@@ -1877,6 +1887,67 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         cl.send(proto.InterceptSet{ .view = view_id, .enabled = 1 });
     }
     pass("stage 22d request interception (seeded filter blocks, log reports, toggle honoured)");
+    // ── Stage 22e: discard destroys the browser, show brings it back ─
+    //
+    // `view_hide` only pauses the painting; `view_discard` (capability
+    // `discard`) destroys the BROWSER and keeps the view record. The
+    // properties that matter to a client are all checked here: the id
+    // survives, a semantic request against a discarded view is ANSWERED
+    // rather than left hanging, and the next `view_show` produces a
+    // fresh frame buffer plus the same page again.
+    {
+        if (!cl.ack_discard) fail("stage 22e: hello_ack lacks the discard capability");
+        cl.resetTitle();
+        const fb_before = cl.fb_seq;
+        cl.send(proto.ViewCreateUrl{
+            .view = discard_view_id,
+            .w = 400,
+            .h = 300,
+            .scale_x1000 = 1000,
+            .context = 0,
+            .url = discard_page,
+        });
+        if (!cl.waitBufferAfter(fb_before, 20_000)) fail("stage 22e: no frame_buffer for the new view");
+        if (!cl.waitTitle("discard-me", 20_000)) fail("stage 22e: the page never reported its title");
+        if (!cl.waitCenterColor(.{ 0, 255, 0 }, 20_000)) fail("stage 22e: the page never painted green");
+
+        const fb_at_discard = cl.fb_seq;
+        cl.send(proto.ViewHide{ .view = discard_view_id });
+        cl.send(proto.ViewDiscard{ .view = discard_view_id });
+
+        // A semantic request now has no page to reach. The helper must
+        // still answer it: a silent drop is a client-side timeout, and
+        // this rig would sit out the whole 20s below rather than fail
+        // in one line.
+        cl.resetSem();
+        const sem_before = cl.sem_seq;
+        cl.send(proto.SemSnapshotReq{
+            .view = discard_view_id,
+            .mode = @intFromEnum(proto.SnapMode.full),
+            .detail = 1,
+            .scope = 0,
+        });
+        if (!cl.waitSeq(&cl.sem_seq, sem_before, 20_000))
+            fail("stage 22e: a discarded view never answered a snapshot request (it must not hang)");
+        if (std.mem.indexOf(u8, cl.semLast(), "discarded") == null) {
+            std.debug.print("smoke-web: snapshot of a discarded view was:\n{s}\n", .{cl.semLast()});
+            fail("stage 22e: the discarded view's answer does not say it is discarded");
+        }
+        // Nothing may paint for a view with no browser.
+        if (cl.fb_seq != fb_at_discard) fail("stage 22e: a discarded view announced a new buffer");
+
+        // The revival: SAME view id, no re-create, no re-navigate.
+        cl.resetTitle();
+        cl.send(proto.ViewShow{ .view = discard_view_id });
+        if (!cl.waitBufferAfter(fb_at_discard, 20_000))
+            fail("stage 22e: showing a discarded view produced no fresh frame buffer");
+        if (!cl.waitTitle("discard-me", 20_000))
+            fail("stage 22e: the revived view did not load the url it was discarded holding");
+        if (!cl.waitCenterColor(.{ 0, 255, 0 }, 20_000))
+            fail("stage 22e: the revived view never repainted the page");
+        cl.send(proto.ViewDestroy{ .view = discard_view_id });
+    }
+    pass("stage 22e view_discard (browser destroyed, answered while discarded, revived on show)");
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;
