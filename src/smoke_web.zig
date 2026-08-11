@@ -222,6 +222,14 @@ const attack_page =
     "setTimeout(function(){document.title=\"attack%20early:\"+early+\"%20late:\"+attack();},50);" ++
     "})();</script></body></html>";
 
+/// A page whose only subresource is an image on a seeded-blocked host
+/// (doubleclick.net is in the built-in seed list). The request is
+/// CANCELLED at on_before_resource_load, before any network — so this
+/// stays network-free like every other page here, and the blocked
+/// entry proves the filter engine ran inline.
+const blocked_img_page =
+    "data:text/html,<body><img%20src=%22https://doubleclick.net/ad.gif%22></body>";
+
 // Cleanup state: `fail` may fire from anywhere, and the helper must
 // never be left running nor the temp dir behind. Killed by EXACT pid.
 var g_pid: c.pid_t = -1;
@@ -391,6 +399,19 @@ const Client = struct {
     eval_ok: u8 = 0,
     eval_seq: u32 = 0,
 
+    ack_intercept: bool = false,
+    // Interception: last coalesced status counters, and the last log
+    // pull rendered to JSON.
+    int_enabled: u8 = 1,
+    int_blocked: u32 = 0,
+    int_total: u32 = 0,
+    int_rules: u32 = 0,
+    int_status_seq: u32 = 0,
+    int_log: [16 * 1024]u8 = @splat(0),
+    int_log_len: usize = 0,
+    int_log_next: u32 = 0,
+    int_log_seq: u32 = 0,
+
     fn deinit(self: *Client) void {
         self.unmap();
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
@@ -547,6 +568,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
                 }
             },
             .frame_buffer => {
@@ -655,6 +677,24 @@ const Client = struct {
                 self.nav_fwd = s.can_fwd;
                 self.nav_seq += 1;
             },
+            .intercept_status => {
+                const s = proto.decode(proto.InterceptStatus, frame.payload) catch fail("intercept_status decode");
+                self.int_enabled = s.enabled;
+                self.int_blocked = s.blocked;
+                self.int_total = s.total;
+                self.int_rules = s.rules;
+                self.int_status_seq += 1;
+            },
+            .intercept_log => {
+                const l = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch fail("intercept_log decode");
+                defer self.gpa.free(l.entries);
+                self.int_log_next = l.next_seq;
+                const json = proto.netLogJson(self.gpa, l.next_seq, l.entries) catch fail("intercept_log json");
+                defer self.gpa.free(json);
+                self.int_log_len = @min(json.len, self.int_log.len);
+                @memcpy(self.int_log[0..self.int_log_len], json[0..self.int_log_len]);
+                self.int_log_seq += 1;
+            },
             else => {},
         }
     }
@@ -728,6 +768,34 @@ const Client = struct {
             if (nowMs() > deadline) return false;
             self.pump(50);
         }
+    }
+
+    /// Poll intercept status until `min_blocked` requests were blocked
+    /// on `view`, driving frames meanwhile.
+    fn waitBlocked(self: *Client, min_blocked: u32, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            self.send(proto.InterceptStatusReq{ .view = view_id });
+            if (self.int_blocked >= min_blocked) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(80);
+        }
+    }
+
+    /// Pull the log and wait for the reply.
+    fn pullLog(self: *Client, since: u32, timeout_ms: i64) bool {
+        const before = self.int_log_seq;
+        self.send(proto.InterceptLogReq{ .view = view_id, .since = since, .max = 64 });
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (self.int_log_seq > before) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
+    }
+
+    fn logSlice(self: *Client) []const u8 {
+        return self.int_log[0..self.int_log_len];
     }
 
     fn sawPopup(self: *Client, needle: []const u8) bool {
@@ -1718,6 +1786,46 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         cl.send(proto.ViewDestroy{ .view = bare_view_id });
     }
     pass("stage 22c unstyled page (opaque white canvas, not a transparent/black frame)");
+
+    // ── Stage 22d: request interception (content blocking) ─────────
+    //
+    // A seeded filter (||doubleclick.net^) must block a matching
+    // subresource inline in the helper, and the counters + request log
+    // must report it. No network is touched: the request is cancelled
+    // at on_before_resource_load, before it ever leaves the process.
+    {
+        if (!cl.ack_intercept) fail("stage 22d: hello_ack lacks the intercept capability");
+        cl.navigate(blocked_img_page);
+        if (!cl.waitBlocked(1, 20_000)) {
+            std.debug.print("smoke-web: intercept status blocked={d} total={d} rules={d}\n", .{ cl.int_blocked, cl.int_total, cl.int_rules });
+            fail("stage 22d: the seeded filter did not block the doubleclick.net image");
+        }
+        if (cl.int_rules == 0) fail("stage 22d: no filter rules were loaded");
+        if (!cl.pullLog(0, 15_000)) fail("stage 22d: the request log never answered");
+        const log = cl.logSlice();
+        if (std.mem.indexOf(u8, log, "doubleclick.net") == null)
+            fail("stage 22d: the request log does not mention the blocked url");
+        if (std.mem.indexOf(u8, log, "\"blocked\":true") == null)
+            fail("stage 22d: the request log does not mark the entry blocked");
+
+        // Disabling blocking for the view must stop new verdicts: reload
+        // and the same image is no longer counted as blocked.
+        const blocked_before = cl.int_blocked;
+        cl.send(proto.InterceptSet{ .view = view_id, .enabled = 0 });
+        cl.navigate(blocked_img_page);
+        // Give the reload a moment; the counter must NOT climb.
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            cl.send(proto.InterceptStatusReq{ .view = view_id });
+            cl.pump(50);
+        }
+        if (cl.int_enabled != 0) fail("stage 22d: intercept_set(disable) was not reflected in the status");
+        if (cl.int_blocked != blocked_before)
+            fail("stage 22d: a request was blocked while blocking was disabled");
+        // Re-enable so the view is left in the default state.
+        cl.send(proto.InterceptSet{ .view = view_id, .enabled = 1 });
+    }
+    pass("stage 22d request interception (seeded filter blocks, log reports, toggle honoured)");
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;
