@@ -601,9 +601,64 @@ pub const Host = struct {
     /// also the correlation key: CEF's callback hands back the path,
     /// not a request id.
     prints: std.ArrayList(Print) = .empty,
+    /// Downloads the engine has told us about (capability "downloads").
+    /// Owned by the HOST, not by a view, because the engine's update
+    /// callbacks outlive our target decision — but every entry still
+    /// names the view it came from, and `dropBrowser` cancels that
+    /// view's entries when the browser goes.
+    downloads: std.ArrayList(Dl) = .empty,
 
     /// One `print_pdf` in flight.
     const Print = struct { view: u32, path: []u8 };
+
+    /// One engine download. `before_cb` is the HELD target decision
+    /// (`ev_download_offer`'s other half); `item_cb` is the latest
+    /// cancel handle the engine offered, kept so a `download_cancel`
+    /// (or a dying view) can abort the transfer. Both references are
+    /// owned and released exactly once, same discipline as `cert_cb`.
+    const Dl = struct {
+        id: u32,
+        view: u32,
+        before_cb: ?*cef.cef_before_download_callback_t = null,
+        item_cb: ?*cef.cef_download_item_callback_t = null,
+        /// The offer was posted (an entry can exist earlier: the engine
+        /// reports progress before `on_before_download`).
+        offered: bool = false,
+        /// The client answered with a path; progress frames flow.
+        decided: bool = false,
+        cancel_requested: bool = false,
+        received: u64 = 0,
+        total: u64 = 0,
+        done: bool = false,
+        failed: bool = false,
+        /// Counters moved since the last flush (the intercept_status
+        /// coalescing pattern: one frame per poll iteration at most).
+        dirty: bool = false,
+        /// Throwaway path a CANCELLED offer was continued into (see
+        /// `cancelDl`: the engine's held target callback must always
+        /// run, or shutdown hangs on the download manager). Unlinked
+        /// when the entry is dropped.
+        trash: [128]u8 = @splat(0),
+        trash_len: usize = 0,
+
+        fn terminal(self: *const Dl) bool {
+            return self.done or self.failed;
+        }
+
+        fn dropTrash(self: *Dl) void {
+            if (self.trash_len == 0) return;
+            self.trash[self.trash_len] = 0;
+            _ = c.unlink(@ptrCast(&self.trash));
+            self.trash_len = 0;
+        }
+
+        fn releaseCbs(self: *Dl) void {
+            if (self.before_cb) |cb| release(&cb.base);
+            self.before_cb = null;
+            if (self.item_cb) |cb| release(&cb.base);
+            self.item_cb = null;
+        }
+    };
 
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
         return .{ .gpa = gpa, .out = out };
@@ -614,6 +669,10 @@ pub const Host = struct {
         self.views.deinit(self.gpa);
         for (self.prints.items) |p| self.gpa.free(p.path);
         self.prints.deinit(self.gpa);
+        // destroyAll's dropBrowser sweep already cancelled and freed
+        // per-view entries; whatever is left never named a live view.
+        for (self.downloads.items) |*d| d.releaseCbs();
+        self.downloads.deinit(self.gpa);
         if (g_host == self) g_host = null;
     }
 
@@ -1030,6 +1089,7 @@ pub const Host = struct {
         // proceed.
         resolveCert(v, false);
         for (&v.perms) |*p| resolvePerm(p, false);
+        self.dropDownloadsOf(v.id);
         if (close) {
             if (browserHost(v)) |host| {
                 // force_close: a windowless browser has no user to
@@ -1401,6 +1461,138 @@ pub const Host = struct {
             }
         }
         for (pending[0..n]) |st| self.post(st);
+    }
+
+    // -- downloads -----------------------------------------------------
+
+    fn findDl(self: *Host, view: u32, id: u32) ?*Dl {
+        for (self.downloads.items) |*d| {
+            if (d.id == id and d.view == view) return d;
+        }
+        return null;
+    }
+
+    /// The client answered an `ev_download_offer`. An id the helper no
+    /// longer holds is ignored (the download may already have failed or
+    /// its view may be gone).
+    pub fn downloadDecide(self: *Host, req: proto.DownloadDecide) void {
+        const d = self.findDl(req.view, req.id) orelse return;
+        if (req.path.len == 0) {
+            self.cancelDl(d);
+            return;
+        }
+        if (d.decided) return;
+        d.decided = true;
+        d.dirty = true;
+        if (d.before_cb) |cb| {
+            d.before_cb = null;
+            var path = std.mem.zeroes(cef.cef_string_t);
+            setStr(req.path, &path);
+            defer cef.cef_string_utf16_clear(&path);
+            if (cb.cont) |f| f(cb, &path, 0);
+            release(&cb.base);
+        }
+    }
+
+    /// `download_cancel`, and the decide-with-empty-path shape of the
+    /// same intent. Idempotent; a download with no cancel handle yet is
+    /// aborted by the next `on_download_updated`.
+    fn cancelDl(self: *Host, d: *Dl) void {
+        _ = self;
+        if (d.terminal()) return;
+        d.cancel_requested = true;
+        // A held target decision must ALWAYS be run — dropping the
+        // callback unanswered leaves Chromium's target determiner
+        // waiting forever and the whole helper then hangs at shutdown
+        // on its download manager (measured; stage 23 caught it). So a
+        // cancel CONTINUES into a throwaway path first and cancels
+        // right after; if the engine wins the race and completes
+        // anyway, the throwaway is unlinked when the entry drops.
+        if (d.before_cb) |cb| {
+            d.before_cb = null;
+            const p = std.fmt.bufPrint(
+                d.trash[0 .. d.trash.len - 1],
+                "/tmp/sketerm-webdl-cancel-{d}-{d}.part",
+                .{ c.getpid(), d.id },
+            ) catch "";
+            d.trash_len = p.len;
+            var path = std.mem.zeroes(cef.cef_string_t);
+            setStr(p, &path);
+            defer cef.cef_string_utf16_clear(&path);
+            if (cb.cont) |f| f(cb, &path, 0);
+            release(&cb.base);
+        }
+        if (d.item_cb) |cb| {
+            d.item_cb = null;
+            if (cb.cancel) |f| f(cb);
+            release(&cb.base);
+        }
+    }
+
+    pub fn downloadCancel(self: *Host, req: proto.DownloadCancel) void {
+        const d = self.findDl(req.view, req.id) orelse return;
+        self.cancelDl(d);
+    }
+
+    /// Push a coalesced `ev_download_progress` for every download whose
+    /// counters moved, and retire terminal entries. Called once per
+    /// poll iteration, like `flushInterceptStatus`.
+    pub fn flushDownloadProgress(self: *Host) void {
+        var i: usize = 0;
+        while (i < self.downloads.items.len) {
+            const d = &self.downloads.items[i];
+            if (d.dirty) {
+                d.dirty = false;
+                // Progress is only worth a frame once the client has a
+                // row for it — but a TERMINAL state must reach an
+                // offered download either way, or a client whose decide
+                // raced the failure waits forever.
+                if (d.offered and (d.decided or d.terminal())) self.post(proto.EvDownloadProgress{
+                    .view = d.view,
+                    .id = d.id,
+                    .received = d.received,
+                    .total = d.total,
+                    .done = if (d.done) 1 else 0,
+                    .failed = if (d.failed) 1 else 0,
+                });
+            }
+            if (d.terminal()) {
+                var gone = self.downloads.swapRemove(i);
+                gone.releaseCbs();
+                gone.dropTrash();
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Cancel and drop every download of `view`, posting the terminal
+    /// frame ourselves — the flush would otherwise never see entries
+    /// removed here. Called from `dropBrowser`.
+    fn dropDownloadsOf(self: *Host, view: u32) void {
+        var i: usize = 0;
+        while (i < self.downloads.items.len) {
+            const d = &self.downloads.items[i];
+            if (d.view != view) {
+                i += 1;
+                continue;
+            }
+            const was_terminal = d.terminal();
+            const was_offered = d.offered;
+            const was_decided = d.decided;
+            self.cancelDl(d);
+            var gone = self.downloads.swapRemove(i);
+            gone.releaseCbs();
+            gone.dropTrash();
+            if (!was_terminal and was_offered and was_decided) self.post(proto.EvDownloadProgress{
+                .view = view,
+                .id = gone.id,
+                .received = gone.received,
+                .total = gone.total,
+                .done = 0,
+                .failed = 1,
+            });
+        }
     }
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {
@@ -2976,6 +3168,7 @@ var resource_request_handler: cef.cef_resource_request_handler_t = undefined;
 var find_handler: cef.cef_find_handler_t = undefined;
 var context_menu_handler: cef.cef_context_menu_handler_t = undefined;
 var permission_handler: cef.cef_permission_handler_t = undefined;
+var download_handler: cef.cef_download_handler_t = undefined;
 var bp_handler: cef.cef_browser_process_handler_t = undefined;
 var rp_handler: cef.cef_render_process_handler_t = undefined;
 var v8_handler: cef.cef_v8_handler_t = undefined;
@@ -3047,6 +3240,10 @@ fn getPermissionHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_permis
     return &permission_handler;
 }
 
+fn getDownloadHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_download_handler_t {
+    return &download_handler;
+}
+
 fn getRequestHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_request_handler_t {
     return &request_handler;
 }
@@ -3083,6 +3280,7 @@ fn installHandlers() void {
     life_span_handler.base = staticBase(cef.cef_life_span_handler_t);
     life_span_handler.on_before_popup = onBeforePopup;
     life_span_handler.on_after_created = onAfterCreated;
+    life_span_handler.on_before_close = onBeforeClose;
 
     load_handler = std.mem.zeroes(cef.cef_load_handler_t);
     load_handler.base = staticBase(cef.cef_load_handler_t);
@@ -3111,6 +3309,12 @@ fn installHandlers() void {
     permission_handler.on_request_media_access_permission = onRequestMediaAccess;
     permission_handler.on_dismiss_permission_prompt = onDismissPermissionPrompt;
 
+    download_handler = std.mem.zeroes(cef.cef_download_handler_t);
+    download_handler.base = staticBase(cef.cef_download_handler_t);
+    download_handler.can_download = onCanDownload;
+    download_handler.on_before_download = onBeforeDownload;
+    download_handler.on_download_updated = onDownloadUpdated;
+
     pdf_callback = std.mem.zeroes(cef.cef_pdf_print_callback_t);
     pdf_callback.base = staticBase(cef.cef_pdf_print_callback_t);
     pdf_callback.on_pdf_print_finished = onPdfPrintFinished;
@@ -3133,6 +3337,7 @@ fn installHandlers() void {
     client.get_find_handler = getFindHandler;
     client.get_context_menu_handler = getContextMenuHandler;
     client.get_permission_handler = getPermissionHandler;
+    client.get_download_handler = getDownloadHandler;
     client.on_process_message_received = onProcessMessage;
 }
 
@@ -3609,10 +3814,30 @@ fn onBeforePopup(
     return 1;
 }
 
+/// Live engine browsers, counted by `on_after_created` /
+/// `on_before_close`. The drain after a client disconnect pumps until
+/// this reaches zero: `close_browser` is asynchronous, and a browser
+/// with post-close work queued (a cancelled download's cleanup, for
+/// one) takes longer than any fixed pump count — `cef_shutdown` then
+/// stalls for its whole internal timeout (stage 23 caught it).
+var open_browsers: usize = 0;
+
+pub fn openBrowserCount() usize {
+    return open_browsers;
+}
+
+fn onBeforeClose(
+    _: [*c]cef.cef_life_span_handler_t,
+    _: [*c]cef.cef_browser_t,
+) callconv(.c) void {
+    if (open_browsers > 0) open_browsers -= 1;
+}
+
 fn onAfterCreated(
     _: [*c]cef.cef_life_span_handler_t,
     browser: [*c]cef.cef_browser_t,
 ) callconv(.c) void {
+    open_browsers += 1;
     const host = g_host orelse return;
     const b: *cef.cef_browser_t = browser orelse return;
     if (host.pending) |v| {
@@ -4055,6 +4280,130 @@ fn onDismissPermissionPrompt(
             if (p.prompt_cb) |cb| release(&cb.base);
             p.* = .{};
             return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Downloads
+// ---------------------------------------------------------------------
+
+/// Every download may proceed as far as the TARGET decision — which is
+/// then held for the client (`on_before_download`). Returning 0 here
+/// would cancel silently, and the policy question belongs to the GUI.
+fn onCanDownload(
+    _: [*c]cef.cef_download_handler_t,
+    _: [*c]cef.cef_browser_t,
+    _: [*c]const cef.cef_string_t,
+    _: [*c]const cef.cef_string_t,
+) callconv(.c) c_int {
+    return 1;
+}
+
+/// The engine's download entry for `id`, minted on first sight — the
+/// engine reports progress BEFORE `on_before_download`, so either
+/// callback can be the first to see an id.
+fn dlSlot(host: *Host, view: u32, id: u32) ?*Host.Dl {
+    if (host.findDl(view, id)) |d| return d;
+    host.downloads.append(host.gpa, .{ .id = id, .view = view }) catch return null;
+    return &host.downloads.items[host.downloads.items.len - 1];
+}
+
+fn onBeforeDownload(
+    _: [*c]cef.cef_download_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    download_item: [*c]cef.cef_download_item_t,
+    suggested_name: [*c]const cef.cef_string_t,
+    callback: [*c]cef.cef_before_download_callback_t,
+) callconv(.c) c_int {
+    const host = g_host orelse return 0;
+    const v = viewOf(browser) orelse return 0;
+    const item: *cef.cef_download_item_t = download_item orelse return 0;
+    const cb: *cef.cef_before_download_callback_t = callback orelse return 0;
+    const id: u32 = if (item.get_id) |gid| gid(item) else return 0;
+    const d = dlSlot(host, v.id, id) orelse return 0;
+    if (d.cancel_requested or d.terminal()) return 0;
+
+    if (item.get_total_bytes) |gt| {
+        const t = gt(item);
+        if (t > 0) d.total = @intCast(t);
+    }
+    d.before_cb = cb;
+    d.offered = true;
+
+    var name = Utf8.init(suggested_name);
+    defer name.free();
+    var url_buf: [2048]u8 = undefined;
+    const url = if (item.get_url) |gu| userfreeInto(gu(item), &url_buf) else "";
+    var mime_buf: [256]u8 = undefined;
+    const mime = if (item.get_mime_type) |gm| userfreeInto(gm(item), &mime_buf) else "";
+    host.post(proto.EvDownloadOffer{
+        .view = v.id,
+        .id = id,
+        .total = d.total,
+        .url = url,
+        .name = name.slice(),
+        .mime = mime,
+    });
+    return 1;
+}
+
+/// Progress, coalesced: the counters land in the entry and the flush in
+/// the poll loop posts at most one frame per iteration. The latest
+/// cancel handle is kept (releasing the previous one), which is what a
+/// `download_cancel` or a dying view aborts through.
+fn onDownloadUpdated(
+    _: [*c]cef.cef_download_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    download_item: [*c]cef.cef_download_item_t,
+    callback: [*c]cef.cef_download_item_callback_t,
+) callconv(.c) void {
+    const host = g_host orelse return;
+    const item: *cef.cef_download_item_t = download_item orelse return;
+    const id: u32 = if (item.get_id) |gid| gid(item) else return;
+    // By id first: the engine's id is process-unique, and a browser
+    // mid-close can stop resolving to its view while its download's
+    // entry (keyed under the real view) lives on.
+    var found: ?*Host.Dl = null;
+    for (host.downloads.items) |*e| {
+        if (e.id == id) found = e;
+    }
+    const view_id: u32 = if (viewOf(browser)) |v| v.id else 0;
+    const cb_arg: ?*cef.cef_download_item_callback_t = callback;
+    const d = (found orelse dlSlot(host, view_id, id)) orelse {
+        if (cb_arg) |cb| release(&cb.base);
+        return;
+    };
+
+    if (item.get_received_bytes) |gr| {
+        const r = gr(item);
+        if (r >= 0) d.received = @intCast(r);
+    }
+    if (item.get_total_bytes) |gt| {
+        const t = gt(item);
+        if (t > 0) d.total = @intCast(t);
+    }
+    if (item.is_complete) |f| {
+        if (f(item) != 0) d.done = true;
+    }
+    const canceled = if (item.is_canceled) |f| f(item) != 0 else false;
+    const interrupted = if (item.is_interrupted) |f| f(item) != 0 else false;
+    if ((canceled or interrupted) and !d.done) d.failed = true;
+    d.dirty = true;
+
+    // One held cancel handle at a time; a terminal download needs none.
+    if (d.item_cb) |old| {
+        d.item_cb = null;
+        release(&old.base);
+    }
+    if (cb_arg) |cb| {
+        if (d.terminal()) {
+            release(&cb.base);
+        } else if (d.cancel_requested) {
+            if (cb.cancel) |f| f(cb);
+            release(&cb.base);
+        } else {
+            d.item_cb = cb;
         }
     }
 }

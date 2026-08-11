@@ -93,8 +93,16 @@ pub const Server = struct {
             self.step();
         }
         // Let CEF finish closing the browsers before the caller shuts
-        // it down; close_browser is asynchronous.
+        // it down; close_browser is asynchronous, and a browser with
+        // post-close work still queued (a cancelled download's cleanup)
+        // outlives any fixed pump count — so pump until every browser
+        // reported `on_before_close`, bounded, then drain the tail.
         self.host.destroyAll();
+        const deadline = cefhost.nowMs() + 5000;
+        while (cefhost.openBrowserCount() > 0 and cefhost.nowMs() < deadline) {
+            cefhost.pump();
+            _ = c.usleep(2_000);
+        }
         var i: usize = 0;
         while (i < drain_pumps) : (i += 1) cefhost.pump();
     }
@@ -155,6 +163,9 @@ pub const Server = struct {
         // `intercept_status` per view per iteration, however many
         // requests the IO thread logged in between.
         self.host.flushInterceptStatus();
+        // Same coalescing for download progress: at most one
+        // `ev_download_progress` per download per iteration.
+        self.host.flushDownloadProgress();
         if (!self.flush()) self.disconnect();
     }
 
@@ -207,7 +218,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [15][]const u8 = .{
+                var caps: [16][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -222,9 +233,10 @@ pub const Server = struct {
                     proto.CAP_PERMISSIONS,
                     proto.CAP_DEVTOOLS,
                     proto.CAP_PRINT_PDF,
+                    proto.CAP_DOWNLOADS,
                     undefined,
                 };
-                var ncaps: usize = 14;
+                var ncaps: usize = 15;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -275,6 +287,8 @@ pub const Server = struct {
             },
             .intercept_status_req => self.host.interceptStatus(try proto.decode(proto.InterceptStatusReq, frame.payload)),
             .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),
+            .download_decide => self.host.downloadDecide(try proto.decode(proto.DownloadDecide, frame.payload)),
+            .download_cancel => self.host.downloadCancel(try proto.decode(proto.DownloadCancel, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
             // Helper-to-client frames arriving from the client, and any

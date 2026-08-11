@@ -93,6 +93,15 @@ const popup_page =
 /// as a uniformly black page.
 const bare_page = "data:text/html,<html><body>hi</body></html>";
 
+/// A full-viewport download anchor, so a trusted centre click starts a
+/// real engine download without any network: the payload rides a data:
+/// url of its own. The bytes are what stage 22j asserts on disk.
+const download_bytes = "HELLODOWNLOADBYTES";
+const download_page =
+    "data:text/html,<body%20style=%22margin:0%22>" ++
+    "<a%20download=%22dl.bin%22%20href=%22data:application/octet-stream," ++ download_bytes ++ "%22%20" ++
+    "style=%22display:block;width:100vw;height:100vh%22>save</a></body>";
+
 /// Link-hints page: two on-screen links, a button, a disabled button
 /// and a link scrolled far out of the viewport.
 const hints_page =
@@ -364,6 +373,7 @@ const Client = struct {
     ack_permissions: bool = false,
     ack_devtools: bool = false,
     ack_print_pdf: bool = false,
+    ack_downloads: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -498,6 +508,22 @@ const Client = struct {
     print_seq: u32 = 0,
     print_path: [1024]u8 = @splat(0),
     print_path_len: usize = 0,
+
+    /// Downloads: the last held offer, and the last progress frame.
+    dl_offer_seq: u32 = 0,
+    dl_view: u32 = 0,
+    dl_id: u32 = 0,
+    dl_total: u64 = 0,
+    dl_name: [256]u8 = @splat(0),
+    dl_name_len: usize = 0,
+    dl_url: [1024]u8 = @splat(0),
+    dl_url_len: usize = 0,
+    dl_prog_seq: u32 = 0,
+    dl_prog_id: u32 = 0,
+    dl_received: u64 = 0,
+    dl_prog_total: u64 = 0,
+    dl_done: u8 = 0,
+    dl_failed: u8 = 0,
 
     fn deinit(self: *Client) void {
         self.unmap();
@@ -665,6 +691,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.ack_permissions = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
                 }
             },
             .frame_buffer => {
@@ -722,6 +749,26 @@ const Client = struct {
                 self.dev_reason_len = @min(e.reason.len, self.dev_reason.len);
                 @memcpy(self.dev_reason[0..self.dev_reason_len], e.reason[0..self.dev_reason_len]);
                 self.dev_reply_seq += 1;
+            },
+            .ev_download_offer => {
+                const o = proto.decode(proto.EvDownloadOffer, frame.payload) catch fail("ev_download_offer decode");
+                self.dl_view = o.view;
+                self.dl_id = o.id;
+                self.dl_total = o.total;
+                self.dl_name_len = @min(o.name.len, self.dl_name.len);
+                @memcpy(self.dl_name[0..self.dl_name_len], o.name[0..self.dl_name_len]);
+                self.dl_url_len = @min(o.url.len, self.dl_url.len);
+                @memcpy(self.dl_url[0..self.dl_url_len], o.url[0..self.dl_url_len]);
+                self.dl_offer_seq += 1;
+            },
+            .ev_download_progress => {
+                const p = proto.decode(proto.EvDownloadProgress, frame.payload) catch fail("ev_download_progress decode");
+                self.dl_prog_id = p.id;
+                self.dl_received = p.received;
+                self.dl_prog_total = p.total;
+                self.dl_done = p.done;
+                self.dl_failed = p.failed;
+                self.dl_prog_seq += 1;
             },
             .ev_print_pdf_done => {
                 const p = proto.decode(proto.EvPrintPdfDone, frame.payload) catch fail("ev_print_pdf_done decode");
@@ -1067,6 +1114,17 @@ const Client = struct {
         const seq = self.sem_seq;
         self.send(proto.SemSnapshotReq{ .view = view_id, .mode = mode, .detail = detail, .scope = 0 });
         if (!self.waitSeq(&self.sem_seq, seq, 20_000)) fail("no sem_snapshot for the request");
+    }
+
+    /// Wait for a TERMINAL progress frame (`done` or `failed`) for
+    /// download `id`.
+    fn waitDlTerminal(self: *Client, id: u32, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (self.dl_prog_id == id and (self.dl_done != 0 or self.dl_failed != 0)) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
     }
 
     /// Navigate, wait for the main frame to finish loading, then for a
@@ -2514,6 +2572,71 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (cl.dev_view != 0) fail("stage 22i devtools: an unknown view was answered with an inspector");
         }
     }
+
+    // ── Stage 22j: downloads ───────────────────────────────────────
+    //
+    // The offer is HELD (the engine decides no target until the client
+    // answers), a decided path lands the exact bytes on disk with a
+    // terminal `done` progress frame, and a decide-with-empty-path
+    // cancels with a terminal `failed` frame — the "always answered"
+    // property every held decision on this wire keeps.
+    {
+        if (!cl.ack_downloads) fail("stage 22j downloads: hello_ack lacks the downloads capability");
+
+        // -- accept ----------------------------------------------------
+        cl.navigate(download_page);
+        const offer0 = cl.dl_offer_seq;
+        cl.clickCenter();
+        if (!cl.waitSeq(&cl.dl_offer_seq, offer0, 20_000))
+            fail("stage 22j downloads: a clicked download anchor produced no ev_download_offer");
+        if (cl.dl_view != view_id) fail("stage 22j downloads: the offer named the wrong view");
+        if (!std.mem.eql(u8, cl.dl_name[0..cl.dl_name_len], "dl.bin"))
+            fail("stage 22j downloads: the offer did not carry the anchor's download name");
+        if (!std.mem.startsWith(u8, cl.dl_url[0..cl.dl_url_len], "data:"))
+            fail("stage 22j downloads: the offer did not carry the source url");
+        const first_id = cl.dl_id;
+
+        var dl_buf: [128]u8 = undefined;
+        const dl_path = std.fmt.bufPrintZ(&dl_buf, "{s}/dl1.bin", .{dir}) catch fail("dl path");
+        cl.send(proto.DownloadDecide{ .view = view_id, .id = first_id, .path = dl_path });
+        if (!cl.waitDlTerminal(first_id, 30_000))
+            fail("stage 22j downloads: no terminal ev_download_progress after deciding a path");
+        if (cl.dl_done != 1) fail("stage 22j downloads: the decided download ended failed, not done");
+        if (cl.dl_received != download_bytes.len)
+            fail("stage 22j downloads: the done frame's received count is not the payload size");
+
+        const f = c.fopen(dl_path.ptr, "rb") orelse fail("stage 22j downloads: no file at the decided path");
+        var got: [64]u8 = @splat(0);
+        const n = c.fread(&got, 1, got.len, f);
+        _ = c.fclose(f);
+        if (n != download_bytes.len or !std.mem.eql(u8, got[0..n], download_bytes))
+            fail("stage 22j downloads: the file's bytes are not the downloaded payload");
+
+        // -- cancel at the offer ---------------------------------------
+        // A fresh document (data: urls have a unique origin each) keeps
+        // Chromium's multiple-download gating out of the picture.
+        cl.navigate(download_page);
+        const offer1 = cl.dl_offer_seq;
+        cl.clickCenter();
+        if (!cl.waitSeq(&cl.dl_offer_seq, offer1, 20_000))
+            fail("stage 22j downloads: no second offer after a reload");
+        const second_id = cl.dl_id;
+        if (second_id == first_id) fail("stage 22j downloads: the second download reused the first id");
+        cl.send(proto.DownloadDecide{ .view = view_id, .id = second_id, .path = "" });
+        if (!cl.waitDlTerminal(second_id, 30_000))
+            fail("stage 22j downloads: a cancelled decide produced no terminal progress frame");
+        if (cl.dl_prog_id == second_id and cl.dl_done != 0)
+            fail("stage 22j downloads: a cancelled decide was reported as done");
+
+        // -- unknown ids are ignored, not fatal ------------------------
+        cl.send(proto.DownloadCancel{ .view = view_id, .id = 0xdead_beef });
+        cl.send(proto.DownloadDecide{ .view = view_id, .id = 0xdead_beef, .path = dl_path });
+        const dmg = cl.dmg_seq;
+        cl.navigate(blue_page);
+        if (!cl.waitDamageAfter(dmg, 20_000))
+            fail("stage 22j downloads: the helper stopped serving after unknown-id download frames");
+    }
+    pass("stage 22j downloads (offer held, decided path lands bytes, cancel answered)");
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;

@@ -68,6 +68,13 @@ pub const CAP_TLS = "tls";
 /// `permission_decision`) instead of letting the engine's default
 /// handling deny them.
 pub const CAP_PERMISSIONS = "permissions";
+/// The helper reports file downloads: an `ev_download_offer` HOLDS the
+/// engine's target decision until a `download_decide` answers it, then
+/// coalesced `ev_download_progress` frames follow, and a
+/// `download_cancel` aborts a running one. A client without it never
+/// sees a download at all (the engine cancels them without a handler),
+/// which is the pre-downloads behaviour.
+pub const CAP_DOWNLOADS = "downloads";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -127,6 +134,10 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
+    ev_download_offer = 0x78,
+    download_decide = 0x79,
+    ev_download_progress = 0x7A,
+    download_cancel = 0x7B,
     intercept_set = 0x80,
     intercept_lists = 0x81,
     intercept_status_req = 0x82,
@@ -824,6 +835,65 @@ pub const PermissionDecision = struct {
     view: u32,
     prompt: u64,
     allow: u8,
+};
+
+// -- downloads (0x78 block, capability "downloads") -------------------
+
+/// The page started a download and the engine is HOLDING its target
+/// decision. Exactly one `download_decide` for the same id resolves it;
+/// until then the bytes may already be streaming into the engine's own
+/// staging, but nothing lands anywhere the user can see. `id` is the
+/// ENGINE's download id, unique per helper process. View destruction
+/// (and `view_discard`) cancels every held or running download of the
+/// view helper-side, so a client that never answers leaks nothing.
+///
+/// `total` is 0 when the server sent no length. `mime` may be empty.
+pub const EvDownloadOffer = struct {
+    pub const tag: Tag = .ev_download_offer;
+    view: u32,
+    id: u32,
+    total: u64,
+    url: []const u8,
+    /// Engine-suggested file name, never a path.
+    name: []const u8,
+    mime: []const u8,
+};
+
+/// Answer to `ev_download_offer`. A non-empty `path` continues the
+/// download INTO that path (helper-side, same machine as the client in
+/// v1; existing bytes there are overwritten). An empty `path` cancels
+/// it. An id the helper no longer holds is ignored, so a client may
+/// always answer late.
+pub const DownloadDecide = struct {
+    pub const tag: Tag = .download_decide;
+    view: u32,
+    id: u32,
+    path: []const u8,
+};
+
+/// Coalesced progress for a decided download: at most one frame per
+/// poll iteration per download, however often the engine updates.
+/// Exactly one terminal frame (`done` or `failed`) ends every decided
+/// download — including one the client cancelled, and one whose view
+/// went away mid-flight.
+pub const EvDownloadProgress = struct {
+    pub const tag: Tag = .ev_download_progress;
+    view: u32,
+    id: u32,
+    received: u64,
+    /// 0 while unknown; the engine may learn it mid-download.
+    total: u64,
+    done: u8,
+    /// Canceled or interrupted. `done` and `failed` are exclusive.
+    failed: u8,
+};
+
+/// Abort a running download. Unknown ids are ignored (the download may
+/// have finished in flight).
+pub const DownloadCancel = struct {
+    pub const tag: Tag = .download_cancel;
+    view: u32,
+    id: u32,
 };
 
 // -- semantic layer (capability "semantic") ---------------------------
@@ -1609,6 +1679,31 @@ test "round-trip: tls and permission frames" {
         .types = perm_camera | perm_microphone,
     });
     try roundTrip(PermissionDecision, .{ .view = 7, .prompt = 0xdead_beef_0000_0001, .allow = 0 });
+}
+
+test "round-trip: download frames" {
+    try roundTrip(EvDownloadOffer, .{
+        .view = 7,
+        .id = 41,
+        .total = 5_000_000_000,
+        .url = "https://example.com/big.iso",
+        .name = "big.iso",
+        .mime = "application/octet-stream",
+    });
+    try roundTrip(EvDownloadOffer, .{ .view = 7, .id = 42, .total = 0, .url = "data:,x", .name = "x", .mime = "" });
+    try roundTrip(DownloadDecide, .{ .view = 7, .id = 41, .path = "/home/x/Downloads/big.iso" });
+    try roundTrip(DownloadDecide, .{ .view = 7, .id = 41, .path = "" });
+    try roundTrip(EvDownloadProgress, .{
+        .view = 7,
+        .id = 41,
+        .received = 1_234_567_890_123,
+        .total = 5_000_000_000_000,
+        .done = 0,
+        .failed = 0,
+    });
+    try roundTrip(EvDownloadProgress, .{ .view = 7, .id = 41, .received = 10, .total = 10, .done = 1, .failed = 0 });
+    try roundTrip(EvDownloadProgress, .{ .view = 7, .id = 41, .received = 3, .total = 0, .done = 0, .failed = 1 });
+    try roundTrip(DownloadCancel, .{ .view = 7, .id = 41 });
 }
 
 // The one growable frame on this wire: a helper that predates the
