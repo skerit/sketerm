@@ -28,6 +28,7 @@ const EditorView = ev.EditorView;
 const ETab = ev.ETab;
 const Fence = ev.Fence;
 const project_mod = @import("../editor/project.zig");
+const findbar = @import("findbar.zig");
 const psearch = @import("../editor/psearch.zig");
 const gitdiff = @import("../editor/gitdiff.zig");
 const search = @import("../editor/search.zig");
@@ -602,24 +603,26 @@ pub fn buildPanel(view: *EditorView) void {
     c.gtk_widget_add_css_class(title, "dim-label");
     c.gtk_box_append(@ptrCast(row), title);
 
-    const entry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Find in project");
-    c.gtk_widget_set_hexpand(entry, 1);
-    _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onSearchActivate), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(row), entry);
-    view.search_entry = entry.?;
-
-    view.search_case = toggle(view, row, "Aa", "Match case");
-    view.search_word = toggle(view, row, "\u{2423}W", "Whole word only");
-    view.search_regex = toggle(view, row, ".*", "Regular expression (same engine as the find bar)");
+    const parts = findbar.build(row, .{
+        .placeholder = "Find in project",
+        .hexpand = true,
+        .flat_toggles = false,
+        .regex_tooltip = "Regular expression (same engine as the find bar)",
+    }, .{
+        .ctx = @ptrCast(view),
+        .on_activate = @ptrCast(&onSearchActivate),
+        .on_stop = @ptrCast(&onSearchStop),
+        .on_toggle_changed = @ptrCast(&onOptionToggled),
+    });
+    view.search_entry = parts.entry;
+    view.search_case = parts.case_btn;
+    view.search_word = parts.word_btn;
+    view.search_regex = parts.regex_btn;
 
     const go = c.gtk_button_new_with_label("Search");
     _ = c.g_signal_connect_data(go, "clicked", @ptrCast(&onSearchClicked), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(row), go);
-    const close = c.gtk_button_new_from_icon_name("window-close-symbolic");
-    c.gtk_button_set_has_frame(@ptrCast(close), 0);
-    _ = c.g_signal_connect_data(close, "clicked", @ptrCast(&onSearchCloseClicked), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(row), close);
+    _ = findbar.navButton(row, "window-close-symbolic", null, @ptrCast(&onSearchCloseClicked), @ptrCast(view));
     c.gtk_box_append(@ptrCast(box), row);
 
     const rrow = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
@@ -669,14 +672,6 @@ pub fn buildPanel(view: *EditorView) void {
     c.gtk_widget_add_controller(box, @ptrCast(keys));
 
     view.search_panel = box.?;
-}
-
-fn toggle(view: *EditorView, row: ?*c.GtkWidget, label: [*:0]const u8, tip: [*:0]const u8) *c.GtkWidget {
-    const btn = c.gtk_toggle_button_new_with_label(label);
-    c.gtk_widget_set_tooltip_text(btn, tip);
-    _ = c.g_signal_connect_data(btn, "toggled", @ptrCast(&onOptionToggled), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(row), btn);
-    return btn.?;
 }
 
 fn searchOptions(view: *EditorView) psearch.Options {
@@ -846,6 +841,12 @@ fn onOptionToggled(_: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onSearchCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    closeSearch(cast.userData(EditorView, user));
+}
+
+/// GtkSearchEntry "stop-search" (Esc in the entry). The panel's own
+/// capture-phase Esc handler normally wins; this is the backstop.
+fn onSearchStop(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     closeSearch(cast.userData(EditorView, user));
 }
 

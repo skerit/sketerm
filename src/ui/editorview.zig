@@ -132,6 +132,7 @@ const clipboard = @import("clipboard.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const input = @import("input.zig");
+const findbar = @import("findbar.zig");
 const Config = @import("../config.zig").Config;
 const fpicker = @import("../filebrowser/picker.zig");
 const editorlsp = @import("editorlsp.zig");
@@ -2213,31 +2214,26 @@ pub const EditorView = struct {
         c.gtk_widget_set_visible(outer, 0);
 
         const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        const entry = c.gtk_entry_new();
-        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Find");
-        c.gtk_editable_set_width_chars(@ptrCast(entry), 22);
-        _ = c.g_signal_connect_data(entry, "changed", @ptrCast(&onFindChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onFindActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), entry);
-        self.find_entry = entry.?;
-
-        const count = c.gtk_label_new("");
-        c.gtk_widget_add_css_class(count, "dim-label");
-        c.gtk_label_set_width_chars(@ptrCast(count), 9);
-        c.gtk_label_set_xalign(@ptrCast(count), 0);
-        c.gtk_box_append(@ptrCast(row), count);
-        self.find_count = @ptrCast(@alignCast(count));
-
-        self.find_case = self.toggleButton(row, "Aa", "Match case");
-        self.find_word = self.toggleButton(row, "\u{2423}W", "Whole word only");
-        self.find_regex = self.toggleButton(
-            row,
-            ".*",
-            "Regular expression. Replacements expand $1..$9 (and $0 for the whole match).",
-        );
-        _ = self.barButton(row, "go-up-symbolic", "Prev", "Previous match (Shift+Enter)", &onFindPrevClicked);
-        _ = self.barButton(row, "go-down-symbolic", "Next", "Next match (Enter)", &onFindNextClicked);
-        _ = self.barButton(row, "window-close-symbolic", "Close", "Close (Escape)", &onFindCloseClicked);
+        const parts = findbar.build(row, .{
+            .placeholder = "Find",
+            .width_chars = 22,
+            .count_width_chars = 9,
+            .regex_tooltip = "Regular expression. Replacements expand $1..$9 (and $0 for the whole match).",
+        }, .{
+            .ctx = @ptrCast(self),
+            .on_changed = @ptrCast(&onFindChanged),
+            .on_activate = @ptrCast(&onFindActivate),
+            .on_stop = @ptrCast(&onFindStop),
+            .on_toggle_changed = @ptrCast(&onFindOptionToggled),
+        });
+        self.find_entry = parts.entry;
+        self.find_count = parts.count.?;
+        self.find_case = parts.case_btn;
+        self.find_word = parts.word_btn;
+        self.find_regex = parts.regex_btn;
+        _ = findbar.navButton(row, "go-up-symbolic", "Previous match (Shift+Enter)", @ptrCast(&onFindPrevClicked), @ptrCast(self));
+        _ = findbar.navButton(row, "go-down-symbolic", "Next match (Enter)", @ptrCast(&onFindNextClicked), @ptrCast(self));
+        _ = findbar.navButton(row, "window-close-symbolic", "Close (Escape)", @ptrCast(&onFindCloseClicked), @ptrCast(self));
         c.gtk_box_append(@ptrCast(outer), row);
 
         const rrow = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
@@ -2355,15 +2351,6 @@ pub const EditorView = struct {
         c.gtk_box_append(@ptrCast(row), later);
 
         self.recover_box = row.?;
-    }
-
-    fn toggleButton(self: *EditorView, box: ?*c.GtkWidget, label: [*:0]const u8, tooltip: [*:0]const u8) *c.GtkWidget {
-        const btn = c.gtk_toggle_button_new_with_label(label);
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_widget_set_tooltip_text(btn, tooltip);
-        _ = c.g_signal_connect_data(btn, "toggled", @ptrCast(&onFindOptionToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(box), btn);
-        return btn.?;
     }
 
     // ---- tabs ---------------------------------------------------------
@@ -3485,8 +3472,10 @@ pub const EditorView = struct {
         };
     }
 
+    /// GtkEditable-based so it works for the GtkSearchEntry needle and
+    /// the plain GtkEntry replace field alike.
     fn entryText(w: *c.GtkWidget) []const u8 {
-        const buf = c.gtk_entry_buffer_get_text(c.gtk_entry_get_buffer(@ptrCast(w)));
+        const buf = c.gtk_editable_get_text(@ptrCast(w));
         if (buf == null) return "";
         const z: [*:0]const u8 = @ptrCast(buf);
         return z[0..std.mem.len(z)];
@@ -3750,6 +3739,12 @@ pub const EditorView = struct {
     }
 
     fn onFindCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(EditorView, user).closeFind();
+    }
+
+    /// GtkSearchEntry "stop-search" (Esc in the entry). The bar's own
+    /// capture-phase Esc handler normally wins; this is the backstop.
+    fn onFindStop(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
         cast.userData(EditorView, user).closeFind();
     }
 
