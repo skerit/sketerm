@@ -16402,3 +16402,51 @@ site merge/clear) pass in both roots; the `zig build test-core`
 RUNNER failure seen this session reproduces identically on the base
 commit (the test binary itself exits 0 with all tests passing) —
 pre-existing, not from this work.
+
+## 2026-08-12: browser downloads (offer/decide wire, strip, send-to-host)
+
+The downloads family, absent entirely before. New 0x78 tag block +
+capability "downloads" in `src/web/protocol.zig` (append-only, u64
+byte counts): `ev_download_offer` HOLDS the engine's target decision,
+`download_decide` continues into a client path ("" cancels),
+`ev_download_progress` is coalesced one-frame-per-poll-iteration per
+download (the intercept_status pattern), `download_cancel` aborts.
+
+- Helper (`cefhost.zig`): `cef_download_handler_t` with the held
+  `before_download_callback` released exactly once (the cert_cb
+  discipline); the latest `download_item_callback` is kept as the
+  cancel handle. `dropBrowser` cancels a dying/discarded view's
+  downloads and posts their terminal frame. TWO measured gotchas:
+  a held target callback must ALWAYS be run (a cancel CONTINUES into
+  a /tmp throwaway, then cancels — dropping it unanswered wedges
+  Chromium's target determiner), and the post-disconnect drain now
+  pumps until `on_before_close` fired for every browser, because a
+  cancelled download's cleanup outlives any fixed pump count and
+  stalled `cef_shutdown` past stage 23's 10s.
+- GUI (`webface.zig`): offer -> save dialog (PickerWindow save_file,
+  suggested name, last dir remembered per window) or, with the new
+  `web_download_ask = false` (docs/config.md), auto-accept into
+  ~/Downloads with " (n)" uniquify. A bottom strip row per download:
+  name, progress bar, byte count via the shared `format.fmtSize`,
+  cancel/dismiss, and on completion Open + Show in Files
+  (`siblingapp.showInFiles`). Row buttons carry a `DlBtnCtx` owned by
+  the button (mechanism 1) and resolve the face through the client
+  registry, PrintCtx-style.
+- REDIRECT-TO-SERVER: the save dialog browses remote hosts natively;
+  a `host:` pick stages under `$XDG_CACHE_HOME/sketerm/webdl/`, then
+  hands off via `file_transfers.Service.submitUpload` (new; a plain
+  durable cross_copy upload intent, no edit watch) — v1 routes
+  origin -> local -> server, never fetch-on-server. The strip's second
+  phase polls `intentProgress` at 2Hz, unlinks the staging file when
+  the daemon transfer lands, and the transfer survives the pane (it
+  is the ledger's, not the GUI's).
+
+Verification: `zig build`, `zig build web`, `zig build mux-portable`,
+`zig build test` (full GUI suite), `zig build test-core` green;
+`zig build smoke-web` green end to end including the NEW stage 22j
+(trusted click on a download anchor -> offer held -> decided path
+lands the exact bytes -> terminal done frame; decide-"" cancels with
+a terminal failed frame; unknown ids ignored). Protocol round-trips
+for all four frames in both test roots. Not covered: a GUI-level
+end-to-end of the dialog/strip (would need a display session +
+helper); the smoke covers the wire and helper halves.
