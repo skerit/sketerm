@@ -1661,6 +1661,29 @@ fn onOpenDone(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").R
     self.replaceWithSpec(res.specs[0]);
 }
 
+/// Do the viewer's own content keys own this modifier state? They are
+/// all BARE keys, and Shift is only ever what produces the keyval
+/// (`<`, `>`, `+` and the uppercase R/K/F/C spellings are each listed
+/// explicitly), so Shift passes; Ctrl/Alt/Super mean the chord belongs
+/// to somebody else. The controller runs in CAPTURE phase on the
+/// window, so claiming those would ALSO swallow the real accelerator.
+fn contentKeysApply(state: c.GdkModifierType) bool {
+    const held = state & input.SIGNIFICANT_MODS;
+    return held & ~@as(c_uint, c.GDK_SHIFT_MASK) == 0;
+}
+
+test "contentKeysApply: bare and Shift-typed keys only" {
+    const t = std.testing;
+    try t.expect(contentKeysApply(0));
+    try t.expect(contentKeysApply(c.GDK_SHIFT_MASK));
+    // Lock and group bits are noise, not modifiers we bind on.
+    try t.expect(contentKeysApply(c.GDK_LOCK_MASK));
+    try t.expect(!contentKeysApply(c.GDK_CONTROL_MASK));
+    try t.expect(!contentKeysApply(c.GDK_ALT_MASK));
+    try t.expect(!contentKeysApply(c.GDK_SUPER_MASK));
+    try t.expect(!contentKeysApply(c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK));
+}
+
 fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(ViewerWindow, user);
     // Keyboard access to the canvas context menu. Handled here rather
@@ -1674,6 +1697,7 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
         showCanvasMenuCentred(menu);
         return 1;
     }
+    if (!contentKeysApply(state)) return 0;
     // Host policy before content keys: Enter activates the current
     // item, and quick-look Space closes in EVERY content mode (the
     // cast/image Space bindings then never see it — play/pause is K).
