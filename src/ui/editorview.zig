@@ -1963,6 +1963,39 @@ pub const EditorView = struct {
         self.detachIm();
     }
 
+    /// Dropped local files open as document tabs, one per file; an
+    /// already-open file is focused rather than opened twice
+    /// (`openSpec`). Non-local URIs (sftp://, trash://) have no path
+    /// and are skipped.
+    fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(EditorView, user);
+        if (self.widgets_dead) return 0;
+        if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
+        const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
+        // get_files is transfer-container: free the list, not the GFiles.
+        const files = c.gdk_file_list_get_files(flist);
+        defer c.g_slist_free(files);
+        var opened: usize = 0;
+        var node = files;
+        while (node != null) : (node = node.*.next) {
+            const gfile: ?*c.GFile = @ptrCast(node.*.data);
+            const path_c = c.g_file_get_path(gfile);
+            if (path_c == null) continue;
+            defer c.g_free(path_c);
+            // A dropped directory is not a document; opening one would
+            // only produce a tab whose load fails.
+            if (c.g_file_query_file_type(gfile, c.G_FILE_QUERY_INFO_NONE, null) == c.G_FILE_TYPE_DIRECTORY) continue;
+            const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
+            if (path.len == 0) continue;
+            var buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+            self.openSpec(paths.formatSpec(&buf, null, path), null);
+            opened += 1;
+        }
+        if (opened == 0) return 0;
+        self.focusFace();
+        return 1;
+    }
+
     fn focusCb(ctx: *anyopaque) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx));
         self.focusFace();
@@ -2113,6 +2146,16 @@ pub const EditorView = struct {
         _ = c.g_signal_connect_data(area_widget, "render", @ptrCast(&onRender), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(area_widget, "resize", @ptrCast(&onAreaResize), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(area_widget, "destroy", @ptrCast(&onAreaDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
+        // File drag & drop onto the canvas -> one document tab per
+        // dropped file. On the canvas rather than the root box so a
+        // hidden editor face (another face showing in the pane) never
+        // sees the drop: an unmapped widget's controller does not fire.
+        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
+        var drop_types = [_]c.GType{c.gdk_file_list_get_type()};
+        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
+        _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(area_widget, @ptrCast(drop));
 
         const overlay = c.gtk_overlay_new();
         c.gtk_widget_set_hexpand(overlay, 1);
