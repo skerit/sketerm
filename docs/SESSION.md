@@ -15837,3 +15837,55 @@ smoke-web grew stages 19-22 (frame rate uncapped + capped, idle page
 costs zero paints, watchdog, input-to-paint latency) and every stage now
 drives begin frames while it waits; stage 6's click is retried, since a
 page whose first compositor frame has not landed swallows input.
+
+## Browser: input latency and fractional-scale sharpness (2026-08-11)
+
+Two user-facing defects, both root-caused with instrumentation before
+any fix (`SKETERM_WEB_LAT` hover probe in webface, `hostlat:` trace in
+cefhost, and the new `zig build measure-web` rig — a smoke-e2e-shaped
+display-session harness that can set a FRACTIONAL viewer scale via a
+`set_scale` intent, plus `SKETERM_WEB_DUMP` for the engine's raw
+buffer).
+
+**Hover latency ("UNUSABLE"):** external begin frames carry a constant
+~30ms input->paint penalty. The helper trace showed a hover's paint
+landing only after the 2nd-3rd begin frame REGARDLESS of their spacing
+— an immediate begin frame on input, a 0.3/5/10/15ms burst, and every
+windowless_frame_rate from 60 to 1000 all left input->paint pinned at
+39ms, while CEF's internal scheduler does the same work in 5-19ms. So
+the default is now the internal scheduler; `frame_request` became
+advisory (watchdog keep-alive) and the cap moved to the append-only
+`view_max_fps` frame (0x15), applied per view through
+`set_windowless_frame_rate` — the GUI ships `browser_max_fps` clamped
+to the CURRENT output's refresh and re-ships it when the window
+changes outputs. MEASURED (60Hz session, idle start, the user's exact
+scenario): input->first-paint-arrival 39ms -> 5.7ms, input->pixel in
+our framebuffer 52ms -> 18ms; smoke-web click-to-paint 6ms; static
+page still 0 paints; view_max_fps 30 delivers exactly 30/s and 5
+bounds an unattended animating page to 7 paints/1.5s. The idle no-tick
+invariant is untouched (verified under SKETERM_WEB_PACE).
+
+**Soft/blurry text at fractional scale:** the GtkGLArea framebuffer is
+at GTK's INTEGER scale (2 on the 1.5 desktop), so CEF's true-1.5 frame
+was resampled TWICE (web_pass 1.5->2 linear, then GSK 2->1.5).
+MEASURED at 1.5: a 1px-stripe page leaves the engine with hard 0/255
+edges and reached the screen as [5,117,127] mush (extreme-pixel
+fraction 0.33). Frames are now presented as GdkTextures on a
+GtkPicture in GTK's scene graph, which GSK composites at the REAL
+fractional scale: dma-buf frames via GdkDmabufTextureBuilder (GSK
+imports, still zero-copy, cached per pool id), shm frames via
+GdkMemoryTextureBuilder with `update_texture`/`update_region` so GSK
+uploads ONLY the damage rects (the old GL pass's economy, now GTK's
+job — measured 60fps steady, ~50us/frame client cost on an animating
+1500x840 page). `render/web_pass.zig` and the EGL importer are
+deleted. THE ALIGNMENT CATCH: a 1:1 texture at a half-device-pixel
+offset measurably collapses 1px stripes into uniform gray, so
+`snapAlignment` nudges the picture onto the device pixel grid by whole
+logical pixels (<=1 at 1.5, <=3 at 1.25) and input coordinates
+subtract the nudge. After: presented pixels are BIT-EXACT against the
+engine buffer (extreme fraction 1.00), text hard-edge count 60 ->
+1615 in the same band. Residual vs Firefox: Chromium's software OSR
+raster is grayscale-AA — 0 of 6793 ink pixels carry color even with
+an opaque background_color and --enable-lcd-text (both kept; the GPU
+raster path may honour the flag and is only verifiable on real
+hardware).
