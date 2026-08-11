@@ -21,6 +21,9 @@
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_request_context_capi.h"
 #include "include/capi/cef_values_capi.h"
+// a11y: `cef_write_json` powers the SKETERM_WEB_AX_DEBUG raw-payload
+// dump (the accessibility handler's value shapes were verified with it).
+#include "include/capi/cef_parser_capi.h"
 // Semantic layer: the render-process side runs in the SAME binary (CEF
 // re-execs it as its own renderer subprocess), so the V8 and
 // process-message APIs belong to this translation unit too.

@@ -23,9 +23,12 @@ const cefhost = @import("cefhost.zig");
 const busy_timeout_ms: c_int = 5;
 const idle_timeout_ms: c_int = 50;
 
-/// Pumps granted to CEF after the client goes away, so `close_browser`
-/// can finish before `cef_shutdown`.
-const drain_pumps = 100;
+/// Wall-clock budget for CEF to finish closing every browser after the
+/// client goes away. `close_browser` is asynchronous renderer IPC —
+/// iterations alone are not time — and `cef_shutdown` with a live
+/// browser hangs the process, so the drain waits for
+/// `cefhost.openBrowsers() == 0` under this cap.
+const drain_deadline_ms: i64 = 5_000;
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -98,13 +101,11 @@ pub const Server = struct {
         // outlives any fixed pump count — so pump until every browser
         // reported `on_before_close`, bounded, then drain the tail.
         self.host.destroyAll();
-        const deadline = cefhost.nowMs() + 5000;
-        while (cefhost.openBrowserCount() > 0 and cefhost.nowMs() < deadline) {
+        const deadline = cefhost.nowMs() + drain_deadline_ms;
+        while (cefhost.openBrowsers() > 0 and cefhost.nowMs() < deadline) {
             cefhost.pump();
             _ = c.usleep(2_000);
         }
-        var i: usize = 0;
-        while (i < drain_pumps) : (i += 1) cefhost.pump();
     }
 
     /// Wait for the client, pumping CEF meanwhile (it has nothing to do
@@ -218,7 +219,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [16][]const u8 = .{
+                var caps: [17][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -234,9 +235,10 @@ pub const Server = struct {
                     proto.CAP_DEVTOOLS,
                     proto.CAP_PRINT_PDF,
                     proto.CAP_DOWNLOADS,
+                    proto.CAP_A11Y,
                     undefined,
                 };
-                var ncaps: usize = 15;
+                var ncaps: usize = 16;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -289,6 +291,7 @@ pub const Server = struct {
             .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),
             .download_decide => self.host.downloadDecide(try proto.decode(proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try proto.decode(proto.DownloadCancel, frame.payload)),
+            .a11y_enable => self.host.a11yEnable(try proto.decode(proto.A11yEnable, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
             // Helper-to-client frames arriving from the client, and any

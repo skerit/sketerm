@@ -524,6 +524,14 @@ const Client = struct {
     dl_prog_total: u64 = 0,
     dl_done: u8 = 0,
     dl_failed: u8 = 0,
+    ack_a11y: bool = false,
+    /// Accessibility stream: every `ev_a11y_tree` node rendered as one
+    /// `[id] role "name"` line, so assertions can grep roles + names.
+    ax_log: [64 * 1024]u8 = @splat(0),
+    ax_log_len: usize = 0,
+    ax_seq: u32 = 0,
+    ax_loc_seq: u32 = 0,
+    ax_event_seq: u32 = 0,
 
     fn deinit(self: *Client) void {
         self.unmap();
@@ -692,7 +700,29 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                 }
+            },
+            .ev_a11y_tree => {
+                const ev = proto.decode(proto.EvA11yTree, frame.payload) catch fail("ev_a11y_tree decode");
+                self.ax_seq += 1;
+                var it = proto.A11yNodeIter.init(ev.nodes.s);
+                while (it.next() catch fail("ev_a11y_tree node decode")) |n| {
+                    var line: [512]u8 = undefined;
+                    const s = std.fmt.bufPrint(&line, "[{d}] {s} \"{s}\" s={x}\n", .{ n.id, n.role, n.name, n.state }) catch continue;
+                    const room = self.ax_log.len - self.ax_log_len;
+                    const take = @min(room, s.len);
+                    @memcpy(self.ax_log[self.ax_log_len..][0..take], s[0..take]);
+                    self.ax_log_len += take;
+                }
+            },
+            .ev_a11y_loc => {
+                _ = proto.decode(proto.EvA11yLoc, frame.payload) catch fail("ev_a11y_loc decode");
+                self.ax_loc_seq += 1;
+            },
+            .ev_a11y_event => {
+                _ = proto.decode(proto.EvA11yEvent, frame.payload) catch fail("ev_a11y_event decode");
+                self.ax_event_seq += 1;
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch fail("frame_buffer decode");
@@ -1138,6 +1168,16 @@ const Client = struct {
         if (!self.waitDamageAfter(dmg, 20_000)) fail("no paint after navigate");
     }
 };
+
+/// State bits of the first ax-log line containing `needle` (the log
+/// renders `[id] role "name" s=<hex>` per node), or null.
+fn axLineState(log: []const u8, needle: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, log, needle) orelse return null;
+    const s_at = std.mem.indexOfPos(u8, log, at, " s=") orelse return null;
+    const start = s_at + 3;
+    const end = std.mem.indexOfScalarPos(u8, log, start, '\n') orelse log.len;
+    return std.fmt.parseInt(u64, log[start..end], 16) catch null;
+}
 
 /// Connect to the helper's socket, retrying while it starts CEF up.
 fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
@@ -2637,6 +2677,55 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 22j downloads: the helper stopped serving after unknown-id download frames");
     }
     pass("stage 22j downloads (offer held, decided path lands bytes, cancel answered)");
+    // ── Stage 22j: the accessibility tree, only on demand ──────────
+    {
+        if (!cl.ack_a11y) fail("stage 22k a11y: hello_ack lacks the a11y capability");
+        const ax_page = "data:text/html,<html><body style='background:%23fff'>" ++
+            "<h1>Axheading</h1><button>Axgo</button>" ++
+            "<input type=checkbox checked aria-label=Axcheck>" ++
+            "<button disabled>Axoff</button></body></html>";
+        cl.navigate(ax_page);
+        // Backlog rule: nothing may stream before a11y_enable.
+        cl.pump(1_500);
+        if (cl.ax_seq != 0) fail("stage 22k a11y: tree events streamed before a11y_enable");
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 1 });
+        const deadline = nowMs() + 20_000;
+        while (nowMs() < deadline) {
+            const log = cl.ax_log[0..cl.ax_log_len];
+            if (std.mem.indexOf(u8, log, "heading \"Axheading\"") != null and
+                std.mem.indexOf(u8, log, "button \"Axgo\"") != null and
+                std.mem.indexOf(u8, log, "document") != null) break;
+            cl.pump(100);
+        }
+        const log = cl.ax_log[0..cl.ax_log_len];
+        if (std.mem.indexOf(u8, log, "heading \"Axheading\"") == null or
+            std.mem.indexOf(u8, log, "button \"Axgo\"") == null)
+        {
+            std.debug.print("smoke-web: ax log was:\n{s}\n", .{log});
+            fail("stage 22k a11y: no heading/button nodes in the streamed tree");
+        }
+        if (std.mem.indexOf(u8, log, "document") == null)
+            fail("stage 22k a11y: no document root in the streamed tree");
+        // State-bit translation: checkedState -> ax_checked and
+        // restriction -> ax_disabled must survive the engine's
+        // serializer (these were designed from Chromium's enums; this
+        // is the assertion that keeps them true).
+        if (axLineState(log, "checkbox \"Axcheck\"")) |st| {
+            if (st & proto.ax_checked == 0) fail("stage 22k a11y: checked checkbox lacks the checked bit");
+        } else fail("stage 22k a11y: no checkbox node in the streamed tree");
+        if (axLineState(log, "button \"Axoff\"")) |st| {
+            if (st & proto.ax_disabled == 0) fail("stage 22k a11y: disabled button lacks the disabled bit");
+        } else fail("stage 22k a11y: no disabled-button node in the streamed tree");
+        // Disable stops the stream: churn the page and expect silence.
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 0 });
+        cl.pump(500);
+        const seq_after_off = cl.ax_seq;
+        cl.navigate("data:text/html,<html><body style='background:%23fff'><p>quiet</p></body></html>");
+        cl.pump(1_500);
+        if (cl.ax_seq != seq_after_off)
+            fail("stage 22k a11y: tree events kept streaming after disable");
+        pass("stage 22k a11y (enable-gated tree, roles+names, disable silences)");
+    }
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;
