@@ -40,6 +40,7 @@ const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
+const filter = @import("filter.zig");
 
 /// The content script — a function expression, called with the two
 /// secrets and the transport (see `onContextCreated`).
@@ -628,6 +629,7 @@ pub const Host = struct {
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
+        interceptRegister(self.gpa, v.id, v.cef_id);
         applyZoom(v);
         // A view without a frame buffer is invisible and unfixable, so
         // the whole view goes rather than leaving a stranded browser.
@@ -651,6 +653,7 @@ pub const Host = struct {
     }
 
     fn freeView(self: *Host, v: *View) void {
+        interceptUnregister(self.gpa, v.id);
         if (browserHost(v)) |host| {
             if (host.close_browser) |cb| cb(host, 1);
             release(&host.base);
@@ -829,6 +832,142 @@ pub const Host = struct {
                 if (host.set_windowless_frame_rate) |sw| sw(host, r);
             }
         }.f, .{rate});
+    }
+
+    // -- request interception ------------------------------------------
+
+    /// Enable/disable blocking, globally (`view` 0) or per view. The
+    /// filter lists stay loaded; only the verdict is gated.
+    pub fn interceptSet(self: *Host, req: proto.InterceptSet) void {
+        _ = self;
+        g_int.acquire();
+        defer g_int.release();
+        if (req.view == 0) {
+            g_int.global_enabled = req.enabled != 0;
+            for (&g_int.slots) |*s| {
+                if (s.used) s.dirty = true;
+            }
+            return;
+        }
+        for (&g_int.slots) |*s| {
+            if (s.used and s.view_id == req.view) {
+                s.enabled = req.enabled != 0;
+                s.dirty = true;
+                return;
+            }
+        }
+    }
+
+    /// Reload the filter set from the seed list, the config filters
+    /// dir, and any extra paths named. No network fetching.
+    pub fn interceptLists(self: *Host, req: proto.InterceptLists) void {
+        interceptReload(self.gpa, req.paths);
+    }
+
+    pub fn interceptStatus(self: *Host, req: proto.InterceptStatusReq) void {
+        self.post(self.statusFrame(req.view));
+    }
+
+    fn statusFrame(self: *Host, view_id: u32) proto.InterceptStatus {
+        _ = self;
+        g_int.acquire();
+        defer g_int.release();
+        var out = proto.InterceptStatus{
+            .view = view_id,
+            .enabled = if (g_int.global_enabled) 1 else 0,
+            .rules = g_int.rules,
+            .blocked = 0,
+            .total = 0,
+        };
+        for (&g_int.slots) |*s| {
+            if (s.used and s.view_id == view_id) {
+                out.enabled = if (g_int.global_enabled and s.enabled) 1 else 0;
+                out.blocked = s.blocked;
+                out.total = s.total;
+                break;
+            }
+        }
+        return out;
+    }
+
+    /// Answer a log pull: entries with seq > `req.since`, oldest first,
+    /// up to `req.max` (bounded). The ring is snapshotted under the
+    /// lock into a small stack buffer, then encoded outside it.
+    pub fn interceptLog(self: *Host, req: proto.InterceptLogReq) void {
+        var snap: [NLOG]proto.NetEntry = undefined;
+        var url_store: [NLOG][LOG_URL_MAX]u8 = undefined;
+        var method_store: [NLOG][8]u8 = undefined;
+        var n: usize = 0;
+        var next_seq: u32 = req.since;
+        const cap: usize = @min(@as(usize, if (req.max == 0) NLOG else req.max), NLOG);
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used or s.view_id != req.view) continue;
+                next_seq = s.next_seq;
+                const ring = s.ring orelse break;
+                // Emit in seq order: the ring is a circular buffer, so
+                // walk it and collect, then a caller-side sort would be
+                // overkill — seqs increase with widx, so oldest is at
+                // widx. Simplest correct pass: scan all, filter, insert
+                // sorted (NLOG is tiny).
+                for (ring) |*e| {
+                    if (e.seq == 0 or e.seq <= req.since) continue;
+                    if (n >= cap) {
+                        // Keep the NEWEST `cap`: replace the oldest held
+                        // if this one is newer.
+                        var oldest: usize = 0;
+                        for (snap[0..n], 0..) |se, i| {
+                            if (se.seq < snap[oldest].seq) oldest = i;
+                        }
+                        if (e.seq <= snap[oldest].seq) continue;
+                        fillEntry(&snap[oldest], &url_store[oldest], &method_store[oldest], e);
+                        continue;
+                    }
+                    fillEntry(&snap[n], &url_store[n], &method_store[n], e);
+                    n += 1;
+                }
+                break;
+            }
+        }
+        // Sort ascending by seq (insertion sort; n <= NLOG).
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            while (j > 0 and snap[j - 1].seq > snap[j].seq) : (j -= 1) {
+                const tmp = snap[j];
+                snap[j] = snap[j - 1];
+                snap[j - 1] = tmp;
+            }
+        }
+        self.post(proto.InterceptLog{ .view = req.view, .next_seq = next_seq, .entries = snap[0..n] });
+    }
+
+    /// Push a coalesced `intercept_status` for every view whose
+    /// counters moved since the last flush. Called once per poll
+    /// iteration — a page issuing thousands of requests still costs at
+    /// most one status frame per iteration per view.
+    pub fn flushInterceptStatus(self: *Host) void {
+        var pending: [MAX_ISLOTS]proto.InterceptStatus = undefined;
+        var n: usize = 0;
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used or !s.dirty) continue;
+                s.dirty = false;
+                pending[n] = .{
+                    .view = s.view_id,
+                    .enabled = if (g_int.global_enabled and s.enabled) 1 else 0,
+                    .rules = g_int.rules,
+                    .blocked = s.blocked,
+                    .total = s.total,
+                };
+                n += 1;
+            }
+        }
+        for (pending[0..n]) |st| self.post(st);
     }
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {
@@ -1588,6 +1727,451 @@ pub const Host = struct {
 var g_host: ?*Host = null;
 
 // ---------------------------------------------------------------------
+// Request interception (capability "intercept")
+// ---------------------------------------------------------------------
+//
+// THE ONE EXCEPTION to this file's single-thread story: CEF delivers
+// `on_before_resource_load` / `on_resource_load_complete` on its IO
+// THREAD, not inside `pump()`. That is also the whole point — a
+// blocking verdict must not round-trip anywhere (uBO's lesson: cross-
+// process blocking latency is the hard part), so the filter engine
+// lives in this process and the verdict is computed inline where the
+// request already is. Everything the IO thread touches lives in the
+// `g_int` registry below, guarded by the repo's spinlock pattern
+// (src/ui/panel/events.zig documents why a spinlock and not a mutex),
+// and NOTHING in it allocates on the IO thread: log entries are
+// fixed-size, appended into per-view rings the MAIN thread allocated.
+// The main thread only ever swaps whole engines / registers slots
+// under the same lock. Host.views is never read from the IO thread.
+
+/// Built-in seed list: a handful of universally safe ad/tracker hosts,
+/// so blocking demonstrably works with zero setup. Typeless rules, so
+/// none of them can ever block a top-level navigation.
+const seed_filter_list =
+    \\! sketerm built-in seed filters (ad/tracker hosts)
+    \\||doubleclick.net^
+    \\||googlesyndication.com^
+    \\||googleadservices.com^
+    \\||google-analytics.com^
+    \\||adservice.google.com^
+    \\||googletagservices.com^
+    \\||scorecardresearch.com^
+    \\||quantserve.com^
+    \\||taboola.com^
+    \\||outbrain.com^
+    \\||criteo.com^
+    \\||adnxs.com^
+    \\||hotjar.com^$third-party
+    \\
+;
+
+/// Log-ring depth per view. At ~300 bytes per entry a view costs
+/// ~38KB, allocated only while the view lives.
+const NLOG = 128;
+
+/// Concurrent views the registry can track. A view past the cap still
+/// gets verdicts (global engine + global enable), just no log/badge.
+const MAX_ISLOTS = 32;
+
+/// Longest URL kept in a log entry; the tail is truncated, the
+/// VERDICT always sees the full url.
+const LOG_URL_MAX = 256;
+
+const LogEntry = struct {
+    seq: u32 = 0,
+    req_id: u64 = 0,
+    start_ms: i64 = 0,
+    dur_ms: u32 = 0,
+    status: u16 = 0,
+    size: u32 = 0,
+    rtype: u8 = 0,
+    blocked: bool = false,
+    done: bool = false,
+    method_len: u8 = 0,
+    method: [8]u8 = @splat(0),
+    url_len: u16 = 0,
+    url: [LOG_URL_MAX]u8 = @splat(0),
+};
+
+const ISlot = struct {
+    used: bool = false,
+    cef_id: c_int = 0,
+    view_id: u32 = 0,
+    enabled: bool = true,
+    blocked: u32 = 0,
+    total: u32 = 0,
+    /// Counters changed since the last pushed `intercept_status`; the
+    /// poll loop flushes at most one frame per view per iteration, so
+    /// an ad-heavy page cannot stream a frame per request.
+    dirty: bool = false,
+    next_seq: u32 = 1,
+    widx: usize = 0,
+    ring: ?*[NLOG]LogEntry = null,
+};
+
+const Intercept = struct {
+    lock: std.atomic.Value(u8) = .init(0),
+    engine: ?*filter.Engine = null,
+    global_enabled: bool = true,
+    rules: u32 = 0,
+    slots: [MAX_ISLOTS]ISlot = @splat(.{}),
+
+    fn acquire(self: *Intercept) void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release(self: *Intercept) void {
+        self.lock.store(0, .release);
+    }
+};
+
+var g_int: Intercept = .{};
+
+/// Register a view in the intercept registry (main thread; idempotent
+/// per view id — `onAfterCreated` and `createViewAt` both call it, so
+/// a load racing `create_browser_sync`'s return is still attributed).
+fn interceptRegister(gpa: std.mem.Allocator, view_id: u32, cef_id: c_int) void {
+    if (cef_id == 0) return;
+    const ring = gpa.create([NLOG]LogEntry) catch return;
+    ring.* = @splat(.{});
+    var keep = false;
+    defer if (!keep) gpa.destroy(ring);
+    g_int.acquire();
+    defer g_int.release();
+    var free_slot: ?*ISlot = null;
+    for (&g_int.slots) |*s| {
+        if (s.used and s.view_id == view_id) {
+            s.cef_id = cef_id;
+            return;
+        }
+        if (!s.used and free_slot == null) free_slot = s;
+    }
+    const s = free_slot orelse return;
+    s.* = .{ .used = true, .cef_id = cef_id, .view_id = view_id, .ring = ring };
+    keep = true;
+}
+
+fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
+    var ring: ?*[NLOG]LogEntry = null;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        for (&g_int.slots) |*s| {
+            if (!s.used or s.view_id != view_id) continue;
+            ring = s.ring;
+            s.* = .{};
+            break;
+        }
+    }
+    // Freed OUTSIDE the lock: nobody can reach it any more, and the IO
+    // thread re-resolves its slot on every callback.
+    if (ring) |r| gpa.destroy(r);
+}
+
+/// Read one file whole (bounded); caller frees.
+fn readFileBounded(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ?[]u8 {
+    const f = c.fopen(path, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        list.appendSlice(gpa, buf[0..n]) catch {
+            list.deinit(gpa);
+            return null;
+        };
+        if (list.items.len > max) break;
+    }
+    return list.toOwnedSlice(gpa) catch {
+        list.deinit(gpa);
+        return null;
+    };
+}
+
+/// $XDG_CONFIG_HOME/sketerm/filters (or ~/.config/...), NUL-terminated
+/// into `buf`.
+fn filtersDir(buf: []u8) ?[:0]const u8 {
+    if (c.getenv("XDG_CONFIG_HOME")) |xdg| {
+        const base = std.mem.span(xdg);
+        if (base.len != 0)
+            return std.fmt.bufPrintZ(buf, "{s}/sketerm/filters", .{base}) catch null;
+    }
+    const home = c.getenv("HOME") orelse return null;
+    return std.fmt.bufPrintZ(buf, "{s}/.config/sketerm/filters", .{std.mem.span(home)}) catch null;
+}
+
+/// Build a fresh engine from the seed list, every *.txt in the config
+/// filters dir, and `extra_paths`, then swap it in. Main thread only.
+fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void {
+    const eng = gpa.create(filter.Engine) catch return;
+    eng.* = filter.Engine.init(gpa);
+    var ok = true;
+    eng.addList(seed_filter_list) catch {
+        ok = false;
+    };
+
+    var dir_buf: [4096]u8 = undefined;
+    if (filtersDir(&dir_buf)) |dir| {
+        if (c.opendir(dir.ptr)) |dp| {
+            defer _ = c.closedir(dp);
+            while (c.readdir(dp)) |entp| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entp.*.d_name)));
+                if (!std.mem.endsWith(u8, name, ".txt")) continue;
+                var path_buf: [4352:0]u8 = undefined;
+                const p = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
+                defer gpa.free(text);
+                eng.addList(text) catch {};
+            }
+        }
+    }
+    for (extra_paths) |path| {
+        var path_buf: [4352:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch continue;
+        const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
+        defer gpa.free(text);
+        eng.addList(text) catch {};
+    }
+    if (!ok) {
+        eng.deinit();
+        gpa.destroy(eng);
+        return;
+    }
+
+    var old: ?*filter.Engine = null;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        old = g_int.engine;
+        g_int.engine = eng;
+        g_int.rules = eng.count;
+        for (&g_int.slots) |*s| {
+            if (s.used) s.dirty = true;
+        }
+    }
+    if (old) |o| {
+        o.deinit();
+        gpa.destroy(o);
+    }
+}
+
+/// Load the initial filter set (seed + config dir). Called once at
+/// helper startup, before any view exists.
+pub fn interceptInit(gpa: std.mem.Allocator) void {
+    interceptReload(gpa, &.{});
+}
+
+/// Free the engine and any leftover rings (client gone, views already
+/// destroyed).
+pub fn interceptDeinit(gpa: std.mem.Allocator) void {
+    var old: ?*filter.Engine = null;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        old = g_int.engine;
+        g_int.engine = null;
+        g_int.rules = 0;
+        for (&g_int.slots) |*s| {
+            if (s.used) {
+                if (s.ring) |r| gpa.destroy(r);
+                s.* = .{};
+            }
+        }
+    }
+    if (old) |o| {
+        o.deinit();
+        gpa.destroy(o);
+    }
+}
+
+/// CEF's resource type as the wire's engine-agnostic byte.
+fn rtypeOf(t: cef.cef_resource_type_t) filter.RType {
+    return switch (t) {
+        cef.RT_MAIN_FRAME => .document,
+        cef.RT_SUB_FRAME => .subdocument,
+        cef.RT_STYLESHEET => .stylesheet,
+        cef.RT_SCRIPT => .script,
+        cef.RT_IMAGE, cef.RT_FAVICON => .image,
+        cef.RT_FONT_RESOURCE => .font,
+        cef.RT_XHR => .xhr,
+        cef.RT_MEDIA => .media,
+        cef.RT_PING, cef.RT_CSP_REPORT => .ping,
+        else => .other,
+    };
+}
+
+/// UTF-8 of a userfree CEF string result, into `buf` (truncated).
+fn userfreeInto(raw: cef.cef_string_userfree_t, buf: []u8) []const u8 {
+    if (raw == null) return "";
+    defer cef.cef_string_userfree_utf16_free(raw);
+    var s = Utf8.init(raw);
+    defer s.free();
+    const src = s.slice();
+    const n = @min(src.len, buf.len);
+    @memcpy(buf[0..n], src[0..n]);
+    return buf[0..n];
+}
+
+/// IO THREAD. The verdict and the log append, inline with the request.
+fn onBeforeResourceLoad(
+    _: [*c]cef.cef_resource_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    _: [*c]cef.cef_callback_t,
+) callconv(.c) cef.cef_return_value_t {
+    const req: *cef.cef_request_t = request orelse return cef.RV_CONTINUE;
+    // Service-worker / urlrequest traffic has no browser and thus no
+    // view to attribute it to; it passes unfiltered (matching without
+    // a first-party context would misapply domain=/third-party rules).
+    const b: *cef.cef_browser_t = browser orelse return cef.RV_CONTINUE;
+    const gi = b.get_identifier orelse return cef.RV_CONTINUE;
+    const cef_id = gi(b);
+
+    var url_raw: [2048]u8 = undefined;
+    var url_buf: [2048]u8 = undefined;
+    const gu = req.get_url orelse return cef.RV_CONTINUE;
+    const url_unf = userfreeInto(gu(req), &url_raw);
+    const url = filter.foldUrl(&url_buf, url_unf);
+    const host = filter.hostOf(url);
+
+    var fp_raw: [512]u8 = undefined;
+    var fp_buf: [512]u8 = undefined;
+    var doc_host: []const u8 = "";
+    if (req.get_first_party_for_cookies) |gfp| {
+        const fp = filter.foldUrl(&fp_buf, userfreeInto(gfp(req), &fp_raw));
+        doc_host = filter.hostOf(fp);
+    }
+
+    var method_buf: [8]u8 = undefined;
+    var method: []const u8 = "";
+    if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
+
+    const rtype = if (req.get_resource_type) |grt| rtypeOf(grt(req)) else filter.RType.other;
+    const req_id: u64 = if (req.get_identifier) |gid| gid(req) else 0;
+    const now = nowMs();
+
+    var verdict = false;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        var slot: ?*ISlot = null;
+        for (&g_int.slots) |*s| {
+            if (s.used and s.cef_id == cef_id) {
+                slot = s;
+                break;
+            }
+        }
+        const enabled = g_int.global_enabled and (if (slot) |s| s.enabled else true);
+        if (enabled and host.len > 0) {
+            if (g_int.engine) |eng| {
+                verdict = eng.match(.{ .url = url, .host = host, .doc_host = doc_host, .rtype = rtype });
+            }
+        }
+        if (slot) |s| {
+            s.total +%= 1;
+            if (verdict) s.blocked +%= 1;
+            s.dirty = true;
+            if (s.ring) |ring| {
+                const e = &ring[s.widx];
+                s.widx = (s.widx + 1) % NLOG;
+                e.* = .{
+                    .seq = s.next_seq,
+                    .req_id = req_id,
+                    .start_ms = now,
+                    .rtype = @intFromEnum(rtype),
+                    .blocked = verdict,
+                    // A blocked entry never completes; it is final now.
+                    .done = verdict,
+                };
+                s.next_seq +%= 1;
+                if (s.next_seq == 0) s.next_seq = 1;
+                e.method_len = @intCast(@min(method.len, e.method.len));
+                @memcpy(e.method[0..e.method_len], method[0..e.method_len]);
+                e.url_len = @intCast(@min(url_unf.len, e.url.len));
+                @memcpy(e.url[0..e.url_len], url_unf[0..e.url_len]);
+            }
+        }
+    }
+    return if (verdict) cef.RV_CANCEL else cef.RV_CONTINUE;
+}
+
+/// IO THREAD. Completes a logged entry with status/size/timing.
+fn onResourceLoadComplete(
+    _: [*c]cef.cef_resource_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    response: [*c]cef.cef_response_t,
+    _: cef.cef_urlrequest_status_t,
+    received: i64,
+) callconv(.c) void {
+    const req: *cef.cef_request_t = request orelse return;
+    const b: *cef.cef_browser_t = browser orelse return;
+    const gi = b.get_identifier orelse return;
+    const cef_id = gi(b);
+    const req_id: u64 = if (req.get_identifier) |gid| gid(req) else return;
+    var status: u16 = 0;
+    if (response) |resp| {
+        if (resp.*.get_status) |gs| status = @intCast(std.math.clamp(gs(resp), 0, 999));
+    }
+    const now = nowMs();
+
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*s| {
+        if (!s.used or s.cef_id != cef_id) continue;
+        const ring = s.ring orelse return;
+        for (ring) |*e| {
+            if (e.seq == 0 or e.req_id != req_id or e.done) continue;
+            e.done = true;
+            e.status = status;
+            e.size = @intCast(std.math.clamp(received, 0, std.math.maxInt(u32)));
+            e.dur_ms = @intCast(std.math.clamp(now - e.start_ms, 0, std.math.maxInt(u32)));
+            s.dirty = true;
+            return;
+        }
+        return;
+    }
+}
+
+/// Copy a ring `LogEntry` into a `proto.NetEntry`, with its strings
+/// staged into caller-owned buffers (the entry's own storage is
+/// released the moment the lock drops). Called under the lock.
+fn fillEntry(out: *proto.NetEntry, url_buf: *[LOG_URL_MAX]u8, method_buf: *[8]u8, e: *const LogEntry) void {
+    @memcpy(url_buf[0..e.url_len], e.url[0..e.url_len]);
+    @memcpy(method_buf[0..e.method_len], e.method[0..e.method_len]);
+    out.* = .{
+        .seq = e.seq,
+        .blocked = if (e.blocked) 1 else 0,
+        .rtype = e.rtype,
+        .done = if (e.done) 1 else 0,
+        .status = e.status,
+        .dur_ms = e.dur_ms,
+        .size = e.size,
+        .method = method_buf[0..e.method_len],
+        .url = url_buf[0..e.url_len],
+    };
+}
+
+fn onGetResourceRequestHandler(
+    _: [*c]cef.cef_request_handler_t,
+    _: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    _: [*c]cef.cef_request_t,
+    _: c_int,
+    _: c_int,
+    _: [*c]const cef.cef_string_t,
+    _: [*c]c_int,
+) callconv(.c) [*c]cef.cef_resource_request_handler_t {
+    return &resource_request_handler;
+}
+
+// ---------------------------------------------------------------------
 // Small CEF call helpers
 // ---------------------------------------------------------------------
 
@@ -1776,6 +2360,7 @@ var display_handler: cef.cef_display_handler_t = undefined;
 var life_span_handler: cef.cef_life_span_handler_t = undefined;
 var load_handler: cef.cef_load_handler_t = undefined;
 var request_handler: cef.cef_request_handler_t = undefined;
+var resource_request_handler: cef.cef_resource_request_handler_t = undefined;
 var find_handler: cef.cef_find_handler_t = undefined;
 var context_menu_handler: cef.cef_context_menu_handler_t = undefined;
 var bp_handler: cef.cef_browser_process_handler_t = undefined;
@@ -1878,6 +2463,15 @@ fn installHandlers() void {
     request_handler = std.mem.zeroes(cef.cef_request_handler_t);
     request_handler.base = staticBase(cef.cef_request_handler_t);
     request_handler.on_render_process_terminated = onRenderProcessTerminated;
+    // Interception: the request handler hands out ONE shared resource
+    // request handler, whose IO-thread callbacks run the filter engine
+    // inline (see the Intercept registry above).
+    request_handler.get_resource_request_handler = onGetResourceRequestHandler;
+
+    resource_request_handler = std.mem.zeroes(cef.cef_resource_request_handler_t);
+    resource_request_handler.base = staticBase(cef.cef_resource_request_handler_t);
+    resource_request_handler.on_before_resource_load = onBeforeResourceLoad;
+    resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
 
     find_handler = std.mem.zeroes(cef.cef_find_handler_t);
     find_handler.base = staticBase(cef.cef_find_handler_t);
@@ -2373,7 +2967,13 @@ fn onAfterCreated(
     const host = g_host orelse return;
     const v = host.pending orelse return;
     if (v.cef_id != 0 or browser == null) return;
-    if (browser.*.get_identifier) |gi| v.cef_id = gi(browser);
+    if (browser.*.get_identifier) |gi| {
+        v.cef_id = gi(browser);
+        // Register as EARLY as possible so the first document's own
+        // subresources are attributed: this fires inside
+        // create_browser_sync, before createViewAt sets cef_id.
+        interceptRegister(host.gpa, v.id, v.cef_id);
+    }
 }
 
 fn onLoadingStateChange(

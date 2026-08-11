@@ -83,6 +83,10 @@ pub const Server = struct {
         self.host = cefhost.Host.init(self.gpa, &self.out);
         defer self.host.deinit();
         self.host.install();
+        // Load the seed list + config filters dir before any view
+        // exists, so the very first navigation is already filtered.
+        cefhost.interceptInit(self.gpa);
+        defer cefhost.interceptDeinit(self.gpa);
 
         try self.accept();
         while (self.client_fd >= 0) {
@@ -147,6 +151,10 @@ pub const Server = struct {
         self.host.watchdog(cefhost.nowMs());
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
+        // Coalesced per-view blocked/total counters: at most one
+        // `intercept_status` per view per iteration, however many
+        // requests the IO thread logged in between.
+        self.host.flushInterceptStatus();
         if (!self.flush()) self.disconnect();
     }
 
@@ -199,7 +207,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [9][]const u8 = .{
+                var caps: [10][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -208,9 +216,10 @@ pub const Server = struct {
                     proto.CAP_FIND,
                     proto.CAP_ZOOM,
                     proto.CAP_CONTEXT_MENU,
+                    proto.CAP_INTERCEPT,
                     undefined,
                 };
-                var ncaps: usize = 8;
+                var ncaps: usize = 9;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -250,6 +259,14 @@ pub const Server = struct {
             .sem_query => try self.host.semQuery(try proto.decode(proto.SemQueryReq, frame.payload)),
             .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
             .sem_eval => try self.host.semEval(try proto.decode(proto.SemEval, frame.payload)),
+            .intercept_set => self.host.interceptSet(try proto.decode(proto.InterceptSet, frame.payload)),
+            .intercept_lists => {
+                const req = try proto.InterceptLists.decodeAlloc(frame.payload, self.gpa);
+                defer self.gpa.free(req.paths);
+                self.host.interceptLists(req);
+            },
+            .intercept_status_req => self.host.interceptStatus(try proto.decode(proto.InterceptStatusReq, frame.payload)),
+            .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},
