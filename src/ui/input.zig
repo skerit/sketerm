@@ -187,6 +187,10 @@ pub const Action = enum {
     /// `hints_open` also lands here first when the web face is showing,
     /// so the one hints chord always hints what is on screen.
     web_hints,
+    /// Flip the focused pane's web face between the live page and
+    /// reader mode: the page's article, extracted by the same
+    /// `sem_read` the `web_read` tool uses, laid out as text.
+    web_reader,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -479,6 +483,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_web_tab => "new_web_tab",
         .new_web_split => "new_web_split",
         .web_hints => "web_hints",
+        .web_reader => "web_reader",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -570,6 +575,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_web_tab => "New web tab (browser engine)",
         .new_web_split => "Split into a web pane (browser engine)",
         .web_hints => "Link hints on the web page (type a label to click)",
+        .web_reader => "Reader view on/off (this pane's web page)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",

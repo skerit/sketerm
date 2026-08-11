@@ -563,7 +563,8 @@ goto_tab_1 goto_tab_2 goto_tab_3 goto_tab_4 goto_tab_5
 goto_tab_6 goto_tab_7 goto_tab_8 goto_tab_9
 duplicate_tab detach_tab configure_shader shader_preset_pick
 apply_profile show_scrollback new_durable_tab new_browser_tab
-new_browser_split close_pane toggle_browser_face new_editor_tab
+new_browser_split new_web_tab new_web_split web_reader
+close_pane toggle_browser_face new_editor_tab
 new_editor_split toggle_editor_face mux_detach paste_clipboard
 copy_selection
 copy_screen copy_scrollback copy_command_output

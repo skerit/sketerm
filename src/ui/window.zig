@@ -3516,6 +3516,14 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // Only reached when the focused pane shows NO web face (the
         // pane-local dispatch consumes it otherwise).
         .web_hints => showToast(self, "This pane shows no web page. Use New Web Tab."),
+        // Reader mode belongs to the face, not the window; the window
+        // only routes the action to the focused pane's web face.
+        .web_reader => if (self.focusedPane()) |p| {
+            if (@import("webface.zig").WebFace.fromPane(p)) |face|
+                face.toggleReader()
+            else
+                showToast(self, "This pane has no web page. Use New Web Tab.");
+        },
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather
