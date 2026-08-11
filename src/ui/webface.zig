@@ -78,7 +78,7 @@
 //!   on Wayland each empty cycle leaks a frame-callback object id per
 //!   offload subsurface until KWin's id space runs out and the process
 //!   dies. `stopTick` is not an optimisation, it is the crash guard.
-//! - ACTIVE: a tick on the GL area paces requests at the CURRENT
+//! - ACTIVE: a tick on the view widget paces requests at the CURRENT
 //!   output's real refresh (from `gdk_frame_clock_get_refresh_info`),
 //!   clamped by `browser_max_fps`. Any input promotes here immediately,
 //!   so the first paint after a keystroke has no added latency.
@@ -87,7 +87,7 @@
 //!   G_SOURCE_REMOVE and zeroing `tick_id`), exactly like the terminal
 //!   surface's animation tick.
 //!
-//! A background tab's GL area is unmapped: the face then sends
+//! A background tab's view widget is unmapped: the face then sends
 //! `view_hide` and stops asking altogether, so an off-screen page paints
 //! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
 //! aborts if a demoted face somehow kept its tick).
@@ -130,7 +130,7 @@
 //! and the buffer that comes back is PHYSICAL. The scale comes from
 //! `gdk_surface_get_scale()` — `gtk_widget_get_scale_factor()` rounds
 //! 1.5 up to 2 and must not be used. A surface only exists once the
-//! GL area is realized, so the face starts at 1.0, re-sends on realize,
+//! view widget is realized, so the face starts at 1.0, re-sends on realize,
 //! and watches `GdkSurface::notify::scale` so dragging the window to a
 //! differently scaled output re-renders crisply.
 //!
@@ -1021,7 +1021,7 @@ pub const WebFace = struct {
     sent_w: u16 = 0,
     sent_h: u16 = 0,
     /// Last device scale handed to the helper, x1000. 1000 until the
-    /// GL area is realized and a GdkSurface can be asked.
+    /// view widget is realized and a GdkSurface can be asked.
     sent_scale: u16 = 1000,
     /// Last `view_max_fps` sent on the CURRENT connection; the sentinel
     /// forces a send after every (re)create.
@@ -1050,7 +1050,7 @@ pub const WebFace = struct {
     idle_timer: c.guint = 0,
     /// Latency-probe timer (`SKETERM_WEB_LAT`), 0 when absent.
     lat_timer: c.guint = 0,
-    /// Whether the GL area is mapped. A background tab is unmapped: it
+    /// Whether the view widget is mapped. A background tab is unmapped: it
     /// gets `view_hide` and is never asked for a frame.
     on_screen: bool = false,
 
@@ -1368,7 +1368,7 @@ pub const WebFace = struct {
     /// PNG of the PAGE as the user sees it, for `screenshot_pane` /
     /// `web_screenshot`. The pane's own screenshot path renders the
     /// terminal surface, which on a web pane is the hidden shell
-    /// underneath — so the face renders its GL area instead,
+    /// underneath — so the face renders its view widget instead,
     /// with the same widget-paintable technique.
     pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
         if (self.widgets_dead) return null;
@@ -1986,7 +1986,7 @@ pub const WebFace = struct {
         return @intCast(@min(n, std.math.maxInt(u16)));
     }
 
-    /// The GL area's LOGICAL size, or 0x0 when it has never been laid
+    /// The view widget's LOGICAL size, or 0x0 when it has never been laid
     /// out. `gtk_widget_get_width` reports the allocation, which exists
     /// from the first size-allocate — well before the first render.
     fn allocationSize(self: *WebFace) struct { w: u16, h: u16 } {

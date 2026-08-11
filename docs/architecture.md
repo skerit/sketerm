@@ -404,6 +404,52 @@ survive, reattach restores screen + scrollback exactly. Daemon
 death (server reboot, kill -9): sessions are gone — orphaned PTYs
 SIGHUP their children. Same boundary as tmux.
 
+## Browser subsystem (integrated CEF)
+
+A pane can host a real browser instead of a terminal. The engine is
+CEF (Chromium) in windowless/off-screen mode, hosted by a separate
+`sketerm-webengine` process; the GUI keeps its own chrome, tab model
+and MCP layer. See `src/web/CLAUDE.md` for the invariants and
+`src/ui/webface.zig`'s header for presentation and pacing detail.
+
+**Process split.** `sketerm-webengine` is the only binary linking CEF,
+and it is a separate process for **crash isolation** — an engine crash
+must not take the terminal and its shells with it. It also lets the
+engine run with no GUI at all (headless MCP), and leaves room for the
+helper to run on a remote host later. It is NOT a GTK3-vs-GTK4
+workaround; libcef links no GTK.
+
+**Wire.** One unix socket, one helper per GUI process, frames
+length-prefixed and little-endian with append-only tags, capabilities
+instead of version bumps — the same discipline as the mux protocol, and
+deliberately engine-neutral so a future engine means a new helper rather
+than a rewrite. Buffers travel as file descriptors over `SCM_RIGHTS`.
+`src/web/protocol.zig` is the source of truth.
+
+**Frames.** Two families, both ending as a `GdkTexture` on the face's
+`GtkPicture`: dma-buf planes imported by GSK with zero copies (GPU
+rasterisation, only under `--ozone-platform=wayland`), or a memfd
+mapping whose damage rects become the texture's update region (software
+fallback). Presenting through a `GtkGLArea` is forbidden — its integer
+scale factor resamples twice on fractional-scale outputs and visibly
+softens text.
+
+**Pacing.** The engine's own scheduler paints, throttled by a per-view
+cap that the GUI clamps to the current output's refresh. An unchanged
+page paints nothing and a hidden view is stopped outright, so idle cost
+is zero without a frame-clock tick.
+
+**Semantic layer.** An injected script publishes a page walker in an
+authenticated channel established before any page script runs; the
+helper keeps a shadow tree with stable element ids, emits deltas rather
+than whole snapshots, and carries ids across navigations by subtree
+fingerprint. This one layer feeds both the MCP `web_*` tools and
+(eventually) accessibility projection.
+
+**Identity.** `sketerm web` / the `sketerm-web` hardlink register their
+own application id, desktop entry and icon, so the browser is its own
+taskbar application and can be set as the system default browser.
+
 ## Module ownership
 
 - `ui/app.zig` — owns `AdwApplication`, spawns windows.

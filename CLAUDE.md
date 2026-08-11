@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`sketerm` — native GTK4 terminal emulator written from scratch in Zig. No vendored terminal cores, no wrapper crates: parser/screen/atlas/render are all in-tree. Dependencies are system C libraries (`gtk4`, `libadwaita-1`, `freetype2`, `harfbuzz`, `epoxy`, `fribidi`, `fontconfig`, `libvpx` — VP9/WebM app-window recording, GUI-only) plus vendored `stb_image.h`/`stb_image_write.h`/`msf_gif.h` for image + GIF encode and a vendored Tree-sitter runtime + generated grammars (`vendor/tree-sitter/`, editor syntax highlighting — compiled into the GUI/test targets ONLY, never into `sketerm-mux`).
+`sketerm` — native GTK4 terminal emulator written from scratch in Zig. No vendored terminal cores, no wrapper crates: parser/screen/atlas/render are all in-tree. Dependencies are system C libraries (`gtk4`, `libadwaita-1`, `freetype2`, `harfbuzz`, `epoxy`, `fribidi`, `fontconfig`, `libvpx` — VP9/WebM app-window recording, GUI-only) plus vendored `stb_image.h`/`stb_image_write.h`/`msf_gif.h` for image + GIF encode and a vendored Tree-sitter runtime + generated grammars (`vendor/tree-sitter/`, editor syntax highlighting — compiled into the GUI/test targets ONLY, never into `sketerm-mux`). The browser adds `cef` as an OPTIONAL dependency of `sketerm-webengine` alone: nothing else links it, and the GUI degrades to "no browser" when it is absent.
 
-Two binaries ship: `sketerm` (the GUI, plus the `cli`/`ssh`/`mux` subcommands) and `sketerm-mux` (the session daemon — **links libc only**, no GTK/GLib/freetype; check with `ldd` after touching its dep graph).
+Three binaries ship: `sketerm` (the GUI, plus the `cli`/`ssh`/`mux` subcommands), `sketerm-mux` (the session daemon — **links libc only**, no GTK/GLib/freetype; check with `ldd` after touching its dep graph), and `sketerm-webengine` (the optional CEF browser helper — the ONLY binary that links CEF, kept in its own process for crash isolation; see `src/web/CLAUDE.md`). `sketerm-web` is not a binary of its own but an argv0 identity hardlink to the GUI, like `sketerm-files`.
 
 ## Toolchain pin
 
@@ -113,6 +113,18 @@ it is loaded, because breaking one is how each was learned:
     datagram size cap is a socket-buffer setting. A closed peer there is
     `recv() == -1`/ECONNRESET, so "channel gone" is `n <= 0`, never `n == 0`.
 
+- **`src/web/CLAUDE.md`** — the CEF browser helper (`sketerm-webengine`),
+  with `src/ui/webface.zig`'s header as its GUI-side counterpart.
+  - Startup order is fixed: `LD_PRELOAD` re-exec, `cef_api_hash` FIRST,
+    our own argv parsed BEFORE `cef_execute_process` (Chromium rewrites
+    the argv block in place), same argv to execute AND initialize.
+  - `--ozone-platform=headless` spawns NO GPU process at all; only
+    `=wayland` gives dma-buf frames.
+  - CEF paces itself; external begin frames cost a constant ~30ms of
+    input latency and must not become the default again.
+  - Frames are `GdkTexture`s in GTK's scene graph, never a `GtkGLArea`
+    (its integer scale factor double-resamples on fractional displays).
+
 - **`src/ui/browser/CLAUDE.md`** (+ pointer in `src/filebrowser/`) — the file
   browser.
   - The GUI never touches the disk: every file op goes to the daemon.
@@ -188,4 +200,4 @@ The stored `pkgver=0.0.0` is a deliberate placeholder: `pkgver()` derives the re
 
 **The semver has exactly one source of truth: `.version` in `build.zig.zon`.** `build.zig` imports the zon and hands the string to every target as `build_options.version`; `src/version.zig` re-exports it (with the `:0` sentinel re-attached, since callers pass it to `fprintf`) for the GUI, the daemon and the MCP server, which is how `sketerm doctor` detects binary skew. `pkgver()` greps the same line and appends `.r<commit-count>.g<sha>`. Bump that one line and everything moves together — never hardcode a version anywhere else. Consequence: **any module importing `src/version.zig` must be in a target that has a `build_options` module**, and a new option set (alongside `glib_opts`/`noglib_opts`/`portable_opts`) must add `version` or that target won't compile.
 
-Two desktop entries and two app icons ship, because **files mode is its own application identity**: `sketerm files` registers the GApplication id `dev.sker.sketerm.files` and sets the matching prgname, so on Wayland the toplevel app_id and on X11 the WM_CLASS are that string and KDE gives the file manager its own taskbar entry and icon (a per-window `gtk_window_set_icon_name` cannot do this). `data/dev.sker.sketerm.desktop` + `apps/dev.sker.sketerm.svg` are the terminal; `data/dev.sker.sketerm.files.desktop` + `apps/dev.sker.sketerm.files.svg` are the file manager, and the latter declares `MimeType=inode/directory;x-scheme-handler/file;` so it can be set as the default file manager. `StartupWMClass` in that entry MUST stay equal to the app id. This is additive: a browser face on a pane inside a terminal window (palette `new_browser_tab`/`new_browser_split`, `cli new-browser-tab`, `sketerm files --here|--tab`) is unrelated to the files identity and must keep working. Terminfo source at `terminfo/sketerm-256color.src` — `tic`-compiled into `/usr/share/terminfo` by the PKGBUILD.
+Three desktop entries and three app icons ship, because **each mode is its own application identity**: `sketerm files` registers the GApplication id `dev.sker.sketerm.files` and sets the matching prgname, so on Wayland the toplevel app_id and on X11 the WM_CLASS are that string and KDE gives the file manager its own taskbar entry and icon (a per-window `gtk_window_set_icon_name` cannot do this). `data/dev.sker.sketerm.desktop` + `apps/dev.sker.sketerm.svg` are the terminal; `data/dev.sker.sketerm.files.desktop` + `apps/dev.sker.sketerm.files.svg` are the file manager, and the latter declares `MimeType=inode/directory;x-scheme-handler/file;` so it can be set as the default file manager. `data/dev.sker.sketerm.web.desktop` + `apps/dev.sker.sketerm.web.svg` are the browser (`sketerm web [url]`, or the `sketerm-web` hardlink), declaring `x-scheme-handler/http;x-scheme-handler/https;text/html;` so it can be set as the default browser; its `Exec=` runs the subcommand rather than a binary of that name, since `sketerm-webengine` owns the helper's name. `StartupWMClass` in each entry MUST stay equal to its app id. This is additive: a browser face on a pane inside a terminal window (palette `new_browser_tab`/`new_browser_split`, `cli new-browser-tab`, `sketerm files --here|--tab`) is unrelated to the files identity and must keep working. Terminfo source at `terminfo/sketerm-256color.src` — `tic`-compiled into `/usr/share/terminfo` by the PKGBUILD.

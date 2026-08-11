@@ -1,9 +1,12 @@
-// sketerm-web — the CEF browser helper process.
+// sketerm-webengine — the CEF browser helper process.
 //
 // Hosts windowless (OSR) browsers and speaks the v1 wire protocol from
-// docs/proposal-browser-protocol.md over a unix socket. It is the ONLY
-// binary that links CEF: the GUI and the daemon never see a CEF type,
-// which is also what keeps CEF's GTK3 dependency out of a GTK4 process.
+// protocol.zig over a unix socket. It is the ONLY binary that links
+// CEF: the GUI and the daemon never see a CEF type, which is what keeps
+// an engine swap to a new helper rather than a rewrite. It is a
+// SEPARATE PROCESS for crash isolation — an engine crash must not take
+// down the terminal and every shell in it. (Not for GTK reasons:
+// libcef links no GTK, in either the upstream or the distro build.)
 //
 // Startup order matters and is not negotiable:
 //   1. re-exec with LD_PRELOAD=libcef.so (see below),
