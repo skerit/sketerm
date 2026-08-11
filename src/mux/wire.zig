@@ -215,6 +215,15 @@ pub const FrameType = enum(u8) {
     /// daemon would answer `.err`, misattributable on a multiplexed
     /// connection.
     web_op = 32,
+    /// Open a TCP stream to an ARBITRARY host:port FROM the daemon's
+    /// host, with the hostname resolved at the daemon's end (remote
+    /// DNS). JSON { req, host, port }. Answered with `stream_reply`
+    /// echoing `req` and, on ok, a `chan_open` (kind tcp_forward) whose
+    /// raw bytes flow as chan_data both ways — the egress primitive
+    /// behind per-container "browse via server X". Unlike `forward_open`
+    /// (loopback-only, port-only) this reaches any host the daemon can.
+    /// Only sent to daemons whose welcome advertises `stream_open:true`.
+    stream_open = 33,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -341,6 +350,12 @@ pub const FrameType = enum(u8) {
     /// { bookmarks:[{id,url,title,folder}] }, site_get { origin,
     /// site:{zoom_x100,popup,block,perms:[{name,decision}]}|null }.
     web_reply = 96,
+    /// Answer to `stream_open`, ALWAYS echoing the request's `req`
+    /// (fs_op nonce discipline): JSON { req, ok, chan?, error? }. On
+    /// ok:true a `chan_open` (kind tcp_forward) for `chan` precedes this
+    /// frame; ok:false carries the failure (bad request, DNS miss,
+    /// connect refused) so a SOCKS bridge can answer its client.
+    stream_reply = 97,
     _,
 };
 

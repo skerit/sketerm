@@ -5115,6 +5115,98 @@ pub const Daemon = struct {
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .tcp_forward));
     }
 
+    const StreamReq = struct { req: u32 = 0, host: []const u8 = "", port: u16 = 0 };
+
+    /// Open a TCP stream to an ARBITRARY host:port FROM this daemon's
+    /// host, resolving the hostname HERE (remote DNS). This is the
+    /// egress primitive behind per-container "browse via server X": a
+    /// local SOCKS5 bridge relays each connection through here, so the
+    /// browser's traffic leaves from — and its names resolve at — the
+    /// remote host the user picked.
+    ///
+    /// getaddrinfo is BLOCKING and runs on the poll loop, so a slow DNS
+    /// server briefly stalls this daemon's other sessions; acceptable
+    /// for a v1 egress path (the alternative is an async resolver, a far
+    /// larger lift). The connect itself is nonblocking — a refused peer
+    /// surfaces as POLLERR -> chan_close, exactly like `forward_open`.
+    pub fn handleStream(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(StreamReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueJson(.stream_reply, .{ .req = @as(u32, 0), .ok = false, .@"error" = "bad stream request" });
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.host.len == 0 or req.host.len > 255 or req.port == 0) {
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "bad host/port" });
+            return;
+        }
+
+        // Resolve on THIS host (remote DNS). NUL-terminate the borrowed
+        // host slice for getaddrinfo.
+        var hostz: [256]u8 = undefined;
+        @memcpy(hostz[0..req.host.len], req.host);
+        hostz[req.host.len] = 0;
+        var portz: [8]u8 = undefined;
+        const ports = std.fmt.bufPrintZ(&portz, "{d}", .{req.port}) catch {
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "bad port" });
+            return;
+        };
+        var hints = std.mem.zeroes(c.struct_addrinfo);
+        hints.ai_family = c.AF_UNSPEC;
+        hints.ai_socktype = c.SOCK_STREAM;
+        var res: ?*c.struct_addrinfo = null;
+        if (c.getaddrinfo(&hostz, ports.ptr, &hints, &res) != 0 or res == null) {
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "name resolution failed" });
+            return;
+        }
+        defer c.freeaddrinfo(res);
+
+        // Try each resolved address until a nonblocking connect starts.
+        var fd: c_int = -1;
+        var ai: ?*c.struct_addrinfo = res;
+        while (ai) |a| : (ai = a.ai_next) {
+            const s = @import("../util/platform.zig").socketCloexec(a.ai_family, a.ai_socktype, a.ai_protocol);
+            if (s < 0) continue;
+            const fl = c.fcntl(s, c.F_GETFL);
+            _ = c.fcntl(s, c.F_SETFL, fl | c.O_NONBLOCK);
+            const r = c.connect(s, a.ai_addr, a.ai_addrlen);
+            if (r == 0 or std.posix.errno(r) == .INPROGRESS) {
+                fd = s;
+                break;
+            }
+            _ = c.close(s);
+        }
+        if (fd < 0) {
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "connect failed" });
+            return;
+        }
+
+        const ch = self.allocator.create(Channel) catch {
+            _ = c.close(fd);
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "out of memory" });
+            return;
+        };
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = fd,
+            .session = null,
+            .client = cl,
+            .tcp = true,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.deinit();
+            cl.queueJson(.stream_reply, .{ .req = req.req, .ok = false, .@"error" = "out of memory" });
+            return;
+        };
+        var ob: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .tcp_forward));
+        cl.queueJson(.stream_reply, .{ .req = req.req, .ok = true, .chan = ch.id });
+    }
+
     pub const LspOpenSrv = struct {
         name: []const u8 = "",
         command: []const u8 = "",

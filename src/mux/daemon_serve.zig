@@ -909,6 +909,11 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // the unknown frame, misattributable on a multiplexed
                 // connection.
                 .web_store = true,
+                // Arbitrary-host TCP egress with remote DNS
+                // (stream_open/stream_reply). Capability, same reasoning
+                // as lsp: an old daemon would `.err` on the unknown
+                // frame, misattributable on a multiplexed connection.
+                .stream_open = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -988,6 +993,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         .search => self.handleSearch(cl, frame.payload),
         .log_get => self.handleLogGet(cl, frame.payload),
         .forward_open => self.handleForward(cl, frame.payload),
+        .stream_open => self.handleStream(cl, frame.payload),
         // NOT attach-scoped (like fs_op): served by whichever process
         // owns the client connection — the broker, in broker mode.
         .lsp_open => self.handleLspOpen(cl, frame.payload),
