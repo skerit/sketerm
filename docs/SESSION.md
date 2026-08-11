@@ -15889,3 +15889,41 @@ raster is grayscale-AA — 0 of 6793 ink pixels carry color even with
 an opaque background_color and --enable-lcd-text (both kept; the GPU
 raster path may honour the flag and is only verifiable on real
 hardware).
+
+## 2026-08-11: headless `web_*` — the browser tools work with NO GUI
+
+The `web_*` family hard-failed with "no GUI control socket ... restart
+with --shared" in the DEFAULT isolated MCP mode — the mode assistants
+actually run in, which made the whole family unusable out of the box
+(the same failure shape as the old bare `gui_socket:false`).
+
+New `src/ipc/webdrive.zig` (appdrive's sibling: GTK-free, in both test
+roots): the MCP server spawns and owns a `sketerm-webengine` of its
+own on `<instance-dir>/web.sock` (+ `web.json` presence metadata, +
+`web-cache` profile — all torn down with the instance), speaks the v1
+protocol directly (hello identity `sketerm-mcp[:name]`), and runs the
+semantic round trips itself under non-blocking deadline IO. Backend
+selection lives in ONE place (`pick` in mcp_web.zig): GUI socket
+attached -> the user's real tabs exactly as before (handle = pane id);
+no GUI -> headless helper views (handle = view id, reported as
+`"view"` — never dressed up as a pane). All twelve tools share the
+same handlers and formatting; `web_screenshot` headless encodes a PNG
+from the shm frame (`png.encodeRgba`), and `web_open` takes
+width/height (default 1280x800) headless. `capabilities` now reports
+`web`/`web_backend` and says the tools work RIGHT NOW with no GUI.
+Helper-binary lookup deduped into `src/web/findbin.zig` (webface +
+webdrive + capabilities all use it).
+
+Also fixed: deleting `mcp_browser.zig` (CDP removal) had taken
+`mkdirs` with it, so `recDir()` never created the mcp-casts dir and
+terminal auto-recording silently turned off (smoke-mcp caught it).
+
+Validation: smoke-mcp grew a headless web stage (isolated, no GUI:
+open file:// page -> snapshot ids -> trusted click with delta ->
+eval-mutation proven in a follow-up delta -> web_read -> real PNG ->
+teardown reaps the helper); smoke-web 25/25 on pinned CEF (distro CEF
+build currently needs glibc 2.44, host has 2.43 — pre-existing);
+mux-portable green. Forward-compat kept for a future "view along":
+discoverable socket + presence file, no new single-client assumptions,
+frame delivery isolated behind one seam (inline-frames family would be
+a new arm, not a rewrite).
