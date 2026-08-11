@@ -456,10 +456,12 @@ pub const OpenWithCtx = struct {
 };
 
 /// Heap context for one app button (GClosureNotify-freed).
+/// `view`/`tab` are null in the standalone (viewer-hosted) chooser,
+/// where every launch is local.
 pub const AppBtnCtx = struct {
     allocator: std.mem.Allocator,
-    view: *BrowserView,
-    tab: *BTab,
+    view: ?*BrowserView,
+    tab: ?*BTab,
     path: []u8,
     /// Local application id (GAppInfo) — launch locally.
     appid: ?[]u8 = null,
@@ -509,26 +511,7 @@ pub fn openWithDialog(self: *BrowserView, tab: *BTab, path: []const u8) void {
     const owdef = c.gtk_check_button_new_with_label("Always use for this file type");
     c.g_object_set_data(@ptrCast(popover), "sketerm-owdef", @ptrCast(owdef));
 
-    var namez: [512:0]u8 = undefined;
-    const base = std.fs.path.basename(path);
-    var app_count: usize = 0;
-    if (std.fmt.bufPrintZ(&namez, "{s}", .{base})) |bz| {
-        var uncertain: c.gboolean = 0;
-        const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
-        if (ct != null) {
-            const apps = c.g_app_info_get_all_for_type(ct);
-            var it = apps;
-            while (it != null and app_count < 20) : (it = it.*.next) {
-                const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
-                const id = c.g_app_info_get_id(app) orelse continue;
-                const nm = c.g_app_info_get_name(app) orelse continue;
-                self.appChoiceButton(box, ctx, std.mem.span(nm), std.mem.span(id), null);
-                app_count += 1;
-            }
-            if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
-            c.g_free(ct);
-        }
-    } else |_| {}
+    const app_count = appendLocalApps(self.allocator, self, tab, popover, box, path);
     if (app_count == 0) {
         const none = c.gtk_label_new("(no known local handler)");
         c.gtk_widget_add_css_class(none, "dim-label");
@@ -576,18 +559,34 @@ pub fn appChoiceButton(
     appid: ?[]const u8,
     exec: ?[]const u8,
 ) void {
-    const actx = self.allocator.create(AppBtnCtx) catch return;
+    addAppChoiceButton(self.allocator, self, ctx.tab, ctx.popover, box, ctx.path, name, appid, exec);
+}
+
+/// The chooser-row builder behind appChoiceButton, callable without a
+/// BrowserView (`view`/`tab` null = local-only launches).
+fn addAppChoiceButton(
+    allocator: std.mem.Allocator,
+    view: ?*BrowserView,
+    tab: ?*BTab,
+    popover: *c.GtkWidget,
+    box: *c.GtkWidget,
+    path: []const u8,
+    name: []const u8,
+    appid: ?[]const u8,
+    exec: ?[]const u8,
+) void {
+    const actx = allocator.create(AppBtnCtx) catch return;
     actx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = ctx.tab,
-        .path = self.allocator.dupe(u8, ctx.path) catch {
-            self.allocator.destroy(actx);
+        .allocator = allocator,
+        .view = view,
+        .tab = tab,
+        .path = allocator.dupe(u8, path) catch {
+            allocator.destroy(actx);
             return;
         },
-        .appid = if (appid) |s| (self.allocator.dupe(u8, s) catch null) else null,
-        .exec = if (exec) |s| (self.allocator.dupe(u8, s) catch null) else null,
-        .popover = ctx.popover,
+        .appid = if (appid) |s| (allocator.dupe(u8, s) catch null) else null,
+        .exec = if (exec) |s| (allocator.dupe(u8, s) catch null) else null,
+        .popover = popover,
     };
     var lbl: [256:0]u8 = undefined;
     const ltxt = std.fmt.bufPrintZ(&lbl, "{s}", .{name}) catch return;
@@ -598,13 +597,87 @@ pub fn appChoiceButton(
     c.gtk_box_append(@ptrCast(box), btn);
 }
 
+/// Local applications for the file's guessed content type, one chooser
+/// row each (bounded). Shared by the browser dialog and the
+/// standalone popover. @return the number of rows added.
+fn appendLocalApps(
+    allocator: std.mem.Allocator,
+    view: ?*BrowserView,
+    tab: ?*BTab,
+    popover: *c.GtkWidget,
+    box: *c.GtkWidget,
+    path: []const u8,
+) usize {
+    var namez: [512:0]u8 = undefined;
+    const base = std.fs.path.basename(path);
+    var app_count: usize = 0;
+    if (std.fmt.bufPrintZ(&namez, "{s}", .{base})) |bz| {
+        var uncertain: c.gboolean = 0;
+        const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+        if (ct != null) {
+            const apps = c.g_app_info_get_all_for_type(ct);
+            var it = apps;
+            while (it != null and app_count < 20) : (it = it.*.next) {
+                const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
+                const id = c.g_app_info_get_id(app) orelse continue;
+                const nm = c.g_app_info_get_name(app) orelse continue;
+                addAppChoiceButton(allocator, view, tab, popover, box, path, std.mem.span(nm), std.mem.span(id), null);
+                app_count += 1;
+            }
+            if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
+            c.g_free(ct);
+        }
+    } else |_| {}
+    return app_count;
+}
+
+/// Standalone local-only Open With chooser for windows without a
+/// BrowserView (the image viewer): local apps for the file's guessed
+/// content type plus the "Always use" default toggle. The popover is
+/// parented to `parent`, anchored at its centre, and unparents itself
+/// on close. @return the popover, or null on allocation failure.
+pub fn openWithLocalPopover(allocator: std.mem.Allocator, parent: *c.GtkWidget, path: []const u8) ?*c.GtkWidget {
+    const popover = c.gtk_popover_new() orelse return null;
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+    const sec = c.gtk_label_new("Open with:");
+    c.gtk_widget_add_css_class(sec, "dim-label");
+    c.gtk_label_set_xalign(@ptrCast(sec), 0);
+    c.gtk_box_append(@ptrCast(box), sec);
+    const owdef = c.gtk_check_button_new_with_label("Always use for this file type");
+    c.g_object_set_data(@ptrCast(popover), "sketerm-owdef", @ptrCast(owdef));
+    const app_count = appendLocalApps(allocator, null, null, popover, box, path);
+    if (app_count == 0) {
+        const none = c.gtk_label_new("(no known local handler)");
+        c.gtk_widget_add_css_class(none, "dim-label");
+        c.gtk_box_append(@ptrCast(box), none);
+    }
+    c.gtk_box_append(@ptrCast(box), owdef);
+    const scroll = c.gtk_scrolled_window_new();
+    c.gtk_widget_set_size_request(scroll, 320, 380);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
+    c.gtk_popover_set_child(@ptrCast(popover), scroll);
+    c.gtk_widget_set_parent(popover, parent);
+    connectPopoverAutoUnparent(popover);
+    const rect = c.GdkRectangle{
+        .x = @divTrunc(c.gtk_widget_get_width(parent), 2),
+        .y = @divTrunc(c.gtk_widget_get_height(parent), 2),
+        .width = 1,
+        .height = 1,
+    };
+    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+    c.gtk_popover_popup(@ptrCast(popover));
+    return popover;
+}
+
 pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const actx: *AppBtnCtx = @ptrCast(@alignCast(user.?));
-    const self = actx.view;
-    const tab = actx.tab;
     if (actx.exec) |exec| {
         // Host application: substituted Exec runs as an app
         // session on the file's host; its window forwards here.
+        // Host rows only exist in the browser chooser, so view/tab
+        // are always present on this branch.
+        const self = actx.view orelse return;
+        const tab = actx.tab orelse return;
         if (self.on_host_exec) |cb| {
             if (self.hooks_ctx) |hctx| {
                 if (buildHostExecCmd(self.allocator, exec, actx.path)) |cmd| {
@@ -624,10 +697,11 @@ pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             if (c.gtk_check_button_get_active(@ptrCast(@alignCast(cb))) != 0)
                 setDefaultAppForPath(appid, actx.path);
         }
-        if (tab.hc.host == null) {
-            launchLocalWithApp(appid, actx.path);
+        const remote_tab: ?*BTab = if (actx.tab) |tab| (if (tab.hc.host != null) tab else null) else null;
+        if (remote_tab) |tab| {
+            if (actx.view) |self| self.openRemoteFile(tab, actx.path, appid) else launchLocalWithApp(appid, actx.path);
         } else {
-            self.openRemoteFile(tab, actx.path, appid);
+            launchLocalWithApp(appid, actx.path);
         }
     }
     c.gtk_popover_popdown(@ptrCast(actx.popover));
