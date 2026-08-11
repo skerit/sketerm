@@ -137,6 +137,8 @@ comptime {
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/keys.zig");
+    _ = @import("ipc/socks5.zig");
+    _ = @import("ipc/socksbridge.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/appdrive.zig");
     _ = @import("ipc/webdrive.zig");

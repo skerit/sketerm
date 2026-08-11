@@ -96,6 +96,8 @@ comptime {
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
     _ = @import("ipc/keys.zig");
+    _ = @import("ipc/socks5.zig");
+    _ = @import("ipc/socksbridge.zig");
     _ = @import("ipc/mcpassets.zig");
     _ = @import("ipc/mcpfilter.zig");
     _ = @import("ipc/mcp_registry.zig");
