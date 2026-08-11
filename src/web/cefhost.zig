@@ -1885,7 +1885,6 @@ fn installHandlers() void {
 
     context_menu_handler = std.mem.zeroes(cef.cef_context_menu_handler_t);
     context_menu_handler.base = staticBase(cef.cef_context_menu_handler_t);
-    context_menu_handler.on_before_context_menu = onBeforeContextMenu;
     context_menu_handler.run_context_menu = onRunContextMenu;
 
     client = std.mem.zeroes(cef.cef_client_t);
@@ -2035,22 +2034,12 @@ fn onFindResult(
     });
 }
 
-/// Clear the engine's default menu so nothing of it survives even on a
-/// build that would display one.
-fn onBeforeContextMenu(
-    _: [*c]cef.cef_context_menu_handler_t,
-    _: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
-    _: [*c]cef.cef_context_menu_params_t,
-    model: [*c]cef.cef_menu_model_t,
-) callconv(.c) void {
-    const m: *cef.cef_menu_model_t = model orelse return;
-    if (m.clear) |cl| _ = cl(m);
-}
-
 /// The context menu is the CLIENT's: report the hit test (position,
 /// link, editability) as `ev_context_menu`, cancel the engine's own
-/// display outright, and return "handled".
+/// display outright, and return "handled". The default model must
+/// reach here UNCLEARED: an empty model after on_before_context_menu
+/// means "show no menu" and Chromium then never calls
+/// run_context_menu at all, so ev_context_menu was never sent.
 fn onRunContextMenu(
     _: [*c]cef.cef_context_menu_handler_t,
     browser: [*c]cef.cef_browser_t,
