@@ -42,6 +42,11 @@ pub const CAP_ZOOM = "zoom";
 /// The helper suppresses the engine's own context menu and posts
 /// `ev_context_menu` instead.
 pub const CAP_CONTEXT_MENU = "context-menu";
+/// The helper runs an in-process network filter engine and accepts the
+/// 0x80-block interception frames. Blocking decisions NEVER round-trip
+/// to the client — the client only configures, polls the bounded
+/// request log, and receives coalesced per-view counters.
+pub const CAP_INTERCEPT = "intercept";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -96,6 +101,12 @@ pub const Tag = enum(u8) {
     set_zoom = 0x52,
     ev_find_result = 0x53,
     ev_context_menu = 0x54,
+    intercept_set = 0x80,
+    intercept_lists = 0x81,
+    intercept_status_req = 0x82,
+    intercept_status = 0x83,
+    intercept_log_req = 0x84,
+    intercept_log = 0x85,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     _,
@@ -743,6 +754,189 @@ pub const SemEvalResult = struct {
     json: Text,
 };
 
+// -- request interception (0x80 block, capability "intercept") --------
+
+/// Resource classes as the wire names them; mirrors `filter.RType`
+/// (engine-agnostic — a Servo helper maps its own enum onto these).
+pub const NetResource = enum(u8) {
+    other = 0,
+    document = 1,
+    subdocument = 2,
+    stylesheet = 3,
+    script = 4,
+    image = 5,
+    font = 6,
+    xhr = 7,
+    media = 8,
+    websocket = 9,
+    ping = 10,
+    _,
+};
+
+/// Enable/disable blocking. `view` 0 is the process-wide default; a
+/// nonzero view carries the per-view (per-site, as the client sees it)
+/// override. Effective = global AND per-view. The filter lists stay
+/// loaded either way — disabling only stops the verdicts.
+pub const InterceptSet = struct {
+    pub const tag: Tag = .intercept_set;
+    view: u32,
+    enabled: u8,
+};
+
+/// Reload the filter set: the built-in seed list plus the helper's
+/// `$XDG_CONFIG_HOME/sketerm/filters/*.txt` plus every path named
+/// here (absolute paths, read helper-side). An empty list just
+/// re-reads seed + config dir. No network fetching, by design.
+pub const InterceptLists = struct {
+    pub const tag: Tag = .intercept_lists;
+    paths: []const []const u8,
+
+    pub fn encodeTo(self: InterceptLists, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU16(gpa, out, @intCast(self.paths.len));
+        for (self.paths) |p| try putStr(gpa, out, p);
+    }
+
+    /// Caller owns the returned `paths` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !InterceptLists {
+        var cur = Cur{ .buf = payload };
+        const n = try cur.readU16();
+        const paths = try gpa.alloc([]const u8, n);
+        errdefer gpa.free(paths);
+        for (paths) |*p| p.* = try cur.readStr();
+        return .{ .paths = paths };
+    }
+};
+
+pub const InterceptStatusReq = struct {
+    pub const tag: Tag = .intercept_status_req;
+    view: u32,
+};
+
+/// Per-view counters. Answered on `intercept_status_req` AND pushed
+/// unsolicited when they change — coalesced helper-side (dirty flag,
+/// one frame per poll iteration at most) so a busy page never streams
+/// a frame per request. `rules` is the loaded-rule count (global).
+pub const InterceptStatus = struct {
+    pub const tag: Tag = .intercept_status;
+    view: u32,
+    enabled: u8,
+    rules: u32,
+    blocked: u32,
+    total: u32,
+};
+
+/// Pull entries with seq > `since` from the view's bounded ring (the
+/// MCP backlog rule: the log is polled, never streamed).
+pub const InterceptLogReq = struct {
+    pub const tag: Tag = .intercept_log_req;
+    view: u32,
+    since: u32,
+    max: u16,
+};
+
+/// One observed request. `done` = the load finished and
+/// `status`/`size`/`dur_ms` are real; a blocked entry is complete at
+/// birth (it never touches the network). `size` is the received body
+/// length, clamped.
+pub const NetEntry = struct {
+    seq: u32,
+    blocked: u8,
+    rtype: u8,
+    done: u8,
+    status: u16,
+    dur_ms: u32,
+    size: u32,
+    method: []const u8,
+    url: []const u8,
+};
+
+pub const InterceptLog = struct {
+    pub const tag: Tag = .intercept_log;
+    view: u32,
+    /// One past the newest seq in the ring; the client's next `since`.
+    next_seq: u32,
+    entries: []const NetEntry,
+
+    pub fn encodeTo(self: InterceptLog, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.next_seq);
+        try putU16(gpa, out, @intCast(self.entries.len));
+        for (self.entries) |e| {
+            try putU32(gpa, out, e.seq);
+            try putU8(gpa, out, e.blocked);
+            try putU8(gpa, out, e.rtype);
+            try putU8(gpa, out, e.done);
+            try putU16(gpa, out, e.status);
+            try putU32(gpa, out, e.dur_ms);
+            try putU32(gpa, out, e.size);
+            try putStr(gpa, out, e.method);
+            try putStr(gpa, out, e.url);
+        }
+    }
+
+    /// Caller owns the returned `entries` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !InterceptLog {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const next_seq = try cur.readU32();
+        const n = try cur.readU16();
+        const entries = try gpa.alloc(NetEntry, n);
+        errdefer gpa.free(entries);
+        for (entries) |*e| {
+            e.seq = try cur.readU32();
+            e.blocked = try cur.readU8();
+            e.rtype = try cur.readU8();
+            e.done = try cur.readU8();
+            e.status = try cur.readU16();
+            e.dur_ms = try cur.readU32();
+            e.size = try cur.readU32();
+            e.method = try cur.readStr();
+            e.url = try cur.readStr();
+        }
+        return .{ .view = view, .next_seq = next_seq, .entries = entries };
+    }
+};
+
+/// Render log entries as one newline-free JSON object — the shared
+/// presentation both clients (the GUI face's `web-network` command and
+/// the headless webdrive) hand to the `web_network` MCP tool. Kept
+/// here because both already depend on this module and a third copy of
+/// the format is how the two would drift. Caller frees.
+pub fn netLogJson(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEntry) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"next_seq\":{d},\"entries\":[", .{next_seq});
+    for (entries, 0..) |e, i| {
+        if (i != 0) try w.writeByte(',');
+        const rt: NetResource = @enumFromInt(e.rtype);
+        const rt_name = switch (rt) {
+            .other, .document, .subdocument, .stylesheet, .script, .image, .font, .xhr, .media, .websocket, .ping => @tagName(rt),
+            _ => "other",
+        };
+        try w.print("{{\"seq\":{d},\"blocked\":{s},\"type\":\"{s}\",\"method\":", .{
+            e.seq,
+            if (e.blocked != 0) "true" else "false",
+            rt_name,
+        });
+        try std.json.Stringify.value(e.method, .{}, w);
+        try w.writeAll(",\"url\":");
+        try std.json.Stringify.value(e.url, .{}, w);
+        if (e.blocked == 0) {
+            if (e.done != 0) {
+                try w.print(",\"status\":{d},\"duration_ms\":{d},\"size\":{d}", .{ e.status, e.dur_ms, e.size });
+            } else {
+                try w.writeAll(",\"pending\":true");
+            }
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+    return aw.toOwnedSlice();
+}
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -1135,6 +1329,73 @@ test "round-trip: semantic layer frames" {
         .code = .{ .s = "document.title" },
     });
     try roundTrip(SemEvalResult, .{ .view = 7, .ok = 1, .json = .{ .s = "{\"value\":\"x\"}" } });
+}
+
+test "round-trip: interception frames" {
+    try roundTrip(InterceptSet, .{ .view = 0, .enabled = 0 });
+    try roundTrip(InterceptSet, .{ .view = 7, .enabled = 1 });
+    try roundTrip(InterceptStatusReq, .{ .view = 7 });
+    try roundTrip(InterceptStatus, .{ .view = 7, .enabled = 1, .rules = 1234, .blocked = 5, .total = 61 });
+    try roundTrip(InterceptLogReq, .{ .view = 7, .since = 41, .max = 50 });
+}
+
+test "round-trip: intercept_lists path list" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const paths = [_][]const u8{ "/tmp/a.txt", "/home/x/.config/sketerm/filters/easylist.txt" };
+    try encode(gpa, &buf, InterceptLists{ .paths = &paths });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.intercept_lists, frame.tag);
+    const got = try InterceptLists.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.paths);
+    try std.testing.expectEqual(@as(usize, 2), got.paths.len);
+    try std.testing.expectEqualStrings(paths[1], got.paths[1]);
+}
+
+test "round-trip: intercept_log entry list" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const entries = [_]NetEntry{
+        .{ .seq = 40, .blocked = 1, .rtype = @intFromEnum(NetResource.image), .done = 1, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://ads.example/px.gif" },
+        .{ .seq = 41, .blocked = 0, .rtype = @intFromEnum(NetResource.script), .done = 1, .status = 200, .dur_ms = 12, .size = 4096, .method = "GET", .url = "https://site.example/app.js" },
+    };
+    try encode(gpa, &buf, InterceptLog{ .view = 7, .next_seq = 42, .entries = &entries });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.intercept_log, frame.tag);
+    const got = try InterceptLog.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.entries);
+    try std.testing.expectEqual(@as(u32, 42), got.next_seq);
+    try std.testing.expectEqual(@as(usize, 2), got.entries.len);
+    try std.testing.expectEqual(@as(u8, 1), got.entries[0].blocked);
+    try std.testing.expectEqualStrings("https://site.example/app.js", got.entries[1].url);
+    try std.testing.expectEqual(@as(u16, 200), got.entries[1].status);
+}
+
+test "netLogJson is one newline-free JSON object" {
+    const gpa = std.testing.allocator;
+    const entries = [_]NetEntry{
+        .{ .seq = 1, .blocked = 1, .rtype = @intFromEnum(NetResource.image), .done = 1, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://ads.example/px.gif" },
+        .{ .seq = 2, .blocked = 0, .rtype = @intFromEnum(NetResource.script), .done = 0, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://site.example/a\njs" },
+        .{ .seq = 3, .blocked = 0, .rtype = 99, .done = 1, .status = 404, .dur_ms = 7, .size = 11, .method = "POST", .url = "https://site.example/api" },
+    };
+    const json = try netLogJson(gpa, 4, &entries);
+    defer gpa.free(json);
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, json, '\n'));
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 4), obj.get("next_seq").?.integer);
+    const arr = obj.get("entries").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), arr.len);
+    try std.testing.expect(arr[0].object.get("blocked").?.bool);
+    try std.testing.expect(arr[1].object.get("pending").?.bool);
+    // An unknown wire type byte renders as "other", not a crash.
+    try std.testing.expectEqualStrings("other", arr[2].object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 404), arr[2].object.get("status").?.integer);
 }
 
 test "a text payload carries more than a str's u16 length" {

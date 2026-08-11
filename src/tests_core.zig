@@ -178,6 +178,7 @@ comptime {
     _ = @import("web/keymap.zig");
     _ = @import("web/semantic.zig");
     _ = @import("web/pace.zig");
+    _ = @import("web/filter.zig");
     _ = @import("web/model.zig");
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
