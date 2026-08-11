@@ -896,15 +896,10 @@ const HintItem = struct {
     widget: *c.GtkWidget,
 };
 
-/// One provider for the hint-label look, added on first use. Named
-/// libadwaita colors keep it legible in both themes.
-var g_webhint_css_added: bool = false;
-
+/// Hint-label look, installed once via cssutil. Named libadwaita
+/// colors keep it legible in both themes.
 fn webhintCss(widget: *c.GtkWidget) void {
-    if (g_webhint_css_added) return;
-    g_webhint_css_added = true;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider,
+    cssutil.install("webhint", widget,
         \\.sketerm-webhint {
         \\  background: @accent_bg_color;
         \\  color: @accent_fg_color;
@@ -916,13 +911,6 @@ fn webhintCss(widget: *c.GtkWidget) void {
         \\  font-family: monospace;
         \\}
     );
-    const display = c.gtk_widget_get_display(widget);
-    c.gtk_style_context_add_provider_for_display(
-        display,
-        @ptrCast(provider),
-        c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-    c.g_object_unref(provider);
 }
 
 /// Refcounted mmap of a frame memfd. `GBytes` built over it hold a
@@ -1452,8 +1440,14 @@ pub const WebFace = struct {
         if (self.hints_token != 0) return true; // request already out
         const token = self.autoBegin(.query, false) orelse return true;
         self.hints_token = token;
-        var buf: [24]u8 = undefined;
-        const arg = std.fmt.bufPrint(&buf, "{d} {d}", .{ self.sent_w, self.sent_h }) catch return true;
+        // The viewport travels in the page's CSS px space: user zoom
+        // shrinks the CSS viewport by its factor while the widget's
+        // logical size stays put.
+        const f = self.userZoomFactor();
+        const vw: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(self.sent_w)) / f));
+        const vh: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(self.sent_h)) / f));
+        var buf: [32]u8 = undefined;
+        const arg = std.fmt.bufPrint(&buf, "{d} {d}", .{ vw, vh }) catch return true;
         client().post(proto.SemQueryReq{
             .view = self.view,
             .kind = @intFromEnum(proto.SemQuery.visible),
@@ -1506,6 +1500,9 @@ pub const WebFace = struct {
 
         const max_x: i32 = @max(0, @as(i32, self.sent_w) - 24);
         const max_y: i32 = @max(0, @as(i32, self.sent_h) - 16);
+        // CSS px -> widget logical px: multiply the user-zoom factor
+        // back in (DPR never appears — the wire is logical throughout).
+        const f = self.userZoomFactor();
         for (parsed[0..n], 0..) |h, i| {
             const url = self.allocator.dupe(u8, h.url) catch break;
             var z: [16:0]u8 = @splat(0);
@@ -1513,8 +1510,10 @@ pub const WebFace = struct {
             @memcpy(z[0..m], labels[i][0..m]);
             const wgt = c.gtk_label_new(&z);
             c.gtk_widget_add_css_class(wgt, "sketerm-webhint");
-            const x = std.math.clamp(h.x + @as(i32, self.snap_dx), 0, max_x);
-            const y = std.math.clamp(h.y + @as(i32, self.snap_dy), 0, max_y);
+            const zx: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(h.x)) * f));
+            const zy: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(h.y)) * f));
+            const x = std.math.clamp(zx + @as(i32, self.snap_dx), 0, max_x);
+            const y = std.math.clamp(zy + @as(i32, self.snap_dy), 0, max_y);
             c.gtk_fixed_put(@ptrCast(layer), wgt, @floatFromInt(x), @floatFromInt(y));
             self.hints_items.append(self.allocator, .{
                 .sid = h.sid,
@@ -2839,8 +2838,16 @@ pub const WebFace = struct {
         self.setZoomLevel(0);
     }
 
+    /// Chromium zoom levels are logarithmic: factor = 1.2^(level/100).
+    fn userZoomFactor(self: *const WebFace) f64 {
+        if (self.zoom_x100 == 0) return 1.0;
+        return std.math.pow(f64, 1.2, @as(f64, @floatFromInt(self.zoom_x100)) / 100.0);
+    }
+
     fn setZoomLevel(self: *WebFace, level_x100: i32) void {
         if (level_x100 == self.zoom_x100) return;
+        // A zoom rescales every hint rect; stale labels would lie.
+        if (self.hints_active) self.cancelHints();
         self.zoom_x100 = level_x100;
         if (!self.view_live) return;
         client().post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
