@@ -127,7 +127,11 @@ const MCP_HELP =
 ;
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_VERSION = "0.1.0";
+
+/// What `serverInfo` reports. The MCP protocol version above is a spec
+/// date and stays a literal; OUR version never is — this one said 0.1.0
+/// for three releases.
+const SERVER_VERSION = @import("../version.zig").string;
 
 /// Pluggable side-effects so the dispatch logic unit-tests without a
 /// GUI, sockets, or real sleeps.
