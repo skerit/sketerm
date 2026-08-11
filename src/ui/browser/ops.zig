@@ -1424,12 +1424,21 @@ pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const [
         a.destroy(req);
         return;
     };
-    var n: usize = 0;
-    for (targets) |p| {
-        paths[n] = a.dupe(u8, p) catch continue;
-        dirs[n] = pathIsDir(tab, p);
-        n += 1;
+    // All-or-nothing: `DeleteReq.destroy` frees `paths`/`dirs` as
+    // whole allocations, so a partially filled array must never
+    // become a shorter sub-slice — freeing that is a length mismatch,
+    // and the untouched tail slots would leak their dupes anyway.
+    for (targets, 0..) |p, i| {
+        paths[i] = a.dupe(u8, p) catch {
+            for (paths[0..i]) |owned| a.free(owned);
+            a.free(paths);
+            a.free(dirs);
+            a.destroy(req);
+            return;
+        };
+        dirs[i] = pathIsDir(tab, p);
     }
+    const n = targets.len;
     var msg: [340:0]u8 = undefined;
     const verb: []const u8 = if (secure) "securely delete" else "permanently delete";
     const txt = if (n == 1)
@@ -1440,8 +1449,8 @@ pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const [
         .allocator = a,
         .view = self,
         .tab = tab,
-        .paths = paths[0..n],
-        .dirs = dirs[0..n],
+        .paths = paths,
+        .dirs = dirs,
         .secure = secure,
     };
     const root = c.gtk_widget_get_root(self.root_box);
