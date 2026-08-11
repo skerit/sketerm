@@ -16092,3 +16092,50 @@ Also fixed while wiring the menu: `classicmenu.Root.destroy` ignored
 `g_object_ref_sink`'s return value — latent (never referenced before,
 so lazy analysis skipped it) until the web face's error path became its
 first caller.
+
+## 2026-08-11: cross-face cleanup — one look, shared chrome, no private frameworks
+
+A duplication and look-and-feel audit across the five faces (terminal,
+files, editor, viewer, web) turned into a 20-commit cleanup. The
+headline user-facing fixes:
+
+- The per-pane titlebar is suppressed for the web identity like the
+  files identity (same redundancy argument), and non-terminal faces
+  now feed it real titles (page title / directory / document name)
+  instead of showing the hidden shell's stale OSC title. Manual lock
+  still wins; the OSC title returns when the shell face does.
+- `font_inc`/`font_dec`/`font_reset` act on the VISIBLE face via
+  `Pane.faceZoom`: the editor zooms its own font (plus Ctrl+wheel)
+  instead of silently resizing the hidden terminal.
+- The editor gained `new_editor_split` (palette, toolbar button,
+  bindable action) mirroring `new_browser_split` — the global tree
+  needed zero changes.
+- Inner tabs (files + editor, shared `tabhost.zig`) drag-reorder with
+  model sync, and the editor has a 10-deep reopen-closed-tab ring like
+  the browser's.
+- Files: Ctrl+F opens directory search. Editor and viewer accept file
+  drops. Web face: see the parity entry above.
+- Theme correctness: image canvas no longer hardcodes dark, the web
+  canvas no longer hardcodes white, tab accents follow the theme.
+
+New shared modules, replacing per-face copies: `ui/confirm.zig`
+(AdwAlertDialog pattern, ~16 sites), `ui/findbar.zig` (find chrome for
+editor find + project grep), `ui/toolbtn.zig` + promoted
+`ui/iconload.zig` (face toolbars; fixes the blank terminal icon under
+Breeze in web/editor toolbars), `ui/cssutil.zig` (one CSS installer,
+also fixes provider leaks), `ui/widgets.zig` (actionButton), shared
+clipboard copy/read helpers in `ui/clipboard.zig` (three async-read
+machines deleted), `input.fallbackToPaneBindings` (four copies), and a
+463-site `cast.userData`/`destroyCtx` adoption sweep. The viewer lost
+its private menu framework (now `classicmenu`), its deprecated
+GtkAppChooserDialog (now the files chooser, host apps included), its
+private byte formatter (MiB -> MB, matching files), and its
+keybinding-deaf hardcoded switch (zoom/copy chords now honor config).
+
+Verification: `zig build`, `zig build web`, `zig build test-core`
+green; `zig build test` is 2199 pass / 5 skip / 6 fail, and the 6
+failures (`ipc.mcp.test.ui_*`) reproduce IDENTICALLY on the pre-cleanup
+base commit on this machine — pre-existing, not from this work, left
+for a separate investigation. GUI behavior (menus, zoom, drops, find
+bars) is compile- and trace-verified; none of it was exercised on a
+live display this session.
