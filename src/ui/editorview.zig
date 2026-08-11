@@ -794,6 +794,18 @@ const ScrollGeom = struct {
     want_h: bool,
 };
 
+/// Closed documents remembered for undo-close (cap of the ring).
+pub const MAX_CLOSED_DOCS = 10;
+
+/// One remembered closed document; both strings are owned by the
+/// view's allocator ("" project = none).
+const ClosedDoc = struct {
+    spec: []u8,
+    cursor: usize,
+    top_line: usize,
+    project: []u8,
+};
+
 pub const EditorView = struct {
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
@@ -920,6 +932,14 @@ pub const EditorView = struct {
     active: ?*ETab = null,
     next_tab_id: u64 = 1,
     next_io_gen: u64 = 1,
+
+    /// Closed documents remembered for undo-close-tab, the editor's
+    /// mirror of the browser's ring (browser/tabs.zig). Only the spec
+    /// and cheap view state are kept: a dirty buffer went through the
+    /// save/discard dialog first, so the ring reopens the FILE, never
+    /// unsaved text; an Untitled tab (no spec) is not recorded.
+    /// Session-only on purpose, like the browser's.
+    closed_docs: std.ArrayList(ClosedDoc) = .empty,
 
     // Owned copies of the pane's font resolution inputs (the pane's
     // own fields live in the Config arena and re-point on config
@@ -2052,6 +2072,11 @@ pub const EditorView = struct {
         }
         for (self.tabs.items) |t| t.destroy();
         self.tabs.deinit(self.allocator);
+        for (self.closed_docs.items) |cd| {
+            self.allocator.free(cd.spec);
+            self.allocator.free(cd.project);
+        }
+        self.closed_docs.deinit(self.allocator);
         // After the tabs: each one releases its project reference.
         self.projects.deinit();
         self.results.deinit();
@@ -2633,7 +2658,56 @@ pub const EditorView = struct {
         }
     }
 
+    /// Remember a closing tab in the closed-document ring. Runs while
+    /// the tab is still intact; skips Untitled buffers (no spec).
+    fn stashClosedDoc(self: *EditorView, tab: *ETab) void {
+        const spec = tab.spec orelse return;
+        const spec_copy = self.allocator.dupe(u8, spec) catch return;
+        var root_buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+        const root: []const u8 = if (tab.project) |p|
+            p.rootSpec(&root_buf)
+        else
+            tab.restored_project orelse "";
+        const root_copy = self.allocator.dupe(u8, root) catch {
+            self.allocator.free(spec_copy);
+            return;
+        };
+        self.closed_docs.append(self.allocator, .{
+            .spec = spec_copy,
+            .cursor = @intCast(tab.sels.primary().head),
+            .top_line = tab.anchor.line,
+            .project = root_copy,
+        }) catch {
+            self.allocator.free(spec_copy);
+            self.allocator.free(root_copy);
+            return;
+        };
+        while (self.closed_docs.items.len > MAX_CLOSED_DOCS) {
+            const oldest = self.closed_docs.orderedRemove(0);
+            self.allocator.free(oldest.spec);
+            self.allocator.free(oldest.project);
+        }
+    }
+
+    /// Reopen the most recently closed document at its old caret and
+    /// scroll position. An already-open spec is focused instead
+    /// (openSpecRestored's rule), and the ring entry is spent either
+    /// way, mirroring the browser's reopenClosedTab.
+    pub fn reopenClosedDoc(self: *EditorView) void {
+        const entry = self.closed_docs.pop() orelse {
+            self.postStatus("no recently closed tab");
+            return;
+        };
+        defer {
+            self.allocator.free(entry.spec);
+            self.allocator.free(entry.project);
+        }
+        self.openSpecRestored(entry.spec, entry.cursor, entry.top_line, entry.project);
+    }
+
     fn closeTabForce(self: *EditorView, tab: *ETab) void {
+        // Undo-close needs the spec + caret before anything is freed.
+        self.stashClosedDoc(tab);
         tab.io_gen = 0; // orphan any in-flight IO
         // didClose + drop this tab's pending requests, while the
         // document (and its URI) still exist.

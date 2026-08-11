@@ -727,6 +727,22 @@ fn menuExtra(ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, m: c
         );
         p.itemIconEnabled("Reveal in File Browser", .{ .name = "folder-open-symbolic" }, saved, &onReveal, @ptrCast(cx));
     }
+
+    // The browser's Reopen Closed Tab precedent: present only when
+    // the ring has something to give back.
+    if (view.closed_docs.items.len > 0) {
+        var label: [96:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+            view.closed_docs.items.len,
+        }) catch "Reopen Closed Tab";
+        const r = m.section();
+        r.itemIcon(text.ptr, .{ .name = "document-open-recent-symbolic" }, &onReopenClosed, ctx);
+    }
+}
+
+fn onReopenClosed(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const view: *EditorView = @ptrCast(@alignCast(user.?));
+    view.reopenClosedDoc();
 }
 
 /// "Open in New Window": a standalone Sketerm Editor window on this
@@ -829,6 +845,13 @@ pub fn showStripMenu(view: *EditorView, x: f64, y: f64) void {
     const m = root.top();
     m.itemIcon("New Document", .{ .name = "tab-new-symbolic" }, &onStripNew, @ptrCast(view));
     m.itemIcon("Open File…", .{ .name = "document-open-symbolic" }, &onStripOpen, @ptrCast(view));
+    if (view.closed_docs.items.len > 0) {
+        var label: [96:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+            view.closed_docs.items.len,
+        }) catch "Reopen Closed Tab";
+        m.item(text.ptr, &onReopenClosed, @ptrCast(view));
+    }
     _ = root.popupVia(view.tabhost.widget(), view.root_box, x, y);
 }
 
