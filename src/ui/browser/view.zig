@@ -1653,6 +1653,7 @@ pub const BrowserView = struct {
         self.tabhost.on_close = &hostCloseCb;
         self.tabhost.on_new = &hostNewCb;
         self.tabhost.on_strip_menu = &hostStripMenuCb;
+        self.tabhost.on_reordered = &hostReorderedCb;
         self.tabhost.tab_menu = tabsmod.tabMenuSpec();
         const notebook = self.tabhost.widget();
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1794,6 +1795,24 @@ pub const BrowserView = struct {
     fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
         tabsmod.showStripMenu(self, x, y);
+    }
+
+    /// TabHost page drag-reorder: move the tab inside `tabs` so the
+    /// model matches the notebook again — paneState/tabPaths persist
+    /// in list order while `active_tab` is the notebook index, and a
+    /// divergence would restore the wrong layout.
+    fn hostReorderedCb(ctx: ?*anyopaque, page: *c.GtkWidget, new_index: usize) void {
+        const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+        for (self.tabs.items, 0..) |t, i| {
+            if (t.page != page) continue;
+            const moved = self.tabs.orderedRemove(i);
+            // Capacity survives the remove, so the insert cannot fail;
+            // the fallback append only exists to satisfy the API.
+            self.tabs.insert(self.allocator, @min(new_index, self.tabs.items.len), moved) catch {
+                self.tabs.append(self.allocator, moved) catch {};
+            };
+            return;
+        }
     }
 
     /// The browser's widgets are gone: nothing deferred may touch them

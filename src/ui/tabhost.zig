@@ -122,6 +122,11 @@ pub const TabHost = struct {
     /// Right-click on the strip's empty area, at notebook-space
     /// coordinates; the consumer builds and pops its own menu.
     on_strip_menu: ?*const fn (ctx: ?*anyopaque, x: f64, y: f64) void = null,
+    /// A page was drag-reordered to `new_index` (its new notebook
+    /// position). The consumer MUST resync its model list here, or
+    /// every "model index == page index" assumption (persistence
+    /// order, active-tab index) silently breaks after a drag.
+    on_reordered: ?*const fn (ctx: ?*anyopaque, page: *c.GtkWidget, new_index: usize) void = null,
     /// Per-tab context menu. Null = no per-tab menu at all (the
     /// right-click and the Menu key then do nothing).
     tab_menu: ?TabMenu = null,
@@ -211,6 +216,7 @@ pub const TabHost = struct {
         c.gtk_widget_add_controller(label_box, @ptrCast(rclick));
 
         _ = c.gtk_notebook_append_page(self.notebook, content, label_box);
+        c.gtk_notebook_set_tab_reorderable(self.notebook, content, 1);
         return handle;
     }
 
@@ -248,11 +254,13 @@ pub const TabHost = struct {
         return if (idx < 0) null else @intCast(idx);
     }
 
-    /// Wire the strip's empty-area gestures: right-click for the
-    /// consumer's menu, double-click for a new tab. Install once,
-    /// after the callbacks are set.
+    /// Wire the strip's empty-area gestures (right-click for the
+    /// consumer's menu, double-click for a new tab) and the
+    /// page-reordered relay. Install once, after the callbacks are
+    /// set and the host struct sits at its stable address.
     pub fn installStripGestures(self: *TabHost) void {
         const nb: *c.GtkWidget = self.widget();
+        _ = c.g_signal_connect_data(nb, "page-reordered", @ptrCast(&onPageReordered), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         const rclick = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
         _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onStripRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -270,6 +278,14 @@ pub const TabHost = struct {
         const keys = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onStripKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(nb, @ptrCast(keys));
+    }
+
+    /// GtkNotebook "page-reordered": relay a drag reorder to the
+    /// consumer so its model list can follow the widget order.
+    fn onPageReordered(_: *c.GtkNotebook, child: *c.GtkWidget, page_num: c.guint, user: ?*anyopaque) callconv(.c) void {
+        const self: *TabHost = @ptrCast(@alignCast(user.?));
+        const cb = self.on_reordered orelse return;
+        cb(self.ctx, child, @intCast(page_num));
     }
 
     // -- per-tab context menu -----------------------------------------

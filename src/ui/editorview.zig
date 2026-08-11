@@ -2120,6 +2120,7 @@ pub const EditorView = struct {
         self.tabhost.on_close = &hostCloseCb;
         self.tabhost.on_new = &hostNewCb;
         self.tabhost.on_strip_menu = &hostStripMenuCb;
+        self.tabhost.on_reordered = &hostReorderedCb;
         self.tabhost.tab_menu = editormenu.tabMenuSpec();
         const nb = self.tabhost.widget();
         c.gtk_widget_set_vexpand(nb, 0);
@@ -2559,6 +2560,24 @@ pub const EditorView = struct {
     fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx.?));
         editormenu.showStripMenu(self, x, y);
+    }
+
+    /// TabHost page drag-reorder: move the tab inside `tabs` so the
+    /// model matches the notebook again — paneState persists files in
+    /// list order and derives `active` from a list walk, so a stale
+    /// order would restore the session with the wrong tab order.
+    fn hostReorderedCb(ctx: ?*anyopaque, page: *c.GtkWidget, new_index: usize) void {
+        const self: *EditorView = @ptrCast(@alignCast(ctx.?));
+        for (self.tabs.items, 0..) |t, i| {
+            if (t.page != page) continue;
+            const moved = self.tabs.orderedRemove(i);
+            // Capacity survives the remove, so the insert cannot fail;
+            // the fallback append only exists to satisfy the API.
+            self.tabs.insert(self.allocator, @min(new_index, self.tabs.items.len), moved) catch {
+                self.tabs.append(self.allocator, moved) catch {};
+            };
+            return;
+        }
     }
 
     fn onSwitchPage(_: *c.GtkNotebook, page: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
