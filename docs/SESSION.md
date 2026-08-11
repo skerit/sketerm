@@ -16450,3 +16450,59 @@ a terminal failed frame; unknown ids ignored). Protocol round-trips
 for all four frames in both test roots. Not covered: a GUI-level
 end-to-end of the dialog/strip (would need a display session +
 helper); the smoke covers the wire and helper halves.
+
+## 2026-08-12: omnibox + palette on one suggestion framework
+
+The proposal's "command palette synthesis": URL / search / history /
+bookmarks / open-tabs / commands as pluggable sources in a shared
+ranking framework, consumed by the web face's address bar AND the
+command palette.
+
+- `src/util/suggest.zig` (GTK-free, both test roots): `Source`
+  vtable (`query(q) -> Candidate{title, detail, kind, score,
+  payload}`), a merger that drops non-matches, normalizes unbounded
+  scales (frecency) per source batch, weights, stably interleaves,
+  dedupes by key (URL) and caps; `matchScore` (prefix 1.0 > word
+  boundary 0.8 > substring 0.6, secondary field x0.7); the
+  address-bar `classify`/`normalizeUrl`/`searchUrl` heuristic with a
+  `{q}` engine template. `percent.zig` gained the RFC 3986 query
+  encoder.
+- `web_search_engine` config key (app-level string, default
+  `https://duckduckgo.com/?q={q}`): validated at parse (http(s) +
+  `{q}` required, bad line skipped), round-trips, clones. Search
+  queries are now PERCENT-ENCODED — the old normalizeUrl pasted the
+  raw query into the DDG URL. webface holds the template in a module
+  buffer (`setSearchEngine`, applied at window init + config apply)
+  because the config arena dies with its window.
+- Omnibox (`src/ui/omnibox.zig`): autohide-off GtkPopover under the
+  address entry; debounced (120ms) as-you-type refresh. Sources:
+  the input's URL/host reading (score 1.0) + its web-search reading
+  (1.0 when it IS a search, 0.35 fallback), open web tabs across all
+  windows (weight .9, activation SWITCHES via view-id →
+  `WebFace.reveal`, never a second load), bookmarks (weight .85,
+  fetched once per session, filtered locally), daemon history
+  (weight .8, normalized frecency; async — superseded queries are
+  `cancelFor`-ed on a dedicated anchor byte so replies cannot
+  mis-rank, and the bookmark fetch rides a second anchor). Keyboard:
+  Down/Up select (capture phase, the palette trick), Enter activates
+  a selection and otherwise stays "go to what I typed", Escape
+  closes. Never blocks the entry. Lifetime is the reader shape:
+  `sever` at the face's prepare-destroy choke point, destroy in
+  deinit.
+- Palette: matching/ranking moved onto the framework — the curated
+  list is a command `Source`, merge scores rows, a listbox sort func
+  puts the best match on top (tie-break on build order keeps the
+  curated ordering for bare queries, pinned by a test). DECISION:
+  the palette stays commands-only. Web sources there would need the
+  omnibox's async plumbing inside a modal dialog and mix "do an
+  action" rows with "go somewhere" rows the palette's dispatch model
+  (`dispatchAction`) has no verb for; the shared framework was the
+  deliverable and either consumer can gain sources later by
+  appending to its source array.
+
+Verification: `zig build`, `mux`, `mux-portable` green; full
+`zig build test` binary run directly: 2271 passed / 0 failed
+(the RUNNER-mode failure again reproduces on the clean base).
+Omnibox dropdown behavior is compile+trace verified (no CEF display
+rig in this session); the merger/scoring/encoding/config paths are
+unit-tested.
