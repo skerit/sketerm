@@ -16615,3 +16615,73 @@ Manual GUI verification: run with `SKETERM_WEB_A11Y=1` on a desktop
 with a live a11y bus, open a web tab, then
 `busctl --user tree :1.<n>` / Accerciser should list "sketerm web:
 <title>" as an application whose tree matches the page.
+## 2026-08-12: the web store gets a face — history, bookmarks, site memory
+
+The store from the previous entry had no UI and three persistence
+loops still ran in memory only. Both are closed.
+
+- `src/ui/webhistory.zig` (new): the History and Bookmarks windows,
+  one file because they share every list idiom. Transient toplevels
+  over the window that opened them (the `app_launcher.zig` shape),
+  non-modal so the page a row navigates to is visible behind them.
+  History searches through `history_query`'s OWN ranking — re-queried
+  per keystroke rather than filtered in the listbox, or a match past
+  the first page would never appear — and rows show title, url,
+  relative time and visit count. Bookmarks group by folder with a
+  `set_header_func` (headers are not rows, so nothing there can be
+  activated or deleted), filter client-side, and can be renamed,
+  re-foldered, reordered and opened in a new tab. Row activation
+  navigates the pane that opened the window, or opens a new web tab
+  when that pane is gone. "Clear History…" goes through `confirm.zig`.
+  Lifetime: one heap `List` freed on the window's "destroy", which is
+  also the `webstore.cancelFor` choke point the store client requires.
+- Palette + keybind actions `web_history` / `web_bookmarks`, and
+  History/Bookmarks rows in the web face's context menu. Neither needs
+  a web pane: they list the daemon's store and open a tab if asked.
+- Bookmark star in the web toolbar, reflecting whether THIS address is
+  bookmarked. State comes from a `bookmark_list` per committed
+  navigation rather than a local cache, so a page starred in another
+  window shows starred here. A plain button, not a toggle: a toggle
+  driven by an async reply would visibly flip back.
+- Permission decisions now persist. `webface.setSiteSettingSink` was
+  a hook nobody had installed; `installStoreSiteSink` (called where
+  the app-level popup policy is applied) makes it write `site_set`,
+  and `onSiteReply` pre-loads an origin's stored decisions into the
+  face's memory on every origin change — so a stored allow/block
+  answers `ev_permission` with NO banner, and a prompt already on
+  screen when the reply lands is drained instead of left asking a
+  question the store has answered. The bitmask is keyed as its
+  '+'-joined bit names (`camera+microphone`); a mask carrying a bit
+  this build cannot name is not persisted at all, because a key that
+  cannot be read back would answer the wrong prompt.
+- Per-site content blocking persists through the named `netStoreApply`
+  hook: the shield writes `site_set`, an origin change re-applies the
+  stored answer, and an origin with no override goes back to the
+  global default rather than inheriting the previous site's answer.
+  Choosing the default clears the override instead of pinning it.
+- Per-site popup override (`Site.popup`, already in the schema) now
+  actually decides in `onPopup`, over the app-level policy in both
+  directions, with an "Allow Popups on This Site" check row.
+- `bookmark_update.folder` became optional daemon-side (absent =
+  unchanged, "" = top level). It was "" = unchanged, which left a
+  bookmark with no way back out of a folder; the alternative was a
+  sentinel folder name, which is a hack.
+- `classicmenu.checkEnabled`: a check row that is greyed rather than
+  hidden when it has nothing to act on, matching `itemIconEnabled`.
+
+Tests: permission-key round-trip incl. combinations, unnamed bits and
+a too-small buffer; `site_get` reply parsing with perms; the relative
+time formatter at every scale (including a zero and a future stamp);
+bookmark folder grouping. Verification: `zig build`, `zig build mux`,
+`zig build mux-portable` green; `zig build test` 2264 passed / 0
+failed and `zig build test-core` 1859 passed / 0 failed (its runner
+"failed command" line is the pre-existing one noted above). Every
+commit was built at its own revision. The UI itself is compile- and
+trace-verified, not driven headlessly.
+
+Known limitation: the permission banner is still unreachable in the
+CEF build this helper uses (see the `webface.zig` header and smoke-web
+stage 22g), so the stored-decision path cannot be exercised end to end
+yet. Its origin matching also assumes the engine reports an origin in
+the same `scheme://host[:port]` form `originOf` normalizes to — a
+mismatch would mean the banner still appears, never a wrong answer.
