@@ -204,6 +204,8 @@ const webstore = @import("webstore.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const omnibox = @import("omnibox.zig");
+const axtree = @import("../web/axtree.zig");
+const webproj = @import("../a11y/webproj.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -552,6 +554,10 @@ pub const Client = struct {
     cap_devtools: bool = false,
     cap_print_pdf: bool = false,
     cap_downloads: bool = false,
+    /// The helper accepts `a11y_enable` and streams the AX tree. An
+    /// older helper simply skips the unknown frame, so this flag only
+    /// records what the face may expect back.
+    cap_a11y: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -915,6 +921,7 @@ pub const Client = struct {
                 self.cap_devtools = false;
                 self.cap_print_pdf = false;
                 self.cap_downloads = false;
+                self.cap_a11y = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -922,6 +929,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                 }
             },
             .frame_buffer => {
@@ -992,6 +1000,14 @@ pub const Client = struct {
             .ev_crashed => {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onCrashed();
+            },
+            .ev_a11y_tree => {
+                const ev = proto.decode(proto.EvA11yTree, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onAxTree(ev);
+            },
+            .ev_a11y_loc => {
+                const ev = proto.decode(proto.EvA11yLoc, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onAxLoc(ev);
             },
             .sem_snapshot => {
                 const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
@@ -1382,6 +1398,17 @@ pub const WebFace = struct {
     find_entry: *c.GtkWidget = undefined,
     find_count: *c.GtkWidget = undefined,
 
+    /// Mirrored AX tree + its AT-SPI projection (see the accessibility
+    /// section below). Both heap-allocated and owned; null until the
+    /// connect worker's handback adopts them.
+    ax_tree: ?*axtree.Tree = null,
+    ax_proj: ?*webproj.Proj = null,
+    ax_watch: c.guint = 0,
+    /// A bus-connect worker for this face is in flight; its idle
+    /// handback resolves through the client's faces list, never
+    /// through a stored pointer.
+    ax_connecting: bool = false,
+
     /// Objects carrying signals whose user-data is this face. All are
     /// disconnected at the teardown choke point -- so the array must be
     /// big enough for every one of them: `track` silently drops what
@@ -1721,6 +1748,8 @@ pub const WebFace = struct {
         self.stopPacing();
         self.stopDiscardTimer();
         self.stopDlTimer();
+        // The a11y bus watch carries this face as user-data too.
+        self.axTeardown();
         // Mechanism 2: one disconnect for every widget/controller that
         // carries this face as user-data, at the single choke point.
         // Nothing here owns a GDestroyNotify — combining the two would
@@ -1779,6 +1808,7 @@ pub const WebFace = struct {
         // Web-store replies resolve through this face: the deinit
         // choke point drops every pending callback (CLAUDE.md rule 2).
         webstore.cancelFor(@ptrCast(self));
+        self.axTeardown();
         self.detachScaleWatch();
         self.stopPacing();
         if (self.reader) |r| {
@@ -3015,6 +3045,175 @@ pub const WebFace = struct {
         self.track(drop);
     }
 
+    // ---- accessibility (capability "a11y") --------------------------
+    //
+    // Read-only projection, gated by SKETERM_WEB_A11Y=1: the helper
+    // streams the page's AX tree only after `a11y_enable` (engine-side
+    // accessibility costs real CPU), a mirrored tree (web/axtree.zig)
+    // lives on this face, and a11y/webproj.zig registers it on the
+    // session's accessibility bus as its own accessible application.
+    // The env flag IS the "a client asked" signal for now; screen-
+    // reader auto-detection (org.a11y.Status) and focus/action/caret
+    // projection are the documented follow-ups.
+    //
+    // The bus connect (SASL auth + GetAddress + Socket.Embed) is
+    // blocking IO, so it runs on a short-lived DETACHED worker that
+    // touches no GTK/face state and hands back through g_idle_add;
+    // only the handback frees the job, and it resolves the face
+    // through the client's faces list (pointer identity, deref only
+    // after match) so a face that died mid-connect just costs the
+    // worker its work.
+
+    fn a11yWanted() bool {
+        const v = c.getenv("SKETERM_WEB_A11Y") orelse return false;
+        return v[0] != 0 and v[0] != '0';
+    }
+
+    const AxJob = struct {
+        gpa: std.mem.Allocator,
+        /// Identity token; dereferenced only after it matches a live
+        /// registered face.
+        face: *WebFace,
+        view: u32,
+        tree: *axtree.Tree,
+        proj: *webproj.Proj,
+        ok: bool = false,
+
+        fn discard(self: *AxJob) void {
+            self.proj.deinit();
+            self.gpa.destroy(self.proj);
+            self.tree.deinit();
+            self.gpa.destroy(self.tree);
+        }
+    };
+
+    /// Bring the projection up (idempotent) and (re)tell the helper to
+    /// stream. Safe against an old helper: an unknown `a11y_enable`
+    /// frame is skipped by the reader, so nothing ever answers.
+    fn ensureA11y(self: *WebFace) void {
+        if (!a11yWanted() or self.attached or self.widgets_dead) return;
+        if (self.ax_proj != null) {
+            // A fresh helper connection knows nothing of the earlier
+            // enable; the projection itself survives helper restarts.
+            client().post(proto.A11yEnable{ .view = self.view, .enabled = 1 });
+            return;
+        }
+        if (self.ax_connecting) return;
+        const gpa = self.allocator;
+        const tree = gpa.create(axtree.Tree) catch return;
+        tree.* = axtree.Tree.init(gpa);
+        const proj = gpa.create(webproj.Proj) catch {
+            gpa.destroy(tree);
+            return;
+        };
+        proj.* = webproj.Proj.init(gpa, tree, "sketerm web page") catch {
+            gpa.destroy(proj);
+            tree.deinit();
+            gpa.destroy(tree);
+            return;
+        };
+        const job = gpa.create(AxJob) catch {
+            proj.deinit();
+            gpa.destroy(proj);
+            tree.deinit();
+            gpa.destroy(tree);
+            return;
+        };
+        job.* = .{ .gpa = gpa, .face = self, .view = self.view, .tree = tree, .proj = proj };
+        self.ax_connecting = true;
+        const th = std.Thread.spawn(.{}, axConnectWorker, .{job}) catch {
+            self.ax_connecting = false;
+            job.discard();
+            gpa.destroy(job);
+            return;
+        };
+        th.detach();
+    }
+
+    /// WORKER THREAD: blocking bus IO only; no GTK, no face state.
+    fn axConnectWorker(job: *AxJob) void {
+        job.ok = if (job.proj.connect(null)) |_| true else |_| false;
+        _ = c.g_idle_add(@ptrCast(&axConnectDone), job);
+    }
+
+    fn axConnectDone(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const job = cast.userData(AxJob, user);
+        const gpa = job.gpa;
+        defer gpa.destroy(job);
+        var adopt: ?*WebFace = null;
+        for (g_client.faces.items) |f| {
+            if (f == job.face and f.view == job.view and !f.widgets_dead) {
+                adopt = f;
+                break;
+            }
+        }
+        const face = adopt orelse {
+            job.discard();
+            return 0;
+        };
+        face.ax_connecting = false;
+        if (!job.ok) {
+            job.discard();
+            return 0;
+        }
+        face.ax_tree = job.tree;
+        face.ax_proj = job.proj;
+        face.ax_watch = c.g_unix_fd_add(
+            job.proj.fd,
+            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&onAxBusReadable),
+            face,
+        );
+        if (face.title) |t| job.proj.setAppName(t);
+        client().post(proto.A11yEnable{ .view = face.view, .enabled = 1 });
+        return 0;
+    }
+
+    fn onAxBusReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        const proj = self.ax_proj orelse {
+            self.ax_watch = 0;
+            return 0;
+        };
+        if (cond & (c.G_IO_HUP | c.G_IO_ERR) != 0 or !proj.step()) {
+            self.ax_watch = 0;
+            self.axTeardown();
+            return 0;
+        }
+        return 1;
+    }
+
+    /// Drop the projection AND stop the helper-side stream: a mirror
+    /// without a bus registration has no consumer. Idempotent; called
+    /// from the teardown choke point, `deinit`, and a dead bus.
+    fn axTeardown(self: *WebFace) void {
+        if (self.ax_watch != 0) {
+            _ = c.g_source_remove(self.ax_watch);
+            self.ax_watch = 0;
+        }
+        if (self.ax_proj) |p| {
+            client().post(proto.A11yEnable{ .view = self.view, .enabled = 0 });
+            p.deinit();
+            self.allocator.destroy(p);
+            self.ax_proj = null;
+        }
+        if (self.ax_tree) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+            self.ax_tree = null;
+        }
+    }
+
+    pub fn onAxTree(self: *WebFace, ev: proto.EvA11yTree) void {
+        const t = self.ax_tree orelse return;
+        t.applyTree(ev) catch {};
+    }
+
+    pub fn onAxLoc(self: *WebFace, ev: proto.EvA11yLoc) void {
+        const t = self.ax_tree orelse return;
+        t.applyLoc(ev) catch {};
+    }
+
     fn setStatus(self: *WebFace, text: []const u8, retryable: bool) void {
         if (self.widgets_dead) return;
         var buf: [512]u8 = undefined;
@@ -3142,6 +3341,9 @@ pub const WebFace = struct {
         // The first load has to paint promptly, and nothing paints
         // unless somebody asks.
         self.promote();
+        // Accessibility rides the view's lifecycle: every path that
+        // mints the view (first create, helper restart) re-asserts it.
+        self.ensureA11y();
         // Deliberately create-then-navigate, not the helper's
         // `view_create_url`: this face's view is created the moment the
         // socket connects, before the `hello_ack` that would say whether
@@ -3504,6 +3706,10 @@ pub const WebFace = struct {
         }
         self.applyTabTitle();
         self.applyPaneFaceTitle();
+        // The accessibility desktop lists the page by its title.
+        if (self.ax_proj) |p| {
+            if (title.len > 0) p.setAppName(title);
+        }
     }
 
     /// The pane's inner titlebar wears the page title too, but only
