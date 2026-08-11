@@ -182,6 +182,7 @@ comptime {
     _ = @import("web/pace.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/model.zig");
+    _ = @import("web/axtree.zig");
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/filehash.zig");
