@@ -197,6 +197,7 @@ const pace = @import("../web/pace.zig");
 const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
+const webhistory = @import("webhistory.zig");
 const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
@@ -500,6 +501,29 @@ var g_site_setting_sink: ?SiteSettingSink = null;
 
 pub fn setSiteSettingSink(sink: ?SiteSettingSink) void {
     g_site_setting_sink = sink;
+}
+
+/// Allocator the store sink queues its `site_set` with. The sink is a
+/// plain function pointer (one process, one store), so the allocator
+/// has to live beside it rather than travel in a context.
+var g_sink_gpa: ?std.mem.Allocator = null;
+
+/// Make the daemon web store the durable home of permission answers.
+/// Idempotent; called wherever the app-level browser policy is applied
+/// (Window construction and every config reload).
+pub fn installStoreSiteSink(gpa: std.mem.Allocator) void {
+    g_sink_gpa = gpa;
+    setSiteSettingSink(&storeSiteSink);
+}
+
+/// The installed sink: one `site_set` per remembered decision. A
+/// permission set this build cannot name is simply not persisted — a
+/// key that could not be read back would answer the wrong prompt.
+fn storeSiteSink(origin: []const u8, types: u32, allow: bool) void {
+    const gpa = g_sink_gpa orelse return;
+    var buf: [256]u8 = undefined;
+    const key = webstore.permKey(&buf, types) orelse return;
+    webstore.siteSetPerm(gpa, origin, key, if (allow) "allow" else "deny");
 }
 
 // ---------------------------------------------------------------------
@@ -1614,6 +1638,14 @@ pub const WebFace = struct {
     /// needs coarse progress. Mechanism 2, severed at the choke point
     /// like the pacing timers.
     dl_timer: c.guint = 0,
+    /// Bookmark star: the id of the bookmark for the CURRENT address,
+    /// or 0 when there is none. Refreshed from the store on every
+    /// committed navigation, so it reflects what other windows did too.
+    bookmark_id: u64 = 0,
+    star_btn: *c.GtkWidget = undefined,
+    /// This origin's stored popup override; `.inherit` follows the
+    /// app-level `web_popup_policy`.
+    site_popup: enum { inherit, allow, block } = .inherit,
 
     // ---- attach / teardown ------------------------------------------
 
@@ -2030,11 +2062,14 @@ pub const WebFace = struct {
         self.completeOp(.network, true, json, .{});
     }
 
-    /// Single integration point for a future daemon-side per-site
-    /// store: the store, when built, calls this with the remembered
-    /// decision for the page's site. Named so the other agent can wire
-    /// it without hunting; currently the toggle is in-memory only.
+    /// The daemon-side per-site store's entry point: called with the
+    /// remembered decision for the page's site on every origin change
+    /// (`onSiteReply`), including the "no override, back to the global
+    /// default" case — a view walks many sites and the previous one's
+    /// answer must not stick. Idempotent, so re-applying the default
+    /// costs no round trip.
     pub fn netStoreApply(self: *WebFace, enabled: bool) void {
+        if (enabled == self.net_enabled) return;
         self.setNetwork(enabled);
     }
 
@@ -2769,6 +2804,13 @@ pub const WebFace = struct {
         _ = c.g_signal_connect_data(@ptrCast(self.entry), "map", @ptrCast(&onEntryMap), self, null, 0);
         self.track(self.entry);
         c.gtk_box_append(@ptrCast(bar), self.entry);
+
+        // Bookmark star. A plain button, not a toggle: its pressed
+        // look would have to be driven from an async store reply, and
+        // a toggle that flips itself back a moment later reads as a
+        // bug. The ICON carries the state instead.
+        self.star_btn = toolbtn.barButton(bar, "non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
+        self.track(self.star_btn);
 
         // Reader mode. A toggle, because it is a state of the pane and
         // not an action: pressed = the article is showing.
@@ -3777,10 +3819,19 @@ pub const WebFace = struct {
     /// daemon web store and, when the origin changed, fetch its stored
     /// per-site zoom.
     fn noteNavigation(self: *WebFace, url: []const u8) void {
-        if (!recordableUrl(url)) return;
+        if (!recordableUrl(url)) {
+            // A blank/error page is bookmarkable by nothing; make sure
+            // the star does not keep claiming the page before it.
+            self.bookmark_id = 0;
+            self.updateStar();
+            return;
+        }
         webstore.recordVisit(self.allocator, url, "");
         if (self.visit_url) |u| self.allocator.free(u);
         self.visit_url = self.allocator.dupe(u8, url) catch null;
+        // Per-URL, not per-origin: two pages of one site are two
+        // different bookmarks.
+        self.refreshBookmarkState();
 
         var obuf: [512]u8 = undefined;
         const origin = webstore.originOf(&obuf, url) orelse return;
@@ -3800,8 +3851,9 @@ pub const WebFace = struct {
             std.mem.startsWith(u8, url, "file://");
     }
 
-    /// site_get answer: apply the origin's stored zoom to the view
-    /// WITHOUT writing it back (only the user path stores).
+    /// site_get answer: apply everything the origin has stored — zoom,
+    /// content-blocking, popup policy, permission decisions — WITHOUT
+    /// writing any of it back (only a user action stores).
     fn onSiteReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         const self = cast.userData(WebFace, ctx);
         if (!ok) return;
@@ -3812,11 +3864,141 @@ pub const WebFace = struct {
         // Stale reply: the face navigated elsewhere meanwhile.
         const cur = self.nav_origin orelse return;
         if (!std.ascii.eqlIgnoreCase(cur, rep.origin)) return;
+
         const zoom: i32 = if (rep.site) |site| site.zoom_x100 else 0;
-        if (zoom == self.zoom_x100) return;
-        self.zoom_x100 = zoom;
-        if (self.view_live)
-            client().post(proto.SetZoom{ .view = self.view, .level_x100 = zoom });
+        if (zoom != self.zoom_x100) {
+            self.zoom_x100 = zoom;
+            if (self.view_live)
+                client().post(proto.SetZoom{ .view = self.view, .level_x100 = zoom });
+        }
+
+        // An origin with no override follows the defaults, which is not
+        // the same as "leave the previous origin's answer in place":
+        // one view walks many sites.
+        self.site_popup = .inherit;
+        var want_block = true;
+        if (rep.site) |site| {
+            if (site.block) |b| want_block = b;
+            if (std.mem.eql(u8, site.popup, "allow")) self.site_popup = .allow;
+            if (std.mem.eql(u8, site.popup, "block")) self.site_popup = .block;
+            for (site.perms) |p| self.preloadPermission(rep.origin, p);
+        }
+        // netStoreApply is the named hook; it no-ops when the live
+        // state already matches.
+        self.netStoreApply(want_block);
+        // A prompt that arrived before this reply is answered now
+        // rather than left on screen asking a question the store has
+        // already answered.
+        self.answerRememberedPrompts();
+    }
+
+    /// Seed the in-process permission memory from the store. Never
+    /// reports to `SiteSettingSink`: this decision CAME from the store,
+    /// and echoing it back would be a write per navigation.
+    fn preloadPermission(self: *WebFace, origin: []const u8, p: webstore.PermEntry) void {
+        const types = webstore.permTypes(p.name) orelse return;
+        const allow = if (std.mem.eql(u8, p.decision, "allow"))
+            true
+        else if (std.mem.eql(u8, p.decision, "deny"))
+            false
+        else
+            return;
+        for (self.site_settings.items) |*s| {
+            if (s.types == types and std.mem.eql(u8, s.origin, origin)) {
+                s.allow = allow;
+                return;
+            }
+        }
+        const owned = self.allocator.dupe(u8, origin) catch return;
+        self.site_settings.append(self.allocator, .{
+            .origin = owned,
+            .types = types,
+            .allow = allow,
+        }) catch self.allocator.free(owned);
+    }
+
+    /// Drain any held prompt the (now loaded) memory can answer.
+    fn answerRememberedPrompts(self: *WebFace) void {
+        var i: usize = 0;
+        while (i < self.perm_queue.items.len) {
+            const p = self.perm_queue.items[i];
+            const allow = self.rememberedSetting(p.origin, p.types) orelse {
+                i += 1;
+                continue;
+            };
+            _ = self.perm_queue.orderedRemove(i);
+            self.postPermission(p.prompt, allow);
+            self.allocator.free(p.origin);
+        }
+        self.showPermPrompt();
+    }
+
+    // ---- bookmarks --------------------------------------------------
+
+    /// Ask the store whether the current address is bookmarked; the
+    /// reply moves the star. Cheap enough per navigation: a bookmark
+    /// list is tens of entries, and it is the only way one window sees
+    /// what another one starred.
+    fn refreshBookmarkState(self: *WebFace) void {
+        if (!webstore.bookmarkList(self.allocator, @ptrCast(self), &onBookmarkList)) {
+            self.bookmark_id = 0;
+            self.updateStar();
+        }
+    }
+
+    fn onBookmarkList(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
+        const self = cast.userData(WebFace, ctx);
+        self.bookmark_id = 0;
+        if (ok) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const url = self.url orelse self.visit_url orelse "";
+            if (url.len > 0) {
+                for (webstore.parseBookmarks(arena.allocator(), payload)) |b| {
+                    if (std.mem.eql(u8, b.url, url)) {
+                        self.bookmark_id = b.id;
+                        break;
+                    }
+                }
+            }
+        }
+        self.updateStar();
+    }
+
+    fn updateStar(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        const on = self.bookmark_id != 0;
+        toolbtn.setIcon(
+            self.star_btn,
+            self.bar,
+            if (on) "starred-symbolic" else "non-starred-symbolic",
+            if (on) "Bookmarked" else "Bookmark",
+        );
+        c.gtk_widget_set_tooltip_text(
+            self.star_btn,
+            if (on) "Remove this page from bookmarks" else "Bookmark this page",
+        );
+    }
+
+    /// Star: add the current page, or remove the bookmark it already
+    /// has. The reply-driven refresh is what learns the new id, so the
+    /// star is only ever as wrong as one round trip.
+    fn onStar(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        if (self.bookmark_id != 0) {
+            webstore.bookmarkRemove(self.allocator, self.bookmark_id);
+            self.bookmark_id = 0;
+            self.updateStar();
+            self.toast("Bookmark removed");
+            return;
+        }
+        const url = self.url orelse self.visit_url orelse return;
+        if (!recordableUrl(url)) return;
+        webstore.bookmarkAdd(self.allocator, url, self.title orelse "", "");
+        self.toast("Bookmarked");
+        // Ordered behind the add on the same connection, so it comes
+        // back with the id the add just minted.
+        self.refreshBookmarkState();
     }
 
     pub fn onLoad(self: *WebFace, ev: proto.EvLoad) void {
@@ -4068,11 +4250,19 @@ pub const WebFace = struct {
     /// and offered as a toast instead, which is the pop-under case. A
     /// helper that predates the flag reports every popup as gestured,
     /// so nothing changes against an old one.
+    ///
+    /// A per-site override stored for this origin wins over the
+    /// app-level policy in both directions — that is the point of
+    /// "allow popups on this site".
     pub fn onPopup(self: *WebFace, url: []const u8, user_gesture: bool) void {
-        const open = switch (g_popup_policy) {
+        const open = switch (self.site_popup) {
             .allow => true,
-            .block_all => false,
-            .block_gestureless => user_gesture,
+            .block => false,
+            .inherit => switch (g_popup_policy) {
+                .allow => true,
+                .block_all => false,
+                .block_gestureless => user_gesture,
+            },
         };
         if (open) {
             const win = self.ownerWindow() orelse return;
@@ -4510,6 +4700,26 @@ pub const WebFace = struct {
         const page = m.section();
         page.check("Reader View", self.reader_active, &onMenuReader, ctx);
         page.itemIconEnabled("Copy Page URL", .none, ctx.page != null, &onMenuCopyUrl, ctx);
+        page.checkEnabled(
+            "Bookmark This Page",
+            self.bookmark_id != 0,
+            ctx.page != null,
+            &onMenuBookmark,
+            ctx,
+        );
+        // Per-site popup override. Only offered once the page has an
+        // origin to attach it to (about:blank has none).
+        page.checkEnabled(
+            "Allow Popups on This Site",
+            self.site_popup == .allow,
+            self.nav_origin != null,
+            &onMenuAllowPopups,
+            ctx,
+        );
+
+        const store_section = m.section();
+        store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
+        store_section.itemIcon("Bookmarks", .{ .name = "starred-symbolic" }, &onMenuBookmarks, ctx);
         // A helper too old for either verb greys the row out rather
         // than hiding it: what a browser pane CAN do stays visible.
         const cl = client();
@@ -4575,6 +4785,37 @@ pub const WebFace = struct {
         const link = ctx.link orelse return;
         const win = ctx.face.ownerWindow() orelse return;
         win.newWebTabFrom(link, ctx.face.ownerPage()) catch {};
+    }
+
+    fn onMenuBookmark(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        onStar(face.star_btn, @ptrCast(face));
+    }
+
+    /// Store (or clear) this origin's popup override and apply it at
+    /// once, so the next popup from the page obeys without a reload.
+    fn onMenuAllowPopups(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const origin = face.nav_origin orelse return;
+        if (face.site_popup == .allow) {
+            face.site_popup = .inherit;
+            webstore.siteSetPopup(face.allocator, origin, "");
+        } else {
+            face.site_popup = .allow;
+            webstore.siteSetPopup(face.allocator, origin, "allow");
+        }
+    }
+
+    fn onMenuHistory(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        webhistory.openHistory(win, face.pane);
+    }
+
+    fn onMenuBookmarks(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        webhistory.openBookmarks(win, face.pane);
     }
 
     fn onMenuDevTools(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -5430,10 +5671,18 @@ pub const WebFace = struct {
         if (self.pane) |p| p.setWebVisible(false);
     }
 
-    /// Flip content blocking for this view (the per-site toggle).
+    /// Flip content blocking for this view AND remember it for the
+    /// site, so the next visit (in any window) starts that way.
     fn onShield(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
-        self.setNetwork(!self.net_enabled);
+        const want = !self.net_enabled;
+        self.setNetwork(want);
+        if (self.nav_origin) |origin| {
+            // A choice that matches the global default clears the
+            // override rather than pinning it, so changing the default
+            // later still moves this site.
+            webstore.siteSetBlock(self.allocator, origin, if (want) null else false);
+        }
     }
 
     /// The crashed / helper-lost overlay's Reload: restart the helper

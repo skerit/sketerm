@@ -635,6 +635,9 @@ pub const Window = struct {
             .block_all => .block_all,
         });
         @import("webface.zig").setSearchEngine(self.config.web_search_engine);
+        // Permission answers outlive the face that made them: the
+        // daemon web store is where they go.
+        @import("webface.zig").installStoreSiteSink(allocator);
         // IM strategy is an app-level key; every face reads it at
         // construction time (imhost.resolve).
         @import("imhost.zig").setPreference(switch (self.config.input_method) {
