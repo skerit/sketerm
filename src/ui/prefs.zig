@@ -1266,6 +1266,22 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addAppViewRow(@ptrCast(@alignCast(apps_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(apps_group)));
 
+    // Browser panes. App-level, like the rest of the web keys: one
+    // helper client, one policy.
+    const web_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(web_group)), "Web pages");
+    addSpinRowU32(
+        @ptrCast(@alignCast(web_group)),
+        ctx,
+        "Discard after (minutes)",
+        "Free an off-screen browser pane's renderer after this long; the pane keeps its last frame, dimmed, and RELOADS (losing back/forward history) when looked at again. 0 = never.",
+        0,
+        1440,
+        &ctx.cfg.web_discard_minutes,
+        applyOnly,
+    );
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(web_group)));
+
     // Input.
     const input_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(input_group)), "Input");
