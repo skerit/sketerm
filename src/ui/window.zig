@@ -240,6 +240,10 @@ pub const Window = struct {
     /// Process-shared durable download/edit-sync service, acquired
     /// lazily when this window creates its first browser face.
     file_transfer_service: ?*file_transfers.Service = null,
+    /// Last directory a web download's save dialog picked in THIS
+    /// window (owned spec, possibly host-qualified); the next dialog
+    /// starts there.
+    web_download_dir: ?[]u8 = null,
     tab_counter: u32 = 0,
     /// Process-global identity of this window, for cross-window
     /// addressing (the `window` field of an IPC `list`). The pane / tab
@@ -595,6 +599,7 @@ pub const Window = struct {
         // module-level in webface, which owns the one helper client.
         @import("webface.zig").setMaxFps(self.config.browser_max_fps);
         @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
+        @import("webface.zig").setDownloadAsk(self.config.web_download_ask);
         @import("webface.zig").setPopupPolicy(switch (self.config.web_popup_policy) {
             .block_gestureless => .block_gestureless,
             .allow => .allow,
@@ -941,6 +946,7 @@ pub const Window = struct {
         for (self.terminals.items) |t| t.deinit();
         for (self.panes.items) |p| p.deinit();
         if (self.file_transfer_service) |service| file_transfers.release(service, @ptrCast(self));
+        if (self.web_download_dir) |d| self.allocator.free(d);
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
         // Tabless app sessions: detach (apps are durable — they keep
@@ -1504,9 +1510,9 @@ pub const Window = struct {
         self.installBrowserHooks(bv);
     }
 
-    /// Give a browser face its window-level abilities: durable
-    /// terminal tabs on any host, and app-forwarded remote opens.
-    pub fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
+    /// The process-shared durable transfer service, acquired on first
+    /// use. Null only when the ledger directory is unusable.
+    pub fn transferService(self: *Window) ?*file_transfers.Service {
         if (self.file_transfer_service == null) {
             self.file_transfer_service = file_transfers.acquire(
                 self.allocator,
@@ -1514,7 +1520,13 @@ pub const Window = struct {
                 &browserTransferNotify,
             ) catch null;
         }
-        bv.transfer_service = self.file_transfer_service;
+        return self.file_transfer_service;
+    }
+
+    /// Give a browser face its window-level abilities: durable
+    /// terminal tabs on any host, and app-forwarded remote opens.
+    pub fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
+        bv.transfer_service = self.transferService();
         // Client-mediated transfers need a browser face with both host
         // connections; the service hands over any whose owner is gone.
         if (self.file_transfer_service) |service|

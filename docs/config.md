@@ -351,6 +351,8 @@ that framebuffer and costs nothing extra.
 | `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances. Applies to whichever shader a pane resolves to. |
 | `browser_max_fps` | int | `0` | Ceiling on how often a browser pane's page repaints. `0` = follow the output the window is on. Anything else must be `5`..`1000`; out of range is a parse error. |
 | `web_discard_minutes` | int | `30` | Minutes a web pane may stay off screen before its page is discarded outright (the browser is destroyed and the pane keeps its last frame, dimmed). `0` = never. |
+| `web_popup_policy` | enum | `block-gestureless` | What a browser pane does with a popup a page asks for: `block-gestureless`, `allow`, `block-all`. Anything else is a parse error. |
+| `web_download_ask` | bool | `true` | Whether a browser pane's download raises a save dialog. `false` auto-accepts into `~/Downloads` under the page's suggested name (uniquified on collision). The save dialog can also pick a `host:` location: the file downloads locally first, then hands off to that host's daemon as an ordinary transfer. |
 
 `browser_max_fps` is a CEILING, not a target. A browser pane paints
 nothing at all while its page is unchanged, and a background tab's page

@@ -430,6 +430,15 @@ pub fn setPopupPolicy(policy: PopupPolicy) void {
     g_popup_policy = policy;
 }
 
+/// `web_download_ask` from the config: true = a save dialog per
+/// download, false = auto-accept into ~/Downloads. App-level and
+/// module-level for the same reason as the popup policy.
+var g_download_ask: bool = true;
+
+pub fn setDownloadAsk(ask: bool) void {
+    g_download_ask = ask;
+}
+
 // ---------------------------------------------------------------------
 // Site settings (permission memory)
 // ---------------------------------------------------------------------
@@ -500,6 +509,7 @@ pub const Client = struct {
     /// hidden, so the verb is still discoverable.
     cap_devtools: bool = false,
     cap_print_pdf: bool = false,
+    cap_downloads: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -862,12 +872,14 @@ pub const Client = struct {
                 self.has_permissions = false;
                 self.cap_devtools = false;
                 self.cap_print_pdf = false;
+                self.cap_downloads = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.has_permissions = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                 }
             },
             .frame_buffer => {
@@ -998,6 +1010,20 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onPrintDone(ev.ok != 0, ev.path);
             },
+            .ev_download_offer => {
+                const ev = proto.decode(proto.EvDownloadOffer, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    face.onDownloadOffer(ev);
+                } else {
+                    // A held decision must always be answered; the pane
+                    // that would ask is gone.
+                    self.post(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" });
+                }
+            },
+            .ev_download_progress => {
+                const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onDownloadProgress(ev);
+            },
             else => {},
         }
     }
@@ -1083,6 +1109,8 @@ const WEBFACE_CSS =
     \\.sketerm-web-interstitial .detail { color: #e0c8c8; font-family: monospace; font-size: 0.9em; }
     \\.sketerm-web-permbar { background: #303030; color: #ffffff; padding: 6px; }
     \\.sketerm-web-permbar label { color: #ffffff; }
+    \\.sketerm-web-dlstrip { background: @headerbar_bg_color; padding: 3px 6px; }
+    \\.sketerm-web-dlrow progressbar { min-width: 120px; }
 ;
 
 fn webviewCss(widget: *c.GtkWidget) void {
@@ -1171,6 +1199,70 @@ const DmabufFds = struct {
     fn destroy(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(DmabufFds, user);
         for (self.fds[0..self.n]) |fd| _ = c.close(fd);
+        self.allocator.destroy(self);
+    }
+};
+
+/// One download this face is tracking, as its strip row shows it. The
+/// string slices are owned by the face's allocator; the widgets belong
+/// to the strip and die with the pane.
+const Download = struct {
+    /// The helper's download id (engine-minted, process-unique).
+    id: u32,
+    name: []u8,
+    /// LOCAL path being written: the user's pick for a local save, the
+    /// staging file for a redirected (host:) save.
+    path: []u8,
+    /// Remote destination of a redirected save; empty host = local.
+    remote_host: []u8,
+    remote_path: []u8,
+    /// Transfer-service ledger token of the handoff upload.
+    upload_token: ?[]u8 = null,
+    received: u64 = 0,
+    total: u64 = 0,
+    state: enum { downloading, uploading, done, failed } = .downloading,
+    /// The user pressed Cancel: the terminal event removes the row
+    /// instead of showing a failure the user asked for.
+    canceled: bool = false,
+
+    row: *c.GtkWidget,
+    label: *c.GtkWidget,
+    bar: *c.GtkWidget,
+    status: *c.GtkWidget,
+    cancel_btn: *c.GtkWidget,
+    open_btn: *c.GtkWidget,
+    reveal_btn: *c.GtkWidget,
+
+    fn free(self: *Download, a: std.mem.Allocator) void {
+        a.free(self.name);
+        a.free(self.path);
+        a.free(self.remote_host);
+        a.free(self.remote_path);
+        if (self.upload_token) |t| a.free(t);
+        a.destroy(self);
+    }
+};
+
+/// User-data for a download row's buttons: ids only, resolved through
+/// the client registry at click time (the PrintCtx liveness fence).
+/// Owned by the button via `cast.destroyCtx` (mechanism 1).
+const DlBtnCtx = struct {
+    allocator: std.mem.Allocator,
+    view: u32,
+    id: u32,
+};
+
+/// User-data for a download's save dialog; the dialog outlives a pane
+/// close by construction, so this carries ids, never the face.
+const DlPickCtx = struct {
+    allocator: std.mem.Allocator,
+    view: u32,
+    id: u32,
+    /// Suggested name (owned), the fallback when a pick has no leaf.
+    name: []u8,
+
+    fn free(self: *DlPickCtx) void {
+        self.allocator.free(self.name);
         self.allocator.destroy(self);
     }
 };
@@ -1437,6 +1529,17 @@ pub const WebFace = struct {
     shield_btn: *c.GtkWidget = undefined,
     shield_label: *c.GtkWidget = undefined,
 
+    /// Downloads this face started (capability "downloads"), shown as
+    /// one compact strip row each, and the strip they live in (bottom
+    /// of the pane, hidden while empty).
+    downloads: std.ArrayList(*Download) = .empty,
+    dl_strip: *c.GtkWidget = undefined,
+    /// 2Hz poll while any download is in its send-to-host phase: the
+    /// transfer service has no per-intent callback, and the strip only
+    /// needs coarse progress. Mechanism 2, severed at the choke point
+    /// like the pacing timers.
+    dl_timer: c.guint = 0,
+
     // ---- attach / teardown ------------------------------------------
 
     /// Put a web face on `pane`. A pane already wearing one just gets
@@ -1562,6 +1665,7 @@ pub const WebFace = struct {
         // below misses them.
         self.stopPacing();
         self.stopDiscardTimer();
+        self.stopDlTimer();
         // Mechanism 2: one disconnect for every widget/controller that
         // carries this face as user-data, at the single choke point.
         // Nothing here owns a GDestroyNotify — combining the two would
@@ -1628,6 +1732,12 @@ pub const WebFace = struct {
             self.reader = null;
         }
         self.stopDiscardTimer();
+        self.stopDlTimer();
+        // The helper cancels this view's engine-side downloads when the
+        // ViewDestroy above lands; a handed-off upload is the durable
+        // transfer service's and deliberately survives the pane.
+        for (self.downloads.items) |d| d.free(self.allocator);
+        self.downloads.deinit(self.allocator);
         self.dropMap();
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
@@ -2742,6 +2852,14 @@ pub const WebFace = struct {
         self.buildCertOverlay();
 
         c.gtk_box_append(@ptrCast(self.root_box), self.overlay);
+
+        // Download strip: one row per download, BELOW the page so an
+        // arriving download never shifts the content the user is
+        // reading. Hidden while empty.
+        self.dl_strip = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        c.gtk_widget_add_css_class(self.dl_strip, "sketerm-web-dlstrip");
+        c.gtk_widget_set_visible(self.dl_strip, 0);
+        c.gtk_box_append(@ptrCast(self.root_box), self.dl_strip);
     }
 
     /// The certificate interstitial: a full-face panel, opaque and
@@ -4513,6 +4631,493 @@ pub const WebFace = struct {
         var uri: [4096:0]u8 = undefined;
         const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{std.mem.span(path)}) catch return;
         _ = c.g_app_info_launch_default_for_uri(u.ptr, null, null);
+    }
+
+    // ---- downloads --------------------------------------------------
+    //
+    // The helper HOLDS every download's target decision until the face
+    // answers (`ev_download_offer` / `download_decide`). A local pick
+    // downloads straight to it; a `host:` pick (the picker browses
+    // remote hosts natively) downloads to a LOCAL staging file first
+    // and then hands off to the daemon's durable transfer path — v1
+    // deliberately routes origin -> local -> server, never
+    // fetch-on-server.
+
+    fn findDownload(self: *WebFace, id: u32) ?*Download {
+        for (self.downloads.items) |d| {
+            if (d.id == id) return d;
+        }
+        return null;
+    }
+
+    fn declineDownload(view: u32, id: u32) void {
+        client().post(proto.DownloadDecide{ .view = view, .id = id, .path = "" });
+    }
+
+    fn onDownloadOffer(self: *WebFace, ev: proto.EvDownloadOffer) void {
+        if (self.widgets_dead) {
+            declineDownload(ev.view, ev.id);
+            return;
+        }
+        const name = if (ev.name.len != 0) ev.name else "download";
+        if (!g_download_ask) {
+            self.autoAcceptDownload(ev.id, name);
+            return;
+        }
+        const pickwin = @import("picker.zig");
+        const ctx = self.allocator.create(DlPickCtx) catch {
+            declineDownload(ev.view, ev.id);
+            return;
+        };
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self.view,
+            .id = ev.id,
+            .name = self.allocator.dupe(u8, name) catch {
+                self.allocator.destroy(ctx);
+                declineDownload(ev.view, ev.id);
+                return;
+            },
+        };
+        const win = self.ownerWindow();
+        const gwin: ?*c.GtkWindow = if (win) |w| @ptrCast(w.app_window) else null;
+        _ = pickwin.PickerWindow.open(self.allocator, gwin, .{
+            .mode = .save_file,
+            .title = "Save Download",
+            .suggested_name = name,
+            // Per-window memory: start where this window last saved.
+            .initial_spec = if (win) |w| w.web_download_dir else null,
+        }, &onDlPathPicked, @ptrCast(ctx)) catch {
+            ctx.free();
+            declineDownload(ev.view, ev.id);
+            self.toast("Could not open the save dialog.");
+        };
+    }
+
+    /// `web_download_ask = false`: straight into ~/Downloads under the
+    /// suggested name, uniquified rather than overwritten.
+    fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8) void {
+        const home = c.getenv("HOME") orelse {
+            declineDownload(self.view, id);
+            return;
+        };
+        var dir_buf: [4096:0]u8 = undefined;
+        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/Downloads", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch {
+            declineDownload(self.view, id);
+            return;
+        };
+        _ = c.mkdir(dir.ptr, 0o755);
+        var path_buf: [4608]u8 = undefined;
+        const path = uniquePath(&path_buf, dir, name) orelse {
+            declineDownload(self.view, id);
+            return;
+        };
+        self.startDownload(id, name, path, "", "");
+    }
+
+    fn onDlPathPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
+        const ctx: *DlPickCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.free();
+        const res = result orelse {
+            declineDownload(ctx.view, ctx.id);
+            return;
+        };
+        if (res.specs.len == 0) {
+            declineDownload(ctx.view, ctx.id);
+            return;
+        }
+        // The face may have died while the dialog was up; the held
+        // decision still has to be answered (the client is immortal).
+        const self = client().findFace(ctx.view) orelse {
+            declineDownload(ctx.view, ctx.id);
+            return;
+        };
+        const spec = res.specs[0];
+        self.rememberDownloadDir(spec);
+        const loc = @import("../filebrowser/paths.zig").parseSpec(spec);
+        const leaf = std.fs.path.basename(loc.path);
+        const name = if (leaf.len != 0) leaf else ctx.name;
+        if (loc.host) |host| {
+            // Remote target: stage locally, hand off on completion.
+            var stage_buf: [4608]u8 = undefined;
+            const staging = self.stagingPath(&stage_buf, ctx.id, name) orelse {
+                declineDownload(ctx.view, ctx.id);
+                self.toast("No writable cache directory to stage the download in.");
+                return;
+            };
+            self.startDownload(ctx.id, name, staging, host, loc.path);
+            return;
+        }
+        self.startDownload(ctx.id, name, loc.path, "", "");
+    }
+
+    /// `$XDG_CACHE_HOME/sketerm/webdl/<id>-<name>`: where a redirected
+    /// download lands before its daemon handoff. Unlinked when the
+    /// handoff finishes (or its row is dismissed).
+    fn stagingPath(self: *WebFace, buf: []u8, id: u32, name: []const u8) ?[]const u8 {
+        _ = self;
+        var root_buf: [4096]u8 = undefined;
+        const cache: []const u8 = blk: {
+            if (c.getenv("XDG_CACHE_HOME")) |x| {
+                const s = std.mem.span(@as([*:0]const u8, @ptrCast(x)));
+                if (s.len != 0) break :blk s;
+            }
+            const home = c.getenv("HOME") orelse return null;
+            break :blk std.fmt.bufPrint(&root_buf, "{s}/.cache", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch return null;
+        };
+        var z: [4096:0]u8 = undefined;
+        const d1 = std.fmt.bufPrintZ(&z, "{s}/sketerm", .{cache}) catch return null;
+        _ = c.mkdir(d1.ptr, 0o700);
+        const d2 = std.fmt.bufPrintZ(&z, "{s}/sketerm/webdl", .{cache}) catch return null;
+        _ = c.mkdir(d2.ptr, 0o700);
+        return std.fmt.bufPrint(buf, "{s}/sketerm/webdl/{d}-{s}", .{ cache, id, name }) catch null;
+    }
+
+    fn rememberDownloadDir(self: *WebFace, spec: []const u8) void {
+        const win = self.ownerWindow() orelse return;
+        const slash = std.mem.lastIndexOfScalar(u8, spec, '/') orelse return;
+        if (slash == 0) return;
+        const dir = spec[0..slash];
+        const owned = win.allocator.dupe(u8, dir) catch return;
+        if (win.web_download_dir) |old| win.allocator.free(old);
+        win.web_download_dir = owned;
+    }
+
+    /// Create the tracking entry + strip row and answer the held offer
+    /// with `path`.
+    fn startDownload(self: *WebFace, id: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8) void {
+        if (self.findDownload(id) != null) return;
+        const d = self.allocator.create(Download) catch {
+            declineDownload(self.view, id);
+            return;
+        };
+        d.* = .{
+            .id = id,
+            .name = self.allocator.dupe(u8, name) catch &.{},
+            .path = self.allocator.dupe(u8, path) catch &.{},
+            .remote_host = self.allocator.dupe(u8, remote_host) catch &.{},
+            .remote_path = self.allocator.dupe(u8, remote_path) catch &.{},
+            .row = undefined,
+            .label = undefined,
+            .bar = undefined,
+            .status = undefined,
+            .cancel_btn = undefined,
+            .open_btn = undefined,
+            .reveal_btn = undefined,
+        };
+        if (d.path.len == 0) {
+            d.free(self.allocator);
+            declineDownload(self.view, id);
+            return;
+        }
+        self.downloads.append(self.allocator, d) catch {
+            d.free(self.allocator);
+            declineDownload(self.view, id);
+            return;
+        };
+        self.buildDlRow(d);
+        client().post(proto.DownloadDecide{ .view = self.view, .id = id, .path = d.path });
+    }
+
+    fn buildDlRow(self: *WebFace, d: *Download) void {
+        if (self.widgets_dead) return;
+        d.row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        c.gtk_widget_add_css_class(d.row, "sketerm-web-dlrow");
+
+        var name_z: [512:0]u8 = undefined;
+        d.label = c.gtk_label_new(std.fmt.bufPrintZ(&name_z, "{s}", .{d.name}) catch "download");
+        c.gtk_label_set_ellipsize(@ptrCast(d.label), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_label_set_max_width_chars(@ptrCast(d.label), 28);
+        c.gtk_label_set_xalign(@ptrCast(d.label), 0);
+        c.gtk_box_append(@ptrCast(d.row), d.label);
+
+        d.bar = c.gtk_progress_bar_new();
+        c.gtk_widget_set_hexpand(d.bar, 1);
+        c.gtk_widget_set_valign(d.bar, c.GTK_ALIGN_CENTER);
+        c.gtk_box_append(@ptrCast(d.row), d.bar);
+
+        d.status = c.gtk_label_new("");
+        c.gtk_widget_add_css_class(d.status, "dim-label");
+        c.gtk_box_append(@ptrCast(d.row), d.status);
+
+        d.open_btn = self.dlButton(d, "document-open-symbolic", "Open", &onDlOpenClicked);
+        c.gtk_widget_set_visible(d.open_btn, 0);
+        d.reveal_btn = self.dlButton(d, "folder-open-symbolic", "Show in Files", &onDlRevealClicked);
+        c.gtk_widget_set_visible(d.reveal_btn, 0);
+        d.cancel_btn = self.dlButton(d, "process-stop-symbolic", "Cancel", &onDlCancelClicked);
+
+        c.gtk_box_append(@ptrCast(self.dl_strip), d.row);
+        c.gtk_widget_set_visible(self.dl_strip, 1);
+        self.updateDlRow(d);
+    }
+
+    /// A flat row button whose user-data is a `DlBtnCtx` OWNED BY THE
+    /// BUTTON (mechanism 1) — never the face, which the row can
+    /// outlive a callback dispatch of.
+    fn dlButton(self: *WebFace, d: *Download, icon: [*:0]const u8, tip: [*:0]const u8, cb: *const fn (?*c.GtkButton, ?*anyopaque) callconv(.c) void) *c.GtkWidget {
+        const btn = c.gtk_button_new_from_icon_name(icon).?;
+        c.gtk_widget_add_css_class(btn, "flat");
+        c.gtk_widget_set_tooltip_text(btn, tip);
+        if (self.allocator.create(DlBtnCtx) catch null) |ctx| {
+            ctx.* = .{ .allocator = self.allocator, .view = self.view, .id = d.id };
+            _ = c.g_signal_connect_data(
+                @ptrCast(btn),
+                "clicked",
+                @ptrCast(cb),
+                @ptrCast(ctx),
+                @ptrCast(cast.destroyCtx(DlBtnCtx)),
+                0,
+            );
+        }
+        c.gtk_box_append(@ptrCast(d.row), btn);
+        return btn;
+    }
+
+    fn updateDlRow(self: *WebFace, d: *Download) void {
+        if (self.widgets_dead) return;
+        const format = @import("../filebrowser/format.zig");
+        var size_buf: [48:0]u8 = undefined;
+        var text: [128:0]u8 = undefined;
+        switch (d.state) {
+            .downloading => {
+                if (d.total > 0) {
+                    c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), @as(f64, @floatFromInt(d.received)) / @as(f64, @floatFromInt(d.total)));
+                } else {
+                    c.gtk_progress_bar_pulse(@ptrCast(d.bar));
+                }
+                const t = std.fmt.bufPrintZ(&text, "{s}", .{format.fmtSize(&size_buf, d.received)}) catch "";
+                c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
+            },
+            .uploading => {
+                var host_z: [128:0]u8 = undefined;
+                const t = std.fmt.bufPrintZ(&text, "Sending to {s}…", .{
+                    std.fmt.bufPrintZ(&host_z, "{s}", .{d.remote_host}) catch "host",
+                }) catch "Sending…";
+                c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
+                if (d.total > 0) c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), @as(f64, @floatFromInt(d.received)) / @as(f64, @floatFromInt(d.total)));
+            },
+            .done => {
+                c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), 1.0);
+                const t = if (d.remote_host.len != 0)
+                    std.fmt.bufPrintZ(&text, "Sent to {s}", .{d.remote_host}) catch "Sent"
+                else
+                    std.fmt.bufPrintZ(&text, "Saved — {s}", .{format.fmtSize(&size_buf, d.received)}) catch "Saved";
+                c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
+                // Open only makes sense for a file on THIS machine.
+                c.gtk_widget_set_visible(d.open_btn, if (d.remote_host.len == 0) 1 else 0);
+                c.gtk_widget_set_visible(d.reveal_btn, 1);
+                c.gtk_button_set_icon_name(@ptrCast(d.cancel_btn), "window-close-symbolic");
+                c.gtk_widget_set_tooltip_text(d.cancel_btn, "Dismiss");
+            },
+            .failed => {
+                c.gtk_label_set_text(@ptrCast(d.status), "Failed");
+                c.gtk_button_set_icon_name(@ptrCast(d.cancel_btn), "window-close-symbolic");
+                c.gtk_widget_set_tooltip_text(d.cancel_btn, "Dismiss");
+            },
+        }
+    }
+
+    fn onDownloadProgress(self: *WebFace, ev: proto.EvDownloadProgress) void {
+        const d = self.findDownload(ev.id) orelse return;
+        d.received = ev.received;
+        if (ev.total > 0) d.total = ev.total;
+        if (ev.failed != 0) {
+            if (d.canceled) {
+                self.removeDownload(d);
+                return;
+            }
+            d.state = .failed;
+            self.updateDlRow(d);
+            return;
+        }
+        if (ev.done != 0) {
+            if (d.remote_host.len != 0) {
+                self.beginHandoff(d);
+            } else {
+                d.state = .done;
+                self.updateDlRow(d);
+            }
+            return;
+        }
+        self.updateDlRow(d);
+    }
+
+    /// The downloaded staging file becomes a durable daemon transfer to
+    /// the picked host — the file browser's own machinery, so a GUI
+    /// crash mid-send resumes like any other transfer.
+    fn beginHandoff(self: *WebFace, d: *Download) void {
+        const win = self.ownerWindow() orelse {
+            d.state = .failed;
+            self.updateDlRow(d);
+            return;
+        };
+        const svc = win.transferService() orelse {
+            d.state = .failed;
+            self.updateDlRow(d);
+            self.toast("Downloaded locally, but the transfer service is unavailable to send it on.");
+            return;
+        };
+        d.upload_token = svc.submitUpload(self.allocator, d.path, d.remote_host, d.remote_path, null);
+        if (d.upload_token == null) {
+            d.state = .failed;
+            self.updateDlRow(d);
+            self.toast("Downloaded locally, but the send to the server could not be recorded.");
+            return;
+        }
+        // Second phase: the bar restarts for the upload leg.
+        d.state = .uploading;
+        d.received = 0;
+        self.updateDlRow(d);
+        self.ensureDlTimer();
+    }
+
+    fn ensureDlTimer(self: *WebFace) void {
+        if (self.dl_timer != 0) return;
+        self.dl_timer = c.g_timeout_add(500, @ptrCast(&onDlTick), self);
+    }
+
+    fn stopDlTimer(self: *WebFace) void {
+        if (self.dl_timer == 0) return;
+        _ = c.g_source_remove(self.dl_timer);
+        self.dl_timer = 0;
+    }
+
+    fn onDlTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        const win = self.ownerWindow();
+        const svc = if (win) |w| w.transferService() else null;
+        var uploading = false;
+        var i: usize = 0;
+        while (i < self.downloads.items.len) {
+            const d = self.downloads.items[i];
+            i += 1;
+            if (d.state != .uploading) continue;
+            const token = d.upload_token orelse continue;
+            const service = svc orelse continue;
+            const progress = service.intentProgress(token) orelse {
+                // Gone from the ledger = finished and acknowledged.
+                self.finishHandoff(d, true);
+                continue;
+            };
+            switch (progress.state) {
+                .done => self.finishHandoff(d, true),
+                .failed => self.finishHandoff(d, false),
+                .canceled => {
+                    self.dropStaging(d);
+                    self.removeDownload(d);
+                    i -|= 1;
+                },
+                else => {
+                    d.received = progress.done;
+                    if (progress.total > 0) d.total = progress.total;
+                    self.updateDlRow(d);
+                    uploading = true;
+                },
+            }
+        }
+        if (!uploading) {
+            self.dl_timer = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    fn finishHandoff(self: *WebFace, d: *Download, ok: bool) void {
+        if (ok) self.dropStaging(d);
+        d.state = if (ok) .done else .failed;
+        if (ok and d.total > 0) d.received = d.total;
+        self.updateDlRow(d);
+    }
+
+    /// Unlink the local staging copy of a redirected download.
+    fn dropStaging(self: *WebFace, d: *Download) void {
+        _ = self;
+        if (d.remote_host.len == 0) return;
+        var z: [4608:0]u8 = undefined;
+        if (d.path.len + 1 > z.len) return;
+        @memcpy(z[0..d.path.len], d.path);
+        z[d.path.len] = 0;
+        _ = c.unlink(&z);
+    }
+
+    fn removeDownload(self: *WebFace, d: *Download) void {
+        for (self.downloads.items, 0..) |it, idx| {
+            if (it != d) continue;
+            _ = self.downloads.orderedRemove(idx);
+            break;
+        }
+        if (!self.widgets_dead) {
+            c.gtk_box_remove(@ptrCast(self.dl_strip), d.row);
+            if (self.downloads.items.len == 0) c.gtk_widget_set_visible(self.dl_strip, 0);
+        }
+        d.free(self.allocator);
+    }
+
+    fn onDlCancelClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(DlBtnCtx, user);
+        const self = client().findFace(ctx.view) orelse return;
+        const d = self.findDownload(ctx.id) orelse return;
+        switch (d.state) {
+            .downloading => {
+                d.canceled = true;
+                client().post(proto.DownloadCancel{ .view = ctx.view, .id = ctx.id });
+            },
+            .uploading => {
+                d.canceled = true;
+                if (d.upload_token) |token| {
+                    if (self.ownerWindow()) |w| {
+                        if (w.transferService()) |svc| svc.cancel(token);
+                    }
+                }
+                // The tick sees the canceled state and removes the row.
+                self.ensureDlTimer();
+            },
+            .done, .failed => self.removeDownload(d),
+        }
+    }
+
+    fn onDlOpenClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(DlBtnCtx, user);
+        const self = client().findFace(ctx.view) orelse return;
+        const d = self.findDownload(ctx.id) orelse return;
+        if (d.remote_host.len != 0) return;
+        var uri: [4700:0]u8 = undefined;
+        const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{d.path}) catch return;
+        _ = c.g_app_info_launch_default_for_uri(u.ptr, null, null);
+    }
+
+    fn onDlRevealClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(DlBtnCtx, user);
+        const self = client().findFace(ctx.view) orelse return;
+        const d = self.findDownload(ctx.id) orelse return;
+        var spec: [4700]u8 = undefined;
+        const s = if (d.remote_host.len != 0)
+            std.fmt.bufPrint(&spec, "{s}:{s}", .{ d.remote_host, d.remote_path }) catch return
+        else
+            d.path;
+        _ = @import("siblingapp.zig").showInFiles(s);
+    }
+
+    /// Fill `buf` with `<dir>/<name>`, appending " (n)" before the
+    /// extension while the plain path already exists.
+    fn uniquePath(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
+        var z: [4608:0]u8 = undefined;
+        const dot = blk: {
+            const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
+            break :blk if (at == 0) name.len else at;
+        };
+        var n: u32 = 0;
+        while (n < 100) : (n += 1) {
+            const candidate = if (n == 0)
+                std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null
+            else
+                std.fmt.bufPrint(buf, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n, name[dot..] }) catch return null;
+            if (candidate.len + 1 > z.len) return null;
+            @memcpy(z[0..candidate.len], candidate);
+            z[candidate.len] = 0;
+            if (c.access(&z, c.F_OK) != 0) return candidate;
+        }
+        return null;
     }
 
     // ---- widget callbacks ------------------------------------------

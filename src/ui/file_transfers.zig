@@ -1305,6 +1305,49 @@ pub const Service = struct {
         self.appendIntent(.download, host, remote_path, "", cache_path, app_id orelse "", watch_token, 0, origin);
     }
 
+    /// Submit a one-way upload of a LOCAL file to `host:remote_path`
+    /// as a durable daemon transfer with no edit watch attached — the
+    /// web download manager's redirect-to-server handoff. Returns the
+    /// ledger token (allocated from `allocator`, caller owns) so the
+    /// submitter can poll `intentProgress`, or null when the record
+    /// could not be created.
+    pub fn submitUpload(self: *Service, allocator: std.mem.Allocator, local_path: []const u8, host: []const u8, remote_path: []const u8, origin: ?*anyopaque) ?[]u8 {
+        if (self.durability_error) {
+            self.notify("transfer not started because recovery state is unavailable", .{});
+            return null;
+        }
+        const it = self.createIntent(.upload, "", local_path, host, remote_path, "", "", 0) catch return null;
+        it.origin = origin;
+        self.intents.append(self.allocator, it) catch {
+            _ = it.handle.destroyRecord();
+            it.destroy(self.allocator);
+            return null;
+        };
+        const token = allocator.dupe(u8, it.token) catch null;
+        self.writeIntent(it);
+        if (self.durability_error) {
+            self.removeIntent(it);
+            if (token) |t| allocator.free(t);
+            return null;
+        }
+        self.pump();
+        self.refreshViews();
+        return token;
+    }
+
+    pub const IntentProgress = struct { state: store.State, done: u64, total: u64 };
+
+    /// Live progress for one owned intent, or null when the record is
+    /// gone — which, for a token this process submitted and has been
+    /// polling, means it finished and was acknowledged away.
+    pub fn intentProgress(self: *Service, token: []const u8) ?IntentProgress {
+        for (self.intents.items) |it| {
+            if (!std.mem.eql(u8, it.token, token)) continue;
+            return .{ .state = it.state, .done = it.done, .total = it.total };
+        }
+        return null;
+    }
+
     fn appendIntent(self: *Service, kind: store.Kind, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, app_id: []const u8, watch_token: []const u8, generation: u64, origin: ?*anyopaque) void {
         if (self.durability_error) {
             self.notify("transfer not started because recovery state is unavailable", .{});

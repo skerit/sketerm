@@ -1172,6 +1172,10 @@ pub const Config = struct {
     /// its back/forward history is gone. Conservative by default for
     /// exactly that reason.
     web_discard_minutes: u32 = 30,
+    /// Whether a browser pane's download raises a save dialog. False =
+    /// auto-accept into ~/Downloads under the page's suggested name
+    /// (uniquified on collision). App-level, like the popup policy.
+    web_download_ask: bool = true,
     /// What a browser pane does with a popup the page asks for. The
     /// helper never opens one itself, so this is the GUI's whole
     /// policy. `block-gestureless` (the default) opens the popups a
@@ -1728,6 +1732,7 @@ pub const Config = struct {
         if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
         if (self.browser_max_fps != 0) try w.print("browser_max_fps = {d}\n", .{self.browser_max_fps});
         if (self.web_discard_minutes != 30) try w.print("web_discard_minutes = {d}\n", .{self.web_discard_minutes});
+        if (!self.web_download_ask) try w.print("web_download_ask = false\n", .{});
         if (self.web_popup_policy != .block_gestureless) try w.print("web_popup_policy = {s}\n", .{
             switch (self.web_popup_policy) {
                 .block_gestureless => "block-gestureless",
@@ -2859,6 +2864,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.browser_max_fps = @intCast(n);
     } else if (std.mem.eql(u8, key, "web_discard_minutes")) {
         cfg.web_discard_minutes = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "web_download_ask")) {
+        cfg.web_download_ask = try parseBool(value);
     } else if (std.mem.eql(u8, key, "web_popup_policy")) {
         cfg.web_popup_policy = if (std.mem.eql(u8, value, "block-gestureless") or
             std.mem.eql(u8, value, "block_gestureless"))
