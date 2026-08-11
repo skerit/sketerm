@@ -1371,6 +1371,38 @@ pub const Window = struct {
             if (n == 1) "" else "s",
         }) catch return;
         showToast(self, msg);
+    /// A palette verb that only means something on a pane wearing the
+    /// WEB face. A pane without one is told so, rather than left
+    /// wondering why the action did nothing.
+    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf }) void {
+        const pane = self.focusedPane() orelse return;
+        const face = @import("webface.zig").WebFace.fromPane(pane) orelse {
+            showToast(self, "This pane has no web page. Use New Web Tab.");
+            return;
+        };
+        switch (what) {
+            .devtools => face.openDevTools(),
+            .print_pdf => face.printToPdf(),
+        }
+    }
+
+    /// Split `source` and give the new pane a web face bound to an
+    /// EXISTING helper-side view — the inspector `devtools_show`
+    /// minted for the page in `source` (src/ui/webface.zig).
+    ///
+    /// `splitPane`, not `splitFocused`: the reply that brings the view
+    /// id arrives from the socket, by which time focus may sit
+    /// anywhere, and splitting the wrong pane would put DevTools
+    /// beside a page it does not inspect.
+    pub fn openDevToolsSplit(self: *Window, source: *Pane, view: u32) !void {
+        const before = self.panes.items.len;
+        try self.splitPane(source, @intCast(c.GTK_ORIENTATION_HORIZONTAL));
+        if (self.panes.items.len <= before) return error.SplitFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attachView(self.allocator, pane, view) catch |err| {
+            logActionError("web_devtools attach", err);
+            return err;
+        };
     }
 
     /// New tab whose pane wears the text-editor face (the shell
@@ -3553,6 +3585,8 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
                 showToast(self, "This pane has no web page. Use New Web Tab.");
         },
         .web_discard_background => self.discardBackgroundWebTabs(),
+        .web_devtools => self.webFaceAction(.devtools),
+        .web_print_pdf => self.webFaceAction(.print_pdf),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

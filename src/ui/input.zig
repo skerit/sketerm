@@ -196,6 +196,13 @@ pub const Action = enum {
     /// dimmed, until it is looked at again. What
     /// `web_discard_minutes` does on a timer, on demand.
     web_discard_background,
+    /// Open the browser engine's DevTools for the focused web pane,
+    /// in a split beside it (src/ui/webface.zig). No debugging port
+    /// is involved: the inspector is another helper-side view.
+    web_devtools,
+    /// Save the focused web pane's page as a PDF, through a save
+    /// dialog; the browser helper writes the file.
+    web_print_pdf,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -490,6 +497,8 @@ pub fn actionName(a: Action) []const u8 {
         .web_hints => "web_hints",
         .web_reader => "web_reader",
         .web_discard_background => "web_discard_background",
+        .web_devtools => "web_devtools",
+        .web_print_pdf => "web_print_pdf",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -583,6 +592,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .web_hints => "Link hints on the web page (type a label to click)",
         .web_reader => "Reader view on/off (this pane's web page)",
         .web_discard_background => "Discard background web tabs (free their memory)",
+        .web_devtools => "Open DevTools for this web pane (in a split)",
+        .web_print_pdf => "Print this web page to a PDF file",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",

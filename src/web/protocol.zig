@@ -34,6 +34,18 @@ pub const CAP_SEMANTIC = "semantic";
 /// two documents (about:blank, then the page) and lets a settle that
 /// watches "some url loaded" answer for the blank one.
 pub const CAP_VIEW_CREATE_URL = "view-create-url";
+/// The helper accepts `view_discard`: a view whose browser is destroyed
+/// outright while its ID and address survive, revived on the next
+/// `view_show`, navigation or input. A client without this capability
+/// keeps sending `view_hide`, which only stops the painting.
+pub const CAP_DISCARD = "discard";
+/// The helper accepts `devtools_show`: the engine's own inspector,
+/// opened as ANOTHER windowless view the client presents like any
+/// other. No remote debugging port is ever opened.
+pub const CAP_DEVTOOLS = "devtools";
+/// The helper accepts `print_pdf`: render a view to a PDF file at a
+/// path IT can write (helper and client are the same machine in v1).
+pub const CAP_PRINT_PDF = "print-pdf";
 /// The helper accepts `find`/`find_stop` and answers with
 /// `ev_find_result`.
 pub const CAP_FIND = "find";
@@ -47,11 +59,6 @@ pub const CAP_CONTEXT_MENU = "context-menu";
 /// to the client — the client only configures, polls the bounded
 /// request log, and receives coalesced per-view counters.
 pub const CAP_INTERCEPT = "intercept";
-/// The helper accepts `view_discard`: a view whose browser is destroyed
-/// outright while its ID and address survive, revived on the next
-/// `view_show`, navigation or input. A client without this capability
-/// keeps sending `view_hide`, which only stops the painting.
-pub const CAP_DISCARD = "discard";
 /// The helper reports certificate errors as `ev_cert_error` and waits
 /// for a `cert_decision` instead of failing the load. A client without
 /// it sees only the generic `ev_load_error` an older helper produced,
@@ -101,6 +108,11 @@ pub const Tag = enum(u8) {
     ev_cursor = 0x46,
     ev_console = 0x47,
     ev_crashed = 0x48,
+    find = 0x50,
+    find_stop = 0x51,
+    set_zoom = 0x52,
+    ev_find_result = 0x53,
+    ev_context_menu = 0x54,
     ev_cert_error = 0x55,
     cert_decision = 0x56,
     ev_permission = 0x57,
@@ -115,11 +127,6 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
-    find = 0x50,
-    find_stop = 0x51,
-    set_zoom = 0x52,
-    ev_find_result = 0x53,
-    ev_context_menu = 0x54,
     intercept_set = 0x80,
     intercept_lists = 0x81,
     intercept_status_req = 0x82,
@@ -128,6 +135,10 @@ pub const Tag = enum(u8) {
     intercept_log = 0x85,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
+    devtools_show = 0xA2,
+    ev_devtools_view = 0xA3,
+    print_pdf = 0xA4,
+    ev_print_pdf_done = 0xA5,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -1100,6 +1111,104 @@ pub fn netLogJson(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEnt
     return aw.toOwnedSlice();
 }
 
+// -- devtools (0xA2 block, capability "devtools") ---------------------
+
+/// Open the engine's inspector for `view`. The helper answers with
+/// exactly one `ev_devtools_view`, whether or not it could open one.
+///
+/// The inspector is a NORMAL view: the helper creates it windowless,
+/// gives it a view id of its own and paints, resizes, inputs and
+/// destroys it through the frames every other view uses. There is
+/// deliberately no debugging PORT anywhere in this design — nothing
+/// listens on TCP, and the inspector is only reachable through this
+/// socket.
+///
+/// `x`/`y` are LOGICAL coordinates in the SOURCE view to inspect
+/// ("inspect element at"); both 0 means "just open it".
+pub const DevToolsShow = struct {
+    pub const tag: Tag = .devtools_show;
+    view: u32,
+    x: i32,
+    y: i32,
+};
+
+/// The inspector view for `view`, or `devtools = 0` when there is no
+/// view to present.
+///
+/// The id is allocated by the HELPER, not by the client, so it comes
+/// from a range client-allocated ids never reach (see
+/// `DEVTOOLS_VIEW_BASE`). A client must treat it as an ordinary view
+/// id from then on: resize it, show/hide it, and `view_destroy` it
+/// when the surface presenting it goes away.
+///
+/// `reason` explains a zero, because the outcomes are not equivalent
+/// and a client says different things about them. It is a short
+/// machine-readable token, empty on success:
+///   - `windowed` — the inspector IS open, in a window of the ENGINE's
+///     own making, because the engine refused to render it off-screen.
+///     Nothing was lost; there is simply no view to put in a pane.
+///     (CEF 151 always answers this — see `Host.adoptBrowser`.)
+///   - `no such view` / `no browser` / `unsupported` — nothing opened.
+pub const EvDevToolsView = struct {
+    pub const tag: Tag = .ev_devtools_view;
+    view: u32,
+    devtools: u32,
+    reason: []const u8,
+};
+
+/// First view id a helper may mint for an inspector. Client ids are
+/// allocated from 1 upwards, so the two ranges cannot collide without
+/// a client opening two billion views first.
+pub const DEVTOOLS_VIEW_BASE: u32 = 0x4000_0000;
+
+// -- print to PDF (0xA4 block, capability "print-pdf") ----------------
+
+/// Render `view` to a PDF at `path`. The path is interpreted by the
+/// HELPER, which is on the same machine as the client in v1; the
+/// helper never creates directories and never overwrites anything the
+/// engine's own writer would not.
+pub const PrintPdf = struct {
+    pub const tag: Tag = .print_pdf;
+    view: u32,
+    /// `print_flag_*` bits.
+    flags: u8,
+    /// `Paper` value; anything unknown means the engine default.
+    paper: u8,
+    path: []const u8,
+};
+
+/// `PrintPdf.flags` bits.
+pub const print_flag_landscape: u8 = 1;
+pub const print_flag_background: u8 = 2;
+
+/// `PrintPdf.paper` presets, in the engine-agnostic terms every
+/// engine has: a named sheet, not a driver's page-setup blob.
+pub const Paper = enum(u8) { default = 0, a4 = 1, letter = 2, legal = 3, _ };
+
+/// A sheet in INCHES — the unit both CDP's `Page.printToPDF` and
+/// CEF's settings struct speak.
+pub const PaperSize = struct { w: f64, h: f64 };
+
+/// Paper size for a preset, or null for "let the engine decide".
+pub fn paperInches(paper: u8) ?PaperSize {
+    return switch (@as(Paper, @enumFromInt(paper))) {
+        .a4 => .{ .w = 8.27, .h = 11.69 },
+        .letter => .{ .w = 8.5, .h = 11.0 },
+        .legal => .{ .w = 8.5, .h = 14.0 },
+        else => null,
+    };
+}
+
+/// The print finished (or failed). `path` echoes the request, so a
+/// client with several prints in flight can tell them apart without
+/// keeping a correlation id.
+pub const EvPrintPdfDone = struct {
+    pub const tag: Tag = .ev_print_pdf_done;
+    view: u32,
+    ok: u8,
+    path: []const u8,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -1625,6 +1734,32 @@ test "netLogJson is one newline-free JSON object" {
     // An unknown wire type byte renders as "other", not a crash.
     try std.testing.expectEqualStrings("other", arr[2].object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 404), arr[2].object.get("status").?.integer);
+}
+
+test "round-trip: devtools and print-to-pdf frames" {
+    try roundTrip(DevToolsShow, .{ .view = 7, .x = 0, .y = 0 });
+    try roundTrip(DevToolsShow, .{ .view = 7, .x = 120, .y = -4 });
+    try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = DEVTOOLS_VIEW_BASE + 1, .reason = "" });
+    try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = 0, .reason = "windowed" });
+    try roundTrip(PrintPdf, .{
+        .view = 7,
+        .flags = print_flag_landscape | print_flag_background,
+        .paper = @intFromEnum(Paper.a4),
+        .path = "/tmp/page.pdf",
+    });
+    try roundTrip(EvPrintPdfDone, .{ .view = 7, .ok = 1, .path = "/tmp/page.pdf" });
+    try roundTrip(EvPrintPdfDone, .{ .view = 7, .ok = 0, .path = "" });
+}
+
+test "a helper-minted devtools id cannot collide with a client-minted one" {
+    // Clients allocate from 1 upwards; the helper's range starts far
+    // above anything a session reaches.
+    try std.testing.expect(DEVTOOLS_VIEW_BASE > 1_000_000);
+    try std.testing.expectEqual(@as(?PaperSize, null), paperInches(@intFromEnum(Paper.default)));
+    try std.testing.expectEqual(@as(f64, 8.27), paperInches(@intFromEnum(Paper.a4)).?.w);
+    // An unknown preset from a newer client is the engine default, not
+    // a decode failure.
+    try std.testing.expectEqual(@as(?PaperSize, null), paperInches(200));
 }
 
 test "a text payload carries more than a str's u16 length" {

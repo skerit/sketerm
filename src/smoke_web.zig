@@ -15,8 +15,20 @@
 //! form validation state in the walk, HiDPI (physical buffers, logical
 //! input), adaptive frame pacing (paints above the old 60fps ceiling, a
 //! honoured cap, an idle page costing zero paints, the helper's
-//! watchdog, input-to-paint latency), and a clean shutdown on
-//! disconnect.
+//! watchdog, input-to-paint latency), TLS interstitials against a real
+//! self-signed server on loopback (a HELD request, cancelled, then
+//! proceeded), and a clean shutdown on disconnect.
+//!
+//! Two stages assert what the ENGINE does rather than what the helper
+//! does, because both surfaced as surprises: a gestureless
+//! `window.open` never reaches the client at all (Chromium's own popup
+//! blocker eats it, stage 6b), and an Alloy windowless browser never
+//! asks the client for a permission handler (stage 22g). Each fails if
+//! that changes, which is exactly when the client-side policy behind
+//! it becomes reachable.
+//!
+//! The certificate stages need `openssl s_server`; a host without one
+//! SKIPS them rather than failing, so the rig stays runnable anywhere.
 //!
 //! Every stage still drives `frame_request`s (~120/s in `Client.pump`,
 //! what the GUI's frame-clock tick does), but since the internal-
@@ -29,9 +41,12 @@
 //! popup stage's click miss often enough to matter.
 //!
 //! Headless by construction: the helper runs CEF with
-//! `--ozone-platform=headless`, so no display is needed. No network is
-//! touched — every page is a data: URL and the one popup target is
-//! `example.invalid`, which the helper cancels before any load.
+//! `--ozone-platform=headless`, so no display is needed. Almost no
+//! network is touched — every page is a data: URL and the one popup
+//! target is `example.invalid`, which the helper cancels before any
+//! load. The exception is the certificate stage, which talks to an
+//! openssl server this rig started on LOOPBACK; nothing leaves the
+//! machine there either.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -60,6 +75,12 @@ const click_page =
 const input_page =
     "data:text/html,<body><input%20id=i%20autofocus%20" ++
     "oninput=%22document.title='typed:'+this.value%22></body>";
+/// Opens a popup with NO user interaction behind it — the pop-under
+/// case the GUI's default policy blocks. `window.open` from a load
+/// handler carries no gesture, which is exactly what the flag says.
+const popup_auto_page =
+    "data:text/html,<body%20onload=%22window.open('https://auto.invalid/y')%22>auto</body>";
+
 const popup_page =
     "data:text/html,<body%20style=%22margin:0%22>" ++
     "<div%20style=%22width:100vw;height:100vh%22%20" ++
@@ -339,6 +360,10 @@ const Client = struct {
     ack_dmabuf: bool = false,
     ack_view_url: bool = false,
     ack_discard: bool = false,
+    ack_tls: bool = false,
+    ack_permissions: bool = false,
+    ack_devtools: bool = false,
+    ack_print_pdf: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -369,8 +394,31 @@ const Client = struct {
     title_len: usize = 0,
 
     popup_view: u32 = 0,
+    /// Gesture flag of the LAST popup request seen; the whole point of
+    /// the GUI's popup policy, so the rig has to observe both values.
+    popup_gesture: u8 = 0xff,
     popup_url: [1024]u8 = @splat(0),
     popup_len: usize = 0,
+
+    /// Certificate errors seen: the held request the TLS interstitial
+    /// exists for. `cert_seq` counts them, the rest describe the last.
+    cert_seq: u32 = 0,
+    cert_view: u32 = 0,
+    cert_code: i32 = 0,
+    cert_host: [256]u8 = @splat(0),
+    cert_host_len: usize = 0,
+    cert_fp: [128]u8 = @splat(0),
+    cert_fp_len: usize = 0,
+    /// Failed main-frame loads (`ev_load_error`), which is what a
+    /// cancelled certificate decision produces.
+    load_err_seq: u32 = 0,
+
+    /// Permission prompts the helper is holding for us.
+    perm_seq: u32 = 0,
+    perm_id: u64 = 0,
+    perm_types: u32 = 0,
+    perm_origin: [256]u8 = @splat(0),
+    perm_origin_len: usize = 0,
 
     nav_back: u8 = 0,
     nav_fwd: u8 = 0,
@@ -432,10 +480,29 @@ const Client = struct {
     int_log_len: usize = 0,
     int_log_next: u32 = 0,
     int_log_seq: u32 = 0,
+    /// The inspector view the helper minted, and everything that
+    /// belongs to IT rather than to the page being inspected. Frames
+    /// are routed by view id the moment `dev_view` is known — which is
+    /// why the helper announces the id BEFORE the view's first
+    /// `frame_buffer`.
+    dev_view: u32 = 0,
+    dev_reply_seq: u32 = 0,
+    dev_reason: [64]u8 = @splat(0),
+    dev_reason_len: usize = 0,
+    dev_fb: ?proto.FrameBuffer = null,
+    dev_fb_fd: c_int = -1,
+    dev_fb_seq: u32 = 0,
+    dev_dmg_seq: u32 = 0,
+
+    print_ok: u8 = 0,
+    print_seq: u32 = 0,
+    print_path: [1024]u8 = @splat(0),
+    print_path_len: usize = 0,
 
     fn deinit(self: *Client) void {
         self.unmap();
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
+        if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
         for (self.fds[0..self.nfds]) |fd| _ = c.close(fd);
         self.in.deinit(self.gpa);
         if (self.fd >= 0) _ = c.close(self.fd);
@@ -469,6 +536,9 @@ const Client = struct {
         self.last_req_us = now;
         self.req_count += 1;
         self.send(proto.FrameRequest{ .view = view_id, .flags = 0 });
+        // An inspector is an ordinary view: it paints when somebody
+        // asks, exactly like the page it inspects.
+        if (self.dev_view != 0) self.send(proto.FrameRequest{ .view = self.dev_view, .flags = 0 });
     }
 
     /// Wait for helper output while driving frames at ~120Hz — what the
@@ -591,11 +661,22 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.ack_discard = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.ack_tls = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.ack_permissions = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
                 }
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch fail("frame_buffer decode");
                 const fd = self.takeFd();
+                if (self.dev_view != 0 and fb.view == self.dev_view) {
+                    if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
+                    self.dev_fb_fd = fd;
+                    self.dev_fb = fb;
+                    self.dev_fb_seq += 1;
+                    return;
+                }
                 self.unmap();
                 if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
                 self.fb_fd = fd;
@@ -628,8 +709,26 @@ const Client = struct {
             .frame_damage => {
                 const d = proto.FrameDamage.decodeAlloc(frame.payload, self.gpa) catch fail("frame_damage decode");
                 defer self.gpa.free(d.rects);
+                if (self.dev_view != 0 and d.view == self.dev_view) {
+                    self.dev_dmg_seq += 1;
+                    return;
+                }
                 self.dmg_buf = d.buf_id;
                 self.dmg_seq += 1;
+            },
+            .ev_devtools_view => {
+                const e = proto.decode(proto.EvDevToolsView, frame.payload) catch fail("ev_devtools_view decode");
+                self.dev_view = e.devtools;
+                self.dev_reason_len = @min(e.reason.len, self.dev_reason.len);
+                @memcpy(self.dev_reason[0..self.dev_reason_len], e.reason[0..self.dev_reason_len]);
+                self.dev_reply_seq += 1;
+            },
+            .ev_print_pdf_done => {
+                const p = proto.decode(proto.EvPrintPdfDone, frame.payload) catch fail("ev_print_pdf_done decode");
+                self.print_ok = p.ok;
+                self.print_path_len = @min(p.path.len, self.print_path.len);
+                @memcpy(self.print_path[0..self.print_path_len], p.path[0..self.print_path_len]);
+                self.print_seq += 1;
             },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
@@ -639,6 +738,7 @@ const Client = struct {
             .ev_popup_request => {
                 const p = proto.decode(proto.EvPopupRequest, frame.payload) catch fail("ev_popup_request decode");
                 self.popup_view = p.view;
+                self.popup_gesture = p.user_gesture;
                 self.popup_len = @min(p.url.len, self.popup_url.len);
                 @memcpy(self.popup_url[0..self.popup_len], p.url[0..self.popup_len]);
             },
@@ -692,6 +792,28 @@ const Client = struct {
                     self.load_seq += 1;
                     if (std.mem.eql(u8, l.url, "about:blank")) self.blank_load_seq += 1;
                 }
+            },
+            .ev_load_error => {
+                _ = proto.decode(proto.EvLoadError, frame.payload) catch fail("ev_load_error decode");
+                self.load_err_seq += 1;
+            },
+            .ev_cert_error => {
+                const e = proto.decode(proto.EvCertError, frame.payload) catch fail("ev_cert_error decode");
+                self.cert_seq += 1;
+                self.cert_view = e.view;
+                self.cert_code = e.code;
+                self.cert_host_len = @min(e.host.len, self.cert_host.len);
+                @memcpy(self.cert_host[0..self.cert_host_len], e.host[0..self.cert_host_len]);
+                self.cert_fp_len = @min(e.fingerprint.len, self.cert_fp.len);
+                @memcpy(self.cert_fp[0..self.cert_fp_len], e.fingerprint[0..self.cert_fp_len]);
+            },
+            .ev_permission => {
+                const e = proto.decode(proto.EvPermission, frame.payload) catch fail("ev_permission decode");
+                self.perm_seq += 1;
+                self.perm_id = e.prompt;
+                self.perm_types = e.types;
+                self.perm_origin_len = @min(e.origin.len, self.perm_origin.len);
+                @memcpy(self.perm_origin[0..self.perm_origin_len], e.origin[0..self.perm_origin_len]);
             },
             .ev_nav_state => {
                 const s = proto.decode(proto.EvNavState, frame.payload) catch fail("ev_nav_state decode");
@@ -1024,6 +1146,251 @@ fn reapHelper(pid: c.pid_t, what: []const u8) void {
     fail("helper did not exit within 10s of the disconnect");
 }
 
+/// Asks for geolocation the moment it loads (no user gesture is
+/// required for that one) and writes the outcome into the title, so
+/// the rig can see the DECISION arrive at the page: code 1 is
+/// PERMISSION_DENIED, i.e. exactly the answer the client sent.
+const geo_page =
+    "<html><body>geo<script>navigator.geolocation.getCurrentPosition(" ++
+    "function(){document.title='geo:ok'}," ++
+    "function(e){document.title='geo:err'+e.code});</script></body></html>";
+
+fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
+    var path_buf: [160]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch return false;
+    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    return c.write(fd, body.ptr, body.len) == @as(isize, @intCast(body.len));
+}
+
+/// One openssl process serving HTTPS with a throwaway self-signed
+/// certificate, or null when the host cannot provide one.
+const BadCertServer = struct {
+    pid: c.pid_t,
+    port: u16,
+};
+
+/// Run `openssl` to completion with `args` (argv[0] included). True on
+/// a clean exit.
+fn runOpenssl(args: []const ?[*:0]const u8) bool {
+    const pid = c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        // stdin from /dev/null: an `openssl req` missing a switch
+        // PROMPTS, and a prompting child would hang the whole rig.
+        const devnull = c.open("/dev/null", c.O_RDWR);
+        if (devnull >= 0) {
+            _ = c.dup2(devnull, 0);
+            _ = c.dup2(devnull, 1);
+            _ = c.dup2(devnull, 2);
+        }
+        var vec: [20:null]?[*:0]const u8 = @splat(null);
+        if (args.len >= vec.len) c._exit(127);
+        for (args, 0..) |a, i| vec[i] = a;
+        _ = c.execvp("openssl", @ptrCast(@constCast(&vec)));
+        c._exit(127);
+    }
+    var status: c_int = 0;
+    if (c.waitpid(pid, &status, 0) != pid) return false;
+    return status == 0;
+}
+
+/// Mint a self-signed certificate in `dir` and serve it on a loopback
+/// port. Null means "not available here" — a missing openssl, a port
+/// that never came up — and the caller SKIPS rather than fails.
+fn startBadCertServer(dir: []const u8) ?BadCertServer {
+    var key_buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrintZ(&key_buf, "{s}/k.pem", .{dir}) catch return null;
+    var crt_buf: [128]u8 = undefined;
+    const crt = std.fmt.bufPrintZ(&crt_buf, "{s}/c.pem", .{dir}) catch return null;
+    // `-subj` is not optional: without it `req` prompts for a subject.
+    if (!runOpenssl(&[_]?[*:0]const u8{
+        "openssl", "req",   "-x509", "-newkey", "rsa:2048",
+        "-keyout", key.ptr, "-out",  crt.ptr,   "-days",
+        "1",       "-nodes", "-subj", "/CN=localhost",
+    })) return null;
+
+    // A port derived from the pid keeps two concurrent rigs apart
+    // without a discovery protocol; a busy one simply fails to serve
+    // and the stage skips.
+    const port: u16 = @intCast(20000 + @mod(c.getpid(), 20000));
+    var port_buf: [16]u8 = undefined;
+    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return null;
+
+    // The document the two stages load. It has to be a REAL file
+    // served over TLS, because a permission prompt needs a secure
+    // context and a `data:` url is not one.
+    if (!writeFile(dir, "geo.html", geo_page)) return null;
+
+    const pid = c.fork();
+    if (pid < 0) return null;
+    if (pid == 0) {
+        const devnull = c.open("/dev/null", c.O_RDWR);
+        if (devnull >= 0) {
+            _ = c.dup2(devnull, 0);
+            _ = c.dup2(devnull, 1);
+            _ = c.dup2(devnull, 2);
+        }
+        // `-WWW` serves files relative to the CWD, which is how the
+        // page above reaches the engine over https.
+        var dir_z: [128:0]u8 = @splat(0);
+        if (dir.len >= dir_z.len) c._exit(127);
+        @memcpy(dir_z[0..dir.len], dir);
+        if (c.chdir(&dir_z) != 0) c._exit(127);
+        var vec: [12:null]?[*:0]const u8 = @splat(null);
+        vec[0] = "openssl";
+        vec[1] = "s_server";
+        vec[2] = "-key";
+        vec[3] = key.ptr;
+        vec[4] = "-cert";
+        vec[5] = crt.ptr;
+        vec[6] = "-accept";
+        vec[7] = port_z.ptr;
+        vec[8] = "-WWW";
+        vec[9] = "-quiet";
+        _ = c.execvp("openssl", @ptrCast(@constCast(&vec)));
+        c._exit(127);
+    }
+    // Wait for the port to accept, which is also how a dead openssl
+    // (missing binary, busy port) is noticed.
+    const deadline = nowMs() + 5000;
+    while (nowMs() < deadline) {
+        var status: c_int = 0;
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) return null;
+        if (probePort(port)) return .{ .pid = pid, .port = port };
+        _ = c.usleep(100_000);
+    }
+    _ = c.kill(pid, c.SIGKILL);
+    var status: c_int = 0;
+    _ = c.waitpid(pid, &status, 0);
+    return null;
+}
+
+fn probePort(port: u16) bool {
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, port);
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7f000001);
+    return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) == 0;
+}
+
+/// A counter plus the value it must pass: what every wait in the
+/// certificate stage is actually watching (Zig has no closures, so the
+/// baseline has to travel with the predicate).
+const Past = struct { cl: *Client, base: u32 };
+
+/// Drive the client until `pred` holds or the deadline passes.
+fn driveUntil(cl: *Client, timeout_ms: i64, ctx: anytype, comptime pred: fn (@TypeOf(ctx)) bool) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        if (pred(ctx)) return true;
+        _ = cl.drive(150, 120);
+    }
+    return pred(ctx);
+}
+
+/// Stage 22f: the held certificate error, both decisions.
+///
+/// ORDER MATTERS: the deny goes first. Chromium remembers a PROCEEDED
+/// certificate for the rest of the session (its SSL host state), so a
+/// second navigation after an allow would not error again and the
+/// stage would be asserting on nothing. A DENY is remembered by
+/// nobody, which is what makes "error again, then allow" the only
+/// ordering that tests both answers.
+fn certStage(cl: *Client, dir: []const u8) void {
+    const server = startBadCertServer(dir) orelse {
+        say("smoke-web: SKIP stage 22f bad certificate (no usable openssl s_server on this host)");
+        return;
+    };
+    defer {
+        _ = c.kill(server.pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(server.pid, &status, 0);
+    }
+
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/geo.html", .{server.port}) catch
+        fail("stage 22f: url");
+
+    // -- deny --------------------------------------------------------
+    var wait = Past{ .cl = cl, .base = cl.cert_seq };
+    const errs_before = cl.load_err_seq;
+    cl.send(proto.Navigate{ .view = view_id, .url = url });
+    if (!driveUntil(cl, 20_000, &wait, struct {
+        fn f(w: *Past) bool {
+            return w.cl.cert_seq > w.base;
+        }
+    }.f)) fail("stage 22f: no ev_cert_error for a self-signed certificate");
+    if (cl.cert_view != view_id) fail("stage 22f: ev_cert_error named the wrong view");
+    if (cl.cert_code == 0) fail("stage 22f: ev_cert_error carried no error code");
+    if (!std.mem.eql(u8, cl.cert_host[0..cl.cert_host_len], "127.0.0.1"))
+        fail("stage 22f: ev_cert_error did not name the host being visited");
+    if (cl.cert_fp_len != 64) fail("stage 22f: ev_cert_error carried no SHA-256 fingerprint");
+    const fp_ok = for (cl.cert_fp[0..cl.cert_fp_len]) |ch| {
+        if (!std.ascii.isHex(ch)) break false;
+    } else true;
+    if (!fp_ok) fail("stage 22f: the fingerprint is not lowercase hex");
+
+    cl.send(proto.CertDecision{ .view = view_id, .proceed = 0 });
+    wait = .{ .cl = cl, .base = errs_before };
+    if (!driveUntil(cl, 20_000, &wait, struct {
+        fn f(w: *Past) bool {
+            return w.cl.load_err_seq > w.base;
+        }
+    }.f)) fail("stage 22f: a cancelled certificate decision did not fail the load");
+
+    // -- allow -------------------------------------------------------
+    wait = .{ .cl = cl, .base = cl.cert_seq };
+    cl.send(proto.Navigate{ .view = view_id, .url = url });
+    if (!driveUntil(cl, 20_000, &wait, struct {
+        fn f(w: *Past) bool {
+            return w.cl.cert_seq > w.base;
+        }
+    }.f)) fail("stage 22f: a cancelled certificate was remembered — no second ev_cert_error");
+    cl.send(proto.CertDecision{ .view = view_id, .proceed = 1 });
+    wait = .{ .cl = cl, .base = cl.load_seq };
+    if (!driveUntil(cl, 30_000, &wait, struct {
+        fn f(w: *Past) bool {
+            return w.cl.load_seq > w.base;
+        }
+    }.f)) fail("stage 22f: the page never loaded after proceeding past the certificate");
+    pass("stage 22f bad certificate (held, cancelled, then proceeded)");
+
+    // ── Stage 22g: what the engine does with a permission request ──
+    //
+    // The page just loaded over TLS is a secure context, so its
+    // geolocation call is a real permission request -- the one thing a
+    // `data:` url can never produce. MEASURED against the installed
+    // CEF: an ALLOY windowless browser never even asks the client for a
+    // permission handler, denies the request internally, and the page
+    // sees PERMISSION_DENIED (code 1). `ev_permission` is therefore
+    // implemented on both sides but unreachable in this configuration.
+    //
+    // This stage pins that deliberately: the day the engine starts
+    // consulting the handler it FAILS and says so, which is when the
+    // GUI's permission banner becomes reachable and deserves a real
+    // allow/deny round trip in place of this stage.
+    _ = cl.drive(3000, 120);
+    if (cl.perm_seq != 0) fail(
+        "stage 22g: the engine now DOES ask the client for permission -- " ++
+            "replace this stage with a real allow/deny round trip",
+    );
+    if (!std.mem.eql(u8, cl.title[0..cl.title_len], "geo:err1")) {
+        std.debug.print("smoke-web: title was '{s}'\n", .{cl.title[0..cl.title_len]});
+        fail("stage 22g: a secure-context geolocation call did not end in PERMISSION_DENIED");
+    }
+    pass("stage 22g permission request (engine-denied; the client is never consulted yet)");
+
+    // Leave the view on a data: page: everything after this stage
+    // assumes no network is involved.
+    cl.send(proto.Navigate{ .view = view_id, .url = red_page });
+    _ = cl.drive(500, 120);
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
     const argv = init.args.vector;
@@ -1067,6 +1434,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     if (cl.ack_proto != proto.PROTO_VERSION) fail("stage 1 handshake: no hello_ack with proto 1");
     if (!cl.ack_shm) fail("stage 1 handshake: hello_ack lacks the frames-shm capability");
+    if (!cl.ack_tls) fail("stage 1 handshake: hello_ack lacks the tls capability");
+    if (!cl.ack_permissions) fail("stage 1 handshake: hello_ack lacks the permissions capability");
     pass("stage 1 handshake");
 
     // ── Stage 2: paint into the shared memfd ──────────────────────
@@ -1133,7 +1502,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     if (!cl.waitPopup("example.invalid", 15_000)) fail("stage 6 popup: no ev_popup_request for the opened url");
     if (cl.popup_view != view_id) fail("stage 6 popup: ev_popup_request carried the wrong opener view");
-    pass("stage 6 popup request");
+    // A popup opened from a click IS gesture-backed: the GUI's default
+    // popup policy opens exactly these and blocks the rest, so the flag
+    // has to be right in both directions.
+    if (cl.popup_gesture != 1) fail("stage 6 popup: a clicked window.open was not reported as a user gesture");
+    pass("stage 6 popup request (gesture-backed)");
+
+    // ── Stage 6b: the engine blocks a gestureless popup itself ─────
+    // MEASURED, and the reason the GUI's `block-gestureless` policy is
+    // a second line of defence rather than the only one: Chromium's own
+    // popup blocker eats a `window.open` with no user activation BEFORE
+    // on_before_popup runs, so no `ev_popup_request` is posted at all.
+    // The wire's gesture flag is still what the policy keys on (a
+    // `block-all` policy, and any future engine without a blocker of
+    // its own, need it); its absent-means-gesture default is covered by
+    // the protocol unit tests, which can produce a payload this engine
+    // never will.
+    cl.popup_gesture = 0xff;
+    cl.popup_len = 0;
+    cl.navigate(popup_auto_page);
+    _ = cl.drive(3000, 120);
+    if (cl.sawPopup("auto.invalid")) fail("stage 6b popup: the engine forwarded a gestureless window.open");
+    pass("stage 6b gestureless popup (never reaches the client)");
 
     // ── Stage 7: history navigation ───────────────────────────────
     cl.navigate(red_page);
@@ -1948,6 +2338,182 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         cl.send(proto.ViewDestroy{ .view = discard_view_id });
     }
     pass("stage 22e view_discard (browser destroyed, answered while discarded, revived on show)");
+
+    // ── Stage 22f: a bad certificate is HELD, not failed ───────────
+    //
+    // A real TLS server with a self-signed certificate, on loopback:
+    // the only honest way to exercise `on_certificate_error`, since
+    // nothing about a held request can be simulated from this side.
+    // The whole stage SKIPS (never fails) when the host has no
+    // `openssl`, because the rig must stay runnable without one.
+    certStage(&cl, dir);
+    // ── Stage 22d: print the page to a PDF file ────────────────────
+    //
+    // The helper writes the file itself (it is the process with the
+    // page), so the assertion is on BYTES ON DISK, not on a reply: a
+    // done event for a file that never appeared would be the whole bug
+    // this stage exists to catch.
+    {
+        if (!cl.ack_print_pdf) fail("stage 22h print_pdf: hello_ack lacks the print-pdf capability");
+        cl.navigate(article_page);
+        var pdf_buf: [128]u8 = undefined;
+        const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/page.pdf", .{dir}) catch fail("pdf path");
+        const seq = cl.print_seq;
+        cl.send(proto.PrintPdf{
+            .view = view_id,
+            .flags = proto.print_flag_background,
+            .paper = @intFromEnum(proto.Paper.a4),
+            .path = pdf,
+        });
+        if (!cl.waitSeq(&cl.print_seq, seq, 30_000)) fail("stage 22h print_pdf: no ev_print_pdf_done");
+        if (cl.print_ok != 1) fail("stage 22h print_pdf: the helper reported a failure");
+        if (!std.mem.eql(u8, cl.print_path[0..cl.print_path_len], pdf))
+            fail("stage 22h print_pdf: the done event echoed a different path");
+
+        const f = c.fopen(pdf.ptr, "rb") orelse fail("stage 22h print_pdf: no file at the requested path");
+        defer _ = c.fclose(f);
+        var head: [5]u8 = @splat(0);
+        const n = c.fread(&head, 1, head.len, f);
+        if (n != head.len or !std.mem.eql(u8, &head, "%PDF-"))
+            fail("stage 22h print_pdf: the file does not start with a PDF magic header");
+        _ = c.fseek(f, 0, c.SEEK_END);
+        const size = c.ftell(f);
+        if (size < 1000) fail("stage 22h print_pdf: the PDF is too small to hold a rendered page");
+        std.debug.print("smoke-web: MEASURED pdf {d} bytes\n", .{size});
+
+        // A path nothing can write must come back as a FAILED print,
+        // not as silence: a client waiting on a save would hang.
+        const bad_seq = cl.print_seq;
+        cl.send(proto.PrintPdf{
+            .view = view_id,
+            .flags = 0,
+            .paper = 0,
+            .path = "/proc/sketerm-no-such-dir/x.pdf",
+        });
+        if (!cl.waitSeq(&cl.print_seq, bad_seq, 30_000))
+            fail("stage 22h print_pdf: an unwritable path produced no answer at all");
+        if (cl.print_ok != 0) fail("stage 22h print_pdf: an unwritable path was reported as success");
+
+        // A view that does not exist is answered too, for the same
+        // reason.
+        const gone_seq = cl.print_seq;
+        cl.send(proto.PrintPdf{ .view = 9999, .flags = 0, .paper = 0, .path = pdf });
+        if (!cl.waitSeq(&cl.print_seq, gone_seq, 10_000))
+            fail("stage 22h print_pdf: an unknown view produced no answer at all");
+        if (cl.print_ok != 0) fail("stage 22h print_pdf: an unknown view was reported as success");
+    }
+    pass("stage 22h print_pdf (real PDF on disk, failures answered)");
+
+    // ── Stage 22e: DevTools ────────────────────────────────────────
+    //
+    // `devtools_show` asks for the inspector as ANOTHER WINDOWLESS
+    // VIEW: its own id, its own frame buffer, resizable and closable
+    // through the frames every view uses, and no debugging PORT
+    // anywhere. Whether the engine can do that is the engine's answer,
+    // and BOTH answers are asserted here, because both are shipped
+    // behaviour:
+    //
+    //   - a view id  -> it must really paint, resize and close;
+    //   - `devtools = 0` + reason `windowed` -> the inspector is open
+    //     in a window the ENGINE made (CEF 151 always lands here; see
+    //     cefhost.adoptBrowser for the measurement).
+    //
+    // Either way the client is ANSWERED, which is the property that
+    // keeps a GUI from waiting forever on a menu item.
+    {
+        if (!cl.ack_devtools) fail("stage 22i devtools: hello_ack lacks the devtools capability");
+        cl.navigate(form_page);
+        const seq = cl.dev_reply_seq;
+        cl.send(proto.DevToolsShow{ .view = view_id, .x = 0, .y = 0 });
+        if (!cl.waitSeq(&cl.dev_reply_seq, seq, 30_000)) fail("stage 22i devtools: no ev_devtools_view");
+
+        if (cl.dev_view == 0) {
+            const why = cl.dev_reason[0..cl.dev_reason_len];
+            if (!std.mem.eql(u8, why, "windowed")) {
+                std.debug.print("smoke-web: devtools refused with reason \"{s}\"\n", .{why});
+                fail("stage 22i devtools: the helper opened no inspector at all");
+            }
+            std.debug.print(
+                "smoke-web: MEASURED devtools: engine refused windowless rendering, inspector opened in its own window\n",
+                .{},
+            );
+            // The refusal must not have taken the inspected view with
+            // it, and asking again must still be answered.
+            const again = cl.dev_reply_seq;
+            cl.send(proto.DevToolsShow{ .view = view_id, .x = 0, .y = 0 });
+            if (!cl.waitSeq(&cl.dev_reply_seq, again, 20_000))
+                fail("stage 22i devtools: a second request went unanswered");
+            const dmg = cl.dmg_seq;
+            cl.navigate(blue_page);
+            if (!cl.waitDamageAfter(dmg, 20_000)) fail("stage 22i devtools: the inspected view stopped painting");
+            pass("stage 22i devtools (engine window fallback, answered and non-destructive)");
+        } else {
+            if (cl.dev_view < proto.DEVTOOLS_VIEW_BASE)
+                fail("stage 22i devtools: the inspector id is inside the client-allocated range");
+
+            // It paints. The id must arrive BEFORE the buffer (a client
+            // cannot place a frame for a view it has not been told
+            // about), and pixels must follow.
+            if (!cl.waitSeq(&cl.dev_fb_seq, 0, 30_000)) fail("stage 22i devtools: no frame_buffer for the inspector");
+            if (!cl.waitSeq(&cl.dev_dmg_seq, 0, 30_000)) fail("stage 22i devtools: the inspector never painted");
+            {
+                const fb = cl.dev_fb.?;
+                const size: usize = @as(usize, fb.stride) * @as(usize, fb.h);
+                const addr = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, cl.dev_fb_fd, 0);
+                if (addr == c.MAP_FAILED) fail("stage 22i devtools: the inspector buffer will not map");
+                const bytes: [*]const u8 = @ptrCast(addr);
+                var nonzero: usize = 0;
+                var i: usize = 0;
+                while (i < size) : (i += 997) {
+                    if (bytes[i] != 0) nonzero += 1;
+                }
+                _ = c.munmap(@constCast(@ptrCast(bytes)), size);
+                if (nonzero == 0) fail("stage 22i devtools: the inspector's frame is entirely blank");
+            }
+
+            // Resizing it is the ordinary view frame, with the ordinary
+            // replacement buffer.
+            {
+                const fbseq = cl.dev_fb_seq;
+                cl.send(proto.ViewResize{ .view = cl.dev_view, .w = 500, .h = 400, .scale_x1000 = 1000 });
+                if (!cl.waitSeq(&cl.dev_fb_seq, fbseq, 20_000))
+                    fail("stage 22i devtools: resizing the inspector announced no new buffer");
+                const fb = cl.dev_fb.?;
+                if (fb.w != 500 or fb.h != 400) fail("stage 22i devtools: the inspector buffer is not the requested size");
+            }
+
+            // Asking again while it is open hands back the SAME view
+            // rather than a second inspector for one page.
+            {
+                const again = cl.dev_reply_seq;
+                const first = cl.dev_view;
+                cl.send(proto.DevToolsShow{ .view = view_id, .x = 0, .y = 0 });
+                if (!cl.waitSeq(&cl.dev_reply_seq, again, 20_000)) fail("stage 22i devtools: no answer to a second request");
+                if (cl.dev_view != first) fail("stage 22i devtools: a second request opened another inspector");
+            }
+
+            cl.send(proto.ViewDestroy{ .view = cl.dev_view });
+            cl.dev_view = 0;
+            // Closing the inspector must not take its target down.
+            {
+                const dmg = cl.dmg_seq;
+                cl.navigate(blue_page);
+                if (!cl.waitDamageAfter(dmg, 20_000)) fail("stage 22i devtools: the inspected view stopped painting");
+            }
+            pass("stage 22i devtools (inspector view: paints, resizes, deduplicates, closes)");
+        }
+
+        // A request for a view that does not exist is refused, not
+        // ignored — the same "always answer" property, on the path
+        // where nothing can be opened at all.
+        {
+            const bad = cl.dev_reply_seq;
+            cl.send(proto.DevToolsShow{ .view = 9999, .x = 0, .y = 0 });
+            if (!cl.waitSeq(&cl.dev_reply_seq, bad, 10_000))
+                fail("stage 22i devtools: an unknown view produced no answer at all");
+            if (cl.dev_view != 0) fail("stage 22i devtools: an unknown view was answered with an inspector");
+        }
+    }
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;

@@ -153,6 +153,35 @@
 //!   combination is a use-after-free per CLAUDE.md.
 //! - The face allocates no idle/timer callbacks of its own, so it needs
 //!   no fence of its own.
+//! - A blocked-popup toast is the one exception, and it takes
+//!   mechanism 1: the toast OWNS its context through a
+//!   `GDestroyNotify`, and that context holds a VIEW ID rather than a
+//!   face pointer, so a toast outliving its tab resolves to nothing
+//!   instead of into freed memory.
+//!
+//! ## Security surfaces (what a page must never be able to imitate)
+//!
+//! Two decisions are made HERE and held by the helper until they are:
+//!
+//! - A certificate error (`ev_cert_error`, capability "tls") stops the
+//!   request and raises a full-face interstitial that COVERS the page,
+//!   dark and fixed-coloured rather than themed. "Back to safety" is
+//!   the default and leaves; "Proceed anyway" accepts the certificate
+//!   for that ONE request — nothing is remembered anywhere.
+//! - A permission request (`ev_permission`, capability "permissions")
+//!   raises a NON-MODAL banner above the page, because a permission is
+//!   not worth blocking the window for. The answer is remembered for
+//!   this face's lifetime, per (origin, permission bits), and reported
+//!   to `SiteSettingSink` — the single hook a durable site-settings
+//!   store attaches to. This file persists nothing.
+//!   NOT REACHABLE TODAY: the CEF build this helper uses never asks
+//!   for a permission handler in Alloy windowless mode and denies
+//!   requests inside the engine, so the banner cannot appear yet. See
+//!   `getPermissionHandler` in `src/web/cefhost.zig` and smoke-web
+//!   stage 22g, which fails the day that changes.
+//!
+//! A helper that advertises neither capability sends neither event, so
+//! it behaves exactly as it did before both existed.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -170,6 +199,7 @@ const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
+const fpicker = @import("../filebrowser/picker.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -186,6 +216,9 @@ const MISSING_MSG =
 ;
 
 const LOST_MSG = "The browser helper stopped. Reload to start it again.";
+const DEVTOOLS_GONE_MSG =
+    "This DevTools view is gone (the browser helper restarted). " ++
+    "Open it again from the page you want to inspect.";
 const CRASH_MSG = "This page's renderer crashed. Reload to bring it back.";
 
 // ---------------------------------------------------------------------
@@ -460,6 +493,11 @@ pub const Client = struct {
     /// keep the GUI from posting decisions such a helper would ignore.
     has_tls: bool = false,
     has_permissions: bool = false,
+    /// Capabilities the CURRENT helper advertised. A helper too old
+    /// for one of these leaves its menu row insensitive rather than
+    /// hidden, so the verb is still discoverable.
+    cap_devtools: bool = false,
+    cap_print_pdf: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -813,14 +851,21 @@ pub const Client = struct {
             .hello_ack => {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(ack.caps);
-                if (ack.proto != proto.PROTO_VERSION) self.fail("The browser helper speaks a different protocol version.");
+                if (ack.proto != proto.PROTO_VERSION) {
+                    self.fail("The browser helper speaks a different protocol version.");
+                    return;
+                }
                 self.cap_discard = false;
                 self.has_tls = false;
                 self.has_permissions = false;
+                self.cap_devtools = false;
+                self.cap_print_pdf = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.has_permissions = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
                 }
             },
             .frame_buffer => {
@@ -936,6 +981,21 @@ pub const Client = struct {
                 defer self.gpa.free(ev.entries);
                 if (self.findFace(ev.view)) |face| face.onInterceptLog(ev);
             },
+            .ev_devtools_view => {
+                const ev = proto.decode(proto.EvDevToolsView, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    face.onDevToolsView(ev.devtools, ev.reason);
+                } else if (ev.devtools != 0) {
+                    // The pane that asked is gone; the inspector it
+                    // would have shown must not stay alive on the
+                    // helper with nobody able to close it.
+                    self.post(proto.ViewDestroy{ .view = ev.devtools });
+                }
+            },
+            .ev_print_pdf_done => {
+                const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onPrintDone(ev.ok != 0, ev.path);
+            },
             else => {},
         }
     }
@@ -1005,16 +1065,27 @@ const MAX_AUTO_RESULTS = 16;
 const DISCARDED_CLASS = "sketerm-web-discarded";
 
 /// Page background for the view area (what a browser shows where
-/// nothing painted; also the gutter during a live resize), plus the
-/// discarded dim. Theme's view background rather than white, so a dark
-/// theme does not flash: a page that paints its own background covers
-/// this anyway.
+/// nothing painted; also the gutter during a live resize). Theme's view
+/// background rather than white, so a dark theme does not flash: a page
+/// that paints its own background covers this anyway.
+///
+/// The two SECURITY surfaces are styled here too, and deliberately do
+/// NOT follow the theme: an interstitial that a page could imitate is
+/// worth less than one that always looks the same.
+const WEBFACE_CSS =
+    \\.sketerm-webview { background: @view_bg_color; }
+    \\.sketerm-web-discarded { opacity: 0.65; }
+    \\.sketerm-web-interstitial { background: #2b1416; color: #ffffff; padding: 24px; }
+    \\.sketerm-web-interstitial label { color: #ffffff; }
+    \\.sketerm-web-interstitial .title { font-size: 1.6em; font-weight: bold; }
+    \\.sketerm-web-interstitial .detail { color: #e0c8c8; font-family: monospace; font-size: 0.9em; }
+    \\.sketerm-web-permbar { background: #303030; color: #ffffff; padding: 6px; }
+    \\.sketerm-web-permbar label { color: #ffffff; }
+;
+
 fn webviewCss(widget: *c.GtkWidget) void {
     c.gtk_widget_add_css_class(widget, "sketerm-webview");
-    cssutil.install("webface", widget,
-        \\.sketerm-webview { background: @view_bg_color; }
-        \\.sketerm-web-discarded { opacity: 0.65; }
-    );
+    cssutil.install("webface", widget, WEBFACE_CSS);
 }
 
 /// Cap on painted hint labels; a page listing more is a page nobody
@@ -1047,6 +1118,12 @@ fn webhintCss(widget: *c.GtkWidget) void {
         \\  font-family: monospace;
         \\}
     );
+}
+
+/// `g_object_set_data_full` notify for a toast's owned path string.
+fn freeToastPath(user: ?*anyopaque) callconv(.c) void {
+    const p: [*:0]u8 = @ptrCast(user orelse return);
+    std.heap.c_allocator.free(std.mem.span(p));
 }
 
 /// Refcounted mmap of a frame memfd. `GBytes` built over it hold a
@@ -1121,8 +1198,16 @@ pub const WebFace = struct {
     view: u32 = 0,
     /// True once `view_create` was sent on the CURRENT connection.
     view_live: bool = false,
+    /// This face PRESENTS a view somebody else created (the inspector
+    /// `devtools_show` minted): it never sends `view_create`, and it
+    /// cannot be rebuilt on a fresh helper connection, because the id
+    /// it holds means nothing to a helper that just started.
+    attached: bool = false,
 
     root_box: *c.GtkWidget = undefined,
+    /// The navigation bar. An attached view has no address of its own
+    /// to steer, so its face hides the whole bar.
+    bar: *c.GtkWidget = undefined,
     back_btn: *c.GtkWidget = undefined,
     fwd_btn: *c.GtkWidget = undefined,
     reload_btn: *c.GtkWidget = undefined,
@@ -1147,14 +1232,6 @@ pub const WebFace = struct {
     tex_prev_is_shm: bool = false,
     status_box: *c.GtkWidget = undefined,
     status_label: *c.GtkWidget = undefined,
-    /// Find-in-page bar (Ctrl+F): hidden until opened. Built by hand —
-    /// this tree has no shared findbar helper yet.
-    find_bar: *c.GtkWidget = undefined,
-    find_entry: *c.GtkWidget = undefined,
-    find_count: *c.GtkWidget = undefined,
-
-    /// Objects carrying signals whose user-data is this face. All are
-    /// disconnected at the teardown choke point.
     /// Full-face certificate interstitial (overlay child, hidden until
     /// an `ev_cert_error` arrives) and the labels it fills in.
     cert_box: *c.GtkWidget = undefined,
@@ -1163,14 +1240,20 @@ pub const WebFace = struct {
     /// Non-modal permission banner between the toolbar and the page.
     perm_bar: *c.GtkWidget = undefined,
     perm_label: *c.GtkWidget = undefined,
+    /// Find-in-page bar (Ctrl+F): hidden until opened. Built by hand --
+    /// this tree has no shared findbar helper yet.
+    find_bar: *c.GtkWidget = undefined,
+    find_entry: *c.GtkWidget = undefined,
+    find_count: *c.GtkWidget = undefined,
 
     /// Objects carrying signals whose user-data is this face. All are
-    /// disconnected at the teardown choke point — so the array must be
+    /// disconnected at the teardown choke point -- so the array must be
     /// big enough for every one of them: `track` silently drops what
     /// does not fit, and a dropped object keeps a handler pointing at a
     /// freed face. Count the `track` calls in `buildUi`,
-    /// `buildCertOverlay` and `wireInput` before shrinking it.
-    signal_objs: [24]?*c.GObject = .{null} ** 24,
+    /// `buildCertOverlay`, `buildFindBar` and `wireInput` before
+    /// shrinking it.
+    signal_objs: [32]?*c.GObject = .{null} ** 32,
     signal_count: usize = 0,
 
     /// Refcounted read-only mapping of the helper's frame memfd. Each
@@ -1250,6 +1333,10 @@ pub const WebFace = struct {
     /// user-data and `stopDiscardTimer` runs at the single teardown
     /// choke point (`prepareDestroyCb`) and once more in `deinit`.
     discard_timer: c.guint = 0,
+
+    /// A `devtools_show` is out and its `ev_devtools_view` has not
+    /// landed; a second request would open nothing new.
+    devtools_pending: bool = false,
 
     /// Address to open once the view exists (attach-time URL).
     pending_url: ?[]u8 = null,
@@ -1346,8 +1433,31 @@ pub const WebFace = struct {
     /// `url` opened in it. Never fails on a missing helper: the face
     /// exists and explains itself.
     pub fn attach(allocator: std.mem.Allocator, pane: *Pane, url: ?[]const u8) !*WebFace {
+        return attachOpts(allocator, pane, .{ .url = url });
+    }
+
+    /// Put a face on `pane` that PRESENTS an existing helper-side view
+    /// instead of creating one — how the inspector `devtools_show`
+    /// minted becomes a pane (`Window.openDevToolsSplit`).
+    ///
+    /// It is the same face and the same connection: `Client` is one
+    /// helper process per GUI process, faces are found by view id in
+    /// it, and every frame this face sends or receives rides the socket
+    /// the source face already uses. Nothing is shared BETWEEN faces,
+    /// so there is no ownership to hand over.
+    pub fn attachView(allocator: std.mem.Allocator, pane: *Pane, view: u32) !*WebFace {
+        return attachOpts(allocator, pane, .{ .existing_view = view });
+    }
+
+    const Opts = struct {
+        url: ?[]const u8 = null,
+        /// Non-zero: present this helper-side view rather than mint one.
+        existing_view: u32 = 0,
+    };
+
+    fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
         if (fromPane(pane)) |existing| {
-            if (url) |u| existing.navigate(u);
+            if (opts.url) |u| existing.navigate(u);
             pane.setWebVisible(true);
             return existing;
         }
@@ -1356,9 +1466,10 @@ pub const WebFace = struct {
         self.* = .{ .allocator = allocator };
         self.pane = pane;
         self.pacer.cap_fps = g_max_fps;
-        if (url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
+        if (opts.url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
 
         self.buildUi();
+        if (opts.existing_view != 0) c.gtk_widget_set_visible(self.bar, 0);
         if (!pane.attachWeb(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb)) {
             // The box never reached a parent, so its floating reference
             // is still the only one.
@@ -1375,6 +1486,17 @@ pub const WebFace = struct {
 
         const cl = client();
         cl.ensure(allocator);
+        if (opts.existing_view != 0) {
+            // The view already exists on the CURRENT connection: adopt
+            // it, live, without a create. Its first `view_resize`
+            // arrives from the sensor's allocation like any other.
+            self.attached = true;
+            self.view = opts.existing_view;
+            self.view_live = cl.state == .ready;
+            cl.register(self);
+            if (cl.state != .ready) self.onDevToolsLost();
+            return self;
+        }
         self.view = cl.next_view;
         cl.next_view += 1;
         cl.register(self);
@@ -1472,7 +1594,9 @@ pub const WebFace = struct {
             if (self.reader) |r| r.focus();
             return;
         }
-        if (self.url == null and self.pending_url == null) {
+        // An attached view has no address bar to focus (the whole nav
+        // bar is hidden), so the page always takes it.
+        if (!self.attached and self.url == null and self.pending_url == null) {
             _ = c.gtk_widget_grab_focus(self.entry);
             return;
         }
@@ -2401,6 +2525,7 @@ pub const WebFace = struct {
         // same inset, same flat buttons, Back+Forward as one linked
         // control.
         const bar = toolbtn.newBar();
+        self.bar = bar;
         toolbtn.installCss(bar);
 
         const navpair = toolbtn.newNavPair();
@@ -2467,6 +2592,29 @@ pub const WebFace = struct {
 
         c.gtk_box_append(@ptrCast(self.root_box), bar);
 
+        // NON-MODAL by construction: a strip in the pane's own box, so
+        // the page below stays live and the rest of the window keeps
+        // working while a prompt is up. A permission request is not
+        // worth a dialog that blocks the terminal behind it.
+        self.perm_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        c.gtk_widget_add_css_class(self.perm_bar, "sketerm-web-permbar");
+        self.perm_label = c.gtk_label_new("");
+        c.gtk_label_set_wrap(@ptrCast(self.perm_label), 1);
+        c.gtk_label_set_xalign(@ptrCast(self.perm_label), 0);
+        c.gtk_widget_set_hexpand(self.perm_label, 1);
+        c.gtk_box_append(@ptrCast(self.perm_bar), self.perm_label);
+        const allow_btn = c.gtk_button_new_with_label("Allow");
+        c.gtk_widget_add_css_class(allow_btn, "suggested-action");
+        _ = c.g_signal_connect_data(@ptrCast(allow_btn), "clicked", @ptrCast(&onPermAllow), self, null, 0);
+        self.track(allow_btn);
+        c.gtk_box_append(@ptrCast(self.perm_bar), allow_btn);
+        const block_btn = c.gtk_button_new_with_label("Block");
+        _ = c.g_signal_connect_data(@ptrCast(block_btn), "clicked", @ptrCast(&onPermBlock), self, null, 0);
+        self.track(block_btn);
+        c.gtk_box_append(@ptrCast(self.perm_bar), block_btn);
+        c.gtk_widget_set_visible(self.perm_bar, 0);
+        c.gtk_box_append(@ptrCast(self.root_box), self.perm_bar);
+
         // Find-in-page bar (Ctrl+F), hidden until opened. Same toolbar
         // styling as the address bar above it.
         self.find_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
@@ -2510,28 +2658,6 @@ pub const WebFace = struct {
 
         c.gtk_widget_set_visible(self.find_bar, 0);
         c.gtk_box_append(@ptrCast(self.root_box), self.find_bar);
-        // NON-MODAL by construction: a strip in the pane's own box, so
-        // the page below stays live and the rest of the window keeps
-        // working while a prompt is up. A permission request is not
-        // worth a dialog that blocks the terminal behind it.
-        self.perm_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-        c.gtk_widget_add_css_class(self.perm_bar, "sketerm-web-permbar");
-        self.perm_label = c.gtk_label_new("");
-        c.gtk_label_set_wrap(@ptrCast(self.perm_label), 1);
-        c.gtk_label_set_xalign(@ptrCast(self.perm_label), 0);
-        c.gtk_widget_set_hexpand(self.perm_label, 1);
-        c.gtk_box_append(@ptrCast(self.perm_bar), self.perm_label);
-        const allow_btn = c.gtk_button_new_with_label("Allow");
-        c.gtk_widget_add_css_class(allow_btn, "suggested-action");
-        _ = c.g_signal_connect_data(@ptrCast(allow_btn), "clicked", @ptrCast(&onPermAllow), self, null, 0);
-        self.track(allow_btn);
-        c.gtk_box_append(@ptrCast(self.perm_bar), allow_btn);
-        const block_btn = c.gtk_button_new_with_label("Block");
-        _ = c.g_signal_connect_data(@ptrCast(block_btn), "clicked", @ptrCast(&onPermBlock), self, null, 0);
-        self.track(block_btn);
-        c.gtk_box_append(@ptrCast(self.perm_bar), block_btn);
-        c.gtk_widget_set_visible(self.perm_bar, 0);
-        c.gtk_box_append(@ptrCast(self.root_box), self.perm_bar);
 
         self.overlay = c.gtk_overlay_new();
         c.gtk_widget_set_hexpand(self.overlay, 1);
@@ -2735,9 +2861,17 @@ pub const WebFace = struct {
         // `ensureView` below mints this one again from scratch.
         self.stopDiscardTimer();
         self.noteRevived();
+        self.devtools_pending = false;
         self.dropMap();
         self.sent_w = 0;
         self.sent_h = 0;
+        // An attached view belonged to the OLD helper process; its id
+        // means nothing to this one and there is nothing to re-create,
+        // since only the source page can ask for an inspector.
+        if (self.attached) {
+            self.onDevToolsLost();
+            return;
+        }
         self.ensureView();
     }
 
@@ -2751,12 +2885,27 @@ pub const WebFace = struct {
         self.view_live = false;
         self.stopDiscardTimer();
         self.noteRevived();
+        self.devtools_pending = false;
         self.dropMap();
+        if (self.attached) {
+            self.onDevToolsLost();
+            return;
+        }
         self.setStatus(reason, retryable);
+    }
+
+    /// The helper this attached view lived in is gone. Say so, and
+    /// offer no Reload: only the page being inspected can open a new
+    /// inspector, and this pane no longer knows which page that was.
+    fn onDevToolsLost(self: *WebFace) void {
+        self.setStatus(DEVTOOLS_GONE_MSG, false);
     }
 
     fn ensureView(self: *WebFace) void {
         const cl = client();
+        // An attached view is created by whoever asked for it (the
+        // inspector's source page), never here.
+        if (self.attached) return;
         if (cl.state != .ready or self.view_live) return;
         // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
         // CURRENT allocation is the truth whenever it has one; the
@@ -3288,7 +3437,9 @@ pub const WebFace = struct {
         if (!self.cert_pending) return;
         self.cert_pending = false;
         self.cert_cancelled = !proceed;
-        client().post(proto.CertDecision{
+        // A helper without the capability never sent the event, so it
+        // can only be a decision for a request nobody holds.
+        if (client().has_tls) client().post(proto.CertDecision{
             .view = self.view,
             .proceed = if (proceed) 1 else 0,
         });
@@ -3341,6 +3492,7 @@ pub const WebFace = struct {
     }
 
     fn postPermission(self: *WebFace, prompt: u64, allow: bool) void {
+        if (!client().has_permissions) return;
         client().post(proto.PermissionDecision{
             .view = self.view,
             .prompt = prompt,
@@ -3846,6 +3998,10 @@ pub const WebFace = struct {
     /// test; show ours at the reported page position.
     pub fn onContextMenu(self: *WebFace, ev: proto.EvContextMenu) void {
         if (self.widgets_dead) return;
+        // Not on an inspector pane: our menu's verbs (Back, Reload,
+        // Copy Page URL) would act on the DEVTOOLS browser, which is
+        // never what a right-click inside the inspector means.
+        if (self.attached) return;
         const root = classicmenu.Root.create(self.allocator) orelse return;
         const ctx = self.allocator.create(MenuCtx) catch {
             root.destroy();
@@ -3869,6 +4025,24 @@ pub const WebFace = struct {
         const page = m.section();
         page.check("Reader View", self.reader_active, &onMenuReader, ctx);
         page.itemIconEnabled("Copy Page URL", .none, ctx.page != null, &onMenuCopyUrl, ctx);
+        // A helper too old for either verb greys the row out rather
+        // than hiding it: what a browser pane CAN do stays visible.
+        const cl = client();
+        const tools = m.section();
+        tools.itemIconEnabled(
+            "Print to PDF…",
+            .{ .name = "document-print-symbolic" },
+            self.view_live and cl.cap_print_pdf,
+            &onMenuPrintPdf,
+            ctx,
+        );
+        tools.itemIconEnabled(
+            "Open DevTools",
+            .{ .name = "applications-engineering-symbolic" },
+            self.view_live and !self.attached and cl.cap_devtools,
+            &onMenuDevTools,
+            ctx,
+        );
 
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
         const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
@@ -3909,6 +4083,191 @@ pub const WebFace = struct {
         const link = ctx.link orelse return;
         const win = ctx.face.ownerWindow() orelse return;
         win.newWebTabAt(link) catch {};
+    }
+
+    fn onMenuDevTools(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.openDevTools();
+    }
+
+    fn onMenuPrintPdf(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.printToPdf();
+    }
+
+    // ---- DevTools ---------------------------------------------------
+
+    /// Ask the helper for this page's inspector. The pane is opened by
+    /// the REPLY (`ev_devtools_view`), because only then is there a
+    /// view id to present.
+    pub fn openDevTools(self: *WebFace) void {
+        // An inspector cannot inspect itself.
+        if (self.attached) return;
+        if (!self.view_live) return;
+        if (!client().cap_devtools) {
+            self.toast("This browser helper is too old for DevTools.");
+            return;
+        }
+        if (self.devtools_pending) return;
+        self.devtools_pending = true;
+        client().post(proto.DevToolsShow{ .view = self.view, .x = 0, .y = 0 });
+    }
+
+    /// The helper's answer: split this pane and give the new one a face
+    /// bound to the inspector view.
+    fn onDevToolsView(self: *WebFace, dev_view: u32, reason: []const u8) void {
+        self.devtools_pending = false;
+        if (dev_view == 0) {
+            // `windowed` is not a failure: the inspector IS open, the
+            // engine just insisted on giving it a window of its own
+            // (every CEF 151 build does — src/web/cefhost.zig
+            // `adoptBrowser`). Saying "could not open" there would be a
+            // lie about a window the user is looking at.
+            if (std.mem.eql(u8, reason, "windowed")) {
+                self.toast("DevTools opened in its own window (this browser engine cannot render it inside a pane).");
+                return;
+            }
+            self.toast("The browser engine did not open DevTools for this page.");
+            return;
+        }
+        const pane = self.pane orelse {
+            client().post(proto.ViewDestroy{ .view = dev_view });
+            return;
+        };
+        const win = self.ownerWindow() orelse {
+            client().post(proto.ViewDestroy{ .view = dev_view });
+            return;
+        };
+        // A view nobody presents is a browser nobody can close: every
+        // failure below hands it straight back.
+        win.openDevToolsSplit(pane, dev_view) catch {
+            client().post(proto.ViewDestroy{ .view = dev_view });
+            self.toast("Could not open a pane for DevTools.");
+        };
+    }
+
+    // ---- print to PDF -------------------------------------------------
+
+    /// User-data for the save dialog: the VIEW id, never the face
+    /// pointer. The dialog outlives a pane close by construction, and
+    /// looking the face back up in the client's registry — which a dead
+    /// face leaves — is the liveness fence for exactly that.
+    const PrintCtx = struct {
+        allocator: std.mem.Allocator,
+        view: u32,
+    };
+
+    /// Save dialog -> `print_pdf`. The helper writes the file itself
+    /// (it is the process holding the page), so the pick has to be a
+    /// path on THIS machine.
+    pub fn printToPdf(self: *WebFace) void {
+        if (!self.view_live) return;
+        if (!client().cap_print_pdf) {
+            self.toast("This browser helper is too old to print to PDF.");
+            return;
+        }
+        const pickwin = @import("picker.zig");
+        const ctx = self.allocator.create(PrintCtx) catch return;
+        ctx.* = .{ .allocator = self.allocator, .view = self.view };
+        var name_buf: [160]u8 = undefined;
+        const suggested = self.suggestedPdfName(&name_buf);
+        const win: ?*c.GtkWindow = if (self.ownerWindow()) |w| @ptrCast(w.app_window) else null;
+        _ = pickwin.PickerWindow.open(self.allocator, win, .{
+            .mode = .save_file,
+            .title = "Print to PDF",
+            .suggested_name = suggested,
+            .local_only = true,
+        }, &onPdfPathPicked, @ptrCast(ctx)) catch {
+            self.allocator.destroy(ctx);
+            self.toast("Could not open the save dialog.");
+        };
+    }
+
+    /// `<page title>.pdf`, with everything a filename should not carry
+    /// flattened to '-'. A page with no title saves as "page.pdf".
+    fn suggestedPdfName(self: *WebFace, buf: []u8) []const u8 {
+        const title = self.title orelse return "page.pdf";
+        var n: usize = 0;
+        const room = @min(buf.len - 5, 80);
+        for (title) |ch| {
+            if (n >= room) break;
+            buf[n] = switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '-', '_', ' ', '.' => ch,
+                else => '-',
+            };
+            n += 1;
+        }
+        while (n > 0 and (buf[n - 1] == ' ' or buf[n - 1] == '.' or buf[n - 1] == '-')) n -= 1;
+        if (n == 0) return "page.pdf";
+        @memcpy(buf[n..][0..4], ".pdf");
+        return buf[0 .. n + 4];
+    }
+
+    fn onPdfPathPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
+        const ctx: *PrintCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.allocator.destroy(ctx);
+        const self = client().findFace(ctx.view) orelse return;
+        const res = result orelse return;
+        if (res.specs.len == 0) return;
+        const win: ?*c.GtkWindow = if (self.ownerWindow()) |w| @ptrCast(w.app_window) else null;
+        // The HELPER writes the file and it runs on this machine; a
+        // `host:/path` pick has nothing that could honour it.
+        const path = @import("picker.zig").localPathOrRefuse(
+            win,
+            res.specs[0],
+            "The browser engine writes the PDF itself, on this machine — pick a local path.",
+        ) orelse return;
+        if (!self.view_live) return;
+        client().post(proto.PrintPdf{
+            .view = self.view,
+            // Background graphics ON: a page saved without them looks
+            // broken, which is not what "print this page" means here.
+            .flags = proto.print_flag_background,
+            .paper = @intFromEnum(proto.Paper.default),
+            .path = path,
+        });
+        var msg: [512]u8 = undefined;
+        self.toast(std.fmt.bufPrint(&msg, "Printing to {s}…", .{path}) catch "Printing to PDF…");
+    }
+
+    fn onPrintDone(self: *WebFace, ok: bool, path: []const u8) void {
+        var msg: [512]u8 = undefined;
+        if (!ok) {
+            self.toast(std.fmt.bufPrint(&msg, "Could not write {s}", .{path}) catch "Could not write the PDF");
+            return;
+        }
+        const win = self.ownerWindow() orelse return;
+        const text = std.fmt.bufPrintZ(&msg, "Saved {s}", .{path}) catch "Saved the PDF";
+        const note = c.adw_toast_new(text.ptr);
+        c.adw_toast_set_timeout(note, 8);
+        // The toast OWNS the path (mechanism 1): GObject frees attached
+        // data at finalize, strictly after the button can be clicked,
+        // so the Open handler can never read freed memory. c_allocator
+        // and not the face's, because the string outlives the face.
+        if (std.heap.c_allocator.dupeZ(u8, path)) |owned| {
+            c.adw_toast_set_button_label(note, "Open");
+            c.g_object_set_data_full(
+                @ptrCast(@alignCast(note)),
+                "sketerm-pdf-path",
+                @ptrCast(owned.ptr),
+                @ptrCast(&freeToastPath),
+            );
+            _ = c.g_signal_connect_data(
+                @ptrCast(@alignCast(note)),
+                "button-clicked",
+                @ptrCast(&onToastOpen),
+                @ptrCast(owned.ptr),
+                null,
+                0,
+            );
+        } else |_| {}
+        c.adw_toast_overlay_add_toast(win.toast_overlay, note);
+    }
+
+    /// Hand the finished PDF to whatever the desktop opens PDFs with.
+    fn onToastOpen(_: ?*c.AdwToast, user: ?*anyopaque) callconv(.c) void {
+        const path: [*:0]const u8 = @ptrCast(user orelse return);
+        var uri: [4096:0]u8 = undefined;
+        const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{std.mem.span(path)}) catch return;
+        _ = c.g_app_info_launch_default_for_uri(u.ptr, null, null);
     }
 
     // ---- widget callbacks ------------------------------------------

@@ -202,6 +202,10 @@ fn externalPacingDefault() bool {
 /// leave running under a wedged client forever.
 const watchdog_ms: i64 = 250;
 
+/// How long a `devtools_show` may go without the engine producing the
+/// browser it promised before the client is told nothing opened.
+const adopt_timeout_ms: i64 = 8000;
+
 // ---------------------------------------------------------------------
 // GPU (accelerated / dma-buf) mode
 // ---------------------------------------------------------------------
@@ -397,10 +401,6 @@ pub const View = struct {
     /// and — after a `view_discard` — the address the browser comes
     /// back at.
     url: []u8 = &.{},
-    /// USER zoom (`set_zoom`), as the engine's log-scale level x100.
-    /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
-    /// every load start because Chromium resets zoom per navigation.
-    user_zoom_x100: i32 = 0,
     /// `view_discard` destroyed this view's browser; the record (id,
     /// geometry, scale, address, fps cap) is all that is left. Any
     /// frame that must show, navigate or reach the page revives it
@@ -409,6 +409,10 @@ pub const View = struct {
     /// forward are empty — the memory is the whole point, and keeping
     /// the history would mean keeping the browser.
     discarded: bool = false,
+    /// USER zoom (`set_zoom`), as the engine's log-scale level x100.
+    /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
+    /// every load start because Chromium resets zoom per navigation.
+    user_zoom_x100: i32 = 0,
 
     /// The engine's callback for a certificate error whose request is
     /// HELD, waiting for a `cert_decision`. At most one per view: a
@@ -432,6 +436,19 @@ pub const View = struct {
     sem_detail: u8 = 1,
     sem_next_req: u32 = 1,
     pending: std.ArrayList(Pending) = .empty,
+
+    /// The view id of this view's OPEN inspector, 0 when it has none.
+    /// Set on the SOURCE view; destroying it takes the inspector with
+    /// it, because an inspector whose target is gone shows nothing and
+    /// nobody would ever close it.
+    devtools_view: u32 = 0,
+    /// The source view this view INSPECTS, 0 for an ordinary view.
+    devtools_of: u32 = 0,
+    /// An inspector the engine insisted on giving its OWN WINDOW. It is
+    /// tracked as a view only so somebody owns the browser and closes
+    /// it — it paints nothing, is never announced to the client, and
+    /// takes no frames.
+    windowed: bool = false,
 
     /// dma-buf pool identity (accelerated mode only). The engine renders
     /// into a handful of buffers and cycles through them, handing the
@@ -567,6 +584,26 @@ pub const Host = struct {
     /// The view a create_browser_sync call is currently building, for
     /// the callbacks CEF fires BEFORE it returns the browser pointer.
     pending: ?*View = null,
+    /// The view waiting for a browser CEF creates on its own schedule:
+    /// `show_dev_tools` returns void and the inspector browser appears
+    /// in a later `on_after_created`, so unlike `pending` this cannot
+    /// be scoped to one call. It is consulted only for a browser no
+    /// view claims by cef id, and cleared the moment one is adopted.
+    adopting: ?*View = null,
+    /// When `adopting` was armed. An engine that answers a
+    /// `show_dev_tools` with no browser at all would otherwise leave a
+    /// client waiting for a reply that never comes — see `watchdog`.
+    adopting_ms: i64 = 0,
+    /// Next helper-minted view id (inspectors). Client ids come from
+    /// the client and start at 1; see `proto.DEVTOOLS_VIEW_BASE`.
+    next_devtools: u32 = proto.DEVTOOLS_VIEW_BASE,
+    /// Prints the engine has not finished yet. `path` is owned and is
+    /// also the correlation key: CEF's callback hands back the path,
+    /// not a request id.
+    prints: std.ArrayList(Print) = .empty,
+
+    /// One `print_pdf` in flight.
+    const Print = struct { view: u32, path: []u8 };
 
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
         return .{ .gpa = gpa, .out = out };
@@ -575,6 +612,8 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         self.destroyAll();
         self.views.deinit(self.gpa);
+        for (self.prints.items) |p| self.gpa.free(p.path);
+        self.prints.deinit(self.gpa);
         if (g_host == self) g_host = null;
     }
 
@@ -655,39 +694,8 @@ pub const Host = struct {
     /// announcement. A failure destroys the view rather than leaving a
     /// record nothing can render.
     fn spawnBrowser(self: *Host, v: *View, initial_url: []const u8) !void {
-        var winfo = std.mem.zeroes(cef.cef_window_info_t);
-        winfo.size = @sizeOf(cef.cef_window_info_t);
-        winfo.windowless_rendering_enabled = 1;
-        // The frame source: with this set, Chromium produces a frame
-        // per `send_external_begin_frame` and never on its own, which
-        // is what lifts the 60fps ceiling AND what makes an untouched
-        // page cost nothing. It is fixed at browser creation and cannot
-        // be toggled per frame, so ALL adaptive behaviour lives in how
-        // often somebody asks (client pacing + the watchdog below).
-        v.external_pacing = externalPacingDefault();
-        winfo.external_begin_frame_enabled = if (v.external_pacing) 1 else 0;
-        // GPU frames. Fixed at browser creation like the flag above, and
-        // only ever honoured when the process got a GPU: with it set and
-        // no GPU compositing available, Chromium simply keeps calling
-        // `on_paint`, which is the software path this helper already
-        // has. That is the whole fallback — no probe, no timeout.
-        winfo.shared_texture_enabled = if (accelerated) 1 else 0;
-        winfo.runtime_style = cef.CEF_RUNTIME_STYLE_ALLOY;
-
-        var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
-        bsettings.size = @sizeOf(cef.cef_browser_settings_t);
-        bsettings.windowless_frame_rate = effectiveWindowlessFps(v.max_fps);
-        // OPAQUE WHITE, PER BROWSER. A windowless browser defaults to
-        // TRANSPARENT, and a page that specifies no background of its
-        // own then paints (0,0,0,0) everywhere: a perfectly healthy
-        // page photographs as a uniformly black frame (measured — the
-        // centre pixel is exactly {0,0,0,0}, smoke-web stage 22c).
-        // `CefSettings.background_color` is documented as the fallback
-        // for a zero value here and is ALREADY opaque white in
-        // `initialize`, but measurably does not reach an alloy
-        // windowless browser: only this per-browser value does. Do not
-        // delete it in favour of the global one.
-        bsettings.background_color = 0xffffffff;
+        var winfo = windowlessInfo(v);
+        var bsettings = windowlessSettings(v);
 
         var url = std.mem.zeroes(cef.cef_string_t);
         setStr(if (initial_url.len != 0) initial_url else "about:blank", &url);
@@ -720,25 +728,39 @@ pub const Host = struct {
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
+            // An inspector outliving its target inspects nothing and
+            // has no client surface left to close it, so it goes too;
+            // an inspector being closed simply frees its target's slot.
+            const inspector = v.devtools_view;
+            if (v.devtools_of != 0) {
+                if (self.find(v.devtools_of)) |src| src.devtools_view = 0;
+            }
+            if (self.adopting == v) self.adopting = null;
             self.freeView(v);
+            if (inspector != 0) self.destroyView(inspector);
             return;
         }
     }
 
     pub fn destroyAll(self: *Host) void {
+        self.adopting = null;
         while (self.views.pop()) |v| self.freeView(v);
     }
 
     /// `view_discard`: destroy the browser, keep the view.
     ///
-    /// The record — id, logical geometry, scale, fps cap and the address
-    /// in `v.url` — survives; the browser, its render process, the frame
-    /// buffer and the whole semantic shadow tree do not. Sending it for
-    /// a view that is already discarded (or unknown) does nothing.
+    /// The record — id, logical geometry, scale, fps cap, USER ZOOM and
+    /// the address in `v.url` — survives; the browser, its render
+    /// process, the frame buffer and the whole semantic shadow tree do
+    /// not. The revival therefore re-applies the zoom itself
+    /// (`spawnBrowser` -> `applyZoom`) and the client never re-sends
+    /// one, unlike the helper-restart path where the record is gone
+    /// too. Sending this for a view that is already discarded (or
+    /// unknown) does nothing.
     pub fn discardView(self: *Host, id: u32) void {
         const v = self.find(id) orelse return;
         if (v.discarded) return;
-        self.dropBrowser(v);
+        self.dropBrowser(v, true);
         v.discarded = true;
         // The engine is gone, so nothing may be asked of it: hidden is
         // what keeps the watchdog and every paint path off this view
@@ -789,22 +811,232 @@ pub const Host = struct {
         return v;
     }
 
+    // -- devtools ------------------------------------------------------
+
+    /// Open the engine's inspector for a view, AS ANOTHER VIEW.
+    ///
+    /// `show_dev_tools` with a windowless `cef_window_info_t` and our
+    /// own client makes the inspector an ordinary OSR browser: it
+    /// paints through the same `on_paint`/`on_accelerated_paint`, takes
+    /// the same input frames, and is closed with `view_destroy`. That
+    /// is the whole reason no remote debugging PORT is involved.
+    ///
+    /// The browser does NOT exist when this returns — CEF creates it on
+    /// its own schedule and announces it in `on_after_created`, which
+    /// is where the view is finished and `ev_devtools_view` is posted.
+    /// Every path answers exactly once, so a client can always wait for
+    /// one reply.
+    pub fn devtoolsShow(self: *Host, req: proto.DevToolsShow) !void {
+        const src = self.find(req.view) orelse {
+            self.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "no such view" });
+            return;
+        };
+        // Already open: the client gets the id it has, not a second
+        // inspector for the same page — or, for the engine-window
+        // fallback, the same "no view, it is a window" answer.
+        if (src.devtools_view != 0) {
+            if (self.find(src.devtools_view)) |dev| {
+                if (dev.windowed) {
+                    focusDevTools(src);
+                    self.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "windowed" });
+                } else {
+                    self.post(proto.EvDevToolsView{ .view = req.view, .devtools = src.devtools_view, .reason = "" });
+                }
+                return;
+            }
+            src.devtools_view = 0;
+        }
+        const host = browserHost(src) orelse {
+            self.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "no browser" });
+            return;
+        };
+        defer release(&host.base);
+        const show = host.show_dev_tools orelse {
+            self.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "unsupported" });
+            return;
+        };
+        // An inspector this helper does NOT track as a view: the
+        // engine-window fallback below already gave this page one.
+        // `show_dev_tools` then only FOCUSES it and creates no browser,
+        // so nothing would ever announce it — answer here instead, and
+        // let the call through so the focus still happens.
+        const has = if (host.has_dev_tools) |f| f(host) != 0 else false;
+        if (has) {
+            show(host, null, null, null, null);
+            self.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "windowed" });
+            return;
+        }
+
+        self.next_devtools +%= 1;
+        if (self.next_devtools < proto.DEVTOOLS_VIEW_BASE) self.next_devtools = proto.DEVTOOLS_VIEW_BASE + 1;
+        const v = try self.gpa.create(View);
+        errdefer self.gpa.destroy(v);
+        v.* = .{
+            .id = self.next_devtools,
+            // The client resizes it the moment its surface is laid out;
+            // this is only what the first layout happens at.
+            .w = src.w,
+            .h = src.h,
+            .scale_x1000 = src.scale_x1000,
+            .pw = physicalOf(src.w, src.scale_x1000),
+            .ph = physicalOf(src.h, src.scale_x1000),
+            .devtools_of = src.id,
+            .sem = semantic.View.init(self.gpa),
+        };
+        try self.views.append(self.gpa, v);
+        errdefer _ = self.views.pop();
+        src.devtools_view = v.id;
+
+        var winfo = windowlessInfo(v);
+        var bsettings = windowlessSettings(v);
+        var point = cef.cef_point_t{ .x = 0, .y = 0 };
+        const inspect = req.x != 0 or req.y != 0;
+        if (inspect) {
+            const pt = viewPoint(src, req.x, req.y);
+            point = .{ .x = pt.x, .y = pt.y };
+        }
+        self.adopting = v;
+        self.adopting_ms = nowMs();
+        show(host, &winfo, &client, &bsettings, if (inspect) &point else null);
+    }
+
+    /// Finish an inspector view once CEF hands over its browser, and
+    /// tell the client which view id it may drive. Called from
+    /// `on_after_created` for a browser no view claims.
+    fn adoptBrowser(self: *Host, v: *View, browser: *cef.cef_browser_t) void {
+        self.adopting = null;
+        // `on_after_created`'s browser is BORROWED; every other browser
+        // pointer this file keeps comes from create_browser_sync with a
+        // reference held, and `freeView` releases one either way.
+        if (browser.base.add_ref) |ar| ar(&browser.base);
+        v.browser = browser;
+        v.cef_id = browserInt(browser, "get_identifier");
+        // DID THE ENGINE HONOUR THE WINDOWLESS REQUEST?
+        //
+        // MEASURED (CEF 151.3.16, the Arch `cef` package and the pinned
+        // upstream build alike): it does NOT. `show_dev_tools` with a
+        // windowless `cef_window_info_t` logs "Windowless rendering is
+        // not supported for this DevTools window" from
+        // chrome_browser_delegate.cc and creates an ORDINARY WINDOWED
+        // DevTools browser instead — `is_window_rendering_disabled()`
+        // on it answers 0. Nothing in the window info moves that:
+        // runtime_style is already ALLOY (what `SetAsWindowless` sets)
+        // and the inspected browser is itself windowless.
+        //
+        // The window it made is real, working DevTools, so it is LEFT
+        // OPEN and the client is told there is no VIEW to present
+        // (`devtools = 0` plus the reason). The client turns that into
+        // "DevTools opened in its own window" rather than an empty
+        // pane. Everything below is the path an engine that honours the
+        // request takes, and it runs the moment one does.
+        if (!isWindowless(v)) {
+            // The view stays in the table WITHOUT a frame buffer: it is
+            // how the window gets closed when its target goes away, and
+            // how `cef_shutdown` finds no browser left open (it aborts
+            // the process otherwise — that is how this was found).
+            v.windowed = true;
+            self.post(proto.EvDevToolsView{
+                .view = v.devtools_of,
+                .devtools = 0,
+                .reason = "windowed",
+            });
+            return;
+        }
+        applyZoom(v);
+        // THE ID GOES OUT FIRST, before the view's `frame_buffer`.
+        // A client learns which view an inspector is from this frame
+        // alone, and one that has not seen it yet has nowhere to put
+        // the buffer — the GUI drops a frame for an unknown view and
+        // would then wait for a repaint that only a geometry change
+        // produces.
+        self.post(proto.EvDevToolsView{ .view = v.devtools_of, .devtools = v.id, .reason = "" });
+        // A view with no frame buffer can never be seen. Nothing but
+        // OOM gets here, and the client's pane simply stays blank
+        // until it is closed; a second `devtools_show` mints a fresh
+        // inspector, because destroying this one frees the slot.
+        self.allocBuffer(v) catch self.destroyView(v.id);
+    }
+
+    // -- print to PDF --------------------------------------------------
+
+    /// Render a view to a PDF file. The answer is always exactly one
+    /// `ev_print_pdf_done`, including for a view that does not exist —
+    /// a client waiting on a save must never wait forever.
+    pub fn printPdf(self: *Host, req: proto.PrintPdf) void {
+        const v = self.find(req.view) orelse {
+            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
+            return;
+        };
+        const host = browserHost(v) orelse {
+            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
+            return;
+        };
+        defer release(&host.base);
+        const print = host.print_to_pdf orelse {
+            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
+            return;
+        };
+        const owned = self.gpa.dupe(u8, req.path) catch {
+            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
+            return;
+        };
+        self.prints.append(self.gpa, .{ .view = v.id, .path = owned }) catch {
+            self.gpa.free(owned);
+            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
+            return;
+        };
+
+        var settings = std.mem.zeroes(cef.cef_pdf_print_settings_t);
+        settings.size = @sizeOf(cef.cef_pdf_print_settings_t);
+        settings.landscape = if (req.flags & proto.print_flag_landscape != 0) 1 else 0;
+        settings.print_background = if (req.flags & proto.print_flag_background != 0) 1 else 0;
+        if (proto.paperInches(req.paper)) |sheet| {
+            settings.paper_width = sheet.w;
+            settings.paper_height = sheet.h;
+        }
+        var path = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.path, &path);
+        defer cef.cef_string_utf16_clear(&path);
+        print(host, &path, &settings, &pdf_callback);
+    }
+
+    /// The engine finished writing (or failed to write) a PDF. The
+    /// path is the correlation key: CEF's callback carries no request
+    /// id, and a client may have several prints in flight.
+    fn onPrintDone(self: *Host, path: []const u8, ok: bool) void {
+        for (self.prints.items, 0..) |p, i| {
+            if (!std.mem.eql(u8, p.path, path)) continue;
+            const done = self.prints.orderedRemove(i);
+            defer self.gpa.free(done.path);
+            self.post(proto.EvPrintPdfDone{
+                .view = done.view,
+                .ok = if (ok) 1 else 0,
+                .path = done.path,
+            });
+            return;
+        }
+    }
+
     /// Tear down a view's browser and everything that belonged to its
     /// document, leaving the record itself untouched. Shared by
-    /// `freeView` (which then frees the record) and `discardView`
-    /// (which keeps it).
-    fn dropBrowser(self: *Host, v: *View) void {
+    /// `freeViewOpts` (which then frees the record) and `discardView`
+    /// (which keeps it). `close` is false exactly once — an inspector
+    /// CEF insisted on giving its own OS window, where closing would
+    /// take the user's DevTools away rather than clean up after it.
+    fn dropBrowser(self: *Host, v: *View, close: bool) void {
         // Held requests belong to a browser that is going away:
         // answering them now is what stops the engine waiting on a
         // decision the client can no longer make. Cancel, never
         // proceed.
         resolveCert(v, false);
         for (&v.perms) |*p| resolvePerm(p, false);
-        if (browserHost(v)) |host| {
-            // force_close: a windowless browser has no user to prompt
-            // and no unload dialog anybody could answer.
-            if (host.close_browser) |cb| cb(host, 1);
-            release(&host.base);
+        if (close) {
+            if (browserHost(v)) |host| {
+                // force_close: a windowless browser has no user to
+                // prompt and no unload dialog anybody could answer.
+                if (host.close_browser) |cb| cb(host, 1);
+                release(&host.base);
+            }
         }
         if (v.browser) |b| release(&b.base);
         v.browser = null;
@@ -831,10 +1063,16 @@ pub const Host = struct {
     }
 
     fn freeView(self: *Host, v: *View) void {
-        interceptUnregister(self.gpa, v.id);
+        self.freeViewOpts(v, true);
+    }
+
+    /// `close`: whether the browser goes down with the view — false
+    /// exactly once, for the windowed inspector (see `dropBrowser`).
+    fn freeViewOpts(self: *Host, v: *View, close: bool) void {
         // Frees the browser, the mapping, every pending request's arg
         // and the shadow tree; what is left is the record's own memory.
-        self.dropBrowser(v);
+        interceptUnregister(self.gpa, v.id);
+        self.dropBrowser(v, close);
         if (v.url.len != 0) self.gpa.free(v.url);
         v.pending.deinit(self.gpa);
         v.sem.deinit();
@@ -995,9 +1233,19 @@ pub const Host = struct {
     /// Keep every visible view alive when the client stops asking (see
     /// `watchdog_ms`). Called once per poll iteration; a client pacing
     /// at anything above 4Hz never reaches the deadline.
-    pub fn watchdog(self: *const Host, now_ms: i64) void {
+    pub fn watchdog(self: *Host, now_ms: i64) void {
+        // An inspector the engine never created. Answering is not
+        // optional: a client blocks a menu item on this reply.
+        if (self.adopting) |v| {
+            if (now_ms - self.adopting_ms > adopt_timeout_ms) {
+                const src_id = v.devtools_of;
+                self.adopting = null;
+                self.destroyView(v.id);
+                self.post(proto.EvDevToolsView{ .view = src_id, .devtools = 0, .reason = "timeout" });
+            }
+        }
         for (self.views.items) |v| {
-            if (v.hidden) continue;
+            if (v.hidden or v.windowed) continue;
             if (now_ms - v.last_begin_ms < watchdog_ms) continue;
             issueBeginFrame(v);
         }
@@ -1193,6 +1441,12 @@ pub const Host = struct {
     /// find API; results come back through `onFindResult`.
     pub fn findInPage(self: *Host, req: proto.Find) void {
         const v = self.find(req.view) orelse return;
+        // No page, no matches — and a silent no-op would leave a client
+        // waiting for a result frame that can never come.
+        if (v.discarded) {
+            self.post(proto.EvFindResult{ .view = v.id, .count = 0, .active = 0, .final = 1 });
+            return;
+        }
         var text = std.mem.zeroes(cef.cef_string_t);
         setStr(req.text, &text);
         defer cef.cef_string_utf16_clear(&text);
@@ -2470,6 +2724,69 @@ fn onGetResourceRequestHandler(
 // Small CEF call helpers
 // ---------------------------------------------------------------------
 
+/// The windowless `cef_window_info_t` every browser this helper makes
+/// is created with — the ordinary views AND the inspector, which is
+/// exactly what makes DevTools just another view.
+fn windowlessInfo(v: *View) cef.cef_window_info_t {
+    var winfo = std.mem.zeroes(cef.cef_window_info_t);
+    winfo.size = @sizeOf(cef.cef_window_info_t);
+    winfo.windowless_rendering_enabled = 1;
+    // The frame source: with this set, Chromium produces a frame per
+    // `send_external_begin_frame` and never on its own, which is what
+    // lifts the 60fps ceiling AND what makes an untouched page cost
+    // nothing. It is fixed at browser creation and cannot be toggled
+    // per frame, so ALL adaptive behaviour lives in how often somebody
+    // asks (client pacing + the watchdog).
+    v.external_pacing = externalPacingDefault();
+    winfo.external_begin_frame_enabled = if (v.external_pacing) 1 else 0;
+    // GPU frames. Fixed at browser creation like the flag above, and
+    // only ever honoured when the process got a GPU: with it set and no
+    // GPU compositing available, Chromium simply keeps calling
+    // `on_paint`, which is the software path this helper already has.
+    // That is the whole fallback — no probe, no timeout.
+    winfo.shared_texture_enabled = if (accelerated) 1 else 0;
+    winfo.runtime_style = cef.CEF_RUNTIME_STYLE_ALLOY;
+    return winfo;
+}
+
+fn windowlessSettings(v: *View) cef.cef_browser_settings_t {
+    var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
+    bsettings.size = @sizeOf(cef.cef_browser_settings_t);
+    bsettings.windowless_frame_rate = effectiveWindowlessFps(v.max_fps);
+    // OPAQUE WHITE, PER BROWSER. A windowless browser defaults to
+    // TRANSPARENT, and a page that specifies no background of its own
+    // then paints (0,0,0,0) everywhere: a perfectly healthy page
+    // photographs as a uniformly black frame (measured — the centre
+    // pixel is exactly {0,0,0,0}, smoke-web stage 22c).
+    // `CefSettings.background_color` is documented as the fallback for
+    // a zero value here and is ALREADY opaque white in `initialize`,
+    // but measurably does not reach an alloy windowless browser: only
+    // this per-browser value does. Do not delete it in favour of the
+    // global one.
+    bsettings.background_color = 0xffffffff;
+    return bsettings;
+}
+
+/// Re-show (i.e. focus) an inspector the engine already has open for
+/// `src`. CEF documents `show_dev_tools` on an open inspector as a
+/// focus request that ignores every other argument.
+fn focusDevTools(src: *View) void {
+    const host = browserHost(src) orelse return;
+    defer release(&host.base);
+    if (host.show_dev_tools) |show| show(host, null, null, null, null);
+}
+
+/// Whether the view's browser really renders off-screen. An engine can
+/// refuse a windowless request (CEF's DevTools window does — see
+/// `Host.adoptBrowser`), and a windowed browser delivers no frame this
+/// protocol can carry.
+fn isWindowless(v: *View) bool {
+    const host = browserHost(v) orelse return false;
+    defer release(&host.base);
+    const f = host.is_window_rendering_disabled orelse return false;
+    return f(host) != 0;
+}
+
 /// Invoke a nullary int-returning `cef_browser_t` accessor by name,
 /// tolerating both a null browser and a null vtable slot.
 fn browserInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
@@ -2662,6 +2979,12 @@ var permission_handler: cef.cef_permission_handler_t = undefined;
 var bp_handler: cef.cef_browser_process_handler_t = undefined;
 var rp_handler: cef.cef_render_process_handler_t = undefined;
 var v8_handler: cef.cef_v8_handler_t = undefined;
+/// The `print_to_pdf` completion callback. A process-lifetime static
+/// like every other handler here, and for the same reason its no-op
+/// refcount is sound: CEF may hold references to it forever and can
+/// never free it. It carries no per-request state — the path in the
+/// callback correlates the answer (see `Host.onPrintDone`).
+var pdf_callback: cef.cef_pdf_print_callback_t = undefined;
 
 /// Milliseconds until CEF next wants `pump()`; -1 = nothing scheduled.
 var pump_delay_ms: i64 = -1;
@@ -2712,6 +3035,14 @@ fn getLifeSpanHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_life_spa
 fn getLoadHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_load_handler_t {
     return &load_handler;
 }
+/// MEASURED, and the reason a permission prompt does not reach the GUI
+/// today: the installed CEF running an ALLOY windowless browser never
+/// asks the client for this handler at all -- a geolocation request is
+/// denied inside the engine and `on_show_permission_prompt` is never
+/// called (smoke-web stage 22g pins that, and FAILS the day it
+/// changes). The handler below is complete and correct for the
+/// configurations that do consult it; nothing here can make the engine
+/// ask.
 fn getPermissionHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_permission_handler_t {
     return &permission_handler;
 }
@@ -2772,6 +3103,17 @@ fn installHandlers() void {
     resource_request_handler.base = staticBase(cef.cef_resource_request_handler_t);
     resource_request_handler.on_before_resource_load = onBeforeResourceLoad;
     resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
+    request_handler.on_certificate_error = onCertificateError;
+
+    permission_handler = std.mem.zeroes(cef.cef_permission_handler_t);
+    permission_handler.base = staticBase(cef.cef_permission_handler_t);
+    permission_handler.on_show_permission_prompt = onShowPermissionPrompt;
+    permission_handler.on_request_media_access_permission = onRequestMediaAccess;
+    permission_handler.on_dismiss_permission_prompt = onDismissPermissionPrompt;
+
+    pdf_callback = std.mem.zeroes(cef.cef_pdf_print_callback_t);
+    pdf_callback.base = staticBase(cef.cef_pdf_print_callback_t);
+    pdf_callback.on_pdf_print_finished = onPdfPrintFinished;
 
     find_handler = std.mem.zeroes(cef.cef_find_handler_t);
     find_handler.base = staticBase(cef.cef_find_handler_t);
@@ -2780,13 +3122,6 @@ fn installHandlers() void {
     context_menu_handler = std.mem.zeroes(cef.cef_context_menu_handler_t);
     context_menu_handler.base = staticBase(cef.cef_context_menu_handler_t);
     context_menu_handler.run_context_menu = onRunContextMenu;
-    request_handler.on_certificate_error = onCertificateError;
-
-    permission_handler = std.mem.zeroes(cef.cef_permission_handler_t);
-    permission_handler.base = staticBase(cef.cef_permission_handler_t);
-    permission_handler.on_show_permission_prompt = onShowPermissionPrompt;
-    permission_handler.on_request_media_access_permission = onRequestMediaAccess;
-    permission_handler.on_dismiss_permission_prompt = onDismissPermissionPrompt;
 
     client = std.mem.zeroes(cef.cef_client_t);
     client.base = staticBase(cef.cef_client_t);
@@ -2822,7 +3157,9 @@ fn onProcessMessage(
 
 /// Resolve the view a callback's browser belongs to. During
 /// create_browser_sync the browser is not registered yet, so the
-/// in-flight view answers instead.
+/// in-flight view answers instead — and likewise for the inspector
+/// browser CEF builds asynchronously, whose `get_view_rect` is asked
+/// before `on_after_created` ever runs.
 fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     const host = g_host orelse return null;
     if (browser != null) {
@@ -2830,7 +3167,7 @@ fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
             if (host.findCef(gi(browser))) |v| return v;
         }
     }
-    return host.pending;
+    return host.pending orelse host.adopting;
 }
 
 /// The view rect the engine renders: LOGICAL (DIP) in software mode,
@@ -3277,15 +3614,37 @@ fn onAfterCreated(
     browser: [*c]cef.cef_browser_t,
 ) callconv(.c) void {
     const host = g_host orelse return;
-    const v = host.pending orelse return;
-    if (v.cef_id != 0 or browser == null) return;
-    if (browser.*.get_identifier) |gi| {
-        v.cef_id = gi(browser);
-        // Register as EARLY as possible so the first document's own
-        // subresources are attributed: this fires inside
-        // create_browser_sync, before createViewAt sets cef_id.
-        interceptRegister(host.gpa, v.id, v.cef_id);
+    const b: *cef.cef_browser_t = browser orelse return;
+    if (host.pending) |v| {
+        if (v.cef_id == 0) {
+            if (b.get_identifier) |gi| {
+                v.cef_id = gi(b);
+                // Register as EARLY as possible so the first document's
+                // own subresources are attributed: this fires inside
+                // create_browser_sync, before createViewAt sets cef_id.
+                interceptRegister(host.gpa, v.id, v.cef_id);
+            }
+        }
+        return;
     }
+    // Nothing is being created synchronously, so this is a browser CEF
+    // made on its own schedule: the inspector `devtools_show` asked
+    // for. It is the only such browser this helper can produce —
+    // popups are cancelled in `on_before_popup`.
+    const v = host.adopting orelse return;
+    if (v.browser != null) return;
+    host.adoptBrowser(v, b);
+}
+
+fn onPdfPrintFinished(
+    _: [*c]cef.cef_pdf_print_callback_t,
+    path: [*c]const cef.cef_string_t,
+    ok: c_int,
+) callconv(.c) void {
+    const host = g_host orelse return;
+    var s = Utf8.init(path);
+    defer s.free();
+    host.onPrintDone(s.slice(), ok != 0);
 }
 
 fn onLoadingStateChange(
