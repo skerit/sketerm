@@ -77,6 +77,16 @@ const ENTRIES = [_]Entry{
        .desc = "Switch focus to the next tab.", .action = .next_tab },
     .{ .icon = "go-previous-symbolic", .title = "Previous Tab",
        .desc = "Switch focus to the previous tab.", .action = .prev_tab },
+    .{ .icon = "sidebar-show-symbolic", .title = "Toggle Tab Tree Sidebar",
+       .desc = "Show or hide the vertical tree-style tab sidebar.", .action = .toggle_tab_sidebar },
+    .{ .icon = "pan-end-symbolic", .title = "Collapse Tab Subtree",
+       .desc = "Hide the current tab's child tabs (tree-style tabs).", .action = .tab_collapse },
+    .{ .icon = "pan-down-symbolic", .title = "Expand Tab Subtree",
+       .desc = "Show the current tab's child tabs again.", .action = .tab_expand },
+    .{ .icon = "go-next-symbolic", .title = "Next Tab (Tree Order)",
+       .desc = "Switch to the next tab in tree order, skipping collapsed subtrees.", .action = .tab_tree_next },
+    .{ .icon = "go-previous-symbolic", .title = "Previous Tab (Tree Order)",
+       .desc = "Switch to the previous tab in tree order, skipping collapsed subtrees.", .action = .tab_tree_prev },
 
     // Panes
     .{ .icon = "view-dual-symbolic", .title = "Split Horizontal",

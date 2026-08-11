@@ -124,6 +124,17 @@ pub const Action = enum {
     /// Show / hide the entire tab bar — useful when working in
     /// single-tab mode where the bar is wasted vertical space.
     toggle_tab_bar,
+    /// Show / hide the vertical tree-style tab sidebar.
+    toggle_tab_sidebar,
+    /// Collapse the current tab's subtree (tree-style tabs) — its
+    /// child tabs hide from the strip and sidebar.
+    tab_collapse,
+    /// Expand the current tab's subtree.
+    tab_expand,
+    /// Next tab in TREE order, skipping collapsed subtrees.
+    tab_tree_next,
+    /// Previous tab in TREE order, skipping collapsed subtrees.
+    tab_tree_prev,
     /// Re-load config.conf from disk + apply live (no restart).
     /// Re-reads the file the process started from: an active
     /// `--config <path>` override, else the XDG search path.
@@ -476,6 +487,11 @@ pub fn actionName(a: Action) []const u8 {
         .restore_closed_tab => "restore_closed_tab",
         .toggle_pin_tab => "toggle_pin_tab",
         .toggle_tab_bar => "toggle_tab_bar",
+        .toggle_tab_sidebar => "toggle_tab_sidebar",
+        .tab_collapse => "tab_collapse",
+        .tab_expand => "tab_expand",
+        .tab_tree_next => "tab_tree_next",
+        .tab_tree_prev => "tab_tree_prev",
         .reload_config => "reload_config",
         .launch_app => "launch_app",
         .app_windows => "app_windows",
@@ -572,6 +588,11 @@ pub fn actionLabel(a: Action) []const u8 {
         .restore_closed_tab => "Re-open closed tab",
         .toggle_pin_tab => "Pin / unpin current tab",
         .toggle_tab_bar => "Show / hide tab bar",
+        .toggle_tab_sidebar => "Show / hide tab tree sidebar",
+        .tab_collapse => "Collapse tab subtree",
+        .tab_expand => "Expand tab subtree",
+        .tab_tree_next => "Next tab (tree order)",
+        .tab_tree_prev => "Previous tab (tree order)",
         .reload_config => "Reload config from disk",
         .launch_app => "Launch app on this host…",
         .app_windows => "Session overview (applications, audio and sessions)…",
