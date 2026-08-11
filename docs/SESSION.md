@@ -16268,3 +16268,53 @@ same title and the same green centre pixel. `zig build test-core` fails
 at the build-step level on this machine — identically on the base
 commit, with the test binary itself reporting 1813 passed / 0 failed
 when run directly, so pre-existing.
+
+## 2026-08-11: TLS interstitials, permission prompts, popup policy
+
+Three security/UX gaps in the browser face, all of them "the engine
+asked a question nobody was answering".
+
+- **TLS interstitials.** A certificate error used to fall into the
+  generic `onLoadError` and read like a DNS failure. The helper now
+  implements `on_certificate_error`, HOLDS the request and posts
+  `ev_cert_error` (tag 0x55, capability `tls`) with the host, the
+  symbolic error name, subject, issuer and the certificate's SHA-256;
+  `cert_decision` (0x56) continues or cancels it. The GUI raises a
+  full-face dark interstitial that COVERS the page — "Back to safety"
+  (default, leaves via history or about:blank) and "Proceed anyway
+  (unsafe)". Proceeding accepts the certificate for that one request:
+  nothing is remembered on either side.
+- **Permission prompts.** `cef_permission_handler_t` is installed
+  (`on_show_permission_prompt` plus `on_request_media_access_permission`,
+  whose media callback has no prompt id of its own and gets a
+  helper-minted one in a disjoint id space). A held prompt travels as
+  `ev_permission` (0x57, capability `permissions`) with an
+  engine-agnostic permission bitmask, and `permission_decision` (0x58)
+  answers it. The GUI shows a NON-MODAL banner above the page and
+  remembers the answer per (origin, permission bits) for the face's
+  lifetime, reporting each one to `webface.SiteSettingSink` — the one
+  named hook a daemon-side site-settings store plugs into. Nothing is
+  persisted here.
+  **Not reachable yet, measured:** the installed CEF never asks an
+  ALLOY windowless browser's client for a permission handler at all and
+  denies the request internally, so the banner cannot appear today.
+  smoke-web stage 22g pins that behaviour and FAILS the day it changes.
+- **Popup policy.** `on_before_popup`'s `user_gesture` now rides the
+  wire as an OPTIONAL TRAILING byte on `ev_popup_request` — the only
+  frame allowed to grow, and only because its decoder reads a short
+  payload as "absent, assume a gesture", so an older helper keeps
+  opening every popup instead of having them all blocked. The new
+  `web_popup_policy` config key (`block-gestureless` default, `allow`,
+  `block-all`) decides: a blocked popup becomes a window toast naming
+  the host with an `Open` button. Chromium's own popup blocker eats a
+  gestureless `window.open` before the callback runs (smoke-web stage
+  6b pins that too), so the policy is a second line of defence and the
+  lever for `block-all`.
+
+Verified: `zig build`, `zig build web`, `zig build test`, `zig build
+test-core` and `zig build smoke-web` all green. New protocol round-trip
+tests cover the four frames plus an old-layout `ev_popup_request`
+decoding as "gesture". New smoke stage 22f drives a REAL self-signed
+`openssl s_server` on loopback: held request, cancel -> load error,
+error again (a denial is remembered by nobody), proceed -> page loads.
+The stage skips instead of failing where openssl is absent.
