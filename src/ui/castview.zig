@@ -10,6 +10,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const castbox = @import("castbox.zig");
+const input = @import("input.zig");
 
 const CAST_QDATA = "sketerm-cast-view";
 
@@ -101,6 +102,7 @@ pub const CastView = struct {
         user: ?*anyopaque,
     ) callconv(.c) c.gboolean {
         const self = cast.userData(CastView, user);
+        if (!contentKeysApply(state)) return 0;
         const shift = (state & c.GDK_SHIFT_MASK) != 0;
         const step: i64 = if (shift) 30_000 else 5_000;
         switch (keyval) {
@@ -114,3 +116,22 @@ pub const CastView = struct {
         return 1;
     }
 };
+
+/// These are BARE content keys: a chord that happens to share a keyval
+/// (Ctrl+R, Alt+Left, ...) belongs to the window/app, not to playback.
+/// Shift stays significant — it selects the 30s seek step.
+fn contentKeysApply(state: c.GdkModifierType) bool {
+    const held = state & input.SIGNIFICANT_MODS;
+    return held & ~@as(c_uint, c.GDK_SHIFT_MASK) == 0;
+}
+
+test "castview contentKeysApply: bare and Shift-typed keys only" {
+    const t = std.testing;
+    try t.expect(contentKeysApply(0));
+    try t.expect(contentKeysApply(c.GDK_SHIFT_MASK));
+    try t.expect(contentKeysApply(c.GDK_LOCK_MASK));
+    try t.expect(!contentKeysApply(c.GDK_CONTROL_MASK));
+    try t.expect(!contentKeysApply(c.GDK_ALT_MASK));
+    try t.expect(!contentKeysApply(c.GDK_SUPER_MASK));
+    try t.expect(!contentKeysApply(c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK));
+}
