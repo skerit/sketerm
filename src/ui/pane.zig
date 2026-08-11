@@ -535,12 +535,7 @@ pub const Pane = struct {
                 const text = self.terminal.screen.extractSelection(self.allocator) catch return true;
                 defer self.allocator.free(text);
                 if (text.len == 0) return true;
-                const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return true;
-                defer self.allocator.free(cstr);
-                @memcpy(cstr, text);
-                const display = c.gtk_widget_get_display(@ptrCast(self.surface.area));
-                const clip = c.gdk_display_get_clipboard(display);
-                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                clipboard.copyText(@ptrCast(self.surface.area), text);
                 if (self.clear_select_on_copy) {
                     self.terminal.screen.selection.clear();
                     self.terminal.screen.dirty = true;
@@ -558,12 +553,7 @@ pub const Pane = struct {
                 const text = maybe orelse return true;
                 defer self.allocator.free(text);
                 if (text.len == 0) return true;
-                const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return true;
-                defer self.allocator.free(cstr);
-                @memcpy(cstr, text);
-                const display = c.gtk_widget_get_display(@ptrCast(self.surface.area));
-                const clip = c.gdk_display_get_clipboard(display);
-                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                clipboard.copyText(@ptrCast(self.surface.area), text);
                 return true;
             },
             .reset_terminal => {
@@ -573,12 +563,7 @@ pub const Pane = struct {
             .copy_link => {
                 const uri = self.menu_link_uri orelse return true;
                 if (uri.len == 0) return true;
-                const cstr = self.allocator.allocSentinel(u8, uri.len, 0) catch return true;
-                defer self.allocator.free(cstr);
-                @memcpy(cstr, uri);
-                const display = c.gtk_widget_get_display(@ptrCast(self.surface.area));
-                const clip = c.gdk_display_get_clipboard(display);
-                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                clipboard.copyText(@ptrCast(self.surface.area), uri);
                 return true;
             },
             .open_link => {
@@ -1693,32 +1678,25 @@ fn onGlyphCoverageEvent(ctx: ?*anyopaque, cp: u32) bool {
 
 fn onClipboardGetEvent(ctx: ?*anyopaque, selection: u8) void {
     const self = cast.userData(Pane, ctx);
-    const display = c.gtk_widget_get_display(@ptrCast(self.surface.area));
-    const clip = if (selection == 'p')
-        c.gdk_display_get_primary_clipboard(display)
-    else
-        c.gdk_display_get_clipboard(display);
+    const which: clipboard.Which = if (selection == 'p') .primary else .clipboard;
+    const clip = clipboard.clipboardFor(@ptrCast(self.surface.area), which) orelse return;
     const rctx = self.allocator.create(ClipReadCtx) catch return;
     rctx.* = .{
         .allocator = self.allocator,
         .drain = self.terminal.drain,
         .selection = selection,
     };
-    c.gdk_clipboard_read_text_async(clip, null, @ptrCast(&onClipReadDone), @ptrCast(rctx));
+    if (!clipboard.readFrom(self.allocator, clip, onClipReadDone, @ptrCast(rctx)))
+        self.allocator.destroy(rctx);
 }
 
-fn onClipReadDone(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onClipReadDone(user: ?*anyopaque, text_opt: ?[]const u8) void {
     const rctx: *ClipReadCtx = @ptrCast(@alignCast(user.?));
     defer rctx.allocator.destroy(rctx);
-    const text_c = c.gdk_clipboard_read_text_finish(@ptrCast(@alignCast(source)), res, null);
-    defer if (text_c != null) c.g_free(text_c);
     if (!rctx.drain.alive.load(.acquire)) return;
     const term = rctx.drain.terminal orelse return;
 
-    var text: []const u8 = if (text_c != null)
-        std.mem.span(@as([*:0]const u8, @ptrCast(text_c)))
-    else
-        "";
+    var text: []const u8 = text_opt orelse "";
     // Bound the reply: the response flows through the PTY input
     // path; cap mirrors the 1 MB write-side limit.
     if (text.len > 1_000_000) text = text[0..1_000_000];

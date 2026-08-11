@@ -1001,12 +1001,7 @@ fn copySelection(ctx: *Ctx) void {
     if (text.len == 0) return;
 
     // Copy to system clipboard.
-    const display = c.gtk_widget_get_display(ctx.widget);
-    const clip = c.gdk_display_get_clipboard(display);
-    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
-    defer ctx.terminal.allocator.free(cstr);
-    @memcpy(cstr, text);
-    c.gdk_clipboard_set_text(clip, cstr.ptr);
+    clipboard.copyText(ctx.widget, text);
 
     if (ctx.clear_select_on_copy) {
         screen.selection.clear();
@@ -1021,12 +1016,7 @@ fn copyScreen(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    const display = c.gtk_widget_get_display(ctx.widget);
-    const clip = c.gdk_display_get_clipboard(display);
-    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
-    defer ctx.terminal.allocator.free(cstr);
-    @memcpy(cstr, text);
-    c.gdk_clipboard_set_text(clip, cstr.ptr);
+    clipboard.copyText(ctx.widget, text);
 }
 
 fn copyScrollback(ctx: *Ctx) void {
@@ -1035,12 +1025,7 @@ fn copyScrollback(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    const display = c.gtk_widget_get_display(ctx.widget);
-    const clip = c.gdk_display_get_clipboard(display);
-    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
-    defer ctx.terminal.allocator.free(cstr);
-    @memcpy(cstr, text);
-    c.gdk_clipboard_set_text(clip, cstr.ptr);
+    clipboard.copyText(ctx.widget, text);
 }
 
 fn copyCommandOutput(ctx: *Ctx) void {
@@ -1050,12 +1035,7 @@ fn copyCommandOutput(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    const display = c.gtk_widget_get_display(ctx.widget);
-    const clip = c.gdk_display_get_clipboard(display);
-    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
-    defer ctx.terminal.allocator.free(cstr);
-    @memcpy(cstr, text);
-    c.gdk_clipboard_set_text(clip, cstr.ptr);
+    clipboard.copyText(ctx.widget, text);
 }
 
 /// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).

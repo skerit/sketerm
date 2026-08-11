@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const clipboard = @import("../clipboard.zig");
 const progress = @import("../../filebrowser/progress.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
@@ -1656,12 +1657,7 @@ const CardMenuItemCtx = struct {
 
 fn onCardCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *CardMenuItemCtx = @ptrCast(@alignCast(user.?));
-    var z: [4096:0]u8 = undefined;
-    const n = @min(ctx.path.len, z.len - 1);
-    @memcpy(z[0..n], ctx.path[0..n]);
-    z[n] = 0;
-    const clip = c.gtk_widget_get_clipboard(ctx.card);
-    c.gdk_clipboard_set_text(clip, &z);
+    clipboard.copyText(ctx.card, ctx.path);
 }
 
 fn cardMenuItem(root: *classicmenu.Root, m: classicmenu.Menu, ctx: *const CardMenuCtx, label: [*:0]const u8, path: []const u8) void {

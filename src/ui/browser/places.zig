@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const clipboard = @import("../clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const paths = @import("../../filebrowser/paths.zig");
 const query_mod = @import("../../filebrowser/query.zig");
@@ -1617,12 +1618,7 @@ fn onPlacesMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn onPlacesMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    var z: [4600:0]u8 = undefined;
-    const n = @min(ctx.spec.len, z.len - 1);
-    @memcpy(z[0..n], ctx.spec[0..n]);
-    z[n] = 0;
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.view.places_list)));
-    c.gdk_clipboard_set_text(clip, &z);
+    clipboard.copyText(@ptrCast(@alignCast(ctx.view.places_list)), ctx.spec);
     ctx.view.setStatus("location copied");
 }
 

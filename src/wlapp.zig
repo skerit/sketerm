@@ -24,6 +24,7 @@ const picker = @import("ui/picker.zig");
 const fpicker = @import("filebrowser/picker.zig");
 const pathZ = @import("util/pathz.zig").pathZ;
 const imhost = @import("ui/imhost.zig");
+const clipmod = @import("ui/clipboard.zig");
 
 /// Pending "where do I put this blob?" pick. The encoded bytes are
 /// captured before the picker opens, so they outlive the app window.
@@ -2552,10 +2553,7 @@ pub const AppHost = struct {
             self.fetch_kinds.orderedRemove(0)
         else
             0;
-        const clipboard = (if (kind == 1) gdkPrimary() else gdkClipboard()) orelse return;
-        const z = self.allocator.dupeZ(u8, bytes) catch return;
-        defer self.allocator.free(z);
-        c.gdk_clipboard_set_text(clipboard, z.ptr);
+        clipmod.copyTextTo(if (kind == 1) gdkPrimary() else gdkClipboard(), bytes);
     }
 
     /// App wants to paste: async-read the host clipboard; ALWAYS
@@ -2569,16 +2567,19 @@ pub const AppHost = struct {
             return;
         };
         self.pending_reads += 1;
-        c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onClipReadDone), self);
+        // Never leave a pending read unanswered: if the request
+        // could not be issued, run the done path with no text.
+        if (!clipmod.readFrom(self.allocator, clipboard, onClipReadDone, @ptrCast(self)))
+            onClipReadDone(@ptrCast(self), null);
     }
 
-    fn onClipReadDone(src: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    /// The liveness guard here is the host's own pending-read count:
+    /// `dead` gates the reply and a doomed host is only freed once the
+    /// last outstanding read has landed.
+    fn onClipReadDone(user: ?*anyopaque, text: ?[]const u8) void {
         const self = cast.userData(AppHost, user);
-        const text = c.gdk_clipboard_read_text_finish(@ptrCast(src), res, null);
-        defer if (text != null) c.g_free(text);
         if (!self.dead) {
-            const bytes: []const u8 = if (text) |tp| std.mem.span(@as([*:0]const u8, @ptrCast(tp))) else "";
-            self.clipDataIntent(bytes);
+            self.clipDataIntent(text orelse "");
             self.flushHost();
         }
         self.pending_reads -= 1;
@@ -2596,16 +2597,16 @@ pub const AppHost = struct {
             return;
         };
         self.pending_reads += 1;
-        c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onPrimaryReadDone), self);
+        // Never leave a pending read unanswered: if the request
+        // could not be issued, run the done path with no text.
+        if (!clipmod.readFrom(self.allocator, clipboard, onPrimaryReadDone, @ptrCast(self)))
+            onPrimaryReadDone(@ptrCast(self), null);
     }
 
-    fn onPrimaryReadDone(src: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onPrimaryReadDone(user: ?*anyopaque, text: ?[]const u8) void {
         const self = cast.userData(AppHost, user);
-        const text = c.gdk_clipboard_read_text_finish(@ptrCast(src), res, null);
-        defer if (text != null) c.g_free(text);
         if (!self.dead) {
-            const bytes: []const u8 = if (text) |tp| std.mem.span(@as([*:0]const u8, @ptrCast(tp))) else "";
-            self.primaryDataIntent(bytes);
+            self.primaryDataIntent(text orelse "");
             self.flushHost();
         }
         self.pending_reads -= 1;

@@ -128,6 +128,7 @@ const pane_mod = @import("pane.zig");
 const Pane = pane_mod.Pane;
 const paths = @import("../filebrowser/paths.zig");
 const imhost = @import("imhost.zig");
+const clipboard = @import("clipboard.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const input = @import("input.zig");
@@ -778,10 +779,6 @@ const DlgCtx = struct {
         const tab = view.findTabById(self.tab_id) orelse return null;
         return .{ .view = view, .tab = tab };
     }
-};
-
-const PasteCtx = struct {
-    fence: *Fence,
 };
 
 /// One frame's worth of scrollbar geometry. Vertical values are in
@@ -5015,11 +5012,7 @@ pub const EditorView = struct {
         const text = vm.selectedText(self.allocator, &tab.doc, &tab.sels) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        const z = self.allocator.dupeZ(u8, text) catch return;
-        defer self.allocator.free(z);
-        const display = c.gtk_widget_get_display(@ptrCast(self.area));
-        const clipboard = c.gdk_display_get_clipboard(display);
-        c.gdk_clipboard_set_text(clipboard, z.ptr);
+        clipboard.copyText(@ptrCast(self.area), text);
     }
 
     fn cutSelection(self: *EditorView, tab: *ETab) void {
@@ -5034,28 +5027,20 @@ pub const EditorView = struct {
     }
 
     fn pasteClipboard(self: *EditorView) void {
-        const ctx = std.heap.c_allocator.create(PasteCtx) catch return;
+        // The Fence ref is the liveness guard: taken here, dropped in
+        // onPasteRead (which always runs, text or not).
         self.fence.ref();
-        ctx.* = .{ .fence = self.fence };
-        const display = c.gtk_widget_get_display(@ptrCast(self.area));
-        const clipboard = c.gdk_display_get_clipboard(display);
-        c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onPasteRead), @ptrCast(ctx));
+        if (!clipboard.readText(std.heap.c_allocator, @ptrCast(self.area), onPasteRead, @ptrCast(self.fence)))
+            self.fence.unref();
     }
 
-    fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *PasteCtx = @ptrCast(@alignCast(user.?));
-        defer {
-            ctx.fence.unref();
-            std.heap.c_allocator.destroy(ctx);
-        }
-        const clipboard: *c.GdkClipboard = @ptrCast(source);
-        const text_ptr = c.gdk_clipboard_read_text_finish(clipboard, result, null);
-        if (text_ptr == null) return;
-        defer c.g_free(text_ptr);
-        const view = ctx.fence.viewIfAlive() orelse return;
+    fn onPasteRead(ctx: ?*anyopaque, text: ?[]const u8) void {
+        const fence: *Fence = @ptrCast(@alignCast(ctx.?));
+        defer fence.unref();
+        const pasted = text orelse return;
+        const view = fence.viewIfAlive() orelse return;
         const tab = view.active orelse return;
-        const cstr: [*:0]const u8 = @ptrCast(text_ptr);
-        view.insertText(tab, cstr[0..std.mem.len(cstr)]);
+        view.insertText(tab, pasted);
     }
 
     const VisualPos = struct { line: usize, row: u32 };
@@ -6011,8 +5996,7 @@ pub const EditorView = struct {
             .copy_line_number => {
                 var buf: [24:0]u8 = undefined;
                 const z = std.fmt.bufPrintZ(&buf, "{d}", .{line + 1}) catch return;
-                const display = c.gtk_widget_get_display(@ptrCast(self.area));
-                c.gdk_clipboard_set_text(c.gdk_display_get_clipboard(display), z.ptr);
+                clipboard.copyText(@ptrCast(self.area), z);
                 var msg: [48:0]u8 = undefined;
                 const m = std.fmt.bufPrintZ(&msg, "Copied line number {d}.", .{line + 1}) catch return;
                 self.setStatus(m.ptr);

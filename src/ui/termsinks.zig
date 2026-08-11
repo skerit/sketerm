@@ -9,6 +9,7 @@ const cast = @import("../util/cast.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
 const Pane = @import("pane.zig").Pane;
+const clipboard = @import("clipboard.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const logActionError = winmod.logActionError;
@@ -75,12 +76,7 @@ pub fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) voi
 
 pub fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Window, ctx);
-    const display = c.gtk_widget_get_display(self.app_window);
-    const clip = c.gdk_display_get_clipboard(display);
-    const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
-    defer self.allocator.free(cstr);
-    @memcpy(cstr, text);
-    c.gdk_clipboard_set_text(clip, cstr.ptr);
+    clipboard.copyText(self.app_window, text);
 }
 
 pub fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {

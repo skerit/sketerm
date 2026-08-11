@@ -3336,12 +3336,7 @@ pub const Window = struct {
         const text = screen.extractScreen(self.allocator) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        const display = c.gtk_widget_get_display(self.app_window);
-        const clip = c.gdk_display_get_clipboard(display);
-        const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
-        defer self.allocator.free(cstr);
-        @memcpy(cstr, text);
-        c.gdk_clipboard_set_text(clip, cstr.ptr);
+        clipboard.copyText(self.app_window, text);
     }
 
     /// Copy the focused pane's scrollback ring + active screen.
@@ -3351,12 +3346,7 @@ pub const Window = struct {
         const text = screen.extractScrollback(self.allocator) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        const display = c.gtk_widget_get_display(self.app_window);
-        const clip = c.gdk_display_get_clipboard(display);
-        const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
-        defer self.allocator.free(cstr);
-        @memcpy(cstr, text);
-        c.gdk_clipboard_set_text(clip, cstr.ptr);
+        clipboard.copyText(self.app_window, text);
     }
 
     /// Open the focused pane's scrollback + screen in a pager tab.

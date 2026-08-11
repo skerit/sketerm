@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const clipboard = @import("../clipboard.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
 const classicmenu = @import("classicmenu.zig");
@@ -936,12 +937,7 @@ pub fn onMenuMoveToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const path = ctx.path orelse return menuDone(ctx);
-    var z: [4096:0]u8 = undefined;
-    const n = @min(path.len, z.len - 1);
-    @memcpy(z[0..n], path[0..n]);
-    z[n] = 0;
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.tab.colview)));
-    c.gdk_clipboard_set_text(clip, &z);
+    clipboard.copyText(@ptrCast(@alignCast(ctx.tab.colview)), path);
     menuDone(ctx);
 }
 
