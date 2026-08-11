@@ -3006,14 +3006,7 @@ pub const WebFace = struct {
         const self = cast.userData(WebFace, user);
         if (self.pane) |pane| {
             if (pane.input_ctx) |ictx| {
-                const lower = c.gdk_keyval_to_lower(keyval);
-                const bindings: []const input.Binding =
-                    if (ictx.bindings.len > 0) ictx.bindings else &input.default_bindings;
-                if (input.matchBinding(bindings, lower, state) orelse
-                    input.matchBinding(bindings, keyval, state)) |action|
-                {
-                    return input.runAction(ictx, action);
-                }
+                if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
             }
         }
         if (self.faceChord(keyval, state)) return 1;

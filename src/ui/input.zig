@@ -345,6 +345,23 @@ pub fn matchBinding(bindings: []const Binding, keyval: c_uint, mods: c_uint) ?Ac
     return null;
 }
 
+/// Run a pane's binding table for a key a face did not claim: the
+/// pane's own table when it has one, the defaults otherwise, tried
+/// against both the lowercased and the raw keyval (GTK4 emits
+/// uppercase keysyms under Shift; the tables are lowercase).
+///
+/// @return null when no binding matched, so the caller can fall
+///         through to its own handling; otherwise `runAction`'s
+///         verdict, which is 0 for an action that declined to run.
+pub fn fallbackToPaneBindings(ictx: *Ctx, keyval: c_uint, state: c.GdkModifierType) ?c.gboolean {
+    const bindings: []const Binding =
+        if (ictx.bindings.len > 0) ictx.bindings else &default_bindings;
+    const lower: c_uint = c.gdk_keyval_to_lower(keyval);
+    const action = matchBinding(bindings, lower, state) orelse
+        matchBinding(bindings, keyval, state) orelse return null;
+    return runAction(ictx, action);
+}
+
 /// Modifier mask the binding matcher cares about. Lock and group
 /// bits are filtered before comparison.
 pub const SIGNIFICANT_MODS: c_uint =
@@ -833,15 +850,8 @@ fn onKeyPressed(
     // IM did not consume. Re-submitting via filter_keypress here would
     // double-process the event.
 
-    // Keybinding match — lowercase the keyval first so 'C' and 'c'
-    // (with/without Shift held) both hit the same binding. GTK4 emits
-    // uppercase keysyms when Shift is held, but our default table
-    // uses lowercase. Match both forms.
-    const lower_kv: c_uint = c.gdk_keyval_to_lower(keyval);
-    const bindings: []const Binding = if (ctx.bindings.len > 0) ctx.bindings else &default_bindings;
-    if (matchBinding(bindings, lower_kv, state) orelse matchBinding(bindings, keyval, state)) |action| {
-        return runAction(ctx, action);
-    }
+    // Keybinding match — see fallbackToPaneBindings.
+    if (fallbackToPaneBindings(ctx, keyval, state)) |handled| return handled;
 
     var buf: [64]u8 = undefined;
     const screen = ctx.terminal.screen;

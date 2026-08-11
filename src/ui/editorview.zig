@@ -5509,10 +5509,7 @@ pub const EditorView = struct {
         // window-level actions keep working (browser template).
         const pane = self.pane orelse return 0;
         const ictx = pane.input_ctx orelse return 0;
-        const bindings: []const input.Binding = if (ictx.bindings.len > 0) ictx.bindings else &input.default_bindings;
-        if (input.matchBinding(bindings, lower, state) orelse input.matchBinding(bindings, keyval, state)) |action| {
-            return input.runAction(ictx, action);
-        }
+        if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
         return 0;
     }
 
