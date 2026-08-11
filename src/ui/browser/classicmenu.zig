@@ -114,7 +114,7 @@ pub const Root = struct {
     /// paths); popup() hands ownership to the popover instead.
     pub fn destroy(self: *Root) void {
         // The box tree is floating until a popover adopts it.
-        c.g_object_ref_sink(@as(?*anyopaque, @ptrCast(self.box)));
+        _ = c.g_object_ref_sink(@as(?*anyopaque, @ptrCast(self.box)));
         c.g_object_unref(@as(?*anyopaque, @ptrCast(self.box)));
         destroyCb(@ptrCast(self));
     }
