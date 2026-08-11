@@ -203,14 +203,15 @@ fn send(gpa: std.mem.Allocator, value: anytype) bool {
 
 fn sendTracked(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback, value: anytype) bool {
     const s = &g_store;
-    s.pending.append(gpa, .{ .req = valueReq(value), .ctx = ctx, .cb = cb }) catch return false;
+    const req: u32 = value.req;
+    s.pending.append(gpa, .{ .req = req, .ctx = ctx, .cb = cb }) catch return false;
     if (send(gpa, value)) return true;
-    _ = s.pending.pop();
+    // A failed send may have marked the store dead, which already
+    // swapped the pending list out and failed our entry — only pop
+    // when the entry is still the tail we just appended.
+    if (s.pending.items.len > 0 and s.pending.items[s.pending.items.len - 1].req == req)
+        _ = s.pending.pop();
     return false;
-}
-
-fn valueReq(value: anytype) u32 {
-    return value.req;
 }
 
 fn nextReq() u32 {
