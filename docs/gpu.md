@@ -1,9 +1,10 @@
 # GPU / graphics
 
-OpenGL integration, `GtkGLArea` lifecycle, context sharing across
-panes, fractional-scaling discipline, driver-specific concerns.
-Referenced by `architecture.md` (D5, D6, D9) and `milestones.md`
-(M0.5, M3).
+OpenGL integration, `GtkGLArea` lifecycle, the atlas, fractional
+scaling, driver-specific concerns. The terminal renderer lives in
+`src/ui/terminal_surface.zig` (widget + GL lifecycle) and
+`src/render/` (the passes); `architecture.md` summarizes the same
+lifecycle in its "GL context lifecycle" section.
 
 ## Stack choice
 
@@ -14,9 +15,18 @@ Referenced by `architecture.md` (D5, D6, D9) and `milestones.md`
     our instanced-quad grid and textured image quads.
   - `libepoxy` is GTK4's built-in GL function loader — no GLEW/GLAD
     needed, already pulled in by the GTK4 dep chain.
-- **No GSK.** GSK's scene-graph model obscures batching; we need
-  direct shader control over the grid pass.
-- **No Vulkan in v1.** Cost/benefit doesn't justify; post-v1 option.
+  - macOS GDK realizes desktop GL only, so `render/gl.zig` keeps a
+    process-wide `api` (`gles` / `gl_core`) and injects the matching
+    `#version` header into every shader. Never set the API on a
+    `GtkGLArea` by hand: `gl.requestArea` before realize,
+    `gl.adoptAreaApi` after `make_current`.
+- **No GSK for the terminal surface.** GSK's scene-graph model
+  obscures batching; we need direct shader control over the grid.
+  Browser panes are the deliberate exception - `src/ui/webface.zig`
+  presents engine frames as `GdkTexture`s on a `GtkPicture` and lets
+  GSK composite them (see *Fractional scaling* below for why).
+- **No Vulkan backend of our own.** GSK may well be running on
+  Vulkan underneath; our passes are GL either way.
 
 ## GL context lifecycle
 
@@ -29,134 +39,141 @@ that window.
 
 | Signal            | When it fires                           | What we do                                           |
 |-------------------|------------------------------------------|------------------------------------------------------|
-| `create-context`  | GTK needs a `GdkGLContext`              | Return a shared context (see *Share groups* below)   |
-| `realize`         | Context current for the first time      | Compile shaders, allocate VBO/VAO, init atlas refs   |
-| `resize`          | Widget dim or scale factor changed      | Recompute cell metrics, update uniform block         |
-| `render`          | A frame must be drawn                   | Grid pass → image pass                               |
-| `unrealize`       | Widget being destroyed                  | Release per-pane GL resources (VBO/VAO/private tex)  |
+| `realize`         | Context current for the first time      | `adoptAreaApi`, drop stale GL state, build atlas, realize every pass |
+| `resize`          | Framebuffer reallocated                 | Recompute cols/rows from cell metrics, `requestResize` the session |
+| `render`          | A frame must be drawn                   | bg -> images(z<0) -> cell -> overlay -> images(z>=0)  |
+| `unrealize`       | Context going away                      | `releaseGL` (or `forgetGL` when the context is already gone) |
 
-Shared resources (atlas, shader programs, global uniforms) are owned
-at the window level and survive individual pane creation/destruction.
+There is no `create-context` handler: GDK creates each area's
+context itself. `auto_render` is switched OFF in
+`TerminalSurface.initInPlace`, so a frame is only drawn when
+something calls `gtk_gl_area_queue_render` - an idle pane costs no
+GL work at all.
 
-## Share groups
+### Every realize is potentially a RE-realize
 
-Each pane is a separate `GtkGLArea` with its own `GdkGLContext`. By
-default, textures created in one context are not visible from
-another. The atlas must be shared across panes; otherwise each
-pane rebuilds its own and blows VRAM.
+`gtk_widget_unparent` unrealizes a widget, and unrealizing a
+`GtkGLArea` destroys its `GdkGLContext`. Splits, tab moves, drags
+between windows and layout rebuilds all reparent, so a pane's
+context is cycled routinely. `onRealize` in
+`src/ui/terminal_surface.zig` therefore assumes nothing survived:
+it `deinit`s the previous `Atlas`, calls `forgetGL()` on
+`GridPass` / `CellPass` / `ImagePass` / `BgPass` / `ShaderPass` /
+the linear-light target / `ImageStore`, and only then rebuilds. Skip
+that and each pass's `realize()` early-returns on its cached
+non-zero program id, and `glUseProgram` on a dead id renders
+silently black.
 
-Pattern:
+`onUnrealize` is the mirror: `releaseGL` when the context is still
+current, `forgetGL` when GTK has already taken it away.
 
-1. On window creation, create a **root `GdkGLContext`** attached to
-   the window's `GdkSurface` via
-   `gdk_surface_create_gl_context(surface, &err)`. `GdkGLContext`
-   is not fully freestanding — it requires a surface to attach to.
-   Realize it with `gdk_gl_context_realize`, then store the pointer
-   on the `Window` struct.
-2. Every pane's `GtkGLArea` also explicitly opts into GL ES:
-   ```zig
-   c.gtk_gl_area_set_use_es(area, 1);
-   ```
-   This matters because `GtkGLArea` otherwise picks desktop GL on
-   most Linux systems; our shaders target ES 3.0 specifically.
-3. Each pane's `GtkGLArea` connects `create-context`:
-   ```zig
-   fn onCreateContext(area: *GtkGLArea, user: *Window) callconv(.C) *GdkGLContext {
-       var err: ?*c.GError = null;
-       return c.gdk_gl_context_create_shared(user.root_ctx, &err);
-       // On error return NULL; GTK falls back to default-create and
-       // we log the error. This should not happen in practice on
-       // a working driver.
-   }
-   ```
-4. All shared contexts can see textures/buffers created while *any*
-   shared context is current.
-5. **Atlas updates happen outside pane render callbacks**, typically
-   in the main-drain path before `gtk_widget_queue_draw`. On that
-   path we `gdk_gl_context_make_current(root_ctx)`, upload new
-   glyphs, then pane render callbacks run with their own contexts
-   current and sample from the atlas read-only.
+## Contexts and the atlas
 
-**Important**: do not `make_current(root_ctx)` from inside a pane's
-`render` signal handler. GDK tracks current context per thread and
-assumes the widget's context is current for the duration of render;
-switching mid-frame is undefined.
+Each pane is a separate `GtkGLArea` with its own `GdkGLContext`, and
+**each `TerminalSurface` owns its own `Atlas`** (`surface.atlas`),
+built in its realize handler against its own context. Nothing is
+shared between panes at the GL level and no window-level root
+context exists. The cost is one atlas texture per pane; the benefit
+is that context loss on one pane is entirely local, which is what
+made the re-realize discipline above tractable.
 
 GDK manages context lifecycle; we never `gdk_gl_context_dispose`
 manually.
 
+**Renderer invariant.** After any atlas rebuild or swap, call
+`surface.onAtlasRebuilt()`. It marks every cell dirty and resets the
+GridPass vertex-buffer validity flags in one place; hand-copying
+that list is how stale glyph UVs get drawn from a fresh texture.
+
 ## Fractional scaling
 
-Plasma 6 defaults to per-monitor fractional scaling (1.25×, 1.5×,
-etc). Four distinct pixel spaces exist:
+Plasma 6 defaults to per-monitor fractional scaling (1.25x, 1.5x,
+etc). **There are two different scales and picking the wrong one is
+a real, shipped-bug-shaped mistake:**
 
-| Space                     | Unit              | Source                                           |
-|---------------------------|-------------------|--------------------------------------------------|
-| Widget logical size       | logical px        | `gtk_widget_get_width` / `_get_height`           |
-| Framebuffer physical size | physical px       | logical × `gdk_surface_get_scale` (f64 scale)    |
-| Font rasterization DPI    | dots/physical in  | 96 × scale                                       |
-| Cell grid / hit-test      | logical px        | derived from rasterized metrics ÷ scale          |
+- `gtk_widget_get_scale_factor()` is an INTEGER. On a 1.5x output it
+  returns 2.
+- `gdk_surface_get_scale()` is the true fractional f64 (GTK >= 4.12),
+  and it needs a realized surface.
+
+### The terminal surface: integer, deliberately
+
+A `GtkGLArea`'s framebuffer is sized by GTK at the INTEGER scale, so
+the terminal path is integer throughout and unit-consistent with it:
+
+| Space                     | Unit             | Source                                                  |
+|---------------------------|------------------|---------------------------------------------------------|
+| Widget logical size       | logical px       | `gtk_widget_get_width` / `_get_height`                  |
+| Framebuffer physical size | framebuffer px   | logical x `gtk_widget_get_scale_factor`                 |
+| Font rasterization        | framebuffer px   | `physicalFontSize()` = pt x (96 x scale_factor) / 72    |
+| Cell grid                 | framebuffer px   | `atlas.cell_w` / `cell_h`, straight from the raster     |
 
 Discipline:
 
-- `glViewport(0, 0, phys_w, phys_h)` — GL works in physical pixels.
-- Grid layout (cols × rows) is computed in logical pixels.
-- `FT_Set_Pixel_Sizes(face, 0, physical_cell_px)` — FreeType at
-  physical DPI.
-- After glyph raster, advance/ascent/descent are divided by scale
-  to yield logical cell metrics.
-- Atlas stores glyphs at physical size; vertex shader computes quad
-  sizes in physical pixels directly.
+- `glViewport(0, 0, phys_w, phys_h)` - GL works in framebuffer pixels.
+- Cell counts are `(framebuffer size - 2*pad) / cell size`; both
+  operands are already framebuffer pixels, so no scale appears in
+  the divide. `onResize` receives framebuffer dimensions directly
+  (that is why `GtkGLArea::resize` exists separately from
+  `size-allocate`) and must NOT multiply by the scale factor again.
+- The atlas stores glyphs at framebuffer size; the passes compute
+  quad geometry in framebuffer pixels.
 
-**Target GTK ≥ 4.12** (for `gdk_surface_get_scale`). Older GTK4
-only exposes `gtk_widget_get_scale_factor` which returns an
-integer. `gdk_surface_get_scale` (fractional f64) landed in
-GTK 4.12. KDE Plasma 6 commonly reports 1.5× — integer scale
-factor would return 2 and over-rasterize by 33%.
+At 1.5x this means we rasterize at 2x and the pane is composited
+down to the surface's real scale: one resampling of text that was
+oversampled to begin with. It is not the double resampling the
+browser path used to suffer, described below.
 
-Separately, target GTK ≥ 4.16 for stable NVIDIA + Wayland
-explicit-sync behavior (see Driver notes below).
+**Known gap (verified absent, not a design choice):** nothing
+watches `notify::scale-factor` on a terminal surface. Cell metrics
+and the atlas are (re)built from the scale factor at realize and on
+font-size change, so dragging a window between differently scaled
+monitors without triggering either leaves the atlas at the old
+raster size until something else rebuilds it.
 
-### Scale-change handling
+### Browser panes: fractional, mandatory
 
-When `gdk_surface_get_scale` changes (monitor move, compositor
-reconfig):
+`src/ui/webface.zig` asks `gdk_surface_get_scale()` (falling back to
+a monitor's scale before realize) and ships that fractional value to
+the engine, which renders at it. The frame comes back as a
+`GdkTexture` that GSK composites at the surface's real scale: 1:1
+texels, zero resampling.
 
-1. Record the new scale in `Window.scale`.
-2. Invalidate the atlas (drop all glyph-by-face slots).
-3. Re-rasterize Latin-1 + cached-recently glyphs at new physical size.
-4. Update per-pane cell metrics.
-5. `gtk_widget_queue_draw` on all panes.
-
-Rebuild is fast (< 50 ms on a warm FreeType cache).
+This is why browser frames are NOT a `GtkGLArea` any more. The
+deleted `render/web_pass.zig` + `ui/webdmabuf.zig` pair drew engine
+frames through a GL area, whose framebuffer is integer-scaled: a
+frame rendered at 1.5 was upscaled 1.5 -> 2 by the pass and then
+downscaled 2 -> 1.5 by GSK. Two resamplings, measurably destroying
+1px detail (hard 0/255 stripes arriving as [5,117,127] mush). The
+texture also has to sit on the device pixel grid to keep that
+property, which is what `Window.alignmentForScale` / `snapDown` do
+for `GtkPaned` divider positions.
 
 ## Frame scheduling
 
 **Do not use `g_idle_add` for redraws.** Idle callbacks do not
 coalesce: schedule one with another pending, you get both executed.
-Correct primitive is `gtk_widget_queue_draw` — GTK coalesces draw
-requests within a frame.
+The correct primitive is `gtk_gl_area_queue_render` (GTK coalesces
+within a frame); `auto_render` is off, so it is also the ONLY thing
+that produces a frame.
 
-Cross-thread path (worker → main):
+**There is no render worker thread and no cross-thread wakeup.**
+PTY reads and VT parsing happen in the `sketerm-mux` daemon, a
+separate process. The GUI's terminal is a mirror: `Terminal`
+(`src/terminal.zig`) watches the daemon socket with `g_unix_fd_add`
+on the main thread, applies parsed events straight into `Screen`,
+and the pane queues a render. Nothing marshals between threads on
+this path, so `g_main_context_invoke`, an SPSC ring, an atomic
+`drain_pending` flag and a shutdown eventfd all no longer exist -
+do not reintroduce them.
 
-```zig
-// worker, after parsing a batch:
-_ = c.g_main_context_invoke(null, main_drain_events, @ptrCast(pane));
-```
-
-`g_main_context_invoke` marshals the callback onto the main thread
-safely. The callback:
-
-1. Drains the SPSC ring into the Screen.
-2. If any line became dirty: `gtk_widget_queue_draw(pane.glarea)`.
-3. Returns `G_SOURCE_REMOVE` (one-shot).
-
-Multiple workers calling `g_main_context_invoke` concurrently is
-safe; GLib serializes.
-
-For cursor blink and animations, use
-`gdk_frame_clock_add_tick_callback` on the pane's frame clock.
-The clock is vsync-locked to the compositor.
+Per-frame work that is genuinely per-frame rides
+`gtk_widget_add_tick_callback` (`TerminalSurface.ensureTickRunning`
+/ `onTick`): custom-shader animation, kitty image animation, child
+exit. Slow visual timers deliberately do NOT: cursor blink, cursor
+trail and the bell fade are `g_timeout_add` handlers, so an idle
+focused pane leaves the frame clock stopped instead of pinning it at
+the display refresh rate.
 
 ## Driver notes
 
@@ -174,9 +191,11 @@ regression-prone configuration even in 2026. Target:
 - KWin ≥ 6.2 (explicit sync support)
 - GTK ≥ 4.16
 
-Before v1 ship: test on NVIDIA hardware (beg/borrow/VM). If
-`GtkGLArea` is unusable, emergency fallback is XWayland
-(`GDK_BACKEND=x11`) — functional but a regression.
+NVIDIA behaviour here is UNVERIFIED by this project - no NVIDIA
+hardware has been tested against. Treat the version floors above as
+what the ecosystem recommends, not as something we measured. Note
+also that `GDK_BACKEND=x11` is not an acceptable diagnostic detour:
+X11 changes the code under test (see `testing.md`).
 
 ### NVIDIA open kernel module
 Same as proprietary for our purposes.
@@ -185,53 +204,79 @@ Same as proprietary for our purposes.
 Works for dev/test; too slow for interactive use (< 30 fps on a
 non-trivial grid).
 
-## Shader programs
+## Render passes
 
-Two programs, compiled once per share group on `realize` of the
-root context:
+Each pass is its own program pair, realized per surface. Draw order
+inside `onRender` (`src/ui/terminal_surface.zig`):
 
-### Grid program
-- VS: reads per-instance cell data from VBO; emits a screen-space
-  quad for the cell.
-- FS: samples the appropriate atlas (R8 for grayscale, RGBA8 for
-  color emoji); modulates with fg color; blends over bg.
-- One draw call per frame per pane:
-  `glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, visible_cells)`.
+1. **`BgPass`** (`render/bg_pass.zig`) - pane background gradient or
+   image, under everything including below-text kitty images.
+2. **`ImagePass`, z < 0** (`render/image_pass.zig`) - kitty's
+   negative-z placements, which the spec puts under glyphs.
+3. **`CellPass`** (`render/cell_pass.zig`) - the instanced cell
+   pipeline: per-cell background and glyph for ordinary rows, with a
+   persistent VBO that only re-uploads dirty rows.
+4. **`GridPass`** (`render/grid_pass.zig`) - the per-vertex overlay:
+   cursor, selection, focus border, scrollback indicator, preedit,
+   bell, plus any row needing bidi reorder or double-height /
+   double-width scaling.
+5. **`ImagePass`, z >= 0** - foreground placements.
 
-### Image program
-- VS: per-placement quad with explicit pixel coords.
-- FS: samples the placement's RGBA texture.
-- Sorted by (z, texture_id). Draws are grouped per texture to
-  minimize state churn.
+Two wrappers can bracket the lot, both drawing the scene into an
+offscreen texture first: `linear_target` (blend in linear light,
+resolve back to sRGB) and `ShaderPass` (user CRT-style shader, or a
+dim-only post for an inactive pane). Both must agree on one blend
+mode per frame, which is why `eff_mode` is computed once and pushed
+into every pass.
+
+Two consequences worth remembering:
+
+- **Glyphs render through TWO pass pairs.** Ordinary rows go through
+  CellPass, complex-script/RTL and DH/DW rows through GridPass. A
+  glyph-rendering change that touches only one of them is half done.
+- **`GridPass.Snapshot` must learn about any new overlay state.**
+  Add a field or hash contribution for it, or the vertex buffer will
+  not rebuild when that state changes.
 
 ## Atlas strategy
 
-Two atlases per window (living on the root context):
+One atlas per `TerminalSurface` (`render/atlas.zig`):
 
-- **R8** — 2048×2048 page(s), grayscale Latin/CJK/symbol glyphs.
-- **RGBA8** — 2048×2048 page(s), color bitmap glyphs (emoji, COLR).
-
-- Packing: shelf packing algorithm.
-- Growth: allocate new page when current fills.
-- Eviction: at 16 pages per atlas (~64 MB), LRU-evict a whole page.
-  Not per-glyph (page-level eviction avoids pointer/slot-id churn).
+- A single **`GL_TEXTURE_2D_ARRAY`, RGBA8**, `PAGE_COUNT` (4) layers
+  of `PAGE_SIZE` (2048) squared - a 64 MB GPU budget. Grayscale
+  coverage and color (emoji / COLR) glyphs share it; `Glyph.colored`
+  tells the shader whether to tint with the cell fg or sample RGBA
+  directly.
+- Packing: shelf packing, per page.
+- Eviction: when packing fails on every page, the page with the
+  smallest `last_used_frame` is dropped whole and reused.
+  `markFrame()` is called once per render to keep those timestamps
+  meaningful.
+- `Glyph.generation` is bumped on eviction so callers that cache
+  UVs can detect a stale reference.
 
 ## Debug tooling
 
-- `GL_KHR_debug` callback on root-context realize — but **check
-  availability first** via `glGetString(GL_EXTENSIONS)` or
-  `epoxy_has_gl_extension("GL_KHR_debug")`. On GL ES it's an
-  extension (not core until ES 3.2); on desktop GL it's common
-  but not universal. Degrade gracefully to `glGetError` polling
-  at suspect points if the extension is absent.
+- `SKETERM_PROFILE=1` - per-pass nanosecond timings
+  (`util/profile.zig`); the render path records `cell_rebuild`,
+  `cell_draw`, `grid_build`, `grid_draw` and `image_pass`.
+- `--debug-images` - image upload and draw diagnostics on stderr.
 - `GDK_DEBUG=opengl` — GDK-level GL tracing.
 - `MESA_DEBUG=1` — driver-level diagnostics.
-- RenderDoc captures work on `GtkGLArea` (confirmed in 2024+).
+- `zig build smoke-gl-core` - compiles every pass's shaders under a
+  desktop GL 3.3 core context, i.e. the macOS code path, on Linux.
+
+No `GL_KHR_debug` callback is installed today. If one is added,
+check `epoxy_has_gl_extension("GL_KHR_debug")` first: on GL ES it is
+an extension, not core until ES 3.2.
 
 ## What we do NOT do
 
-- No Vulkan backend (v2 maybe).
+- No Vulkan backend of our own.
 - No software fallback beyond llvmpipe.
-- No HDR; sRGB only.
+- No HDR; sRGB only (with an optional linear-light blend stage).
 - No multi-GPU discrimination; let GTK/Wayland pick.
-- No custom DMA-BUF importing; images go through CPU → texture.
+- No dma-buf import in the TERMINAL path - terminal images go
+  CPU -> texture. Browser frames do import dma-bufs, via
+  `GdkDmabufTextureBuilder` in `ui/webface.zig`, so GSK samples the
+  engine's buffers with no copy.

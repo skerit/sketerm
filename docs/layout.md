@@ -1,8 +1,9 @@
 # Layout persistence
 
-Save/restore of tab/split/pane layouts. Supplements `milestones.md`
-M8 and `plan.md` requirement 7. `lifecycle.md` covers how restored
-panes actually spawn processes.
+Save/restore of tab/split/pane layouts. The model is
+`src/layout.zig` (the schema and the file IO) and
+`src/ui/winlayout.zig` (collect from / rebuild into the window).
+`lifecycle.md` covers how restored panes actually spawn processes.
 
 ## Scope
 
@@ -11,11 +12,16 @@ the skeleton, not the session.
 
 ### Preserved
 
-- Tab tree (ordered list of tabs)
-- Per-tab sticky title
+- Tab tree (ordered list of tabs), each with its sticky title,
+  pinned flag, colour swatch, title-locked flag and the per-tab
+  `show_activity` / `warn_inactive` toggles
 - Per-tab split tree (nested horizontal/vertical splits with ratios)
-- Per-pane cwd
-- Per-pane initial command (argv)
+- Per-pane cwd and initial command (argv)
+- Per-pane profile name, font-size override, and shader pick
+  (preset name, explicit path, or a sticky "cleared")
+- Per-pane durable mux session name and transport host
+- Browser-face state (its internal tabs) and editor-face state
+  (open file specs, active index, cursor offsets)
 - Schema version
 
 ### Not preserved
@@ -25,8 +31,9 @@ the skeleton, not the session.
 - Environment variables
 - Running job / shell state / aliases / history
 - Clipboard contents
-- Font or color overrides per pane (v1 uses window-global font)
 - Images currently displayed (ImageStore state)
+- Unsaved (dirty) editor buffers - by design; see
+  `src/editor/model.zig`
 
 ## Rationale
 
@@ -40,225 +47,225 @@ The layout is a starting point. Shell init files (`.bashrc`,
 `.zshrc`), tmux / direnv / starship, and similar restore whatever
 per-session state the user wants.
 
+The exception is a pane with a `mux_session`: the layout stores only
+the session NAME, but reattaching to a session the daemon still owns
+brings back the live process and its scrollback. Durability is the
+daemon's job, not the layout file's.
+
 ## File format
 
-ZON (Zig Object Notation). Chosen because:
-
-- Native — no external parser dependency.
-- Human-readable and human-editable.
-- Comment support.
-- Zig struct literals round-trip cleanly.
+**JSON**, written with `std.json.Stringify` and read with
+`std.json.parseFromSlice`. Not ZON: the schema carries optional and
+nullable fields that std's JSON round-trips directly, and
+`ignore_unknown_fields` gives forward compatibility for free.
 
 ### Example
 
-```zig
-.{
-    .version = 1,
-    .tabs = &.{
-        .{
-            .title = "Editor",
-            .tree = .{ .split = .{
-                .orientation = .vertical,
-                .ratio = 0.6,
-                .first  = .{ .pane = .{
-                    .cwd = "/home/user/projects/sketerm",
-                    .command = &.{ "nvim", "." },
-                }},
-                .second = .{ .pane = .{
-                    .cwd = "/home/user/projects/sketerm",
-                    .command = &.{ "bash" },
-                }},
-            }},
-        },
-        .{
-            .title = "Logs",
-            .tree = .{ .pane = .{
-                .cwd = "/var/log",
-                .command = &.{ "bash", "-c", "journalctl -fe" },
-            }},
-        },
-    },
+```json
+{
+  "version": 2,
+  "tabs": [
+    {
+      "title": "Editor",
+      "tree": {
+        "split": {
+          "orientation": "vertical",
+          "ratio": 0.6,
+          "children": [
+            { "pane": { "cwd": "/home/user/projects/sketerm",
+                        "command": ["nvim", "."] } },
+            { "pane": { "cwd": "/home/user/projects/sketerm",
+                        "command": ["bash"] } }
+          ]
+        }
+      }
+    }
+  ]
 }
 ```
 
 ## Schema
 
+Current: **version 2** - every tab carries a recursive `Tree`.
+Abbreviated (see `src/layout.zig` for the full `PaneSpec`):
+
 ```zig
 pub const Layout = struct {
-    version: u32,       // current: 1
-    tabs: []const Tab,
+    version: u32 = 2,
+    tabs: []const TabSpec,
 };
 
-pub const Tab = struct {
+pub const TabSpec = struct {
     title: []const u8,
     tree: Tree,
+    pinned: bool = false,
+    color: ?[]const u8 = null,      // "#RRGGBB"
+    title_locked: ?bool = null,
+    show_activity: bool = true,
+    warn_inactive: bool = false,
 };
 
-pub const Tree = union(enum) {
-    pane: Pane,
-    split: Split,
+pub const Tree = union(enum) { pane: PaneSpec, split: SplitSpec };
+
+pub const SplitSpec = struct {
+    orientation: Orient,            // horizontal | vertical
+    ratio: f32,                     // 0.0-1.0, first/total
+    children: []const Tree,         // length must be 2
 };
 
-pub const Split = struct {
-    orientation: enum { horizontal, vertical },
-    ratio: f32,         // 0.0–1.0, first/total
-    first: *const Tree,
-    second: *const Tree,
-};
-
-pub const Pane = struct {
-    cwd: []const u8,                 // absolute path
-    command: []const []const u8,     // argv; [0] is exec target
+pub const PaneSpec = struct {
+    cwd: []const u8,
+    command: []const []const u8,    // argv; [0] is the exec target
+    font_size: ?u16 = null,
+    profile: []const u8 = "",
+    custom_shader: []const u8 = "",
+    shader_preset: []const u8 = "",
+    shader_cleared: bool = false,
+    mux_session: []const u8 = "",
+    mux_host: []const u8 = "",
+    browser: ?browser_model.PaneState = null,
+    editor: ?editor_model.PaneState = null,
+    // plus `browser_tabs`, the compatibility reader for layouts
+    // written by the first browser prototype.
 };
 ```
 
 ## Schema versioning
 
-`version` starts at 1. Loader policy:
+The loader does not branch on `version` today. Compatibility comes
+from the two mechanisms in the code instead:
 
-- **Equal**: load directly.
-- **Lower**: run in-order migrations (each migration is a function
-  `v_N_to_N+1(Layout) Layout`; documented in `docs/MIGRATIONS.md`
-  when we first bump).
-- **Higher**: error — *"layout requires sketerm ≥ vX; upgrade"*.
+- `ignore_unknown_fields = true`, so a file from a newer sketerm
+  loads with its unknown fields dropped rather than failing.
+- Every field added since v2 carries a default, so an older file
+  parses and the missing fields take the default. The defaults are
+  chosen to reproduce the old behaviour (e.g. `title_locked = null`
+  means "treat restored titles as renamed", which is what pre-field
+  files did).
 
-When to bump:
-- Field removed or renamed
-- Field semantics changed (e.g. `ratio` meaning reversed)
-- Tree shape changed
+`newTabFromSpec` carries a comment about v1-compat (flat
+cwd/command) specs, but `TabSpec.tree` has no default, so a literal
+v1 file would fail to parse; treat that path as vestigial.
 
-Additive optional fields with safe defaults do not require a bump.
+A real bump would be needed if a field's SEMANTICS changed or the
+tree shape changed; adding optional fields with safe defaults, as
+above, does not need one.
 
-## Save triggers
+## The three files
 
-| Trigger                            | Destination                                   |
-|------------------------------------|-----------------------------------------------|
-| *Save Layout…* menu action         | User-chosen path via `GtkFileChooserNative`   |
-| App shutdown (clean exit)          | `$XDG_STATE_HOME/sketerm/last.zon`            |
-| `--save-on-exit=<path>` CLI flag   | Given path, overrides auto destination        |
+`src/layout.zig` names two well-known paths under
+`$XDG_STATE_HOME/sketerm/` (falling back to `~/.local/state/...`,
+then `/tmp`), plus whatever the user picks explicitly:
 
-Crash (uncaught signal) does **not** save. Users get the last
-clean save via `--restore`.
+| Path             | Written by                                  | Read by                               |
+|------------------|---------------------------------------------|---------------------------------------|
+| `last.json`      | auto-save on clean exit, and the `save_layout` action | `--restore`                  |
+| `default.json`   | the `save_default_layout` action            | startup, when neither flag was passed |
+| any path         | the `save_layout_as` action                 | `--layout <path>` / `load_layout`     |
+
+Crash (uncaught signal) does not save. `--no-save` disables the
+auto-save entirely, and it is skipped for `files` and `web` mode
+windows.
 
 ## Load triggers
 
-| Trigger                          | Behavior                                        |
-|----------------------------------|-------------------------------------------------|
-| `--layout <path>`                | Load from path, error if missing/invalid        |
-| `--restore`                      | Load `$XDG_STATE_HOME/sketerm/last.zon` if exists; else default 1-pane |
-| *Open Layout…* menu action       | Opens file chooser; replaces current window's tabs (confirm prompt if unsaved) |
+| Trigger                    | Behavior                                                        |
+|----------------------------|-----------------------------------------------------------------|
+| `--layout <path>`          | Load from path; on failure log to stderr and continue empty      |
+| `--restore`                | Load `last.json` if present, else the normal default window      |
+| neither flag               | Load `default.json` if present, else the normal default window   |
+| `load_layout` action       | File chooser, then the same path as `--layout`                   |
+
+`--layout` also accepts the `.layout` text format (dispatched on the
+extension): an indent-based, comment-supporting alternative parsed
+by `src/layout_simple.zig`, meant to be written by hand.
+
+```
+Dev
+  hsplit
+    pane bash @ /tmp
+    pane fish @ /home
+```
 
 ## Degraded-load behavior
 
-The loader is tolerant — a layout should open even if individual
-panes can't fully realize.
+The loader is tolerant in the sense that one bad tab or pane does
+not stop the rest: `newTabFromSpec` failures are logged to stderr
+and the loop continues. Beyond that, the behaviour is what the
+spawn path does, not a layout-specific policy:
 
-### Binary not found on PATH
-
-```
-Policy:
-    1. Still create the pane.
-    2. Spawn $SHELL (fallback: /bin/sh).
-    3. Print to pane grid, dim colour:
-       [sketerm: command 'foo' not found; started $SHELL]
-```
-
-Rationale: user can investigate and relaunch manually from inside
-the pane.
-
-### cwd does not exist
-
-```
-Policy:
-    1. Fall back to $HOME.
-    2. Fall back to / if $HOME is unset.
-    3. Print to pane grid:
-       [sketerm: cwd '/tmp/gone' not accessible; started in /home/user]
-    4. Continue pane load.
-```
-
-### cwd exists but permission denied
-
-Treated identically to nonexistent cwd.
-
-### Child exits immediately
-
-Command exec succeeded but child returned non-zero (or zero)
-quickly. Per `plan.md` shell-exit-handling policy:
-
-```
-    [process exited with status N]
-```
-
-Pane stays open by default (`hold-on-exit = true` config).
-Closing pane is a manual action.
-
-### Malformed ZON file
-
-Whole-layout error. Prompt user with file path + Zon error
-location. Do not auto-fallback — user may want to fix the file
-rather than lose it silently.
-
-### version > CURRENT
-
-Whole-layout error with explicit message.
+- **Binary not found on PATH** - `execvp` fails in the child, which
+  writes `sketerm: execvp failed` and `_exit(127)`. The pane shows
+  `[process exited with status 127]` and then follows `exit_action`
+  (default `close`; `--hold` or `exit_action = hold` keeps it).
+  There is no `$SHELL` fallback and no separate diagnostic line.
+- **cwd missing or unreadable** - the `chdir` simply fails and the
+  child starts in the inherited working directory. No message.
+- **Durable mux pane whose session cannot be restored** - logged,
+  then a plain local shell is spawned in its place. Remote mux panes
+  never block startup: they get a local placeholder and reattach
+  asynchronously via `startMuxRestoreJob`, because connecting over
+  ssh/udp on the main loop would freeze the GUI.
+- **Malformed JSON, unreadable file, or file over 1 MB** - the whole
+  load fails with a stderr diagnostic; nothing is overwritten, so
+  the file can be fixed by hand.
+- **Split with fewer than 2 children** - `error.InvalidLayout`; a
+  ratio outside (0,1) is silently replaced with 0.5.
 
 ## Environment policy
 
-Layouts never store `env`. At load time, each restored pane's
-child inherits:
-
-- The sketerm parent process's env
-- Plus sketerm-set vars:
-  - `TERM=sketerm-256color` (fallback `xterm-256color`)
-  - `COLORTERM=truecolor`
-  - `TERM_PROGRAM=sketerm`
-  - `TERM_PROGRAM_VERSION=<version>`
-  - `COLUMNS`, `LINES`
+Layouts never store `env`. A restored pane's child gets exactly the
+same environment as any other pane: the daemon process's env plus
+the vars `pty.zig` sets. `protocols.md` has that list; the layout
+adds nothing to it.
 
 Shell init files configure user-specific env.
 
 ## Path handling
 
 - All paths UTF-8. No normalization applied.
-- **Absolute paths required.** Relative paths in `cwd` are
-  rejected at load time with a diagnostic. Rationale: relative
-  resolution against the process cwd at load time is surprising;
-  resolution against the layout-file directory is magical; better
-  to disallow and keep behavior unambiguous.
+- **Absolute paths expected but not validated.** `paneSpec` writes
+  the OSC 7 cwd the shell reported, or `"/"` when it reported none,
+  so saved paths are absolute. A hand-written relative `cwd` is not
+  rejected at load: the `chdir` is simply attempted and, failing,
+  the pane starts in the inherited directory.
 - No home expansion (`~/foo` stays literal and is treated as a
   missing directory). Users should write absolute paths;
   sketerm's own save path always writes absolute.
-- ZON string escape rules are the standard.
+- JSON string escape rules are the standard.
 
 ## Atomic save
 
-To prevent mid-write corruption:
+`layout.save` (in `src/layout.zig`):
 
-1. Serialize in memory.
-2. Write to `<target>.tmp`.
-3. `fsync(tmp_fd)`.
-4. `rename(tmp, target)` — atomic on same filesystem.
+1. `makeParentDirs` - each component `mkdir`ed 0755, existing
+   directories left alone.
+2. Serialize into a fixed 16 KB buffer with
+   `std.json.Stringify.value` (indent 2).
+3. `fopen`/`fwrite`/`fclose` to `<target>.tmp`.
+4. `rename(tmp, target)` - atomic on the same filesystem. A failed
+   rename unlinks the temp file.
 
-`$XDG_STATE_HOME/sketerm/` is created with mode 0700 if absent.
+There is no `fsync` before the rename, so the write survives a crash
+of sketerm but is not guaranteed against a machine-level power loss.
 
 ## Size limits
 
-- Max **file size**: 1 MB. Larger rejected outright — legitimate
-  layouts are single-digit KB.
-- Max **tabs per layout**: 64
-- Max **nesting depth**: 16
-- Max **panes per tab**: 32 (note: `architecture.md` D9 has a
-  per-window soft limit of ~32 panes total for rendering reasons;
-  a layout with many panes may load but render sluggishly — the
-  caps in this doc are *storage* caps, D9 is the *rendering* ceiling).
-- Max **argv length**: 64 args, 4 KB total bytes
-- Max **cwd length**: 4 KB
-- Max **tab title length**: 256 bytes
+Enforced:
 
-Exceeding any limit at load time: diagnostic + layout rejected.
-Exceeding at save time: diagnostic + save aborted with "reduce
-the layout" suggestion.
+- **File size on load**: 1 MB (`error.BadFile` past it). Legitimate
+  layouts are single-digit KB.
+- **Serialized size on save**: the 16 KB stringify buffer. A layout
+  that overflows it fails the save with a stderr diagnostic rather
+  than writing a truncated file.
+- **Path length**: 4096 bytes for the target path and for a pane's
+  cwd (the latter in `pty.zig`, which skips the `chdir` rather than
+  truncating).
+
+There are NO caps on tab count, nesting depth, panes per tab, argv
+length or title length. `architecture.md` D9's ~32-panes-per-window
+figure is a rendering-cost rule of thumb, not something this loader
+checks.
 
 ## Security / trust model
 
@@ -267,41 +274,38 @@ arbitrary commands on load — just like a malicious `.desktop` file,
 tmux-resurrect file, or shell rc file. The attack surface is small
 because:
 
-- Loading requires explicit user action (`--layout <path>`,
-  `--restore`, or menu *Open Layout…*).
-- Auto-load only reads `$XDG_STATE_HOME/sketerm/last.zon`, written
-  by sketerm itself.
+- `--layout <path>` and the `load_layout` action require an explicit
+  user action.
+- The two auto-loaded paths (`last.json`, `default.json`) live under
+  `$XDG_STATE_HOME/sketerm/` and are written by sketerm itself.
 
 Guidance:
-- Never pipe untrusted layout files to `sketerm --layout -`.
 - Never `--layout` a file from an untrusted download without reading
   it first.
-- sketerm does not sign layouts in v1; treat files as plaintext.
+- sketerm does not sign layouts; treat files as plaintext.
 
 Defensive behavior:
 - No env-var storage (layouts cannot leak tokens).
 - File-size cap (1 MB) prevents OOM.
-- Command not-found / cwd-invalid → diagnostic, not crash.
-- Loader bounded by the size limits above.
-
-Post-v1: consider a "quarantine" mode that wraps spawned panes
-in a confirmation prompt when loaded from a layout file outside
-`$XDG_STATE_HOME/sketerm/`.
+- Command not-found / cwd-invalid degrade to an exited or
+  differently-rooted pane, not a crash.
 
 ## CLI reference
 
 ```
---layout <path>          Load from specific path at startup
---restore                Load last.zon from XDG_STATE_HOME
---save-on-exit <path>    Override auto-save destination
---no-save                Disable auto-save
+--layout <path>          Load from a specific path at startup
+                         (.json, or .layout for the text format)
+--restore                Load last.json from XDG_STATE_HOME
+--no-save                Don't write last.json on exit
+--hold                   Keep panes open after their command exits
 ```
 
-## Future extensions (post-v1, non-binding)
+There is no `--save-on-exit`; the auto-save destination is fixed.
 
-- Per-pane font size / color palette
+## Not implemented
+
 - Named layout presets (`sketerm --preset editor`)
 - Include / composition (one layout embeds another)
-- Partial load (single tab from multi-tab file)
+- Partial load (single tab from a multi-tab file)
 - Event hooks: run a shell command after restore
-- Per-pane environment overlays (allow-listed keys only)
+- Per-pane environment overlays

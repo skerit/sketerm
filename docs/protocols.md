@@ -1,11 +1,18 @@
 # Protocols
 
-Escape sequences and protocols sketerm supports in v1.
-"Deferred" = not in v1; architecturally permitted.
+Escape sequences and protocols sketerm supports. The dispatcher is
+`Screen.csi` in `src/grid/screen_ops.zig`, which routes by
+`params.private` to `csiPrivate` (`?`), `csiAux` (`>`),
+`csiKittyKbd` (`=` / `<`) or `csiPublic`; OSC lands in
+`Screen.onOsc` in `src/grid/screen.zig`.
+
+A tick in the tables below means the sequence is implemented
+today. Sequences we have decided never to implement are listed at
+the end.
 
 ## C0 control codes
 
-| Byte  | Name | v1                        |
+| Byte  | Name | Supported                 |
 |-------|------|---------------------------|
 | 0x07  | BEL — bell              | visual flash overlay (~200ms) via `bell_at_us` |
 | 0x08  | BS  — backspace         | ✓ |
@@ -22,7 +29,7 @@ Escape sequences and protocols sketerm supports in v1.
 ## CSI sequences
 
 All canonical CSI handlers from the Williams spec dispatch to
-either implemented or stub. Implemented in v1:
+either implemented or stub. Implemented:
 
 ### Cursor movement
 - CUU, CUD, CUF, CUB — cursor up/down/forward/back
@@ -50,25 +57,30 @@ ANSI modes:
 - IRM (4) — insert/replace
 - LNM (20) — line feed mode
 
-DECSET / DECRST (`?`-prefixed):
+DECSET / DECRST (`?`-prefixed), per `modeSet` in `screen_ops.zig`:
 - 1  — DECCKM — application cursor keys
+- 2  - DECANM - reset enters VT52, set returns to ANSI
+- 3  - DECCOLM - 80/132 columns, honoured only when 40 is set
 - 5  — DECSCNM — reverse video
 - 6  — DECOM — origin mode
 - 7  — DECAWM — autowrap
-- 12 — cursor blink (steady/blink)
 - 25 — DECTCEM — cursor visible
+- 40 - allow DECCOLM
 - 1000 — X10 mouse
 - 1002 — cell-motion mouse
 - 1003 — all-motion mouse
-- 1004 — **focus reporting** ✓ (v1 req)
-- 1006 — SGR mouse (preferred modern) ✓
-- 1047 — alt screen (simple)
+- 1004 - **focus reporting** ✓
+- 1005 / 1006 / 1015 / 1016 - mouse encodings, see *Mouse protocols*
+- 47 / 1047 - alt screen (simple)
 - 1049 — alt screen + save cursor
-- 2004 — **bracketed paste mode** ✓ (v1 req)
+- 2004 - **bracketed paste mode** ✓
 - 2026 — synchronized output ✓
 - 2027 — grapheme clustering: always on; DECRQM reports "permanently set" ✓
 - 2031 — color-scheme change reports (`CSI ? 997 ; 1|2 n` on dark/light flips; query via `CSI ? 996 n`) ✓
 - 2048 — in-band resize reports (`CSI 48;rows;cols;hpx;wpx t` on set + every resize) ✓
+
+**Not implemented:** mode 12 (cursor blink enable). `modeSet` has no
+arm for it; blinking is selected through DECSCUSR instead.
 
 Over the mux, protocol replies come from exactly one side: the
 daemon's authoritative Screen answers state queries (DSR, DA,
@@ -83,13 +95,15 @@ conceal, strike, 256-color fg/bg (`38/48;5;n`), truecolor
 overlined (subset).
 
 ### Device status / version
-- DA1 (`CSI c`) — primary device attributes
+- DA1 (`CSI c`), and DECID (`CSI Z`) with the same payload
 - DA2 (`CSI > c`) — secondary device attributes
-- DA3 (`CSI = c`) — tertiary (stub response, spec says optional)
+- DA3 (`CSI = c`) - **no response at all**; the spec allows this
 - DSR (`CSI 5n` / `CSI 6n`) — device status / cursor position
 - XTVERSION (`CSI > 0 q`) — ✓
+- XTMODKEYS (`CSI > 4 ; Pp m`) - the level is recorded; key encoding
+  does not yet act on it
 
-### Window manipulation (XTWINOPS) — read-only subset in v1
+### Window manipulation (XTWINOPS) - read-only subset
 - `CSI 14 t` — report text-area size **in pixels**: `CSI 4 ; H ; W t`
 - `CSI 18 t` — report text-area size **in cells**: `CSI 8 ; rows ; cols t`
 - `CSI 19 t` — report screen size in cells (same as 18t for us)
@@ -98,7 +112,7 @@ overlined (subset).
 htop and btop need the report subset for accurate rendering.
 
 ### Cursor shape — DECSCUSR
-`CSI Ps SP q` — ✓ v1 requirement.
+`CSI Ps SP q` - ✓
 - `0`/`1` — blinking block (default)
 - `2` — steady block
 - `3` — blinking underline
@@ -109,23 +123,24 @@ htop and btop need the report subset for accurate rendering.
 ### Scroll region — DECSTBM
 `CSI t ; b r` — set top and bottom scrolling margins. ✓
 
-### Done in v1 (originally listed deferred)
+### Implemented, and once planned not to be
 - SS2 / SS3 single-shifts (ESC N / ESC O — bypass charset
   translation for the next codepoint; G2/G3 not modelled).
 - Character set designation (SCS for G0/G1 → DEC graphics, SI/SO).
 - ED 3 (erase scrollback).
 - Selective erase (DECSED / DECSEL routed to plain ED/EL — we
   don't model the protection bit).
-- DECDHL / DECDWL (double-height / double-width lines, M12).
+- DECDHL / DECDWL (double-height / double-width lines).
 - DECSCNM (reverse-video mode).
 - DECCOLM (80/132 column, gated behind DECSET 40).
 - VT52 mode (DECRST 2 enters VT52, DECSET 2 returns to ANSI).
 
 ## OSC sequences
 
-| Number | Purpose                                   | v1 |
+| Number | Purpose                                   | Supported |
 |--------|-------------------------------------------|----|
 | 0, 2   | Set window/icon title                     | ✓ (per pane) |
+| 1      | Set icon name                             | accepted and ignored (no separate icon-name surface) |
 | 4      | Color palette query + set (multi-pair)    | ✓ |
 | 7      | Report working directory (file://…)       | ✓ |
 | 8      | Hyperlinks                                | ✓ |
@@ -137,10 +152,15 @@ htop and btop need the report subset for accurate rendering.
 | 133    | Shell integration (FinalTerm prompt marks)| ✓ (A-marks navigate via Ctrl+Shift+Up/Down; C/D bound the command-output zone behind "Copy Command Output" / `copy_command_output`) |
 | 9      | iTerm2 desktop notification               | ✓ |
 | 9;4    | ConEmu progress (tab ring + taskbar)      | ✓ |
+| 9;9    | ConEmu/Cmder cwd report (quotes stripped) | ✓ |
+| 17, 19 | Selection bg / fg color, query + set      | ✓ |
+| 21     | Kitty unified color query/set protocol    | ✓ |
+| 117, 119 | Reset selection bg / fg                 | ✓ |
+| 633    | VS Code shell integration (superset of 133) | ✓ |
 | 777    | Desktop notifications (notify variant)    | ✓ |
 | 22     | Set X11 / GTK mouse-cursor shape          | ✓ |
 | 50     | Font query (set is no-op)                 | ✓ |
-| 1337   | iTerm2 proprietary (File=, CursorShape, ClearScrollback, SetMark, RequestAttention, CopyToClipboard, EndCopy, StealFocus-deny) | ✓ |
+| 1337   | iTerm2 proprietary - `File=` plus CursorShape, ClearScrollback, SetMark, RequestAttention, CopyToClipboard, EndCopy, ReportCellSize, SetUserVar, SetColors, SetProfile, StealFocus-deny | ✓ |
 
 ## Bracketed paste (DECSET 2004)
 
@@ -167,22 +187,22 @@ Default behavior per app:
 
 ## DCS frames
 
-| Prefix | Purpose                                   | v1 |
+| Prefix | Purpose                                   | Supported |
 |--------|-------------------------------------------|----|
-| `q`    | Sixel image                               | ✓ (M9b) |
+| `q`    | Sixel image                               | ✓ |
 | `$q`   | DECRQSS — report setting (m/r/" q)        | ✓ |
 | `+q`   | XTGETTCAP — terminfo query                | ✓ (TN, Co, RGB, Tc, bce, U8, civis/cnorm, csr, Su) |
 | `P`    | DECUDK — user-defined keys                | never |
 
 ## APC frames
 
-| Prefix | Purpose                                   | v1 |
+| Prefix | Purpose                                   | Supported |
 |--------|-------------------------------------------|----|
-| `G…`   | Kitty graphics protocol                   | ✓ (M9a) |
+| `G...`   | Kitty graphics protocol                   | ✓ |
 
 ## Mouse protocols
 
-| Mode | Name                     | v1 |
+| Mode | Name                     | Supported |
 |------|--------------------------|----|
 | 1000 | X10 button               | ✓ |
 | 1002 | Cell-motion tracking     | ✓ |
@@ -194,7 +214,7 @@ Default behavior per app:
 
 ## Keyboard protocols
 
-| Mode                                  | v1 |
+| Mode                                  | Supported |
 |---------------------------------------|----|
 | xterm baseline (modifyOtherKeys=0)    | ✓ |
 | Cursor + tilde + SS3 keys with Shift/Alt/Ctrl modifier codes | ✓ |
@@ -202,16 +222,34 @@ Default behavior per app:
 | modifyOtherKeys=2 (all printable)     | ✓ |
 | DECCKM — application-cursor-keys mode | ✓ |
 | DECPAM / DECPNM — keypad mode         | ✓ (numpad emits ESC O X under DECPAM) |
-| Kitty progressive enhancement (CSI > N u, disambiguate)        | ✓ |
-| Kitty progressive enhancement (CSI = N;M u, push/pop stack)    | ✓ |
-| Kitty progressive enhancement (flag 0x02, release+repeat)      | ✓ |
 | CSI u (libtermkey)                                             | ✓ |
+
+Kitty keyboard protocol (`csiAux` / `csiKittyKbd` in
+`screen_ops.zig`) - note which form does what, they are easy to
+confuse:
+
+| Sequence          | Effect                                              |
+|-------------------|-----------------------------------------------------|
+| `CSI > flags u`   | PUSH current flags, then set - how apps enable it    |
+| `CSI = flags ; mode u` | Set WITHOUT touching the stack; mode 1 assign, 2 or-in, 3 clear |
+| `CSI < N u`       | Pop N levels                                        |
+| `CSI ? u`         | Query, replies `CSI ? flags u`                      |
+
+The push stack drops its oldest entry when full rather than
+refusing, so a program that pushes without popping cannot wedge the
+protocol for everything after it.
 
 ## Character encodings
 
-**UTF-8 only in v1.** No ISO 2022 designation / invocation. No
-VT100 character sets (SO/SI ignored). Legacy encodings never
-supported.
+**UTF-8 for text.** No ISO 2022 designation / invocation, and no
+legacy encodings.
+
+The VT100 line-drawing set IS supported, contrary to what this
+section used to claim: `Screen.Charset` is `{ ascii, dec_graphics }`
+with independent G0/G1 slots, SI/SO switch the active slot, SCS
+designates, and SS2/SS3 single-shift the next codepoint. G2/G3 are
+not modelled, so a single shift with nothing designated is consumed
+without effect.
 
 ## Image protocols — wire details
 
@@ -227,9 +265,9 @@ supported.
 - Commands: `t` / `T` (transmit, transmit+place), `p` (put),
   `d` (delete), `q` (query support), `f` (frame data),
   `a` (animation control).
-- Formats v1: `f=32` RGBA, `f=24` RGB, `f=100` PNG.
-- Media v1: `t=d` direct inline, `t=t` tempfile (read+unlink),
-  `t=f` file path.
+- Formats: `f=32` RGBA, `f=24` RGB, `f=100` PNG.
+- Media: `t=d` direct inline, `t=t` tempfile (read then unlink),
+  `t=f` file path. `t=s` (shared memory) is NOT supported.
 - Compression: `o=z` zlib via `std.compress.flate`.
 - Chunked transmit via `m=1` / `m=0`.
 - Placement IDs, image IDs, z-index — all per spec.
@@ -241,78 +279,95 @@ supported.
   is updated in place via `glTexSubImage2D`.
 
 ### iTerm2 OSC 1337
-- Only `File=` key in v1.
-- Payload: base64. Streamed decode; buffer across OSC writes
-  until terminator.
-- Format v1: PNG only (via vendored `stb_image.h`).
-- Format **deferred v1**: JPEG, GIF, TIFF, WebP.
-- Placement at cursor, sized by `width=` / `height=` or image
-  dimensions.
+- `File=` carries images; the other directives are listed in the OSC
+  table above.
+- Payload: base64, buffered across OSC writes until the terminator.
+- **PNG only**, enforced by an explicit magic check in
+  `parser/iterm_image.zig` before stb_image sees the bytes. JPEG,
+  GIF, TIFF and WebP are not accepted.
+- `inline=0` (the protocol default) means "transfer, do not show";
+  we have no download side, so those payloads are dropped rather
+  than drawn where the app expects nothing.
+- Placement at cursor; the requested box (`width=` / `height=` in
+  cells, pixels, percent or auto) is resolved against the pane's
+  real cell metrics.
 
 ## Terminal responses
 
 | Query                           | Response                                                   |
 |---------------------------------|------------------------------------------------------------|
-| DA1 (`CSI c`)                   | `CSI ? 62 ; 4 ; 8 ; 22 ; 28 c` — VT220 + sixel + color     |
-| DA2 (`CSI > c`)                 | `CSI > 42 ; M ; m c` — vendor id 42 = sketerm; M/m = version |
-| DA3 (`CSI = c`)                 | stub empty response                                        |
+| DA1 (`CSI c`)                   | `CSI ? 62 ; 4 ; 22 c` - VT220 + sixel + ANSI color         |
+| DA2 (`CSI > c`)                 | `CSI > 42 ; 1 ; 0 c` - vendor id 42 = sketerm              |
+| DA3 (`CSI = c`)                 | no response                                                |
 | DSR cursor (`CSI 6 n`)          | `CSI row ; col R`                                          |
-| XTVERSION (`CSI > 0 q`)         | `DCS > ` `\|sketerm vMAJOR.MINOR.PATCH` `\e\\`             |
+| XTVERSION (`CSI > 0 q`)         | `DCS > \|sketerm 0.1.0 ESC \\`                             |
 | Kitty query (`APC G a=q,i=1 ; ...`) | per Kitty spec: `OK` or diagnostic              |
 | CSI 14 t                        | `CSI 4 ; H ; W t` (pixels)                                 |
 | CSI 18 t                        | `CSI 8 ; rows ; cols t`                                    |
 | CSI 19 t                        | `CSI 9 ; rows ; cols t`                                    |
 | Focus in/out                    | `CSI I` / `CSI O` (when mode 1004 enabled)                 |
 
-**Note on DA1 `4`**: advertises sixel. Do not advertise until
-sixel decoding (M9b) is solid. Until then, respond with
-`CSI ? 62 ; 22 c` and let apps fall back to ASCII.
+**Version strings are hardcoded.** Both the DA2 payload and
+XTVERSION carry literal constants in `screen_ops.zig` rather than
+`version.string`, so they do not track `.version` in
+`build.zig.zon`. Anything parsing them is reading a fixed value.
 
 ## Environment variables set for child
 
+Set by `Pty.spawn` (`src/pty.zig`) in the forked child:
+
 | Variable                | Value                                            |
 |-------------------------|--------------------------------------------------|
-| `TERM`                  | `sketerm-256color` (or `xterm-256color` fallback) |
-| `COLORTERM`             | `truecolor`                                      |
+| `TERM`                  | `xterm-256color` by default; the `term` config key selects something else, e.g. `sketerm-256color` |
+| `COLORTERM`             | `truecolor` (config `color_term`)                |
 | `TERM_PROGRAM`          | `sketerm`                                        |
-| `TERM_PROGRAM_VERSION`  | semver string                                    |
-| `COLUMNS`               | current cell columns                             |
-| `LINES`                 | current cell rows                                |
+| `TERM_PROGRAM_VERSION`  | `version.string`                                 |
+| `KITTY_WINDOW_ID`       | `1` - the hint most tools (yazi, lf, btop, chafa, viu) check for kitty-graphics capability, and it is accurate |
+| `SKETERM_PANE_ID`       | pane id, so `sketerm cli` inside the pane can self-address |
+| `SKETERM_SOCKET`, `SKETERM_MUX_SOCKET` | control + daemon sockets, when set |
+| `SKETERM_SESSION`, `SKETERM_SESSION_ORIGIN_ID` | durable session identity |
+
+`COLUMNS` / `LINES` are NOT set: the kernel's winsize is the source
+of truth and the shell derives them itself. A session may also get
+`WAYLAND_DISPLAY`, `PULSE_SERVER`, `XDG_RUNTIME_DIR` and a11y bus
+variables when the daemon is hosting forwarded apps.
 
 ## Terminfo
 
-v1 ships **`sketerm-256color.src`** compiled via `tic`. Declared
-capabilities:
-- Truecolor (`Tc`, `RGB`)
-- Sixel (`sixel`)
-- OSC 52 (`Ms`)
-- OSC 8 (custom `u8`)
-- Full xterm-256color base
-- Focus reporting (`fe`, `fd`)
-- Bracketed paste (`BE`, `BD`)
-- DECSCUSR variants (`Ss`, `Se`)
+`terminfo/sketerm-256color.src` is compiled with `tic -x` and
+installed by the PKGBUILD. It is `use=xterm-256color` plus:
 
-Fallback behavior: if the remote host doesn't have the
-`sketerm-256color` terminfo file, sketerm falls back to advertising
-`$TERM=xterm-256color` for that child (future: a probe step; v1
-just uses the env var unconditionally and lets `tput` fail
-silently where it must).
+- Truecolor (`Tc`, `RGB`)
+- OSC 52 clipboard (`Ms`)
+- Bracketed paste (`BE`, `BD`, `PS`, `PE`)
+- Cursor shape (`Ss`, `Se`)
+- Focus reporting (`fe`, `fd`)
+
+It does NOT declare a `sixel` capability or an OSC 8 extension,
+despite the header comment mentioning sixel in the description
+string. Sixel capability reaches apps through DA1's `;4;` instead.
+
+Because the default `$TERM` is `xterm-256color`, a child only sees
+`sketerm-256color` when the user opts in with `term =` in the
+config - which is also what makes remote hosts without our terminfo
+file a non-issue by default.
 
 ## Feature-detect heuristics apps use
 
 Documented so we don't surprise app heuristics:
 
 - Sixel: apps check terminfo `sixel`, or sniff `$TERM` for
-  `xterm-kitty` / `wezterm` / `foot` / `mlterm`, or probe DA1.
-  With our `sketerm-256color`, terminfo check passes (when sixel
-  is advertised post-M9b).
-- Kitty graphics: apps probe with `APC Gi=…,a=q,t=d,f=24;...`.
-  We respond per spec.
+  `xterm-kitty` / `wezterm` / `foot` / `mlterm`, or probe DA1. Our
+  terminfo does NOT carry the capability, so the DA1 `;4;`
+  advertisement is what these probes land on.
+- Kitty graphics: apps probe with `APC Gi=...,a=q,t=d,f=24;...` and we
+  reply `OK` (silently, at `q>=1`). Many tools skip the probe
+  entirely and trust `$KITTY_WINDOW_ID`, which we set to `1`.
 - Truecolor: apps check `COLORTERM=truecolor`. We set it
   unconditionally.
-- Hyperlinks (OSC 8): apps check `$TERM` against a known list.
-  We add `sketerm-256color` to such lists informally by being
-  fully compatible.
+- Hyperlinks (OSC 8): apps check `$TERM` against a known list, so a
+  pane running the default `xterm-256color` inherits xterm's
+  standing there.
 
 ## What we never implement
 
@@ -320,4 +375,7 @@ Documented so we don't surprise app heuristics:
 - `DECBI` / `DECFI` (back/forward index) — VT420-specific, unused.
 - Arbitrary set-window XTWINOPS (move, resize, iconify, raise) —
   we respond to size-report subsets only (14t / 18t / 19t).
-- macOS / Windows ports — Linux-only by design.
+- Windows. (macOS is NOT on this list any more: the platform seams
+  exist and the cross-compile check is
+  `zig build mux-portable -Dportable-target=aarch64-macos`. See
+  `docs/macos.md`.)
