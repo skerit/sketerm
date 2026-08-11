@@ -375,7 +375,14 @@ pub const Menu = struct {
     /// A check row (Nemo's Show Hidden Files). The mark reflects
     /// `checked` at build time; the handler flips the real state.
     pub fn check(self: Menu, label: [*:0]const u8, checked: bool, cb: anytype, ctx: ?*anyopaque) void {
+        self.checkEnabled(label, checked, true, cb, ctx);
+    }
+
+    /// `check` for a state that exists but cannot be changed right now
+    /// — greyed out rather than hidden, exactly like `itemIconEnabled`.
+    pub fn checkEnabled(self: Menu, label: [*:0]const u8, checked: bool, enabled: bool, cb: anytype, ctx: ?*anyopaque) void {
         const row = self.makeRow(label, .none, false);
+        if (!enabled) c.gtk_widget_set_sensitive(row, 0);
         const img = c.g_object_get_data(@ptrCast(@alignCast(row)), "sketerm-cm-icon");
         if (img != null) {
             c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(img)), "object-select-symbolic");
