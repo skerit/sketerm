@@ -2,68 +2,54 @@
 
 ## Module tree
 
+Directory-level, since the file list churns. Each entry says who may
+depend on it — the dependency direction is the part that must not drift.
+
 ```
 src/
-├── main.zig                application entry, CLI args, signal wiring
-├── c.zig                   @cImport bundle: gtk4, adwaita, freetype,
-│                           harfbuzz, epoxy (GL), lua, glib, gio
-├── config.zig              config file loader (ZON)
-├── pty.zig                 PTY spawn + read loop (per-pane worker)
-├── terminal.zig            composes pty + parser + screen per pane
+├── main.zig                GUI entry: CLI args, argv0 identity dispatch
+├── mux_main.zig            sketerm-mux entry (libc only)
+├── c.zig                   @cImport bundle for the GUI target
+├── config.zig              config.conf loader + ProfileSettings
+├── pty.zig                 PTY spawn + read loop (daemon side)
+├── terminal.zig            one Screen + parser + Remote connection
+├── layout.zig              tab/pane tree ↔ JSON persistence
 │
-├── parser/
-│   ├── vt.zig              Paul Williams VT state machine → Event
-│   ├── event.zig           Event tagged union (Print, CSI, OSC, DCS, APC, …)
-│   ├── osc.zig             OSC dispatcher (52, 8, 7, 11, 1337, palette)
-│   ├── dcs.zig             DCS frame framing (sixel passthrough)
-│   ├── apc.zig             APC frame framing (kitty graphics)
-│   ├── sixel.zig           DCS q…ST → RGBA + placement metadata
-│   ├── kitty_image.zig     APC G=… → image commands (transmit/put/del)
-│   └── iterm_image.zig     OSC 1337;File=… → RGBA (PNG via stb_image)
-│
-├── grid/
-│   ├── cell.zig            Cell struct (8 bytes) — see D3
-│   ├── style_pool.zig      interned StyleEntry for fg/bg/attrs
-│   ├── rune_pool.zig       interned multi-codepoint clusters
-│   ├── link_table.zig      OSC 8 link_id ↔ URL table
-│   ├── line.zig            Line + dirty flag + wrap flag
-│   ├── screen.zig          active + alternate + scrollback ring
-│   ├── image_store.zig     per-pane image placements (see images.md)
-│   ├── selection.zig       selection model
-│   └── width.zig           Unicode width tables (generated)
-│
-├── render/
-│   ├── atlas.zig           FreeType glyphs → GL texture pages, LRU
-│   ├── gl.zig              minimal GL wrapper + shader compilation
-│   ├── grid_pass.zig       instanced-quad grid renderer
-│   ├── image_pass.zig      textured-quad image renderer
-│   └── cursor.zig          cursor styles (DECSCUSR), blink timer
-│
-├── ui/
-│   ├── app.zig             AdwApplication singleton
-│   ├── window.zig          AdwApplicationWindow + AdwTabView + root GL context
-│   ├── tab.zig             one tab = one pane_tree + sticky title
-│   ├── pane.zig            interactive pane: input/menus/faces around a surface
-│   ├── terminal_surface.zig terminal renderer: GLArea + passes + visual timers
-│   ├── pane_tree.zig       binary tree {Leaf(Pane) | Split(H|V, a, b)}
-│   ├── menu.zig            GMenu / GActionMap builder
-│   ├── clipboard.zig       GdkClipboard ↔ OSC 52 bridge
-│   ├── input.zig           GdkEvent → xterm byte encoding
-│   └── ime.zig             GtkIMMulticontext (fcitx5/ibus)
-│
-├── layout.zig              serialize/deserialize tab tree (ZON)
-└── util/
-    ├── ring.zig            SPSC lock-free ring buffer
-    ├── utf8.zig            utf-8 decode helpers
-    ├── base64.zig          streaming base64 decoder (for OSC 52, iTerm2)
-    └── eventfd.zig         eventfd wrapper for worker wakeup
+├── parser/                 VT state machine → Event; sixel, kitty and
+│                           iTerm2 image protocols. GTK-free.
+├── grid/                   Cell (8 bytes) + side tables, Screen,
+│                           scrollback, reflow, selection. GTK-free.
+├── editor/                 rope, transactions, syntax, search — the
+│                           editor model. GTK-free.
+├── lsp/                    LSP client (see src/lsp/CLAUDE.md). GTK-free.
+├── filebrowser/            file-browser model, jobs, previews. GTK-free.
+├── mux/                    daemon, wire protocol, transports, app
+│                           forwarding (see src/mux/CLAUDE.md). GTK-free.
+├── ipc/                    remote control, MCP server, appdrive
+│                           (see src/ipc/CLAUDE.md).
+├── web/                    CEF browser helper — the only CEF linkage
+│                           (see src/web/CLAUDE.md). Its own binary.
+├── render/                 atlas, GL wrapper, grid/cell/image/bg passes,
+│                           shader passes, editor text layout.
+├── ui/                     everything GTK: app, window, tab, pane,
+│                           terminal_surface, the faces (browser/, panel/,
+│                           editor*, webface), prefs, menus, palette.
+└── util/                   platform primitives, codecs, recording,
+                            small helpers shared by everything.
 build.zig
-build.zig.zon               Zig toolchain pin; no package deps (all system libs)
+build.zig.zon               toolchain pin + the single version source
 ```
+
+The hard rule in that list: **`ui/` and `render/` may depend on
+everything, but nothing depends on them.** Anything the daemon imports
+(`mux/`, `parser/`, `grid/`, `config.zig`) must stay free of GTK and
+GLib, which `zig build mux-portable` checks against musl.
 
 ## Data flow
 
-Steady-state path from child process byte to pixel:
+Steady-state path from child process byte to pixel. The PTY read and
+the VT parse both happen in the DAEMON — the GUI process owns no pty
+and runs no parser thread:
 
 ```
    child process (bash)
@@ -71,25 +57,24 @@ Steady-state path from child process byte to pixel:
           ▼  writes bytes to slave fd
    PTY (kernel)
           │
-          ▼  poll(master_fd, shutdown_fd)
-   ┌──────────────────┐    worker thread (one per pane)
+          ▼  poll() in the daemon's single-threaded loop
+   ┌──────────────────┐    sketerm-mux (separate process)
    │   PTY read       │
    │   Parser (VT)    │
    │   emits Events   │
    └────────┬─────────┘
-            │ push
+            │ EVENTS frames (parsed events, never re-encoded
+            │ escape sequences); SNAPSHOT on attach/resync
             ▼
-   ┌──────────────────┐    lock-free SPSC ring (64 KB, fixed-size)
-   │   Event Ring     │
+   ┌──────────────────┐    unix socket / ssh transport
+   │   mux wire       │
    └────────┬─────────┘
-            │  g_main_context_invoke(main_drain)
+            │ g_unix_fd_add, non-blocking, never read blocking
             ▼
-   ┌──────────────────┐    main thread (GLib main loop)
-   │  main_drain:     │
-   │   drain ring     │
-   │   apply to Screen│
-   │   update images  │
-   │   queue_draw     │
+   ┌──────────────────┐    GUI, main thread (GLib main loop)
+   │  apply to Screen │
+   │  update images   │
+   │  queue_draw      │
    └────────┬─────────┘
             │ gtk_widget_queue_draw (coalesced by frame clock)
             ▼
@@ -102,90 +87,81 @@ Steady-state path from child process byte to pixel:
          pixels
 ```
 
-Back-pressure is natural: if the main thread falls behind, the ring
-fills. When full, the worker blocks on push, which blocks PTY read,
-which blocks the child on write. Self-regulating, no explicit flow
-control needed.
+Back-pressure is natural: the socket buffer fills, the daemon's write
+blocks, its PTY read stops, and the child blocks on write.
+Self-regulating, no explicit flow control needed.
+
+The in-process path this replaced — a worker thread per pane, a
+lock-free SPSC ring, a `drain_pending` cross-thread wakeup and a
+`mainDrain` callback — is GONE, and deliberately so. Do not
+reintroduce it.
 
 ## Threading model
 
-| Thread        | Owns                                                   |
-| ------------- | ------------------------------------------------------ |
-| GTK main      | All GTK/GDK/GL objects, Screen, ImageStore, UI state   |
-| PTY worker    | PTY fd + Parser state + ring producer + shutdown eventfd |
-| (none others) | v1 has no other threads                                |
+| Thread          | Owns                                                     |
+| --------------- | -------------------------------------------------------- |
+| GTK main        | Everything: GTK/GDK/GL objects, Screen, ImageStore, UI    |
+| detached worker | Short-lived blocking IO ONLY, touching none of the above  |
 
-One worker **per pane**. All GTK/GDK/GL objects live exclusively
-on the main thread. The worker never touches anything but the PTY
-fd, its shutdown eventfd, and its ring producer side.
+Terminal rendering has no worker thread at all; the off-thread parsing
+happens in another process. The one exception is short-lived **detached**
+workers for blocking IO that touches no widget, render or Screen state:
+panel transport setup, panel asset file reads, gdk-pixbuf decode (see
+`src/ui/panelhost.zig`). They hand back through `g_idle_add`, and ONLY
+the idle handback frees the job, so a cancelled worker can never race
+its own teardown. A worker that needs GTK is a bug, not a pattern to
+copy.
 
-See `docs/lifecycle.md` for start/stop/signal details.
+Never block the GLib main loop on a socket read. Every socket the GUI
+watches — the daemon connection, the browser helper — is non-blocking
+and watched with `g_unix_fd_add`.
 
-## Cross-thread wakeup
+See `docs/lifecycle.md` for start/stop/signal details, and `docs/gpu.md`
+for the full GL-integration rationale.
 
-**Do not use `g_idle_add`** — it does not coalesce. But
-`g_main_context_invoke` doesn't self-coalesce either: 1000 calls
-schedule 1000 sources. Coalesce explicitly with a per-pane
-atomic flag:
+## Deferred callbacks and liveness
 
-```zig
-// Worker, after parsing a batch and pushing events:
-const was_pending = term.drain_pending.swap(true, .acq_rel);
-if (!was_pending) {
-    // We transitioned false → true; we own the wakeup.
-    _ = c.g_main_context_invoke(null, mainDrainEvents, @ptrCast(term));
-}
-// If was_pending == true, an earlier wakeup is already in flight;
-// the main-thread drain will see our new events.
+The hazard that outlived the worker is a callback firing into freed
+user data. `DrainHandle` is the fence for callbacks that are not
+attached to a widget and so have no widget lifetime to borrow: idle
+callbacks, timers, async sink replies (the OSC 52 clipboard read),
+reconnect handbacks, retry timers. It is allocated per `Terminal` and
+outlives it; `alive` lets a queued callback detect a teardown between
+queue and dispatch, and `terminal` is the fenced back-pointer those
+callbacks resolve through.
 
-// Main thread drain callback:
-fn mainDrainEvents(user: ?*anyopaque) callconv(.C) c.gboolean {
-    const term: *Terminal = @ptrCast(@alignCast(user.?));
-    // Clear flag BEFORE draining. If worker pushes during drain,
-    // it will reschedule us.
-    term.drain_pending.store(false, .release);
-    // Drain ring → Screen → ImageStore → queue_draw
-    while (term.ring.pop()) |ev| term.screen.apply(ev);
-    c.gtk_widget_queue_draw(term.glarea);
-    return c.G_SOURCE_REMOVE;
-}
-```
+For widget-attached callbacks the mechanisms are different and must not
+be mixed — `CLAUDE.md`'s memory-ownership section is the reference.
 
-This guarantees at most one `g_main_context_invoke` in flight per
-pane, regardless of how many events the worker produces. Many
-events per batch → one wakeup, one drain, one `queue_draw`.
-
-`gtk_widget_queue_draw` itself coalesces automatically within a
-frame, so multiple drain cycles within one frame still produce
-one render.
-
-Frame-clock-driven animations (cursor blink) use
-`gdk_frame_clock_add_tick_callback` per widget.
-
-See `docs/gpu.md` for the full GL-integration rationale.
+`gtk_widget_queue_draw` coalesces automatically within a frame, so
+several applied event batches inside one frame still produce one
+render. Frame-clock-driven animation uses a tick callback that is
+installed only while something is animating and removes itself when
+that ends.
 
 ## Allocator strategy
 
 Zig's explicit allocation discipline, three domains:
 
-1. **App allocator** — `std.heap.GeneralPurposeAllocator` with
-   `.safety = true` in debug. Long-lived objects (windows, tab
-   trees, screens, scrollback, image textures). Main thread only.
-2. **Parser arena** — `std.heap.ArenaAllocator` per worker. Reset
-   once per ring-drain cycle (not per event — too fine; not per
-   connection lifetime — too coarse). Holds transient event
-   payloads (CSI params, short OSC strings).
-3. **Event ring** — per pane, fixed-size (64 KB). Payloads ≤ 32 B
-   inline; larger payloads (long OSC, image bytes) heap-allocated
-   on the worker and ownership transfers to the main thread via
-   the ring entry.
-
-**OSC payload pool** (M5+): a per-worker slab pool for ≤ 4 KB OSC
-payloads avoids GPA contention under rapid OSC 52 writes. Large
-payloads still go through GPA.
+1. **App allocator** — the process `GeneralPurposeAllocator`. All
+   long-lived state (windows, tab trees, screens, scrollback, image
+   textures). Main thread only in the GUI.
+2. **Parse arena** — `std.heap.ArenaAllocator` for transient event
+   payloads (CSI params, short OSC strings), reset once per drain
+   rather than per event or per connection. This lives with the
+   parser, which means the daemon.
+3. **Config arena** — `applyConfigChange` clones the config into a
+   fresh arena and frees the old one, so anything holding
+   config-arena slices must be re-pointed in that same loop.
 
 No GC. Every allocation has a defined owner and a defined free
 site. Leak detection via GPA's debug mode during development.
+
+GTK signal contexts are the subtle case, because a callback can
+outlive what it points at: `CLAUDE.md`'s memory-ownership section is
+the reference, and its central rule is that the three mechanisms
+(widget-owned destroy notify, disconnect at teardown, liveness fence)
+are alternatives — never layers.
 
 ## GL context lifecycle
 
@@ -223,7 +199,8 @@ Decouples threading. Events are batchable, testable (record/replay
 fixtures), and natural to drain atomically.
 
 ### D2 — One Parser per PTY
-Parser state is per-stream. Each pane's worker owns its own state.
+Parser state is per-stream, owned by the daemon session that owns
+the PTY.
 
 ### D3 — Cell is 8 bytes; heavy data in side tables
 
@@ -275,7 +252,10 @@ Most glyphs are grayscale → R8 saves VRAM. Color bitmap glyphs
 (emoji) go into RGBA8. Eviction at page level, not glyph.
 
 ### D5 — OpenGL ES 3.0 via GtkGLArea (not GSK)
-Direct shader control. See `docs/gpu.md`.
+Direct shader control, for the TERMINAL surface. See `docs/gpu.md`.
+Browser panes are the deliberate exception: their frames are
+`GdkTexture`s composited by GSK, because a GL area resamples them
+twice on fractional-scale outputs.
 
 ### D6 — Image model: placement-based, per-pane `ImageStore`
 Full details in `docs/images.md`. Summary:
@@ -353,8 +333,8 @@ the parsed `Event` representation, so every feature (kitty graphics,
 OSC 52, hyperlinks, underline colors) works through the mux with no
 per-feature support — the property tmux structurally cannot have.
 Attach sends a sequence-stamped snapshot, then streams live events;
-the client applies them to its local `Screen` through the exact code
-path the local PTY worker uses.
+the client applies them to its local `Screen` through the same code
+path every session uses — there is no separate "local" path left.
 
 **Transports.** One protocol, three pipes:
 - *Local*: Unix socket at `$XDG_RUNTIME_DIR/sketerm/mux.sock`.
@@ -456,14 +436,24 @@ taskbar application and can be set as the system default browser.
 - `ui/window.zig` — owns `AdwApplicationWindow`, the root
   `GdkGLContext`, `AdwTabView`, shared atlas.
 - `ui/tab.zig` — owns one `pane_tree` and the sticky tab title.
-- `ui/pane.zig` — owns one `Terminal` and one `GtkGLArea`.
-- `terminal.zig` — owns one `pty`, one `parser.State`, one
-  `Screen`, one `ImageStore`, one `Renderer`, one SPSC ring,
-  and the worker thread handle.
+- `ui/pane.zig` — owns one `Terminal`, one `TerminalSurface` (by
+  value), and the pane's faces (file browser, editor, panel,
+  app embed, web).
+- `ui/terminal_surface.zig` — owns the pane's `GtkGLArea` and its
+  GL lifecycle, the render passes, one `ImageStore`, and the
+  visual timers (cursor blink, trail, bell).
+- `terminal.zig` — owns one `parser.State`, one `Screen`, and the
+  `Remote` connection to the daemon. It owns NO pty and no worker
+  thread: the PTY read and the parse both happen in `sketerm-mux`,
+  and what arrives here is already-parsed events.
 - `grid/screen.zig` — owns active screen, alternate screen,
   scrollback ring.
-- `grid/image_store.zig` — owns all placements and decoded images
-  for a pane. (GL texture handles freed on main thread only.)
+- `grid/image_store.zig` — owned by `ui/terminal_surface.zig`; owns
+  all placements and decoded images for a pane. (GL texture handles
+  freed on main thread only.)
+- `ui/webface.zig` — owns one browser view and the client shared by
+  every web face in the process; the CEF engine itself is a
+  separate process.
 - `render/atlas.zig` — owned by `ui/window.zig`; shared across all
   of the window's panes.
 
@@ -475,5 +465,5 @@ taskbar application and can be set as the system default browser.
   alt-screen isolation, eviction
 - `docs/layout.md` — persistence format, save/load triggers,
   degraded-load behavior
-- `docs/lifecycle.md` — PTY spawn, worker management, signal
+- `docs/lifecycle.md` — PTY spawn, session lifetime, signal
   handling, teardown
