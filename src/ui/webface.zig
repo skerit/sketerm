@@ -816,6 +816,15 @@ pub const Client = struct {
                 const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onEvalResult(ev);
             },
+            .intercept_status => {
+                const ev = proto.decode(proto.InterceptStatus, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onInterceptStatus(ev);
+            },
+            .intercept_log => {
+                const ev = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entries);
+                if (self.findFace(ev.view)) |face| face.onInterceptLog(ev);
+            },
             else => {},
         }
     }
@@ -841,7 +850,7 @@ pub fn client() *Client {
 /// flight per view: the reply frames carry no request id (the protocol
 /// correlates by view), so two overlapping evals could not be told
 /// apart — and an awaited promise can settle out of order.
-pub const AutoKind = enum { snapshot, act, expand, query, read, eval };
+pub const AutoKind = enum { snapshot, act, expand, query, read, eval, network };
 
 const AutoOp = struct {
     token: u32,
@@ -1133,6 +1142,19 @@ pub const WebFace = struct {
     hints_typed_len: usize = 0,
     hints_token: u32 = 0,
     hints_active: bool = false,
+    /// Request interception (capability "intercept"): per-view counters,
+    /// freshened by the helper's coalesced `intercept_status` pushes.
+    /// The blocked count drives the toolbar badge; the log is PULLED on
+    /// demand through the `.network` auto op.
+    net_enabled: bool = true,
+    net_blocked: u32 = 0,
+    net_total: u32 = 0,
+    net_rules: u32 = 0,
+    net_next_seq: u32 = 0,
+    /// The shield toggle button and its label; the badge shows the
+    /// blocked count for the current page.
+    shield_btn: *c.GtkWidget = undefined,
+    shield_label: *c.GtkWidget = undefined,
 
     // ---- attach / teardown ------------------------------------------
 
@@ -1426,6 +1448,72 @@ pub const WebFace = struct {
             .code = .{ .s = code },
         });
         return token;
+    }
+
+    /// Pull recent network-log entries (`intercept_log`), answered
+    /// through the same token/`web-result` path the semantic ops use.
+    pub fn autoNetworkLog(self: *WebFace, since: u32, max: u16) ?u32 {
+        const token = self.autoBegin(.network, false) orelse return null;
+        client().post(proto.InterceptLogReq{ .view = self.view, .since = since, .max = max });
+        return token;
+    }
+
+    /// Enable/disable blocking for THIS view (the per-site toggle). The
+    /// daemon-side per-site store is a separate integration point (see
+    /// `netStoreApply`); this only moves the live helper state.
+    pub fn setNetwork(self: *WebFace, enabled: bool) void {
+        if (!self.view_live) return;
+        self.net_enabled = enabled;
+        client().post(proto.InterceptSet{ .view = self.view, .enabled = if (enabled) 1 else 0 });
+        self.updateShield();
+    }
+
+    pub fn netCounters(self: *WebFace) struct { enabled: bool, blocked: u32, total: u32, rules: u32 } {
+        return .{ .enabled = self.net_enabled, .blocked = self.net_blocked, .total = self.net_total, .rules = self.net_rules };
+    }
+
+    /// A coalesced `intercept_status` arrived: refresh the badge.
+    pub fn onInterceptStatus(self: *WebFace, ev: proto.InterceptStatus) void {
+        self.net_enabled = ev.enabled != 0;
+        self.net_blocked = ev.blocked;
+        self.net_total = ev.total;
+        self.net_rules = ev.rules;
+        self.updateShield();
+    }
+
+    pub fn onInterceptLog(self: *WebFace, ev: proto.InterceptLog) void {
+        self.net_next_seq = ev.next_seq;
+        const json = proto.netLogJson(self.allocator, ev.next_seq, ev.entries) catch return;
+        defer self.allocator.free(json);
+        self.completeOp(.network, true, json, .{});
+    }
+
+    /// Single integration point for a future daemon-side per-site
+    /// store: the store, when built, calls this with the remembered
+    /// decision for the page's site. Named so the other agent can wire
+    /// it without hunting; currently the toggle is in-memory only.
+    pub fn netStoreApply(self: *WebFace, enabled: bool) void {
+        self.setNetwork(enabled);
+    }
+
+    fn updateShield(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        var buf: [32]u8 = undefined;
+        const txt = if (!self.net_enabled)
+            std.fmt.bufPrintZ(&buf, "off", .{}) catch "off"
+        else if (self.net_blocked > 0)
+            std.fmt.bufPrintZ(&buf, "{d}", .{self.net_blocked}) catch "0"
+        else
+            std.fmt.bufPrintZ(&buf, "0", .{}) catch "0";
+        c.gtk_label_set_text(@ptrCast(self.shield_label), txt.ptr);
+        var tip: [128]u8 = undefined;
+        const t = std.fmt.bufPrintZ(&tip, "Content blocking: {s} ({d} blocked of {d} requests, {d} rules)", .{
+            if (self.net_enabled) "on" else "off",
+            self.net_blocked,
+            self.net_total,
+            self.net_rules,
+        }) catch "Content blocking";
+        c.gtk_widget_set_tooltip_text(self.shield_btn, t.ptr);
     }
 
     /// Wheel scrolling through the ORDINARY input path, at the last
@@ -2060,6 +2148,22 @@ pub const WebFace = struct {
             self,
         );
         self.track(self.reader_btn);
+        // Content-blocking shield: a flat button carrying the
+        // blocked-count badge for the current page, styled like the
+        // rest of the toolbar chrome. Clicking it toggles blocking for
+        // this view. A plain button (not a toggle) so a programmatic
+        // counter refresh never re-fires a "toggled" handler.
+        self.shield_btn = c.gtk_button_new().?;
+        const shield_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        c.gtk_box_append(@ptrCast(shield_row), toolbtn.iconOrText(bar, "security-high-symbolic", "Block"));
+        self.shield_label = c.gtk_label_new("0");
+        c.gtk_box_append(@ptrCast(shield_row), self.shield_label);
+        c.gtk_button_set_child(@ptrCast(self.shield_btn), shield_row);
+        c.gtk_widget_set_tooltip_text(self.shield_btn, "Content blocking");
+        toolbtn.flatten(self.shield_btn);
+        _ = c.g_signal_connect_data(@ptrCast(self.shield_btn), "clicked", @ptrCast(&onShield), self, null, 0);
+        self.track(self.shield_btn);
+        c.gtk_box_append(@ptrCast(bar), self.shield_btn);
 
         // `sketerm-terminal-symbolic` is one of our own bundled icons,
         // but it goes through the fallback like every other name: a
@@ -3178,6 +3282,12 @@ pub const WebFace = struct {
     fn onShowShell(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         if (self.pane) |p| p.setWebVisible(false);
+    }
+
+    /// Flip content blocking for this view (the per-site toggle).
+    fn onShield(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        self.setNetwork(!self.net_enabled);
     }
 
     /// The crashed / helper-lost overlay's Reload: restart the helper
