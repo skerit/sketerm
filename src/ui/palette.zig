@@ -2,7 +2,12 @@
 //! entry and a scrolling list of curated actions, each rendered as
 //! an AdwActionRow (icon + bold title + dim subtitle + keybind hint).
 //!
-//! Filter: case-insensitive substring across title + description.
+//! Filter + ranking go through the shared suggestion framework
+//! (src/util/suggest.zig): the curated action list is a command
+//! `Source` and the merger scores rows (title prefix > word boundary >
+//! substring > description hit), so the best match sorts to the top.
+//! A bare query scores every row equally and the tie-break on the
+//! build order keeps the curated ordering exactly as authored.
 //! Keyboard: Up/Down move selection while focus stays in the entry,
 //! Enter activates, Escape dismisses (handled by AdwDialog itself).
 //!
@@ -13,6 +18,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const suggest = @import("../util/suggest.zig");
 const render_kick = @import("../util/render_kick.zig");
 const input = @import("input.zig");
 const ecmd = @import("../editor/commands.zig");
@@ -184,6 +190,11 @@ const RowCtx = struct {
     action: input.Action,
     title_lower: []u8,
     desc_lower: []u8,
+    /// Build order — the sort tie-break that keeps the curated
+    /// ordering for bare queries.
+    orig_index: usize = 0,
+    /// Last merge score; 0 = filtered out (row hidden).
+    score: f32 = 1.0,
     /// Non-null = a dynamic [domain.<name>] row: activation opens a
     /// durable tab on this transport-prefixed host instead of
     /// dispatching `action`. Arena-owned.
@@ -297,6 +308,7 @@ pub fn open(window: *Window) !void {
             .action = entry.action,
             .title_lower = try toLowerOwned(arena, entry.title),
             .desc_lower = try toLowerOwned(arena, entry.desc),
+            .orig_index = i,
         };
         rows[i] = rctx;
 
@@ -337,6 +349,7 @@ pub fn open(window: *Window) !void {
                 .action = .toggle_editor_face, // unused for editor rows
                 .title_lower = try toLowerOwned(arena, ecmd.label(cmd)),
                 .desc_lower = try toLowerOwned(arena, ecmd.describe(cmd)),
+                .orig_index = row_count,
                 .editor_cmd = cmd,
             };
             rows[row_count] = rctx;
@@ -373,6 +386,7 @@ pub fn open(window: *Window) !void {
             .action = .new_durable_tab,
             .title_lower = try toLowerOwned(arena, title_z),
             .desc_lower = try toLowerOwned(arena, desc_z),
+            .orig_index = row_count,
             .domain_host = try dom.hostSpec(arena),
         };
         rows[row_count] = rctx;
@@ -400,6 +414,13 @@ pub fn open(window: *Window) !void {
         c.G_CONNECT_DEFAULT,
     );
     ctx.rows = rows[0..row_count];
+
+    // Ranked ordering: best match first, curated order on ties (every
+    // row starts at score 1.0, so the initial view IS the curated
+    // order). The rows' RowCtx carries the scores; the qdata pointer
+    // outlives every sort because the arena lives until the dialog's
+    // destroy-notify.
+    c.gtk_list_box_set_sort_func(@ptrCast(@alignCast(listbox)), @ptrCast(&onSortRows), null, null);
 
     // Search filter.
     _ = c.g_signal_connect_data(
@@ -444,29 +465,74 @@ pub fn open(window: *Window) !void {
     _ = c.gtk_widget_grab_focus(search);
 }
 
+/// The curated action rows as a suggestion `Source`: one candidate
+/// per matching row, payload = index into `ctx.rows`.
+fn commandSource(ctx_: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_.?));
+    var qbuf: [256]u8 = undefined;
+    const ql = suggest.toLower(&qbuf, q);
+    for (ctx.rows, 0..) |rctx, i| {
+        const score = suggest.fieldsScore(ql, rctx.title_lower, rctx.desc_lower);
+        if (score <= 0) continue;
+        out.append(gpa, .{
+            .title = rctx.title_lower,
+            .kind = .command,
+            .score = score,
+            .payload = i,
+        }) catch {};
+    }
+}
+
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     const text = cast.editableText(entry);
+    const lb: *c.GtkListBox = @ptrCast(@alignCast(ctx.listbox));
 
-    var first_visible_idx: i32 = -1;
+    // Rank through the shared framework; a row absent from the merge
+    // result scores 0 and is hidden.
+    for (ctx.rows) |rctx| rctx.score = 0;
+    const sources = [_]suggest.Source{.{ .ctx = ctx, .query = &commandSource }};
+    var cands: std.ArrayList(suggest.Candidate) = .empty;
+    defer cands.deinit(ctx.allocator);
+    suggest.merge(ctx.allocator, &sources, text, ctx.rows.len, &cands) catch return;
+    for (cands.items) |cand| ctx.rows[@intCast(cand.payload)].score = cand.score;
+
     var idx: i32 = 0;
     while (idx < @as(i32, @intCast(ctx.rows.len))) : (idx += 1) {
-        const rctx = ctx.rows[@intCast(idx)];
-        const visible = matches(text, rctx.title_lower, rctx.desc_lower);
-        const row = c.gtk_list_box_get_row_at_index(@ptrCast(@alignCast(ctx.listbox)), idx);
-        if (row != null) {
-            c.gtk_widget_set_visible(@ptrCast(row), if (visible) 1 else 0);
-            if (visible and first_visible_idx < 0) first_visible_idx = idx;
+        const row = c.gtk_list_box_get_row_at_index(lb, idx) orelse break;
+        const data = c.g_object_get_data(@ptrCast(@alignCast(row)), "palette-row") orelse continue;
+        const rctx: *RowCtx = @ptrCast(@alignCast(data));
+        c.gtk_widget_set_visible(@ptrCast(row), if (rctx.score > 0) 1 else 0);
+    }
+    c.gtk_list_box_invalidate_sort(lb);
+
+    // Always select the first visible row (post-sort: the best match)
+    // so Enter has a target.
+    idx = 0;
+    while (idx < @as(i32, @intCast(ctx.rows.len))) : (idx += 1) {
+        const row = c.gtk_list_box_get_row_at_index(lb, idx) orelse break;
+        if (c.gtk_widget_get_visible(@ptrCast(row)) != 0) {
+            c.gtk_list_box_select_row(lb, row);
+            return;
         }
     }
+    c.gtk_list_box_unselect_all(lb);
+}
 
-    // Always select the first visible row so Enter has a target.
-    if (first_visible_idx >= 0) {
-        const row = c.gtk_list_box_get_row_at_index(@ptrCast(@alignCast(ctx.listbox)), first_visible_idx);
-        if (row != null) c.gtk_list_box_select_row(@ptrCast(@alignCast(ctx.listbox)), row);
-    } else {
-        c.gtk_list_box_unselect_all(@ptrCast(@alignCast(ctx.listbox)));
-    }
+/// GtkListBox sort: score descending, curated build order on ties.
+fn onSortRows(row1: ?*c.GtkListBoxRow, row2: ?*c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) c_int {
+    const a = rowCtxOf(row1) orelse return 0;
+    const b = rowCtxOf(row2) orelse return 0;
+    if (a.score > b.score) return -1;
+    if (a.score < b.score) return 1;
+    if (a.orig_index < b.orig_index) return -1;
+    if (a.orig_index > b.orig_index) return 1;
+    return 0;
+}
+
+fn rowCtxOf(row: ?*c.GtkListBoxRow) ?*RowCtx {
+    const data = c.g_object_get_data(@ptrCast(@alignCast(row orelse return null)), "palette-row") orelse return null;
+    return @ptrCast(@alignCast(data));
 }
 
 fn onKeyPressed(
@@ -641,17 +707,6 @@ fn toLowerOwned(arena: std.mem.Allocator, s: [:0]const u8) ![]u8 {
         out[i] = std.ascii.toLower(ch);
     }
     return out;
-}
-
-fn matches(query: []const u8, title_lower: []const u8, desc_lower: []const u8) bool {
-    if (query.len == 0) return true;
-    var lower_buf: [256]u8 = undefined;
-    const n = @min(query.len, lower_buf.len);
-    for (query[0..n], 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
-    const q = lower_buf[0..n];
-    if (std.mem.indexOf(u8, title_lower, q) != null) return true;
-    if (std.mem.indexOf(u8, desc_lower, q) != null) return true;
-    return false;
 }
 
 /// Keybind hint for an editor-command row: the `editor_keybind.*`
