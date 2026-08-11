@@ -1761,11 +1761,22 @@ fn recDir() ?[]const u8 {
     var stamp_buf: [40]u8 = undefined;
     const stamp = McpLog.stamp(&stamp_buf);
     const dir = std.fmt.allocPrint(a, "{s}/sketerm/mcp-casts/{s}-{d}", .{ state_base, stamp, c.getpid() }) catch return null;
+    // mkdir -p, leaf included: this call replaced mcp_browser.mkdirs
+    // when the CDP set was deleted — without it recording is silently
+    // off on any fresh state dir.
     var probe: [4096]u8 = undefined;
     const dir_z = std.fmt.bufPrintZ(&probe, "{s}", .{dir}) catch {
         a.free(dir);
         return null;
     };
+    var i: usize = 1;
+    while (i <= dir_z.len) : (i += 1) {
+        if (i != dir_z.len and probe[i] != '/') continue;
+        const save = probe[i];
+        probe[i] = 0;
+        _ = c.mkdir(&probe, 0o700);
+        probe[i] = save;
+    }
     if (c.access(dir_z.ptr, c.W_OK) != 0) {
         a.free(dir);
         return null;
