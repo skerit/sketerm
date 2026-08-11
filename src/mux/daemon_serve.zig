@@ -36,6 +36,7 @@ const opuscodec = @import("opuscodec.zig");
 const build_options = @import("build_options");
 const wsproto = @import("../winstream/proto.zig");
 const wallMs = dmod.wallMs;
+const webstore = @import("webstore.zig");
 
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
@@ -903,6 +904,11 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // even when no snapshot/event profile overlaps.
                 .panel_rpc = wire.PANEL_RPC_VERSION,
                 .attach_identity = true,
+                // Daemon-side web store (web_op/web_reply). Capability,
+                // same reasoning as lsp: an old daemon would `.err` on
+                // the unknown frame, misattributable on a multiplexed
+                // connection.
+                .web_store = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -963,6 +969,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         },
         .udp_ticket_req => handleUdpTicketReq(self, cl, frame.payload),
         .fs_op => handleFsOp(self, cl, frame.payload),
+        // NOT attach-scoped (like fs_op): the web store belongs to the
+        // daemon host, served by whichever process owns the connection.
+        .web_op => handleWebOp(self, cl, frame.payload),
         .fs_write => handleFsWrite(self, cl, frame.payload),
         .file_open => handleFileOpen(self, cl, frame.payload),
         .file_data => handleFileData(self, cl, frame.payload),
@@ -2820,5 +2829,137 @@ pub fn fsWatchReadable(self: *Daemon) void {
                 .changes = pv.changes.items,
             });
         }
+    }
+}
+
+// === Web store (web_op / web_reply) ============================
+// Browsing history, bookmarks and per-site settings persisted on THIS
+// daemon's host ($XDG_STATE_HOME/sketerm/web) — a GUI attached to a
+// remote daemon sees that host's browsing state. All verbs are bounded
+// inline work in the poll loop. NOT attach-scoped: served by whichever
+// process owns the client connection (the broker, in broker mode).
+
+pub const WebOpReq = struct {
+    req: u32 = 0,
+    op: []const u8 = "",
+    url: []const u8 = "",
+    title: []const u8 = "",
+    /// history_query search text ("" = overall top entries).
+    q: []const u8 = "",
+    /// history_query result bound (0 = default 20, hard cap 200).
+    max: u32 = 0,
+    /// bookmark_remove/bookmark_update target.
+    id: u64 = 0,
+    folder: []const u8 = "",
+    /// bookmark_update reorder destination.
+    index: ?u32 = null,
+    origin: []const u8 = "",
+    zoom_x100: ?i32 = null,
+    popup: ?[]const u8 = null,
+    block: ?bool = null,
+    block_clear: bool = false,
+    perm: []const u8 = "",
+    decision: []const u8 = "",
+};
+
+fn webReplyErr(cl: *Client, req: u32, msg: []const u8) void {
+    cl.queueJson(.web_reply, .{ .req = req, .ok = false, .@"error" = msg });
+}
+
+/// The daemon's web store, opened on first use (missing files are an
+/// empty store; an unresolvable state dir fails each op, not the daemon).
+fn webStore(self: *Daemon) ?*webstore.WebStore {
+    if (self.web_store == null) {
+        const dir = webstore.defaultDirAlloc(self.allocator) catch return null;
+        defer self.allocator.free(dir);
+        self.web_store = webstore.WebStore.init(self.allocator, dir) catch return null;
+    }
+    return &self.web_store.?;
+}
+
+pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
+    const parsed = std.json.parseFromSlice(WebOpReq, self.allocator, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        cl.queueErr("bad web_op");
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value;
+    const store = webStore(self) orelse return webReplyErr(cl, r.req, "web store unavailable");
+
+    if (std.mem.eql(u8, r.op, "history_add")) {
+        store.addVisit(r.url, r.title, wallMs()) catch return webReplyErr(cl, r.req, "history write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "history_title")) {
+        store.setTitle(r.url, r.title) catch return webReplyErr(cl, r.req, "history write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "history_query")) {
+        const max: usize = if (r.max == 0) 20 else @min(r.max, 200);
+        const hits = store.query(self.allocator, r.q, max, wallMs()) catch
+            return webReplyErr(cl, r.req, "query failed");
+        defer self.allocator.free(hits);
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .hits = hits });
+    } else if (std.mem.eql(u8, r.op, "history_delete")) {
+        const removed = store.deleteUrl(r.url) catch return webReplyErr(cl, r.req, "history write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .removed = removed });
+    } else if (std.mem.eql(u8, r.op, "history_clear")) {
+        store.clearHistory() catch return webReplyErr(cl, r.req, "history write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "bookmark_add")) {
+        const id = store.bookmarkAdd(r.url, r.title, r.folder) catch
+            return webReplyErr(cl, r.req, "bookmark write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
+    } else if (std.mem.eql(u8, r.op, "bookmark_remove")) {
+        const removed = store.bookmarkRemove(r.id) catch
+            return webReplyErr(cl, r.req, "bookmark write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .removed = removed });
+    } else if (std.mem.eql(u8, r.op, "bookmark_update")) {
+        // Empty strings mean "leave unchanged" on this verb — a
+        // bookmark's url/title/folder are cleared by removing it, not
+        // by blanking fields.
+        const found = store.bookmarkUpdate(r.id, .{
+            .url = if (r.url.len > 0) r.url else null,
+            .title = if (r.title.len > 0) r.title else null,
+            .folder = if (r.folder.len > 0) r.folder else null,
+            .index = if (r.index) |i| i else null,
+        }) catch return webReplyErr(cl, r.req, "bookmark write failed");
+        if (!found) return webReplyErr(cl, r.req, "no such bookmark");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "bookmark_list")) {
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .bookmarks = store.bookmarks.items });
+    } else if (std.mem.eql(u8, r.op, "site_get")) {
+        if (store.siteGet(r.origin)) |site| {
+            cl.queueJson(.web_reply, .{
+                .req = r.req,
+                .ok = true,
+                .origin = r.origin,
+                .site = .{
+                    .zoom_x100 = site.zoom_x100,
+                    .popup = site.popup,
+                    .block = site.block,
+                    .perms = site.perms.items,
+                },
+            });
+        } else {
+            cl.queueJson(.web_reply, .{
+                .req = r.req,
+                .ok = true,
+                .origin = r.origin,
+                .site = @as(?u8, null),
+            });
+        }
+    } else if (std.mem.eql(u8, r.op, "site_set")) {
+        store.siteSet(r.origin, .{
+            .zoom_x100 = r.zoom_x100,
+            .popup = r.popup,
+            .block = r.block,
+            .block_clear = r.block_clear,
+            .perm = r.perm,
+            .decision = r.decision,
+        }) catch return webReplyErr(cl, r.req, "site write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else {
+        webReplyErr(cl, r.req, "unknown web op");
     }
 }

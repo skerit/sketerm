@@ -202,6 +202,19 @@ pub const FrameType = enum(u8) {
     /// Correlated native-panel RPC request with [u64 id little-endian]
     /// [opaque JSON], rewritten to a daemon route id for one presenter.
     panel_request = 31,
+    /// Web-store op (browsing history / bookmarks / per-site settings
+    /// persisted on the DAEMON's host, so browsing state follows the
+    /// host you attach to). JSON { req, op, ... } where op selects the
+    /// verb (history_add/history_title/history_query/history_delete/
+    /// history_clear/bookmark_add/bookmark_remove/bookmark_update/
+    /// bookmark_list/site_get/site_set) — extending the store is a new
+    /// op string, not a new frame type (the fs_op shape). NOT
+    /// attach-scoped: served by whichever process owns the client
+    /// connection. Answered by `web_reply` echoing `req`. Only sent to
+    /// daemons whose welcome advertises `web_store:true` — an older
+    /// daemon would answer `.err`, misattributable on a multiplexed
+    /// connection.
+    web_op = 32,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -321,6 +334,13 @@ pub const FrameType = enum(u8) {
     /// Correlated native-panel RPC result accepted only from the selected
     /// presenter and restored to the requester's original caller id.
     panel_reply = 95,
+    /// JSON answer to `web_op`, ALWAYS echoing the request's `req`
+    /// (fs_op nonce discipline): { req, ok, error?, ... } with
+    /// op-specific fields — history_query { hits:[{url,title,visits,
+    /// last_ms,score}] }, bookmark_add { id }, bookmark_list
+    /// { bookmarks:[{id,url,title,folder}] }, site_get { origin,
+    /// site:{zoom_x100,popup,block,perms:[{name,decision}]}|null }.
+    web_reply = 96,
     _,
 };
 
@@ -846,9 +866,11 @@ test "wire: frame peel handles partial + complete + unknown type" {
 test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 30), @intFromEnum(FrameType.play_control));
     try std.testing.expectEqual(@as(u8, 31), @intFromEnum(FrameType.panel_request));
+    try std.testing.expectEqual(@as(u8, 32), @intFromEnum(FrameType.web_op));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));
     try std.testing.expectEqual(@as(u8, 95), @intFromEnum(FrameType.panel_reply));
+    try std.testing.expectEqual(@as(u8, 96), @intFromEnum(FrameType.web_reply));
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(EventTag.print));
     try std.testing.expectEqual(@as(u8, 11), @intFromEnum(EventTag.parse_error));
 }

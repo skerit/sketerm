@@ -153,6 +153,7 @@ comptime {
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/wire.zig");
+    _ = @import("mux/webstore.zig");
     _ = @import("parser/clipboard_conformance_test.zig");
     _ = @import("parser/conformance_test.zig");
     _ = @import("parser/event.zig");

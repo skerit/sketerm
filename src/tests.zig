@@ -149,6 +149,7 @@ comptime {
     _ = @import("util/markdown.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
+    _ = @import("mux/webstore.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");

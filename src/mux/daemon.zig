@@ -2429,6 +2429,9 @@ pub const Daemon = struct {
     /// behind an MCP client's between-tool-calls backlog) keeps
     /// serving until everything drained or this deadline passes.
     drain_deadline_ms: i64 = 0,
+    /// Lazily-opened web store (history/bookmarks/site settings) under
+    /// $XDG_STATE_HOME/sketerm/web — see daemon_serve.handleWebOp.
+    web_store: ?@import("webstore.zig").WebStore = null,
 
     const SocketPathState = enum { live, stale, unknown };
 
@@ -2640,6 +2643,7 @@ pub const Daemon = struct {
         self.channels.deinit(self.allocator);
         if (self.dmabuf_importer) |*importer| importer.deinit();
         self.dmabuf_capabilities.deinit(self.allocator);
+        if (self.web_store) |*ws| ws.deinit();
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();

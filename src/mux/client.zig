@@ -296,6 +296,10 @@ pub const Conn = struct {
     /// play_control frames). Gates both — an old daemon would spawn a
     /// login shell for the request and `.err` on the control frame.
     cast_playback: bool = false,
+    /// Daemon serves `web_op` (welcome capability): history, bookmarks
+    /// and per-site settings stored on the daemon's host. Absent =
+    /// never send the frame; the client degrades to no persistence.
+    web_store: bool = false,
     /// Independent panel relay capability advertised by the daemon.
     panel_rpc: u8 = 0,
     /// The daemon can put immutable session identity before the initial GUI
@@ -456,6 +460,7 @@ pub const Conn = struct {
         self.display_v2 = false;
         self.lsp_support = false;
         self.cast_playback = false;
+        self.web_store = false;
         self.panel_rpc = 0;
         self.attach_identity = false;
         self.attach_identity_pending = false;
@@ -472,6 +477,7 @@ pub const Conn = struct {
             display_v2: bool = false,
             lsp: bool = false,
             cast_playback: bool = false,
+            web_store: bool = false,
             panel_rpc: u8 = 0,
             attach_identity: bool = false,
             build: []const u8 = "",
@@ -493,6 +499,7 @@ pub const Conn = struct {
             self.display_v2 = parsed.value.display_v2;
             self.lsp_support = parsed.value.lsp;
             self.cast_playback = parsed.value.cast_playback;
+            self.web_store = parsed.value.web_store;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
             self.attach_identity = parsed.value.attach_identity;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
