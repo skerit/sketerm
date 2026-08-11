@@ -1371,6 +1371,8 @@ pub const Window = struct {
             if (n == 1) "" else "s",
         }) catch return;
         showToast(self, msg);
+    }
+
     /// A palette verb that only means something on a pane wearing the
     /// WEB face. A pane without one is told so, rather than left
     /// wondering why the action did nothing.
