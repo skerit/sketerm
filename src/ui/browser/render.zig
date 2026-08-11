@@ -37,6 +37,7 @@ const launchLocal = @import("open.zig").launchLocal;
 const millerNextSegment = @import("../../filebrowser/paths.zig").millerNextSegment;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const tagColorHex = @import("../../filebrowser/format.zig").tagColorHex;
+const cast = @import("../../util/cast.zig");
 
 /// Horizontal gap between two adjacent widgets of a name cell
 /// (expander, icon, label, chips). Shared with colview.zig.
@@ -95,7 +96,7 @@ pub fn scheduleListingRender(self: *BrowserView) void {
 }
 
 fn onListingRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.listing_render_src = 0;
     self.renderCurrent();
     return 0; // one-shot
@@ -335,7 +336,7 @@ pub const HeaderCtx = struct {
     column: ?browser_model.Column,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(HeaderCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -440,7 +441,7 @@ pub const AttrColumnCtx = struct {
     entry: ?*c.GtkWidget,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(AttrColumnCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -456,7 +457,7 @@ const MetaColCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const self: *MetaColCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(MetaColCtx, user);
         self.allocator.free(self.key);
         self.allocator.destroy(self);
     }
@@ -522,7 +523,7 @@ fn removeAttrColumnByName(tab: *BTab, name: []const u8) void {
 
 /// A known-metadata-column checkbox in the picker flipped.
 pub fn onMetaColToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MetaColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MetaColCtx, user);
     const on = c.gtk_check_button_get_active(check) != 0;
     const shown = attrColumnShown(ctx.tab, ctx.key);
     if (on and !shown) {
@@ -537,7 +538,7 @@ pub fn onMetaColToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c
 
 /// Remove button of a CUSTOM extra-column row in the picker.
 pub fn onAttrColumnRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MetaColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MetaColCtx, user);
     const tab = ctx.tab;
     // The picker's custom-row list is now stale; close it.
     tab.view.closeColumnPicker();
@@ -562,7 +563,7 @@ fn applyColumnChange(self: *BrowserView, tab: *BTab, xattr_changed: bool) void {
 }
 
 pub fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(AttrColumnCtx, user);
     const tab = ctx.tab;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const name = std.mem.trim(u8, raw, " ");
@@ -580,7 +581,7 @@ pub fn closeColumnPicker(self: *BrowserView) void {
 }
 
 fn onColumnPickerClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.column_picker == @as(*c.GtkWidget, @ptrCast(pop))) self.column_picker = null;
 }
 
@@ -608,7 +609,7 @@ pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(HeaderCtx, user);
     showColumnPicker(ctx.tab, @ptrCast(@alignCast(btn)), null);
 }
 
@@ -778,7 +779,7 @@ pub fn showColumnPicker(tab: *BTab, btn: *c.GtkWidget, point: ?PickerPoint) void
 }
 
 pub fn onColumnToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(HeaderCtx, user);
     const col = ctx.column orelse return;
     const on = c.gtk_check_button_get_active(check) != 0;
     if (on) ctx.tab.columns.insert(col) else ctx.tab.columns.remove(col);
@@ -873,14 +874,14 @@ pub fn addEntryDragSource(_: *BTab, widget: *c.GtkWidget) void {
 }
 
 fn onGridDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
-    const child: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const child = cast.userData(c.GtkWidget, user);
     const data = c.g_object_get_data(@ptrCast(@alignCast(child)), "sketerm-row") orelse return null;
     const ctx: *RowCtx = @ptrCast(@alignCast(data));
     return dnd.provider(ctx.tab, ctx.path);
 }
 
 fn onGridDrop(target: *c.GtkDropTarget, value: *c.GValue, x: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     var dst_dir: []const u8 = tab.root.path;
     if (tab.flowbox) |fb| {
         if (c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y))) |child| {
@@ -974,14 +975,14 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
 }
 
 pub fn onGridChildActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return;
     const ctx: *RowCtx = @ptrCast(@alignCast(data));
     activateEntry(tab, ctx);
 }
 
 pub fn onGridSelectionChanged(fb: *c.GtkFlowBox, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     if (tab.rendering) return;
     const a = tab.view.allocator;
     for (tab.selected.items) |p| a.free(p);
@@ -1001,7 +1002,7 @@ pub fn onGridSelectionChanged(fb: *c.GtkFlowBox, user: ?*anyopaque) callconv(.c)
 
 pub fn onGridRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n_press;
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const self = tab.view;
     const fb = tab.flowbox orelse return;
     var path: ?[]u8 = null;
@@ -1124,7 +1125,7 @@ pub fn renderMillerCols(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn onMillerRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse return;
     const ctx: *RowCtx = @ptrCast(@alignCast(data));
     var buf: [4096]u8 = undefined;
@@ -1218,7 +1219,7 @@ pub const RowCtx = struct {
 };
 
 pub fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx: *RowCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(RowCtx, user);
     ctx.allocator.free(ctx.path);
     ctx.allocator.destroy(ctx);
 }

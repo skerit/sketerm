@@ -29,6 +29,7 @@ const menuDone = @import("menu.zig").menuDone;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const uniqueName = @import("../../filebrowser/paths.zig").uniqueName;
 const urlUnescape = @import("../../filebrowser/paths.zig").urlUnescape;
+const cast = @import("../../util/cast.zig");
 
 /// One in-flight .trashinfo fetch for Restore from Trash.
 pub const RestoreRead = struct {
@@ -525,7 +526,7 @@ fn finishPasteRun(self: *BrowserView, run: *PasteRun) void {
 }
 
 fn onPasteIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.widgets_dead or self.paste_runs.items.len == 0) {
         self.paste_idle = 0;
         return 0;
@@ -913,7 +914,7 @@ pub fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {
 }
 
 pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const popover = c.gtk_popover_new();
@@ -950,7 +951,7 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onTagsActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const txt = c.gtk_editable_get_text(@ptrCast(entry));
@@ -960,7 +961,7 @@ pub fn onTagsActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuExportSel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     var cmd: std.ArrayList(u8) = .empty;
@@ -1023,7 +1024,7 @@ pub const EditorRename = struct {
 };
 
 pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     if (tab.selected.items.len < 2) return menuDone(ctx);
@@ -1116,7 +1117,7 @@ pub fn onEditorRenameDone(
     user: ?*anyopaque,
 ) callconv(.c) void {
     if (event != c.G_FILE_MONITOR_EVENT_CREATED and event != c.G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT) return;
-    const er: *EditorRename = @ptrCast(@alignCast(user.?));
+    const er = cast.userData(EditorRename, user);
     const self = er.view;
     if (self.editor_rename != er) return;
     defer {
@@ -1168,7 +1169,7 @@ pub fn onEditorRenameDone(
 }
 
 pub fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const popover = c.gtk_popover_new();
@@ -1203,7 +1204,7 @@ pub fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     if (!tab.hc.conn.copy_no_replace) {
@@ -1317,7 +1318,7 @@ fn trashOne(self: *BrowserView, hc: *HostConn, path: []const u8) void {
 }
 
 pub fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
@@ -1370,7 +1371,7 @@ const DeleteReq = struct {
 };
 
 pub fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
     confirmDeletePaths(ctx.view, ctx.tab, targets);
@@ -1378,7 +1379,7 @@ pub fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuSecureDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
     confirmDeletePathsMode(ctx.view, ctx.tab, targets, true);
@@ -1532,7 +1533,7 @@ pub fn entryDialog(self: *BrowserView, tab: *BTab, mode: @TypeOf(@as(MenuCtx, un
 }
 
 pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const txt = c.gtk_editable_get_text(@ptrCast(entry));
     const name = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
@@ -1701,7 +1702,7 @@ pub fn finishInlineRenameDeferred(ctx: *InlineRename, commit: bool) void {
 }
 
 fn inlineRenameIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *InlineRename = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(InlineRename, user);
     const self = ctx.view;
     const tab = ctx.tab;
     if (ctx.commit) {

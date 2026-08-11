@@ -34,6 +34,7 @@ const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 const menuButton = @import("menu.zig").menuButton;
 const menuDone = @import("menu.zig").menuDone;
 const MenuCtx = @import("menu.zig").MenuCtx;
+const cast = @import("../../util/cast.zig");
 
 /// Per-tab selection state.
 pub const TabSel = struct {
@@ -115,7 +116,7 @@ pub const RegCtx = struct {
     entry: ?*c.GtkWidget = null,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *RegCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(RegCtx, user);
         ctx.allocator.free(ctx.name);
         ctx.allocator.destroy(ctx);
     }
@@ -168,7 +169,7 @@ pub fn installSelectionGestures(self: *BrowserView, tab: *BTab, widget: *c.GtkWi
 }
 
 fn onSelectionReleased(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     dnd.clearDragSelection(tab);
 }
 
@@ -181,7 +182,7 @@ fn plainClick(gesture: *c.GtkGestureClick) bool {
 }
 
 pub fn onListStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     // Group headers collapse on a plain click regardless of modes.
     if (colview.pickItem(tab, x, y)) |p| {
         if (p.data.kind == .entry) dnd.armSelection(tab, p.data.path);
@@ -215,7 +216,7 @@ pub fn onListStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, 
 }
 
 pub fn onGridStickyPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const fb = tab.flowbox orelse return;
     const child = c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y)) orelse return;
     const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return;
@@ -384,7 +385,7 @@ pub fn cancelVisual(self: *BrowserView, tab: *BTab) void {
 /// would otherwise consume them first (arrows collapse the selection
 /// to the cursor row on the way; Ctrl+Space OPENS the focused file).
 pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     // This runs in the CAPTURE phase, i.e. before an inline-rename
     // editor inside a row sees its own keys; while one is up, every
     // key belongs to it.
@@ -542,14 +543,14 @@ fn reportMarks(self: *BrowserView, name: []const u8, added: usize, full: bool) v
 }
 
 pub fn onMenuRegisterAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     var one: [1][]u8 = undefined;
     markPaths(ctx.view, ctx.tab, registers.COLLECTION, markTargets(ctx, &one));
     menuDone(ctx);
 }
 
 pub fn onMenuRegisterAddNamed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     menuDone(ctx);
     markDialog(self);
@@ -557,7 +558,7 @@ pub fn onMenuRegisterAddNamed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) v
 
 /// Unmark the clicked row from the register its tab is showing.
 pub fn onMenuRegisterRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const spec = ctx.path orelse return menuDone(ctx);
     const name = if (ctx.tab.virtual_spec.len > 0) ctx.tab.virtual_spec else registers.COLLECTION;
@@ -813,7 +814,7 @@ pub fn installSelectionMenu(self: *BrowserView) void {
 }
 
 pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const popover = c.gtk_popover_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
@@ -883,7 +884,7 @@ pub fn onSelectionMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c)
 }
 
 pub fn onStickyToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want != tab.sel.sticky) toggleSticky(self, tab);
@@ -954,7 +955,7 @@ fn openMarkDialog(self: *BrowserView, action: @TypeOf(@as(RegCtx, undefined).act
 }
 
 pub fn onMarkActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *RegCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(RegCtx, user);
     const self = ctx.view;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const name = std.mem.trim(u8, raw, " ");
@@ -993,7 +994,7 @@ fn markResults(self: *BrowserView, tab: *BTab, name: []const u8) void {
 }
 
 pub fn onRegAction(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *RegCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(RegCtx, user);
     const self = ctx.view;
     // The register menu popover dies with the button that owns this
     // ctx, so copy the name out BEFORE popping the menu down. And it
@@ -1069,7 +1070,7 @@ fn confirmDelete(self: *BrowserView, name: []const u8) void {
 }
 
 pub fn onDeleteRegisterConfirmed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *RegCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(RegCtx, user);
     const self = ctx.view;
     var nbuf: [registers.MAX_NAME]u8 = undefined;
     if (ctx.name.len > nbuf.len) return;

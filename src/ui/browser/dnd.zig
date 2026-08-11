@@ -6,6 +6,7 @@ const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const BTab = @import("types.zig").BTab;
+const cast = @import("../../util/cast.zig");
 
 const Origin = struct {
     active: bool = false,
@@ -104,7 +105,7 @@ fn targetAction(target: *c.GtkDropTarget, tab: *BTab) c.GdkDragAction {
 }
 
 fn onTargetMotion(target: *c.GtkDropTarget, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.GdkDragAction {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const action = targetAction(target, tab);
     c.g_object_set_data(@ptrCast(@alignCast(target)), "sketerm-drop-action", @ptrFromInt(@as(usize, @intCast(action))));
     return action;

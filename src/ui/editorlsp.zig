@@ -386,7 +386,7 @@ pub const Conn = struct {
     }
 
     fn onWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Conn = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Conn, user);
         if (self.closing) {
             self.watch_in = 0;
             return 0;
@@ -411,7 +411,7 @@ pub const Conn = struct {
     }
 
     fn onReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Conn = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Conn, user);
         if (self.closing) {
             self.watch_out = 0;
             return 0;
@@ -453,7 +453,7 @@ pub const Conn = struct {
     /// Drain stderr so the pipe never fills (a server whose stderr
     /// blocks stops serving), keeping the last line for the status bar.
     fn onStderr(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Conn = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Conn, user);
         if (self.closing) {
             self.watch_err = 0;
             return 0;
@@ -622,7 +622,7 @@ pub const RemoteLink = struct {
     }
 
     fn onLinkWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *RemoteLink = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(RemoteLink, user);
         if (self.state != .up) {
             self.watch_out = 0;
             return 0;
@@ -645,7 +645,7 @@ pub const RemoteLink = struct {
     }
 
     fn onLinkReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *RemoteLink = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(RemoteLink, user);
         if (self.state != .up) {
             self.watch_in = 0;
             return 0;
@@ -787,7 +787,7 @@ const LinkJob = struct {
 };
 
 fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job: *LinkJob = @ptrCast(@alignCast(data.?));
+    const job = cast.userData(LinkJob, data);
     const a = std.heap.c_allocator;
     run: {
         var config = Config.load(a);
@@ -802,7 +802,7 @@ fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn linkIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *LinkJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(LinkJob, user);
     defer job.destroy();
     const view = job.fence.viewIfAlive() orelse {
         if (job.ok) job.conn.deinit();
@@ -1311,7 +1311,7 @@ pub const Manager = struct {
     }
 
     fn commandInstalled(ctx: ?*anyopaque, command: []const u8) bool {
-        const self: *Manager = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(Manager, ctx);
         return proc.onPath(self.alloc, command);
     }
 
@@ -1527,7 +1527,7 @@ pub const Manager = struct {
     }
 
     fn onKillTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const cn: *Conn = @ptrCast(@alignCast(user.?));
+        const cn = cast.userData(Conn, user);
         cn.kill_timer = 0;
         if (cn.closing) return 0;
         cn.mgr.removeConn(cn);
@@ -1581,7 +1581,7 @@ pub const Manager = struct {
     }
 
     fn onChangeTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabCtx, user);
         defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
@@ -3023,7 +3023,7 @@ pub const Manager = struct {
     }
 
     fn onDecorTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabCtx, user);
         defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
@@ -3399,7 +3399,7 @@ pub const Manager = struct {
     }
 
     fn onDwellTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Manager = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Manager, user);
         self.dwell_timer = 0;
         if (self.view.widgets_dead) return 0;
         // Not while a list is up: the popup would be under the pointer
@@ -3920,7 +3920,7 @@ pub const Manager = struct {
     }
 
     fn onCompletionTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabCtx, user);
         defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
@@ -3950,7 +3950,7 @@ pub const Manager = struct {
     }
 
     fn onSignatureTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ctx: *TabCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabCtx, user);
         defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;

@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const cast = @import("../util/cast.zig");
 
 pub const Backend = enum { glycin, gdk_pixbuf };
 
@@ -345,7 +346,7 @@ const PixbufLimit = struct {
 };
 
 fn onPixbufSizePrepared(loader: *c.GdkPixbufLoader, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
-    const limit: *PixbufLimit = @ptrCast(@alignCast(user.?));
+    const limit = cast.userData(PixbufLimit, user);
     if (width <= 0 or height <= 0) return;
     const pixels = std.math.mul(usize, @intCast(width), @intCast(height)) catch limit.max_pixels +| 1;
     const frame_bytes = std.math.mul(usize, pixels, 4) catch limit.max_animation_bytes +| 1;

@@ -22,6 +22,7 @@ const Entry = @import("types.zig").Entry;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const menuButton = @import("menu.zig").menuButton;
 const showColumnPicker = @import("render.zig").showColumnPicker;
+const cast = @import("../../util/cast.zig");
 
 /// One zoom step. Icon sizes stop at 128 on purpose: that is the
 /// freedesktop `normal` tier the thumbnail pipeline generates and
@@ -194,7 +195,7 @@ pub fn syncFilterEntry(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn onFilterChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.views.syncing_filter) return;
     const entry = self.views.filter_entry orelse return;
     const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
@@ -202,14 +203,14 @@ pub fn onFilterChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onFilterKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (keyval != c.GDK_KEY_Escape) return 0;
     toggleFilter(self);
     return 1;
 }
 
 pub fn onFilterClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     toggleFilter(self);
 }
 
@@ -230,7 +231,7 @@ pub fn zoomBy(self: *BrowserView, delta: i32) void {
 /// Ctrl+wheel zoom. Installed in the CAPTURE phase so the scrolled
 /// window never sees the event first; a plain wheel still scrolls.
 pub fn onZoomScroll(ctrl: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const state = c.gtk_event_controller_get_current_event_state(@ptrCast(ctrl));
     if (state & c.GDK_CONTROL_MASK == 0) return 0;
     if (dy == 0) return 1;
@@ -485,14 +486,14 @@ const ModeCtx = struct {
     mode: browser_model.ViewMode,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *ModeCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(ModeCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
 
 pub fn onViewModeChosen(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
     if (c.gtk_check_button_get_active(check) == 0) return;
-    const ctx: *ModeCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ModeCtx, user);
     const self = ctx.view;
     const tab = self.currentTab() orelse return;
     if (tab.view_mode == ctx.mode) return;
@@ -510,7 +511,7 @@ fn updateZoomLabel(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const popover = c.gtk_popover_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
@@ -619,19 +620,19 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 }
 
 pub fn onViewMenuClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     // The label dies with the popover.
     self.views.zoom_label = null;
 }
 
 pub fn onGroupToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     setGrouping(self, tab, c.gtk_check_button_get_active(check) != 0);
 }
 
 pub fn onFlatToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want == flatOn(tab)) return;
@@ -639,7 +640,7 @@ pub fn onFlatToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) v
 }
 
 pub fn onZebraToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want == self.zebra) return;
     self.zebra = want;
@@ -666,7 +667,7 @@ pub fn onZoomOut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onFilterMenu(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const bar = ensureFilterBar(self) orelse return;
     if (c.gtk_widget_get_visible(bar) == 0) toggleFilter(self);
 }
@@ -674,7 +675,7 @@ pub fn onFilterMenu(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// "Columns..." in the view menu: close this popover, then open the
 /// column picker over the tab's header strip.
 pub fn onColumnsMenu(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     if (c.gtk_widget_get_ancestor(@ptrCast(@alignCast(btn)), c.gtk_popover_get_type())) |pop|
         c.gtk_popover_popdown(@ptrCast(pop));
@@ -682,7 +683,7 @@ pub fn onColumnsMenu(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onForgetFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     forgetFolder(self, tab);
 }

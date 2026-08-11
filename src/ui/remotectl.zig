@@ -13,6 +13,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const muxtabs = @import("muxtabs.zig");
+const cast = @import("../util/cast.zig");
 const Window = winmod.Window;
 
 // ── Remote control (sketerm cli) ─────────────────────────────
@@ -277,7 +278,7 @@ pub fn mintUdpTicket(self: *Window, bare_host: []const u8, ctx: ?*anyopaque, cb:
 /// Exactly-once resolution from the Terminal's pending slot (frame,
 /// refusal, transport loss, teardown fence).
 fn onTicketResolved(ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void {
-    const wait: *TicketWait = @ptrCast(@alignCast(ctx.?));
+    const wait = cast.userData(TicketWait, ctx);
     if (wait.timeout_id != 0) _ = c.g_source_remove(wait.timeout_id);
     const cb = wait.cb;
     const uctx = wait.ctx;
@@ -287,7 +288,7 @@ fn onTicketResolved(ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void {
 }
 
 fn onTicketTimeout(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const wait: *TicketWait = @ptrCast(@alignCast(user.?));
+    const wait = cast.userData(TicketWait, user);
     wait.timeout_id = 0;
     // Empty the pending slot so a late frame cannot fire into the
     // memory freed below; the DrainHandle fences terminal teardown.

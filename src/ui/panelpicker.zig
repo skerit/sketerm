@@ -32,6 +32,7 @@ const canary = @import("panel/canary.zig");
 const confirm = @import("confirm.zig");
 const Pane = @import("pane.zig").Pane;
 const window_mod = @import("window.zig");
+const cast = @import("../util/cast.zig");
 const Window = window_mod.Window;
 
 /// Where an activated row lands. A saved panel gets a TAB of its own:
@@ -574,7 +575,7 @@ fn runStoreJob(job: *StoreJob) void {
 }
 
 fn storeJobDone(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *StoreJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(StoreJob, user);
     if (!job.ready.load(.acquire)) return 1;
     if (job.counted_active and active_store_workers > 0) active_store_workers -= 1;
 

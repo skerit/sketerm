@@ -28,6 +28,7 @@ const WireJobEv = @import("types.zig").WireJobEv;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const launchLocal = @import("open.zig").launchLocal;
 const launchLocalWithApp = @import("open.zig").launchLocalWithApp;
+const cast = @import("../../util/cast.zig");
 
 pub const CopyAck = struct {
     req: u32 = 0,
@@ -579,7 +580,7 @@ const COPY_RETRY_DELAY_MS: c.guint = 5_000;
 /// Submit everything whose delay has elapsed. The timer is view-owned,
 /// but every retry also has a ledger record another face can adopt.
 pub fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.retry_timer = 0;
     var pending = self.retry_pending;
     self.retry_pending = .empty;

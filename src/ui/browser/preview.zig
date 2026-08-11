@@ -58,6 +58,7 @@ const fileicon = @import("../../filebrowser/fileicon.zig");
 const isImageName = @import("../../filebrowser/paths.zig").isImageName;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const isWorkerImageName = @import("../../filebrowser/paths.zig").isWorkerImageName;
+const cast = @import("../../util/cast.zig");
 
 /// Shared context between a BrowserView and its thumbnail worker
 /// thread. Refcounted: the thread holds one ref, every in-flight
@@ -645,7 +646,7 @@ pub fn thumbSaveLocal(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300:0]u8, tp_l
 }
 
 pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const res: *ThumbResult = @ptrCast(@alignCast(user.?));
+    const res = cast.userData(ThumbResult, user);
     const a = std.heap.c_allocator;
     const tc = res.ctx;
     defer {
@@ -747,7 +748,7 @@ pub fn scheduleThumbRender(self: *BrowserView) void {
 }
 
 pub fn onThumbRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.thumb_render_src = 0;
     self.renderCurrent();
     return 0; // one-shot
@@ -1086,7 +1087,7 @@ fn armRemoteThumbWatch(self: *BrowserView) void {
 /// clobbering the status line, and the entry is marked failed so the
 /// row is not re-queued in a loop.
 pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const now = clock.nowMs();
     var i: usize = 0;
     while (i < self.remote_thumbs.items.len) {
@@ -1738,7 +1739,7 @@ fn setImageEntryIcon(img: *c.GtkWidget, name: []const u8, is_dir: bool) void {
 
 /// The card view toggle (View options menu).
 pub fn onSideInfoToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const want = c.gtk_check_button_get_active(check) != 0;
     if (want == self.side_info) return;
     self.side_info = want;
@@ -2683,7 +2684,7 @@ fn showPreviewNote(self: *BrowserView, note: []const u8) void {
 }
 
 pub fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.preview_on = c.gtk_toggle_button_get_active(btn) != 0;
     c.gtk_widget_set_visible(self.preview_box, @intFromBool(self.preview_on));
     if (self.preview_on) {
@@ -2913,7 +2914,7 @@ pub fn quickLookClose(self: *BrowserView) void {
 }
 
 fn onQuickLookDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.preview_state.quick_look = null;
 }
 
@@ -2921,7 +2922,7 @@ fn onQuickLookDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 /// double-click activation does, then close the viewer. The spec's
 /// memory dies with the window, so the path is copied out first.
 fn onQuickLookActivate(user: ?*anyopaque, spec: []const u8) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const resource = viewer_model.Resource.parse(spec);
     var buf: [4096]u8 = undefined;
     if (resource.path.len >= buf.len) return;

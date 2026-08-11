@@ -22,6 +22,7 @@ const tabhost = @import("../tabhost.zig");
 const paths = @import("../../filebrowser/paths.zig");
 const dnd = @import("dnd.zig");
 const dropValueIntoAction = @import("ops.zig").dropValueIntoAction;
+const cast = @import("../../util/cast.zig");
 
 /// Closed tabs remembered for undo-close-tab. Session state on
 /// purpose: a reopened tab is a within-session correction, while
@@ -245,7 +246,7 @@ pub fn openInNewTab(tab: *BTab, path: []const u8) void {
 }
 
 pub fn onTileMiddleClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const fb = tab.flowbox orelse return;
     const child = c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y)) orelse return;
     const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return;
@@ -255,7 +256,7 @@ pub fn onTileMiddleClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: 
 }
 
 pub fn onTabDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     // The destination is the tab's own root, even when another tab
     // is the visible one.
     var dbuf: [4096]u8 = undefined;
@@ -292,7 +293,7 @@ fn tabForPage(self: *BrowserView, page: *c.GtkWidget) ?*BTab {
 }
 
 fn menuExtra(ctx: ?*anyopaque, _: *c.GtkWidget, _: *classicmenu.Root, m: classicmenu.Menu) void {
-    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(BrowserView, ctx);
     if (self.closed_tabs.closed.items.len == 0) return;
     var label: [96:0]u8 = undefined;
     const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
@@ -302,13 +303,13 @@ fn menuExtra(ctx: ?*anyopaque, _: *c.GtkWidget, _: *classicmenu.Root, m: classic
 }
 
 fn menuDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) void {
-    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(BrowserView, ctx);
     const tab = tabForPage(self, page) orelse return;
     self.duplicateTab(tab);
 }
 
 fn menuCanDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
-    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(BrowserView, ctx);
     const tab = tabForPage(self, page) orelse return false;
     return snapshotable(tab);
 }
@@ -317,7 +318,7 @@ fn menuCanDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
 /// the same call the menubar's File ▸ New Window makes, given this
 /// tab's directory instead of the default one.
 fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
-    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(BrowserView, ctx);
     const tab = tabForPage(self, page) orelse return;
     const win = self.ownerWindow() orelse return;
     var spec_buf: [4096]u8 = undefined;
@@ -326,13 +327,13 @@ fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
 }
 
 fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
-    const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(BrowserView, ctx);
     const tab = tabForPage(self, page) orelse return false;
     return self.ownerWindow() != null and snapshotable(tab);
 }
 
 fn onTabMenuReopen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.reopenClosedTab();
 }
 
@@ -362,6 +363,6 @@ fn onStripNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onStripReopen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.reopenClosedTab();
 }

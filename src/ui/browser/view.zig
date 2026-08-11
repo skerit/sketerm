@@ -76,6 +76,7 @@ const tabsmod = @import("tabs.zig");
 const tabhost_mod = @import("../tabhost.zig");
 const templates_mod = @import("templates.zig");
 const viewsmod = @import("views.zig");
+const cast = @import("../../util/cast.zig");
 
 /// Constrained-presentation hooks for the file PICKER (src/ui/
 /// picker.zig). `null` on a BrowserView means normal browsing --
@@ -1103,7 +1104,7 @@ pub const BrowserView = struct {
     /// pane is pulled over, and the location face that pane was
     /// editing folds back so exactly one address bar is ever open.
     fn onFaceClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         if (self.widgets_dead) return;
         const root = c.gtk_widget_get_root(self.root_box) orelse return;
         if (c.gtk_root_get_focus(root)) |focused| {
@@ -1458,7 +1459,7 @@ pub const BrowserView = struct {
     /// The hamburger button: builds its classic menu fresh per open,
     /// so every check row and submenu reflects the current state.
     fn onBurgerClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         @import("menu.zig").showHamburgerMenu(self, @ptrCast(@alignCast(btn)));
     }
 
@@ -1509,7 +1510,7 @@ pub const BrowserView = struct {
     /// the view: the same one-shot `list` the resync path uses, for
     /// the root and for every miller/column directory beside it.
     fn onRefreshClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         const tab = self.currentTab() orelse return;
         self.clearFailureCaches();
         self.refreshDir(tab, tab.root);
@@ -1523,7 +1524,7 @@ pub const BrowserView = struct {
     /// what a split IS (it can differ per profile), so this forwards
     /// the action rather than reimplementing it.
     pub fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         const pane = self.pane orelse return;
         const ictx = pane.input_ctx orelse return;
         // splitFocused acts on the WINDOW's focused pane; a toolbar
@@ -1777,7 +1778,7 @@ pub const BrowserView = struct {
     /// TabHost close request (close button / middle click on a tab
     /// label): route to the browser's own closeTab.
     fn hostCloseCb(ctx: ?*anyopaque, page: *c.GtkWidget) void {
-        const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(BrowserView, ctx);
         for (self.tabs.items) |t| {
             if (t.page == page) {
                 self.closeTab(t);
@@ -1793,7 +1794,7 @@ pub const BrowserView = struct {
     }
 
     fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
-        const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(BrowserView, ctx);
         tabsmod.showStripMenu(self, x, y);
     }
 
@@ -1819,7 +1820,7 @@ pub const BrowserView = struct {
     /// again. The view itself lives on until the pane's deferred
     /// deinit, so this cannot free anything -- it only fences.
     fn onRootDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.widgets_dead = true;
         self.root_destroyed = true;
         self.severPreviewAnimation();
@@ -1841,7 +1842,7 @@ pub const BrowserView = struct {
 
     /// notify::page-size on the breadcrumb adjustment.
     pub fn onCrumbViewport(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.evaluateBarOverflow();
     }
 
@@ -1849,7 +1850,7 @@ pub const BrowserView = struct {
     /// born too narrow to show ANY path never moves page-size off
     /// zero, so the notify alone would never fire for it.
     pub fn onCrumbConfigured(_: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.evaluateBarOverflow();
     }
 
@@ -1867,7 +1868,7 @@ pub const BrowserView = struct {
     }
 
     pub fn barOverflowIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.bar_idle_src = 0;
         if (self.widgets_dead) return 0;
         if (self.wantBarCollapsed()) |want| self.setBarCollapsed(want);
@@ -1922,7 +1923,7 @@ pub const BrowserView = struct {
     }
 
     fn closePaneIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.close_pane_src = 0;
         if (self.widgets_dead) return 0;
         const pane = self.pane orelse return 0;
@@ -1939,7 +1940,7 @@ pub const BrowserView = struct {
     /// A drag emits this per pixel; the write is debounced so a resize
     /// costs one places.json save, not hundreds.
     fn onInfoPanedPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         // Position is the LISTING side; the panel width is the rest.
         if (self.widgets_dead or !self.preview_on or !self.chrome_ready) return;
         const total = c.gtk_widget_get_width(@ptrCast(@alignCast(obj)));
@@ -1952,7 +1953,7 @@ pub const BrowserView = struct {
     }
 
     fn onSidebarPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         // A hidden sidebar reports whatever GtkPaned last computed;
         // only a visible one describes a width the user chose.
         if (self.widgets_dead or !self.places_on or !self.chrome_ready) return;
@@ -1964,7 +1965,7 @@ pub const BrowserView = struct {
     }
 
     fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(BrowserView, user);
         self.sidebar_save_src = 0;
         self.savePlaces();
         return 0;

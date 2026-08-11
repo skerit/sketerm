@@ -214,7 +214,7 @@ pub const Canvas = struct {
     }
 
     fn onScroll(controller: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         const state = c.gtk_event_controller_get_current_event_state(@ptrCast(controller));
         if (state & c.GDK_CONTROL_MASK == 0) return 0;
         if (dy != 0) {
@@ -240,25 +240,25 @@ pub const Canvas = struct {
     }
 
     fn onDragBegin(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         self.drag_x = c.gtk_adjustment_get_value(c.gtk_scrolled_window_get_hadjustment(self.scroller));
         self.drag_y = c.gtk_adjustment_get_value(c.gtk_scrolled_window_get_vadjustment(self.scroller));
     }
 
     fn onDragUpdate(_: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         if (self.viewport.mode == .fit or self.viewport.mode == .fill) return;
         c.gtk_adjustment_set_value(c.gtk_scrolled_window_get_hadjustment(self.scroller), self.drag_x - dx);
         c.gtk_adjustment_set_value(c.gtk_scrolled_window_get_vadjustment(self.scroller), self.drag_y - dy);
     }
 
     fn onPinchBegin(_: *c.GtkGesture, _: ?*c.GdkEventSequence, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         self.pinch_scale = 1;
     }
 
     fn onPinchScale(gesture: *c.GtkGestureZoom, scale: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         if (scale <= 0 or self.pinch_scale <= 0) return;
         var x: f64 = 0;
         var y: f64 = 0;
@@ -268,23 +268,23 @@ pub const Canvas = struct {
     }
 
     fn onRotateBegin(_: *c.GtkGesture, _: ?*c.GdkEventSequence, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         self.rotate_angle = 0;
     }
 
     fn onRotateAngle(_: *c.GtkGestureRotate, _: f64, angle_delta: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         self.rotate_angle = angle_delta;
     }
 
     fn onRotateEnd(_: *c.GtkGesture, _: ?*c.GdkEventSequence, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         if (@abs(self.rotate_angle) < @as(f64, std.math.pi) / 4.0) return;
         if (self.on_rotate) |callback| callback(self.rotate_ctx, if (self.rotate_angle > 0) 1 else -1);
     }
 
     fn onSwipe(_: *c.GtkGestureSwipe, velocity_x: f64, velocity_y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *Canvas = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Canvas, user);
         if (@abs(velocity_x) < 300 or @abs(velocity_x) <= @abs(velocity_y)) return;
         if (self.on_navigate) |callback| callback(self.navigate_ctx, if (velocity_x < 0) 1 else -1);
     }
@@ -527,7 +527,7 @@ pub const Session = struct {
     }
 
     fn onAnimationTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Session = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Session, user);
         self.timer = 0;
         if (!self.playing or !self.animated()) return 0;
         const now = c.g_get_monotonic_time();

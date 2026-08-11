@@ -191,7 +191,7 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
             "activate",
             @ptrCast(&onActivate),
             @ptrCast(slot),
-            @ptrCast(&freeActionSlot),
+            @ptrCast(cast.destroyCtx(ActionSlot)),
             c.G_CONNECT_DEFAULT,
         );
         c.g_action_map_add_action(@ptrCast(group), @ptrCast(act));
@@ -318,7 +318,7 @@ fn addHover(allocator: std.mem.Allocator, btn: *c.GtkWidget, cctx: *ClickCtx, su
         "enter",
         @ptrCast(&onRowEnter),
         @ptrCast(hctx),
-        @ptrCast(&freeHoverCtx),
+        @ptrCast(cast.destroyCtx(HoverCtx)),
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(btn, motion);
@@ -351,13 +351,6 @@ fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
     }
 }
 
-fn freeHoverCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const hctx: *HoverCtx = @ptrCast(@alignCast(u));
-        hctx.allocator.destroy(hctx);
-    }
-}
-
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const slot = cast.userData(ActionSlot, user);
     slot.view.menuAction(slot.action);
@@ -367,13 +360,6 @@ fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
         c.gtk_popover_popdown(@ptrCast(pop));
-    }
-}
-
-fn freeActionSlot(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const slot: *ActionSlot = @ptrCast(@alignCast(u));
-        slot.allocator.destroy(slot);
     }
 }
 
@@ -471,18 +457,13 @@ const GutterCtx = struct {
     fn make(root: *classicmenu.Root, view: *EditorView, action: GutterAction, line: usize) ?*GutterCtx {
         const ctx = view.allocator.create(GutterCtx) catch return null;
         ctx.* = .{ .allocator = view.allocator, .view = view, .action = action, .line = line };
-        root.own(&free, @ptrCast(ctx));
+        root.own(cast.destroyCtx(GutterCtx), @ptrCast(ctx));
         return ctx;
-    }
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *GutterCtx = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
     }
 };
 
 fn onGutterRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *GutterCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(GutterCtx, user);
     ctx.view.gutterAction(ctx.action, ctx.line);
 }
 
@@ -574,18 +555,13 @@ const StatusCtx = struct {
     fn make(root: *classicmenu.Root, view: *EditorView, action: StatusAction) ?*StatusCtx {
         const ctx = view.allocator.create(StatusCtx) catch return null;
         ctx.* = .{ .allocator = view.allocator, .view = view, .action = action };
-        root.own(&free, @ptrCast(ctx));
+        root.own(cast.destroyCtx(StatusCtx), @ptrCast(ctx));
         return ctx;
-    }
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *StatusCtx = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
     }
 };
 
 fn onStatusRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *StatusCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(StatusCtx, user);
     ctx.view.statusAction(ctx.action);
 }
 
@@ -665,17 +641,12 @@ const TabCtx = struct {
     fn make(root: *classicmenu.Root, view: *EditorView, tab: *ETab) ?*TabCtx {
         const ctx = view.allocator.create(TabCtx) catch return null;
         ctx.* = .{ .allocator = view.allocator, .view = view, .tab_id = tab.id };
-        root.own(&free, @ptrCast(ctx));
+        root.own(cast.destroyCtx(TabCtx), @ptrCast(ctx));
         return ctx;
     }
 
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *TabCtx = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
-
     fn resolve(user: ?*anyopaque) ?struct { view: *EditorView, tab: *ETab } {
-        const self: *TabCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(TabCtx, user);
         const tab = self.view.findTabByIdPublic(self.tab_id) orelse return null;
         return .{ .view = self.view, .tab = tab };
     }
@@ -705,7 +676,7 @@ fn tabForPage(view: *EditorView, page: *c.GtkWidget) ?*ETab {
 /// disk yet, no project to be relative to) — the menu should still
 /// show what a document tab can do.
 fn menuExtra(ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, m: classicmenu.Menu) void {
-    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const view = cast.userData(EditorView, ctx);
     const tab = tabForPage(view, page) orelse return;
     const saved = tab.spec != null;
 
@@ -749,20 +720,20 @@ fn onReopenClosed(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 /// file — `siblingapp.openInEditor`, the same handoff the viewer and
 /// the file browser use. Nothing is moved, so the tab stays.
 fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
-    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const view = cast.userData(EditorView, ctx);
     const tab = tabForPage(view, page) orelse return;
     const spec = tab.spec orelse return;
     _ = siblingapp.openInEditor(spec, null);
 }
 
 fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
-    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const view = cast.userData(EditorView, ctx);
     const tab = tabForPage(view, page) orelse return false;
     return tab.spec != null;
 }
 
 fn menuModified(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
-    const view: *EditorView = @ptrCast(@alignCast(ctx.?));
+    const view = cast.userData(EditorView, ctx);
     const tab = tabForPage(view, page) orelse return false;
     return tab.isDirty();
 }
@@ -856,12 +827,12 @@ pub fn showStripMenu(view: *EditorView, x: f64, y: f64) void {
 }
 
 fn onStripNew(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const view: *EditorView = @ptrCast(@alignCast(user.?));
+    const view = cast.userData(EditorView, user);
     _ = view.newTab(null);
 }
 
 fn onStripOpen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const view: *EditorView = @ptrCast(@alignCast(user.?));
+    const view = cast.userData(EditorView, user);
     view.openPicker();
 }
 

@@ -17,6 +17,7 @@ const WireReply = @import("types.zig").WireReply;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZN;
 const uniqueDstName = @import("ops.zig").uniqueDstName;
+const cast = @import("../../util/cast.zig");
 
 /// Cap on the entries a template menu shows. A Templates directory is
 /// a hand-curated place; a huge one is a mistake, not a use case.
@@ -57,7 +58,7 @@ const PickCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const ctx: *PickCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(PickCtx, user);
         ctx.allocator.free(ctx.source);
         ctx.allocator.destroy(ctx);
     }
@@ -218,7 +219,7 @@ fn populate(self: *BrowserView, hc: *HostConn, rep: WireReply) void {
 }
 
 fn onPick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PickCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PickCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     // The button dies with the popover, so copy what is needed out

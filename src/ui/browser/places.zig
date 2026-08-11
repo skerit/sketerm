@@ -19,6 +19,7 @@ const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
 const classicmenu = @import("classicmenu.zig");
 const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
+const cast = @import("../../util/cast.zig");
 
 /// Browser faces in this process. `authoritative` owns the one
 /// process-wide places snapshot; registered views are synchronized to
@@ -594,14 +595,14 @@ pub const PlaceCtx = struct {
     is_bookmark: bool,
 
     pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const p: *PlaceCtx = @ptrCast(@alignCast(user.?));
+        const p = cast.userData(PlaceCtx, user);
         p.allocator.free(p.spec);
         p.allocator.destroy(p);
     }
 };
 
 pub fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.places_on = c.gtk_toggle_button_get_active(btn) != 0;
     c.gtk_widget_set_visible(self.places_box, @intFromBool(self.places_on));
     if (self.places_on) {
@@ -1137,7 +1138,7 @@ const PlacesMenuCtx = struct {
     popover: *c.GtkWidget,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(PlacesMenuCtx, user);
         ctx.allocator.free(ctx.spec);
         ctx.allocator.destroy(ctx);
     }
@@ -1152,7 +1153,7 @@ fn isRecentSpec(self: *BrowserView, spec: []const u8) bool {
 }
 
 pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     var spec: []const u8 = "";
     var is_bookmark = false;
     if (c.gtk_list_box_get_row_at_y(self.places_list, @intFromFloat(y))) |row| {
@@ -1245,7 +1246,7 @@ const SectionCtx = struct {
     }
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(SectionCtx, user);
         ctx.allocator.free(ctx.key);
         ctx.allocator.destroy(ctx);
     }
@@ -1309,7 +1310,7 @@ fn showSidebarConfigMenu(self: *BrowserView, x: f64, y: f64) void {
 }
 
 fn onSectionToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     var kbuf: [180]u8 = undefined;
     if (ctx.key.len > kbuf.len) return;
     @memcpy(kbuf[0..ctx.key.len], ctx.key);
@@ -1317,7 +1318,7 @@ fn onSectionToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onSectionMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     var kbuf: [180]u8 = undefined;
     if (ctx.key.len > kbuf.len) return;
     @memcpy(kbuf[0..ctx.key.len], ctx.key);
@@ -1325,7 +1326,7 @@ fn onSectionMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onSectionMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     var kbuf: [180]u8 = undefined;
     if (ctx.key.len > kbuf.len) return;
     @memcpy(kbuf[0..ctx.key.len], ctx.key);
@@ -1342,24 +1343,24 @@ fn widgetSectionIndex(self: *BrowserView, key: []const u8) ?usize {
 }
 
 fn onSectionAddWidget(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const si = widgetSectionIndex(ctx.view, ctx.key) orelse return;
     sidewidgets.openWidgetForm(ctx.view, si, null);
 }
 
 fn onSectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const si = widgetSectionIndex(ctx.view, ctx.key) orelse return;
     sidewidgets.removeSection(ctx.view, si);
 }
 
 fn onNewWidgetSection(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     openNamePrompt(ctx.view, .new_section, null, "New Widget Section", "section name", "", null);
 }
 
 fn onBookmarkHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     bookmarkCurrent(ctx.view);
 }
 
@@ -1398,25 +1399,25 @@ fn widgetCtxIds(ctx: *SectionCtx) ?struct { si: usize, wi: usize } {
 }
 
 fn onWidgetEdit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const ids = widgetCtxIds(ctx) orelse return;
     sidewidgets.openWidgetForm(ctx.view, ids.si, ids.wi);
 }
 
 fn onWidgetRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const ids = widgetCtxIds(ctx) orelse return;
     sidewidgets.removeWidget(ctx.view, ids.si, ids.wi);
 }
 
 fn onWidgetMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const ids = widgetCtxIds(ctx) orelse return;
     sidewidgets.moveWidget(ctx.view, ids.si, ids.wi, true);
 }
 
 fn onWidgetMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SectionCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SectionCtx, user);
     const ids = widgetCtxIds(ctx) orelse return;
     sidewidgets.moveWidget(ctx.view, ids.si, ids.wi, false);
 }
@@ -1424,7 +1425,7 @@ fn onWidgetMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 // ── bookmark row verbs ───────────────────────────────────────────
 
 fn onBookmarkRenameItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     const i = bookmarkIndexOf(self, ctx.spec) orelse return;
     const current = bookmarkLabelAt(self, i) orelse std.fs.path.basename(self.bookmarks.items[i]);
@@ -1432,7 +1433,7 @@ fn onBookmarkRenameItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onBookmarkIconItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     const i = bookmarkIndexOf(self, ctx.spec) orelse return;
     openNamePrompt(
@@ -1447,13 +1448,13 @@ fn onBookmarkIconItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onBookmarkMoveUp(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const i = bookmarkIndexOf(ctx.view, ctx.spec) orelse return;
     moveBookmark(ctx.view, i, true);
 }
 
 fn onBookmarkMoveDown(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const i = bookmarkIndexOf(ctx.view, ctx.spec) orelse return;
     moveBookmark(ctx.view, i, false);
 }
@@ -1470,7 +1471,7 @@ const NamePromptCtx = struct {
     entry: *c.GtkWidget,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(NamePromptCtx, user);
         if (ctx.target) |target| ctx.allocator.free(target);
         ctx.allocator.destroy(ctx);
     }
@@ -1550,7 +1551,7 @@ fn openNamePrompt(
 }
 
 fn onNamePromptCancel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(NamePromptCtx, user);
     c.gtk_window_destroy(@ptrCast(ctx.window));
 }
 
@@ -1559,7 +1560,7 @@ fn onNamePromptActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onNamePromptOk(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *NamePromptCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(NamePromptCtx, user);
     const self = ctx.view;
     const text = std.mem.span(c.gtk_editable_get_text(@ptrCast(ctx.entry)));
     var nbuf: [512]u8 = undefined;
@@ -1582,7 +1583,7 @@ fn onNamePromptOk(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// Activate the row exactly as a click would (navigate here, run the
 /// query, open the register).
 fn onPlacesMenuOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     var buf: [4600]u8 = undefined;
@@ -1606,7 +1607,7 @@ fn onPlacesMenuOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onPlacesMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     var buf: [4600]u8 = undefined;
@@ -1616,14 +1617,14 @@ fn onPlacesMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onPlacesMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     clipboard.copyText(@ptrCast(@alignCast(ctx.view.places_list)), ctx.spec);
     ctx.view.setStatus("location copied");
 }
 
 fn onPlacesMenuBookmark(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     var buf: [4600]u8 = undefined;
@@ -1635,7 +1636,7 @@ fn onPlacesMenuBookmark(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// Remove the row from whichever durable list owns it (bookmark,
 /// saved query, recent location).
 fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PlacesMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PlacesMenuCtx, user);
     const self = ctx.view;
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     var bookmark_changed = false;
@@ -1667,7 +1668,7 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-place") orelse return;
     const ctx: *PlaceCtx = @ptrCast(@alignCast(data));
     if (ctx.spec.len == 0) return;
@@ -1736,7 +1737,7 @@ pub fn runSavedSearch(self: *BrowserView, idx: usize) void {
 }
 
 pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const ls = self.last_search orelse {
         self.setStatus("run a query first, then save it");
         return;

@@ -33,6 +33,7 @@ const colview = @import("colview.zig");
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
+const cast = @import("../../util/cast.zig");
 
 /// Files whose metadata is remembered. Each row is a handful of
 /// short strings, and re-entering a folder should not re-extract.
@@ -299,7 +300,7 @@ pub fn schedule(self: *BrowserView) void {
 }
 
 fn onTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.media.timer = 0;
     pump(self);
     return 0;
@@ -316,7 +317,7 @@ pub fn ensureScrollWatch(self: *BrowserView, tab: *BTab) void {
 }
 
 fn onScrolled(_: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |tab| {
         if (tabWantsMedia(tab)) schedule(self);
     }

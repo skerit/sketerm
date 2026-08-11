@@ -120,7 +120,7 @@ pub const Root = struct {
     }
 
     fn destroyCb(user: ?*anyopaque) callconv(.c) void {
-        const self: *Root = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Root, user);
         for (self.cleanups.items) |o| o.cb(o.ctx);
         self.cleanups.deinit(self.allocator);
         self.subpops.deinit(self.allocator);
@@ -256,7 +256,7 @@ fn onClosed(pop: *c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
 }
 
 fn unparentIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const pop: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const pop = cast.userData(c.GtkWidget, user);
     // Submenu popovers are parented to rows INSIDE this popover; they
     // must come off before their parents are disposed.
     if (c.g_object_get_data(@ptrCast(@alignCast(pop)), "sketerm-classicmenu")) |data| {
@@ -280,13 +280,13 @@ const ItemCtx = struct {
     ctx: ?*anyopaque,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const self: *ItemCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(ItemCtx, user);
         self.allocator.destroy(self);
     }
 };
 
 fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ictx: *ItemCtx = @ptrCast(@alignCast(user.?));
+    const ictx = cast.userData(ItemCtx, user);
     if (c.getenv("SKETERM_DEBUG_MENU") != null) std.debug.print("menu: item clicked\n", .{});
     // Close first: handlers open dialogs/popovers of their own, and
     // the new grab must not race this one.
@@ -332,7 +332,7 @@ fn onSubDebugPress(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, _: ?*anyopaq
 }
 
 fn onSubKey(controller: *c.GtkEventControllerKey, keyval: c.guint, _: c.guint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const root: *Root = @ptrCast(@alignCast(user.?));
+    const root = cast.userData(Root, user);
     const sp = c.gtk_event_controller_get_widget(@ptrCast(controller)) orelse return 0;
     if (keyval == c.GDK_KEY_Left) {
         c.gtk_popover_popdown(@ptrCast(@alignCast(sp)));

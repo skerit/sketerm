@@ -319,7 +319,7 @@ pub fn attachWithPrePopup(
             "activate",
             @ptrCast(&onActivate),
             @ptrCast(slot),
-            @ptrCast(&freeActionSlot),
+            @ptrCast(cast.destroyCtx(ActionSlot)),
             c.G_CONNECT_DEFAULT,
         );
         c.g_action_map_add_action(@ptrCast(group), @ptrCast(act));
@@ -571,7 +571,7 @@ fn addHover(allocator: std.mem.Allocator, btn: *c.GtkWidget, cctx: *ClickCtx, su
         "enter",
         @ptrCast(&onRowEnter),
         @ptrCast(hctx),
-        @ptrCast(&freeHoverCtx),
+        @ptrCast(cast.destroyCtx(HoverCtx)),
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(btn, motion);
@@ -633,13 +633,6 @@ pub fn returnFocusTo(widget: *c.GtkWidget, popover: *c.GtkWidget) void {
     _ = c.gtk_widget_grab_focus(widget);
 }
 
-fn freeHoverCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const hctx: *HoverCtx = @ptrCast(@alignCast(u));
-        hctx.allocator.destroy(hctx);
-    }
-}
-
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const slot = cast.userData(ActionSlot, user);
     slot.sink(slot.sink_ctx, slot.action);
@@ -653,13 +646,6 @@ fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
         c.gtk_popover_popdown(@ptrCast(pop));
-    }
-}
-
-fn freeActionSlot(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const slot: *ActionSlot = @ptrCast(@alignCast(u));
-        slot.allocator.destroy(slot);
     }
 }
 

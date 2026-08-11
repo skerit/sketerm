@@ -25,6 +25,7 @@ const copyZ = @import("../../filebrowser/format.zig").copyZN;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
 const uniqueDstNameIn = @import("ops.zig").uniqueDstNameIn;
+const cast = @import("../../util/cast.zig");
 
 /// What the user decided for one collision. `merge` and `replace` are
 /// directory-only; `overwrite` is the file spelling of `replace`.
@@ -177,7 +178,7 @@ const BtnCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const ctx: *BtnCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(BtnCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -510,7 +511,7 @@ fn armThumbTick(self: *BrowserView) void {
 }
 
 fn onThumbTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.conflicts.thumb_ticks += 1;
     if (self.conflicts.popover == null or self.conflicts.thumb_ticks >= THUMB_TICKS_MAX) {
         self.conflicts.thumb_tick = 0;
@@ -545,7 +546,7 @@ fn dropHead(self: *BrowserView) void {
 // ── applying a decision ─────────────────────────────────────────
 
 fn onChoice(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *BtnCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(BtnCtx, user);
     // Everything this handler needs is read BEFORE the popover goes
     // down: popping it down destroys the button, which frees `ctx`
     // through its GDestroyNotify.

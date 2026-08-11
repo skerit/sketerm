@@ -25,6 +25,7 @@ const wire = @import("../mux/wire.zig");
 const store = @import("../filebrowser/transfers.zig");
 const xferqueue = @import("../filebrowser/xferqueue.zig");
 const pathz = @import("../util/pathz.zig");
+const cast = @import("../util/cast.zig");
 
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
 const Subscriber = struct { ctx: *anyopaque, callback: NotifyFn };
@@ -556,7 +557,7 @@ pub const Service = struct {
     }
 
     fn onSweep(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Service = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Service, user);
         if (self.shutting_down) return 0;
         self.migrateLegacy();
         self.adoptOrphans();
@@ -916,7 +917,7 @@ pub const Service = struct {
     }
 
     fn onRetry(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Service = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Service, user);
         self.retry_source = 0;
         self.connect();
         for (self.intents.items) |it| {
@@ -952,7 +953,7 @@ pub const Service = struct {
     }
 
     fn onFd(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Service = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Service, user);
         self.in_fd_callback = true;
         defer self.in_fd_callback = false;
         const conn = if (self.conn) |*v| v else {
@@ -2602,7 +2603,7 @@ pub const Service = struct {
 
     fn onWatchChanged(_: *c.GFileMonitor, _: ?*c.GFile, _: ?*c.GFile, event: c.GFileMonitorEvent, user: ?*anyopaque) callconv(.c) void {
         if (event != c.G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT and event != c.G_FILE_MONITOR_EVENT_CREATED and event != c.G_FILE_MONITOR_EVENT_MOVED_IN) return;
-        const w: *Watch = @ptrCast(@alignCast(user.?));
+        const w = cast.userData(Watch, user);
         const fp = fingerprint(w.cache_path) orelse return;
         if (fp.size == w.synced_size and fp.mtime_ns == w.synced_mtime_ns) return;
         w.dirty_generation += 1;

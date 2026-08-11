@@ -19,6 +19,7 @@ const WireReply = @import("types.zig").WireReply;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
+const cast = @import("../../util/cast.zig");
 
 /// Two-tree compare/sync: both trees are scanned HOST-SIDE (find
 /// jobs streaming path+kind+size+mtime digests — only digests cross
@@ -330,7 +331,7 @@ pub const CompareCtx = struct {
 
     /// g_object destroy-notify on the window: final cleanup.
     pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CompareCtx, user);
         if (self.view.compare == self) self.view.compare = null;
         self.window = null;
         for (self.hpairs.items) |pp| self.allocator.destroy(pp);
@@ -353,7 +354,7 @@ pub const CompareCtx = struct {
     }
 
     pub fn onExecuteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CompareCtx, user);
         self.execute();
     }
     /// Hash-verify equal-size "differs" rows: identical digests
@@ -430,12 +431,12 @@ pub const CompareCtx = struct {
     }
 
     pub fn onHashVerifyClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CompareCtx, user);
         self.startHashVerify();
     }
 
     pub fn onMirrorClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CompareCtx, user);
         var n: usize = 0;
         for (self.rows.items) |row| {
             if (row.status == .right_only) {
@@ -446,13 +447,13 @@ pub const CompareCtx = struct {
         self.view.setStatusFmt("mirror: {d} target-only row(s) marked for deletion — review, then Execute", .{n});
     }
     pub fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CompareCtx, user);
         self.close();
     }
 };
 
 pub fn onMenuSyncHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const board = self.clipboard();
     const src = board.first() orelse return menuDone(ctx);

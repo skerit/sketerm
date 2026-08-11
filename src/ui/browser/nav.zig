@@ -25,6 +25,7 @@ const completionMatches = @import("../../filebrowser/paths.zig").completionMatch
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
+const cast = @import("../../util/cast.zig");
 
 pub const PathCompletion = struct {
     req: u32,
@@ -220,7 +221,7 @@ pub fn currentTab(self: *BrowserView) ?*BTab {
 }
 
 pub fn onTabCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     tab.view.closeTab(tab);
 }
 
@@ -951,22 +952,22 @@ pub fn onBrowserKey(
 }
 
 pub fn onBackClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |t| self.goBack(t);
 }
 
 pub fn onFwdClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |t| self.goForward(t);
 }
 
 pub fn onUpClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |t| self.goUp(t);
 }
 
 pub fn onNewTabClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |t| {
         var buf: [4096]u8 = undefined;
         if (t.root.path.len >= buf.len) return;
@@ -978,13 +979,13 @@ pub fn onNewTabClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onTerminalClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const pane = self.pane orelse return;
     pane.setBrowserVisible(false);
 }
 
 pub fn onCwdSyncClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const pane = self.pane orelse return;
     const cwd = pane.terminal.cwd orelse {
@@ -1000,7 +1001,7 @@ pub fn onCwdSyncClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onHiddenToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.currentTab()) |tab| tab.show_hidden = c.gtk_toggle_button_get_active(btn) != 0;
     self.renderCurrent();
 }
@@ -1010,7 +1011,7 @@ pub const CompletionCtx = struct {
     view: *BrowserView,
     text: []u8,
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *CompletionCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(CompletionCtx, user);
         ctx.allocator.free(ctx.text);
         ctx.allocator.destroy(ctx);
     }
@@ -1039,14 +1040,14 @@ pub fn closePathCompletion(self: *BrowserView) void {
 }
 
 pub fn onPathChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.syncing_path_entry) return;
     if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
     self.completion_source = c.g_timeout_add(150, @ptrCast(&onCompletionTimeout), @ptrCast(self));
 }
 
 pub fn onCompletionTimeout(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.completion_source = 0;
     self.renderPathCompletion();
     return 0;
@@ -1169,7 +1170,7 @@ pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefi
 }
 
 pub fn onCompletionActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-completion") orelse return;
     const ctx: *CompletionCtx = @ptrCast(@alignCast(data));
     self.syncing_path_entry = true;
@@ -1186,7 +1187,7 @@ pub fn onCompletionActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*an
 }
 
 pub fn onPathKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (keyval == c.GDK_KEY_Escape) {
         // First Escape dismisses the completion list, the next one
         // abandons the entry face for the breadcrumb.
@@ -1216,7 +1217,7 @@ pub const JumpCtx = struct {
     entry: *c.GtkWidget,
     list: *c.GtkWidget,
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *JumpCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(JumpCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -1281,7 +1282,7 @@ fn nowMsWall() i64 {
 }
 
 fn onJumpChanged(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *JumpCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(JumpCtx, user);
     const text = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     fillJumpList(ctx, text);
 }
@@ -1319,7 +1320,7 @@ pub const PatternCtx = struct {
     view: *BrowserView,
     popover: *c.GtkWidget,
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *PatternCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(PatternCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -1343,7 +1344,7 @@ pub fn showSelectPattern(self: *BrowserView) void {
 }
 
 pub fn onPatternActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PatternCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PatternCtx, user);
     const pattern = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     if (pattern.len > 0) ctx.view.selectPattern(pattern, false);
     if (c.gtk_widget_get_parent(ctx.popover) != null) c.gtk_widget_unparent(ctx.popover);
@@ -1440,7 +1441,7 @@ pub fn typeaheadJump(self: *BrowserView) bool {
 }
 
 pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const tab = self.currentTab() orelse return;
     const txt = c.gtk_editable_get_text(@ptrCast(entry));
     const spec = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
@@ -1458,7 +1459,7 @@ pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     // Quick Look's batch was built from the old tab's listing. Close it
     // rather than leaving a viewer aimed at another tab's host.
     if (self.preview_state.quick_look != null) self.quickLookClose();
@@ -1469,7 +1470,7 @@ pub fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyo
 }
 
 pub fn idleAfterSwitch(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.switch_idle = 0;
     if (self.currentTab()) |t| {
         c.gtk_toggle_button_set_active(self.hidden_toggle, @intFromBool(t.show_hidden));

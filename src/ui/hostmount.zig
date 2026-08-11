@@ -18,6 +18,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const cast = @import("../util/cast.zig");
 
 /// How long a freshly spawned mount is given to come up before the
 /// caller falls back to downloading. A local daemon answers in
@@ -246,7 +247,7 @@ fn spawn(m: *Mount) bool {
 fn onMountExited(pid: c.GPid, status: c_int, user: ?*anyopaque) callconv(.c) void {
     _ = status;
     c.g_spawn_close_pid(pid);
-    const m: *Mount = @ptrCast(@alignCast(user.?));
+    const m = cast.userData(Mount, user);
     m.pid = 0;
     // One-shot: it has fired, so teardown must not remove it again.
     m.watch = 0;
@@ -376,7 +377,7 @@ const Waiter = struct {
 };
 
 fn onWaiterTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const w: *Waiter = @ptrCast(@alignCast(user.?));
+    const w = cast.userData(Waiter, user);
     const state = ensure(w.allocator, w.host);
     if (state == .starting and nowMs() < w.deadline_ms) return 1;
     const mounted = state == .ready;

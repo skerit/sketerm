@@ -1140,7 +1140,7 @@ fn startOp(self: *Switcher, daemon: *DaemonState, kill_session: ?[]const u8) voi
 }
 
 fn onOpTicket(user: ?*anyopaque, ticket: ?mux_client.UdpTicket) void {
-    const ctx: *Op = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Op, user);
     ctx.ticket = ticket;
     spawnOp(ctx);
 }
@@ -1247,7 +1247,7 @@ fn findDaemon(self: *Switcher, host: ?[]const u8) ?*DaemonState {
 }
 
 fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *Op = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Op, user);
     const self = ctx.sw;
     const alive = !self.dead;
     var changed = false;
@@ -1410,7 +1410,7 @@ fn attachThreadMain(ctx: *Attach) void {
 }
 
 fn onAttachIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *Attach = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Attach, user);
     const self = ctx.sw;
     const alive = !self.dead;
     var ok = false;

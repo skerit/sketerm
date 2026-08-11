@@ -474,12 +474,12 @@ fn sweepOpenCopies(directory: [:0]const u8) void {
 }
 
 fn decodeStillCurrent(user: ?*anyopaque) bool {
-    const work: *LoadWork = @ptrCast(@alignCast(user.?));
+    const work = cast.userData(LoadWork, user);
     return !work.target.current(work.generation);
 }
 
 fn loadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const work: *LoadWork = @ptrCast(@alignCast(user.?));
+    const work = cast.userData(LoadWork, user);
     const target = work.target;
     target.lock();
     const deliver = target.alive and target.generation == work.generation;
@@ -862,7 +862,7 @@ pub const ViewerWindow = struct {
     }
 
     fn destroyViewer(user: ?*anyopaque) callconv(.c) void {
-        const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(ViewerWindow, user);
         // Finalize path: the widget tree is already gone, so free the
         // controller without touching the cast_slot (onWindowDestroy
         // severed the timers/sinks when the window started dying).
@@ -887,7 +887,7 @@ pub const ViewerWindow = struct {
     }
 
     fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(ViewerWindow, user);
         self.anim_bar.sever();
         switch (self.content) {
             .cast => |box| box.severLive(),
@@ -1192,7 +1192,7 @@ fn onCanvasMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onCanvasRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const menu: *CanvasMenu = @ptrCast(@alignCast(user.?));
+    const menu = cast.userData(CanvasMenu, user);
     // Claim before popup — an unclaimed RELEASE reads as a click
     // outside the fresh popover and dismisses it (see menu.zig).
     _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
@@ -1216,13 +1216,6 @@ fn onCanvasRowClicked(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const rctx: *CanvasRowCtx = @ptrCast(@alignCast(user.?));
     _ = c.gtk_widget_grab_focus(rctx.host);
     _ = c.gtk_widget_activate(rctx.source);
-}
-
-fn freeCanvasRow(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const rctx: *CanvasRowCtx = @ptrCast(@alignCast(u));
-        rctx.allocator.destroy(rctx);
-    }
 }
 
 fn freeCanvasMenu(user: ?*anyopaque) callconv(.c) void {
@@ -1296,7 +1289,7 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
 }
 
 fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     if (result.variant == .head) return onHeadLoaded(self, result);
     const image = if (result.decoded) |*decoded_image| decoded_image else {
         if (result.variant == .preview) {
@@ -1395,7 +1388,7 @@ test "localPreviewKind separates local images from posters and remotes" {
 }
 
 fn onOpenCopyLoaded(user: ?*anyopaque, result: *LoadResult) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     if (result.materialized_len == 0) {
         var buf: [256:0]u8 = undefined;
         const text = std.fmt.bufPrintZ(&buf, "Could not prepare the remote image: {s}", .{result.messageText()}) catch
@@ -1417,7 +1410,7 @@ fn mayAnimate(name: []const u8) bool {
 }
 
 fn onCanvasZoom(user: ?*anyopaque, zoom: f64, mode: model.Viewport.Mode) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     if (mode == .fit) return c.gtk_label_set_text(self.zoom_label, "Fit");
     if (mode == .fill) return c.gtk_label_set_text(self.zoom_label, "Fill");
     var buf: [24:0]u8 = undefined;
@@ -1426,62 +1419,62 @@ fn onCanvasZoom(user: ?*anyopaque, zoom: f64, mode: model.Viewport.Mode) void {
 }
 
 fn onPrevious(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.move(-1);
 }
 
 fn onNext(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.move(1);
 }
 
 fn onZoomOut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.canvas.zoomBy(1.0 / 1.2);
 }
 
 fn onZoomIn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.canvas.zoomBy(1.2);
 }
 
 fn onFit(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.canvas.fit();
 }
 
 fn onFill(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.canvas.fill();
 }
 
 fn onActual(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.canvas.actual();
 }
 
 fn onOriginal(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.loadOriginal();
 }
 
 fn onRotateLeft(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.rotate(-1);
 }
 
 fn onRotateRight(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.rotate(1);
 }
 
 fn onPlayPause(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.session.togglePlayback();
 }
 
 fn onCastTitle(user: ?*anyopaque, name: []const u8) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     const n = @min(name.len, self.cast_title.len);
     @memcpy(self.cast_title[0..n], name[0..n]);
     self.cast_title_len = n;
@@ -1493,7 +1486,7 @@ fn onCastTitle(user: ?*anyopaque, name: []const u8) void {
 /// Status line for casts: recording title + position/duration, where
 /// images show dimensions.
 fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     const title = self.cast_title[0..self.cast_title_len];
     var buf: [700:0]u8 = undefined;
     const suffix: []const u8 = switch (st.kind) {
@@ -1517,7 +1510,7 @@ fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
 }
 
 fn onSessionPlaybackChanged(user: ?*anyopaque, event: image_canvas.Session.PlaybackEvent) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     switch (event) {
         .state => {
             self.updatePlaybackButton();
@@ -1533,29 +1526,29 @@ fn onSessionPlaybackChanged(user: ?*anyopaque, event: image_canvas.Session.Playb
 // ── animated-image playbar source ────────────────────────────────
 
 fn srcAnimToggle(ctx: ?*anyopaque) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(ViewerWindow, ctx);
     self.session.togglePlayback();
 }
 
 fn srcAnimRestart(ctx: ?*anyopaque) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(ViewerWindow, ctx);
     if (!self.session.animated()) return;
     self.session.seekToFrame(0);
     if (!self.session.isPlaying()) self.session.togglePlayback();
 }
 
 fn srcAnimSeekToMs(ctx: ?*anyopaque, target_ms: u64) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(ViewerWindow, ctx);
     self.session.seekToMs(target_ms);
 }
 
 fn onCanvasNavigate(user: ?*anyopaque, delta: isize) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.move(delta);
 }
 
 fn onCanvasRotate(user: ?*anyopaque, delta: i8) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.rotate(delta);
 }
 
@@ -1572,24 +1565,24 @@ fn onCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     self.showCurrent();
 }
 
 fn onOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     const resource = self.current() orelse return;
     if (resource.host) |host| return openWithRemote(self, host, resource.path);
     showAppChooser(self, resource.path);
 }
 
 fn onReveal(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     revealCurrent(self);
 }
 
 fn onFullscreen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     toggleFullscreen(self);
 }
 
@@ -1627,7 +1620,7 @@ fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, us
 }
 
 fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     // The ref keeps the window (and the qdata that resolves back to
     // `self`) alive until the one-shot callback runs.
     _ = c.g_object_ref(@ptrCast(self.window));
@@ -1655,7 +1648,7 @@ fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onOpenDone(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {
-    const window: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const window = cast.userData(c.GtkWidget, user);
     defer c.g_object_unref(@ptrCast(window));
     const res = result orelse return;
     if (res.specs.len == 0) return;
@@ -1668,7 +1661,7 @@ fn onOpenDone(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").R
 }
 
 fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(ViewerWindow, user);
     // Keyboard access to the canvas context menu. Handled here rather
     // than on the canvas because this controller runs in CAPTURE
     // phase on the window and would otherwise swallow the keys first.
@@ -1781,7 +1774,7 @@ const ChooserCopy = struct {
 };
 
 fn freeChooserCopy(user: ?*anyopaque) callconv(.c) void {
-    const copy: *ChooserCopy = @ptrCast(@alignCast(user.?));
+    const copy = cast.userData(ChooserCopy, user);
     _ = c.unlink(copy.path.ptr);
     std.heap.c_allocator.free(copy.path);
     std.heap.c_allocator.destroy(copy);
@@ -1862,7 +1855,7 @@ fn openWithRemote(self: *ViewerWindow, host: []const u8, path: []const u8) void 
 }
 
 fn onOpenWithMountReady(user: ?*anyopaque, mounted: bool) void {
-    const pending: *MountOpen = @ptrCast(@alignCast(user.?));
+    const pending = cast.userData(MountOpen, user);
     defer {
         const allocator = std.heap.c_allocator;
         allocator.free(pending.host);

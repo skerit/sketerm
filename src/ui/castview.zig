@@ -75,7 +75,7 @@ pub const CastView = struct {
     /// GDestroyNotify at window finalize: free the view and kill the
     /// ephemeral session (the box's Terminal.deinit sends the kill).
     fn destroyView(user: ?*anyopaque) callconv(.c) void {
-        const self: *CastView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(CastView, user);
         self.severLive();
         self.box.destroy();
         self.allocator.destroy(self);

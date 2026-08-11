@@ -49,6 +49,7 @@ const canary = @import("panel/canary.zig");
 const events = @import("panel/events.zig");
 const PanelView = @import("panel/view.zig").PanelView;
 const PanelWindow = @import("panelwin.zig").PanelWindow;
+const cast = @import("../util/cast.zig");
 
 pub const Target = enum {
     /// The requesting pane itself wears the panel face.
@@ -1313,7 +1314,7 @@ fn readLocalAsset(
 }
 
 fn localReadJobDone(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *LocalReadJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(LocalReadJob, user);
     if (!job.ready.load(.acquire)) return 1;
     if (active_local_read_jobs > 0) active_local_read_jobs -= 1;
     if (findHydration(job.pending_id)) |pending| {
@@ -1460,7 +1461,7 @@ fn runCacheInitJob(job: *CacheInitJob, init_fn: CacheInitFn) void {
 }
 
 fn cacheInitJobDone(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *CacheInitJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(CacheInitJob, user);
     if (!job.ready.load(.acquire)) return 1;
     cache_init_active = false;
     const origin_live = job.drain.alive.load(.acquire) and job.drain.terminal != null;
@@ -1547,7 +1548,7 @@ fn cacheJobMain(job: *CacheJob) void {
 }
 
 fn cacheJobDone(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *CacheJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(CacheJob, user);
     if (!job.ready.load(.acquire)) return 1;
     if (active_cache_jobs > 0) active_cache_jobs -= 1;
     const pending = findHydration(job.pending_id);
@@ -1988,7 +1989,7 @@ fn panelTabConnect(job: *PanelTabJob) !void {
 }
 
 fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *PanelTabJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(PanelTabJob, user);
     removePanelTabJob(job);
     const scope = job.scope;
     defer {
@@ -2711,7 +2712,7 @@ fn detachPanelAndScheduleTabClose(pane: *Pane) void {
 }
 
 fn closeDetachedPanelTab(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const pending: *DeferredPanelTabClose = @ptrCast(@alignCast(user.?));
+    const pending = cast.userData(DeferredPanelTabClose, user);
     defer std.heap.c_allocator.destroy(pending);
     if (!pending.drain.alive.load(.acquire)) return 0;
     const terminal = pending.drain.terminal orelse return 0;

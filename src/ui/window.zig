@@ -1618,7 +1618,7 @@ pub const Window = struct {
     };
 
     fn onFilesLaunchTicket(ctx: ?*anyopaque, ticket: ?@import("../mux/client.zig").UdpTicket) void {
-        const l: *FilesLaunch = @ptrCast(@alignCast(ctx.?));
+        const l = cast.userData(FilesLaunch, ctx);
         const host: ?[]const u8 = if (ticket != null) l.host else null;
         if (!spawnFilesProcess(l.spec, host, ticket)) {
             std.debug.print("sketerm: files launch failed (deferred spawn)\n", .{});
@@ -2310,7 +2310,7 @@ pub const Window = struct {
             "notify::position",
             @ptrCast(&winlayout_mod.onPanedPositionChanged),
             @ptrCast(ratio_holder),
-            @ptrCast(&winlayout_mod.freePanedRatio),
+            @ptrCast(cast.destroyCtx(winlayout_mod.PanedRatioCtx)),
             c.G_CONNECT_DEFAULT,
         );
         _ = c.g_signal_connect_data(
@@ -2982,7 +2982,7 @@ pub const Window = struct {
         c.gtk_widget_set_halign(btn, c.GTK_ALIGN_CENTER);
         const cctx = self.allocator.create(CrashBtnCtx) catch return;
         cctx.* = .{ .allocator = self.allocator, .window = self, .pane = pane };
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onCrashRestartClicked), @ptrCast(cctx), @ptrCast(&freeCrashBtnCtx), c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onCrashRestartClicked), @ptrCast(cctx), @ptrCast(cast.destroyCtx(Window.CrashBtnCtx)), c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), face);
         c.gtk_box_append(@ptrCast(box), msg);
         c.gtk_box_append(@ptrCast(box), btn);
@@ -3775,16 +3775,9 @@ pub fn showToast(self: *Window, text: []const u8) void {
 }
 
 fn onCrashRestartClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const cctx: *Window.CrashBtnCtx = @ptrCast(@alignCast(user.?));
+    const cctx = cast.userData(Window.CrashBtnCtx, user);
     // Reuse the detach-to-shell swap: spawn a fresh session into this slot.
     cctx.window.detachPaneToShell(cctx.pane);
-}
-
-fn freeCrashBtnCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *Window.CrashBtnCtx = @ptrCast(@alignCast(u));
-        ctx.allocator.destroy(ctx);
-    }
 }
 
 fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {

@@ -19,6 +19,7 @@ const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
+const cast = @import("../../util/cast.zig");
 
 /// Trailing debounce for change-driven refreshes. A file operation or
 /// an editor save lands as a burst of watch deltas; one job per burst
@@ -158,7 +159,7 @@ fn ensurePoll(self: *BrowserView) void {
 }
 
 fn onGitPollTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.git_poll_src = 0;
     if (self.widgets_dead) return 0;
     const tab = gitTab(self) orelse return 0;
@@ -180,7 +181,7 @@ pub fn scheduleGitRefresh(self: *BrowserView) void {
 }
 
 fn onGitDeltaTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.git_delta_src = 0;
     if (self.widgets_dead) return 0;
     const tab = self.currentTab() orelse return 0;

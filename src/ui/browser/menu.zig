@@ -36,6 +36,7 @@ const onMenuTags = @import("ops.zig").onMenuTags;
 const onMenuTrash = @import("ops.zig").onMenuTrash;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const setMountXattr = @import("ops.zig").setMountXattr;
+const cast = @import("../../util/cast.zig");
 
 /// Heap context for one open menu/dialog popover; owned by the
 /// popover via g_object_set_data_full (freed when it dies).
@@ -54,7 +55,7 @@ pub const MenuCtx = struct {
     entry2: ?*c.GtkWidget = null,
 
     pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(MenuCtx, user);
         if (ctx.path) |p| ctx.allocator.free(p);
         if (ctx.name) |n| ctx.allocator.free(n);
         ctx.allocator.destroy(ctx);
@@ -75,7 +76,7 @@ pub fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *an
 
 pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n_press;
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const self = tab.view;
 
     // Right-click on the column header strip: the column picker,
@@ -108,7 +109,7 @@ pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64,
 /// could be pasted into it.
 pub fn onAreaRightClick(_: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n_press;
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     if (c.gtk_widget_get_visible(tab.empty_box) == 0) return;
     const parent = c.gtk_widget_get_parent(tab.empty_box) orelse return;
     tab.view.showEntryMenu(tab, parent, x, y, null, null, false);
@@ -268,13 +269,8 @@ const HamModeCtx = struct {
     mode: browser_model.ViewMode,
 };
 
-fn hamModeCleanup(user: ?*anyopaque) callconv(.c) void {
-    const hm: *HamModeCtx = @ptrCast(@alignCast(user.?));
-    hm.allocator.destroy(hm);
-}
-
 fn onHamModeChosen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const hm: *HamModeCtx = @ptrCast(@alignCast(user.?));
+    const hm = cast.userData(HamModeCtx, user);
     const self = hm.view;
     const tab = self.currentTab() orelse return;
     if (tab.view_mode == hm.mode) return;
@@ -285,13 +281,13 @@ fn onHamModeChosen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onHamTogglePlaces(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const on = c.gtk_toggle_button_get_active(self.places_toggle);
     c.gtk_toggle_button_set_active(self.places_toggle, @intFromBool(on == 0));
 }
 
 fn onHamToggleInfo(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const on = c.gtk_toggle_button_get_active(self.info_toggle);
     c.gtk_toggle_button_set_active(self.info_toggle, @intFromBool(on == 0));
 }
@@ -337,7 +333,7 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
     for (mode_rows) |mr| {
         const hm = self.allocator.create(HamModeCtx) catch break;
         hm.* = .{ .allocator = self.allocator, .view = self, .mode = mr.mode };
-        root.own(&hamModeCleanup, @ptrCast(hm));
+        root.own(cast.destroyCtx(HamModeCtx), @ptrCast(hm));
         modes.check(mr.label, tab.view_mode == mr.mode, &onHamModeChosen, @ptrCast(hm));
     }
 
@@ -402,14 +398,14 @@ const OpenAppCtx = struct {
 };
 
 fn openAppCleanup(user: ?*anyopaque) callconv(.c) void {
-    const a: *OpenAppCtx = @ptrCast(@alignCast(user.?));
+    const a = cast.userData(OpenAppCtx, user);
     a.allocator.free(a.path);
     if (a.appid) |s| a.allocator.free(s);
     a.allocator.destroy(a);
 }
 
 fn onOpenAppActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const actx: *OpenAppCtx = @ptrCast(@alignCast(user.?));
+    const actx = cast.userData(OpenAppCtx, user);
     const self = actx.view;
     if (actx.tab.hc.host != null) {
         self.openRemoteFile(actx.tab, actx.path, if (actx.appid) |id| id else null);
@@ -605,13 +601,13 @@ const CompressCtx = struct {
 };
 
 fn compressCleanup(user: ?*anyopaque) callconv(.c) void {
-    const cc: *CompressCtx = @ptrCast(@alignCast(user.?));
+    const cc = cast.userData(CompressCtx, user);
     cc.allocator.free(cc.path);
     cc.allocator.destroy(cc);
 }
 
 fn onCompressActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const cc: *CompressCtx = @ptrCast(@alignCast(user.?));
+    const cc = cast.userData(CompressCtx, user);
     var out: [4096]u8 = undefined;
     const archive = std.fmt.bufPrint(&out, "{s}.{s}", .{ cc.path, cc.ext }) catch return;
     cc.view.startDaemonJob(cc.tab.hc, "archive_create", cc.path, archive, "create archive");
@@ -708,7 +704,7 @@ pub fn onMenuSplit1G(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuCombine(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     var lbl: [160]u8 = undefined;
@@ -755,13 +751,13 @@ const TemplateItemCtx = struct {
 };
 
 fn templateItemCleanup(user: ?*anyopaque) callconv(.c) void {
-    const t: *TemplateItemCtx = @ptrCast(@alignCast(user.?));
+    const t = cast.userData(TemplateItemCtx, user);
     t.allocator.free(t.source);
     t.allocator.destroy(t);
 }
 
 fn onTemplateItemActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const t: *TemplateItemCtx = @ptrCast(@alignCast(user.?));
+    const t = cast.userData(TemplateItemCtx, user);
     @import("templates.zig").instantiate(t.view, t.tab, t.source);
 }
 
@@ -876,14 +872,14 @@ pub fn menuDone(ctx: *MenuCtx) void {
 /// deferred because the close destroys the widget tree this popover
 /// (and this handler) live in.
 pub fn onMenuClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const view = ctx.view;
     menuDone(ctx);
     view.closePaneDeferred();
 }
 
 pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     // Entry menus target the clicked directory; the background menu
     // (no path) targets the folder being shown.
     const path = ctx.path orelse ctx.tab.root.path;
@@ -903,7 +899,7 @@ pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 }
 
 pub fn onMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     if (ctx.path) |p| _ = ctx.view.newTab(ctx.tab.hc.host, p);
     menuDone(ctx);
 }
@@ -917,7 +913,7 @@ pub fn onMenuCut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuCopyToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = if (ctx.path) |p| self.allocator.dupe(u8, p) catch null else null;
     defer if (path) |p| self.allocator.free(p);
@@ -926,7 +922,7 @@ pub fn onMenuCopyToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuMoveToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = if (ctx.path) |p| self.allocator.dupe(u8, p) catch null else null;
     defer if (path) |p| self.allocator.free(p);
@@ -935,14 +931,14 @@ pub fn onMenuMoveToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const path = ctx.path orelse return menuDone(ctx);
     clipboard.copyText(@ptrCast(@alignCast(ctx.tab.colview)), path);
     menuDone(ctx);
 }
 
 pub fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const board = self.clipboard();
     if (board.isEmpty()) return menuDone(ctx);
@@ -951,7 +947,7 @@ pub fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuTermTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse ctx.tab.root.path;
     if (self.on_host_term) |cb| {
@@ -961,7 +957,7 @@ pub fn onMenuTermTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuHostOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     if (self.on_host_open) |cb| {
@@ -974,7 +970,7 @@ pub fn onMenuHostOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const mctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const mctx = cast.userData(MenuCtx, user);
     const self = mctx.view;
     const orig = mctx.path orelse return menuDone(mctx);
     const tab = mctx.tab;
@@ -991,7 +987,7 @@ pub fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// Open the clicked file in this pane's editor face (created on
 /// demand). Host-qualified, so remote files edit over the daemon.
 pub fn onMenuEditor(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const tab = ctx.tab;
@@ -1012,7 +1008,7 @@ pub fn onMenuEditor(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// the browser tab it was clicked in exactly as it was. Same
 /// host-qualified spec as onMenuEditor.
 pub fn onMenuEditorTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const tab = ctx.tab;
@@ -1032,7 +1028,7 @@ pub fn onMenuEditorTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// spawned as its own process the way the Viewer item does — a separate
 /// GApplication is what gives it its own window list, icon and app id.
 pub fn onMenuEditorWindow(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const tab = ctx.tab;
@@ -1049,7 +1045,7 @@ pub fn onMenuEditorWindow(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 }
 
 pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     var path_buf: [4096]u8 = undefined;
@@ -1064,7 +1060,7 @@ pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// "Play in Sketerm": a `.cast` recording opens in a playback window
 /// of the terminal identity, spawned as its own process.
 pub fn onMenuCastPlay(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     // Format the spec BEFORE menuDone frees the ctx storage.
@@ -1079,7 +1075,7 @@ pub fn onMenuCastPlay(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const spec = ctx.path orelse return menuDone(ctx);
     const loc = parseSpec(spec);
@@ -1092,7 +1088,7 @@ pub fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) voi
 }
 
 pub fn onMenuCompare(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const target = if (ctx.is_dir and ctx.path != null) ctx.path.? else tab.root.path;
@@ -1105,7 +1101,7 @@ pub fn onMenuCompare(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuBookmark(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     var spec_buf: [4400]u8 = undefined;
@@ -1126,7 +1122,7 @@ pub fn onMenuEvict(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuTrashRestoreItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const tab = ctx.tab;
@@ -1139,21 +1135,21 @@ pub fn onMenuTrashRestoreItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) v
 }
 
 pub fn onMenuUndo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const view = ctx.view;
     menuDone(ctx);
     view.performUndo();
 }
 
 pub fn onMenuCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const path = ctx.path orelse return menuDone(ctx);
     ctx.view.startDaemonJobKind(ctx.tab.hc, "find", path, "", "*", "calculate size", .{ .kind = .calc_size });
     menuDone(ctx);
 }
 
 pub fn onMenuAnalyzeUsage(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const tab = ctx.tab;
     const path = ctx.path orelse tab.root.path;
     var buf: [4096]u8 = undefined;
@@ -1165,7 +1161,7 @@ pub fn onMenuAnalyzeUsage(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 }
 
 pub fn onMenuFindDups(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
     const tab = ctx.tab;
@@ -1178,13 +1174,13 @@ pub fn onMenuFindDups(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuNewFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     ctx.view.entryDialog(ctx.tab, .mkdir, null);
     menuDone(ctx);
 }
 
 pub fn onMenuNewFromTemplate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     // A popover opened from inside a menu must be built AFTER the menu
@@ -1194,7 +1190,7 @@ pub fn onMenuNewFromTemplate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) vo
 }
 
 pub fn onMenuDuplicate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const path = ctx.path orelse return menuDone(ctx);
@@ -1229,7 +1225,7 @@ fn pasteAsLink(ctx: *MenuCtx, hard: bool) void {
 }
 
 pub fn onMenuDiffFiles(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     if (tab.selected.items.len != 2) return;
@@ -1246,7 +1242,7 @@ pub fn onMenuDiffFiles(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const orig = ctx.path orelse return menuDone(ctx);
@@ -1262,7 +1258,7 @@ pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onMenuBrowseArchive(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const path = ctx.path orelse return menuDone(ctx);
@@ -1275,7 +1271,7 @@ pub fn onMenuBrowseArchive(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 }
 
 pub fn onMenuExtractMember(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
     const member = ctx.path orelse return menuDone(ctx);
@@ -1288,7 +1284,7 @@ pub fn onMenuExtractMember(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 }
 
 pub fn onMenuExtractHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const path = ctx.path orelse return menuDone(ctx);
     const parent = std.fs.path.dirname(path) orelse "/";
     ctx.view.startDaemonJob(ctx.tab.hc, "extract", path, parent, "extract archive");
@@ -1299,7 +1295,7 @@ pub fn onMenuExtractHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// asked via the entry dialog, the daemon `create` op does an
 /// O_EXCL create so an existing file can never be clobbered.
 pub fn onMenuNewEmptyFile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     ctx.view.entryDialog(ctx.tab, .newfile, null);
     menuDone(ctx);
 }
@@ -1307,7 +1303,7 @@ pub fn onMenuNewEmptyFile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 /// The background menu's Show Hidden Files check row: flips the real
 /// hamburger toggle so every surface stays in sync.
 pub fn onMenuToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const view = ctx.view;
     menuDone(ctx);
     const active = c.gtk_toggle_button_get_active(view.hidden_toggle);
@@ -1316,7 +1312,7 @@ pub fn onMenuToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 
 /// Open the application preferences (same dialog as terminal mode).
 pub fn onMenuPrefs(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const view = ctx.view;
     menuDone(ctx);
     if (view.ownerWindow()) |win| win.openPrefs();
@@ -1324,7 +1320,7 @@ pub fn onMenuPrefs(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 /// Properties of the folder the background click landed in.
 pub fn onMenuFolderProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(MenuCtx, user);
     const view = ctx.view;
     const tab = ctx.tab;
     menuDone(ctx);
@@ -1341,7 +1337,7 @@ pub const ActionCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const a: *ActionCtx = @ptrCast(@alignCast(user.?));
+        const a = cast.userData(ActionCtx, user);
         if (a.host) |h| a.allocator.free(h);
         a.allocator.free(a.cmdline);
         a.allocator.destroy(a);
@@ -1443,7 +1439,7 @@ fn actionCtxCleanup(user: ?*anyopaque) callconv(.c) void {
 /// A user .action item fired. The popover closes itself (classic
 /// menu); this only runs the command.
 pub fn onActionActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const actx: *ActionCtx = @ptrCast(@alignCast(user.?));
+    const actx = cast.userData(ActionCtx, user);
     const self = actx.view;
     if (actx.runs_on_host) {
         if (self.on_host_exec) |cb| {

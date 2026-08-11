@@ -21,6 +21,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const classicmenu = @import("browser/classicmenu.zig");
+const cast = @import("../util/cast.zig");
 
 /// Per-page label handle. Heap-allocated by addPage and freed
 /// automatically when the label box is destroyed (qdata notify), so
@@ -62,11 +63,6 @@ pub const TabLabel = struct {
             std.fmt.bufPrintZ(&buf, "{s}", .{t}) catch return;
         c.gtk_label_set_text(self.label, txt.ptr);
     }
-
-    fn freeCb(user: ?*anyopaque) callconv(.c) void {
-        const self: *TabLabel = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 /// Per-tab context-menu contract. Every hook is optional and a null
@@ -100,11 +96,6 @@ const TabMenuCtx = struct {
     /// The page the menu was opened ON — not necessarily the current
     /// one (right-clicking an inactive tab acts on that tab).
     page: *c.GtkWidget,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *TabMenuCtx = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 pub const TabHost = struct {
@@ -186,7 +177,7 @@ pub const TabHost = struct {
             @ptrCast(@alignCast(label_box)),
             "sketerm-tabhandle",
             @ptrCast(handle),
-            @ptrCast(&TabLabel.freeCb),
+            @ptrCast(cast.destroyCtx(TabLabel)),
         );
         // The strip gestures below hit-test against this mark to tell
         // "on a tab" from "on the strip's empty space".
@@ -347,7 +338,7 @@ pub const TabHost = struct {
             self.allocator.destroy(ctx);
             return false;
         };
-        root.own(&TabMenuCtx.free, @ptrCast(ctx));
+        root.own(cast.destroyCtx(TabMenuCtx), @ptrCast(ctx));
 
         const m = root.top();
         if (spec.extra) |f| f(self.ctx, page, root, m);
@@ -385,7 +376,7 @@ pub const TabHost = struct {
     }
 
     fn onTabMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
-        const nb: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+        const nb = cast.userData(c.GtkWidget, user);
         @import("menu.zig").returnFocusTo(nb, @ptrCast(pop));
     }
 
@@ -427,7 +418,7 @@ pub const TabHost = struct {
     }
 
     fn onTabRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const handle: *TabLabel = @ptrCast(@alignCast(user.?));
+        const handle = cast.userData(TabLabel, user);
         const host = handle.host;
         if (host.tab_menu == null) return;
         // Claim before popping up: an unclaimed release dismisses the
@@ -438,35 +429,35 @@ pub const TabHost = struct {
     }
 
     fn onMenuClose(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         const cb = ctx.host.on_close orelse return;
         cb(ctx.host.ctx, ctx.page);
     }
 
     fn onMenuCloseOthers(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         ctx.host.closeMatching(ctx.page, &wantOthers);
     }
 
     fn onMenuCloseRight(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         ctx.host.closeMatching(ctx.page, &wantRight);
     }
 
     fn onMenuCloseUnmodified(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         ctx.host.closeMatching(ctx.page, &wantUnmodified);
     }
 
     fn onMenuDuplicate(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         const spec = ctx.host.tab_menu orelse return;
         const f = spec.duplicate orelse return;
         f(ctx.host.ctx, ctx.page);
     }
 
     fn onMenuNewWindow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *TabMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(TabMenuCtx, user);
         const spec = ctx.host.tab_menu orelse return;
         const f = spec.new_window orelse return;
         f(ctx.host.ctx, ctx.page);
@@ -494,13 +485,13 @@ pub const TabHost = struct {
     }
 
     fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const handle: *TabLabel = @ptrCast(@alignCast(user.?));
+        const handle = cast.userData(TabLabel, user);
         const host = handle.host;
         if (host.on_close) |cb| cb(host.ctx, handle.page);
     }
 
     fn onMiddleClick(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const handle: *TabLabel = @ptrCast(@alignCast(user.?));
+        const handle = cast.userData(TabLabel, user);
         const host = handle.host;
         if (host.on_close) |cb| cb(host.ctx, handle.page);
     }
@@ -509,7 +500,7 @@ pub const TabHost = struct {
     /// previous. Touchpad smooth-scroll bursts accumulate so each
     /// ~1.0 of delta moves exactly one tab.
     fn onStripScroll(_: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const handle: *TabLabel = @ptrCast(@alignCast(user.?));
+        const handle = cast.userData(TabLabel, user);
         const host = handle.host;
         const delta = if (dy != 0) dy else dx;
         if (delta == 0) return 0;
@@ -521,7 +512,7 @@ pub const TabHost = struct {
     }
 
     fn onStripRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *TabHost = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(TabHost, user);
         // A tab's own menu already answered this press.
         const when = c.gtk_event_controller_get_current_event_time(@ptrCast(gesture));
         if (when != 0 and when == self.tab_press_time) return;
@@ -533,7 +524,7 @@ pub const TabHost = struct {
 
     fn onStripDoubleClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         if (n_press != 2) return;
-        const self: *TabHost = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(TabHost, user);
         if (!self.onStripEmpty(x, y)) return;
         const cb = self.on_new orelse return;
         _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);

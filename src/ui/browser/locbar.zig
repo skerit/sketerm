@@ -26,6 +26,7 @@ const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparen
 const dnd = @import("dnd.zig");
 const dropValueIntoAction = @import("ops.zig").dropValueIntoAction;
 const millerNextSegment = @import("../../filebrowser/paths.zig").millerNextSegment;
+const cast = @import("../../util/cast.zig");
 
 /// Segment budget for one bar. Deeper paths keep the root plus the
 /// deepest segments (see crumbs.split); the horizontal scroller
@@ -90,7 +91,7 @@ pub const PathCtx = struct {
 
     /// GDestroyNotify shape (g_object_set_data_full).
     pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *PathCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(PathCtx, user);
         ctx.allocator.free(ctx.path);
         ctx.allocator.destroy(ctx);
     }
@@ -124,7 +125,7 @@ pub const HistoryCtx = struct {
 
     /// GDestroyNotify shape (g_object_set_data_full).
     pub fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *HistoryCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(HistoryCtx, user);
         ctx.allocator.destroy(ctx);
     }
 
@@ -184,7 +185,7 @@ pub fn installLocationFace(self: *BrowserView, bar: *c.GtkWidget, entry: *c.GtkW
 /// through the toggle so `locbar.editing` cannot drift.
 fn onPathDoubleClick(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
     if (n_press != 2) return;
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     if (self.locbar.editing) return;
     self.toggleLocationFace();
 }
@@ -200,7 +201,7 @@ fn onCrumbAdjustment(adj: *c.GtkAdjustment, _: ?*anyopaque) callconv(.c) void {
 }
 
 fn pinCrumbTail(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const adj: *c.GtkAdjustment = @ptrCast(@alignCast(user.?));
+    const adj = cast.userData(c.GtkAdjustment, user);
     const tail = c.gtk_adjustment_get_upper(adj) - c.gtk_adjustment_get_page_size(adj);
     if (tail > 0) c.gtk_adjustment_set_value(adj, tail);
     c.g_object_unref(@ptrCast(adj));
@@ -225,7 +226,7 @@ pub fn installHistoryMenuGesture(self: *BrowserView, btn: *c.GtkWidget, side: Hi
 }
 
 fn onHistoryGesture(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *HistoryCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(HistoryCtx, user);
     const widget = c.gtk_event_controller_get_widget(@ptrCast(gesture)) orelse return;
     _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
     ctx.view.showHistoryMenu(widget, ctx.side);
@@ -307,7 +308,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
 }
 
 pub fn onCrumbClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PathCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PathCtx, user);
     const self = ctx.view;
     const tab = self.currentTab() orelse return;
     // Navigating rebuilds the bar, which destroys the button this
@@ -326,7 +327,7 @@ pub fn onCrumbClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onCrumbDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *PathCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PathCtx, user);
     const tab = ctx.view.currentTab() orelse return 0;
     return @intFromBool(dropValueIntoAction(ctx.view, tab, value, ctx.path, dnd.dropAction(target, tab)));
 }
@@ -334,7 +335,7 @@ pub fn onCrumbDrop(target: *c.GtkDropTarget, value: *c.GValue, _: f64, _: f64, u
 /// Ask the host for the dropdown's directory listing. The popover is
 /// built in feedSiblings when the reply lands.
 pub fn onSiblingArrow(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PathCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PathCtx, user);
     const self = ctx.view;
     const tab = self.currentTab() orelse return;
     if (tab.hc.state != .ready) {
@@ -453,7 +454,7 @@ fn popupAnchored(pop: *c.GtkWidget, anchor: *c.GtkWidget) void {
 }
 
 pub fn onSiblingActivated(list: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-crumb") orelse return;
     const ctx: *PathCtx = @ptrCast(@alignCast(data));
     var path_buf: [4200]u8 = undefined;
@@ -562,7 +563,7 @@ pub fn showHistoryMenu(self: *BrowserView, anchor: *c.GtkWidget, side: HistorySi
 }
 
 pub fn onHistoryActivated(list: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-history") orelse return;
     const ctx: *HistoryCtx = @ptrCast(@alignCast(data));
     const side = ctx.side;
@@ -598,7 +599,7 @@ pub fn installNavGestures(self: *BrowserView, tab: *BTab, widget: *c.GtkWidget) 
 }
 
 pub fn onSideButton(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     switch (c.gtk_gesture_single_get_current_button(@ptrCast(gesture))) {
         8 => tab.view.goBack(tab),
         9 => tab.view.goForward(tab),

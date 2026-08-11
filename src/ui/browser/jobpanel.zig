@@ -27,6 +27,7 @@ const cssutil = @import("../cssutil.zig");
 const copyZ = @import("../../filebrowser/format.zig").copyZN;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const jobs = @import("jobs.zig");
+const cast = @import("../../util/cast.zig");
 
 /// Panel refresh cadence while any row is active.
 const TICK_MS: c.guint = 500;
@@ -153,11 +154,6 @@ const Spark = struct {
         @memcpy(self.values[0..samples.len], samples);
         self.peak = sampler.peak();
     }
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *Spark = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 /// Segment-aware progress bar model, owned by its drawing area (freed
@@ -170,11 +166,6 @@ const BarData = struct {
     /// left off instead of lying with 0%.
     resumed: f64 = 0,
     kind: PaintKind = .accent,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *BarData = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 /// Aggregate progress ring on the ambient strip, same ownership rule.
@@ -183,11 +174,6 @@ const RingData = struct {
     fraction: f64 = 0,
     indeterminate: bool = false,
     kind: PaintKind = .accent,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *RingData = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 const PaintKind = enum(u8) { accent, ok, err, warn, dim };
@@ -1144,7 +1130,7 @@ pub const JobBtnCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(JobBtnCtx, user);
         if (ctx.service_token) |token| ctx.allocator.free(token);
         if (ctx.meter_token) |token| ctx.allocator.free(token);
         ctx.allocator.destroy(ctx);
@@ -1178,7 +1164,7 @@ pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ct
 }
 
 pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(JobBtnCtx, user);
     const self = ctx.view;
     if (ctx.kind == .expand) {
         // Expansion is view state, kept on the meter so it survives the
@@ -1635,7 +1621,7 @@ const CardMenuCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const ctx: *CardMenuCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(CardMenuCtx, user);
         ctx.allocator.free(ctx.src);
         ctx.allocator.free(ctx.dst);
         ctx.allocator.destroy(ctx);
@@ -1649,7 +1635,7 @@ const CardMenuItemCtx = struct {
     card: *c.GtkWidget,
 
     fn cleanup(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *CardMenuItemCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(CardMenuItemCtx, user);
         ctx.allocator.free(ctx.path);
         ctx.allocator.destroy(ctx);
     }
@@ -1674,7 +1660,7 @@ fn cardMenuItem(root: *classicmenu.Root, m: classicmenu.Menu, ctx: *const CardMe
 
 fn onCardMenu(gesture: ?*c.GtkGestureClick, _: c.gint, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = gesture;
-    const ctx: *CardMenuCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(CardMenuCtx, user);
     const root = classicmenu.Root.create(ctx.view.allocator) orelse return;
     const m = root.top();
     cardMenuItem(root, m, ctx, "Copy Source Path", ctx.src);
@@ -1781,7 +1767,7 @@ fn buildCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) 
         bar_data = self.allocator.create(BarData) catch null;
         if (bar_data) |data| {
             data.* = .{ .allocator = self.allocator };
-            c.gtk_drawing_area_set_draw_func(@ptrCast(bar), @ptrCast(&drawBar), @ptrCast(data), @ptrCast(&BarData.free));
+            c.gtk_drawing_area_set_draw_func(@ptrCast(bar), @ptrCast(&drawBar), @ptrCast(data), @ptrCast(cast.destroyCtx(BarData)));
         }
         c.gtk_box_append(@ptrCast(card), bar);
     }
@@ -1818,7 +1804,7 @@ fn buildCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) 
             if (spark_data) |data| {
                 data.* = .{ .allocator = self.allocator };
                 data.take(&meter.sampler);
-                c.gtk_drawing_area_set_draw_func(@ptrCast(spark), @ptrCast(&drawSpark), @ptrCast(data), @ptrCast(&Spark.free));
+                c.gtk_drawing_area_set_draw_func(@ptrCast(spark), @ptrCast(&drawSpark), @ptrCast(data), @ptrCast(cast.destroyCtx(Spark)));
             }
             c.gtk_box_append(@ptrCast(detail), spark);
         }
@@ -1857,7 +1843,7 @@ fn buildCard(self: *BrowserView, parent: *c.GtkWidget, row: Row, meter: *Meter) 
 }
 
 fn onStripClick(_: ?*c.GtkGestureClick, _: c.gint, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.jobs_panel.center_open = !self.jobs_panel.center_open;
     self.renderJobs();
 }
@@ -1876,7 +1862,7 @@ fn buildStrip(self: *BrowserView, parent: *c.GtkWidget, info: *const StripInfo) 
     const ring_data = self.allocator.create(RingData) catch null;
     if (ring_data) |data| {
         data.* = .{ .allocator = self.allocator };
-        c.gtk_drawing_area_set_draw_func(@ptrCast(ring), @ptrCast(&drawRing), @ptrCast(data), @ptrCast(&RingData.free));
+        c.gtk_drawing_area_set_draw_func(@ptrCast(ring), @ptrCast(&drawRing), @ptrCast(data), @ptrCast(cast.destroyCtx(RingData)));
     }
     c.gtk_box_append(@ptrCast(strip), ring);
 
@@ -1967,7 +1953,7 @@ const ScrollRestore = struct {
     panel: *Panel,
 
     fn destroy(user: ?*anyopaque) callconv(.c) void {
-        const self: *ScrollRestore = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(ScrollRestore, user);
         c.g_object_unref(@as(?*anyopaque, @ptrCast(self.adjustment)));
         self.allocator.destroy(self);
     }
@@ -2007,7 +1993,7 @@ fn restoreScroll(self: *BrowserView, scroller: *c.GtkWidget, state: ScrollState)
 }
 
 fn restoreScrollIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *ScrollRestore = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ScrollRestore, user);
     const adjustment = ctx.adjustment;
     const state = ctx.panel.scroll_state orelse return 0;
     c.gtk_adjustment_set_value(adjustment, scrollTarget(
@@ -2134,7 +2120,7 @@ fn armTick(self: *BrowserView, rows: []const Row) void {
 }
 
 fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.jobs_panel.in_tick = true;
     self.renderJobs();
     self.jobs_panel.in_tick = false;

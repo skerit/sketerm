@@ -18,6 +18,7 @@ const classicmenu = @import("classicmenu.zig");
 const cssutil = @import("../cssutil.zig");
 const ops = @import("ops.zig");
 const places_ui = @import("places.zig");
+const cast = @import("../../util/cast.zig");
 
 /// One top-level menu button's ctx (lives as long as the window).
 const BarCtx = struct {
@@ -27,11 +28,6 @@ const BarCtx = struct {
     which: Which,
 
     const Which = enum { file, edit, view, go, bookmarks, help };
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *BarCtx = @ptrCast(@alignCast(user.?));
-        ctx.allocator.destroy(ctx);
-    }
 };
 
 const BarState = struct {
@@ -40,11 +36,6 @@ const BarState = struct {
     active_button: ?*c.GtkWidget = null,
     active_popover: ?*c.GtkWidget = null,
     target_pane: ?*Pane = null,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *BarState = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 /// Build the menu bar row. `win` may still be mid-init: the pointer is
@@ -70,7 +61,7 @@ pub fn build(allocator: std.mem.Allocator, win: *Window, app_window: *c.GtkWidge
     installCss(bar);
     const state = allocator.create(BarState) catch return bar;
     state.* = .{ .allocator = allocator, .bar = bar };
-    c.g_object_set_data_full(@ptrCast(app_window), "sketerm-fb-menubar-state", @ptrCast(state), @ptrCast(&BarState.free));
+    c.g_object_set_data_full(@ptrCast(app_window), "sketerm-fb-menubar-state", @ptrCast(state), @ptrCast(cast.destroyCtx(BarState)));
     _ = c.g_signal_connect_data(bar, "destroy", @ptrCast(&onBarDestroyed), @ptrCast(state), null, c.G_CONNECT_DEFAULT);
     const entries = [_]struct { label: [*:0]const u8, which: BarCtx.Which }{
         .{ .label = "File", .which = .file },
@@ -87,7 +78,7 @@ pub fn build(allocator: std.mem.Allocator, win: *Window, app_window: *c.GtkWidge
         c.gtk_widget_add_css_class(btn, "flat");
         const ctx = allocator.create(BarCtx) catch continue;
         ctx.* = .{ .allocator = allocator, .win = win, .state = state, .which = e.which };
-        c.g_object_set_data_full(@ptrCast(btn), "sketerm-fb-menubar-ctx", @ptrCast(ctx), @ptrCast(&BarCtx.free));
+        c.g_object_set_data_full(@ptrCast(btn), "sketerm-fb-menubar-ctx", @ptrCast(ctx), @ptrCast(cast.destroyCtx(BarCtx)));
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onMenuButton), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), btn);
     }
@@ -182,14 +173,14 @@ const ItemCtx = struct {
     }
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *ItemCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(ItemCtx, user);
         if (ctx.spec.len > 0) ctx.allocator.free(ctx.spec);
         ctx.allocator.destroy(ctx);
     }
 };
 
 fn onMenuButton(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *BarCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(BarCtx, user);
     const button: *c.GtkWidget = @ptrCast(@alignCast(btn));
     if (ctx.state.active_button == button) {
         closeActive(ctx.state, true);
@@ -199,13 +190,13 @@ fn onMenuButton(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onBarMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const state: *BarState = @ptrCast(@alignCast(user.?));
+    const state = cast.userData(BarState, user);
     if (state.active_popover == null) return;
     switchAtPoint(state, .{ .x = @floatCast(x), .y = @floatCast(y) });
 }
 
 fn onPopoverMotion(controller: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const state: *BarState = @ptrCast(@alignCast(user.?));
+    const state = cast.userData(BarState, user);
     const pop = c.gtk_event_controller_get_widget(@ptrCast(controller)) orelse return;
     const bar = state.bar orelse return;
     var source = c.graphene_point_t{ .x = @floatCast(x), .y = @floatCast(y) };
@@ -229,7 +220,7 @@ fn switchAtPoint(state: *BarState, point: c.graphene_point_t) void {
 }
 
 fn onBarKey(_: *c.GtkEventControllerKey, keyval: c.guint, _: c.guint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const state: *BarState = @ptrCast(@alignCast(user.?));
+    const state = cast.userData(BarState, user);
     if (keyval == c.GDK_KEY_F10) {
         if (state.active_popover != null) {
             closeActive(state, true);
@@ -301,7 +292,7 @@ fn focusFirstItem(pop: *c.GtkWidget) void {
 }
 
 fn onMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
-    const state: *BarState = @ptrCast(@alignCast(user.?));
+    const state = cast.userData(BarState, user);
     const widget: *c.GtkWidget = @ptrCast(@alignCast(pop));
     if (state.active_popover != widget) return;
     if (state.active_button) |button| c.gtk_widget_unset_state_flags(button, c.GTK_STATE_FLAG_SELECTED);
@@ -311,7 +302,7 @@ fn onMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onBarDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-    const state: *BarState = @ptrCast(@alignCast(user.?));
+    const state = cast.userData(BarState, user);
     closeActive(state, true);
     state.bar = null;
 }
@@ -401,7 +392,7 @@ fn addCheck(root: *classicmenu.Root, m: classicmenu.Menu, a: std.mem.Allocator, 
 }
 
 fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ItemCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ItemCtx, user);
     const win = ctx.win;
     const target = targetBrowser(win, ctx.target_pane);
     const bv = target;

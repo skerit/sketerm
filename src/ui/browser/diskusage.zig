@@ -10,6 +10,7 @@ const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
 const WireJobEv = @import("types.zig").WireJobEv;
+const cast = @import("../../util/cast.zig");
 
 const STATE_QDATA = "sketerm-disk-usage-state";
 const ROW_QDATA = "sketerm-disk-usage-row";
@@ -70,7 +71,7 @@ pub const State = struct {
     hovered: ?usize = null,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *State = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(State, user);
         if (self.tab_alive and self.tab.usage == self) self.tab.usage = null;
         if (self.render_source != 0) _ = c.g_source_remove(self.render_source);
         self.children.deinit(self.allocator);
@@ -141,11 +142,6 @@ const RowCtx = struct {
     allocator: std.mem.Allocator,
     state: *State,
     index: usize,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const self: *RowCtx = @ptrCast(@alignCast(user.?));
-        self.allocator.destroy(self);
-    }
 };
 
 fn withinRoot(root: []const u8, path: []const u8) bool {
@@ -674,7 +670,7 @@ fn appendNodeRow(self: *State, index: usize, total: u64) void {
     c.gtk_box_append(@ptrCast(box), items);
     c.gtk_list_box_row_set_child(@ptrCast(row), box);
     c.gtk_widget_set_tooltip_text(row, zText(&name_z, node.path));
-    c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(ctx), @ptrCast(&RowCtx.free));
+    c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(ctx), @ptrCast(cast.destroyCtx(RowCtx)));
     c.gtk_list_box_append(self.listbox, row);
 }
 
@@ -717,26 +713,26 @@ fn appendOtherRow(self: *State, value: u64, total: u64, omitted: usize) void {
 }
 
 fn onRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     self.render_source = 0;
     self.render();
     return 0;
 }
 
 fn onFilesClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     const tab = self.tab;
     forget(tab);
     tab.view.renderTab(tab);
 }
 
 fn onUpClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     _ = self.goUp();
 }
 
 fn onCancelClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     if (!self.running or self.job == 0 or self.canceling) return;
     if (!self.tab.view.sendOpOk(self.hc, .{ .req = self.tab.view.nextReq(), .op = "job_cancel", .job = self.job })) return;
     self.canceling = true;
@@ -745,7 +741,7 @@ fn onCancelClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onRescanClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     if (self.running and !self.canceling) return;
     const root = self.allocator.dupe(u8, self.root) catch null;
     self.model.clear();
@@ -765,7 +761,7 @@ fn onRescanClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 fn onMetricToggled(button: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
     if (c.gtk_check_button_get_active(button) == 0) return;
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     self.metric = if (button == self.apparent_check) .apparent else .allocated;
     self.render();
 }
@@ -789,7 +785,7 @@ fn hitAt(self: *State, x: f64, y: f64) ?usize {
 }
 
 fn onChartPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     const id = hitAt(self, x, y) orelse return;
     if (id == OTHER_ID) return;
     const node = self.model.nodes.items[id];
@@ -797,7 +793,7 @@ fn onChartPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyop
 }
 
 fn onChartMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     const id = hitAt(self, x, y);
     if (id == self.hovered) return;
     self.hovered = id;
@@ -820,7 +816,7 @@ fn onChartMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaq
 }
 
 fn onChartLeave(_: *c.GtkEventControllerMotion, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     self.hovered = null;
     c.gtk_widget_set_tooltip_text(self.chart, null);
     c.gtk_widget_set_cursor_from_name(self.chart, "default");
@@ -838,7 +834,7 @@ const PALETTE = [_][3]f64{
 };
 
 fn drawChart(area: *c.GtkDrawingArea, cr: *c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
-    const self: *State = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(State, user);
     self.hits.clearRetainingCapacity();
     self.model.directChildren(self.current, self.metric, &self.children) catch return;
     const direct_count = @min(self.children.items.len, MAX_TILES - 1);

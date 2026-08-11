@@ -1209,7 +1209,7 @@ pub const Pane = struct {
     }
 
     fn onWrapperDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self: *Pane = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(Pane, user);
         self.widgets_dead = true;
     }
 

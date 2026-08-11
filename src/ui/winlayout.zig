@@ -18,9 +18,9 @@ const muxtabs = @import("muxtabs.zig");
 const picker = @import("picker.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 
-/// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
-/// `freePanedRatio`. Carries its own allocator so the GTK destroy-notify
-/// can free without needing a Window pointer.
+/// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap`,
+/// released by a `cast.destroyCtx(PanedRatioCtx)` notify. Carries its own
+/// allocator so that notify can free without needing a Window pointer.
 /// Live ratio tracker for a GtkPaned. `ratio` is updated whenever the
 /// user drags (via notify::position) and re-applied on every map (via
 /// the map signal). Tab switches unmap+remap the paged subtree; without
@@ -242,7 +242,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 "notify::position",
                 @ptrCast(&onPanedPositionChanged),
                 @ptrCast(ratio_holder),
-                @ptrCast(&freePanedRatio),
+                @ptrCast(cast.destroyCtx(PanedRatioCtx)),
                 c.G_CONNECT_DEFAULT,
             );
             _ = c.g_signal_connect_data(
@@ -921,11 +921,4 @@ pub fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
     ctx.setting = true;
     c.gtk_paned_set_position(@ptrCast(paned), pos);
     ctx.setting = false;
-}
-
-pub fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *PanedRatioCtx = @ptrCast(@alignCast(u));
-        ctx.allocator.destroy(ctx);
-    }
 }

@@ -15,6 +15,7 @@ const places_mod = @import("../../filebrowser/places.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const places_ui = @import("places.zig");
+const cast = @import("../../util/cast.zig");
 
 pub const Kind = enum {
     title,
@@ -234,7 +235,7 @@ pub fn resetRuns(self: *BrowserView) void {
 }
 
 fn onRefreshTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const run: *Run = @ptrCast(@alignCast(user.?));
+    const run = cast.userData(Run, user);
     if (!run.fetching) startFetch(run);
     return 1; // keep the interval armed
 }
@@ -258,7 +259,7 @@ fn startFetch(run: *Run) void {
 }
 
 fn onFetchDone(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const run: *Run = @ptrCast(@alignCast(user.?));
+    const run = cast.userData(Run, user);
     const sub: *c.GSubprocess = @ptrCast(@alignCast(source.?));
     defer c.g_object_unref(sub);
     var stdout_c: ?[*:0]u8 = null;
@@ -454,7 +455,7 @@ const GraphCtx = struct {
     samples: []f64,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const g: *GraphCtx = @ptrCast(@alignCast(user.?));
+        const g = cast.userData(GraphCtx, user);
         g.allocator.free(g.samples);
         g.allocator.destroy(g);
     }
@@ -512,7 +513,7 @@ fn trimZeros(buf: *[64:0]u8, txt: []u8) [*:0]const u8 {
 }
 
 fn drawGraph(area: *c.GtkDrawingArea, cr: *c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
-    const g: *GraphCtx = @ptrCast(@alignCast(user.?));
+    const g = cast.userData(GraphCtx, user);
     var color: c.GdkRGBA = undefined;
     c.gtk_widget_get_color(@ptrCast(area), &color);
     const w: f64 = @floatFromInt(width);
@@ -610,11 +611,6 @@ const FormCtx = struct {
     command_entry: *c.GtkWidget,
     path_entry: *c.GtkWidget,
     interval_spin: *c.GtkWidget,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *FormCtx = @ptrCast(@alignCast(user.?));
-        ctx.allocator.destroy(ctx);
-    }
 };
 
 const kind_labels = [_:null]?[*:0]const u8{ "Title", "Text", "Command output", "Image", "Graph (command)" };
@@ -694,7 +690,7 @@ pub fn openWidgetForm(self: *BrowserView, si: usize, wi: ?usize) void {
         .path_entry = path_entry,
         .interval_spin = interval_spin,
     };
-    c.g_object_set_data_full(@ptrCast(win), "sketerm-widget-form", @ptrCast(ctx), @ptrCast(&FormCtx.free));
+    c.g_object_set_data_full(@ptrCast(win), "sketerm-widget-form", @ptrCast(ctx), @ptrCast(cast.destroyCtx(FormCtx)));
     _ = c.g_signal_connect_data(cancel, "clicked", @ptrCast(&onFormCancel), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(save, "clicked", @ptrCast(&onFormSave), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
 
@@ -720,12 +716,12 @@ fn setEntryText(entry: *c.GtkWidget, text: []const u8) void {
 }
 
 fn onFormCancel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *FormCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(FormCtx, user);
     c.gtk_window_destroy(@ptrCast(ctx.window));
 }
 
 fn onFormSave(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *FormCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(FormCtx, user);
     const self = ctx.view;
     const a = self.allocator;
     if (ctx.section_index >= self.widgets.sections.items.len) {

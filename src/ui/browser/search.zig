@@ -30,6 +30,7 @@ const HostConn = @import("types.zig").HostConn;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const WireJobEv = @import("types.zig").WireJobEv;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const cast = @import("../../util/cast.zig");
 
 /// Duplicate finder: a host-side scan buckets files by SIZE, then
 /// same-size candidates are hash-confirmed with daemon hash jobs.
@@ -398,7 +399,7 @@ pub fn onPromoteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// The panelize preset menu: ready-made commands, dropped into the
 /// search bar so they stay editable before they run.
 pub fn onPresetClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const popover = c.gtk_popover_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
     c.gtk_widget_set_margin_start(box, 8);
@@ -441,7 +442,7 @@ pub fn onPresetClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// `rg -l TEXT` needs its TEXT replaced, and every preset is worth a
 /// look before it executes on the host.
 pub fn onPresetPicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const raw = c.g_object_get_data(@ptrCast(btn), "sketerm-preset") orelse return;
     const idx = @intFromPtr(raw) - 1;
     if (idx >= query.presets.len) return;
@@ -724,13 +725,13 @@ pub fn dupMaybeFinish(self: *BrowserView) void {
 }
 
 pub fn onSearchToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     const on = c.gtk_toggle_button_get_active(btn) != 0;
     c.gtk_widget_set_visible(self.search_bar, if (on) 1 else 0);
     if (on) _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.search_entry)));
 }
 
 pub fn onSearchActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(BrowserView, user);
     self.startSearch();
 }

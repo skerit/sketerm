@@ -480,14 +480,14 @@ fn probeThread(job: *ProbeJob) void {
 }
 
 fn probeIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *ProbeJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(ProbeJob, user);
     if (job.fence.viewIfAlive()) |view| view.onProbeDone(job);
     job.destroy();
     return 0;
 }
 
 fn ioIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *IoJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(IoJob, user);
     if (job.fence.viewIfAlive()) |view| view.onIoDone(job);
     job.destroy();
     return 0;
@@ -1329,7 +1329,7 @@ pub const EditorView = struct {
     }
 
     fn onParseTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(DlgCtx, user);
         defer ctx.destroy();
         if (ctx.resolve()) |r| {
             r.tab.parse_timer = 0;
@@ -1433,7 +1433,7 @@ pub const EditorView = struct {
         tab: *ETab,
 
         fn atLine(ctx: ?*anyopaque, line: usize) ?structure.FoldRegion {
-            const self: *FoldCtx = @ptrCast(@alignCast(ctx.?));
+            const self = cast.userData(FoldCtx, ctx);
             return self.view.foldRegionAtLine(self.tab, line);
         }
     };
@@ -2572,18 +2572,18 @@ pub const EditorView = struct {
     }
 
     fn hostCloseCb(ctx: ?*anyopaque, page: *c.GtkWidget) void {
-        const self: *EditorView = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(EditorView, ctx);
         const tab = self.findTabByPage(page) orelse return;
         self.requestCloseTab(tab);
     }
 
     fn hostNewCb(ctx: ?*anyopaque) void {
-        const self: *EditorView = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(EditorView, ctx);
         _ = self.newTab(null);
     }
 
     fn hostStripMenuCb(ctx: ?*anyopaque, x: f64, y: f64) void {
-        const self: *EditorView = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(EditorView, ctx);
         editormenu.showStripMenu(self, x, y);
     }
 
@@ -2606,7 +2606,7 @@ pub const EditorView = struct {
     }
 
     fn onSwitchPage(_: *c.GtkNotebook, page: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         if (self.widgets_dead) return;
         self.active = self.findTabByPage(page);
         self.updateBanner();
@@ -5056,7 +5056,7 @@ pub const EditorView = struct {
     }
 
     fn onSaveAsPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(DlgCtx, user);
         defer ctx.destroy();
         const r = ctx.resolve() orelse return;
         const res = result orelse {
@@ -5097,7 +5097,7 @@ pub const EditorView = struct {
     }
 
     fn onOpenPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
-        const ctx: *OpenCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(OpenCtx, user);
         defer {
             ctx.fence.unref();
             std.heap.c_allocator.destroy(ctx);
@@ -5154,7 +5154,7 @@ pub const EditorView = struct {
     }
 
     fn onImCommit(user: ?*anyopaque, text: []const u8) void {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         const tab = self.active orelse return;
         if (text.len == 0) return;
         // A symbol/results popup filters on typed characters instead of
@@ -5915,7 +5915,7 @@ pub const EditorView = struct {
     /// one) gates nothing — small documents re-parse synchronously on
     /// every edit, so staleness is a one-keystroke window.
     fn gateIsCode(ctx: ?*anyopaque, offset: usize) bool {
-        const tab: *ETab = @ptrCast(@alignCast(ctx.?));
+        const tab = cast.userData(ETab, ctx);
         const hl = tab.hl orelse return true;
         if (hl.isStale(&tab.doc)) return true;
         const kind = hl.kindAt(&tab.doc, offset) catch return true;
@@ -5983,7 +5983,7 @@ pub const EditorView = struct {
     }
 
     fn onGotoLineActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(DlgCtx, user);
         const r = ctx.resolve() orelse return;
         const raw = c.gtk_editable_get_text(@ptrCast(entry));
         if (raw != null) {
@@ -6227,7 +6227,7 @@ pub const EditorView = struct {
     // ---- mouse --------------------------------------------------------
 
     fn onClickPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         const tab = self.active orelse return;
         _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
         if (self.lsp) |m| m.cancelDwell();
@@ -6296,13 +6296,13 @@ pub const EditorView = struct {
     }
 
     fn onClickReleased(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         self.drag_anchor = null;
         self.block_anchor = null;
     }
 
     fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         // Dwell hover: this only RESTARTS a timer, it never issues a
         // request (editorlsp.onPointerMoved).
         if (self.lsp) |m| m.onPointerMoved(x, y);
@@ -6329,7 +6329,7 @@ pub const EditorView = struct {
     /// Wheel: vertical by 3 rows; horizontal (or Shift+wheel) pans when
     /// wrap is off.
     fn onScroll(ctl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *EditorView = @ptrCast(@alignCast(user.?));
+        const self = cast.userData(EditorView, user);
         const tab = self.active orelse return 0;
         if (self.lsp) |m| m.cancelDwell();
         const state = c.gtk_event_controller_get_current_event_state(@ptrCast(ctl));

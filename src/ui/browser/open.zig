@@ -20,6 +20,7 @@ const paths = @import("../../filebrowser/paths.zig");
 const platform = @import("../../util/platform.zig");
 const viewer_model = @import("../../viewer.zig");
 const views = @import("views.zig");
+const cast = @import("../../util/cast.zig");
 
 /// One remote open waiting for its host's FUSE mount to come up.
 pub const PendingOpen = struct {
@@ -89,7 +90,7 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
 }
 
 fn onMountReady(ctx: ?*anyopaque, mounted: bool) void {
-    const p: *PendingOpen = @ptrCast(@alignCast(ctx.?));
+    const p = cast.userData(PendingOpen, ctx);
     defer p.destroy();
     const self = p.view orelse return;
     for (self.pending_opens.items, 0..) |pending, i| {
@@ -237,7 +238,7 @@ const ManifestCleanup = struct {
 };
 
 fn cleanupViewerManifest(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const cleanup: *ManifestCleanup = @ptrCast(@alignCast(user.?));
+    const cleanup = cast.userData(ManifestCleanup, user);
     _ = c.unlink(cleanup.path.ptr);
     cleanup.allocator.free(cleanup.path);
     cleanup.allocator.destroy(cleanup);
@@ -448,7 +449,7 @@ pub const OpenWithCtx = struct {
     popover: *c.GtkWidget,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *OpenWithCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(OpenWithCtx, user);
         if (ctx.view.openwith == ctx) ctx.view.openwith = null;
         ctx.allocator.free(ctx.path);
         ctx.allocator.destroy(ctx);
@@ -471,7 +472,7 @@ pub const AppBtnCtx = struct {
 
     fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
         _ = closure;
-        const a: *AppBtnCtx = @ptrCast(@alignCast(user.?));
+        const a = cast.userData(AppBtnCtx, user);
         a.allocator.free(a.path);
         if (a.appid) |s| a.allocator.free(s);
         if (a.exec) |s| a.allocator.free(s);

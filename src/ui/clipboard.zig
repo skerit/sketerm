@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const Terminal = @import("../terminal.zig").Terminal;
+const cast = @import("../util/cast.zig");
 
 const DrainHandle = @import("../terminal.zig").DrainHandle;
 

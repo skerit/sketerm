@@ -23,6 +23,7 @@ const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const menuDone = @import("menu.zig").menuDone;
+const cast = @import("../../util/cast.zig");
 
 /// Recursive size probe: a daemon job so the walk happens on the
 /// host that owns the tree.
@@ -239,7 +240,7 @@ pub const PropsCtx = struct {
     syncing: bool = false,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
-        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(PropsCtx, user);
         forgetPropsWindow(ctx.allocator, ctx.window);
         ctx.allocator.free(ctx.path);
         ctx.allocator.destroy(ctx);
@@ -354,7 +355,7 @@ pub fn propsRow(box: *c.GtkWidget, label: []const u8, value: []const u8) void {
 }
 
 pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const old: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const old = cast.userData(MenuCtx, user);
     const old_path = old.path orelse return menuDone(old);
     const self = old.view;
     const tab = old.tab;
@@ -687,7 +688,7 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
 /// dispatch leaves the app without a focused toplevel, and the next
 /// context-menu popover then fails to appear.
 fn onPropsEscape(_: ?*c.GtkWidget, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     c.gtk_window_close(@ptrCast(ctx.window));
     return 1;
 }
@@ -730,7 +731,7 @@ pub const AttrRowCtx = struct {
     entry: *c.GtkWidget,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *AttrRowCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(AttrRowCtx, user);
         ctx.allocator.free(ctx.path);
         ctx.allocator.free(ctx.name);
         ctx.allocator.destroy(ctx);
@@ -800,7 +801,7 @@ pub fn feedAttrRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
 }
 
 pub fn onAttrRowSet(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *AttrRowCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(AttrRowCtx, user);
     const value = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry)))));
     const self = ctx.view;
     self.sendOp(ctx.hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = ctx.name, .to = value });
@@ -815,7 +816,7 @@ pub fn onAttrRowActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPropsAttrAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     const self = ctx.view;
     const name = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.attr_name_entry)))));
     const value = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.attr_value_entry)))));
@@ -830,13 +831,13 @@ pub fn onPropsAttrAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPropsChecksum(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     const hc = ctx.liveHost() orelse return;
     ctx.view.startProbe(.hash, hc, ctx.hash_label, "hash", ctx.path);
 }
 
 pub fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     const box = ctx.media_label orelse return;
     // media_meta takes a batch; one file is a batch of one, and it
     // goes through the SAME daemon-side extractor and host-side
@@ -846,19 +847,19 @@ pub fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPropsOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     if (ctx.liveHost() == null) return;
     ctx.view.openWithDialog(ctx.tab, ctx.path);
 }
 
 pub fn onPropsBitToggled(_: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     if (ctx.syncing) return;
     ctx.setOctal(ctx.modeFromChecks());
 }
 
 pub fn onPropsOctalChanged(entry: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     if (ctx.syncing) return;
     const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const mode = std.fmt.parseInt(u32, txt, 8) catch return;
@@ -867,7 +868,7 @@ pub fn onPropsOctalChanged(entry: *c.GtkEditable, user: ?*anyopaque) callconv(.c
 }
 
 pub fn onPropsCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     const self = ctx.view;
     const hc = ctx.liveHost() orelse return;
     if (hc.state != .ready) {
@@ -878,7 +879,7 @@ pub fn onPropsCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn onPropsApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PropsCtx, user);
     const self = ctx.view;
     const hc = ctx.liveHost() orelse return;
     if (hc.state != .ready) {
@@ -1117,7 +1118,7 @@ pub const SnapRowCtx = struct {
     mtime_ms: i64,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(SnapRowCtx, user);
         ctx.allocator.free(ctx.vpath);
         ctx.allocator.free(ctx.orig);
         ctx.allocator.destroy(ctx);
@@ -1147,7 +1148,7 @@ fn makeSnapRowCtx(self: *BrowserView, sr: *SnapRequest, vpath: []const u8, mtime
 /// Open the snapshot's copy read-only-in-effect: the snapshot subvol
 /// is mounted read-only, so opening the path directly is safe.
 pub fn onSnapOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SnapRowCtx, user);
     const self = ctx.view;
     if (ctx.hc.host != null and ctx.hc.state != .ready)
         return self.setStatusFmt("not connected to {s}", .{ctx.hc.label()});
@@ -1158,7 +1159,7 @@ pub fn onSnapOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// YYYY-MM-DD)" through the normal daemon copy job -- the original
 /// is never overwritten.
 pub fn onSnapRestore(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *SnapRowCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(SnapRowCtx, user);
     const self = ctx.view;
     if (ctx.hc.state != .ready)
         return self.setStatusFmt("not connected to {s}", .{ctx.hc.label()});

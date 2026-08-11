@@ -91,7 +91,7 @@ const DirCache = struct {
     }
 
     fn exists(ctx: ?*anyopaque, dir: []const u8, name: []const u8) bool {
-        const self: *DirCache = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(DirCache, ctx);
         const names = self.namesOf(dir) orelse return false;
         for (names) |n| {
             if (std.mem.eql(u8, n, name)) return true;
@@ -156,7 +156,7 @@ pub fn resolveProject(view: *EditorView, tab: *ETab) void {
 }
 
 fn projThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job: *ProjJob = @ptrCast(@alignCast(data.?));
+    const job = cast.userData(ProjJob, data);
     const loc = paths.parseSpec(job.spec);
     if (ev.connectFs(loc.host)) |fs_val| {
         var fs = fs_val;
@@ -176,7 +176,7 @@ fn projThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn projIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *ProjJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(ProjJob, user);
     defer job.destroy();
     const view = job.fence.viewIfAlive() orelse return 0;
     const tab = view.findTabByIdPublic(job.tab_id) orelse return 0;
@@ -213,7 +213,7 @@ const FixedRoot = struct {
     host: []const u8,
 
     fn exists(ctx: ?*anyopaque, dir: []const u8, name: []const u8) bool {
-        const self: *FixedRoot = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(FixedRoot, ctx);
         return std.mem.eql(u8, dir, self.root) and std.mem.eql(u8, name, self.marker);
     }
 };
@@ -278,7 +278,7 @@ pub fn refreshGit(view: *EditorView, tab: *ETab) void {
 }
 
 fn gitThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job: *GitJob = @ptrCast(@alignCast(data.?));
+    const job = cast.userData(GitJob, data);
     run: {
         const loc = paths.parseSpec(job.spec);
         var fs = ev.connectFs(loc.host) catch break :run;
@@ -310,7 +310,7 @@ fn drainJobEvents(fs: *fsdrive.Fs) void {
 }
 
 fn gitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *GitJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(GitJob, user);
     defer job.destroy();
     const view = job.fence.viewIfAlive() orelse return 0;
     const tab = view.findTabByIdPublic(job.tab_id) orelse return 0;
@@ -474,7 +474,7 @@ fn startSearchJob(view: *EditorView, mode: SearchMode) void {
 }
 
 fn searchThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job: *SearchJob = @ptrCast(@alignCast(data.?));
+    const job = cast.userData(SearchJob, data);
     run: {
         const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
         var fs = ev.connectFs(host) catch {
@@ -560,7 +560,7 @@ fn searchThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn searchIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *SearchJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(SearchJob, user);
     const view_opt = job.fence.viewIfAlive();
     if (view_opt == null or view_opt.?.search_gen != job.gen) {
         job.destroy();
@@ -984,7 +984,7 @@ fn applyReplace(view: *EditorView) void {
 }
 
 fn applyThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job: *ApplyJob = @ptrCast(@alignCast(data.?));
+    const job = cast.userData(ApplyJob, data);
     for (job.items) |it| {
         const loc = paths.parseSpec(it.spec);
         var fs = ev.connectFs(loc.host) catch {
@@ -1003,7 +1003,7 @@ fn applyThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
 }
 
 fn applyIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job: *ApplyJob = @ptrCast(@alignCast(user.?));
+    const job = cast.userData(ApplyJob, user);
     const ok = job.ok;
     const conflicts = job.conflicts;
     const failures = job.failures;

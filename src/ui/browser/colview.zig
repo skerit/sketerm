@@ -41,6 +41,7 @@ const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const copyZN = @import("../../filebrowser/format.zig").copyZN;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const tagColorHex = @import("../../filebrowser/format.zig").tagColorHex;
+const cast = @import("../../util/cast.zig");
 
 /// Width of the expander stand-in on rows that cannot expand.
 pub const EXPANDER_PX = 16;
@@ -330,7 +331,7 @@ const ColCtx = struct {
     ref: ColumnRef,
 
     fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-        const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+        const ctx = cast.userData(ColCtx, user);
         ctx.allocator.destroy(ctx);
     }
 };
@@ -420,7 +421,7 @@ fn onRowBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque)
 }
 
 fn onEmptyPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     if (pickItem(tab, x, y) != null or pickIsHeader(tab, x, y)) {
         tab.empty_press = null;
         return;
@@ -429,7 +430,7 @@ fn onEmptyPressed(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyop
 }
 
 fn onEmptyReleased(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const press = tab.empty_press orelse return;
     tab.empty_press = null;
     // A release that travelled is a rubber band (GTK's), not a click.
@@ -440,21 +441,21 @@ fn onEmptyReleased(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyo
 }
 
 fn onMiddleClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const p = pickItem(tab, x, y) orelse return;
     if (p.data.kind != .entry or !p.data.is_dir) return;
     @import("tabs.zig").openInNewTab(tab, p.data.path);
 }
 
 fn onActivate(_: *c.GtkColumnView, pos: c.guint, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     const d = itemDataAt(tab, pos) orelse return;
     if (d.kind != .entry) return;
     render_mod.activatePath(tab, d.path, d.is_dir);
 }
 
 fn onSelectionChanged(_: *c.GtkSelectionModel, _: c.guint, _: c.guint, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     if (tab.rendering) return;
     syncSelectedMirror(tab);
     tab.view.updatePreview();
@@ -581,7 +582,7 @@ fn alignHeaderIndicators(w: *c.GtkWidget) void {
 }
 
 fn onColumnWidthChanged(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const tab = ctx.tab;
     if (tab.col_syncing or tab.rendering) return;
     const width = c.gtk_column_view_column_get_fixed_width(@ptrCast(@alignCast(obj)));
@@ -597,7 +598,7 @@ fn onColumnWidthChanged(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) ca
 }
 
 fn onWidthSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     tab.width_save_src = 0;
     views.rememberFolder(tab.view, tab);
     return 0;
@@ -727,7 +728,7 @@ pub fn installWidthFit(tab: *BTab) void {
 }
 
 fn onViewportWidthChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     // Only an explicit Name width can ever need re-fitting; an auto
     // one is GTK's own leftover and already correct.
     if (tab.name_width <= 0 or tab.width_fit_src != 0) return;
@@ -738,7 +739,7 @@ fn onViewportWidthChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) ca
 /// a width feeds back into the adjustment, so the idle is one-shot and
 /// re-arms only when the target actually moved.
 fn onWidthFitTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     tab.width_fit_src = 0;
     if (tab.view.widgets_dead) return 0;
     tab.col_syncing = true;
@@ -777,7 +778,7 @@ fn applySortIndicator(tab: *BTab) void {
 /// A header click cycled GTK's column sorter; mirror it into the
 /// tab's sort state and re-render.
 fn onSorterChanged(sorter: *c.GtkSorter, _: c_int, user: ?*anyopaque) callconv(.c) void {
-    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    const tab = cast.userData(BTab, user);
     if (tab.col_syncing) return;
     // The sorter also fires while GTK tears the columnview down;
     // re-rendering then touches dead widgets, and re-applying a sort
@@ -829,15 +830,10 @@ const NameCell = struct {
     label: *c.GtkWidget,
     git: *c.GtkWidget,
     tag: *c.GtkWidget,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const nc: *NameCell = @ptrCast(@alignCast(user.?));
-        nc.allocator.destroy(nc);
-    }
 };
 
 fn onNameSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const cell: *c.GtkColumnViewCell = @ptrCast(@alignCast(obj));
     const root = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, render_mod.CELL_SPACING);
 
@@ -892,7 +888,7 @@ fn onNameSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaqu
         .git = git.?,
         .tag = tag.?,
     };
-    c.g_object_set_data_full(@ptrCast(@alignCast(root)), "sketerm-namecell", @ptrCast(nc), @ptrCast(&NameCell.free));
+    c.g_object_set_data_full(@ptrCast(@alignCast(root)), "sketerm-namecell", @ptrCast(nc), @ptrCast(cast.destroyCtx(NameCell)));
     c.g_object_set_data(@ptrCast(@alignCast(root)), "sketerm-cellobj", @ptrCast(cell));
 
     // Any part of the row drags the file (spec string; terminals
@@ -932,7 +928,7 @@ fn nameCellOf(root: *c.GtkWidget) ?*NameCell {
 
 fn onCellExpandClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     _ = btn;
-    const root: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const root = cast.userData(c.GtkWidget, user);
     const d: *ItemData = @ptrCast(@alignCast(c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item") orelse return));
     const tab = d.tab;
     if (d.kind == .group) {
@@ -947,14 +943,14 @@ fn onCellExpandClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
-    const root: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const root = cast.userData(c.GtkWidget, user);
     const d: *ItemData = @ptrCast(@alignCast(c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item") orelse return null));
     if (d.kind != .entry) return null;
     return dnd.provider(d.tab, d.path);
 }
 
 fn onNameBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const cell: *c.GtkColumnViewCell = @ptrCast(@alignCast(obj));
     const root = c.gtk_column_view_cell_get_child(cell) orelse return;
     const nc = nameCellOf(root) orelse return;
@@ -1111,7 +1107,7 @@ fn applyGitBadge(nc: *const NameCell, badge: ?gitstatus.Badge, tip: []const u8) 
 const GIT_CSS_CLASSES = [_][:0]const u8{ "dim-label", "warning", "success", "error", "accent" };
 
 fn onNameUnbind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const cell: *c.GtkColumnViewCell = @ptrCast(@alignCast(obj));
     const root = c.gtk_column_view_cell_get_child(cell) orelse return;
     if (c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item")) |dp| {
@@ -1159,7 +1155,7 @@ fn setEntryIcon(img: *c.GtkWidget, anchor: *c.GtkWidget, e: Entry, px: i32) void
 // ── data cells ───────────────────────────────────────────────────
 
 fn onCellSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const cell: *c.GtkColumnViewCell = @ptrCast(@alignCast(obj));
     const label = c.gtk_label_new("");
     c.gtk_widget_add_css_class(label, "sketerm-fb-cell");
@@ -1187,7 +1183,7 @@ fn onCellSetup(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaqu
 }
 
 fn onCellBind(_: *c.GtkSignalListItemFactory, obj: *c.GObject, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ColCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ColCtx, user);
     const cell: *c.GtkColumnViewCell = @ptrCast(@alignCast(obj));
     const label = c.gtk_column_view_cell_get_child(cell) orelse return;
     const d = itemPayload(c.gtk_column_view_cell_get_item(cell)) orelse return;
@@ -1605,7 +1601,7 @@ fn restoreScroll(tab: *BTab, value: f64) void {
 }
 
 fn scrollKeepIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *ScrollKeep = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ScrollKeep, user);
     c.gtk_adjustment_set_value(ctx.adj, ctx.value);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.adj)));
     ctx.allocator.destroy(ctx);

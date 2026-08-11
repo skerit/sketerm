@@ -25,6 +25,7 @@ const WireDelta = @import("types.zig").WireDelta;
 const WireReply = @import("types.zig").WireReply;
 const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
+const cast = @import("../../util/cast.zig");
 
 /// Heap context handed to the connect worker thread. The thread only
 /// touches this struct (its own allocator for the Conn); the idle
@@ -129,7 +130,7 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
 /// orphan/dead handling, because with no thread spawned yet nobody
 /// else will free this HostConn.
 fn onMintForConnect(user: ?*anyopaque, ticket: ?muxclient.UdpTicket) void {
-    const ctx: *ConnectCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ConnectCtx, user);
     const hc = ctx.hc;
     const allocator = ctx.allocator;
     if (hc.orphaned) {
@@ -217,7 +218,7 @@ fn upgradeReconnect(alloc: std.mem.Allocator, ctx: *ConnectCtx, conn: muxclient.
 }
 
 pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx: *ConnectCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ConnectCtx, user);
     const hc = ctx.hc;
     const allocator = ctx.allocator;
     defer {
@@ -397,7 +398,7 @@ pub fn clearReconnect(self: *BrowserView, host: ?[]const u8) void {
 }
 
 fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const r: *Reconnect = @ptrCast(@alignCast(user.?));
+    const r = cast.userData(Reconnect, user);
     const self = r.view;
     r.source = 0;
     if (self.widgets_dead) return 0;
@@ -688,7 +689,7 @@ fn dropReadWatch(hc: *HostConn) void {
 
 fn onFdWritable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
     _ = fd;
-    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const hc = cast.userData(HostConn, user);
     const self = hc.view;
     if (self.widgets_dead) {
         hc.write_watch_id = 0;
@@ -914,7 +915,7 @@ fn ensureDrainIdle(hc: *HostConn) void {
 }
 
 fn onDrainIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const hc = cast.userData(HostConn, user);
     const self = hc.view;
     if (self.widgets_dead or hc.state != .ready) {
         hc.drain_idle = 0;
@@ -935,7 +936,7 @@ fn onDrainIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 
 pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
     _ = fd;
-    const hc: *HostConn = @ptrCast(@alignCast(user.?));
+    const hc = cast.userData(HostConn, user);
     const self = hc.view;
     if (self.widgets_dead) {
         hc.watch_id = 0;
