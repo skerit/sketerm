@@ -211,6 +211,19 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
         }
         chosen = std.mem.span(want)["--ozone-platform=".len ..];
     }
+    // Subpixel (LCD) text AA. MEASURED on the software (headless-ozone)
+    // path: no effect — glyph pixels stay 100% neutral gray with the
+    // flag AND an opaque background_color (0 of 6793 ink pixels carried
+    // any color). Chromium's software OSR raster is grayscale-AA,
+    // period; that is the one residual sharpness difference against a
+    // subpixel-AA Firefox. The flag is kept because GPU rasterization
+    // (ozone wayland) takes a different text path where it may enable
+    // subpixel AA; harmless where it does nothing, and the background
+    // is opaque either way.
+    if (n < buf.len) {
+        buf[n] = @constCast(@ptrCast("--enable-lcd-text"));
+        n += 1;
+    }
     // Only a real ozone platform ever produces a GPU process here, and
     // only wayland was measured to deliver shared textures.
     cefhost.setAccelerated(std.mem.eql(u8, chosen.?, "wayland"));

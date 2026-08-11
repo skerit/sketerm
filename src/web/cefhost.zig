@@ -2464,6 +2464,11 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
     settings.size = @sizeOf(cef.cef_settings_t);
     settings.no_sandbox = 1;
     settings.windowless_rendering_enabled = 1;
+    // Opaque background: a windowless browser defaults to transparent,
+    // and Chromium disables LCD (subpixel) text AA on any surface that
+    // MIGHT be transparent. Opaque is also what the face paints (it
+    // composites over white).
+    settings.background_color = 0xffffffff;
     settings.log_severity = cef.LOGSEVERITY_WARNING;
     setStr(cache_dir, &settings.root_cache_path);
     setStr(log_file, &settings.log_file);
