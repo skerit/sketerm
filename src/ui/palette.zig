@@ -125,6 +125,8 @@ const ENTRIES = [_]Entry{
        .desc = "Open the browser engine's inspector for this web pane, in a split beside it. No remote debugging port is opened.", .action = .web_devtools },
     .{ .icon = "document-print-symbolic", .title = "Print Web Page to PDF…",
        .desc = "Save this web pane's page as a PDF file; the browser engine renders it.", .action = .web_print_pdf },
+    .{ .icon = "dialog-password-symbolic", .title = "Fill Password (Web Pane)…",
+       .desc = "Pick a login saved in your keyring for this page's site and type it in as username, Tab, password. Focus the username field first; nothing is ever saved back.", .action = .web_fill_password },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",

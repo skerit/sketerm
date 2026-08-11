@@ -1376,7 +1376,7 @@ pub const Window = struct {
     /// A palette verb that only means something on a pane wearing the
     /// WEB face. A pane without one is told so, rather than left
     /// wondering why the action did nothing.
-    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf }) void {
+    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf, fill_password }) void {
         const pane = self.focusedPane() orelse return;
         const face = @import("webface.zig").WebFace.fromPane(pane) orelse {
             showToast(self, "This pane has no web page. Use New Web Tab.");
@@ -1385,6 +1385,7 @@ pub const Window = struct {
         switch (what) {
             .devtools => face.openDevTools(),
             .print_pdf => face.printToPdf(),
+            .fill_password => face.fillPassword(),
         }
     }
 
@@ -3589,6 +3590,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .web_discard_background => self.discardBackgroundWebTabs(),
         .web_devtools => self.webFaceAction(.devtools),
         .web_print_pdf => self.webFaceAction(.print_pdf),
+        .web_fill_password => self.webFaceAction(.fill_password),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather
