@@ -1925,6 +1925,9 @@ pub const EditorView = struct {
     /// which a headless/unfocused toplevel may never deliver.
     pub fn focusFace(self: *EditorView) void {
         if (self.widgets_dead) return;
+        // Raising the face re-asserts its title on the pane titlebar
+        // (the flip cleared whatever the previous face had put there).
+        self.applyPaneFaceTitle();
         self.syncBackButton();
         _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
         self.checkDisk();
@@ -2490,6 +2493,7 @@ pub const EditorView = struct {
         if (self.widgets_dead) return;
         self.active = self.findTabByPage(page);
         self.updateBanner();
+        self.applyPaneFaceTitle();
         if (self.active) |tab| {
             editorproj.onTabActivated(self, tab);
             editoroutline.refresh(self, tab, true);
@@ -2562,6 +2566,7 @@ pub const EditorView = struct {
             if (self.tabs.items.len == 0) {
                 if (self.pane) |p| p.setEditorVisible(false);
             }
+            self.applyPaneFaceTitle();
             self.updateStatus();
             self.queueRender();
         }
@@ -3807,10 +3812,26 @@ pub const EditorView = struct {
 
     // ---- shared post-edit refresh ------------------------------------
 
+    /// Feed the pane's inner titlebar the active document's name
+    /// (with a dirty marker) while the editor face is the one showing.
+    fn applyPaneFaceTitle(self: *EditorView) void {
+        const pane = self.pane orelse return;
+        if (!pane.editorFaceVisible()) return;
+        const tab = self.active orelse return;
+        const name = tab.title();
+        var buf: [300]u8 = undefined;
+        const txt = if (tab.isDirty())
+            std.fmt.bufPrint(&buf, "{s} *", .{name}) catch name
+        else
+            name;
+        pane.setFaceTitle(txt);
+    }
+
     fn refresh(self: *EditorView, tab: *ETab) void {
         if (self.widgets_dead) return;
         tab.handle.setTitle(tab.title());
         tab.handle.setDirty(tab.isDirty());
+        if (tab == self.active) self.applyPaneFaceTitle();
         self.noteActivity();
         self.ensureCaretVisible(tab);
         self.updateStatus();

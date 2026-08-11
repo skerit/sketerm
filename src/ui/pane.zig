@@ -267,6 +267,11 @@ pub const Pane = struct {
     title_locked: bool = false,
     /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
     titlebar_text: ?[]u8 = null,
+    /// Title provided by the visible non-terminal face (web page
+    /// title, browser directory, editor document). Shown while such
+    /// a face covers the terminal; the OSC/manual title returns when
+    /// the terminal face shows again. Owned; freed in deinit.
+    face_title: ?[]u8 = null,
 
     /// Optional group name. When the Window's groupsend mode is `.group`,
     /// keystrokes typed in any pane with the same group name are
@@ -716,6 +721,7 @@ pub const Pane = struct {
         if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
+        if (self.face_title) |t| self.allocator.free(t);
         self.freeSpawnArgv();
         self.allocator.destroy(self);
     }
@@ -805,6 +811,9 @@ pub const Pane = struct {
     pub fn setBrowserVisible(self: *Pane, show: bool) void {
         const bw = self.browser_widget orelse return;
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
+        // The face title belongs to whichever face is raised: drop it
+        // on every flip; the focus callback below re-asserts it.
+        self.clearFaceTitle();
         if (show) {
             // Faces are exclusive: raising the browser hides an
             // editor, panel or web face too.
@@ -863,6 +872,7 @@ pub const Pane = struct {
         self.browser_widget = null;
         // No browser face left to return to.
         self.editor_prev_face = .terminal;
+        self.clearFaceTitle();
         if (ctx) |browser_ctx| {
             if (prepare_destroy_cb) |cb| cb(browser_ctx);
         }
@@ -928,6 +938,9 @@ pub const Pane = struct {
                 self.editor_prev_face = .terminal;
         }
         c.gtk_widget_set_visible(ew, if (show) @as(c_int, 1) else 0);
+        // Face title follows the raised face; the focus callback (or
+        // setBrowserVisible below) re-asserts the new face's title.
+        self.clearFaceTitle();
         if (!show and self.editor_prev_face == .browser and self.hasBrowserFace()) {
             // setBrowserVisible owns the rest: offload widget, banner
             // and focus.
@@ -985,6 +998,7 @@ pub const Pane = struct {
         self.editor_focus = null;
         self.editor_widget = null;
         self.editor_prev_face = .terminal;
+        self.clearFaceTitle();
         if (ctx) |editor_ctx| {
             if (prepare_destroy_cb) |cb| cb(editor_ctx, self.widgets_dead);
         }
@@ -1040,6 +1054,9 @@ pub const Pane = struct {
     pub fn setPanelVisible(self: *Pane, show: bool) void {
         const pw = self.panel_widget orelse return;
         c.gtk_widget_set_visible(pw, if (show) @as(c_int, 1) else 0);
+        // The panel face carries no title of its own; drop any other
+        // face's leftover so the OSC title shows underneath.
+        self.clearFaceTitle();
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
             if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
@@ -1083,6 +1100,7 @@ pub const Pane = struct {
         self.panel_deinit = null;
         self.panel_focus = null;
         self.panel_widget = null;
+        self.clearFaceTitle();
         if (ctx) |panel_ctx| {
             if (prepare_destroy_cb) |cb| cb(panel_ctx, self.widgets_dead);
         }
@@ -1127,6 +1145,9 @@ pub const Pane = struct {
     pub fn setWebVisible(self: *Pane, show: bool) void {
         const ww = self.web_widget orelse return;
         c.gtk_widget_set_visible(ww, if (show) @as(c_int, 1) else 0);
+        // Face title follows the raised face; the focus callback
+        // re-asserts the web face's page title.
+        self.clearFaceTitle();
         if (show) {
             if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
             if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
@@ -1162,6 +1183,7 @@ pub const Pane = struct {
         self.web_deinit = null;
         self.web_focus = null;
         self.web_widget = null;
+        self.clearFaceTitle();
         if (ctx) |web_ctx| {
             if (prepare_destroy_cb) |cb| cb(web_ctx, self.widgets_dead);
         }
@@ -1347,28 +1369,79 @@ pub const Pane = struct {
             self.allocator.free(old);
         }
         self.titlebar_text = self.allocator.dupe(u8, text) catch null;
+        // Screen readers announce the pane by its accessible label:
+        // keep it tracking the terminal title (OSC 0/1/2).
+        if (!platform.is_macos and !self.widgets_dead and text.len > 0) {
+            if (self.allocator.allocSentinel(u8, text.len, 0) catch null) |z| {
+                defer self.allocator.free(z);
+                @memcpy(z, text);
+                a11y.setLabel(@ptrCast(self.surface.area), z.ptr);
+            }
+        }
+        self.refreshTitlebarLabel();
+    }
+
+    /// Title from the visible non-terminal face (web page, browser
+    /// directory, editor document). Displayed only while such a face
+    /// covers the terminal, and never over a user-locked title.
+    pub fn setFaceTitle(self: *Pane, text: []const u8) void {
+        if (self.face_title) |old| {
+            if (std.mem.eql(u8, old, text)) return;
+            self.allocator.free(old);
+        }
+        self.face_title = self.allocator.dupe(u8, text) catch null;
+        self.refreshTitlebarLabel();
+    }
+
+    /// Drop the face-provided title; the OSC/manual title returns.
+    pub fn clearFaceTitle(self: *Pane) void {
+        const old = self.face_title orelse return;
+        self.allocator.free(old);
+        self.face_title = null;
+        self.refreshTitlebarLabel();
+    }
+
+    /// True while a non-terminal face covers the terminal face.
+    fn faceCoversTerminal(self: *Pane) bool {
+        return self.browserFaceVisible() or self.editorFaceVisible() or
+            self.panelFaceVisible() or self.webFaceVisible();
+    }
+
+    /// Recompute the titlebar label from the precedence chain:
+    /// manual lock > visible face title > OSC title.
+    fn refreshTitlebarLabel(self: *Pane) void {
+        if (self.widgets_dead) return;
+        const lbl = self.titlebar_label orelse return;
+        const text: []const u8 = pick: {
+            if (!self.title_locked) {
+                if (self.face_title) |ft| {
+                    if (self.faceCoversTerminal()) break :pick ft;
+                }
+            }
+            break :pick self.titlebar_text orelse "Terminal";
+        };
         const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
         defer self.allocator.free(z);
         @memcpy(z, text);
-        // Screen readers announce the pane by its accessible label:
-        // keep it tracking the terminal title (OSC 0/1/2).
-        if (!platform.is_macos and !self.widgets_dead and text.len > 0)
-            a11y.setLabel(@ptrCast(self.surface.area), z.ptr);
-        const lbl = self.titlebar_label orelse return;
         c.gtk_label_set_text(lbl, z.ptr);
     }
 
     /// Lock the title bar to a manual string. Subsequent OSC 0/1/2
     /// updates are dropped until `unlockTitle` is called.
     pub fn lockTitle(self: *Pane, text: []const u8) void {
-        self.applyTitle(text);
+        // Locked BEFORE applying so the refresh inside applyTitle
+        // already prefers the manual string over any face title.
         self.title_locked = true;
+        self.applyTitle(text);
+        self.refreshTitlebarLabel();
     }
 
     /// Resume tracking incoming OSC 0/1/2 titles. The current label
-    /// stays as-is until the next OSC update arrives.
+    /// stays as-is until the next OSC update arrives -- unless a face
+    /// title is waiting behind the lock, which shows immediately.
     pub fn unlockTitle(self: *Pane) void {
         self.title_locked = false;
+        self.refreshTitlebarLabel();
     }
 
     /// Show / hide the per-pane title bar.

@@ -1138,6 +1138,9 @@ pub const WebFace = struct {
     fn focusCb(ctx: *anyopaque) void {
         const self: *WebFace = @ptrCast(@alignCast(ctx));
         if (self.widgets_dead) return;
+        // Raising the face re-asserts its title on the pane titlebar
+        // (the flip cleared whatever the previous face had put there).
+        self.applyPaneFaceTitle();
         if (self.url == null and self.pending_url == null) {
             _ = c.gtk_widget_grab_focus(self.entry);
             return;
@@ -2238,6 +2241,17 @@ pub const WebFace = struct {
         if (self.title) |t| self.allocator.free(t);
         self.title = self.allocator.dupe(u8, title) catch null;
         self.applyTabTitle();
+        self.applyPaneFaceTitle();
+    }
+
+    /// The pane's inner titlebar wears the page title too, but only
+    /// while THIS face is the one showing -- a background face must
+    /// not overwrite the visible face's title.
+    fn applyPaneFaceTitle(self: *WebFace) void {
+        const pane = self.pane orelse return;
+        if (!pane.webFaceVisible()) return;
+        const title = self.title orelse return;
+        pane.setFaceTitle(title);
     }
 
     /// The pane's tab wears the page title while a web face is on it.

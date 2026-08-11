@@ -535,6 +535,23 @@ pub fn updateTabLabel(self: *BrowserView, tab: *BTab) void {
     c.gtk_label_set_text(tab.tab_label, txt.ptr);
 }
 
+/// Feed the pane's inner titlebar the current directory's display
+/// name (same text as the inner tab label) while the browser face
+/// is the one showing.
+pub fn applyPaneFaceTitle(self: *BrowserView) void {
+    const pane = self.pane orelse return;
+    if (!pane.browserFaceVisible()) return;
+    const tab = self.currentTab() orelse return;
+    const base = std.fs.path.basename(tab.root.path);
+    const name = if (base.len == 0) "/" else base;
+    var buf: [160]u8 = undefined;
+    const txt = if (tab.hc.host) |h|
+        std.fmt.bufPrint(&buf, "{s}: {s}", .{ h, name }) catch name
+    else
+        name;
+    pane.setFaceTitle(txt);
+}
+
 pub fn syncPathEntry(self: *BrowserView, tab: *BTab) void {
     if (self.currentTab() != tab) return;
     var buf: [4200]u8 = undefined;
@@ -560,6 +577,9 @@ pub fn syncPathEntry(self: *BrowserView, tab: *BTab) void {
     self.rebuildCrumbs(tab);
     c.gtk_widget_set_sensitive(self.back_button, @intFromBool(tab.back.items.len > 0));
     c.gtk_widget_set_sensitive(self.fwd_button, @intFromBool(tab.fwd.items.len > 0));
+    // Every committed navigation (and inner-tab switch) lands here for
+    // the current tab: keep the pane's titlebar on the directory name.
+    self.applyPaneFaceTitle();
 }
 
 pub fn setStatus(self: *BrowserView, msg: []const u8) void {

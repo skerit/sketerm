@@ -468,6 +468,7 @@ pub const BrowserView = struct {
     pub const goUp = @import("nav.zig").goUp;
     pub const toggleExpand = @import("nav.zig").toggleExpand;
     pub const updateTabLabel = @import("nav.zig").updateTabLabel;
+    pub const applyPaneFaceTitle = @import("nav.zig").applyPaneFaceTitle;
     pub const syncPathEntry = @import("nav.zig").syncPathEntry;
     pub const setStatus = @import("nav.zig").setStatus;
     pub const setStatusFmt = @import("nav.zig").setStatusFmt;
@@ -1025,6 +1026,9 @@ pub const BrowserView = struct {
 
     fn focusCb(ctx: *anyopaque) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
+        // Raising the face re-asserts its title on the pane titlebar
+        // (the flip cleared whatever the previous face had put there).
+        self.applyPaneFaceTitle();
         self.focusListing();
     }
 
