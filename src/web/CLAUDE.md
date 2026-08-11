@@ -92,6 +92,45 @@ but measurably does NOT reach an alloy windowless browser. smoke-web
 stage 22c is the guard, and every other stage styles its own
 background, which is why this survived so long.
 
+## DevTools cannot be an OSR view on CEF 151 (measured)
+
+`devtools_show` (0xA2) asks for the inspector as ANOTHER windowless
+view — same window info as `createViewAt`, our own client, its own view
+id — so it would paint, resize and close through the frames every view
+already uses, and **no debugging port is ever opened**. That is the
+design, and the helper still takes that path first.
+
+CEF refuses it. MEASURED 2026-08-11 on CEF 151.3.16 (the Arch `cef`
+package AND the pinned upstream tarball, identically):
+`show_dev_tools` with `windowless_rendering_enabled = 1` logs
+`Windowless rendering is not supported for this DevTools window` from
+`chrome_browser_delegate.cc` and creates an ORDINARY WINDOWED DevTools
+browser instead — `is_window_rendering_disabled()` on the browser that
+arrives in `on_after_created` answers 0. `runtime_style` is already
+`ALLOY` (what `SetAsWindowless` sets) and the inspected browser is
+itself windowless, so there is nothing left in the window info to
+change. Do not "fix" this by adding `--remote-debugging-port`.
+
+So `adoptBrowser` checks the browser it is handed and, when the engine
+went windowed, keeps the view **without a frame buffer** purely to own
+the browser, and answers `ev_devtools_view` with `devtools = 0, reason
+= "windowed"`. Two consequences that are load-bearing:
+
+- The view must STAY in the table. Releasing our reference and
+  forgetting the browser leaves it open at `cef_shutdown`, which kills
+  the helper on a signal (smoke-web stage 23 caught exactly that).
+- A second `devtools_show` for the same page must be ANSWERED. CEF only
+  FOCUSES an already-open inspector and creates no browser, so
+  `on_after_created` never fires again; the helper answers from
+  `has_dev_tools()`/the tracked view instead, and an engine that
+  promises a browser and never delivers one is answered by the
+  `adopt_timeout_ms` arm of `Host.watchdog`. Every path answers exactly
+  once — a GUI blocks a menu item on that reply.
+
+`print_pdf` (0xA4) has no such caveat: `print_to_pdf` writes the file
+and the completion callback is correlated BY PATH, because CEF's
+callback carries no request id.
+
 ## Presentation belongs to GTK, not to us
 
 Frames are `GdkTexture`s on a `GtkPicture` (`webface.zig`). **Never
