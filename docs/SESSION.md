@@ -16506,3 +16506,50 @@ Verification: `zig build`, `mux`, `mux-portable` green; full
 Omnibox dropdown behavior is compile+trace verified (no CEF display
 rig in this session); the merger/scoring/encoding/config paths are
 unit-tested.
+## 2026-08-12: tree-style tabs for the whole suite
+
+One tab system for ALL of sketerm (the proposal's decision): a
+window-level tab TREE — not browser-private — with the TST clone as
+the behavioral spec (behaviors ported, no code).
+
+- `src/ui/tabforest.zig`: toolkit-free `Forest(Ref)` model, sibling of
+  `ui/tree.zig`'s PaneTree discipline (model first, widgets are a
+  view). Parent/child + collapse per node; promote-on-remove splices
+  children into the removed node's position; reparent moves whole
+  subtrees and rejects cycles; visible-flatten / wrap-around stepping;
+  `validate()` for the verifier. Unit-tested on `Forest(u32)`.
+- `Window.tab_forest` (`TabForest = Forest(*AdwTabPage)`) is kept in
+  sync inside the page-attached / page-detached handlers: a page
+  entering the view gets a node (child of a pending opener, else
+  root); a page leaving has its children PROMOTED — so cross-window
+  drags move one page and its children stay behind, and the model can
+  never diverge from the page set. `verifyTabForest`
+  (SKETERM_VERIFY_TREE=1) aborts if it ever does.
+- Vertical sidebar `src/ui/tabsidebar.zig` (GtkListBox in the content
+  hbox): rows in visible tree order, indent by depth, expander on
+  parents, close button, middle-click close; row drag reparents the
+  subtree (drop on a row = child of it, drop on empty space = root).
+  Selecting a hidden page (Ctrl+Tab, goto_tab_N) auto-expands its
+  ancestors. The strip stays: collapsed subtrees just hide from it
+  (`TabBar.refreshHidden` + a Window-supplied predicate).
+- Opener nesting: web popups, hint-modifier opens and
+  open-link-in-new-tab go through `newWebTabFrom(url, opener_page)`;
+  collapsing a subtree also discards its hidden web panes'
+  renderers (`WebFace.discardNow`, the tab-unloading synergy).
+- Close policy: every accept branch of the close-page gate funnels
+  through `acceptTabClose`; `tab_close_parent = close-subtree` sweeps
+  the descendants (captured before the forest promotes them),
+  reentrancy-guarded so each child still gets its dirty-editor veto.
+- Config: `show_tab_sidebar`, `tab_close_parent`, `tab_child_insert`.
+  Actions: toggle_tab_sidebar, tab_collapse, tab_expand,
+  tab_tree_next/prev (visible TREE order). Layout: append-only
+  `tree_parent` + `collapsed` on TabSpec; old files load flat;
+  restore rebuilds nesting after all tabs exist.
+
+Verification: `zig build` green; new model/layout/config tests pass in
+the full suite (2267 passed, 0 failed when the test binary runs
+directly — the `zig build test` RUNNER failure reproduces identically
+on the clean base). smoke-e2e (with SKETERM_VERIFY_TREE=1, now
+including the forest check) progresses exactly as far as the base
+does: the copy-mode-yank stage fails on the base too (deep worktree
+path wraps the prompt). Sidebar interaction is compile+trace verified.
