@@ -204,6 +204,13 @@ pub const Pane = struct {
     editor_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     editor_deinit: ?*const fn (*anyopaque) void = null,
     editor_focus: ?*const fn (*anyopaque) void = null,
+    /// Font-zoom hook for the editor face: font_inc/font_dec/
+    /// font_reset (and Ctrl+wheel routed via Window) land here while
+    /// that face is visible. delta is in points; reset=true returns to
+    /// the prefs-resolved size and wins over delta. Set by the face
+    /// AFTER attachEditor (not part of the shared five-pointer
+    /// contract); cleared by detachEditor.
+    editor_zoom: ?*const fn (*anyopaque, delta: i32, reset: bool) void = null,
     /// Which face the editor displaced when it was last raised, so
     /// hiding it again returns there instead of always falling through
     /// to the terminal ("Edit in Sketerm Editor" from the browser's
@@ -616,6 +623,23 @@ pub const Pane = struct {
         return self.editorFaceVisible() or self.browserFaceVisible() or self.webFaceVisible();
     }
 
+    /// Route a font-zoom request (font_inc/font_dec/font_reset) to the
+    /// VISIBLE face. The single dispatch point for per-face zoom — the
+    /// browser/web faces join here when they grow a zoom hook.
+    /// @return true when a non-terminal face consumed it, so the caller
+    /// must leave the terminal surface's font size alone.
+    pub fn faceZoom(self: *Pane, delta: i32, reset: bool) bool {
+        if (self.editorFaceVisible()) {
+            if (self.editor_zoom) |zoom| {
+                if (self.editor_ctx) |ctx| {
+                    zoom(ctx, delta, reset);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
     /// Pane.cursor_hidden without input.zig importing pane.zig.
     fn setCursorHiddenSink(ctx: ?*anyopaque, hidden: bool) void {
@@ -981,6 +1005,7 @@ pub const Pane = struct {
         self.editor_prepare_destroy = null;
         self.editor_deinit = null;
         self.editor_focus = null;
+        self.editor_zoom = null;
         self.editor_widget = null;
         self.editor_prev_face = .terminal;
         self.clearFaceTitle();

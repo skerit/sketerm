@@ -1079,6 +1079,7 @@ pub const EditorView = struct {
 
         self.buildUi();
         pane.attachEditor(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
+        pane.editor_zoom = zoomCb;
         // The face is in the widget tree now, so ownerWindow() (and
         // therefore the config) resolves.
         self.syncConfig();
@@ -1777,6 +1778,44 @@ pub const EditorView = struct {
             t.layout.invalidateAll();
             t.rows_lines = 0; // row heights changed: re-estimate
         }
+    }
+
+    /// Apply a new font size through the same machinery syncConfig
+    /// uses for a prefs font change: atlas rebuild (which invalidates
+    /// every layout + row estimate), wrap re-measure, redraw.
+    pub fn setFontSize(self: *EditorView, size: u16) void {
+        const clamped: u16 = @intCast(std.math.clamp(@as(i32, size), 6, 72));
+        if (clamped == self.font_size) return;
+        self.font_size = clamped;
+        self.rebuildAtlas();
+        for (self.tabs.items) |t| self.applyWrapWidth(t);
+        if (self.active) |t| self.ensureCaretVisible(t);
+        self.queueRender();
+    }
+
+    /// The prefs-resolved font size (same resolution syncConfig uses:
+    /// the editor key wins, else the profile's terminal size). This is
+    /// what font_reset returns to.
+    fn configuredFontSize(self: *EditorView) u16 {
+        const cfg: *const Config = if (self.ownerWindow()) |win|
+            &win.config
+        else
+            self.standalone_config orelse return self.font_size;
+        const prof = if (self.pane) |p| p.active_profile orelse "" else "";
+        const s = cfg.profileSettings(prof);
+        return if (s.editor_font_size > 0) s.editor_font_size else s.font_size;
+    }
+
+    /// Pane face-zoom hook (font_inc/font_dec/font_reset while this
+    /// face is visible). reset wins over delta.
+    fn zoomCb(ctx: *anyopaque, delta: i32, reset: bool) void {
+        const self: *EditorView = @ptrCast(@alignCast(ctx));
+        if (reset) {
+            self.setFontSize(self.configuredFontSize());
+            return;
+        }
+        const new = std.math.clamp(@as(i32, @intCast(self.font_size)) + delta, 6, 72);
+        self.setFontSize(@intCast(new));
     }
 
     /// Restore an editor face from persisted layout state.

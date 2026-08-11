@@ -2639,6 +2639,9 @@ pub const Window = struct {
     /// Ctrl+- / Ctrl+= / Ctrl+0.
     pub fn adjustFocusedFontSize(self: *Window, delta: i32) void {
         const pane = self.focusedPane() orelse return;
+        // A visible non-terminal face owns the zoom; resizing the
+        // hidden terminal behind it would be invisible and surprising.
+        if (pane.faceZoom(delta, false)) return;
         const new: i32 = @as(i32, @intCast(pane.surface.font_size)) + delta;
         const clamped: u16 = @intCast(std.math.clamp(new, 6, 72));
         if (clamped == pane.surface.font_size) return;
@@ -2647,6 +2650,7 @@ pub const Window = struct {
 
     pub fn resetFocusedFontSize(self: *Window) void {
         const pane = self.focusedPane() orelse return;
+        if (pane.faceZoom(0, true)) return;
         const base = self.config.profileSettings(pane.active_profile orelse "").font_size;
         if (pane.surface.font_size == base) return;
         pane.setFontSize(base);
