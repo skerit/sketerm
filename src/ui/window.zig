@@ -3764,6 +3764,11 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .web_devtools => self.webFaceAction(.devtools),
         .web_print_pdf => self.webFaceAction(.print_pdf),
         .web_fill_password => self.webFaceAction(.fill_password),
+        // Both windows work with no web pane in sight: they list the
+        // daemon's store, and a row without a face to navigate opens a
+        // new web tab.
+        .web_history => @import("webhistory.zig").openHistory(self, self.focusedPane()),
+        .web_bookmarks => @import("webhistory.zig").openBookmarks(self, self.focusedPane()),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

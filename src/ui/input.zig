@@ -219,6 +219,12 @@ pub const Action = enum {
     /// username-Tab-password (src/ui/secrets.zig). Fill only: nothing
     /// is ever saved to the keyring, and nothing fills on its own.
     web_fill_password,
+    /// Open the browsing-history window (src/ui/webhistory.zig): the
+    /// daemon web store's pages, searchable through the same ranking
+    /// the address bar uses.
+    web_history,
+    /// Open the bookmarks window (src/ui/webhistory.zig).
+    web_bookmarks,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -521,6 +527,8 @@ pub fn actionName(a: Action) []const u8 {
         .web_devtools => "web_devtools",
         .web_print_pdf => "web_print_pdf",
         .web_fill_password => "web_fill_password",
+        .web_history => "web_history",
+        .web_bookmarks => "web_bookmarks",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -622,6 +630,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .web_devtools => "Open DevTools for this web pane (in a split)",
         .web_print_pdf => "Print this web page to a PDF file",
         .web_fill_password => "Fill a saved login from the keyring into this web page",
+        .web_history => "Browsing history (search, open, forget pages)",
+        .web_bookmarks => "Bookmarks (open, rename, reorder)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",
