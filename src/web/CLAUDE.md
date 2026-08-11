@@ -131,6 +131,36 @@ the browser, and answers `ev_devtools_view` with `devtools = 0, reason
 and the completion callback is correlated BY PATH, because CEF's
 callback carries no request id.
 
+## Accessibility (0x70 block, capability "a11y")
+
+- **Nothing streams before `a11y_enable` for that view.** Engine-side
+  accessibility costs real renderer CPU, and unsolicited tree frames
+  would break the backlog rule. Disable stops the stream again
+  (smoke-web stage 22j asserts both edges).
+- **The accessibility callbacks carry NO browser pointer** — only the
+  serialized payload's `ax_tree_id` token. `axResolveView` joins on
+  the token a view was last seen with and rebinds an unknown token
+  only when exactly ONE view has a11y enabled; with several enabled
+  views an unattributable payload is dropped, never guessed.
+- The payload shapes documented at the `onAxTreeChange` section header
+  were verified empirically on CEF 151 (`SKETERM_WEB_AX_DEBUG=1` dumps
+  the raw value as JSON). `checkedState`/`restriction` fold into wire
+  state BITS, roles map to ARIA-ish lowercase tokens (kebab-cased
+  pass-through for the long tail), and `inlineTextBox` nodes are
+  dropped — a child id with no node is defined as an absent child.
+- **The post-disconnect drain waits on `cefhost.openBrowsers() == 0`**
+  (life-span `on_before_close`), not a fixed pump count: closing an
+  a11y-enabled browser needs wall-clock renderer IPC time, and
+  `cef_shutdown` with a live browser hangs the helper (stage 23 caught
+  exactly that).
+- GUI side: `web/axtree.zig` mirrors the stream per face and
+  `a11y/webproj.zig` projects the mirror onto the SESSION a11y bus as
+  its own accessible application (`Socket.Embed`, Chromium's shape —
+  GTK4's internal AT-SPI backend cannot host a foreign subtree).
+  `zig build smoke-webax` proves that half against a real private bus
+  with no CEF at all; in the GUI it is gated by `SKETERM_WEB_A11Y=1`
+  until screen-reader detection lands.
+
 ## Presentation belongs to GTK, not to us
 
 Frames are `GdkTexture`s on a `GtkPicture` (`webface.zig`). **Never

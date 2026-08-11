@@ -16553,3 +16553,65 @@ on the clean base). smoke-e2e (with SKETERM_VERIFY_TREE=1, now
 including the forest check) progresses exactly as far as the base
 does: the copy-mode-yank stage fails on the base too (deep worktree
 path wraps the prompt). Sidebar interaction is compile+trace verified.
+## 2026-08-12: the web page's accessibility tree, engine to screen reader
+
+The browser roadmap's a11y block, read-only tree first. Three layers,
+each tested on its own:
+
+**Wire (0x70 block, capability `a11y`).** `a11y_enable` gates
+per-view streaming — nothing flows unsolicited (backlog rule);
+`ev_a11y_tree` carries INCREMENTAL node lists (Chromium's update
+shape kept: changed nodes with full content + child lists,
+`node_id_to_clear`, root/focus ids) via a shared
+`A11yNodeWriter`/`A11yNodeIter` binary encoding; `ev_a11y_loc` is
+pure geometry so scroll storms stay cheap to skip; `ev_a11y_event`
+speaks a tiny token vocabulary ("focus", "load-complete"). Roles are
+ARIA-ish lowercase tokens, states are our own `ax_*` bits — no engine
+enum crosses the wire. Round-trip unit tests in both roots.
+
+**Helper.** `set_accessibility_state(STATE_ENABLED)` per view on
+demand; `cef_accessibility_handler_t` translates the serialized
+payloads (shapes verified empirically on CEF 151 with
+`SKETERM_WEB_AX_DEBUG=1`). The callbacks carry no browser pointer, so
+attribution joins on the payload's `ax_tree_id` token, rebinding an
+unknown token only when exactly one view is enabled. Found+fixed en
+route: the post-disconnect drain was 100 tight pumps — an
+a11y-enabled browser needs wall-clock IPC to close and `cef_shutdown`
+then hangs forever; the drain now waits on `openBrowsers() == 0`
+(life-span `on_before_close`). smoke-web stage 22k asserts the
+enable gate, roles+names, checked/disabled state bits, and silence
+after disable.
+
+**Projection.** Seam chosen: (a) — the org.a11y.atspi interfaces
+served DIRECTLY on the session a11y bus, as a pure-Zig D-Bus server
+over `mux/dbus.zig` (no GDBus, no libatspi). The page tree registers
+as its OWN accessible application via `Socket.Embed` on the registry,
+which is Chromium's own shape on Linux; nesting under the pane's
+GtkAccessible is not possible because GTK4's AT-SPI backend cannot
+answer a child walk with a foreign bus reference. `web/axtree.zig`
+mirrors the stream (incremental apply + reachability prune, unit
+tests both roots); `a11y/webproj.zig` serves Accessible / Component
+(extents through the offset-container chain) / Application /
+Properties / Cache. `zig build smoke-webax` proves it end to end with
+NO CEF and NO GUI: private dbus-daemon + at-spi2-registryd
+(`a11yhub`), tree fed through real wire bytes, then the daemon's own
+AT-SPI client walks the REGISTRY desktop and finds the application,
+the DOCUMENT_WEB root, HEADING/PUSH_BUTTON role numbers, chain-
+resolved extents, and an incremental rename on re-walk.
+
+**GUI.** Web faces mirror `ev_a11y_tree`/`ev_a11y_loc` per view; a
+detached worker does the blocking bus connect (idle handback resolves
+through the client's faces list), the projection follows the page
+title, and every view-minting path re-asserts `a11y_enable`. Gated by
+`SKETERM_WEB_A11Y=1` for now — the flag IS the "a client asked"
+signal until org.a11y.Status screen-reader detection lands.
+
+Explicit follow-ups (not this pass, by design): object event
+emission (children-changed/state-changed — a reader must re-walk
+today), focus/caret/Action/Text interfaces, iframe (child-tree)
+flattening, screen-reader auto-detection, screen-coordinate origin
+(extents are window-relative until the GUI feeds `setOrigin`).
+Manual GUI verification: run with `SKETERM_WEB_A11Y=1` on a desktop
+with a live a11y bus, open a web tab, then
+`busctl --user tree :1.<n>` / Accerciser should list "sketerm web:
+<title>" as an application whose tree matches the page.
