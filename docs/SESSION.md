@@ -16685,3 +16685,79 @@ stage 22g), so the stored-decision path cannot be exercised end to end
 yet. Its origin matching also assumes the engine reports an origin in
 the same `scheme://host[:port]` form `originOf` normalizes to — a
 mismatch would mean the banner still appears, never a wrong answer.
+## 2026-08-12: browser containers (per-tab identity contexts) + per-tab remote egress
+
+Per-tab identity contexts land end to end, plus the flagship "browse via
+server X" egress: a container whose traffic exits from a connected remote
+host with remote DNS. A container is a private cookie jar / cache (CEF
+request context), optionally routed through a proxy; incognito is the
+ephemeral (in-memory) preset. Proven through real CEF by two new
+smoke-web stages.
+
+- `src/web/protocol.zig` (both test roots): new 0x90 block —
+  `context_create` (id, ephemeral, name, proxy) / `context_destroy`,
+  capability `CAP_CONTEXTS`. Append-only; round-trip tests added. The
+  `context: u32` field already on `view_create`/`view_create_url` is now
+  honored.
+- `src/web/cefhost.zig`: a request-context registry on `Host`. Each
+  `context_create` builds `cef_request_context_create_context` with its
+  own cache dir under the profile (ephemeral = empty cache_path =
+  in-memory incognito store, nothing to scrub), and, per the browser
+  spike, `set_preference("proxy", {mode:"fixed_servers", server:<url>})`
+  on the context's base preference manager. `spawnBrowser` passes the
+  looked-up context as `create_browser_sync`'s 6th arg (0 = default,
+  null context); `View.context` survives a discard/revive.
+  `src/web/server.zig` advertises the cap (array grown 15->16) and
+  dispatches the two frames; `src/web/main.zig` hands the cache dir to
+  the server so per-context dirs sit under it.
+- `src/mux/wire.zig` + `src/mux/daemon.zig` + `src/mux/daemon_serve.zig`:
+  new `stream_open` verb (frame 33) / `stream_reply` (96->97 reply
+  family), welcome capability `stream_open:true`. The daemon resolves an
+  ARBITRARY host:port at ITS end (remote DNS via getaddrinfo), nonblocking
+  connect, and answers `chan_open` (kind tcp_forward) + `stream_reply`.
+  It is the arbitrary-host analog of the pre-existing loopback-only
+  `forward_open`; that verb did NOT suffice (port-only, 127.0.0.1-only),
+  so a new one was added, keeping `sketerm-mux` libc-only
+  (`zig build mux-portable` stays green). getaddrinfo runs on the poll
+  loop (blocking) — acceptable v1 tradeoff, documented at the handler.
+- `src/ipc/socks5.zig` (NEW, both test roots): minimal RFC1928 codec —
+  greeting + CONNECT request (atyp ipv4/domain/ipv6), reply headers,
+  host formatting. Incremental parsers, fully unit-tested.
+- `src/ipc/socksbridge.zig` (NEW, both test roots): the local loopback
+  SOCKS5 listener that relays each CONNECT over the mux `stream_open`
+  verb (GTK-free poll loop, mirrors `mux forward`). `Socks` driver
+  unit-tested (greeting/request/pipelining/auth-refusal/BIND-refusal);
+  `Egress` binds the listener on the caller thread (so the proxy port is
+  known synchronously) and connects+serves on a worker via an injected
+  connect fn.
+- `src/ui/webface.zig`: process-wide container registry (name + accent
+  color from an 8-swatch palette + ephemeral + proxy + egress host +
+  live `Egress`). `createContainer`/`createIncognito` mint an id, spin
+  the egress bridge when a host is given (proxy = `socks5://127.0.0.1:
+  <port>`), and publish `context_create`. `Client.cap_contexts`; every
+  container is re-published to a fresh helper BEFORE its faces re-create
+  views. `WebFace.container` (immutable, survives restart) feeds
+  `view_create.context`.
+- `src/ui/window.zig`: `newWebTabInContainer` / `newIncognitoWebTab`;
+  the tab gets the container's accent via `setTabColor`.
+  `src/ui/input.zig` + `src/ui/palette.zig`: `new_incognito_web_tab`
+  action + palette row. Web-face context menu gains "New Incognito Web
+  Tab" and a "New Tab in Container" submenu listing live containers.
+- `src/smoke_web.zig`: stage 26 (per-context SOCKS5 proxy: a navigation
+  on a proxied context reaches an in-process SOCKS5 probe with
+  atyp=domain, hostname unresolved = remote DNS) and stage 27 (two
+  contexts -> two proxies -> independent egress = isolation). Both run on
+  their own helper AFTER teardown, because a proxied request context
+  makes CEF's cef_shutdown noisy (it exits on SIGSEGV even after clean
+  per-object teardown — a shutdown-path engine artifact, reported not
+  failed; a hang still fails). The probe uses the shared `socks5.zig`.
+
+Verification: `zig build`, `zig build web`, `zig build mux-portable`,
+`zig build test` (rc 0), `zig build test-core` (rc 0) all green;
+`zig build smoke-web` PASS with stages 26 + 27 passing. The daemon
+`stream_open` verb is covered by build + mux-portable + the codec/driver
+unit tests; a dedicated smoke-mux stage for it was not added (it mirrors
+the proven `forward_open` path). Known limitation: daemon-side DNS is
+blocking on the poll loop; the GUI egress bridge connect happens on a
+worker thread and degrades to refused connections if the host is
+unreachable.

@@ -198,6 +198,8 @@ const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const webhistory = @import("webhistory.zig");
+const socksbridge = @import("../ipc/socksbridge.zig");
+const mux_cli = @import("../ipc/mux_cli.zig");
 const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
@@ -582,6 +584,10 @@ pub const Client = struct {
     /// older helper simply skips the unknown frame, so this flag only
     /// records what the face may expect back.
     cap_a11y: bool = false,
+    /// The helper accepts `context_create`/`context_destroy` (per-tab
+    /// identity contexts). An older helper ignores the frames and every
+    /// view shares one cookie jar — silent, correct degradation.
+    cap_contexts: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -764,6 +770,12 @@ pub const Client = struct {
             self,
         );
         self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "sketerm-gui" });
+        // Re-publish every container BEFORE the faces mint their views:
+        // a fresh helper knows no contexts, and a view_create naming one
+        // must be preceded by its context_create. Sent optimistically
+        // (before hello_ack, like view_create) — an old helper skips the
+        // unknown frames and every view shares the default jar.
+        publishContexts(self);
         for (self.faces.items) |f| f.onClientReady();
         return true;
     }
@@ -946,6 +958,7 @@ pub const Client = struct {
                 self.cap_print_pdf = false;
                 self.cap_downloads = false;
                 self.cap_a11y = false;
+                self.cap_contexts = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -954,6 +967,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                 }
             },
             .frame_buffer => {
@@ -1117,6 +1131,146 @@ var g_client: Client = .{};
 
 pub fn client() *Client {
     return &g_client;
+}
+
+// ---------------------------------------------------------------------
+// Containers — per-tab identity contexts (private cookie jar / cache,
+// optional remote egress). The registry is process-wide, like the
+// Client singleton; a container id is minted here, published to the
+// helper as a `context_create`, and named by a face's `container` field.
+// ---------------------------------------------------------------------
+
+/// A small, visually distinct accent palette; the last entry is the
+/// incognito preset's slate.
+pub const container_palette = [_][3]u8{
+    .{ 0x3b, 0x82, 0xf6 }, // blue
+    .{ 0x22, 0xc5, 0x5e }, // green
+    .{ 0xf5, 0x9e, 0x0b }, // amber
+    .{ 0xef, 0x44, 0x44 }, // red
+    .{ 0xa8, 0x55, 0xf7 }, // purple
+    .{ 0x14, 0xb8, 0xa6 }, // teal
+    .{ 0xec, 0x48, 0x99 }, // pink
+    .{ 0x64, 0x74, 0x8b }, // slate (incognito)
+};
+
+pub const Container = struct {
+    id: u32,
+    name: []u8,
+    color: [3]u8,
+    ephemeral: bool,
+    /// Fixed-server proxy url published to the helper ("" = direct). For
+    /// an egress container this is `socks5://127.0.0.1:<bridge port>`.
+    proxy: []u8,
+    /// Egress host this container routes through ("" = none), shown in
+    /// the UI.
+    egress_host: []u8,
+    /// The live SOCKS5->mux bridge for an egress container, else null.
+    egress: ?*socksbridge.Egress = null,
+};
+
+var g_containers: std.ArrayList(Container) = .empty;
+var g_next_container_id: u32 = 1;
+
+pub fn containers() []Container {
+    return g_containers.items;
+}
+
+pub fn findContainer(id: u32) ?*Container {
+    for (g_containers.items) |*ctn| {
+        if (ctn.id == id) return ctn;
+    }
+    return null;
+}
+
+/// Accent color of a container, or null for the default context.
+pub fn containerColor(id: u32) ?[3]u8 {
+    if (id == 0) return null;
+    if (findContainer(id)) |ctn| return ctn.color;
+    return null;
+}
+
+/// Create a container. `egress_host` empty = local/direct; non-empty
+/// spins a loopback SOCKS5 bridge that relays over the mux daemon to
+/// that host (remote DNS), and the container's proxy points at it.
+/// Returns the new id (0 on allocation failure).
+pub fn createContainer(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    ephemeral: bool,
+    egress_host: []const u8,
+) u32 {
+    const id = g_next_container_id;
+    const color = if (ephemeral)
+        container_palette[container_palette.len - 1]
+    else
+        container_palette[(g_containers.items.len) % (container_palette.len - 1)];
+
+    const name_owned = gpa.dupe(u8, name) catch return 0;
+    const host_owned = gpa.dupe(u8, egress_host) catch {
+        gpa.free(name_owned);
+        return 0;
+    };
+    var proxy_owned: []u8 = gpa.dupe(u8, "") catch {
+        gpa.free(name_owned);
+        gpa.free(host_owned);
+        return 0;
+    };
+    var egress: ?*socksbridge.Egress = null;
+    if (egress_host.len != 0) {
+        if (socksbridge.Egress.create(gpa, egress_host, mux_cli.muxConnect)) |eg| {
+            eg.spawn();
+            egress = eg;
+            gpa.free(proxy_owned);
+            proxy_owned = std.fmt.allocPrint(gpa, "socks5://127.0.0.1:{d}", .{eg.port()}) catch blk: {
+                break :blk gpa.dupe(u8, "") catch unreachable;
+            };
+        }
+    }
+
+    g_containers.append(gpa, .{
+        .id = id,
+        .name = name_owned,
+        .color = color,
+        .ephemeral = ephemeral,
+        .proxy = proxy_owned,
+        .egress_host = host_owned,
+        .egress = egress,
+    }) catch {
+        if (egress) |eg| {
+            eg.stop();
+            eg.destroy();
+        }
+        gpa.free(name_owned);
+        gpa.free(host_owned);
+        gpa.free(proxy_owned);
+        return 0;
+    };
+    g_next_container_id += 1;
+    // Publish to a live helper at once; a helper that starts later gets
+    // the whole set replayed by `publishContexts` on connect.
+    publishOne(client(), &g_containers.items[g_containers.items.len - 1]);
+    return id;
+}
+
+/// One-shot incognito preset: a throwaway ephemeral container.
+pub fn createIncognito(gpa: std.mem.Allocator) u32 {
+    return createContainer(gpa, "Incognito", true, "");
+}
+
+fn publishOne(cl: *Client, ctn: *const Container) void {
+    if (cl.state != .ready) return;
+    cl.post(proto.ContextCreate{
+        .id = ctn.id,
+        .ephemeral = if (ctn.ephemeral) 1 else 0,
+        .name = ctn.name,
+        .proxy = ctn.proxy,
+    });
+}
+
+/// Re-publish every container to a (possibly fresh) helper, BEFORE its
+/// faces re-create their views.
+fn publishContexts(cl: *Client) void {
+    for (g_containers.items) |*ctn| publishOne(cl, ctn);
 }
 
 // ---------------------------------------------------------------------
@@ -1372,6 +1526,12 @@ pub const WebFace = struct {
     /// Helper-side view id, allocated once and kept across helper
     /// restarts (a fresh helper knows no ids at all).
     view: u32 = 0,
+    /// Identity context (container) this face's view lives in, 0 = the
+    /// shared default. Assigned once at creation and immutable — a
+    /// container is a private cookie jar / cache / egress, and the
+    /// helper fixes it at `view_create`. Kept across helper restarts so
+    /// a rebuilt view lands back in the same container.
+    container: u32 = 0,
     /// True once `view_create` was sent on the CURRENT connection.
     view_live: bool = false,
     /// This face PRESENTS a view somebody else created (the inspector
@@ -1656,6 +1816,11 @@ pub const WebFace = struct {
         return attachOpts(allocator, pane, .{ .url = url });
     }
 
+    /// Web face whose view lives in identity `container` (0 = default).
+    pub fn attachContainer(allocator: std.mem.Allocator, pane: *Pane, url: ?[]const u8, container: u32) !*WebFace {
+        return attachOpts(allocator, pane, .{ .url = url, .container = container });
+    }
+
     /// Put a face on `pane` that PRESENTS an existing helper-side view
     /// instead of creating one — how the inspector `devtools_show`
     /// minted becomes a pane (`Window.openDevToolsSplit`).
@@ -1673,6 +1838,9 @@ pub const WebFace = struct {
         url: ?[]const u8 = null,
         /// Non-zero: present this helper-side view rather than mint one.
         existing_view: u32 = 0,
+        /// Identity context (container) to create the view in, 0 =
+        /// default. Immutable once the face exists.
+        container: u32 = 0,
     };
 
     fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
@@ -1685,6 +1853,7 @@ pub const WebFace = struct {
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator };
         self.pane = pane;
+        self.container = opts.container;
         self.pacer.cap_fps = g_max_fps;
         if (opts.url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
 
@@ -3361,7 +3530,7 @@ pub const WebFace = struct {
             .w = w,
             .h = h,
             .scale_x1000 = self.sent_scale,
-            .context = 0,
+            .context = self.container,
         });
         self.view_live = true;
         // A fresh helper connection knows no cap; force the send.
@@ -4746,9 +4915,45 @@ pub const WebFace = struct {
             ctx,
         );
 
+        // Container / identity actions.
+        const tabs = m.section();
+        tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
+        if (containers().len != 0) {
+            const cont = tabs.submenu("New Tab in Container");
+            for (containers()) |*ctn| {
+                const rc = self.allocator.create(ContainerRowCtx) catch continue;
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+                root.own(freeContainerRowCtx, rc);
+                var lbuf: [128]u8 = undefined;
+                cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
+            }
+        }
+
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
         const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
         _ = root.popup(self.view_area, x, y);
+    }
+
+    const ContainerRowCtx = struct {
+        allocator: std.mem.Allocator,
+        face: *WebFace,
+        container: u32,
+    };
+
+    fn freeContainerRowCtx(user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(ContainerRowCtx, user);
+        ctx.allocator.destroy(ctx);
+    }
+
+    fn onMenuIncognito(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
+        win.newIncognitoWebTab() catch {};
+    }
+
+    fn onMenuOpenInContainer(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const rc = cast.userData(ContainerRowCtx, user);
+        const win = rc.face.ownerWindow() orelse return;
+        win.newWebTabInContainer(rc.container, null) catch {};
     }
 
     fn copyText(self: *WebFace, text: []const u8) void {

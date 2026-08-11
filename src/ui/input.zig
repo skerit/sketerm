@@ -190,6 +190,9 @@ pub const Action = enum {
     new_web_tab,
     /// Split the focused pane and give the new pane a web face.
     new_web_split,
+    /// Open a web tab in a fresh throwaway incognito container (a
+    /// private, ephemeral cookie jar / cache).
+    new_incognito_web_tab,
     /// Link hints on the focused pane's web face (Vimium-style): label
     /// every visible interactive element of the page, type a label to
     /// click it through the trusted-input path (Shift/Ctrl on the last
@@ -521,6 +524,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_browser_split => "new_browser_split",
         .new_web_tab => "new_web_tab",
         .new_web_split => "new_web_split",
+        .new_incognito_web_tab => "new_incognito_web_tab",
         .web_hints => "web_hints",
         .web_reader => "web_reader",
         .web_discard_background => "web_discard_background",
@@ -624,6 +628,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_browser_split => "Split into a second file browser pane",
         .new_web_tab => "New web tab (browser engine)",
         .new_web_split => "Split into a web pane (browser engine)",
+        .new_incognito_web_tab => "New incognito web tab (private, ephemeral)",
         .web_hints => "Link hints on the web page (type a label to click)",
         .web_reader => "Reader view on/off (this pane's web page)",
         .web_discard_background => "Discard background web tabs (free their memory)",

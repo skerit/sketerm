@@ -1378,6 +1378,32 @@ pub const Window = struct {
         };
     }
 
+    /// Web tab created inside an identity container (`container` = 0 is
+    /// the default context). The container's accent colors the tab.
+    pub fn newWebTabInContainer(self: *Window, container: u32, url: ?[]const u8) !void {
+        const webface = @import("webface.zig");
+        const before = self.panes.items.len;
+        try self.newShellTab("Web");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = webface.WebFace.attachContainer(self.allocator, pane, url, container) catch |err| {
+            logActionError("new_web_tab_in_container attach", err);
+            return err;
+        };
+        // Accent the tab with the container color.
+        if (webface.containerColor(container)) |rgb| {
+            if (tabPageForPane(self, pane)) |page| self.setTabColor(page, rgb);
+        }
+    }
+
+    /// Open a web tab in a fresh throwaway incognito container.
+    pub fn newIncognitoWebTab(self: *Window) !void {
+        const webface = @import("webface.zig");
+        const id = webface.createIncognito(self.allocator);
+        if (id == 0) return error.ContainerCreateFailed;
+        try self.newWebTabInContainer(id, null);
+    }
+
     /// Fill this window with the web tabs a `sketerm web [urls...]`
     /// invocation asked for: one tab per address, or a single blank tab
     /// (address entry focused) when none were given.
@@ -3752,6 +3778,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
         .new_web_tab => self.newWebTab() catch |err| logActionError("new_web_tab", err),
         .new_web_split => self.newWebSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_web_split", err),
+        .new_incognito_web_tab => self.newIncognitoWebTab() catch |err| logActionError("new_incognito_web_tab", err),
         // Only reached when the focused pane shows NO web face (the
         // pane-local dispatch consumes it otherwise).
         .web_hints => showToast(self, "This pane shows no web page. Use New Web Tab."),
