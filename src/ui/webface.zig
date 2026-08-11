@@ -159,6 +159,7 @@ const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
+const toolbtn = @import("toolbtn.zig");
 const proto = @import("../web/protocol.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
@@ -1666,32 +1667,24 @@ pub const WebFace = struct {
     fn buildUi(self: *WebFace) void {
         self.root_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 
-        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        c.gtk_widget_add_css_class(bar, "toolbar");
-        c.gtk_widget_set_margin_start(bar, 4);
-        c.gtk_widget_set_margin_end(bar, 4);
-        c.gtk_widget_set_margin_top(bar, 4);
-        c.gtk_widget_set_margin_bottom(bar, 4);
+        // The file manager's toolbar is the reference look: same class,
+        // same inset, same flat buttons, Back+Forward as one linked
+        // control.
+        const bar = toolbtn.newBar();
+        toolbtn.installCss(bar);
 
-        self.back_btn = c.gtk_button_new_from_icon_name("go-previous-symbolic");
-        c.gtk_widget_set_tooltip_text(self.back_btn, "Back");
+        const navpair = toolbtn.newNavPair();
+        self.back_btn = toolbtn.barButton(navpair, "go-previous-symbolic", "Back", "Back", &onBack, self);
         c.gtk_widget_set_sensitive(self.back_btn, 0);
-        _ = c.g_signal_connect_data(@ptrCast(self.back_btn), "clicked", @ptrCast(&onBack), self, null, 0);
         self.track(self.back_btn);
-        c.gtk_box_append(@ptrCast(bar), self.back_btn);
 
-        self.fwd_btn = c.gtk_button_new_from_icon_name("go-next-symbolic");
-        c.gtk_widget_set_tooltip_text(self.fwd_btn, "Forward");
+        self.fwd_btn = toolbtn.barButton(navpair, "go-next-symbolic", "Forward", "Forward", &onForward, self);
         c.gtk_widget_set_sensitive(self.fwd_btn, 0);
-        _ = c.g_signal_connect_data(@ptrCast(self.fwd_btn), "clicked", @ptrCast(&onForward), self, null, 0);
         self.track(self.fwd_btn);
-        c.gtk_box_append(@ptrCast(bar), self.fwd_btn);
+        c.gtk_box_append(@ptrCast(bar), navpair);
 
-        self.reload_btn = c.gtk_button_new_from_icon_name("view-refresh-symbolic");
-        c.gtk_widget_set_tooltip_text(self.reload_btn, "Reload");
-        _ = c.g_signal_connect_data(@ptrCast(self.reload_btn), "clicked", @ptrCast(&onReload), self, null, 0);
+        self.reload_btn = toolbtn.barButton(bar, "view-refresh-symbolic", "Reload", "Reload", &onReload, self);
         self.track(self.reload_btn);
-        c.gtk_box_append(@ptrCast(bar), self.reload_btn);
 
         self.entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(self.entry, 1);
@@ -1707,11 +1700,12 @@ pub const WebFace = struct {
         self.track(self.entry);
         c.gtk_box_append(@ptrCast(bar), self.entry);
 
-        self.shell_btn = c.gtk_button_new_from_icon_name("sketerm-terminal-symbolic");
-        c.gtk_widget_set_tooltip_text(self.shell_btn, "Show this pane's shell");
-        _ = c.g_signal_connect_data(@ptrCast(self.shell_btn), "clicked", @ptrCast(&onShowShell), self, null, 0);
+        // `sketerm-terminal-symbolic` is one of our own bundled icons,
+        // but it goes through the fallback like every other name: a
+        // theme chain that cannot draw it must not leave the way out
+        // of the browser as an invisible button.
+        self.shell_btn = toolbtn.barButton(bar, "sketerm-terminal-symbolic", "Shell", "Show this pane's shell", &onShowShell, self);
         self.track(self.shell_btn);
-        c.gtk_box_append(@ptrCast(bar), self.shell_btn);
 
         c.gtk_box_append(@ptrCast(self.root_box), bar);
 

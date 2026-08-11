@@ -4,7 +4,7 @@
 //! (shipped stale by the theme's installer) makes GTK pick a file
 //! that does not exist and silently render the missing-image icon --
 //! `gtk_image_set_from_icon_name` has no failure path. Every themed
-//! icon the browser shows goes through here instead: the lookup's
+//! icon a face shows goes through here instead: the lookup's
 //! chosen file is stat'ed, and when the cache lied, other sizes,
 //! scales and the non-symbolic name variant are tried until one
 //! resolves to a real file.
@@ -14,7 +14,7 @@
 //! `scaleOf`).
 
 const std = @import("std");
-const c = @import("../../c.zig").c;
+const c = @import("../c.zig").c;
 
 /// Sizes tried (after the requested one) when the cache lies. Covers
 /// the directory sizes real themes ship.

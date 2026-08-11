@@ -23,7 +23,8 @@ const clipboard_mod = @import("../../filebrowser/clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const emblems_mod = @import("../../filebrowser/emblems.zig");
 const gitstatus = @import("../../filebrowser/gitstatus.zig");
-const iconload = @import("iconload.zig");
+const iconload = @import("../iconload.zig");
+const toolbtn = @import("../toolbtn.zig");
 const Pane = @import("../pane.zig").Pane;
 const file_transfers = @import("../file_transfers.zig");
 const image_canvas = @import("../image_canvas.zig");
@@ -1443,43 +1444,11 @@ pub const BrowserView = struct {
         self.allocator.destroy(self);
     }
 
-    /// True when the running icon theme can actually draw `name`.
-    ///
-    /// `gtk_button_new_from_icon_name` with an unresolvable name is
-    /// SILENT: the button lays out and renders nothing. That is how the
-    /// "show the shell" button became invisible on a KDE desktop --
-    /// Adwaita keeps `utilities-terminal-symbolic` only under
-    /// `symbolic/legacy/`, which a Breeze-based theme chain never
-    /// reaches. Names sketerm ships itself live in `data/icons` (the
-    /// hicolor fallback, always searched), so they always resolve.
-    fn iconAvailable(name: [*:0]const u8) bool {
-        const display = c.gdk_display_get_default() orelse return true;
-        const theme = c.gtk_icon_theme_get_for_display(display) orelse return true;
-        return c.gtk_icon_theme_has_icon(theme, name) != 0;
-    }
-
-    /// Nemo's toolbar buttons: flat, icon-only, and out of the focus
-    /// chain, so Tab walks the listing rather than the chrome.
-    pub fn flatten(btn: *c.GtkWidget) void {
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_widget_add_css_class(btn, "flat");
-        c.gtk_widget_set_can_focus(btn, 0);
-    }
-
-    /// One toolbar button. Falls back to a text label when the icon
-    /// name does not resolve, so the worst case is a labelled button
-    /// rather than an invisible one.
+    /// One toolbar button, with THIS view as its user data. The shape
+    /// (flat, labelled when the icon name does not resolve) is the
+    /// shared one every face toolbar uses.
     fn barButton(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
-        const btn = if (iconAvailable(icon)) blk: {
-            const b = c.gtk_button_new();
-            c.gtk_button_set_child(@ptrCast(b), iconload.newImageIcon(bar, icon, 16));
-            break :blk b;
-        } else c.gtk_button_new_with_label(text);
-        c.gtk_widget_set_tooltip_text(btn, tip);
-        flatten(btn.?);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), btn);
-        return btn.?;
+        return toolbtn.barButton(bar, icon, text, tip, cb, @ptrCast(self));
     }
 
     /// The hamburger button: builds its classic menu fresh per open,
@@ -1491,53 +1460,39 @@ pub const BrowserView = struct {
 
     /// `barButton` for a toggle. Same icon guarantee.
     fn barToggle(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
-        const btn = c.gtk_toggle_button_new();
-        if (iconAvailable(icon))
-            c.gtk_button_set_child(@ptrCast(btn), iconload.newImageIcon(bar, icon, 16))
-        else
-            c.gtk_button_set_label(@ptrCast(btn), text);
-        c.gtk_widget_set_tooltip_text(btn, tip);
-        flatten(btn.?);
-        _ = c.g_signal_connect_data(btn, "toggled", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), btn);
-        return btn.?;
+        return toolbtn.barToggle(bar, icon, text, tip, cb, @ptrCast(self));
     }
 
-    /// The browser's own stylesheet: the linked nav pair and the
-    /// breadcrumb holder have to read as single controls, which no
-    /// stock GTK class does for a plain box of flat buttons. Installed
-    /// once per display, at APPLICATION priority, so a user theme
-    /// still wins. It also states the hover/active feedback outright:
-    /// Breeze draws NOTHING for a `.flat` button, so without this the
-    /// whole browser chrome reads as dead pixels under the pointer.
+    /// The browser's own stylesheet, on top of the shared toolbar one
+    /// (`toolbtn.installCss`): the breadcrumb holder has to read as a
+    /// single control, which no stock GTK class does for a plain box
+    /// of flat buttons. Installed once per display, at APPLICATION
+    /// priority, so a user theme still wins. It also states the
+    /// hover/active feedback outright: Breeze draws NOTHING for a
+    /// `.flat` button, so without this the breadcrumb reads as dead
+    /// pixels under the pointer.
     var css_installed: bool = false;
 
     fn installCss(any_widget: *c.GtkWidget) void {
+        toolbtn.installCss(any_widget);
         if (css_installed) return;
         css_installed = true;
         const css =
-            \\.sketerm-fb-navpair, .sketerm-fb-path {
+            \\.sketerm-fb-path {
             \\  border: 1px solid rgba(128,128,128,0.35);
             \\  border-radius: 7px;
             \\}
-            \\.sketerm-fb-navpair button, .sketerm-fb-path button {
+            \\.sketerm-fb-path button {
             \\  border-radius: 6px;
             \\  margin: 0;
             \\  min-height: 24px;
             \\}
-            \\.sketerm-fb-toolbar button { padding-left: 6px; padding-right: 6px; }
             \\.sketerm-fb-section arrow, .sketerm-fb-section image { opacity: 0.6; }
-            \\.sketerm-fb-toolbar button:hover,
             \\.sketerm-fb-path button:hover {
             \\  background: alpha(currentColor, 0.10);
             \\}
-            \\.sketerm-fb-toolbar button:active,
-            \\.sketerm-fb-toolbar button:checked,
             \\.sketerm-fb-path button:active {
             \\  background: alpha(currentColor, 0.20);
-            \\}
-            \\.sketerm-fb-toolbar button:checked:hover {
-            \\  background: alpha(currentColor, 0.26);
             \\}
             \\.sketerm-fb-gitchip {
             \\  font-size: 0.72em;
@@ -1602,19 +1557,10 @@ pub const BrowserView = struct {
         // Nemo's shape: a flat icon-only nav cluster on the left, the
         // path control filling the middle, a flat icon-only tool
         // cluster on the right.
-        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_add_css_class(bar, "sketerm-fb-toolbar");
-        c.gtk_widget_set_margin_start(bar, 3);
-        c.gtk_widget_set_margin_end(bar, 3);
-        c.gtk_widget_set_margin_top(bar, 3);
-        c.gtk_widget_set_margin_bottom(bar, 3);
+        const bar = toolbtn.newBar();
 
         const left = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
-        // Back and Forward are ONE control with two halves: they are
-        // the same axis, and Nemo's own pathbar reads that way.
-        const navpair = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
-        c.gtk_widget_add_css_class(navpair, "linked");
-        c.gtk_widget_add_css_class(navpair, "sketerm-fb-navpair");
+        const navpair = toolbtn.newNavPair();
         const back = self.barButton(navpair, "go-previous-symbolic", "Back", "Back (Alt+Left)", &onBackClicked);
         c.gtk_widget_set_sensitive(back, 0);
         const fwd = self.barButton(navpair, "go-next-symbolic", "Forward", "Forward (Alt+Right)", &onFwdClicked);

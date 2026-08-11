@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const iconload = @import("iconload.zig");
+const iconload = @import("../iconload.zig");
 
 /// The legacy menu-handler shape, called with a null button.
 pub const Handler = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;

@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const model_mod = @import("../../filebrowser/diskusage.zig");
 const format = @import("../../filebrowser/format.zig");
+const toolbtn = @import("../toolbtn.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -159,11 +160,11 @@ fn zText(buf: []u8, text: []const u8) [*:0]const u8 {
     return @ptrCast(buf.ptr);
 }
 
-fn makeButton(icon: [*:0]const u8, tip: [*:0]const u8, callback: anytype, state: *State) *c.GtkWidget {
-    const button = c.gtk_button_new_from_icon_name(icon).?;
-    c.gtk_widget_set_tooltip_text(button, tip);
-    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(callback), @ptrCast(state), null, c.G_CONNECT_DEFAULT);
-    return button;
+/// A header button. Framed (this bar is a header, not flat chrome),
+/// but through the shared helper so an icon name the theme cannot
+/// draw still yields a labelled button rather than an empty one.
+fn makeButton(anchor: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, callback: anytype, state: *State) *c.GtkWidget {
+    return toolbtn.button(anchor, icon, text, tip, callback, @ptrCast(state));
 }
 
 fn createState(tab: *BTab, root: []const u8) ?*State {
@@ -198,9 +199,9 @@ fn createState(tab: *BTab, root: []const u8) ?*State {
     c.gtk_widget_set_margin_end(toolbar, 12);
     c.gtk_widget_set_margin_top(toolbar, 10);
     c.gtk_widget_set_margin_bottom(toolbar, 10);
-    const files = makeButton("view-list-symbolic", "Return to the file listing", &onFilesClicked, self);
+    const files = makeButton(toolbar, "view-list-symbolic", "Files", "Return to the file listing", &onFilesClicked, self);
     c.gtk_box_append(@ptrCast(toolbar), files);
-    self.up_button = makeButton("go-up-symbolic", "Analyze the parent shown in this scan", &onUpClicked, self);
+    self.up_button = makeButton(toolbar, "go-up-symbolic", "Up", "Analyze the parent shown in this scan", &onUpClicked, self);
     c.gtk_box_append(@ptrCast(toolbar), self.up_button);
 
     const titles = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 1).?;
@@ -220,9 +221,9 @@ fn createState(tab: *BTab, root: []const u8) ?*State {
     self.spinner = @ptrCast(@alignCast(c.gtk_spinner_new().?));
     c.gtk_spinner_start(self.spinner);
     c.gtk_box_append(@ptrCast(toolbar), @ptrCast(@alignCast(self.spinner)));
-    self.cancel_button = makeButton("process-stop-symbolic", "Cancel this scan", &onCancelClicked, self);
+    self.cancel_button = makeButton(toolbar, "process-stop-symbolic", "Cancel", "Cancel this scan", &onCancelClicked, self);
     c.gtk_box_append(@ptrCast(toolbar), self.cancel_button);
-    self.rescan_button = makeButton("view-refresh-symbolic", "Scan this folder again", &onRescanClicked, self);
+    self.rescan_button = makeButton(toolbar, "view-refresh-symbolic", "Rescan", "Scan this folder again", &onRescanClicked, self);
     c.gtk_widget_set_visible(self.rescan_button, 0);
     c.gtk_box_append(@ptrCast(toolbar), self.rescan_button);
     c.gtk_box_append(@ptrCast(page), toolbar);

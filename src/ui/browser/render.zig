@@ -15,7 +15,7 @@ const dnd = @import("dnd.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
-const iconload = @import("iconload.zig");
+const iconload = @import("../iconload.zig");
 const format = @import("../../filebrowser/format.zig");
 const mediacols = @import("mediacols.zig");
 

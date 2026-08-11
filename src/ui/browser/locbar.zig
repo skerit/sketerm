@@ -16,6 +16,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const crumbs = @import("../../filebrowser/crumbs.zig");
+const toolbtn = @import("../toolbtn.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -274,10 +275,10 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     label_z[n] = 0;
 
     const btn = c.gtk_button_new_with_label(&label_z);
-    // `.flat` as well as frameless: the hover/active rules in
-    // view.zig's stylesheet key off it, and a breadcrumb segment that
+    // `.flat` as well as frameless: the hover/active rules in the
+    // browser's stylesheet key off it, and a breadcrumb segment that
     // does not light up under the pointer does not read as clickable.
-    BrowserView.flatten(btn.?);
+    toolbtn.flatten(btn.?);
     if (seg.root and tab.hc.host != null) c.gtk_widget_add_css_class(btn, "accent");
     var tip: [4200:0]u8 = undefined;
     if (std.fmt.bufPrintZ(&tip, "{s}", .{seg.path})) |t| c.gtk_widget_set_tooltip_text(btn, t.ptr) else |_| {}
@@ -294,7 +295,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     c.gtk_box_append(@ptrCast(box), btn);
 
     const arrow = c.gtk_button_new_from_icon_name("pan-down-symbolic");
-    BrowserView.flatten(arrow.?);
+    toolbtn.flatten(arrow.?);
     c.gtk_widget_set_tooltip_text(arrow, if (seg.root)
         "Folders in this root"
     else

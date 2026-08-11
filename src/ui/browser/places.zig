@@ -16,7 +16,7 @@ const query_mod = @import("../../filebrowser/query.zig");
 const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
 const classicmenu = @import("classicmenu.zig");
-const iconload = @import("iconload.zig");
+const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
 
 /// Browser faces in this process. `authoritative` owns the one

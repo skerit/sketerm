@@ -14,6 +14,7 @@ const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
 const viewmem = @import("../../filebrowser/viewmem.zig");
+const toolbtn = @import("../toolbtn.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -468,10 +469,10 @@ pub fn installViewMenu(self: *BrowserView) void {
     // lives in the hamburger menu).
     const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.places_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("view-list-symbolic");
-    // Same treatment view.zig's `flatten` gives every other toolbar
+    // Same treatment `toolbtn.flatten` gives every other toolbar
     // button: flat, out of the focus chain, so the right cluster
     // reads as one row of icons.
-    BrowserView.flatten(btn.?);
+    toolbtn.flatten(btn.?);
     c.gtk_widget_set_tooltip_text(btn, "View options: view mode, columns, grouping, zoom, filter, flat view, folder memory");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onViewMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_insert_child_after(@ptrCast(bar), btn, null);

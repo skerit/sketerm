@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const places_mod = @import("../../filebrowser/places.zig");
 const registers = @import("../../filebrowser/registers.zig");
+const toolbtn = @import("../toolbtn.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -802,10 +803,10 @@ pub fn installSelectionMenu(self: *BrowserView) void {
     // (the old hidden-files anchor moved into the hamburger menu).
     const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.places_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("edit-select-all-symbolic");
-    // Same treatment view.zig's `flatten` gives every other toolbar
+    // Same treatment `toolbtn.flatten` gives every other toolbar
     // button; without it this one framed itself on hover while its
     // neighbours did not.
-    BrowserView.flatten(btn.?);
+    toolbtn.flatten(btn.?);
     c.gtk_widget_set_tooltip_text(btn, "Selection: sticky clicks, visual range mode, persistent registers");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSelectionMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.places_toggle)));

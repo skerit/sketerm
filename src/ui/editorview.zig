@@ -110,6 +110,7 @@ const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("../editor/view_model.zig");
 const ecmd = @import("../editor/commands.zig");
 const editormenu = @import("editormenu.zig");
+const toolbtn = @import("toolbtn.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
@@ -1940,10 +1941,10 @@ pub const EditorView = struct {
         const btn = self.back_button orelse return;
         const pane = self.pane orelse return;
         if (pane.editorReturnsToBrowser()) {
-            c.gtk_button_set_icon_name(@ptrCast(btn), "folder-symbolic");
+            toolbtn.setIcon(btn, btn, "folder-symbolic", "Files");
             c.gtk_widget_set_tooltip_text(btn, "Back to the file browser");
         } else {
-            c.gtk_button_set_icon_name(@ptrCast(btn), "sketerm-terminal-symbolic");
+            toolbtn.setIcon(btn, btn, "sketerm-terminal-symbolic", "Shell");
             c.gtk_widget_set_tooltip_text(btn, "Show this pane's shell");
         }
     }
@@ -2019,18 +2020,15 @@ pub const EditorView = struct {
 
         // Toolbar: open/save/save-as on the left, the way back to the
         // shell on the right. Flat icon buttons, browser-toolbar style.
-        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_set_margin_start(bar, 3);
-        c.gtk_widget_set_margin_end(bar, 3);
-        c.gtk_widget_set_margin_top(bar, 3);
-        c.gtk_widget_set_margin_bottom(bar, 3);
-        _ = self.barButton(bar, "document-open-symbolic", "Open a file (Ctrl+O)", &onOpenClicked);
-        _ = self.barButton(bar, "document-save-symbolic", "Save (Ctrl+S)", &onSaveClicked);
-        _ = self.barButton(bar, "document-save-as-symbolic", "Save As (Ctrl+Shift+S)", &onSaveAsClicked);
+        const bar = toolbtn.newBar();
+        toolbtn.installCss(bar);
+        _ = self.barButton(bar, "document-open-symbolic", "Open", "Open a file (Ctrl+O)", &onOpenClicked);
+        _ = self.barButton(bar, "document-save-symbolic", "Save", "Save (Ctrl+S)", &onSaveClicked);
+        _ = self.barButton(bar, "document-save-as-symbolic", "Save As", "Save As (Ctrl+Shift+S)", &onSaveAsClicked);
         const spacer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
         c.gtk_widget_set_hexpand(spacer, 1);
         c.gtk_box_append(@ptrCast(bar), spacer);
-        self.back_button = self.barButton(bar, "sketerm-terminal-symbolic", "Show this pane's shell", &onTerminalClicked);
+        self.back_button = self.barButton(bar, "sketerm-terminal-symbolic", "Shell", "Show this pane's shell", &onTerminalClicked);
         c.gtk_box_append(@ptrCast(vbox), bar);
         self.toolbar_box = bar;
 
@@ -2196,13 +2194,11 @@ pub const EditorView = struct {
         self.root_box = vbox;
     }
 
-    fn barButton(self: *EditorView, box: ?*c.GtkWidget, icon: [*:0]const u8, tooltip: [*:0]const u8, cb: *const fn (*c.GtkButton, ?*anyopaque) callconv(.c) void) *c.GtkWidget {
-        const btn = c.gtk_button_new_from_icon_name(icon);
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_widget_set_tooltip_text(btn, tooltip);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(box), btn);
-        return btn.?;
+    /// One toolbar button, with THIS view as its user data. The shape
+    /// (flat, labelled when the icon name does not resolve) is the
+    /// shared one every face toolbar uses.
+    fn barButton(self: *EditorView, box: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tooltip: [*:0]const u8, cb: *const fn (*c.GtkButton, ?*anyopaque) callconv(.c) void) *c.GtkWidget {
+        return toolbtn.barButton(box, icon, text, tooltip, cb, @ptrCast(self));
     }
 
     /// Browser-style find bar, floating at the canvas's top-right.
@@ -2240,9 +2236,9 @@ pub const EditorView = struct {
             ".*",
             "Regular expression. Replacements expand $1..$9 (and $0 for the whole match).",
         );
-        _ = self.barButton(row, "go-up-symbolic", "Previous match (Shift+Enter)", &onFindPrevClicked);
-        _ = self.barButton(row, "go-down-symbolic", "Next match (Enter)", &onFindNextClicked);
-        _ = self.barButton(row, "window-close-symbolic", "Close (Escape)", &onFindCloseClicked);
+        _ = self.barButton(row, "go-up-symbolic", "Prev", "Previous match (Shift+Enter)", &onFindPrevClicked);
+        _ = self.barButton(row, "go-down-symbolic", "Next", "Next match (Enter)", &onFindNextClicked);
+        _ = self.barButton(row, "window-close-symbolic", "Close", "Close (Escape)", &onFindCloseClicked);
         c.gtk_box_append(@ptrCast(outer), row);
 
         const rrow = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
