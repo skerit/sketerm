@@ -186,6 +186,7 @@ comptime {
     _ = @import("util/filehash.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/imagecodec.zig");
+    _ = @import("util/markdown.zig");
     _ = @import("util/marks.zig");
     _ = @import("util/mounts.zig");
     _ = @import("util/ocr.zig");
