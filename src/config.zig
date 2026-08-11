@@ -124,6 +124,15 @@ pub const TextBlending = enum(u8) {
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
+/// `tab_close_parent`: closing a tab that has child tabs (tree-style
+/// tabs) either promotes the children or closes the whole subtree.
+/// Defined here (not in `src/ui/tabforest.zig`) for the same reason
+/// as WebPopupPolicy: config.zig is compiled into `sketerm-mux`.
+pub const TabCloseParent = enum(u8) { promote = 0, close_subtree = 1 };
+
+/// `tab_child_insert`: where a new child tab lands among its siblings.
+pub const TabChildInsert = enum(u8) { last = 0, first = 1 };
+
 /// What a middle / right click does when the running app isn't in
 /// mouse-report mode. `menu` only makes sense for right-click.
 pub const MouseAction = enum { menu, paste_primary, paste_clipboard, none };
@@ -1280,6 +1289,16 @@ pub const Config = struct {
     /// a single tab can set this to false (or rebind toggle_tab_bar)
     /// to reclaim ~32 px of vertical space.
     show_tab_bar: bool = true,
+    /// Show the vertical tree-style tab sidebar at startup. Off by
+    /// default; toggleable at runtime via toggle_tab_sidebar.
+    show_tab_sidebar: bool = false,
+    /// Tree-style tabs: what closing a tab with child tabs does —
+    /// promote the children one level up (default, TST-style) or
+    /// close the whole subtree with it.
+    tab_close_parent: TabCloseParent = .promote,
+    /// Tree-style tabs: where a new child tab lands among its
+    /// siblings (opener-relative insert position).
+    tab_child_insert: TabChildInsert = .last,
     /// Active pane title bar foreground / background. Default
     /// matches Terminator (red bg / white fg) so users coming from
     /// Terminator see the familiar "this pane has focus" cue.
@@ -1957,6 +1976,9 @@ pub const Config = struct {
         if (self.window_title_template.len > 0)
             try w.print("window_title_template = {s}\n", .{self.window_title_template});
         if (!self.show_tab_bar) try w.writeAll("show_tab_bar = false\n");
+        if (self.show_tab_sidebar) try w.writeAll("show_tab_sidebar = true\n");
+        if (self.tab_close_parent != .promote) try w.writeAll("tab_close_parent = close-subtree\n");
+        if (self.tab_child_insert != .last) try w.writeAll("tab_child_insert = first\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
         const default_tab: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 };
         const default_tif: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 };
@@ -3138,6 +3160,22 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.show_titlebar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "show_tab_bar")) {
         cfg.show_tab_bar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "show_tab_sidebar")) {
+        cfg.show_tab_sidebar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "tab_close_parent")) {
+        cfg.tab_close_parent = if (std.mem.eql(u8, value, "promote"))
+            .promote
+        else if (std.mem.eql(u8, value, "close-subtree") or std.mem.eql(u8, value, "close_subtree"))
+            .close_subtree
+        else
+            return error.BadTabCloseParent;
+    } else if (std.mem.eql(u8, key, "tab_child_insert")) {
+        cfg.tab_child_insert = if (std.mem.eql(u8, value, "last"))
+            .last
+        else if (std.mem.eql(u8, value, "first"))
+            .first
+        else
+            return error.BadTabChildInsert;
     } else if (std.mem.eql(u8, key, "title_active_fg")) {
         cfg.title_active_fg = try parseColor(value);
     } else if (std.mem.eql(u8, key, "title_active_bg")) {
@@ -3876,6 +3914,36 @@ test "config: show_titlebar / show_tab_bar round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqual(true, parsed.show_titlebar);
     try std.testing.expectEqual(false, parsed.show_tab_bar);
+}
+
+test "config: tree-style tab keys round-trip" {
+    var cfg = Config{};
+    cfg.show_tab_sidebar = true; // default false → emitted
+    cfg.tab_close_parent = .close_subtree; // default promote → emitted
+    cfg.tab_child_insert = .first; // default last → emitted
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_sidebar = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tab_close_parent = close-subtree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tab_child_insert = first") != null);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, out);
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.show_tab_sidebar);
+    try std.testing.expectEqual(TabCloseParent.close_subtree, parsed.tab_close_parent);
+    try std.testing.expectEqual(TabChildInsert.first, parsed.tab_child_insert);
+
+    // Defaults are not emitted.
+    const def = Config{};
+    var buf2: [8192]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try def.serialise(&w2);
+    const out2 = w2.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out2, "show_tab_sidebar") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "tab_close_parent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "tab_child_insert") == null);
 }
 
 test "config: ~ expansion in path-valued keys" {

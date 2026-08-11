@@ -84,6 +84,12 @@ pub const TabSpec = struct {
     show_activity: bool = true,
     /// Per-tab "warn when inactive" toggle. Defaults false.
     warn_inactive: bool = false,
+    /// Tree-style tabs: index (into this layout's `tabs` array) of the
+    /// tab this one nests under. null = a root tab — and every tab of
+    /// an older layout file, which therefore restores flat.
+    tree_parent: ?u32 = null,
+    /// Tree-style tabs: whether this tab's subtree was collapsed.
+    collapsed: bool = false,
 };
 
 pub const Layout = struct {
@@ -330,6 +336,53 @@ test "round trip preserves per-tab effect toggles, defaults on old files" {
     // restores with the glow on and the warning off.
     try std.testing.expectEqual(true, parsed.value.tabs[1].show_activity);
     try std.testing.expectEqual(false, parsed.value.tabs[1].warn_inactive);
+}
+
+test "round trip preserves tab-tree nesting; old files load flat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/tree.json", .{real_path});
+
+    const cmd = [_][]const u8{"sh"};
+    var tabs = [_]TabSpec{
+        .{ .title = "parent", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } }, .collapsed = true },
+        .{ .title = "child", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } }, .tree_parent = 0 },
+        .{ .title = "root2", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
+    };
+    try save(.{ .tabs = &tabs }, file_path);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parsed.value.tabs[0].tree_parent);
+    try std.testing.expectEqual(true, parsed.value.tabs[0].collapsed);
+    try std.testing.expectEqual(@as(?u32, 0), parsed.value.tabs[1].tree_parent);
+    try std.testing.expectEqual(false, parsed.value.tabs[1].collapsed);
+    try std.testing.expectEqual(@as(?u32, null), parsed.value.tabs[2].tree_parent);
+
+    // A pre-tree file (no fields at all) loads flat.
+    const old_json =
+        \\{ "version": 2, "tabs": [
+        \\  { "title": "t",
+        \\    "tree": { "pane": { "cwd": "/", "command": ["sh"] } } }
+        \\] }
+    ;
+    const old_path = try std.fmt.allocPrint(a, "{s}/oldtree.json", .{real_path});
+    var fp_z: [4096]u8 = undefined;
+    if (old_path.len >= fp_z.len) return error.PathTooLong;
+    @memcpy(fp_z[0..old_path.len], old_path);
+    fp_z[old_path.len] = 0;
+    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
+    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
+    _ = c.fclose(fp);
+    const old_parsed = try load(a, old_path);
+    defer old_parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), old_parsed.value.tabs[0].tree_parent);
+    try std.testing.expectEqual(false, old_parsed.value.tabs[0].collapsed);
 }
 
 test "load tolerates older JSON without profile / pinned fields" {
