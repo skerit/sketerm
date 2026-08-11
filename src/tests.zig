@@ -95,6 +95,7 @@ comptime {
     // these modules silently never runs unless the file is referenced
     // here by name. Proven with a deliberately failing canary.
     _ = @import("ui/webface.zig");
+    _ = @import("ui/webreader.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/browser/view.zig");
     _ = @import("ui/browser/types.zig");
@@ -145,6 +146,7 @@ comptime {
     _ = @import("util/titlefmt.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/mounts.zig");
+    _ = @import("util/markdown.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/fsserve.zig");

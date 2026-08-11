@@ -163,6 +163,8 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-rendering-symbolic.svg"
     install -Dm644 data/icons/hicolor/scalable/actions/sketerm-preview-pane-symbolic.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-preview-pane-symbolic.svg"
+    install -Dm644 data/icons/hicolor/scalable/actions/sketerm-reader-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-reader-symbolic.svg"
 
     # xdg-desktop-portal FileChooser backend (OPT-IN: installing these
     # files only makes the backend selectable; nothing uses it until

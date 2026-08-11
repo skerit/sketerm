@@ -169,6 +169,7 @@ const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const clipboard = @import("clipboard.zig");
+const webreader = @import("webreader.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -804,7 +805,12 @@ pub const Client = struct {
             },
             .sem_read_result => {
                 const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.completeOp(.read, true, ev.markdown.s, .{});
+                if (self.findFace(ev.view)) |face| {
+                    face.completeOp(.read, true, ev.markdown.s, .{});
+                    // The GUI reader rides the same request kind as the
+                    // `web_read` tool; this is where it collects its own.
+                    face.onReadReply();
+                }
             },
             .sem_eval_result => {
                 const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
@@ -973,6 +979,7 @@ pub const WebFace = struct {
     back_btn: *c.GtkWidget = undefined,
     fwd_btn: *c.GtkWidget = undefined,
     reload_btn: *c.GtkWidget = undefined,
+    reader_btn: *c.GtkWidget = undefined,
     shell_btn: *c.GtkWidget = undefined,
     entry: *c.GtkWidget = undefined,
     overlay: *c.GtkWidget = undefined,
@@ -1096,6 +1103,21 @@ pub const WebFace = struct {
     auto_ops: std.ArrayList(AutoOp) = .empty,
     auto_results: std.ArrayList(AutoResult) = .empty,
     auto_next: u32 = 1,
+
+    /// Reader mode (src/ui/webreader.zig): the extracted article laid
+    /// out as text ON TOP of the live page, which keeps running
+    /// underneath so that leaving reader mode costs one visibility
+    /// flip. Built on first use, then kept for the face's life.
+    reader: ?*webreader.Reader = null,
+    reader_active: bool = false,
+    /// The `sem_read` round trip the reader is waiting on, so its reply
+    /// can be told apart from an MCP `web_read` running at the same
+    /// time (both are `AutoKind.read`, correlated by token).
+    reader_token: ?u32 = null,
+    /// True while the code is driving the toggle button itself, so the
+    /// `toggled` handler does not act on its own state sync.
+    reader_syncing: bool = false,
+
     last_snapshot: ?[]u8 = null,
     last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
@@ -1191,6 +1213,11 @@ pub const WebFace = struct {
         // included, and the ONLY place the surface watch is severed
         // besides the area's own unrealize.
         self.detachScaleWatch();
+        // The reader's own controllers carry the READER as user-data,
+        // so the disconnect loop below (which matches on this face)
+        // cannot reach them; its `sever` is the same mechanism applied
+        // at the same choke point.
+        if (self.reader) |r| r.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
         // two pacing sources, which carry this face as user-data and
         // are not signals, so the disconnect loop below misses them.
@@ -1230,6 +1257,10 @@ pub const WebFace = struct {
         // Raising the face re-asserts its title on the pane titlebar
         // (the flip cleared whatever the previous face had put there).
         self.applyPaneFaceTitle();
+        if (self.reader_active) {
+            if (self.reader) |r| r.focus();
+            return;
+        }
         if (self.url == null and self.pending_url == null) {
             _ = c.gtk_widget_grab_focus(self.entry);
             return;
@@ -1243,6 +1274,11 @@ pub const WebFace = struct {
         cl.unregister(self);
         self.detachScaleWatch();
         self.stopPacing();
+        if (self.reader) |r| {
+            r.sever(self.widgets_dead);
+            r.destroy();
+            self.reader = null;
+        }
         self.dropMap();
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
@@ -2013,6 +2049,18 @@ pub const WebFace = struct {
         self.track(self.entry);
         c.gtk_box_append(@ptrCast(bar), self.entry);
 
+        // Reader mode. A toggle, because it is a state of the pane and
+        // not an action: pressed = the article is showing.
+        self.reader_btn = toolbtn.barToggle(
+            bar,
+            "sketerm-reader-symbolic",
+            "Reader",
+            "Reader view (the page's article as plain text)",
+            &onReaderToggled,
+            self,
+        );
+        self.track(self.reader_btn);
+
         // `sketerm-terminal-symbolic` is one of our own bundled icons,
         // but it goes through the fallback like every other name: a
         // theme chain that cannot draw it must not leave the way out
@@ -2199,6 +2247,8 @@ pub const WebFace = struct {
         // up: drop the requests so their kinds are usable again.
         self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
+        // The document the article came from does not exist any more.
+        self.exitReader();
         self.crashed = false;
         self.clearStatus();
         self.view_live = false;
@@ -2674,6 +2724,10 @@ pub const WebFace = struct {
             self.cancelHints();
             self.crashed = false;
             self.clearStatus();
+            // A navigation the page started itself (a link the reader
+            // did not send, a redirect, a form) also invalidates the
+            // article that is showing.
+            self.exitReader();
         } else if (ev.state == @intFromEnum(proto.LoadState.finished) or
             ev.state == @intFromEnum(proto.LoadState.failed))
         {
@@ -2714,6 +2768,7 @@ pub const WebFace = struct {
     pub fn onCrashed(self: *WebFace) void {
         self.crashed = true;
         self.cancelHints();
+        self.exitReader();
         self.dropMap();
         self.setStatus(CRASH_MSG, true);
     }
@@ -2731,6 +2786,8 @@ pub const WebFace = struct {
     pub fn navigate(self: *WebFace, spec: []const u8) void {
         const trimmed = std.mem.trim(u8, spec, " \t\r\n");
         if (trimmed.len == 0) return;
+        // The article belongs to the document being left behind.
+        self.exitReader();
         var buf: [4096]u8 = undefined;
         const url = normalizeUrl(&buf, trimmed) orelse return;
         if (self.pending_url) |u| self.allocator.free(u);
@@ -2823,6 +2880,152 @@ pub const WebFace = struct {
         c.gtk_label_set_text(@ptrCast(self.find_count), z.ptr);
     }
 
+    // ---- reader mode -------------------------------------------------
+
+    /// The `web_reader` action, the toolbar toggle and the context-menu
+    /// row all land here.
+    pub fn toggleReader(self: *WebFace) void {
+        if (self.reader_active) self.exitReader() else self.requestReader();
+    }
+
+    /// Ask the page for its article. The answer arrives on the socket,
+    /// so this only starts the round trip; `onReadReply` finishes it.
+    fn requestReader(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        self.syncReaderButton(true);
+        if (!self.view_live) {
+            self.toast("The page is not ready yet.");
+            self.syncReaderButton(false);
+            return;
+        }
+        // `autoRead` refuses a second read while one is in flight — an
+        // MCP `web_read` on the same view, or an earlier press.
+        self.reader_token = self.autoRead() orelse {
+            self.toast("Still reading this page. Try again in a moment.");
+            self.syncReaderButton(false);
+            return;
+        };
+    }
+
+    /// A `sem_read_result` landed. It is only OURS when its token is
+    /// the one this face is waiting on: an MCP `web_read` against the
+    /// same view produces the same frame and must not be stolen.
+    fn onReadReply(self: *WebFace) void {
+        const token = self.reader_token orelse return;
+        const res = self.autoTake(token) orelse return;
+        defer self.allocator.free(res.text);
+        self.reader_token = null;
+        if (!res.ok) {
+            self.toast("Could not read this page.");
+            self.syncReaderButton(false);
+            return;
+        }
+        self.enterReader(res.text);
+    }
+
+    fn enterReader(self: *WebFace, md: []const u8) void {
+        if (self.widgets_dead) return;
+        if (self.reader == null) {
+            const r = webreader.Reader.create(
+                self.allocator,
+                @ptrCast(self),
+                &readerLinkCb,
+                &readerKeyCb,
+            ) orelse {
+                self.toast("Could not open the reader view.");
+                self.syncReaderButton(false);
+                return;
+            };
+            c.gtk_widget_set_visible(r.widget(), 0);
+            // Last overlay child = on top of the frame, the sensor and
+            // the status box, and the only one of them that takes
+            // input, so the page underneath sees nothing while it shows.
+            c.gtk_overlay_add_overlay(@ptrCast(self.overlay), r.widget());
+            self.reader = r;
+        }
+        const r = self.reader.?;
+        if (!r.setMarkdown(md, self.url orelse "")) {
+            self.toast("No article found on this page.");
+            self.syncReaderButton(false);
+            return;
+        }
+        c.gtk_widget_set_visible(r.widget(), 1);
+        c.gtk_widget_set_visible(self.picture, 0);
+        self.reader_active = true;
+        self.syncReaderButton(true);
+        r.focus();
+    }
+
+    /// Back to the page. Cheap by design — the view never stopped
+    /// living, so nothing is reloaded and no history entry was made.
+    /// Also the exit path for a navigation, which is why it must be a
+    /// no-op (and must NOT steal focus) when no reader is up.
+    pub fn exitReader(self: *WebFace) void {
+        const was_pending = self.reader_token != null;
+        self.reader_token = null;
+        if (!self.reader_active) {
+            if (was_pending) self.syncReaderButton(false);
+            return;
+        }
+        self.reader_active = false;
+        if (self.widgets_dead) return;
+        if (self.reader) |r| c.gtk_widget_set_visible(r.widget(), 0);
+        c.gtk_widget_set_visible(self.picture, 1);
+        self.syncReaderButton(false);
+        _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
+    fn syncReaderButton(self: *WebFace, on: bool) void {
+        if (self.widgets_dead) return;
+        self.reader_syncing = true;
+        defer self.reader_syncing = false;
+        c.gtk_toggle_button_set_active(@ptrCast(self.reader_btn), if (on) @as(c_int, 1) else 0);
+    }
+
+    fn toast(self: *WebFace, msg: []const u8) void {
+        const win = self.ownerWindow() orelse return;
+        @import("window.zig").showToast(win, msg);
+    }
+
+    /// A link in the article: navigate the page underneath and leave
+    /// reader mode, which is what a reader's link click means
+    /// everywhere else too.
+    fn readerLinkCb(ctx: ?*anyopaque, url: []const u8) void {
+        const self = cast.userData(WebFace, ctx);
+        self.exitReader();
+        self.navigate(url);
+    }
+
+    /// Keys the reader did not want. Escape leaves; everything else
+    /// gets the pane/window bindings, so a focused reader is no more of
+    /// a keyboard trap than a focused page.
+    fn readerKeyCb(ctx: ?*anyopaque, keyval: c.guint, state: c.GdkModifierType) bool {
+        const self = cast.userData(WebFace, ctx);
+        if (keyval == c.GDK_KEY_Escape) {
+            self.exitReader();
+            return true;
+        }
+        if (self.pane) |pane| {
+            if (pane.input_ctx) |ictx| {
+                if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled != 0;
+            }
+        }
+        return false;
+    }
+
+    fn onReaderToggled(btn: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        if (self.reader_syncing) return;
+        if (c.gtk_toggle_button_get_active(@ptrCast(btn)) != 0)
+            self.requestReader()
+        else
+            self.exitReader();
+    }
+
+    fn onMenuReader(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.toggleReader();
+    }
+
     // ---- zoom -------------------------------------------------------
 
     /// Zoom bounds in level x100: 1.2^-7 (~28%) to 1.2^8 (~430%),
@@ -2913,6 +3116,7 @@ pub const WebFace = struct {
             links.item("Copy Link URL", &onMenuCopyLink, ctx);
         }
         const page = m.section();
+        page.check("Reader View", self.reader_active, &onMenuReader, ctx);
         page.itemIconEnabled("Copy Page URL", .none, ctx.page != null, &onMenuCopyUrl, ctx);
 
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
