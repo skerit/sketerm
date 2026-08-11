@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const fmtSize = @import("../filebrowser/format.zig").fmtSize;
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -179,8 +180,8 @@ fn addRow(self: *Browser, e: Terminal.DirEntry) void {
     c.gtk_box_append(@ptrCast(box), label);
 
     if (!e.is_dir) {
-        var size_buf: [32]u8 = undefined;
-        const size_z = humanSize(&size_buf, e.size);
+        var size_buf: [48:0]u8 = undefined;
+        const size_z = fmtSize(&size_buf, e.size);
         const slabel = c.gtk_label_new(size_z.ptr);
         c.gtk_widget_add_css_class(slabel, "dim-label");
         c.gtk_box_append(@ptrCast(box), slabel);
@@ -248,15 +249,4 @@ fn clearList(listbox: *c.GtkWidget) void {
     while (c.gtk_widget_get_first_child(listbox)) |child| {
         c.gtk_list_box_remove(@ptrCast(listbox), child);
     }
-}
-
-fn humanSize(buf: []u8, n: u64) [:0]const u8 {
-    const fmt = std.fmt;
-    if (n < 1024) return fmt.bufPrintZ(buf, "{d} B", .{n}) catch "";
-    const kb = @as(f64, @floatFromInt(n)) / 1024.0;
-    if (n < 1024 * 1024) return fmt.bufPrintZ(buf, "{d:.1} KB", .{kb}) catch "";
-    const mb = kb / 1024.0;
-    if (n < 1024 * 1024 * 1024) return fmt.bufPrintZ(buf, "{d:.1} MB", .{mb}) catch "";
-    const gb = mb / 1024.0;
-    return fmt.bufPrintZ(buf, "{d:.1} GB", .{gb}) catch "";
 }

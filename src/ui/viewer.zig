@@ -8,6 +8,7 @@ const decoder = @import("image_decoder.zig");
 const image_canvas = @import("image_canvas.zig");
 const hostmount = @import("hostmount.zig");
 const hexdump = @import("../filebrowser/hexdump.zig");
+const fmtSize = @import("../filebrowser/format.zig").fmtSize;
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
