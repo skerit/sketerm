@@ -93,6 +93,16 @@ pub const InputMethod = enum { auto, simple, multi };
 ///   fringe goes without the weight shift.
 ///
 /// `linear-corrected` (ghostty's spelling) parses too.
+/// `web_popup_policy`: what a browser pane does with `window.open`.
+/// Kept here rather than in `src/ui/webface.zig` because `config.zig`
+/// is compiled into `sketerm-mux`, which must not reach into `ui/`.
+pub const WebPopupPolicy = enum(u8) {
+    /// Open popups a user interaction produced, block the rest.
+    block_gestureless = 0,
+    allow = 1,
+    block_all = 2,
+};
+
 pub const TextBlending = enum(u8) {
     native = 0,
     linear = 1,
@@ -1162,6 +1172,13 @@ pub const Config = struct {
     /// its back/forward history is gone. Conservative by default for
     /// exactly that reason.
     web_discard_minutes: u32 = 30,
+    /// What a browser pane does with a popup the page asks for. The
+    /// helper never opens one itself, so this is the GUI's whole
+    /// policy. `block-gestureless` (the default) opens the popups a
+    /// user interaction produced and offers the rest as a toast; a
+    /// page that opens windows on its own is the case it exists for.
+    /// App-level, like the frame cap: one helper client, one policy.
+    web_popup_policy: WebPopupPolicy = .block_gestureless,
 
     /// Colour space glyph coverage is blended in (see TextBlending).
     /// App-level, like every other rendering flag: it changes the GL
@@ -1711,6 +1728,13 @@ pub const Config = struct {
         if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
         if (self.browser_max_fps != 0) try w.print("browser_max_fps = {d}\n", .{self.browser_max_fps});
         if (self.web_discard_minutes != 30) try w.print("web_discard_minutes = {d}\n", .{self.web_discard_minutes});
+        if (self.web_popup_policy != .block_gestureless) try w.print("web_popup_policy = {s}\n", .{
+            switch (self.web_popup_policy) {
+                .block_gestureless => "block-gestureless",
+                .allow => "allow",
+                .block_all => "block-all",
+            },
+        });
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -2835,6 +2859,16 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.browser_max_fps = @intCast(n);
     } else if (std.mem.eql(u8, key, "web_discard_minutes")) {
         cfg.web_discard_minutes = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "web_popup_policy")) {
+        cfg.web_popup_policy = if (std.mem.eql(u8, value, "block-gestureless") or
+            std.mem.eql(u8, value, "block_gestureless"))
+            .block_gestureless
+        else if (std.mem.eql(u8, value, "allow"))
+            .allow
+        else if (std.mem.eql(u8, value, "block-all") or std.mem.eql(u8, value, "block_all"))
+            .block_all
+        else
+            return error.BadWebPopupPolicy;
     } else if (std.mem.eql(u8, key, "graphics_offload")) {
         cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {

@@ -207,7 +207,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [11][]const u8 = .{
+                var caps: [13][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -218,9 +218,11 @@ pub const Server = struct {
                     proto.CAP_CONTEXT_MENU,
                     proto.CAP_INTERCEPT,
                     proto.CAP_DISCARD,
+                    proto.CAP_TLS,
+                    proto.CAP_PERMISSIONS,
                     undefined,
                 };
-                var ncaps: usize = 10;
+                var ncaps: usize = 12;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -241,6 +243,8 @@ pub const Server = struct {
             .view_show => self.host.showView((try proto.decode(proto.ViewShow, frame.payload)).view, true),
             .view_hide => self.host.showView((try proto.decode(proto.ViewHide, frame.payload)).view, false),
             .view_max_fps => self.host.setMaxFps(try proto.decode(proto.ViewMaxFps, frame.payload)),
+            .cert_decision => self.host.certDecision(try proto.decode(proto.CertDecision, frame.payload)),
+            .permission_decision => self.host.permissionDecision(try proto.decode(proto.PermissionDecision, frame.payload)),
             .navigate => self.host.navigate(try proto.decode(proto.Navigate, frame.payload)),
             .nav_action => self.host.navAction(try proto.decode(proto.NavAction, frame.payload)),
             .find => self.host.findInPage(try proto.decode(proto.Find, frame.payload)),

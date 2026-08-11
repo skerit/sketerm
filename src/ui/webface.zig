@@ -374,6 +374,47 @@ pub fn discardSupported() bool {
 }
 
 // ---------------------------------------------------------------------
+// App-level popup policy
+// ---------------------------------------------------------------------
+
+/// What happens to a page's `window.open` / `target=_blank`.
+///
+/// The helper never opens a popup itself: it cancels and reports, so
+/// this is purely the GUI's decision. `block_gestureless` is the
+/// default because the flag it keys on is what separates "the user
+/// clicked a link that opens a tab" from "the page opened one on its
+/// own" — the second is the advertising pop-under, and it is the only
+/// one blocked.
+pub const PopupPolicy = enum { block_gestureless, allow, block_all };
+
+var g_popup_policy: PopupPolicy = .block_gestureless;
+
+/// `web_popup_policy` from the config. App-level and module-level for
+/// the same reason as the frame cap: one helper client, one policy.
+pub fn setPopupPolicy(policy: PopupPolicy) void {
+    g_popup_policy = policy;
+}
+
+// ---------------------------------------------------------------------
+// Site settings (permission memory)
+// ---------------------------------------------------------------------
+
+/// Where a permission decision goes once the user has made it.
+///
+/// THE integration point for the daemon-side site-settings store: set
+/// this once and every Allow/Block a face records is reported to it,
+/// origin and permission bits included. Nothing in this file persists
+/// anything — a face's memory is in-process and dies with the tab, by
+/// design, so the store owns durability alone.
+pub const SiteSettingSink = *const fn (origin: []const u8, types: u32, allow: bool) void;
+
+var g_site_setting_sink: ?SiteSettingSink = null;
+
+pub fn setSiteSettingSink(sink: ?SiteSettingSink) void {
+    g_site_setting_sink = sink;
+}
+
+// ---------------------------------------------------------------------
 // Client — one helper process per GUI process
 // ---------------------------------------------------------------------
 
@@ -412,6 +453,13 @@ pub const Client = struct {
     /// hidden face behaves exactly as it did before the feature: paused
     /// painting, browser kept.
     cap_discard: bool = false,
+    /// Capabilities the CURRENT helper answered with. A helper that
+    /// predates either feature advertises neither, sends neither event,
+    /// and the face keeps behaving exactly as it did before them — the
+    /// degradation is silent by construction, and these two flags only
+    /// keep the GUI from posting decisions such a helper would ignore.
+    has_tls: bool = false,
+    has_permissions: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -767,8 +815,12 @@ pub const Client = struct {
                 defer self.gpa.free(ack.caps);
                 if (ack.proto != proto.PROTO_VERSION) self.fail("The browser helper speaks a different protocol version.");
                 self.cap_discard = false;
+                self.has_tls = false;
+                self.has_permissions = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.has_permissions = true;
                 }
             },
             .frame_buffer => {
@@ -818,7 +870,15 @@ pub const Client = struct {
             },
             .ev_popup_request => {
                 const ev = proto.decode(proto.EvPopupRequest, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.onPopup(ev.url);
+                if (self.findFace(ev.view)) |face| face.onPopup(ev.url, ev.user_gesture != 0);
+            },
+            .ev_cert_error => {
+                const ev = proto.decode(proto.EvCertError, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onCertError(ev);
+            },
+            .ev_permission => {
+                const ev = proto.decode(proto.EvPermission, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onPermission(ev);
             },
             .ev_find_result => {
                 const ev = proto.decode(proto.EvFindResult, frame.payload) catch return;
@@ -1036,6 +1096,23 @@ const DmabufFds = struct {
     }
 };
 
+/// One permission prompt the helper is holding, as the banner shows it.
+/// `origin` is owned by the face.
+const PermPrompt = struct {
+    prompt: u64,
+    origin: []u8,
+    types: u32,
+};
+
+/// A remembered Allow/Block for one origin and one exact permission
+/// set. Matching is on the exact bits: a page that later asks for
+/// camera alone has not been answered by a camera+microphone decision.
+const SiteSetting = struct {
+    origin: []u8,
+    types: u32,
+    allow: bool,
+};
+
 pub const WebFace = struct {
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
@@ -1078,6 +1155,21 @@ pub const WebFace = struct {
 
     /// Objects carrying signals whose user-data is this face. All are
     /// disconnected at the teardown choke point.
+    /// Full-face certificate interstitial (overlay child, hidden until
+    /// an `ev_cert_error` arrives) and the labels it fills in.
+    cert_box: *c.GtkWidget = undefined,
+    cert_title: *c.GtkWidget = undefined,
+    cert_detail: *c.GtkWidget = undefined,
+    /// Non-modal permission banner between the toolbar and the page.
+    perm_bar: *c.GtkWidget = undefined,
+    perm_label: *c.GtkWidget = undefined,
+
+    /// Objects carrying signals whose user-data is this face. All are
+    /// disconnected at the teardown choke point — so the array must be
+    /// big enough for every one of them: `track` silently drops what
+    /// does not fit, and a dropped object keeps a handler pointing at a
+    /// freed face. Count the `track` calls in `buildUi`,
+    /// `buildCertOverlay` and `wireInput` before shrinking it.
     signal_objs: [24]?*c.GObject = .{null} ** 24,
     signal_count: usize = 0,
 
@@ -1170,6 +1262,22 @@ pub const WebFace = struct {
     /// settle needs it because "not loading" is also true BEFORE the
     /// navigation it is waiting for has started.
     load_seq: u32 = 0,
+
+    /// True while the helper is HOLDING a request on a certificate the
+    /// interstitial is asking about. Exactly one decision goes back.
+    cert_pending: bool = false,
+    /// Set when this face cancelled a held request itself, so the load
+    /// error the cancellation produces is not also shown as a failure
+    /// (the interstitial already said what happened).
+    cert_cancelled: bool = false,
+    /// Permission prompts the helper is holding for this view, oldest
+    /// first; the banner shows `[0]`. Bounded by the helper, which holds
+    /// at most four per view.
+    perm_queue: std.ArrayList(PermPrompt) = .empty,
+    /// Decisions this face remembers for the rest of its life, keyed on
+    /// (origin, permission bits). In-process only — persistence belongs
+    /// to whatever `SiteSettingSink` is set.
+    site_settings: std.ArrayList(SiteSetting) = .empty,
 
     /// Where the pane's tab title comes from while this face lives.
     title: ?[]u8 = null,
@@ -1389,6 +1497,12 @@ pub const WebFace = struct {
         if (self.pending_url) |u| self.allocator.free(u);
         if (self.url) |u| self.allocator.free(u);
         if (self.title) |t| self.allocator.free(t);
+        // The helper cancels whatever it still holds for a destroyed
+        // view, so nothing is answered here — only freed.
+        for (self.perm_queue.items) |p| self.allocator.free(p.origin);
+        self.perm_queue.deinit(self.allocator);
+        for (self.site_settings.items) |s| self.allocator.free(s.origin);
+        self.site_settings.deinit(self.allocator);
         self.autoClear();
         self.auto_ops.deinit(self.allocator);
         self.auto_results.deinit(self.allocator);
@@ -2396,6 +2510,28 @@ pub const WebFace = struct {
 
         c.gtk_widget_set_visible(self.find_bar, 0);
         c.gtk_box_append(@ptrCast(self.root_box), self.find_bar);
+        // NON-MODAL by construction: a strip in the pane's own box, so
+        // the page below stays live and the rest of the window keeps
+        // working while a prompt is up. A permission request is not
+        // worth a dialog that blocks the terminal behind it.
+        self.perm_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        c.gtk_widget_add_css_class(self.perm_bar, "sketerm-web-permbar");
+        self.perm_label = c.gtk_label_new("");
+        c.gtk_label_set_wrap(@ptrCast(self.perm_label), 1);
+        c.gtk_label_set_xalign(@ptrCast(self.perm_label), 0);
+        c.gtk_widget_set_hexpand(self.perm_label, 1);
+        c.gtk_box_append(@ptrCast(self.perm_bar), self.perm_label);
+        const allow_btn = c.gtk_button_new_with_label("Allow");
+        c.gtk_widget_add_css_class(allow_btn, "suggested-action");
+        _ = c.g_signal_connect_data(@ptrCast(allow_btn), "clicked", @ptrCast(&onPermAllow), self, null, 0);
+        self.track(allow_btn);
+        c.gtk_box_append(@ptrCast(self.perm_bar), allow_btn);
+        const block_btn = c.gtk_button_new_with_label("Block");
+        _ = c.g_signal_connect_data(@ptrCast(block_btn), "clicked", @ptrCast(&onPermBlock), self, null, 0);
+        self.track(block_btn);
+        c.gtk_box_append(@ptrCast(self.perm_bar), block_btn);
+        c.gtk_widget_set_visible(self.perm_bar, 0);
+        c.gtk_box_append(@ptrCast(self.root_box), self.perm_bar);
 
         self.overlay = c.gtk_overlay_new();
         c.gtk_widget_set_hexpand(self.overlay, 1);
@@ -2462,7 +2598,61 @@ pub const WebFace = struct {
         c.gtk_widget_set_visible(self.status_box, 0);
         c.gtk_overlay_add_overlay(@ptrCast(self.overlay), self.status_box);
 
+        self.buildCertOverlay();
+
         c.gtk_box_append(@ptrCast(self.root_box), self.overlay);
+    }
+
+    /// The certificate interstitial: a full-face panel, opaque and
+    /// dark, that COVERS the page rather than annotating it. It is an
+    /// overlay child sized to fill, so nothing of the held page shows
+    /// through and no click reaches it while a decision is outstanding.
+    fn buildCertOverlay(self: *WebFace) void {
+        self.cert_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12);
+        c.gtk_widget_add_css_class(self.cert_box, "sketerm-web-interstitial");
+        c.gtk_widget_set_halign(self.cert_box, c.GTK_ALIGN_FILL);
+        c.gtk_widget_set_valign(self.cert_box, c.GTK_ALIGN_FILL);
+
+        const heading = c.gtk_label_new("Your connection is not private");
+        c.gtk_widget_add_css_class(heading, "title");
+        c.gtk_label_set_wrap(@ptrCast(heading), 1);
+        c.gtk_widget_set_valign(heading, c.GTK_ALIGN_END);
+        c.gtk_widget_set_vexpand(heading, 1);
+        c.gtk_box_append(@ptrCast(self.cert_box), heading);
+
+        self.cert_title = c.gtk_label_new("");
+        c.gtk_label_set_wrap(@ptrCast(self.cert_title), 1);
+        c.gtk_label_set_justify(@ptrCast(self.cert_title), c.GTK_JUSTIFY_CENTER);
+        c.gtk_box_append(@ptrCast(self.cert_box), self.cert_title);
+
+        self.cert_detail = c.gtk_label_new("");
+        c.gtk_widget_add_css_class(self.cert_detail, "detail");
+        c.gtk_label_set_wrap(@ptrCast(self.cert_detail), 1);
+        c.gtk_label_set_selectable(@ptrCast(self.cert_detail), 1);
+        c.gtk_label_set_justify(@ptrCast(self.cert_detail), c.GTK_JUSTIFY_CENTER);
+        c.gtk_box_append(@ptrCast(self.cert_box), self.cert_detail);
+
+        const buttons = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12);
+        c.gtk_widget_set_halign(buttons, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_set_valign(buttons, c.GTK_ALIGN_START);
+        c.gtk_widget_set_vexpand(buttons, 1);
+        c.gtk_widget_set_margin_top(buttons, 8);
+        // Safety is the DEFAULT action and the visually loud one; the
+        // way out is deliberately spelled as the danger it is.
+        const back = c.gtk_button_new_with_label("Back to safety");
+        c.gtk_widget_add_css_class(back, "suggested-action");
+        _ = c.g_signal_connect_data(@ptrCast(back), "clicked", @ptrCast(&onCertBack), self, null, 0);
+        self.track(back);
+        c.gtk_box_append(@ptrCast(buttons), back);
+        const proceed = c.gtk_button_new_with_label("Proceed anyway (unsafe)");
+        c.gtk_widget_add_css_class(proceed, "destructive-action");
+        _ = c.g_signal_connect_data(@ptrCast(proceed), "clicked", @ptrCast(&onCertProceed), self, null, 0);
+        self.track(proceed);
+        c.gtk_box_append(@ptrCast(buttons), proceed);
+        c.gtk_box_append(@ptrCast(self.cert_box), buttons);
+
+        c.gtk_widget_set_visible(self.cert_box, 0);
+        c.gtk_overlay_add_overlay(@ptrCast(self.overlay), self.cert_box);
     }
 
     fn wireInput(self: *WebFace) void {
@@ -2534,6 +2724,12 @@ pub const WebFace = struct {
         self.exitReader();
         self.crashed = false;
         self.clearStatus();
+        // Whatever the previous helper was holding died with it: a
+        // decision now would name a request nobody has.
+        self.cert_pending = false;
+        self.cert_cancelled = false;
+        if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
+        self.clearPermPrompts();
         self.view_live = false;
         // A fresh helper holds no views at all, discarded or otherwise:
         // `ensureView` below mints this one again from scratch.
@@ -2548,6 +2744,10 @@ pub const WebFace = struct {
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
         self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
+        self.cert_pending = false;
+        self.cert_cancelled = false;
+        if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
+        self.clearPermPrompts();
         self.view_live = false;
         self.stopDiscardTimer();
         self.noteRevived();
@@ -3023,6 +3223,10 @@ pub const WebFace = struct {
             // did not send, a redirect, a form) also invalidates the
             // article that is showing.
             self.exitReader();
+            // The engine dismisses the prompts of a document it is
+            // leaving; a banner for a page that is gone would answer
+            // into nothing.
+            self.clearPermPrompts();
         } else if (ev.state == @intFromEnum(proto.LoadState.finished) or
             ev.state == @intFromEnum(proto.LoadState.failed))
         {
@@ -3031,9 +3235,202 @@ pub const WebFace = struct {
     }
 
     pub fn onLoadError(self: *WebFace, ev: proto.EvLoadError) void {
+        // A request this face is asking about, or just cancelled from
+        // the interstitial, fails by design: the interstitial is the
+        // explanation, and the generic overlay on top of it would only
+        // restate it in weaker words.
+        if (self.cert_pending) return;
+        if (self.cert_cancelled) {
+            self.cert_cancelled = false;
+            return;
+        }
         var buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Could not load {s}: {s} ({d})", .{ ev.url, ev.msg, ev.code }) catch "Could not load this page.";
         self.setStatus(msg, true);
+    }
+
+    // ---- TLS interstitial -------------------------------------------
+
+    /// The helper is HOLDING a request whose certificate failed. Until
+    /// `certDecide` answers, the page is neither loaded nor failed.
+    pub fn onCertError(self: *WebFace, ev: proto.EvCertError) void {
+        self.cert_pending = true;
+        self.cert_cancelled = false;
+        if (self.widgets_dead) return;
+        // The generic status overlay would otherwise sit on top of the
+        // interstitial saying the same thing in weaker words.
+        self.clearStatus();
+
+        var buf: [512]u8 = undefined;
+        const named = if (ev.host.len != 0) ev.host else ev.url;
+        const title = std.fmt.bufPrintZ(
+            &buf,
+            "sketerm cannot verify that this is {s}. Someone may be impersonating it to steal what you type.",
+            .{named},
+        ) catch "This site's certificate could not be verified.";
+        c.gtk_label_set_text(@ptrCast(self.cert_title), title.ptr);
+
+        var dbuf: [1024]u8 = undefined;
+        const detail = std.fmt.bufPrintZ(&dbuf, "{s} ({d})\nIssued to: {s}\nIssued by: {s}\nSHA-256: {s}", .{
+            ev.msg,
+            ev.code,
+            if (ev.subject.len != 0) ev.subject else "(unknown)",
+            if (ev.issuer.len != 0) ev.issuer else "(unknown)",
+            if (ev.fingerprint.len != 0) ev.fingerprint else "(unavailable)",
+        }) catch "";
+        c.gtk_label_set_text(@ptrCast(self.cert_detail), detail.ptr);
+        c.gtk_widget_set_visible(self.cert_box, 1);
+    }
+
+    /// Answer the held request. `proceed` accepts the certificate for
+    /// THIS request only: nothing is remembered, here or helper-side.
+    fn certDecide(self: *WebFace, proceed: bool) void {
+        if (!self.cert_pending) return;
+        self.cert_pending = false;
+        self.cert_cancelled = !proceed;
+        client().post(proto.CertDecision{
+            .view = self.view,
+            .proceed = if (proceed) 1 else 0,
+        });
+        if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
+        if (proceed) {
+            self.promote();
+            return;
+        }
+        // "Back to safety" means LEAVING, not sitting on a cancelled
+        // request: back where there is history, a blank page where the
+        // bad site was the first thing this tab ever opened.
+        if (self.can_back) {
+            self.navAction(.back);
+        } else {
+            client().post(proto.Navigate{ .view = self.view, .url = "about:blank" });
+        }
+    }
+
+    fn onCertBack(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).certDecide(false);
+    }
+
+    fn onCertProceed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).certDecide(true);
+    }
+
+    // ---- permission prompts -----------------------------------------
+
+    /// A page asked for a permission and the helper is holding it.
+    /// A remembered answer for the same (origin, permission set) is
+    /// applied at once and nothing is shown.
+    pub fn onPermission(self: *WebFace, ev: proto.EvPermission) void {
+        if (self.rememberedSetting(ev.origin, ev.types)) |allow| {
+            self.postPermission(ev.prompt, allow);
+            return;
+        }
+        const origin = self.allocator.dupe(u8, ev.origin) catch return;
+        self.perm_queue.append(self.allocator, .{
+            .prompt = ev.prompt,
+            .origin = origin,
+            .types = ev.types,
+        }) catch {
+            self.allocator.free(origin);
+            // Nobody can answer a prompt that was not queued, so answer
+            // it now rather than leaving the page waiting forever.
+            self.postPermission(ev.prompt, false);
+            return;
+        };
+        self.showPermPrompt();
+    }
+
+    fn postPermission(self: *WebFace, prompt: u64, allow: bool) void {
+        client().post(proto.PermissionDecision{
+            .view = self.view,
+            .prompt = prompt,
+            .allow = if (allow) 1 else 0,
+        });
+    }
+
+    fn rememberedSetting(self: *WebFace, origin: []const u8, types: u32) ?bool {
+        for (self.site_settings.items) |s| {
+            if (s.types == types and std.mem.eql(u8, s.origin, origin)) return s.allow;
+        }
+        return null;
+    }
+
+    fn rememberSetting(self: *WebFace, origin: []const u8, types: u32, allow: bool) void {
+        for (self.site_settings.items) |*s| {
+            if (s.types == types and std.mem.eql(u8, s.origin, origin)) {
+                s.allow = allow;
+                break;
+            }
+        } else {
+            const owned = self.allocator.dupe(u8, origin) catch return;
+            self.site_settings.append(self.allocator, .{
+                .origin = owned,
+                .types = types,
+                .allow = allow,
+            }) catch {
+                self.allocator.free(owned);
+                return;
+            };
+        }
+        if (g_site_setting_sink) |sink| sink(origin, types, allow);
+    }
+
+    /// Show the head of the queue, or hide the banner when it is empty.
+    fn showPermPrompt(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        if (self.perm_queue.items.len == 0) {
+            c.gtk_widget_set_visible(self.perm_bar, 0);
+            return;
+        }
+        const p = self.perm_queue.items[0];
+        var buf: [512]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "{s} wants to use {s}", .{
+            if (p.origin.len != 0) p.origin else "This page",
+            permissionLabel(p.types),
+        }) catch "This page wants a permission";
+        c.gtk_label_set_text(@ptrCast(self.perm_label), text.ptr);
+        c.gtk_widget_set_visible(self.perm_bar, 1);
+    }
+
+    fn answerPermission(self: *WebFace, allow: bool) void {
+        if (self.perm_queue.items.len == 0) {
+            if (!self.widgets_dead) c.gtk_widget_set_visible(self.perm_bar, 0);
+            return;
+        }
+        const p = self.perm_queue.orderedRemove(0);
+        defer self.allocator.free(p.origin);
+        self.postPermission(p.prompt, allow);
+        if (p.origin.len != 0) self.rememberSetting(p.origin, p.types, allow);
+        // Anything else already answered by the same decision goes with
+        // it, so one Allow does not produce four identical banners.
+        var i: usize = 0;
+        while (i < self.perm_queue.items.len) {
+            const q = self.perm_queue.items[i];
+            if (q.types == p.types and std.mem.eql(u8, q.origin, p.origin)) {
+                _ = self.perm_queue.orderedRemove(i);
+                self.postPermission(q.prompt, allow);
+                self.allocator.free(q.origin);
+                continue;
+            }
+            i += 1;
+        }
+        self.showPermPrompt();
+    }
+
+    /// Drop every held prompt without answering: the engine dismisses
+    /// its own prompts across a navigation, so the callbacks are gone.
+    fn clearPermPrompts(self: *WebFace) void {
+        for (self.perm_queue.items) |p| self.allocator.free(p.origin);
+        self.perm_queue.clearRetainingCapacity();
+        if (!self.widgets_dead) c.gtk_widget_set_visible(self.perm_bar, 0);
+    }
+
+    fn onPermAllow(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).answerPermission(true);
+    }
+
+    fn onPermBlock(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).answerPermission(false);
     }
 
     pub fn onCursor(self: *WebFace, cursor: u8) void {
@@ -3055,9 +3452,61 @@ pub const WebFace = struct {
 
     /// A popup (target=_blank, window.open) becomes a NEW web tab in
     /// this window — never a navigation of the page that asked.
-    pub fn onPopup(self: *WebFace, url: []const u8) void {
+    ///
+    /// `user_gesture` decides whether it opens at all: under the
+    /// default policy a popup the page produced on its own is BLOCKED
+    /// and offered as a toast instead, which is the pop-under case. A
+    /// helper that predates the flag reports every popup as gestured,
+    /// so nothing changes against an old one.
+    pub fn onPopup(self: *WebFace, url: []const u8, user_gesture: bool) void {
+        const open = switch (g_popup_policy) {
+            .allow => true,
+            .block_all => false,
+            .block_gestureless => user_gesture,
+        };
+        if (open) {
+            const win = self.ownerWindow() orelse return;
+            win.newWebTabAt(url) catch {};
+            return;
+        }
+        self.toastBlockedPopup(url);
+    }
+
+    /// Offer a blocked popup rather than swallowing it: a toast naming
+    /// the host, with an Open button that opens the tab after all.
+    fn toastBlockedPopup(self: *WebFace, url: []const u8) void {
         const win = self.ownerWindow() orelse return;
-        win.newWebTabAt(url) catch {};
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Popup blocked — {s}", .{hostOf(url)}) catch return;
+        // Named `t` because the face already has a `toast` METHOD (the
+        // plain, buttonless one); this popup toast needs a button, so
+        // it is built here instead of going through it.
+        const t = c.adw_toast_new(text.ptr);
+        c.adw_toast_set_timeout(t, 6);
+        // The toast OWNS the context (mechanism 1): the closure dies
+        // with the toast, so a popup nobody opened frees itself and
+        // there is no lifetime to remember. The context deliberately
+        // holds no pointer to this face — a view id, resolved through
+        // the immortal client at click time, cannot dangle.
+        const ctx = self.allocator.create(PopupCtx) catch return;
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self.view,
+            .url = self.allocator.dupe(u8, url) catch {
+                self.allocator.destroy(ctx);
+                return;
+            },
+        };
+        c.adw_toast_set_button_label(t, "Open");
+        _ = c.g_signal_connect_data(
+            @ptrCast(t),
+            "button-clicked",
+            @ptrCast(&onPopupToastOpen),
+            ctx,
+            @ptrCast(&freePopupCtx),
+            0,
+        );
+        c.adw_toast_overlay_add_toast(win.toast_overlay, t);
     }
 
     pub fn onCrashed(self: *WebFace) void {
@@ -3999,6 +4448,71 @@ fn normalizeUrl(buf: []u8, spec: []const u8) ?[]const u8 {
         std.mem.indexOfScalar(u8, spec, '.') != null;
     if (looks_like_host) return std.fmt.bufPrint(buf, "https://{s}", .{spec}) catch null;
     return std.fmt.bufPrint(buf, "https://duckduckgo.com/?q={s}", .{spec}) catch null;
+}
+
+/// Host part of a url for a message that names a site. Falls back to
+/// the whole string, which is still better than naming nothing.
+fn hostOf(url: []const u8) []const u8 {
+    const start = if (std.mem.indexOf(u8, url, "//")) |i| i + 2 else 0;
+    var rest = url[start..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
+    return if (rest.len == 0) url else rest;
+}
+
+/// What a permission bitmask is called in a sentence. A prompt can
+/// carry several bits; the common pairs get a phrase of their own and
+/// anything unrecognised is named honestly rather than guessed at.
+fn permissionLabel(types: u32) []const u8 {
+    if (types == (proto.perm_camera | proto.perm_microphone)) return "your camera and microphone";
+    return switch (types) {
+        proto.perm_geolocation => "your location",
+        proto.perm_notifications => "notifications",
+        proto.perm_camera => "your camera",
+        proto.perm_microphone => "your microphone",
+        proto.perm_midi => "your MIDI devices",
+        proto.perm_clipboard => "your clipboard",
+        proto.perm_pointer_lock => "pointer lock",
+        proto.perm_idle_detection => "idle detection",
+        proto.perm_storage_access => "storage across sites",
+        proto.perm_window_management => "your window layout",
+        proto.perm_protected_media => "protected media playback",
+        proto.perm_local_fonts => "your installed fonts",
+        proto.perm_file_system => "files on this machine",
+        proto.perm_downloads => "multiple downloads",
+        proto.perm_sensors => "device sensors",
+        proto.perm_vr => "immersive VR/AR",
+        else => "a device permission",
+    };
+}
+
+/// Blocked-popup toast context. It carries a VIEW ID, not a face
+/// pointer: the toast can outlive the face, and the immortal client
+/// resolves the id to whatever still exists at click time.
+const PopupCtx = struct {
+    allocator: std.mem.Allocator,
+    view: u32,
+    url: []u8,
+};
+
+fn onPopupToastOpen(_: *c.AdwToast, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(PopupCtx, user);
+    const face = g_client.findFace(ctx.view) orelse return;
+    const win = face.ownerWindow() orelse return;
+    win.newWebTabAt(ctx.url) catch {};
+}
+
+fn freePopupCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
+    const ctx: *PopupCtx = @ptrCast(@alignCast(user orelse return));
+    ctx.allocator.free(ctx.url);
+    ctx.allocator.destroy(ctx);
+}
+
+test "hostOf names the site a message is about" {
+    try std.testing.expectEqualStrings("example.com", hostOf("https://example.com/a/b?c=d"));
+    try std.testing.expectEqualStrings("example.com", hostOf("https://user@example.com/"));
+    try std.testing.expectEqualStrings("example.com:8443", hostOf("https://example.com:8443/x"));
+    try std.testing.expectEqualStrings("about:blank", hostOf("about:blank"));
 }
 
 test "normalizeUrl keeps explicit schemes and promotes hosts" {

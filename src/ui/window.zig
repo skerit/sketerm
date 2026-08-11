@@ -595,6 +595,11 @@ pub const Window = struct {
         // module-level in webface, which owns the one helper client.
         @import("webface.zig").setMaxFps(self.config.browser_max_fps);
         @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
+        @import("webface.zig").setPopupPolicy(switch (self.config.web_popup_policy) {
+            .block_gestureless => .block_gestureless,
+            .allow => .allow,
+            .block_all => .block_all,
+        });
         // IM strategy is an app-level key; every face reads it at
         // construction time (imhost.resolve).
         @import("imhost.zig").setPreference(switch (self.config.input_method) {

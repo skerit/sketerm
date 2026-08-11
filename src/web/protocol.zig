@@ -52,6 +52,15 @@ pub const CAP_INTERCEPT = "intercept";
 /// `view_show`, navigation or input. A client without this capability
 /// keeps sending `view_hide`, which only stops the painting.
 pub const CAP_DISCARD = "discard";
+/// The helper reports certificate errors as `ev_cert_error` and waits
+/// for a `cert_decision` instead of failing the load. A client without
+/// it sees only the generic `ev_load_error` an older helper produced,
+/// which is exactly the pre-interstitial behaviour.
+pub const CAP_TLS = "tls";
+/// The helper hands permission prompts to the client (`ev_permission` /
+/// `permission_decision`) instead of letting the engine's default
+/// handling deny them.
+pub const CAP_PERMISSIONS = "permissions";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -92,6 +101,10 @@ pub const Tag = enum(u8) {
     ev_cursor = 0x46,
     ev_console = 0x47,
     ev_crashed = 0x48,
+    ev_cert_error = 0x55,
+    cert_decision = 0x56,
+    ev_permission = 0x57,
+    permission_decision = 0x58,
     sem_snapshot_req = 0x60,
     sem_snapshot = 0x61,
     sem_act = 0x62,
@@ -597,11 +610,42 @@ pub const EvNavState = struct {
     url: []const u8,
 };
 
+/// A page asked for a popup. The helper never opens one: it cancels
+/// and reports, so the client decides between a tab, a window and a
+/// refusal.
+///
+/// `user_gesture` is an OPTIONAL TRAILING field — the one shape in
+/// which this wire tolerates growing a frame, and only because the
+/// decoder below treats a payload that ends early as "field absent"
+/// instead of `error.Truncated`. It defaults to 1 (a gesture) when
+/// absent, so a client with a popup policy keeps a pre-gesture helper's
+/// popups working exactly as before rather than blocking all of them.
+/// Nothing may be appended after it unless the same rule is kept, and
+/// no EXISTING field may ever be widened or reordered.
 pub const EvPopupRequest = struct {
     pub const tag: Tag = .ev_popup_request;
     view: u32,
     url: []const u8,
     disposition: u8,
+    /// 1 when the page asked from inside a real user interaction.
+    user_gesture: u8 = 1,
+
+    pub fn encodeTo(self: EvPopupRequest, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putStr(gpa, out, self.url);
+        try putU8(gpa, out, self.disposition);
+        try putU8(gpa, out, self.user_gesture);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !EvPopupRequest {
+        var cur = Cur{ .buf = payload };
+        return .{
+            .view = try cur.readU32(),
+            .url = try cur.readStr(),
+            .disposition = try cur.readU8(),
+            .user_gesture = cur.readU8() catch 1,
+        };
+    }
 };
 
 pub const EvCursor = struct {
@@ -684,6 +728,91 @@ pub const EvContextMenu = struct {
     y: i32,
     flags: u8,
     link_url: []const u8,
+};
+
+// -- TLS interstitials (capability "tls") -----------------------------
+
+/// The engine refused a certificate and is HOLDING the request. Exactly
+/// one `cert_decision` for the same view resolves it; until then the
+/// load is neither committed nor failed, so a client that never answers
+/// leaves the page hanging (view destruction cancels it helper-side).
+///
+/// `code` is the engine's own error number, the same space
+/// `ev_load_error` uses, and `msg` its symbolic name. `fingerprint` is
+/// the certificate's SHA-256 as lowercase hex, or empty when the engine
+/// gave no certificate to hash — never trust it to be present.
+pub const EvCertError = struct {
+    pub const tag: Tag = .ev_cert_error;
+    view: u32,
+    code: i32,
+    /// The url whose request is held.
+    url: []const u8,
+    /// Host of `url`, extracted helper-side so every client agrees on
+    /// what the interstitial names.
+    host: []const u8,
+    msg: []const u8,
+    subject: []const u8,
+    issuer: []const u8,
+    fingerprint: []const u8,
+};
+
+/// Answer to `ev_cert_error`. `proceed = 1` continues the request with
+/// the certificate accepted FOR THIS REQUEST only — nothing is
+/// remembered helper-side, deliberately: a persisted exception is a
+/// stored security decision and belongs to whoever owns site settings,
+/// not to a stateless render helper.
+pub const CertDecision = struct {
+    pub const tag: Tag = .cert_decision;
+    view: u32,
+    proceed: u8,
+};
+
+// -- permission prompts (capability "permissions") --------------------
+
+/// Permission bits, deliberately OUR OWN numbering: an engine's
+/// permission enum is not part of this wire. Anything the helper cannot
+/// map lands in `perm_other`, which a client must still be able to name
+/// and prompt for.
+pub const perm_geolocation: u32 = 1 << 0;
+pub const perm_notifications: u32 = 1 << 1;
+pub const perm_camera: u32 = 1 << 2;
+pub const perm_microphone: u32 = 1 << 3;
+pub const perm_midi: u32 = 1 << 4;
+pub const perm_clipboard: u32 = 1 << 5;
+pub const perm_pointer_lock: u32 = 1 << 6;
+pub const perm_idle_detection: u32 = 1 << 7;
+pub const perm_storage_access: u32 = 1 << 8;
+pub const perm_window_management: u32 = 1 << 9;
+pub const perm_protected_media: u32 = 1 << 10;
+pub const perm_local_fonts: u32 = 1 << 11;
+pub const perm_file_system: u32 = 1 << 12;
+pub const perm_downloads: u32 = 1 << 13;
+pub const perm_sensors: u32 = 1 << 14;
+pub const perm_vr: u32 = 1 << 15;
+pub const perm_other: u32 = 1 << 31;
+
+/// A page asked for a permission and the engine is HOLDING the request.
+/// `prompt` identifies it for the matching `permission_decision`; ids
+/// are unique per helper process, not per view.
+pub const EvPermission = struct {
+    pub const tag: Tag = .ev_permission;
+    view: u32,
+    prompt: u64,
+    /// Origin as the engine reports it ("https://example.com").
+    origin: []const u8,
+    /// One or more `perm_*` bits; a single prompt can carry several
+    /// (a call asking for camera AND microphone is one decision).
+    types: u32,
+};
+
+/// Answer to `ev_permission`. An id the helper no longer holds — the
+/// page navigated away, the view went — is ignored, so a client may
+/// always answer late.
+pub const PermissionDecision = struct {
+    pub const tag: Tag = .permission_decision;
+    view: u32,
+    prompt: u64,
+    allow: u8,
 };
 
 // -- semantic layer (capability "semantic") ---------------------------
@@ -987,6 +1116,10 @@ fn putU32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
     try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, v)));
 }
 
+fn putU64(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u64) !void {
+    try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u64, v)));
+}
+
 fn putI32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: i32) !void {
     try putU32(gpa, out, @bitCast(v));
 }
@@ -1031,6 +1164,12 @@ pub const Cur = struct {
         return std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
     }
 
+    pub fn readU64(self: *Cur) !u64 {
+        if (self.pos + 8 > self.buf.len) return error.Truncated;
+        defer self.pos += 8;
+        return std.mem.readInt(u64, self.buf[self.pos..][0..8], .little);
+    }
+
     pub fn readI32(self: *Cur) !i32 {
         return @bitCast(try self.readU32());
     }
@@ -1069,6 +1208,7 @@ pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !
                 u8 => try putU8(gpa, out, v),
                 u16 => try putU16(gpa, out, v),
                 u32 => try putU32(gpa, out, v),
+                u64 => try putU64(gpa, out, v),
                 i32 => try putI32(gpa, out, v),
                 []const u8 => try putStr(gpa, out, v),
                 Text => try putText(gpa, out, v),
@@ -1082,9 +1222,13 @@ pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !
 }
 
 /// Decode a payload into `T`. String fields BORROW from `payload`.
-/// Types with list fields provide `decodeAlloc` instead.
+/// Types with list fields provide `decodeAlloc` instead; a type with a
+/// `decodeFrom` (a bounded array, or an optional trailing field) owns
+/// its own reader and is routed to it, so callers never have to know
+/// which shape a frame has.
 pub fn decode(comptime T: type, payload: []const u8) !T {
     if (@hasDecl(T, "decodeAlloc")) @compileError(@typeName(T) ++ " needs decodeAlloc");
+    if (@hasDecl(T, "decodeFrom")) return T.decodeFrom(payload);
     var cur = Cur{ .buf = payload };
     var out: T = undefined;
     inline for (std.meta.fields(T)) |f| {
@@ -1092,6 +1236,7 @@ pub fn decode(comptime T: type, payload: []const u8) !T {
             u8 => try cur.readU8(),
             u16 => try cur.readU16(),
             u32 => try cur.readU32(),
+            u64 => try cur.readU64(),
             i32 => try cur.readI32(),
             []const u8 => try cur.readStr(),
             Text => try cur.readText(),
@@ -1318,7 +1463,8 @@ test "round-trip: scalar and string frames" {
     try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });
     try roundTrip(EvFavicon, .{ .view = 7, .url = "http://x/favicon.ico" });
     try roundTrip(EvNavState, .{ .view = 7, .can_back = 1, .can_fwd = 0, .loading = 0, .url = "http://x/" });
-    try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 0 });
+    try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 0, .user_gesture = 1 });
+    try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 2, .user_gesture = 0 });
     try roundTrip(EvCursor, .{ .view = 7, .cursor = 1 });
     try roundTrip(EvConsole, .{ .view = 7, .level = 2, .msg = "boom" });
     try roundTrip(EvCrashed, .{ .view = 7 });
@@ -1333,6 +1479,54 @@ test "round-trip: scalar and string frames" {
         .flags = ctx_flag_link,
         .link_url = "https://example.com/a",
     });
+}
+
+test "round-trip: tls and permission frames" {
+    try roundTrip(EvCertError, .{
+        .view = 7,
+        .code = -202,
+        .url = "https://self-signed.example/",
+        .host = "self-signed.example",
+        .msg = "CERT_AUTHORITY_INVALID",
+        .subject = "self-signed.example",
+        .issuer = "self-signed.example",
+        .fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    });
+    try roundTrip(CertDecision, .{ .view = 7, .proceed = 1 });
+    try roundTrip(EvPermission, .{
+        .view = 7,
+        .prompt = 0xdead_beef_0000_0001,
+        .origin = "https://example.com",
+        .types = perm_camera | perm_microphone,
+    });
+    try roundTrip(PermissionDecision, .{ .view = 7, .prompt = 0xdead_beef_0000_0001, .allow = 0 });
+}
+
+// The one growable frame on this wire: a helper that predates the
+// gesture flag sends three fields, and a client built with four must
+// read that as "a gesture" rather than as a truncated frame — the
+// difference between an old helper behaving as it always did and one
+// whose every popup is silently blocked.
+test "an ev_popup_request without the trailing gesture byte still decodes" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    // Hand-built in the OLD layout: [view][url][disposition], no more.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try putU32(gpa, &body, 7);
+    try putStr(gpa, &body, "http://x/p");
+    try putU8(gpa, &body, 1);
+    try putU32(gpa, &buf, @intCast(body.items.len + 1));
+    try putU8(gpa, &buf, @intFromEnum(Tag.ev_popup_request));
+    try buf.appendSlice(gpa, body.items);
+
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    const got = try decode(EvPopupRequest, frame.payload);
+    try std.testing.expectEqualStrings("http://x/p", got.url);
+    try std.testing.expectEqual(@as(u8, 1), got.disposition);
+    try std.testing.expectEqual(@as(u8, 1), got.user_gesture);
 }
 
 test "round-trip: semantic layer frames" {
