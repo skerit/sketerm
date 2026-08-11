@@ -15,6 +15,7 @@
 
 const c = @import("../c.zig").c;
 const iconload = @import("iconload.zig");
+const cssutil = @import("cssutil.zig");
 
 /// The css class every face toolbar wears. Named for the file
 /// browser, which is where the look was designed; the web and editor
@@ -114,11 +115,7 @@ pub fn newNavPair() *c.GtkWidget {
 /// Breeze draws NOTHING for a `.flat` button and the chrome would
 /// otherwise read as dead pixels under the pointer. Installed once
 /// per process, at APPLICATION priority, so a user theme still wins.
-var css_installed: bool = false;
-
 pub fn installCss(any_widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
     const css =
         \\.sketerm-fb-navpair {
         \\  border: 1px solid rgba(128,128,128,0.35);
@@ -141,8 +138,5 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\  background: alpha(currentColor, 0.26);
         \\}
     ;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    cssutil.install("toolbtn", any_widget, css);
 }
