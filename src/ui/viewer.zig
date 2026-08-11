@@ -797,6 +797,15 @@ pub const ViewerWindow = struct {
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(window, @ptrCast(keys));
 
+        // File drag & drop anywhere on the window shows the dropped
+        // file, exactly as the Open dialog would. Several files: the
+        // first one with a local path wins.
+        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
+        var drop_types = [_]c.GType{c.gdk_file_list_get_type()};
+        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
+        _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(window, @ptrCast(drop));
+
         // Right-click / Menu key on the image itself. Every row
         // forwards to the header or hamburger button that already
         // implements it, so the menu adds no second copy of any
@@ -1590,6 +1599,31 @@ fn toggleFullscreen(self: *ViewerWindow) void {
         c.gtk_window_fullscreen(@ptrCast(self.window))
     else
         c.gtk_window_unfullscreen(@ptrCast(self.window));
+}
+
+/// A dropped file replaces the batch, the same way a pick from the
+/// Open dialog does. Non-local URIs (sftp://, trash://) carry no path
+/// and are skipped; the first file that has one wins.
+fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) == 0) return 0;
+    const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
+    // get_files is transfer-container: free the list, not the GFiles.
+    const files = c.gdk_file_list_get_files(flist);
+    defer c.g_slist_free(files);
+    var node = files;
+    while (node != null) : (node = node.*.next) {
+        const gfile: ?*c.GFile = @ptrCast(node.*.data);
+        const path_c = c.g_file_get_path(gfile);
+        if (path_c == null) continue;
+        defer c.g_free(path_c);
+        if (c.g_file_query_file_type(gfile, c.G_FILE_QUERY_INFO_NONE, null) == c.G_FILE_TYPE_DIRECTORY) continue;
+        const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
+        if (path.len == 0) continue;
+        self.replaceWithLocal(path);
+        return 1;
+    }
+    return 0;
 }
 
 fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
