@@ -7,6 +7,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const browser_model = @import("filebrowser/model.zig");
 const editor_model = @import("editor/model.zig");
+const web_model = @import("web/model.zig");
 
 pub const Orient = enum { horizontal, vertical };
 
@@ -49,6 +50,9 @@ pub const PaneSpec = struct {
     /// Text-editor face: open file specs + active index + cursors.
     /// Dirty (unsaved) buffers are NOT persisted — see editor/model.zig.
     editor: ?editor_model.PaneState = null,
+    /// Web (browser) face: address + page zoom. Null = the pane wears
+    /// no web face; older layout files parse into that.
+    web: ?web_model.PaneState = null,
 };
 
 pub const SplitSpec = struct {
@@ -366,6 +370,74 @@ test "load tolerates older JSON without profile / pinned fields" {
         .pane => |p| try std.testing.expectEqualStrings("", p.profile),
         else => try std.testing.expect(false),
     }
+}
+
+test "round trip preserves web pane state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/web.json", .{real_path});
+
+    const cmd = [_][]const u8{"sh"};
+    const kids = [_]Tree{
+        .{ .pane = .{ .cwd = "/", .command = &cmd, .web = .{
+            .url = "https://example.com/docs",
+            .zoom_level_x100 = 200,
+        } } },
+        // A blank web tab: face present, no address yet.
+        .{ .pane = .{ .cwd = "/", .command = &cmd, .web = .{} } },
+    };
+    const tabs = [_]TabSpec{.{ .title = "web", .tree = .{ .split = .{
+        .orientation = .vertical,
+        .ratio = 0.5,
+        .children = &kids,
+    } } }};
+    try save(.{ .tabs = &tabs }, file_path);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    const restored = parsed.value.tabs[0].tree.split.children;
+    const left = restored[0].pane.web.?;
+    try std.testing.expectEqualStrings("https://example.com/docs", left.url);
+    try std.testing.expectEqual(@as(i16, 200), left.zoom_level_x100);
+    const right = restored[1].pane.web.?;
+    try std.testing.expectEqualStrings("", right.url);
+    try std.testing.expectEqual(@as(i16, 0), right.zoom_level_x100);
+}
+
+test "load tolerates a layout written before the web field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/preweb.json", .{real_path});
+
+    // No "web" key at all, and a "zoom" key the schema never had —
+    // an old file must load, and an unknown field must not fail it.
+    const old_json =
+        \\{ "version": 2, "tabs": [
+        \\  { "title": "t", "tree": { "pane": {
+        \\      "cwd": "/", "command": ["sh"], "zoom": 3 } } }
+        \\] }
+    ;
+    var fp_z: [4096]u8 = undefined;
+    if (file_path.len >= fp_z.len) return error.PathTooLong;
+    @memcpy(fp_z[0..file_path.len], file_path);
+    fp_z[file_path.len] = 0;
+    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
+    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
+    _ = c.fclose(fp);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    // No web face is restored for a pane that never had one.
+    try std.testing.expect(parsed.value.tabs[0].tree.pane.web == null);
 }
 
 test "round trip preserves full browser pane state" {

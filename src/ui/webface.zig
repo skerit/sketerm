@@ -164,6 +164,7 @@ const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
+const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const clipboard = @import("clipboard.zig");
@@ -1105,6 +1106,25 @@ pub const WebFace = struct {
     pub fn fromPane(pane: *Pane) ?*WebFace {
         const ctx = pane.web_ctx orelse return null;
         return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Snapshot for layout persistence. The address falls back to the
+    /// attach-time one so a pane saved before the helper answered still
+    /// restores its page.
+    ///
+    pub fn paneState(self: *WebFace, arena: std.mem.Allocator) !web_model.PaneState {
+        const addr: []const u8 = self.url orelse self.pending_url orelse "";
+        return .{
+            .url = try arena.dupe(u8, addr),
+            .zoom_level_x100 = @intCast(std.math.clamp(self.zoom_x100, zoom_min_x100, zoom_max_x100)),
+        };
+    }
+
+    /// Re-apply a persisted zoom on restore. Setting the field before
+    /// the view is live is enough: the connect path re-posts a nonzero
+    /// zoom_x100, the same way a helper restart re-applies it.
+    pub fn applyRestoredZoom(self: *WebFace, zoom_level_x100: i16) void {
+        self.setZoomLevel(std.math.clamp(@as(i32, zoom_level_x100), zoom_min_x100, zoom_max_x100));
     }
 
     fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {

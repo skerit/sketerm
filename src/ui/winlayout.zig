@@ -188,6 +188,18 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 }
             }
 
+            // Web face: reopen the saved address. A blank tab (no url)
+            // still gets the face back, with its address bar focused.
+            if (p.web) |wstate| {
+                const webface = @import("webface.zig");
+                const url: ?[]const u8 = if (wstate.url.len > 0) wstate.url else null;
+                if (webface.WebFace.attach(self.allocator, pane, url)) |wf| {
+                    wf.applyRestoredZoom(wstate.zoom_level_x100);
+                } else |err| {
+                    std.debug.print("sketerm: web restore failed: {s}\n", .{@errorName(err)});
+                }
+            }
+
             // Editor face: reopen the saved files (async loads).
             if (p.editor) |estate| {
                 if (estate.files.len > 0) {
@@ -561,6 +573,12 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
             };
             // Editor face: open file specs + cursors (dirty buffers
             // are not persisted).
+            // Web face: address + zoom (no scroll offset — the helper
+            // protocol reports none).
+            const web_state = blk: {
+                const wf = @import("webface.zig").WebFace.fromPane(p) orelse break :blk null;
+                break :blk try wf.paneState(arena);
+            };
             const editor_state = blk: {
                 const ev = @import("editorview.zig").EditorView.fromPane(p) orelse break :blk null;
                 const state = try ev.paneState(arena);
@@ -580,6 +598,7 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
                 .browser_tabs = browser_tabs,
                 .browser = browser_state,
                 .editor = editor_state,
+                .web = web_state,
             };
         }
     }
