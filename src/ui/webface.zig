@@ -202,6 +202,8 @@ const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
 const secrets = @import("secrets.zig");
+const suggest = @import("../util/suggest.zig");
+const omnibox = @import("omnibox.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -408,6 +410,19 @@ pub fn discardSupported() bool {
     return g_client.cap_discard;
 }
 
+/// Every registered web face in this GUI process — the omnibox's
+/// open-tabs source. Borrowed; do not hold across GTK dispatch.
+pub fn openFaces() []const *WebFace {
+    return g_client.faces.items;
+}
+
+/// Resolve a view id to its face — the id-not-pointer indirection the
+/// popup toast uses too, so a deferred activation can never touch a
+/// face that died in between.
+pub fn faceByView(view: u32) ?*WebFace {
+    return g_client.findFace(view);
+}
+
 // ---------------------------------------------------------------------
 // App-level popup policy
 // ---------------------------------------------------------------------
@@ -437,6 +452,33 @@ var g_download_ask: bool = true;
 
 pub fn setDownloadAsk(ask: bool) void {
     g_download_ask = ask;
+}
+
+// ---------------------------------------------------------------------
+// App-level search engine
+// ---------------------------------------------------------------------
+
+/// `web_search_engine` from the config, COPIED into a module buffer:
+/// the config string lives in a per-window arena that
+/// `applyConfigChange` frees, and a module global must not dangle when
+/// the window that last applied it closes.
+var g_search_buf: [512]u8 = undefined;
+var g_search_len: usize = 0;
+
+/// App-level and module-level like the popup policy: one helper
+/// client, one engine. An over-long template falls back to the
+/// default (the config layer never produces one).
+pub fn setSearchEngine(template: []const u8) void {
+    if (template.len > g_search_buf.len) {
+        g_search_len = 0;
+        return;
+    }
+    @memcpy(g_search_buf[0..template.len], template);
+    g_search_len = template.len;
+}
+
+pub fn searchTemplate() []const u8 {
+    return if (g_search_len == 0) suggest.default_search_template else g_search_buf[0..g_search_len];
 }
 
 // ---------------------------------------------------------------------
@@ -1492,6 +1534,12 @@ pub const WebFace = struct {
     /// flip. Built on first use, then kept for the face's life.
     reader: ?*webreader.Reader = null,
     reader_active: bool = false,
+
+    /// The address bar's suggestion dropdown (src/ui/omnibox.zig).
+    /// Same lifetime shape as the reader: severed at the face's
+    /// prepare-destroy choke point, destroyed in deinit. Null on an
+    /// attached face (its nav bar is hidden) or when creation failed.
+    omni: ?*omnibox.Omnibox = null,
     /// The `sem_read` round trip the reader is waiting on, so its reply
     /// can be told apart from an MCP `web_read` running at the same
     /// time (both are `AutoKind.read`, correlated by token).
@@ -1597,6 +1645,12 @@ pub const WebFace = struct {
         // every call — so no teardown path has to clear it.
         if (pane.input_ctx) |ictx| ictx.web_hints = webHintsSink;
 
+        // Suggestion dropdown under the address bar. An attached view
+        // hides the whole nav bar, so it gets none; a face without one
+        // still navigates exactly as before.
+        if (opts.existing_view == 0)
+            self.omni = omnibox.Omnibox.create(allocator, self, self.entry) catch null;
+
         const cl = client();
         cl.ensure(allocator);
         if (opts.existing_view != 0) {
@@ -1657,8 +1711,9 @@ pub const WebFace = struct {
         // The reader's own controllers carry the READER as user-data,
         // so the disconnect loop below (which matches on this face)
         // cannot reach them; its `sever` is the same mechanism applied
-        // at the same choke point.
+        // at the same choke point. The omnibox is the same shape.
         if (self.reader) |r| r.sever(self.widgets_dead);
+        if (self.omni) |o| o.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
         // pacing sources and the discard countdown, which carry this
         // face as user-data and are not signals, so the disconnect loop
@@ -1730,6 +1785,11 @@ pub const WebFace = struct {
             r.sever(self.widgets_dead);
             r.destroy();
             self.reader = null;
+        }
+        if (self.omni) |o| {
+            o.sever(self.widgets_dead);
+            o.destroy();
+            self.omni = null;
         }
         self.stopDiscardTimer();
         self.stopDlTimer();
@@ -3867,6 +3927,20 @@ pub const WebFace = struct {
         return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
     }
 
+    /// Bring this face's tab and pane to the front — what activating
+    /// an omnibox open-tab candidate does instead of loading the page
+    /// a second time.
+    pub fn reveal(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        const win = self.ownerWindow() orelse return;
+        const pane = self.pane orelse return;
+        if (@import("window.zig").tabPageForPane(win, pane)) |page|
+            c.adw_tab_view_set_selected_page(win.tab_view, page);
+        pane.setWebVisible(true);
+        self.reviveNow();
+        _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
     // ---- commands ---------------------------------------------------
 
     /// Open `spec`, turning a bare host or a search-looking string into
@@ -5646,17 +5720,10 @@ fn modsFromState(state: c.GdkModifierType) u32 {
 }
 
 /// What the address bar means: an explicit scheme wins, a token with a
-/// dot and no space is a host, anything else is a web search.
+/// dot and no space is a host, anything else is a web search on the
+/// configured `web_search_engine` (percent-encoded query).
 fn normalizeUrl(buf: []u8, spec: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, spec, "://") != null) return spec;
-    if (std.mem.startsWith(u8, spec, "about:") or
-        std.mem.startsWith(u8, spec, "data:") or
-        std.mem.startsWith(u8, spec, "file:") or
-        std.mem.startsWith(u8, spec, "chrome:")) return spec;
-    const looks_like_host = std.mem.indexOfScalar(u8, spec, ' ') == null and
-        std.mem.indexOfScalar(u8, spec, '.') != null;
-    if (looks_like_host) return std.fmt.bufPrint(buf, "https://{s}", .{spec}) catch null;
-    return std.fmt.bufPrint(buf, "https://duckduckgo.com/?q={s}", .{spec}) catch null;
+    return suggest.normalizeUrl(buf, spec, searchTemplate());
 }
 
 /// Host part of a url for a message that names a site. Falls back to
@@ -5730,4 +5797,20 @@ test "normalizeUrl keeps explicit schemes and promotes hosts" {
     try std.testing.expectEqualStrings("data:text/html,x", normalizeUrl(&buf, "data:text/html,x").?);
     try std.testing.expectEqualStrings("https://example.com", normalizeUrl(&buf, "example.com").?);
     try std.testing.expect(std.mem.startsWith(u8, normalizeUrl(&buf, "two words").?, "https://duckduckgo.com/"));
+}
+
+test "normalizeUrl percent-encodes searches on the configured engine" {
+    var buf: [256]u8 = undefined;
+    setSearchEngine("https://www.google.com/search?q={q}");
+    defer setSearchEngine("");
+    try std.testing.expectEqualStrings(
+        "https://www.google.com/search?q=a%26b%20c",
+        normalizeUrl(&buf, "a&b c").?,
+    );
+    // Reset falls back to the default engine.
+    setSearchEngine("");
+    try std.testing.expectEqualStrings(
+        "https://duckduckgo.com/?q=two%20words",
+        normalizeUrl(&buf, "two words").?,
+    );
 }
