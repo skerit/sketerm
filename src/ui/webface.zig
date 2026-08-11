@@ -160,13 +160,10 @@ const cast = @import("../util/cast.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
 const proto = @import("../web/protocol.zig");
+const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
 const clock = @import("../util/clock.zig");
 const Pane = @import("pane.zig").Pane;
-
-/// Helper binary name, looked up next to our own executable (the
-/// `sketerm-mux` rule) before falling back to a dev build tree.
-const HELPER_NAME = "sketerm-webengine";
 
 /// How long the GUI waits for a freshly spawned helper to bind its
 /// socket. CEF's startup (zygote + GPU process) dominates this.
@@ -377,7 +374,7 @@ pub const Client = struct {
         }
 
         var bin_buf: [4096:0]u8 = undefined;
-        const bin = findHelperBinary(&bin_buf) orelse {
+        const bin = findbin.find(&bin_buf) orelse {
             self.failWith(MISSING_MSG, false);
             return;
         };
@@ -804,36 +801,6 @@ var g_client: Client = .{};
 
 pub fn client() *Client {
     return &g_client;
-}
-
-/// `sketerm-webengine` next to our own executable (installed layout and
-/// `zig build` trees both), then the dev build tree, then $PATH.
-/// `$SKETERM_WEB_BIN` pins it outright, which is what test rigs use.
-fn findHelperBinary(buf: *[4096:0]u8) ?[*:0]const u8 {
-    if (c.getenv("SKETERM_WEB_BIN")) |p| {
-        if (c.access(p, c.X_OK) == 0) return p;
-    }
-    if (platform.exePathZ(buf)) |exe_path| {
-        if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
-            const dir = exe_path[0 .. slash + 1];
-            // Installed / `zig build` layout: a sibling of the GUI.
-            if (writeCandidate(buf, dir, HELPER_NAME)) |p| return p;
-            // A dev run straight out of a source checkout, where the
-            // GUI was started from somewhere else in the tree.
-            if (writeCandidate(buf, dir, "../zig-out/bin/" ++ HELPER_NAME)) |p| return p;
-        }
-    }
-    if (c.access("zig-out/bin/" ++ HELPER_NAME, c.X_OK) == 0) return "zig-out/bin/" ++ HELPER_NAME;
-    return null;
-}
-
-fn writeCandidate(buf: *[4096:0]u8, dir: []const u8, name: []const u8) ?[*:0]const u8 {
-    if (dir.len + name.len + 1 >= buf.len) return null;
-    // `dir` aliases `buf`; only the tail after it is written.
-    @memcpy(buf[dir.len .. dir.len + name.len], name);
-    buf[dir.len + name.len] = 0;
-    if (c.access(buf, c.X_OK) != 0) return null;
-    return @ptrCast(buf);
 }
 
 // ---------------------------------------------------------------------
