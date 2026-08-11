@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Harness = @import("test_harness.zig").Harness;
+const version = @import("../version.zig");
 
 // ── test_char_manipulation ────────────────────────────────────────
 
@@ -641,7 +642,9 @@ test "parser.py: XTVERSION (CSI > q) reply" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[>q");
-    try std.testing.expectEqualStrings("\x1bP>|sketerm 0.1.0\x1b\\", h.wtc.items);
+    // Derived from build.zig.zon, never spelled out: a literal here is
+    // what let XTVERSION report 0.1.0 for three releases.
+    try std.testing.expectEqualStrings("\x1bP>|sketerm " ++ version.string ++ "\x1b\\", h.wtc.items);
 }
 
 test "parser.py: DA2 (CSI > c) reply" {
@@ -649,7 +652,10 @@ test "parser.py: DA2 (CSI > c) reply" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[>c");
-    try std.testing.expectEqualStrings("\x1b[>42;1;0c", h.wtc.items);
+    const v = try std.SemanticVersion.parse(version.string);
+    var buf: [32]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf, "\x1b[>42;{d};0c", .{v.major * 10000 + v.minor * 100 + v.patch});
+    try std.testing.expectEqualStrings(want, h.wtc.items);
 }
 
 // ── window-state queries (CSI t) ─────────────────────────────────

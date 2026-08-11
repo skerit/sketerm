@@ -11,6 +11,22 @@ const Line = @import("line.zig").Line;
 const Pool = @import("style_pool.zig").Pool;
 const Charset = Screen.Charset;
 const Entry = @import("style_pool.zig").Entry;
+const version = @import("../version.zig");
+
+/// The two replies that name our own version, built once at comptime
+/// from `build.zig.zon`'s `.version`. Hardcoding either drifts silently
+/// the moment that line is bumped, which is exactly what happened
+/// before: XTVERSION reported 0.1.0 for three releases.
+const XTVERSION_REPLY = "\x1bP>|sketerm " ++ version.string ++ "\x1b\\";
+
+/// DA2's version field is numeric, so the semver is folded into one
+/// integer as major*10000 + minor*100 + patch (0.1.2 -> 102), the same
+/// shape xterm's patch number has.
+const DA2_REPLY = blk: {
+    const v = std.SemanticVersion.parse(version.string) catch
+        @compileError("build.zig.zon .version is not valid semver: " ++ version.string);
+    break :blk std.fmt.comptimePrint("\x1b[>42;{d};0c", .{v.major * 10000 + v.minor * 100 + v.patch});
+};
 
 // ── CSI dispatch ─────────────────────────────────────────────
 
@@ -60,8 +76,8 @@ pub fn csiPrivate(self: *Screen, params: Event.Csi) void {
 
 pub fn csiAux(self: *Screen, params: Event.Csi) void {
     switch (params.final) {
-        'c' => respond(self, "\x1b[>42;1;0c"), // DA2: vendor 42 (sketerm), version 1
-        'q' => respond(self, "\x1bP>|sketerm 0.1.0\x1b\\"), // XTVERSION
+        'c' => respond(self, DA2_REPLY), // DA2: vendor 42 (sketerm) + our version
+        'q' => respond(self, XTVERSION_REPLY),
         'm' => {
             // XTMODKEYS — `CSI > Pn ; Pp m`. Pn=4 sets
             // modifyOtherKeys level. We accept the level but
