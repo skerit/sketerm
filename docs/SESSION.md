@@ -15963,3 +15963,89 @@ cancelled churn, ids stable, history still replays; measured there:
 replay 708 B vs coalesced 66 B). smoke-web 26/26, smoke-mcp, test-core
 1808 pass, mux-portable all green (pinned CEF; distro CEF still blocked
 by the pre-existing glibc 2.44 skew).
+
+## 2026-08-11: `web_open` returns the page it asked for; multi-view made legible
+
+Field report: `web_open <url>` came back with a first snapshot reading
+`doc 1 rev 1` for **about:blank**, the real page only appearing later as
+doc 2. Two independent causes, both fixed.
+
+**The blank document existed at all.** `cefhost.createView` always
+created the CEF browser at `about:blank` and the requested url arrived
+as a separate `Navigate` right after `ViewCreate`, so every addressed
+view minted TWO documents. New append-only frame `view_create_url`
+(tag 0x16) carries the initial url, gated by the new capability
+`view-create-url`; `ViewCreate`'s layout is untouched, which is why it
+is a new frame and not a field. `webdrive.zig` (headless, creates views
+after the handshake) uses it whenever a url is given and falls back to
+create-then-navigate against an older helper. `webface.zig` deliberately
+does NOT adopt it: the GUI creates its view the instant the socket
+connects, before the `hello_ack` that advertises capabilities — so
+blank GUI tabs keep working exactly as before, at the cost of one
+about:blank per addressed tab.
+
+**The settle accepted the wrong document.** `web_open` broke out of its
+wait on `url.len > 0 and !loading`, which the about:blank load finishing
+satisfies. `openSettled` now requires a FINISHED load (`load_seq`, a
+counter both backends report — `loading:false` is equally true in the
+gap before the requested navigation starts), nothing in flight, and a
+non-blank document. It deliberately does not compare against the
+requested url: redirects and normalisation make the settled one
+legitimately different. The reply gained `settled` (with a note when the
+budget ran out — the "call web_snapshot" fallback is unchanged) plus
+`document`/`revision`, so "no blank document was ever created" is
+checkable from the reply itself.
+
+**Multi-view was undocumented.** A handle-less `web_*` call resolves to
+the CURRENT view (last touched). `web_tabs` now prints `current:true`
+in headless mode too (it only ever printed `focused` with a GUI) and
+explains the rule; `web_open`'s description says it always creates a NEW
+view and becomes the default target; every `pane`-taking tool says
+omitting the handle means the current view and passing one switches it.
+
+Returning that early also made a LATENT bug reachable: the engine has
+nothing to hit-test until it has composited once, so a `web_act` click
+issued immediately after `web_open` landed on nothing and came back with
+a delta of no changes (smoke-web stage 6 documents the same swallowing,
+and the wasted about:blank document used to hide it by delaying every
+caller). `webdrive.awaitFirstPaint` bounds-waits for the view's first
+frame before any synthesized input, and costs nothing after it.
+
+Coverage: smoke-web stage 22b (create a view AT a url; its first
+snapshot is `doc 1` and describes the page, and no about:blank load
+arrives — with the blank load of the stage-2 view asserted first so the
+contrast is measured, not assumed). smoke-mcp's web stage opens a page
+whose head blocks for 3s and asserts the reply is settled, carries
+SLOWMARKER, mentions no about:blank and reports `document:1`, then that
+`web_tabs` marks the current view and that an explicit handle moves it.
+
+## 2026-08-11: an unstyled page screenshotted as a solid black frame
+
+Reported as `web_screenshot` returning a correctly sized, uniformly
+black 1280x800 PNG while the same view's tree, `web_read` and clicks all
+worked. Measured cause: a windowless CEF browser defaults to a
+TRANSPARENT canvas, so a page that specifies no background of its own
+paints (0,0,0,0) everywhere; the screenshot path forces alpha to 255 and
+that is black. Proof it was the canvas and not the capture: the SAME
+view goes black -> red -> black again as `document.body.style.background`
+is set and cleared, and with the fix reverted smoke-web reads the centre
+pixel as exactly {0,0,0,0}.
+
+`CefSettings.background_color` (in `cefhost.initialize`) has been opaque
+white since the subpixel-AA work and is documented as the fallback for a
+zero per-browser value — it measurably does not reach an alloy
+windowless browser. The fix is `background_color = 0xffffffff` on
+`cef_browser_settings_t` in `createViewAt`. smoke-web stage 22c opens a
+page with no background at all (`<html><body>hi</body></html>`) and
+asserts a white canvas; it was confirmed RED without the fix.
+
+Hardening in the same pass, for a hazard found by reading rather than by
+failing: `onPaint` drops any paint that arrives before the view's shared
+buffer exists (`map.len == 0`) and otherwise copies only the damaged
+rects, so a first paint that raced `allocBuffer` could leave a freshly
+zeroed buffer black forever on a page that never repaints. `allocBuffer`
+now marks the mapping `buf_unpainted` — the next paint is copied WHOLE
+whatever the damage rects say — and invalidates the view so a dropped
+first paint is re-requested (skipped while hidden; `showView` already
+invalidates on unhide). This was NOT the cause of the black frames
+above.
