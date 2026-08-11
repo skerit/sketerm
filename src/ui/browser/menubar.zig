@@ -15,6 +15,7 @@ const Window = @import("../window.zig").Window;
 const Pane = @import("../pane.zig").Pane;
 const BrowserView = @import("view.zig").BrowserView;
 const classicmenu = @import("classicmenu.zig");
+const cssutil = @import("../cssutil.zig");
 const ops = @import("ops.zig");
 const places_ui = @import("places.zig");
 
@@ -48,11 +49,7 @@ const BarState = struct {
 
 /// Build the menu bar row. `win` may still be mid-init: the pointer is
 /// only stored, never dereferenced until a menu opens.
-var css_installed = false;
-
 fn installCss(any_widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
     const css =
         \\box.sketerm-fb-menubar > button {
         \\  padding: 2px 10px;
@@ -64,10 +61,7 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  box-shadow: inset 0 -3px 0 @theme_selected_bg_color;
         \\}
     ;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    cssutil.install("browser_menubar", any_widget, css);
 }
 
 pub fn build(allocator: std.mem.Allocator, win: *Window, app_window: *c.GtkWidget) *c.GtkWidget {

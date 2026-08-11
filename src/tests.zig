@@ -80,6 +80,7 @@ comptime {
     _ = @import("ui/hostmount.zig");
     _ = @import("ui/image_decoder.zig");
     _ = @import("ui/image_canvas.zig");
+    _ = @import("ui/cssutil.zig");
     _ = @import("ui/playbar.zig");
     _ = @import("ui/viewer.zig");
     _ = @import("ui/app_switcher.zig");

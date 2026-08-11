@@ -15,15 +15,13 @@ const cast = @import("../util/cast.zig");
 const profile = @import("../util/profile.zig");
 const Config = @import("../config.zig").Config;
 const tab_effects = @import("tab_effects.zig");
+const cssutil = @import("cssutil.zig");
 
 const TAB_W: c_int = 170;
 
 /// Fallback config so `TabBar.config` is always valid before the owning
 /// Window points it at the real one (and in tests).
 var default_config: Config = .{};
-
-/// CSS installed once per display.
-var css_installed = false;
 
 const Dragged = struct {
     view: *c.AdwTabView,
@@ -636,8 +634,6 @@ pub const TabBar = struct {
 /// of our own except the native-style close-button reveal-on-hover
 /// (which AdwTab does in C, not CSS).
 fn installCss(any_widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
     const css =
         \\tab .tab-close-button {
         \\  opacity: 0;
@@ -653,10 +649,7 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  box-shadow: 0 0 0 1px rgba(0,0,0,0.06), 0 1px 3px 1px rgba(0,0,0,0.12), 0 2px 6px 2px rgba(0,0,0,0.08);
         \\}
     ;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    cssutil.install("tabbar", any_widget, css);
 }
 
 var theme_loaded = false;

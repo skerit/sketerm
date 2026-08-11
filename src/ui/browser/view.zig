@@ -28,6 +28,7 @@ const toolbtn = @import("../toolbtn.zig");
 const Pane = @import("../pane.zig").Pane;
 const file_transfers = @import("../file_transfers.zig");
 const image_canvas = @import("../image_canvas.zig");
+const cssutil = @import("../cssutil.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const AttrRequest = @import("props.zig").AttrRequest;
@@ -1471,12 +1472,8 @@ pub const BrowserView = struct {
     /// hover/active feedback outright: Breeze draws NOTHING for a
     /// `.flat` button, so without this the breadcrumb reads as dead
     /// pixels under the pointer.
-    var css_installed: bool = false;
-
     fn installCss(any_widget: *c.GtkWidget) void {
         toolbtn.installCss(any_widget);
-        if (css_installed) return;
-        css_installed = true;
         const css =
             \\.sketerm-fb-path {
             \\  border: 1px solid rgba(128,128,128,0.35);
@@ -1502,10 +1499,7 @@ pub const BrowserView = struct {
             \\  background: alpha(@theme_bg_color, 0.85);
             \\}
         ;
-        const provider = c.gtk_css_provider_new();
-        c.gtk_css_provider_load_from_string(provider, css);
-        const display = c.gtk_widget_get_display(any_widget);
-        c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        cssutil.install("browser_view", any_widget, css);
     }
 
     /// Re-list what the tab is showing, without touching history or

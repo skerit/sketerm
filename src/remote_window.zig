@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const cssutil = @import("ui/cssutil.zig");
 
 // Backend-specific identity calls; the headers are too heavy for the
 // cimport set, so declare the handful of symbols directly. Referenced
@@ -73,20 +74,11 @@ pub fn create(title: [:0]const u8, w: i32, h: i32, decorated: bool) ?Widgets {
 /// window and the opaque background never shows. (Linux keeps the
 /// transparent background so CSD shadows/rounded corners blend.)
 pub fn ensureTransparentCss() void {
-    const S = struct {
-        var done: bool = false;
-    };
-    if (S.done) return;
-    S.done = true;
-    const display = c.gdk_display_get_default() orelse return;
-    const provider = c.gtk_css_provider_new();
     const css = if (builtin.os.tag == .macos)
         "window.sketerm-remote-app { background: transparent; }\nwindow.sketerm-remote-app.opaque-resize { background: black; }"
     else
         "window.sketerm-remote-app { background: transparent; }";
-    c.gtk_css_provider_load_from_string(provider, css);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    c.g_object_unref(provider);
+    cssutil.install("remote_window", null, css);
 }
 
 /// Desktop identity: app ids double as icon names by convention

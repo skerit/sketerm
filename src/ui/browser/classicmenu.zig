@@ -24,6 +24,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const iconload = @import("../iconload.zig");
+const cssutil = @import("../cssutil.zig");
 
 /// The legacy menu-handler shape, called with a null button.
 pub const Handler = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
@@ -45,13 +46,9 @@ pub const Icon = union(enum) {
     gicon: *c.GIcon,
 };
 
-var css_installed = false;
-
 /// Menu row styling. Breeze draws NOTHING for a `.flat` button, so
 /// the hover feedback is stated outright.
 fn installCss(any_widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
     const css =
         \\button.sketerm-cm-row {
         \\  padding: 4px 8px;
@@ -76,10 +73,7 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  border-radius: 3px;
         \\}
     ;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    cssutil.install("browser_classicmenu", any_widget, css);
 }
 
 pub const Root = struct {

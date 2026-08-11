@@ -26,6 +26,7 @@ const grouping = @import("../../filebrowser/grouping.zig");
 const gitstatus = @import("../../filebrowser/gitstatus.zig");
 const iconload = @import("../iconload.zig");
 const dnd = @import("dnd.zig");
+const cssutil = @import("../cssutil.zig");
 const profile = @import("../../util/profile.zig");
 const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
@@ -1245,8 +1246,6 @@ fn zebraClass(w: *c.GtkWidget, d: *ItemData) void {
 
 // ── CSS ──────────────────────────────────────────────────────────
 
-var css_installed = false;
-
 const rename_selection_css =
     \\text.sketerm-fb-rename > selection {
     \\  background-color: @theme_selected_bg_color;
@@ -1258,8 +1257,6 @@ const rename_selection_css =
 /// Installed once per process at APPLICATION priority, scoped to
 /// the sketerm-fb-cv class.
 pub fn installCss(any_widget: *c.GtkWidget) void {
-    if (css_installed) return;
-    css_installed = true;
     const css =
         \\columnview.sketerm-fb-cv > listview > row {
         \\  padding: 0;
@@ -1298,10 +1295,7 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\  caret-color: @theme_text_color;
         \\}
     ++ rename_selection_css;
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    const display = c.gtk_widget_get_display(any_widget);
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    cssutil.install("browser_colview", any_widget, css);
 }
 
 test "inline rename styles the text selection node" {

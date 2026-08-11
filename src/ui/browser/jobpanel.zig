@@ -22,6 +22,7 @@ const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
 const classicmenu = @import("classicmenu.zig");
+const cssutil = @import("../cssutil.zig");
 const copyZ = @import("../../filebrowser/format.zig").copyZN;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const jobs = @import("jobs.zig");
@@ -1495,11 +1496,7 @@ fn drawRing(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int,
 }
 
 /// One-time CSS for the panel's badge pill.
-var g_panel_css = false;
-
 fn ensurePanelCss() void {
-    if (g_panel_css) return;
-    g_panel_css = true;
     const css =
         ".job-badge { padding: 1px 8px; border-radius: 10px; font-size: 0.85em; " ++
         "background: alpha(currentColor, 0.12); }\n" ++
@@ -1511,14 +1508,7 @@ fn ensurePanelCss() void {
         ".xfer-card-dim { background: transparent; border-color: transparent; " ++
         "padding-top: 1px; padding-bottom: 1px; }\n" ++
         ".xfer-name { font-weight: 600; }\n";
-    const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, css);
-    c.gtk_style_context_add_provider_for_display(
-        c.gdk_display_get_default(),
-        @ptrCast(provider),
-        c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-    c.g_object_unref(provider);
+    cssutil.install("browser_jobpanel", null, css);
 }
 
 /// Swap the Adwaita color class on a widget (the classes are mutually
