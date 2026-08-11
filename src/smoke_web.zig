@@ -6,7 +6,8 @@
 //! click, keyboard text entry, resize (new buffer), popup requests,
 //! back/forward navigation state, the whole semantic layer (snapshot
 //! with stable ids, mutation delta, trusted sem_act click, expand,
-//! cross-navigation id carrying, reader extraction, query), a hostile
+//! cross-navigation id carrying, reader extraction, query, spontaneous
+//! churn coalescing with the history-mode replay), a hostile
 //! page that tries to forge semantic replies and hijack the command
 //! entry point, script evaluation (values, DOM refs, degradation,
 //! throws, awaited promises), dropdowns (native <select> by option
@@ -147,6 +148,29 @@ const validation_page =
     "<label%20for=tos>Terms</label><input%20id=tos%20type=checkbox%20checked>" ++
     "<button%20id=dis%20disabled>Submit</button>" ++
     "</form></body></html>";
+
+/// A page that mutates on its own: each timer tick rebuilds the SAME
+/// six rows under fresh DOM nodes and blinks a popup in and out. Twelve
+/// ticks per phase (popup ends removed, list content identical), a
+/// phase per trusted click, `churn:done<phase>` in the title when one
+/// finishes. What the coalescing stage feeds the shadow tree.
+const churn_page =
+    "data:text/html,<html><body><h1>Churn</h1><ul%20id=list></ul><p>steady</p>" ++
+    "<script>" ++
+    "var%20phase=0,cycles=0,timer=null;" ++
+    "function%20rows(){var%20l=document.getElementById('list');l.innerHTML='';" ++
+    "['Alpha%20row%20one','Beta%20row%20two','Gamma%20row%20three','Delta%20row%20four'," ++
+    "'Epsilon%20row%20five','Zeta%20row%20six']" ++
+    ".forEach(function(t){var%20li=document.createElement('li');li.textContent=t;l.appendChild(li);});}" ++
+    "function%20tick(){cycles++;rows();" ++
+    "var%20p=document.getElementById('pop');" ++
+    "if(p){p.remove();}else{var%20d=document.createElement('div');d.id='pop';" ++
+    "d.setAttribute('role','alert');d.textContent='Popup%20flash';document.body.appendChild(d);}" ++
+    "if(cycles>=12){clearInterval(timer);timer=null;document.title='churn:done'+phase;}}" ++
+    "function%20start(){phase++;cycles=0;timer=setInterval(tick,180);}" ++
+    "rows();" ++
+    "document.addEventListener('mousedown',function(e){if(e.isTrusted&&!timer)start();});" ++
+    "</script></body></html>";
 
 /// A page that attacks the semantic layer from the inside: at parse
 /// time (before its own load event) and again after it, it hunts for
@@ -1058,8 +1082,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 9 sem_act: the click was not trusted");
         }
     }
-    if (!cl.waitSem("~ [", 20_000)) fail("stage 9 delta: no changed-node line arrived");
-    if (!cl.waitSem("after", 20_000)) fail("stage 9 delta: the changed label is missing");
+    // Coalescing means the delta is ANSWERED, never pushed: ask for it.
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.auto), 1);
+    if (std.mem.indexOf(u8, cl.semLog(), "~ [") == null) fail("stage 9 delta: no changed-node line in the reply");
+    if (std.mem.indexOf(u8, cl.semLog(), "after") == null) fail("stage 9 delta: the changed label is missing");
     {
         var mark: [64]u8 = undefined;
         const changed = std.fmt.bufPrint(&mark, "~ [{d}]", .{lbl_id}) catch fail("bufPrint");
@@ -1094,9 +1121,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     cl.snapshot(1, 1);
     if (!cl.waitSem("link \"Three\"", 20_000)) fail("stage 11 cross-nav: no snapshot of the first page");
     const three_id = cl.idOfLine("link \"Three\"") orelse fail("stage 11 cross-nav: no id for a nav link");
-    cl.resetSem();
     cl.navigate(nav_page_b);
-    if (!cl.waitSem("carried [", 20_000)) {
+    // The carry is reported by the first snapshot CONSUMED after the
+    // navigation (nothing is pushed for the navigation itself).
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.auto), 1);
+    if (std.mem.indexOf(u8, cl.semLog(), "carried [") == null) {
         std.debug.print("smoke-web: post-navigation payload was:\n{s}\n", .{cl.semLog()});
         fail("stage 11 cross-nav: the navigation did not carry any ids");
     }
@@ -1145,6 +1175,75 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 13 sem_query");
 
+    // ── Stage 13b: spontaneous churn coalesces into ONE delta ──────
+    // A page that rebuilds identical rows and blinks a popup on a
+    // timer, left alone for several quiesce cycles with nobody
+    // consuming. The default snapshot must answer with exactly one
+    // delta section in which the cancelled-out churn and the
+    // re-rendered rows do not appear; the history opt-in must still
+    // replay the churn revision by revision.
+    {
+        cl.navigate(churn_page);
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1); // the consumed baseline
+        const row_id = cl.idOfLine("\"Alpha row one\"") orelse fail("stage 13b churn: no id for a list row");
+
+        // Phase 1: churn with nobody consuming, then read the replay.
+        cl.resetTitle();
+        cl.clickCenter();
+        if (!cl.waitTitle("churn:done1", 25_000)) fail("stage 13b churn: phase 1 never finished");
+        {
+            const until = nowMs() + 700; // the final mutation's quiesce walk
+            while (nowMs() < until) cl.pump(50);
+        }
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.history), 1);
+        const hist_len = cl.semLast().len;
+        if (std.mem.indexOf(u8, cl.semLast(), "Popup flash") == null)
+            fail("stage 13b churn: the history replay lost the popup");
+        if (std.mem.count(u8, cl.semLast(), "delta rev") < 2)
+            fail("stage 13b churn: the history replay is not per-revision");
+
+        // Phase 2: identical churn, consumed with the default mode.
+        cl.resetTitle();
+        cl.clickCenter();
+        if (!cl.waitTitle("churn:done2", 25_000)) fail("stage 13b churn: phase 2 never finished");
+        {
+            const until = nowMs() + 700;
+            while (nowMs() < until) cl.pump(50);
+        }
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.auto), 1);
+        const co = cl.semLast();
+        if (cl.sem_kind != @intFromEnum(proto.SnapKind.delta))
+            fail("stage 13b churn: the coalesced answer was not a delta");
+        if (std.mem.count(u8, co, "delta rev") != 1) {
+            std.debug.print("smoke-web: coalesced payload was:\n{s}\n", .{co});
+            fail("stage 13b churn: expected exactly one delta section");
+        }
+        if (std.mem.indexOf(u8, co, "Popup") != null)
+            fail("stage 13b churn: cancelled-out popup churn leaked into the delta");
+        if (std.mem.indexOf(u8, co, "\n+ [") != null or std.mem.indexOf(u8, co, "\n- [") != null) {
+            std.debug.print("smoke-web: coalesced payload was:\n{s}\n", .{co});
+            fail("stage 13b churn: re-rendered identical rows leaked into the delta");
+        }
+        if (co.len * 3 >= hist_len) {
+            std.debug.print("smoke-web: coalesced {d} bytes vs replay {d} bytes\n", .{ co.len, hist_len });
+            fail("stage 13b churn: the coalesced delta is not materially smaller than the replay");
+        }
+        {
+            var line: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&line, "stage 13b sizes: history replay {d} bytes, coalesced delta {d} bytes", .{ hist_len, co.len }) catch unreachable;
+            say(msg);
+        }
+        // The rebuilt rows kept their ids across both phases.
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+        const again = cl.idOfLine("\"Alpha row one\"") orelse fail("stage 13b churn: the row vanished");
+        if (again != row_id) fail("stage 13b churn: a re-rendered identical row lost its stable id");
+    }
+    pass("stage 13b churn coalescing (one delta, stable ids, history opt-in replays)");
+
     // ── Stage 14: a hostile page cannot forge or hijack ────────────
     {
         cl.navigate(attack_page);
@@ -1192,7 +1291,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // element has to come back addressable by web_act.
     {
         cl.navigate(form_page);
-        if (!cl.waitSem("button \"Go\"", 20_000)) fail("stage 15 eval: no snapshot of the form page");
         cl.resetSem();
         cl.snapshot(1, 1);
         if (!cl.waitSem("button \"Go\"", 20_000)) fail("stage 15 eval: no full snapshot");
@@ -1250,13 +1348,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // set_value has to cover both or that capability was dropped.
     {
         cl.navigate(dropdown_page);
+        cl.resetSem();
+        cl.snapshot(1, 1);
         if (!cl.waitSem("combobox \"Country\"", 20_000)) {
-            cl.resetSem();
-            cl.snapshot(1, 1);
-            if (!cl.waitSem("combobox \"Country\"", 20_000)) {
-                std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
-                fail("stage 16 dropdown: no snapshot of the dropdown page");
-            }
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 16 dropdown: no snapshot of the dropdown page");
         }
         const native_id = cl.idOfLine("combobox \"Country\"") orelse
             fail("stage 16 dropdown: no id for the native select");
