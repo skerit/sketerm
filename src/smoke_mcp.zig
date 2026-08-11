@@ -1874,10 +1874,146 @@ pub fn main() u8 {
         say("smoke-mcp: ui_show_files ok");
     }
 
+    // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
+    //
+    // The regression this guards: the web tools once hard-failed with
+    // "no GUI control socket ... restart with --shared" in the DEFAULT
+    // mode — the mode assistants actually run in. They must work
+    // against the MCP server's own sketerm-webengine instead. Gated on
+    // the helper being built (CEF is optional): a clean SKIP, never a
+    // silent pass.
+    {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &bin_buf);
+        if (web_bin == null or c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0) {
+            say("smoke-mcp: SKIP web stage (sketerm-webengine not built; `zig build web`)");
+        } else {
+            _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+            defer _ = c.unsetenv("SKETERM_WEB_BIN");
+            webStage(allocator, exe, rt);
+            say("smoke-mcp: headless web tools ok");
+        }
+    }
+
     // Retire the durable daemon we started.
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
 
     say("smoke-mcp: PASS");
     return 0;
+}
+
+/// The `[id]` immediately preceding `needle` on its snapshot line —
+/// how a caller reads "the node id of the button named X" out of an
+/// (escaped) tool reply.
+fn nodeIdBefore(hay: []const u8, needle: []const u8) ?u32 {
+    const at = std.mem.indexOf(u8, hay, needle) orelse return null;
+    var i = at;
+    while (i > 0) {
+        i -= 1;
+        if (hay[i] == '[') break;
+        if (hay[i] == '\n') return null;
+    }
+    if (hay[i] != '[') return null;
+    var j = i + 1;
+    var v: u32 = 0;
+    var any = false;
+    while (j < hay.len and hay[j] >= '0' and hay[j] <= '9') : (j += 1) {
+        v = v * 10 + (hay[j] - '0');
+        any = true;
+    }
+    if (!any or j >= hay.len or hay[j] != ']') return null;
+    return v;
+}
+
+/// Isolated `sketerm mcp` (no GUI, no --shared) driving a real page
+/// end to end through the headless web backend.
+fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    // A local page with a button that mutates a paragraph: enough for
+    // snapshot ids, a trusted click, the delta and reader extraction.
+    var page_buf: [512]u8 = undefined;
+    const page_path = std.fmt.bufPrintZ(&page_buf, "{s}/web-smoke.html", .{rt}) catch unreachable;
+    {
+        const f = c.fopen(page_path.ptr, "wb") orelse fail("cannot write web smoke page");
+        const html =
+            "<html><head><title>Headless Smoke</title></head><body>" ++
+            "<article><h1>Headless Article</h1><p>HEADLESS-READ-MARKER prose for the reader tool.</p></article>" ++
+            "<button id=b onclick=\"document.getElementById('p').textContent='AFTERCLICK'\">PressMe</button>" ++
+            "<p id=p>BEFORECLICK</p></body></html>";
+        _ = c.fwrite(html.ptr, 1, html.len, f);
+        _ = c.fclose(f);
+    }
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+
+    // capabilities must say the tools work HERE, headlessly — the old
+    // report steered assistants to --shared / launch_app instead.
+    const caps = m.callTool("capabilities", "{}");
+    if (std.mem.indexOf(u8, caps, "\\\"web\\\":true") == null or
+        std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"headless\\\"") == null)
+        fail("capabilities does not report the headless web backend");
+
+    // web_open: spawns the helper lazily, loads the page, returns a
+    // first snapshot with stable node ids.
+    var args_buf: [1024]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);
+    const opened = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, opened, "isError") != null) fail("web_open failed headlessly (the NoGuiSocket regression)");
+    if (std.mem.indexOf(u8, opened, "\\\"view\\\":1") == null)
+        fail("web_open did not hand back a headless view handle");
+    if (std.mem.indexOf(u8, opened, "PressMe") == null or std.mem.indexOf(u8, opened, "BEFORECLICK") == null)
+        fail("web_open's first snapshot is missing the page's nodes");
+    const btn = nodeIdBefore(opened, "PressMe") orelse fail("cannot read the button's node id from the snapshot");
+
+    // The instance dir carries the discoverable helper socket and the
+    // presence file (the future view-along contract).
+    var probe_buf: [512]u8 = undefined;
+    if (!fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.sock", .{ rt, m.pid }) catch unreachable))
+        fail("helper socket is not at the well-known instance-dir path");
+    if (!fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable))
+        fail("web.json presence file missing next to the helper socket");
+
+    // web_act: a trusted click, whose reply carries the DELTA showing
+    // the paragraph the click mutated.
+    const acted = m.callTool("web_act", std.fmt.bufPrint(&args_buf, "{{\"id\":{d},\"action\":\"click\"}}", .{btn}) catch unreachable);
+    if (std.mem.indexOf(u8, acted, "\\\"acted\\\":true") == null)
+        fail("web_act click did not act");
+    if (std.mem.indexOf(u8, acted, "AFTERCLICK") == null)
+        fail("web_act's delta does not show the mutated paragraph");
+
+    // Mutate via eval, then prove a FOLLOW-UP web_snapshot returns a
+    // delta containing exactly the changed node.
+    const evald = m.callTool("web_eval", "{\"code\":\"document.getElementById('p').textContent='EVALMUTATION'; 40+2\"}");
+    if (std.mem.indexOf(u8, evald, "\\\"evaluated\\\":true") == null or
+        std.mem.indexOf(u8, evald, "42") == null)
+        fail("web_eval did not run in the page");
+    const snap = m.callTool("web_snapshot", "{}");
+    if (std.mem.indexOf(u8, snap, "\\\"kind\\\":\\\"delta\\\"") == null or
+        std.mem.indexOf(u8, snap, "EVALMUTATION") == null)
+        fail("the follow-up snapshot's delta does not carry the changed node");
+
+    // web_read: reader-mode extraction of the article.
+    const read = m.callTool("web_read", "{}");
+    if (std.mem.indexOf(u8, read, "HEADLESS-READ-MARKER") == null)
+        fail("web_read did not extract the article text");
+
+    // web_screenshot: a real PNG from the helper's software frame
+    // (base64 "iVBOR..." is the PNG magic).
+    const shot = m.callTool("web_screenshot", "{}");
+    if (std.mem.indexOf(u8, shot, "\\\"image\\\"") == null and std.mem.indexOf(u8, shot, "\"image\"") == null)
+        fail("web_screenshot returned no image block");
+    if (std.mem.indexOf(u8, shot, "iVBOR") == null)
+        fail("web_screenshot's payload is not a PNG");
+
+    // web_tabs names the backend and the handle kind honestly.
+    const tabs = m.callTool("web_tabs", "{}");
+    if (std.mem.indexOf(u8, tabs, "\\\"backend\\\":\\\"headless\\\"") == null or
+        std.mem.indexOf(u8, tabs, "\\\"view\\\":1") == null)
+        fail("web_tabs does not list the headless view");
+
+    m.closeStdinWait();
+    // Ephemeral teardown must have reaped the helper's instance dir.
+    if (fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, m.pid }) catch unreachable))
+        fail("instance dir (with the web helper's socket) survived teardown");
 }
