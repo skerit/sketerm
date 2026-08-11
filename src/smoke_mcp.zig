@@ -2007,6 +2007,58 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     if (std.mem.indexOf(u8, shot, "iVBOR") == null)
         fail("web_screenshot's payload is not a PNG");
 
+    // The web_open settle regression: a page that takes SECONDS to
+    // finish loading must still come back as ITSELF. The blocking
+    // script below keeps the document loading long past the moment a
+    // create-then-navigate helper would have finished about:blank, and
+    // the old settle ("some url is loaded and nothing is in flight")
+    // was satisfied by that blank document — web_open then answered
+    // with a snapshot of an empty page and the caller believed the
+    // requested page was blank.
+    var slow_buf: [512]u8 = undefined;
+    const slow_path = std.fmt.bufPrintZ(&slow_buf, "{s}/web-slow.html", .{rt}) catch unreachable;
+    {
+        const f = c.fopen(slow_path.ptr, "wb") orelse fail("cannot write the slow web smoke page");
+        const html =
+            "<html><head><title>Slow</title>" ++
+            "<script>var t=Date.now();while(Date.now()-t<3000);</script></head>" ++
+            "<body><h1>SLOWMARKER heading</h1><p>slow page body</p></body></html>";
+        _ = c.fwrite(html.ptr, 1, html.len, f);
+        _ = c.fclose(f);
+    }
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{slow_path}) catch unreachable);
+    const slow = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, slow, "isError") != null) fail("web_open on a slow page failed");
+    if (std.mem.indexOf(u8, slow, "\\\"settled\\\":true") == null)
+        fail("web_open reported the slow page as unsettled");
+    if (std.mem.indexOf(u8, slow, "SLOWMARKER") == null)
+        fail("web_open's first snapshot is not the requested page (the about:blank settle race)");
+    if (std.mem.indexOf(u8, slow, "about:blank") != null)
+        fail("web_open answered with a blank document");
+    // doc 1: the view has only ever held THIS page, so no blank
+    // document was created for it at all (the view_create_url path).
+    if (std.mem.indexOf(u8, slow, "\\\"document\\\":1") == null)
+        fail("the slow page is not the view's FIRST document (a blank one was minted first)");
+
+    // Two views exist now, and the newest is what a handle-less call
+    // means: web_tabs must SAY so rather than leaving it to be guessed.
+    const tabs2 = m.callTool("web_tabs", "{}");
+    if (std.mem.indexOf(u8, tabs2, "\\\"view\\\":2") == null)
+        fail("web_tabs does not list the second headless view");
+    if (std.mem.indexOf(u8, tabs2, "\\\"current\\\":true") == null)
+        fail("web_tabs does not mark the current view");
+    if (std.mem.indexOf(u8, tabs2, "current_view") == null)
+        fail("web_tabs does not explain which view a handle-less call addresses");
+    // Addressing the FIRST view explicitly makes it current again.
+    const back1 = m.callTool("web_read", "{\"pane\":1}");
+    if (std.mem.indexOf(u8, back1, "HEADLESS-READ-MARKER") == null)
+        fail("web_read against an explicit handle did not reach that view");
+    const tabs3 = m.callTool("web_tabs", "{}");
+    const cur_at = std.mem.indexOf(u8, tabs3, "\\\"current\\\":true") orelse
+        fail("web_tabs stopped marking a current view");
+    if (std.mem.lastIndexOf(u8, tabs3[0..cur_at], "\\\"view\\\":1") == null)
+        fail("an explicit handle did not become the current view");
+
     // web_tabs names the backend and the handle kind honestly.
     const tabs = m.callTool("web_tabs", "{}");
     if (std.mem.indexOf(u8, tabs, "\\\"backend\\\":\\\"headless\\\"") == null or

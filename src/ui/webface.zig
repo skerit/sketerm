@@ -1028,6 +1028,10 @@ pub const WebFace = struct {
     loading: bool = false,
     crashed: bool = false,
     widgets_dead: bool = false,
+    /// Main-frame load-finished counter, reported by `web-list`. A
+    /// settle needs it because "not loading" is also true BEFORE the
+    /// navigation it is waiting for has started.
+    load_seq: u32 = 0,
 
     /// Where the pane's tab title comes from while this face lives.
     title: ?[]u8 = null,
@@ -1883,6 +1887,13 @@ pub const WebFace = struct {
         // The first load has to paint promptly, and nothing paints
         // unless somebody asks.
         self.promote();
+        // Deliberately create-then-navigate, not the helper's
+        // `view_create_url`: this face's view is created the moment the
+        // socket connects, before the `hello_ack` that would say whether
+        // the capability exists. The cost is one about:blank document
+        // per addressed tab, which only a load-settle has to see past
+        // (mcp_web's `web_open`); the headless driver, which creates its
+        // views after the handshake, takes the single-document path.
         if (self.pending_url) |u| {
             cl.post(proto.Navigate{ .view = self.view, .url = u });
         } else if (self.url) |u| {
@@ -2283,6 +2294,10 @@ pub const WebFace = struct {
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
             self.crashed = false;
             self.clearStatus();
+        } else if (ev.state == @intFromEnum(proto.LoadState.finished) or
+            ev.state == @intFromEnum(proto.LoadState.failed))
+        {
+            self.load_seq +%= 1;
         }
     }
 

@@ -111,6 +111,11 @@ const View = struct {
     can_fwd: bool = false,
     focused: bool = false,
     visible: bool = false,
+    /// Finished main-frame loads on this view (both backends report
+    /// it). `web_open`'s settle needs a COUNTER, not a flag: `loading`
+    /// is false before the requested navigation starts as well as after
+    /// it ends.
+    load_seq: u32 = 0,
 };
 
 const Views = struct {
@@ -231,6 +236,7 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                     .can_fwd = v.can_fwd,
                     .focused = v.id == e.current,
                     .visible = false,
+                    .load_seq = v.load_seq,
                 });
             }
             return Views{
@@ -254,6 +260,37 @@ fn viewFor(views: Views, handle: ?u32) ?View {
         if (v.focused) return v;
     }
     return views.views[0];
+}
+
+/// A document that is not a page: what a view holds before anything was
+/// loaded into it, and what create-then-navigate mints on the way to the
+/// requested page.
+fn isBlankDoc(url: []const u8) bool {
+    return url.len == 0 or
+        std.mem.eql(u8, url, "about:blank") or
+        std.mem.eql(u8, url, "about:blank#blocked");
+}
+
+/// Has the navigation `web_open` asked for actually landed?
+///
+/// Three things have to be true, and each one alone is a wrong answer:
+/// a load must have FINISHED (`load_seq` moved past the state at open —
+/// `loading == false` is equally true in the gap before the engine
+/// starts), nothing may be in flight, and the document may not be the
+/// blank one. The blank test is what makes this correct on the GUI
+/// backend, which still creates a view blank and navigates it
+/// afterwards: without it the about:blank load finishing satisfies the
+/// first two and `web_open` answers with a snapshot of an empty page.
+///
+/// A freshly created view has `load_seq` 0, so any finished load it
+/// reports is one this call caused. Deliberately NOT a comparison
+/// against the requested url: redirects and normalisation make the
+/// settled url legitimately different.
+fn openSettled(v: View, wanted_blank: bool) bool {
+    if (v.load_seq == 0) return false;
+    if (v.loading) return false;
+    if (wanted_blank) return true;
+    return !isBlankDoc(v.url);
 }
 
 /// Map webdrive errors to one described sentence (plain text; callers
@@ -652,7 +689,14 @@ pub fn webTool(
             try w.writeAll(",\"title\":");
             try std.json.Stringify.value(view.title, .{}, w);
             try w.print(",\"loading\":{},\"can_back\":{},\"can_fwd\":{}", .{ view.loading, view.can_back, view.can_fwd });
-            if (drv == .gui) try w.print(",\"focused\":{},\"visible\":{}", .{ view.focused, view.visible });
+            // `current` must be VISIBLE in every mode: it is which view
+            // a handle-less call addresses, and a field nobody prints
+            // is a rule nobody can discover. GUI mode reports the same
+            // thing under `focused`, because there the GUI owns focus.
+            if (drv == .gui)
+                try w.print(",\"focused\":{},\"visible\":{},\"current\":{}", .{ view.focused, view.visible, view.focused })
+            else
+                try w.print(",\"current\":{}", .{view.focused});
             try w.writeAll("}");
         }
         try w.writeAll("],\"helper\":");
@@ -664,6 +708,10 @@ pub fn webTool(
         switch (drv) {
             .gui => try w.writeAll(",\"handle\":\"the 'pane' field is the id every other web_* tool takes (the same id list_terminals uses); these are the USER'S OWN GUI tabs\""),
             .headless => try w.writeAll(",\"handle\":\"the 'view' field is the id every other web_* tool takes (as its 'pane' argument); these are HEADLESS helper views owned by this MCP server, not GUI panes — no user is looking at them\""),
+        }
+        switch (drv) {
+            .gui => try w.writeAll(",\"current_view\":\"the view with current:true is what a web_* call with no 'pane' addresses; with a GUI that is the focused tab. Pass 'pane' to work on another one\""),
+            .headless => try w.writeAll(",\"current_view\":\"the view with current:true is what a web_* call with no 'pane' addresses. It is the LAST one touched: web_open makes its new view current, and passing 'pane' to any tool makes that view current for the calls after it\""),
         }
         try w.writeAll(",\"note\":");
         try std.json.Stringify.value(TRUST_NOTE, .{}, w);
@@ -683,19 +731,34 @@ pub fn webTool(
 
         // Settle: a fresh view needs the helper handshake plus the
         // load, and a snapshot before the document exists is empty.
+        // With a url, the wait is for THAT navigation (see
+        // `openSettled`) — "some url is loaded and idle" was satisfied
+        // by the about:blank document a create-then-navigate mints, and
+        // web_open then returned a first snapshot of a blank page.
         const budget = timeoutOf(args, 20_000);
         const deadline = drv.now() + budget;
+        const wanted_blank = if (url) |u| isBlankDoc(u) else true;
         var v: View = .{ .pane = new_handle };
+        var settled = url == null;
         while (drv.now() < deadline) {
             if (try listViews(drv, arena)) |vs| {
                 if (viewFor(vs, new_handle)) |found| {
                     v = found;
-                    if (url == null or (found.url.len > 0 and !found.loading)) break;
+                    // A view created blank has load_seq 0 to start
+                    // with; anything it has already finished by the
+                    // first poll is a load this call caused.
+                    if (url == null or openSettled(found, wanted_blank)) {
+                        settled = true;
+                        break;
+                    }
                 }
             }
             drv.sleep(100);
         }
         var out = try Out.init(arena, drv, v);
+        try out.flag("settled", settled);
+        if (!settled)
+            try out.field("settle_note", "the requested page had not finished loading inside the timeout; anything below describes the view as it was at that moment — call web_snapshot (or web_wait for:\"load\") for the settled page");
         if (drv == .headless and !eql(u8, where, "tab"))
             try out.field("where_note", "no GUI is attached: headless views have no tab/split/window placement, 'where' was ignored");
         const remaining = @max(deadline - drv.now(), 2000);
@@ -709,6 +772,13 @@ pub fn webTool(
                 if (r.timed_out) {
                     try out.field("snapshot_error", "the page did not answer a first snapshot in time (it may still be loading; call web_snapshot)");
                 } else {
+                    // `document` is the engine's per-document counter:
+                    // 1 means the view has only ever held THIS page. A
+                    // higher number on a fresh view means a document
+                    // preceded it (the GUI backend still creates a tab
+                    // blank and navigates it afterwards).
+                    try out.field("document", r.doc_gen);
+                    try out.field("revision", r.rev);
                     try out.field("snapshot", r.payload);
                 }
             },

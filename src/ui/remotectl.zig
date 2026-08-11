@@ -872,6 +872,10 @@ const WebViewInfo = struct {
     can_fwd: bool,
     focused: bool,
     visible: bool,
+    /// Finished main-frame loads on this view. A caller settling a
+    /// navigation needs it: `loading:false` is also true in the gap
+    /// between asking for a page and the engine starting it.
+    load_seq: u32,
 };
 
 fn webFaceOf(self: *Window, req: ipc_protocol.Request) ?*webface.WebFace {
@@ -903,6 +907,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                     .can_fwd = face.can_fwd,
                     .focused = focused == p,
                     .visible = p.webFaceVisible(),
+                    .load_seq = face.load_seq,
                 });
             }
         }
