@@ -1806,6 +1806,15 @@ pub const EditorView = struct {
         return if (s.editor_font_size > 0) s.editor_font_size else s.font_size;
     }
 
+    /// The terminal face reads this off the pane (synced from config
+    /// by Window); a paneless standalone editor reads the config
+    /// directly.
+    fn mousewheelZoomDisabled(self: *EditorView) bool {
+        if (self.pane) |p| return p.disable_mousewheel_zoom;
+        const cfg = self.standalone_config orelse return false;
+        return cfg.disable_mousewheel_zoom;
+    }
+
     /// Pane face-zoom hook (font_inc/font_dec/font_reset while this
     /// face is visible). reset wins over delta.
     fn zoomCb(ctx: *anyopaque, delta: i32, reset: bool) void {
@@ -6191,6 +6200,16 @@ pub const EditorView = struct {
         const tab = self.active orelse return 0;
         if (self.lsp) |m| m.cancelDwell();
         const state = c.gtk_event_controller_get_current_event_state(@ptrCast(ctl));
+        // Ctrl+wheel = font-size zoom, same convention (and disable
+        // flag) as the terminal face in pane.zig onScroll.
+        if ((state & c.GDK_CONTROL_MASK) != 0 and !self.mousewheelZoomDisabled()) {
+            if (dy < 0) {
+                zoomCb(@ptrCast(self), 1, false);
+            } else if (dy > 0) {
+                zoomCb(@ptrCast(self), -1, false);
+            }
+            return 1;
+        }
         const shift = (state & input.SIGNIFICANT_MODS & c.GDK_SHIFT_MASK) != 0;
         const line_h = self.lineHeight();
         var handled = false;
