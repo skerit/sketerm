@@ -63,6 +63,7 @@ const BrowserView = @import("browser/view.zig").BrowserView;
 const PickerHooks = @import("browser/view.zig").PickerHooks;
 const BTab = @import("browser/types.zig").BTab;
 const nav = @import("browser/nav.zig");
+const confirm = @import("confirm.zig");
 const guessMime = @import("browser/open.zig").guessMime;
 
 pub const ResultCb = *const fn (ctx: ?*anyopaque, result: ?fpicker.Result) void;
@@ -87,11 +88,13 @@ pub fn localPathOrRefuse(
         "\"{s}\" lives on {s}. " ++ detail,
         .{ loc.path, host },
     ) catch std.fmt.bufPrintZ(&body, detail, .{}) catch unreachable;
-    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Remote file", b.ptr)));
-    c.adw_alert_dialog_add_response(dialog, "ok", "OK");
-    c.adw_alert_dialog_set_default_response(dialog, "ok");
-    c.adw_alert_dialog_set_close_response(dialog, "ok");
-    c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(@alignCast(parent)));
+    _ = confirm.present(@ptrCast(@alignCast(parent)), .{
+        .heading = "Remote file",
+        .body = b.ptr,
+        .responses = &.{
+            .{ .id = "ok", .label = "OK", .is_default = true, .is_close = true },
+        },
+    }, null);
     return null;
 }
 
@@ -730,11 +733,13 @@ pub const PickerWindow = struct {
                 "another host. Copy it here first, then pick the local copy.",
             .{ leaf, h },
         ) catch std.fmt.bufPrintZ(&body, "The application that opened this dialog can only use files on this machine.", .{}) catch unreachable;
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("File is on another host", b.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "ok", "OK");
-        c.adw_alert_dialog_set_default_response(dialog, "ok");
-        c.adw_alert_dialog_set_close_response(dialog, "ok");
-        c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(@alignCast(self.window)));
+        _ = confirm.present(@ptrCast(@alignCast(self.window)), .{
+            .heading = "File is on another host",
+            .body = b.ptr,
+            .responses = &.{
+                .{ .id = "ok", .label = "OK", .is_default = true, .is_close = true },
+            },
+        }, null);
         self.view.setStatusFmt("\"{s}\" is on {s}; this dialog can only return local files", .{ leaf, h });
         self.markEntryError(true);
         return true;
@@ -980,16 +985,21 @@ pub const PickerWindow = struct {
         const b = std.fmt.bufPrintZ(&body, "\"{s}\" already exists. Replacing it overwrites its contents.", .{name}) catch blk: {
             break :blk std.fmt.bufPrintZ(&body, "The file already exists. Replacing it overwrites its contents.", .{}) catch unreachable;
         };
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Replace file?", b.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "replace", "Replace");
-        c.adw_alert_dialog_set_response_appearance(dialog, "replace", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_default_response(dialog, "cancel");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
-        c.adw_alert_dialog_choose(dialog, @ptrCast(@alignCast(self.window)), null, onOverwriteResponse, @ptrCast(ctx));
+        if (confirm.present(@ptrCast(@alignCast(self.window)), .{
+            .heading = "Replace file?",
+            .body = b.ptr,
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                .{ .id = "replace", .label = "Replace", .appearance = .destructive },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onOverwriteResponse, .ctx = @ptrCast(ctx) }) == null) {
+            self.allocator.free(ctx.spec);
+            self.allocator.free(ctx.name);
+            self.allocator.destroy(ctx);
+        }
     }
 
-    fn onOverwriteResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onOverwriteResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx = cast.userData(OverwriteCtx, user);
         const self = ctx.self;
         defer {
@@ -997,9 +1007,6 @@ pub const PickerWindow = struct {
             self.allocator.free(ctx.name);
             self.allocator.destroy(ctx);
         }
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
         if (!std.mem.eql(u8, resp, "replace")) return;
         self.deliver(&.{ctx.spec}, ctx.name);
     }

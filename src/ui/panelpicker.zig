@@ -29,6 +29,7 @@ const mux_daemon = @import("../mux/daemon.zig");
 const panelhost = @import("panelhost.zig");
 const Doc = @import("panel/doc.zig");
 const canary = @import("panel/canary.zig");
+const confirm = @import("confirm.zig");
 const Pane = @import("pane.zig").Pane;
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
@@ -695,12 +696,17 @@ fn onDeleteClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .{rctx.name},
     ) catch "This saved panel will be removed. This cannot be undone.";
 
-    const alert: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Delete saved panel?", body.ptr)));
-    c.adw_alert_dialog_add_response(alert, "cancel", "Cancel");
-    c.adw_alert_dialog_add_response(alert, "delete", "Delete");
-    c.adw_alert_dialog_set_response_appearance(alert, "delete", c.ADW_RESPONSE_DESTRUCTIVE);
-    c.adw_alert_dialog_set_default_response(alert, "cancel");
-    c.adw_alert_dialog_set_close_response(alert, "cancel");
+    const alert = confirm.present(ctx.window.app_window, .{
+        .heading = "Delete saved panel?",
+        .body = body.ptr,
+        .responses = &.{
+            .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+            .{ .id = "delete", .label = "Delete", .appearance = .destructive },
+        },
+    }, .{ .allocator = allocator, .cb = &onDeleteResponse, .ctx = @ptrCast(dctx) }) orelse {
+        dctx.destroy();
+        return;
+    };
     // The alert outlives its async choose operation, so its qdata is the
     // exactly-once owner. The callback only borrows this pointer.
     c.g_object_set_data_full(
@@ -709,13 +715,10 @@ fn onDeleteClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         @ptrCast(dctx),
         @ptrCast(&freeDeleteCtx),
     );
-    c.adw_alert_dialog_choose(alert, ctx.window.app_window, null, onDeleteResponse, @ptrCast(dctx));
 }
 
-fn onDeleteResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onDeleteResponse(user: ?*anyopaque, resp: []const u8) void {
     const dctx = canary.live(DeleteCtx, user) orelse return;
-    const alert: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-    const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(alert, result))));
     if (!std.mem.eql(u8, resp, "delete")) return;
     const ctx = dctx.handle.ctx orelse return;
     if (!canary.alive(ctx) or ctx.busy) return;

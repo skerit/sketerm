@@ -111,6 +111,7 @@ const vm = @import("../editor/view_model.zig");
 const ecmd = @import("../editor/commands.zig");
 const editormenu = @import("editormenu.zig");
 const toolbtn = @import("toolbtn.zig");
+const confirm = @import("confirm.zig");
 const editor_model = @import("../editor/model.zig");
 const syntax = @import("../editor/syntax.zig");
 const structure = @import("../editor/structure.zig");
@@ -2508,15 +2509,15 @@ pub const EditorView = struct {
         const ctx = DlgCtx.create(self, tab) orelse return;
         var body: [300:0]u8 = undefined;
         const b = std.fmt.bufPrintZ(&body, "\"{s}\" has unsaved changes.", .{tab.title()}) catch "This file has unsaved changes.";
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Save changes?", b.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "discard", "Discard");
-        c.adw_alert_dialog_add_response(dialog, "save", "Save");
-        c.adw_alert_dialog_set_response_appearance(dialog, "discard", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_response_appearance(dialog, "save", c.ADW_RESPONSE_SUGGESTED);
-        c.adw_alert_dialog_set_default_response(dialog, "save");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onCloseDirtyResponse, @ptrCast(ctx));
+        if (confirm.present(self.dialogParent(), .{
+            .heading = "Save changes?",
+            .body = b.ptr,
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_close = true },
+                .{ .id = "discard", .label = "Discard", .appearance = .destructive },
+                .{ .id = "save", .label = "Save", .appearance = .suggested, .is_default = true },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onCloseDirtyResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
     }
 
     fn dialogParent(self: *EditorView) ?*c.GtkWidget {
@@ -2525,11 +2526,9 @@ pub const EditorView = struct {
         return @ptrCast(@alignCast(root));
     }
 
-    fn onCloseDirtyResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onCloseDirtyResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
         defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const r = ctx.resolve() orelse return;
         if (std.mem.eql(u8, resp, "discard")) {
             r.view.closeTabForce(r.tab);
@@ -2744,9 +2743,6 @@ pub const EditorView = struct {
         if (self.widgets_dead) return;
         const tab = self.active orelse return;
         const ctx = DlgCtx.create(self, tab) orelse return;
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(
-            c.adw_alert_dialog_new("Rename symbol", null),
-        ));
         const entry = c.gtk_entry_new();
         const z = self.allocator.dupeZ(u8, current) catch {
             ctx.destroy();
@@ -2755,23 +2751,28 @@ pub const EditorView = struct {
         defer self.allocator.free(z);
         c.gtk_editable_set_text(@ptrCast(entry), z.ptr);
         c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
-        c.adw_alert_dialog_set_extra_child(dialog, entry);
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "rename", "Rename");
-        c.adw_alert_dialog_set_response_appearance(dialog, "rename", c.ADW_RESPONSE_SUGGESTED);
-        c.adw_alert_dialog_set_default_response(dialog, "rename");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
         // The entry lives on the dialog, so it is alive for as long as
         // the response callback can fire.
         self.rename_entry = entry;
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onRenameResponse, @ptrCast(ctx));
+        if (confirm.present(self.dialogParent(), .{
+            .heading = "Rename symbol",
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_close = true },
+                .{ .id = "rename", .label = "Rename", .appearance = .suggested, .is_default = true },
+            },
+            .extra_child = entry,
+        }, .{ .allocator = self.allocator, .cb = &onRenameResponse, .ctx = @ptrCast(ctx) }) == null) {
+            self.rename_entry = null;
+            // Nothing adopted the floating entry.
+            _ = c.g_object_ref_sink(@ptrCast(entry));
+            c.g_object_unref(@ptrCast(entry));
+            ctx.destroy();
+        }
     }
 
-    fn onRenameResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onRenameResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
         defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const r = ctx.resolve() orelse return;
         const entry = r.view.rename_entry;
         r.view.rename_entry = null;
@@ -4277,11 +4278,13 @@ pub const EditorView = struct {
     fn errorDialog(self: *EditorView, heading: [*:0]const u8, detail: []const u8) void {
         var body: [200:0]u8 = undefined;
         const b = std.fmt.bufPrintZ(&body, "{s}", .{detail}) catch "unknown error";
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(heading, b.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "ok", "OK");
-        c.adw_alert_dialog_set_default_response(dialog, "ok");
-        c.adw_alert_dialog_set_close_response(dialog, "ok");
-        c.adw_dialog_present(@ptrCast(dialog), self.dialogParent());
+        _ = confirm.present(self.dialogParent(), .{
+            .heading = heading,
+            .body = b.ptr,
+            .responses = &.{
+                .{ .id = "ok", .label = "OK", .is_default = true, .is_close = true },
+            },
+        }, null);
     }
 
     // ---- external-change detection -------------------------------------
@@ -4526,23 +4529,19 @@ pub const EditorView = struct {
 
     fn confirmReloadDirty(self: *EditorView, tab: *ETab) void {
         const ctx = DlgCtx.create(self, tab) orelse return;
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(
-            "Discard your changes?",
-            "Reloading replaces the buffer with the on-disk version; your unsaved edits are lost.",
-        )));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "reload", "Discard and Reload");
-        c.adw_alert_dialog_set_response_appearance(dialog, "reload", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_default_response(dialog, "cancel");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onReloadDirtyResponse, @ptrCast(ctx));
+        if (confirm.present(self.dialogParent(), .{
+            .heading = "Discard your changes?",
+            .body = "Reloading replaces the buffer with the on-disk version; your unsaved edits are lost.",
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                .{ .id = "reload", .label = "Discard and Reload", .appearance = .destructive },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onReloadDirtyResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
     }
 
-    fn onReloadDirtyResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onReloadDirtyResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
         defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const r = ctx.resolve() orelse return;
         if (std.mem.eql(u8, resp, "reload")) {
             r.view.clearAlert(r.tab);
@@ -4830,23 +4829,22 @@ pub const EditorView = struct {
             "{d} unsaved buffer(s) from a previous session will be deleted. This cannot be undone.",
             .{self.recovery.len},
         ) catch "These unsaved buffers will be deleted.";
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Discard recovered work?", b.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "discard", "Discard");
-        c.adw_alert_dialog_set_response_appearance(dialog, "discard", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_default_response(dialog, "cancel");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
         const ctx = std.heap.c_allocator.create(DlgCtx) catch return;
         self.fence.ref();
         ctx.* = .{ .fence = self.fence, .tab_id = 0 };
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onRecoverDiscardResponse, @ptrCast(ctx));
+        if (confirm.present(self.dialogParent(), .{
+            .heading = "Discard recovered work?",
+            .body = b.ptr,
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                .{ .id = "discard", .label = "Discard", .appearance = .destructive },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onRecoverDiscardResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
     }
 
-    fn onRecoverDiscardResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onRecoverDiscardResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
         defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         // tab_id 0 never resolves to a tab, so this one uses the fence
         // directly: the records are the view's, not a tab's.
         const view = ctx.fence.viewIfAlive() orelse return;
@@ -5754,9 +5752,6 @@ pub const EditorView = struct {
         if (self.widgets_dead) return;
         const tab = self.active orelse return;
         const ctx = DlgCtx.create(self, tab) orelse return;
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(
-            c.adw_alert_dialog_new("Go to line", "Line, or line:column"),
-        ));
         const entry = c.gtk_entry_new();
         // AdwAlertDialog does not run Enter through the default-widget
         // machinery, so the entry's own activate is the Enter path;
@@ -5767,17 +5762,25 @@ pub const EditorView = struct {
             return;
         };
         _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onGotoLineActivate), @ptrCast(ectx), @ptrCast(&freeDlgCtx), c.G_CONNECT_DEFAULT);
-        c.adw_alert_dialog_set_extra_child(dialog, entry);
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "go", "Go");
-        c.adw_alert_dialog_set_response_appearance(dialog, "go", c.ADW_RESPONSE_SUGGESTED);
-        c.adw_alert_dialog_set_default_response(dialog, "go");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
         self.goto_entry = entry;
-        // Without this the dialog maps with nothing focused and typed
-        // digits vanish into the modal barrier.
-        c.adw_dialog_set_focus(@ptrCast(dialog), entry);
-        c.adw_alert_dialog_choose(dialog, self.dialogParent(), null, onGotoLineResponse, @ptrCast(ctx));
+        if (confirm.present(self.dialogParent(), .{
+            .heading = "Go to line",
+            .body = "Line, or line:column",
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_close = true },
+                .{ .id = "go", .label = "Go", .appearance = .suggested, .is_default = true },
+            },
+            .extra_child = entry,
+            // Without this the dialog maps with nothing focused and
+            // typed digits vanish into the modal barrier.
+            .focus = entry,
+        }, .{ .allocator = self.allocator, .cb = &onGotoLineResponse, .ctx = @ptrCast(ctx) }) == null) {
+            self.goto_entry = null;
+            // Nothing adopted the floating entry (which owns `ectx`).
+            _ = c.g_object_ref_sink(@ptrCast(entry));
+            c.g_object_unref(@ptrCast(entry));
+            ctx.destroy();
+        }
     }
 
     fn freeDlgCtx(user: ?*anyopaque) callconv(.c) void {
@@ -5815,11 +5818,9 @@ pub const EditorView = struct {
         }
     }
 
-    fn onGotoLineResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onGotoLineResponse(user: ?*anyopaque, resp: []const u8) void {
         const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
         defer ctx.destroy();
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const r = ctx.resolve() orelse return;
         const entry = r.view.goto_entry;
         r.view.goto_entry = null;

@@ -6,7 +6,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
-const render_kick = @import("../util/render_kick.zig");
+const confirm = @import("confirm.zig");
 const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -3959,23 +3959,23 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
             }
         }
         if (dirty > 0) {
-            const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(
-                "Discard unsaved changes?",
-                "This tab has editor files with unsaved changes. Closing it discards them.",
-            )));
-            c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-            c.adw_alert_dialog_add_response(dialog, "close", "Discard and Close");
-            c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
-            c.adw_alert_dialog_set_default_response(dialog, "cancel");
-            c.adw_alert_dialog_set_close_response(dialog, "cancel");
             const pending = self.allocator.create(PendingCloseTab) catch {
                 c.adw_tab_view_close_page_finish(view, page, 1);
                 return 1;
             };
             pending.* = .{ .win = self, .page = page };
-            _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
-            c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
-            render_kick.dialogPresented(self.app_window);
+            if (confirm.present(self.app_window, .{
+                .heading = "Discard unsaved changes?",
+                .body = "This tab has editor files with unsaved changes. Closing it discards them.",
+                .responses = &.{
+                    .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                    .{ .id = "close", .label = "Discard and Close", .appearance = .destructive },
+                },
+                .kick_root = self.app_window,
+            }, .{ .allocator = self.allocator, .cb = &onCloseTabResponse, .ctx = @ptrCast(pending) }) == null) {
+                self.allocator.destroy(pending);
+                c.adw_tab_view_close_page_finish(view, page, 1);
+            }
             return 1;
         }
     }
@@ -3999,15 +3999,6 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
         }
     }
 
-    const heading = "Close tab?";
-    const body = "This tab has split panes. Closing it will end every shell inside.";
-    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(heading, body)));
-    c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-    c.adw_alert_dialog_add_response(dialog, "close", "Close");
-    c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
-    c.adw_alert_dialog_set_default_response(dialog, "cancel");
-    c.adw_alert_dialog_set_close_response(dialog, "cancel");
-
     const pending = self.allocator.create(PendingCloseTab) catch {
         // OOM — bail safely by accepting the close.
         c.adw_tab_view_close_page_finish(view, page, 1);
@@ -4015,19 +4006,24 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
     };
     pending.* = .{ .win = self, .page = page };
 
-    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
-    c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
-    render_kick.dialogPresented(self.app_window);
+    if (confirm.present(self.app_window, .{
+        .heading = "Close tab?",
+        .body = "This tab has split panes. Closing it will end every shell inside.",
+        .responses = &.{
+            .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+            .{ .id = "close", .label = "Close", .appearance = .destructive },
+        },
+        .kick_root = self.app_window,
+    }, .{ .allocator = self.allocator, .cb = &onCloseTabResponse, .ctx = @ptrCast(pending) }) == null) {
+        self.allocator.destroy(pending);
+        c.adw_tab_view_close_page_finish(view, page, 1);
+    }
     return 1;
 }
 
-fn onCloseTabResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onCloseTabResponse(user: ?*anyopaque, resp: []const u8) void {
     const pending = cast.userData(PendingCloseTab, user);
     defer pending.win.allocator.destroy(pending);
-
-    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-    const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
-    const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
     const accept = std.mem.eql(u8, resp, "close");
     c.adw_tab_view_close_page_finish(pending.win.tab_view, pending.page, if (accept) 1 else 0);
 }
@@ -4060,17 +4056,20 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
                 dirty,
                 if (dirty == 1) @as([]const u8, "") else @as([]const u8, "s"),
             }) catch "There are editor files with unsaved changes.";
-            const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Discard unsaved changes?", b.ptr)));
-            c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-            c.adw_alert_dialog_add_response(dialog, "close", "Discard and Close");
-            c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
-            c.adw_alert_dialog_set_default_response(dialog, "cancel");
-            c.adw_alert_dialog_set_close_response(dialog, "cancel");
             const pending = self.allocator.create(PendingCloseWin) catch return 0;
             pending.* = .{ .win = self };
-            _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
-            c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
-            render_kick.dialogPresented(self.app_window);
+            if (confirm.present(self.app_window, .{
+                .heading = "Discard unsaved changes?",
+                .body = b.ptr,
+                .responses = &.{
+                    .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                    .{ .id = "close", .label = "Discard and Close", .appearance = .destructive },
+                },
+                .kick_root = self.app_window,
+            }, .{ .allocator = self.allocator, .cb = &onCloseWinResponse, .ctx = @ptrCast(pending) }) == null) {
+                self.allocator.destroy(pending);
+                return 0;
+            }
             return 1;
         }
     }
@@ -4080,7 +4079,6 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     const npanes = self.panes.items.len;
     if (self.config.confirm_close == .multiple and npanes <= 1) return 0;
 
-    const heading = "Close window?";
     const body_buf = std.fmt.allocPrintSentinel(
         self.allocator,
         "There {s} {d} {s} open. Closing the window will end every shell.",
@@ -4096,29 +4094,27 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     };
     defer self.allocator.free(body_buf);
 
-    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(heading, body_buf.ptr)));
-    c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-    c.adw_alert_dialog_add_response(dialog, "close", "Close");
-    c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
-    c.adw_alert_dialog_set_default_response(dialog, "cancel");
-    c.adw_alert_dialog_set_close_response(dialog, "cancel");
-
     const pending = self.allocator.create(PendingCloseWin) catch return 0;
     pending.* = .{ .win = self };
 
-    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
-    c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
-    render_kick.dialogPresented(self.app_window);
+    if (confirm.present(self.app_window, .{
+        .heading = "Close window?",
+        .body = body_buf.ptr,
+        .responses = &.{
+            .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+            .{ .id = "close", .label = "Close", .appearance = .destructive },
+        },
+        .kick_root = self.app_window,
+    }, .{ .allocator = self.allocator, .cb = &onCloseWinResponse, .ctx = @ptrCast(pending) }) == null) {
+        self.allocator.destroy(pending);
+        return 0;
+    }
     return 1; // block while dialog is up
 }
 
-fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+fn onCloseWinResponse(user: ?*anyopaque, resp: []const u8) void {
     const pending = cast.userData(PendingCloseWin, user);
     defer pending.win.allocator.destroy(pending);
-
-    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-    const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
-    const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
     if (std.mem.eql(u8, resp, "close")) {
         // Primary only; see onWindowCloseRequest.
         if (pending.win.save_on_close and pending.win.is_primary) {

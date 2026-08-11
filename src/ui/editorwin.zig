@@ -24,6 +24,7 @@ const Config = @import("../config.zig").Config;
 const editorview = @import("editorview.zig");
 const EditorView = editorview.EditorView;
 const ETab = editorview.ETab;
+const confirm = @import("confirm.zig");
 
 const EDITOR_QDATA = "sketerm-editor-window";
 
@@ -290,26 +291,27 @@ pub const EditorWindow = struct {
             std.fmt.bufPrintZ(&body, "One document has unsaved changes.", .{}) catch "Unsaved changes."
         else
             std.fmt.bufPrintZ(&body, "{d} documents have unsaved changes.", .{dirty}) catch "Unsaved changes.";
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new("Save changes?", text.ptr)));
-        c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
-        c.adw_alert_dialog_add_response(dialog, "discard", "Discard");
-        c.adw_alert_dialog_add_response(dialog, "save", "Save All");
-        c.adw_alert_dialog_set_response_appearance(dialog, "discard", c.ADW_RESPONSE_DESTRUCTIVE);
-        c.adw_alert_dialog_set_response_appearance(dialog, "save", c.ADW_RESPONSE_SUGGESTED);
-        c.adw_alert_dialog_set_default_response(dialog, "save");
-        c.adw_alert_dialog_set_close_response(dialog, "cancel");
         // The ref keeps the window (and the qdata resolving back to
         // `self`) alive until the one-shot callback runs.
         _ = c.g_object_ref(@ptrCast(self.window));
-        c.adw_alert_dialog_choose(dialog, self.window, null, onCloseResponse, @ptrCast(self.window));
+        if (confirm.present(self.window, .{
+            .heading = "Save changes?",
+            .body = text.ptr,
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_close = true },
+                .{ .id = "discard", .label = "Discard", .appearance = .destructive },
+                .{ .id = "save", .label = "Save All", .appearance = .suggested, .is_default = true },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onCloseResponse, .ctx = @ptrCast(self.window) }) == null) {
+            c.g_object_unref(@ptrCast(self.window));
+            return 0;
+        }
         return 1;
     }
 
-    fn onCloseResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    fn onCloseResponse(user: ?*anyopaque, resp: []const u8) void {
         const window: *c.GtkWidget = @ptrCast(@alignCast(user.?));
         defer c.g_object_unref(@ptrCast(window));
-        const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
-        const resp = std.mem.span(@as([*:0]const u8, @ptrCast(c.adw_alert_dialog_choose_finish(dialog, result))));
         const raw = c.g_object_get_data(@ptrCast(window), EDITOR_QDATA) orelse return;
         const self: *EditorWindow = @ptrCast(@alignCast(raw));
         if (self.destroyed) return;

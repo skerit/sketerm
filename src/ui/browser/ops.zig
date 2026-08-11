@@ -20,6 +20,7 @@ const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
 const clipboard = @import("../../filebrowser/clipboard.zig");
+const confirm = @import("../confirm.zig");
 const conflict = @import("conflict.zig");
 const dnd = @import("dnd.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
@@ -1357,7 +1358,6 @@ const DeleteReq = struct {
     tab: *BTab,
     paths: [][]u8,
     dirs: []bool,
-    dialog: *c.GtkAlertDialog,
     /// Overwrite-then-unlink instead of a plain delete (files only).
     secure: bool = false,
 
@@ -1365,7 +1365,6 @@ const DeleteReq = struct {
         for (self.paths) |p| self.allocator.free(p);
         self.allocator.free(self.paths);
         self.allocator.free(self.dirs);
-        c.g_object_unref(self.dialog);
         self.allocator.destroy(self);
     }
 };
@@ -1436,33 +1435,26 @@ pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const [
         std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} \"{s}\"?", .{ verb, std.fs.path.basename(paths[0]) }) catch "Permanently delete this item?"
     else
         std.fmt.bufPrintZ(&msg, "Are you sure you want to {s} the {d} selected items?", .{ verb, n }) catch "Permanently delete the selected items?";
-    const dlg = c.gtk_alert_dialog_new("%s", txt.ptr) orelse {
-        for (paths[0..n]) |p| a.free(p);
-        a.free(paths);
-        a.free(dirs);
-        a.destroy(req);
-        return;
-    };
     req.* = .{
         .allocator = a,
         .view = self,
         .tab = tab,
         .paths = paths[0..n],
         .dirs = dirs[0..n],
-        .dialog = dlg,
         .secure = secure,
     };
-    c.gtk_alert_dialog_set_detail(dlg, if (secure)
-        "Contents are overwritten before deletion; recovery tools will not get them back. Folders are skipped."
-    else
-        "If you delete an item, it will be permanently lost.");
-    const buttons = [_:null]?[*:0]const u8{ "Cancel", "Delete" };
-    c.gtk_alert_dialog_set_buttons(dlg, @ptrCast(@constCast(&buttons)));
-    c.gtk_alert_dialog_set_cancel_button(dlg, 0);
-    c.gtk_alert_dialog_set_default_button(dlg, 0);
-    c.gtk_alert_dialog_set_modal(dlg, 1);
     const root = c.gtk_widget_get_root(self.root_box);
-    c.gtk_alert_dialog_choose(dlg, @ptrCast(@alignCast(root)), null, @ptrCast(&onDeleteChosen), @ptrCast(req));
+    if (confirm.present(@ptrCast(@alignCast(root)), .{
+        .heading = txt.ptr,
+        .body = if (secure)
+            "Contents are overwritten before deletion; recovery tools will not get them back. Folders are skipped."
+        else
+            "If you delete an item, it will be permanently lost.",
+        .responses = &.{
+            .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+            .{ .id = "delete", .label = "Delete", .appearance = .destructive },
+        },
+    }, .{ .allocator = a, .cb = &onDeleteChosen, .ctx = @ptrCast(req) }) == null) req.destroy();
 }
 
 fn secureDeleteOne(self: *BrowserView, tab: *BTab, path: []const u8, is_dir: bool) void {
@@ -1485,12 +1477,10 @@ fn deleteOne(self: *BrowserView, tab: *BTab, path: []const u8, is_dir: bool) voi
     }
 }
 
-fn onDeleteChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    _ = source;
+fn onDeleteChosen(user: ?*anyopaque, resp: []const u8) void {
     const req: *DeleteReq = @ptrCast(@alignCast(user.?));
     defer req.destroy();
-    const choice = c.gtk_alert_dialog_choose_finish(req.dialog, res, null);
-    if (choice != 1) return;
+    if (!std.mem.eql(u8, resp, "delete")) return;
     const self = req.view;
     if (self.widgets_dead) return;
     if (req.secure) {
