@@ -16049,3 +16049,46 @@ whatever the damage rects say — and invalidates the view so a dropped
 first paint is re-requested (skipped while hidden; `showView` already
 invalidates on unhide). This was NOT the cause of the black frames
 above.
+
+## 2026-08-11: web face parity — find-in-page, context menu, zoom, file drop
+
+Four gaps between the web face and the other faces, closed in one pass.
+Protocol grows an append-only 0x50 block (`protocol.zig` stays the
+source of truth): `find` 0x50 / `find_stop` 0x51 / `set_zoom` 0x52
+client-to-helper, `ev_find_result` 0x53 / `ev_context_menu` 0x54 back,
+advertised as capabilities `find`, `zoom`, `context-menu`. An old helper
+drops the unknown tags on the floor (the Reader's append-only rule), so
+the GUI sends unconditionally.
+
+- **Find-in-page**: Ctrl+F on the web face opens a hand-built bar (this
+  tree has no shared findbar helper) — search entry, N/M match counter,
+  prev/next/close. Text changes start a fresh engine search
+  (`cef_browser_host_t.find`, `find_next=0`), Enter / the arrows step
+  (`find_next=1`), Escape or close stops (`stop_finding`, selection
+  cleared). Match counts ride `on_find_result` -> `ev_find_result`.
+- **Context menu**: the helper's context-menu handler clears CEF's
+  default model and `run_context_menu` cancels the engine display
+  outright, posting `ev_context_menu` with LOGICAL coordinates, a
+  link flag + url from the hit test, and an editable flag. The face
+  shows a `classicmenu` popover there: Back/Forward (sensitivity from
+  nav state), Reload, and — on a link — Open Link in New Tab + Copy
+  Link URL, plus Copy Page URL. A page that preventDefault()s
+  contextmenu suppresses ours too, exactly like a normal browser.
+- **Zoom**: Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+wheel set a USER zoom,
+  carried as the engine's log-scale level x100 (factor 1.2^level, one
+  step = 100 = the conventional 120% browser step, clamped to
+  Chromium's ~28%..430% preset range). The helper ADDS it to the DPR
+  zoom that `applyZoom` already uses in accelerated mode (levels are
+  logarithmic, so the device scale and the user zoom compose by
+  addition) and re-applies both on every load start, since Chromium
+  resets zoom per navigation. The GUI re-sends it in `ensureView` so a
+  helper restart keeps the level.
+- **File drop**: a GtkDropTarget on the view area (pane.zig's shape)
+  navigates to the first dropped file's `g_file_get_uri` (file:// or
+  whatever the GFile really is); dropped text goes through the address
+  bar's normalizeUrl.
+
+Also fixed while wiring the menu: `classicmenu.Root.destroy` ignored
+`g_object_ref_sink`'s return value — latent (never referenced before,
+so lazy analysis skipped it) until the web face's error path became its
+first caller.
