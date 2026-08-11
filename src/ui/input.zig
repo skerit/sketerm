@@ -26,6 +26,12 @@ pub const Ctx = struct {
     /// Swap the pane's editor and terminal faces. @return false when
     /// the pane has no editor face, so the key falls through.
     editor_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Start link hints on the pane's VISIBLE web face. @return false
+    /// when the pane shows no web page, so `hints_open` falls through
+    /// to the terminal quick-select. Installed by WebFace.attach; the
+    /// fn is stateless (it resolves the face from the Pane), so a
+    /// detached face just answers false and nothing dangles.
+    web_hints: ?*const fn (ctx: ?*anyopaque) bool = null,
     /// Pop the pane's context menu at the text cursor (keyboard path:
     /// Menu / Shift+F10). @return false when the pane has no menu
     /// attached yet, so the key falls through to the child.
@@ -173,6 +179,14 @@ pub const Action = enum {
     new_web_tab,
     /// Split the focused pane and give the new pane a web face.
     new_web_split,
+    /// Link hints on the focused pane's web face (Vimium-style): label
+    /// every visible interactive element of the page, type a label to
+    /// click it through the trusted-input path (Shift/Ctrl on the last
+    /// letter opens a link in a new tab). Dispatched locally; a pane
+    /// not showing a web page leaves the chord to whatever is next.
+    /// `hints_open` also lands here first when the web face is showing,
+    /// so the one hints chord always hints what is on screen.
+    web_hints,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -464,6 +478,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_browser_split => "new_browser_split",
         .new_web_tab => "new_web_tab",
         .new_web_split => "new_web_split",
+        .web_hints => "web_hints",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -554,6 +569,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_browser_split => "Split into a second file browser pane",
         .new_web_tab => "New web tab (browser engine)",
         .new_web_split => "Split into a web pane (browser engine)",
+        .web_hints => "Link hints on the web page (type a label to click)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",
@@ -896,6 +912,18 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         .toggle_editor_face => {
             const flip = ctx.editor_toggle orelse return 0;
             return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
+        // One hints chord, face decides: a pane wearing the web face
+        // gets LINK hints (the terminal quick-select would scan the
+        // hidden shell under it); otherwise the window-level sink runs
+        // the terminal hints for `hints_open`, or explains itself for
+        // an explicit `web_hints` on a non-web pane.
+        .web_hints, .hints_open => {
+            if (ctx.web_hints) |start| {
+                if (start(ctx.pane_ctx)) return 1;
+            }
+            if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, action);
+            return 1;
         },
         .context_menu => {
             const show = ctx.context_menu orelse return 0;

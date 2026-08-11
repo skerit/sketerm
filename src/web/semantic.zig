@@ -71,6 +71,11 @@ pub const InNode = struct {
     h: i32 = 0,
     /// Length of the untruncated name text, so truncation is visible.
     full: u32 = 0,
+    /// Resolved link target (anchors only, absent otherwise). Not part
+    /// of the fingerprint or the delta comparison: a href swap under
+    /// identical text keeps the id, and hints/new-tab read the LIVE
+    /// tree anyway.
+    url: []const u8 = "",
 };
 
 /// A whole DOM walk; `doc` is the script's per-V8-context token, which
@@ -117,6 +122,8 @@ const Node = struct {
     sent: u32,
     fp: u64,
     nchildren: u32,
+    /// Resolved link target; empty for everything but anchors.
+    url: []u8,
 };
 
 /// A node as the CLIENT last received it: just enough to diff against
@@ -174,6 +181,7 @@ pub const View = struct {
         self.gpa.free(n.name);
         self.gpa.free(n.value);
         self.gpa.free(n.states);
+        self.gpa.free(n.url);
     }
 
     fn freeBase(self: *View, b: *BaseNode) void {
@@ -563,6 +571,7 @@ pub const View = struct {
                 .sent = sent,
                 .fp = fps[i],
                 .nchildren = nkids[i],
+                .url = try self.gpa.dupe(u8, nd.url),
             });
         }
         return out;
@@ -736,6 +745,41 @@ pub const View = struct {
             if (nd.sid != root_sid and !self.descends(nd, root_sid)) continue;
             try w.splatByteAll(' ', @as(usize, nd.depth -| root.depth) * 2);
             try writeNodeLine(w, nd);
+            try w.writeByte('\n');
+        }
+        return self.gpa.dupe(u8, out.written());
+    }
+
+    /// The link-hints answer: every interactive node of the LIVE tree
+    /// whose box intersects the `vw` x `vh` viewport, one per line in a
+    /// fixed tab-separated format the GUI overlay parses:
+    ///
+    ///   hints <count> vw <vw> vh <vh>
+    ///   <sid>\t<x>\t<y>\t<w>\t<h>\t<role>\t<url>\t<name>
+    ///
+    /// Rects are the walk's viewport-relative CSS px. `url`/`name` are
+    /// page-authored (untrusted), so any byte that would break the
+    /// line/field framing is flattened to a space. Reads the live tree
+    /// only — the caller is responsible for having folded a FRESH walk
+    /// first, because scrolling moves every rect without a single DOM
+    /// mutation. Does not touch the consumed base.
+    pub fn renderHints(self: *const View, vw: i32, vh: i32) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        var count: usize = 0;
+        for (self.nodes.items) |nd| {
+            if (hintableInViewport(nd, vw, vh)) count += 1;
+        }
+        try w.print("hints {d} vw {d} vh {d}\n", .{ count, vw, vh });
+        for (self.nodes.items) |nd| {
+            if (!hintableInViewport(nd, vw, vh)) continue;
+            try w.print("{d}\t{d}\t{d}\t{d}\t{d}\t", .{ nd.sid, nd.x, nd.y, nd.w, nd.h });
+            try writeSanitized(w, nd.role);
+            try w.writeByte('\t');
+            try writeSanitized(w, nd.url);
+            try w.writeByte('\t');
+            try writeSanitized(w, nd.name);
             try w.writeByte('\n');
         }
         return self.gpa.dupe(u8, out.written());
@@ -927,6 +971,37 @@ fn childLists(arena: std.mem.Allocator, n: usize, parents: []const usize, none: 
     }
     for (0..n) |i| lists[i] = store[i];
     return lists;
+}
+
+/// Roles a hint label makes sense on: things a click or focus acts on.
+/// A node with a link url qualifies regardless (role=link is derived,
+/// but an explicit role attribute can shadow it).
+fn hintableRole(role: []const u8) bool {
+    const roles = [_][]const u8{
+        "link",         "button",       "textbox",          "searchbox",
+        "checkbox",     "radio",        "combobox",         "listbox",
+        "option",       "menuitem",     "menuitemcheckbox", "menuitemradio",
+        "slider",       "spinbutton",   "switch",           "tab",
+        "summary",      "colorpicker",
+    };
+    for (roles) |r| {
+        if (std.mem.eql(u8, role, r)) return true;
+    }
+    return false;
+}
+
+fn hintableInViewport(nd: Node, vw: i32, vh: i32) bool {
+    if (!hintableRole(nd.role) and nd.url.len == 0) return false;
+    if (hasState(nd.states, "disabled")) return false;
+    if (nd.w <= 0 or nd.h <= 0) return false;
+    return nd.x < vw and nd.y < vh and nd.x + nd.w > 0 and nd.y + nd.h > 0;
+}
+
+/// Page-authored text into one TSV field: framing bytes become spaces.
+fn writeSanitized(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |ch| {
+        try w.writeByte(if (ch == '\t' or ch == '\n' or ch == '\r') ' ' else ch);
+    }
 }
 
 fn hasState(states: []const u8, want: []const u8) bool {
@@ -1177,6 +1252,57 @@ test "a walk parses from the injected script's JSON" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.nodes.len);
     try std.testing.expectEqualStrings("disabled", parsed.value.nodes[1].states);
     try std.testing.expectEqual(@as(i32, 40), parsed.value.nodes[1].w);
+}
+
+test "renderHints lists visible interactive nodes with rects and urls" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const nodes = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "link", .name = "Docs", .url = "https://x/docs", .x = 10, .y = 20, .w = 60, .h = 16 },
+        .{ .id = 3, .parent = 1, .role = "button", .name = "Go", .x = 10, .y = 40, .w = 40, .h = 20 },
+        // Scrolled out below the viewport.
+        .{ .id = 4, .parent = 1, .role = "link", .name = "Far", .url = "https://x/far", .x = 10, .y = 9000, .w = 60, .h = 16 },
+        // Disabled control: no hint.
+        .{ .id = 5, .parent = 1, .role = "button", .name = "Nope", .states = "disabled", .x = 10, .y = 60, .w = 40, .h = 20 },
+        // Zero-size box: no hint.
+        .{ .id = 6, .parent = 1, .role = "link", .name = "Ghost", .url = "https://x/g", .x = 10, .y = 80, .w = 0, .h = 0 },
+        // Plain text: never hinted.
+        .{ .id = 7, .parent = 1, .role = "paragraph", .name = "words", .x = 0, .y = 100, .w = 100, .h = 20 },
+    };
+    try v.apply(tree(7, "http://x/", &nodes));
+
+    const text = try v.renderHints(800, 600);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "hints 2 vw 800 vh 600\n"));
+    const link_sid = v.sidFor(2);
+    const btn_sid = v.sidFor(3);
+    var buf: [96]u8 = undefined;
+    const link_line = try std.fmt.bufPrint(&buf, "{d}\t10\t20\t60\t16\tlink\thttps://x/docs\tDocs\n", .{link_sid});
+    try std.testing.expect(std.mem.indexOf(u8, text, link_line) != null);
+    var buf2: [96]u8 = undefined;
+    const btn_line = try std.fmt.bufPrint(&buf2, "{d}\t10\t40\t40\t20\tbutton\t\tGo\n", .{btn_sid});
+    try std.testing.expect(std.mem.indexOf(u8, text, btn_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Far") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Nope") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ghost") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "words") == null);
+}
+
+test "renderHints flattens framing bytes in page-authored fields" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const nodes = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "link", .name = "a\tb\nc", .url = "https://x/\ty", .x = 0, .y = 0, .w = 10, .h = 10 },
+    };
+    try v.apply(tree(7, "http://x/", &nodes));
+    const text = try v.renderHints(100, 100);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "https://x/ y\ta b c\n") != null);
 }
 
 test "spontaneous churn coalesces to one empty delta; history keeps the replay" {

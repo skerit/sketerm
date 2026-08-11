@@ -115,6 +115,8 @@ const ENTRIES = [_]Entry{
        .desc = "Open a web page in a pane (needs the opt-in browser helper: zig build fetch-cef && zig build web).", .action = .new_web_tab },
     .{ .icon = "web-browser-symbolic", .title = "New Web Pane (Split)",
        .desc = "Add a web pane beside this one; the pane's shell stays one click away.", .action = .new_web_split },
+    .{ .icon = "input-keyboard-symbolic", .title = "Link Hints (Web Page)",
+       .desc = "Label every link and control on the page; type a label to click it (Shift opens links in a new tab).", .action = .web_hints },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",

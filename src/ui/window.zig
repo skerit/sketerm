@@ -3513,6 +3513,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
         .new_web_tab => self.newWebTab() catch |err| logActionError("new_web_tab", err),
         .new_web_split => self.newWebSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_web_split", err),
+        // Only reached when the focused pane shows NO web face (the
+        // pane-local dispatch consumes it otherwise).
+        .web_hints => showToast(self, "This pane shows no web page. Use New Web Tab."),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

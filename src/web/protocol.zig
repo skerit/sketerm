@@ -204,8 +204,16 @@ pub const SemAct = enum(u8) {
     _,
 };
 
-/// `sem_query` kind byte.
-pub const SemQuery = enum(u8) { find_text = 0, subtree = 1, focused = 2, _ };
+/// `sem_query` kind byte (append-only values).
+///
+/// `visible` is the link-hints request: `arg` is "<vw> <vh>" (logical
+/// px), and unlike the other kinds the helper answers it AFTER a fresh
+/// DOM walk — hint rects must reflect the current scroll position,
+/// which mutation observation alone never sees. The reply payload is
+/// the tab-separated format of `semantic.View.renderHints`; the walk
+/// folds into the live tree and deliberately does NOT advance the
+/// consumed base.
+pub const SemQuery = enum(u8) { find_text = 0, subtree = 1, focused = 2, visible = 3, _ };
 
 // ---------------------------------------------------------------------
 // Frame payload types. Field ORDER is the wire order; every type carries

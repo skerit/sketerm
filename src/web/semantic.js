@@ -341,7 +341,7 @@
       var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
       var id = idOf(el);
       byId.set(id, el);
-      out.push({
+      var node = {
         id: id,
         parent: parent,
         role: role,
@@ -353,7 +353,17 @@
         w: r ? Math.round(r.width) : 0,
         h: r ? Math.round(r.height) : 0,
         full: full
-      });
+      };
+      // The resolved link target, for "open this hint in a new tab"
+      // (and any consumer that wants the destination without a click).
+      // Only anchors carry one; String() flattens SVG's animated href.
+      if (role === "link" && el.href) {
+        try {
+          var u = String(el.href);
+          if (u) node.url = u.slice(0, 300);
+        } catch (e) {}
+      }
+      out.push(node);
       return id;
     }
 

@@ -162,6 +162,7 @@ const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
+const webhints = @import("../web/hints.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
 const web_model = @import("../web/model.zig");
@@ -793,7 +794,13 @@ pub const Client = struct {
             },
             .sem_query_result => {
                 const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.completeOp(.query, true, ev.payload.s, .{});
+                if (self.findFace(ev.view)) |face| {
+                    // A hints request rides the query kind; the face
+                    // consumes its own reply before the automation
+                    // bookkeeping can hand it to an MCP caller.
+                    if (!face.onHintsResult(ev.payload.s))
+                        face.completeOp(.query, true, ev.payload.s, .{});
+                }
             },
             .sem_read_result => {
                 const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
@@ -872,6 +879,50 @@ const MAX_AUTO_RESULTS = 16;
 fn webviewCss(widget: *c.GtkWidget) void {
     c.gtk_widget_add_css_class(widget, "sketerm-webview");
     cssutil.install("webface", widget, ".sketerm-webview { background: @view_bg_color; }");
+}
+
+/// Cap on painted hint labels; a page listing more is a page nobody
+/// hint-navigates past the first few hundred anyway.
+const MAX_HINTS = 300;
+
+/// One painted link hint: the semantic id it activates, the link
+/// target (for the new-tab modifier), its label and its label widget.
+/// `url`/`label` are owned by the face's allocator; the widget belongs
+/// to the hints layer and dies with it.
+const HintItem = struct {
+    sid: u32,
+    url: []u8,
+    label: []u8,
+    widget: *c.GtkWidget,
+};
+
+/// One provider for the hint-label look, added on first use. Named
+/// libadwaita colors keep it legible in both themes.
+var g_webhint_css_added: bool = false;
+
+fn webhintCss(widget: *c.GtkWidget) void {
+    if (g_webhint_css_added) return;
+    g_webhint_css_added = true;
+    const provider = c.gtk_css_provider_new();
+    c.gtk_css_provider_load_from_string(provider,
+        \\.sketerm-webhint {
+        \\  background: @accent_bg_color;
+        \\  color: @accent_fg_color;
+        \\  border: 1px solid alpha(@accent_fg_color, 0.5);
+        \\  border-radius: 4px;
+        \\  padding: 0px 4px;
+        \\  font-weight: 700;
+        \\  font-size: 11px;
+        \\  font-family: monospace;
+        \\}
+    );
+    const display = c.gtk_widget_get_display(widget);
+    c.gtk_style_context_add_provider_for_display(
+        display,
+        @ptrCast(provider),
+        c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    c.g_object_unref(provider);
 }
 
 /// Refcounted mmap of a frame memfd. `GBytes` built over it hold a
@@ -1061,6 +1112,18 @@ pub const WebFace = struct {
     last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
 
+    /// Link-hints mode (`web_hints`). `hints_token` is the automation
+    /// token of the in-flight `visible` query (0 when none); once the
+    /// reply builds the overlay, `hints_active` turns the face's key
+    /// controller into the label matcher and nothing leaks to the page
+    /// or the chord table until Escape/activation.
+    hints_items: std.ArrayList(HintItem) = .empty,
+    hints_layer: ?*c.GtkWidget = null,
+    hints_typed: [8]u8 = @splat(0),
+    hints_typed_len: usize = 0,
+    hints_token: u32 = 0,
+    hints_active: bool = false,
+
     // ---- attach / teardown ------------------------------------------
 
     /// Put a web face on `pane`. A pane already wearing one just gets
@@ -1088,6 +1151,11 @@ pub const WebFace = struct {
             allocator.destroy(self);
             return error.PaneHasNoWrapper;
         }
+
+        // Link hints dispatch (input.zig `web_hints` / `hints_open`).
+        // The fn is stateless — it resolves this face from the Pane on
+        // every call — so no teardown path has to clear it.
+        if (pane.input_ctx) |ictx| ictx.web_hints = webHintsSink;
 
         const cl = client();
         cl.ensure(allocator);
@@ -1130,6 +1198,7 @@ pub const WebFace = struct {
     fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
         const self: *WebFace = @ptrCast(@alignCast(ctx));
         self.widgets_dead = self.widgets_dead or widgets_dead;
+        self.cancelHints();
         // Owned reference: safe from any teardown path, dead widgets
         // included, and the ONLY place the surface watch is severed
         // besides the area's own unrealize.
@@ -1187,6 +1256,8 @@ pub const WebFace = struct {
         self.detachScaleWatch();
         self.stopPacing();
         self.dropMap();
+        self.cancelHints();
+        self.hints_items.deinit(self.allocator);
         if (self.pending_url) |u| self.allocator.free(u);
         if (self.url) |u| self.allocator.free(u);
         if (self.title) |t| self.allocator.free(t);
@@ -1362,6 +1433,217 @@ pub const WebFace = struct {
     /// reply pages through `web_expand [0]`.
     pub fn lastEval(self: *WebFace) ?[]const u8 {
         return self.last_eval;
+    }
+
+    // ---- link hints (the human skin over the semantic layer) --------
+
+    /// Kick off link hints: ask the helper for the visible interactive
+    /// elements (a `visible` semantic query — the same ids `web_act`
+    /// clicks), then paint labels when the reply lands. Returns true
+    /// when the chord is consumed; false only when this face cannot
+    /// hint at all, so `hints_open` falls through to the terminal.
+    pub fn startHints(self: *WebFace) bool {
+        if (self.widgets_dead or !self.view_live) return false;
+        if (self.hints_active) {
+            // The chord toggles: hints-while-hinting means "never mind".
+            self.cancelHints();
+            return true;
+        }
+        if (self.hints_token != 0) return true; // request already out
+        const token = self.autoBegin(.query, false) orelse return true;
+        self.hints_token = token;
+        var buf: [24]u8 = undefined;
+        const arg = std.fmt.bufPrint(&buf, "{d} {d}", .{ self.sent_w, self.sent_h }) catch return true;
+        client().post(proto.SemQueryReq{
+            .view = self.view,
+            .kind = @intFromEnum(proto.SemQuery.visible),
+            .arg = arg,
+        });
+        // The matcher lives on the view area's key controller.
+        _ = c.gtk_widget_grab_focus(self.view_area);
+        self.promote();
+        return true;
+    }
+
+    /// True when this query reply was a hints reply and is consumed
+    /// here; false hands it to the automation bookkeeping untouched.
+    pub fn onHintsResult(self: *WebFace, text: []const u8) bool {
+        if (self.hints_token == 0) return false;
+        for (self.auto_ops.items, 0..) |op, i| {
+            if (op.token == self.hints_token) {
+                _ = self.auto_ops.orderedRemove(i);
+                break;
+            }
+        }
+        self.hints_token = 0;
+        self.buildHints(text);
+        return true;
+    }
+
+    /// Parse the reply and paint one label per hint on a fresh overlay
+    /// layer. Rects are page-logical px, which IS the widget's logical
+    /// coordinate space — the inverse of the input mapping is just the
+    /// `snap_dx/dy` pixel-grid nudge the picture is drawn under.
+    fn buildHints(self: *WebFace, text: []const u8) void {
+        self.cancelHints();
+        if (self.widgets_dead or !self.on_screen) return;
+        const parsed = (webhints.parse(self.allocator, text) catch return) orelse return;
+        defer self.allocator.free(parsed);
+        if (parsed.len == 0) return;
+        const n = @min(parsed.len, MAX_HINTS);
+        const labels = webhints.generateLabels(self.allocator, n, webhints.ALPHABET) catch return;
+        var labels_moved: usize = 0;
+        defer {
+            for (labels[labels_moved..]) |l| self.allocator.free(l);
+            self.allocator.free(labels);
+        }
+
+        webhintCss(self.view_area);
+        const layer = c.gtk_fixed_new();
+        c.gtk_widget_set_can_target(layer, 0);
+        c.gtk_overlay_add_overlay(@ptrCast(self.overlay), layer);
+        self.hints_layer = layer;
+
+        const max_x: i32 = @max(0, @as(i32, self.sent_w) - 24);
+        const max_y: i32 = @max(0, @as(i32, self.sent_h) - 16);
+        for (parsed[0..n], 0..) |h, i| {
+            const url = self.allocator.dupe(u8, h.url) catch break;
+            var z: [16:0]u8 = @splat(0);
+            const m = @min(labels[i].len, 15);
+            @memcpy(z[0..m], labels[i][0..m]);
+            const wgt = c.gtk_label_new(&z);
+            c.gtk_widget_add_css_class(wgt, "sketerm-webhint");
+            const x = std.math.clamp(h.x + @as(i32, self.snap_dx), 0, max_x);
+            const y = std.math.clamp(h.y + @as(i32, self.snap_dy), 0, max_y);
+            c.gtk_fixed_put(@ptrCast(layer), wgt, @floatFromInt(x), @floatFromInt(y));
+            self.hints_items.append(self.allocator, .{
+                .sid = h.sid,
+                .url = url,
+                .label = labels[i],
+                .widget = wgt,
+            }) catch {
+                self.allocator.free(url);
+                break;
+            };
+            labels_moved = i + 1;
+        }
+        if (self.hints_items.items.len == 0) {
+            self.cancelHints();
+            return;
+        }
+        self.hints_typed_len = 0;
+        self.hints_active = true;
+    }
+
+    /// Take down the overlay and every owned hint string. Idempotent,
+    /// safe with dead widgets, and it also orphans any reply still in
+    /// flight (the automation bookkeeping absorbs it).
+    fn cancelHints(self: *WebFace) void {
+        if (self.hints_layer) |layer| {
+            if (!self.widgets_dead) c.gtk_overlay_remove_overlay(@ptrCast(self.overlay), layer);
+            self.hints_layer = null;
+        }
+        for (self.hints_items.items) |it| {
+            self.allocator.free(it.url);
+            self.allocator.free(it.label);
+        }
+        self.hints_items.clearRetainingCapacity();
+        self.hints_typed_len = 0;
+        self.hints_token = 0;
+        self.hints_active = false;
+    }
+
+    /// The hints-mode key matcher. Consumes EVERY press — nothing may
+    /// leak to the page or to the chord table while labels are up —
+    /// and only Escape (or a dead-end prefix) leaves the mode.
+    fn hintsKey(self: *WebFace, keyval: c.guint, state: c.GdkModifierType) c.gboolean {
+        if (keyval == c.GDK_KEY_Escape) {
+            self.cancelHints();
+            return 1;
+        }
+        if (keyval == c.GDK_KEY_BackSpace) {
+            if (self.hints_typed_len > 0) {
+                self.hints_typed_len -= 1;
+                self.refilterHints(false, false);
+            }
+            return 1;
+        }
+        const new_tab = (@as(c_uint, @intCast(state)) &
+            (c.GDK_SHIFT_MASK | c.GDK_CONTROL_MASK)) != 0;
+        if (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter) {
+            if (self.soleVisibleHint()) |i| self.activateHint(i, new_tab);
+            return 1;
+        }
+        const lower = c.gdk_keyval_to_lower(keyval);
+        if (lower >= 'a' and lower <= 'z' and
+            std.mem.indexOfScalar(u8, webhints.ALPHABET, @intCast(lower)) != null)
+        {
+            if (self.hints_typed_len < self.hints_typed.len) {
+                self.hints_typed[self.hints_typed_len] = @intCast(lower);
+                self.hints_typed_len += 1;
+            }
+            self.refilterHints(true, new_tab);
+            return 1;
+        }
+        // Everything else (bare modifiers included) is swallowed.
+        return 1;
+    }
+
+    /// Show only the labels matching the typed prefix. A fully typed
+    /// label activates (prefix-freedom makes that unambiguous); a
+    /// prefix nothing matches ends the mode, like Vimium.
+    fn refilterHints(self: *WebFace, allow_activate: bool, new_tab: bool) void {
+        const typed = self.hints_typed[0..self.hints_typed_len];
+        var visible: usize = 0;
+        var exact: ?usize = null;
+        for (self.hints_items.items, 0..) |it, i| {
+            const match = std.mem.startsWith(u8, it.label, typed);
+            if (!self.widgets_dead)
+                c.gtk_widget_set_visible(it.widget, if (match) @as(c_int, 1) else 0);
+            if (match) visible += 1;
+            if (std.mem.eql(u8, it.label, typed)) exact = i;
+        }
+        if (!allow_activate) return;
+        if (exact) |i| {
+            self.activateHint(i, new_tab);
+            return;
+        }
+        if (visible == 0) self.cancelHints();
+    }
+
+    fn soleVisibleHint(self: *WebFace) ?usize {
+        const typed = self.hints_typed[0..self.hints_typed_len];
+        var found: ?usize = null;
+        for (self.hints_items.items, 0..) |it, i| {
+            if (!std.mem.startsWith(u8, it.label, typed)) continue;
+            if (found != null) return null;
+            found = i;
+        }
+        return found;
+    }
+
+    /// Activate one hint: a link with the new-tab modifier opens its
+    /// url in a fresh web tab (`newWebTabAt`, the popup path); anything
+    /// else is a trusted click on the semantic id — byte-for-byte what
+    /// MCP's `web_act` does.
+    fn activateHint(self: *WebFace, idx: usize, new_tab: bool) void {
+        const it = self.hints_items.items[idx];
+        const sid = it.sid;
+        var url_buf: [512]u8 = undefined;
+        var url: []const u8 = "";
+        if (it.url.len > 0 and it.url.len <= url_buf.len) {
+            @memcpy(url_buf[0..it.url.len], it.url);
+            url = url_buf[0..it.url.len];
+        }
+        self.cancelHints();
+        if (new_tab and url.len > 0) {
+            if (self.ownerWindow()) |win| {
+                win.newWebTabAt(url) catch {};
+                return;
+            }
+        }
+        _ = self.autoAct(sid, @intFromEnum(proto.SemAct.click), "");
+        self.promote();
     }
 
     /// PNG of the PAGE as the user sees it, for `screenshot_pane` /
@@ -1594,6 +1876,7 @@ pub const WebFace = struct {
             return;
         }
         if (self.view_live) client().post(proto.ViewHide{ .view = self.view });
+        self.cancelHints();
         self.stopPacing();
         if (paceLogging()) std.debug.print("webface pace: view {d} off screen (tick={d})\n", .{ self.view, self.tick_id });
     }
@@ -1915,6 +2198,7 @@ pub const WebFace = struct {
     pub fn onClientReady(self: *WebFace) void {
         // Nothing in flight can be answered by a helper that just came
         // up: drop the requests so their kinds are usable again.
+        self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
         self.crashed = false;
         self.clearStatus();
@@ -1926,6 +2210,7 @@ pub const WebFace = struct {
     }
 
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
+        self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
         self.view_live = false;
         self.dropMap();
@@ -2387,6 +2672,7 @@ pub const WebFace = struct {
         // A document changing state is about to paint.
         self.promote();
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
+            self.cancelHints();
             self.crashed = false;
             self.clearStatus();
         } else if (ev.state == @intFromEnum(proto.LoadState.finished) or
@@ -2428,6 +2714,7 @@ pub const WebFace = struct {
 
     pub fn onCrashed(self: *WebFace) void {
         self.crashed = true;
+        self.cancelHints();
         self.dropMap();
         self.setStatus(CRASH_MSG, true);
     }
@@ -2942,6 +3229,7 @@ pub const WebFace = struct {
 
     fn onResize(_: ?*c.GtkDrawingArea, w: c_int, h: c_int, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
+        if (self.hints_active) self.cancelHints();
         if (w <= 0 or h <= 0) return;
         const nw: u16 = @intCast(@min(w, std.math.maxInt(u16)));
         const nh: u16 = @intCast(@min(h, std.math.maxInt(u16)));
@@ -2975,6 +3263,9 @@ pub const WebFace = struct {
 
     fn onPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
+        // A real click while labels are up means the user went back to
+        // the mouse; the click itself still reaches the page.
+        if (self.hints_active) self.cancelHints();
         _ = c.gtk_widget_grab_focus(self.view_area);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
         self.sendPointer(.down, x, y, cefButton(btn), @intCast(@max(1, n_press)), modsOf(@ptrCast(gesture)));
@@ -2988,6 +3279,8 @@ pub const WebFace = struct {
 
     fn onScroll(ctrl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(WebFace, user);
+        // Scrolling moves every hint rect; stale labels would lie.
+        if (self.hints_active) self.cancelHints();
         if (!self.view_live) return 0;
         // Ctrl+wheel is zoom, not scroll — the page never sees it.
         if (modsOf(@ptrCast(ctrl)) & proto.mod_ctrl != 0) {
@@ -3024,6 +3317,10 @@ pub const WebFace = struct {
     ) callconv(.c) c.gboolean {
         _ = ctrl;
         const self = cast.userData(WebFace, user);
+        // Hints mode owns the keyboard outright: labels are picked by
+        // typing, and neither the page nor the chord table may see a
+        // key until Escape or an activation ends the mode.
+        if (self.hints_active) return self.hintsKey(keyval, state);
         if (self.pane) |pane| {
             if (pane.input_ctx) |ictx| {
                 if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
@@ -3042,6 +3339,9 @@ pub const WebFace = struct {
     ) callconv(.c) void {
         _ = ctrl;
         const self = cast.userData(WebFace, user);
+        // The matching key-down was swallowed by hints mode; releasing
+        // it into the page would be an unpaired key-up.
+        if (self.hints_active) return;
         _ = self.sendKey(.up, keyval, keycode, state);
     }
 
@@ -3112,6 +3412,17 @@ pub const WebFace = struct {
         return 1;
     }
 };
+
+/// input.zig `web_hints` sink: stateless, resolves the face from the
+/// Pane on every call, so nothing dangles when the face detaches.
+/// False (pane not showing a web page) lets `hints_open` fall through
+/// to the terminal quick-select.
+fn webHintsSink(pane_ctx: ?*anyopaque) bool {
+    const pane: *Pane = @ptrCast(@alignCast(pane_ctx orelse return false));
+    if (!pane.webFaceVisible()) return false;
+    const face = WebFace.fromPane(pane) orelse return false;
+    return face.startHints();
+}
 
 /// The refresh rate of the output this frame clock drives, or `fallback`
 /// when GDK does not know one yet (an unmapped or just-realized

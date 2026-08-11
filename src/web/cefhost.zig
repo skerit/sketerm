@@ -469,6 +469,11 @@ const Pending = struct {
 
     const Kind = enum {
         snapshot,
+        /// A `sem_query` of kind `visible` (link hints): answered from
+        /// the live tree AFTER the fresh walk this request solicits,
+        /// because scrolling moves every rect without one DOM mutation.
+        /// `arg` holds the "<vw> <vh>" viewport string.
+        hints,
         click,
         hover,
         act,
@@ -1292,9 +1297,25 @@ pub const Host = struct {
 
     /// Queries are answered from the shadow tree, never by a fresh DOM
     /// walk: a spot-check must not cost a traversal and must not invent
-    /// ids the client has never been told about.
+    /// ids the client has never been told about. The ONE exception is
+    /// the `visible` (link hints) kind, whose whole answer is rects: it
+    /// solicits a walk first, because a scroll moves every box without
+    /// a single mutation the observer could have folded.
     pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
         const v = self.find(req.view) orelse return;
+        if (req.kind == @intFromEnum(proto.SemQuery.visible)) {
+            const arg = try self.gpa.dupe(u8, req.arg);
+            errdefer self.gpa.free(arg);
+            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .hints, .arg = arg });
+            var buf: [96]u8 = undefined;
+            const cmd = std.fmt.bufPrint(
+                &buf,
+                "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
+                .{ rid, v.sem_detail },
+            ) catch return;
+            self.sendScript(v, cmd);
+            return;
+        }
         const text = v.sem.query(req.kind, req.arg) catch return;
         defer self.gpa.free(text);
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
@@ -1340,11 +1361,13 @@ pub const Host = struct {
         var buf: [96]u8 = undefined;
         var resent = false;
         for (v.pending.items) |p| {
-            if (p.kind != .snapshot) continue;
+            // Hints ride the same walk op, so they are re-solicited the
+            // same way (their detail is the view's current level).
+            if (p.kind != .snapshot and p.kind != .hints) continue;
             const cmd = std.fmt.bufPrint(
                 &buf,
                 "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
-                .{ p.req, p.detail },
+                .{ p.req, if (p.kind == .snapshot) p.detail else v.sem_detail },
             ) catch continue;
             self.sendScript(v, cmd);
             resent = true;
@@ -1457,6 +1480,22 @@ pub const Host = struct {
         defer parsed.deinit();
         v.sem.apply(parsed.value) catch return;
         const p = pend orelse return;
+
+        if (p.kind == .hints) {
+            // Link hints: the walk just folded, so the live tree's rects
+            // are current. Renders from the live tree and does NOT
+            // consume the base — a hints pass must not eat the delta a
+            // real snapshot request is owed.
+            var vw: i32 = std.math.maxInt(i32);
+            var vh: i32 = std.math.maxInt(i32);
+            var it = std.mem.tokenizeScalar(u8, p.arg, ' ');
+            if (it.next()) |s| vw = std.fmt.parseInt(i32, s, 10) catch vw;
+            if (it.next()) |s| vh = std.fmt.parseInt(i32, s, 10) catch vh;
+            const text = v.sem.renderHints(vw, vh) catch return;
+            defer self.gpa.free(text);
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
+            return;
+        }
 
         if (p.scope != 0) {
             // A scoped snapshot is a peek at one subtree: rendered in

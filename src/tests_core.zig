@@ -177,6 +177,7 @@ comptime {
     _ = @import("web/protocol.zig");
     _ = @import("web/keymap.zig");
     _ = @import("web/semantic.zig");
+    _ = @import("web/hints.zig");
     _ = @import("web/pace.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/model.zig");
