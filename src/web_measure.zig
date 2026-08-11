@@ -216,6 +216,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         var url_z: [4096:0]u8 = undefined;
         const uz = std.fmt.bufPrintZ(&url_z, "{s}", .{url}) catch c._exit(126);
+        // `--url exec:<path>` runs an arbitrary binary as the display
+        // client instead of the browser GUI (probe experiments).
+        if (std.mem.startsWith(u8, std.mem.span(uz.ptr), "exec:")) {
+            const bin: [*:0]const u8 = uz.ptr + 5;
+            const pargv = [_:null]?[*:0]const u8{ bin, null };
+            _ = c.execv(bin, @ptrCast(@constCast(&pargv)));
+            c._exit(127);
+        }
         const gargv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "web", uz.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&gargv)));
         c._exit(127);
