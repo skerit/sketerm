@@ -16180,3 +16180,47 @@ fail; `zig build smoke-web` all stages PASS including new stage 13c
 The GTK overlay interaction itself (labels, typing, activation) is
 widget-side and not smoke-covered — verified by compile + review only,
 not on a live display.
+## 2026-08-11: reader mode for humans, on the extraction the tools already had
+
+`web_read` (MCP) has extracted a page's article to Markdown since the
+semantic layer landed; the browser face had no way to show it. It does
+now: a **Reader** toggle on the web toolbar (plus a `Reader View` check
+row in the page context menu and a bindable `web_reader` action in the
+palette) swaps the page for its article, laid out as text, and back.
+
+- The request is the SAME round trip the tool uses — `sem_read` out,
+  `sem_read_result` in — sent from the face's own helper socket and
+  correlated by the existing `AutoKind.read` token, so a `web_read`
+  running against the same view at the same moment is not stolen and
+  does not steal.
+- Rendering is a `GtkTextView` with text tags, NOT a `data:` URL loaded
+  back into the engine: a reader that navigates would discard the live
+  page's state and write junk into its history. The page keeps running
+  underneath the overlay, so leaving reader mode is one visibility flip
+  and costs no reload. Navigation of any kind (link, address bar,
+  reload, redirect, helper restart, renderer crash) exits it.
+- New `src/util/markdown.zig` — a compact block+inline walker for the
+  dialect `semantic.js` emits (headings, paragraphs, fenced code,
+  quotes, `-`/`N.` items, rules, `**bold**` `*italic*` `` `code` ``
+  `[link](url)` `![alt](src)`). Pure data, no GTK, so it is in BOTH
+  test roots. There was no markdown renderer anywhere in the tree
+  before this (`editorlsp.zig` still flattens LSP hover markdown to
+  plain text and says so; a richer hover could reuse this walker).
+- New `src/ui/webreader.zig` — the GTK half: tags for headings/bold/
+  italic/code/quote/links, an `AdwClamp` holding a 700px reading
+  measure, serif body text on `@view_bg_color`/`@view_fg_color` so it
+  follows light and dark, clickable links (resolved against the page's
+  own address, absolute/root-relative/protocol-relative/relative) that
+  navigate the page underneath and leave reader mode, and Escape to
+  leave. Unhandled keys fall through to the pane bindings, so a focused
+  reader is not a keyboard trap.
+- `sketerm-reader-symbolic` ships in `data/icons` (and the PKGBUILD):
+  `view-reader-mode-symbolic` is a GNOME Web name that a Breeze chain
+  never resolves, and an unresolvable icon name renders an invisible
+  button.
+
+Lifetimes follow the face's own discipline: the reader's controllers
+carry the READER as user-data, so the face's signal-disconnect loop
+cannot reach them — `Reader.sever` is called from the face's
+prepare-destroy (the same choke point, mechanism 2) and `Reader.destroy`
+from `WebFace.deinit`.
