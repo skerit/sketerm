@@ -182,16 +182,7 @@ pub const EditorWindow = struct {
         icon: [*:0]const u8,
         cb: *const fn (*c.GtkButton, ?*anyopaque) callconv(.c) void,
     ) *c.GtkWidget {
-        const button = c.gtk_button_new().?;
-        c.gtk_button_set_has_frame(@ptrCast(button), 0);
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
-        c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name(icon).?);
-        const text = c.gtk_label_new(label).?;
-        c.gtk_label_set_xalign(@ptrCast(text), 0);
-        c.gtk_widget_set_hexpand(text, 1);
-        c.gtk_box_append(@ptrCast(row), text);
-        c.gtk_button_set_child(@ptrCast(button), row);
-        c.gtk_box_append(@ptrCast(box), button);
+        const button = @import("widgets.zig").actionButton(box, label, icon);
         _ = c.g_signal_connect_data(button, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         return button;
     }

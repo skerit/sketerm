@@ -348,6 +348,49 @@ pub fn matchBinding(bindings: []const Binding, keyval: c_uint, mods: c_uint) ?Ac
 pub const SIGNIFICANT_MODS: c_uint =
     c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK | c.GDK_SUPER_MASK;
 
+/// Rebuild `list` as `default_bindings` overlaid with config
+/// (action-name, accel) overrides. An override replaces EVERY default
+/// entry for its action; an empty accel unbinds the action. Duplicate
+/// accelerators warn on stderr but stand. `keybinds` is any slice
+/// whose elements expose `.name`/`.accel` byte slices, so callers
+/// without a Window (the viewer) can feed `Config.keybinds` directly
+/// without input.zig importing config.zig.
+pub fn rebuildBindings(list: *std.ArrayList(Binding), ally: std.mem.Allocator, keybinds: anytype) void {
+    list.clearRetainingCapacity();
+    for (default_bindings) |b| list.append(ally, b) catch return;
+    for (keybinds) |kb| {
+        const action = actionFromName(kb.name) orelse {
+            std.debug.print("sketerm: keybind: unknown action '{s}'\n", .{kb.name});
+            continue;
+        };
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (list.items[i].action == action) {
+                _ = list.orderedRemove(i);
+            } else i += 1;
+        }
+        if (kb.accel.len == 0) continue; // unbound
+        const parsed = parseAccel(kb.accel) orelse {
+            std.debug.print("sketerm: keybind: bad accelerator '{s}' for '{s}'\n", .{ kb.accel, kb.name });
+            continue;
+        };
+        for (list.items) |existing| {
+            if (existing.keyval == parsed.keyval and (existing.mods & SIGNIFICANT_MODS) == (parsed.mods & SIGNIFICANT_MODS)) {
+                std.debug.print(
+                    "sketerm: keybind: '{s}' shadows '{s}' (same accelerator)\n",
+                    .{ actionName(action), actionName(existing.action) },
+                );
+                break;
+            }
+        }
+        list.append(ally, .{
+            .keyval = parsed.keyval,
+            .mods = parsed.mods,
+            .action = action,
+        }) catch {};
+    }
+}
+
 /// Convert an Action to its config-key string form. Stable across
 /// versions — config files reference these names. Inverse: `actionFromName`.
 pub fn actionName(a: Action) []const u8 {

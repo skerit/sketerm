@@ -1063,56 +1063,11 @@ pub fn refreshShaderSource(self: *Window) void {
 }
 
 /// Build the active keybinding table from default_bindings overlaid
-/// with Config.keybinds. Each (action, accel) override either
-/// replaces a default's accel for that action OR (if the action's
-/// default is unbound and the user-supplied accel matches an
-/// existing default's accel) does nothing — the user can't "free
-/// up" a default chord without an explicit unbind.
-/// Empty accel means "unbind that action" (remove all entries).
-/// Logs duplicate-accel collisions to stderr but doesn't error.
+/// with Config.keybinds (shared overlay logic: input.rebuildBindings),
+/// then re-point every pane's Ctx at the fresh slice.
 pub fn refreshBindings(self: *Window) void {
     const input = @import("input.zig");
-    const ally = self.allocator;
-    // Reset.
-    self.bindings.clearRetainingCapacity();
-    // Start with defaults.
-    for (input.default_bindings) |b| self.bindings.append(ally, b) catch return;
-    // Apply overrides.
-    for (self.config.keybinds.items) |kb| {
-        const action = input.actionFromName(kb.name) orelse {
-            std.debug.print("sketerm: keybind: unknown action '{s}'\n", .{kb.name});
-            continue;
-        };
-        // Drop every existing binding for this action (multiple
-        // defaults may map to the same action — e.g. font_inc has
-        // 4 entries; an override clears all of them).
-        var i: usize = 0;
-        while (i < self.bindings.items.len) {
-            if (self.bindings.items[i].action == action) {
-                _ = self.bindings.orderedRemove(i);
-            } else i += 1;
-        }
-        if (kb.accel.len == 0) continue; // unbound
-        const parsed = input.parseAccel(kb.accel) orelse {
-            std.debug.print("sketerm: keybind: bad accelerator '{s}' for '{s}'\n", .{ kb.accel, kb.name });
-            continue;
-        };
-        // Conflict warn if another action already uses this combo.
-        for (self.bindings.items) |existing| {
-            if (existing.keyval == parsed.keyval and (existing.mods & input.SIGNIFICANT_MODS) == (parsed.mods & input.SIGNIFICANT_MODS)) {
-                std.debug.print(
-                    "sketerm: keybind: '{s}' shadows '{s}' (same accelerator)\n",
-                    .{ input.actionName(action), input.actionName(existing.action) },
-                );
-                break;
-            }
-        }
-        self.bindings.append(ally, .{
-            .keyval = parsed.keyval,
-            .mods = parsed.mods,
-            .action = action,
-        }) catch {};
-    }
+    input.rebuildBindings(&self.bindings, self.allocator, self.config.keybinds.items);
     // Push pointer into every existing pane's Ctx.
     for (self.panes.items) |p| {
         if (p.input_ctx) |ictx| ictx.bindings = self.bindings.items;
