@@ -36,6 +36,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const proto = @import("web/protocol.zig");
+const webhints = @import("web/hints.zig");
 
 const view_id: u32 = 1;
 /// The stage-22b view, created directly at a url.
@@ -68,6 +69,17 @@ const popup_page =
 /// to TRANSPARENT, which reaches a client as (0,0,0,0) and photographs
 /// as a uniformly black page.
 const bare_page = "data:text/html,<html><body>hi</body></html>";
+
+/// Link-hints page: two on-screen links, a button, a disabled button
+/// and a link scrolled far out of the viewport.
+const hints_page =
+    "data:text/html,<html><body>" ++
+    "<a%20href=%22https://example.com/alpha%22>Alpha%20Link</a>%20" ++
+    "<a%20href=%22https://example.com/beta%22>Beta%20Link</a>%20" ++
+    "<button%20id=b>Press</button>%20" ++
+    "<button%20disabled>Dead</button>" ++
+    "<a%20href=%22https://example.com/far%22%20style=%22position:absolute;top:9000px%22>Far%20Link</a>" ++
+    "</body></html>";
 
 /// Repaints on every animation frame, i.e. on every begin frame the
 /// rig drives — the page whose achieved rate measures the ceiling.
@@ -1262,6 +1274,45 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     pass("stage 13 sem_query");
+
+    // ── Stage 13c: link hints (`visible` query = fresh rects + urls) ─
+    // The GUI's hint overlay is widget-side and not smokeable here;
+    // what this proves is the whole data path it consumes: the query
+    // solicits a FRESH walk, the reply carries per-element rects and
+    // link urls, and viewport clipping / disabled filtering hold.
+    {
+        cl.navigate(hints_page);
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{
+            .view = view_id,
+            .kind = @intFromEnum(proto.SemQuery.visible),
+            .arg = "800 600",
+        });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 13c hints: no sem_query_result");
+        const payload = cl.queryPayload();
+        if (!std.mem.startsWith(u8, payload, "hints ")) {
+            std.debug.print("smoke-web: hints payload was:\n{s}\n", .{payload});
+            fail("stage 13c hints: reply is not a hints payload");
+        }
+        const parsed = (webhints.parse(gpa, payload) catch fail("stage 13c hints: parse error")) orelse
+            fail("stage 13c hints: parse refused the payload");
+        defer gpa.free(parsed);
+        var alpha: ?webhints.Hint = null;
+        var press = false;
+        for (parsed) |h| {
+            if (std.mem.endsWith(u8, h.url, "/alpha")) alpha = h;
+            if (std.mem.eql(u8, h.name, "Press")) press = true;
+            if (std.mem.endsWith(u8, h.url, "/far")) fail("stage 13c hints: off-viewport link was listed");
+            if (std.mem.eql(u8, h.name, "Dead")) fail("stage 13c hints: disabled button was listed");
+        }
+        const a = alpha orelse fail("stage 13c hints: the alpha link is missing");
+        if (!std.mem.eql(u8, a.role, "link")) fail("stage 13c hints: alpha's role is not link");
+        if (!std.mem.eql(u8, a.name, "Alpha Link")) fail("stage 13c hints: alpha's name is wrong");
+        if (a.w <= 0 or a.h <= 0) fail("stage 13c hints: alpha has no box");
+        if (a.y < 0 or a.y >= 600) fail("stage 13c hints: alpha's rect is outside the viewport");
+        if (!press) fail("stage 13c hints: the button is missing");
+    }
+    pass("stage 13c link hints (fresh rects, urls, viewport clip)");
 
     // ── Stage 13b: spontaneous churn coalesces into ONE delta ──────
     // A page that rebuilds identical rows and blinks a popup on a

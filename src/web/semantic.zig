@@ -767,11 +767,11 @@ pub const View = struct {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
         const w = &out.writer;
-        var count: usize = 0;
+        var n_hints: usize = 0;
         for (self.nodes.items) |nd| {
-            if (hintableInViewport(nd, vw, vh)) count += 1;
+            if (hintableInViewport(nd, vw, vh)) n_hints += 1;
         }
-        try w.print("hints {d} vw {d} vh {d}\n", .{ count, vw, vh });
+        try w.print("hints {d} vw {d} vh {d}\n", .{ n_hints, vw, vh });
         for (self.nodes.items) |nd| {
             if (!hintableInViewport(nd, vw, vh)) continue;
             try w.print("{d}\t{d}\t{d}\t{d}\t{d}\t", .{ nd.sid, nd.x, nd.y, nd.w, nd.h });
