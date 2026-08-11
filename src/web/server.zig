@@ -207,7 +207,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [10][]const u8 = .{
+                var caps: [11][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -217,9 +217,10 @@ pub const Server = struct {
                     proto.CAP_ZOOM,
                     proto.CAP_CONTEXT_MENU,
                     proto.CAP_INTERCEPT,
+                    proto.CAP_DISCARD,
                     undefined,
                 };
-                var ncaps: usize = 9;
+                var ncaps: usize = 10;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -235,6 +236,7 @@ pub const Server = struct {
             .view_create => try self.host.createView(try proto.decode(proto.ViewCreate, frame.payload)),
             .view_create_url => try self.host.createViewUrl(try proto.decode(proto.ViewCreateUrl, frame.payload)),
             .view_destroy => self.host.destroyView((try proto.decode(proto.ViewDestroy, frame.payload)).view),
+            .view_discard => self.host.discardView((try proto.decode(proto.ViewDiscard, frame.payload)).view),
             .view_resize => try self.host.resizeView(try proto.decode(proto.ViewResize, frame.payload)),
             .view_show => self.host.showView((try proto.decode(proto.ViewShow, frame.payload)).view, true),
             .view_hide => self.host.showView((try proto.decode(proto.ViewHide, frame.payload)).view, false),

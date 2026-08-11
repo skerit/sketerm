@@ -763,6 +763,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.config = cloned;
     rebuildSymbolSpecs(self);
     @import("webface.zig").setMaxFps(self.config.browser_max_fps);
+    @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
     // IM strategy is app-level; faces read it at construction time.
     @import("imhost.zig").setPreference(switch (self.config.input_method) {
         .auto => .auto,

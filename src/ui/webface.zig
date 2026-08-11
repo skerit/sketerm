@@ -335,6 +335,45 @@ pub fn setMaxFps(fps: u16) void {
 }
 
 // ---------------------------------------------------------------------
+// Automatic tab discard
+// ---------------------------------------------------------------------
+
+/// `web_discard_minutes`: how long a face may stay off screen before
+/// its page is discarded outright (0 = never). App-level and
+/// module-level for the same reason as the frame cap — every face reads
+/// the same number.
+var g_discard_minutes: u32 = 30;
+
+/// Apply `web_discard_minutes`, re-arming every off-screen face against
+/// the new interval (and disarming them all at 0). Called from
+/// `applyConfigChange` and at window construction.
+pub fn setDiscardMinutes(minutes: u32) void {
+    g_discard_minutes = minutes;
+    for (g_client.faces.items) |f| {
+        f.stopDiscardTimer();
+        if (!f.on_screen) f.armDiscardTimer();
+    }
+}
+
+/// Discard every face that is not on screen, now — the
+/// `web_discard_background` action. Returns how many pages were let go,
+/// which is what the toast reports.
+pub fn discardBackground() usize {
+    var n: usize = 0;
+    for (g_client.faces.items) |f| {
+        if (f.on_screen) continue;
+        if (f.discardNow()) n += 1;
+    }
+    return n;
+}
+
+/// Whether the connected helper can discard at all, so a UI can say
+/// "not supported" instead of quietly doing nothing.
+pub fn discardSupported() bool {
+    return g_client.cap_discard;
+}
+
+// ---------------------------------------------------------------------
 // Client — one helper process per GUI process
 // ---------------------------------------------------------------------
 
@@ -368,6 +407,11 @@ pub const Client = struct {
     connect_tries: u32 = 0,
     next_view: u32 = 1,
     faces: std.ArrayList(*WebFace) = .empty,
+    /// The helper advertised `discard` (protocol `CAP_DISCARD`). An
+    /// older helper without it never sees a `view_discard` and every
+    /// hidden face behaves exactly as it did before the feature: paused
+    /// painting, browser kept.
+    cap_discard: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -469,6 +513,9 @@ pub const Client = struct {
             _ = c.close(self.fd);
             self.fd = -1;
         }
+        // Capabilities belong to the CONNECTION, not to the client: a
+        // restart may land on a different helper build.
+        self.cap_discard = false;
         for (self.fds.items) |fd| _ = c.close(fd);
         self.fds.clearRetainingCapacity();
         self.in.clearRetainingCapacity();
@@ -719,6 +766,10 @@ pub const Client = struct {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(ack.caps);
                 if (ack.proto != proto.PROTO_VERSION) self.fail("The browser helper speaks a different protocol version.");
+                self.cap_discard = false;
+                for (ack.caps) |cap| {
+                    if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
+                }
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
@@ -887,13 +938,23 @@ pub const AutoResult = struct {
 /// from growing without bound.
 const MAX_AUTO_RESULTS = 16;
 
+/// CSS class dimming a discarded view's LAST frame, so the pane still
+/// shows what the page looked like while reading as not-live. Subtle on
+/// purpose: it is the same content, one keystroke from being real
+/// again, not an error state.
+const DISCARDED_CLASS = "sketerm-web-discarded";
+
 /// Page background for the view area (what a browser shows where
-/// nothing painted; also the gutter during a live resize). Theme's view
-/// background rather than white, so a dark theme does not flash: a page
-/// that paints its own background covers this anyway.
+/// nothing painted; also the gutter during a live resize), plus the
+/// discarded dim. Theme's view background rather than white, so a dark
+/// theme does not flash: a page that paints its own background covers
+/// this anyway.
 fn webviewCss(widget: *c.GtkWidget) void {
     c.gtk_widget_add_css_class(widget, "sketerm-webview");
-    cssutil.install("webface", widget, ".sketerm-webview { background: @view_bg_color; }");
+    cssutil.install("webface", widget,
+        \\.sketerm-webview { background: @view_bg_color; }
+        \\.sketerm-web-discarded { opacity: 0.65; }
+    );
 }
 
 /// Cap on painted hint labels; a page listing more is a page nobody
@@ -1082,6 +1143,21 @@ pub const WebFace = struct {
     /// Whether the view widget is mapped. A background tab is unmapped: it
     /// gets `view_hide` and is never asked for a frame.
     on_screen: bool = false,
+    /// The helper destroyed this view's browser at our request
+    /// (`view_discard`): the page is gone from memory, the LAST frame
+    /// is still on the picture (dimmed), and the next map, focus or
+    /// navigation revives it. False on a helper without `CAP_DISCARD`,
+    /// which is never sent the frame at all.
+    discarded: bool = false,
+    /// One-shot GLib timeout counting the off-screen minutes down to a
+    /// discard, 0 when not armed. Armed the moment the face leaves the
+    /// screen and removed the moment it comes back, so a face that is
+    /// looked at every few minutes never discards.
+    ///
+    /// Lifetime is the pacing timers' (mechanism 2): the face is its
+    /// user-data and `stopDiscardTimer` runs at the single teardown
+    /// choke point (`prepareDestroyCb`) and once more in `deinit`.
+    discard_timer: c.guint = 0,
 
     /// Address to open once the view exists (attach-time URL).
     pending_url: ?[]u8 = null,
@@ -1241,9 +1317,11 @@ pub const WebFace = struct {
         // at the same choke point.
         if (self.reader) |r| r.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
-        // two pacing sources, which carry this face as user-data and
-        // are not signals, so the disconnect loop below misses them.
+        // pacing sources and the discard countdown, which carry this
+        // face as user-data and are not signals, so the disconnect loop
+        // below misses them.
         self.stopPacing();
+        self.stopDiscardTimer();
         // Mechanism 2: one disconnect for every widget/controller that
         // carries this face as user-data, at the single choke point.
         // Nothing here owns a GDestroyNotify — combining the two would
@@ -1276,6 +1354,9 @@ pub const WebFace = struct {
     fn focusCb(ctx: *anyopaque) void {
         const self: *WebFace = @ptrCast(@alignCast(ctx));
         if (self.widgets_dead) return;
+        // Raising a pane whose page was discarded brings it back before
+        // the user has to ask twice.
+        self.reviveNow();
         // Raising the face re-asserts its title on the pane titlebar
         // (the flip cleared whatever the previous face had put there).
         self.applyPaneFaceTitle();
@@ -1301,6 +1382,7 @@ pub const WebFace = struct {
             r.destroy();
             self.reader = null;
         }
+        self.stopDiscardTimer();
         self.dropMap();
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
@@ -1346,6 +1428,13 @@ pub const WebFace = struct {
     /// one right now, which the caller reports rather than hanging.
     fn autoBegin(self: *WebFace, kind: AutoKind, want_full: bool) ?u32 {
         if (!self.view_live) return null;
+        // An agent driving a background tab must not be handed the
+        // helper's "this view is discarded" answer when what it wants
+        // is the page: revive first, so the request rides the reload
+        // (a pending snapshot is re-issued at load end helper-side).
+        // The helper's error reply stays the backstop for any client
+        // that does not do this.
+        self.reviveNow();
         if (self.autoBusy(kind)) return null;
         const token = self.auto_next;
         self.auto_next +%= 1;
@@ -1984,12 +2073,19 @@ pub const WebFace = struct {
 
     /// The page went on or off screen (tab switch, pane teardown). An
     /// off-screen page is not painted at all: `view_hide` stops the
-    /// helper's own watchdog too, so nothing anywhere renders it.
+    /// helper's own watchdog too, so nothing anywhere renders it — and
+    /// after `web_discard_minutes` of that, the page is let go entirely.
     fn setOnScreen(self: *WebFace, on: bool) void {
         if (self.on_screen == on) return;
         self.on_screen = on;
         if (on) {
             if (paceLogging()) std.debug.print("webface pace: view {d} on screen\n", .{self.view});
+            self.stopDiscardTimer();
+            // `view_show` IS the revive frame, so the order below is
+            // "clear our own discarded state, then show": the helper
+            // recreates the browser and the buffer it announces lands
+            // on a face that is no longer dimmed.
+            self.noteRevived();
             if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
             self.startIdleTimer();
             self.startLatProbe();
@@ -2001,7 +2097,90 @@ pub const WebFace = struct {
         if (self.view_live) client().post(proto.ViewHide{ .view = self.view });
         self.cancelHints();
         self.stopPacing();
+        self.armDiscardTimer();
         if (paceLogging()) std.debug.print("webface pace: view {d} off screen (tick={d})\n", .{ self.view, self.tick_id });
+    }
+
+    // ---- tab discard --------------------------------------------------
+
+    /// Start the off-screen countdown, if discarding is possible and
+    /// configured. Idempotent; a face that is already discarded, has no
+    /// view, or sits on a helper without the capability arms nothing.
+    fn armDiscardTimer(self: *WebFace) void {
+        if (self.discard_timer != 0 or self.discarded) return;
+        if (g_discard_minutes == 0 or self.on_screen) return;
+        if (!self.view_live or !client().cap_discard) return;
+        const ms: u64 = @as(u64, g_discard_minutes) * 60 * 1000;
+        self.discard_timer = c.g_timeout_add(
+            @intCast(@min(ms, std.math.maxInt(c_uint))),
+            @ptrCast(&onDiscardTimer),
+            @ptrCast(self),
+        );
+    }
+
+    fn stopDiscardTimer(self: *WebFace) void {
+        if (self.discard_timer == 0) return;
+        _ = c.g_source_remove(self.discard_timer);
+        self.discard_timer = 0;
+    }
+
+    /// The countdown ran out: let the page go. One-shot — a discarded
+    /// face needs no timer, and a revived one arms a fresh one when it
+    /// leaves the screen again.
+    fn onDiscardTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        self.discard_timer = 0;
+        if (self.widgets_dead or self.on_screen) return 0; // G_SOURCE_REMOVE
+        _ = self.discardNow();
+        return 0; // G_SOURCE_REMOVE
+    }
+
+    /// Discard this face's page NOW. True when a `view_discard` went
+    /// out, false when there was nothing to discard (no view, already
+    /// discarded, helper too old).
+    ///
+    /// The last delivered frame deliberately STAYS on the picture: the
+    /// pane keeps showing the page, dimmed, instead of going blank at a
+    /// moment the user did not ask for anything. Only OUR reference to
+    /// the shared mapping is dropped — the presented texture holds its
+    /// own, so the pixels survive the memfd going away helper-side.
+    fn discardNow(self: *WebFace) bool {
+        if (self.discarded or !self.view_live) return false;
+        const cl = client();
+        if (!cl.cap_discard) return false;
+        self.stopDiscardTimer();
+        cl.post(proto.ViewDiscard{ .view = self.view });
+        self.discarded = true;
+        self.auto_ops.clearRetainingCapacity();
+        self.stopPacing();
+        self.dropMap();
+        // A fresh helper-side view knows no cap; the revival re-sends.
+        self.sent_max_fps = 0xffff;
+        if (!self.widgets_dead) c.gtk_widget_add_css_class(self.picture, DISCARDED_CLASS);
+        if (paceLogging()) std.debug.print("webface pace: view {d} discarded\n", .{self.view});
+        return true;
+    }
+
+    /// Undo the GUI half of a discard. The helper revives on the frame
+    /// that follows (show, navigation or input), so this only clears
+    /// what the face itself is holding — including the dim, which must
+    /// go before the revived page's first frame lands under it.
+    fn noteRevived(self: *WebFace) void {
+        if (!self.discarded) return;
+        self.discarded = false;
+        if (!self.widgets_dead) c.gtk_widget_remove_css_class(self.picture, DISCARDED_CLASS);
+        if (paceLogging()) std.debug.print("webface pace: view {d} revived\n", .{self.view});
+    }
+
+    /// Bring a discarded page back on purpose, with `view_show` as the
+    /// waking frame. For a NAVIGATION use `noteRevived` instead: the
+    /// navigate frame is itself a revive, and showing first would load
+    /// the old address as an extra document.
+    fn reviveNow(self: *WebFace) void {
+        if (!self.discarded) return;
+        self.noteRevived();
+        if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
+        self.promote();
     }
 
     // ---- device scale ----------------------------------------------
@@ -2356,6 +2535,10 @@ pub const WebFace = struct {
         self.crashed = false;
         self.clearStatus();
         self.view_live = false;
+        // A fresh helper holds no views at all, discarded or otherwise:
+        // `ensureView` below mints this one again from scratch.
+        self.stopDiscardTimer();
+        self.noteRevived();
         self.dropMap();
         self.sent_w = 0;
         self.sent_h = 0;
@@ -2366,6 +2549,8 @@ pub const WebFace = struct {
         self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
         self.view_live = false;
+        self.stopDiscardTimer();
+        self.noteRevived();
         self.dropMap();
         self.setStatus(reason, retryable);
     }
@@ -2405,7 +2590,13 @@ pub const WebFace = struct {
         // A view is created visible; tell the helper at once when this
         // face is on a background tab (a helper restart can rebuild a
         // view whose pane nobody is looking at).
-        if (!self.on_screen) cl.post(proto.ViewHide{ .view = self.view });
+        if (!self.on_screen) {
+            cl.post(proto.ViewHide{ .view = self.view });
+            // A view minted for a pane nobody is looking at starts its
+            // off-screen countdown here, not at some later unmap that
+            // will never come.
+            self.armDiscardTimer();
+        }
         // The first load has to paint promptly, and nothing paints
         // unless somebody asks.
         self.promote();
@@ -2908,12 +3099,19 @@ pub const WebFace = struct {
             self.ensureView();
             return;
         }
+        // The navigate frame IS the revive for a discarded view, and
+        // the helper brings the browser back straight AT this url — so
+        // only the GUI-side state is cleared here; sending `view_show`
+        // as well would load the old address first.
+        self.noteRevived();
         cl.post(proto.Navigate{ .view = self.view, .url = url });
         self.promote();
     }
 
     pub fn navAction(self: *WebFace, action: proto.NavAct) void {
         if (!self.view_live) return;
+        // Same as a navigation: `nav_action` revives helper-side.
+        self.noteRevived();
         client().post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
         self.promote();
     }

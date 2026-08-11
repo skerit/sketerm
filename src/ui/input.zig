@@ -191,6 +191,11 @@ pub const Action = enum {
     /// reader mode: the page's article, extracted by the same
     /// `sem_read` the `web_read` tool uses, laid out as text.
     web_reader,
+    /// Discard every web pane that is not on screen: the browser
+    /// engine lets each page go and the pane keeps its last frame,
+    /// dimmed, until it is looked at again. What
+    /// `web_discard_minutes` does on a timer, on demand.
+    web_discard_background,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,
@@ -484,6 +489,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_web_split => "new_web_split",
         .web_hints => "web_hints",
         .web_reader => "web_reader",
+        .web_discard_background => "web_discard_background",
         .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .new_editor_tab => "new_editor_tab",
@@ -576,6 +582,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_web_split => "Split into a web pane (browser engine)",
         .web_hints => "Link hints on the web page (type a label to click)",
         .web_reader => "Reader view on/off (this pane's web page)",
+        .web_discard_background => "Discard background web tabs (free their memory)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",

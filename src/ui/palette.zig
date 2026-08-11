@@ -119,6 +119,8 @@ const ENTRIES = [_]Entry{
        .desc = "Label every link and control on the page; type a label to click it (Shift opens links in a new tab).", .action = .web_hints },
     .{ .icon = "sketerm-reader-symbolic", .title = "Reader View / Show Page",
        .desc = "Swap this pane's web page for its article as plain text, and back. The page keeps running underneath.", .action = .web_reader },
+    .{ .icon = "web-browser-symbolic", .title = "Discard Background Web Tabs",
+       .desc = "Let go of every web page that is not on screen. Each pane keeps its last frame, dimmed, and reloads when you look at it again.", .action = .web_discard_background },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",

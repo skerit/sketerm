@@ -47,6 +47,11 @@ pub const CAP_CONTEXT_MENU = "context-menu";
 /// to the client — the client only configures, polls the bounded
 /// request log, and receives coalesced per-view counters.
 pub const CAP_INTERCEPT = "intercept";
+/// The helper accepts `view_discard`: a view whose browser is destroyed
+/// outright while its ID and address survive, revived on the next
+/// `view_show`, navigation or input. A client without this capability
+/// keeps sending `view_hide`, which only stops the painting.
+pub const CAP_DISCARD = "discard";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -65,6 +70,7 @@ pub const Tag = enum(u8) {
     view_hide = 0x14,
     view_max_fps = 0x15,
     view_create_url = 0x16,
+    view_discard = 0x17,
     navigate = 0x18,
     nav_action = 0x19,
     input_pointer = 0x20,
@@ -291,6 +297,26 @@ pub const ViewCreateUrl = struct {
 
 pub const ViewDestroy = struct {
     pub const tag: Tag = .view_destroy;
+    view: u32,
+};
+
+/// Destroy a view's BROWSER while keeping the view (capability
+/// `discard`): the id, its logical geometry, its scale and its current
+/// address survive, everything the engine held for it does not.
+///
+/// Distinct from `view_hide`, which only stops the painting: after this
+/// the page is gone from memory entirely. The next `view_show`,
+/// `navigate`, `nav_action` or input frame for the id recreates the
+/// browser at the stored address, so a client sees nothing but a
+/// reload. NAVIGATION HISTORY IS LOST — back/forward start empty again,
+/// as does any unsubmitted form state, which is the price of the
+/// memory and the reason this is a deliberate client decision rather
+/// than something the helper does on its own.
+///
+/// Discarding a view that has no browser is a no-op, so a client may
+/// send it twice.
+pub const ViewDiscard = struct {
+    pub const tag: Tag = .view_discard;
     view: u32,
 };
 
@@ -1257,6 +1283,7 @@ test "round-trip: scalar and string frames" {
         .url = "https://example.com/",
     });
     try roundTrip(ViewDestroy, .{ .view = 7 });
+    try roundTrip(ViewDiscard, .{ .view = 7 });
     try roundTrip(ViewResize, .{ .view = 7, .w = 1024, .h = 768, .scale_x1000 = 1500 });
     try roundTrip(ViewShow, .{ .view = 7 });
     try roundTrip(ViewHide, .{ .view = 7 });

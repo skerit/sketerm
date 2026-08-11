@@ -1151,6 +1151,18 @@ pub const Config = struct {
     /// nothing at all, and no cap can make a view exceed its display.
     browser_max_fps: u16 = 0,
 
+    /// Minutes a web pane may stay off screen before its page is
+    /// DISCARDED: the helper destroys the browser outright and the pane
+    /// keeps showing the last frame, dimmed, until it is looked at
+    /// again (protocol capability `discard`). 0 = never.
+    ///
+    /// Not the same lever as hiding: a hidden page already paints
+    /// nothing, so this is about the memory a Chromium renderer holds
+    /// while idle, and the price is that the revived page RELOADS and
+    /// its back/forward history is gone. Conservative by default for
+    /// exactly that reason.
+    web_discard_minutes: u32 = 30,
+
     /// Colour space glyph coverage is blended in (see TextBlending).
     /// App-level, like every other rendering flag: it changes the GL
     /// target every pane in the window draws into, and a per-profile
@@ -1698,6 +1710,7 @@ pub const Config = struct {
         if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
         if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
         if (self.browser_max_fps != 0) try w.print("browser_max_fps = {d}\n", .{self.browser_max_fps});
+        if (self.web_discard_minutes != 30) try w.print("web_discard_minutes = {d}\n", .{self.web_discard_minutes});
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -2820,6 +2833,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         const n = try parseU32(value);
         if (n != 0 and (n < 5 or n > 1000)) return error.BadBrowserMaxFps;
         cfg.browser_max_fps = @intCast(n);
+    } else if (std.mem.eql(u8, key, "web_discard_minutes")) {
+        cfg.web_discard_minutes = try parseU32(value);
     } else if (std.mem.eql(u8, key, "graphics_offload")) {
         cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {

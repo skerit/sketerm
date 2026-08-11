@@ -594,6 +594,7 @@ pub const Window = struct {
         // Browser frame cap: app-level like the IM strategy below, and
         // module-level in webface, which owns the one helper client.
         @import("webface.zig").setMaxFps(self.config.browser_max_fps);
+        @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
         // IM strategy is an app-level key; every face reads it at
         // construction time (imhost.resolve).
         @import("imhost.zig").setPreference(switch (self.config.input_method) {
@@ -1343,6 +1344,28 @@ pub const Window = struct {
             logActionError("new_web_split attach", err);
             return err;
         };
+    }
+
+    /// `web_discard_background`: let go of every web page that is not
+    /// on screen, right now. The panes keep their last frame; each
+    /// reloads when it is next looked at.
+    pub fn discardBackgroundWebTabs(self: *Window) void {
+        const webface = @import("webface.zig");
+        if (!webface.discardSupported()) {
+            showToast(self, "The browser helper in use cannot discard pages.");
+            return;
+        }
+        const n = webface.discardBackground();
+        if (n == 0) {
+            showToast(self, "No background web pages to discard.");
+            return;
+        }
+        var buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "Discarded {d} background web page{s}.", .{
+            n,
+            if (n == 1) "" else "s",
+        }) catch return;
+        showToast(self, msg);
     }
 
     /// New tab whose pane wears the text-editor face (the shell
@@ -3524,6 +3547,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
             else
                 showToast(self, "This pane has no web page. Use New Web Tab.");
         },
+        .web_discard_background => self.discardBackgroundWebTabs(),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

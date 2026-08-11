@@ -143,6 +143,14 @@ const max_rects = 32;
 /// what a u16 length can describe.
 const max_expand: u32 = 60_000;
 
+/// What every semantic request for a DISCARDED view is answered with.
+///
+/// Answering at all is the point: those requests have no page to reach
+/// and no reply would ever arrive on its own, so a client that waits
+/// for one (`webdrive`, the `web_*` MCP tools) would sit out its whole
+/// timeout on what is really a one-line explanation.
+const discarded_msg = "view discarded: its browser was destroyed to free memory. Show or navigate the view to bring the page back.";
+
 /// Ceiling on the engine's own scheduler (and, on the accelerated
 /// path, the minimum capture period of the frame-sink video capturer —
 /// MEASURED at 3840x2160: 60 gives 59.7 dma-buf paints/s, 240 gives
@@ -385,12 +393,22 @@ pub const View = struct {
     /// Whether this browser was created with external begin frames, so
     /// the client is the frame source. See `externalPacingLatency`.
     external_pacing: bool = false,
-    /// Last address CEF reported, owned; the `ev_nav_state` payload.
+    /// Last address CEF reported, owned; the `ev_nav_state` payload,
+    /// and — after a `view_discard` — the address the browser comes
+    /// back at.
     url: []u8 = &.{},
     /// USER zoom (`set_zoom`), as the engine's log-scale level x100.
     /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
     /// every load start because Chromium resets zoom per navigation.
     user_zoom_x100: i32 = 0,
+    /// `view_discard` destroyed this view's browser; the record (id,
+    /// geometry, scale, address, fps cap) is all that is left. Any
+    /// frame that must show, navigate or reach the page revives it
+    /// through `findWake`. NAVIGATION HISTORY DOES NOT SURVIVE: the
+    /// revived browser starts a fresh session at `url`, so back and
+    /// forward are empty — the memory is the whole point, and keeping
+    /// the history would mean keeping the browser.
+    discarded: bool = false,
 
     /// Semantic-layer state: the shadow tree plus the requests waiting
     /// on a reply from the injected script.
@@ -582,7 +600,19 @@ pub const Host = struct {
         };
         try self.views.append(self.gpa, v);
         errdefer _ = self.views.pop();
+        return self.spawnBrowser(v, initial_url);
+    }
 
+    /// Give an EXISTING view record a windowless browser at
+    /// `initial_url`, plus the frame buffer that makes it visible.
+    ///
+    /// Both the first creation and a post-discard revival come through
+    /// here, which is what makes a revived view identical to a fresh one
+    /// in everything but its id: same window info, same per-browser
+    /// opaque background, same zoom-carried scale, same buffer
+    /// announcement. A failure destroys the view rather than leaving a
+    /// record nothing can render.
+    fn spawnBrowser(self: *Host, v: *View, initial_url: []const u8) !void {
         var winfo = std.mem.zeroes(cef.cef_window_info_t);
         winfo.size = @sizeOf(cef.cef_window_info_t);
         winfo.windowless_rendering_enabled = 1;
@@ -657,18 +687,107 @@ pub const Host = struct {
         while (self.views.pop()) |v| self.freeView(v);
     }
 
-    fn freeView(self: *Host, v: *View) void {
-        interceptUnregister(self.gpa, v.id);
+    /// `view_discard`: destroy the browser, keep the view.
+    ///
+    /// The record — id, logical geometry, scale, fps cap and the address
+    /// in `v.url` — survives; the browser, its render process, the frame
+    /// buffer and the whole semantic shadow tree do not. Sending it for
+    /// a view that is already discarded (or unknown) does nothing.
+    pub fn discardView(self: *Host, id: u32) void {
+        const v = self.find(id) orelse return;
+        if (v.discarded) return;
+        self.dropBrowser(v);
+        v.discarded = true;
+        // The engine is gone, so nothing may be asked of it: hidden is
+        // what keeps the watchdog and every paint path off this view
+        // until it is revived.
+        v.hidden = true;
+    }
+
+    /// Bring a discarded view's browser back at the address it held.
+    ///
+    /// The client is told nothing: the id, the geometry and the scale
+    /// are the ones it already knows, and the only thing it observes is
+    /// a fresh `frame_buffer` plus the load of the same url — i.e. a
+    /// reload. The navigation history is NOT restored (see
+    /// `View.discarded`).
+    fn reviveView(self: *Host, v: *View) void {
+        if (!v.discarded) return;
+        // `spawnBrowser` can reach `setUrl` through an address-change
+        // callback fired inside create_browser_sync, which would free
+        // the very slice it is loading; the copy costs one url.
+        const url = self.gpa.dupe(u8, v.url) catch return;
+        defer self.gpa.free(url);
+        self.reviveAt(v, url);
+    }
+
+    /// Revive a discarded view AT `url` — the same single document a
+    /// fresh `view_create_url` produces, which is why a navigation into
+    /// a discarded view does not first load the address it had.
+    fn reviveAt(self: *Host, v: *View, url: []const u8) void {
+        const id = v.id;
+        v.discarded = false;
+        v.hidden = false;
+        self.spawnBrowser(v, url) catch {
+            // A hard failure destroys the view outright (spawnBrowser
+            // will not strand a record with no buffer); if it is still
+            // here, it stays discarded rather than pretending.
+            if (self.find(id) != null) v.discarded = true;
+        };
+    }
+
+    /// The view a SHOW/navigation/input frame names, revived first if it
+    /// was discarded — those frames are exactly the ones that mean
+    /// "somebody is using this page again". Null when the id is unknown
+    /// or the revival failed, which every caller treats as "ignore".
+    fn findWake(self: *Host, id: u32) ?*View {
+        const v = self.find(id) orelse return null;
+        if (v.discarded) self.reviveView(v);
+        if (v.discarded) return null;
+        return v;
+    }
+
+    /// Tear down a view's browser and everything that belonged to its
+    /// document, leaving the record itself untouched. Shared by
+    /// `freeView` (which then frees the record) and `discardView`
+    /// (which keeps it).
+    fn dropBrowser(self: *Host, v: *View) void {
         if (browserHost(v)) |host| {
+            // force_close: a windowless browser has no user to prompt
+            // and no unload dialog anybody could answer.
             if (host.close_browser) |cb| cb(host, 1);
             release(&host.base);
         }
         if (v.browser) |b| release(&b.base);
-        if (v.map.len != 0) _ = c.munmap(v.map.ptr, v.map.len);
-        if (v.url.len != 0) self.gpa.free(v.url);
+        v.browser = null;
+        // `close_browser` is ASYNCHRONOUS: CEF may still run callbacks
+        // for this browser after it returns. Clearing the id is what
+        // stops `viewOf` resolving them onto a view whose buffer is
+        // gone (browser ids start at 1, so 0 matches nothing).
+        v.cef_id = 0;
+        if (v.map.len != 0) {
+            _ = c.munmap(v.map.ptr, v.map.len);
+            v.map = &.{};
+        }
+        v.buf_unpainted = false;
+        v.forgetPool();
         for (v.pending.items) |p| {
             if (p.arg.len != 0) self.gpa.free(p.arg);
         }
+        v.pending.clearRetainingCapacity();
+        // The shadow tree described a document that no longer exists;
+        // its ids must not be answerable after this.
+        v.sem.deinit();
+        v.sem = semantic.View.init(self.gpa);
+        v.sem_observing = false;
+    }
+
+    fn freeView(self: *Host, v: *View) void {
+        interceptUnregister(self.gpa, v.id);
+        // Frees the browser, the mapping, every pending request's arg
+        // and the shadow tree; what is left is the record's own memory.
+        self.dropBrowser(v);
+        if (v.url.len != 0) self.gpa.free(v.url);
         v.pending.deinit(self.gpa);
         v.sem.deinit();
         self.gpa.destroy(v);
@@ -738,6 +857,14 @@ pub const Host = struct {
         v.w = w;
         v.h = h;
         v.scale_x1000 = scale;
+        // A discarded view records the new geometry and stops there: a
+        // background pane the window resized must NOT cost a revived
+        // browser, and the revival lays out at these numbers anyway.
+        if (v.discarded) {
+            v.pw = physicalOf(w, scale);
+            v.ph = physicalOf(h, scale);
+            return;
+        }
         const pw = physicalOf(w, scale);
         const ph = physicalOf(h, scale);
         const buffer_changed = pw != v.pw or ph != v.ph;
@@ -766,8 +893,13 @@ pub const Host = struct {
         if (!v.hidden) issueBeginFrame(v);
     }
 
+    /// `view_show` / `view_hide`. A SHOW revives a discarded view — it
+    /// is the frame that means the pane is on screen again, and the
+    /// revived browser is created visible, so the calls below then only
+    /// re-state what is already true.
     pub fn showView(self: *Host, id: u32, show: bool) void {
-        const v = self.find(id) orelse return;
+        const v = if (show) self.findWake(id) orelse return else self.find(id) orelse return;
+        if (v.discarded) return;
         v.hidden = !show;
         // A view coming back needs the invalidate below to land on a
         // frame; a view going away is simply never asked again.
@@ -977,6 +1109,12 @@ pub const Host = struct {
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {
         const v = self.find(req.view) orelse return;
+        // A discarded view is revived straight AT the requested address
+        // rather than at the one it was discarded holding: reviving
+        // first and navigating after would mint a document nobody asked
+        // for, which is the two-document trap `view_create_url` exists
+        // to avoid.
+        if (v.discarded) return self.reviveAt(v, req.url);
         const b = v.browser orelse return;
         const get_frame = b.get_main_frame orelse return;
         const frame: *cef.cef_frame_t = get_frame(b) orelse return;
@@ -987,8 +1125,11 @@ pub const Host = struct {
         if (frame.load_url) |lu| lu(frame, &url);
     }
 
+    /// Back/forward/reload/stop. A discarded view is revived first, so
+    /// a reload of one does exactly what the user expects; back and
+    /// forward then find an empty history (see `View.discarded`).
     pub fn navAction(self: *Host, req: proto.NavAction) void {
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         const b = v.browser orelse return;
         switch (@as(proto.NavAct, @enumFromInt(req.action))) {
             .back => if (b.go_back) |f| f(b),
@@ -1041,7 +1182,7 @@ pub const Host = struct {
 
     pub fn pointer(self: *Host, req: proto.InputPointer) void {
         latStamp("input");
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -1064,7 +1205,7 @@ pub const Host = struct {
     }
 
     pub fn scroll(self: *Host, req: proto.InputScroll) void {
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -1078,7 +1219,7 @@ pub const Host = struct {
     }
 
     pub fn key(self: *Host, req: proto.InputKey) void {
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         const mapped = keymap.map(req.keyval);
         var ev = std.mem.zeroes(cef.cef_key_event_t);
         ev.size = @sizeOf(cef.cef_key_event_t);
@@ -1133,7 +1274,7 @@ pub const Host = struct {
     }
 
     pub fn ime(self: *Host, req: proto.InputIme) void {
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         var text = std.mem.zeroes(cef.cef_string_t);
         setStr(req.text, &text);
         defer cef.cef_string_utf16_clear(&text);
@@ -1150,7 +1291,7 @@ pub const Host = struct {
     }
 
     pub fn focus(self: *Host, req: proto.InputFocus) void {
-        const v = self.find(req.view) orelse return;
+        const v = self.findWake(req.view) orelse return;
         withHostArgs(v, setFocus, .{@as(c_int, if (req.focused != 0) 1 else 0)});
     }
 
@@ -1207,6 +1348,19 @@ pub const Host = struct {
 
     pub fn semSnapshot(self: *Host, req: proto.SemSnapshotReq) !void {
         const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            // A discarded view has no page to walk, and a request that
+            // simply went unanswered would hang every client that waits
+            // for its reply frame. Answer, and say what to do about it.
+            self.post(proto.SemSnapshot{
+                .view = v.id,
+                .doc_gen = 0,
+                .rev = 0,
+                .kind = @intFromEnum(proto.SnapKind.full),
+                .payload = .{ .s = discarded_msg },
+            });
+            return;
+        }
         v.sem_detail = req.detail;
         const rid = try self.pushPending(v, .{
             .req = nextReq(v),
@@ -1230,6 +1384,10 @@ pub const Host = struct {
 
     pub fn semAct(self: *Host, req: proto.SemAction) !void {
         const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = discarded_msg });
+            return;
+        }
         const eid = v.sem.eidFor(req.id);
         if (eid == 0) {
             self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "unknown id" });
@@ -1275,6 +1433,18 @@ pub const Host = struct {
 
     pub fn semExpand(self: *Host, req: proto.SemExpand) !void {
         const v = self.find(req.view) orelse return;
+        // A discarded view's shadow tree is empty, so the unknown-id
+        // answer below would already fire; saying so explicitly keeps
+        // "no text" from reading like a page that had none.
+        if (v.discarded) {
+            self.post(proto.SemExpandResult{
+                .view = v.id,
+                .id = req.id,
+                .off = req.off,
+                .text = discarded_msg,
+            });
+            return;
+        }
         const eid = v.sem.eidFor(req.id);
         if (eid == 0) {
             self.post(proto.SemExpandResult{ .view = v.id, .id = req.id, .off = req.off, .text = "" });
@@ -1303,6 +1473,10 @@ pub const Host = struct {
     /// a single mutation the observer could have folded.
     pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
         const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = discarded_msg } });
+            return;
+        }
         if (req.kind == @intFromEnum(proto.SemQuery.visible)) {
             const arg = try self.gpa.dupe(u8, req.arg);
             errdefer self.gpa.free(arg);
@@ -1327,6 +1501,14 @@ pub const Host = struct {
     /// runs, so the RESULT is page-authored data like any other.
     pub fn semEval(self: *Host, req: proto.SemEval) !void {
         const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemEvalResult{
+                .view = v.id,
+                .ok = 0,
+                .json = .{ .s = "{\"error\":\"" ++ discarded_msg ++ "\"}" },
+            });
+            return;
+        }
         const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .eval });
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
@@ -1342,6 +1524,10 @@ pub const Host = struct {
 
     pub fn semRead(self: *Host, req: proto.SemRead) !void {
         const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = discarded_msg } });
+            return;
+        }
         const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read });
         var buf: [64]u8 = undefined;
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d}}}", .{rid}) catch return;
