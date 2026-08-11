@@ -527,6 +527,11 @@ pub const Window = struct {
         c.adw_tab_button_set_view(@ptrCast(tab_btn), @ptrCast(tab_view_w));
         c.gtk_widget_set_tooltip_text(tab_btn, "Tab Overview");
         c.gtk_actionable_set_action_name(@ptrCast(tab_btn), "overview.open");
+        // AdwHeaderBar spaces packed children against each other but
+        // not against the window edge; without CSD window controls the
+        // last pack_end child sits flush right. 6 px mirrors the pane
+        // titlebar's margin convention.
+        c.gtk_widget_set_margin_end(tab_btn, 6);
         c.adw_header_bar_pack_end(@ptrCast(header_bar), tab_btn);
         c.adw_application_window_set_content(@ptrCast(app_window), overview);
 
