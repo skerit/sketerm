@@ -8,7 +8,7 @@ const decoder = @import("image_decoder.zig");
 const image_canvas = @import("image_canvas.zig");
 const hostmount = @import("hostmount.zig");
 const hexdump = @import("../filebrowser/hexdump.zig");
-const fmtSize = @import("../filebrowser/format.zig").fmtSize;
+const cast = @import("../util/cast.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
@@ -1169,7 +1169,7 @@ fn showCanvasMenu(menu: *CanvasMenu, x: f64, y: f64) void {
                 c.gtk_widget_get_visible(r.source) != 0;
             const rctx = menu.allocator.create(CanvasRowCtx) catch continue;
             rctx.* = .{ .allocator = menu.allocator, .host = menu.host, .source = r.source };
-            root.own(&freeCanvasRow, @ptrCast(rctx));
+            root.own(cast.destroyCtx(CanvasRowCtx), @ptrCast(rctx));
             top.itemIconEnabled(r.label, .{ .name = r.icon }, usable, &onCanvasRowClicked, @ptrCast(rctx));
         },
     };

@@ -5,6 +5,7 @@ const c = @import("../c.zig").c;
 const Viewport = @import("../viewer.zig").Viewport;
 const decoder = @import("image_decoder.zig");
 const cssutil = @import("cssutil.zig");
+const cast = @import("../util/cast.zig");
 
 pub const Canvas = struct {
     root: *c.GtkWidget,
