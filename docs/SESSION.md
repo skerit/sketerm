@@ -16358,3 +16358,47 @@ the window fallback otherwise, and that either way every request is
 answered and the inspected page survives). The GUI split was not
 exercised on a live display — no engine here produces the view it
 needs.
+## 2026-08-11: daemon-side web store — history, bookmarks, site settings
+
+The browser's persistence backbone. Browsing state lives with the
+`sketerm-mux` daemon under `$XDG_STATE_HOME/sketerm/web/`, accessed
+over the wire protocol — so a GUI attached to a remote daemon sees
+that host's browsing state ("daemon-side => follows you across
+machines").
+
+- `src/mux/webstore.zig` (GTK-free, both test roots): history as an
+  append-only JSONL log (`history.jsonl`) replayed into an in-memory
+  per-URL index (visit count + last-visit ms for omnibox ranking),
+  compacted atomically once the log passes 2x live entries + slack,
+  pruned at 50k entries; ranked substring queries (frecency weight x
+  visit count, 4x prefix bonus on url/host). Bookmarks: ordered JSON
+  with cheap string folders and monotonic ids. Site settings: JSON
+  keyed by case-normalized origin — zoom_x100, popup policy,
+  content-blocking override, named permission decisions; an
+  all-default site is removed from the file.
+- Wire: `web_op = 32` (client→daemon, `{req, op, ...}` — the fs_op
+  shape, so new verbs are op strings, not frame types) and
+  `web_reply = 96` (echoes `req`). Ops: history_add / history_title /
+  history_query / history_delete / history_clear, bookmark_add /
+  remove / update / list, site_get / site_set. Gated on the welcome
+  capability `web_store:true`; NOT attach-scoped (the broker serves it
+  in broker mode). `Conn.web_store` carries the capability client-side.
+- `src/ui/webstore.zig`: one process-wide non-blocking connection to
+  the local daemon (webface Client singleton shape), `g_unix_fd_add`
+  read watch + EAGAIN-safe write watch, nonce-correlated callbacks.
+  Liveness is disconnect-at-teardown: `webstore.cancelFor(face)` from
+  `WebFace.deinit` is the single choke point.
+- Web face wiring (minimal, no UI): a committed navigation records a
+  visit immediately and files the title later via `history_title`
+  (no double count); an origin change fetches the stored per-site
+  zoom and applies it without writing back; a USER zoom change
+  persists per origin (0 clears). about:/data: URLs never make
+  history.
+
+Verification: `zig build`, `zig build mux`, `zig build mux-portable`
+green; `ldd zig-out/bin/sketerm-mux` shows libc/libm only. The
+webstore unit tests (round-trip, compaction, ranking, bookmarks,
+site merge/clear) pass in both roots; the `zig build test-core`
+RUNNER failure seen this session reproduces identically on the base
+commit (the test binary itself exits 0 with all tests passing) —
+pre-existing, not from this work.
