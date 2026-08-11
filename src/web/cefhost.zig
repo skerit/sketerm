@@ -142,36 +142,39 @@ const max_rects = 32;
 /// what a u16 length can describe.
 const max_expand: u32 = 60_000;
 
-/// `windowless_frame_rate` means two different things on the two paths,
-/// and getting that wrong costs half the frame rate.
-///
-/// On the SOFTWARE path it is CEF's internal scheduler, which
-/// `external_begin_frame_enabled` replaces outright — one
-/// `send_external_begin_frame`, one paint — so the value is ignored
-/// there and only matters if a build ever loses the external path.
-///
-/// On the ACCELERATED path it ALSO sets the minimum capture period of
-/// the frame-sink video capturer that produces the shared textures, and
-/// that ceiling applies to externally driven frames too. MEASURED at
-/// 3840x2160: 60 gives 59.7 dma-buf paints/s however fast the client
-/// asks; 240 gives 150. So it is set well above any real display and the
-/// client's pacing stays the only limit, which is the whole point of
-/// `src/web/pace.zig`.
+/// Ceiling on the engine's own scheduler (and, on the accelerated
+/// path, the minimum capture period of the frame-sink video capturer —
+/// MEASURED at 3840x2160: 60 gives 59.7 dma-buf paints/s, 240 gives
+/// 150). 240 is CEF's maximum; the REAL pacing lever is the client's
+/// `view_max_fps` (its `browser_max_fps` clamped to the display's
+/// refresh), applied through `set_windowless_frame_rate` per view.
 const windowless_fps: c_int = 240;
+
+/// The `windowless_frame_rate` for a view whose client cap is
+/// `max_fps` (0 = uncapped): the cap clamped into CEF's valid 1-240
+/// band. `SKETERM_WEB_WFPS` overrides outright (measurement knob).
+fn effectiveWindowlessFps(max_fps: u16) c_int {
+    if (c.getenv("SKETERM_WEB_WFPS")) |v| {
+        const n = std.fmt.parseInt(c_int, std.mem.span(v), 10) catch 0;
+        if (n > 0) return n;
+    }
+    if (max_fps == 0) return windowless_fps;
+    return std.math.clamp(@as(c_int, max_fps), 1, windowless_fps);
+}
 
 /// Whether the browsers this process creates are driven by the CLIENT's
 /// `frame_request`s (`external_begin_frame_enabled`) or by CEF's own
-/// windowless scheduler. Decided per MODE at creation, because it is
-/// fixed per browser and the two modes measured opposite ways.
+/// windowless scheduler. Fixed per browser at creation.
 ///
 /// `SKETERM_WEB_EXTERNAL_BEGINFRAME=1`/`=0` forces it either way; that
-/// is the switch the measurements below were taken with.
+/// is the switch the measurements in `externalPacingLatency` were taken
+/// with.
 fn externalPacingDefault() bool {
     if (c.getenv("SKETERM_WEB_EXTERNAL_BEGINFRAME")) |v| {
         const s = std.mem.span(v);
         return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
     }
-    return externalPacingWins();
+    return false;
 }
 
 /// How long a view may go without a client `frame_request` before the
@@ -216,18 +219,44 @@ pub fn isAccelerated() bool {
     return accelerated;
 }
 
-/// Whether CLIENT-driven begin frames beat CEF's own scheduler in the
-/// mode this process runs in. The answer is YES IN BOTH MODES, and it is
-/// a function rather than a constant because it was an open question
-/// that had to be settled per mode with numbers.
+/// externalPacingLatency — why the DEFAULT is the engine's own
+/// scheduler, in numbers. Client-driven external begin frames shipped
+/// first on a throughput/idle-cost table (kept below); what they turned
+/// out to cost is INPUT LATENCY, which outranks both.
 ///
-/// MEASURED 2026-08-11 on the real display, a browser pane at 3840x2160
-/// physical (2514x1275 logical at scale 1.5), GSK's `ngl` renderer,
-/// comparing `SKETERM_WEB_EXTERNAL_BEGINFRAME=1` against `=0`. Every row
-/// verified to have painted at the pane's real size — an earlier
-/// version of this table was measured while the first buffer came back
-/// at a placeholder size, which is a different (and much cheaper)
-/// workload.
+/// MEASURED 2026-08-11, hover probe (`SKETERM_WEB_LAT`, src/ui/webface
+/// `Lat`): pointer-move sent -> paint arrived / -> hover pixel in OUR
+/// framebuffer, software (memfd) path, 60Hz session, idle start:
+///
+///   external begin frames   input->paint 39ms CONSTANT (->pixel 52ms)
+///   internal scheduler      input->paint 5-19ms       (->pixel 16-26ms)
+///
+/// The external 39ms is a fixed property of Chromium's external-begin-
+/// frame mode, not of our pacing: it survives an immediate begin frame
+/// on input, a burst of begin frames 0.3/5/10/15ms after input, and
+/// every `windowless_frame_rate` from 60 to 1000. The helper-side trace
+/// (`hostlat:`) showed the paint landing only after the 2nd-3rd begin
+/// frame REGARDLESS of their spacing. That constant is 2-3 refresh
+/// periods of added latency on every interaction — the user-facing
+/// "hover takes a few frames" bug — so internal pacing wins and the
+/// client's cap now travels as `view_max_fps` instead of as request
+/// spacing.
+///
+/// What the old external default bought, and where that went:
+/// - cap enforcement: now `set_windowless_frame_rate` (view_max_fps).
+/// - idle cost: the internal scheduler only paints on damage; a static
+///   page produces nothing. Verified by the stats line reading 0 fps
+///   on an untouched page.
+/// - background tabs: `view_hide`/`was_hidden` still stops everything.
+/// - a window the compositor stops PRESENTING while it animates keeps
+///   painting under internal pacing (external stopped asking when the
+///   GUI's ticks stopped). Known, accepted: latency outranks it, and
+///   the frames are dropped helper-side without ever crossing the
+///   socket when the backlog cap bites.
+///
+/// The historical throughput table (GSK `ngl`, 3840x2160 physical pane,
+/// scale 1.5, GPU hardware), kept because its PRESENTED column is what
+/// settled the earlier round:
 ///
 ///   animating page      delivered  presented  per-frame  uploaded
 ///     GPU     external    98-106      ~180/s     0.2 us    0 MiB/s
@@ -241,27 +270,10 @@ pub fn isAccelerated() bool {
 ///     memfd   external        44        46/s     1.93 ms 1244 MiB/s
 ///     memfd   internal      8-9          0/s      109 ms  250 MiB/s
 ///
-/// Read the PRESENTED column, not the delivered one: it is the
-/// compositor's frame callbacks that decide what a user sees, and it is
-/// the same in every row that got presented at all. Internal pacing just
-/// paints `windowless_frame_rate` times a second and throws the excess
-/// away — and the two `memfd internal` rows are the cost of that in its
-/// purest form: a window the compositor was NOT presenting still had 35
-/// and 250 MiB/s of pixels uploaded into it.
-///
-/// It also makes the client's cap meaningless. Forced off, `smoke-web`
-/// stage 19 measures 209 paints/s for a client asking for 30, and fails.
-///
-/// The earlier observation that external pacing was SLOWER (20-39 fps
-/// erratic against a steady 60) reproduces only when the GUI's frame
-/// clock is being throttled — a window on no output, or GSK's Vulkan
-/// renderer at 4K, both of which drop the tick rate to ~11/s and take
-/// the request rate with it. That is a presentation problem, not a
-/// pacing one; the `reqs`/`ticks` counters in `webface`'s stats line
-/// exist to tell the two apart.
-fn externalPacingWins() bool {
-    return true;
-}
+/// (The two poor `memfd internal` rows were measured with NO frame-rate
+/// cap; `view_max_fps` now clamps the internal scheduler to the
+/// display's refresh, which is exactly the spacing external requests
+/// used to impose.)
 
 /// How the engine is told what DPR to lay out at.
 ///
@@ -293,6 +305,24 @@ fn scaleViaZoom() bool {
 fn zoomLevelFor(scale_x1000: u16) f64 {
     const f = @as(f64, @floatFromInt(scale_x1000)) / 1000.0;
     return @log(f) / @log(@as(f64, 1.2));
+}
+
+// Latency tracing (`SKETERM_WEB_LAT`, measurement harness): stamps the
+// input/begin-frame/paint path so the GUI's probe deltas decompose.
+var g_lat_trace: enum { unknown, off, on } = .unknown;
+
+fn latTrace() bool {
+    if (g_lat_trace == .unknown)
+        g_lat_trace = if (c.getenv("SKETERM_WEB_LAT") != null) .on else .off;
+    return g_lat_trace == .on;
+}
+
+fn latStamp(tag: []const u8) void {
+    if (!latTrace()) return;
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    const ms = @as(f64, @floatFromInt(ts.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(ts.tv_nsec)) / 1e6;
+    std.debug.print("hostlat: {s} {d:.2}\n", .{ tag, ms });
 }
 
 /// Monotonic milliseconds (`std.time.milliTimestamp` is gone in 0.16).
@@ -341,8 +371,10 @@ pub const View = struct {
     /// Monotonic milliseconds of the last begin frame issued for this
     /// view, whoever asked for it. Drives the watchdog.
     last_begin_ms: i64 = 0,
+    /// Client-set frame-rate cap (`view_max_fps`), 0 = uncapped.
+    max_fps: u16 = 0,
     /// Whether this browser was created with external begin frames, so
-    /// the client is the frame source. See `externalPacingWins`.
+    /// the client is the frame source. See `externalPacingLatency`.
     external_pacing: bool = false,
     /// Last address CEF reported, owned; the `ev_nav_state` payload.
     url: []u8 = &.{},
@@ -532,7 +564,7 @@ pub const Host = struct {
 
         var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
         bsettings.size = @sizeOf(cef.cef_browser_settings_t);
-        bsettings.windowless_frame_rate = windowless_fps;
+        bsettings.windowless_frame_rate = effectiveWindowlessFps(v.max_fps);
 
         var url = std.mem.zeroes(cef.cef_string_t);
         setStr("about:blank", &url);
@@ -706,6 +738,7 @@ pub const Host = struct {
         // has already done its real job (promoting the view out of
         // hidden state, above).
         if (!v.external_pacing) return;
+        latStamp("bf");
         withHost(v, struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.send_external_begin_frame) |bf| bf(host);
@@ -722,6 +755,22 @@ pub const Host = struct {
             if (now_ms - v.last_begin_ms < watchdog_ms) continue;
             issueBeginFrame(v);
         }
+    }
+
+    /// `view_max_fps`: the client's cap (its `browser_max_fps` clamped
+    /// to the display's real refresh; 0 = uncapped). On the default
+    /// internal scheduler this IS the pacing lever —
+    /// `set_windowless_frame_rate` takes effect immediately.
+    pub fn setMaxFps(self: *Host, req: proto.ViewMaxFps) void {
+        const v = self.find(req.view) orelse return;
+        if (v.max_fps == req.fps) return;
+        v.max_fps = req.fps;
+        const rate = effectiveWindowlessFps(v.max_fps);
+        withHostArgs(v, struct {
+            fn f(host: *cef.cef_browser_host_t, r: c_int) void {
+                if (host.set_windowless_frame_rate) |sw| sw(host, r);
+            }
+        }.f, .{rate});
     }
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {
@@ -752,6 +801,7 @@ pub const Host = struct {
     // -- input ---------------------------------------------------------
 
     pub fn pointer(self: *Host, req: proto.InputPointer) void {
+        latStamp("input");
         const v = self.find(req.view) orelse return;
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
@@ -1848,6 +1898,7 @@ fn onPaint(
         }
     }
     if (n == 0) return;
+    latStamp("paint");
     v.gen +%= 1;
     host.post(proto.FrameDamage{
         .view = v.id,

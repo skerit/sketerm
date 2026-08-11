@@ -589,6 +589,32 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
 
+    // Browser measurement rig — `zig build measure-web`. Same display-
+    // session recipe as smoke-e2e, plus a fractional viewer scale, for
+    // the hover-latency and sharpness numbers (src/web_measure.zig).
+    {
+        const wm_mod = b.createModule(.{
+            .root_source_file = b.path("src/web_measure.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureSysDeps(b, wm_mod, cbindings_mod);
+        wm_mod.addImport("build_options", glib_opts_mod);
+        const wm = b.addExecutable(.{
+            .name = "sketerm-web-measure",
+            .root_module = wm_mod,
+            .use_lld = use_lld,
+        });
+        b.installArtifact(wm);
+        const wm_run = b.addRunArtifact(wm);
+        wm_run.step.dependOn(b.getInstallStep());
+        wm_run.setCwd(b.path("."));
+        if (b.args) |args| wm_run.addArgs(args);
+        const wm_step = b.step("measure-web", "Browser latency/sharpness measurement rig (headless display session)");
+        wm_step.dependOn(&wm_run.step);
+    }
+
     // LSP GUI smoke — `zig build smoke-lsp-gui`. Same rig as smoke-e2e
     // (private daemon, display session, viewer attached first), running
     // the real editor against a real language server:

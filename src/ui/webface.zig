@@ -65,12 +65,19 @@
 //!
 //! ## Frame pacing (who decides when the page paints)
 //!
-//! The helper's browsers run with `external_begin_frame_enabled`, so the
-//! engine paints EXACTLY as often as somebody asks it to and never on
-//! its own. That is what lifts CEF's 60fps windowless ceiling on a
-//! 120/165Hz output, and what makes an untouched page cost nothing.
+//! The ENGINE paces itself (CEF's internal scheduler), throttled by the
+//! `view_max_fps` this face ships — the configured `browser_max_fps`
+//! clamped to the current output's real refresh. External begin frames
+//! (the previous default) measured a CONSTANT ~30ms of added
+//! input-to-paint latency that no request timing could remove; the
+//! numbers live at `externalPacingLatency` in `src/web/cefhost.zig`.
+//! An untouched page still costs nothing: the scheduler only paints on
+//! damage (smoke-web stage 20 holds it at zero).
 //!
-//! Asking is this file's job, through `src/web/pace.zig`:
+//! The pacer below still runs, because the GUI-side state it manages is
+//! about PRESENTING, not painting — when the tick exists, and when the
+//! face may stop watching. Its requests ride along through
+//! `src/web/pace.zig`:
 //!
 //! - IDLE: a 5Hz GLib timeout asks for a frame, so a page that starts
 //!   moving on its own is still noticed. NO frame-clock tick exists in
@@ -94,14 +101,15 @@
 //! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
 //! aborts if a demoted face somehow kept its tick).
 //!
-//! Client pacing was RE-MEASURED against CEF's own scheduler on both
-//! frame families before the GPU path shipped; `externalPacingWins` in
-//! `src/web/cefhost.zig` carries the table. Short version: the presented
-//! rate is the same either way because the compositor sets it, and
-//! CEF's scheduler simply paints twice as often and throws half of it
-//! away — including into a window the compositor is not presenting at
-//! all, which measured 250 MiB/s of uploads for zero frames on screen —
-//! and it leaves `browser_max_fps` meaning nothing.
+//! The REQUESTS the pacer sends are advisory now: the helper's default
+//! is CEF's OWN scheduler (`externalPacingLatency` in
+//! `src/web/cefhost.zig` — external begin frames measured a constant
+//! ~30ms of added input latency that no request timing could remove),
+//! so paints arrive on their own and `frame_request` only keeps the
+//! helper's watchdog quiet. What replaced request-spacing as the
+//! throttle is `view_max_fps`: `syncMaxFps` ships the cap clamped to
+//! the CURRENT output's refresh whenever either changes, and the
+//! helper applies it via `set_windowless_frame_rate`.
 //!
 //! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
 //! delivered frame rate, the time spent here, the bytes actually
@@ -260,6 +268,47 @@ const Stats = struct {
 var g_stats: Stats = .{};
 
 // ---------------------------------------------------------------------
+// Hover-latency probe (`SKETERM_WEB_LAT=1` slow / `=fast`)
+// ---------------------------------------------------------------------
+
+/// Input-to-pixel latency probe: a timer alternates a synthetic pointer
+/// move between a point INSIDE a hover-styled element (expected to turn
+/// red) and one outside it (back to blue), and the render callback reads
+/// the probed pixel back from the GL framebuffer after the draw. The
+/// printed delta is input-send to pixel-in-our-framebuffer; compositor
+/// presentation adds one more cycle on top and is NOT included.
+/// `slow` (700ms period) starts each probe from the pacer's idle state —
+/// the user's "mouse arrives at a button on a static page" case; `fast`
+/// (100ms) keeps the view active.
+const Lat = struct {
+    mode: enum { off, slow, fast } = .off,
+    checked: bool = false,
+    /// A probe input was sent and its pixel not yet observed.
+    pending: bool = false,
+    expect_hover: bool = false,
+    t_input_us: i64 = 0,
+    /// First frame REQUEST sent after the input; 0 until one goes out.
+    req_us: i64 = 0,
+    /// First frame arrival after the input; 0 until one lands.
+    arrival_us: i64 = 0,
+    /// Frames that arrived between the input and the matching pixel.
+    frames_seen: u32 = 0,
+
+    fn enabled(self: *Lat) bool {
+        if (!self.checked) {
+            self.checked = true;
+            if (c.getenv("SKETERM_WEB_LAT")) |v| {
+                const s = std.mem.span(v);
+                self.mode = if (std.mem.eql(u8, s, "fast")) .fast else .slow;
+            }
+        }
+        return self.mode != .off;
+    }
+};
+
+var g_lat: Lat = .{};
+
+// ---------------------------------------------------------------------
 // Pace logging (`SKETERM_WEB_PACE=1`)
 // ---------------------------------------------------------------------
 
@@ -287,7 +336,10 @@ var g_max_fps: u16 = 0;
 /// same shape as `imhost.setPreference`.
 pub fn setMaxFps(fps: u16) void {
     g_max_fps = fps;
-    for (g_client.faces.items) |f| f.pacer.cap_fps = fps;
+    for (g_client.faces.items) |f| {
+        f.pacer.cap_fps = fps;
+        f.syncMaxFps();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -900,6 +952,9 @@ pub const WebFace = struct {
     /// Last device scale handed to the helper, x1000. 1000 until the
     /// GL area is realized and a GdkSurface can be asked.
     sent_scale: u16 = 1000,
+    /// Last `view_max_fps` sent on the CURRENT connection; the sentinel
+    /// forces a send after every (re)create.
+    sent_max_fps: u16 = 0xffff,
     /// The realized surface whose scale we watch, with a reference held
     /// (CLAUDE.md: a raw widget/surface pointer kept past the widget
     /// tree's lifetime must own one) plus its handler id.
@@ -922,6 +977,8 @@ pub const WebFace = struct {
     /// starting to move, and the reason no tick is needed to do so.
     /// Armed for the face's whole on-screen life.
     idle_timer: c.guint = 0,
+    /// Latency-probe timer (`SKETERM_WEB_LAT`), 0 when absent.
+    lat_timer: c.guint = 0,
     /// Whether the GL area is mapped. A background tab is unmapped: it
     /// gets `view_hide` and is never asked for a frame.
     on_screen: bool = false,
@@ -1360,7 +1417,22 @@ pub const WebFace = struct {
         if (!self.view_live or !self.on_screen) return;
         client().post(proto.FrameRequest{ .view = self.view, .flags = 0 });
         if (g_stats.enabled()) g_stats.reqs += 1;
+        if (g_lat.mode != .off and g_lat.pending and g_lat.req_us == 0)
+            g_lat.req_us = c.g_get_monotonic_time();
         self.pacer.noteRequest(c.g_get_monotonic_time());
+    }
+
+    /// Ship the frame-rate cap the helper should apply — the configured
+    /// `browser_max_fps` clamped to the CURRENT output's real refresh
+    /// (`Pacer.effectiveFps`). The helper's internal scheduler paces
+    /// paints with it (`set_windowless_frame_rate`); only changes are
+    /// sent.
+    fn syncMaxFps(self: *WebFace) void {
+        if (!self.view_live) return;
+        const want = self.pacer.effectiveFps();
+        if (want == self.sent_max_fps) return;
+        self.sent_max_fps = want;
+        client().post(proto.ViewMaxFps{ .view = self.view, .fps = want });
     }
 
     /// Go active: what every input, navigation and geometry change does.
@@ -1412,12 +1484,52 @@ pub const WebFace = struct {
             _ = c.g_source_remove(self.idle_timer);
             self.idle_timer = 0;
         }
+        if (self.lat_timer != 0) {
+            _ = c.g_source_remove(self.lat_timer);
+            self.lat_timer = 0;
+        }
         self.pacer.stop();
+    }
+
+    /// Arm the latency probe (measurement harness, env-gated).
+    fn startLatProbe(self: *WebFace) void {
+        if (!g_lat.enabled() or self.lat_timer != 0) return;
+        const ms: c_uint = if (g_lat.mode == .fast) 100 else 700;
+        self.lat_timer = c.g_timeout_add(ms, @ptrCast(&onLatTimer), @ptrCast(self));
+    }
+
+    fn onLatTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(WebFace, user);
+        if (self.widgets_dead or !self.view_live) {
+            self.lat_timer = 0;
+            return 0;
+        }
+        if (self.sent_w < 200 or self.sent_h < 200) return 1;
+        if (g_lat.pending) {
+            std.debug.print(
+                "weblat: {s} UNANSWERED after probe period (state {s}, {d} frames)\n",
+                .{ if (g_lat.expect_hover) "hover" else "clear", @tagName(self.pacer.state), g_lat.frames_seen },
+            );
+        }
+        g_lat.expect_hover = !g_lat.expect_hover;
+        const x: f64 = if (g_lat.expect_hover) 60 else @floatFromInt(self.sent_w - 20);
+        const y: f64 = @floatFromInt(self.sent_h / 2);
+        g_lat.pending = true;
+        g_lat.frames_seen = 0;
+        g_lat.arrival_us = 0;
+        g_lat.req_us = 0;
+        g_lat.t_input_us = c.g_get_monotonic_time();
+        self.sendPointer(.move, x, y, 0, 0, 0);
+        return 1;
     }
 
     /// A paint landed: keep the view active, and wake it if the page
     /// started moving while nobody was touching it.
     fn notePaint(self: *WebFace) void {
+        if (g_lat.mode != .off and g_lat.pending) {
+            g_lat.frames_seen += 1;
+            if (g_lat.arrival_us == 0) g_lat.arrival_us = c.g_get_monotonic_time();
+        }
         if (self.pacer.notePaint() and paceLogging())
             std.debug.print("webface pace: view {d} idle -> active (paint)\n", .{self.view});
         self.ensureTick();
@@ -1433,6 +1545,7 @@ pub const WebFace = struct {
             if (paceLogging()) std.debug.print("webface pace: view {d} on screen\n", .{self.view});
             if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
             self.startIdleTimer();
+            self.startLatProbe();
             // A tab coming forward must show its current content at
             // once, not at the next idle tick.
             self.promote();
@@ -1749,6 +1862,9 @@ pub const WebFace = struct {
             .context = 0,
         });
         self.view_live = true;
+        // A fresh helper connection knows no cap; force the send.
+        self.sent_max_fps = 0xffff;
+        self.syncMaxFps();
         // A view is created visible; tell the helper at once when this
         // face is on a background tab (a helper restart can rebuild a
         // view whose pane nobody is looking at).
@@ -2184,6 +2300,9 @@ pub const WebFace = struct {
         // change and no reconnect.
         if (g_stats.enabled()) g_stats.ticks += 1;
         self.pacer.display_fps = refreshFps(frame_clock, self.pacer.display_fps);
+        // A changed refresh rate (window dragged across outputs) moves
+        // the helper-side cap with it.
+        self.syncMaxFps();
         if (self.pacer.dueAt(c.g_get_monotonic_time())) self.requestFrame();
         if (self.pacer.demoteDue()) {
             self.pacer.demote();
@@ -2300,7 +2419,78 @@ pub const WebFace = struct {
             @intCast(@max(0, @min(w, std.math.maxInt(u16)))),
             @intCast(@max(0, @min(h, std.math.maxInt(u16)))),
         );
+        self.logFramebufferGeometry(w, h, scale);
+        self.probePixel(w, h, scale);
         return @intFromBool(true);
+    }
+
+    /// One-time (per size) framebuffer geometry report under
+    /// `SKETERM_WEB_STATS=1`: the widget's logical size, GTK's INTEGER
+    /// scale, the surface's REAL fractional scale, and the actual size
+    /// of the texture GTK gave this render pass to draw into. This is
+    /// the measurement behind the resample count on fractional desktops.
+    fn logFramebufferGeometry(self: *WebFace, w: c_int, h: c_int, scale: c_int) void {
+        if (!g_stats.enabled()) return;
+        const S = struct {
+            var last_w: c_int = -1;
+            var last_h: c_int = -1;
+        };
+        if (S.last_w == w and S.last_h == h) return;
+        S.last_w = w;
+        S.last_h = h;
+        var frac: f64 = 0;
+        if (c.gtk_widget_get_native(self.view_area)) |native| {
+            if (c.gtk_native_get_surface(native)) |surface|
+                frac = c.gdk_surface_get_scale(surface);
+        }
+        // The texture the GLArea attached to the draw framebuffer.
+        var att_type: c_int = 0;
+        var att_name: c_int = 0;
+        c.glGetFramebufferAttachmentParameteriv(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &att_type);
+        c.glGetFramebufferAttachmentParameteriv(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att_name);
+        var tw: c_int = 0;
+        var th: c_int = 0;
+        if (att_type == c.GL_TEXTURE and att_name != 0) {
+            c.glBindTexture(c.GL_TEXTURE_2D, @intCast(att_name));
+            c.glGetTexLevelParameteriv(c.GL_TEXTURE_2D, 0, c.GL_TEXTURE_WIDTH, &tw);
+            c.glGetTexLevelParameteriv(c.GL_TEXTURE_2D, 0, c.GL_TEXTURE_HEIGHT, &th);
+        }
+        std.debug.print(
+            "webface fb: widget {d}x{d} logical, int scale {d} -> fb {d}x{d} (attachment {d}x{d}), surface scale {d:.3}, frame tex {d}x{d} phys ({d}x{d} logical at {d})\n",
+            .{ w, h, scale, w * scale, h * scale, tw, th, frac, self.web_pass.tex_w, self.web_pass.tex_h, self.web_pass.frame_lw, self.web_pass.frame_lh, self.sent_scale },
+        );
+    }
+
+    /// Latency-probe pixel readback; see `Lat`.
+    fn probePixel(self: *WebFace, w: c_int, h: c_int, scale: c_int) void {
+        _ = self;
+        _ = w;
+        if (g_lat.mode == .off or !g_lat.pending) return;
+        // Probe at logical (60, h/2), the hover point. Framebuffer rows
+        // start at the BOTTOM; the drawn frame is anchored top-left.
+        const px: c_int = 60 * scale + @divTrunc(scale, 2);
+        const py_top: c_int = @divTrunc(h, 2) * scale;
+        const fb_y: c_int = h * scale - py_top - 1;
+        var pix: [4]u8 = .{ 0, 0, 0, 0 };
+        c.glReadPixels(px, fb_y, 1, 1, c.GL_RGBA, c.GL_UNSIGNED_BYTE, &pix);
+        const is_red = pix[0] > 150 and pix[2] < 100;
+        const is_blue = pix[2] > 150 and pix[0] < 100;
+        const matched = if (g_lat.expect_hover) is_red else is_blue;
+        if (!matched) return;
+        const now = c.g_get_monotonic_time();
+        const arr = if (g_lat.arrival_us != 0) g_lat.arrival_us else now;
+        const req = if (g_lat.req_us != 0) g_lat.req_us else now;
+        std.debug.print(
+            "weblat: {s} input->req {d:.1} ms, ->arrival {d:.1} ms, ->pixel {d:.1} ms, {d} frames\n",
+            .{
+                if (g_lat.expect_hover) "hover" else "clear",
+                @as(f64, @floatFromInt(req - g_lat.t_input_us)) / 1000.0,
+                @as(f64, @floatFromInt(arr - g_lat.t_input_us)) / 1000.0,
+                @as(f64, @floatFromInt(now - g_lat.t_input_us)) / 1000.0,
+                g_lat.frames_seen,
+            },
+        );
+        g_lat.pending = false;
     }
 
     fn onSurfaceScale(_: ?*c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {

@@ -1673,6 +1673,20 @@ pub const App = struct {
         self.conn.sendFrame(.chan_data, payload.items) catch return Error.NotConnected;
     }
 
+    /// Tell the session's compositor this viewer's display scale x120
+    /// (the fractional-scale wire unit: 1.5 -> 180). The brain
+    /// re-announces every scale channel, so apps re-render for the new
+    /// pixel grid. Test rigs use it to reproduce fractional-scale
+    /// desktops on a headless session (which otherwise runs at 1).
+    pub fn setViewerScale120(self: *App, scale120: u32) Error!void {
+        var pl: [4]u8 = undefined;
+        std.mem.writeInt(u32, &pl, scale120, .little);
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+        wlpipe.appendUnit(&units, self.allocator, .set_scale, &pl) catch return Error.OutOfMemory;
+        for (self.chans.keys()) |chan| try self.sendIntents(chan, units.items);
+    }
+
     /// Left=1 Middle=2 Right=3 (GDK numbering) → evdev BTN_*.
     fn evdevButton(button: u32) u32 {
         return switch (button) {

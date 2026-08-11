@@ -44,6 +44,7 @@ pub const Tag = enum(u8) {
     view_resize = 0x12,
     view_show = 0x13,
     view_hide = 0x14,
+    view_max_fps = 0x15,
     navigate = 0x18,
     nav_action = 0x19,
     input_pointer = 0x20,
@@ -366,6 +367,17 @@ pub const FrameRequest = struct {
     /// Reserved, must be 0. Room for future per-request hints (force a
     /// full repaint, "this one is a resize settle", …) without a tag.
     flags: u8,
+};
+
+/// Client -> helper: cap this view's frame production at `fps` (0 =
+/// engine maximum). With the engine's own scheduler pacing paints —
+/// the default since external begin frames measured a fixed ~30ms of
+/// added input latency — this is how `browser_max_fps` and the display's
+/// real refresh rate reach the engine (`set_windowless_frame_rate`).
+pub const ViewMaxFps = struct {
+    pub const tag: Tag = .view_max_fps;
+    view: u32,
+    fps: u16,
 };
 
 /// Max planes in a `frame_dmabuf`; matches CEF's
@@ -947,6 +959,7 @@ test "round-trip: scalar and string frames" {
     try roundTrip(FrameBuffer, .{ .view = 7, .buf_id = 3, .w = 800, .h = 600, .stride = 3200 });
     try roundTrip(FrameRelease, .{ .view = 7, .buf_id = 2 });
     try roundTrip(FrameRequest, .{ .view = 7, .flags = 0 });
+    try roundTrip(ViewMaxFps, .{ .view = 7, .fps = 144 });
     try roundTrip(EvLoad, .{ .view = 7, .state = 2, .url = "about:blank" });
     try roundTrip(EvLoadError, .{ .view = 7, .code = -105, .url = "http://x/", .msg = "NAME_NOT_RESOLVED" });
     try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });

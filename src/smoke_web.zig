@@ -17,11 +17,11 @@
 //! watchdog, input-to-paint latency), and a clean shutdown on
 //! disconnect.
 //!
-//! EVERY stage drives frames: the helper's browsers run with external
-//! begin frames, so a client that never sends `frame_request` sees only
-//! the helper's 4fps watchdog. `Client.pump` therefore paces ~120
-//! requests a second while it waits, which is what the GUI's frame-clock
-//! tick does.
+//! Every stage still drives `frame_request`s (~120/s in `Client.pump`,
+//! what the GUI's frame-clock tick does), but since the internal-
+//! scheduler default (`externalPacingLatency` in cefhost.zig) they are
+//! advisory: paints arrive on the engine's own damage-driven schedule,
+//! and the CAP travels as `view_max_fps` instead of as request spacing.
 //!
 //! The HiDPI stage runs LAST on purpose: its scale changes leave the
 //! engine re-laying-out for a while, and running it mid-rig made the
@@ -1438,17 +1438,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (req_fps <= 60) fail("stage 19 fps: the rig itself never drove above 60 begin-frames/s");
         if (paint_fps <= 65) fail("stage 19 fps: paints did not exceed the old 60fps windowless ceiling");
 
-        // ... and a cap is honoured: at 30 requests/s the engine paints
-        // about 30 times a second, not 60 and not 240.
-        const capped = cl.drive(2000, 30);
+        // ... and the cap is honoured: `view_max_fps 30` must hold the
+        // engine's scheduler to ~30 paints/s however hard the client
+        // drives requests.
+        cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 30 });
+        _ = cl.drive(300, 240); // let the new rate land
+        const capped = cl.drive(2000, 240);
         const cap_fps = @divTrunc(@as(i64, capped.paints) * 1000, @max(capped.ms, 1));
         std.debug.print(
             "smoke-web: MEASURED capped at 30: {d} begin-frames, {d} paints ({d}/s) over {d} ms\n",
             .{ capped.requests, capped.paints, cap_fps, capped.ms },
         );
-        if (cap_fps < 20 or cap_fps > 40) fail("stage 19 fps: a 30/s request rate did not produce ~30 paints/s");
+        if (cap_fps < 20 or cap_fps > 40) fail("stage 19 fps: view_max_fps 30 did not produce ~30 paints/s");
+        cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 0 });
     }
-    pass("stage 19 frame rate (above 60fps uncapped, ~30fps when the request rate caps it)");
+    pass("stage 19 frame rate (above 60fps uncapped, ~30fps under view_max_fps 30)");
 
     // ── Stage 20: an idle page paints nothing ──────────────────────
     //
@@ -1468,24 +1472,33 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 20 idle page (hundreds of begin-frames, zero paints)");
 
-    // ── Stage 21: the helper's watchdog ────────────────────────────
+    // ── Stage 21: no client, page still alive — and boundable ──────
     //
-    // External begin frames make the CLIENT the frame source, so a GUI
-    // that stalls would otherwise freeze the page for good. The helper
-    // keeps a slow floor under it: alive, obviously degraded.
+    // Under the internal-scheduler default a client that stops asking
+    // costs nothing: the engine paces itself. The page must stay alive
+    // with ZERO requests, and `view_max_fps` must still bound it — the
+    // lever the GUI would use on a view it cannot present.
     {
         cl.navigate(anim_page);
         _ = cl.drive(300, 120);
         const abandoned = cl.drive(1500, 0);
         std.debug.print(
-            "smoke-web: MEASURED watchdog: {d} paints in {d} ms with ZERO client requests\n",
+            "smoke-web: MEASURED unattended: {d} paints in {d} ms with ZERO client requests\n",
             .{ abandoned.paints, abandoned.ms },
         );
-        if (abandoned.requests != 0) fail("stage 21 watchdog: the rig kept asking for frames");
-        if (abandoned.paints == 0) fail("stage 21 watchdog: the page froze once the client stopped asking");
-        if (abandoned.paints > 20) fail("stage 21 watchdog: the self-paced floor is not a floor");
+        if (abandoned.requests != 0) fail("stage 21 unattended: the rig kept asking for frames");
+        if (abandoned.paints == 0) fail("stage 21 unattended: the page froze once the client stopped asking");
+        cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 5 });
+        _ = cl.drive(300, 0);
+        const floored = cl.drive(1500, 0);
+        std.debug.print(
+            "smoke-web: MEASURED floored at 5: {d} paints in {d} ms\n",
+            .{ floored.paints, floored.ms },
+        );
+        if (floored.paints > 15) fail("stage 21 unattended: view_max_fps 5 did not bound an unattended page");
+        cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 0 });
     }
-    pass("stage 21 watchdog (page stays alive at a few fps with no client)");
+    pass("stage 21 unattended (page alive with no client, bounded by view_max_fps)");
 
     // ── Stage 22: input paints immediately ─────────────────────────
     {

@@ -224,6 +224,7 @@ pub const Server = struct {
             .view_resize => try self.host.resizeView(try proto.decode(proto.ViewResize, frame.payload)),
             .view_show => self.host.showView((try proto.decode(proto.ViewShow, frame.payload)).view, true),
             .view_hide => self.host.showView((try proto.decode(proto.ViewHide, frame.payload)).view, false),
+            .view_max_fps => self.host.setMaxFps(try proto.decode(proto.ViewMaxFps, frame.payload)),
             .navigate => self.host.navigate(try proto.decode(proto.Navigate, frame.payload)),
             .nav_action => self.host.navAction(try proto.decode(proto.NavAction, frame.payload)),
             .input_pointer => self.host.pointer(try proto.decode(proto.InputPointer, frame.payload)),
