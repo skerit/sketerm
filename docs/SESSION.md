@@ -16139,3 +16139,44 @@ base commit on this machine — pre-existing, not from this work, left
 for a separate investigation. GUI behavior (menus, zoom, drops, find
 bars) is compile- and trace-verified; none of it was exercised on a
 live display this session.
+
+## 2026-08-11 — Link hints for the web face (Vimium-style)
+
+The human skin over the MCP semantic layer: `web_hints` (palette "Link
+Hints (Web Page)", bindable) labels every visible interactive element
+of the page; typing a label clicks it through the SAME trusted-input
+path and semantic id `web_act` uses, so hints double as a visual debug
+of the semantic layer. Shift/Ctrl on the completing key opens a link's
+url in a new web tab (`newWebTabAt`). Escape, a dead-end prefix, a real
+click, scroll, zoom, resize or navigation cancels; Backspace un-types.
+While labels are up the key controller consumes EVERYTHING — nothing
+leaks to the page or the chord table. `hints_open` (Ctrl+Shift+E)
+delegates to web hints when the pane wears the web face and stays the
+terminal quick-select otherwise, so one chord always hints what is on
+screen.
+
+Plumbing — no new frame tags: hints are `sem_query` kind `visible = 3`
+(arg "vw vh" in page CSS px). Unlike other queries the helper answers
+it AFTER soliciting a fresh DOM walk (scrolling moves every rect
+without one DOM mutation), then renders `semantic.View.renderHints`
+from the live tree — the consumed base is deliberately untouched, so a
+hints pass never eats a snapshot's delta. Walk nodes now carry the
+resolved anchor url (`InNode.url`, additive JSON field, excluded from
+fingerprints/deltas). `semRearm` re-solicits pending hints across a
+navigation like snapshots. GUI-side rects are CSS px: label placement
+multiplies the user-zoom factor (1.2^(level/100)) back in plus the
+snap_dx/dy nudge; the request divides the viewport by it.
+
+New `src/web/hints.zig` (std-only, both test roots): Vimium-style
+prefix-free shortest-label generator over the home-row alphabet plus
+the TSV payload parser shared by the overlay. Files:
+`web/{protocol,semantic,cefhost,hints}.zig`, `semantic.js`,
+`ui/{webface,input,window,palette}.zig`, smoke stage 13c.
+
+Verification: `zig build`, `zig build web` green; `zig build test-core`
+1820 pass / 6 skip / 0 fail; `zig build test` 2217 pass / 5 skip / 0
+fail; `zig build smoke-web` all stages PASS including new stage 13c
+(fresh rects, urls, viewport clip, disabled filtering over the wire).
+The GTK overlay interaction itself (labels, typing, activation) is
+widget-side and not smoke-covered — verified by compile + review only,
+not on a live display.
