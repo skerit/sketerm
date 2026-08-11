@@ -815,7 +815,7 @@ test "async delete response after owner teardown touches no GTK state" {
     };
     canary.poison(&dctx);
     const before = canary.trips;
-    onDeleteResponse(undefined, null, @ptrCast(&dctx));
+    onDeleteResponse(@ptrCast(&dctx), "delete");
     try std.testing.expectEqual(before + 1, canary.trips);
 }
 
