@@ -15,6 +15,11 @@ const platform = @import("../util/platform.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const Playbar = @import("playbar.zig").Playbar;
+const input = @import("input.zig");
+const classicmenu = @import("browser/classicmenu.zig");
+const browser_open = @import("browser/open.zig");
+const format = @import("../filebrowser/format.zig");
+const actionButton = @import("widgets.zig").actionButton;
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -583,6 +588,9 @@ pub const ViewerWindow = struct {
     /// Image-canvas context menu. Borrowed: the click gesture on the
     /// canvas owns it and frees it when the canvas dies.
     canvas_menu: ?*CanvasMenu = null,
+    /// Active keybinding table (`default_bindings` overlaid with the
+    /// user's `keybind.*` config). Empty = fall back to defaults.
+    bindings: []input.Binding = &.{},
 
     pub fn open(allocator: std.mem.Allocator, app: ?*c.GtkApplication, batch: model.Batch, options: Options) !*ViewerWindow {
         const self = try allocator.create(ViewerWindow);
@@ -825,6 +833,20 @@ pub const ViewerWindow = struct {
         }
         self.canvas_menu = try attachCanvasMenu(allocator, self.canvas.widget(), menu_items[0..n_menu_items]);
 
+        // Chorded keys resolve through the user's keybinding table
+        // (Ctrl+= / Ctrl+- / Ctrl+0 by default); loaded once per
+        // window, like the daemon connection loads its own Config.
+        {
+            var config = Config.load(allocator);
+            defer config.deinit();
+            var list: std.ArrayList(input.Binding) = .empty;
+            input.rebuildBindings(&list, allocator, config.keybinds.items);
+            self.bindings = list.toOwnedSlice(allocator) catch blk: {
+                list.deinit(allocator);
+                break :blk &.{};
+            };
+        }
+
         self.showCurrent();
         c.gtk_window_present(@ptrCast(window));
         return self;
@@ -846,6 +868,7 @@ pub const ViewerWindow = struct {
         self.target.close();
         self.session.deinit(self.allocator);
         self.batch.deinit();
+        if (self.bindings.len > 0) self.allocator.free(self.bindings);
         self.allocator.destroy(self);
     }
 
@@ -1075,75 +1098,38 @@ pub const CanvasMenuItem = union(enum) {
     },
 };
 
-const MAX_CANVAS_MENU_ROWS = 24;
-
-/// Owns the canvas popover and the row→source mapping. Freed by the
-/// click gesture's GDestroyNotify, which fires when the controller is
-/// removed from the canvas — i.e. when the canvas widget dies.
+/// The mirror list behind the canvas context menu. Owned by the
+/// right-click gesture's GDestroyNotify, which fires when the
+/// controller is removed from the canvas — i.e. when the canvas
+/// widget dies. Each popup builds a fresh classicmenu from it.
 const CanvasMenu = struct {
     allocator: std.mem.Allocator,
     host: *c.GtkWidget,
-    popover: *c.GtkWidget,
-    rows: [MAX_CANVAS_MENU_ROWS]?*c.GtkWidget = @splat(null),
-    sources: [MAX_CANVAS_MENU_ROWS]?*c.GtkWidget = @splat(null),
-    n: usize = 0,
+    items: []CanvasMenuItem,
 };
 
-/// Per-row signal context. Heap-allocated, so it carries its own
-/// allocator and is released through `freeCanvasRow`.
+/// Per-row activation context, owned by the popped-up menu's Root
+/// (`root.own`), so it dies with that popup's popover.
 const CanvasRowCtx = struct {
     allocator: std.mem.Allocator,
-    menu: *CanvasMenu,
+    host: *c.GtkWidget,
     source: *c.GtkWidget,
 };
 
 /// Give `host` a right-click (and Menu-key) context menu built from
-/// `items`. Rows past MAX_CANVAS_MENU_ROWS are ignored rather than
-/// overflowing; the compile-time assert keeps that from going unseen.
+/// `items`.
 fn attachCanvasMenu(
     allocator: std.mem.Allocator,
     host: *c.GtkWidget,
     items: []const CanvasMenuItem,
 ) !*CanvasMenu {
-    const popover = c.gtk_popover_new().?;
-    c.gtk_widget_set_parent(popover, host);
-    c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
-
     const menu = try allocator.create(CanvasMenu);
     errdefer allocator.destroy(menu);
-    menu.* = .{ .allocator = allocator, .host = host, .popover = popover };
-
-    const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
-    for (items) |item| switch (item) {
-        .separator => c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?),
-        .row => |r| {
-            if (menu.n >= MAX_CANVAS_MENU_ROWS) continue;
-            const btn = actionButton(list, r.label, r.icon);
-            const rctx = try allocator.create(CanvasRowCtx);
-            rctx.* = .{ .allocator = allocator, .menu = menu, .source = r.source };
-            _ = c.g_signal_connect_data(
-                btn,
-                "clicked",
-                @ptrCast(&onCanvasRowClicked),
-                @ptrCast(rctx),
-                @ptrCast(&freeCanvasRow),
-                c.G_CONNECT_DEFAULT,
-            );
-            menu.rows[menu.n] = btn;
-            menu.sources[menu.n] = r.source;
-            menu.n += 1;
-        },
+    menu.* = .{
+        .allocator = allocator,
+        .host = host,
+        .items = try allocator.dupe(CanvasMenuItem, items),
     };
-    // Same GTK4 popover-sizing trap menu.zig documents: a bare box's
-    // MINIMUM height is the whole list, and a popover whose minimum
-    // does not fit the granted space is silently popped down.
-    const scroller = c.gtk_scrolled_window_new().?;
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
-    c.gtk_popover_set_child(@ptrCast(popover), scroller);
-
     const click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
     _ = c.g_signal_connect_data(
@@ -1155,38 +1141,45 @@ fn attachCanvasMenu(
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(host, @ptrCast(click));
-    // Dismissing without picking anything (Escape, click-away) must
-    // not strand focus in the dead popover.
-    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onCanvasMenuClosed), @ptrCast(menu), null, c.G_CONNECT_DEFAULT);
     return menu;
 }
 
-fn onCanvasMenuClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
-    const menu: *CanvasMenu = @ptrCast(@alignCast(user.?));
-    const root = c.gtk_widget_get_root(menu.host) orelse return;
+/// Build a classicmenu from the mirror list and pop it up at (x, y).
+/// Reading each source button's sensitivity/visibility at popup time
+/// is what keeps the menu honest: "Next Image" greys out on the last
+/// image, "Pause" while no animation is loaded, exactly as the
+/// toolbar does.
+fn showCanvasMenu(menu: *CanvasMenu, x: f64, y: f64) void {
+    const root = classicmenu.Root.create(menu.allocator) orelse return;
+    const top = root.top();
+    for (menu.items) |item| switch (item) {
+        .separator => _ = top.section(),
+        .row => |r| {
+            const usable = c.gtk_widget_get_sensitive(r.source) != 0 and
+                c.gtk_widget_get_visible(r.source) != 0;
+            const rctx = menu.allocator.create(CanvasRowCtx) catch continue;
+            rctx.* = .{ .allocator = menu.allocator, .host = menu.host, .source = r.source };
+            root.own(&freeCanvasRow, @ptrCast(rctx));
+            top.itemIconEnabled(r.label, .{ .name = r.icon }, usable, &onCanvasRowClicked, @ptrCast(rctx));
+        },
+    };
+    const pop = root.popup(menu.host, x, y);
+    // Dismissing without picking anything (Escape, click-away) must
+    // not strand focus in the dead popover. The host widget is the
+    // popover's parent, so it strictly outlives this connection.
+    _ = c.g_signal_connect_data(pop, "closed", @ptrCast(&onCanvasMenuClosed), @ptrCast(menu.host), null, c.G_CONNECT_DEFAULT);
+}
+
+fn onCanvasMenuClosed(pop: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    const host: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+    const root = c.gtk_widget_get_root(host) orelse return;
     const focus = c.gtk_root_get_focus(@ptrCast(root));
     // Only reclaim focus that is still inside the popover — a row
     // that opened a dialog has already moved it somewhere better.
     const inside = focus == null or
-        focus == menu.popover or
-        c.gtk_widget_is_ancestor(focus, menu.popover) != 0;
-    if (inside) _ = c.gtk_widget_grab_focus(menu.host);
-}
-
-/// Refresh every row's sensitivity from its source button, then pop
-/// up at (x, y). Reading the source each time is what keeps the menu
-/// honest: "Next Image" greys out on the last image, "Pause" while no
-/// animation is loaded, exactly as the toolbar does.
-fn showCanvasMenu(menu: *CanvasMenu, x: f64, y: f64) void {
-    for (menu.rows[0..menu.n], menu.sources[0..menu.n]) |maybe_row, maybe_src| {
-        const row = maybe_row orelse continue;
-        const src = maybe_src orelse continue;
-        const usable = c.gtk_widget_get_sensitive(src) != 0 and c.gtk_widget_get_visible(src) != 0;
-        c.gtk_widget_set_sensitive(row, @intFromBool(usable));
-    }
-    var rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(menu.popover), &rect);
-    c.gtk_popover_popup(@ptrCast(menu.popover));
+        focus == @as(*c.GtkWidget, @ptrCast(pop)) or
+        c.gtk_widget_is_ancestor(focus, @ptrCast(pop)) != 0;
+    if (inside) _ = c.gtk_widget_grab_focus(host);
 }
 
 fn onCanvasRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1206,13 +1199,13 @@ fn showCanvasMenuCentred(menu: *CanvasMenu) void {
     showCanvasMenu(menu, w / 2.0, h / 2.0);
 }
 
-fn onCanvasRowClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+/// classicmenu Handler shape: the popover has already popped down.
+/// Focus goes back to the canvas before the action runs, so a
+/// dismissed menu never leaves the keyboard stranded; an action that
+/// opens its own dialog takes focus after.
+fn onCanvasRowClicked(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const rctx: *CanvasRowCtx = @ptrCast(@alignCast(user.?));
-    c.gtk_popover_popdown(@ptrCast(rctx.menu.popover));
-    // Focus goes back to the canvas before the action runs, so a
-    // dismissed menu never leaves the keyboard stranded in a dead
-    // popover. An action that opens its own dialog takes focus after.
-    _ = c.gtk_widget_grab_focus(rctx.menu.host);
+    _ = c.gtk_widget_grab_focus(rctx.host);
     _ = c.gtk_widget_activate(rctx.source);
 }
 
@@ -1226,26 +1219,9 @@ fn freeCanvasRow(user: ?*anyopaque) callconv(.c) void {
 fn freeCanvasMenu(user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const menu: *CanvasMenu = @ptrCast(@alignCast(u));
-        // A popover added with gtk_widget_set_parent must be
-        // unparented before the host finalizes, or GTK warns about
-        // leftover children (same rule as menu.zig's freeClickCtx).
-        if (c.gtk_widget_get_parent(menu.popover) != null) c.gtk_widget_unparent(menu.popover);
+        menu.allocator.free(menu.items);
         menu.allocator.destroy(menu);
     }
-}
-
-fn actionButton(box: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8) *c.GtkWidget {
-    const button = c.gtk_button_new().?;
-    c.gtk_button_set_has_frame(@ptrCast(button), 0);
-    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
-    c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name(icon).?);
-    const text = c.gtk_label_new(label).?;
-    c.gtk_label_set_xalign(@ptrCast(text), 0);
-    c.gtk_widget_set_hexpand(text, 1);
-    c.gtk_box_append(@ptrCast(row), text);
-    c.gtk_button_set_child(@ptrCast(button), row);
-    c.gtk_box_append(@ptrCast(box), button);
-    return button;
 }
 
 fn setTextViewContent(self: *ViewerWindow, text: []const u8) void {
@@ -1294,18 +1270,18 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
     c.gtk_label_set_text(self.metadata_label, if (binary) "Binary file (hex dump of the head)" else "Plain text file");
     const kind: []const u8 = if (binary) "Binary (hex dump)" else "UTF-8 text";
     var status_buf: [256:0]u8 = undefined;
-    var head_buf: [48]u8 = undefined;
-    var total_buf: [48]u8 = undefined;
+    var head_buf: [48:0]u8 = undefined;
+    var total_buf: [48:0]u8 = undefined;
     const text = if (result.source_bytes > head.len)
         std.fmt.bufPrintZ(&status_buf, "{s}  showing first {s} of {s}", .{
             kind,
-            formatBytes(&head_buf, head.len),
-            formatBytes(&total_buf, result.source_bytes),
+            format.fmtSize(&head_buf, head.len),
+            format.fmtSize(&total_buf, result.source_bytes),
         }) catch "File loaded"
     else
         std.fmt.bufPrintZ(&status_buf, "{s}  {s}", .{
             kind,
-            formatBytes(&total_buf, result.source_bytes),
+            format.fmtSize(&total_buf, result.source_bytes),
         }) catch "File loaded";
     c.gtk_label_set_text(self.status, text.ptr);
 }
@@ -1349,13 +1325,13 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
         .glycin => "Glycin",
         .gdk_pixbuf => "GdkPixbuf",
     };
-    var size_buf: [48]u8 = undefined;
+    var size_buf: [48:0]u8 = undefined;
     const text = std.fmt.bufPrintZ(&status, "{s}  {d} x {d}  {s}  {s}{s}", .{
         if (result.variant == .preview) "Preview" else "Full resolution",
         first.width,
         first.height,
         backend,
-        formatBytes(&size_buf, result.source_bytes),
+        format.fmtSize(&size_buf, result.source_bytes),
         if (image.animated()) "  Animated" else "",
     }) catch "Image loaded";
     c.gtk_label_set_text(self.status, text.ptr);
@@ -1422,12 +1398,6 @@ fn onOpenCopyLoaded(user: ?*anyopaque, result: *LoadResult) void {
         result.materialized_len = 0;
         c.gtk_label_set_text(self.status, "Remote image ready for an external application");
     }
-}
-
-fn formatBytes(buf: []u8, bytes: usize) []const u8 {
-    if (bytes >= 1024 * 1024) return std.fmt.bufPrint(buf, "{d:.1} MiB", .{@as(f64, @floatFromInt(bytes)) / (1024 * 1024)}) catch "";
-    if (bytes >= 1024) return std.fmt.bufPrint(buf, "{d:.1} KiB", .{@as(f64, @floatFromInt(bytes)) / 1024}) catch "";
-    return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
 }
 
 fn mayAnimate(name: []const u8) bool {
@@ -1580,12 +1550,16 @@ fn onCanvasRotate(user: ?*anyopaque, delta: i8) void {
     self.rotate(delta);
 }
 
-fn onCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+fn copyImage(self: *ViewerWindow) void {
     const texture = self.session.currentTexture() orelse return;
     const clipboard = c.gtk_widget_get_clipboard(self.window) orelse return;
     c.gdk_clipboard_set_texture(clipboard, texture);
     c.gtk_label_set_text(self.status, "Image copied to clipboard");
+}
+
+fn onCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *ViewerWindow = @ptrCast(@alignCast(user.?));
+    copyImage(self);
 }
 
 fn onReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1721,6 +1695,28 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
         },
         .image => {},
     }
+    // Chorded input (image mode) resolves through the user's
+    // keybinding table, the same lowered-then-raw lookup the faces
+    // do: Ctrl+= / Ctrl+- / Ctrl+0 zoom by default (the terminal's
+    // font chords), and the copy chord copies the image. A chord
+    // bound to anything the viewer cannot do falls through to GTK.
+    // Shift alone stays with the bare-key switch (`<`, `>`, `+`).
+    const mods = state & input.SIGNIFICANT_MODS;
+    if ((mods & ~@as(c_uint, c.GDK_SHIFT_MASK)) != 0) {
+        const bindings: []const input.Binding =
+            if (self.bindings.len > 0) self.bindings else &input.default_bindings;
+        const lower_kv: c_uint = c.gdk_keyval_to_lower(keyval);
+        const action = input.matchBinding(bindings, lower_kv, mods) orelse
+            input.matchBinding(bindings, keyval, mods) orelse return 0;
+        switch (action) {
+            .font_inc => self.canvas.zoomBy(1.2),
+            .font_dec => self.canvas.zoomBy(1.0 / 1.2),
+            .font_reset => self.canvas.actual(),
+            .copy, .copy_selection, .interrupt_or_copy => copyImage(self),
+            else => return 0,
+        }
+        return 1;
+    }
     switch (keyval) {
         c.GDK_KEY_Left => self.move(-1),
         c.GDK_KEY_Right => self.move(1),
@@ -1742,8 +1738,6 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
     return 1;
 }
 
-const APP_CHOOSER_FILE = "sketerm-viewer-app-file";
-
 fn showAppChooser(self: *ViewerWindow, path: []const u8) void {
     _ = showAppChooserPath(self, path, false);
 }
@@ -1764,56 +1758,43 @@ fn delayedChooserCopyCleanup(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) bool {
-    var path_buf: [4096:0]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch {
-        c.gtk_label_set_text(self.status, "Path is too long for Open With");
-        return false;
-    };
-    const file = c.g_file_new_for_path(path_z.ptr) orelse return false;
-    const dialog = c.gtk_app_chooser_dialog_new(@ptrCast(self.window), c.GTK_DIALOG_MODAL, file) orelse {
-        c.g_object_unref(file);
-        return false;
-    };
-    _ = c.g_object_ref(file);
-    c.g_object_set_data_full(@ptrCast(dialog), APP_CHOOSER_FILE, @ptrCast(file), @ptrCast(&c.g_object_unref));
-    c.g_object_unref(file);
-    if (owned_copy) {
-        const allocator = std.heap.c_allocator;
-        const copy = allocator.create(ChooserCopy) catch {
-            c.gtk_window_destroy(@ptrCast(dialog));
-            return false;
-        };
-        copy.* = .{ .path = allocator.dupeZ(u8, path) catch {
-            allocator.destroy(copy);
-            c.gtk_window_destroy(@ptrCast(dialog));
-            return false;
-        } };
-        c.g_object_set_data_full(@ptrCast(dialog), "sketerm-viewer-open-copy", @ptrCast(copy), @ptrCast(&freeChooserCopy));
-    }
-    c.gtk_app_chooser_dialog_set_heading(@ptrCast(dialog), "Open image with another application");
-    _ = c.g_signal_connect_data(dialog, "response", @ptrCast(&onAppChooserResponse), null, null, c.G_CONNECT_DEFAULT);
-    c.gtk_window_present(@ptrCast(dialog));
-    return true;
+/// GDestroyNotify on the chooser popover: begin the delayed unlink of
+/// the materialized temp copy once the popover is gone, so an app the
+/// user just launched still has 60 seconds to open the file (the same
+/// grace the old dialog gave after its launch).
+fn chooserCopyPopoverGone(user: ?*anyopaque) callconv(.c) void {
+    if (c.g_timeout_add_seconds(60, @ptrCast(&delayedChooserCopyCleanup), user) == 0)
+        freeChooserCopy(user);
 }
 
-fn onAppChooserResponse(dialog: *c.GtkDialog, response: c_int, _: ?*anyopaque) callconv(.c) void {
-    if (response == c.GTK_RESPONSE_OK) {
-        const app = c.gtk_app_chooser_get_app_info(@ptrCast(dialog));
-        const file_any = c.g_object_get_data(@ptrCast(dialog), APP_CHOOSER_FILE);
-        if (app != null and file_any != null) {
-            var files: ?*c.GList = null;
-            files = c.g_list_append(files, file_any);
-            _ = c.g_app_info_launch(app, files, null, null);
-            c.g_list_free(files);
-            c.g_object_unref(app);
-            if (c.g_object_steal_data(@ptrCast(dialog), "sketerm-viewer-open-copy")) |raw| {
-                if (c.g_timeout_add_seconds(60, @ptrCast(&delayedChooserCopyCleanup), raw) == 0)
-                    freeChooserCopy(raw);
-            }
-        }
+/// Show the file manager's local-app chooser for `path`. With
+/// `owned_copy`, a returned `true` transfers ownership of the temp
+/// file to the chooser (unlinked 60s after the popover closes);
+/// `false` leaves ownership with the caller.
+fn showAppChooserPath(self: *ViewerWindow, path: []const u8, owned_copy: bool) bool {
+    var copy: ?*ChooserCopy = null;
+    if (owned_copy) {
+        const allocator = std.heap.c_allocator;
+        const cp = allocator.create(ChooserCopy) catch return false;
+        cp.* = .{ .path = allocator.dupeZ(u8, path) catch {
+            allocator.destroy(cp);
+            return false;
+        } };
+        copy = cp;
     }
-    c.gtk_window_destroy(@ptrCast(dialog));
+    const popover = browser_open.openWithLocalPopover(std.heap.c_allocator, self.window, path) orelse {
+        if (copy) |cp| {
+            // No unlink here: on failure the temp file stays owned by
+            // the caller's LoadResult, which removes it itself.
+            std.heap.c_allocator.free(cp.path);
+            std.heap.c_allocator.destroy(cp);
+        }
+        c.gtk_label_set_text(self.status, "Could not open the application chooser");
+        return false;
+    };
+    if (copy) |cp|
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-viewer-open-copy", @ptrCast(cp), @ptrCast(&chooserCopyPopoverGone));
+    return true;
 }
 
 const MountOpen = struct {
