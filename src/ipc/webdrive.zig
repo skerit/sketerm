@@ -178,6 +178,9 @@ pub const Engine = struct {
     current: u32 = 0,
     cap_shm: bool = false,
     cap_semantic: bool = false,
+    /// The helper can create a view directly at a url, so a view opened
+    /// with one never holds a blank document first.
+    cap_view_url: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8) !Engine {
         const owned_dir = try gpa.dupe(u8, dir);
@@ -416,6 +419,11 @@ pub const Engine = struct {
     }
 
     /// Create a headless view; `url` may be empty for a blank page.
+    ///
+    /// With a url and a helper advertising `view-create-url` the browser
+    /// is created AT it, so the view holds exactly one document. The
+    /// create-then-navigate fallback (older helper) mints about:blank
+    /// first, which is what `load_seq` lets a settle see past.
     pub fn openView(self: *Engine, url: []const u8, w: u16, h: u16) !*View {
         if (!self.ensure()) return error.Unavailable;
         const v = try self.gpa.create(View);
@@ -423,17 +431,28 @@ pub const Engine = struct {
         v.* = .{ .id = self.next_view, .w = w, .h = h };
         self.next_view += 1;
         try self.views.append(self.gpa, v);
-        self.send(proto.ViewCreate{
-            .view = v.id,
-            .w = w,
-            .h = h,
-            .scale_x1000 = 1000,
-            .context = 0,
-        }) catch return error.Unavailable;
+        if (url.len > 0 and self.cap_view_url) {
+            self.send(proto.ViewCreateUrl{
+                .view = v.id,
+                .w = w,
+                .h = h,
+                .scale_x1000 = 1000,
+                .context = 0,
+                .url = url,
+            }) catch return error.Unavailable;
+        } else {
+            self.send(proto.ViewCreate{
+                .view = v.id,
+                .w = w,
+                .h = h,
+                .scale_x1000 = 1000,
+                .context = 0,
+            }) catch return error.Unavailable;
+        }
         // A hidden view is never painted; headless views are always
         // "shown" — nothing else would ever show them.
         self.send(proto.ViewShow{ .view = v.id }) catch return error.Unavailable;
-        if (url.len > 0) {
+        if (url.len > 0 and !self.cap_view_url) {
             self.send(proto.Navigate{ .view = v.id, .url = url }) catch return error.Unavailable;
         }
         self.current = v.id;
@@ -470,6 +489,7 @@ pub const Engine = struct {
     pub fn scroll(self: *Engine, id: u32, dx: i32, dy: i32) !void {
         if (!self.ensure()) return error.Unavailable;
         const v = self.findView(id) orelse return error.NoView;
+        self.awaitFirstPaint(id, 5_000);
         self.send(proto.InputScroll{
             .view = id,
             .x = @intCast(v.w / 2),
@@ -488,6 +508,27 @@ pub const Engine = struct {
 
     // ---- semantic round trips ---------------------------------------
 
+    /// Wait, bounded, for the view's FIRST composited frame.
+    ///
+    /// The engine has nothing to hit-test until it has composited once,
+    /// and input aimed at a view in that state is swallowed silently
+    /// (smoke-web stage 6 retries its clicks for the same reason). It
+    /// used to be hidden by the wasted about:blank document: the page
+    /// had painted long before anything acted on it. Cheap after the
+    /// first frame — `frame_gen` never returns to 0.
+    fn awaitFirstPaint(self: *Engine, view_id: u32, budget_ms: i64) void {
+        const v0 = self.findView(view_id) orelse return;
+        if (v0.frame_gen != 0) return;
+        self.send(proto.FrameRequest{ .view = view_id, .flags = 0 }) catch return;
+        const deadline = clock.nowMs() + budget_ms;
+        while (clock.nowMs() < deadline) {
+            const v = self.findView(view_id) orelse return;
+            if (v.frame_gen != 0) return;
+            if (self.state != .ready) return;
+            self.pumpOnce(20);
+        }
+    }
+
     /// Run one semantic operation to completion under `budget_ms`.
     /// Synchronous by design: this driver is called from the MCP
     /// single-threaded dispatch, so nothing else could overlap it.
@@ -495,6 +536,10 @@ pub const Engine = struct {
         if (!self.ensure()) return error.Unavailable;
         if (!self.cap_semantic) return error.NoSemantic;
         const v = self.findView(view_id) orelse return error.NoView;
+
+        // `click`/`hover` are synthesized through the real input path,
+        // which needs a composited frame to hit-test against.
+        if (req.kind == .act) self.awaitFirstPaint(view_id, @min(budget_ms, 5_000));
 
         const ki = @intFromEnum(req.kind);
         // Drop a stale parked reply from an earlier timed-out call of
@@ -725,6 +770,7 @@ pub const Engine = struct {
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
                 }
             },
             .frame_buffer => {

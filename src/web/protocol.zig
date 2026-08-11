@@ -28,6 +28,12 @@ pub const CAP_FRAMES_DMABUF = "frames-dmabuf";
 pub const CAP_INPUT = "input";
 pub const CAP_NAVIGATION = "navigation";
 pub const CAP_SEMANTIC = "semantic";
+/// The helper accepts `view_create_url`: a view created directly AT a
+/// url, so no blank document is ever minted for it. A client without
+/// this capability keeps using `view_create` + `navigate`, which mints
+/// two documents (about:blank, then the page) and lets a settle that
+/// watches "some url loaded" answer for the blank one.
+pub const CAP_VIEW_CREATE_URL = "view-create-url";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -45,6 +51,7 @@ pub const Tag = enum(u8) {
     view_show = 0x13,
     view_hide = 0x14,
     view_max_fps = 0x15,
+    view_create_url = 0x16,
     navigate = 0x18,
     nav_action = 0x19,
     input_pointer = 0x20,
@@ -224,6 +231,30 @@ pub const ViewCreate = struct {
     h: u16,
     scale_x1000: u16,
     context: u32,
+};
+
+/// `view_create` with the first url built in, gated by
+/// `CAP_VIEW_CREATE_URL`.
+///
+/// It is a NEW frame rather than a url field on `ViewCreate` because the
+/// wire is append-only: adding a field would change an existing frame's
+/// layout, and an older peer would decode the next frame's bytes as
+/// part of this one. The two frames are mutually exclusive per view —
+/// send exactly one.
+///
+/// An empty `url` means the same as `view_create` (a blank document).
+/// The point of the frame is that a NON-empty url produces exactly ONE
+/// document: create-then-navigate always produced two (about:blank plus
+/// the page), so a "did the load settle" test could be satisfied by the
+/// blank one and hand back a snapshot of an empty page.
+pub const ViewCreateUrl = struct {
+    pub const tag: Tag = .view_create_url;
+    view: u32,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+    context: u32,
+    url: []const u8,
 };
 
 pub const ViewDestroy = struct {
@@ -938,6 +969,14 @@ fn roundTrip(comptime T: type, value: T) !void {
 test "round-trip: scalar and string frames" {
     try roundTrip(Hello, .{ .proto = 1, .client_name = "sketerm-gui" });
     try roundTrip(ViewCreate, .{ .view = 7, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
+    try roundTrip(ViewCreateUrl, .{
+        .view = 7,
+        .w = 800,
+        .h = 600,
+        .scale_x1000 = 1000,
+        .context = 0,
+        .url = "https://example.com/",
+    });
     try roundTrip(ViewDestroy, .{ .view = 7 });
     try roundTrip(ViewResize, .{ .view = 7, .w = 1024, .h = 768, .scale_x1000 = 1500 });
     try roundTrip(ViewShow, .{ .view = 7 });

@@ -78,6 +78,20 @@ An idle page must keep costing nothing: the scheduler paints only on
 damage (smoke-web stage 20 asserts zero paints on a static page), and a
 hidden view is stopped outright by `view_hide`.
 
+## The canvas is opaque only if the BROWSER says so
+
+A windowless CEF browser defaults to a TRANSPARENT canvas, so a page
+that specifies no background of its own paints `(0,0,0,0)` everywhere
+and a screenshot of a perfectly healthy page comes back uniformly
+black (its tree, text and clicks all work — the pixels are simply
+transparent). `cefhost.createViewAt` therefore sets
+`cef_browser_settings_t.background_color = 0xffffffff` per browser.
+`CefSettings.background_color` in `initialize` is documented as the
+fallback for a zero value there and has been opaque white all along,
+but measurably does NOT reach an alloy windowless browser. smoke-web
+stage 22c is the guard, and every other stage styles its own
+background, which is why this survived so long.
+
 ## Presentation belongs to GTK, not to us
 
 Frames are `GdkTexture`s on a `GtkPicture` (`webface.zig`). **Never
@@ -125,7 +139,20 @@ H.264/AAC) while the distro build enables them.
 - The wire protocol is **append-only**: new frame tags and capabilities,
   never a renumbering or a version bump. `protocol.zig` is the source of
   truth (`docs/proposal-browser-protocol.md` is an untracked design doc
-  and may be absent).
+  and may be absent). `view_create_url` (capability `view-create-url`)
+  is the worked example of the rule: the initial url had to be a NEW
+  frame, because adding a field to `view_create` would have changed an
+  existing frame's layout.
+- **A view opened at a url must not hold about:blank first.**
+  `view_create` + `navigate` mints TWO documents, and the blank one
+  finishes loading immediately — any client settling on "a url is loaded
+  and nothing is in flight" can be answered by it, which is how
+  `web_open` once returned a first snapshot of an empty page. Clients
+  that create views after the handshake (`webdrive.zig`) use
+  `view_create_url`; the GUI face creates its view the moment the socket
+  connects, before the `hello_ack` that would advertise the capability,
+  so it stays on create-then-navigate and the settle in `mcp_web.zig`
+  sees past the blank document instead.
 - CEF types stay inside this directory — that seam is what keeps a
   future engine swap to a new helper binary rather than a rewrite.
   `semantic.zig` and `semantic.js` in particular must stay engine-free.

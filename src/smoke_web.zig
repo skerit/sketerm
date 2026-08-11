@@ -38,6 +38,10 @@ const c = @import("c.zig").c;
 const proto = @import("web/protocol.zig");
 
 const view_id: u32 = 1;
+/// The stage-22b view, created directly at a url.
+const url_view_id: u32 = 2;
+/// The stage-22c view: a page with NO background of its own.
+const bare_view_id: u32 = 3;
 
 /// Pages under test. `#` MUST be percent-encoded inside a data: URL —
 /// a raw one starts the fragment and truncates the document.
@@ -57,6 +61,13 @@ const popup_page =
     "data:text/html,<body%20style=%22margin:0%22>" ++
     "<div%20style=%22width:100vw;height:100vh%22%20" ++
     "onclick=%22window.open('https://example.invalid/x')%22></div></body>";
+
+/// No background, no script, no styling: what a page looks like when it
+/// says nothing about its canvas. The engine's own default has to be
+/// opaque white, as in every browser — a windowless CEF browser defaults
+/// to TRANSPARENT, which reaches a client as (0,0,0,0) and photographs
+/// as a uniformly black page.
+const bare_page = "data:text/html,<html><body>hi</body></html>";
 
 /// Repaints on every animation frame, i.e. on every begin frame the
 /// rig drives — the page whose achieved rate measures the ceiling.
@@ -298,6 +309,7 @@ const Client = struct {
     ack_shm: bool = false,
     ack_semantic: bool = false,
     ack_dmabuf: bool = false,
+    ack_view_url: bool = false,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -340,6 +352,10 @@ const Client = struct {
     /// resize, a scale change) satisfies it immediately, and the stage
     /// then drives input at a document that has not loaded yet.
     load_seq: u32 = 0,
+    /// Finished loads of a BLANK document, whatever view they belong
+    /// to. A view created with `view_create` and navigated afterwards
+    /// produces one; a view created with `view_create_url` must not.
+    blank_load_seq: u32 = 0,
 
     // Semantic layer. `sem_log` accumulates every payload since the
     // last reset (snapshots arrive unsolicited too, from the mutation
@@ -530,6 +546,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
                 }
             },
             .frame_buffer => {
@@ -627,7 +644,10 @@ const Client = struct {
             },
             .ev_load => {
                 const l = proto.decode(proto.EvLoad, frame.payload) catch fail("ev_load decode");
-                if (l.state == @intFromEnum(proto.LoadState.finished)) self.load_seq += 1;
+                if (l.state == @intFromEnum(proto.LoadState.finished)) {
+                    self.load_seq += 1;
+                    if (std.mem.eql(u8, l.url, "about:blank")) self.blank_load_seq += 1;
+                }
             },
             .ev_nav_state => {
                 const s = proto.decode(proto.EvNavState, frame.payload) catch fail("ev_nav_state decode");
@@ -1621,6 +1641,83 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (latency > 150) fail("stage 22 promotion: the paint after a click took more than 150 ms");
     }
     pass("stage 22 input promotion (click paints within a frame or two)");
+
+    // ── Stage 22b: a view created AT a url mints ONE document ──────
+    //
+    // `view_create` + `navigate` always loads about:blank first, and a
+    // client settling on "a url loaded and nothing is in flight" can be
+    // answered by that blank document — which is how `web_open` once
+    // returned a first snapshot of an empty page. `view_create_url`
+    // (capability `view-create-url`) removes the blank document
+    // instead of asking every client to see past it.
+    {
+        if (!cl.ack_view_url) fail("stage 22b: hello_ack lacks the view-create-url capability");
+        // View 1 was created blank at stage 2: the contrast this stage
+        // exists for has to be REAL, not assumed.
+        if (cl.blank_load_seq == 0) fail("stage 22b: no blank load was ever seen (the contrast is not being measured)");
+        const blank_before = cl.blank_load_seq;
+        const load_before = cl.load_seq;
+        cl.resetSem();
+        cl.send(proto.ViewCreateUrl{
+            .view = url_view_id,
+            .w = 400,
+            .h = 300,
+            .scale_x1000 = 1000,
+            .context = 0,
+            .url = form_page,
+        });
+        if (!cl.waitSeq(&cl.load_seq, load_before, 20_000)) fail("stage 22b: the view never finished a load");
+        // The FIRST document is the page: doc 1 in the snapshot header.
+        // A preceding about:blank would make it doc 2 — the exact shape
+        // of the field report this stage guards.
+        const seq = cl.sem_seq;
+        cl.send(proto.SemSnapshotReq{
+            .view = url_view_id,
+            .mode = @intFromEnum(proto.SnapMode.full),
+            .detail = 1,
+            .scope = 0,
+        });
+        if (!cl.waitSeq(&cl.sem_seq, seq, 20_000)) fail("stage 22b: no sem_snapshot for the created-at-url view");
+        if (std.mem.indexOf(u8, cl.semLast(), "button \"Go\"") == null) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{cl.semLast()});
+            fail("stage 22b: the first snapshot does not describe the requested page");
+        }
+        if (!std.mem.startsWith(u8, cl.semLast(), "doc 1 ")) {
+            std.debug.print("smoke-web: snapshot header was:\n{s}\n", .{cl.semLast()[0..@min(cl.semLast().len, 80)]});
+            fail("stage 22b: the requested page is not the view's FIRST document");
+        }
+        if (cl.blank_load_seq != blank_before)
+            fail("stage 22b: a blank document was loaded anyway");
+        cl.send(proto.ViewDestroy{ .view = url_view_id });
+    }
+    pass("stage 22b view_create_url (one document, never about:blank)");
+
+    // ── Stage 22c: a page with no background of its own ────────────
+    //
+    // Windowless CEF paints TRANSPARENT unless the browser is given an
+    // opaque background_color, and a transparent frame reaches a client
+    // as all-zero pixels — a screenshot of a perfectly healthy page,
+    // uniformly black. Every other stage here styles its background, so
+    // nothing caught it; this one deliberately does not.
+    {
+        const fbseq = cl.fb_seq;
+        cl.send(proto.ViewCreateUrl{
+            .view = bare_view_id,
+            .w = 400,
+            .h = 300,
+            .scale_x1000 = 1000,
+            .context = 0,
+            .url = bare_page,
+        });
+        if (!cl.waitBufferAfter(fbseq, 20_000)) fail("stage 22c: no frame_buffer for the unstyled view");
+        if (!cl.waitCenterColor(.{ 255, 255, 255 }, 20_000)) {
+            const px = cl.pixel(cl.fb.?.w / 2, cl.fb.?.h / 2);
+            std.debug.print("smoke-web: centre pixel was {any}\n", .{px});
+            fail("stage 22c: an unstyled page did not paint on an opaque white canvas");
+        }
+        cl.send(proto.ViewDestroy{ .view = bare_view_id });
+    }
+    pass("stage 22c unstyled page (opaque white canvas, not a transparent/black frame)");
 
     // ── Stage 23: teardown ────────────────────────────────────────
     cl.have_view = false;

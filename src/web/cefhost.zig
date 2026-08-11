@@ -366,6 +366,14 @@ pub const View = struct {
     /// fd itself is handed to the client and closed by the sender: a
     /// mapping outlives its descriptor.
     map: []align(std.heap.page_size_min) u8 = &.{},
+    /// The mapping was just (re)allocated and is still all zeroes, so
+    /// its contents are UNKNOWN: the next paint must be copied WHOLE,
+    /// however little the engine says is damaged. Without this a paint
+    /// that reports only what changed leaves the rest of a freshly
+    /// zeroed buffer black forever on a page that never repaints again
+    /// — and a first paint arriving before the buffer existed is
+    /// dropped outright by the `map.len == 0` guard in `onPaint`.
+    buf_unpainted: bool = false,
     gen: u32 = 0,
     hidden: bool = false,
     /// Monotonic milliseconds of the last begin frame issued for this
@@ -524,9 +532,29 @@ pub const Host = struct {
         return self.views.items.len;
     }
 
-    /// Create a windowless browser for `id`. A duplicate id is ignored
-    /// (view ids are client-allocated and never reused).
+    /// Create a windowless browser showing a blank document.
     pub fn createView(self: *Host, req: proto.ViewCreate) !void {
+        return self.createViewAt(req, "");
+    }
+
+    /// Create a windowless browser AT `req.url` (capability
+    /// `view-create-url`): the browser's first and only document is the
+    /// requested page, where create-then-navigate would have loaded
+    /// about:blank first.
+    pub fn createViewUrl(self: *Host, req: proto.ViewCreateUrl) !void {
+        return self.createViewAt(.{
+            .view = req.view,
+            .w = req.w,
+            .h = req.h,
+            .scale_x1000 = req.scale_x1000,
+            .context = req.context,
+        }, req.url);
+    }
+
+    /// Create a windowless browser for `id`. A duplicate id is ignored
+    /// (view ids are client-allocated and never reused). An empty
+    /// `initial_url` means a blank document.
+    fn createViewAt(self: *Host, req: proto.ViewCreate, initial_url: []const u8) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
         const v = try self.gpa.create(View);
         errdefer self.gpa.destroy(v);
@@ -567,9 +595,20 @@ pub const Host = struct {
         var bsettings = std.mem.zeroes(cef.cef_browser_settings_t);
         bsettings.size = @sizeOf(cef.cef_browser_settings_t);
         bsettings.windowless_frame_rate = effectiveWindowlessFps(v.max_fps);
+        // OPAQUE WHITE, PER BROWSER. A windowless browser defaults to
+        // TRANSPARENT, and a page that specifies no background of its
+        // own then paints (0,0,0,0) everywhere: a perfectly healthy
+        // page photographs as a uniformly black frame (measured — the
+        // centre pixel is exactly {0,0,0,0}, smoke-web stage 22c).
+        // `CefSettings.background_color` is documented as the fallback
+        // for a zero value here and is ALREADY opaque white in
+        // `initialize`, but measurably does not reach an alloy
+        // windowless browser: only this per-browser value does. Do not
+        // delete it in favour of the global one.
+        bsettings.background_color = 0xffffffff;
 
         var url = std.mem.zeroes(cef.cef_string_t);
-        setStr("about:blank", &url);
+        setStr(if (initial_url.len != 0) initial_url else "about:blank", &url);
         defer cef.cef_string_utf16_clear(&url);
 
         self.pending = v;
@@ -647,6 +686,7 @@ pub const Host = struct {
         const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
         v.map = bytes[0..size];
         @memset(v.map, 0);
+        v.buf_unpainted = true;
         v.buf_id +%= 1;
         if (v.buf_id == 0) v.buf_id = 1;
         try self.out.post(proto.FrameBuffer{
@@ -657,6 +697,18 @@ pub const Host = struct {
             .stride = v.stride(),
         }, fd);
         keep_fd = true;
+        // Ask for a repaint INTO the buffer just installed (the fields
+        // above already point at it, so this cannot land in the old
+        // one). A view whose very first paint raced the buffer into
+        // existence has no other way to get one: nothing else damages a
+        // static page. A hidden view is not painted at all — `showView`
+        // invalidates when it comes back, and `buf_unpainted` makes
+        // that first paint a whole-buffer copy.
+        if (!v.hidden) withHost(v, struct {
+            fn f(host: *cef.cef_browser_host_t) void {
+                if (host.invalidate) |inv| inv(host, cef.PET_VIEW);
+            }
+        }.f);
     }
 
     /// A resize OR a scale change (the window moved to a differently
@@ -1917,7 +1969,9 @@ fn onPaint(
 
     var list: [max_rects]proto.Rect = undefined;
     var n: usize = 0;
-    const collapse = count == 0 or count > max_rects;
+    // A buffer nobody has painted into yet is all zeroes: copy the
+    // whole frame regardless of what the engine says changed.
+    const collapse = v.buf_unpainted or count == 0 or count > max_rects;
     const src_rects = if (rects == null) &[_]cef.cef_rect_t{} else rects[0..count];
     if (collapse) {
         copyRect(v, src, stride, 0, 0, v.pw, v.ph);
@@ -1936,6 +1990,7 @@ fn onPaint(
         }
     }
     if (n == 0) return;
+    v.buf_unpainted = false;
     latStamp("paint");
     v.gen +%= 1;
     host.post(proto.FrameDamage{
