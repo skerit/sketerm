@@ -355,11 +355,7 @@ pub fn loadLayoutDefault(self: *Window) !bool {
     };
     defer parsed.deinit();
 
-    for (parsed.value.tabs) |tab| {
-        self.newTabFromSpec(tab, true) catch |err| {
-            std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
-        };
-    }
+    restoreTabsWithTree(self, parsed.value.tabs);
     return true;
 }
 
@@ -372,12 +368,42 @@ pub fn loadLayoutFromPath(self: *Window, path: []const u8) !bool {
         return false;
     };
     defer parsed.deinit();
-    for (parsed.value.tabs) |tab| {
+    restoreTabsWithTree(self, parsed.value.tabs);
+    return true;
+}
+
+/// Spawn every TabSpec, then re-apply the saved tab-tree nesting +
+/// collapse state (tree-style tabs). Nesting is applied AFTER all
+/// tabs exist so a parent index can point anywhere in the batch;
+/// indexes are batch-relative, which also keeps `--layout` appends
+/// (load into a window that already has tabs) correct.
+fn restoreTabsWithTree(self: *Window, specs: []const layout_mod.TabSpec) void {
+    var pages: std.ArrayList(?*c.AdwTabPage) = .empty;
+    defer pages.deinit(self.allocator);
+    for (specs) |tab| {
+        self.last_created_page = null;
         self.newTabFromSpec(tab, true) catch |err| {
             std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
         };
+        pages.append(self.allocator, self.last_created_page) catch return;
     }
-    return true;
+    var changed = false;
+    for (specs, 0..) |tab, i| {
+        const page = pages.items[i] orelse continue;
+        if (tab.tree_parent) |pi| {
+            if (pi < pages.items.len) {
+                if (pages.items[pi]) |parent| {
+                    self.tab_forest.reparent(page, parent, .last) catch {};
+                    changed = true;
+                }
+            }
+        }
+        if (tab.collapsed) {
+            self.tab_forest.setCollapsed(page, true);
+            changed = true;
+        }
+    }
+    if (changed) self.forestChanged();
 }
 
 pub fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
@@ -450,6 +476,13 @@ pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout
             .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
             .show_activity = tab_effects.tabSettings(page.?).show_activity,
             .warn_inactive = tab_effects.tabSettings(page.?).warn_inactive,
+            // Tree-style tabs: parent as a view-order index (the same
+            // order this loop serializes tabs in), collapse per tab.
+            .tree_parent = if (self.tab_forest.parentOf(page.?)) |parent| blk: {
+                const pos = c.adw_tab_view_get_page_position(self.tab_view, parent);
+                break :blk if (pos >= 0) @as(?u32, @intCast(pos)) else null;
+            } else null,
+            .collapsed = self.tab_forest.isCollapsed(page.?),
         });
     }
     return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
@@ -664,6 +697,36 @@ pub fn verifyAllTabs(self: *Window) void {
         const wrapper = c.adw_tab_page_get_child(page) orelse continue;
         const root = c.gtk_widget_get_first_child(@ptrCast(wrapper)) orelse continue;
         verifyTreeModel(self, page, root);
+    }
+    verifyTabForest(self);
+}
+
+/// SKETERM_VERIFY_TREE=1: cross-check the tab FOREST (tree-style
+/// tabs) against the AdwTabView page set — every live page has
+/// exactly one node, no orphan nodes, links consistent/acyclic.
+/// Aborts on divergence, like verifyTreeModel.
+pub fn verifyTabForest(self: *Window) void {
+    if (c.getenv("SKETERM_VERIFY_TREE") == null) return;
+    if (self.destroying) return;
+    const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    var fail: ?[]const u8 = null;
+    if (!self.tab_forest.validate()) {
+        fail = "forest links inconsistent";
+    } else if (self.tab_forest.count() != @as(usize, @intCast(n))) {
+        fail = "forest node count != page count";
+    } else {
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+            if (self.tab_forest.find(page) == null) {
+                fail = "page missing from forest";
+                break;
+            }
+        }
+    }
+    if (fail) |msg| {
+        std.debug.print("sketerm: VERIFY FAILED: tab forest diverges: {s}\n", .{msg});
+        c.abort();
     }
 }
 

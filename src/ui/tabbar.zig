@@ -315,6 +315,12 @@ pub const TabBar = struct {
     /// is the clicked tab widget and `x`/`y` are click coords within it.
     context_ctx: ?*anyopaque = null,
     on_context: ?*const fn (ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWidget, x: f64, y: f64) void = null,
+    /// Tree-style tabs: pages inside a collapsed subtree are hidden
+    /// from the strip. The owning Window supplies the predicate; the
+    /// strip stays tree-agnostic. Applied in `rebuild` and on demand
+    /// via `refreshHidden`.
+    hidden_ctx: ?*anyopaque = null,
+    is_hidden: ?*const fn (ctx: ?*anyopaque, page: *c.AdwTabPage) bool = null,
 
     pub const Tab = struct {
         bar: *TabBar,
@@ -524,7 +530,20 @@ pub const TabBar = struct {
                 continue;
             };
         }
+        self.refreshHidden();
         self.refresh();
+    }
+
+    /// Apply the tree-collapse hidden state to the strip: a hidden
+    /// tab's widget (and its leading separator) goes invisible. Cheap
+    /// enough to run after any collapse/expand without a rebuild.
+    pub fn refreshHidden(self: *TabBar) void {
+        const f = self.is_hidden orelse return;
+        for (self.tabs.items) |t| {
+            const hid = f(self.hidden_ctx, t.page);
+            c.gtk_widget_set_visible(t.child, @intFromBool(!hid));
+            if (t.sep_before) |s| c.gtk_widget_set_visible(s, @intFromBool(!hid));
+        }
     }
 
     fn buildTab(self: *TabBar, t: *Tab, page: *c.AdwTabPage) void {

@@ -38,6 +38,15 @@ const crashlog = @import("../util/crashlog.zig");
 /// below also updates the model. See src/ui/tree.zig.
 pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
+const tabforest_mod = @import("tabforest.zig");
+const tabsidebar_mod = @import("tabsidebar.zig");
+
+/// Toolkit-free tab-forest model — window-level tree-style-tabs
+/// nesting (parent/child + collapse per AdwTabPage), one per Window.
+/// The strip (hidden tabs) and the vertical sidebar are VIEWS of it;
+/// every mutation goes through Window methods that call
+/// `forestChanged`. See src/ui/tabforest.zig.
+pub const TabForest = tabforest_mod.Forest(*c.AdwTabPage);
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const picker = @import("picker.zig");
@@ -223,6 +232,19 @@ pub const Window = struct {
     toolbar_view: *c.GtkWidget,
     /// Floats transient notices (upload finished/failed) over the grid.
     toast_overlay: *c.AdwToastOverlay,
+    /// Tree-style tabs model: parent/child + collapse per page.
+    tab_forest: TabForest,
+    /// Vertical tree sidebar (view of tab_forest). Null only when its
+    /// creation failed; visibility follows Config.show_tab_sidebar +
+    /// the toggle_tab_sidebar action.
+    tab_sidebar: ?*tabsidebar_mod.Sidebar = null,
+    /// HBox holding [sidebar | toast_overlay] as the toolbar content.
+    content_box: *c.GtkWidget,
+    /// Opener page consumed by the NEXT page-attached, so a web popup /
+    /// open-link-in-new-tab nests as a CHILD of the tab that opened it.
+    forest_pending_parent: ?*c.AdwTabPage = null,
+    /// Reentrancy guard for the close-subtree policy sweep.
+    closing_subtree: bool = false,
     title_buf: [256]u8 = undefined,
     panes: std.ArrayList(*Pane) = .empty,
     terminals: std.ArrayList(*Terminal) = .empty,
@@ -490,8 +512,13 @@ pub const Window = struct {
         // upload finished / failed) float over the terminal grid.
         const toast_overlay = c.adw_toast_overlay_new();
         c.gtk_widget_set_vexpand(toast_overlay, 1);
+        c.gtk_widget_set_hexpand(toast_overlay, 1);
         c.adw_toast_overlay_set_child(@ptrCast(@alignCast(toast_overlay)), @ptrCast(@alignCast(tab_view_w)));
-        c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), toast_overlay);
+        // Content hbox: the (initially absent/hidden) tree-style tab
+        // sidebar is prepended here after `self` is initialized.
+        const content_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_box_append(@ptrCast(content_box), toast_overlay);
+        c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), content_box);
 
         // Scrollback search bar — bottom of the window. Hidden by
         // default; revealed by Ctrl+F (search_open shortcut).
@@ -584,6 +611,8 @@ pub const Window = struct {
             .tabbar = tabbar,
             .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
             .toast_overlay = @ptrCast(@alignCast(toast_overlay)),
+            .tab_forest = TabForest.init(allocator),
+            .content_box = @ptrCast(@alignCast(content_box)),
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
             .is_primary = is_primary,
@@ -656,6 +685,18 @@ pub const Window = struct {
         // the GTK widget default; users can hide via config or the
         // toggle_tab_bar action at runtime.
         if (!self.config.show_tab_bar) c.gtk_widget_set_visible(self.tab_bar, 0);
+
+        // Tree-style tabs: the strip hides pages inside a collapsed
+        // subtree; the vertical sidebar renders the tree itself.
+        self.tabbar.hidden_ctx = @ptrCast(self);
+        self.tabbar.is_hidden = tabForestHiddenHook;
+        if (tabsidebar_mod.Sidebar.create(allocator, self)) |sb| {
+            self.tab_sidebar = sb;
+            c.gtk_box_prepend(@ptrCast(content_box), sb.root);
+            c.gtk_widget_set_visible(sb.root, @intFromBool(self.config.show_tab_sidebar));
+        } else |err| {
+            std.debug.print("sketerm: tab sidebar init failed: {s}\n", .{@errorName(err)});
+        }
 
         // Search wiring.
         _ = c.g_signal_connect_data(search_entry, "search-changed", @ptrCast(&modes_mod.onSearchChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -987,6 +1028,9 @@ pub const Window = struct {
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
         if (self.si_bash_shim) |s| self.allocator.free(s);
+        if (self.tab_sidebar) |sb| sb.deinit();
+        self.tab_sidebar = null;
+        self.tab_forest.deinit();
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1124,6 +1168,7 @@ pub const Window = struct {
     const modelTreeToLayout = winlayout.modelTreeToLayout;
     const verifyTreeModel = winlayout.verifyTreeModel;
     const verifyAllTabs = winlayout.verifyAllTabs;
+    const verifyTabForest = winlayout.verifyTabForest;
     const widgetMatchesNode = winlayout.widgetMatchesNode;
     const saveLayoutToDefault = winlayout.saveLayoutToDefault;
 
@@ -3520,6 +3565,116 @@ pub const Window = struct {
         const is_pinned = c.adw_tab_page_get_pinned(page) != 0;
         c.adw_tab_view_set_page_pinned(self.tab_view, page, if (is_pinned) 0 else 1);
     }
+
+    // ── Tree-style tabs (model: src/ui/tabforest.zig, sidebar:
+    //    src/ui/tabsidebar.zig) ──────────────────────────────────────
+
+    fn childInsertPos(self: *const Window) tabforest_mod.InsertPos {
+        return switch (self.config.tab_child_insert) {
+            .last => .last,
+            .first => .first,
+        };
+    }
+
+    /// Refresh every view of the tab forest after a mutation: the
+    /// strip's hidden state, the sidebar rows, and (under
+    /// SKETERM_VERIFY_TREE) the model/view cross-check.
+    pub fn forestChanged(self: *Window) void {
+        if (self.destroying) return;
+        self.tabbar.refreshHidden();
+        if (self.tab_sidebar) |sb| {
+            if (c.gtk_widget_get_visible(sb.root) != 0) sb.rebuild();
+        }
+        // Forest-only verify: forestChanged fires from page-attached,
+        // BEFORE appendOrInsertTab has attached the new page's
+        // PaneTree — the pane-tree check would warn spuriously there.
+        self.verifyTabForest();
+    }
+
+    /// Collapse / expand a tab's subtree. Collapsing pulls the
+    /// selection up to the collapsed tab if it sat inside the hidden
+    /// subtree (TST behaviour), and offers the newly hidden WEB panes
+    /// to the discard path — a collapsed subtree is the natural
+    /// unload candidate.
+    pub fn setTabCollapsed(self: *Window, page: *c.AdwTabPage, collapsed: bool) void {
+        self.tab_forest.setCollapsed(page, collapsed);
+        if (collapsed) {
+            if (c.adw_tab_view_get_selected_page(self.tab_view)) |sel| {
+                if (self.tab_forest.isHidden(sel))
+                    c.adw_tab_view_set_selected_page(self.tab_view, page);
+            }
+            self.discardCollapsedWebPanes(page);
+        }
+        self.forestChanged();
+    }
+
+    /// Discard the web pages of every pane hidden by collapsing
+    /// `page`'s subtree (the descendants, not the collapsed tab
+    /// itself). Panes without a web face are untouched; discard keeps
+    /// the last frame and revives on next look, so this is free.
+    fn discardCollapsedWebPanes(self: *Window, page: *c.AdwTabPage) void {
+        const webface = @import("webface.zig");
+        if (!webface.discardSupported()) return;
+        var subtree: std.ArrayList(*c.AdwTabPage) = .empty;
+        defer subtree.deinit(self.allocator);
+        self.tab_forest.appendSubtree(self.allocator, page, &subtree) catch return;
+        if (subtree.items.len <= 1) return;
+        for (subtree.items[1..]) |desc| {
+            const t = tabTreeOf(desc) orelse continue;
+            var leaves: std.ArrayList(*Pane) = .empty;
+            defer leaves.deinit(self.allocator);
+            t.appendLeaves(self.allocator, &leaves) catch continue;
+            for (leaves.items) |pane| {
+                if (webface.WebFace.fromPane(pane)) |face| _ = face.discardNow();
+            }
+        }
+    }
+
+    /// Reparent `page` (subtree and all) under `new_parent`, or to
+    /// the root level when null — the sidebar drag-drop entry point.
+    pub fn tabForestReparent(self: *Window, page: *c.AdwTabPage, new_parent: ?*c.AdwTabPage) void {
+        self.tab_forest.reparent(page, new_parent, self.childInsertPos()) catch |err| {
+            if (err == error.WouldCycle)
+                showToast(self, "Cannot drop a tab into its own subtree.");
+            return;
+        };
+        self.forestChanged();
+    }
+
+    /// Show / hide the vertical tree-style tab sidebar
+    /// (toggle_tab_sidebar action; startup state = show_tab_sidebar).
+    pub fn toggleTabSidebarVisibility(self: *Window) void {
+        const sb = self.tab_sidebar orelse return;
+        const visible = c.gtk_widget_get_visible(sb.root) != 0;
+        c.gtk_widget_set_visible(sb.root, @intFromBool(!visible));
+        // Rows are not rebuilt while hidden; catch up on reveal.
+        if (!visible) sb.rebuild();
+    }
+
+    /// tab_collapse / tab_expand on the selected tab. Collapsing a
+    /// tab without children is a no-op rather than a surprise.
+    pub fn collapseCurrentTab(self: *Window, collapse: bool) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        if (collapse and !self.tab_forest.hasChildren(page)) return;
+        self.setTabCollapsed(page, collapse);
+    }
+
+    /// tab_tree_next / tab_tree_prev: walk the VISIBLE tree order
+    /// (collapsed subtrees skipped), wrapping at the ends.
+    pub fn tabTreeStep(self: *Window, forward: bool) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        const next = (self.tab_forest.stepVisible(self.allocator, page, forward) catch return) orelse return;
+        c.adw_tab_view_set_selected_page(self.tab_view, next);
+    }
+
+    /// Web tab nested under `opener` in the tab tree (a page popup or
+    /// an open-link-in-new-tab from that tab). The pending parent is
+    /// consumed by the page-attached handler minting the forest node.
+    pub fn newWebTabFrom(self: *Window, url: ?[]const u8, opener: ?*c.AdwTabPage) !void {
+        self.forest_pending_parent = opener;
+        defer self.forest_pending_parent = null;
+        try self.newWebTabAt(url);
+    }
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
@@ -3564,6 +3719,11 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .restore_closed_tab => self.restoreLastClosed(),
         .toggle_pin_tab => self.togglePinCurrentTab(),
         .toggle_tab_bar => self.toggleTabBarVisibility(),
+        .toggle_tab_sidebar => self.toggleTabSidebarVisibility(),
+        .tab_collapse => self.collapseCurrentTab(true),
+        .tab_expand => self.collapseCurrentTab(false),
+        .tab_tree_next => self.tabTreeStep(true),
+        .tab_tree_prev => self.tabTreeStep(false),
         .reload_config => self.reloadConfigFromDisk(),
         .launch_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .app_windows => @import("app_switcher.zig").open(self),
@@ -4039,6 +4199,26 @@ const PendingCloseTab = struct {
 /// Pending window close-request. Same idea.
 const PendingCloseWin = struct { win: *Window };
 
+/// Accept a pending tab close. Single funnel for every accept branch
+/// of the close-page gate, so the tree-style `tab_close_parent =
+/// close-subtree` policy applies uniformly: the tab's descendants
+/// (captured BEFORE finish detaches the page and the forest promotes
+/// them) are closed along with it. Each descendant close re-enters
+/// onClosePage with `closing_subtree` set, so it neither re-collects
+/// nor recurses; its own dirty-editor veto still applies.
+fn acceptTabClose(self: *Window, view: *c.AdwTabView, page: *c.AdwTabPage) void {
+    var subtree: std.ArrayList(*c.AdwTabPage) = .empty;
+    defer subtree.deinit(self.allocator);
+    const close_kids = self.config.tab_close_parent == .close_subtree and !self.closing_subtree;
+    if (close_kids) self.tab_forest.appendSubtree(self.allocator, page, &subtree) catch {};
+    c.adw_tab_view_close_page_finish(view, page, 1);
+    if (close_kids and subtree.items.len > 1) {
+        self.closing_subtree = true;
+        defer self.closing_subtree = false;
+        for (subtree.items[1..]) |desc| _ = c.adw_tab_view_close_page(self.tab_view, desc);
+    }
+}
+
 /// AdwTabView "close-page" gate. Always returns GDK_EVENT_STOP (TRUE)
 /// so we own the close lifecycle; subsequent
 /// adw_tab_view_close_page_finish(view, page, accept) actually
@@ -4060,7 +4240,7 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
         }
         if (dirty > 0) {
             const pending = self.allocator.create(PendingCloseTab) catch {
-                c.adw_tab_view_close_page_finish(view, page, 1);
+                acceptTabClose(self, view, page);
                 return 1;
             };
             pending.* = .{ .win = self, .page = page };
@@ -4074,14 +4254,14 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
                 .kick_root = self.app_window,
             }, .{ .allocator = self.allocator, .cb = &onCloseTabResponse, .ctx = @ptrCast(pending) }) == null) {
                 self.allocator.destroy(pending);
-                c.adw_tab_view_close_page_finish(view, page, 1);
+                acceptTabClose(self, view, page);
             }
             return 1;
         }
     }
 
     if (self.config.confirm_close == .never) {
-        c.adw_tab_view_close_page_finish(view, page, 1);
+        acceptTabClose(self, view, page);
         return 1;
     }
 
@@ -4094,14 +4274,14 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
         else
             0;
         if (npanes <= 1) {
-            c.adw_tab_view_close_page_finish(view, page, 1);
+            acceptTabClose(self, view, page);
             return 1;
         }
     }
 
     const pending = self.allocator.create(PendingCloseTab) catch {
         // OOM — bail safely by accepting the close.
-        c.adw_tab_view_close_page_finish(view, page, 1);
+        acceptTabClose(self, view, page);
         return 1;
     };
     pending.* = .{ .win = self, .page = page };
@@ -4116,7 +4296,7 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
         .kick_root = self.app_window,
     }, .{ .allocator = self.allocator, .cb = &onCloseTabResponse, .ctx = @ptrCast(pending) }) == null) {
         self.allocator.destroy(pending);
-        c.adw_tab_view_close_page_finish(view, page, 1);
+        acceptTabClose(self, view, page);
     }
     return 1;
 }
@@ -4124,8 +4304,11 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
 fn onCloseTabResponse(user: ?*anyopaque, resp: []const u8) void {
     const pending = cast.userData(PendingCloseTab, user);
     defer pending.win.allocator.destroy(pending);
-    const accept = std.mem.eql(u8, resp, "close");
-    c.adw_tab_view_close_page_finish(pending.win.tab_view, pending.page, if (accept) 1 else 0);
+    if (std.mem.eql(u8, resp, "close")) {
+        acceptTabClose(pending.win, pending.win.tab_view, pending.page);
+    } else {
+        c.adw_tab_view_close_page_finish(pending.win.tab_view, pending.page, 0);
+    }
 }
 
 /// Window-level close-request gate. Returning TRUE blocks the close
@@ -4243,6 +4426,13 @@ fn onPageOrderChanged(_: *c.AdwTabView, _: *c.AdwTabPage, _: c_int, user: ?*anyo
 
 fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    // Tree-style tabs: drop the page's forest node, PROMOTING its
+    // children (they stay in this window whether the page was closed
+    // or dragged to another window — a transfer moves one page).
+    if (self.tab_forest.find(page) != null) {
+        self.tab_forest.remove(page) catch {};
+        self.forestChanged();
+    }
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
 
@@ -4345,9 +4535,33 @@ fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 /// already ours — adoptPane no-ops on them.
 fn onPageAttached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    // Tree-style tabs: every page entering this view gets a forest
+    // node — a child of its opener when one is pending (the popup /
+    // open-in-new-tab path), a root otherwise (plain new tab, tab
+    // transferred in from another window).
+    if (self.tab_forest.find(page) == null) {
+        const opener = self.forest_pending_parent;
+        self.forest_pending_parent = null;
+        var nested = false;
+        if (opener) |parent| {
+            if (self.tab_forest.find(parent) != null) {
+                _ = self.tab_forest.addChild(page, parent, self.childInsertPos()) catch null;
+                nested = self.tab_forest.find(page) != null;
+            }
+        }
+        if (!nested) _ = self.tab_forest.add(page) catch null;
+        self.forestChanged();
+    }
     const child = c.adw_tab_page_get_child(page) orelse return;
     self.adoptPanesInTree(@ptrCast(child));
     self.updateTaskbarProgress();
+}
+
+/// TabBar hidden-page predicate (tree-style tabs): a page inside a
+/// collapsed subtree is hidden from the strip.
+fn tabForestHiddenHook(ctx: ?*anyopaque, page: *c.AdwTabPage) bool {
+    const self = cast.userData(Window, ctx);
+    return self.tab_forest.isHidden(page);
 }
 
 /// Custom-strip drag-out: a tab was dropped outside any strip. Spawn a

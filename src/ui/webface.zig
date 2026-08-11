@@ -2273,7 +2273,7 @@ pub const WebFace = struct {
         self.cancelHints();
         if (new_tab and url.len > 0) {
             if (self.ownerWindow()) |win| {
-                win.newWebTabAt(url) catch {};
+                win.newWebTabFrom(url, self.ownerPage()) catch {};
                 return;
             }
         }
@@ -2567,7 +2567,7 @@ pub const WebFace = struct {
     /// moment the user did not ask for anything. Only OUR reference to
     /// the shared mapping is dropped — the presented texture holds its
     /// own, so the pixels survive the memfd going away helper-side.
-    fn discardNow(self: *WebFace) bool {
+    pub fn discardNow(self: *WebFace) bool {
         if (self.discarded or !self.view_live) return false;
         const cl = client();
         if (!cl.cap_discard) return false;
@@ -3870,7 +3870,9 @@ pub const WebFace = struct {
         };
         if (open) {
             const win = self.ownerWindow() orelse return;
-            win.newWebTabAt(url) catch {};
+            // Tree-style tabs: the popup nests under the tab that
+            // opened it (opener -> child, the TST relationship).
+            win.newWebTabFrom(url, self.ownerPage()) catch {};
             return;
         }
         self.toastBlockedPopup(url);
@@ -3939,6 +3941,14 @@ pub const WebFace = struct {
         pane.setWebVisible(true);
         self.reviveNow();
         _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
+    /// Tab page hosting this face's pane — the OPENER page for tabs
+    /// this face spawns (tree-style tab nesting).
+    fn ownerPage(self: *WebFace) ?*c.AdwTabPage {
+        const pane = self.pane orelse return null;
+        const win = self.ownerWindow() orelse return null;
+        return @import("window.zig").tabPageForPane(win, pane);
     }
 
     // ---- commands ---------------------------------------------------
@@ -4358,7 +4368,7 @@ pub const WebFace = struct {
         const ctx = cast.userData(MenuCtx, user);
         const link = ctx.link orelse return;
         const win = ctx.face.ownerWindow() orelse return;
-        win.newWebTabAt(link) catch {};
+        win.newWebTabFrom(link, ctx.face.ownerPage()) catch {};
     }
 
     fn onMenuDevTools(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
