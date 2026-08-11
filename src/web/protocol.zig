@@ -144,8 +144,16 @@ pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 /// so the generic encoder can tell the two apart by field TYPE.
 pub const Text = struct { s: []const u8 };
 
-/// `sem_snapshot_req` mode byte.
-pub const SnapMode = enum(u8) { auto = 0, full = 1, _ };
+/// `sem_snapshot_req` mode byte (append-only values).
+///
+/// `auto` answers with ONE coalesced delta from the tree as the client
+/// last CONSUMED it straight to the current tree — spontaneous
+/// mutations are folded helper-side and never pushed, so intermediate
+/// churn cancels out. `full` restates the whole tree. `history` opts
+/// back into the per-revision replay of every fold since the last
+/// consume (bounded helper-side), for debugging pages whose changes
+/// appear and vanish between snapshots.
+pub const SnapMode = enum(u8) { auto = 0, full = 1, history = 2, _ };
 
 /// `sem_snapshot_req` detail byte.
 pub const SnapDetail = enum(u8) { minimal = 0, normal = 1, full_text = 2, _ };

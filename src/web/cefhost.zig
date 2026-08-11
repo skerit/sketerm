@@ -383,7 +383,9 @@ pub const View = struct {
     /// on a reply from the injected script.
     sem: semantic.View = undefined,
     /// Set once the client asked for a snapshot; from then on mutation
-    /// batches keep arriving and turn into unsolicited deltas.
+    /// batches keep arriving and fold into the live shadow tree
+    /// (nothing is pushed for them — the next snapshot request answers
+    /// with one coalesced delta).
     sem_observing: bool = false,
     /// Detail level of the last request, replayed after a navigation.
     sem_detail: u8 = 1,
@@ -1095,10 +1097,29 @@ pub const Host = struct {
 
     /// Re-arm a fresh document: a navigation builds a new V8 context,
     /// so the observer and the first walk have to be asked for again.
+    ///
+    /// A snapshot REQUEST sent into the dying context would never be
+    /// answered (its walk dies with the context), so pending snapshot
+    /// requests are re-issued here with their original ids — without
+    /// this, a client that snapshots right after navigating times out.
     fn semRearm(self: *Host, v: *View) void {
         if (!v.sem_observing) return;
         self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
         var buf: [96]u8 = undefined;
+        var resent = false;
+        for (v.pending.items) |p| {
+            if (p.kind != .snapshot) continue;
+            const cmd = std.fmt.bufPrint(
+                &buf,
+                "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
+                .{ p.req, p.detail },
+            ) catch continue;
+            self.sendScript(v, cmd);
+            resent = true;
+        }
+        if (resent) return;
+        // No request in flight: an unsolicited walk keeps the live tree
+        // (queries, action routing) following the navigation.
         const cmd = std.fmt.bufPrint(
             &buf,
             "{{\"op\":\"snapshot\",\"req\":0,\"detail\":{d}}}",
@@ -1186,9 +1207,11 @@ pub const Host = struct {
         }
     }
 
-    /// A full DOM walk: the shadow tree turns it into a snapshot or a
-    /// delta. An unsolicited batch (req 0, the MutationObserver) is
-    /// dropped when nothing actually changed.
+    /// A full DOM walk, folded into the LIVE shadow tree either way. An
+    /// unsolicited batch (req 0, the MutationObserver) posts NOTHING —
+    /// the client is answered with one coalesced delta when it next
+    /// asks (semantic.View.consume), so churn that appeared and
+    /// vanished in between is never replayed at it.
     fn onTree(self: *Host, v: *View, rid: u32, json: []const u8) void {
         const pend = self.takePending(v, rid);
         // A named request id that nothing is waiting on was either
@@ -1200,22 +1223,37 @@ pub const Host = struct {
         };
         const parsed = semantic.parseTree(self.gpa, json) catch return;
         defer parsed.deinit();
-        const force_full = if (pend) |p| p.mode == @intFromEnum(proto.SnapMode.full) else false;
-        const up = v.sem.apply(parsed.value, force_full) catch return;
-        defer self.gpa.free(up.text);
-        if (pend == null and up.changes == 0) return;
+        v.sem.apply(parsed.value) catch return;
+        const p = pend orelse return;
 
-        var scoped: ?[]u8 = null;
-        defer if (scoped) |s| self.gpa.free(s);
-        if (pend) |p| {
-            if (p.scope != 0) scoped = v.sem.renderScoped(p.scope) catch null;
+        if (p.scope != 0) {
+            // A scoped snapshot is a peek at one subtree: rendered in
+            // full, and deliberately NOT consuming the base (the caller
+            // did not see the rest of the page).
+            const scoped = v.sem.renderScoped(p.scope) catch return;
+            defer self.gpa.free(scoped);
+            self.post(proto.SemSnapshot{
+                .view = v.id,
+                .doc_gen = v.sem.doc_gen,
+                .rev = v.sem.rev,
+                .kind = @intFromEnum(proto.SnapKind.full),
+                .payload = .{ .s = scoped },
+            });
+            return;
         }
+        const mode: semantic.Mode = switch (p.mode) {
+            @intFromEnum(proto.SnapMode.full) => .full,
+            @intFromEnum(proto.SnapMode.history) => .history,
+            else => .auto,
+        };
+        const up = v.sem.consume(mode) catch return;
+        defer self.gpa.free(up.text);
         self.post(proto.SemSnapshot{
             .view = v.id,
             .doc_gen = up.doc_gen,
             .rev = up.rev,
-            .kind = if (scoped != null) @intFromEnum(proto.SnapKind.full) else @intFromEnum(up.kind),
-            .payload = .{ .s = scoped orelse up.text },
+            .kind = @intFromEnum(up.kind),
+            .payload = .{ .s = up.text },
         });
     }
 

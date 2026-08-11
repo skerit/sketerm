@@ -12,6 +12,21 @@
 //! script's WeakMap counter restarts whenever a fresh V8 context is
 //! created. Stable ids are allocated here, never reused within a view,
 //! and CARRIED across a navigation by bottom-up subtree fingerprinting.
+//! The same fingerprint match runs WITHIN a document, anchored to a
+//! matched parent, so a page that rebuilds identical rows under fresh
+//! DOM nodes keeps their ids instead of minting churn.
+//!
+//! ## Live tree vs consumed base
+//!
+//! `apply` folds EVERY walk (solicited or the MutationObserver's) into
+//! the LIVE tree, so ids, engine-id routing and queries stay fresh —
+//! but nothing is sent for a spontaneous walk. What the client has
+//! actually SEEN is the separate `base` copy, advanced only by
+//! `consume`: a snapshot request answers with ONE delta from the base
+//! straight to the live tree, so churn that appeared and vanished in
+//! between cancels out instead of being replayed revision by revision.
+//! The replay is still available on request (`Mode.history`) from the
+//! bounded per-revision `hist` buffer.
 
 const std = @import("std");
 
@@ -35,6 +50,11 @@ pub fn nameClamp(detail: u8) u32 {
 /// have little in common and a delta would be noise: send a full tree.
 const carry_full_num = 1;
 const carry_full_den = 4;
+
+/// Bound on the stored per-revision replay; past it the oldest content
+/// is already gone, so a marker says so instead of lying by omission.
+const MAX_HISTORY = 64 * 1024;
+pub const HISTORY_OVERFLOW = "... earlier changes dropped (history buffer full); ask for mode=full\n";
 
 /// One node exactly as the injected script reports it; field names are
 /// the JSON keys on the wire between helper and script.
@@ -63,8 +83,11 @@ pub const InTree = struct {
 
 pub const Kind = enum(u8) { full = 0, delta = 1 };
 
-/// The result of folding one walk into the shadow tree; `text` is owned
-/// by the caller and `changes` is zero when nothing is worth sending.
+/// What a `consume` answers with. Mirrors `proto.SnapMode` values.
+pub const Mode = enum(u8) { auto = 0, full = 1, history = 2 };
+
+/// The result of consuming the view state; `text` is owned by the
+/// caller.
 pub const Update = struct {
     kind: Kind,
     doc_gen: u32,
@@ -74,7 +97,7 @@ pub const Update = struct {
     carried: usize,
 };
 
-/// A node as last sent to the client.
+/// A node of the live tree.
 const Node = struct {
     sid: u32,
     eid: u32,
@@ -96,6 +119,16 @@ const Node = struct {
     nchildren: u32,
 };
 
+/// A node as the CLIENT last received it: just enough to diff against
+/// and to describe a removal.
+const BaseNode = struct {
+    sid: u32,
+    role: []u8,
+    name: []u8,
+    value: []u8,
+    states: []u8,
+};
+
 /// Parse a walk emitted by the injected script.
 pub fn parseTree(gpa: std.mem.Allocator, json: []const u8) !std.json.Parsed(InTree) {
     return std.json.parseFromSlice(InTree, gpa, json, .{ .ignore_unknown_fields = true });
@@ -113,6 +146,15 @@ pub const View = struct {
     url: []u8 = &.{},
     has_tree: bool = false,
 
+    /// The tree as last CONSUMED (sent to the client); the diff base.
+    base: std.ArrayList(BaseNode) = .empty,
+    base_rev: u32 = 0,
+    base_doc_gen: u32 = 0,
+    base_ok: bool = false,
+    /// Rendered per-revision deltas since the last consume, oldest
+    /// first — today's replay, kept for `Mode.history`.
+    hist: std.ArrayList(u8) = .empty,
+
     pub fn init(gpa: std.mem.Allocator) View {
         return .{ .gpa = gpa };
     }
@@ -120,6 +162,9 @@ pub const View = struct {
     pub fn deinit(self: *View) void {
         for (self.nodes.items) |*n| self.freeNode(n);
         self.nodes.deinit(self.gpa);
+        for (self.base.items) |*b| self.freeBase(b);
+        self.base.deinit(self.gpa);
+        self.hist.deinit(self.gpa);
         if (self.url.len != 0) self.gpa.free(self.url);
         self.url = &.{};
     }
@@ -131,8 +176,15 @@ pub const View = struct {
         self.gpa.free(n.states);
     }
 
+    fn freeBase(self: *View, b: *BaseNode) void {
+        self.gpa.free(b.role);
+        self.gpa.free(b.name);
+        self.gpa.free(b.value);
+        self.gpa.free(b.states);
+    }
+
     /// Engine-local id backing `sid`, for routing an action to the
-    /// script; 0 when the id is not in the tree as last sent.
+    /// script; 0 when the id is not in the live tree.
     pub fn eidFor(self: *const View, sid: u32) u32 {
         for (self.nodes.items) |n| {
             if (n.sid == sid) return n.eid;
@@ -152,12 +204,15 @@ pub const View = struct {
         return self.nodes.items.len;
     }
 
-    /// Fold one walk into the shadow tree and render what to send.
+    /// Fold one walk into the LIVE tree. Nothing is rendered for the
+    /// wire here: `consume` does that against the base on request. The
+    /// per-revision delta is appended to the bounded `hist` buffer so
+    /// `Mode.history` can still replay it.
     ///
-    /// `force_full` is the client's mode=1; a full tree is also sent
-    /// when nothing was sent yet, when a navigation carried too little,
-    /// or when the delta would have as many lines as the tree itself.
-    pub fn apply(self: *View, in: InTree, force_full: bool) !Update {
+    /// `rev` advances only when the walk actually changed something (or
+    /// switched documents) — a re-walk of an unchanged page is free,
+    /// which is also what lets a rev-polling idle wait settle.
+    pub fn apply(self: *View, in: InTree) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -195,6 +250,10 @@ pub const View = struct {
         var carried: usize = 0;
         if (!new_doc) {
             for (in.nodes, 0..) |nd, i| sids[i] = self.sidFor(nd.id);
+            // Fresh DOM nodes with old content: a re-render of the same
+            // rows must keep their ids (anchored, so it cannot pair a
+            // node into a different part of the page).
+            if (self.has_tree) _ = try self.carryIntraDoc(arena, in.nodes, parents, fps, sids);
         } else if (self.has_tree) {
             carried = try self.carrySubtrees(arena, in.nodes, parents, fps, sids);
         }
@@ -204,7 +263,8 @@ pub const View = struct {
             self.next_sid += 1;
         }
 
-        // Delta records, captured against the OLD shadow before it goes.
+        // Delta records, captured against the OLD live tree before it
+        // goes.
         var added: std.ArrayList(usize) = .empty; // index into in.nodes
         var changed: std.ArrayList(Change) = .empty;
         var removed: std.ArrayList(Gone) = .empty;
@@ -246,17 +306,8 @@ pub const View = struct {
         }
 
         const changes = added.items.len + changed.items.len + removed.items.len;
-        var kind: Kind = .delta;
-        if (force_full or !self.has_tree) {
-            kind = .full;
-        } else if (new_doc and carried * carry_full_den < n * carry_full_num) {
-            kind = .full;
-        } else if (n != 0 and changes >= n) {
-            kind = .full;
-        }
-
         const from_rev = self.rev;
-        self.rev += 1;
+        if (changes != 0 or new_doc) self.rev += 1;
         if (new_doc) {
             self.doc_gen += 1;
             self.doc_token = in.doc;
@@ -265,26 +316,207 @@ pub const View = struct {
         if (self.url.len != 0) self.gpa.free(self.url);
         self.url = new_url;
 
-        // Swap the shadow in; the render below reads the NEW tree for a
-        // full snapshot and the arena-captured records for a delta.
+        // Swap the live tree in even when nothing changed: the walk may
+        // carry fresh engine ids for identical content, and actions
+        // route through them.
         const fresh = try self.buildNodes(in, sids, parents, depths, nkids, fps, n);
         for (self.nodes.items) |*old| self.freeNode(old);
         self.nodes.deinit(self.gpa);
         self.nodes = fresh;
         self.has_tree = true;
 
-        const text = if (kind == .full)
+        if (changes == 0 and !new_doc) return;
+
+        // Append this revision to the replay buffer. A navigation that
+        // carried too little (or a delta as large as the tree) restates
+        // the world, exactly as the old per-walk push did.
+        var fold_full = false;
+        if (new_doc and carried * carry_full_den < n * carry_full_num) {
+            fold_full = true;
+        } else if (n != 0 and changes >= n) {
+            fold_full = true;
+        }
+        const text = if (fold_full)
             try self.renderFull()
         else
             try self.renderDelta(from_rev, in.nodes, sids, added.items, changed.items, removed.items, if (new_doc) carried else 0, carry_lo, carry_hi);
+        defer self.gpa.free(text);
+        if (fold_full) self.hist.clearRetainingCapacity();
+        if (self.hist.items.len + text.len <= MAX_HISTORY) {
+            try self.hist.appendSlice(self.gpa, text);
+        } else if (!std.mem.endsWith(u8, self.hist.items, HISTORY_OVERFLOW)) {
+            try self.hist.appendSlice(self.gpa, HISTORY_OVERFLOW);
+        }
+    }
 
+    /// Render what the client is owed and advance the base to the live
+    /// tree. `auto` is ONE coalesced delta base->live (never a replay of
+    /// intermediate revisions); `history` is the stored replay;
+    /// `full` — and any state where the client has never consumed this
+    /// view — restates the whole tree.
+    pub fn consume(self: *View, mode: Mode) !Update {
+        var kind: Kind = .full;
+        var text: ?[]u8 = null;
+        errdefer if (text) |t| self.gpa.free(t);
+        var changes: usize = self.nodes.items.len;
+        var carried: usize = 0;
+
+        if (mode != .full and self.base_ok) {
+            switch (mode) {
+                .history => {
+                    kind = .delta;
+                    text = if (self.hist.items.len != 0)
+                        try self.gpa.dupe(u8, self.hist.items)
+                    else
+                        try std.fmt.allocPrint(self.gpa, "delta rev {d}->{d}\n", .{ self.base_rev, self.rev });
+                    changes = 0;
+                },
+                else => {
+                    const co = try self.renderCoalesced();
+                    changes = co.changes;
+                    carried = co.carried;
+                    if (!co.full) {
+                        kind = .delta;
+                        text = co.text;
+                    } else {
+                        self.gpa.free(co.text);
+                    }
+                },
+            }
+        }
+        const out = text orelse try self.renderFull();
+        try self.commitBase();
         return .{
             .kind = kind,
             .doc_gen = self.doc_gen,
             .rev = self.rev,
-            .text = text,
+            .text = out,
             .changes = changes,
             .carried = carried,
+        };
+    }
+
+    /// Deep-copy the live tree into the base and drop the replay: the
+    /// client is now up to date with everything before this point.
+    fn commitBase(self: *View) !void {
+        for (self.base.items) |*b| self.freeBase(b);
+        self.base.clearRetainingCapacity();
+        try self.base.ensureTotalCapacity(self.gpa, self.nodes.items.len);
+        for (self.nodes.items) |nd| {
+            const role = try self.gpa.dupe(u8, nd.role);
+            errdefer self.gpa.free(role);
+            const name = try self.gpa.dupe(u8, nd.name);
+            errdefer self.gpa.free(name);
+            const value = try self.gpa.dupe(u8, nd.value);
+            errdefer self.gpa.free(value);
+            const states = try self.gpa.dupe(u8, nd.states);
+            self.base.appendAssumeCapacity(.{
+                .sid = nd.sid,
+                .role = role,
+                .name = name,
+                .value = value,
+                .states = states,
+            });
+        }
+        self.base_rev = self.rev;
+        self.base_doc_gen = self.doc_gen;
+        self.base_ok = true;
+        self.hist.clearRetainingCapacity();
+    }
+
+    const Coalesced = struct { text: []u8, changes: usize, carried: usize, full: bool };
+
+    /// One delta from the base straight to the live tree. Falls back to
+    /// a full restatement (`full = true`, text still owned) when a
+    /// document change carried too little or the delta would rival the
+    /// tree itself.
+    fn renderCoalesced(self: *View) !Coalesced {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var base_by_sid = std.AutoHashMap(u32, usize).init(arena);
+        for (self.base.items, 0..) |b, i| try base_by_sid.put(b.sid, i);
+        var live_sids = std.AutoHashMap(u32, void).init(arena);
+        for (self.nodes.items) |nd| try live_sids.put(nd.sid, {});
+
+        var adds: usize = 0;
+        var mods: usize = 0;
+        var gone: usize = 0;
+        var shared: usize = 0;
+        var carry_lo: u32 = 0;
+        var carry_hi: u32 = 0;
+        for (self.nodes.items) |nd| {
+            const bi = base_by_sid.get(nd.sid) orelse {
+                adds += 1;
+                continue;
+            };
+            shared += 1;
+            if (carry_lo == 0 or nd.sid < carry_lo) carry_lo = nd.sid;
+            if (nd.sid > carry_hi) carry_hi = nd.sid;
+            const b = self.base.items[bi];
+            if (!std.mem.eql(u8, b.role, nd.role) or !std.mem.eql(u8, b.name, nd.name) or
+                !std.mem.eql(u8, b.value, nd.value) or !std.mem.eql(u8, b.states, nd.states))
+            {
+                mods += 1;
+            }
+        }
+        for (self.base.items) |b| {
+            if (!live_sids.contains(b.sid)) gone += 1;
+        }
+
+        const n = self.nodes.items.len;
+        const changes = adds + mods + gone;
+        const doc_moved = self.doc_gen != self.base_doc_gen;
+        if (doc_moved and shared * carry_full_den < n * carry_full_num)
+            return .{ .text = try self.renderFull(), .changes = changes, .carried = shared, .full = true };
+        if (n != 0 and changes >= n)
+            return .{ .text = try self.renderFull(), .changes = changes, .carried = shared, .full = true };
+
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.print("delta rev {d}->{d}\n", .{ self.base_rev, self.rev });
+        if (doc_moved and shared != 0) {
+            try w.print("carried [{d}..{d}] {d} nodes\n", .{ carry_lo, carry_hi, shared });
+        }
+        var last_parent: u32 = 0;
+        for (self.nodes.items) |nd| {
+            if (base_by_sid.contains(nd.sid)) continue;
+            if (nd.parent_sid != 0 and nd.parent_sid != last_parent) {
+                if (self.findSid(nd.parent_sid)) |p| {
+                    try w.print("under [{d}] {s} \"{s}\"\n", .{ p.sid, p.role, p.name });
+                }
+                last_parent = nd.parent_sid;
+            }
+            try w.writeAll("+ ");
+            try writeNodeLine(w, nd);
+            try w.writeByte('\n');
+        }
+        for (self.base.items) |b| {
+            if (live_sids.contains(b.sid)) continue;
+            try w.print("- [{d}] {s} \"{s}\"\n", .{ b.sid, b.role, b.name });
+        }
+        for (self.nodes.items) |nd| {
+            const bi = base_by_sid.get(nd.sid) orelse continue;
+            const b = self.base.items[bi];
+            const d_role = !std.mem.eql(u8, b.role, nd.role);
+            const d_name = !std.mem.eql(u8, b.name, nd.name);
+            const d_value = !std.mem.eql(u8, b.value, nd.value);
+            const d_states = !std.mem.eql(u8, b.states, nd.states);
+            if (!d_role and !d_name and !d_value and !d_states) continue;
+            try w.print("~ [{d}] {s} \"{s}\"", .{ nd.sid, nd.role, nd.name });
+            if (d_role) try w.print(" role={s}", .{nd.role});
+            if (d_name) try w.print(" name=\"{s}\"", .{nd.name});
+            if (d_value) try w.print(" value=\"{s}\"", .{nd.value});
+            if (d_states) try w.print(" states=({s})", .{nd.states});
+            try w.writeByte('\n');
+        }
+        return .{
+            .text = try self.gpa.dupe(u8, out.written()),
+            .changes = changes,
+            .carried = shared,
+            .full = false,
         };
     }
 
@@ -336,6 +568,32 @@ pub const View = struct {
         return out;
     }
 
+    /// Index of the old (live) node carrying `sid`, or null.
+    fn oldIndexOfSid(self: *const View, sid: u32) ?usize {
+        for (self.nodes.items, 0..) |o, j| {
+            if (o.sid == sid) return j;
+        }
+        return null;
+    }
+
+    /// Parent indices and child lists of the OLD live tree, in document
+    /// order; shared by both carry passes.
+    fn oldChildLists(self: *const View, arena: std.mem.Allocator) ![][]const usize {
+        const m = self.nodes.items.len;
+        const old_parents = try arena.alloc(usize, m);
+        for (self.nodes.items, 0..) |o, i| {
+            old_parents[i] = m;
+            if (o.parent_sid == 0) continue;
+            for (self.nodes.items, 0..) |p, j| {
+                if (p.sid == o.parent_sid) {
+                    old_parents[i] = j;
+                    break;
+                }
+            }
+        }
+        return childLists(arena, m, old_parents, m);
+    }
+
     /// Carry stable ids onto identical subtrees of a NEW document.
     ///
     /// Matching is by fingerprint and top-down: the first (outermost)
@@ -355,20 +613,8 @@ pub const View = struct {
         const used = try arena.alloc(bool, m);
         @memset(used, false);
 
-        // Children lists on both sides, in document order.
         const new_kids = try childLists(arena, n, parents, n);
-        const old_parents = try arena.alloc(usize, m);
-        for (self.nodes.items, 0..) |o, i| {
-            old_parents[i] = m;
-            if (o.parent_sid == 0) continue;
-            for (self.nodes.items, 0..) |p, j| {
-                if (p.sid == o.parent_sid) {
-                    old_parents[i] = j;
-                    break;
-                }
-            }
-        }
-        const old_kids = try childLists(arena, m, old_parents, m);
+        const old_kids = try self.oldChildLists(arena);
 
         var carried: usize = 0;
         for (0..n) |i| {
@@ -381,6 +627,58 @@ pub const View = struct {
             }
             const j = match orelse continue;
             carried += self.pair(i, j, sids, used, new_kids, old_kids);
+        }
+        return carried;
+    }
+
+    /// Carry stable ids onto re-rendered subtrees WITHIN a document: a
+    /// walk node with a fresh engine id keeps its predecessor's id when
+    /// an identical (same fingerprint) old subtree sat under the SAME
+    /// matched parent and is not claimed by a surviving engine id.
+    ///
+    /// The parent anchor is the safety property: two look-alike nodes
+    /// in different parts of the page can never swap ids, so an action
+    /// routed through a carried id cannot land elsewhere. Look-alikes
+    /// under one parent pair in document order, and equal fingerprints
+    /// mean equal subtrees, so whichever pairing is chosen names the
+    /// same content.
+    fn carryIntraDoc(
+        self: *View,
+        arena: std.mem.Allocator,
+        nodes: []const InNode,
+        parents: []const usize,
+        fps: []const u64,
+        sids: []u32,
+    ) !usize {
+        const n = nodes.len;
+        const m = self.nodes.items.len;
+        if (m == 0) return 0;
+        const used = try arena.alloc(bool, m);
+        @memset(used, false);
+        // An old node whose engine id survived is spoken for.
+        for (self.nodes.items, 0..) |o, j| {
+            for (sids) |s| {
+                if (s != 0 and s == o.sid) {
+                    used[j] = true;
+                    break;
+                }
+            }
+        }
+
+        const new_kids = try childLists(arena, n, parents, n);
+        const old_kids = try self.oldChildLists(arena);
+
+        var carried: usize = 0;
+        for (0..n) |i| {
+            if (sids[i] != 0) continue;
+            const pi = parents[i];
+            if (pi >= n or sids[pi] == 0) continue; // anchor required
+            const oj = self.oldIndexOfSid(sids[pi]) orelse continue;
+            for (old_kids[oj]) |cand| {
+                if (used[cand] or self.nodes.items[cand].fp != fps[i]) continue;
+                carried += self.pair(i, cand, sids, used, new_kids, old_kids);
+                break;
+            }
         }
         return carried;
     }
@@ -425,8 +723,9 @@ pub const View = struct {
     /// A full snapshot restricted to one subtree.
     ///
     /// The shadow tree stays WHOLE either way — a scoped request only
-    /// narrows what is rendered, so ids and later deltas keep meaning
-    /// the same thing.
+    /// narrows what is rendered and deliberately does NOT advance the
+    /// consumed base (the caller saw one subtree, not the page), so ids
+    /// and later deltas keep meaning the same thing.
     pub fn renderScoped(self: *const View, root_sid: u32) ![]u8 {
         const root = self.findSid(root_sid) orelse return self.renderFull();
         var out: std.Io.Writer.Allocating = .init(self.gpa);
@@ -489,9 +788,10 @@ pub const View = struct {
         return self.gpa.dupe(u8, out.written());
     }
 
-    /// Answer a `sem_query` from the tree AS LAST SENT — deliberately
-    /// not a fresh walk, so a query never costs a DOM traversal and
-    /// never invents ids the client has not seen.
+    /// Answer a `sem_query` from the LIVE tree — deliberately not a
+    /// fresh DOM walk, so a query never costs a traversal. The live
+    /// tree may be ahead of what the client has consumed; ids it names
+    /// are stable and actionable either way.
     pub fn query(self: *const View, kind: u8, arg: []const u8) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
@@ -659,6 +959,13 @@ fn tree(doc: u32, url: []const u8, nodes: []const InNode) InTree {
     return .{ .doc = doc, .url = url, .nodes = nodes };
 }
 
+/// Fold a walk and consume in one step, the way a solicited snapshot
+/// request behaves end to end.
+fn applyConsume(v: *View, in: InTree, mode: Mode) !Update {
+    try v.apply(in);
+    return v.consume(mode);
+}
+
 test "full snapshot renders the documented text format" {
     const gpa = std.testing.allocator;
     var v = View.init(gpa);
@@ -670,7 +977,7 @@ test "full snapshot renders the documented text format" {
         .{ .id = 3, .parent = 1, .role = "button", .name = "Go", .states = "focused" },
         .{ .id = 4, .parent = 1, .role = "textbox", .name = "Name", .value = "abc" },
     };
-    const up = try v.apply(tree(7, "http://x/", &nodes), false);
+    const up = try applyConsume(&v, tree(7, "http://x/", &nodes), .auto);
     defer gpa.free(up.text);
     try std.testing.expectEqual(Kind.full, up.kind);
     try std.testing.expectEqualStrings(
@@ -693,7 +1000,7 @@ test "ids are stable across a delta and a removal never reuses one" {
         .{ .id = 2, .parent = 1, .role = "heading", .name = "Hello" },
         .{ .id = 3, .parent = 1, .role = "paragraph", .name = "before" },
     };
-    var up = try v.apply(tree(7, "http://x/", &first), false);
+    var up = try applyConsume(&v, tree(7, "http://x/", &first), .auto);
     gpa.free(up.text);
     const heading = v.sidFor(2);
     const para = v.sidFor(3);
@@ -706,7 +1013,7 @@ test "ids are stable across a delta and a removal never reuses one" {
         .{ .id = 2, .parent = 1, .role = "heading", .name = "Hello" },
         .{ .id = 3, .parent = 1, .role = "paragraph", .name = "after" },
     };
-    up = try v.apply(tree(7, "http://x/", &second), false);
+    up = try applyConsume(&v, tree(7, "http://x/", &second), .auto);
     defer gpa.free(up.text);
     try std.testing.expectEqual(Kind.delta, up.kind);
     try std.testing.expectEqual(heading, v.sidFor(2));
@@ -715,19 +1022,20 @@ test "ids are stable across a delta and a removal never reuses one" {
     try std.testing.expect(std.mem.indexOf(u8, up.text, "after") != null);
     try std.testing.expect(std.mem.indexOf(u8, up.text, "Hello") == null);
 
-    // Dropping the paragraph and adding one back must mint a new id.
+    // Dropping the paragraph and adding an UNRELATED one back must mint
+    // a new id (different content, so no intra-document carry either).
     const third = [_]InNode{
         .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
         .{ .id = 2, .parent = 1, .role = "heading", .name = "Hello" },
     };
-    const up3 = try v.apply(tree(7, "http://x/", &third), false);
+    const up3 = try applyConsume(&v, tree(7, "http://x/", &third), .auto);
     gpa.free(up3.text);
     const fourth = [_]InNode{
         .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
         .{ .id = 2, .parent = 1, .role = "heading", .name = "Hello" },
-        .{ .id = 9, .parent = 1, .role = "paragraph", .name = "after" },
+        .{ .id = 9, .parent = 1, .role = "paragraph", .name = "fresh words" },
     };
-    const up4 = try v.apply(tree(7, "http://x/", &fourth), false);
+    const up4 = try applyConsume(&v, tree(7, "http://x/", &fourth), .auto);
     gpa.free(up4.text);
     try std.testing.expect(v.sidFor(9) != para);
     try std.testing.expectEqual(@as(u32, 0), v.eidFor(para));
@@ -748,7 +1056,7 @@ test "a navigation carries ids for an identical subtree" {
         .{ .id = 5, .parent = 2, .role = "link", .name = "About" },
         .{ .id = 6, .parent = 1, .role = "paragraph", .name = "page one" },
     };
-    var up = try v.apply(tree(11, "http://x/1", &page1), false);
+    var up = try applyConsume(&v, tree(11, "http://x/1", &page1), .auto);
     gpa.free(up.text);
     const nav = v.sidFor(2);
     const home = v.sidFor(3);
@@ -762,7 +1070,7 @@ test "a navigation carries ids for an identical subtree" {
         .{ .id = 5, .parent = 2, .role = "link", .name = "About" },
         .{ .id = 6, .parent = 1, .role = "paragraph", .name = "page two" },
     };
-    up = try v.apply(tree(12, "http://x/2", &page2), false);
+    up = try applyConsume(&v, tree(12, "http://x/2", &page2), .auto);
     defer gpa.free(up.text);
     try std.testing.expectEqual(Kind.delta, up.kind);
     try std.testing.expectEqual(nav, v.sidFor(2));
@@ -783,7 +1091,7 @@ test "a navigation with no overlap falls back to a full snapshot" {
         .{ .id = 3, .parent = 1, .role = "paragraph", .name = "beta" },
         .{ .id = 4, .parent = 1, .role = "paragraph", .name = "gamma" },
     };
-    var up = try v.apply(tree(11, "http://x/1", &page1), false);
+    var up = try applyConsume(&v, tree(11, "http://x/1", &page1), .auto);
     gpa.free(up.text);
 
     const page2 = [_]InNode{
@@ -792,7 +1100,7 @@ test "a navigation with no overlap falls back to a full snapshot" {
         .{ .id = 3, .parent = 1, .role = "link", .name = "epsilon" },
         .{ .id = 4, .parent = 1, .role = "button", .name = "zeta" },
     };
-    up = try v.apply(tree(12, "http://x/2", &page2), false);
+    up = try applyConsume(&v, tree(12, "http://x/2", &page2), .auto);
     defer gpa.free(up.text);
     try std.testing.expectEqual(Kind.full, up.kind);
     try std.testing.expect(std.mem.startsWith(u8, up.text, "doc 2 rev 2 url http://x/2"));
@@ -807,7 +1115,7 @@ test "truncation bookkeeping survives a detail-level change" {
         .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
         .{ .id = 2, .parent = 1, .role = "paragraph", .name = "the beginning", .full = 513 },
     };
-    const up = try v.apply(tree(7, "http://x/", &clamped), false);
+    const up = try applyConsume(&v, tree(7, "http://x/", &clamped), .auto);
     defer gpa.free(up.text);
     const sid = v.sidFor(2);
     var marker: [64]u8 = undefined;
@@ -820,14 +1128,14 @@ test "truncation bookkeeping survives a detail-level change" {
         .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
         .{ .id = 2, .parent = 1, .role = "paragraph", .name = "the beginning and the rest" },
     };
-    const up2 = try v.apply(tree(7, "http://x/", &whole), false);
+    const up2 = try applyConsume(&v, tree(7, "http://x/", &whole), .auto);
     defer gpa.free(up2.text);
     try std.testing.expectEqual(Kind.delta, up2.kind);
     try std.testing.expect(std.mem.indexOf(u8, up2.text, "chars, expand") == null);
     try std.testing.expect(std.mem.indexOf(u8, up2.text, "name=\"the beginning and the rest\"") != null);
 }
 
-test "queries read the tree as last sent" {
+test "queries read the live tree" {
     const gpa = std.testing.allocator;
     var v = View.init(gpa);
     defer v.deinit();
@@ -838,8 +1146,7 @@ test "queries read the tree as last sent" {
         .{ .id = 3, .parent = 2, .role = "link", .name = "Documentation" },
         .{ .id = 4, .parent = 1, .role = "textbox", .name = "Name", .states = "focused" },
     };
-    const up = try v.apply(tree(7, "http://x/", &nodes), false);
-    gpa.free(up.text);
+    try v.apply(tree(7, "http://x/", &nodes));
 
     const find = try v.query(0, "docum");
     defer gpa.free(find);
@@ -870,4 +1177,202 @@ test "a walk parses from the injected script's JSON" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.nodes.len);
     try std.testing.expectEqualStrings("disabled", parsed.value.nodes[1].states);
     try std.testing.expectEqual(@as(i32, 40), parsed.value.nodes[1].w);
+}
+
+test "spontaneous churn coalesces to one empty delta; history keeps the replay" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const quiet = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "row one" },
+        .{ .id = 4, .parent = 2, .role = "listitem", .name = "row two" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &quiet), .auto);
+    gpa.free(up.text);
+    const rev0 = v.rev;
+
+    // A popup appears (spontaneous fold, nothing consumed)...
+    const with_popup = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "row one" },
+        .{ .id = 4, .parent = 2, .role = "listitem", .name = "row two" },
+        .{ .id = 5, .parent = 1, .role = "alert", .name = "Popup flash" },
+    };
+    try v.apply(tree(7, "http://x/", &with_popup));
+    // ...and vanishes again.
+    try v.apply(tree(7, "http://x/", &quiet));
+    try std.testing.expect(v.rev > rev0);
+
+    // The replay knows about the popup; the coalesced answer does not.
+    const hist = try v.consume(.history);
+    defer gpa.free(hist.text);
+    try std.testing.expectEqual(Kind.delta, hist.kind);
+    try std.testing.expect(std.mem.indexOf(u8, hist.text, "Popup flash") != null);
+    try std.testing.expect(std.mem.count(u8, hist.text, "delta rev") >= 2);
+
+    // Same churn again, consumed with the default mode: one delta,
+    // nothing in it.
+    try v.apply(tree(7, "http://x/", &with_popup));
+    try v.apply(tree(7, "http://x/", &quiet));
+    up = try v.consume(.auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Popup") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "+ [") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "- [") == null);
+    try std.testing.expectEqual(@as(usize, 0), up.changes);
+}
+
+test "an intra-document re-render keeps ids and refreshes engine routing" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const before = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "row one" },
+        .{ .id = 4, .parent = 2, .role = "listitem", .name = "row two" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &before), .auto);
+    gpa.free(up.text);
+    const row1 = v.sidFor(3);
+    const row2 = v.sidFor(4);
+
+    // The page rebuilt the same rows: identical content, fresh engine
+    // ids. The stable ids must survive and route to the NEW nodes.
+    const rebuilt = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 30, .parent = 2, .role = "listitem", .name = "row one" },
+        .{ .id = 40, .parent = 2, .role = "listitem", .name = "row two" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &rebuilt), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expectEqual(@as(usize, 0), up.changes);
+    try std.testing.expectEqual(row1, v.sidFor(30));
+    try std.testing.expectEqual(row2, v.sidFor(40));
+    try std.testing.expectEqual(@as(u32, 30), v.eidFor(row1));
+    try std.testing.expectEqual(@as(u32, 40), v.eidFor(row2));
+}
+
+test "intra-document carry cannot pair across different parents" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    // Two identical "Delete" buttons under two DIFFERENT rows.
+    const before = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "listitem", .name = "invoice A" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "Delete" },
+        .{ .id = 4, .parent = 1, .role = "listitem", .name = "invoice B" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "Delete" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &before), .auto);
+    gpa.free(up.text);
+    const del_a = v.sidFor(3);
+    const del_b = v.sidFor(5);
+
+    // Row A is re-rendered (fresh engine ids); row B keeps its nodes.
+    // A's Delete must keep A's id, never steal B's.
+    const rebuilt = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 20, .parent = 1, .role = "listitem", .name = "invoice A" },
+        .{ .id = 30, .parent = 20, .role = "button", .name = "Delete" },
+        .{ .id = 4, .parent = 1, .role = "listitem", .name = "invoice B" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "Delete" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &rebuilt), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(@as(usize, 0), up.changes);
+    try std.testing.expectEqual(del_a, v.sidFor(30));
+    try std.testing.expectEqual(del_b, v.sidFor(5));
+    try std.testing.expectEqual(@as(u32, 30), v.eidFor(del_a));
+    try std.testing.expectEqual(@as(u32, 5), v.eidFor(del_b));
+}
+
+test "a document the client never consumed answers full, not a delta" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    // The web_open field case: an about:blank tree is consumed, then
+    // the real page arrives via spontaneous folds only.
+    const blank = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "" },
+    };
+    var up = try applyConsume(&v, tree(1, "about:blank", &blank), .auto);
+    gpa.free(up.text);
+
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Real" },
+        .{ .id = 2, .parent = 1, .role = "heading", .name = "Welcome" },
+        .{ .id = 3, .parent = 1, .role = "paragraph", .name = "body text" },
+        .{ .id = 4, .parent = 1, .role = "button", .name = "Go" },
+    };
+    try v.apply(tree(2, "http://x/", &page));
+
+    up = try v.consume(.auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.full, up.kind);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Welcome") != null);
+}
+
+test "a coalesced delta rivaling the tree restates it in full" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const before = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "paragraph", .name = "one" },
+        .{ .id = 3, .parent = 1, .role = "paragraph", .name = "two" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &before), .auto);
+    gpa.free(up.text);
+
+    // Everything changed: a delta would repeat the whole tree.
+    const after = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Other" },
+        .{ .id = 2, .parent = 1, .role = "paragraph", .name = "three" },
+        .{ .id = 3, .parent = 1, .role = "paragraph", .name = "four" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &after), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.full, up.kind);
+}
+
+test "the history buffer bounds itself with an overflow marker" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    var name_buf: [600]u8 = undefined;
+    @memset(&name_buf, 'x');
+    const first = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "paragraph", .name = "seed" },
+    };
+    const up = try applyConsume(&v, tree(7, "http://x/", &first), .auto);
+    gpa.free(up.text);
+
+    // Each fold changes one long name; enough of them overflow 64KB.
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        const nodes = [_]InNode{
+            .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+            .{ .id = 2, .parent = 1, .role = "paragraph", .name = name_buf[0 .. 590 - (i % 2)] },
+        };
+        try v.apply(tree(7, "http://x/", &nodes));
+    }
+    const hist = try v.consume(.history);
+    defer gpa.free(hist.text);
+    try std.testing.expect(std.mem.endsWith(u8, hist.text, HISTORY_OVERFLOW));
+    try std.testing.expect(hist.text.len <= MAX_HISTORY + HISTORY_OVERFLOW.len);
 }
