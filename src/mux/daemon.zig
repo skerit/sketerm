@@ -1919,20 +1919,34 @@ test "daemon listener paths are canonicalized before bind and export" {
 
 test "equivalent dot and symlinked socket spellings share one physical identity" {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    const real_rel = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/real", .{&tmp.sub_path});
+    // Rooted in /tmp, NOT in the repo's .zig-cache: the last assertion
+    // is a sockaddr_un length check, and a checkout under a long path
+    // (a git worktree, a CI workspace) pushes the canonical path past
+    // the ~108-byte cap and fails the test for the wrong reason.
+    var root_buf: [64:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-sockid-{d}", .{c.getpid()});
+    _ = c.mkdir(root.ptr, 0o700);
+    const real_rel = try std.fmt.allocPrint(t.allocator, "{s}/real", .{root});
     defer t.allocator.free(real_rel);
-    const alias_rel = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/alias", .{&tmp.sub_path});
+    const alias_rel = try std.fmt.allocPrint(t.allocator, "{s}/alias", .{root});
     defer t.allocator.free(alias_rel);
-    var real_z_buf: [4096]u8 = undefined;
-    var alias_z_buf: [4096]u8 = undefined;
-    try t.expect(c.mkdir(try pathZ(&real_z_buf, real_rel), 0o700) == 0);
     const child_rel = try std.fmt.allocPrint(t.allocator, "{s}/child", .{real_rel});
     defer t.allocator.free(child_rel);
+    var real_z_buf: [4096]u8 = undefined;
+    var alias_z_buf: [4096]u8 = undefined;
     var child_z_buf: [4096]u8 = undefined;
-    try t.expect(c.mkdir(try pathZ(&child_z_buf, child_rel), 0o700) == 0);
-    try t.expect(c.symlink("real/child", try pathZ(&alias_z_buf, alias_rel)) == 0);
+    const real_z = try pathZ(&real_z_buf, real_rel);
+    const alias_z = try pathZ(&alias_z_buf, alias_rel);
+    const child_z = try pathZ(&child_z_buf, child_rel);
+    try t.expect(c.mkdir(real_z, 0o700) == 0);
+    try t.expect(c.mkdir(child_z, 0o700) == 0);
+    try t.expect(c.symlink("real/child", alias_z) == 0);
+    defer {
+        _ = c.unlink(alias_z);
+        _ = c.rmdir(child_z);
+        _ = c.rmdir(real_z);
+        _ = c.rmdir(root.ptr);
+    }
 
     const through_real = try std.fmt.allocPrint(t.allocator, "{s}/mux.sock", .{real_rel});
     defer t.allocator.free(through_real);
