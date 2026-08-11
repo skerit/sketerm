@@ -182,6 +182,9 @@ pub const BrowserView = struct {
     history_busy: bool = false,
     search_bar: *c.GtkWidget = undefined,
     search_entry: *c.GtkEntry = undefined,
+    /// The toolbar's Search toggle: Ctrl+F flips it so the chord and
+    /// the button share one code path (and one visible state).
+    search_toggle: *c.GtkToggleButton = undefined,
     search_content: *c.GtkWidget = undefined,
     hidden_toggle: *c.GtkToggleButton = undefined,
     /// Information side panel (toggleable), Dolphin-style: preview
@@ -1597,7 +1600,8 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(right), cluster);
 
         const keep = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
-        _ = self.barToggle(keep, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
+        const search_btn = self.barToggle(keep, "system-search-symbolic", "Search", "Search this directory (Ctrl+F; daemon-side, recursive)", &onSearchToggled);
+        self.search_toggle = @ptrCast(@alignCast(search_btn));
         // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
         // only under symbolic/legacy/, so on a Breeze theme chain this
         // button -- the one that leaves the browser -- rendered blank.

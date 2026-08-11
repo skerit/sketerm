@@ -680,6 +680,7 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK, .what = "cut selection", .run = &chordCut },
     .{ .keyval = c.GDK_KEY_c, .mods = c.GDK_CONTROL_MASK, .what = "copy selection", .run = &chordCopy },
     .{ .keyval = c.GDK_KEY_v, .mods = c.GDK_CONTROL_MASK, .what = "paste", .run = &chordPaste },
+    .{ .keyval = c.GDK_KEY_f, .mods = c.GDK_CONTROL_MASK, .what = "search this directory", .run = &chordSearch },
     .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK, .what = "filter listing", .run = &chordFilter },
     .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK, .what = "flat view", .run = &chordFlat },
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK, .what = "mark selection in a register", .run = &selection.chordMark },
@@ -822,6 +823,20 @@ fn chordSelectAll(self: *BrowserView) bool {
 
 fn chordInvertSelection(self: *BrowserView) bool {
     self.selectPattern("*", true);
+    return true;
+}
+
+/// Ctrl+F opens the search row by flipping the toolbar's Search
+/// toggle (one code path, one visible state). Already open, it only
+/// refocuses the entry -- same reasoning as Ctrl+L: a toggle-close
+/// here would shut a row the user was trying to reach. Escape and
+/// the toolbar button are the way back.
+fn chordSearch(self: *BrowserView) bool {
+    if (c.gtk_toggle_button_get_active(self.search_toggle) == 0) {
+        c.gtk_toggle_button_set_active(self.search_toggle, 1);
+    } else {
+        _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.search_entry)));
+    }
     return true;
 }
 
