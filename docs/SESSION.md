@@ -15927,3 +15927,39 @@ mux-portable green. Forward-compat kept for a future "view along":
 discoverable socket + presence file, no new single-client assumptions,
 frame delivery isolated behind one seam (inline-frames family would be
 a new arm, not a rewrite).
+
+## 2026-08-11: coalesced semantic deltas — churn cancels instead of replaying
+
+Field waste bug: on a self-mutating page, one `web_snapshot` answered
+with a base tree plus a replay of every intermediate revision (~19k
+chars where ~10k carried the information; two 56-node blocks were the
+page re-rendering the SAME rows under fresh ids). Root cause was
+structural: the helper rendered a delta per MutationObserver walk and
+pushed it, both clients (webface.zig, webdrive.zig) buffered the pushes
+as OPAQUE TEXT (`pending_delta`), and text cannot cancel.
+
+Fix, helper-side in `semantic.zig`: the LIVE shadow tree still folds
+every walk (ids, engine-id routing and queries stay fresh), but the
+tree as last CONSUMED by the client is now a separate base copy. A
+snapshot request answers with ONE delta base→live (`View.consume`);
+spontaneous walks post nothing. `SnapMode.history` (append-only value
+2; `web_snapshot history:true`) opts back into the per-revision replay
+from a bounded helper-side buffer — for debugging things that appear
+and vanish between snapshots. Intra-document id carry (subtree
+fingerprint, anchored to a matched parent so look-alikes in different
+places can never swap) keeps a re-rendered identical row's id, so it
+vanishes from deltas entirely. `rev` now only advances on actual
+change, which also makes `web_wait for:"idle"`'s rev polling settle.
+A snapshot request in flight across a navigation is re-issued into the
+fresh V8 context (`semRearm`) instead of silently dying with the old
+one. Client-side `pending_delta` buffering is deleted in both clients.
+
+Measured (56-row list re-rendering + popup blinking, 6 unattended
+cycles, then one snapshot): OLD buffered replay 63,888 bytes — just
+under the old 64KB cap — vs NEW coalesced delta 124 bytes; history
+opt-in 492 bytes. First-full snapshot unchanged (8,938 bytes).
+smoke-web gained stage 13b (churn page, exactly one delta section, no
+cancelled churn, ids stable, history still replays; measured there:
+replay 708 B vs coalesced 66 B). smoke-web 26/26, smoke-mcp, test-core
+1808 pass, mux-portable all green (pinned CEF; distro CEF still blocked
+by the pre-existing glibc 2.44 skew).

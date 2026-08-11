@@ -129,6 +129,17 @@ H.264/AAC) while the distro build enables them.
 - CEF types stay inside this directory — that seam is what keeps a
   future engine swap to a new helper binary rather than a rewrite.
   `semantic.zig` and `semantic.js` in particular must stay engine-free.
+- The semantic layer COALESCES: spontaneous MutationObserver walks fold
+  into the live shadow tree and post nothing; a snapshot request answers
+  with ONE delta from the client's consumed base to the current tree
+  (`semantic.View.consume`), and `SnapMode.history` opts back into the
+  bounded per-revision replay. Never reintroduce unsolicited
+  `sem_snapshot` pushes or client-side delta-text concatenation — text
+  deltas cannot cancel, and the buffered replay measured 64KB where the
+  coalesced answer was ~100 bytes (smoke-web stage 13b guards this).
+  Intra-document id carry (fingerprint match anchored to a matched
+  parent) is what keeps a re-rendered identical row's id stable; the
+  parent anchor is the safety property, do not loosen it.
 - The injected bridge script is published at context-creation time,
   before any page script runs, then unpublished, with a per-request
   nonce authenticating replies. Page scripts otherwise win the race and
