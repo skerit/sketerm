@@ -467,3 +467,20 @@ taskbar application and can be set as the system default browser.
   degraded-load behavior
 - `docs/lifecycle.md` — PTY spawn, session lifetime, signal
   handling, teardown
+- `docs/REMOTE.md` — durable and remote sessions from the user's side
+- `docs/config.md` — every config key, with the profile rules
+- `docs/mcp.md` — the MCP server and its tool families
+- `docs/lsp.md` — the editor's LSP client
+- `docs/display.md` — external display sessions (the headless test rig)
+- `docs/macos.md` — the macOS port's state and its platform seams
+- `docs/testing.md` — test roots, smoke rigs, what may not be Xvfb'd
+- `docs/protocols.md` — the escape sequences and protocols supported
+
+Nested `CLAUDE.md` files carry the invariants for the subsystems that
+have earned them: `src/mux/`, `src/ipc/`, `src/web/`, `src/lsp/` and
+`src/ui/browser/`. Read the one for the subsystem before changing it.
+
+Planning documents (`plan*.md`, `milestones.md`, `risks.md`,
+`references.md`, `mux-design.md`, `render-thread-analysis.md`) are
+HISTORICAL. They record what was intended and why, not what exists;
+where they disagree with the code, the code wins.

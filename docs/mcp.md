@@ -121,6 +121,40 @@ new commands while a tracked command is pending.
 The default `wait_for: "idle"` remains appropriate for interactive
 programs that do not return to a shell prompt.
 
+## Browser (`web_*`)
+
+These drive sketerm's OWN browser views (`src/ipc/mcp_web.zig`), not an
+external Chromium over a debug port. There is no automation flag and no
+CDP: input is delivered as real engine events, so a page sees
+`isTrusted` clicks and keystrokes.
+
+`web_open`, `web_navigate`, `web_tabs`, `web_wait`, `web_scroll`,
+`web_screenshot` do the obvious things. The rest are the semantic layer:
+
+- `web_snapshot` returns the page as roles, names and stable ids. The
+  FIRST snapshot of a document is complete; every later one is a
+  **delta** against what was already sent, so an unchanged page answers
+  `unchanged: true` with an empty body and a click answers with the two
+  or three nodes that changed. Ask for a full snapshot explicitly when
+  the client's own memory has been compacted away.
+- Ids survive navigation where the content did: the server fingerprints
+  subtrees and carries matching ones across a load, so moving between
+  two pages of one site reports the shared chrome as carried rather
+  than re-sending it.
+- `web_act` acts on an id rather than a selector, and echoes what it
+  actually hit.
+- `web_expand` fetches text that a snapshot truncated; `web_read`
+  returns the main content as prose; `web_query` spot-checks a subtree
+  without paying for a snapshot; `web_eval` runs script, with DOM
+  results returned as `{semantic_id, role, name}` so they feed straight
+  back into `web_act`.
+
+**Page content is untrusted input.** The reply channel is
+authenticated, so a page cannot forge a snapshot or intercept a reply,
+but a page owns its own DOM and can label a "Confirm payment" button
+"Cancel". No server can adjudicate that, which is why `web_act` reports
+what it clicked instead of refusing on content grounds.
+
 ## Panels (`ui_*`)
 
 `ui_show` renders a declarative document as native GTK widgets inside

@@ -1,6 +1,13 @@
 # sketerm-mux — durable panes & remote domains (design)
 
-Status: **draft for discussion** — nothing here is implemented yet.
+Status: **historical design draft — SHIPPED and since evolved.** This is
+the document that argued for the mux, kept for its rationale. It is not
+a description of the current system, and where the two disagree the code
+wins. For what actually exists, read `docs/architecture.md`, `REMOTE.md`
+and `src/mux/CLAUDE.md`. The largest divergence: the design speaks of an
+optional daemon alongside an in-process terminal path, and the shipped
+architecture has no in-process path at all — the GUI is ALWAYS a mux
+client, and the per-pane worker thread and its event ring are gone.
 
 ## Why
 
