@@ -2852,8 +2852,11 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
             fail("stage 33 webext: manifest name not reported");
         }
 
-        // Give the background page a moment to come up (its listener must
-        // exist before the content script's message arrives).
+        // A head start for the background page, NOT the guarantee: the
+        // fixture's content script retries its sendMessage until the
+        // background answers, because "the listener exists by now" is a
+        // wall-clock bet that loses on a loaded machine (observed as
+        // `reply:null:hello` — i18n and storage fine, reply missing).
         {
             const d = nowMs() + 1500;
             while (nowMs() < d) cl.pump(50);
