@@ -16999,3 +16999,33 @@ limitations: remote downloads/print-pdf (seam above), one bridge
 reconnect requires the pane's Reload (no auto-retry), and a remote
 helper's stderr goes to /dev/null on the daemon host (CEF refusal
 detail is only visible as the described channel failure).
+## Hamburger menus harmonized across the suite
+
+Five surfaces had a primary menu and three different families behind
+them; they are one family now (`classicmenu`), all ending in the same
+Help tail:
+
+- **Terminal window** (`src/ui/winmenu.zig`, new): a hamburger END-MOST
+  on the headerbar, carrying the 6px flush-right margin the overview
+  button used to have. Its rows are `menu.zig`'s spec rows, taken
+  through the new `menu.labelFor`/`menu.iconFor` and dispatched through
+  `Pane.runMenuAction` — the same `Sink` a right-click row uses, so no
+  verb is wired twice.
+- **Web face**: a toolbar hamburger sharing the page context menu's
+  handlers and `MenuCtx`; only the row list differs (no link rows, plus
+  find, zoom and the downloads strip toggle).
+- **Standalone editor and viewer**: their private popover-of-buttons
+  menus are gone. The viewer's four popover-only verbs became one
+  `VERB_ROWS` table that the canvas context menu expands too, and its
+  metadata block became owned TEXT rendered per popup (a widget cannot
+  outlive a menu that is rebuilt on every open). `src/ui/widgets.zig`
+  went with them.
+- **Shared** (`src/ui/appmenu.zig`, new): one `AdwAboutWindow` builder
+  per identity plus a Keyboard Shortcuts window generated from the
+  ACTIVE binding table (`input.rebuildBindings`), so the cheat sheet
+  cannot drift from what `input.zig` dispatches. `appendHelp` puts both
+  on any classicmenu in two lines. Files' menubar About is now this one.
+
+`smoke-atspi` gained a stage that activates the hamburger over the a11y
+bridge (every rect reports 0,0 on Wayland, so there is no honest pixel
+to click) and asserts its rows are real accessible objects.
