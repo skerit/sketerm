@@ -198,6 +198,7 @@ const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const webhistory = @import("webhistory.zig");
+const webuserscripts = @import("webuserscripts.zig");
 const socksbridge = @import("../ipc/socksbridge.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const clipboard = @import("clipboard.zig");
@@ -588,6 +589,11 @@ pub const Client = struct {
     /// identity contexts). An older helper ignores the frames and every
     /// view shares one cookie jar — silent, correct degradation.
     cap_contexts: bool = false,
+    /// The helper accepts the 0xC0 user-content sets (userscripts +
+    /// userstyles). On the ack the client fetches both sets from the
+    /// daemon web store and pushes them; an older helper skips the
+    /// frames and pages get no user content — silent degradation.
+    cap_userscripts: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -808,6 +814,54 @@ pub const Client = struct {
         return null;
     }
 
+    /// Fetch the stored userscript + userstyle sets from the daemon
+    /// web store and push them to the helper as replace-all frames.
+    /// Called on every hello_ack and after every management-UI edit
+    /// (src/ui/webuserscripts.zig); a helper without the capability,
+    /// or a store-less daemon, degrades to "no user content".
+    pub fn refreshUserContent(self: *Client) void {
+        if (self.state != .ready or !self.cap_userscripts) return;
+        _ = webstore.userscriptList(self.gpa, @ptrCast(self), &onUserscriptsReply);
+        _ = webstore.userstyleList(self.gpa, @ptrCast(self), &onUserstylesReply);
+    }
+
+    fn onUserscriptsReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
+        const self = cast.userData(Client, ctx);
+        if (!ok or self.state != .ready or !self.cap_userscripts) return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const list = webstore.parseUserscripts(arena.allocator(), payload);
+        var scripts: std.ArrayList(proto.UsScript) = .empty;
+        defer scripts.deinit(self.gpa);
+        for (list) |s| {
+            if (!s.enabled or s.source.len == 0) continue;
+            scripts.append(self.gpa, .{
+                .id = @truncate(s.id),
+                .source = .{ .s = s.source },
+            }) catch return;
+        }
+        self.post(proto.UsScriptSet{ .scripts = scripts.items });
+    }
+
+    fn onUserstylesReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
+        const self = cast.userData(Client, ctx);
+        if (!ok or self.state != .ready or !self.cap_userscripts) return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const list = webstore.parseUserstyles(arena.allocator(), payload);
+        var styles: std.ArrayList(proto.UsStyle) = .empty;
+        defer styles.deinit(self.gpa);
+        for (list, 0..) |s, i| {
+            if (!s.enabled or s.css.len == 0) continue;
+            styles.append(self.gpa, .{
+                .id = @intCast(i + 1),
+                .host = s.host,
+                .css = .{ .s = s.css },
+            }) catch return;
+        }
+        self.post(proto.UsStyleSet{ .styles = styles.items });
+    }
+
     /// Queue a frame and push what the socket takes now. A stalled
     /// helper must never block the GLib loop, so the remainder rides a
     /// writable-fd watch.
@@ -959,6 +1013,7 @@ pub const Client = struct {
                 self.cap_downloads = false;
                 self.cap_a11y = false;
                 self.cap_contexts = false;
+                self.cap_userscripts = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -968,7 +1023,11 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                 }
+                // Seed the helper with the stored user content before
+                // the faces' first navigations get far.
+                self.refreshUserContent();
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
@@ -4889,6 +4948,15 @@ pub const WebFace = struct {
         const store_section = m.section();
         store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
         store_section.itemIcon("Bookmarks", .{ .name = "starred-symbolic" }, &onMenuBookmarks, ctx);
+        store_section.itemIcon("Userscripts…", .{ .name = "application-x-addon-symbolic" }, &onMenuUserscripts, ctx);
+        // A style needs a site to be scoped to; about:blank has none.
+        store_section.itemIconEnabled(
+            "Edit Site Style…",
+            .{ .name = "applications-graphics-symbolic" },
+            self.nav_origin != null,
+            &onMenuSiteStyle,
+            ctx,
+        );
         // A helper too old for either verb greys the row out rather
         // than hiding it: what a browser pane CAN do stays visible.
         const cl = client();
@@ -5021,6 +5089,25 @@ pub const WebFace = struct {
         const face = cast.userData(MenuCtx, user).face;
         const win = face.ownerWindow() orelse return;
         webhistory.openBookmarks(win, face.pane);
+    }
+
+    fn onMenuUserscripts(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        webuserscripts.openManager(win);
+    }
+
+    fn onMenuSiteStyle(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        const origin = face.nav_origin orelse return;
+        // The style is keyed by HOST: strip the origin's scheme and
+        // any port, so http/https share one style per site.
+        var host = origin;
+        if (std.mem.indexOf(u8, host, "://")) |i| host = host[i + 3 ..];
+        if (std.mem.lastIndexOfScalar(u8, host, ':')) |ci| host = host[0..ci];
+        if (host.len == 0) return;
+        webuserscripts.openSiteStyle(win, host);
     }
 
     fn onMenuDevTools(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

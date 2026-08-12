@@ -322,6 +322,42 @@ pub fn siteSetPerm(gpa: std.mem.Allocator, origin: []const u8, perm: []const u8,
     });
 }
 
+// ── userscripts / userstyles ────────────────────────────────────
+
+/// Store a userscript (enabled); the reply carries its id. `name` is
+/// display-only — parse it out of the source's metadata block first.
+pub fn userscriptAdd(gpa: std.mem.Allocator, name: []const u8, source: []const u8, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userscript_add", .name = name, .source = source });
+}
+
+pub fn userscriptRemove(gpa: std.mem.Allocator, id: u64, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userscript_remove", .id = id });
+}
+
+pub fn userscriptEnable(gpa: std.mem.Allocator, id: u64, enabled: bool, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userscript_enable", .id = id, .enabled = enabled });
+}
+
+/// Reply via `cb`; parse with `parseUserscripts` (sources included).
+pub fn userscriptList(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userscript_list" });
+}
+
+/// Set/replace the one style stored for `host` (empty css deletes it).
+pub fn userstyleSet(gpa: std.mem.Allocator, host: []const u8, css: []const u8, enabled: bool, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userstyle_set", .host = host, .css = css, .enabled = enabled });
+}
+
+/// Reply via `cb`; parse with `parseUserstyle`.
+pub fn userstyleGet(gpa: std.mem.Allocator, host: []const u8, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userstyle_get", .host = host });
+}
+
+/// Reply via `cb`; parse with `parseUserstyles`.
+pub fn userstyleList(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userstyle_list" });
+}
+
 // ── permission bitmask <-> store key ────────────────────────────
 
 /// The store keys permissions by NAME, the engine by bitmask, and a
@@ -459,7 +495,89 @@ pub fn parseBookmarks(arena: std.mem.Allocator, payload: []const u8) []const Boo
     return parsed.bookmarks;
 }
 
+pub const UserscriptEntry = struct {
+    id: u64 = 0,
+    enabled: bool = true,
+    name: []const u8 = "",
+    source: []const u8 = "",
+};
+
+const UserscriptsReply = struct {
+    ok: bool = false,
+    scripts: []const UserscriptEntry = &.{},
+};
+
+/// Parse a userscript_list web_reply. Slices borrow `arena` memory.
+pub fn parseUserscripts(arena: std.mem.Allocator, payload: []const u8) []const UserscriptEntry {
+    const parsed = std.json.parseFromSliceLeaky(UserscriptsReply, arena, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return &.{};
+    if (!parsed.ok) return &.{};
+    return parsed.scripts;
+}
+
+pub const UserstyleEntry = struct {
+    host: []const u8 = "",
+    enabled: bool = true,
+    css: []const u8 = "",
+};
+
+const UserstyleReply = struct {
+    ok: bool = false,
+    style: ?UserstyleEntry = null,
+};
+
+/// Parse a userstyle_get web_reply; null = nothing stored (or error).
+pub fn parseUserstyle(arena: std.mem.Allocator, payload: []const u8) ?UserstyleEntry {
+    const parsed = std.json.parseFromSliceLeaky(UserstyleReply, arena, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    if (!parsed.ok) return null;
+    return parsed.style;
+}
+
+const UserstylesReply = struct {
+    ok: bool = false,
+    styles: []const UserstyleEntry = &.{},
+};
+
+/// Parse a userstyle_list web_reply. Slices borrow `arena` memory.
+pub fn parseUserstyles(arena: std.mem.Allocator, payload: []const u8) []const UserstyleEntry {
+    const parsed = std.json.parseFromSliceLeaky(UserstylesReply, arena, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return &.{};
+    if (!parsed.ok) return &.{};
+    return parsed.styles;
+}
+
 // ── tests ───────────────────────────────────────────────────────
+
+test "webstore: userscript and userstyle replies parse" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const scripts = parseUserscripts(arena.allocator(),
+        \\{"req":1,"ok":true,"scripts":[
+        \\{"id":3,"enabled":false,"name":"A","source":"x()"},
+        \\{"id":4,"name":"B","source":"y()"}]}
+    );
+    try t.expectEqual(@as(usize, 2), scripts.len);
+    try t.expect(!scripts[0].enabled);
+    try t.expectEqualStrings("x()", scripts[0].source);
+    try t.expect(scripts[1].enabled);
+
+    const style = parseUserstyle(arena.allocator(),
+        \\{"req":2,"ok":true,"style":{"host":"a.com","enabled":true,"css":"b{}"}}
+    ).?;
+    try t.expectEqualStrings("a.com", style.host);
+    try t.expect(parseUserstyle(arena.allocator(), "{\"req\":3,\"ok\":true,\"style\":null}") == null);
+
+    const styles = parseUserstyles(arena.allocator(),
+        \\{"req":4,"ok":true,"styles":[{"host":"","enabled":true,"css":"*{}"}]}
+    );
+    try t.expectEqual(@as(usize, 1), styles.len);
+    try t.expectEqualStrings("", styles[0].host);
+}
 
 test "webstore: permission keys round-trip, including combinations" {
     const t = std.testing;
