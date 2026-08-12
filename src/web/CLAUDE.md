@@ -256,3 +256,13 @@ H.264/AAC) while the distro build enables them.
   never can be, so page content is untrusted input to every consumer.
 - `--keep` must return immediately: a daemon spawning `/proc/self/exe`
   as a display keeper must never get a browser helper instead.
+- **User content (0xC0 block, capability "userscripts")** is REPLACE-ALL:
+  `us_script_set` carries raw `==UserScript==` sources (the helper
+  parses metadata via `userscript.zig`), `us_style_set` per-host CSS
+  applied instantly to live views. Injection is browser-side
+  `execute_java_script` at load start (`injectUserContent`), so
+  "document-start" means AT COMMIT, cosmetic hiding can flash, and
+  scripts run wrapped in the page's MAIN world — no isolated world
+  exists on this path, and GM_* is a no-op `GM_info` only. Cosmetic
+  hiding (`filter.zig cosmeticFor`) obeys the SAME per-view shield
+  gate as network verdicts. Smoke stages 28-30 assert all of it.

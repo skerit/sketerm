@@ -16794,3 +16794,39 @@ parallel wave can pre-empt it:
   re-read after resolution, and the tag enum was checked for duplicate
   values (70 tags, none duplicated — the pre-assigned per-agent ranges
   held).
+
+## Browser: userscripts, userstyles, cosmetic filtering
+
+Three "sketerm-shaped differentiators" from the proposal, one wire block
+(0xC0-0xC1, capability `userscripts`; caps array now `[19]`/`18`):
+
+- **Cosmetic filtering** (`src/web/filter.zig`): `##sel`,
+  `a.com,~b.com##sel` and `#@#` exceptions parse into a cosmetic set;
+  `cosmeticFor(host)` compiles the applicable sheet (one
+  `{display:none !important}` rule per selector, so one bad selector
+  cannot kill its siblings). `#?#`/`#$#` are refused and counted
+  (`cos_dropped`). Hiding follows the SAME shield gate as the network
+  verdicts — shield off = no cosmetic CSS injected.
+- **Userscripts** (`src/web/userscript.zig`): `==UserScript==` parse
+  (@name/@match/@include/@exclude/@run-at/@grant) with MV2 match
+  patterns; regex includes refused+counted. The helper receives RAW
+  sources (`us_script_set`, replace-all) and injects per navigation
+  grouped by run-at. GM_* is a no-op `GM_info` only, by design.
+- **Userstyles**: per-site user CSS in the daemon web store
+  (`userstyles.json`, one style per lowercased host, "" = global),
+  pushed as `us_style_set` and applied INSTANTLY to live matching
+  views plus at every navigation.
+- Storage: daemon web store grew `userscripts.json`/`userstyles.json`
+  and web_op verbs `userscript_add/remove/enable/list`,
+  `userstyle_set/get/list` (append-only). GUI: `refreshUserContent`
+  pushes both sets on every hello_ack and after each edit; management
+  UI in `src/ui/webuserscripts.zig` (script list with enable/remove +
+  add-from-file, per-site CSS editor), menu rows on the web face.
+- Injection limitations (documented at `injectUserContent` in
+  cefhost.zig): browser-side `execute_java_script` at load start, so
+  `document-start` means "at commit" and cosmetic hiding can flash;
+  scripts run in the page's MAIN world (no isolated world on the C API
+  path); main frame only.
+- smoke-web stages 28 (cosmetic rule hides, sibling kept, shield
+  gates), 29 (document-end userscript mutates DOM, replace-all clears),
+  30 (userstyle instant apply, survives navigation, clear removes).
