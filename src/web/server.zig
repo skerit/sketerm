@@ -23,6 +23,13 @@ const cefhost = @import("cefhost.zig");
 const busy_timeout_ms: c_int = 5;
 const idle_timeout_ms: c_int = 50;
 
+/// Poll timeout while a blocking-webRequest decision is outstanding.
+/// The reply travels renderer -> browser process and is only delivered
+/// inside `cef_do_message_loop_work`, so the loop's period IS the
+/// round-trip's floor. 1ms rather than 0 because a held request is
+/// short-lived and a busy spin would burn a core for it.
+const wreq_timeout_ms: c_int = 1;
+
 /// Wall-clock budget for CEF to finish closing every browser after the
 /// client goes away. `close_browser` is asynchronous renderer IPC —
 /// iterations alone are not time — and `cef_shutdown` with a live
@@ -218,13 +225,32 @@ pub const Server = struct {
 
     /// One loop iteration: poll, drain the socket, pump CEF, flush.
     fn step(self: *Server) void {
-        var pfd = c.struct_pollfd{
-            .fd = self.client_fd,
-            .events = @as(c_short, c.POLLIN) | (if (self.out.empty()) @as(c_short, 0) else @as(c_short, c.POLLOUT)),
-            .revents = 0,
+        // Two descriptors: the client, and the browser helper's own
+        // blocking-webRequest wake pipe. A request HELD on CEF's IO
+        // thread is a page that has stopped loading, and the decision
+        // can only be dispatched from this thread — waiting out a 5ms
+        // poll that was already running would put that entire 5ms on
+        // the critical path of every held subresource. The wake byte
+        // ends the poll the instant a hold appears.
+        var pfds: [2]c.struct_pollfd = .{
+            .{
+                .fd = self.client_fd,
+                .events = @as(c_short, c.POLLIN) | (if (self.out.empty()) @as(c_short, 0) else @as(c_short, c.POLLOUT)),
+                .revents = 0,
+            },
+            .{ .fd = cefhost.webrequestWakeFd(), .events = c.POLLIN, .revents = 0 },
         };
-        const timeout: c_int = if (self.host.viewCount() > 0) busy_timeout_ms else idle_timeout_ms;
-        const n = c.poll(@ptrCast(&pfd), 1, timeout);
+        const nfds: c.nfds_t = if (pfds[1].fd >= 0) 2 else 1;
+        const timeout: c_int = if (cefhost.webrequestBusy())
+            // Already holding something: the answer arrives through
+            // CEF's message loop, which only turns when we pump.
+            wreq_timeout_ms
+        else if (self.host.viewCount() > 0)
+            busy_timeout_ms
+        else
+            idle_timeout_ms;
+        const n = c.poll(&pfds, nfds, timeout);
+        const pfd = pfds[0];
         if (n < 0 and errno() != c.EINTR) {
             self.disconnect();
             return;
@@ -242,8 +268,15 @@ pub const Server = struct {
         // Nothing paints without a begin frame: keep a floor under every
         // visible view in case the client stopped asking for them.
         self.host.watchdog(cefhost.nowMs());
+        // Dispatch queued blocking-webRequest holds BEFORE pumping, so
+        // the command reaches the background renderer in the same
+        // message-loop turn that will carry its answer back.
+        self.host.webrequestPump();
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
+        // A decision may have arrived in that pump; retire timeouts and
+        // start any second phase without waiting a whole iteration.
+        self.host.webrequestPump();
         // Coalesced per-view blocked/total counters: at most one
         // `intercept_status` per view per iteration, however many
         // requests the IO thread logged in between.
@@ -379,6 +412,7 @@ pub const Server = struct {
             .webext_set => self.host.webextSet(try proto.decode(proto.WebextSet, frame.payload)),
             .webext_remove => self.host.webextRemove((try proto.decode(proto.WebextRemove, frame.payload)).id),
             .webext_list_req => self.host.webextList(),
+            .webext_wreq_stats_req => self.host.webrequestStats(),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

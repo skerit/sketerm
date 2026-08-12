@@ -192,6 +192,7 @@ comptime {
     _ = @import("web/webext/match.zig");
     _ = @import("web/webext/manifest.zig");
     _ = @import("web/webext/storage.zig");
+    _ = @import("web/webext/webrequest.zig");
     _ = @import("web/webext/zip.zig");
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");

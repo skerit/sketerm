@@ -49,6 +49,7 @@ const userscript = @import("userscript.zig");
 const webexthost = @import("webext/host.zig");
 const extmatch = @import("webext/match.zig");
 const extmanifest = @import("webext/manifest.zig");
+const webrequest = @import("webext/webrequest.zig");
 const manifestRunAt = extmanifest.RunAt;
 const manifestContentScript = extmanifest.ContentScript;
 
@@ -362,6 +363,15 @@ pub fn nowMs() i64 {
     var ts: c.struct_timespec = undefined;
     _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+}
+
+/// Microsecond monotonic clock — the blocking-webRequest round trip is
+/// measured in hundreds of microseconds, so milliseconds would quantise
+/// the whole distribution away.
+pub fn nowUs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1_000_000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000);
 }
 
 /// Physical pixels for `logical` at `scale_x1000`, per the protocol's
@@ -962,6 +972,10 @@ pub const Host = struct {
     }
 
     pub fn destroyView(self: *Host, id: u32) void {
+        // An enumerated exit for the held-request table: whether this is
+        // a page whose requests are held or a background page that was
+        // going to answer them, nothing can answer once it is gone.
+        wreqAbandonView(id);
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
@@ -2460,13 +2474,21 @@ pub const Host = struct {
             self.ensureBackground(e);
             self.injectContentScriptsAll(e);
         } else {
+            wreqAbandonExt(req.id);
+            self.webext.clearListeners(e);
             self.teardownBackground(e);
         }
         self.postWebextState(e);
     }
 
     pub fn webextRemove(self: *Host, id: []const u8) void {
-        if (self.webext.find(id)) |e| self.teardownBackground(e);
+        // An enumerated exit: every request this extension was holding
+        // is continued before its registry goes away.
+        wreqAbandonExt(id);
+        if (self.webext.find(id)) |e| {
+            self.webext.clearListeners(e);
+            self.teardownBackground(e);
+        }
         self.webext.remove(id);
         // A removal has no dedicated frame; the client already dropped
         // the row. Nothing more to report.
@@ -2515,7 +2537,9 @@ pub const Host = struct {
             return;
         };
         e.bg_view = id;
+        webrequest.setBgView(e.id, id);
         self.spawnBackground(v) catch {
+            webrequest.setBgView(e.id, 0);
             self.destroyView(id);
             e.bg_view = 0;
             return;
@@ -2554,6 +2578,9 @@ pub const Host = struct {
         if (e.bg_view == 0) return;
         const view = e.bg_view;
         e.bg_view = 0;
+        webrequest.setBgView(e.id, 0);
+        // An enumerated exit: the page that would answer is going away.
+        wreqAbandonView(view);
         self.destroyView(view);
     }
 
@@ -2721,6 +2748,8 @@ pub const Host = struct {
             self.extApiCall(v, json);
         } else if (std.mem.eql(u8, op, "ext-send")) {
             self.extRouteSend(v, json);
+        } else if (std.mem.eql(u8, op, "ext-wreq-decision")) {
+            self.wreqDecision(json);
         } else if (std.mem.eql(u8, op, "ext-reply")) {
             self.extRouteReply(json);
         } else if (std.mem.eql(u8, op, "ext-error")) {
@@ -2752,6 +2781,15 @@ pub const Host = struct {
             self.extReplyErr(v, r.req);
             return;
         };
+        // A CONTENT SCRIPT has no business registering a network
+        // filter: it runs in a page's renderer, in the main world, and
+        // a page could reach it. Only the extension's own background
+        // page may. This is the one gate `dispatchApi` cannot make on
+        // its own — it has no idea which frame called.
+        if (std.mem.eql(u8, r.ns, "webRequest") and !v.webext_bg) {
+            self.extReplyErr(v, r.req);
+            return;
+        }
         // Re-serialize args as a JSON array string for the host.
         var args_buf: std.Io.Writer.Allocating = .init(self.gpa);
         defer args_buf.deinit();
@@ -2761,6 +2799,12 @@ pub const Host = struct {
         };
         var changed: ?[]u8 = null;
         const result = self.webext.dispatchApi(e, r.ns, r.method, args_buf.written(), &changed);
+        // A webRequest registration is the moment the request path
+        // learns WHERE to send the question: `ensureBackground` may have
+        // run before the extension was ever published, so recording the
+        // view here — from the frame the call actually arrived on — is
+        // the only placement that cannot be stale.
+        if (std.mem.eql(u8, r.ns, "webRequest")) webrequest.setBgView(e.id, v.id);
         defer self.gpa.free(result);
         // result is `{"result":..}` or `{"error":..}`; forward the inner
         // value/ok to the frame.
@@ -2855,6 +2899,336 @@ pub const Host = struct {
         std.json.Stringify.value(parsed.value.resp, .{}, w) catch return;
         w.writeByte('}') catch return;
         self.sendScript(origin, cmd.written());
+    }
+
+    // -- blocking webRequest, main-thread half ------------------------
+
+    /// Called once per poll iteration. Two jobs, both of which have to
+    /// happen on this thread because both touch a browser: dispatch the
+    /// holds the IO thread queued, and fail-open anything past its
+    /// deadline.
+    ///
+    /// Cheap when idle: one relaxed atomic load and a return.
+    pub fn webrequestPump(self: *Host) void {
+        if (!webrequestBusy()) return;
+        webrequestDrainWake();
+
+        // One pass, copying what we need out under the lock — sending a
+        // command re-enters CEF and must not run with the spinlock held.
+        const Job = struct {
+            hid: u32,
+            bg_view: u32,
+            ext: usize,
+            event: webrequest.Event,
+            rtype: u8,
+            view_id: u32,
+            with_headers: bool,
+            url: [HOLD_URL_MAX]u8,
+            url_len: u16,
+            method: [8]u8,
+            method_len: u8,
+            hdr: [HOLD_HDR_MAX]u8,
+            hdr_len: u16,
+        };
+        var jobs: [MAX_HOLDS]Job = undefined;
+        var njobs: usize = 0;
+        var expired: [MAX_HOLDS]u32 = undefined;
+        var nexpired: usize = 0;
+        const now = nowMs();
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            for (&g_wreq.holds) |*h| {
+                if (!h.used) continue;
+                if (h.dispatched) {
+                    if (now >= h.deadline_ms) {
+                        expired[nexpired] = h.hid;
+                        nexpired += 1;
+                    }
+                    continue;
+                }
+                h.dispatched = true;
+                const j = &jobs[njobs];
+                njobs += 1;
+                j.* = .{
+                    .hid = h.hid,
+                    .bg_view = h.bg_view,
+                    .ext = h.ext,
+                    .event = h.event,
+                    .rtype = h.rtype,
+                    .view_id = h.view_id,
+                    .with_headers = h.want_request_headers,
+                    .url = h.url,
+                    .url_len = h.url_len,
+                    .method = h.method,
+                    .method_len = h.method_len,
+                    .hdr = h.hdr,
+                    .hdr_len = h.hdr_len,
+                };
+            }
+        }
+
+        for (jobs[0..njobs]) |*j| {
+            var ext_buf: [webrequest.MAX_ID]u8 = undefined;
+            var ext_len: usize = 0;
+            {
+                g_wreq.acquire();
+                defer g_wreq.release();
+                if (wstatIdx(j.ext)) |s| {
+                    ext_len = s.id_len;
+                    @memcpy(ext_buf[0..ext_len], s.idSlice());
+                }
+            }
+            const bg = self.find(j.bg_view);
+            if (ext_len == 0 or bg == null) {
+                // The listener became unreachable between the hold and
+                // this dispatch. An enumerated exit: fail open.
+                self.wreqFailOpen(j.hid);
+                continue;
+            }
+            var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+            defer cmd.deinit();
+            const w = &cmd.writer;
+            w.writeAll("{\"op\":\"ext-wreq\",\"ext\":") catch continue;
+            jsonStr(w, ext_buf[0..ext_len]) catch continue;
+            w.print(",\"hid\":{d},\"event\":", .{j.hid}) catch continue;
+            jsonStr(w, j.event.toStr()) catch continue;
+            w.writeAll(",\"details\":{\"requestId\":") catch continue;
+            var rid_buf: [24]u8 = undefined;
+            const rid = std.fmt.bufPrint(&rid_buf, "{d}", .{j.hid}) catch "0";
+            jsonStr(w, rid) catch continue;
+            w.writeAll(",\"url\":") catch continue;
+            jsonStr(w, j.url[0..j.url_len]) catch continue;
+            w.writeAll(",\"method\":") catch continue;
+            jsonStr(w, j.method[0..j.method_len]) catch continue;
+            w.writeAll(",\"type\":") catch continue;
+            const rt: webrequest.RType = @enumFromInt(j.rtype);
+            jsonStr(w, rt.toStr()) catch continue;
+            // `tabId` is a STUB: this helper has no tab identity of its
+            // own (the GUI owns tabs) and inventing one would make an
+            // extension's per-tab state silently wrong. -1 is MV2's
+            // documented "not associated with a tab".
+            w.print(",\"tabId\":-1,\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":{d}", .{now}) catch continue;
+            if (j.with_headers and j.hdr_len != 0) {
+                w.writeAll(",\"requestHeaders\":") catch continue;
+                w.writeAll(j.hdr[0..j.hdr_len]) catch continue;
+            }
+            w.writeAll("}}") catch continue;
+            self.sendScript(bg.?, cmd.written());
+        }
+
+        for (expired[0..nexpired]) |hid| {
+            g_wreq.acquire();
+            if (wreqFind(hid)) |h| {
+                if (wstatIdx(h.ext)) |s| {
+                    s.timed_out +%= 1;
+                    s.failed_open +%= 1;
+                }
+            }
+            g_wreq.release();
+            // A timeout continues the request. NEVER cancels: a wedged
+            // or slow extension must degrade the browser's filtering,
+            // not its ability to load pages.
+            self.wreqFailOpen(hid);
+        }
+    }
+
+    /// Let a held request through, unfiltered, and free its slot. THE
+    /// single "answer without a decision" exit, and it always continues
+    /// — never cancels. A broken, slow or vanished extension must cost
+    /// the user filtering, never the ability to load a page.
+    ///
+    /// Every path that can end a hold reaches one of exactly four
+    /// places, and they are all of them:
+    ///   - a decision arrived            -> `wreqDecision`
+    ///   - the deadline passed           -> here, from `webrequestPump`
+    ///   - the listener became unreachable between hold and dispatch
+    ///                                   -> here, from `webrequestPump`
+    ///   - the extension was disabled, removed or reparsed
+    ///                                   -> `wreqAbandonExt`
+    ///   - its background page or the requesting view was destroyed
+    ///                                   -> `wreqAbandonView`
+    ///   - the helper is shutting down   -> `webrequestDeinit`
+    /// Anything added later that can make a listener unreachable MUST
+    /// call one of these. A hold that is never answered is a page that
+    /// never finishes loading, with no error and no way out.
+    fn wreqFailOpen(self: *Host, hid: u32) void {
+        _ = self;
+        var cb: ?*cef.cef_callback_t = null;
+        var req: ?*cef.cef_request_t = null;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            const h = wreqFind(hid) orelse return;
+            cb = h.cb;
+            req = h.req;
+            h.* = .{};
+            _ = g_wreq.outstanding.fetchSub(1, .release);
+        }
+        if (cb) |x| {
+            if (x.cont) |f| f(x);
+            release(&x.base);
+        }
+        if (req) |r| release(&r.base);
+    }
+
+    /// A background page answered. Applies the decision to the held
+    /// request and either continues it, cancels it, or moves it to the
+    /// second phase (`onBeforeSendHeaders`).
+    fn wreqDecision(self: *Host, json: []const u8) void {
+        const R = struct { hid: u32 = 0, d: std.json.Value = .null };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const hid = parsed.value.hid;
+
+        // Take our OWN reference to the request before dropping the
+        // lock: an abandon (extension removed, view destroyed) racing
+        // us would otherwise release the last one while we are still
+        // calling set_url on it.
+        var req: ?*cef.cef_request_t = null;
+        var event: webrequest.Event = .before_request;
+        var want_sh = false;
+        var ext: usize = 0;
+        var start_us: i64 = 0;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            const h = wreqFind(hid) orelse return;
+            req = h.req;
+            event = h.event;
+            want_sh = h.want_send_headers;
+            ext = h.ext;
+            start_us = h.start_us;
+            if (req) |r| if (r.base.add_ref) |ar| ar(&r.base);
+        }
+        defer if (req) |r| release(&r.base);
+
+        var dec_buf: std.Io.Writer.Allocating = .init(self.gpa);
+        defer dec_buf.deinit();
+        std.json.Stringify.value(parsed.value.d, .{}, &dec_buf.writer) catch return;
+        const hdr_key: []const u8 = switch (event) {
+            .before_send_headers => "requestHeaders",
+            else => "",
+        };
+        var dp = webrequest.parseDecision(self.gpa, dec_buf.written(), hdr_key) catch return;
+        defer dp.deinit(self.gpa);
+        const d = dp.decision;
+
+        const cancel = d.cancel;
+        var redirected = false;
+        var hdr_changed = false;
+        if (!cancel) {
+            if (req) |r| {
+                if (d.redirect) |u| {
+                    // Changing the url of a request held in
+                    // on_before_resource_load IS the redirect: CEF
+                    // re-issues the load at the new url when we
+                    // continue.
+                    var s = std.mem.zeroes(cef.cef_string_t);
+                    setStr(u, &s);
+                    defer cef.cef_string_utf16_clear(&s);
+                    if (r.set_url) |f| {
+                        f(r, &s);
+                        redirected = true;
+                    }
+                }
+                if (d.headers) |edits| {
+                    if (r.set_header_by_name) |seth| {
+                        for (edits) |ed| {
+                            var nk = std.mem.zeroes(cef.cef_string_t);
+                            var nv = std.mem.zeroes(cef.cef_string_t);
+                            setStr(ed.name, &nk);
+                            defer cef.cef_string_utf16_clear(&nk);
+                            if (ed.value.len != 0) setStr(ed.value, &nv);
+                            defer cef.cef_string_utf16_clear(&nv);
+                            // An empty value REMOVES the header: MV2
+                            // expresses a deletion by omitting it from
+                            // the returned array, and the JS side turns
+                            // that omission into an empty-valued entry.
+                            seth(r, &nk, if (ed.value.len != 0) &nv else null, 1);
+                            hdr_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second phase, only when the first neither cancelled nor
+        // redirected — a redirect restarts the request and its own
+        // onBeforeSendHeaders fires on the new load.
+        const go_second = !cancel and !redirected and event == .before_request and want_sh;
+
+        var cb: ?*cef.cef_callback_t = null;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            const h = wreqFind(hid) orelse return; // abandoned meanwhile
+            if (wstatIdx(ext)) |s| {
+                if (cancel) s.cancelled +%= 1;
+                if (redirected) s.redirected +%= 1;
+                if (hdr_changed) s.headers_modified +%= 1;
+                const us = nowUs() - start_us;
+                s.note(@intCast(std.math.clamp(us, 0, std.math.maxInt(u32))));
+            }
+            if (go_second) {
+                h.event = .before_send_headers;
+                h.dispatched = false;
+                h.want_request_headers = true;
+                if (h.hdr_len == 0) {
+                    if (h.req) |r| h.hdr_len = wreqHeadersJson(r, &h.hdr);
+                }
+                return;
+            }
+            cb = h.cb;
+            const hreq = h.req;
+            h.* = .{};
+            _ = g_wreq.outstanding.fetchSub(1, .release);
+            if (hreq) |r| release(&r.base);
+        }
+        if (cb) |x| {
+            if (cancel) {
+                if (x.cancel) |f| f(x);
+            } else {
+                if (x.cont) |f| f(x);
+            }
+            release(&x.base);
+        }
+    }
+
+    /// Report per-extension blocking-webRequest counters (0xB4 -> 0xB5).
+    pub fn webrequestStats(self: *Host) void {
+        var out: [webrequest.MAX_PUBLISHED]proto.EvWebextWreqStats = undefined;
+        var ids: [webrequest.MAX_PUBLISHED][webrequest.MAX_ID]u8 = undefined;
+        var n: usize = 0;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            for (&g_wreq.stats) |*s| {
+                if (!s.used) continue;
+                @memcpy(ids[n][0..s.id_len], s.idSlice());
+                var sorted: [WREQ_SAMPLES]u32 = undefined;
+                const cnt = @min(s.nsamples, WREQ_SAMPLES);
+                @memcpy(sorted[0..cnt], s.samples[0..cnt]);
+                std.mem.sort(u32, sorted[0..cnt], {}, std.sort.asc(u32));
+                out[n] = .{
+                    .id = ids[n][0..s.id_len],
+                    .matched = s.matched,
+                    .held = s.held,
+                    .cancelled = s.cancelled,
+                    .redirected = s.redirected,
+                    .headers_modified = s.headers_modified,
+                    .headers_received_dropped = s.headers_received_dropped,
+                    .timed_out = s.timed_out,
+                    .failed_open = s.failed_open,
+                    .us_p50 = pct(sorted[0..cnt], 50),
+                    .us_p95 = pct(sorted[0..cnt], 95),
+                    .us_max = if (cnt == 0) 0 else sorted[cnt - 1],
+                    .samples = cnt,
+                };
+                n += 1;
+            }
+        }
+        for (out[0..n]) |ev| self.post(ev);
     }
 
     /// Deliver a `storage.onChanged` payload to every live frame of the
@@ -4112,11 +4486,16 @@ fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void
 /// helper startup, before any view exists.
 pub fn interceptInit(gpa: std.mem.Allocator) void {
     interceptReload(gpa, &.{});
+    wreqInitPipe();
+    wreqReadTimeoutEnv();
 }
 
 /// Free the engine and any leftover rings (client gone, views already
 /// destroyed).
 pub fn interceptDeinit(gpa: std.mem.Allocator) void {
+    // Before anything else: a held request must not outlive the table
+    // that owns its callback.
+    webrequestDeinit();
     var old: ?*filter.Engine = null;
     {
         g_int.acquire();
@@ -4204,7 +4583,7 @@ fn onBeforeResourceLoad(
     browser: [*c]cef.cef_browser_t,
     _: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
-    _: [*c]cef.cef_callback_t,
+    callback: [*c]cef.cef_callback_t,
 ) callconv(.c) cef.cef_return_value_t {
     const req: *cef.cef_request_t = request orelse return cef.RV_CONTINUE;
     // Service-worker / urlrequest traffic has no browser and thus no
@@ -4238,6 +4617,8 @@ fn onBeforeResourceLoad(
     const now = nowMs();
 
     var verdict = false;
+    var shield_on = true;
+    var view_id: u32 = 0;
     {
         g_int.acquire();
         defer g_int.release();
@@ -4248,7 +4629,9 @@ fn onBeforeResourceLoad(
                 break;
             }
         }
+        if (slot) |s| view_id = s.view_id;
         const enabled = g_int.global_enabled and (if (slot) |s| s.enabled else true);
+        shield_on = enabled;
         if (enabled and host.len > 0) {
             if (g_int.engine) |eng| {
                 verdict = eng.match(.{ .url = url, .host = host, .doc_host = doc_host, .rtype = rtype });
@@ -4279,7 +4662,142 @@ fn onBeforeResourceLoad(
             }
         }
     }
-    return if (verdict) cef.RV_CANCEL else cef.RV_CONTINUE;
+    // PRECEDENCE, step 1: the native engine's cancel is FINAL. An
+    // extension is never asked about a request the built-in blocker
+    // already refused, and never asked at all while the shield is off.
+    if (verdict) return cef.RV_CANCEL;
+    if (!shield_on) return cef.RV_CONTINUE;
+
+    if (wreqConsider(req, callback, url_unf, method, wreqTypeOf(
+        if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE,
+    ), view_id)) return cef.RV_CONTINUE_ASYNC;
+    return cef.RV_CONTINUE;
+}
+
+/// IO THREAD. `onHeadersReceived`, observationally.
+///
+/// MEASURED ENGINE LIMITATION, and the reason this is not a hold:
+/// `cef_resource_request_handler_t::on_resource_response` takes NO
+/// `cef_callback_t` and returns an int — there is no
+/// `RV_CONTINUE_ASYNC` equivalent anywhere on the response path, so the
+/// request cannot be paused while a listener in another process
+/// answers. The listener therefore RUNS and SEES the real response
+/// headers, but a `responseHeaders` array it returns is counted and
+/// dropped rather than applied. The alternative — taking the whole load
+/// over with our own `cef_resource_handler_t` and re-issuing it through
+/// `cef_urlrequest` — would put credentials, cookies, ranges and
+/// streaming back in our hands, which is a far bigger correctness
+/// surface than the feature buys. smoke-web stage 34d is the canary.
+fn onResourceResponse(
+    _: [*c]cef.cef_resource_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    response: [*c]cef.cef_response_t,
+) callconv(.c) c_int {
+    const req: *cef.cef_request_t = request orelse return 0;
+    _ = browser;
+    if (!webrequest.any_listeners.load(.acquire)) return 0;
+
+    var url_raw: [2048]u8 = undefined;
+    const gu = req.get_url orelse return 0;
+    const url = userfreeInto(gu(req), &url_raw);
+    const rtype = wreqTypeOf(if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE);
+
+    var ext_buf: [webrequest.MAX_ID]u8 = undefined;
+    var ext_len: usize = 0;
+    var bg_view: u32 = 0;
+    {
+        webrequest.acquire();
+        defer webrequest.release();
+        for (&webrequest.slots) |*s| {
+            if (!s.used) continue;
+            const reg = s.reg orelse continue;
+            if (webrequest.needFor(reg, .headers_received, url, rtype).isNone()) continue;
+            ext_len = s.id_len;
+            @memcpy(ext_buf[0..ext_len], s.idSlice());
+            bg_view = s.bg_view;
+            break;
+        }
+    }
+    if (ext_len == 0 or bg_view == 0) return 0;
+
+    var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
+    var hdr_len: u16 = 0;
+    if (response) |resp| hdr_len = wreqResponseHeadersJson(resp, &hdr_buf);
+
+    g_wreq.acquire();
+    var slot: ?*Hold = null;
+    for (&g_wreq.holds) |*h| {
+        if (!h.used) {
+            slot = h;
+            break;
+        }
+    }
+    const st = wstatFor(ext_buf[0..ext_len]);
+    if (st) |s| {
+        s.matched +%= 1;
+        // Counted here, at the only moment we know a listener will be
+        // told about headers it cannot change.
+        s.headers_received_dropped +%= 1;
+    }
+    if (slot) |h| {
+        h.* = .{
+            .used = true,
+            .hid = g_wreq.next_hid,
+            .ext = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0,
+            .bg_view = bg_view,
+            .event = .headers_received,
+            .start_us = nowUs(),
+            .deadline_ms = nowMs() + g_wreq.timeout_ms,
+            .hdr_len = hdr_len,
+            .want_request_headers = true,
+            .rtype = @intFromEnum(rtype),
+        };
+        g_wreq.next_hid +%= 1;
+        if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
+        h.url_len = @intCast(@min(url.len, h.url.len));
+        @memcpy(h.url[0..h.url_len], url[0..h.url_len]);
+        if (hdr_len != 0) @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
+        _ = g_wreq.outstanding.fetchAdd(1, .release);
+    }
+    g_wreq.release();
+    wreqPoke();
+    return 0;
+}
+
+/// A response's headers as a JSON array. IO THREAD, no allocation.
+fn wreqResponseHeadersJson(resp: *cef.cef_response_t, out: []u8) u16 {
+    const gh = resp.get_header_map orelse return 0;
+    const map = cef.cef_string_multimap_alloc() orelse return 0;
+    defer cef.cef_string_multimap_free(map);
+    gh(resp, map);
+    var w = std.Io.Writer.fixed(out);
+    w.writeByte('[') catch return 0;
+    const n = cef.cef_string_multimap_size(map);
+    var i: usize = 0;
+    var first = true;
+    while (i < n) : (i += 1) {
+        var key = std.mem.zeroes(cef.cef_string_t);
+        var val = std.mem.zeroes(cef.cef_string_t);
+        defer cef.cef_string_utf16_clear(&key);
+        defer cef.cef_string_utf16_clear(&val);
+        if (cef.cef_string_multimap_key(map, i, &key) == 0) continue;
+        _ = cef.cef_string_multimap_value(map, i, &val);
+        var kbuf: [256]u8 = undefined;
+        var vbuf: [1024]u8 = undefined;
+        const ks = utf16Into(&key, &kbuf);
+        const vs = utf16Into(&val, &vbuf);
+        if (!first) w.writeByte(',') catch break;
+        first = false;
+        w.writeAll("{\"name\":") catch break;
+        jsonStr(&w, ks) catch break;
+        w.writeAll(",\"value\":") catch break;
+        jsonStr(&w, vs) catch break;
+        w.writeByte('}') catch break;
+    }
+    w.writeByte(']') catch return 0;
+    return @intCast(w.end);
 }
 
 /// IO THREAD. Completes a logged entry with status/size/timing.
@@ -4338,6 +4856,556 @@ fn fillEntry(out: *proto.NetEntry, url_buf: *[LOG_URL_MAX]u8, method_buf: *[8]u8
         .method = method_buf[0..e.method_len],
         .url = url_buf[0..e.url_len],
     };
+}
+
+// ---------------------------------------------------------------------
+// Blocking webRequest: the held-request path
+// ---------------------------------------------------------------------
+//
+// WHERE THE ROUND TRIP GOES, and why it never leaves this process:
+//
+//   CEF IO thread (on_before_resource_load)
+//     -> hold slot + wake byte
+//   helper main thread (between two poll iterations)
+//     -> execute_java_script into the extension's BACKGROUND PAGE
+//   that page's RENDERER process
+//     -> the MV2 listener runs, returns a BlockingResponse
+//   back over the nonce-authenticated bridge to the main thread
+//     -> apply the decision to the cef_request_t, cont()/cancel()
+//
+// The background page is a hidden windowless browser THIS HELPER owns
+// (View.webext_bg), so the only cross-process hop is the one Chromium
+// forces on us. The GUI is not involved and no frame crosses the mux
+// wire; a decision path through the client would add a socket hop and a
+// GUI main-loop turn to the most latency-sensitive code in the browser.
+//
+// PRECEDENCE with the native engine (`filter.zig`), stated once here and
+// mirrored in src/web/CLAUDE.md:
+//
+//   1. The native filter engine runs FIRST and its CANCEL is FINAL. An
+//      extension is never consulted about a request the built-in
+//      blocker already refused — there is nothing for it to un-cancel
+//      (MV2 has no "uncancel"), and consulting it would put a JS round
+//      trip on requests we already decided in nanoseconds.
+//   2. Extensions see everything the native engine let through, in
+//      registration order per extension and extension order after that.
+//   3. Among extensions, FIRST CANCEL WINS and a cancel beats a
+//      redirect, which is Firefox's own resolution.
+//   4. The per-view shield gate (`intercept_enable`) disables BOTH: a
+//      user who turned blocking off for a site gets no extension
+//      filtering there either, because "off" has to mean off.
+//
+// EVERY HELD REQUEST IS ANSWERED ON EVERY PATH. That is not a wish, it
+// is the reason this table has an explicit `answer()` and only one:
+// a request held forever is a page that never finishes loading, with no
+// error and no way out. The exits are enumerated at `answerHold`.
+
+/// How long a blocking listener may take before the request is let
+/// through unfiltered. Firefox has no such cap (it trusts its own
+/// extension process); we do, because a wedged background page here is
+/// a wedged browser. 500ms is far above the measured p95 (see the
+/// benchmark numbers in src/web/CLAUDE.md) and far below a user's
+/// patience for a stuck load.
+const wreq_timeout_ms_default: i64 = 500;
+
+/// Concurrent held/queued requests. A burst past this fails OPEN —
+/// requests continue unfiltered rather than queue behind a listener.
+const MAX_HOLDS = 32;
+const HOLD_URL_MAX = 1024;
+const HOLD_HDR_MAX = 3072;
+
+/// Latency samples kept per extension for the p50/p95 report.
+const WREQ_SAMPLES = 256;
+
+
+const Hold = struct {
+    used: bool = false,
+    hid: u32 = 0,
+    /// Non-null only while the request is genuinely HELD. An
+    /// observational slot has none and must never touch these.
+    cb: ?*cef.cef_callback_t = null,
+    req: ?*cef.cef_request_t = null,
+    /// Index into `g_wstats` — the extension being asked.
+    ext: usize = 0,
+    bg_view: u32 = 0,
+    /// Which MV2 event this dispatch is for. CEF gives ONE pre-flight
+    /// callback for both `onBeforeRequest` and `onBeforeSendHeaders`,
+    /// so a request needing both is dispatched TWICE in sequence from
+    /// the same hold — which is also MV2's documented ordering.
+    event: webrequest.Event = .before_request,
+    /// A slot with no `cb` is a MAILBOX, not a hold: the request has
+    /// already continued and this exists only to deliver an
+    /// observational notification.
+    want_send_headers: bool = false,
+    want_request_headers: bool = false,
+    /// False until the main thread has actually sent the command.
+    dispatched: bool = false,
+    deadline_ms: i64 = 0,
+    start_us: i64 = 0,
+    rtype: u8 = 0,
+    view_id: u32 = 0,
+    url_len: u16 = 0,
+    url: [HOLD_URL_MAX]u8 = @splat(0),
+    method_len: u8 = 0,
+    method: [8]u8 = @splat(0),
+    /// A JSON array of `{name,value}` — built on the IO thread from the
+    /// request's own header map, into this fixed buffer (no allocation
+    /// on that thread, same rule the intercept log follows).
+    hdr_len: u16 = 0,
+    hdr: [HOLD_HDR_MAX]u8 = @splat(0),
+
+    fn urlSlice(self: *const Hold) []const u8 {
+        return self.url[0..self.url_len];
+    }
+};
+
+const WStat = struct {
+    used: bool = false,
+    id: [webrequest.MAX_ID]u8 = @splat(0),
+    id_len: usize = 0,
+    matched: u32 = 0,
+    held: u32 = 0,
+    cancelled: u32 = 0,
+    redirected: u32 = 0,
+    headers_modified: u32 = 0,
+    headers_received_dropped: u32 = 0,
+    timed_out: u32 = 0,
+    failed_open: u32 = 0,
+    nsamples: u32 = 0,
+    widx: usize = 0,
+    samples: [WREQ_SAMPLES]u32 = @splat(0),
+
+    fn idSlice(self: *const WStat) []const u8 {
+        return self.id[0..self.id_len];
+    }
+
+    fn note(self: *WStat, us: u32) void {
+        self.samples[self.widx] = us;
+        self.widx = (self.widx + 1) % WREQ_SAMPLES;
+        if (self.nsamples < WREQ_SAMPLES) self.nsamples += 1;
+    }
+};
+
+const WreqState = struct {
+    lock: std.atomic.Value(u8) = .init(0),
+    /// Read WITHOUT the lock on the request path so a helper with no
+    /// blocking extension pays one relaxed load per request.
+    outstanding: std.atomic.Value(u32) = .init(0),
+    next_hid: u32 = 1,
+    timeout_ms: i64 = wreq_timeout_ms_default,
+    holds: [MAX_HOLDS]Hold = @splat(.{}),
+    stats: [webrequest.MAX_PUBLISHED]WStat = @splat(.{}),
+
+    fn acquire(self: *WreqState) void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+    fn release(self: *WreqState) void {
+        self.lock.store(0, .release);
+    }
+};
+
+var g_wreq: WreqState = .{};
+
+/// Self-pipe so the IO thread can cut the main loop's poll short the
+/// instant a request is held. Without it the first hold of a page load
+/// waits out whatever poll timeout was already running (5ms), which is
+/// pure dead time on the critical path.
+var g_wreq_wake: [2]c_int = .{ -1, -1 };
+
+/// The read end for `server.zig` to poll, or -1 when the pipe could not
+/// be made (the loop then falls back to its ordinary timeout).
+pub fn webrequestWakeFd() c_int {
+    return g_wreq_wake[0];
+}
+
+/// True while at least one request is held or queued. The loop shortens
+/// its poll on this, because a held request is a stalled page.
+pub fn webrequestBusy() bool {
+    return g_wreq.outstanding.load(.acquire) != 0;
+}
+
+pub fn webrequestDrainWake() void {
+    if (g_wreq_wake[0] < 0) return;
+    var buf: [64]u8 = undefined;
+    while (c.read(g_wreq_wake[0], &buf, buf.len) > 0) {}
+}
+
+fn wreqPoke() void {
+    if (g_wreq_wake[1] < 0) return;
+    const one: [1]u8 = .{1};
+    _ = c.write(g_wreq_wake[1], &one, 1);
+}
+
+fn wreqInitPipe() void {
+    if (g_wreq_wake[0] >= 0) return;
+    if (c.pipe(&g_wreq_wake) != 0) {
+        g_wreq_wake = .{ -1, -1 };
+        return;
+    }
+    // Both ends non-blocking: the IO thread must never block on a full
+    // pipe (a byte already there means the loop is already awake), and
+    // the drain must never block on an empty one.
+    for (g_wreq_wake) |fd| {
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+    }
+}
+
+/// Override the fail-open deadline. Used by the benchmark and the smoke
+/// rig; `SKETERM_WEB_WREQ_TIMEOUT_MS=<n>` is the operator-facing form.
+fn wreqReadTimeoutEnv() void {
+    const v = c.getenv("SKETERM_WEB_WREQ_TIMEOUT_MS") orelse return;
+    const s = std.mem.span(v);
+    const n = std.fmt.parseInt(i64, s, 10) catch return;
+    if (n > 0) g_wreq.timeout_ms = n;
+}
+
+fn wstatFor(id: []const u8) ?*WStat {
+    for (&g_wreq.stats) |*s| {
+        if (s.used and std.mem.eql(u8, s.idSlice(), id)) return s;
+    }
+    for (&g_wreq.stats) |*s| {
+        if (s.used) continue;
+        if (id.len > s.id.len) return null;
+        s.* = .{ .used = true };
+        @memcpy(s.id[0..id.len], id);
+        s.id_len = id.len;
+        return s;
+    }
+    return null;
+}
+
+/// CEF's resource type as the MV2 `ResourceType` the filters speak.
+fn wreqTypeOf(t: cef.cef_resource_type_t) webrequest.RType {
+    return switch (t) {
+        cef.RT_MAIN_FRAME => .main_frame,
+        cef.RT_SUB_FRAME => .sub_frame,
+        cef.RT_STYLESHEET => .stylesheet,
+        cef.RT_SCRIPT => .script,
+        cef.RT_IMAGE => .image,
+        cef.RT_FAVICON => .image,
+        cef.RT_FONT_RESOURCE => .font,
+        cef.RT_XHR => .xmlhttprequest,
+        cef.RT_MEDIA => .media,
+        cef.RT_PING => .ping,
+        cef.RT_CSP_REPORT => .csp_report,
+        cef.RT_OBJECT => .object,
+        else => .other,
+    };
+}
+
+/// Serialize a request's headers into `out` as a JSON array. IO THREAD:
+/// CEF allocates the multimap, we allocate nothing.
+fn wreqHeadersJson(req: *cef.cef_request_t, out: []u8) u16 {
+    const gh = req.get_header_map orelse return 0;
+    const map = cef.cef_string_multimap_alloc() orelse return 0;
+    defer cef.cef_string_multimap_free(map);
+    gh(req, map);
+    var w = std.Io.Writer.fixed(out);
+    w.writeByte('[') catch return 0;
+    const n = cef.cef_string_multimap_size(map);
+    var i: usize = 0;
+    var first = true;
+    while (i < n) : (i += 1) {
+        var key = std.mem.zeroes(cef.cef_string_t);
+        var val = std.mem.zeroes(cef.cef_string_t);
+        defer cef.cef_string_utf16_clear(&key);
+        defer cef.cef_string_utf16_clear(&val);
+        if (cef.cef_string_multimap_key(map, i, &key) == 0) continue;
+        _ = cef.cef_string_multimap_value(map, i, &val);
+        var kbuf: [256]u8 = undefined;
+        var vbuf: [1024]u8 = undefined;
+        const ks = utf16Into(&key, &kbuf);
+        const vs = utf16Into(&val, &vbuf);
+        if (!first) w.writeByte(',') catch break;
+        first = false;
+        w.writeAll("{\"name\":") catch break;
+        jsonStr(&w, ks) catch break;
+        w.writeAll(",\"value\":") catch break;
+        jsonStr(&w, vs) catch break;
+        w.writeByte('}') catch break;
+    }
+    w.writeByte(']') catch return 0;
+    return @intCast(w.end);
+}
+
+/// A `cef_string_t`'s UTF-8 into `buf` (truncated). Unlike
+/// `userfreeInto` this does NOT take ownership.
+fn utf16Into(s: *const cef.cef_string_t, buf: []u8) []const u8 {
+    if (s.str == null or s.length == 0) return "";
+    var u = Utf8.init(@constCast(s));
+    defer u.free();
+    const src = u.slice();
+    const n = @min(src.len, buf.len);
+    @memcpy(buf[0..n], src[0..n]);
+    return buf[0..n];
+}
+
+/// IO THREAD. Decide whether this request needs any extension at all,
+/// and if so whether it must be HELD.
+///
+/// Returns true when the caller must return `RV_CONTINUE_ASYNC` — the
+/// request is now this table's responsibility and WILL be answered.
+///
+/// LOCK ORDER: `webrequest.lock` (the registry) is taken and RELEASED
+/// before `g_wreq.lock` (the hold table). They are never nested, in
+/// either direction, anywhere.
+fn wreqConsider(
+    req: *cef.cef_request_t,
+    cb: ?*cef.cef_callback_t,
+    url: []const u8,
+    method: []const u8,
+    rtype: webrequest.RType,
+    view_id: u32,
+) bool {
+    // THE fast path: one relaxed load. A helper with no extension
+    // listener at all, which is the overwhelmingly common case, pays
+    // exactly this and nothing else.
+    if (!webrequest.any_listeners.load(.acquire)) return false;
+
+    // Which extension cares, and how. Copied out under the registry
+    // lock so nothing is held while we touch CEF.
+    var ext_id_buf: [webrequest.MAX_ID]u8 = undefined;
+    var ext_id_len: usize = 0;
+    var bg_view: u32 = 0;
+    var need_before = webrequest.Need.none();
+    var need_send = webrequest.Need.none();
+    {
+        webrequest.acquire();
+        defer webrequest.release();
+        for (&webrequest.slots) |*s| {
+            if (!s.used) continue;
+            const reg = s.reg orelse continue;
+            const nb = webrequest.needFor(reg, .before_request, url, rtype);
+            const ns = webrequest.needFor(reg, .before_send_headers, url, rtype);
+            if (nb.isNone() and ns.isNone()) continue;
+            // v1 asks ONE extension per request — the first that
+            // matches. Chaining several would multiply the round trip
+            // by the extension count on the critical path, and the
+            // measured cost of one round trip (src/web/CLAUDE.md) is
+            // already the dominant term. Documented, not hidden.
+            ext_id_len = s.id_len;
+            @memcpy(ext_id_buf[0..s.id_len], s.idSlice());
+            bg_view = s.bg_view;
+            need_before = nb;
+            need_send = ns;
+            break;
+        }
+    }
+    if (ext_id_len == 0) return false;
+
+    const ext_id = ext_id_buf[0..ext_id_len];
+    const blocking = need_before.blocking or need_send.blocking;
+    // No background page yet (or torn down): there is nobody to ask.
+    // Fail open immediately rather than hold for a listener that cannot
+    // run — this is one of the enumerated exits.
+    if (bg_view == 0) {
+        g_wreq.acquire();
+        defer g_wreq.release();
+        if (wstatFor(ext_id)) |st| {
+            st.matched +%= 1;
+            if (blocking) st.failed_open +%= 1;
+        }
+        return false;
+    }
+
+    // Header collection costs a CEF multimap walk; only pay for it when
+    // a matching listener asked for requestHeaders.
+    var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
+    var hdr_len: u16 = 0;
+    if (need_before.want_request_headers or need_send.want_request_headers) {
+        hdr_len = wreqHeadersJson(req, &hdr_buf);
+    }
+
+    g_wreq.acquire();
+    var slot: ?*Hold = null;
+    for (&g_wreq.holds) |*h| {
+        if (!h.used) {
+            slot = h;
+            break;
+        }
+    }
+    const st = wstatFor(ext_id);
+    if (st) |s| s.matched +%= 1;
+    const h = slot orelse {
+        // Table full. Fail OPEN: a burst of requests must not queue
+        // behind a listener, and dropping the notification is strictly
+        // better than stalling the page.
+        if (st) |s| if (blocking) {
+            s.failed_open +%= 1;
+        };
+        g_wreq.release();
+        return false;
+    };
+
+    const ext_idx: usize = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0;
+    h.* = .{
+        .used = true,
+        .hid = g_wreq.next_hid,
+        .ext = ext_idx,
+        .bg_view = bg_view,
+        .view_id = view_id,
+        .rtype = @intFromEnum(rtype),
+        .start_us = nowUs(),
+        .deadline_ms = nowMs() + g_wreq.timeout_ms,
+        .hdr_len = hdr_len,
+    };
+    g_wreq.next_hid +%= 1;
+    if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
+    h.url_len = @intCast(@min(url.len, h.url.len));
+    @memcpy(h.url[0..h.url_len], url[0..h.url_len]);
+    h.method_len = @intCast(@min(method.len, h.method.len));
+    @memcpy(h.method[0..h.method_len], method[0..h.method_len]);
+    if (hdr_len != 0) @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
+
+    if (!blocking) {
+        // A NON-blocking listener must not hold the request at all —
+        // the slot is only a mailbox for the notification, and the
+        // caller has already been told to continue.
+        h.event = if (need_before.matched) .before_request else .before_send_headers;
+        h.want_request_headers = need_before.want_request_headers or need_send.want_request_headers;
+    } else if (need_before.blocking) {
+        h.event = .before_request;
+        h.want_send_headers = need_send.blocking;
+        h.want_request_headers = need_before.want_request_headers;
+    } else {
+        h.event = .before_send_headers;
+        h.want_request_headers = true;
+    }
+
+    if (blocking) {
+        h.cb = cb;
+        h.req = req;
+        if (cb) |x| if (x.base.add_ref) |ar| ar(&x.base);
+        if (req.base.add_ref) |ar| ar(&req.base);
+        if (st) |s| s.held +%= 1;
+    }
+    _ = g_wreq.outstanding.fetchAdd(1, .release);
+    g_wreq.release();
+    wreqPoke();
+    return blocking;
+}
+
+/// Answer every hold belonging to one extension. Main thread.
+fn wreqAbandonExt(ext_id: []const u8) void {
+    var cbs: [MAX_HOLDS]?*cef.cef_callback_t = @splat(null);
+    var reqs: [MAX_HOLDS]?*cef.cef_request_t = @splat(null);
+    var n: usize = 0;
+    {
+        g_wreq.acquire();
+        defer g_wreq.release();
+        var want: ?usize = null;
+        for (&g_wreq.stats, 0..) |*st, i| {
+            if (st.used and std.mem.eql(u8, st.idSlice(), ext_id)) {
+                want = i;
+                break;
+            }
+        }
+        const target = want orelse return;
+        for (&g_wreq.holds) |*h| {
+            if (!h.used or h.ext != target) continue;
+            if (h.cb != null) {
+                if (wstatIdx(target)) |st| st.failed_open +%= 1;
+            }
+            cbs[n] = h.cb;
+            reqs[n] = h.req;
+            n += 1;
+            h.* = .{};
+            _ = g_wreq.outstanding.fetchSub(1, .release);
+        }
+    }
+    // CEF is re-entered OUTSIDE the spinlock, always.
+    for (0..n) |i| {
+        if (cbs[i]) |x| {
+            if (x.cont) |f| f(x);
+            release(&x.base);
+        }
+        if (reqs[i]) |r| release(&r.base);
+    }
+}
+
+/// The `p`-th percentile of an ASCENDING slice (nearest-rank).
+fn pct(sorted: []const u32, p: usize) u32 {
+    if (sorted.len == 0) return 0;
+    const rank = (sorted.len * p + 99) / 100;
+    const idx = @min(if (rank == 0) 0 else rank - 1, sorted.len - 1);
+    return sorted[idx];
+}
+
+/// The hold with this id, or null when it has already been answered.
+/// Caller holds `g_wreq.lock`.
+fn wreqFind(hid: u32) ?*Hold {
+    for (&g_wreq.holds) |*h| {
+        if (h.used and h.hid == hid) return h;
+    }
+    return null;
+}
+
+fn wstatIdx(i: usize) ?*WStat {
+    if (i >= g_wreq.stats.len) return null;
+    return &g_wreq.stats[i];
+}
+
+/// Answer every hold whose background page or page view is `view`.
+fn wreqAbandonView(view: u32) void {
+    var cbs: [MAX_HOLDS]?*cef.cef_callback_t = @splat(null);
+    var reqs: [MAX_HOLDS]?*cef.cef_request_t = @splat(null);
+    var n: usize = 0;
+    {
+        g_wreq.acquire();
+        defer g_wreq.release();
+        for (&g_wreq.holds) |*h| {
+            if (!h.used) continue;
+            if (h.bg_view != view and h.view_id != view) continue;
+            if (h.cb != null) {
+                if (wstatIdx(h.ext)) |s| s.failed_open +%= 1;
+            }
+            cbs[n] = h.cb;
+            reqs[n] = h.req;
+            n += 1;
+            h.* = .{};
+            _ = g_wreq.outstanding.fetchSub(1, .release);
+        }
+    }
+    for (0..n) |i| {
+        if (cbs[i]) |x| {
+            if (x.cont) |f| f(x);
+            release(&x.base);
+        }
+        if (reqs[i]) |r| release(&r.base);
+    }
+}
+
+/// Free the pipe and answer anything still held. Helper shutdown.
+pub fn webrequestDeinit() void {
+    var cbs: [MAX_HOLDS]?*cef.cef_callback_t = @splat(null);
+    var reqs: [MAX_HOLDS]?*cef.cef_request_t = @splat(null);
+    var n: usize = 0;
+    {
+        g_wreq.acquire();
+        defer g_wreq.release();
+        for (&g_wreq.holds) |*h| {
+            if (!h.used) continue;
+            cbs[n] = h.cb;
+            reqs[n] = h.req;
+            n += 1;
+            h.* = .{};
+        }
+        g_wreq.outstanding.store(0, .release);
+    }
+    for (0..n) |i| {
+        if (cbs[i]) |x| {
+            if (x.cont) |f| f(x);
+            release(&x.base);
+        }
+        if (reqs[i]) |r| release(&r.base);
+    }
+    for (&g_wreq_wake) |*fd| {
+        if (fd.* >= 0) _ = c.close(fd.*);
+        fd.* = -1;
+    }
 }
 
 fn onGetResourceRequestHandler(
@@ -4808,6 +5876,7 @@ fn installHandlers() void {
     resource_request_handler = std.mem.zeroes(cef.cef_resource_request_handler_t);
     resource_request_handler.base = staticBase(cef.cef_resource_request_handler_t);
     resource_request_handler.on_before_resource_load = onBeforeResourceLoad;
+    resource_request_handler.on_resource_response = onResourceResponse;
     resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
     request_handler.on_certificate_error = onCertificateError;
 

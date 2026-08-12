@@ -1049,8 +1049,153 @@
     };
   }
 
+  // -- blocking webRequest (MV2) ---------------------------------------
+  //
+  // The listener FUNCTIONS live here, in the background page's renderer;
+  // only their RequestFilter and extraInfoSpec go to the browser
+  // process, which is what lets it decide whether a request needs JS at
+  // all without asking. A held request arrives as one "ext-wreq"
+  // command and is answered by exactly one "ext-wreq-decision" — the
+  // browser process is holding a real network request open across that
+  // gap, so every path below answers, including the ones that throw.
+  var extWreqSeq = 1;
+
+  function extWebRequestEvent(extId, ctx, eventName) {
+    var entries = []; // {fn, id, blocking}
+    ctx.wreq[eventName] = entries;
+    return {
+      addListener: function (fn, filter, extraInfoSpec) {
+        if (typeof fn !== "function") return;
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].fn === fn) return;
+        }
+        var spec = extraInfoSpec || [];
+        var id = extWreqSeq++;
+        entries.push({
+          fn: fn,
+          id: id,
+          blocking: spec.indexOf("blocking") >= 0
+        });
+        extApiCall(extId, "webRequest", "addListener", [
+          eventName, id, filter || {}, spec
+        ]);
+      },
+      removeListener: function (fn) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].fn !== fn) continue;
+          var id = entries[i].id;
+          entries.splice(i, 1);
+          extApiCall(extId, "webRequest", "removeListener", [id]);
+          return;
+        }
+      },
+      hasListener: function (fn) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].fn === fn) return true;
+        }
+        return false;
+      }
+    };
+  }
+
+  // MV2's ResourceType enum. uBlock Origin reads this object directly
+  // (`browser.webRequest.ResourceType.WEBSOCKET`) to decide whether it
+  // may filter websockets at all, so it is a value, not a stub.
+  var extResourceType = {
+    MAIN_FRAME: "main_frame",
+    SUB_FRAME: "sub_frame",
+    STYLESHEET: "stylesheet",
+    SCRIPT: "script",
+    IMAGE: "image",
+    FONT: "font",
+    OBJECT: "object",
+    XMLHTTPREQUEST: "xmlhttprequest",
+    PING: "ping",
+    CSP_REPORT: "csp_report",
+    MEDIA: "media",
+    WEBSOCKET: "websocket",
+    OTHER: "other"
+  };
+
+  function makeWebRequest(extId, ctx) {
+    return {
+      ResourceType: extResourceType,
+      MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
+      onBeforeRequest: extWebRequestEvent(extId, ctx, "onBeforeRequest"),
+      onBeforeSendHeaders: extWebRequestEvent(extId, ctx, "onBeforeSendHeaders"),
+      onHeadersReceived: extWebRequestEvent(extId, ctx, "onHeadersReceived"),
+      handlerBehaviorChanged: function () {
+        return extApiCall(extId, "webRequest", "handlerBehaviorChanged", []);
+      }
+    };
+  }
+
+  // One held request. Runs the matching listeners in registration order
+  // and answers with the FIRST decisive BlockingResponse; a cancel beats
+  // a redirect, matching Firefox's own resolution. A listener that
+  // throws is skipped, never fatal — the browser process would fail the
+  // request open on a timeout anyway, and answering promptly is better.
+  function extWebRequest(m) {
+    var answered = false;
+    function answer(d) {
+      if (answered) return;
+      answered = true;
+      try {
+        send({ op: "ext-wreq-decision", hid: m.hid, d: d || {} });
+      } catch (e) {}
+    }
+    var ctx = extCtx[m.ext];
+    if (!ctx || !ctx.wreq) {
+      answer(null);
+      return;
+    }
+    var entries = ctx.wreq[m.event];
+    if (!entries || entries.length === 0) {
+      answer(null);
+      return;
+    }
+    var details = m.details || {};
+    var pending = null;
+    var merged = null;
+    for (var i = 0; i < entries.length; i++) {
+      var r;
+      try {
+        r = entries[i].fn(details);
+      } catch (e) {
+        continue;
+      }
+      if (!entries[i].blocking) continue;
+      if (r && typeof r.then === "function") {
+        // Firefox lets a blocking listener return a Promise. Take the
+        // first one and let it decide; the browser process's deadline
+        // is the backstop if it never settles.
+        pending = r;
+        break;
+      }
+      if (!r || typeof r !== "object") continue;
+      if (r.cancel === true) {
+        answer({ cancel: true });
+        return;
+      }
+      if (typeof r.redirectUrl === "string" && r.redirectUrl.length) {
+        answer({ redirectUrl: r.redirectUrl });
+        return;
+      }
+      if (r.requestHeaders || r.responseHeaders) merged = r;
+    }
+    if (pending) {
+      pending.then(function (r2) {
+        answer(r2 && typeof r2 === "object" ? r2 : null);
+      }, function () {
+        answer(null);
+      });
+      return;
+    }
+    answer(merged);
+  }
+
   function makeBrowser(extId, baseUrl, manifestObj, messages) {
-    var ctx = { listeners: extEvent(), changed: extEvent() };
+    var ctx = { listeners: extEvent(), changed: extEvent(), wreq: {} };
     extCtx[extId] = ctx;
     var storageLocal = {
       get: function (keys) {
@@ -1086,6 +1231,7 @@
         onMessage: ctx.listeners
       },
       storage: { local: storageLocal, onChanged: ctx.changed },
+      webRequest: makeWebRequest(extId, ctx),
       i18n: {
         getMessage: function (key) {
           var e = messages && messages[key];
@@ -1245,6 +1391,9 @@
         break;
       case "ext-message":
         extDeliver(m);
+        break;
+      case "ext-wreq":
+        extWebRequest(m);
         break;
       case "ext-result":
         extResult(m);

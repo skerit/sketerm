@@ -15,6 +15,7 @@ const c = @import("cbindings");
 const manifest = @import("manifest.zig");
 const match = @import("match.zig");
 const storage = @import("storage.zig");
+const webrequest = @import("webrequest.zig");
 
 pub const Extension = struct {
     /// Stable id (the client's), owned.
@@ -32,6 +33,12 @@ pub const Extension = struct {
     /// background or is disabled. Owned by cefhost; recorded here so a
     /// routing lookup finds it.
     bg_view: u32 = 0,
+    /// Blocking-webRequest listener registry, HEAP-allocated so the
+    /// pointer stays valid while `Host.exts` reallocates — the engine's
+    /// IO thread reads it through `webrequest.slots` and an ArrayList
+    /// element's address is not stable. Null until the extension first
+    /// registers a listener.
+    wreq: ?*webrequest.Registry = null,
 
     fn name(self: *const Extension) []const u8 {
         return if (self.man) |*m| m.name else "";
@@ -59,6 +66,15 @@ pub const Host = struct {
     }
 
     fn freeExt(self: *Host, e: *Extension) void {
+        // ORDER IS THE SAFETY PROPERTY: the slot must leave the
+        // published table before the registry it points at is freed, or
+        // the engine's IO thread can read a dangling pointer.
+        webrequest.unpublish(e.id);
+        if (e.wreq) |r| {
+            r.deinit(self.gpa);
+            self.gpa.destroy(r);
+            e.wreq = null;
+        }
         self.gpa.free(e.id);
         self.gpa.free(e.dir);
         if (e.err.len != 0) self.gpa.free(e.err);
@@ -103,7 +119,31 @@ pub const Host = struct {
         return e;
     }
 
+    /// Forget every webRequest listener of `e`. Called whenever the
+    /// thing that OWNS the listener functions goes away — the manifest
+    /// is reparsed, the extension is disabled, its background page is
+    /// torn down. Held requests are answered by the engine side, which
+    /// watches the same events; this only drops the registrations so no
+    /// later request can be held for a listener that no longer exists.
+    pub fn clearListeners(self: *Host, e: *Extension) void {
+        const r = e.wreq orelse return;
+        webrequest.acquire();
+        defer webrequest.release();
+        r.clear(self.gpa);
+        webrequest.refreshAnyLocked();
+    }
+
     fn reparse(self: *Host, e: *Extension) void {
+        // The compiled host permissions belong to the OLD manifest.
+        if (e.wreq) |r| {
+            webrequest.acquire();
+            r.clear(self.gpa);
+            r.hosts.deinit(self.gpa);
+            r.hosts = .{};
+            r.hosts_built = false;
+            webrequest.refreshAnyLocked();
+            webrequest.release();
+        }
         if (e.man) |*m| {
             m.deinit();
             e.man = null;
@@ -208,7 +248,89 @@ pub const Host = struct {
         if (std.mem.eql(u8, ns, "runtime")) return self.dispatchRuntime(e, method, args_json);
         if (std.mem.eql(u8, ns, "i18n")) return self.dispatchI18n(e, method, args_json);
         if (std.mem.eql(u8, ns, "tabs")) return self.dispatchTabs(e, method, args_json);
+        if (std.mem.eql(u8, ns, "webRequest")) return self.dispatchWebRequest(e, method, args_json);
         return self.errResult("unknown namespace");
+    }
+
+    /// `browser.webRequest` — registration only. The EVENTS are pushed
+    /// the other way (engine -> background page) and never come through
+    /// here, so this arm stays a small bookkeeping call: it is the seam
+    /// the 0xB0 block's header promised, filled in without reshaping the
+    /// dispatch around it.
+    ///
+    /// The caller must already have refused this for a non-background
+    /// frame — a content script has no business registering a network
+    /// filter, and the engine side is the only thing that knows which
+    /// frame a call arrived from.
+    fn dispatchWebRequest(self: *Host, e: *Extension, method: []const u8, args_json: []const u8) []u8 {
+        const man = if (e.man) |*m| m else return self.errResult("extension has no manifest");
+
+        if (std.mem.eql(u8, method, "handlerBehaviorChanged")) {
+            // Nothing is cached across requests here, so this is
+            // genuinely a no-op rather than a stub: there is no stale
+            // decision for it to flush.
+            return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
+        }
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch
+            return self.errResult("bad args");
+        defer parsed.deinit();
+        const args = if (parsed.value == .array) parsed.value.array.items else &[_]std.json.Value{};
+
+        if (std.mem.eql(u8, method, "removeListener")) {
+            if (args.len < 1 or args[0] != .integer) return self.errResult("bad listener id");
+            const lid: u32 = @intCast(@max(args[0].integer, 0));
+            const r = e.wreq orelse return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
+            webrequest.acquire();
+            r.remove(self.gpa, lid);
+            webrequest.refreshAnyLocked();
+            webrequest.release();
+            return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
+        }
+
+        if (!std.mem.eql(u8, method, "addListener")) return self.errResult("unknown webRequest method");
+
+        // args: [eventName, listenerId, RequestFilter, extraInfoSpec]
+        if (args.len < 2 or args[0] != .string or args[1] != .integer) return self.errResult("bad args");
+        const event = webrequest.Event.fromStr(args[0].string) orelse
+            return self.errResult("unsupported webRequest event");
+        const lid: u32 = @intCast(@max(args[1].integer, 0));
+
+        var urls: std.ArrayList([]const u8) = .empty;
+        defer urls.deinit(self.gpa);
+        var types: u32 = webrequest.ALL_TYPES;
+        if (args.len > 2 and args[2] == .object) {
+            const f = args[2].object;
+            if (f.get("urls")) |uv| {
+                if (uv == .array) {
+                    for (uv.array.items) |it| {
+                        if (it == .string) urls.append(self.gpa, it.string) catch return self.errResult("oom");
+                    }
+                }
+            }
+            types = webrequest.typesMask(f.get("types"));
+        }
+        const extra = webrequest.extraFrom(if (args.len > 3) args[3] else null);
+
+        const r = e.wreq orelse blk: {
+            const fresh = self.gpa.create(webrequest.Registry) catch return self.errResult("oom");
+            fresh.* = .{};
+            e.wreq = fresh;
+            break :blk fresh;
+        };
+
+        webrequest.acquire();
+        r.buildHosts(self.gpa, man);
+        const res = r.add(self.gpa, man, lid, event, extra, types, urls.items);
+        webrequest.refreshAnyLocked();
+        webrequest.release();
+        res catch |err| return self.errResult(@errorName(err));
+
+        // Publishing AFTER a successful add: a registry with no listener
+        // has nothing for the request path to find, and publishing on
+        // failure would put an empty slot in a 16-deep table.
+        if (!webrequest.publish(e.id, r)) return self.errResult("too many extensions with webRequest listeners");
+        return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
     }
 
     fn dispatchStorage(self: *Host, e: *Extension, method: []const u8, args_json: []const u8, changed: *?[]u8) []u8 {

@@ -214,11 +214,21 @@ pub const Tag = enum(u8) {
     webext_remove = 0xB1,
     webext_list_req = 0xB2,
     ev_webext_state = 0xB3,
-    // 0xB4-0xBF reserved for the WebExtensions block: the clearly-named
-    // seam for a later wave's blocking webRequest (a `webext_request`
-    // frame the helper HOLDS until a `webext_request_decision` answers,
-    // exactly the cert/permission shape) goes here without disturbing
-    // any existing frame's layout.
+    webext_wreq_stats_req = 0xB4,
+    ev_webext_wreq_stats = 0xB5,
+    // 0xB6-0xBF stay reserved for the WebExtensions block.
+    //
+    // NOTE for anyone reading the 0xB4-0xBF reservation as originally
+    // written: there is deliberately NO `webext_request` /
+    // `webext_request_decision` pair on this wire. A blocking
+    // webRequest decision is answered by the extension's BACKGROUND
+    // PAGE, which is a hidden windowless browser INSIDE the helper —
+    // the round trip is browser-process -> renderer -> back and never
+    // leaves the process, so routing it out to the GUI and back would
+    // add a socket hop, a GUI main-loop turn and a whole new "the
+    // client died mid-decision" failure mode to the latency-critical
+    // path. What DOES cross the wire is observability only: the client
+    // asks for counters and gets them.
     us_script_set = 0xC0,
     us_style_set = 0xC1,
     cookies_req = 0xC8,
@@ -2054,6 +2064,46 @@ pub const EvWebextState = struct {
     err: []const u8,
 };
 
+/// Ask for one `ev_webext_wreq_stats` per extension that has ever
+/// registered a blocking-webRequest listener.
+pub const WebextWreqStatsReq = struct {
+    pub const tag: Tag = .webext_wreq_stats_req;
+};
+
+/// Blocking-webRequest counters for one extension. This is the ONLY
+/// thing the held-request path sends to a client: the decision itself
+/// never crosses this socket (see the Tag block's note).
+///
+/// `failed_open` is the number the operator should watch — every one of
+/// them is a request that was HELD and then let through unfiltered
+/// because the extension could not answer (timed out, background page
+/// gone, extension removed mid-flight). A fail-open is a deliberate
+/// policy, not an error: a broken extension must not be able to wedge
+/// the browser.
+pub const EvWebextWreqStats = struct {
+    pub const tag: Tag = .ev_webext_wreq_stats;
+    id: []const u8,
+    /// Requests a RequestFilter matched (blocking or observational).
+    matched: u32,
+    /// Requests actually HELD waiting for a blocking decision.
+    held: u32,
+    cancelled: u32,
+    redirected: u32,
+    /// Held requests whose decision changed request headers.
+    headers_modified: u32,
+    /// `onHeadersReceived` decisions the engine could not apply — see
+    /// the measured limitation in `src/web/CLAUDE.md`.
+    headers_received_dropped: u32,
+    timed_out: u32,
+    failed_open: u32,
+    /// Round-trip latency of the held decision, in MICROSECONDS,
+    /// measured helper-side from the hold to its answer.
+    us_p50: u32,
+    us_p95: u32,
+    us_max: u32,
+    samples: u32,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -2533,6 +2583,22 @@ test "round-trip: webext frames" {
         .err = "",
     });
     try roundTrip(EvWebextState, .{ .id = "bad", .name = "", .version = "", .enabled = 0, .ok = 0, .err = "bad manifest" });
+    try roundTrip(WebextWreqStatsReq, .{});
+    try roundTrip(EvWebextWreqStats, .{
+        .id = "abc123",
+        .matched = 900,
+        .held = 120,
+        .cancelled = 40,
+        .redirected = 3,
+        .headers_modified = 7,
+        .headers_received_dropped = 2,
+        .timed_out = 1,
+        .failed_open = 1,
+        .us_p50 = 640,
+        .us_p95 = 1900,
+        .us_max = 20_000,
+        .samples = 120,
+    });
 }
 
 test "round-trip: semantic layer frames" {
