@@ -16,6 +16,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const confirm = @import("confirm.zig");
 const webface = @import("webface.zig");
 const proto = @import("../web/protocol.zig");
 const manifest = @import("../web/webext/manifest.zig");
@@ -104,7 +105,7 @@ pub fn ensureLoaded(gpa: std.mem.Allocator) void {
         // Fill name/version from the manifest if it still parses.
         var name: []const u8 = "";
         var version: []const u8 = "";
-        var man = readManifest(gpa, edir);
+        var man = readManifest(gpa, edir) catch null;
         defer if (man) |*m| m.deinit();
         if (man) |*m| {
             name = m.name;
@@ -184,13 +185,37 @@ pub fn onState(st: proto.EvWebextState) void {
 
 // -- install / remove / toggle ---------------------------------------
 
-pub const InstallError = error{ BadManifest, NoManifest, WriteFailed, BadArchive, OutOfMemory };
+pub const InstallError = error{
+    BadManifest,
+    NoManifest,
+    WriteFailed,
+    BadArchive,
+    /// An MV3 package. Its own error because it is the ONE failure a
+    /// user hits by accident (every Chrome Web Store download is MV3)
+    /// and the only one where the fix is "get the Firefox build".
+    UnsupportedManifestVersion,
+    OutOfMemory,
+};
+
+/// A human sentence for the install failure, for the error dialog.
+pub fn installErrorText(e: InstallError) [*:0]const u8 {
+    return switch (e) {
+        error.NoManifest => "No manifest.json was found in that folder or package.",
+        error.BadManifest => "The manifest.json could not be parsed.",
+        error.UnsupportedManifestVersion =>
+            "This is a Manifest V3 extension. sketerm hosts the Firefox MV2 surface, " ++
+            "where blocking webRequest still exists; install the Firefox build instead.",
+        error.BadArchive => "That file is not a readable .xpi/.zip archive.",
+        error.WriteFailed => "The extension could not be written to the data directory.",
+        error.OutOfMemory => "Out of memory.",
+    };
+}
 
 /// Install a "load unpacked" directory: the helper loads it in place, so
 /// nothing is copied. Returns the id.
 pub fn installUnpacked(gpa: std.mem.Allocator, dir: []const u8) InstallError![]const u8 {
     ensureLoaded(gpa);
-    var man = readManifest(gpa, dir) orelse return error.NoManifest;
+    var man = try readManifest(gpa, dir);
     defer man.deinit();
     return register(gpa, dir, &man, false);
 }
@@ -203,15 +228,20 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     var arc = zip.read(gpa, bytes) catch return error.BadArchive;
     defer arc.deinit();
     const man_entry = arc.find("manifest.json") orelse return error.NoManifest;
-    var man = manifest.parse(gpa, man_entry.data) catch return error.BadManifest;
+    var man = manifest.parse(gpa, man_entry.data) catch |err| return mapParseError(err);
     defer man.deinit();
 
-    var idbuf: [16]u8 = undefined;
-    const id = manifest.deriveId(man.name, man.version, &idbuf);
+    var idbuf: [manifest.MAX_ID_LEN]u8 = undefined;
+    const id = manifest.extensionId(&man, &idbuf);
     const base = dataDir(gpa) orelse return error.WriteFailed;
     defer gpa.free(base);
     const dest = std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, id }) catch return error.OutOfMemory;
     defer gpa.free(dest);
+    // AN UPGRADE REPLACES, it does not merge. The id is version-
+    // independent, so v2 unpacks over v1's directory; without this wipe
+    // every file v2 dropped would survive as a stale asset the helper
+    // still serves over `chrome-extension://`.
+    removeTree(gpa, dest);
     mkdirAll(dest);
     for (arc.entries) |entry| {
         if (entry.is_dir) continue;
@@ -225,34 +255,69 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     return register(gpa, dest, &man, true);
 }
 
-fn register(gpa: std.mem.Allocator, dir: []const u8, man: *manifest.Manifest, owned: bool) []const u8 {
-    var idbuf: [16]u8 = undefined;
-    const id = manifest.deriveId(man.name, man.version, &idbuf);
+fn mapParseError(err: manifest.ParseError) InstallError {
+    return switch (err) {
+        error.UnsupportedManifestVersion => error.UnsupportedManifestVersion,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
+}
+
+/// Register (or REPLACE) one extension in the registry.
+///
+/// Replacement in place is the whole point: the id no longer moves with
+/// the version, so installing v2 of an installed extension updates the
+/// one row instead of minting a second id — which used to leave both
+/// versions enabled and injecting, with v2 on a fresh empty
+/// `storage.local` and v1's files never deleted.
+fn register(gpa: std.mem.Allocator, dir: []const u8, man: *manifest.Manifest, owned: bool) InstallError![]const u8 {
+    var idbuf: [manifest.MAX_ID_LEN]u8 = undefined;
+    const id = manifest.extensionId(man, &idbuf);
     if (find(id)) |e| {
-        // Re-install: update the dir + metadata, keep enabled state.
+        // An upgrade whose files moved (unpacked -> packaged, or the
+        // other way) must not strand the old owned copy on disk.
+        if (e.owned_files and !std.mem.eql(u8, e.dir, dir)) removeTree(gpa, e.dir);
+        const new_dir = gpa.dupe(u8, dir) catch return error.OutOfMemory;
+        const new_name = gpa.dupe(u8, man.name) catch {
+            gpa.free(new_dir);
+            return error.OutOfMemory;
+        };
+        const new_version = gpa.dupe(u8, man.version) catch {
+            gpa.free(new_dir);
+            gpa.free(new_name);
+            return error.OutOfMemory;
+        };
         gpa.free(e.dir);
-        e.dir = gpa.dupe(u8, dir) catch e.dir;
+        e.dir = new_dir;
         gpa.free(e.name);
-        e.name = gpa.dupe(u8, man.name) catch e.name;
+        e.name = new_name;
         gpa.free(e.version);
-        e.version = gpa.dupe(u8, man.version) catch e.version;
+        e.version = new_version;
         e.owned_files = owned;
     } else {
-        g_exts.append(gpa, .{
-            .id = gpa.dupe(u8, id) catch return "",
-            .dir = gpa.dupe(u8, dir) catch return "",
-            .name = gpa.dupe(u8, man.name) catch return "",
-            .version = gpa.dupe(u8, man.version) catch return "",
+        var fresh = Ext{
+            .id = gpa.dupe(u8, id) catch return error.OutOfMemory,
+            .dir = gpa.dupe(u8, dir) catch return error.OutOfMemory,
+            .name = gpa.dupe(u8, man.name) catch return error.OutOfMemory,
+            .version = gpa.dupe(u8, man.version) catch return error.OutOfMemory,
             .enabled = true,
             .owned_files = owned,
-        }) catch return "";
+        };
+        g_exts.append(gpa, fresh) catch {
+            freeExt(&fresh);
+            return error.OutOfMemory;
+        };
     }
     save();
-    if (find(id)) |e| {
-        webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
-    }
+    const e = find(id) orelse return error.WriteFailed;
+    // A REPLACED extension must be torn down in the helper before the
+    // new files are announced: the same id keeps the same storage but
+    // its background page, listeners and content scripts belong to the
+    // version that is going away.
+    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = 0 });
+    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
     refreshOpenManager();
-    return id;
+    return e.id;
 }
 
 pub fn setEnabled(id: []const u8, on: bool) void {
@@ -458,7 +523,7 @@ fn onFolderChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, _: ?*anyopaque) ca
     defer c.g_object_unref(file);
     const path = c.g_file_get_path(file) orelse return;
     defer c.g_free(path);
-    _ = installUnpacked(m.gpa, std.mem.span(path)) catch {};
+    _ = installUnpacked(m.gpa, std.mem.span(path)) catch |err| reportInstallError(err);
 }
 
 fn onLoadArchive(_: ?*c.GtkWidget, _: ?*anyopaque) callconv(.c) void {
@@ -474,17 +539,33 @@ fn onArchiveChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, _: ?*anyopaque) c
     defer c.g_object_unref(file);
     const path = c.g_file_get_path(file) orelse return;
     defer c.g_free(path);
-    _ = installArchive(m.gpa, std.mem.span(path)) catch {};
+    _ = installArchive(m.gpa, std.mem.span(path)) catch |err| reportInstallError(err);
+}
+
+/// Tell the user an install failed, and why.
+///
+/// It used to be `catch {}`: picking an MV3 package — which is what
+/// every Chrome Web Store download and most "download extension" links
+/// give you — did nothing at all, with no row, no message and no log
+/// line. A failure the user CAUSED must be a failure the user SEES.
+fn reportInstallError(err: InstallError) void {
+    std.debug.print("webext: install failed: {s}\n", .{@errorName(err)});
+    const m = g_manager orelse return;
+    _ = confirm.present(m.window, .{
+        .heading = "Could not install extension",
+        .body = installErrorText(err),
+        .responses = &.{.{ .id = "close", .label = "Close", .is_default = true, .is_close = true }},
+    }, null);
 }
 
 // -- filesystem helpers ----------------------------------------------
 
-fn readManifest(gpa: std.mem.Allocator, dir: []const u8) ?manifest.Manifest {
-    const path = std.fmt.allocPrint(gpa, "{s}/manifest.json", .{dir}) catch return null;
+fn readManifest(gpa: std.mem.Allocator, dir: []const u8) InstallError!manifest.Manifest {
+    const path = std.fmt.allocPrint(gpa, "{s}/manifest.json", .{dir}) catch return error.OutOfMemory;
     defer gpa.free(path);
-    const bytes = readFile(gpa, path) orelse return null;
+    const bytes = readFile(gpa, path) orelse return error.NoManifest;
     defer gpa.free(bytes);
-    return manifest.parse(gpa, bytes) catch null;
+    return manifest.parse(gpa, bytes) catch |err| mapParseError(err);
 }
 
 fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
