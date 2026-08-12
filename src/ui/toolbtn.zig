@@ -57,6 +57,14 @@ pub fn setIcon(btn: *c.GtkWidget, anchor: *c.GtkWidget, icon: [*:0]const u8, tex
         c.gtk_button_set_label(@ptrCast(btn), text);
 }
 
+/// A standalone icon widget, falling back to a text label when the
+/// name does not resolve — for composing a custom button child (a
+/// badge next to an icon) with the same fallback guarantee.
+pub fn iconOrText(anchor: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8) *c.GtkWidget {
+    if (iconAvailable(icon)) return iconload.newImageIcon(anchor, icon, ICON_PX);
+    return c.gtk_label_new(text).?;
+}
+
 /// A framed icon button, wired but NOT appended and NOT flattened --
 /// for the bars that are not flat chrome (the disk-usage header).
 pub fn button(anchor: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype, user: ?*anyopaque) *c.GtkWidget {

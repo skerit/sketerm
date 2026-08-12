@@ -388,6 +388,22 @@ palette (action `web_discard_background`) does the same thing on
 demand, whatever this key says. A helper too old to advertise `discard`
 never receives the frame, and every web pane then behaves exactly as it
 did before this key existed.
+`web_popup_policy` decides what happens when a page calls
+`window.open` or follows a `target=_blank` link. The browser helper
+never opens a popup itself — it cancels the request and reports it — so
+this key is the whole policy:
+
+- `block-gestureless` (default): a popup produced by a real user
+  interaction opens as a new web tab, exactly as before. One the page
+  produced on its own is BLOCKED and offered as a toast naming the host,
+  with an `Open` button that opens it after all. That flag is what
+  separates a link the user clicked from an advertising pop-under.
+- `allow`: every popup opens, the pre-policy behaviour.
+- `block-all`: every popup becomes a toast, gesture or not.
+
+A browser helper older than the policy reports no gesture flag, and a
+missing flag counts as a gesture — such a helper keeps opening every
+popup rather than having all of them blocked.
 
 `web_search_engine` is used whenever address-bar input is neither an
 explicit URL nor something that looks like a host: the query is

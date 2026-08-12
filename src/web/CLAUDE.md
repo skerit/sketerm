@@ -136,7 +136,7 @@ callback carries no request id.
 - **Nothing streams before `a11y_enable` for that view.** Engine-side
   accessibility costs real renderer CPU, and unsolicited tree frames
   would break the backlog rule. Disable stops the stream again
-  (smoke-web stage 22j asserts both edges).
+  (smoke-web stage 22k asserts both edges).
 - **The accessibility callbacks carry NO browser pointer** — only the
   serialized payload's `ax_tree_id` token. `axResolveView` joins on
   the token a view was last seen with and rebinds an unknown token
@@ -569,7 +569,7 @@ over, and both are measured, not assumed:
   nowhere else.
 
 Cookie VALUES never cross the wire: `ev_cookies` carries names, scopes,
-flags and the value's LENGTH. smoke-web stage 28 asserts the value byte
+flags and the value's LENGTH. smoke-web stage 31 asserts the value byte
 string is absent from the frame, so a future "just add the value, it is
 convenient" change fails there.
 
@@ -616,6 +616,23 @@ H.264/AAC) while the distro build enables them.
   connects, before the `hello_ack` that would advertise the capability,
   so it stays on create-then-navigate and the settle in `mcp_web.zig`
   sees past the blank document instead.
+- **A held security decision must always be answered.** A certificate
+  error (`ev_cert_error`) and a permission prompt (`ev_permission`)
+  both keep an engine callback alive in `View` until a
+  `cert_decision` / `permission_decision` resolves it, so every exit
+  path answers: `freeView` cancels/denies whatever is still held, and
+  `on_dismiss_permission_prompt` drops a slot the engine took back
+  WITHOUT calling into a spent callback. The engine's own reference is
+  released at the same moment. Nothing about a decision is remembered
+  helper-side — no cert exception, no allowed origin — because a
+  stateless render helper is the wrong owner for a stored security
+  decision; the GUI remembers permissions in memory and a
+  `SiteSettingSink` is where persistence plugs in.
+- **`ev_popup_request` carries an OPTIONAL TRAILING `user_gesture`
+  byte**, and its decoder treats a short payload as "field absent,
+  assume a gesture". That is the only frame on this wire allowed to
+  grow, and only because the reader tolerates the old length: an
+  existing field may still never be widened, reordered or removed.
 - CEF types stay inside this directory — that seam is what keeps a
   future engine swap to a new helper binary rather than a rewrite.
   `semantic.zig` and `semantic.js` in particular must stay engine-free.
