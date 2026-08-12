@@ -81,6 +81,14 @@ pub const CAP_DOWNLOADS = "downloads";
 /// streamed for a view that never asked: engine-side accessibility is
 /// not free, and an unsolicited stream would break the backlog rule.
 pub const CAP_A11Y = "a11y";
+/// The helper accepts the 0xC0 user-content frames: `us_script_set`
+/// (userscripts, raw source with a `==UserScript==` block, injected
+/// per navigation by run-at) and `us_style_set` (per-site user CSS,
+/// applied instantly to live matching views AND at every navigation).
+/// Both are REPLACE-ALL sets, so a client re-sends the whole enabled
+/// set after any edit and the helper holds no partial state. An older
+/// helper skips the frames and pages simply get no user content.
+pub const CAP_USERSCRIPTS = "userscripts";
 /// The helper accepts `context_create`/`context_destroy`: per-tab
 /// identity contexts (separate cookie jars / caches), each optionally
 /// pointed at a proxy. A view's `context` field then selects one
@@ -168,6 +176,8 @@ pub const Tag = enum(u8) {
     ev_devtools_view = 0xA3,
     print_pdf = 0xA4,
     ev_print_pdf_done = 0xA5,
+    us_script_set = 0xC0,
+    us_style_set = 0xC1,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -1564,6 +1574,88 @@ pub const EvPrintPdfDone = struct {
     path: []const u8,
 };
 
+// -- user content (0xC0 block, capability "userscripts") --------------
+
+/// One userscript: RAW source including its `==UserScript==` block.
+/// The HELPER parses the metadata (src/web/userscript.zig) — the wire
+/// carries no digest of it, so parser fixes never need a wire change.
+/// `id` is the client's stable identity for the script (store id).
+pub const UsScript = struct {
+    id: u32,
+    source: Text,
+};
+
+/// Replace the COMPLETE set of enabled userscripts. The client sends
+/// only enabled scripts; disabling one is re-sending the set without
+/// it. Injection happens per navigation by each script's `@run-at`.
+pub const UsScriptSet = struct {
+    pub const tag: Tag = .us_script_set;
+    scripts: []const UsScript,
+
+    pub fn encodeTo(self: UsScriptSet, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU16(gpa, out, @intCast(self.scripts.len));
+        for (self.scripts) |s| {
+            try putU32(gpa, out, s.id);
+            try putText(gpa, out, s.source);
+        }
+    }
+
+    /// Caller owns the returned `scripts` slice (sources borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !UsScriptSet {
+        var cur = Cur{ .buf = payload };
+        const n = try cur.readU16();
+        const scripts = try gpa.alloc(UsScript, n);
+        errdefer gpa.free(scripts);
+        for (scripts) |*s| {
+            s.id = try cur.readU32();
+            s.source = try cur.readText();
+        }
+        return .{ .scripts = scripts };
+    }
+};
+
+/// One userstyle: user CSS scoped to `host` ("" = every page; a named
+/// host also covers its subdomains). `id` is the client's identity.
+pub const UsStyle = struct {
+    id: u32,
+    host: []const u8,
+    css: Text,
+};
+
+/// Replace the COMPLETE set of enabled userstyles. Applied instantly
+/// to live views whose current host matches, and injected again at
+/// every navigation — a style is the user's own choice, so it is NOT
+/// gated by the content-blocking shield.
+pub const UsStyleSet = struct {
+    pub const tag: Tag = .us_style_set;
+    styles: []const UsStyle,
+
+    pub fn encodeTo(self: UsStyleSet, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU16(gpa, out, @intCast(self.styles.len));
+        for (self.styles) |s| {
+            try putU32(gpa, out, s.id);
+            try putStr(gpa, out, s.host);
+            try putText(gpa, out, s.css);
+        }
+    }
+
+    /// Caller owns the returned `styles` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !UsStyleSet {
+        var cur = Cur{ .buf = payload };
+        const n = try cur.readU16();
+        const styles = try gpa.alloc(UsStyle, n);
+        errdefer gpa.free(styles);
+        for (styles) |*s| {
+            s.id = try cur.readU32();
+            s.host = try cur.readStr();
+            s.css = try cur.readText();
+        }
+        return .{ .styles = styles };
+    }
+};
+
 // -- containers / identity contexts (0x90 block, capability "contexts") --
 
 /// Create a per-tab identity context: its own cookie jar and cache,
@@ -2217,6 +2309,54 @@ test "round-trip: intercept_lists path list" {
     defer gpa.free(got.paths);
     try std.testing.expectEqual(@as(usize, 2), got.paths.len);
     try std.testing.expectEqualStrings(paths[1], got.paths[1]);
+}
+
+test "round-trip: user content sets (0xC0 block)" {
+    const gpa = std.testing.allocator;
+    // Tag values are append-only wire facts.
+    try std.testing.expectEqual(@as(u8, 0xC0), @intFromEnum(Tag.us_script_set));
+    try std.testing.expectEqual(@as(u8, 0xC1), @intFromEnum(Tag.us_style_set));
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const scripts = [_]UsScript{
+        .{ .id = 3, .source = .{ .s = "// ==UserScript==\n// @name a\n// ==/UserScript==\nx()" } },
+        .{ .id = 9, .source = .{ .s = "" } },
+    };
+    try encode(gpa, &buf, UsScriptSet{ .scripts = &scripts });
+    const styles = [_]UsStyle{
+        .{ .id = 1, .host = "example.com", .css = .{ .s = "body{color:red}" } },
+        .{ .id = 2, .host = "", .css = .{ .s = "*{}" } },
+    };
+    try encode(gpa, &buf, UsStyleSet{ .styles = &styles });
+
+    var r = Reader.init(buf.items);
+    const f1 = (try r.next()).?;
+    try std.testing.expectEqual(Tag.us_script_set, f1.tag);
+    const got_s = try UsScriptSet.decodeAlloc(f1.payload, gpa);
+    defer gpa.free(got_s.scripts);
+    try std.testing.expectEqual(@as(usize, 2), got_s.scripts.len);
+    try std.testing.expectEqual(@as(u32, 3), got_s.scripts[0].id);
+    try std.testing.expectEqualStrings(scripts[0].source.s, got_s.scripts[0].source.s);
+    try std.testing.expectEqual(@as(usize, 0), got_s.scripts[1].source.s.len);
+
+    const f2 = (try r.next()).?;
+    try std.testing.expectEqual(Tag.us_style_set, f2.tag);
+    const got_y = try UsStyleSet.decodeAlloc(f2.payload, gpa);
+    defer gpa.free(got_y.styles);
+    try std.testing.expectEqual(@as(usize, 2), got_y.styles.len);
+    try std.testing.expectEqualStrings("example.com", got_y.styles[0].host);
+    try std.testing.expectEqualStrings("body{color:red}", got_y.styles[0].css.s);
+    try std.testing.expectEqualStrings("", got_y.styles[1].host);
+
+    // Empty replace-all sets are valid frames (clear everything).
+    buf.clearRetainingCapacity();
+    try encode(gpa, &buf, UsScriptSet{ .scripts = &.{} });
+    var r2 = Reader.init(buf.items);
+    const f3 = (try r2.next()).?;
+    const got_e = try UsScriptSet.decodeAlloc(f3.payload, gpa);
+    defer gpa.free(got_e.scripts);
+    try std.testing.expectEqual(@as(usize, 0), got_e.scripts.len);
 }
 
 test "round-trip: intercept_log entry list" {
