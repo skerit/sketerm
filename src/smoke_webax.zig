@@ -34,6 +34,9 @@
 //!   7. `Text` answers the field's CONTENT (not its label), the caret
 //!      offset, and a real selection range — what a braille display
 //!      follows.
+//!   8. screen-reader DETECTION answers correctly against this same
+//!      real bus, fails safe when no session bus is reachable, and is
+//!      overridden by SKETERM_WEB_A11Y in both directions.
 //!
 //! SKIPs (exit 0) when dbus-daemon or at-spi2-registryd is missing.
 
@@ -43,6 +46,7 @@ const proto = @import("web/protocol.zig");
 const axtree = @import("web/axtree.zig");
 const webproj = @import("a11y/webproj.zig");
 const A11yHub = @import("mux/a11yhub.zig").Hub;
+const a11ydetect = @import("a11y/detect.zig");
 
 var g_dir: [64]u8 = @splat(0);
 
@@ -352,6 +356,43 @@ pub fn main() !void {
             fail("GetSelection did not report the selected range");
         }
         say("Text reports content, caret offset and selection over the bus");
+    }
+
+    // ── screen-reader detection, against a REAL bus ───────────────
+    // The hub sets org.a11y.Status IsEnabled + ScreenReaderEnabled on
+    // its private bus, which is exactly the desktop this projection is
+    // supposed to switch itself on for.
+    {
+        // The override wins over any desktop signal, both ways: assert
+        // that first, then clear it so the probe is the thing tested.
+        _ = c.setenv("SKETERM_WEB_A11Y", "0", 1);
+        if (a11ydetect.detect(gpa) != .forced_off)
+            fail("SKETERM_WEB_A11Y=0 did not force accessibility off");
+        _ = c.setenv("SKETERM_WEB_A11Y", "1", 1);
+        if (!a11ydetect.detect(gpa).enabled())
+            fail("SKETERM_WEB_A11Y=1 did not force accessibility on");
+        _ = c.unsetenv("SKETERM_WEB_A11Y");
+
+        // Point the probe at a session bus that has no accessibility
+        // stack at all: it must fail SAFE, and must not activate one.
+        _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/sketerm-webax", 1);
+        const dead = a11ydetect.detect(gpa);
+        if (dead.enabled()) {
+            std.debug.print("smoke-webax: detection said {s}\n", .{dead.token()});
+            fail("detection enabled accessibility with no reachable session bus");
+        }
+
+        // Now the private bus, where the hub advertises a reader.
+        var addr_buf: [256]u8 = undefined;
+        const addr = std.fmt.bufPrintZ(&addr_buf, "unix:path={s}", .{hub.bus_path}) catch unreachable;
+        _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", addr.ptr, 1);
+        const live = a11ydetect.detect(gpa);
+        if (!live.enabled()) {
+            std.debug.print("smoke-webax: detection said {s}\n", .{live.token()});
+            fail("detection did not notice the reader this bus advertises");
+        }
+        std.debug.print("smoke-webax: detection on a reader bus = {s}\n", .{live.token()});
+        say("screen-reader detection answers correctly on a real bus (and fails safe without one)");
     }
 
     // ── teardown ──────────────────────────────────────────────────
