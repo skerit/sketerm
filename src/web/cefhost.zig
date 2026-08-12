@@ -928,6 +928,9 @@ pub const Host = struct {
 
         const rc: *cef.cef_request_context_t = cef.cef_request_context_create_context(&settings, null) orelse return;
 
+        // The global registration does not reach this context.
+        registerExtSchemeOn(rc);
+
         if (req.proxy.len != 0) applyProxy(rc, req.proxy);
 
         self.contexts.append(self.gpa, .{
@@ -2877,6 +2880,15 @@ pub const Host = struct {
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
         v.hidden = true;
+        // The SAME rule as `spawnBrowser`, and this is the other browser
+        // creation path — now taken for every real extension. Leaving a
+        // background page at STATE_DEFAULT lets the engine enable
+        // accessibility on it by itself on any desktop with an at-spi
+        // bus, and its tree then arrives carrying an `ax_tree_id` bound
+        // to no view: `axResolveView` rebinds the unknown token onto the
+        // single a11y-enabled CLIENT view, so a screen reader gets the
+        // blank 1x1 background page instead of the page being read.
+        applyA11yState(v);
         // Tell the engine the view is hidden so it keeps no compositor /
         // frame production alive for a page that never paints.
         withHost(v, struct {
@@ -2990,7 +3002,16 @@ pub const Host = struct {
         }
         if (!any) return;
 
-        w.writeAll("{\"op\":\"ext-inject\",\"ext\":") catch return;
+        // The nonce AUTHENTICATES the command; `priv` (deliberately
+        // absent here) AUTHORIZES publishing the globals. Content
+        // scripts must not get `window.browser`, but they must still
+        // prove they came from this process: `ext-inject` hands the
+        // scripts it runs a live `browser.*` bound to `ext`, so an
+        // unauthenticated one let ANY page pass its own source and get
+        // that extension's tabs and storage.local.
+        w.writeAll("{\"op\":\"ext-inject\",\"tok\":\"") catch return;
+        w.writeAll(&sem_secret.nonce) catch return;
+        w.writeAll("\",\"ext\":") catch return;
         jsonStr(w, e.id) catch return;
         w.writeAll(",\"base\":") catch return;
         var base_buf: [256]u8 = undefined;
@@ -3534,6 +3555,10 @@ pub const Host = struct {
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const p = self.findPort(parsed.value.gid) orelse return;
+        // "Not a participant" and "the peer is gone" are different
+        // answers: `peerOf` returns 0 for both, and treating the first
+        // as the second let a non-participant CLOSE any port it named.
+        if (p.a_view != v.id and p.b_view != v.id) return;
         const peer_id = p.peerOf(v.id);
         const peer = if (peer_id != 0) self.find(peer_id) else null;
         if (peer == null) {
@@ -3554,10 +3579,17 @@ pub const Host = struct {
     }
 
     fn extPortClose(self: *Host, v: *View, json: []const u8) void {
-        _ = v;
         const R = struct { gid: u32 = 0 };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        // ONLY a participant may close a port. gids are small and
+        // sequential, so ignoring the calling view let anything able to
+        // emit `ext-*` walk the space and disconnect ports belonging to
+        // OTHER tabs — and a content script treats a disconnect as
+        // teardown, so uBO and Violentmonkey would go silently dead
+        // across every open tab with nothing logged.
+        const p = self.findPort(parsed.value.gid) orelse return;
+        if (p.a_view != v.id and p.b_view != v.id) return;
         self.closePortByGid(parsed.value.gid);
     }
 
@@ -6800,17 +6832,33 @@ fn extSchemeCreate(
     // stopped mid-sequence with no error anywhere, and it simply never
     // filtered. A page cannot mint such a load for another origin, so
     // treating it as the extension's own is both safe and necessary.
+    // A NAVIGATION is the only load whose initiating frame legitimately
+    // still reports the PREVIOUS document's url. Narrowing the `about:`
+    // relaxation to it is what stops a hostile page creating an
+    // about:blank iframe and `fetch()`ing any file in any installed
+    // package — including the generated bootstrap, which carries the
+    // bridge NONCE in plaintext and would defeat every nonce gate in
+    // semantic.js.
+    const rtype_raw = if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE;
+    const is_navigation = rtype_raw == cef.RT_MAIN_FRAME or rtype_raw == cef.RT_SUB_FRAME;
+
+    // `strict` = the initiating document really IS this extension.
+    // Tracked apart from `same_origin` because the relaxations below are
+    // right for package FILES and wrong for the generated paths.
+    var strict = false;
     var same_origin = frame == null;
     if (frame) |f| {
         if (f.*.get_url) |fu| {
             var fbuf: [2048]u8 = undefined;
             const furl = userfreeInto(fu(f), &fbuf);
-            same_origin = std.mem.eql(u8, extassets.urlHost(furl), host);
+            strict = std.mem.eql(u8, extassets.urlHost(furl), host);
+            same_origin = strict;
             // A top-level navigation TO the extension page reports the
             // frame's previous url, so allow the document itself: this
             // is how the background page, the popup and the options page
             // load at all.
-            if (!same_origin and (furl.len == 0 or std.mem.startsWith(u8, furl, "about:"))) same_origin = true;
+            if (!same_origin and is_navigation and
+                (furl.len == 0 or std.mem.startsWith(u8, furl, "about:"))) same_origin = true;
         } else same_origin = true;
     }
     if (!same_origin) {
@@ -6824,11 +6872,22 @@ fn extSchemeCreate(
     // and they are checked before the file lookup so a package cannot
     // shadow either with a file of its own.
     if (std.mem.eql(u8, path, extorigins.BOOTSTRAP_PATH)) {
+        // STRICT only. This body contains the bridge nonce, so it is the
+        // one path where "close enough to same-origin" is not good
+        // enough: it is always a `<script src>` from the extension's own
+        // document, where the frame reports the extension origin. A
+        // manifest publishing `"/*"` must not put it in reach either,
+        // which is why this is checked AFTER the WAR gate.
+        if (!strict) return extResourceFor(&.{}, "text/plain", 403);
         const js = buildExtBootstrap(&slot, host) orelse
             return extResourceFor("", "text/javascript", 500);
         return extResourceOwned(js, "text/javascript", 200);
     }
     if (std.mem.eql(u8, path, extorigins.GENERATED_BG_PATH)) {
+        // The background DOCUMENT is fetched by a navigation, so it
+        // cannot require `strict`; it must still never be a subresource
+        // another origin can read.
+        if (!strict and !is_navigation) return extResourceFor(&.{}, "text/plain", 403);
         const doc = buildGeneratedBackground(&slot) orelse
             return extResourceFor("", "text/html", 500);
         return extResourceOwned(doc, "text/html", 200);
@@ -7128,9 +7187,38 @@ fn registerExtSchemeFactory() void {
     // what we want: one factory, many extensions, dispatched on the host
     // through the origin table.
     ext_scheme_ok = cef.cef_register_scheme_handler_factory(&name, null, &scheme_factory) != 0;
+    // The doc calls this half the TRAP (it answers 1 even for a scheme
+    // Chromium refuses to register), so the debug switch has to print it
+    // — it was only printing add_custom_scheme's return, which is the
+    // half that is never ambiguous.
+    if (c.getenv("SKETERM_WEB_SCHEME_DEBUG") != null) {
+        std.debug.print("sketerm-web: register_scheme_handler_factory(" ++ ext_scheme ++ ") = {d}\n", .{@intFromBool(ext_scheme_ok)});
+    }
     if (!ext_scheme_ok) {
-        std.debug.print("sketerm-web: chrome-extension:// scheme refused; " ++
+        std.debug.print("sketerm-web: " ++ ext_scheme ++ ":// scheme refused; " ++
             "background pages fall back to inline scripts (no ES modules)\n", .{});
+    }
+}
+
+/// The same factory on ONE request context.
+///
+/// `cef_register_scheme_handler_factory` registers on the GLOBAL context
+/// only, so a container view — which runs on its own
+/// `cef_request_context_t` — has no handler for `ext_scheme` and every
+/// extension url inside a container fails to load, silently: the factory
+/// is never entered, so even the scheme debug env var prints nothing.
+/// uBO's redirect rules rewrite trackers to extension urls, so this is
+/// reached on ordinary browsing in a container, not just on an
+/// extension page.
+fn registerExtSchemeOn(rc: *cef.cef_request_context_t) void {
+    if (!ext_scheme_ok) return;
+    const reg = rc.register_scheme_handler_factory orelse return;
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr(ext_scheme, &name);
+    defer cef.cef_string_utf16_clear(&name);
+    if (reg(rc, &name, null, &scheme_factory) == 0) {
+        std.debug.print("sketerm-web: " ++ ext_scheme ++ ":// factory refused on a " ++
+            "container context; extension urls will not load in it\n", .{});
     }
 }
 
@@ -7536,6 +7624,12 @@ fn axResolveView(host: *Host, tree_id: []const u8) ?*View {
     var only: ?*View = null;
     for (host.views.items) |v| {
         if (!v.a11y or v.browser == null) continue;
+        // A background page is never a client view, so its tree must
+        // never be adoptable as one. `spawnBackground` disables its AX
+        // explicitly, which already prevents this; the skip is here so
+        // a future path that forgets cannot silently hand a reader a
+        // hidden 1x1 page in place of the page it is reading.
+        if (v.webext_bg) continue;
         if (only != null) return null; // ambiguous — drop, never guess
         only = v;
     }

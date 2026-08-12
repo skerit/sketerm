@@ -1758,11 +1758,28 @@
   // costs a page nothing, but a `browser` object bound to an installed
   // extension's id would reach that extension's `storage.local`, so
   // that half is gated.
+  // The nonce AUTHENTICATES an ext-inject; `priv` AUTHORIZES the
+  // globals. Both are needed and they are not the same question.
+  function extAuthentic(m) {
+    return typeof m.tok === "string" && m.tok === NONCE;
+  }
+
   function extPrivileged(m) {
-    return m.priv === true && typeof m.tok === "string" && m.tok === NONCE;
+    return m.priv === true && extAuthentic(m);
   }
 
   function extInject(m) {
+    // EVERY ext-inject must carry the nonce, not just the privileged
+    // one. The scripts this runs are handed `api` — a live `browser.*`
+    // bound to `m.ext` — as their `browser`/`chrome`/`self` arguments,
+    // so the closure isolates NOTHING from a caller who chose the
+    // script text. `window[SLOT]` is a discoverable own property, so
+    // before this check any page could post
+    // `{op:"ext-inject",ext:"uBlock0@raymondhill.net",scripts:[...]}`
+    // and read the user's whole tab list, navigate the active tab, or
+    // rewrite that extension's storage.local. Only the browser process
+    // knows the nonce, and it is on all three legitimate producers.
+    if (!extAuthentic(m)) return;
     var extId = m.ext;
     if (m.dbg) extDebug = true;
     if (typeof m.uilang === "string" && m.uilang) extUiLanguage = m.uilang;
