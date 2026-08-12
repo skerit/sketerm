@@ -1722,6 +1722,10 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     allocator.free(opened);
     if (!app.waitChangeSince(win_id, &ref, 15_000, 0.01, null))
         return "the command palette did not open";
+    // Let the present animation finish BEFORE the pre-typing baseline,
+    // or the fade-in is still repainting and the "did the entry take
+    // the text" check below passes on the animation instead.
+    _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
 
     // Type the query. The palette filters ~80 rows down to a handful,
     // which is a large visual change; if nothing moves, the entry never
@@ -1741,15 +1745,20 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     if (!typed) return "typing 'tab' into the palette changed nothing on screen";
     _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
 
-    // The artefact a human reviews for the ranked order.
-    if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
-        defer allocator.free(shot.png);
-        writePng("/tmp/sketerm-e2e-command-palette.png", shot.png);
-    } else |_| {}
-
+    // No screenshot on the happy path, deliberately. AdwDialog presents
+    // with a fade, and the frame this rig captures reliably predates the
+    // filter being painted — a success artefact would show an
+    // UNFILTERED palette and read as though the stage were bogus. The
+    // verdict below is behavioural and does not depend on pixels; the
+    // failure branch keeps a frame for whoever has to debug a red run.
     app.pressKey(null, "return") catch return "injecting return into the palette failed";
     _ = app.waitIdle(300, 5_000);
 
+    // This check is self-validating, which is why it is the one that
+    // matters: with an EMPTY entry the top row is the catalogue's first,
+    // "Copy", and copy_selection opens no tab. So a tab appearing proves
+    // BOTH that the entry took the text and that ranking chose a
+    // tab-opening row over the earlier-in-catalogue decoys.
     var got: usize = before;
     var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {
@@ -1759,6 +1768,10 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     }
     if (got != before + 1) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: palette tabs %zu -> %zu\n", before, got);
+        if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-command-palette-fail.png", shot.png);
+        } else |_| {}
         // Leave nothing armed if the WRONG row won: hints_open (the
         // decoy) puts the pane into hint mode.
         app.pressKey(null, "escape") catch {};
