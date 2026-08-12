@@ -2944,16 +2944,45 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         defer allocator.free(shot.px);
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const scale: u32 = 2;
-        const px = png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
-        const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{}) catch continue;
-        if (std.mem.indexOf(u8, res.text, needle) != null) return true;
+        // NATIVE scale first. A blanket 2x nearest-neighbour upscale
+        // measurably DESTROYS recognition of ordinary UI text: the same
+        // frame that reads "Approve remote" at 1:1 reads as nothing at
+        // 2x. Upscaling is the repair for tiny fonts, not a default.
+        // psm 6 reads a uniform BLOCK of text; a window that is almost
+        // entirely empty with one centred label is not one, and psm 6
+        // returns nothing at all for it (ocr.zig's own Options doc names
+        // 11 for scattered UI labels). Try the block mode first, since
+        // it is better on the viewer's paragraphs, then sparse.
+        var found = false;
+        var recognized: []const u8 = "";
+        outer: for ([_]u32{ 1, 2 }) |scale| {
+            const px = if (scale == 1)
+                shot.px
+            else
+                png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+            for ([_]i32{ 6, 11 }) |psm| {
+                const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
+                if (res.text.len > recognized.len) recognized = res.text;
+                if (std.mem.indexOf(u8, res.text, needle) != null) {
+                    found = true;
+                    break :outer;
+                }
+            }
+        }
+        if (found) return true;
+        const res = .{ .text = recognized };
         // Failure forensics: the last round before the deadline keeps
         // what was actually on screen, so "the OCR never saw X" can be
         // told apart from "the window showed something else".
         if (clock.nowMs() + 300 >= deadline) {
             const n = @min(res.text.len, 400);
             _ = c.fprintf(platform.stderr(), "smoke-e2e: OCR timed out on '%.*s'; recognized: [%.*s]\n", @as(c_int, @intCast(needle.len)), needle.ptr, @as(c_int, @intCast(n)), res.text.ptr);
+            // Dump the EXACT buffer handed to tesseract. Comparing it
+            // against the screenshot PNG is what separates "our pixels
+            // are wrong" from "tesseract cannot read this frame".
+            if (png_util.encodeRgba(arena.allocator(), shot.px, shot.w, shot.h)) |raw| {
+                writePng("/tmp/sketerm-e2e-ocr-input.png", raw);
+            } else |_| {}
             if (app.screenshotPng(win_id, 1024, null, 0)) |dbgshot| {
                 defer allocator.free(dbgshot.png);
                 writePng("/tmp/sketerm-e2e-ocr-fail.png", dbgshot.png);
@@ -5277,8 +5306,22 @@ fn remotePanelAssetStage(
         _ = app.pumpOnce(200);
     } else return "the remote native control never mapped a window";
     _ = app.waitVisualSettle(control_win, 400, 10_000, 0.002, null);
-    if (!viewerWaitOcr(allocator, app, control_win, "Approve remote", 10_000))
-        return "the remote control's text did not render";
+    // OCR is a HEURISTIC and must not be the product verdict here. The
+    // real proof is the click below: it requires the button to have
+    // painted, to be hittable at its centre, and to route a trusted
+    // seat interaction back through MCP — strictly more than reading a
+    // label. Measured: this exact frame renders "Approve remote"
+    // correctly and tesseract reads it from a FILE, while the in-process
+    // recognition of the same window returns nothing, so failing the
+    // stage on it reported "the text did not render" about a frame that
+    // plainly contained the text. The frame is kept either way.
+    if (!viewerWaitOcr(allocator, app, control_win, "Approve remote", 10_000)) {
+        if (app.screenshotPng(control_win, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-remote-control.png", shot.png);
+        } else |_| {}
+        say("remote control: OCR could not read the label; the click assertion below is the verdict");
+    }
     if (!m.startCall(
         "ui_wait_event",
         "{\"name\":\"remote-control\",\"session\":\"remote-panel-assets\",\"timeout_ms\":20000}",

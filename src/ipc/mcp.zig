@@ -3109,8 +3109,16 @@ pub fn ocrWindow(
     const shot = app.snapshotRgba(win_id, region) catch
         return .{ .err = "no rendered pixels in that window (yet?)" };
     defer app_state.allocator.free(shot.px);
-    var scale: u32 = @min(scale_req, 8);
-    if (scale == 0) scale = std.math.clamp(4096 / @max(1, @max(shot.w, shot.h)), 1, 3);
+    // Upscaling is a REPAIR for tiny fonts, not a free improvement:
+    // measured on an ordinary GTK dialog, nearest-neighbour 2x-3x made
+    // Tesseract read NOTHING where the native-scale image read the label
+    // correctly. The old auto rule (4096/longest edge, clamped to 3)
+    // fired on every window under ~1365px — i.e. nearly all of them —
+    // so the default silently hurt the common case to help the rare one.
+    // Auto now means "native first, upscale only if that found nothing".
+    // An explicit `scale` from the caller is still honoured verbatim.
+    const auto = scale_req == 0;
+    var scale: u32 = if (auto) 1 else @min(scale_req, 8);
     var px: []const u8 = shot.px;
     var w = shot.w;
     var h = shot.h;
@@ -3119,12 +3127,27 @@ pub fn ocrWindow(
         w *= scale;
         h *= scale;
     }
-    const res = ocr.recognize(arena, px, w, h, .{ .lang = lang, .psm = psm }) catch |err| return .{ .err = switch (err) {
+    var res = ocr.recognize(arena, px, w, h, .{ .lang = lang, .psm = psm }) catch |err| return .{ .err = switch (err) {
         ocr.Error.Unavailable => "OCR unavailable: libtesseract was not found on this machine. Install tesseract plus a language pack (e.g. tesseract-data-eng) — sketerm loads it at runtime, no rebuild needed.",
         ocr.Error.InitFailed => "tesseract loaded but could not initialize the language — install its traineddata (e.g. tesseract-data-eng) or set TESSDATA_PREFIX",
         ocr.Error.OutOfMemory => return error.OutOfMemory,
         else => "text recognition failed",
     } };
+    // Nothing legible at native scale: this is the tiny-font case the
+    // upscale exists for, so pay for it now rather than by default.
+    if (auto and res.words.len == 0) {
+        const up = std.math.clamp(4096 / @max(1, @max(shot.w, shot.h)), 1, 3);
+        if (up > 1) {
+            if (png_util.upscaleRgba(arena, shot.px, shot.w, shot.h, up)) |big| {
+                if (ocr.recognize(arena, big, shot.w * up, shot.h * up, .{ .lang = lang, .psm = psm })) |res2| {
+                    if (res2.words.len > 0) {
+                        res = res2;
+                        scale = up;
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+    }
     for (res.words) |*wd| {
         wd.x = shot.ox + wd.x / scale;
         wd.y = shot.oy + wd.y / scale;

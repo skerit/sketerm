@@ -47,6 +47,56 @@ pub const Options = struct {
     ppi: i32 = 96,
 };
 
+// DO NOT add a "dark image? invert it" pre-pass here. It is the obvious
+// idea — tesseract is trained on dark text over a light page — and it
+// MEASURABLY MAKES THINGS WORSE, because tesseract already detects and
+// handles inverted text itself; a global invert leaves it inverting a
+// second time. Measured 2026-08-12 on a real dark GTK panel: the frame
+// as captured reads "cannot load /LEFTFAILURE cannot load /RIGHTFAILURE",
+// and the same frame inverted reads "- -". Both through the same
+// tesseract build, the pixels otherwise identical.
+
+/// Mean luma (0..255, Rec. 601) of a tightly packed RGBA image,
+/// sampled on a stride so a 4K window costs a fraction of a frame.
+pub fn meanLuma(rgba: []const u8, w: u32, h: u32) u8 {
+    const px = @as(usize, w) * h;
+    if (px == 0 or rgba.len < px * 4) return 128;
+    // At most ~40k samples: enough for a background estimate, cheap
+    // enough to run on every call.
+    const step: usize = @max(1, px / 40_000);
+    var sum: u64 = 0;
+    var n: u64 = 0;
+    var i: usize = 0;
+    while (i < px) : (i += step) {
+        const o = i * 4;
+        sum += (@as(u64, rgba[o]) * 77 + @as(u64, rgba[o + 1]) * 150 + @as(u64, rgba[o + 2]) * 29) >> 8;
+        n += 1;
+    }
+    if (n == 0) return 128;
+    return @intCast(@min(255, sum / n));
+}
+
+/// Luma below this counts as a dark image (diagnostics only).
+pub const DARK_LUMA: u8 = 110;
+
+/// Rec. 601 luma, one byte per pixel, tightly packed. The channel order
+/// of the SOURCE does not matter for text: our frames are B,G,R,A and
+/// the weights differ only in which of two near-equal greys a coloured
+/// pixel lands on, while glyphs are neutral.
+fn toGray(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) Error![]u8 {
+    const px = @as(usize, w) * h;
+    const out = allocator.alloc(u8, px) catch return Error.OutOfMemory;
+    var i: usize = 0;
+    while (i < px) : (i += 1) {
+        const o = i * 4;
+        if (o + 2 >= rgba.len) break;
+        out[i] = @intCast((@as(u32, rgba[o]) * 29 + @as(u32, rgba[o + 1]) * 150 + @as(u32, rgba[o + 2]) * 77) >> 8);
+    }
+    return out;
+}
+
+
+
 const Create = *const fn () callconv(.c) ?*anyopaque;
 const Delete = *const fn (?*anyopaque) callconv(.c) void;
 const Init3 = *const fn (?*anyopaque, ?[*:0]const u8, [*:0]const u8) callconv(.c) c_int;
@@ -213,7 +263,29 @@ pub fn recognize(
     const api = getApi() orelse return Error.Unavailable;
     const t = try ensureInit(api, opts.lang);
     api.set_psm(t, opts.psm);
-    api.set_image(t, rgba.ptr, @intCast(w), @intCast(h), 4, @intCast(w * 4));
+    // GRAYSCALE, 1 byte per pixel — not the raw RGBA.
+    //
+    // `TessBaseAPISetImage` with bytes_per_pixel = 4 documents its input
+    // as R,G,B,A in memory; ours arrives from the compositor as Wayland
+    // ARGB8888, i.e. B,G,R,A little-endian, and the 4bpp path also drags
+    // an alpha channel tesseract has no use for. MEASURED 2026-08-12:
+    // handing it the 4bpp buffer returned "- -" for a panel whose own
+    // pixels, written out and read by the tesseract CLI, give "cannot
+    // load /LEFTFAILURE cannot load /RIGHTFAILURE". Luma is what it
+    // thresholds anyway, so converting here removes the byte-order and
+    // alpha questions instead of guessing at them — and costs a quarter
+    // of the data.
+    //
+    // HONEST LIMIT: this did NOT fix that panel. Feeding the identical
+    // pixels through this binding still under-reads badly (psm 6 -> "- -",
+    // psm 11 -> nothing) where the tesseract CLI on the same file reads
+    // every word, and sweeping psm and ppi changes nothing. Something
+    // else in this binding is wrong and is not yet found; the change is
+    // kept because passing B,G,R,A to an API documented as R,G,B,A was a
+    // real defect regardless of whether it was THE defect.
+    const gray = try toGray(allocator, rgba, w, h);
+    defer allocator.free(gray);
+    api.set_image(t, gray.ptr, @intCast(w), @intCast(h), 1, @intCast(w));
     api.set_resolution(t, opts.ppi);
 
     const raw = api.get_text(t) orelse return Error.RecognizeFailed;
@@ -331,4 +403,30 @@ test "recognize reads synthetic rendered text (skips without tesseract)" {
     defer res.deinit(a);
     // Blocky strokes OCR loosely; just require an H to have been seen.
     try std.testing.expect(std.mem.indexOfScalar(u8, res.text, 'H') != null);
+}
+
+test "meanLuma separates a dark page from a light one" {
+    const a = std.testing.allocator;
+    const w: u32 = 40;
+    const h: u32 = 20;
+    const dark = try a.alloc(u8, w * h * 4);
+    defer a.free(dark);
+    @memset(dark, 0x22);
+    try std.testing.expect(meanLuma(dark, w, h) < DARK_LUMA);
+
+    const light = try a.alloc(u8, w * h * 4);
+    defer a.free(light);
+    @memset(light, 0xee);
+    try std.testing.expect(meanLuma(light, w, h) >= DARK_LUMA);
+}
+
+test "toGray collapses a frame to one byte per pixel" {
+    const a = std.testing.allocator;
+    // Two pixels: opaque white, then black.
+    const src = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff };
+    const g = try toGray(a, &src, 2, 1);
+    defer a.free(g);
+    try std.testing.expectEqual(@as(usize, 2), g.len);
+    try std.testing.expect(g[0] > 240);
+    try std.testing.expectEqual(@as(u8, 0), g[1]);
 }
