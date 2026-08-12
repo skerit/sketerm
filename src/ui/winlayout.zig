@@ -199,7 +199,16 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 const first: ?[]const u8 = if (wstate.pages.len > 0)
                     (if (wstate.pages[0].url.len > 0) wstate.pages[0].url else null)
                 else if (wstate.url.len > 0) wstate.url else null;
-                if (webface.WebFace.attach(self.allocator, pane, first)) |wf| {
+                // Page 0's identity container, saved with the layout. A
+                // plain `attach` would put it in the default jar, so a
+                // "Work" tab came back looking right (the tab colour is
+                // restored separately) while actually browsing as
+                // nobody — the failure this restores.
+                const first_container: u32 = if (wstate.pages.len > 0)
+                    wstate.pages[0].container
+                else
+                    wstate.container;
+                if (webface.WebFace.attachContainer(self.allocator, pane, first, first_container)) |wf| {
                     wf.applyRestoredZoom(if (wstate.pages.len > 0)
                         wstate.pages[0].zoom_level_x100
                     else

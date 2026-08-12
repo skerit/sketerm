@@ -431,6 +431,78 @@ pub fn userstyleList(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback) boo
     return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "userstyle_list" });
 }
 
+// ── containers ──────────────────────────────────────────────────
+
+/// Every container plus every per-site rule, in one reply; parse with
+/// `parseContainers`.
+pub fn containerList(gpa: std.mem.Allocator, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "container_list" });
+}
+
+/// Create a container. `jar` "" seeds the (immutable) jar key from the
+/// name; reply carries the new id, parsed with `parseContainerId`.
+pub fn containerAdd(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    jar: []const u8,
+    color: [3]u8,
+    egress_host: []const u8,
+    remote_host: []const u8,
+    ctx: ?*anyopaque,
+    cb: Callback,
+) bool {
+    return sendTracked(gpa, ctx, cb, .{
+        .req = nextReq(),
+        .op = "container_add",
+        .name = name,
+        .jar = jar,
+        .color = packRgb(color),
+        .egress_host = egress_host,
+        .remote_host = remote_host,
+    });
+}
+
+/// Rename / recolour / re-route. A null field is left alone; "" clears
+/// a host. The jar key and the id can never change.
+pub fn containerUpdate(
+    gpa: std.mem.Allocator,
+    id: u32,
+    name: ?[]const u8,
+    color: ?[3]u8,
+    egress_host: ?[]const u8,
+    remote_host: ?[]const u8,
+    ctx: ?*anyopaque,
+    cb: Callback,
+) bool {
+    return sendTracked(gpa, ctx, cb, .{
+        .req = nextReq(),
+        .op = "container_update",
+        .container = id,
+        .name = name orelse "",
+        .color = if (color) |rgb| packRgb(rgb) else null,
+        .egress_host = egress_host,
+        .remote_host = remote_host,
+    });
+}
+
+pub fn containerRemove(gpa: std.mem.Allocator, id: u32, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{ .req = nextReq(), .op = "container_remove", .container = id });
+}
+
+/// "Always open this host in container X"; `id` 0 clears the rule.
+pub fn containerSiteSet(gpa: std.mem.Allocator, host: []const u8, id: u32, ctx: ?*anyopaque, cb: Callback) bool {
+    return sendTracked(gpa, ctx, cb, .{
+        .req = nextReq(),
+        .op = "container_site_set",
+        .host = host,
+        .container = id,
+    });
+}
+
+fn packRgb(rgb: [3]u8) u32 {
+    return (@as(u32, rgb[0]) << 16) | (@as(u32, rgb[1]) << 8) | @as(u32, rgb[2]);
+}
+
 // ── permission bitmask <-> store key ────────────────────────────
 
 /// The store keys permissions by NAME, the engine by bitmask, and a
@@ -621,6 +693,86 @@ pub fn parseUserstyles(arena: std.mem.Allocator, payload: []const u8) []const Us
     }) catch return &.{};
     if (!parsed.ok) return &.{};
     return parsed.styles;
+}
+
+/// A stored container, as the daemon reports it. `jar` is the engine's
+/// immutable cache key, NOT the display name.
+pub const ContainerEntry = struct {
+    id: u32 = 0,
+    name: []const u8 = "",
+    jar: []const u8 = "",
+    color: [3]u8 = .{ 0, 0, 0 },
+    egress_host: []const u8 = "",
+    remote_host: []const u8 = "",
+};
+
+pub const ContainerSiteEntry = struct {
+    host: []const u8 = "",
+    container: u32 = 0,
+};
+
+pub const ContainersReply = struct {
+    ok: bool = false,
+    containers: []const ContainerEntry = &.{},
+    sites: []const ContainerSiteEntry = &.{},
+};
+
+/// Parse a container_list web_reply. Slices borrow `arena` memory.
+pub fn parseContainers(arena: std.mem.Allocator, payload: []const u8) ContainersReply {
+    return std.json.parseFromSliceLeaky(ContainersReply, arena, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch .{};
+}
+
+const ContainerIdReply = struct {
+    ok: bool = false,
+    id: u32 = 0,
+};
+
+/// The id a container_add minted, or 0 if the store refused it.
+pub fn parseContainerId(arena: std.mem.Allocator, payload: []const u8) u32 {
+    const parsed = std.json.parseFromSliceLeaky(ContainerIdReply, arena, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return 0;
+    if (!parsed.ok) return 0;
+    return parsed.id;
+}
+
+test "webstore: container_list reply parses containers and site rules" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const payload =
+        \\{"req":3,"ok":true,
+        \\ "containers":[{"id":7,"name":"Employer","jar":"Work","color":[59,130,246],
+        \\                "egress_host":"","remote_host":""}],
+        \\ "sites":[{"host":"example.com","container":7}]}
+    ;
+    const rep = parseContainers(arena.allocator(), payload);
+    try t.expect(rep.ok);
+    try t.expectEqual(@as(usize, 1), rep.containers.len);
+    try t.expectEqual(@as(u32, 7), rep.containers[0].id);
+    // The display name and the jar key are independent: this container
+    // was renamed and kept its cookies.
+    try t.expectEqualStrings("Employer", rep.containers[0].name);
+    try t.expectEqualStrings("Work", rep.containers[0].jar);
+    try t.expectEqual(@as(u8, 130), rep.containers[0].color[1]);
+    try t.expectEqual(@as(usize, 1), rep.sites.len);
+    try t.expectEqualStrings("example.com", rep.sites[0].host);
+    try t.expectEqual(@as(u32, 7), rep.sites[0].container);
+}
+
+test "webstore: a failed container reply yields nothing, not a wrong id" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try t.expectEqual(@as(u32, 0), parseContainerId(arena.allocator(), "{\"ok\":false,\"id\":9}"));
+    try t.expectEqual(@as(u32, 5), parseContainerId(arena.allocator(), "{\"ok\":true,\"id\":5}"));
+    const rep = parseContainers(arena.allocator(), "{\"ok\":false}");
+    try t.expectEqual(@as(usize, 0), rep.containers.len);
+    // Garbage must not throw: a degraded store is silent, never fatal.
+    const bad = parseContainers(arena.allocator(), "not json");
+    try t.expect(!bad.ok);
 }
 
 // ── tests ───────────────────────────────────────────────────────

@@ -486,6 +486,12 @@ pub const Window = struct {
         const self = try allocator.create(Window);
         errdefer allocator.destroy(self);
 
+        // Pull the stored browser containers in before anything can
+        // restore a web pane: a face bound to a container holds its view
+        // back until the registry has landed, so the earlier this is
+        // kicked the less a restored browser tab waits. Idempotent.
+        @import("webface.zig").loadContainers(allocator);
+
         const app_window = c.adw_application_window_new(app);
         c.gtk_window_set_title(@ptrCast(app_window), "sketerm");
         // refreshWindowTitle re-applies once groupsend / etc. settle.

@@ -1428,7 +1428,16 @@ pub const container_palette = [_][3]u8{
 
 pub const Container = struct {
     id: u32,
+    /// Display name. Freely renameable, and NOT what the engine keys
+    /// its cookie jar on — see `jar`.
     name: []u8,
+    /// The name published to the helper as `context_create.name`, and
+    /// thus half of the engine's on-disk jar path
+    /// (`{profile}/contexts/{jar}-{id}`; `cefhost.sanitizeContextName`).
+    /// Fixed at creation so a RENAME keeps the cookies: deriving the
+    /// path from the display name would silently hand a renamed
+    /// container a fresh, empty jar.
+    jar: []u8,
     color: [3]u8,
     ephemeral: bool,
     /// Fixed-server proxy url published to the helper ("" = direct). For
@@ -1440,7 +1449,22 @@ pub const Container = struct {
     /// Remote-helper host ("" = local): faces in this container run on
     /// a `sketerm-webengine` spawned by THAT host's mux daemon, frames
     /// inline over the wire — the browser IS there rather than proxied
-    /// through there. Mutually exclusive with `egress_host`.
+    /// through there.
+    ///
+    /// **Still mutually exclusive with `egress_host`**, re-examined
+    /// 2026-08-12 and kept, because the conflict is an address-space
+    /// one rather than a policy choice: an egress container's proxy is
+    /// `socks5://127.0.0.1:<port>`, a listener in THIS process, so the
+    /// url only means anything on the machine the GUI runs on. Handing
+    /// it to a helper on another host would point that host's Chromium
+    /// at its OWN loopback — nothing there, or worse, something
+    /// unrelated. `publishOne` therefore strips the proxy for a remote
+    /// client, which is exactly why the pair cannot be expressed.
+    /// Lifting it needs the bridge reachable from the helper's host (a
+    /// reverse tunnel, or running the SOCKS listener daemon-side); that
+    /// is a transport feature, not a flag, so the exclusion stands and
+    /// the UI refuses the combination rather than silently dropping one
+    /// half.
     remote_host: []u8,
     /// The live SOCKS5->mux bridge for an egress container, else null.
     egress: ?*socksbridge.Egress = null,
@@ -1448,6 +1472,9 @@ pub const Container = struct {
 
 var g_containers: std.ArrayList(Container) = .empty;
 var g_next_container_id: u32 = 1;
+/// Ephemeral (incognito) ids live above every id the daemon store will
+/// ever mint — see `createContainerAt`.
+var g_next_ephemeral_id: u32 = 0x8000_0000;
 
 pub fn containers() []Container {
     return g_containers.items;
@@ -1500,24 +1527,69 @@ fn createContainerFull(
     egress_host: []const u8,
     remote_host: []const u8,
 ) u32 {
-    const id = g_next_container_id;
-    const color = if (ephemeral)
+    return createContainerAt(gpa, .{
+        .name = name,
+        .ephemeral = ephemeral,
+        .egress_host = egress_host,
+        .remote_host = remote_host,
+    });
+}
+
+/// Everything a container can be created with. `id` 0 mints a fresh id;
+/// a non-zero one ADOPTS a persisted container, which is how a stored
+/// identity keeps the engine jar it already has on disk.
+pub const ContainerSpec = struct {
+    id: u32 = 0,
+    name: []const u8,
+    jar: []const u8 = "",
+    color: ?[3]u8 = null,
+    ephemeral: bool = false,
+    egress_host: []const u8 = "",
+    remote_host: []const u8 = "",
+};
+
+pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
+    // Ephemeral containers are minted here and never stored, so their
+    // ids come from a DISJOINT high range: the daemon store counts up
+    // from 1, and an incognito tab opened before the stored registry
+    // arrived would otherwise be able to claim an id a real container
+    // already owns on disk — two identities, one cookie jar.
+    const id = if (spec.id != 0)
+        spec.id
+    else if (spec.ephemeral) blk: {
+        const e = g_next_ephemeral_id;
+        g_next_ephemeral_id += 1;
+        break :blk e;
+    } else g_next_container_id;
+    if (findContainer(id) != null) return 0;
+    const color = spec.color orelse if (spec.ephemeral)
         container_palette[container_palette.len - 1]
     else
         container_palette[(g_containers.items.len) % (container_palette.len - 1)];
+    const name = spec.name;
+    const ephemeral = spec.ephemeral;
+    const egress_host = spec.egress_host;
+    const remote_host = spec.remote_host;
 
     const name_owned = gpa.dupe(u8, name) catch return 0;
+    const jar_owned = gpa.dupe(u8, if (spec.jar.len != 0) spec.jar else name) catch {
+        gpa.free(name_owned);
+        return 0;
+    };
     const host_owned = gpa.dupe(u8, egress_host) catch {
         gpa.free(name_owned);
+        gpa.free(jar_owned);
         return 0;
     };
     const remote_owned = gpa.dupe(u8, remote_host) catch {
         gpa.free(name_owned);
+        gpa.free(jar_owned);
         gpa.free(host_owned);
         return 0;
     };
     var proxy_owned: []u8 = gpa.dupe(u8, "") catch {
         gpa.free(name_owned);
+        gpa.free(jar_owned);
         gpa.free(host_owned);
         gpa.free(remote_owned);
         return 0;
@@ -1537,6 +1609,7 @@ fn createContainerFull(
     g_containers.append(gpa, .{
         .id = id,
         .name = name_owned,
+        .jar = jar_owned,
         .color = color,
         .ephemeral = ephemeral,
         .proxy = proxy_owned,
@@ -1549,17 +1622,61 @@ fn createContainerFull(
             eg.destroy();
         }
         gpa.free(name_owned);
+        gpa.free(jar_owned);
         gpa.free(host_owned);
         gpa.free(remote_owned);
         gpa.free(proxy_owned);
         return 0;
     };
-    g_next_container_id += 1;
+    if (!ephemeral and id >= g_next_container_id) g_next_container_id = id + 1;
     // Publish to every live helper at once; a helper that starts later
     // gets the whole set replayed by `publishContexts` on connect.
     publishOne(client(), &g_containers.items[g_containers.items.len - 1]);
     for (g_remote_clients.items) |cl| publishOne(cl, &g_containers.items[g_containers.items.len - 1]);
     return id;
+}
+
+/// Rename / recolour in place. The jar key is untouched, so the
+/// container keeps every cookie it had.
+pub fn renameContainer(gpa: std.mem.Allocator, id: u32, name: []const u8) bool {
+    const ctn = findContainer(id) orelse return false;
+    const dup = gpa.dupe(u8, name) catch return false;
+    gpa.free(ctn.name);
+    ctn.name = dup;
+    return true;
+}
+
+pub fn recolorContainer(id: u32, rgb: [3]u8) bool {
+    const ctn = findContainer(id) orelse return false;
+    ctn.color = rgb;
+    return true;
+}
+
+/// Forget a container: tell every helper to drop the request context
+/// and release our own record. Views already open in it keep their
+/// engine-side context alive (CEF holds its own reference), so an open
+/// tab does not lose its jar mid-session — the id simply stops
+/// resolving for anything new.
+pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
+    for (g_containers.items, 0..) |*ctn, i| {
+        if (ctn.id != id) continue;
+        if (client().state == .ready) client().post(proto.ContextDestroy{ .id = id });
+        for (g_remote_clients.items) |cl| {
+            if (cl.state == .ready) cl.post(proto.ContextDestroy{ .id = id });
+        }
+        if (ctn.egress) |eg| {
+            eg.stop();
+            eg.destroy();
+        }
+        const dead = g_containers.orderedRemove(i);
+        gpa.free(dead.name);
+        gpa.free(dead.jar);
+        gpa.free(dead.proxy);
+        gpa.free(dead.egress_host);
+        gpa.free(dead.remote_host);
+        return true;
+    }
+    return false;
 }
 
 /// One-shot incognito preset: a throwaway ephemeral container.
@@ -1572,7 +1689,10 @@ fn publishOne(cl: *Client, ctn: *const Container) void {
     cl.post(proto.ContextCreate{
         .id = ctn.id,
         .ephemeral = if (ctn.ephemeral) 1 else 0,
-        .name = ctn.name,
+        // The JAR key, never the display name: this string is half the
+        // engine's on-disk cache path, so it must not move when the
+        // user renames the container.
+        .name = ctn.jar,
         // An egress proxy url names a LOOPBACK bridge port of THIS
         // machine; on a remote helper that loopback is the remote host's
         // own, so the proxy is stripped there (a remote container's
@@ -1585,6 +1705,216 @@ fn publishOne(cl: *Client, ctn: *const Container) void {
 /// faces re-create their views.
 fn publishContexts(cl: *Client) void {
     for (g_containers.items) |*ctn| publishOne(cl, ctn);
+}
+
+// ── stored containers (the daemon web store) ────────────────────
+
+const SiteRule = struct { host: []u8, container: u32 };
+var g_container_sites: std.ArrayList(SiteRule) = .empty;
+var g_containers_loaded: bool = false;
+var g_containers_loading: bool = false;
+var g_containers_gpa: ?std.mem.Allocator = null;
+
+/// True once the daemon's stored registry has been merged in (or has
+/// definitively failed).
+///
+/// A face bound to a container must not mint its view before this. The
+/// helper resolves an unknown context id to the DEFAULT request context
+/// rather than erroring, so a view created ahead of its
+/// `context_create` loads in the shared jar with nothing to show for
+/// it — the exact "you are not in the identity you think you are"
+/// failure containers exist to prevent.
+pub fn containersLoaded() bool {
+    return g_containers_loaded;
+}
+
+/// Container a per-site rule assigns `host` to, or 0 for none.
+pub fn containerForHost(host: []const u8) u32 {
+    for (g_container_sites.items) |rule| {
+        if (std.ascii.eqlIgnoreCase(rule.host, host)) return rule.container;
+    }
+    return 0;
+}
+
+/// Record "always open `host` in `id`" (0 clears), locally and in the
+/// daemon store. The local cache is updated first so the very next
+/// navigation obeys the rule without waiting for the round trip.
+pub fn setSiteContainer(gpa: std.mem.Allocator, host: []const u8, id: u32) void {
+    for (g_container_sites.items, 0..) |*rule, i| {
+        if (!std.ascii.eqlIgnoreCase(rule.host, host)) continue;
+        if (id == 0) {
+            gpa.free(g_container_sites.orderedRemove(i).host);
+        } else rule.container = id;
+        _ = webstore.containerSiteSet(gpa, host, id, null, &onStoreAck);
+        return;
+    }
+    if (id != 0) {
+        const owned = gpa.dupe(u8, host) catch return;
+        g_container_sites.append(gpa, .{ .host = owned, .container = id }) catch {
+            gpa.free(owned);
+            return;
+        };
+    }
+    _ = webstore.containerSiteSet(gpa, host, id, null, &onStoreAck);
+}
+
+/// Fire-and-forget store writes still need a callback slot; nothing is
+/// resolved through it, so there is nothing to fence.
+fn onStoreAck(_: ?*anyopaque, _: bool, _: []const u8) void {}
+
+/// Pull the stored registry in. Idempotent, and safe to call before any
+/// helper exists.
+///
+/// The reply callback carries a NULL context on purpose: everything it
+/// touches is module-global state that lives as long as the process
+/// (the same immortality that fences `clientForHost`), so there is no
+/// owner whose teardown a `webstore.cancelFor` would have to match.
+pub fn loadContainers(gpa: std.mem.Allocator) void {
+    if (g_containers_loading or g_containers_loaded) return;
+    g_containers_gpa = gpa;
+    g_containers_loading = true;
+    if (!webstore.containerList(gpa, null, &onContainerList)) {
+        // No daemon-side store on this host: containers degrade to
+        // session-local rather than wedging every container-bound view.
+        g_containers_loading = false;
+        markContainersReady(gpa);
+    }
+}
+
+fn onContainerList(_: ?*anyopaque, ok: bool, payload: []const u8) void {
+    const gpa = g_containers_gpa orelse return;
+    g_containers_loading = false;
+    if (!ok) return markContainersReady(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const rep = webstore.parseContainers(arena.allocator(), payload);
+    for (rep.containers) |stored| {
+        if (stored.id == 0 or stored.name.len == 0) continue;
+        // Adopt the STORED id: it is the engine's jar path component.
+        _ = createContainerAt(gpa, .{
+            .id = stored.id,
+            .name = stored.name,
+            .jar = stored.jar,
+            .color = stored.color,
+            .egress_host = stored.egress_host,
+            .remote_host = stored.remote_host,
+        });
+    }
+    for (rep.sites) |rule| {
+        if (rule.host.len == 0 or rule.container == 0) continue;
+        const owned = gpa.dupe(u8, rule.host) catch continue;
+        g_container_sites.append(gpa, .{ .host = owned, .container = rule.container }) catch
+            gpa.free(owned);
+    }
+    markContainersReady(gpa);
+}
+
+/// Open the gate: publish every container to every live helper, then
+/// let the faces that were waiting on it mint their views.
+fn markContainersReady(gpa: std.mem.Allocator) void {
+    _ = gpa;
+    if (g_containers_loaded) return;
+    g_containers_loaded = true;
+    publishContexts(client());
+    for (g_remote_clients.items) |cl| publishContexts(cl);
+    for (client().faces.items) |f| f.ensureView();
+    for (g_remote_clients.items) |cl| {
+        for (cl.faces.items) |f| f.ensureView();
+    }
+}
+
+/// Result of a stored-container create: the new id, or 0 on failure.
+pub const ContainerCreated = *const fn (ctx: ?*anyopaque, id: u32) void;
+
+const PendingCreate = struct {
+    allocator: std.mem.Allocator,
+    ctx: ?*anyopaque,
+    cb: ?ContainerCreated,
+    name: []u8,
+    egress_host: []u8,
+    remote_host: []u8,
+    color: [3]u8,
+
+    fn free(self: *PendingCreate) void {
+        self.allocator.free(self.name);
+        self.allocator.free(self.egress_host);
+        self.allocator.free(self.remote_host);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Create a PERSISTENT container.
+///
+/// The id is minted by the daemon store rather than here, because it is
+/// half the engine's on-disk jar path: a per-process counter would hand
+/// the same identity a different jar on every launch. The container
+/// therefore only exists once the reply lands, which is why this is
+/// asynchronous where `createContainer` is not.
+///
+/// `egress_host` and `remote_host` are mutually exclusive (see
+/// `Container.remote_host`); passing both is refused outright.
+pub fn createStoredContainer(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    color: [3]u8,
+    egress_host: []const u8,
+    remote_host: []const u8,
+    ctx: ?*anyopaque,
+    cb: ?ContainerCreated,
+) bool {
+    if (name.len == 0) return false;
+    if (egress_host.len != 0 and remote_host.len != 0) return false;
+    const p = gpa.create(PendingCreate) catch return false;
+    p.* = .{
+        .allocator = gpa,
+        .ctx = ctx,
+        .cb = cb,
+        .color = color,
+        .name = gpa.dupe(u8, name) catch {
+            gpa.destroy(p);
+            return false;
+        },
+        .egress_host = gpa.dupe(u8, egress_host) catch {
+            gpa.free(p.name);
+            gpa.destroy(p);
+            return false;
+        },
+        .remote_host = gpa.dupe(u8, remote_host) catch {
+            gpa.free(p.name);
+            gpa.free(p.egress_host);
+            gpa.destroy(p);
+            return false;
+        },
+    };
+    // The jar key starts equal to the name and never moves again.
+    if (!webstore.containerAdd(gpa, name, name, color, egress_host, remote_host, @ptrCast(p), &onContainerAdded)) {
+        p.free();
+        return false;
+    }
+    return true;
+}
+
+fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
+    const p: *PendingCreate = @ptrCast(@alignCast(user orelse return));
+    defer p.free();
+    const gpa = p.allocator;
+    var id: u32 = 0;
+    if (ok) {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        id = webstore.parseContainerId(arena.allocator(), payload);
+    }
+    if (id != 0) {
+        id = createContainerAt(gpa, .{
+            .id = id,
+            .name = p.name,
+            .jar = p.name,
+            .color = p.color,
+            .egress_host = p.egress_host,
+            .remote_host = p.remote_host,
+        });
+    }
+    if (p.cb) |cb| cb(p.ctx, id);
 }
 
 // ---------------------------------------------------------------------
@@ -2194,17 +2524,33 @@ pub const WebFace = struct {
         url: ?[]const u8,
         opener: ?*WebFace,
     ) !*WebFace {
+        return attachPageIn(allocator, g, url, opener, inheritedContainer(g, opener));
+    }
+
+    /// A new page inherits the container of the page it was opened
+    /// from: a link followed inside a container stays in that
+    /// container, which is the whole point of one.
+    fn inheritedContainer(g: *webgroup.Group, opener: ?*WebFace) u32 {
+        if (opener) |op| return op.container;
+        const cur = g.active() orelse return 0;
+        return cur.container;
+    }
+
+    /// Page whose container is GIVEN rather than inherited — the
+    /// restore path, which must reproduce what was saved instead of
+    /// copying whichever page happens to be active.
+    pub fn attachPageIn(
+        allocator: std.mem.Allocator,
+        g: *webgroup.Group,
+        url: ?[]const u8,
+        opener: ?*WebFace,
+        container: u32,
+    ) !*WebFace {
         return attachOpts(allocator, g.pane, .{
             .url = url,
             .as_page = true,
             .opener = opener,
-            // A new page inherits the container of the page it was
-            // opened from: a link followed inside a container stays in
-            // that container, which is the whole point of one.
-            .container = if (opener) |op| op.container else blk: {
-                const cur = g.active() orelse break :blk 0;
-                break :blk cur.container;
-            },
+            .container = container,
         });
     }
 
@@ -4194,6 +4540,13 @@ pub const WebFace = struct {
         // inspector's source page), never here.
         if (self.attached) return;
         if (cl.state != .ready or self.view_live) return;
+        // A container's request context must reach the helper BEFORE a
+        // view names it: an unknown context id resolves to the shared
+        // default jar rather than failing, so the page would load in the
+        // wrong identity silently. The stored registry arrives
+        // asynchronously, so a container-bound face waits for it and
+        // `markContainersReady` kicks every waiter.
+        if (self.container != 0 and !g_containers_loaded) return;
         // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
         // CURRENT allocation is the truth whenever it has one; the
         // 800x600 below is for a face whose widget has never been laid

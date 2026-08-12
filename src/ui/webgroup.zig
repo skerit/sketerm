@@ -254,6 +254,12 @@ pub const Group = struct {
         return webface.WebFace.attachPage(self.allocator, self, url, opener);
     }
 
+    /// Page in an EXPLICIT container (restore, and "open this site in
+    /// container X"), rather than inheriting the opener's.
+    pub fn newPageIn(self: *Group, url: ?[]const u8, opener: ?*WebFace, container: u32) !*WebFace {
+        return webface.WebFace.attachPageIn(self.allocator, self, url, opener, container);
+    }
+
     /// Show the in-pane strip only when the sidebar is not listing this
     /// group's pages and there is more than one of them.
     pub fn refreshChrome(self: *Group) void {
@@ -288,7 +294,11 @@ pub const Group = struct {
             if (p.face.attached) continue;
             const st = try p.face.paneState(arena);
             if (cur == p.face) active_idx = @intCast(out.items.len);
-            try out.append(arena, .{ .url = st.url, .zoom_level_x100 = st.zoom_level_x100 });
+            try out.append(arena, .{
+                .url = st.url,
+                .zoom_level_x100 = st.zoom_level_x100,
+                .container = p.face.container,
+            });
             try kept.append(arena, p.face);
         }
         // Second pass: a parent is only referable once every kept page
@@ -303,6 +313,7 @@ pub const Group = struct {
             .zoom_level_x100 = out.items[active_idx].zoom_level_x100,
             .pages = out.items,
             .active_page = active_idx,
+            .container = out.items[active_idx].container,
         };
     }
 
@@ -323,7 +334,10 @@ pub const Group = struct {
                 break :blk built.items[pi];
             };
             const url: ?[]const u8 = if (ps.url.len > 0) ps.url else null;
-            const face = self.newPage(url, parent) catch break;
+            // The SAVED container, not the opener's: a restored tree can
+            // mix identities, and inheriting would quietly move a page
+            // into whichever container its parent happened to be in.
+            const face = self.newPageIn(url, parent, ps.container) catch break;
             face.applyRestoredZoom(ps.zoom_level_x100);
             built.append(self.allocator, face) catch break;
         }
