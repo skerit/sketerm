@@ -6344,6 +6344,13 @@ const ax_attr_map = [_]struct { from: []const u8, to: []const u8 }{
     .{ .from = "autoComplete", .to = "autocomplete" },
     .{ .from = "accessKey", .to = "access-key" },
     .{ .from = "keyShortcuts", .to = "key-shortcuts" },
+    // The engine's OWN verb for a node's default action ("press",
+    // "check", "uncheck", "jump", "open", ...). A projection announces
+    // this to the user, so taking Chromium's word beats guessing from
+    // the role. "clickAncestor" marks a node whose click belongs to an
+    // ancestor (static text inside a button) and must NOT read as
+    // actionable; the consumer filters it.
+    .{ .from = "defaultActionVerb", .to = "default-action" },
 };
 
 /// Any attribute value as its wire string, arena-allocated.
@@ -6421,6 +6428,7 @@ fn axEmitUpdate(
         }
     }
 
+    var field_sel: ?[2]i32 = null;
     var nodes_buf: std.ArrayList(u8) = .empty;
     defer nodes_buf.deinit(host.gpa);
     var w = proto.A11yNodeWriter{ .gpa = host.gpa, .buf = &nodes_buf };
@@ -6433,8 +6441,33 @@ fn axEmitUpdate(
             const nd = listDict(nodes, i) orelse continue;
             defer release(@ptrCast(&nd.base));
             axPutNode(&w, nd, alloc) catch return; // OOM: drop frame
+            // A text form control's selection is NOT in tree_data:
+            // MEASURED on CEF 151, setSelectionRange(2,6) in an
+            // <input> arrives there as a COLLAPSED caret at 2. The
+            // real range is on the node, so prefer it for the focused
+            // field. Absent keys change nothing.
+            if (focus_id != 0 and field_sel == null) {
+                if (dInt(nd, "id")) |nid| {
+                    if (@as(u32, @bitCast(nid)) == focus_id) {
+                        if (dDict(nd, "attributes")) |at| {
+                            defer release(@ptrCast(&at.base));
+                            const ss = dInt(at, "textSelStart");
+                            const se = dInt(at, "textSelEnd");
+                            if (ss != null and se != null and ss.? >= 0 and se.? >= 0)
+                                field_sel = .{ ss.?, se.? };
+                        }
+                    }
+                }
+            }
         }
     }
+    if (field_sel) |fs| caret = .{
+        .view = v.id,
+        .anchor_id = focus_id,
+        .anchor_offset = fs[0],
+        .focus_id = focus_id,
+        .focus_offset = fs[1],
+    };
 
     host.post(proto.EvA11yTree{
         .view = v.id,

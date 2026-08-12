@@ -143,9 +143,11 @@ pub const Proj = struct {
 
     /// One node as last published. `children` is an owned copy: a
     /// precise children-changed needs the OLD list, and a hash could
-    /// only say "something moved".
+    /// only say "something moved". Deliberately holds no parent —
+    /// structure is diffed from each parent's own child list, and
+    /// resolving a parent per node per frame would make `publish`
+    /// quadratic in the size of the page.
     const Shadow = struct {
-        parent: u32,
         state: u64,
         name_hash: u64,
         children: []u32,
@@ -472,7 +474,6 @@ pub const Proj = struct {
         while (it.next()) |e| {
             const n = e.value_ptr;
             try self.shadow.put(self.gpa, n.id, .{
-                .parent = self.parentOf(n.id) orelse 0,
                 .state = n.state,
                 .name_hash = std.hash.Wyhash.hash(0, n.name),
                 .children = try self.gpa.dupe(u32, n.children),
@@ -516,7 +517,6 @@ pub const Proj = struct {
             }
             sh.name_hash = nh;
             sh.state = n.state;
-            sh.parent = self.parentOf(n.id) orelse 0;
         }
         // Retire shadows whose node is gone (their parent's diff, or
         // its own disappearance, already told the reader).
@@ -535,7 +535,6 @@ pub const Proj = struct {
             const n = e.value_ptr;
             if (self.shadow.contains(n.id)) continue;
             try self.shadow.put(self.gpa, n.id, .{
-                .parent = self.parentOf(n.id) orelse 0,
                 .state = n.state,
                 .name_hash = std.hash.Wyhash.hash(0, n.name),
                 .children = try self.gpa.dupe(u32, n.children),
@@ -960,7 +959,7 @@ pub const Proj = struct {
             sig.* = "a(sss)";
             const tok = try bw.beginArray(8);
             try bw.pad(8);
-            try bw.putString(action_name);
+            try bw.putString(actionNameOf(n));
             try bw.putString(""); // description
             try bw.putString(""); // key binding
             bw.endArray(tok);
@@ -972,7 +971,7 @@ pub const Proj = struct {
             var rd = dbus.Reader.init(body);
             const idx = try rd.i32v();
             sig.* = "s";
-            try bw.putString(if (idx == 0) action_name else "");
+            try bw.putString(if (idx == 0) actionNameOf(n) else "");
             return true;
         }
         if (std.mem.eql(u8, member, "GetDescription") or
@@ -1488,14 +1487,33 @@ const action_roles = [_][]const u8{
     "rowheader",  "menuitem",
 };
 
+/// The engine's own verb for the node's default action, when it gave
+/// one. `clickAncestor` is explicitly NOT an action of this node — it
+/// marks a node (static text inside a button) whose click belongs to
+/// an ancestor, and exposing it would put a pressable object under
+/// every label.
+fn actionVerb(n: *const axtree.Node) ?[]const u8 {
+    const v = n.attr("default-action") orelse return null;
+    if (v.len == 0) return null;
+    if (std.mem.eql(u8, v, "none") or std.mem.eql(u8, v, "clickAncestor")) return null;
+    return v;
+}
+
 fn isActionable(n: *const axtree.Node) bool {
     // A disabled control is not pressable, whatever its role.
     if (n.state & proto.ax_disabled != 0) return false;
+    if (actionVerb(n) != null) return true;
     if (n.state & proto.ax_focusable != 0) return true;
     for (action_roles) |r| {
         if (std.mem.eql(u8, n.role, r)) return true;
     }
     return false;
+}
+
+/// What the reader announces for the press. The engine's verb when it
+/// supplied one, else the generic default.
+fn actionNameOf(n: *const axtree.Node) []const u8 {
+    return actionVerb(n) orelse action_name;
 }
 
 fn nodePath(buf: *[64]u8, id: u32) []const u8 {
@@ -1769,6 +1787,7 @@ test "text boundaries: char, word and line" {
 test "actionability follows role or focusability, and never a disabled node" {
     var n = axtree.Node{ .id = 1, .role = @constCast("button") };
     try t.expect(isActionable(&n));
+    try t.expectEqualStrings("click", actionNameOf(&n));
     // A disabled control is not pressable whatever its role.
     n.state = proto.ax_disabled;
     try t.expect(!isActionable(&n));
@@ -1777,6 +1796,26 @@ test "actionability follows role or focusability, and never a disabled node" {
     try t.expect(!isActionable(&d));
     d.state = proto.ax_focusable;
     try t.expect(isActionable(&d));
+}
+
+test "the engine's own action verb wins, and clickAncestor is not one" {
+    var kv = [_]axtree.Attr{.{ .key = @constCast("default-action"), .value = @constCast("uncheck") }};
+    var box = axtree.Node{ .id = 1, .role = @constCast("checkbox"), .attrs = &kv };
+    try t.expect(isActionable(&box));
+    // What the reader announces is the engine's verb, not "click".
+    try t.expectEqualStrings("uncheck", actionNameOf(&box));
+
+    // Static text inside a button reports clickAncestor: the press
+    // belongs to the ancestor, so this node must not be pressable or
+    // every label becomes an object a reader offers to activate.
+    var anc = [_]axtree.Attr{.{ .key = @constCast("default-action"), .value = @constCast("clickAncestor") }};
+    var label = axtree.Node{ .id = 2, .role = @constCast("text"), .attrs = &anc };
+    try t.expect(!isActionable(&label));
+
+    // A verb never rescues a disabled control.
+    var off = [_]axtree.Attr{.{ .key = @constCast("default-action"), .value = @constCast("press") }};
+    var dis = axtree.Node{ .id = 3, .role = @constCast("button"), .state = proto.ax_disabled, .attrs = &off };
+    try t.expect(!isActionable(&dis));
 }
 
 test "node paths round-trip through the AT-SPI prefix" {
