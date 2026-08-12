@@ -240,6 +240,27 @@ pub const Sidebar = struct {
         _ = c.g_signal_connect_data(expander, "clicked", @ptrCast(&onExpanderClicked), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), expander);
 
+        // Container dot. A page's identity has to be visible where the
+        // pages are listed — the window tab's accent says nothing about
+        // WHICH page in a browser pane is in a container. Markup rather
+        // than a CSS class because the colour is an arbitrary palette
+        // entry, so there is no fixed class to install.
+        if (item == .page) {
+            if (@import("webface.zig").containerColor(item.page.container)) |rgb| {
+                const dot = c.gtk_label_new(null);
+                var mk: [96]u8 = undefined;
+                const m = std.fmt.bufPrintZ(
+                    &mk,
+                    "<span foreground=\"#{x:0>2}{x:0>2}{x:0>2}\">\u{25CF}</span>",
+                    .{ rgb[0], rgb[1], rgb[2] },
+                ) catch "";
+                c.gtk_label_set_markup(@ptrCast(dot), m.ptr);
+                c.gtk_widget_set_valign(dot, c.GTK_ALIGN_CENTER);
+                c.gtk_widget_set_tooltip_text(dot, "In a container");
+                c.gtk_box_append(@ptrCast(box), dot);
+            }
+        }
+
         const label = c.gtk_label_new(null);
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
         c.gtk_label_set_xalign(@ptrCast(label), 0.0);
