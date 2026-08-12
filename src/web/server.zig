@@ -223,7 +223,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [19][]const u8 = .{
+                var caps: [20][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -242,9 +242,10 @@ pub const Server = struct {
                     proto.CAP_A11Y,
                     proto.CAP_CONTEXTS,
                     proto.CAP_USERSCRIPTS,
+                    proto.CAP_SITEDATA,
                     undefined,
                 };
-                var ncaps: usize = 18;
+                var ncaps: usize = 19;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -312,6 +313,10 @@ pub const Server = struct {
             },
             .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
+            .cookies_req => self.host.cookiesReq(try proto.decode(proto.CookiesReq, frame.payload)),
+            .cookie_delete => self.host.cookieDelete(try proto.decode(proto.CookieDelete, frame.payload)),
+            .cookies_clear => self.host.cookiesClear(try proto.decode(proto.CookiesClear, frame.payload)),
+            .sitedata_clear => self.host.sitedataClear(try proto.decode(proto.SitedataClear, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

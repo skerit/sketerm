@@ -1199,6 +1199,180 @@ pub const Host = struct {
         }
     }
 
+    // -- cookies + site data (capability "sitedata") -------------------
+
+    /// This view's request context, WITH a reference held.
+    ///
+    /// The browser's own context is the authority (it is the one the
+    /// page's requests actually use), but a DISCARDED view has no
+    /// browser at all and still has cookies to show, so the container
+    /// it was created in answers for it — and view 0's shared jar is
+    /// the engine's global context.
+    fn requestContextFor(self: *Host, v: *View) ?*cef.cef_request_context_t {
+        if (browserHost(v)) |bh| {
+            defer release(&bh.base);
+            if (bh.get_request_context) |get| {
+                if (get(bh)) |rc| return rc;
+            }
+        }
+        if (self.lookupContext(v.context)) |rc| {
+            if (rc.base.base.add_ref) |add| add(&rc.base.base);
+            return rc;
+        }
+        const global: ?*cef.cef_request_context_t = cef.cef_request_context_get_global_context();
+        return global;
+    }
+
+    /// This view's cookie manager, WITH a reference held.
+    fn cookieManagerFor(self: *Host, v: *View) ?*cef.cef_cookie_manager_t {
+        const rc = self.requestContextFor(v) orelse return null;
+        defer release(&rc.base.base);
+        const get = rc.get_cookie_manager orelse return null;
+        const mgr: ?*cef.cef_cookie_manager_t = get(rc, null);
+        return mgr;
+    }
+
+    /// The url a 0xC8-block request is scoped to: what it named, or the
+    /// view's current address. Never guessed — an empty result means
+    /// "there is no site here yet" and the request is answered as a
+    /// failure rather than run against every site at once.
+    fn siteUrlOf(v: *View, asked: []const u8) []const u8 {
+        return if (asked.len != 0) asked else v.url;
+    }
+
+    /// Enumerate the cookies visible to a site (metadata only).
+    pub fn cookiesReq(self: *Host, req: proto.CookiesReq) void {
+        const v = self.find(req.view) orelse return self.postNoCookies(req.view, req.req);
+        const url = siteUrlOf(v, req.url);
+        if (url.len == 0) return self.postNoCookies(req.view, req.req);
+        const mgr = self.cookieManagerFor(v) orelse return self.postNoCookies(req.view, req.req);
+        defer release(&mgr.base);
+        CookieJob.start(self.gpa, mgr, url, .{
+            .view = req.view,
+            .req = req.req,
+            .mode = .list,
+            .kind = .cookies_clear,
+            .name = "",
+            .detail = "",
+        }) orelse self.postNoCookies(req.view, req.req);
+    }
+
+    fn postNoCookies(self: *Host, view: u32, req: u32) void {
+        self.post(proto.EvCookies{ .view = view, .req = req, .ok = 0, .total = 0, .entries = &.{} });
+    }
+
+    pub fn cookieDelete(self: *Host, req: proto.CookieDelete) void {
+        self.deleteCookies(req.view, req.req, req.url, req.name, .cookie_delete, "");
+    }
+
+    pub fn cookiesClear(self: *Host, req: proto.CookiesClear) void {
+        self.deleteCookies(req.view, req.req, req.url, "", .cookies_clear, "");
+    }
+
+    /// Shared body of `cookie_delete` / `cookies_clear` and of the
+    /// cookie half of `sitedata_clear`. An empty `name` deletes every
+    /// cookie the site can see, host and domain cookies alike — which
+    /// is why the deletion runs through the VISITOR rather than
+    /// `delete_cookies(url, ...)`, whose url-only form deliberately
+    /// spares domain cookies.
+    fn deleteCookies(
+        self: *Host,
+        view: u32,
+        req: u32,
+        asked_url: []const u8,
+        name: []const u8,
+        kind: proto.SitedataKind,
+        detail: []const u8,
+    ) void {
+        const v = self.find(view) orelse return self.postSiteFail(view, req, kind, detail);
+        const url = siteUrlOf(v, asked_url);
+        if (url.len == 0) return self.postSiteFail(view, req, kind, detail);
+        const mgr = self.cookieManagerFor(v) orelse return self.postSiteFail(view, req, kind, detail);
+        defer release(&mgr.base);
+        CookieJob.start(self.gpa, mgr, url, .{
+            .view = view,
+            .req = req,
+            .mode = if (name.len != 0) .delete_named else .delete_all,
+            .kind = kind,
+            .name = name,
+            .detail = detail,
+        }) orelse self.postSiteFail(view, req, kind, detail);
+    }
+
+    fn postSiteFail(self: *Host, view: u32, req: u32, kind: proto.SitedataKind, detail: []const u8) void {
+        self.post(proto.EvSitedataDone{
+            .view = view,
+            .req = req,
+            .ok = 0,
+            .kind = @intFromEnum(kind),
+            .removed = 0,
+            .detail = detail,
+        });
+    }
+
+    /// Clear an origin's site data: cookies, script-visible storage,
+    /// and the HTTP cache, each independently selected by `what`.
+    ///
+    /// TWO ENGINE LIMITS ARE REPORTED, NOT HIDDEN (see
+    /// `EvSitedataDone.detail`):
+    ///   - `clear_http_cache` is the only cache verb the C API has and
+    ///     it clears the WHOLE request context, so a shared-jar view
+    ///     drops every site's cache. Reported as `cache-whole-context`.
+    ///   - localStorage / sessionStorage / IndexedDB / Cache Storage
+    ///     have no browser-process API at all; they are cleared by
+    ///     running script IN the document, which only works while the
+    ///     view is still ON that origin. A request for another origin's
+    ///     storage is reported as `storage-skipped-origin` rather than
+    ///     silently claiming success.
+    pub fn sitedataClear(self: *Host, req: proto.SitedataClear) void {
+        var detail_buf: [96]u8 = undefined;
+        var detail_len: usize = 0;
+        const v = self.find(req.view) orelse
+            return self.postSiteFail(req.view, req.req, .sitedata_clear, "");
+        const url = siteUrlOf(v, req.url);
+        if (url.len == 0) return self.postSiteFail(req.view, req.req, .sitedata_clear, "");
+
+        if (req.what & proto.sitedata_storage != 0) {
+            if (sameOrigin(url, v.url)) {
+                self.clearPageStorage(v);
+            } else {
+                appendDetail(&detail_buf, &detail_len, "storage-skipped-origin");
+            }
+        }
+        if (req.what & proto.sitedata_cache != 0) {
+            if (self.requestContextFor(v)) |rc| {
+                defer release(&rc.base.base);
+                if (rc.clear_http_cache) |clear| clear(rc, null);
+                appendDetail(&detail_buf, &detail_len, "cache-whole-context");
+            }
+        }
+        if (req.what & proto.sitedata_cookies != 0) {
+            // The cookie visit is asynchronous and owns the reply, so
+            // it carries the detail accumulated above.
+            return self.deleteCookies(req.view, req.req, url, "", .sitedata_clear, detail_buf[0..detail_len]);
+        }
+        self.post(proto.EvSitedataDone{
+            .view = req.view,
+            .req = req.req,
+            .ok = 1,
+            .kind = @intFromEnum(proto.SitedataKind.sitedata_clear),
+            .removed = 0,
+            .detail = detail_buf[0..detail_len],
+        });
+    }
+
+    /// Wipe the document's own storage. Fire-and-forget on purpose:
+    /// every API involved is either synchronous or a promise nobody can
+    /// await from the browser process, and a failure to clear one of
+    /// them must not stop the others.
+    fn clearPageStorage(_: *Host, v: *View) void {
+        const b = v.browser orelse return;
+        const get_frame = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = get_frame(b) orelse return;
+        defer release(&frame.base);
+        runJs(frame, clear_storage_js);
+    }
+
     /// Tear down a view's browser and everything that belonged to its
     /// document, leaving the record itself untouched. Shared by
     /// `freeViewOpts` (which then frees the record) and `discardView`
@@ -2762,6 +2936,343 @@ pub const Host = struct {
 };
 
 var g_host: ?*Host = null;
+
+// ---------------------------------------------------------------------
+// Cookies + site data (capability "sitedata")
+// ---------------------------------------------------------------------
+
+/// Everything an origin's own scripts can wipe. Guarded one by one:
+/// a page served over a scheme where `localStorage` throws on ACCESS
+/// (not on use) must still get its IndexedDB cleared.
+const clear_storage_js =
+    "(function(){" ++
+    "try{localStorage.clear()}catch(e){}" ++
+    "try{sessionStorage.clear()}catch(e){}" ++
+    "try{if(indexedDB.databases)indexedDB.databases().then(function(l){" ++
+    "l.forEach(function(d){try{indexedDB.deleteDatabase(d.name)}catch(e){}})})}catch(e){}" ++
+    "try{if(window.caches)caches.keys().then(function(k){" ++
+    "k.forEach(function(n){try{caches.delete(n)}catch(e){}})})}catch(e){}" ++
+    "})();";
+
+/// Scheme + authority of `url` ("https://host:8443"), empty when it has
+/// no authority at all (about:, data:).
+fn originSlice(url: []const u8) []const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return "";
+    const rest = url[sep + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    return url[0 .. sep + 3 + end];
+}
+
+fn sameOrigin(a: []const u8, b: []const u8) bool {
+    const oa = originSlice(a);
+    if (oa.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(oa, originSlice(b));
+}
+
+/// Append one comma-separated token to a bounded detail string,
+/// dropping it rather than truncating into a token nobody can match.
+fn appendDetail(buf: []u8, len: *usize, token: []const u8) void {
+    const need = token.len + @as(usize, if (len.* == 0) 0 else 1);
+    if (len.* + need > buf.len) return;
+    if (len.* != 0) {
+        buf[len.*] = ',';
+        len.* += 1;
+    }
+    @memcpy(buf[len.*..][0..token.len], token);
+    len.* += token.len;
+}
+
+/// Milliseconds since the Unix epoch for a CEF base time, which counts
+/// MICROSECONDS since the Windows epoch (1601). A time at or before the
+/// Unix epoch reads as 0, i.e. "no useful expiry".
+fn baseTimeMs(bt: cef.cef_basetime_t) u64 {
+    const win_to_unix_us: i64 = 11_644_473_600 * std.time.us_per_s;
+    const unix_us = bt.val - win_to_unix_us;
+    if (unix_us <= 0) return 0;
+    return @intCast(@divTrunc(unix_us, 1000));
+}
+
+/// One in-flight cookie visit.
+///
+/// REFCOUNTED FOR REAL, unlike every other client-side struct in this
+/// file: `visit_url_cookies` takes ownership of the visitor reference
+/// it is handed (CEF's CToCpp wrappers transfer, never add), calls
+/// `visit` once per cookie on the UI thread — which under a
+/// single-threaded message loop is THIS thread, inside `pump()` — and
+/// releases when it is done. The final release is therefore both the
+/// "visiting finished" signal and the free, so the answer is posted
+/// from there and nowhere else. That also covers the failure path: a
+/// manager that refuses the visit destroys the wrapper immediately and
+/// the client still gets its (empty) reply.
+const CookieJob = struct {
+    /// FIRST FIELD: CEF is handed `&job.visitor` and hands the same
+    /// pointer back as `self`.
+    visitor: cef.cef_cookie_visitor_t,
+    refs: i32,
+    gpa: std.mem.Allocator,
+    view: u32,
+    req: u32,
+    mode: Mode,
+    kind: proto.SitedataKind,
+    /// Owned copy of the name `delete_named` matches.
+    name: []u8,
+    /// Owned copy of the detail tokens the reply must carry.
+    detail: []u8,
+    /// String bytes for every recorded cookie, referenced by OFFSET —
+    /// the list grows, so a slice into it would dangle on the realloc.
+    strings: std.ArrayList(u8) = .empty,
+    recs: std.ArrayList(Rec) = .empty,
+    /// Cookies seen, whether or not `recs` had room for them.
+    total: u32 = 0,
+    removed: u32 = 0,
+    /// The manager accepted the visit. False means the cookie store
+    /// could not be reached at all, which a client must be able to
+    /// tell apart from a site with no cookies.
+    accessible: bool = true,
+
+    const Mode = enum { list, delete_named, delete_all };
+
+    const Span = struct { off: u32, len: u32 };
+
+    const Rec = struct {
+        name: Span,
+        domain: Span,
+        path: Span,
+        flags: u8,
+        same_site: u8,
+        expires_ms: u64,
+        value_len: u32,
+    };
+
+    const Opts = struct {
+        view: u32,
+        req: u32,
+        mode: Mode,
+        kind: proto.SitedataKind,
+        name: []const u8,
+        detail: []const u8,
+    };
+
+    /// Hand a visitor to `mgr` for `url`. Null means nothing was
+    /// started and the caller still owes the client a reply.
+    fn start(
+        gpa: std.mem.Allocator,
+        mgr: *cef.cef_cookie_manager_t,
+        url: []const u8,
+        opts: Opts,
+    ) ?void {
+        const visit = mgr.visit_url_cookies orelse return null;
+        const job = gpa.create(CookieJob) catch return null;
+        const name = gpa.dupe(u8, opts.name) catch {
+            gpa.destroy(job);
+            return null;
+        };
+        const detail = gpa.dupe(u8, opts.detail) catch {
+            gpa.free(name);
+            gpa.destroy(job);
+            return null;
+        };
+        job.* = .{
+            .visitor = .{
+                .base = .{
+                    .size = @sizeOf(cef.cef_cookie_visitor_t),
+                    .add_ref = jobAddRef,
+                    .release = jobRelease,
+                    .has_one_ref = jobHasOneRef,
+                    .has_at_least_one_ref = jobHasAtLeastOneRef,
+                },
+                .visit = jobVisit,
+            },
+            .refs = 1,
+            .gpa = gpa,
+            .view = opts.view,
+            .req = opts.req,
+            .mode = opts.mode,
+            .kind = opts.kind,
+            .name = name,
+            .detail = detail,
+        };
+
+        var u = std.mem.zeroes(cef.cef_string_t);
+        setStr(url, &u);
+        defer cef.cef_string_utf16_clear(&u);
+        // The call CONSUMES a reference (CEF's CToCpp wrappers take
+        // ownership, they never add one) and may drop it before it even
+        // returns, when the manager refuses. A second reference is held
+        // across the call so the return value is still readable when
+        // the answer is composed — releasing it here is then what
+        // triggers `finish` in the ordinary case.
+        job.refs = 2;
+        if (visit(mgr, &u, 1, &job.visitor) == 0) job.accessible = false;
+        _ = jobRelease(&job.visitor.base);
+        return {};
+    }
+
+    fn record(self: *CookieJob, cookie: *const cef.cef_cookie_t) void {
+        if (self.recs.items.len >= proto.MAX_COOKIE_ENTRIES) return;
+        var name = Utf8.init(&cookie.name);
+        defer name.free();
+        var domain = Utf8.init(&cookie.domain);
+        defer domain.free();
+        var path = Utf8.init(&cookie.path);
+        defer path.free();
+        var value = Utf8.init(&cookie.value);
+        defer value.free();
+
+        const n = self.intern(name.slice()) orelse return;
+        const d = self.intern(domain.slice()) orelse return;
+        const p = self.intern(path.slice()) orelse return;
+
+        var flags: u8 = 0;
+        if (cookie.secure != 0) flags |= proto.cookie_secure;
+        if (cookie.httponly != 0) flags |= proto.cookie_httponly;
+        if (cookie.has_expires == 0) flags |= proto.cookie_session;
+        if (domain.slice().len != 0 and domain.slice()[0] == '.') flags |= proto.cookie_domain_scoped;
+
+        self.recs.append(self.gpa, .{
+            .name = n,
+            .domain = d,
+            .path = p,
+            .flags = flags,
+            .same_site = sameSiteOf(cookie.same_site),
+            .expires_ms = if (cookie.has_expires != 0) baseTimeMs(cookie.expires) else 0,
+            .value_len = @intCast(value.slice().len),
+        }) catch {};
+    }
+
+    fn intern(self: *CookieJob, s: []const u8) ?Span {
+        const off: u32 = @intCast(self.strings.items.len);
+        self.strings.appendSlice(self.gpa, s) catch return null;
+        return .{ .off = off, .len = @intCast(s.len) };
+    }
+
+    fn matches(self: *const CookieJob, cookie: *const cef.cef_cookie_t) bool {
+        var name = Utf8.init(&cookie.name);
+        defer name.free();
+        return std.mem.eql(u8, name.slice(), self.name);
+    }
+
+    /// Post the answer. Runs from the LAST release, so the visit is
+    /// over and every cookie has been seen.
+    fn finish(self: *CookieJob) void {
+        const host = g_host orelse return;
+        switch (self.mode) {
+            .list => {
+                const entries = self.gpa.alloc(proto.CookieEntry, self.recs.items.len) catch {
+                    host.postNoCookies(self.view, self.req);
+                    return;
+                };
+                defer self.gpa.free(entries);
+                for (entries, self.recs.items) |*e, r| {
+                    e.* = .{
+                        .name = self.str(r.name),
+                        .domain = self.str(r.domain),
+                        .path = self.str(r.path),
+                        .flags = r.flags,
+                        .same_site = r.same_site,
+                        .expires_ms = r.expires_ms,
+                        .value_len = r.value_len,
+                    };
+                }
+                host.post(proto.EvCookies{
+                    .view = self.view,
+                    .req = self.req,
+                    .ok = if (self.accessible) 1 else 0,
+                    .total = self.total,
+                    .entries = entries,
+                });
+            },
+            .delete_named, .delete_all => host.post(proto.EvSitedataDone{
+                .view = self.view,
+                .req = self.req,
+                .ok = if (self.accessible) 1 else 0,
+                .kind = @intFromEnum(self.kind),
+                .removed = self.removed,
+                .detail = self.detail,
+            }),
+        }
+    }
+
+    fn str(self: *const CookieJob, s: Span) []const u8 {
+        return self.strings.items[s.off..][0..s.len];
+    }
+
+    fn destroy(self: *CookieJob) void {
+        const gpa = self.gpa;
+        self.strings.deinit(gpa);
+        self.recs.deinit(gpa);
+        gpa.free(self.name);
+        gpa.free(self.detail);
+        gpa.destroy(self);
+    }
+};
+
+/// CEF's SameSite enum -> the wire's engine-agnostic one. Written as
+/// comparisons rather than a switch because translate-c gives the enum
+/// TYPE a different signedness from its CONSTANTS.
+fn sameSiteOf(v: cef.cef_cookie_same_site_t) u8 {
+    const T = cef.cef_cookie_same_site_t;
+    if (v == @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_NO_RESTRICTION))) return @intFromEnum(proto.SameSite.none);
+    if (v == @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_LAX_MODE))) return @intFromEnum(proto.SameSite.lax);
+    if (v == @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_STRICT_MODE))) return @intFromEnum(proto.SameSite.strict);
+    return @intFromEnum(proto.SameSite.unspecified);
+}
+
+fn jobOf(base: [*c]cef.cef_base_ref_counted_t) *CookieJob {
+    const v: *cef.cef_cookie_visitor_t = @ptrCast(@alignCast(base));
+    return @fieldParentPtr("visitor", v);
+}
+
+fn jobAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
+    jobOf(base).refs += 1;
+}
+
+fn jobRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    const job = jobOf(base);
+    job.refs -= 1;
+    if (job.refs > 0) return 0;
+    job.finish();
+    job.destroy();
+    return 1;
+}
+
+fn jobHasOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    return if (jobOf(base).refs == 1) 1 else 0;
+}
+
+fn jobHasAtLeastOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    return if (jobOf(base).refs >= 1) 1 else 0;
+}
+
+fn jobVisit(
+    self_: [*c]cef.cef_cookie_visitor_t,
+    cookie: [*c]const cef.cef_cookie_t,
+    count: c_int,
+    total: c_int,
+    delete_cookie: [*c]c_int,
+) callconv(.c) c_int {
+    _ = count;
+    _ = total;
+    if (self_ == null or cookie == null) return 0;
+    const vis: *cef.cef_cookie_visitor_t = @ptrCast(self_);
+    const job: *CookieJob = @fieldParentPtr("visitor", vis);
+    const ck: *const cef.cef_cookie_t = @ptrCast(cookie);
+    job.total += 1;
+    switch (job.mode) {
+        .list => job.record(ck),
+        .delete_all => {
+            if (delete_cookie != null) delete_cookie.* = 1;
+            job.removed += 1;
+        },
+        .delete_named => {
+            if (job.matches(ck)) {
+                if (delete_cookie != null) delete_cookie.* = 1;
+                job.removed += 1;
+            }
+        },
+    }
+    return 1;
+}
 
 // ---------------------------------------------------------------------
 // Request interception (capability "intercept")

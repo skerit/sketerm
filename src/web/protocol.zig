@@ -95,6 +95,21 @@ pub const CAP_USERSCRIPTS = "userscripts";
 /// (0 = the shared default context). A client without this capability
 /// keeps sending `context = 0` and every view shares one jar.
 pub const CAP_CONTEXTS = "contexts";
+/// The helper accepts the 0xC8-block site-data frames: enumerate the
+/// cookies a site can see (`cookies_req` -> `ev_cookies`), delete one
+/// (`cookie_delete`), clear them all (`cookies_clear`), and clear the
+/// origin's storage (`sitedata_clear`), each answered by
+/// `ev_sitedata_done`. Everything is scoped to the VIEW, so the work
+/// lands in that view's container/request context and never in the
+/// shared jar. A client without this capability shows no cookie or
+/// site-data section at all — there is nothing it could ask.
+///
+/// COOKIE VALUES NEVER CROSS THE WIRE. The enumeration carries names,
+/// scopes, flags and the value's LENGTH, which is what a site-data
+/// panel displays; shipping the values themselves would put every
+/// session token of every open tab into the GUI's address space for a
+/// panel that never renders them.
+pub const CAP_SITEDATA = "sitedata";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -178,6 +193,12 @@ pub const Tag = enum(u8) {
     ev_print_pdf_done = 0xA5,
     us_script_set = 0xC0,
     us_style_set = 0xC1,
+    cookies_req = 0xC8,
+    ev_cookies = 0xC9,
+    cookie_delete = 0xCA,
+    cookies_clear = 0xCB,
+    sitedata_clear = 0xCC,
+    ev_sitedata_done = 0xCD,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -1693,6 +1714,172 @@ pub const ContextDestroy = struct {
     id: u32,
 };
 
+// -- cookies + site data (0xC8 block, capability "sitedata") ----------
+
+/// Most cookies one `ev_cookies` carries. A site with more is not
+/// mis-reported: `total` still counts every match, only `entries` is
+/// truncated, and a panel that lists a couple of hundred rows has
+/// already told the user everything a list can tell them.
+pub const MAX_COOKIE_ENTRIES: usize = 200;
+
+/// `CookieEntry.flags` bits.
+pub const cookie_secure: u8 = 1;
+pub const cookie_httponly: u8 = 2;
+/// No expiry: the cookie dies with the session.
+pub const cookie_session: u8 = 4;
+/// The cookie is a DOMAIN cookie (stored with a leading dot, visible
+/// to sub-domains) rather than a host cookie.
+pub const cookie_domain_scoped: u8 = 8;
+
+/// `CookieEntry.same_site` (append-only values, mirroring every
+/// engine's SameSite attribute rather than any one engine's enum).
+pub const SameSite = enum(u8) { unspecified = 0, none = 1, lax = 2, strict = 3, _ };
+
+/// Ask for the cookies visible to `url` in this VIEW's cookie jar —
+/// the container's jar when the view lives in one, the shared jar
+/// otherwise. An empty `url` means the view's current address.
+///
+/// `req` is client-allocated and echoed back on `ev_cookies`, because
+/// the answer is asynchronous (the engine visits its cookie store on
+/// its own thread) and a panel may have moved on by the time it lands.
+pub const CookiesReq = struct {
+    pub const tag: Tag = .cookies_req;
+    view: u32,
+    req: u32,
+    url: []const u8,
+};
+
+/// One cookie, WITHOUT its value (see `CAP_SITEDATA`).
+pub const CookieEntry = struct {
+    name: []const u8,
+    domain: []const u8,
+    path: []const u8,
+    /// `cookie_*` bits.
+    flags: u8,
+    /// A `SameSite` value.
+    same_site: u8,
+    /// Expiry in milliseconds since the Unix epoch, 0 when
+    /// `cookie_session` is set.
+    expires_ms: u64,
+    /// Byte length of the value that was NOT sent, so a panel can say
+    /// how much is stored without ever holding it.
+    value_len: u32,
+};
+
+pub const EvCookies = struct {
+    pub const tag: Tag = .ev_cookies;
+    view: u32,
+    req: u32,
+    /// 0 when the cookie store could not be reached at all, which is
+    /// NOT the same as a site with no cookies.
+    ok: u8,
+    /// Every match, even the ones `entries` was truncated past.
+    total: u32,
+    entries: []const CookieEntry,
+
+    pub fn encodeTo(self: EvCookies, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.req);
+        try putU8(gpa, out, self.ok);
+        try putU32(gpa, out, self.total);
+        try putU16(gpa, out, @intCast(self.entries.len));
+        for (self.entries) |e| {
+            try putStr(gpa, out, e.name);
+            try putStr(gpa, out, e.domain);
+            try putStr(gpa, out, e.path);
+            try putU8(gpa, out, e.flags);
+            try putU8(gpa, out, e.same_site);
+            try putU64(gpa, out, e.expires_ms);
+            try putU32(gpa, out, e.value_len);
+        }
+    }
+
+    /// Caller owns the returned `entries` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !EvCookies {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const req = try cur.readU32();
+        const ok = try cur.readU8();
+        const total = try cur.readU32();
+        const n = try cur.readU16();
+        const entries = try gpa.alloc(CookieEntry, n);
+        errdefer gpa.free(entries);
+        for (entries) |*e| {
+            e.name = try cur.readStr();
+            e.domain = try cur.readStr();
+            e.path = try cur.readStr();
+            e.flags = try cur.readU8();
+            e.same_site = try cur.readU8();
+            e.expires_ms = try cur.readU64();
+            e.value_len = try cur.readU32();
+        }
+        return .{ .view = view, .req = req, .ok = ok, .total = total, .entries = entries };
+    }
+};
+
+/// Delete every cookie visible to `url` whose name is exactly `name`.
+/// Matching is by NAME, not by (name, domain, path): the panel row a
+/// user clicks names one cookie as the page sees it, and two entries
+/// sharing a name across scopes are one thing to delete as far as that
+/// user is concerned.
+pub const CookieDelete = struct {
+    pub const tag: Tag = .cookie_delete;
+    view: u32,
+    req: u32,
+    url: []const u8,
+    name: []const u8,
+};
+
+/// Delete every cookie visible to `url`, host and domain cookies alike.
+pub const CookiesClear = struct {
+    pub const tag: Tag = .cookies_clear;
+    view: u32,
+    req: u32,
+    url: []const u8,
+};
+
+/// `SitedataClear.what` bits. They are independent: a client asking
+/// for storage alone keeps the cookies.
+pub const sitedata_cookies: u32 = 1;
+/// The origin's script-visible storage: localStorage, sessionStorage,
+/// IndexedDB and the Cache Storage API.
+pub const sitedata_storage: u32 = 2;
+/// The request context's HTTP cache. NOT per-origin on any engine that
+/// exposes only a whole-cache clear — see `EvSitedataDone.detail`.
+pub const sitedata_cache: u32 = 4;
+
+/// Clear site data for `url`'s origin in this view's context.
+pub const SitedataClear = struct {
+    pub const tag: Tag = .sitedata_clear;
+    view: u32,
+    req: u32,
+    url: []const u8,
+    what: u32,
+};
+
+/// `EvSitedataDone.kind`: which request this answers.
+pub const SitedataKind = enum(u8) { cookie_delete = 0, cookies_clear = 1, sitedata_clear = 2, _ };
+
+/// One answer for every mutating 0xC8-block frame. `removed` counts
+/// cookies actually deleted (0 for a pure storage/cache clear).
+///
+/// `detail` is a short, machine-readable, comma-separated list of what
+/// the helper could NOT do exactly as asked — empty when everything
+/// was. The only value v1 produces is `cache-whole-context`, because
+/// no engine here exposes a per-origin HTTP cache clear; a client
+/// showing "site data cleared" is expected to read it.
+pub const EvSitedataDone = struct {
+    pub const tag: Tag = .ev_sitedata_done;
+    view: u32,
+    req: u32,
+    ok: u8,
+    /// A `SitedataKind` value.
+    kind: u8,
+    removed: u32,
+    detail: []const u8,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -2378,6 +2565,82 @@ test "round-trip: intercept_log entry list" {
     try std.testing.expectEqual(@as(u8, 1), got.entries[0].blocked);
     try std.testing.expectEqualStrings("https://site.example/app.js", got.entries[1].url);
     try std.testing.expectEqual(@as(u16, 200), got.entries[1].status);
+}
+
+test "round-trip: site-data request frames" {
+    try roundTrip(CookiesReq, .{ .view = 7, .req = 3, .url = "https://site.example/a" });
+    // An empty url means "the view's current address".
+    try roundTrip(CookiesReq, .{ .view = 7, .req = 4, .url = "" });
+    try roundTrip(CookieDelete, .{ .view = 7, .req = 5, .url = "https://site.example/", .name = "sid" });
+    try roundTrip(CookiesClear, .{ .view = 7, .req = 6, .url = "https://site.example/" });
+    try roundTrip(SitedataClear, .{
+        .view = 7,
+        .req = 7,
+        .url = "https://site.example/",
+        .what = sitedata_cookies | sitedata_storage | sitedata_cache,
+    });
+    try roundTrip(EvSitedataDone, .{ .view = 7, .req = 7, .ok = 1, .kind = @intFromEnum(SitedataKind.sitedata_clear), .removed = 3, .detail = "cache-whole-context" });
+    try roundTrip(EvSitedataDone, .{ .view = 7, .req = 5, .ok = 0, .kind = @intFromEnum(SitedataKind.cookie_delete), .removed = 0, .detail = "" });
+}
+
+test "round-trip: ev_cookies entry list carries metadata, never values" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const entries = [_]CookieEntry{
+        .{
+            .name = "sid",
+            .domain = "site.example",
+            .path = "/",
+            .flags = cookie_secure | cookie_httponly,
+            .same_site = @intFromEnum(SameSite.lax),
+            .expires_ms = 1_800_000_000_000,
+            .value_len = 64,
+        },
+        .{
+            .name = "theme",
+            .domain = ".site.example",
+            .path = "/app",
+            .flags = cookie_session | cookie_domain_scoped,
+            .same_site = @intFromEnum(SameSite.unspecified),
+            .expires_ms = 0,
+            .value_len = 4,
+        },
+    };
+    // `total` is the whole match count, `entries` may be truncated.
+    try encode(gpa, &buf, EvCookies{ .view = 7, .req = 9, .ok = 1, .total = 205, .entries = &entries });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.ev_cookies, frame.tag);
+    const got = try EvCookies.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.entries);
+    try std.testing.expectEqual(@as(u32, 9), got.req);
+    try std.testing.expectEqual(@as(u8, 1), got.ok);
+    try std.testing.expectEqual(@as(u32, 205), got.total);
+    try std.testing.expectEqual(@as(usize, 2), got.entries.len);
+    try std.testing.expectEqualStrings("sid", got.entries[0].name);
+    try std.testing.expect(got.entries[0].flags & cookie_secure != 0);
+    try std.testing.expect(got.entries[0].flags & cookie_session == 0);
+    try std.testing.expectEqual(@as(u64, 1_800_000_000_000), got.entries[0].expires_ms);
+    try std.testing.expectEqual(@as(u32, 64), got.entries[0].value_len);
+    try std.testing.expectEqualStrings(".site.example", got.entries[1].domain);
+    try std.testing.expect(got.entries[1].flags & cookie_session != 0);
+    try std.testing.expectEqual(@as(u64, 0), got.entries[1].expires_ms);
+
+    // No value field exists to leak: the encoded frame carries the
+    // names and scopes and nothing that could be a token.
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, buf.items, "SECRET"));
+
+    // An empty answer is still an answer.
+    var buf2: std.ArrayList(u8) = .empty;
+    defer buf2.deinit(gpa);
+    try encode(gpa, &buf2, EvCookies{ .view = 7, .req = 10, .ok = 1, .total = 0, .entries = &.{} });
+    var r2 = Reader.init(buf2.items);
+    const f2 = (try r2.next()).?;
+    const got2 = try EvCookies.decodeAlloc(f2.payload, gpa);
+    defer gpa.free(got2.entries);
+    try std.testing.expectEqual(@as(usize, 0), got2.entries.len);
+    try std.testing.expectEqual(@as(u32, 0), got2.total);
 }
 
 test "netLogJson is one newline-free JSON object" {
