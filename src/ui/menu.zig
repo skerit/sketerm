@@ -246,6 +246,28 @@ const N_HOST_WIDGETS = blk: {
     break :blk n;
 };
 
+/// This spec's wording and icon for one action, so another surface
+/// can offer the same verb without a second copy of either. The
+/// window hamburger is the consumer: its rows are this table's rows,
+/// dispatched through the same `Sink`, so a relabelled verb moves in
+/// both places at once.
+///
+/// `Action` has exactly one row (pinned by a test below), which is
+/// what makes the lookup total.
+pub fn labelFor(action: Action) [*:0]const u8 {
+    for (BINDS) |b| {
+        if (b.action == action) return b.label;
+    }
+    unreachable;
+}
+
+pub fn iconFor(action: Action) [*:0]const u8 {
+    for (BINDS) |b| {
+        if (b.action == action) return b.icon;
+    }
+    unreachable;
+}
+
 /// Widget data key under which a menu-bearing widget publishes its
 /// ClickCtx, so `popupAt` can reach it from the keyboard path. The
 /// data is NOT owned here (no GDestroyNotify): the click gesture's
@@ -479,6 +501,17 @@ pub fn popupAt(widget: *c.GtkWidget, x: f64, y: f64) bool {
     const data = c.g_object_get_data(@ptrCast(@alignCast(widget)), CTX_KEY) orelse return false;
     const ctx: *ClickCtx = @ptrCast(@alignCast(data));
     return showAt(ctx, x, y);
+}
+
+test "menu: label/icon lookup answers for every action" {
+    // `labelFor`/`iconFor` are `unreachable` on a miss because the
+    // one-row-per-Action test below makes a miss impossible; this
+    // walks every arm so the pair is proven total, not assumed.
+    inline for (@typeInfo(Action).@"enum".fields) |field| {
+        const a: Action = @enumFromInt(field.value);
+        try std.testing.expect(std.mem.span(labelFor(a)).len != 0);
+        try std.testing.expect(std.mem.span(iconFor(a)).len != 0);
+    }
 }
 
 test "menu: every row's detailed action name matches its bare name" {

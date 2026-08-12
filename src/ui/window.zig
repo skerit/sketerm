@@ -562,7 +562,20 @@ pub const Window = struct {
         // not against the window edge; without CSD window controls the
         // last pack_end child sits flush right. 6 px mirrors the pane
         // titlebar's margin convention.
-        c.gtk_widget_set_margin_end(tab_btn, 6);
+        // The hamburger is the END-MOST item on every sketerm toolbar,
+        // so it takes over the flush-right margin and the overview
+        // button packs after it (pack_end fills right-to-left). The
+        // files identity has a menubar plus the browser view's own
+        // hamburger, and the web identity has the web face's — a
+        // second one in the headerbar there would be two primary
+        // menus in one window.
+        if (!files_identity and !web_identity) {
+            const burger = @import("winmenu.zig").button(self);
+            c.gtk_widget_set_margin_end(burger, 6);
+            c.adw_header_bar_pack_end(@ptrCast(header_bar), burger);
+        } else {
+            c.gtk_widget_set_margin_end(tab_btn, 6);
+        }
         c.adw_header_bar_pack_end(@ptrCast(header_bar), tab_btn);
         c.adw_application_window_set_content(@ptrCast(app_window), overview);
 

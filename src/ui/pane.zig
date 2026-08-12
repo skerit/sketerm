@@ -535,6 +535,14 @@ pub const Pane = struct {
         return self;
     }
 
+    /// Run a context-menu verb on this pane from a surface that is not
+    /// the pane's own popover — the window hamburger. Goes through the
+    /// SAME sink a right-click row does, so pane-local handling and the
+    /// Window fallback both stay in one place.
+    pub fn runMenuAction(self: *Pane, action: menu.Action) void {
+        paneMenuSink(@ptrCast(self), action);
+    }
+
     fn handleMenuLocal(self: *Pane, action: menu.Action) bool {
         switch (action) {
             .copy => {
