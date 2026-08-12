@@ -30,6 +30,66 @@ const idle_timeout_ms: c_int = 50;
 /// `cefhost.openBrowsers() == 0` under this cap.
 const drain_deadline_ms: i64 = 5_000;
 
+/// Capabilities this helper always advertises. `frames-shm` is here
+/// even in GPU mode: the engine drops back to software compositing on
+/// its own when the GPU goes away, and the client must be ready for the
+/// memfd frames that follow. Conditional ones are appended at handshake
+/// time — adding either kind is ONE line and nothing else, which is the
+/// whole point of the shape below.
+const unconditional_caps = [_][]const u8{
+    proto.CAP_FRAMES_SHM,
+    proto.CAP_INPUT,
+    proto.CAP_NAVIGATION,
+    proto.CAP_SEMANTIC,
+    proto.CAP_VIEW_CREATE_URL,
+    proto.CAP_DISCARD,
+    proto.CAP_FIND,
+    proto.CAP_ZOOM,
+    proto.CAP_CONTEXT_MENU,
+    proto.CAP_INTERCEPT,
+    proto.CAP_TLS,
+    proto.CAP_PERMISSIONS,
+    proto.CAP_DEVTOOLS,
+    proto.CAP_PRINT_PDF,
+    proto.CAP_DOWNLOADS,
+    proto.CAP_A11Y,
+    proto.CAP_CONTEXTS,
+    proto.CAP_USERSCRIPTS,
+    proto.CAP_SITEDATA,
+};
+
+/// Bounded builder for the `hello_ack` capability set. Its capacity is
+/// derived from the protocol's OWN vocabulary — the number of `CAP_*`
+/// constants `protocol.zig` declares — so there is no size to bump and
+/// no count to keep in step: advertising more capabilities than exist
+/// is not expressible. This replaced a fixed array plus a hand-tracked
+/// `ncaps`, which three parallel branches each had to merge by hand.
+const CapList = struct {
+    const capacity = blk: {
+        var n: usize = 0;
+        for (@typeInfo(proto).@"struct".decls) |d| {
+            if (std.mem.startsWith(u8, d.name, "CAP_")) n += 1;
+        }
+        break :blk n;
+    };
+
+    buf: [capacity][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *CapList, cap: []const u8) void {
+        self.buf[self.len] = cap;
+        self.len += 1;
+    }
+
+    fn addAll(self: *CapList, caps: []const []const u8) void {
+        for (caps) |cap| self.add(cap);
+    }
+
+    fn slice(self: *const CapList) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     listen_fd: c_int = -1,
@@ -219,42 +279,14 @@ pub const Server = struct {
             .hello => {
                 const req = try proto.decode(proto.Hello, frame.payload);
                 if (req.proto != proto.PROTO_VERSION) return error.ProtocolMismatch;
-                // `frames-shm` is unconditional even in GPU mode: the
-                // engine drops back to software compositing on its own
-                // when the GPU goes away, and the client must be ready
-                // for the memfd frames that follow.
-                var caps: [20][]const u8 = .{
-                    proto.CAP_FRAMES_SHM,
-                    proto.CAP_INPUT,
-                    proto.CAP_NAVIGATION,
-                    proto.CAP_SEMANTIC,
-                    proto.CAP_VIEW_CREATE_URL,
-                    proto.CAP_DISCARD,
-                    proto.CAP_FIND,
-                    proto.CAP_ZOOM,
-                    proto.CAP_CONTEXT_MENU,
-                    proto.CAP_INTERCEPT,
-                    proto.CAP_TLS,
-                    proto.CAP_PERMISSIONS,
-                    proto.CAP_DEVTOOLS,
-                    proto.CAP_PRINT_PDF,
-                    proto.CAP_DOWNLOADS,
-                    proto.CAP_A11Y,
-                    proto.CAP_CONTEXTS,
-                    proto.CAP_USERSCRIPTS,
-                    proto.CAP_SITEDATA,
-                    undefined,
-                };
-                var ncaps: usize = 19;
-                if (cefhost.isAccelerated()) {
-                    caps[ncaps] = proto.CAP_FRAMES_DMABUF;
-                    ncaps += 1;
-                }
+                var caps: CapList = .{};
+                caps.addAll(&unconditional_caps);
+                if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
                 try self.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
                     .engine_version = cefhost.engineVersion(),
-                    .caps = caps[0..ncaps],
+                    .caps = caps.slice(),
                 }, null);
                 self.greeted = true;
             },
