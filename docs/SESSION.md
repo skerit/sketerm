@@ -17302,3 +17302,125 @@ the client always dialled the per-user local daemon. `web_store_socket`
 then `$SKETERM_MUX_SOCKET` then the default: a forwarded socket now
 gives every machine ONE history, and an isolated instance stops writing
 into the user's real store.
+
+## 2026-08-12: command palette synthesis — one ranking system, two views
+
+`docs/proposal-browser.md` asked for the omnibox and the palette to
+become "ONE grown-up system: URL / search / history / bookmarks /
+open-tabs / commands as pluggable sources in a shared ranking
+framework". Ranking was already shared (`src/util/suggest.zig`); the
+three things that kept the surfaces apart were dispatch, async, and the
+fact that the command set could not be queried without a dialog on
+screen. All three are gone.
+
+**Activation moved into the framework.** A `Candidate` used to carry an
+opaque `payload: u64` and every consumer re-invented what to do with it.
+Sources now declare an `activate` fn that `merge` stamps onto each
+candidate, so a row is dispatched by calling `cand.fire()` — one merged
+list can hold rows from any number of sources and neither view has a
+per-kind switch left. `Source.activate_ctx` exists because a source's
+query storage and its dispatch target are often different objects (the
+command catalogue reads rows out of itself but dispatches through a
+Window).
+
+**Async became a framework concern.** `suggest.Model` owns the query, a
+generation counter, and the two hooks a view needs. An IO-backed source
+declares `refresh`, gets handed the generation its request answers, and
+checks `Model.accepts(gen)` before storing the reply. The omnibox had
+hand-rolled this against two anchor bytes and a hits cache. Note that
+`webstore.cancelFor` did NOT go away and must not: generations answer
+"does this reply still answer the current question", not "is my
+callback's user-data still allocated" — different problems, and dropping
+the second is a use-after-free.
+
+**The command catalogue is data now** (`src/ui/commandcat.zig`, GTK-free,
+in both test roots). It used to be built inside `palette.zig`'s `open()`
+interleaved with AdwActionRow construction. Extracting it required
+splitting the `Action` enum out of `input.zig` into `src/ui/action.zig`,
+because `input.zig` imports `c.zig` and dragged GTK in with it — one
+more step of the de-GTK-ing that `tree.zig` and `tabforest.zig` started.
+
+**The source sets genuinely cross over.** The palette gained a tab
+switcher: every tab of every window, ranked in the same list as the
+commands, activating by switching rather than by doing. The omnibox
+gained the command catalogue at weight 0.5 — an address bar is for
+addresses first, so a command must be named almost exactly before it
+outranks what the typed text already means.
+
+**Terminal-side win: recency.** Activating a command moves it up among
+EQUALLY good matches, in one process-wide store shared by both surfaces
+("recently used" is a property of the user, not of the window he reached
+for). The bonus is capped at 0.04 against the 0.1 gap between match
+grades, so it can never promote a row across a grade — recency breaks
+ties, it never overrules what was typed. Both halves are pinned by
+tests, including that a boosted substring match still loses to a prefix
+match.
+
+**Deliberately NOT shared: the list widget.** A shared suggestion-list
+view looks like the obvious next step and is the wrong one. The palette's
+rows are AdwActionRows carrying icon-theme and keybind lookups, built
+once then only re-sorted and shown/hidden; the omnibox rebuilds cheap
+GtkBox rows every keystroke because its candidate set changes per query.
+One view would have to branch on that, on popover-vs-dialog, on focus
+policy and on what Enter means — and it would be GTK code, so everything
+moved into it would leave the `test-core` root. The split is one model,
+two thin views. The visible consequence: the palette hosts every source
+it can ENUMERATE when it opens, and the omnibox additionally hosts the
+async ones.
+
+**The sibling pickers adopted the matcher, not the merger.** Three of the
+four now match through `suggest.zig` — `app_launcher` and `webhistory`
+take `containsFold`, `editorlsp` takes `subsequenceMatch`. None adopts
+`merge`, and that is correct: each returns a boolean into a GTK filter
+func or a visibility index, and each has a domain order (recency-then-
+alphabetical, folder grouping plus manual ordering, server ranking or
+document hierarchy) that a global score sort would destroy. The
+docblocks say so at the call site now. `editorlsp`'s matcher had claimed
+to be "the filtering every fuzzy picker in this codebase already uses"
+while being the only subsequence matcher in the tree; adding
+`subsequenceMatch` to the framework made the claim true rather than
+deleting it. `app_launcher`'s version also failed OPEN — it lowercased
+into 256/512-byte stack buffers and returned "matches" on overflow, so a
+long query showed every long-named app.
+
+`app_switcher` keeps its own matcher, on purpose. Its rows are
+application and session names that need `g_utf8_casefold`, and
+`suggest.zig` cannot use GLib because it compiles into `sketerm-mux`'s
+test root; the shared ASCII matcher would regress the Música/MÚSICA case
+its own test pins. That is a structural limit of the framework, not an
+oversight, and it is written down where the next reader will look.
+
+**Verified**, not just compiled. `suggest.zig` and `commandcat.zig` are
+GTK-free and carry unit tests in BOTH roots covering activation stamping
+and `fire()`, generation-gated async replies (a superseded reply is
+refused outright, not merely un-rendered), the before/after merge hook
+ordering an arena reset depends on, query truncation, the subsequence
+grading axes, `containsFold`'s absent length ceiling, the MRU's
+move-to-front and overflow, and the grade-boundary safety property.
+
+One of those tests pins the exact ranking the GUI stage asserts: typing
+"tab" puts "New Tab" above "Keyboard Hints", whose DESCRIPTION mentions
+Tab and which sits earlier in the catalogue. So a ranking regression
+fails in CI with no GUI at all.
+
+smoke-e2e gained `commandPaletteStage`, before `copyModeStage` for the
+same reason the tree-sidebar stage is: it opens the palette on the
+display session, types "tab", presses Enter, and asserts a window tab
+appeared. That assertion is self-validating, which is why it is the one
+that matters — with an empty entry the top row is the catalogue's first,
+"Copy", and `copy_selection` opens no tab, so a tab appearing proves
+both that the entry took the text and that ranking beat the decoys.
+Green on every run that reached it; one further run flaked in GUI
+startup ("socket never appeared"), before any stage executed.
+
+The stage takes no screenshot on the happy path, which is deliberate
+and worth not undoing: AdwDialog presents with a fade and the frame
+this rig captures reliably predates the filter being painted, so a
+success artefact showed an UNFILTERED palette and read as though the
+assertion were bogus. The verdict is behavioural and needs no pixels; a
+frame is kept only on failure.
+
+The stage was written while `copyModeStage` was still red and therefore
+placed ahead of it. That blocker is gone (see the audit entry above —
+the stage assumed a one-line shell prompt), so the ordering is now a
+convenience, not a requirement.
