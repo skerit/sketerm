@@ -1,12 +1,23 @@
 //! Omnibox — the web face's as-you-type address-bar dropdown.
 //!
-//! A GtkPopover under the address entry, fed by the shared suggestion
-//! framework (src/util/suggest.zig): the typed input's URL/search
-//! interpretation, open web tabs (switch, don't navigate), cached
-//! bookmarks, and daemon-side history (async; replies for a stale
-//! query are dropped). The entry is NEVER blocked: history rides the
-//! webstore's non-blocking socket and the dropdown re-renders when a
-//! reply lands.
+//! A GtkPopover under the address entry, and one of the two views over
+//! the shared suggestion model (`src/util/suggest.zig`); the command
+//! palette is the other. Sources, in weight order: the typed input's
+//! URL/search reading, open web tabs (switch, don't navigate), cached
+//! bookmarks, daemon-side history (async), and the command catalogue
+//! the palette is built from — so an action can be run from the address
+//! bar without a second ranking implementation existing anywhere.
+//!
+//! The entry is NEVER blocked: history rides the webstore's
+//! non-blocking socket and the dropdown re-renders when a reply lands.
+//!
+//! Staleness and liveness are separate mechanisms here, deliberately.
+//! A superseded history reply is dropped by the model's GENERATION
+//! (`Model.accepts`), which used to be hand-rolled against two anchor
+//! bytes. `webstore.cancelFor` stays, but for the other problem: it
+//! stops a reply dispatching into freed user-data after `sever`. The
+//! generation could not do that and dropping the cancel would be a
+//! use-after-free, so both remain and neither is redundant.
 //!
 //! Lifetime is the webreader shape: created by WebFace, `sever`ed at
 //! the face's prepare-destroy choke point (mechanism 2 — one
@@ -19,25 +30,15 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const suggest = @import("../util/suggest.zig");
+const commandcat = @import("commandcat.zig");
 const webstore = @import("webstore.zig");
 const webface = @import("webface.zig");
+const window_mod = @import("window.zig");
 const WebFace = webface.WebFace;
 
 const DEBOUNCE_MS: c_uint = 120;
 const MAX_ROWS: usize = 10;
 const HISTORY_MAX: u32 = 8;
-
-/// What activating a row does. `spec` is render-arena owned and
-/// rebuilt on every refresh; rows only ever index the CURRENT items.
-const Item = struct {
-    kind: suggest.Kind,
-    /// For navigating kinds: handed to `WebFace.navigate` (a URL, or
-    /// the raw query — navigate's normalization does the rest).
-    spec: []const u8 = "",
-    /// open_tab: the target face's view id, resolved at click time so
-    /// a face that died in between is a no-op, not a stale pointer.
-    view: u32 = 0,
-};
 
 pub const Omnibox = struct {
     allocator: std.mem.Allocator,
@@ -46,7 +47,8 @@ pub const Omnibox = struct {
     popover: *c.GtkWidget,
     listbox: *c.GtkWidget,
 
-    /// Per-refresh strings (query copy aside) + row payloads.
+    /// Per-merge strings. Reset from the model's `on_before_merge`,
+    /// because an async reply starts a merge without the view asking.
     render_arena: std.heap.ArenaAllocator,
     /// History hits for the CURRENT query, duplicated out of the reply
     /// payload (the payload dies with the dispatch).
@@ -57,15 +59,26 @@ pub const Omnibox = struct {
     bm_arena: std.heap.ArenaAllocator,
     bookmarks: std.ArrayList(webstore.BookmarkEntry) = .empty,
     bm_state: enum { empty, loading, ready } = .empty,
+    /// The command catalogue, built once — it does not vary with the
+    /// query, only with the focused pane, and a web pane wears no
+    /// editor face.
+    cat_arena: std.heap.ArenaAllocator,
+    catalog: std.ArrayList(commandcat.Row) = .empty,
+    feed: commandcat.Feed = undefined,
 
-    items: std.ArrayList(Item) = .empty,
+    /// Stable storage: `model` borrows this slice for its lifetime.
+    sources: [5]suggest.Source = undefined,
+    model: suggest.Model = undefined,
+    /// Rows currently shown, parallel to the listbox children.
+    shown: std.ArrayList(suggest.Candidate) = .empty,
+
     debounce_id: c.guint = 0,
     /// Distinct webstore-callback anchors: cancelling one class of
     /// pending reply must not drop the other.
     hist_anchor: u8 = 0,
     bm_anchor: u8 = 0,
-    q_buf: [512]u8 = undefined,
-    q_len: usize = 0,
+    /// Model generation the outstanding history request answers.
+    hist_gen: u64 = 0,
     severed: bool = false,
 
     pub fn create(allocator: std.mem.Allocator, face: *WebFace, entry: *c.GtkWidget) !*Omnibox {
@@ -79,7 +92,12 @@ pub const Omnibox = struct {
             .render_arena = std.heap.ArenaAllocator.init(allocator),
             .hist_arena = std.heap.ArenaAllocator.init(allocator),
             .bm_arena = std.heap.ArenaAllocator.init(allocator),
+            .cat_arena = std.heap.ArenaAllocator.init(allocator),
         };
+        errdefer allocator.destroy(self);
+
+        commandcat.build(self.cat_arena.allocator(), .{}, &self.catalog) catch {};
+        self.feed = .{ .rows = self.catalog.items, .mru = &commandcat.recent };
 
         // Autohide OFF: the popover must never grab focus away from
         // the entry the user is typing into.
@@ -103,6 +121,28 @@ pub const Omnibox = struct {
         self.listbox = listbox;
         c.gtk_scrolled_window_set_child(@ptrCast(scroller), listbox);
         c.gtk_popover_set_child(@ptrCast(pop), scroller);
+
+        self.sources = .{
+            .{ .ctx = self, .query = inputSource, .activate = &activateNavigate },
+            .{ .ctx = self, .weight = 0.9, .query = tabsSource, .activate = &activateTab },
+            .{ .ctx = self, .weight = 0.85, .query = bookmarksSource, .activate = &activateUrl },
+            .{
+                .ctx = self,
+                .normalize = true,
+                .weight = 0.8,
+                .query = historySource,
+                .refresh = &historyRefresh,
+                .activate = &activateUrl,
+            },
+            // Well below every navigating source: an address bar is for
+            // addresses first. A command has to be named almost exactly
+            // before it outranks what the typed text already means.
+            self.feed.source(&activateCommand, self, 0.5),
+        };
+        self.model = suggest.Model.init(allocator, &self.sources, MAX_ROWS);
+        self.model.view_ctx = self;
+        self.model.on_before_merge = &resetRenderArena;
+        self.model.on_changed = &onRanked;
 
         // As-you-type refresh, debounced. `changed` also fires for the
         // programmatic address rewrite on navigation, which only ever
@@ -160,12 +200,15 @@ pub const Omnibox = struct {
 
     pub fn destroy(self: *Omnibox) void {
         self.sever(true);
-        self.items.deinit(self.allocator);
+        self.model.deinit();
+        self.shown.deinit(self.allocator);
         self.hits.deinit(self.allocator);
         self.bookmarks.deinit(self.allocator);
+        self.catalog.deinit(self.cat_arena.allocator());
         self.render_arena.deinit();
         self.hist_arena.deinit();
         self.bm_arena.deinit();
+        self.cat_arena.deinit();
         self.allocator.destroy(self);
     }
 
@@ -176,11 +219,6 @@ pub const Omnibox = struct {
         if (self.severed) return;
         // Programmatic rewrites only touch an unfocused entry.
         if (c.gtk_widget_has_focus(self.entry) == 0) return;
-        const text_c = c.gtk_editable_get_text(@ptrCast(self.entry)) orelse return;
-        const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
-        const n = @min(text.len, self.q_buf.len);
-        @memcpy(self.q_buf[0..n], text[0..n]);
-        self.q_len = n;
         if (self.debounce_id != 0) _ = c.g_source_remove(self.debounce_id);
         self.debounce_id = c.g_timeout_add(DEBOUNCE_MS, &onDebounce, self);
     }
@@ -188,7 +226,20 @@ pub const Omnibox = struct {
     fn onDebounce(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(Omnibox, user);
         self.debounce_id = 0;
-        if (!self.severed) self.refresh();
+        if (self.severed) return 0;
+        const text_c = c.gtk_editable_get_text(@ptrCast(self.entry));
+        const text = if (text_c != null) std.mem.span(@as([*:0]const u8, @ptrCast(text_c))) else "";
+        if (text.len == 0) {
+            self.model.setQuery("");
+            self.hide();
+            return 0;
+        }
+        if (self.bm_state == .empty) {
+            self.bm_state = .loading;
+            if (!webstore.bookmarkList(self.allocator, @ptrCast(&self.bm_anchor), &onBookmarksReply))
+                self.bm_state = .empty; // degraded daemon: filter nothing
+        }
+        self.model.setQuery(text);
         return 0; // one-shot
     }
 
@@ -245,7 +296,8 @@ pub const Omnibox = struct {
         const lb: *c.GtkListBox = @ptrCast(@alignCast(self.listbox));
         const cur = c.gtk_list_box_get_selected_row(lb);
         const cur_idx: i32 = if (cur == null) -1 else c.gtk_list_box_row_get_index(cur);
-        const total: i32 = @intCast(self.items.items.len);
+        const total: i32 = @intCast(self.shown.items.len);
+        if (total == 0) return;
         var next = cur_idx + delta;
         if (next < 0) next = total - 1;
         if (next >= total) next = 0;
@@ -253,61 +305,42 @@ pub const Omnibox = struct {
         c.gtk_list_box_select_row(lb, row);
     }
 
+    /// Dispatch is the candidate's own: the framework stamped each row
+    /// with its source's activation, so there is no per-kind switch.
     fn activateRow(self: *Omnibox, row: *c.GtkListBoxRow) void {
         const idx = c.gtk_list_box_row_get_index(row);
-        if (idx < 0 or @as(usize, @intCast(idx)) >= self.items.items.len) return;
-        const item = self.items.items[@intCast(idx)];
+        if (idx < 0 or @as(usize, @intCast(idx)) >= self.shown.items.len) return;
+        const cand = self.shown.items[@intCast(idx)];
         self.hide();
-        switch (item.kind) {
-            .open_tab => if (webface.faceByView(item.view)) |target| target.reveal(),
-            else => {
-                // navigate() normalizes: URLs pass through, raw
-                // queries become a search on the configured engine.
-                // Stack copy: the next refresh resets the arena the
-                // spec lives in.
-                var spec_buf: [2048]u8 = undefined;
-                const n = @min(item.spec.len, spec_buf.len);
-                @memcpy(spec_buf[0..n], item.spec[0..n]);
-                self.face.navigate(spec_buf[0..n]);
-                _ = c.gtk_widget_grab_focus(self.face.view_area);
-            },
-        }
+        _ = cand.fire();
     }
 
     fn hide(self: *Omnibox) void {
         c.gtk_popover_popdown(@ptrCast(self.popover));
     }
 
-    // ---- refresh ----------------------------------------------------
+    // ---- async replies ----------------------------------------------
 
-    fn query(self: *const Omnibox) []const u8 {
-        return self.q_buf[0..self.q_len];
-    }
-
-    fn refresh(self: *Omnibox) void {
-        const q = self.query();
-        if (q.len == 0) {
-            self.items.clearRetainingCapacity();
-            self.hide();
-            return;
-        }
-        // Hits belong to the query they answered; a new query starts
-        // from none and the async reply fills them back in.
+    /// Kick the daemon-side history query for a new model generation.
+    /// Hits belong to the query they answered, so a new one starts from
+    /// none and the reply fills them back in.
+    fn historyRefresh(ctx: ?*anyopaque, q: []const u8, gen: u64) void {
+        const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
+        if (self.severed) return;
         self.hits.clearRetainingCapacity();
         _ = self.hist_arena.reset(.retain_capacity);
+        self.hist_gen = gen;
         webstore.cancelFor(@ptrCast(&self.hist_anchor));
+        if (q.len == 0) return;
         _ = webstore.historyQuery(self.allocator, q, HISTORY_MAX, @ptrCast(&self.hist_anchor), &onHistoryReply);
-        if (self.bm_state == .empty) {
-            self.bm_state = .loading;
-            if (!webstore.bookmarkList(self.allocator, @ptrCast(&self.bm_anchor), &onBookmarksReply))
-                self.bm_state = .empty; // degraded daemon: filter nothing
-        }
-        self.render();
     }
 
     fn onHistoryReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         const self: *Omnibox = @alignCast(@fieldParentPtr("hist_anchor", @as(*u8, @ptrCast(ctx.?))));
         if (self.severed or !ok) return;
+        // Gate on staleness BEFORE storing: keeping a superseded
+        // payload would rank answers to a question nobody asked.
+        if (!self.model.accepts(self.hist_gen)) return;
         // The payload dies with this dispatch: keep our own copies.
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
@@ -323,9 +356,12 @@ pub const Omnibox = struct {
                 .score = hit.score,
             }) catch break;
         }
-        self.render();
+        self.model.remerge();
     }
 
+    /// Bookmarks are fetched once and filtered locally, so unlike
+    /// history this reply answers no particular query and needs no
+    /// generation check.
     fn onBookmarksReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         const self: *Omnibox = @alignCast(@fieldParentPtr("bm_anchor", @as(*u8, @ptrCast(ctx.?))));
         if (self.severed) return;
@@ -347,7 +383,7 @@ pub const Omnibox = struct {
             }) catch break;
         }
         self.bm_state = .ready;
-        self.render();
+        self.model.remerge();
     }
 
     // ---- sources ----------------------------------------------------
@@ -358,6 +394,7 @@ pub const Omnibox = struct {
     /// address).
     fn inputSource(ctx: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
         const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
+        if (q.len == 0) return;
         const arena = self.render_arena.allocator();
         const class = suggest.classify(q);
         if (class != .search) {
@@ -386,16 +423,14 @@ pub const Omnibox = struct {
     fn tabsSource(ctx: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
         const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
         const arena = self.render_arena.allocator();
-        var qbuf: [256]u8 = undefined;
-        const ql = suggest.toLower(&qbuf, q);
         for (webface.openFaces()) |f| {
             if (f == self.face or f.attached or f.widgets_dead) continue;
             const url = f.url orelse continue;
             const title: []const u8 = f.title orelse url;
-            const tl = suggest.toLower(arena.alloc(u8, title.len) catch continue, title);
-            const ul = suggest.toLower(arena.alloc(u8, url.len) catch continue, url);
-            const score = suggest.fieldsScore(ql, tl, ul);
+            const score = suggest.fieldsScore(q, title, url);
             if (score <= 0) continue;
+            // Duped: a face can navigate between merges, and the rows
+            // hold these strings until the next one.
             out.append(gpa, .{
                 .title = arena.dupe(u8, title) catch continue,
                 .detail = arena.dupe(u8, url) catch continue,
@@ -408,13 +443,8 @@ pub const Omnibox = struct {
 
     fn bookmarksSource(ctx: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
         const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
-        const arena = self.render_arena.allocator();
-        var qbuf: [256]u8 = undefined;
-        const ql = suggest.toLower(&qbuf, q);
         for (self.bookmarks.items) |bm| {
-            const tl = suggest.toLower(arena.alloc(u8, bm.title.len) catch continue, bm.title);
-            const ul = suggest.toLower(arena.alloc(u8, bm.url.len) catch continue, bm.url);
-            const score = suggest.fieldsScore(ql, tl, ul);
+            const score = suggest.fieldsScore(q, bm.title, bm.url);
             if (score <= 0) continue;
             out.append(gpa, .{
                 .title = if (bm.title.len > 0) bm.title else bm.url,
@@ -442,37 +472,73 @@ pub const Omnibox = struct {
         }
     }
 
+    // ---- activation --------------------------------------------------
+
+    /// Navigating rows whose target is the TITLE (the typed input's own
+    /// readings). navigate() normalizes: URLs pass through, raw queries
+    /// become a search on the configured engine.
+    fn activateNavigate(ctx: ?*anyopaque, cand: suggest.Candidate) void {
+        const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
+        self.navigateTo(cand.title);
+    }
+
+    /// Rows whose target is the DETAIL column (history, bookmarks).
+    fn activateUrl(ctx: ?*anyopaque, cand: suggest.Candidate) void {
+        const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
+        self.navigateTo(cand.detail);
+    }
+
+    fn activateTab(_: ?*anyopaque, cand: suggest.Candidate) void {
+        // Resolved at click time so a face that died in between is a
+        // no-op, not a stale pointer.
+        if (webface.faceByView(@intCast(cand.payload))) |target| target.reveal();
+    }
+
+    fn activateCommand(ctx: ?*anyopaque, cand: suggest.Candidate) void {
+        const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
+        const idx: usize = @intCast(cand.payload);
+        if (idx >= self.catalog.items.len) return;
+        const row = self.catalog.items[idx];
+        // Only plain actions are offered here: the catalogue is built
+        // with no editor face and no domains for a web pane.
+        if (row.kind != .action) return;
+        commandcat.recent.note(commandcat.keyOf(row));
+        const win = self.face.ownerWindow() orelse return;
+        window_mod.dispatchAction(win, row.action);
+    }
+
+    /// Stack-copy the spec first: navigate() can trigger a merge that
+    /// resets the arena the candidate's strings live in.
+    fn navigateTo(self: *Omnibox, spec: []const u8) void {
+        var spec_buf: [2048]u8 = undefined;
+        const n = @min(spec.len, spec_buf.len);
+        @memcpy(spec_buf[0..n], spec[0..n]);
+        self.face.navigate(spec_buf[0..n]);
+        _ = c.gtk_widget_grab_focus(self.face.view_area);
+    }
+
     // ---- rendering --------------------------------------------------
 
-    fn render(self: *Omnibox) void {
+    /// The model's pre-merge hook. Sources build candidate strings in
+    /// this arena, so it can only be reset where a merge is known to be
+    /// starting — including the merges an async reply triggers.
+    fn resetRenderArena(user: ?*anyopaque) void {
+        const self = cast.userData(Omnibox, user);
         _ = self.render_arena.reset(.retain_capacity);
-        self.items.clearRetainingCapacity();
-        const q = self.query();
+    }
 
-        const sources = [_]suggest.Source{
-            .{ .ctx = self, .query = inputSource },
-            .{ .ctx = self, .weight = 0.9, .query = tabsSource },
-            .{ .ctx = self, .weight = 0.85, .query = bookmarksSource },
-            .{ .ctx = self, .normalize = true, .weight = 0.8, .query = historySource },
-        };
-        var cands: std.ArrayList(suggest.Candidate) = .empty;
-        defer cands.deinit(self.allocator);
-        suggest.merge(self.allocator, &sources, q, MAX_ROWS, &cands) catch return;
+    fn onRanked(user: ?*anyopaque) void {
+        const self = cast.userData(Omnibox, user);
+        if (self.severed) return;
 
         const lb: *c.GtkListBox = @ptrCast(@alignCast(self.listbox));
         while (c.gtk_widget_get_first_child(self.listbox)) |child|
             c.gtk_list_box_remove(lb, @ptrCast(child));
 
+        self.shown.clearRetainingCapacity();
         const arena = self.render_arena.allocator();
-        for (cands.items) |cand| {
-            const item: Item = switch (cand.kind) {
-                .open_tab => .{ .kind = .open_tab, .view = @intCast(cand.payload) },
-                .url => .{ .kind = .url, .spec = cand.title },
-                .search => .{ .kind = .search, .spec = cand.title },
-                // history/bookmark rows navigate to their URL.
-                else => .{ .kind = cand.kind, .spec = arena.dupe(u8, cand.detail) catch continue },
-            };
-            self.items.append(self.allocator, item) catch break;
+        for (self.model.items.items) |cand| {
+            self.shown.append(self.allocator, cand) catch break;
 
             const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
             c.gtk_widget_set_margin_start(row_box, 8);
@@ -505,7 +571,10 @@ pub const Omnibox = struct {
         // what I typed" (the entry's own activate).
         c.gtk_list_box_unselect_all(lb);
 
-        if (self.items.items.len == 0 or c.gtk_widget_has_focus(self.entry) == 0) {
+        if (self.shown.items.len == 0 or
+            self.model.query().len == 0 or
+            c.gtk_widget_has_focus(self.entry) == 0)
+        {
             self.hide();
             return;
         }
@@ -526,6 +595,7 @@ pub const Omnibox = struct {
             .bookmark => "starred-symbolic",
             .open_tab => "tab-new-symbolic",
             .command => "utilities-terminal-symbolic",
+            .session => "go-jump-symbolic",
         };
     }
 };

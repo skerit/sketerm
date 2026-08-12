@@ -5186,7 +5186,10 @@ pub const WebFace = struct {
         self.setStatus(CRASH_MSG, true);
     }
 
-    fn ownerWindow(self: *WebFace) ?*@import("window.zig").Window {
+    /// The Window this face is displayed in, resolved through the
+    /// widget root. Public because the omnibox dispatches command rows
+    /// through it. Null once the widgets are dead.
+    pub fn ownerWindow(self: *WebFace) ?*@import("window.zig").Window {
         if (self.widgets_dead) return null;
         const root = c.gtk_widget_get_root(self.root_box) orelse return null;
         return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));

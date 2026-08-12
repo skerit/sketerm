@@ -1,225 +1,70 @@
 //! Command palette — Ctrl+Shift+P. Modal AdwDialog with a search
-//! entry and a scrolling list of curated actions, each rendered as
-//! an AdwActionRow (icon + bold title + dim subtitle + keybind hint).
+//! entry and a scrolling list, each row an AdwActionRow (icon + bold
+//! title + dim subtitle + keybind hint).
 //!
-//! Filter + ranking go through the shared suggestion framework
-//! (src/util/suggest.zig): the curated action list is a command
-//! `Source` and the merger scores rows (title prefix > word boundary >
-//! substring > description hit), so the best match sorts to the top.
-//! A bare query scores every row equally and the tie-break on the
-//! build order keeps the curated ordering exactly as authored.
+//! This is one of the two views over the shared suggestion model
+//! (`src/util/suggest.zig`); the omnibox is the other. The palette owns
+//! no ranking, no matching and no dispatch of its own: it builds a row
+//! per candidate slot, hands `suggest.Model` its sources, and renders
+//! what comes back. Rows are activated by calling the candidate's own
+//! `fire()`, so adding a source means adding it to `ctx.sources` — not
+//! extending a dispatch switch here.
+//!
+//! Sources, in weight order:
+//!   - the command catalogue (`commandcat.zig`) — curated actions,
+//!     editor-face commands, one row per `[domain.<name>]`;
+//!   - open tabs across every window, which activate by switching to
+//!     the tab rather than doing anything.
+//!
+//! Why the palette hosts every source that can be ENUMERATED when it
+//! opens, and no async ones: its rows are AdwActionRows carrying icon
+//! theme lookups and keybind-label lookups, built once and thereafter
+//! only re-sorted and shown/hidden. That is the right cost model for
+//! ~80 rows and the wrong one for a set that changes per keystroke. The
+//! omnibox rebuilds cheap GtkBox rows every keystroke and so can carry
+//! daemon-backed history; the framework supports both and neither view
+//! has to know about the other. See `suggest.Model`'s docblock.
+//!
 //! Keyboard: Up/Down move selection while focus stays in the entry,
-//! Enter activates, Escape dismisses (handled by AdwDialog itself).
-//!
-//! Dispatch: every match dispatches the chosen action through
-//! `Window.dispatchAction`, which mirrors the keybind dispatch path
-//! (focused-pane input.Ctx first, falls through to onShortcut).
+//! Enter activates, Escape dismisses.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const suggest = @import("../util/suggest.zig");
+const commandcat = @import("commandcat.zig");
 const render_kick = @import("../util/render_kick.zig");
 const input = @import("input.zig");
 const ecmd = @import("../editor/commands.zig");
 const EditorView = @import("editorview.zig").EditorView;
+const remotectl = @import("remotectl.zig");
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
 
-const Entry = struct {
-    icon: [:0]const u8,
+/// A "switch to this tab" row. Kept as a resolved page pointer rather
+/// than an index because tabs can close while the dialog is up; the
+/// activation re-checks the page is still in its view before selecting.
+const TabRow = struct {
     title: [:0]const u8,
-    desc: [:0]const u8,
-    action: input.Action,
-};
-
-/// Curated action set — every row that "makes sense" in a discoverable
-/// list. Actions reachable only via context-menu / per-pane chords
-/// are intentionally excluded; keybind-only actions where the chord
-/// is the entire UX (Alt+digit goto-tab) are excluded too.
-const ENTRIES = [_]Entry{
-    // Clipboard
-    .{ .icon = "edit-copy-symbolic", .title = "Copy",
-       .desc = "Copy the selected text to the clipboard.", .action = .copy_selection },
-    .{ .icon = "edit-paste-symbolic", .title = "Paste",
-       .desc = "Paste clipboard contents at the cursor.", .action = .paste_clipboard },
-    .{ .icon = "edit-select-all-symbolic", .title = "Select All",
-       .desc = "Select the whole buffer: scrollback ring plus the visible screen.", .action = .select_all },
-    .{ .icon = "open-menu-symbolic", .title = "Context Menu",
-       .desc = "Open the pane's right-click menu at the text cursor (Menu key / Shift+F10).", .action = .context_menu },
-    .{ .icon = "view-fullscreen-symbolic", .title = "Copy Screen",
-       .desc = "Copy the entire visible terminal area.", .action = .copy_screen },
-    .{ .icon = "document-save-symbolic", .title = "Copy Scrollback",
-       .desc = "Copy the full scrollback buffer plus the visible screen.", .action = .copy_scrollback },
-    .{ .icon = "utilities-terminal-symbolic", .title = "Copy Command Output",
-       .desc = "Copy the output of the last command (needs OSC 133 shell integration).", .action = .copy_command_output },
-    .{ .icon = "find-location-symbolic", .title = "Keyboard Hints",
-       .desc = "Label matches on screen; type a label to act on one. Shift copies, Alt pastes, Tab collects several.", .action = .hints_open },
-    .{ .icon = "edit-select-all-symbolic", .title = "Copy Mode",
-       .desc = "Keyboard-driven selection: vi motions (w/e/b, H/M/L, %, f), select with v, copy with y.", .action = .copy_mode },
-    .{ .icon = "view-fullscreen-symbolic", .title = "Zoom Pane",
-       .desc = "Toggle the focused pane to fill the whole tab (tmux z).", .action = .zoom_pane },
-
-    // Tabs
-    .{ .icon = "tab-new-symbolic", .title = "New Tab",
-       .desc = "Open a new tab in the current window.", .action = .new_tab },
-    .{ .icon = "edit-copy-symbolic", .title = "Duplicate Tab",
-       .desc = "Open a new tab inheriting this tab's working directory and profile.", .action = .duplicate_tab },
-    .{ .icon = "window-close-symbolic", .title = "Close Tab",
-       .desc = "Close the active tab.", .action = .close_tab },
-    .{ .icon = "view-pin-symbolic", .title = "Pin / Unpin Tab",
-       .desc = "Toggle pinning. Pinned tabs sit at the start of the tab bar.", .action = .toggle_pin_tab },
-    .{ .icon = "edit-undo-symbolic", .title = "Restore Closed Tab",
-       .desc = "Reopen the most recently closed tab.", .action = .restore_closed_tab },
-    .{ .icon = "view-grid-symbolic", .title = "Toggle Tab Bar",
-       .desc = "Show or hide the tab bar at the top of the window.", .action = .toggle_tab_bar },
-    .{ .icon = "go-next-symbolic", .title = "Next Tab",
-       .desc = "Switch focus to the next tab.", .action = .next_tab },
-    .{ .icon = "go-previous-symbolic", .title = "Previous Tab",
-       .desc = "Switch focus to the previous tab.", .action = .prev_tab },
-    .{ .icon = "sidebar-show-symbolic", .title = "Toggle Tab Tree Sidebar",
-       .desc = "Show or hide the vertical tree-style tab sidebar.", .action = .toggle_tab_sidebar },
-    .{ .icon = "pan-end-symbolic", .title = "Collapse Tab Subtree",
-       .desc = "Hide the current tab's child tabs (tree-style tabs).", .action = .tab_collapse },
-    .{ .icon = "pan-down-symbolic", .title = "Expand Tab Subtree",
-       .desc = "Show the current tab's child tabs again.", .action = .tab_expand },
-    .{ .icon = "go-next-symbolic", .title = "Next Tab (Tree Order)",
-       .desc = "Switch to the next tab in tree order, skipping collapsed subtrees.", .action = .tab_tree_next },
-    .{ .icon = "go-previous-symbolic", .title = "Previous Tab (Tree Order)",
-       .desc = "Switch to the previous tab in tree order, skipping collapsed subtrees.", .action = .tab_tree_prev },
-
-    // Panes
-    .{ .icon = "view-dual-symbolic", .title = "Split Horizontal",
-       .desc = "Split the active pane left and right.", .action = .split_h },
-    .{ .icon = "view-paged-symbolic", .title = "Split Vertical",
-       .desc = "Split the active pane top and bottom.", .action = .split_v },
-    .{ .icon = "go-next-symbolic", .title = "Next Pane",
-       .desc = "Move focus to the next pane within this tab.", .action = .pane_next },
-    .{ .icon = "go-previous-symbolic", .title = "Previous Pane",
-       .desc = "Move focus to the previous pane within this tab.", .action = .pane_prev },
-
-    // Search & scrollback
-    .{ .icon = "edit-find-symbolic", .title = "Search",
-       .desc = "Search the scrollback for a string.", .action = .search_open },
-    .{ .icon = "system-search-symbolic", .title = "Search All Sessions",
-       .desc = "Search every mux session's scrollback (local daemon).", .action = .cross_search },
-    .{ .icon = "view-restore-symbolic", .title = "Attach All Sessions",
-       .desc = "Open every durable session not already shown (bulk handoff).", .action = .attach_all },
-    .{ .icon = "go-up-symbolic", .title = "Previous Prompt",
-       .desc = "Jump to the previous shell prompt (uses OSC 133 marks).", .action = .prompt_prev },
-    .{ .icon = "go-down-symbolic", .title = "Next Prompt",
-       .desc = "Jump to the next shell prompt.", .action = .prompt_next },
-    .{ .icon = "go-top-symbolic", .title = "Scroll to Top",
-       .desc = "Jump to the oldest line in the scrollback.", .action = .scrollback_top },
-    .{ .icon = "go-bottom-symbolic", .title = "Scroll to Bottom",
-       .desc = "Return to the live screen position.", .action = .scrollback_bottom },
-    .{ .icon = "go-up-symbolic", .title = "Page Up",
-       .desc = "Scroll back one screenful.", .action = .scrollback_page_up },
-    .{ .icon = "go-down-symbolic", .title = "Page Down",
-       .desc = "Scroll forward one screenful.", .action = .scrollback_page_down },
-    .{ .icon = "edit-clear-all-symbolic", .title = "Clear Scrollback",
-       .desc = "Wipe the scrollback ring. The visible screen stays.", .action = .clear_scrollback },
-    .{ .icon = "view-list-symbolic", .title = "Show Scrollback in Pager",
-       .desc = "Open the scrollback buffer plus visible screen in a pager tab.", .action = .show_scrollback },
-    .{ .icon = "network-server-symbolic", .title = "New Durable Tab (mux)",
-       .desc = "Shell in the sketerm-mux daemon; survives GUI restarts.", .action = .new_durable_tab },
-    .{ .icon = "folder-symbolic", .title = "New File Browser Tab",
-       .desc = "Browse files with live listings; the pane's shell is one click away.", .action = .new_browser_tab },
-    .{ .icon = "view-dual-symbolic", .title = "New Browser Pane (Split)",
-       .desc = "Add a browser pane beside this one. Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
-    .{ .icon = "web-browser-symbolic", .title = "New Web Tab",
-       .desc = "Open a web page in a pane (needs the opt-in browser helper: zig build fetch-cef && zig build web).", .action = .new_web_tab },
-    .{ .icon = "web-browser-symbolic", .title = "New Web Pane (Split)",
-       .desc = "Add a web pane beside this one; the pane's shell stays one click away.", .action = .new_web_split },
-    .{ .icon = "view-private-symbolic", .title = "New Incognito Web Tab",
-       .desc = "Open a web tab in a private, throwaway container: its own cookie jar and cache, wiped when it closes.", .action = .new_incognito_web_tab },
-    .{ .icon = "input-keyboard-symbolic", .title = "Link Hints (Web Page)",
-       .desc = "Label every link and control on the page; type a label to click it (Shift opens links in a new tab).", .action = .web_hints },
-    .{ .icon = "sketerm-reader-symbolic", .title = "Reader View / Show Page",
-       .desc = "Swap this pane's web page for its article as plain text, and back. The page keeps running underneath.", .action = .web_reader },
-    .{ .icon = "web-browser-symbolic", .title = "Discard Background Web Tabs",
-       .desc = "Let go of every web page that is not on screen. Each pane keeps its last frame, dimmed, and reloads when you look at it again.", .action = .web_discard_background },
-    .{ .icon = "applications-engineering-symbolic", .title = "Open DevTools (Web Pane)",
-       .desc = "Open the browser engine's inspector for this web pane, in a split beside it. No remote debugging port is opened.", .action = .web_devtools },
-    .{ .icon = "document-print-symbolic", .title = "Print Web Page to PDF…",
-       .desc = "Save this web pane's page as a PDF file; the browser engine renders it.", .action = .web_print_pdf },
-    .{ .icon = "dialog-password-symbolic", .title = "Fill Password (Web Pane)…",
-       .desc = "Pick a login saved in your keyring for this page's site and type it in as username, Tab, password. Focus the username field first; nothing is ever saved back.", .action = .web_fill_password },
-    .{ .icon = "channel-secure-symbolic", .title = "Site Information (Web Pane)",
-       .desc = "What this site is, what it was allowed to do, and what it has stored — with the way to undo each.", .action = .web_site_info },
-    .{ .icon = "document-open-recent-symbolic", .title = "History (Web)",
-       .desc = "Search the pages this daemon remembers visiting; open, or forget, any of them.", .action = .web_history },
-    .{ .icon = "starred-symbolic", .title = "Bookmarks (Web)",
-       .desc = "Open, rename, re-folder and reorder bookmarks; the web toolbar's star adds them.", .action = .web_bookmarks },
-    .{ .icon = "window-close-symbolic", .title = "Close Pane",
-       .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
-    .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",
-       .desc = "Swap this pane between its file browser and its shell. Both stay alive; neither is closed.", .action = .toggle_browser_face },
-    .{ .icon = "document-edit-symbolic", .title = "New Editor Tab",
-       .desc = "Edit text files (local or remote) with multi-caret editing; the pane's shell is one click away.", .action = .new_editor_tab },
-    .{ .icon = "document-edit-symbolic", .title = "New Editor Pane (Split)",
-       .desc = "Add a text editor pane beside this one; the pane's shell stays one click away.", .action = .new_editor_split },
-    .{ .icon = "document-edit-symbolic", .title = "Show Editor / Show Shell",
-       .desc = "Swap this pane between its text editor and its shell. Both stay alive; neither is closed.", .action = .toggle_editor_face },
-    .{ .icon = "view-paged-symbolic", .title = "Open Saved Panel…",
-       .desc = "Reopen a declarative UI panel saved for this pane's session. Broken documents are listed with the reason; each row can be deleted.", .action = .panel_open },
-    .{ .icon = "window-close-symbolic", .title = "Close Panel",
-       .desc = "Take the panel off this pane, or off this tab. A panel that replaced a shell gives the shell back.", .action = .panel_close },
-
-    // Font
-    .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",
-       .desc = "Bump the cell font up by one point.", .action = .font_inc },
-    .{ .icon = "zoom-out-symbolic", .title = "Decrease Font Size",
-       .desc = "Drop the cell font down by one point.", .action = .font_dec },
-    .{ .icon = "zoom-original-symbolic", .title = "Reset Font Size",
-       .desc = "Restore the configured default size.", .action = .font_reset },
-
-    // Layout & config
-    .{ .icon = "document-save-symbolic", .title = "Save Layout",
-       .desc = "Write the current tabs and panes to last.json.", .action = .save_layout },
-    .{ .icon = "document-save-as-symbolic", .title = "Save Layout As…",
-       .desc = "Pick a path and save the current layout there.", .action = .save_layout_as },
-    .{ .icon = "starred-symbolic", .title = "Save Default Layout",
-       .desc = "Save current tabs and panes as the default for every new launch.", .action = .save_default_layout },
-    .{ .icon = "document-open-symbolic", .title = "Load Layout…",
-       .desc = "Pick a saved layout file and open its tabs in a new window.", .action = .load_layout },
-    .{ .icon = "view-refresh-symbolic", .title = "Reload Config",
-       .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
-    .{ .icon = "application-x-executable-symbolic", .title = "Launch App…",
-       .desc = "Pick an installed GUI app on this pane's host and run it as a forwarded app.", .action = .launch_app },
-    .{ .icon = "view-grid-symbolic", .title = "Session Overview…",
-       .desc = "Every session and app window, local and remote: raise, attach, or kill; shows which one is playing audio.", .action = .app_windows },
-    .{ .icon = "preferences-other-symbolic", .title = "Apply Profile to Pane…",
-       .desc = "Re-style the focused pane with a profile's font/colors/scrollback.", .action = .apply_profile },
-
-    // Shaders
-    .{ .icon = "starred-symbolic", .title = "Shader Preset…",
-       .desc = "Apply or delete a saved shader preset on the focused pane.", .action = .shader_preset_pick },
-
-    // Misc
-    .{ .icon = "input-keyboard-symbolic", .title = "Broadcast Mode",
-       .desc = "Cycle broadcast typing across panes: off → group → all → off.", .action = .broadcast_cycle },
-    .{ .icon = "preferences-system-symbolic", .title = "Preferences",
-       .desc = "Open the preferences dialog.", .action = .prefs_open },
+    detail: [:0]const u8,
+    win: *Window,
+    page: *c.AdwTabPage,
 };
 
 const RowCtx = struct {
     palette: *Ctx,
-    action: input.Action,
-    title_lower: []u8,
-    desc_lower: []u8,
-    /// Build order — the sort tie-break that keeps the curated
-    /// ordering for bare queries.
-    orig_index: usize = 0,
+    /// Index into the palette's SINGLE row index space: catalogue rows
+    /// first, then tab rows. Both sources emit into it as `payload`,
+    /// which is what lets one merged ranking address rows from either.
+    index: usize,
+    /// Build order — the sort tie-break that keeps catalogue order for
+    /// rows the merger scored equally.
+    orig_index: usize,
     /// Last merge score; 0 = filtered out (row hidden).
     score: f32 = 1.0,
-    /// Non-null = a dynamic [domain.<name>] row: activation opens a
-    /// durable tab on this transport-prefixed host instead of
-    /// dispatching `action`. Arena-owned.
-    domain_host: ?[]const u8 = null,
-    /// Non-null = an editor-face command row: activation runs it on
-    /// the focused pane's editor view instead of dispatching `action`.
-    editor_cmd: ?ecmd.Command = null,
+    /// The candidate this row last stood for. Carries the framework's
+    /// activation, so `fire()` is the whole of dispatch.
+    cand: ?suggest.Candidate = null,
 };
 
 const Ctx = struct {
@@ -230,6 +75,13 @@ const Ctx = struct {
     search_entry: *c.GtkWidget,
     listbox: *c.GtkWidget,
     rows: []*RowCtx,
+    /// The two row stores `RowCtx.index` addresses, in order.
+    catalog: std.ArrayList(commandcat.Row) = .empty,
+    tabs: std.ArrayList(TabRow) = .empty,
+    feed: commandcat.Feed = undefined,
+    /// Stable storage: `model` borrows this slice for its lifetime.
+    sources: [2]suggest.Source = undefined,
+    model: suggest.Model = undefined,
 };
 
 pub fn open(window: *Window) !void {
@@ -273,7 +125,7 @@ pub fn open(window: *Window) !void {
     // Search entry on top.
     const search = c.gtk_search_entry_new();
     c.gtk_widget_set_hexpand(search, 1);
-    c.gtk_search_entry_set_placeholder_text(@ptrCast(@alignCast(search)), "Search actions…");
+    c.gtk_search_entry_set_placeholder_text(@ptrCast(@alignCast(search)), "Search actions and tabs…");
     c.gtk_widget_set_margin_bottom(search, 8);
     c.gtk_box_append(@ptrCast(root), search);
     ctx.search_entry = search;
@@ -309,120 +161,71 @@ pub fn open(window: *Window) !void {
     };
     defer if (fallback_theme) |ft| c.g_object_unref(ft);
 
-    // Build rows: the curated static set, plus the editor-face command
-    // set when the focused pane wears an editor, plus one "New Tab on
-    // <name>" per configured [domain.<name>].
-    const domains = window.config.domains.items;
-    const editor_here: bool = blk: {
-        const pane = window.focusedPane() orelse break :blk false;
-        break :blk EditorView.fromPane(pane) != null;
-    };
-    const n_ed: usize = if (editor_here) ecmd.COMMAND_COUNT else 0;
-    const rows = try arena.alloc(*RowCtx, ENTRIES.len + n_ed + domains.len);
-    for (ENTRIES, 0..) |entry, i| {
+    try buildCatalog(ctx, arena, window);
+    collectTabs(ctx, arena, window);
+
+    const total = ctx.catalog.items.len + ctx.tabs.items.len;
+    const rows = try arena.alloc(*RowCtx, total);
+    var built: usize = 0;
+
+    for (ctx.catalog.items, 0..) |entry, i| {
         const rctx = try arena.create(RowCtx);
-        rctx.* = .{
-            .palette = ctx,
-            .action = entry.action,
-            .title_lower = try toLowerOwned(arena, entry.title),
-            .desc_lower = try toLowerOwned(arena, entry.desc),
-            .orig_index = i,
-        };
-        rows[i] = rctx;
+        rctx.* = .{ .palette = ctx, .index = i, .orig_index = built };
+        rows[built] = rctx;
+        built += 1;
 
         const row = c.adw_action_row_new();
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), entry.title);
         c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), entry.desc);
         // Activatable is on the GtkListBoxRow base class.
         c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
+        c.adw_action_row_add_prefix(
+            @ptrCast(@alignCast(row)),
+            iconImage(window, fallback_theme, entry.icon, 20),
+        );
 
-        const icon = iconImage(window, fallback_theme, entry.icon, 20);
-        c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
-
-        // Keybind hint suffix — looks up the active binding for this
-        // action and renders the chord with `gtk_accelerator_get_label`.
+        // Keybind hint suffix — the active binding for this row, if any.
         // No binding → no suffix (keeps the row clean).
-        if (findBindingLabel(arena, window, entry.action)) |label_z| {
-            const kbd = c.gtk_label_new(label_z);
+        const label_z: ?[*:0]const u8 = switch (entry.kind) {
+            .action => findBindingLabel(arena, window, entry.action),
+            .editor => if (entry.editor_cmd) |cmd| findEdBindingLabel(arena, window, cmd) else null,
+            .domain => null,
+        };
+        if (label_z) |lz| {
+            const kbd = c.gtk_label_new(lz);
             c.gtk_widget_add_css_class(kbd, "dim-label");
             c.gtk_widget_add_css_class(kbd, "monospace");
             c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), kbd);
         }
 
         // Stash the rctx pointer on the row so the listbox-level
-        // `row-activated` signal can recover the action. AdwActionRow
-        // is a GObject; the arena owns rctx for the dialog's lifetime.
+        // `row-activated` signal can recover it. AdwActionRow is a
+        // GObject; the arena owns rctx for the dialog's lifetime.
         c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
-
         c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
     }
 
-    var row_count: usize = ENTRIES.len;
-    if (editor_here) {
-        inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
-            const cmd: ecmd.Command = @enumFromInt(field.value);
-            const rctx = try arena.create(RowCtx);
-            rctx.* = .{
-                .palette = ctx,
-                .action = .toggle_editor_face, // unused for editor rows
-                .title_lower = try toLowerOwned(arena, ecmd.label(cmd)),
-                .desc_lower = try toLowerOwned(arena, ecmd.describe(cmd)),
-                .orig_index = row_count,
-                .editor_cmd = cmd,
-            };
-            rows[row_count] = rctx;
-            row_count += 1;
-
-            const row = c.adw_action_row_new();
-            c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), ecmd.label(cmd));
-            c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), ecmd.describe(cmd));
-            c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
-            const icon = iconImage(window, fallback_theme, "document-edit-symbolic", 20);
-            c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
-            if (findEdBindingLabel(arena, window, cmd)) |label_z| {
-                const kbd = c.gtk_label_new(label_z);
-                c.gtk_widget_add_css_class(kbd, "dim-label");
-                c.gtk_widget_add_css_class(kbd, "monospace");
-                c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), kbd);
-            }
-            c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
-            c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
-        }
-    }
-    for (domains) |dom| {
-        if (dom.host.len == 0) continue;
-        const title_z = try std.fmt.allocPrintSentinel(arena, "New Tab on {s}", .{dom.name}, 0);
-        const desc_z = try std.fmt.allocPrintSentinel(
-            arena,
-            "Durable remote shell on {s} ({s}).",
-            .{ dom.host, @tagName(dom.transport) },
-            0,
-        );
+    for (ctx.tabs.items, 0..) |tab, i| {
         const rctx = try arena.create(RowCtx);
-        rctx.* = .{
-            .palette = ctx,
-            .action = .new_durable_tab,
-            .title_lower = try toLowerOwned(arena, title_z),
-            .desc_lower = try toLowerOwned(arena, desc_z),
-            .orig_index = row_count,
-            .domain_host = try dom.hostSpec(arena),
-        };
-        rows[row_count] = rctx;
-        row_count += 1;
+        rctx.* = .{ .palette = ctx, .index = ctx.catalog.items.len + i, .orig_index = built };
+        rows[built] = rctx;
+        built += 1;
 
         const row = c.adw_action_row_new();
-        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title_z);
-        c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), desc_z);
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), tab.title);
+        c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), tab.detail);
         c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
-        const icon = iconImage(window, fallback_theme, "network-server-symbolic", 20);
-        c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
+        c.adw_action_row_add_prefix(
+            @ptrCast(@alignCast(row)),
+            iconImage(window, fallback_theme, "go-jump-symbolic", 20),
+        );
         c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
         c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
     }
+    ctx.rows = rows[0..built];
 
     // Single listbox-level activation handler — fires for click,
-    // double-click on AdwActionRow, and `gtk_list_box_row_activate`
-    // (the path our Enter key forwarding takes).
+    // double-click on AdwActionRow, and our Enter forwarding.
     _ = c.g_signal_connect_data(
         listbox,
         "row-activated",
@@ -431,14 +234,29 @@ pub fn open(window: *Window) !void {
         null,
         c.G_CONNECT_DEFAULT,
     );
-    ctx.rows = rows[0..row_count];
 
-    // Ranked ordering: best match first, curated order on ties (every
-    // row starts at score 1.0, so the initial view IS the curated
-    // order). The rows' RowCtx carries the scores; the qdata pointer
-    // outlives every sort because the arena lives until the dialog's
-    // destroy-notify.
+    // Ranked ordering: best match first, catalogue order on ties. The
+    // RowCtx carries the scores; the qdata pointer outlives every sort
+    // because the arena lives until the dialog's destroy-notify.
     c.gtk_list_box_set_sort_func(@ptrCast(@alignCast(listbox)), @ptrCast(&onSortRows), null, null);
+
+    ctx.feed = .{ .rows = ctx.catalog.items, .mru = &commandcat.recent };
+    ctx.sources = .{
+        ctx.feed.source(&activateCommand, @ptrCast(ctx), 1.0),
+        // Below the catalogue on purpose: a command you named exactly
+        // must still win over a tab whose title happens to contain the
+        // same word. 0.75 keeps even a perfect tab-title hit under a
+        // command's word-boundary match (0.8).
+        .{
+            .ctx = @ptrCast(ctx),
+            .weight = 0.75,
+            .query = &tabsQuery,
+            .activate = &activateTab,
+        },
+    };
+    ctx.model = suggest.Model.init(allocator, &ctx.sources, ctx.rows.len);
+    ctx.model.view_ctx = @ptrCast(ctx);
+    ctx.model.on_changed = &onRanked;
 
     // Search filter.
     _ = c.g_signal_connect_data(
@@ -468,11 +286,9 @@ pub fn open(window: *Window) !void {
     );
     c.gtk_widget_add_controller(search, @ptrCast(key_ctrl));
 
-    // Initial selection — first row.
-    if (ENTRIES.len > 0) {
-        const first = c.gtk_list_box_get_row_at_index(@ptrCast(@alignCast(listbox)), 0);
-        if (first != null) c.gtk_list_box_select_row(@ptrCast(@alignCast(listbox)), first);
-    }
+    // Seed the ranking (and every row's candidate) for the bare query,
+    // then select the top row so Enter always has a target.
+    ctx.model.setQuery("");
 
     c.adw_dialog_set_child(dialog, root);
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(window.app_window), null, c.G_CONNECT_DEFAULT);
@@ -483,43 +299,183 @@ pub fn open(window: *Window) !void {
     _ = c.gtk_widget_grab_focus(search);
 }
 
-/// The curated action rows as a suggestion `Source`: one candidate
-/// per matching row, payload = index into `ctx.rows`.
-fn commandSource(ctx_: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
+// ── row construction ──────────────────────────────────────────────
+
+/// The catalogue for this opening: curated actions, the editor-face
+/// commands when the focused pane wears an editor, and one row per
+/// configured `[domain.<name>]`.
+fn buildCatalog(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) !void {
+    const editor_here: bool = blk: {
+        const pane = window.focusedPane() orelse break :blk false;
+        break :blk EditorView.fromPane(pane) != null;
+    };
+
+    var domains: std.ArrayList(commandcat.DomainRow) = .empty;
+    for (window.config.domains.items) |dom| {
+        if (dom.host.len == 0) continue;
+        try domains.append(arena, .{
+            .name = dom.name,
+            .host_spec = try dom.hostSpec(arena),
+            .title = try std.fmt.allocPrintSentinel(arena, "New Tab on {s}", .{dom.name}, 0),
+            .desc = try std.fmt.allocPrintSentinel(
+                arena,
+                "Durable remote shell on {s} ({s}).",
+                .{ dom.host, @tagName(dom.transport) },
+                0,
+            ),
+        });
+    }
+
+    try commandcat.build(arena, .{ .editor = editor_here, .domains = domains.items }, &ctx.catalog);
+}
+
+/// Every tab of every window of this process. Failure to enumerate is
+/// not fatal: the palette simply offers no tab rows.
+fn collectTabs(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) void {
+    const app = c.gtk_window_get_application(@ptrCast(window.app_window));
+    const wins = remotectl.liveWindows(arena, app) catch return;
+    const many = wins.len > 1;
+    for (wins) |win| {
+        const n = c.adw_tab_view_get_n_pages(win.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(win.tab_view, i) orelse continue;
+            const title_c = c.adw_tab_page_get_title(page);
+            const title = if (title_c != null) std.mem.span(title_c) else "";
+            const title_z = arena.dupeZ(u8, if (title.len > 0) title else "Untitled tab") catch continue;
+            const detail_z = if (many)
+                std.fmt.allocPrintSentinel(arena, "Window {d} · tab {d}", .{ win.id, i + 1 }, 0) catch continue
+            else
+                std.fmt.allocPrintSentinel(arena, "Tab {d}", .{i + 1}, 0) catch continue;
+            ctx.tabs.append(arena, .{
+                .title = title_z,
+                .detail = detail_z,
+                .win = win,
+                .page = page,
+            }) catch return;
+        }
+    }
+}
+
+// ── sources ───────────────────────────────────────────────────────
+
+/// Open tabs as suggestion rows. `payload` continues the catalogue's
+/// index space so a merged candidate maps straight back to a widget.
+fn tabsQuery(ctx_: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_.?));
-    var qbuf: [256]u8 = undefined;
-    const ql = suggest.toLower(&qbuf, q);
-    for (ctx.rows, 0..) |rctx, i| {
-        const score = suggest.fieldsScore(ql, rctx.title_lower, rctx.desc_lower);
+    for (ctx.tabs.items, 0..) |tab, i| {
+        const score = suggest.fieldsScore(q, tab.title, tab.detail);
         if (score <= 0) continue;
         out.append(gpa, .{
-            .title = rctx.title_lower,
-            .kind = .command,
+            .title = tab.title,
+            .detail = tab.detail,
+            .kind = .session,
             .score = score,
-            .payload = i,
+            .payload = ctx.catalog.items.len + i,
         }) catch {};
     }
 }
 
+/// Dispatch a catalogue row. Everything arena-owned that survives the
+/// dialog has to be copied first: `force_close` runs the destroy-notify
+/// that frees the arena.
+fn activateCommand(ctx_: ?*anyopaque, cand: suggest.Candidate) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_.?));
+    const idx: usize = @intCast(cand.payload);
+    if (idx >= ctx.catalog.items.len) return;
+    const row = ctx.catalog.items[idx];
+    const win = ctx.window;
+
+    // Recency goes to the process-wide store, which outlives this
+    // dialog by design — and is shared with the omnibox.
+    commandcat.recent.note(commandcat.keyOf(row));
+
+    var host_buf: [512]u8 = undefined;
+    const host: ?[]const u8 = if (row.kind == .domain and row.host.len > 0 and row.host.len < host_buf.len) blk: {
+        @memcpy(host_buf[0..row.host.len], row.host);
+        break :blk host_buf[0..row.host.len];
+    } else null;
+    const kind = row.kind;
+    const action = row.action;
+    const editor_cmd = row.editor_cmd;
+
+    // Dismiss BEFORE dispatching: actions like .prefs_open open another
+    // dialog, and the palette would otherwise stack on top.
+    c.adw_dialog_force_close(@ptrCast(@alignCast(ctx.dialog)));
+
+    switch (kind) {
+        .domain => {
+            const h = host orelse return;
+            win.newDurableTab(h) catch {
+                std.debug.print("sketerm: durable tab on {s} failed (ssh/key auth?)\n", .{h});
+            };
+        },
+        .editor => {
+            const cmd = editor_cmd orelse return;
+            const pane = win.focusedPane() orelse return;
+            const view = EditorView.fromPane(pane) orelse return;
+            const tab = view.activeTab() orelse return;
+            view.runCommand(tab, cmd);
+        },
+        .action => window_mod.dispatchAction(win, action),
+    }
+}
+
+/// Switch to an open tab. The page is re-checked against its view
+/// because a tab can close while the dialog is up.
+fn activateTab(ctx_: ?*anyopaque, cand: suggest.Candidate) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_.?));
+    const idx: usize = @intCast(cand.payload);
+    if (idx < ctx.catalog.items.len) return;
+    const at = idx - ctx.catalog.items.len;
+    if (at >= ctx.tabs.items.len) return;
+    const tab = ctx.tabs.items[at];
+    const win = tab.win;
+    const page = tab.page;
+    c.adw_dialog_force_close(@ptrCast(@alignCast(ctx.dialog)));
+    if (!pageStillThere(win, page)) return;
+    c.adw_tab_view_set_selected_page(win.tab_view, page);
+    c.gtk_window_present(@ptrCast(win.app_window));
+}
+
+fn pageStillThere(win: *Window, page: *c.AdwTabPage) bool {
+    const n = c.adw_tab_view_get_n_pages(win.tab_view);
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        if (c.adw_tab_view_get_nth_page(win.tab_view, i) == page) return true;
+    }
+    return false;
+}
+
+// ── ranking → widgets ─────────────────────────────────────────────
+
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
-    const text = cast.editableText(entry);
+    ctx.model.setQuery(cast.editableText(entry));
+}
+
+/// The model's single "results changed" hook: stamp the merge result
+/// onto the rows, hide what did not match, re-sort, and keep a
+/// selection under Enter.
+fn onRanked(user: ?*anyopaque) void {
+    const ctx = cast.userData(Ctx, user);
     const lb: *c.GtkListBox = @ptrCast(@alignCast(ctx.listbox));
 
-    // Rank through the shared framework; a row absent from the merge
-    // result scores 0 and is hidden.
-    for (ctx.rows) |rctx| rctx.score = 0;
-    const sources = [_]suggest.Source{.{ .ctx = ctx, .query = &commandSource }};
-    var cands: std.ArrayList(suggest.Candidate) = .empty;
-    defer cands.deinit(ctx.allocator);
-    suggest.merge(ctx.allocator, &sources, text, ctx.rows.len, &cands) catch return;
-    for (cands.items) |cand| ctx.rows[@intCast(cand.payload)].score = cand.score;
+    for (ctx.rows) |rctx| {
+        rctx.score = 0;
+        rctx.cand = null;
+    }
+    for (ctx.model.items.items) |cand| {
+        const at: usize = @intCast(cand.payload);
+        if (at >= ctx.rows.len) continue;
+        ctx.rows[at].score = cand.score;
+        ctx.rows[at].cand = cand;
+    }
 
     var idx: i32 = 0;
     while (idx < @as(i32, @intCast(ctx.rows.len))) : (idx += 1) {
         const row = c.gtk_list_box_get_row_at_index(lb, idx) orelse break;
-        const data = c.g_object_get_data(@ptrCast(@alignCast(row)), "palette-row") orelse continue;
-        const rctx: *RowCtx = @ptrCast(@alignCast(data));
+        const rctx = rowCtxOf(row) orelse continue;
         c.gtk_widget_set_visible(@ptrCast(row), if (rctx.score > 0) 1 else 0);
     }
     c.gtk_list_box_invalidate_sort(lb);
@@ -537,7 +493,7 @@ fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) voi
     c.gtk_list_box_unselect_all(lb);
 }
 
-/// GtkListBox sort: score descending, curated build order on ties.
+/// GtkListBox sort: score descending, catalogue build order on ties.
 fn onSortRows(row1: ?*c.GtkListBoxRow, row2: ?*c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) c_int {
     const a = rowCtxOf(row1) orelse return 0;
     const b = rowCtxOf(row2) orelse return 0;
@@ -613,54 +569,23 @@ fn activateSelected(ctx: *Ctx) void {
     if (row == null) return;
     // Call our handler directly — equivalent to what the listbox's
     // "row-activated" signal would do on a click. (GTK4 dropped
-    // `gtk_list_box_row_activate`; emitting the signal manually is
-    // the modern equivalent.)
+    // `gtk_list_box_row_activate`; calling the handler is the modern
+    // equivalent.)
     onListBoxRowActivated(lb, row, @ptrCast(ctx));
 }
 
-// GtkListBox::row-activated — fires for click, AdwActionRow
-// double-click, and `gtk_list_box_row_activate` (the path our Enter
-// key forwarding takes). Recover the RowCtx via the row's stashed
-// g_object_data, dispatch, dismiss.
+/// GtkListBox::row-activated. Recover the RowCtx from the row's qdata
+/// and fire the candidate it stands for — the framework decides what
+/// that means, so there is no per-kind switch here.
 fn onListBoxRowActivated(
     _: *c.GtkListBox,
     row: *c.GtkListBoxRow,
     user: ?*anyopaque,
 ) callconv(.c) void {
-    const ctx = cast.userData(Ctx, user);
-    const data = c.g_object_get_data(@ptrCast(@alignCast(row)), "palette-row") orelse return;
-    const rctx: *RowCtx = @ptrCast(@alignCast(data));
-    const win = ctx.window;
-    const action = rctx.action;
-    const domain_host = rctx.domain_host;
-    const editor_cmd = rctx.editor_cmd;
-    // Dismiss BEFORE dispatching: actions like .prefs_open open
-    // another dialog, and the palette would otherwise stack on top.
-    // NOTE: domain_host is arena memory freed by the dialog's
-    // destroy-notify; copy before closing.
-    var host_buf: [512]u8 = undefined;
-    const host_copy: ?[]const u8 = if (domain_host) |h|
-        (if (h.len < host_buf.len) blk: {
-            @memcpy(host_buf[0..h.len], h);
-            break :blk host_buf[0..h.len];
-        } else null)
-    else
-        null;
-    c.adw_dialog_force_close(@ptrCast(@alignCast(ctx.dialog)));
-    if (host_copy) |h| {
-        win.newDurableTab(h) catch {
-            std.debug.print("sketerm: durable tab on {s} failed (ssh/key auth?)\n", .{h});
-        };
-        return;
-    }
-    if (editor_cmd) |cmd| {
-        const pane = win.focusedPane() orelse return;
-        const view = EditorView.fromPane(pane) orelse return;
-        const tab = view.activeTab() orelse return;
-        view.runCommand(tab, cmd);
-        return;
-    }
-    window_mod.dispatchAction(win, action);
+    _ = user;
+    const rctx = rowCtxOf(row) orelse return;
+    const cand = rctx.cand orelse return;
+    _ = cand.fire();
 }
 
 fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
@@ -672,6 +597,7 @@ fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
 fn freeCtx(user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const ctx: *Ctx = @ptrCast(@alignCast(u));
+        ctx.model.deinit();
         ctx.arena.deinit();
         ctx.allocator.destroy(ctx);
     }
@@ -719,14 +645,6 @@ fn iconFileExists(paintable: ?*c.GtkIconPaintable) bool {
     return c.g_file_query_exists(file, null) != 0;
 }
 
-fn toLowerOwned(arena: std.mem.Allocator, s: [:0]const u8) ![]u8 {
-    const out = try arena.alloc(u8, s.len);
-    for (s, 0..) |ch, i| {
-        out[i] = std.ascii.toLower(ch);
-    }
-    return out;
-}
-
 /// Keybind hint for an editor-command row: the `editor_keybind.*`
 /// override when one exists, else the command's default accelerator.
 fn findEdBindingLabel(arena: std.mem.Allocator, window: *Window, cmd: ecmd.Command) ?[*:0]const u8 {
@@ -743,22 +661,6 @@ fn findEdBindingLabel(arena: std.mem.Allocator, window: *Window, cmd: ecmd.Comma
     const z = arena.allocSentinel(u8, label.len, 0) catch return null;
     @memcpy(z, label);
     return z.ptr;
-}
-
-test "the curated set carries the panel actions" {
-    // The saved-panel picker is reachable ONLY from here (no default
-    // chord, no menu item), so a missing row is the whole feature
-    // missing. `zig build smoke-e2e` drives the actions themselves
-    // through a config keybind — see `panelPickerStage` for why the
-    // palette's own entry cannot be typed into on that display.
-    var open_row = false;
-    var close_row = false;
-    for (ENTRIES) |e| {
-        if (e.action == .panel_open) open_row = true;
-        if (e.action == .panel_close) close_row = true;
-    }
-    try std.testing.expect(open_row);
-    try std.testing.expect(close_row);
 }
 
 fn findBindingLabel(arena: std.mem.Allocator, window: *Window, action: input.Action) ?[*:0]const u8 {

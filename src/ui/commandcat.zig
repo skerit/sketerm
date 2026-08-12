@@ -322,6 +322,16 @@ pub const mru_max_boost: f32 = 0.04;
 /// compiles into `sketerm-mux`'s test root means dragging path
 /// resolution and file IO in behind it, for a feature whose value is
 /// almost entirely within one sitting.
+/// The process-wide recency store, shared by every surface that offers
+/// commands. "Recently used" is a property of the user, not of the
+/// window they happened to reach for: running a command from the
+/// omnibox should float it in the palette too. Surfaces are built and
+/// destroyed constantly, so this cannot live in any of them.
+///
+/// Main-loop state, mutated only from the GTK thread. Tests construct
+/// their own `Mru` rather than touching this.
+pub var recent: Mru = .{};
+
 pub const Mru = struct {
     keys: [mru_cap]Key = @splat(.{ .kind = .action, .id = 0 }),
     /// Occupied prefix of `keys`.
@@ -367,7 +377,11 @@ pub const Mru = struct {
 /// that ranks them. Embed one in whatever context owns the surface.
 pub const Feed = struct {
     rows: []const Row = &.{},
-    mru: Mru = .{},
+    /// BORROWED, never owned: recency has to outlive the surface that
+    /// records it. The palette's feed dies with its dialog, and a
+    /// per-dialog MRU would forget everything the moment you ran a
+    /// command — so the consumer keeps the store and lends it here.
+    mru: *Mru,
 
     /// `act` is the consumer's dispatch and `act_ctx` the object it
     /// needs (a Window, say) — the feed itself is only the row store,
@@ -455,7 +469,8 @@ test "typing 'tab' ranks New Tab above every description-only hit" {
     var rows: std.ArrayList(Row) = .empty;
     defer rows.deinit(t.allocator);
     try build(t.allocator, .{}, &rows);
-    var feed = Feed{ .rows = rows.items };
+    var mru = Mru{};
+    var feed = Feed{ .rows = rows.items, .mru = &mru };
 
     var out: std.ArrayList(suggest.Candidate) = .empty;
     defer out.deinit(t.allocator);
@@ -475,7 +490,8 @@ test "a bare query keeps the curated order" {
     var rows: std.ArrayList(Row) = .empty;
     defer rows.deinit(t.allocator);
     try build(t.allocator, .{}, &rows);
-    var feed = Feed{ .rows = rows.items };
+    var mru = Mru{};
+    var feed = Feed{ .rows = rows.items, .mru = &mru };
 
     var out: std.ArrayList(suggest.Candidate) = .empty;
     defer out.deinit(t.allocator);
@@ -518,7 +534,8 @@ test "the MRU boost re-orders within a grade but never across one" {
     var rows: std.ArrayList(Row) = .empty;
     defer rows.deinit(t.allocator);
     try build(t.allocator, .{}, &rows);
-    var feed = Feed{ .rows = rows.items };
+    var mru = Mru{};
+    var feed = Feed{ .rows = rows.items, .mru = &mru };
 
     var out: std.ArrayList(suggest.Candidate) = .empty;
     defer out.deinit(t.allocator);
