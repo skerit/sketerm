@@ -41,6 +41,7 @@ const proto = @import("protocol.zig");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
 const filter = @import("filter.zig");
+const userscript = @import("userscript.zig");
 
 /// The content script — a function expression, called with the two
 /// secrets and the transport (see `onContextCreated`).
@@ -630,6 +631,29 @@ pub const Host = struct {
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
 
+    /// User content (capability "userscripts"): the enabled userscript
+    /// and userstyle sets, replaced whole by `us_script_set` /
+    /// `us_style_set` and injected per navigation in `onLoadStart`
+    /// (see `injectUserContent` for the timing/world limitations).
+    /// Each set owns ONE arena so a replace frees the old set whole
+    /// without invalidating the other's slices.
+    us_script_arena: ?std.heap.ArenaAllocator = null,
+    us_scripts: std.ArrayList(ScriptRec) = .empty,
+    us_style_arena: ?std.heap.ArenaAllocator = null,
+    us_styles: std.ArrayList(StyleRec) = .empty,
+
+    const ScriptRec = struct {
+        id: u32,
+        meta: userscript.Meta,
+        source: []const u8,
+    };
+    const StyleRec = struct {
+        id: u32,
+        /// "" = every page; otherwise the host and its subdomains.
+        host: []const u8,
+        css: []const u8,
+    };
+
     /// One `print_pdf` in flight.
     const Print = struct { view: u32, path: []u8 };
 
@@ -705,6 +729,10 @@ pub const Host = struct {
         self.downloads.deinit(self.gpa);
         for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
         self.contexts.deinit(self.gpa);
+        self.us_scripts.deinit(self.gpa);
+        if (self.us_script_arena) |*a| a.deinit();
+        self.us_styles.deinit(self.gpa);
+        if (self.us_style_arena) |*a| a.deinit();
         if (g_host == self) g_host = null;
     }
 
@@ -1562,6 +1590,157 @@ pub const Host = struct {
             }
         }
         for (pending[0..n]) |st| self.post(st);
+    }
+
+    // -- user content (userscripts / userstyles) -----------------------
+
+    /// Replace the enabled userscript set. Sources whose
+    /// `==UserScript==` block is missing or unterminated are refused
+    /// (not a userscript); the rest take effect at the NEXT navigation
+    /// of any matching page.
+    pub fn usScriptSet(self: *Host, req: proto.UsScriptSet) void {
+        if (self.us_script_arena) |*a| a.deinit();
+        self.us_script_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const arena = self.us_script_arena.?.allocator();
+        self.us_scripts.clearRetainingCapacity();
+        for (req.scripts) |s| {
+            const src = arena.dupe(u8, s.source.s) catch continue;
+            const meta = (userscript.parseMeta(arena, src) catch continue) orelse continue;
+            self.us_scripts.append(self.gpa, .{ .id = s.id, .meta = meta, .source = src }) catch {};
+        }
+    }
+
+    /// Replace the enabled userstyle set and apply it INSTANTLY to
+    /// every live view (including removing styles that are no longer
+    /// in the set); navigations re-inject from the stored set.
+    pub fn usStyleSet(self: *Host, req: proto.UsStyleSet) void {
+        if (self.us_style_arena) |*a| a.deinit();
+        self.us_style_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const arena = self.us_style_arena.?.allocator();
+        self.us_styles.clearRetainingCapacity();
+        for (req.styles) |s| {
+            const host = arena.alloc(u8, s.host.len) catch continue;
+            for (s.host, host) |ch, *o| o.* = std.ascii.toLower(ch);
+            const css = arena.dupe(u8, s.css.s) catch continue;
+            self.us_styles.append(self.gpa, .{ .id = s.id, .host = host, .css = css }) catch {};
+        }
+        for (self.views.items) |v| self.applyStylesNow(v);
+    }
+
+    fn styleMatches(st: *const StyleRec, host: []const u8) bool {
+        if (st.host.len == 0) return true;
+        return filter.hostWithin(host, st.host);
+    }
+
+    /// Swap a live document's userstyle elements for the current set.
+    /// Runs even when NOTHING matches: that is how a deleted style
+    /// disappears from the page it is on.
+    fn applyStylesNow(self: *Host, v: *View) void {
+        if (v.discarded) return;
+        const b = v.browser orelse return;
+        const gf = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = gf(b) orelse return;
+        defer release(&frame.base);
+        var fold_buf: [2048]u8 = undefined;
+        const folded = filter.foldUrl(&fold_buf, v.url);
+        const host = filter.hostOf(folded);
+
+        var code: std.Io.Writer.Allocating = .init(self.gpa);
+        defer code.deinit();
+        const w = &code.writer;
+        w.writeAll("(function(){var d=document;var o=d.querySelectorAll('style[data-sketerm-us]');" ++
+            "for(var i=0;i<o.length;i++)o[i].remove();" ++
+            "function A(t){var s=d.createElement('style');s.setAttribute('data-sketerm-us','');" ++
+            "s.textContent=t;(d.head||d.documentElement).appendChild(s);}") catch return;
+        for (self.us_styles.items) |*st| {
+            if (!styleMatches(st, host)) continue;
+            w.writeAll("A(") catch return;
+            jsonStr(w, st.css) catch return;
+            w.writeAll(");") catch return;
+        }
+        w.writeAll("})();") catch return;
+        runJs(frame, code.written());
+    }
+
+    /// Inject the user content applicable to a newly-committed
+    /// document: cosmetic hiding (shield-gated — a disabled shield
+    /// injects NO cosmetic CSS), userstyles, and userscripts by
+    /// `@run-at`. MAIN FRAME ONLY.
+    ///
+    /// LIMITATIONS (deliberate, verified by smoke-web): injection is
+    /// browser-side `execute_java_script` at load START, which lands
+    /// after the parser has begun — cosmetic hiding can flash briefly,
+    /// and `document-start` here means "at commit", not "before every
+    /// page script" (only the embedded semantic bridge gets that,
+    /// renderer-side). Scripts run wrapped in a closure in the page's
+    /// MAIN world — the C API exposes no isolated world on this path —
+    /// with a no-op `GM_info` and NO other GM_* API (`@grant` values
+    /// beyond `none` are recorded by the parser and provided nothing).
+    fn injectUserContent(self: *Host, v: *View, frame: *cef.cef_frame_t) void {
+        var url_raw: [2048]u8 = undefined;
+        const gu = frame.get_url orelse return;
+        const url = userfreeInto(gu(frame), &url_raw);
+        var fold_buf: [2048]u8 = undefined;
+        const folded = filter.foldUrl(&fold_buf, url);
+        const host = filter.hostOf(folded);
+
+        var code: std.Io.Writer.Allocating = .init(self.gpa);
+        defer code.deinit();
+        const w = &code.writer;
+        var any = false;
+        w.writeAll("(function(){var d=document;" ++
+            "function A(t,m){var s=d.createElement('style');s.setAttribute(m,'');" ++
+            "s.textContent=t;(d.head||d.documentElement).appendChild(s);}") catch return;
+
+        if (cosmeticEnabledFor(v.id)) {
+            if (cosmeticCss(self.gpa, host)) |css| {
+                defer self.gpa.free(css);
+                any = true;
+                w.writeAll("A(") catch return;
+                jsonStr(w, css) catch return;
+                w.writeAll(",'data-sketerm-cos');") catch return;
+            }
+        }
+        for (self.us_styles.items) |*st| {
+            if (!styleMatches(st, host)) continue;
+            any = true;
+            w.writeAll("A(") catch return;
+            jsonStr(w, st.css) catch return;
+            w.writeAll(",'data-sketerm-us');") catch return;
+        }
+
+        var scripts = false;
+        for (self.us_scripts.items) |*sc| {
+            if (!userscript.applies(&sc.meta, url)) continue;
+            if (!scripts) {
+                scripts = true;
+                any = true;
+                w.writeAll("var S=[],E=[],I=[];") catch return;
+            }
+            const arr: []const u8 = switch (sc.meta.run_at) {
+                .document_start => "S",
+                .document_end => "E",
+                .document_idle => "I",
+            };
+            w.writeAll(arr) catch return;
+            w.writeAll(".push([") catch return;
+            jsonStr(w, sc.meta.name) catch return;
+            w.writeAll(",") catch return;
+            jsonStr(w, sc.source) catch return;
+            w.writeAll("]);") catch return;
+        }
+        if (scripts) {
+            w.writeAll("function R(p){for(var i=0;i<p.length;i++){" ++
+                "try{(new Function('GM_info',p[i][1]))" ++
+                "({script:{name:p[i][0]},scriptHandler:'sketerm'});}" ++
+                "catch(e){console.error('[sketerm userscript]',p[i][0],e);}}}" ++
+                "R(S);" ++
+                "if(d.readyState==='loading')d.addEventListener('DOMContentLoaded',function(){R(E);});else R(E);" ++
+                "if(d.readyState==='complete')R(I);else window.addEventListener('load',function(){R(I);});") catch return;
+        }
+        if (!any) return;
+        w.writeAll("})();") catch return;
+        runJs(frame, code.written());
     }
 
     // -- downloads -----------------------------------------------------
@@ -2844,6 +3023,39 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
         o.deinit();
         gpa.destroy(o);
     }
+}
+
+/// Whether the shield allows cosmetic hiding for `view_id`: global
+/// AND per-view, exactly the network-verdict gate. Main thread.
+fn cosmeticEnabledFor(view_id: u32) bool {
+    g_int.acquire();
+    defer g_int.release();
+    if (!g_int.global_enabled) return false;
+    for (&g_int.slots) |*s| {
+        if (s.used and s.view_id == view_id) return s.enabled;
+    }
+    return true;
+}
+
+/// The compiled element-hiding sheet for one host, or null when there
+/// is nothing to hide. MAIN THREAD ONLY: the engine pointer is read
+/// under the lock but walked outside it, which is safe because engine
+/// swaps (`interceptReload`) happen on this same thread — the IO
+/// thread only ever reads. Caller frees.
+fn cosmeticCss(gpa: std.mem.Allocator, host: []const u8) ?[]u8 {
+    var eng: ?*filter.Engine = null;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        eng = g_int.engine;
+    }
+    const e = eng orelse return null;
+    const css = e.cosmeticFor(gpa, host) catch return null;
+    if (css.len == 0) {
+        gpa.free(css);
+        return null;
+    }
+    return css;
 }
 
 /// CEF's resource type as the wire's engine-agnostic byte.
@@ -4612,6 +4824,9 @@ fn onLoadStart(
     // accelerated mode the zoom IS the device scale factor, so a page
     // that lost it would render at logical resolution.
     applyZoom(v);
+    // Cosmetic hiding, userstyles and userscripts go in per document,
+    // as early as this path can put them (see `injectUserContent`).
+    if (frame) |f| host.injectUserContent(v, f);
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.started),

@@ -223,7 +223,7 @@ pub const Server = struct {
                 // engine drops back to software compositing on its own
                 // when the GPU goes away, and the client must be ready
                 // for the memfd frames that follow.
-                var caps: [18][]const u8 = .{
+                var caps: [19][]const u8 = .{
                     proto.CAP_FRAMES_SHM,
                     proto.CAP_INPUT,
                     proto.CAP_NAVIGATION,
@@ -241,9 +241,10 @@ pub const Server = struct {
                     proto.CAP_DOWNLOADS,
                     proto.CAP_A11Y,
                     proto.CAP_CONTEXTS,
+                    proto.CAP_USERSCRIPTS,
                     undefined,
                 };
-                var ncaps: usize = 17;
+                var ncaps: usize = 18;
                 if (cefhost.isAccelerated()) {
                     caps[ncaps] = proto.CAP_FRAMES_DMABUF;
                     ncaps += 1;
@@ -299,6 +300,16 @@ pub const Server = struct {
             .download_decide => self.host.downloadDecide(try proto.decode(proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try proto.decode(proto.DownloadCancel, frame.payload)),
             .a11y_enable => self.host.a11yEnable(try proto.decode(proto.A11yEnable, frame.payload)),
+            .us_script_set => {
+                const req = try proto.UsScriptSet.decodeAlloc(frame.payload, self.gpa);
+                defer self.gpa.free(req.scripts);
+                self.host.usScriptSet(req);
+            },
+            .us_style_set => {
+                const req = try proto.UsStyleSet.decodeAlloc(frame.payload, self.gpa);
+                defer self.gpa.free(req.styles);
+                self.host.usStyleSet(req);
+            },
             .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
             // Helper-to-client frames arriving from the client, and any

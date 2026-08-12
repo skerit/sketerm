@@ -526,7 +526,7 @@ fn looksLikeOptions(s: []const u8) bool {
 }
 
 /// `host` equals `base` or is a subdomain of it.
-fn hostWithin(host: []const u8, base: []const u8) bool {
+pub fn hostWithin(host: []const u8, base: []const u8) bool {
     if (std.mem.eql(u8, host, base)) return true;
     if (host.len <= base.len) return false;
     return host[host.len - base.len - 1] == '.' and
