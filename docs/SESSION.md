@@ -17713,6 +17713,12 @@ product verdict: the click assertion beneath it (the button paints, is
 hittable, routes a trusted interaction back to MCP) is strictly
 stronger, so OCR is advisory there.
 
+> **CORRECTED 2026-08-13.** The binding was never wrong. `toGray` was
+> dropping the frame's premultiplied alpha, which turned a real window's
+> transparent shadow into pure black and pulled tesseract's global Otsu
+> threshold off the text. See "the binding was never broken" below —
+> this paragraph is kept for the record, not as a live claim.
+
 ### Still open, and what each needs
 
 - **Filter-list subscription.** Lists are still hand-dropped into
@@ -17732,3 +17738,114 @@ stronger, so OCR is advisory there.
   the signed-helper-bundle layout; this repo's own lesson is that a
   green cross-compile is not a working macOS build, so it stays
   unproven rather than claimed.
+
+## 2026-08-13: a full audit of the unpushed range — 28 defects, one critical
+
+A ten-dimension adversarial audit of the whole `origin/master..master` range
+(42 commits, ~12.6k added lines), every finding then handed to a separate
+reader whose job was to REFUTE it. 28 survived, 6 did not. All 28 are fixed
+here. The three that matter most were all invisible to a green suite.
+
+**A percent-encoded slash escaped the extension package (critical).**
+`webext/assets.zig` split the url on the RAW `/` and percent-decoded each
+piece AFTERWARDS, so `%2e%2e%2f%2e%2e%2fetc%2fpasswd` arrived as ONE segment,
+decoded to `../../etc/passwd`, matched neither `.` nor `..`, and was memcpy'd
+whole into the on-disk path — then served with `Access-Control-Allow-Origin:
+*`. Any page on any site could read any file the helper's uid could, as soon
+as one extension was installed. The test named "resolve REFUSES every escape,
+however spelled" passed the entire time because every escape in it is spelled
+with a literal `/`. A decoded separator is now refused outright, there is a
+containment backstop as an explicit branch (this tree builds ReleaseFast,
+where `assert` compiles away), and the test grew the spellings that were open
+plus a property check over attacker-shaped inputs.
+
+**Any page could mint a live `browser.*` for an installed extension.** Only
+`publishGlobals` was nonce-gated; `extInject` built the real api for ANY
+`ext-inject` and passed it to `new Function(...)` as `browser`/`chrome`/
+`self`. The comment reasoned that running your own code in your own closure
+costs a page nothing — true, but the closure is HANDED the api, so it
+isolated nothing. `window[SLOT]` is discoverable, so a page could read the
+whole tab list, navigate the active tab, and read/rewrite that extension's
+`storage.local`. The nonce now authenticates every `ext-inject` (the
+content-script producer carried none at all); `priv` still authorizes the
+globals. Authentication and authorization are different questions.
+
+**And that fix would have been defeated by the next one.** An `about:blank`
+iframe bypassed the whole `web_accessible_resources` gate, and what it could
+fetch includes the generated bootstrap — which carries the bridge nonce in
+plaintext. The `about:` relaxation is now limited to real navigations, and
+the generated paths require a strict host match. Measured before designing
+it, with the gate's own debug print: the generated background document and an
+author's `background.html` arrive as `RT_MAIN_FRAME` with a frame, the
+bootstrap as `RT_SCRIPT` with the frame already at the extension origin.
+
+Two more that made the suite itself untrustworthy:
+
+- **stage 35b never asserted the zero-hit network check** that its own
+  comment and `src/web/CLAUDE.md` both cite as the proof uBO blocks. The hit
+  count was loaded and PRINTED. A cancel landing after dispatch, a
+  redirect-to-abort, or an unrelated socket reset all look identical from the
+  page. The per-attempt baseline now exists.
+- **`browser.tabs` was advertised and never produced.** The only producer of
+  `webext_tabs` in the tree was the smoke rig, so the shipped GUI sent no tab
+  list and every extension saw `tabId -1` — which MV2 defines as "not
+  associated with a tab" and which, by the measurement recorded two commits
+  above it, makes uBO cancel the top-level navigation of every page. The GUI
+  posts its real tab list now.
+
+The rest, briefly: `spawnBackground` never set an accessibility state, so an
+extension's hidden page could have a11y auto-enabled and its tree adopted by
+the one enabled client view (the same defect as 669f208, on the other browser
+creation path); the extension scheme factory was registered only on the
+global request context, so extension urls failed silently in every container;
+the daemon's `containerAdd`/`containerSiteSet` errdefers spanned the store
+write and freed records the list still owned; `g_store_socket` aliased a
+per-WINDOW config arena; `loadContainers` ran before `web_store_socket` was
+applied and its failure LATCHED an empty registry for the session; the a11y
+connect handback scanned only the local client; deleting a container left its
+per-site rules live; `ext-port-close` ignored the calling view, so gid
+enumeration disconnected other tabs' Ports; and extension-supplied JSON ints
+were narrowed with `@intCast` in a ReleaseFast build, so `windowId: 2**32+1`
+answered with window 1's tabs.
+
+### The OCR defect: the binding was never broken
+
+The previous entry recorded that "something in the binding is still wrong",
+because identical pixels read perfectly through the tesseract CLI and came
+back as `- -` through us. That conclusion was wrong, and it is worth
+correcting rather than leaving in the log.
+
+Reproduced standalone (no repo deps, pixels embedded, the API dlopen'd
+exactly as `ocr.zig` does it), then split: the CLI gives the SAME `- -` when
+fed our exact grayscale bytes, while reading the colour PNG perfectly. So the
+binding was fine and `toGray` was destroying the image.
+
+Our frames are PREMULTIPLIED Wayland ARGB, and a real window is transparent
+wherever its shadow and rounded corners are — 7% of the measured 928x709
+panel snapshot. Dropping alpha turned all of that into pure BLACK, a colour
+nothing on screen had. Tesseract's default global Otsu then split
+black-vs-everything and put the actual text (0.2% of the pixels) on the
+background side of the threshold. The PNG we dumped to compare against
+CARRIED its alpha, so leptonica blended it over white and the CLI never saw
+the fabricated black — which is exactly why "same pixels, different result"
+looked impossible.
+
+Compositing the premultiplied alpha over white restores the CLI's exact
+reading, and measured better than any thresholder change (Sauvola reads it
+too, but with character errors). Byte 0 is red, not blue, verified from a
+real snapshot; the weights follow, so `toGray` and `meanLuma` no longer
+disagree about an identically laid-out buffer.
+
+`smoke-e2e` passes end to end again as a result, which also un-hid the rest
+of that rig: it now runs 34 stages.
+
+### A timing bet, replaced
+
+stage 33 failed once and passed on the re-run. Its cause was a fixed 1500ms
+sleep whose own comment said what it was for — "give the background page a
+moment to come up (its listener must exist before the content script's
+message arrives)". A wall-clock bet loses on a loaded machine, and it loses
+as `reply:null:hello`: i18n and storage working, only the reply missing. The
+fixture's content script now RETRIES its `sendMessage` until the background
+answers, so the assertion means "the message got through" rather than "it got
+through within a budget".
