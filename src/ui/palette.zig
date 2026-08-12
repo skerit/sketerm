@@ -175,6 +175,16 @@ pub fn open(window: *Window) !void {
         built += 1;
 
         const row = c.adw_action_row_new();
+        // AdwActionRow's template binds BOTH the title and the subtitle
+        // label's `use-markup` to the row's, and it defaults to TRUE — so
+        // a plain `&`, `<` or `>` anywhere in a row's text is parsed as
+        // Pango markup, fails, and GTK renders the label EMPTY (with a
+        // console warning nobody reads). Every string here is prose or
+        // user data, never markup: one command description says
+        // "zig build fetch-cef && zig build web" and lost its whole
+        // subtitle to this. Turning markup off is the fix at the source
+        // rather than escaping at each of the call sites.
+        c.adw_preferences_row_set_use_markup(@ptrCast(@alignCast(row)), 0);
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), entry.title);
         c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), entry.desc);
         // Activatable is on the GtkListBoxRow base class.
@@ -212,6 +222,10 @@ pub fn open(window: *Window) !void {
         built += 1;
 
         const row = c.adw_action_row_new();
+        // Same markup trap as the catalogue rows above, and worse here:
+        // a tab title is whatever the shell set it to, so an ordinary
+        // `make && ./run` title would render as an EMPTY row.
+        c.adw_preferences_row_set_use_markup(@ptrCast(@alignCast(row)), 0);
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), tab.title);
         c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), tab.detail);
         c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
