@@ -158,8 +158,54 @@ callback carries no request id.
   its own accessible application (`Socket.Embed`, Chromium's shape —
   GTK4's internal AT-SPI backend cannot host a foreign subtree).
   `zig build smoke-webax` proves that half against a real private bus
-  with no CEF at all; in the GUI it is gated by `SKETERM_WEB_A11Y=1`
-  until screen-reader detection lands.
+  with no CEF at all.
+- **Whether it runs at all is `a11y/detect.zig`, never an inference.**
+  It reads `org.a11y.Status` (`ScreenReaderEnabled`, else `IsEnabled`)
+  on the SESSION bus, and asks `NameHasOwner` FIRST because
+  `org.a11y.Bus` is ACTIVATABLE — a bare property read would start the
+  accessibility stack on a desktop that has none. Every failure resolves
+  to OFF. `SKETERM_WEB_A11Y` overrides both ways. The probe is a D-Bus
+  round trip, so it runs on the same detached worker as the bus connect,
+  never on the main loop; a negative answer is cached for 30s only, so a
+  reader started later is picked up without a restart.
+- **Events are DIFFED against a shadow, and the first publish is
+  silent.** A reader that just embedded learns the tree by walking it;
+  replaying it as thousands of children-changed signals is pure noise.
+  A change bigger than the threshold collapses to one children-changed
+  on the root, because a navigation would otherwise emit a per-node
+  storm saying the same thing. `Proj.publish` is called after every
+  applied frame and is linear in the tree — it deliberately keeps no
+  parent in the shadow, since resolving one per node per frame made it
+  quadratic in page size.
+- **A projected `Action.DoAction` routes OUT through `on_action`**, it
+  does not act: `webproj` must not learn how to reach an engine (that is
+  what keeps it GLib-free and lets the smoke rig substitute a hook). The
+  GUI turns it into real `input_pointer` frames at the node's resolved
+  centre — the same trusted path a human click takes, and deliberately
+  NOT a DOM `click()`, which is not user-activated and which pages
+  reject. The helper keeps no AX tree, so resolving a node to a point is
+  necessarily the CLIENT's job. `Component.GrabFocus` stays `false` on
+  purpose: the only trusted route back is a pointer event, and clicking
+  an element to focus it would also activate it.
+- **`org.a11y.atspi.Text` counts CHARACTERS; the wire counts UTF-16.**
+  `ev_a11y_caret` (0x76, capability `a11y-caret`) carries the caret and
+  selection as UTF-16 code units — the unit the DOM itself defines text
+  offsets in, so no engine has to convert — and `axtree.zig` turns them
+  into character offsets because it is the only layer that also has the
+  node TEXT. Converting at the bus boundary is not pedantry: an
+  unsnapped byte offset can split a codepoint, and D-Bus rejects a
+  string that is not valid UTF-8, so the whole reply would vanish.
+  libatspi reads the caret through the `CaretOffset` PROPERTY, not
+  `GetCaretOffset`; both are served, but that is the one that runs.
+- **MEASURED CEILING (CEF 151, 2026-08-12): a text form control's
+  SELECTION is reported collapsed.** `tree_data`'s `sel_anchor_*` /
+  `sel_focus_*` track an `<input>`'s caret correctly, but
+  `setSelectionRange(2,6)` arrives as `a=2@2 f=2@2` — the anchor, with
+  no extent. The full range lives on the NODE as `textSelStart` /
+  `textSelEnd`, which is why `axPutNode` forwards them and the caret
+  prefers them for the focused node. Document/contenteditable
+  selections do come through `tree_data` normally. `sel_*` uses `-99`,
+  not 0, as its "no selection" sentinel.
 
 ## DRM: what smoke-web pins, and what it cannot
 

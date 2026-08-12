@@ -17424,3 +17424,87 @@ The stage was written while `copyModeStage` was still red and therefore
 placed ahead of it. That blocker is gone (see the audit entry above —
 the stage assumed a one-line shell prompt), so the ordering is now a
 convenience, not a requirement.
+
+## Web accessibility: focus, actions and a caret (2026-08-12)
+
+Stage 1 of the browser a11y plan (a read-only tree projected onto the
+session AT-SPI bus) already worked. Stages 2-4 did not, and the env gate
+meant none of it ran by default. All four moved.
+
+**A reader is now TOLD, not made to re-walk.** `Proj.publish` diffs the
+mirrored tree against a shadow of what the bus was last told and emits
+`org.a11y.atspi.Event.Object` signals for what actually changed: focus
+(both edges — un-focus the old node, focus the new one, in that order,
+or a reader announces the stale one), children added/removed, name
+changes, and a small set of states a reader acts on. Two properties are
+load-bearing. The FIRST publish primes the shadow silently, because a
+reader that just embedded learns the tree by walking it and replaying it
+as thousands of signals is pure noise. And a change bigger than a
+threshold collapses to one children-changed on the root — a navigation
+would otherwise emit a per-node storm saying exactly that. The shadow
+deliberately holds no parent: resolving one per node per frame made
+publish quadratic in page size, and nothing read it.
+
+**A press is a real click.** `org.a11y.atspi.Action` is served on
+actionable nodes, but the projection does not act — it cannot reach the
+engine and must not learn how, which is what keeps it GLib-free and lets
+the smoke rig substitute its own hook. `DoAction` resolves the node to a
+point through the same offset-container chain `GetExtents` walks and
+hands it out; the GUI turns that into real `input_pointer` frames at the
+node's centre, landing on the same CEF call a human click does. Not a
+DOM `click()`: that is not user-activated, so it cannot open a popup or
+start media, and pages reject it. `GrabFocus` stays false on purpose —
+the only trusted route back is a pointer event, and clicking an element
+to focus it would also activate it. The action NAME is Chromium's own
+verb ("press", "uncheck"), since the engine already labels every node;
+`clickAncestor` is filtered, or every label becomes pressable.
+
+**The caret crosses the wire.** New `ev_a11y_caret` (0x76, capability
+`a11y-caret`), because a selection is a pair of (node, offset) endpoints
+that may straddle nodes and belongs beside the tree, not on a node.
+Offsets are UTF-16 code units — the unit the DOM itself defines text
+offsets in, so no engine has to convert — and become character offsets
+in the mirror, the only layer that also has the node TEXT. An astral
+codepoint is two units but one character, so that conversion cannot be a
+subtraction. Converting at the bus boundary is not pedantry either: an
+unsnapped byte offset can split a codepoint, and D-Bus rejects a string
+that is not valid UTF-8, so the whole reply would vanish. libatspi reads
+the caret through the `CaretOffset` PROPERTY, not `GetCaretOffset`.
+
+**MEASURED CEILING, CEF 151.3.16.** A text selection arrives COLLAPSED
+to its anchor. Tried three ways: an `<input>` via `setSelectionRange(2,6)`
+gave `a=2@2 f=2@2`, a contenteditable via a DOM Range gave `a=5@2 f=5@2`,
+and real shift+Right key events produced no frame at all. No
+`textSelStart`/`textSelEnd` node attributes exist either. The wire, the
+mirror and `org.a11y.atspi.Text` all carry and serve a real range —
+smoke-webax proves that whole path against a live bus — so this is the
+engine's half alone: a braille display following this browser gets the
+caret, not the selected range. smoke-web stage 36 reports it distinctly
+and passes, the way the Widevine probe does, and starts announcing the
+day an engine reports an extent.
+
+**The env gate is gone.** `a11y/detect.zig` asks the desktop, via
+`org.a11y.Status` on the session bus: `ScreenReaderEnabled` (a reader is
+running now) or `IsEnabled` (the toolkit-accessibility switch). It asks
+`NameHasOwner` FIRST, because `org.a11y.Bus` is ACTIVATABLE and a bare
+property read would start the accessibility stack on a desktop that has
+none — a side effect we have no business causing and a way to talk
+ourselves into a false positive. Every failure resolves to OFF; the only
+way to ON is an explicit true from a bus that was already there.
+`SKETERM_WEB_A11Y` still overrides both ways. The probe is a D-Bus round
+trip, so it runs on the same detached worker as the bus connect and never
+on the main loop; a negative answer is cached 30s only, so a user who
+starts Orca mid-session is picked up at the next view mint. Whatever the
+answer, the CEF state is still set EXPLICITLY on both edges — leaving it
+implicit is what let Chromium switch accessibility on by itself and
+serialize every page (669f208).
+
+**Proof.** smoke-webax gained three stages, each asserted through the BUS
+rather than through our own objects: a focus change received as a real
+signal on a SECOND connection with a match rule (the only way to prove
+something was EMITTED rather than merely pollable), an Action press
+reaching the hook at the node's resolved centre (57,79 through the
+container chain, so a routing that clicked the wrong element fails), and
+Text answering the field's CONTENT rather than its label. smoke-web
+stage 36 is the engine half: it takes the button's rect from the streamed
+tree, clicks its centre, and requires the page's own handler to have run.
