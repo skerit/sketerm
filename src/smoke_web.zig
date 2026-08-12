@@ -565,6 +565,19 @@ const HttpProbe = struct {
         "document.title=\"cookie:\"+document.cookie;</script></body></html>";
 
     fn start(self: *HttpProbe) bool {
+/// A trivial loopback HTTP server for the WebExtensions stage: it serves
+/// ONE fixed HTML page on every request so a content script whose match
+/// pattern is `http://127.0.0.1/*` runs on a real (non-data:) url, which
+/// is where content scripts run in a real browser. Threaded like
+/// `ProxyProbe`; serves until stopped.
+const HttpServer = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+    body: []const u8,
+    thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *HttpServer) bool {
         const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
         if (lfd < 0) return false;
         var one: c_int = 1;
@@ -586,6 +599,7 @@ const HttpProbe = struct {
         self.fd = lfd;
         self.port = std.mem.bigToNative(u16, got.sin_port);
         self.thread = std.Thread.spawn(.{}, HttpProbe.serve, .{self}) catch {
+        self.thread = std.Thread.spawn(.{}, HttpServer.serve, .{self}) catch {
             _ = c.close(lfd);
             self.fd = -1;
             return false;
@@ -594,12 +608,24 @@ const HttpProbe = struct {
     }
 
     fn serve(self: *HttpProbe) void {
+    fn serve(self: *HttpServer) void {
         while (!self.stop.load(.acquire)) {
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
             if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
             const afd = c.accept(self.fd, null, null);
             if (afd < 0) continue;
             self.handle(afd);
+            // Read (and discard) the request line so the client is not
+            // reset before our response is written.
+            var req: [2048]u8 = undefined;
+            _ = c.read(afd, &req, req.len);
+            var hdr_buf: [256]u8 = undefined;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{self.body.len}) catch {
+                _ = c.close(afd);
+                continue;
+            };
+            _ = c.write(afd, hdr.ptr, hdr.len);
+            _ = c.write(afd, self.body.ptr, self.body.len);
             _ = c.close(afd);
         }
     }
@@ -622,6 +648,7 @@ const HttpProbe = struct {
     }
 
     fn shutdown(self: *HttpProbe) void {
+    fn deinit(self: *HttpServer) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
         self.thread = null;
@@ -654,6 +681,15 @@ const Client = struct {
     ack_print_pdf: bool = false,
     ack_downloads: bool = false,
     ack_contexts: bool = false,
+    ack_webext: bool = false,
+
+    /// Last `ev_webext_state` observed (one extension in the stage).
+    we_ok: u8 = 0xff,
+    we_enabled: u8 = 0xff,
+    we_name: [128]u8 = @splat(0),
+    we_name_len: usize = 0,
+    we_err: [256]u8 = @splat(0),
+    we_err_len: usize = 0,
 
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
@@ -1041,6 +1077,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
                 }
             },
             .frame_inline => {
@@ -1222,6 +1259,15 @@ const Client = struct {
                 self.print_path_len = @min(p.path.len, self.print_path.len);
                 @memcpy(self.print_path[0..self.print_path_len], p.path[0..self.print_path_len]);
                 self.print_seq += 1;
+            },
+            .ev_webext_state => {
+                const st = proto.decode(proto.EvWebextState, frame.payload) catch fail("ev_webext_state decode");
+                self.we_ok = st.ok;
+                self.we_enabled = st.enabled;
+                self.we_name_len = @min(st.name.len, self.we_name.len);
+                @memcpy(self.we_name[0..self.we_name_len], st.name[0..self.we_name_len]);
+                self.we_err_len = @min(st.err.len, self.we_err.len);
+                @memcpy(self.we_err[0..self.we_err_len], st.err[0..self.we_err_len]);
             },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
@@ -2163,6 +2209,173 @@ const small_anim_page =
     "<div%20id=d%20style=%22position:fixed;left:0;top:0;width:16px;height:16px%22></div>" ++
     "<script>var%20i=0;function%20f(){i=(i+9)%25256;" ++
     "d.style.background='rgb(0,'+i+',0)';requestAnimationFrame(f)}requestAnimationFrame(f);</script></body>";
+
+// The committed fixture extension, embedded so the stage never depends
+// on the working directory: it is written to a fresh unpacked directory
+// at runtime and loaded from there via `webext_set`.
+const fx_manifest = @embedFile("web/webext/testdata/fixture/manifest.json");
+const fx_content = @embedFile("web/webext/testdata/fixture/content.js");
+const fx_bg = @embedFile("web/webext/testdata/fixture/bg.js");
+const fx_css = @embedFile("web/webext/testdata/fixture/content.css");
+const fx_messages = @embedFile("web/webext/testdata/fixture/_locales/en/messages.json");
+
+const webext_page =
+    "<!doctype html><html><head><title>webext-page</title></head>" ++
+    "<body>webext test page</body></html>";
+
+fn mkdirZ(path: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    if (path.len + 1 > buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    _ = c.mkdir(@ptrCast(&buf), 0o755);
+}
+
+/// Write the fixture into `<ext_dir>` as an unpacked extension.
+fn writeFixture(ext_dir: []const u8) bool {
+    mkdirZ(ext_dir);
+    var loc_buf: [4200]u8 = undefined;
+    const loc = std.fmt.bufPrint(&loc_buf, "{s}/_locales", .{ext_dir}) catch return false;
+    mkdirZ(loc);
+    var en_buf: [4300]u8 = undefined;
+    const en = std.fmt.bufPrint(&en_buf, "{s}/_locales/en", .{ext_dir}) catch return false;
+    mkdirZ(en);
+    if (!writeFile(ext_dir, "manifest.json", fx_manifest)) return false;
+    if (!writeFile(ext_dir, "content.js", fx_content)) return false;
+    if (!writeFile(ext_dir, "bg.js", fx_bg)) return false;
+    if (!writeFile(ext_dir, "content.css", fx_css)) return false;
+    if (!writeFile(en, "messages.json", fx_messages)) return false;
+    return true;
+}
+
+/// Stage 28: the WebExtensions foundation, end to end against real CEF.
+/// Run 1 proves content-script injection at document_end (a DOM mutation
+/// and a title change) and runtime.sendMessage to the background with a
+/// reply; run 2 (a fresh helper, same XDG_DATA_HOME) proves
+/// storage.local persisted across the restart.
+fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    // Isolated data dir for storage.json, and the unpacked extension.
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/wedata", .{dir}) catch fail("webext data path");
+    mkdirZ(data_dir);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/wecache", .{dir}) catch fail("webext cache path");
+    mkdirZ(cache_dir);
+    var ext_buf: [4096]u8 = undefined;
+    const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/wefix", .{dir}) catch fail("webext ext path");
+    if (!writeFixture(ext_dir)) fail("stage 33 webext: could not write the fixture extension");
+    // The helper reads XDG_DATA_HOME for its per-extension storage; a
+    // child inherits this, and both runs share it so storage persists.
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+
+    var srv = HttpServer{ .body = webext_page };
+    if (!srv.start()) fail("stage 33 webext: loopback HTTP server would not start");
+    defer srv.deinit();
+    var page_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("webext url");
+
+    const ext_id = "smokefixture01";
+
+    // ── Run 1: injection + messaging ──────────────────────────────
+    {
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we1.sock", .{dir}) catch fail("webext sock");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        if (!cl.ack_webext) fail("stage 33 webext: hello_ack lacks the webext capability");
+
+        cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_ok != 1) fail("stage 33 webext: extension failed to load (ok=0)");
+        if (cl.we_enabled != 1) fail("stage 33 webext: extension not reported enabled");
+        if (!std.mem.eql(u8, cl.we_name[0..cl.we_name_len], "sketerm smoke fixture")) {
+            fail("stage 33 webext: manifest name not reported");
+        }
+
+        // Give the background page a moment to come up (its listener must
+        // exist before the content script's message arrives).
+        {
+            const d = nowMs() + 1500;
+            while (nowMs() < d) cl.pump(50);
+        }
+
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage 33 webext: no frame_buffer for the page view");
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        // "reply:42:hello" proves: content script injected (it set the
+        // title), it reached the background over runtime.sendMessage, the
+        // background replied {n:42}, AND browser.i18n.getMessage worked.
+        if (!cl.waitTitle("reply:42:hello", 25_000)) {
+            std.debug.print("stage 33: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 33 webext: content script did not report the background reply");
+        }
+        pass("stage 33 webext run 1 (content script injected, background messaged, i18n)");
+
+        // Tear the extension down first so its hidden background browser
+        // is closed during the normal loop, not left for cef_shutdown.
+        cl.send(proto.WebextRemove{ .id = ext_id });
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.deinit(); // close the socket so the helper disconnects and exits
+        reapHelperTolerant(pid, "stage 33 webext run 1", 30_000);
+    }
+
+    // ── Run 2: storage.local persisted across the restart ─────────
+    {
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we2.sock", .{dir}) catch fail("webext sock2");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_ok != 1) fail("stage 33 webext: extension failed to load on restart");
+
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage 33 webext: no frame_buffer on restart");
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        // "stored:v1" proves the value the FIRST helper wrote to
+        // storage.local survived to this SECOND helper process.
+        if (!cl.waitTitle("stored:v1", 25_000)) {
+            std.debug.print("stage 33: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 33 webext: storage.local did not persist across the restart");
+        }
+        pass("stage 33 webext run 2 (storage.local persisted across a helper restart)");
+
+        cl.send(proto.WebextRemove{ .id = ext_id });
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.deinit(); // close the socket so the helper disconnects and exits
+        reapHelperTolerant(pid, "stage 33 webext run 2", 30_000);
+    }
+}
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
@@ -4072,6 +4285,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     } else {
         say("smoke-web: NOTE stage 32 skipped (no sketerm-mux path in argv[2])");
     }
+    // ── Stage 28: WebExtensions foundation ────────────────────────
+    runWebextStage(gpa, exe, dir);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {

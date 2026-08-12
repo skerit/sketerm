@@ -117,46 +117,56 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // (5) CEF subprocess passthrough (renderer, gpu, zygote, ...).
     if (cefhost.executeProcess(@intCast(cef_argv.len), cef_argv.ptr)) |code| return code;
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    // All CEF + allocator teardown runs inside this block (its defers);
+    // the hard `_exit` below then terminates the browser process. A
+    // browser process that hosted a WebExtensions background page can
+    // otherwise HANG in libc's normal exit path — a CEF worker thread
+    // outlives `cef_shutdown` and the atexit join never returns — so we
+    // exit deterministically once our own teardown is complete rather
+    // than returning through the C runtime.
+    var exit_code: u8 = 0;
+    {
+        var gpa_state: std.heap.DebugAllocator(.{}) = .{};
+        defer _ = gpa_state.deinit();
+        const gpa = gpa_state.allocator();
 
-    const sock = socket_path orelse blk: {
-        if (socket_fd >= 0) break :blk "";
-        std.debug.print("sketerm-web: --socket PATH is required\n{s}", .{USAGE});
-        return 2;
-    };
+        const sock = socket_path orelse blk: {
+            if (socket_fd >= 0) break :blk "";
+            std.debug.print("sketerm-web: --socket PATH is required\n{s}", .{USAGE});
+            return 2;
+        };
 
-    const cache = cache_dir orelse defaultCacheDir(gpa) orelse {
-        std.debug.print("sketerm-web: no --cache-dir and no HOME\n", .{});
-        return 2;
-    };
-    defer if (cache_dir == null) gpa.free(cache);
-    mkdirAll(cache);
-    const log_path = std.fmt.allocPrint(gpa, "{s}/cef.log", .{cache}) catch return 1;
-    defer gpa.free(log_path);
+        const cache = cache_dir orelse defaultCacheDir(gpa) orelse {
+            std.debug.print("sketerm-web: no --cache-dir and no HOME\n", .{});
+            return 2;
+        };
+        defer if (cache_dir == null) gpa.free(cache);
+        mkdirAll(cache);
+        const log_path = std.fmt.allocPrint(gpa, "{s}/cef.log", .{cache}) catch return 1;
+        defer gpa.free(log_path);
 
-    if (!cefhost.initialize(@intCast(cef_argv.len), cef_argv.ptr, cache, log_path)) {
-        std.debug.print("sketerm-web: cef_initialize failed\n", .{});
-        return 1;
+        if (!cefhost.initialize(@intCast(cef_argv.len), cef_argv.ptr, cache, log_path)) {
+            std.debug.print("sketerm-web: cef_initialize failed\n", .{});
+            return 1;
+        }
+        defer cefhost.shutdown();
+
+        var srv = server.Server.init(gpa, sock);
+        srv.profile_dir = cache;
+        srv.force_inline = frames_inline;
+        defer srv.deinit();
+        if (socket_fd >= 0) {
+            srv.adoptClientFd(socket_fd);
+        } else srv.listen() catch |e| {
+            std.debug.print("sketerm-web: listen on {s} failed: {s}\n", .{ sock, @errorName(e) });
+            return 1;
+        };
+        srv.run() catch |e| {
+            std.debug.print("sketerm-web: serve failed: {s}\n", .{@errorName(e)});
+            exit_code = 1;
+        };
     }
-    defer cefhost.shutdown();
-
-    var srv = server.Server.init(gpa, sock);
-    srv.profile_dir = cache;
-    srv.force_inline = frames_inline;
-    defer srv.deinit();
-    if (socket_fd >= 0) {
-        srv.adoptClientFd(socket_fd);
-    } else srv.listen() catch |e| {
-        std.debug.print("sketerm-web: listen on {s} failed: {s}\n", .{ sock, @errorName(e) });
-        return 1;
-    };
-    srv.run() catch |e| {
-        std.debug.print("sketerm-web: serve failed: {s}\n", .{@errorName(e)});
-        return 1;
-    };
-    return 0;
+    c._exit(exit_code);
 }
 
 /// Re-exec this binary with LD_PRELOAD pointing at the CEF library the

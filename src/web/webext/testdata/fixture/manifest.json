@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "name": "sketerm smoke fixture",
+  "version": "1.0",
+  "description": "Exercises content-script injection, background messaging and storage.local for zig build smoke-web.",
+  "default_locale": "en",
+  "permissions": ["storage", "tabs"],
+  "content_scripts": [
+    {
+      "matches": ["http://127.0.0.1/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "scripts": ["bg.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Smoke Fixture"
+  }
+}

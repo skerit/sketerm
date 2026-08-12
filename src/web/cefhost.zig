@@ -2540,6 +2540,14 @@ pub const Host = struct {
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
+        v.hidden = true;
+        // Tell the engine the view is hidden so it keeps no compositor /
+        // frame production alive for a page that never paints.
+        withHost(v, struct {
+            fn f(host: *cef.cef_browser_host_t) void {
+                if (host.was_hidden) |wh| wh(host, 1);
+            }
+        }.f);
     }
 
     fn teardownBackground(self: *Host, e: *webexthost.Extension) void {
@@ -2622,6 +2630,8 @@ pub const Host = struct {
         // manifest inline (small), for getManifest.
         w.writeAll(",\"manifest\":") catch return;
         self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
+        w.writeAll(",\"messages\":") catch return;
+        self.writeMessagesJson(w, e);
         w.writeAll(",\"css\":[") catch return;
         w.writeAll(css_buf.written()) catch return;
         w.writeAll("],\"scripts\":[") catch return;
@@ -2637,6 +2647,31 @@ pub const Host = struct {
         defer self.gpa.free(bytes);
         // Inline the raw manifest bytes verbatim (already valid JSON).
         try w.writeAll(bytes);
+    }
+
+    /// Inline the `_locales/<default_locale>/messages.json` object (or
+    /// `null`) so `browser.i18n.getMessage` resolves synchronously in
+    /// the content script.
+    fn writeMessagesJson(self: *Host, w: *std.Io.Writer, e: *webexthost.Extension) void {
+        const man = if (e.man) |*m| m else {
+            w.writeAll("null") catch {};
+            return;
+        };
+        const locale = man.default_locale orelse {
+            w.writeAll("null") catch {};
+            return;
+        };
+        var buf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/_locales/{s}/messages.json", .{ e.dir, locale }) catch {
+            w.writeAll("null") catch {};
+            return;
+        };
+        const bytes = webexthost.readFilePub(self.gpa, path, webext_max_asset) orelse {
+            w.writeAll("null") catch {};
+            return;
+        };
+        defer self.gpa.free(bytes);
+        w.writeAll(bytes) catch {};
     }
 
     fn contentScriptMatches(self: *Host, cs: manifestContentScript, url: []const u8) bool {
@@ -2664,6 +2699,8 @@ pub const Host = struct {
         jsonStr(w, base) catch return;
         w.writeAll(",\"manifest\":") catch return;
         self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
+        w.writeAll(",\"messages\":") catch return;
+        self.writeMessagesJson(w, e);
         w.writeAll(",\"css\":[],\"scripts\":[") catch return;
         var first = true;
         for (bg.scripts) |rel| {
