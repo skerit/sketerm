@@ -197,6 +197,7 @@ const pace = @import("../web/pace.zig");
 const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const classicmenu = @import("browser/classicmenu.zig");
+const appmenu = @import("appmenu.zig");
 const webhistory = @import("webhistory.zig");
 const webuserscripts = @import("webuserscripts.zig");
 const socksbridge = @import("../ipc/socksbridge.zig");
@@ -1827,6 +1828,8 @@ pub const WebFace = struct {
     reload_btn: *c.GtkWidget = undefined,
     reader_btn: *c.GtkWidget = undefined,
     shell_btn: *c.GtkWidget = undefined,
+    /// The toolbar hamburger; also the anchor its menu pops under.
+    burger_btn: *c.GtkWidget = undefined,
     entry: *c.GtkWidget = undefined,
     overlay: *c.GtkWidget = undefined,
     view_area: *c.GtkWidget = undefined,
@@ -3494,6 +3497,12 @@ pub const WebFace = struct {
         // of the browser as an invisible button.
         self.shell_btn = toolbtn.barButton(bar, "sketerm-terminal-symbolic", "Shell", "Show this pane's shell", &onShowShell, self);
         self.track(self.shell_btn);
+
+        // The hamburger is END-MOST on every sketerm toolbar. Its menu
+        // is built fresh per open (every row's sensitivity depends on
+        // the page's current state), the classicmenu way.
+        self.burger_btn = toolbtn.barButton(bar, "open-menu-symbolic", "Menu", "Main Menu", &onBurger, self);
+        self.track(self.burger_btn);
 
         c.gtk_box_append(@ptrCast(self.root_box), bar);
 
@@ -5630,6 +5639,153 @@ pub const WebFace = struct {
 
     fn onMenuFillPassword(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         cast.userData(MenuCtx, user).face.fillPassword();
+    }
+
+    // ---- toolbar hamburger -------------------------------------------
+
+    fn onBurger(btn: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).showBurgerMenu(btn);
+    }
+
+    /// The toolbar's primary menu: every verb this face already has,
+    /// gathered in one place.
+    ///
+    /// It shares the page context menu's handlers (and its `MenuCtx`)
+    /// rather than repeating them — the difference between the two
+    /// menus is which rows they list, never what a row does. Link rows
+    /// are absent here: a toolbar click has no hit test behind it.
+    fn showBurgerMenu(self: *WebFace, anchor: *c.GtkWidget) void {
+        if (self.widgets_dead) return;
+        const root = classicmenu.Root.create(self.allocator) orelse return;
+        const ctx = self.allocator.create(MenuCtx) catch {
+            root.destroy();
+            return;
+        };
+        ctx.* = .{ .allocator = self.allocator, .face = self };
+        if (self.url) |u| ctx.page = self.allocator.dupe(u8, u) catch null;
+        root.own(freeMenuCtx, ctx);
+
+        const m = root.top();
+        m.itemIconEnabled("Back", .{ .name = "go-previous-symbolic" }, self.can_back, &onMenuBack, ctx);
+        m.itemIconEnabled("Forward", .{ .name = "go-next-symbolic" }, self.can_fwd, &onMenuForward, ctx);
+        m.itemIcon("Reload", .{ .name = "view-refresh-symbolic" }, &onMenuReload, ctx);
+
+        const view = m.section();
+        view.itemIcon("Find in Page…", .{ .name = "edit-find-symbolic" }, &onMenuFind, ctx);
+        view.itemIcon("Zoom In", .{ .name = "zoom-in-symbolic" }, &onMenuZoomIn, ctx);
+        view.itemIcon("Zoom Out", .{ .name = "zoom-out-symbolic" }, &onMenuZoomOut, ctx);
+        view.itemIconEnabled("Reset Zoom", .{ .name = "zoom-original-symbolic" }, self.zoom_x100 != 0, &onMenuZoomReset, ctx);
+        view.check("Reader View", self.reader_active, &onMenuReader, ctx);
+
+        const page = m.section();
+        page.itemIconEnabled("Copy Page URL", .none, ctx.page != null, &onMenuCopyUrl, ctx);
+        page.checkEnabled("Bookmark This Page", self.bookmark_id != 0, ctx.page != null, &onMenuBookmark, ctx);
+        page.checkEnabled(
+            "Allow Popups on This Site",
+            self.site_popup == .allow,
+            self.nav_origin != null,
+            &onMenuAllowPopups,
+            ctx,
+        );
+
+        const store_section = m.section();
+        store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
+        store_section.itemIcon("Bookmarks", .{ .name = "starred-symbolic" }, &onMenuBookmarks, ctx);
+        // The strip shows itself when a download starts; this row is
+        // how it comes BACK after being dismissed, so it is dead
+        // weight while this face has downloaded nothing.
+        store_section.checkEnabled(
+            "Downloads",
+            self.downloads.items.len != 0 and c.gtk_widget_get_visible(self.dl_strip) != 0,
+            self.downloads.items.len != 0,
+            &onMenuDownloads,
+            ctx,
+        );
+
+        const cl = client();
+        const tools = m.section();
+        tools.itemIconEnabled(
+            "Print to PDF…",
+            .{ .name = "document-print-symbolic" },
+            self.view_live and cl.cap_print_pdf,
+            &onMenuPrintPdf,
+            ctx,
+        );
+        tools.itemIconEnabled(
+            "Open DevTools",
+            .{ .name = "applications-engineering-symbolic" },
+            self.view_live and !self.attached and cl.cap_devtools,
+            &onMenuDevTools,
+            ctx,
+        );
+        tools.itemIconEnabled(
+            "Fill Password…",
+            .{ .name = "dialog-password-symbolic" },
+            self.view_live and ctx.page != null,
+            &onMenuFillPassword,
+            ctx,
+        );
+
+        const tabs = m.section();
+        tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
+        if (containers().len != 0) {
+            const cont = tabs.submenu("New Tab in Container");
+            for (containers()) |*ctn| {
+                const rc = self.allocator.create(ContainerRowCtx) catch continue;
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+                root.own(freeContainerRowCtx, rc);
+                var lbuf: [128]u8 = undefined;
+                cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
+            }
+        }
+        tabs.itemIconEnabled(
+            "Show This Pane's Shell",
+            .{ .name = "sketerm-terminal-symbolic" },
+            self.pane != null,
+            &onMenuShell,
+            ctx,
+        );
+
+        appmenu.appendHelp(
+            m,
+            self.allocator,
+            if (self.ownerWindow()) |w| @ptrCast(@alignCast(w.app_window)) else null,
+            .web,
+        );
+
+        _ = root.popup(
+            anchor,
+            @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)),
+            @floatFromInt(c.gtk_widget_get_height(anchor)),
+        );
+    }
+
+    fn onMenuFind(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.openFind();
+    }
+
+    fn onMenuZoomIn(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.zoomStep(1);
+    }
+
+    fn onMenuZoomOut(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.zoomStep(-1);
+    }
+
+    fn onMenuZoomReset(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.zoomReset();
+    }
+
+    fn onMenuDownloads(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        if (face.widgets_dead) return;
+        const on = c.gtk_widget_get_visible(face.dl_strip) != 0;
+        c.gtk_widget_set_visible(face.dl_strip, if (on) 0 else 1);
+    }
+
+    fn onMenuShell(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        onShowShell(face.shell_btn, @ptrCast(face));
     }
 
     // ---- password fill (Secret Service) ------------------------------
