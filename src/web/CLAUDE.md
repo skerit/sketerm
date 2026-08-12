@@ -197,15 +197,23 @@ callback carries no request id.
   string that is not valid UTF-8, so the whole reply would vanish.
   libatspi reads the caret through the `CaretOffset` PROPERTY, not
   `GetCaretOffset`; both are served, but that is the one that runs.
-- **MEASURED CEILING (CEF 151, 2026-08-12): a text form control's
-  SELECTION is reported collapsed.** `tree_data`'s `sel_anchor_*` /
-  `sel_focus_*` track an `<input>`'s caret correctly, but
-  `setSelectionRange(2,6)` arrives as `a=2@2 f=2@2` — the anchor, with
-  no extent. The full range lives on the NODE as `textSelStart` /
-  `textSelEnd`, which is why `axPutNode` forwards them and the caret
-  prefers them for the focused node. Document/contenteditable
-  selections do come through `tree_data` normally. `sel_*` uses `-99`,
-  not 0, as its "no selection" sentinel.
+- **MEASURED CEILING (CEF 151, 2026-08-12): a text SELECTION is
+  reported collapsed, and there is no second source for it.**
+  `tree_data`'s `sel_anchor_*` / `sel_focus_*` track the caret
+  correctly, but the extent never arrives — measured three ways, all in
+  smoke-web stage 36: an `<input>` via `setSelectionRange(2,6)` gives
+  `a=2@2 f=2@2`, a contenteditable via a DOM Range 2..6 gives
+  `a=5@2 f=5@2`, and real shift+Right events give no frame at all.
+  Contenteditable is NOT a working case — do not read the collapsed
+  contenteditable frame as one. The node attributes carry no
+  `textSelStart` / `textSelEnd` either; `axEmitUpdate` (not
+  `axPutNode`) looks for them and prefers them for the focused field,
+  which is forward-looking code that does nothing until some engine
+  fills them in. The "no selection" sentinel the code actually honours
+  is `sel_focus_object_id == 0`, not a numeric offset. The wire, the
+  mirror and `org.a11y.atspi.Text` all carry a real range — smoke-webax
+  proves that half against a live bus — so a braille display gets the
+  caret and not the range purely because of the engine.
 
 ## DRM: what smoke-web pins, and what it cannot
 
