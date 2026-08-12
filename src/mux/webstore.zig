@@ -7,9 +7,10 @@
 //! History is an append-only JSONL log replayed into an in-memory index
 //! (per-URL visit count + last-visit time for omnibox ranking) and
 //! compacted in place once the log grows past ~2x the live entry count.
-//! Bookmarks and site settings are small whole-file JSON documents
-//! written atomically (tmp + rename). Pure libc file IO — no GTK, no
-//! sockets; unit-tested headless in BOTH test roots.
+//! Bookmarks, site settings, userscripts and userstyles are small
+//! whole-file JSON documents written atomically (tmp + rename). Pure
+//! libc file IO — no GTK, no sockets; unit-tested headless in BOTH
+//! test roots.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -23,6 +24,8 @@ const COMPACT_SLACK: usize = 512;
 pub const MAX_URL: usize = 4096;
 /// Titles are capped (at a UTF-8 boundary) before storing.
 pub const MAX_TITLE: usize = 512;
+/// Largest userscript source / userstyle CSS the store accepts.
+pub const MAX_SOURCE: usize = 2 << 20;
 
 /// The `scheme://host[:port]` prefix of `url`, lowercased into `buf`.
 /// Null for URLs with no authority (about:, data:, mailto:) or when
@@ -195,6 +198,22 @@ pub const SitePatch = struct {
     decision: []const u8 = "",
 };
 
+pub const UserScript = struct {
+    id: u64,
+    enabled: bool,
+    /// Display name (from the metadata block at add time).
+    name: []u8,
+    /// Raw source including the `==UserScript==` block.
+    source: []u8,
+};
+
+pub const UserStyle = struct {
+    /// Lowercased host the style is scoped to ("" = every page).
+    host: []u8,
+    enabled: bool,
+    css: []u8,
+};
+
 pub const WebStore = struct {
     allocator: std.mem.Allocator,
     dir: []u8,
@@ -204,6 +223,9 @@ pub const WebStore = struct {
     bookmarks: std.ArrayList(Bookmark) = .empty,
     next_bookmark_id: u64 = 1,
     sites: std.StringHashMapUnmanaged(Site) = .empty,
+    userscripts: std.ArrayList(UserScript) = .empty,
+    next_userscript_id: u64 = 1,
+    userstyles: std.ArrayList(UserStyle) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8) !WebStore {
         var self: WebStore = .{
@@ -214,6 +236,8 @@ pub const WebStore = struct {
         self.loadHistory();
         self.loadBookmarks();
         self.loadSites();
+        self.loadUserScripts();
+        self.loadUserStyles();
         return self;
     }
 
@@ -232,6 +256,16 @@ pub const WebStore = struct {
             e.value_ptr.deinit(self.allocator);
         }
         self.sites.deinit(self.allocator);
+        for (self.userscripts.items) |s| {
+            self.allocator.free(s.name);
+            self.allocator.free(s.source);
+        }
+        self.userscripts.deinit(self.allocator);
+        for (self.userstyles.items) |s| {
+            self.allocator.free(s.host);
+            self.allocator.free(s.css);
+        }
+        self.userstyles.deinit(self.allocator);
         self.allocator.free(self.dir);
     }
 
@@ -791,6 +825,215 @@ pub const WebStore = struct {
         for (origin, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
         return buf[0..origin.len];
     }
+
+    // ── userscripts ─────────────────────────────────────────────
+
+    const UserScriptsDoc = struct {
+        next_id: u64 = 1,
+        scripts: []const UserScriptDto = &.{},
+    };
+    const UserScriptDto = struct {
+        id: u64 = 0,
+        enabled: bool = true,
+        name: []const u8 = "",
+        source: []const u8 = "",
+    };
+
+    fn loadUserScripts(self: *WebStore) void {
+        var pb: [4096]u8 = undefined;
+        const path = self.filePath(&pb, "userscripts.json") catch return;
+        const bytes = readFileAlloc(self.allocator, path, 64 << 20) orelse return;
+        defer self.allocator.free(bytes);
+        const parsed = std.json.parseFromSlice(UserScriptsDoc, self.allocator, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        self.next_userscript_id = @max(parsed.value.next_id, 1);
+        for (parsed.value.scripts) |s| {
+            if (s.source.len == 0 or s.source.len > MAX_SOURCE) continue;
+            const name = self.allocator.dupe(u8, capUtf8(s.name, MAX_TITLE)) catch continue;
+            const source = self.allocator.dupe(u8, s.source) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            const id = if (s.id > 0) s.id else self.next_userscript_id;
+            if (id >= self.next_userscript_id) self.next_userscript_id = id + 1;
+            self.userscripts.append(self.allocator, .{
+                .id = id,
+                .enabled = s.enabled,
+                .name = name,
+                .source = source,
+            }) catch {
+                self.allocator.free(name);
+                self.allocator.free(source);
+            };
+        }
+    }
+
+    fn saveUserScripts(self: *WebStore) !void {
+        var dtos = try self.allocator.alloc(UserScriptDto, self.userscripts.items.len);
+        defer self.allocator.free(dtos);
+        for (self.userscripts.items, 0..) |s, i| dtos[i] = .{
+            .id = s.id,
+            .enabled = s.enabled,
+            .name = s.name,
+            .source = s.source,
+        };
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(UserScriptsDoc{
+            .next_id = self.next_userscript_id,
+            .scripts = dtos,
+        }, .{}, &aw.writer) catch return error.WriteFailed;
+        var pb: [4096]u8 = undefined;
+        const path = try self.filePath(&pb, "userscripts.json");
+        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+    }
+
+    /// Store one userscript (enabled); returns its id. The daemon does
+    /// not parse the source — the NAME is the caller's business (the
+    /// GUI parses the metadata block), the source is opaque bytes.
+    pub fn userscriptAdd(self: *WebStore, name: []const u8, source: []const u8) !u64 {
+        if (source.len == 0 or source.len > MAX_SOURCE) return error.BadSource;
+        const n = try self.allocator.dupe(u8, capUtf8(name, MAX_TITLE));
+        errdefer self.allocator.free(n);
+        const s = try self.allocator.dupe(u8, source);
+        errdefer self.allocator.free(s);
+        const id = self.next_userscript_id;
+        self.next_userscript_id += 1;
+        try self.userscripts.append(self.allocator, .{
+            .id = id,
+            .enabled = true,
+            .name = n,
+            .source = s,
+        });
+        try self.saveUserScripts();
+        return id;
+    }
+
+    pub fn userscriptRemove(self: *WebStore, id: u64) !bool {
+        for (self.userscripts.items, 0..) |s, i| {
+            if (s.id != id) continue;
+            const dead = self.userscripts.orderedRemove(i);
+            self.allocator.free(dead.name);
+            self.allocator.free(dead.source);
+            try self.saveUserScripts();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn userscriptEnable(self: *WebStore, id: u64, enabled: bool) !bool {
+        for (self.userscripts.items) |*s| {
+            if (s.id != id) continue;
+            if (s.enabled != enabled) {
+                s.enabled = enabled;
+                try self.saveUserScripts();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // ── userstyles ──────────────────────────────────────────────
+
+    const UserStylesDoc = struct {
+        styles: []const UserStyleDto = &.{},
+    };
+    const UserStyleDto = struct {
+        host: []const u8 = "",
+        enabled: bool = true,
+        css: []const u8 = "",
+    };
+
+    fn loadUserStyles(self: *WebStore) void {
+        var pb: [4096]u8 = undefined;
+        const path = self.filePath(&pb, "userstyles.json") catch return;
+        const bytes = readFileAlloc(self.allocator, path, 64 << 20) orelse return;
+        defer self.allocator.free(bytes);
+        const parsed = std.json.parseFromSlice(UserStylesDoc, self.allocator, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        for (parsed.value.styles) |s| {
+            if (s.css.len == 0 or s.css.len > MAX_SOURCE or s.host.len > MAX_URL) continue;
+            const host = self.allocator.dupe(u8, s.host) catch continue;
+            for (host) |*ch| ch.* = std.ascii.toLower(ch.*);
+            const css = self.allocator.dupe(u8, s.css) catch {
+                self.allocator.free(host);
+                continue;
+            };
+            self.userstyles.append(self.allocator, .{
+                .host = host,
+                .enabled = s.enabled,
+                .css = css,
+            }) catch {
+                self.allocator.free(host);
+                self.allocator.free(css);
+            };
+        }
+    }
+
+    fn saveUserStyles(self: *WebStore) !void {
+        var dtos = try self.allocator.alloc(UserStyleDto, self.userstyles.items.len);
+        defer self.allocator.free(dtos);
+        for (self.userstyles.items, 0..) |s, i| dtos[i] = .{
+            .host = s.host,
+            .enabled = s.enabled,
+            .css = s.css,
+        };
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(UserStylesDoc{ .styles = dtos }, .{}, &aw.writer) catch
+            return error.WriteFailed;
+        var pb: [4096]u8 = undefined;
+        const path = try self.filePath(&pb, "userstyles.json");
+        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+    }
+
+    /// One style per host: set replaces, empty css deletes. The host
+    /// key is case-normalized; "" scopes the style to every page.
+    pub fn userstyleSet(self: *WebStore, host: []const u8, css: []const u8, enabled: bool) !void {
+        if (css.len > MAX_SOURCE or host.len > 512) return error.BadStyle;
+        var hbuf: [512]u8 = undefined;
+        for (host, 0..) |ch, i| hbuf[i] = std.ascii.toLower(ch);
+        const key = hbuf[0..host.len];
+        for (self.userstyles.items, 0..) |*s, i| {
+            if (!std.mem.eql(u8, s.host, key)) continue;
+            if (css.len == 0) {
+                const dead = self.userstyles.orderedRemove(i);
+                self.allocator.free(dead.host);
+                self.allocator.free(dead.css);
+            } else {
+                const nc = try self.allocator.dupe(u8, css);
+                self.allocator.free(s.css);
+                s.css = nc;
+                s.enabled = enabled;
+            }
+            try self.saveUserStyles();
+            return;
+        }
+        if (css.len == 0) return; // deleting what is not there
+        const h = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(h);
+        const nc = try self.allocator.dupe(u8, css);
+        errdefer self.allocator.free(nc);
+        try self.userstyles.append(self.allocator, .{ .host = h, .enabled = enabled, .css = nc });
+        try self.saveUserStyles();
+    }
+
+    /// The style stored for exactly this host key, if any. The pointer
+    /// is invalidated by the next `userstyleSet`.
+    pub fn userstyleGet(self: *WebStore, host: []const u8) ?*const UserStyle {
+        var hbuf: [512]u8 = undefined;
+        if (host.len > hbuf.len) return null;
+        for (host, 0..) |ch, i| hbuf[i] = std.ascii.toLower(ch);
+        const key = hbuf[0..host.len];
+        for (self.userstyles.items) |*s| {
+            if (std.mem.eql(u8, s.host, key)) return s;
+        }
+        return null;
+    }
 };
 
 // ── tests ───────────────────────────────────────────────────────
@@ -805,7 +1048,7 @@ fn testDir(buf: *[64]u8) ?[]const u8 {
 
 fn rmTree(dir: []const u8) void {
     var pb: [4096:0]u8 = undefined;
-    for ([_][]const u8{ "history.jsonl", "bookmarks.json", "sites.json" }) |f| {
+    for ([_][]const u8{ "history.jsonl", "bookmarks.json", "sites.json", "userscripts.json", "userstyles.json" }) |f| {
         const p = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ dir, f }) catch continue;
         _ = c.unlink(p.ptr);
     }
@@ -967,6 +1210,76 @@ test "webstore: bookmarks keep order, folders and updates across reload" {
     // Ids never recycle after reload.
     const id = try store.bookmarkAdd("https://d.com/", "D", "");
     try t.expect(id > first);
+}
+
+test "webstore: userscripts add/enable/remove survive reload" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+
+    const src = "// ==UserScript==\n// @name A\n// ==/UserScript==\nx();";
+    var first: u64 = 0;
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        first = try store.userscriptAdd("A", src);
+        _ = try store.userscriptAdd("B", "// ==UserScript==\n// ==/UserScript==\ny();");
+        try t.expect(try store.userscriptEnable(first, false));
+        try t.expect(!(try store.userscriptEnable(9999, true)));
+        try t.expectError(error.BadSource, store.userscriptAdd("empty", ""));
+    }
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        try t.expectEqual(@as(usize, 2), store.userscripts.items.len);
+        try t.expectEqualStrings("A", store.userscripts.items[0].name);
+        try t.expectEqualStrings(src, store.userscripts.items[0].source);
+        try t.expect(!store.userscripts.items[0].enabled);
+        try t.expect(store.userscripts.items[1].enabled);
+        try t.expect(try store.userscriptRemove(first));
+        try t.expect(!(try store.userscriptRemove(first)));
+    }
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+    try t.expectEqual(@as(usize, 1), store.userscripts.items.len);
+    // Ids never recycle after reload.
+    const id = try store.userscriptAdd("C", "z();");
+    try t.expect(id > first);
+}
+
+test "webstore: userstyles set/replace/delete survive reload" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        try store.userstyleSet("Example.COM", "body{color:red}", true);
+        try store.userstyleSet("", "*{cursor:default}", true);
+        // Replace + disable in one set.
+        try store.userstyleSet("example.com", "body{color:blue}", false);
+        // Deleting the absent is a no-op.
+        try store.userstyleSet("nobody.test", "", true);
+    }
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        try t.expectEqual(@as(usize, 2), store.userstyles.items.len);
+        const ex = store.userstyleGet("EXAMPLE.com").?;
+        try t.expectEqualStrings("body{color:blue}", ex.css);
+        try t.expect(!ex.enabled);
+        const glob = store.userstyleGet("").?;
+        try t.expectEqualStrings("*{cursor:default}", glob.css);
+        // Empty css deletes.
+        try store.userstyleSet("example.com", "", true);
+        try t.expectEqual(@as(?*const UserStyle, null), store.userstyleGet("example.com"));
+    }
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+    try t.expectEqual(@as(usize, 1), store.userstyles.items.len);
 }
 
 test "webstore: site settings merge, clear and survive reload" {
