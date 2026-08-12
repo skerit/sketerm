@@ -384,13 +384,6 @@ pub fn subsequenceScore(q: []const u8, hay: []const u8) f32 {
     return 0.5 * tightness + 0.3 * prefix + 0.2 * earliness;
 }
 
-/// ASCII-lowercase `s` into `out`, truncating to `out.len`.
-pub fn toLower(out: []u8, s: []const u8) []const u8 {
-    const n = @min(s.len, out.len);
-    for (s[0..n], 0..) |ch, i| out[i] = std.ascii.toLower(ch);
-    return out[0..n];
-}
-
 // ── the address-bar heuristic ────────────────────────────────────
 
 /// What a typed address-bar string means.

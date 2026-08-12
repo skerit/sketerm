@@ -770,6 +770,11 @@ pub fn main() u8 {
         // unrelated red stage) does not hide this one.
         if (treeSidebarStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("tree sidebar: open, new_tab made a browser PAGE; closed, new_tab made a window tab");
+
+        // The palette RANKS rather than filters. Also before copy mode,
+        // for the same reason the sidebar stage is.
+        if (commandPaletteStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("command palette: typing 'tab' ranked New Tab top, and Enter ran it");
         if (copyModeStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("copy mode selected a word with vi motions and yanked it to the clipboard");
         if (hintsStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -1677,6 +1682,103 @@ fn countTabs(resp: []const u8) usize {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, resp, from, "\"panes\":[")) |at| : (from = at + 9) n += 1;
     return n;
+}
+
+fn tabCount(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+    defer allocator.free(r);
+    return countTabs(r);
+}
+
+/// The command palette RANKS, it does not merely filter.
+///
+/// Typing "tab" has to select "New Tab". The trap it must avoid is
+/// "Keyboard Hints", whose DESCRIPTION mentions Tab and which sits
+/// earlier in the catalogue — a filter-only palette (what this was
+/// before the shared suggestion framework) hides non-matches while
+/// preserving catalogue order, so it would put Keyboard Hints on top.
+///
+/// Asserted behaviourally rather than by reading pixels, because there
+/// is no IPC command that reads a widget's text and OCR cannot say
+/// which row is FIRST without a fragile geometry comparison. Enter
+/// activates whatever the palette selected, and the two candidates have
+/// different observable effects: New Tab adds a window tab, Keyboard
+/// Hints does not. The tab count is therefore the ranking assertion and
+/// it cannot pass by accident. `commandcat.zig` pins the same
+/// expectation as a unit test; this proves the GUI wires it up.
+fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    _ = app.drainLive(1_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+
+    const before = tabCount(allocator, sock_path) orelse
+        return "list roundtrip failed before the command-palette stage";
+
+    // Open it through the same action the keybind dispatches.
+    var ref = app.frameRef(win_id, true) orelse return "no baseline frame for the command palette";
+    defer ref.deinit(allocator);
+    const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"command_palette\"}\n") orelse
+        return "command_palette action roundtrip failed";
+    allocator.free(opened);
+    if (!app.waitChangeSince(win_id, &ref, 15_000, 0.01, null))
+        return "the command palette did not open";
+
+    // Type the query. The palette filters ~80 rows down to a handful,
+    // which is a large visual change; if nothing moves, the entry never
+    // took the text and any ranking verdict below would be a lie.
+    var ref2 = app.frameRef(win_id, true) orelse return "no pre-typing frame for the command palette";
+    defer ref2.deinit(allocator);
+    app.typeText(null, "tab") catch {};
+    var typed = app.waitChangeSince(win_id, &ref2, 5_000, 0.005, null);
+    if (!typed) {
+        // GTK's wayland IM module can leave a focused GtkText waiting
+        // for the compositor to produce its text, and nothing in this
+        // harness plays IME. A paste goes through GtkText's own binding
+        // and bypasses the IM entirely.
+        app.pasteText(null, "tab") catch return "pasting the palette query failed";
+        typed = app.waitChangeSince(win_id, &ref2, 8_000, 0.005, null);
+    }
+    if (!typed) return "typing 'tab' into the palette changed nothing on screen";
+    _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
+
+    // The artefact a human reviews for the ranked order.
+    if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-command-palette.png", shot.png);
+    } else |_| {}
+
+    app.pressKey(null, "return") catch return "injecting return into the palette failed";
+    _ = app.waitIdle(300, 5_000);
+
+    var got: usize = before;
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        got = tabCount(allocator, sock_path) orelse got;
+        if (got == before + 1) break;
+        _ = app.pumpOnce(100);
+    }
+    if (got != before + 1) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: palette tabs %zu -> %zu\n", before, got);
+        // Leave nothing armed if the WRONG row won: hints_open (the
+        // decoy) puts the pane into hint mode.
+        app.pressKey(null, "escape") catch {};
+        return "the palette's top-ranked row for 'tab' did not open a new tab";
+    }
+
+    // Put the window back the way the later stages expect it. The
+    // count is re-read BEFORE each close, never after one is assumed to
+    // have landed, or a slow close closes a tab the next stage wanted.
+    var closes: u32 = 0;
+    while (closes < 10) : (closes += 1) {
+        const n = tabCount(allocator, sock_path) orelse break;
+        if (n <= before) break;
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |r|
+            allocator.free(r)
+        else
+            break;
+        _ = app.waitIdle(300, 5_000);
+    }
+    return null;
 }
 
 /// Tree-style tabs, browser scope: while the sidebar is open it is the

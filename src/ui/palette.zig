@@ -51,12 +51,11 @@ const TabRow = struct {
     page: *c.AdwTabPage,
 };
 
+/// Per-widget-row state. Rows sit in ONE index space — catalogue rows
+/// first, then tab rows — which both sources emit as `payload`; that is
+/// what lets a single merged ranking address rows from either source.
+/// `ctx.rows[cand.payload]` is the row a candidate stands for.
 const RowCtx = struct {
-    palette: *Ctx,
-    /// Index into the palette's SINGLE row index space: catalogue rows
-    /// first, then tab rows. Both sources emit into it as `payload`,
-    /// which is what lets one merged ranking address rows from either.
-    index: usize,
     /// Build order — the sort tie-break that keeps catalogue order for
     /// rows the merger scored equally.
     orig_index: usize,
@@ -75,7 +74,8 @@ const Ctx = struct {
     search_entry: *c.GtkWidget,
     listbox: *c.GtkWidget,
     rows: []*RowCtx,
-    /// The two row stores `RowCtx.index` addresses, in order.
+    /// The two row stores the shared index space addresses, in order:
+    /// a payload below `catalog.len` is a command, at or above it a tab.
     catalog: std.ArrayList(commandcat.Row) = .empty,
     tabs: std.ArrayList(TabRow) = .empty,
     feed: commandcat.Feed = undefined,
@@ -168,9 +168,9 @@ pub fn open(window: *Window) !void {
     const rows = try arena.alloc(*RowCtx, total);
     var built: usize = 0;
 
-    for (ctx.catalog.items, 0..) |entry, i| {
+    for (ctx.catalog.items) |entry| {
         const rctx = try arena.create(RowCtx);
-        rctx.* = .{ .palette = ctx, .index = i, .orig_index = built };
+        rctx.* = .{ .orig_index = built };
         rows[built] = rctx;
         built += 1;
 
@@ -205,9 +205,9 @@ pub fn open(window: *Window) !void {
         c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
     }
 
-    for (ctx.tabs.items, 0..) |tab, i| {
+    for (ctx.tabs.items) |tab| {
         const rctx = try arena.create(RowCtx);
-        rctx.* = .{ .palette = ctx, .index = ctx.catalog.items.len + i, .orig_index = built };
+        rctx.* = .{ .orig_index = built };
         rows[built] = rctx;
         built += 1;
 
