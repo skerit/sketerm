@@ -17665,3 +17665,70 @@ the version (it prefers `browser_specific_settings.gecko.id`), so
 installing v2 REPLACES v1 instead of minting a second enabled copy with
 empty storage and orphaned files; and a failed install says why, rather
 than `catch {}` leaving a picked MV3 XPI to do nothing at all.
+
+## 2026-08-12: closing the plan audit — five branches integrated
+
+The audit's list, worked to completion except where an engine or an
+absent machine stops it. Five agent branches were rebased onto master
+(never merged) with a gate between each, plus the direct work recorded
+above.
+
+**Scroll is on the wire now.** `web/model.zig` used to say scroll was
+absent "on purpose: the helper protocol reports no scroll offset". It
+does now — `ev_scroll` / `scroll_to` (0xC2, capability `scroll`),
+straight from Chromium's `OnScrollOffsetChanged`. The numbers are
+carried through UNINTERPRETED: whatever the engine reports is what goes
+back, so a restore lands where the save happened without our arithmetic
+having to agree with the engine's units. Reporting is throttled to
+150ms (the callback fires per scroll step) and the resting position
+still gets out, because the throttle owes the client whatever differs
+from what it last sent and the watchdog turn flushes it. The offset is
+applied only after the load finishes: a document still growing clamps an
+early scroll to its current height and lands short.
+
+**OCR had two real defects**, both in the path the MCP `app_read_text` /
+`app_wait_text` tools ride on:
+
+- We handed CEF's B,G,R,A frames to an API documented as taking R,G,B,A,
+  alpha channel and all. It gets 8-bit luma now, which is what tesseract
+  thresholds anyway.
+- "auto" scale upscaled by 4096/longest-edge, so every window under
+  ~1365px — nearly all of them — was recognized at 2x-3x nearest
+  neighbour. MEASURED: an ordinary GTK dialog reads its label correctly
+  at 1:1 and reads as NOTHING at 2x. Auto now means native first,
+  upscale only if that found nothing.
+
+A dark-image inversion pre-pass is deliberately absent and the docblock
+says why with numbers: it is the obvious idea, tesseract already handles
+inverted text, and a global invert makes it invert twice — the same
+frame reads "cannot load /LEFTFAILURE cannot load /RIGHTFAILURE" as
+captured and "- -" inverted. I added it, measured it, and took it out.
+
+**An OCR limit is left open and named**: feeding identical pixels
+through our binding still under-reads badly (psm 6 -> "- -", psm 11 ->
+nothing) where the tesseract CLI on the same file reads every word, and
+sweeping psm and ppi changes nothing. Something in the binding is still
+wrong. The e2e stage that tripped over it no longer treats OCR as a
+product verdict: the click assertion beneath it (the button paints, is
+hittable, routes a trusted interaction back to MCP) is strictly
+stronger, so OCR is advisory there.
+
+### Still open, and what each needs
+
+- **Filter-list subscription.** Lists are still hand-dropped into
+  `$XDG_CONFIG_HOME/sketerm/filters`. The helper is the only process
+  that can fetch over HTTPS, so this needs a refcounted
+  `cef_urlrequest` client — and the one genuinely refcounted
+  client-side struct we have (`CookieJob`) is documented as droppable by
+  CEF *before the call returns*. Worth doing carefully, not quickly.
+- **`"...and N more"` list collapsing** in the semantic walk: today it
+  stops at `MAX_NODES` with no marker.
+- **Reader results carry no semantic ids**, so a `web_read` hit cannot
+  be fed to `web_act` without a separate snapshot.
+- **Capability-based helper routing** is designed for (20 flags, latched
+  per client) but has nothing to route to until a second engine exists.
+  Building a selection policy now would be untestable scaffolding.
+- **macOS/Windows for the browser.** Needs a macOS CEF distribution and
+  the signed-helper-bundle layout; this repo's own lesson is that a
+  green cross-compile is not a working macOS build, so it stays
+  unproven rather than claimed.
