@@ -18,6 +18,23 @@
 //!   3. extents resolved through the offset-container chain;
 //!   4. an incremental update (button renamed) visible on a re-walk.
 //!
+//! Then the three things that make it usable rather than merely
+//! present, each asserted through the BUS and not through our own
+//! objects:
+//!
+//!   5. a focus move is EMITTED as `object:state-changed:focused` —
+//!      both the 1 on the new node and the 0 on the old one, received
+//!      on a separate connection with a match rule. This is the whole
+//!      difference between a reader being told and a reader having to
+//!      re-walk;
+//!   6. `Action.DoAction(0)` on the button reaches the owner's
+//!      trusted-input hook, aimed at the node's resolved CENTRE (the
+//!      projection cannot reach the engine, so this hook is the seam
+//!      that keeps `webproj` engine-free);
+//!   7. `Text` answers the field's CONTENT (not its label), the caret
+//!      offset, and a real selection range — what a braille display
+//!      follows.
+//!
 //! SKIPs (exit 0) when dbus-daemon or at-spi2-registryd is missing.
 
 const std = @import("std");
@@ -76,15 +93,61 @@ fn applyWire(
     tree.applyTree(ev) catch fail("applyTree");
 }
 
+/// The projection is single-threaded by design (in the GUI, `publish`
+/// and `step` both run on the main loop). This rig needs a serve
+/// thread so blocking client calls can be made from `main`, so
+/// publishing is handed to that SAME thread through a ticket
+/// handshake — two threads writing D-Bus messages onto one socket
+/// would interleave them into garbage.
 const ServeCtx = struct {
     proj: *webproj.Proj,
     stop: std.atomic.Value(bool) = .init(false),
+    publish_req: std.atomic.Value(u32) = .init(0),
+    publish_done: std.atomic.Value(u32) = .init(0),
 };
 
 fn serveThread(ctx: *ServeCtx) void {
     while (!ctx.stop.load(.acquire)) {
-        if (!ctx.proj.serveSlice(50)) return;
+        const want = ctx.publish_req.load(.acquire);
+        if (want != ctx.publish_done.load(.acquire)) {
+            ctx.proj.publish();
+            ctx.publish_done.store(want, .release);
+        }
+        if (!ctx.proj.serveSlice(20)) return;
     }
+}
+
+/// Ask the serve thread to publish and wait for it. Returns false if
+/// it never did (the thread died).
+fn publishAndWait(ctx: *ServeCtx) bool {
+    const ticket = ctx.publish_req.load(.acquire) + 1;
+    ctx.publish_req.store(ticket, .release);
+    const deadline = nowMs() + 5_000;
+    while (nowMs() < deadline) {
+        if (ctx.publish_done.load(.acquire) == ticket) return true;
+        _ = c.usleep(2_000);
+    }
+    return false;
+}
+
+/// What a projected `DoAction` asked the owner to do. In the GUI this
+/// hook posts `input_pointer` frames; here it just records, which is
+/// exactly the seam that keeps `webproj` engine-free.
+const ActionLog = struct {
+    calls: u32 = 0,
+    node_id: u32 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+};
+var g_action: ActionLog = .{};
+
+fn onAction(ctx: ?*anyopaque, req: webproj.ActionReq) bool {
+    _ = ctx;
+    g_action.calls += 1;
+    g_action.node_id = req.node_id;
+    g_action.x = req.x;
+    g_action.y = req.y;
+    return true;
 }
 
 pub fn main() !void {
@@ -110,10 +173,24 @@ pub fn main() !void {
     var tree = axtree.Tree.init(gpa);
     defer tree.deinit();
     applyWire(gpa, &tree, 1, 0, 4, &.{
-        .{ .id = 1, .role = "document", .name = "Ax page", .x = 0, .y = 0, .w = 800, .h = 600, .children = &.{ 2, 3 } },
+        .{ .id = 1, .role = "document", .name = "Ax page", .x = 0, .y = 0, .w = 800, .h = 600, .children = &.{ 2, 3, 5 } },
         .{ .id = 2, .role = "heading", .name = "Axheading", .x = 8, .y = 8, .w = 300, .h = 40, .offset_container = 1, .attributes = &.{.{ .key = "level", .value = "1" }} },
         .{ .id = 3, .role = "generic", .x = 8, .y = 60, .w = 400, .h = 100, .offset_container = 1, .children = &.{4} },
         .{ .id = 4, .role = "button", .name = "Axgo", .state = proto.ax_focusable, .x = 4, .y = 4, .w = 90, .h = 30, .offset_container = 3 },
+        // A field whose LABEL and CONTENT differ: the caret must be
+        // reported against "Axtext here", never against "Axlabel".
+        .{
+            .id = 5,
+            .role = "textbox",
+            .name = "Axlabel",
+            .value = "Axtext here",
+            .state = proto.ax_focusable | proto.ax_editable,
+            .x = 8,
+            .y = 200,
+            .w = 200,
+            .h = 24,
+            .offset_container = 1,
+        },
     });
 
     // ── project it onto the bus ───────────────────────────────────
@@ -122,8 +199,12 @@ pub fn main() !void {
     proj.connect(hub.bus_path) catch fail("could not connect+embed on the a11y bus");
     say("embedded on the registry");
 
+    proj.setActionHook(null, onAction);
     var ctx = ServeCtx{ .proj = &proj };
     const th = std.Thread.spawn(.{}, serveThread, .{&ctx}) catch fail("serve thread");
+    // Prime the shadow: the first publish is deliberately silent, so
+    // everything asserted below is a real emitted change.
+    if (!publishAndWait(&ctx)) fail("initial publish never ran");
 
     // ── walk the desktop with the daemon's own AT-SPI client ──────
     const json = hub.treeJson(gpa) orelse fail("registry walk produced no tree");
@@ -181,6 +262,97 @@ pub fn main() !void {
     if (std.mem.indexOf(u8, json2, "Axheading") == null)
         fail("untouched nodes vanished after the incremental update");
     say("incremental update visible on a re-walk");
+
+    // ── a focus move is EMITTED, not just answerable ──────────────
+    // The difference this stage exists for: a reader must be told,
+    // rather than having to re-walk the tree to notice.
+    {
+        var watch = hub.watchEvents(gpa) orelse fail("could not watch a11y bus events");
+        defer watch.deinit();
+
+        _ = c.usleep(200_000); // let the walk's stragglers drain
+        // Focus moves from the button (4) to the text field (5).
+        applyWire(gpa, &tree, 1, 0, 5, &.{
+            .{ .id = 5, .role = "textbox", .name = "Axlabel", .value = "Axtext here", .state = proto.ax_focusable | proto.ax_editable, .x = 8, .y = 200, .w = 200, .h = 24, .offset_container = 1 },
+        });
+        if (!publishAndWait(&ctx)) fail("publish never ran for the focus move");
+
+        var saw_focus_on = false;
+        var saw_focus_off = false;
+        var path_buf: [64]u8 = undefined;
+        const want_on = std.fmt.bufPrint(&path_buf, "/org/a11y/atspi/accessible/{d}", .{5}) catch unreachable;
+        const deadline = nowMs() + 10_000;
+        while (nowMs() < deadline and !saw_focus_on) {
+            const ev = watch.next(1_000) orelse continue;
+            if (!std.mem.eql(u8, ev.member(), "StateChanged")) continue;
+            if (!std.mem.eql(u8, ev.detail(), "focused")) continue;
+            if (ev.detail1 == 1 and std.mem.eql(u8, ev.path(), want_on)) saw_focus_on = true;
+            if (ev.detail1 == 0 and std.mem.endsWith(u8, ev.path(), "/4")) saw_focus_off = true;
+        }
+        if (!saw_focus_on)
+            fail("no object:state-changed:focused(1) signal reached the bus for the newly focused node");
+        if (!saw_focus_off)
+            fail("the previously focused node was never un-focused (a reader would announce both)");
+        say("focus change emitted as a real AT-SPI signal (both edges)");
+    }
+
+    // ── an Action press reaches the trusted-input route ───────────
+    {
+        var id_buf: [128]u8 = undefined;
+        const btn_id = std.fmt.bufPrint(&id_buf, "{s}#{d}", .{ proj.uniqueName(), 4 }) catch unreachable;
+        g_action = .{};
+        if (!hub.doAction(gpa, btn_id, 0))
+            fail("Action.DoAction(0) on the button was refused");
+        if (g_action.calls != 1)
+            fail("DoAction did not reach the owner's trusted-input hook exactly once");
+        if (g_action.node_id != 4)
+            fail("the press was routed for the wrong node");
+        // The button resolves to 12,64 90x30 through the container
+        // chain, so its centre is 57,79 in view coordinates. A press
+        // aimed anywhere else would click the wrong element.
+        if (g_action.x != 57 or g_action.y != 79) {
+            std.debug.print("smoke-webax: press point was {d},{d}\n", .{ g_action.x, g_action.y });
+            fail("the press was not aimed at the node's centre");
+        }
+        say("Action press routed to the trusted-input hook at the node's centre");
+    }
+
+    // ── Text: caret offset and selection for a braille display ────
+    {
+        var id_buf: [128]u8 = undefined;
+        const field_id = std.fmt.bufPrint(&id_buf, "{s}#{d}", .{ proj.uniqueName(), 5 }) catch unreachable;
+
+        // Caret after "Axtext" (UTF-16 unit 6 -> character 6).
+        tree.applyCaret(.{ .view = 1, .anchor_id = 5, .anchor_offset = 6, .focus_id = 5, .focus_offset = 6 });
+        if (!publishAndWait(&ctx)) fail("publish never ran for the caret");
+
+        const st = hub.textState(gpa, field_id) orelse
+            fail("the field answered no org.a11y.atspi.Text state");
+        defer gpa.free(st.text);
+        if (!std.mem.eql(u8, st.text, "Axtext here")) {
+            std.debug.print("smoke-webax: Text.GetText returned '{s}'\n", .{st.text});
+            fail("Text.GetText returned the label instead of the field's content");
+        }
+        if (st.caret != 6) {
+            std.debug.print("smoke-webax: caret offset was {d}\n", .{st.caret});
+            fail("Text.CaretOffset did not report where the caret is");
+        }
+        if (hub.textNSelections(gpa, field_id) orelse -1 != 0)
+            fail("a collapsed caret was reported as a selection");
+
+        // Now select "text" (characters 2..6).
+        tree.applyCaret(.{ .view = 1, .anchor_id = 5, .anchor_offset = 2, .focus_id = 5, .focus_offset = 6 });
+        if (!publishAndWait(&ctx)) fail("publish never ran for the selection");
+        if (hub.textNSelections(gpa, field_id) orelse -1 != 1)
+            fail("a real selection was not reported by GetNSelections");
+        const sel = hub.textSelection(gpa, field_id) orelse
+            fail("GetSelection(0) answered nothing");
+        if (sel[0] != 2 or sel[1] != 6) {
+            std.debug.print("smoke-webax: selection was {d}..{d}\n", .{ sel[0], sel[1] });
+            fail("GetSelection did not report the selected range");
+        }
+        say("Text reports content, caret offset and selection over the bus");
+    }
 
     // ── teardown ──────────────────────────────────────────────────
     ctx.stop.store(true, .release);
