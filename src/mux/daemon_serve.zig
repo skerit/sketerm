@@ -2869,6 +2869,16 @@ pub const WebOpReq = struct {
     block_clear: bool = false,
     perm: []const u8 = "",
     decision: []const u8 = "",
+    /// userscript_add display name.
+    name: []const u8 = "",
+    /// userscript_add raw source / userstyle_set CSS carrier.
+    source: []const u8 = "",
+    /// userscript_enable / userstyle_set enabled flag.
+    enabled: ?bool = null,
+    /// userstyle host key ("" = every page — which is why this is not
+    /// `origin`: an empty origin is invalid there).
+    host: []const u8 = "",
+    css: []const u8 = "",
 };
 
 fn webReplyErr(cl: *Client, req: u32, msg: []const u8) void {
@@ -2970,6 +2980,34 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             .decision = r.decision,
         }) catch return webReplyErr(cl, r.req, "site write failed");
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "userscript_add")) {
+        const id = store.userscriptAdd(r.name, r.source) catch
+            return webReplyErr(cl, r.req, "userscript write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
+    } else if (std.mem.eql(u8, r.op, "userscript_remove")) {
+        const removed = store.userscriptRemove(r.id) catch
+            return webReplyErr(cl, r.req, "userscript write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .removed = removed });
+    } else if (std.mem.eql(u8, r.op, "userscript_enable")) {
+        const found = store.userscriptEnable(r.id, r.enabled orelse true) catch
+            return webReplyErr(cl, r.req, "userscript write failed");
+        if (!found) return webReplyErr(cl, r.req, "no such userscript");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "userscript_list")) {
+        // Sources included: the GUI pushes them whole to the helper.
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .scripts = store.userscripts.items });
+    } else if (std.mem.eql(u8, r.op, "userstyle_set")) {
+        store.userstyleSet(r.host, r.css, r.enabled orelse true) catch
+            return webReplyErr(cl, r.req, "userstyle write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "userstyle_get")) {
+        if (store.userstyleGet(r.host)) |style| {
+            cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .style = style.* });
+        } else {
+            cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .style = @as(?u8, null) });
+        }
+    } else if (std.mem.eql(u8, r.op, "userstyle_list")) {
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .styles = store.userstyles.items });
     } else {
         webReplyErr(cl, r.req, "unknown web op");
     }
