@@ -961,8 +961,14 @@ pub const Host = struct {
         interceptRegister(self.gpa, v.id, v.cef_id);
         applyZoom(v);
         // A revived (or freshly created) browser knows nothing of the
-        // client's earlier `a11y_enable`; re-apply it.
-        if (v.a11y) applyA11yState(v);
+        // client's earlier `a11y_enable`; re-apply it. ALWAYS, including
+        // the off case: leaving the engine at STATE_DEFAULT lets it turn
+        // accessibility on by ITSELF whenever the platform looks like it
+        // wants it (an at-spi bus on the session, i.e. every GNOME/KDE
+        // desktop with toolkit-accessibility set). The whole a11y block
+        // is opt-in per view — a view that never asked must not have the
+        // engine's AX machinery running behind the client's back.
+        applyA11yState(v);
         // A view without a frame buffer is invisible and unfixable, so
         // the whole view goes rather than leaving a stranded browser.
         self.allocBuffer(v) catch |e| {
