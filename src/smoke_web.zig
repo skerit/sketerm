@@ -2097,13 +2097,14 @@ const RigBridge = struct {
     chan: u32,
     fd: c_int,
     thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = .init(false),
 
     fn spawn(self: *RigBridge) void {
         self.thread = std.Thread.spawn(.{}, RigBridge.run, .{self}) catch fail("bridge thread");
     }
 
     fn run(self: *RigBridge) void {
-        while (true) {
+        while (!self.stop_flag.load(.acquire)) {
             var fds: [2]c.struct_pollfd = .{
                 .{ .fd = self.mux.fd, .events = c.POLLIN, .revents = 0 },
                 .{ .fd = self.fd, .events = c.POLLIN, .revents = 0 },
@@ -2138,11 +2139,19 @@ const RigBridge = struct {
     }
 
     fn stop(self: *RigBridge) void {
-        // Closing the socketpair end wakes the loop (read -> 0).
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        // The flag, not a close, is what ends the loop: closing a
+        // descriptor does NOT wake a poll already blocked on it in
+        // another thread, and a -1 fd is silently ignored by every
+        // later poll — so the old close-then-join hung whenever the
+        // helper was still alive and idle (nothing sends chan_close),
+        // which is a race the stage lost about half the time. The fd
+        // is closed only AFTER the join, so the pump can never poll a
+        // descriptor another thread has already reused.
+        self.stop_flag.store(true, .release);
         if (self.thread) |t| t.join();
         self.thread = null;
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
     }
 };
 
