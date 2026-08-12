@@ -646,6 +646,10 @@ pub const Client = struct {
     /// The helper hosts MV2-flavor WebExtensions (the 0xB0 frame block).
     /// Absent, the GUI loads no extension and the helper hosts none.
     cap_webext: bool = false,
+    /// The helper accepts `webext_tabs` (0xB6), i.e. `browser.tabs` and
+    /// `sender.tab` can be made real. Without it every extension sees
+    /// `tabId = -1`.
+    cap_webext_tabs: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -891,6 +895,9 @@ pub const Client = struct {
         // the same way, before any view exists.
         webext.ensureLoaded(self.gpa);
         webext.publish(self);
+        // A fresh helper holds no tab table; the extensions published
+        // above will ask for one on their first request.
+        tabsChanged();
         for (self.faces.items) |f| f.onClientReady();
         return true;
     }
@@ -917,12 +924,14 @@ pub const Client = struct {
 
     pub fn register(self: *Client, face: *WebFace) void {
         self.faces.append(self.gpa, face) catch {};
+        tabsChanged(); // MV2 onCreated
     }
 
     pub fn unregister(self: *Client, face: *WebFace) void {
         for (self.faces.items, 0..) |f, i| {
             if (f == face) {
                 _ = self.faces.swapRemove(i);
+                tabsChanged(); // MV2 onRemoved
                 return;
             }
         }
@@ -1154,6 +1163,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SCROLL)) self.cap_scroll = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1732,12 +1742,95 @@ fn publishContexts(cl: *Client) void {
     for (g_containers.items) |*ctn| publishOne(cl, ctn);
 }
 
+// ── browser.tabs: the client half of `webext_tabs` ──────────────
+//
+// The helper advertises `webext-tabs` and decodes 0xB6, but until this
+// existed the ONLY producer in the tree was the smoke rig — so stage 35b
+// was green while the shipped GUI never sent a tab list at all. Every
+// dispatched request then carried `tabId = -1`, which MV2 defines as
+// "not associated with a tab", and uBO reads exactly that to take its
+// behind-the-scene path: it CANCELS the top-level navigation of every
+// page. That is the regression the tab table was built to fix, hidden
+// by a rig that posted the frame itself.
+
+/// One tab as `webext_tabs` spells it. Field names ARE the JSON keys
+/// (`cefhost.webextTabs` reads them verbatim), so they are camelCase
+/// here on purpose; stringifying a struct is also what keeps a url or
+/// title containing a quote from breaking the payload.
+const TabJson = struct {
+    id: u32,
+    view: u32,
+    windowId: u32,
+    index: u32,
+    active: bool,
+    focusedWindow: bool,
+    url: []const u8,
+    title: []const u8,
+    loading: bool,
+};
+
+/// Post this client's whole tab list. Replace-all by design: the helper
+/// diffs two consecutive tables into MV2's onCreated/onUpdated/
+/// onRemoved/onActivated, so nothing can desynchronise the way an
+/// incremental protocol would.
+fn publishTabs(cl: *Client) void {
+    if (!cl.cap_webext_tabs or cl.state != .ready) return;
+    var rows: std.ArrayList(TabJson) = .empty;
+    defer rows.deinit(cl.gpa);
+    for (cl.faces.items) |f| {
+        // A face whose view has not been minted yet has nothing the
+        // helper could key on, and a torn-down one must not be listed.
+        if (f.view == 0 or f.widgets_dead) continue;
+        rows.append(cl.gpa, .{
+            // The view id is process-wide unique and stable for the
+            // face's whole life, which is exactly what a tab id has to
+            // be, so it serves as both.
+            .id = f.view,
+            .view = f.view,
+            .windowId = 0,
+            .index = @intCast(rows.items.len),
+            .active = f.on_screen,
+            .focusedWindow = true,
+            .url = if (f.url) |u| u else "",
+            .title = if (f.title) |t| t else "",
+            .loading = f.loading,
+        }) catch return;
+    }
+    var aw: std.Io.Writer.Allocating = .init(cl.gpa);
+    defer aw.deinit();
+    std.json.Stringify.value(rows.items, .{}, &aw.writer) catch return;
+    cl.post(proto.WebextTabs{ .tabs_json = aw.written() });
+}
+
+/// The tab set changed somewhere. Coalesced onto an idle so a burst of
+/// per-face updates (a navigation touches url, title and loading) costs
+/// one frame rather than three.
+var g_tabs_dirty = false;
+
+pub fn tabsChanged() void {
+    if (g_tabs_dirty) return;
+    g_tabs_dirty = true;
+    // No user data, so nothing can dangle: the callback reads only
+    // module-level state that outlives every face.
+    _ = c.g_idle_add(@ptrCast(&flushTabs), null);
+}
+
+fn flushTabs(_: ?*anyopaque) callconv(.c) c.gboolean {
+    g_tabs_dirty = false;
+    publishTabs(&g_client);
+    for (g_remote_clients.items) |cl| publishTabs(cl);
+    return 0;
+}
+
 // ── stored containers (the daemon web store) ────────────────────
 
 const SiteRule = struct { host: []u8, container: u32 };
 var g_container_sites: std.ArrayList(SiteRule) = .empty;
 var g_containers_loaded: bool = false;
 var g_containers_loading: bool = false;
+/// A container list actually landed. See `loadContainers` for why this
+/// is not the same bit as `g_containers_loaded`.
+var g_containers_fetched: bool = false;
 var g_containers_gpa: ?std.mem.Allocator = null;
 
 /// True once the daemon's stored registry has been merged in (or has
@@ -3839,6 +3932,7 @@ pub const WebFace = struct {
     fn setOnScreen(self: *WebFace, on: bool) void {
         if (self.on_screen == on) return;
         self.on_screen = on;
+        tabsChanged(); // MV2 onActivated
         if (on) {
             if (paceLogging()) std.debug.print("webface pace: view {d} on screen\n", .{self.view});
             self.stopDiscardTimer();
@@ -5210,6 +5304,7 @@ pub const WebFace = struct {
     pub fn onTitle(self: *WebFace, title: []const u8) void {
         if (self.title) |t| self.allocator.free(t);
         self.title = self.allocator.dupe(u8, title) catch null;
+        tabsChanged(); // MV2 onUpdated
         // The visit was recorded at navigation commit; the first title
         // for that page completes its history entry (no extra count).
         if (self.visit_url) |vu| {
@@ -5270,6 +5365,7 @@ pub const WebFace = struct {
         if (self.widgets_dead) return;
         c.gtk_widget_set_sensitive(self.back_btn, if (ev.can_back != 0) @as(c_int, 1) else 0);
         c.gtk_widget_set_sensitive(self.fwd_btn, if (ev.can_fwd != 0) @as(c_int, 1) else 0);
+        if (self.loading != (ev.loading != 0)) tabsChanged(); // MV2 onUpdated (status)
         self.loading = ev.loading != 0;
         self.can_back = ev.can_back != 0;
         self.can_fwd = ev.can_fwd != 0;
@@ -5287,6 +5383,7 @@ pub const WebFace = struct {
             self.allocator.free(u);
         }
         self.url = self.allocator.dupe(u8, url) catch null;
+        tabsChanged(); // MV2 onUpdated
         if (self.pending_url) |u| {
             self.allocator.free(u);
             self.pending_url = null;
