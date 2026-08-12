@@ -1001,6 +1001,201 @@
     }
   }
 
+  // -- WebExtensions content-script runtime ----------------------------
+  //
+  // Reuses this SAME authenticated channel: the browser process injects
+  // an extension's content scripts by evaluating source in this frame's
+  // SLOT (op "ext-inject"), the injected `browser`/`chrome` object posts
+  // async calls back over the nonce-prefixed transport, and replies
+  // arrive as further SLOT commands. Each extension runs in its own
+  // closure with its own `browser`, so extensions do not see each
+  // other's state. This is NOT a separate V8 world (a CEF OSR limit,
+  // see src/web/CLAUDE.md): the closure isolates the API surface, not
+  // the intrinsics, so page and content script still share globals.
+  var extReqSeq = 1;
+  var extPending = {}; // req -> resolve fn
+  var extCtx = {}; // ext id -> { listeners:[], changed:[] }
+
+  function extApiCall(extId, ns, method, args) {
+    var req = extReqSeq++;
+    return new Promise(function (resolve) {
+      extPending[req] = resolve;
+      send({ op: "ext-call", ext: extId, ns: ns, method: method, args: args, req: req });
+    });
+  }
+
+  function extSendMessage(extId, msg) {
+    var req = extReqSeq++;
+    return new Promise(function (resolve) {
+      extPending[req] = resolve;
+      send({ op: "ext-send", ext: extId, req: req, msg: msg });
+    });
+  }
+
+  function extEvent() {
+    var fns = [];
+    return {
+      _fns: fns,
+      addListener: function (fn) {
+        if (typeof fn === "function" && fns.indexOf(fn) < 0) fns.push(fn);
+      },
+      removeListener: function (fn) {
+        var i = fns.indexOf(fn);
+        if (i >= 0) fns.splice(i, 1);
+      },
+      hasListener: function (fn) {
+        return fns.indexOf(fn) >= 0;
+      }
+    };
+  }
+
+  function makeBrowser(extId, baseUrl, manifestObj, messages) {
+    var ctx = { listeners: extEvent(), changed: extEvent() };
+    extCtx[extId] = ctx;
+    var storageLocal = {
+      get: function (keys) {
+        return extApiCall(extId, "storage", "get", [keys === undefined ? null : keys]);
+      },
+      set: function (obj) {
+        return extApiCall(extId, "storage", "set", [obj]);
+      },
+      remove: function (keys) {
+        return extApiCall(extId, "storage", "remove", [keys]);
+      },
+      clear: function () {
+        return extApiCall(extId, "storage", "clear", []);
+      },
+      onChanged: ctx.changed
+    };
+    return {
+      runtime: {
+        id: extId,
+        lastError: null,
+        getManifest: function () {
+          return manifestObj;
+        },
+        getURL: function (path) {
+          return baseUrl + String(path == null ? "" : path).replace(/^\//, "");
+        },
+        sendMessage: function (msg) {
+          // The 1-arg form; an extension id / options arg is tolerated
+          // by ignoring everything but the last message-shaped arg.
+          var m = arguments.length > 1 ? arguments[arguments.length - 1] : msg;
+          return extSendMessage(extId, m);
+        },
+        onMessage: ctx.listeners
+      },
+      storage: { local: storageLocal, onChanged: ctx.changed },
+      i18n: {
+        getMessage: function (key) {
+          var e = messages && messages[key];
+          return e && typeof e.message === "string" ? e.message : "";
+        }
+      },
+      tabs: {
+        query: function (q) {
+          return extApiCall(extId, "tabs", "query", [q || {}]);
+        },
+        get: function (id) {
+          return extApiCall(extId, "tabs", "get", [id]);
+        },
+        sendMessage: function (id, msg) {
+          return extApiCall(extId, "tabs", "sendMessage", [id, msg]);
+        }
+      }
+    };
+  }
+
+  function extInject(m) {
+    var extId = m.ext;
+    if (m.css) {
+      for (var i = 0; i < m.css.length; i++) {
+        try {
+          var style = document.createElement("style");
+          style.textContent = m.css[i];
+          (document.head || document.documentElement).appendChild(style);
+        } catch (e) {}
+      }
+    }
+    if (!m.scripts || !m.scripts.length) {
+      // A background page with no scripts, or css-only content: still
+      // register the ctx so messages can be delivered.
+      if (!extCtx[extId]) makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+      return;
+    }
+    var api = makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+    for (var j = 0; j < m.scripts.length; j++) {
+      try {
+        var fn = new Function("browser", "chrome", "self", m.scripts[j]);
+        fn(api, api, api);
+      } catch (e2) {
+        try {
+          send({ op: "ext-error", ext: extId, msg: String(e2 && e2.message || e2) });
+        } catch (e3) {}
+      }
+    }
+  }
+
+  // A runtime message routed to THIS frame's listeners (the background
+  // receives a content script's sendMessage this way). A listener may
+  // return a value, a Promise, or call the sendResponse callback; the
+  // first defined response wins and is posted back under `gid`.
+  function extDeliver(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) {
+      send({ op: "ext-reply", gid: m.gid, resp: null });
+      return;
+    }
+    var fns = ctx.listeners._fns.slice();
+    var answered = false;
+    function respond(resp) {
+      if (answered) return;
+      answered = true;
+      send({ op: "ext-reply", gid: m.gid, resp: resp === undefined ? null : resp });
+    }
+    var sender = m.sender || {};
+    for (var i = 0; i < fns.length; i++) {
+      var r;
+      try {
+        r = fns[i](m.msg, sender, respond);
+      } catch (e) {
+        continue;
+      }
+      if (r && typeof r.then === "function") {
+        r.then(respond, function () {
+          respond(null);
+        });
+        return;
+      }
+      if (r !== undefined && r !== true) {
+        respond(r);
+        return;
+      }
+      // `true` means the listener will call respond asynchronously; keep
+      // waiting for it rather than answering now.
+      if (r === true) return;
+    }
+    if (!answered) respond(null);
+  }
+
+  function extResult(m) {
+    var fn = extPending[m.req];
+    if (!fn) return;
+    delete extPending[m.req];
+    fn(m.ok === false ? undefined : m.result);
+  }
+
+  function extChanged(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) return;
+    var fns = ctx.changed._fns.slice();
+    for (var i = 0; i < fns.length; i++) {
+      try {
+        fns[i](m.changes || {}, m.area || "local");
+      } catch (e) {}
+    }
+  }
+
   // -- command entry point ---------------------------------------------
 
   function handle(json) {
@@ -1044,6 +1239,18 @@
         break;
       case "eval":
         evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000);
+        break;
+      case "ext-inject":
+        extInject(m);
+        break;
+      case "ext-message":
+        extDeliver(m);
+        break;
+      case "ext-result":
+        extResult(m);
+        break;
+      case "ext-changed":
+        extChanged(m);
         break;
       default:
         break;

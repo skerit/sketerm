@@ -57,6 +57,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_USERSCRIPTS,
     proto.CAP_SITEDATA,
     proto.CAP_FRAMES_INLINE,
+    proto.CAP_WEBEXT,
 };
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -375,6 +376,9 @@ pub const Server = struct {
             .cookie_delete => self.host.cookieDelete(try proto.decode(proto.CookieDelete, frame.payload)),
             .cookies_clear => self.host.cookiesClear(try proto.decode(proto.CookiesClear, frame.payload)),
             .sitedata_clear => self.host.sitedataClear(try proto.decode(proto.SitedataClear, frame.payload)),
+            .webext_set => self.host.webextSet(try proto.decode(proto.WebextSet, frame.payload)),
+            .webext_remove => self.host.webextRemove((try proto.decode(proto.WebextRemove, frame.payload)).id),
+            .webext_list_req => self.host.webextList(),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

@@ -120,6 +120,15 @@ pub const CAP_SITEDATA = "sitedata";
 /// posting `frame_buffer` frames whose descriptors were silently eaten
 /// by the bridge, i.e. a black pane forever).
 pub const CAP_FRAMES_INLINE = "frames-inline";
+/// The helper hosts MV2-flavor WebExtensions: it accepts the 0xB0-block
+/// frames (`webext_set`/`webext_remove`/`webext_list_req`), loads an
+/// unpacked extension directory, runs its background scripts in a hidden
+/// off-screen page, injects its content scripts into matching pages
+/// through a per-extension isolated bridge, and bridges the `browser.*`
+/// promise API (runtime/storage/tabs/i18n). It reports each extension's
+/// state as `ev_webext_state`. A client without this capability never
+/// loads an extension and the helper hosts none.
+pub const CAP_WEBEXT = "webext";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -201,6 +210,15 @@ pub const Tag = enum(u8) {
     ev_devtools_view = 0xA3,
     print_pdf = 0xA4,
     ev_print_pdf_done = 0xA5,
+    webext_set = 0xB0,
+    webext_remove = 0xB1,
+    webext_list_req = 0xB2,
+    ev_webext_state = 0xB3,
+    // 0xB4-0xBF reserved for the WebExtensions block: the clearly-named
+    // seam for a later wave's blocking webRequest (a `webext_request`
+    // frame the helper HOLDS until a `webext_request_decision` answers,
+    // exactly the cert/permission shape) goes here without disturbing
+    // any existing frame's layout.
     us_script_set = 0xC0,
     us_style_set = 0xC1,
     cookies_req = 0xC8,
@@ -1979,6 +1997,59 @@ pub const EvSitedataDone = struct {
     kind: u8,
     removed: u32,
     detail: []const u8,
+// -- WebExtensions (0xB0 block, capability "webext") ------------------
+//
+// The GUI owns the extension FILES (it installs an unpacked dir or an
+// XPI it unpacks under `$XDG_DATA_HOME/sketerm/webext/<id>/`, lists them
+// and removes them); the helper LOADS those directories, hosts the
+// background page and content scripts, and persists per-extension
+// storage. These frames carry the load/enable/remove commands and the
+// state reports — everything else (content<->background messaging,
+// storage round trips, the browser.* dispatch) stays entirely inside
+// the helper, reusing its existing renderer<->browser bridge.
+
+/// Load-and-enable, or disable, one extension. `dir` is the absolute
+/// path of its unpacked directory (helper and client are the same
+/// machine in v1); the helper parses `dir/manifest.json`, and on
+/// `enabled = 1` spins up its background page and arms its content
+/// scripts, on `enabled = 0` tears them down but keeps the record.
+/// Sending it again with a changed `enabled` toggles in place.
+pub const WebextSet = struct {
+    pub const tag: Tag = .webext_set;
+    /// Stable extension id (the GUI's, derived or from the manifest).
+    id: []const u8,
+    dir: []const u8,
+    enabled: u8,
+};
+
+/// Unload an extension entirely: its background page and content
+/// scripts go, and the helper forgets the id. The GUI deletes the files
+/// separately; a `webext_remove` for an unknown id is a no-op.
+pub const WebextRemove = struct {
+    pub const tag: Tag = .webext_remove;
+    id: []const u8,
+};
+
+/// Ask the helper to (re)report every loaded extension's state — one
+/// `ev_webext_state` per extension. A client sends it after the
+/// handshake to learn what a durable helper already had loaded.
+pub const WebextListReq = struct {
+    pub const tag: Tag = .webext_list_req;
+};
+
+/// One extension's state, pushed on every change and in answer to
+/// `webext_list_req`. `ok = 0` means loading failed and `err` says why
+/// (a bad manifest, a missing file); `enabled` reflects the last
+/// `webext_set`. `name`/`version` come from the parsed manifest, empty
+/// when it would not parse.
+pub const EvWebextState = struct {
+    pub const tag: Tag = .ev_webext_state;
+    id: []const u8,
+    name: []const u8,
+    version: []const u8,
+    enabled: u8,
+    ok: u8,
+    err: []const u8,
 };
 
 // ---------------------------------------------------------------------
@@ -2444,6 +2515,22 @@ test "round-trip: container/context frames" {
     });
     try roundTrip(ContextCreate, .{ .id = 4, .ephemeral = 0, .name = "", .proxy = "" });
     try roundTrip(ContextDestroy, .{ .id = 3 });
+}
+
+test "round-trip: webext frames" {
+    try roundTrip(WebextSet, .{ .id = "abc123", .dir = "/home/x/.local/share/sketerm/webext/abc123", .enabled = 1 });
+    try roundTrip(WebextSet, .{ .id = "abc123", .dir = "", .enabled = 0 });
+    try roundTrip(WebextRemove, .{ .id = "abc123" });
+    try roundTrip(WebextListReq, .{});
+    try roundTrip(EvWebextState, .{
+        .id = "abc123",
+        .name = "uBlock Origin",
+        .version = "1.0",
+        .enabled = 1,
+        .ok = 1,
+        .err = "",
+    });
+    try roundTrip(EvWebextState, .{ .id = "bad", .name = "", .version = "", .enabled = 0, .ok = 0, .err = "bad manifest" });
 }
 
 test "round-trip: semantic layer frames" {

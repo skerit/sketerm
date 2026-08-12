@@ -46,6 +46,11 @@ const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
 const filter = @import("filter.zig");
 const userscript = @import("userscript.zig");
+const webexthost = @import("webext/host.zig");
+const extmatch = @import("webext/match.zig");
+const extmanifest = @import("webext/manifest.zig");
+const manifestRunAt = extmanifest.RunAt;
+const manifestContentScript = extmanifest.ContentScript;
 
 /// The content script — a function expression, called with the two
 /// secrets and the transport (see `onContextCreated`).
@@ -143,6 +148,15 @@ const MFD_CLOEXEC: c_uint = 1;
 /// at 3840x2160 (1.14 GB/s either way): Chromium reports full-viewport
 /// damage there, it is not the cap collapsing a long list.
 const max_rects = 32;
+
+/// First helper-minted view id for a WebExtensions background page.
+/// Above `DEVTOOLS_VIEW_BASE` (0x4000_0000) so the three id ranges
+/// (client, inspector, background) never collide.
+const webext_bg_view_base: u32 = 0x5000_0000;
+
+/// A per-content-script asset is bounded so a pathological manifest
+/// cannot make one `ext-inject` command unbounded.
+const webext_max_asset: usize = 4 * 1024 * 1024;
 
 /// `sem_expand_result` carries a `str`, so one expand cannot exceed
 /// what a u16 length can describe.
@@ -483,6 +497,11 @@ pub const View = struct {
     /// than queued so a slow link coalesces bursts instead of
     /// ballooning the outbox; the flush (`flushInlineView`) clears it.
     inline_dirty: ?proto.Rect = null,
+    /// A hidden WebExtensions background page: a 1x1 windowless browser
+    /// that hosts the extension's background scripts and never paints or
+    /// is announced to the client. It has no frame buffer, so `onPaint`
+    /// posts nothing for it.
+    webext_bg: bool = false,
 
     const PoolEntry = struct { ino: u64 = 0, id: u32 = 0, seen: u64 = 0 };
 
@@ -645,6 +664,19 @@ pub const Host = struct {
     /// id; id 0 is the shared default (a null request context) and never
     /// appears here.
     contexts: std.ArrayList(Ctx) = .empty,
+
+    /// WebExtensions host: the loaded-extension registry, storage and
+    /// browser.* dispatch. Content-script injection and background-page
+    /// hosting are driven from here through the existing semantic bridge.
+    webext: webexthost.Host = undefined,
+    /// Next helper-minted view id for a background page. Kept far above
+    /// both client ids (from 1) and inspector ids (DEVTOOLS_VIEW_BASE).
+    next_bg_view: u32 = webext_bg_view_base,
+    /// Cross-frame runtime.sendMessage routing: a content script's
+    /// message gets a process-global id here so the background's reply
+    /// can find its way home. Bounded — the oldest is dropped.
+    webext_routes: std.ArrayList(MsgRoute) = .empty,
+    webext_next_gid: u32 = 1,
     /// Root cache directory (the `--cache-dir`), under which a persistent
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
@@ -671,6 +703,9 @@ pub const Host = struct {
         host: []const u8,
         css: []const u8,
     };
+    /// One in-flight `runtime.sendMessage` from a content frame awaiting
+    /// its background's reply.
+    const MsgRoute = struct { gid: u32, origin_view: u32, origin_req: u32 };
 
     /// One `print_pdf` in flight.
     const Print = struct { view: u32, path: []u8 };
@@ -733,12 +768,14 @@ pub const Host = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
-        return .{ .gpa = gpa, .out = out };
+        return .{ .gpa = gpa, .out = out, .webext = webexthost.Host.init(gpa) };
     }
 
     pub fn deinit(self: *Host) void {
         self.destroyAll();
         self.views.deinit(self.gpa);
+        self.webext.deinit();
+        self.webext_routes.deinit(self.gpa);
         for (self.prints.items) |p| self.gpa.free(p.path);
         self.prints.deinit(self.gpa);
         // destroyAll's dropBrowser sweep already cancelled and freed
@@ -2404,6 +2441,404 @@ pub const Host = struct {
         withHostArgs(v, setFocus, .{@as(c_int, if (req.focused != 0) 1 else 0)});
     }
 
+    // -- WebExtensions -------------------------------------------------
+
+    /// Load-or-toggle an extension (`webext_set`) and report its state.
+    pub fn webextSet(self: *Host, req: proto.WebextSet) void {
+        const e = self.webext.set(req.id, req.dir, req.enabled != 0) catch {
+            self.post(proto.EvWebextState{
+                .id = req.id,
+                .name = "",
+                .version = "",
+                .enabled = 0,
+                .ok = 0,
+                .err = "out of memory",
+            });
+            return;
+        };
+        if (e.enabled and e.ok) {
+            self.ensureBackground(e);
+            self.injectContentScriptsAll(e);
+        } else {
+            self.teardownBackground(e);
+        }
+        self.postWebextState(e);
+    }
+
+    pub fn webextRemove(self: *Host, id: []const u8) void {
+        if (self.webext.find(id)) |e| self.teardownBackground(e);
+        self.webext.remove(id);
+        // A removal has no dedicated frame; the client already dropped
+        // the row. Nothing more to report.
+    }
+
+    pub fn webextList(self: *Host) void {
+        for (self.webext.exts.items) |*e| self.postWebextState(e);
+    }
+
+    fn postWebextState(self: *Host, e: *webexthost.Extension) void {
+        self.post(proto.EvWebextState{
+            .id = e.id,
+            .name = if (e.man) |*m| m.name else "",
+            .version = if (e.man) |*m| m.version else "",
+            .enabled = if (e.enabled) 1 else 0,
+            .ok = if (e.ok) 1 else 0,
+            .err = e.err,
+        });
+    }
+
+    /// Spin up the hidden background page for an enabled extension that
+    /// declares one. Idempotent.
+    fn ensureBackground(self: *Host, e: *webexthost.Extension) void {
+        const man = if (e.man) |*m| m else return;
+        const bg = man.background orelse return;
+        if (bg.scripts.len == 0 and bg.page == null) return;
+        if (e.bg_view != 0 and self.find(e.bg_view) != null) return;
+
+        const id = self.next_bg_view;
+        self.next_bg_view += 1;
+        const v = self.gpa.create(View) catch return;
+        v.* = .{
+            .id = id,
+            .w = 1,
+            .h = 1,
+            .scale_x1000 = 1000,
+            .pw = 1,
+            .ph = 1,
+            .context = 0,
+            .webext_bg = true,
+            .sem = semantic.View.init(self.gpa),
+        };
+        self.views.append(self.gpa, v) catch {
+            v.sem.deinit();
+            self.gpa.destroy(v);
+            return;
+        };
+        e.bg_view = id;
+        self.spawnBackground(v) catch {
+            self.destroyView(id);
+            e.bg_view = 0;
+            return;
+        };
+    }
+
+    /// Like `spawnBrowser` but for a hidden background page: no frame
+    /// buffer, so it never paints or is announced. The semantic bridge
+    /// still injects at context creation, so `injectBackground` can send
+    /// its scripts on load.
+    fn spawnBackground(self: *Host, v: *View) !void {
+        var winfo = windowlessInfo(v);
+        var bsettings = windowlessSettings(v);
+        var url = std.mem.zeroes(cef.cef_string_t);
+        // A minimal document so the main frame exists and the bridge
+        // injects; the background scripts arrive over the bridge.
+        setStr("data:text/html,<!doctype html><title>bg</title>", &url);
+        defer cef.cef_string_utf16_clear(&url);
+        self.pending = v;
+        defer self.pending = null;
+        const browser = cef.cef_browser_host_create_browser_sync(&winfo, &client, &url, &bsettings, null, null);
+        if (browser == null) return error.BrowserCreateFailed;
+        v.browser = browser;
+        v.cef_id = browserInt(browser, "get_identifier");
+    }
+
+    fn teardownBackground(self: *Host, e: *webexthost.Extension) void {
+        if (e.bg_view == 0) return;
+        const view = e.bg_view;
+        e.bg_view = 0;
+        self.destroyView(view);
+    }
+
+    /// Inject an extension's content scripts into every live, non-hidden
+    /// client view whose url matches — used when an extension is enabled
+    /// while pages are already open.
+    fn injectContentScriptsAll(self: *Host, e: *webexthost.Extension) void {
+        for (self.views.items) |v| {
+            if (v.webext_bg or v.discarded or v.browser == null) continue;
+            if (v.url.len == 0) continue;
+            self.injectExtInto(v, e, null);
+        }
+    }
+
+    /// Inject every enabled extension's content scripts matching `v`'s
+    /// url. `only_phase` null runs every content script (load end / late
+    /// enable); a specific phase runs only scripts whose `run_at` equals
+    /// it (load start, for document_start scripts).
+    fn injectMatchingExtensions(self: *Host, v: *View, only_phase: ?manifestRunAt) void {
+        if (v.webext_bg) return;
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok) continue;
+            self.injectExtInto(v, e, only_phase);
+        }
+    }
+
+    /// Build and send one `ext-inject` for extension `e` into view `v`,
+    /// including only content scripts whose match patterns accept the
+    /// url and (when `only_phase` is set) whose run_at equals it.
+    fn injectExtInto(self: *Host, v: *View, e: *webexthost.Extension, only_phase: ?manifestRunAt) void {
+        const man = if (e.man) |*m| m else return;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        var any = false;
+
+        // Buffer CSS and JS across all matching content_scripts.
+        var css_buf: std.Io.Writer.Allocating = .init(self.gpa);
+        defer css_buf.deinit();
+        var js_buf: std.Io.Writer.Allocating = .init(self.gpa);
+        defer js_buf.deinit();
+        var css_first = true;
+        var js_first = true;
+
+        for (man.content_scripts) |cs| {
+            if (only_phase) |p| {
+                if (cs.run_at != p) continue;
+            }
+            if (!self.contentScriptMatches(cs, v.url)) continue;
+            any = true;
+            for (cs.css) |rel| {
+                const bytes = self.webext.readAsset(e, rel) orelse continue;
+                defer self.gpa.free(bytes);
+                if (!css_first) css_buf.writer.writeByte(',') catch {};
+                css_first = false;
+                jsonStr(&css_buf.writer, bytes) catch {};
+            }
+            for (cs.js) |rel| {
+                const bytes = self.webext.readAsset(e, rel) orelse continue;
+                defer self.gpa.free(bytes);
+                if (!js_first) js_buf.writer.writeByte(',') catch {};
+                js_first = false;
+                jsonStr(&js_buf.writer, bytes) catch {};
+            }
+        }
+        if (!any) return;
+
+        w.writeAll("{\"op\":\"ext-inject\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"base\":") catch return;
+        var base_buf: [256]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, "chrome-extension://{s}/", .{e.id}) catch "";
+        jsonStr(w, base) catch return;
+        // manifest inline (small), for getManifest.
+        w.writeAll(",\"manifest\":") catch return;
+        self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
+        w.writeAll(",\"css\":[") catch return;
+        w.writeAll(css_buf.written()) catch return;
+        w.writeAll("],\"scripts\":[") catch return;
+        w.writeAll(js_buf.written()) catch return;
+        w.writeAll("]}") catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    fn writeManifestJson(self: *Host, w: *std.Io.Writer, e: *webexthost.Extension) !void {
+        var buf: [4096]u8 = undefined;
+        const mpath = std.fmt.bufPrint(&buf, "{s}/manifest.json", .{e.dir}) catch return error.Path;
+        const bytes = webexthost.readFilePub(self.gpa, mpath, webext_max_asset) orelse return error.NoFile;
+        defer self.gpa.free(bytes);
+        // Inline the raw manifest bytes verbatim (already valid JSON).
+        try w.writeAll(bytes);
+    }
+
+    fn contentScriptMatches(self: *Host, cs: manifestContentScript, url: []const u8) bool {
+        var set = extmatch.PatternSet{};
+        defer set.deinit(self.gpa);
+        for (cs.matches) |pat| set.addInclude(self.gpa, pat) catch continue;
+        for (cs.exclude_matches) |pat| set.addExclude(self.gpa, pat) catch continue;
+        if (set.include.items.len == 0) return false;
+        return set.matchesUrl(url);
+    }
+
+    /// Inject background scripts into the background page once its
+    /// document is up (called from the load handler).
+    fn injectBackground(self: *Host, v: *View, e: *webexthost.Extension) void {
+        const man = if (e.man) |*m| m else return;
+        const bg = man.background orelse return;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-inject\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"base\":") catch return;
+        var base_buf: [256]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, "chrome-extension://{s}/", .{e.id}) catch "";
+        jsonStr(w, base) catch return;
+        w.writeAll(",\"manifest\":") catch return;
+        self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
+        w.writeAll(",\"css\":[],\"scripts\":[") catch return;
+        var first = true;
+        for (bg.scripts) |rel| {
+            const bytes = self.webext.readAsset(e, rel) orelse continue;
+            defer self.gpa.free(bytes);
+            if (!first) w.writeByte(',') catch {};
+            first = false;
+            jsonStr(w, bytes) catch {};
+        }
+        w.writeAll("]}") catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    /// Handle one `ext-*` message from a content or background frame
+    /// (routed here from `onScriptMessage`). `v` is the frame's view.
+    fn onExtMessage(self: *Host, v: *View, op: []const u8, json: []const u8) void {
+        if (std.mem.eql(u8, op, "ext-call")) {
+            self.extApiCall(v, json);
+        } else if (std.mem.eql(u8, op, "ext-send")) {
+            self.extRouteSend(v, json);
+        } else if (std.mem.eql(u8, op, "ext-reply")) {
+            self.extRouteReply(json);
+        } else if (std.mem.eql(u8, op, "ext-error")) {
+            const E = struct { ext: []const u8 = "", msg: []const u8 = "" };
+            const e = std.json.parseFromSlice(E, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer e.deinit();
+            // Surfaced as a console frame so it reaches the client log.
+            var buf: [512]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "[webext {s}] {s}", .{ e.value.ext, e.value.msg }) catch return;
+            self.post(proto.EvConsole{ .view = v.id, .level = 2, .msg = line });
+        }
+    }
+
+    /// A `browser.*` API call: dispatch through the host and reply with
+    /// `ext-result`. A storage mutation's `onChanged` is broadcast to
+    /// this extension's frames.
+    fn extApiCall(self: *Host, v: *View, json: []const u8) void {
+        const R = struct {
+            ext: []const u8 = "",
+            ns: []const u8 = "",
+            method: []const u8 = "",
+            args: std.json.Value = .null,
+            req: u32 = 0,
+        };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        const e = self.webext.find(r.ext) orelse {
+            self.extReplyErr(v, r.req);
+            return;
+        };
+        // Re-serialize args as a JSON array string for the host.
+        var args_buf: std.Io.Writer.Allocating = .init(self.gpa);
+        defer args_buf.deinit();
+        std.json.Stringify.value(r.args, .{}, &args_buf.writer) catch {
+            self.extReplyErr(v, r.req);
+            return;
+        };
+        var changed: ?[]u8 = null;
+        const result = self.webext.dispatchApi(e, r.ns, r.method, args_buf.written(), &changed);
+        defer self.gpa.free(result);
+        // result is `{"result":..}` or `{"error":..}`; forward the inner
+        // value/ok to the frame.
+        self.sendExtResult(v, r.req, result);
+        if (changed) |ch| {
+            defer self.gpa.free(ch);
+            self.broadcastChanged(e, ch);
+        }
+    }
+
+    fn sendExtResult(self: *Host, v: *View, req: u32, host_result: []const u8) void {
+        // host_result is a full JSON object; embed it and mark ok.
+        const is_err = std.mem.indexOf(u8, host_result, "\"error\"") != null;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.print("{{\"op\":\"ext-result\",\"req\":{d},\"ok\":{s},", .{ req, if (is_err) "false" else "true" }) catch return;
+        // Pull the inner value out of {"result":X} / {"error":X}.
+        w.writeAll("\"result\":") catch return;
+        const inner = innerJson(host_result);
+        w.writeAll(inner) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    fn extReplyErr(self: *Host, v: *View, req: u32) void {
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":false,\"result\":null}}", .{req}) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// A content frame's `runtime.sendMessage`: route it to the
+    /// extension's background page, remembering where to send the reply.
+    fn extRouteSend(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { ext: []const u8 = "", req: u32 = 0, msg: std.json.Value = .null };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        const e = self.webext.find(r.ext) orelse {
+            self.extReplyErr(v, r.req);
+            return;
+        };
+        const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
+        if (bg == null) {
+            // No background listening: resolve to undefined, as the web
+            // API does when nothing answers.
+            self.extReplyErr(v, r.req);
+            return;
+        }
+        const gid = self.webext_next_gid;
+        self.webext_next_gid +%= 1;
+        if (self.webext_next_gid == 0) self.webext_next_gid = 1;
+        if (self.webext_routes.items.len >= 256) _ = self.webext_routes.orderedRemove(0);
+        self.webext_routes.append(self.gpa, .{ .gid = gid, .origin_view = v.id, .origin_req = r.req }) catch {
+            self.extReplyErr(v, r.req);
+            return;
+        };
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.print("{{\"op\":\"ext-message\",\"ext\":", .{}) catch return;
+        jsonStr(w, r.ext) catch return;
+        w.print(",\"gid\":{d},\"sender\":{{\"id\":", .{gid}) catch return;
+        jsonStr(w, r.ext) catch return;
+        w.writeAll("},\"msg\":") catch return;
+        std.json.Stringify.value(r.msg, .{}, w) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(bg.?, cmd.written());
+    }
+
+    /// The background's reply to a routed message: deliver it to the
+    /// original content frame's pending promise.
+    fn extRouteReply(self: *Host, json: []const u8) void {
+        const R = struct { gid: u32 = 0, resp: std.json.Value = .null };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const gid = parsed.value.gid;
+        var idx: ?usize = null;
+        for (self.webext_routes.items, 0..) |route, i| {
+            if (route.gid == gid) {
+                idx = i;
+                break;
+            }
+        }
+        const i = idx orelse return;
+        const route = self.webext_routes.orderedRemove(i);
+        const origin = self.find(route.origin_view) orelse return;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.print("{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":", .{route.origin_req}) catch return;
+        std.json.Stringify.value(parsed.value.resp, .{}, w) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(origin, cmd.written());
+    }
+
+    /// Deliver a `storage.onChanged` payload to every live frame of the
+    /// extension (its content-script frames and its background).
+    fn broadcastChanged(self: *Host, e: *webexthost.Extension, changes_json: []const u8) void {
+        for (self.views.items) |v| {
+            if (v.browser == null or v.discarded) continue;
+            // Every frame with the extension injected has its ctx; a
+            // frame that never got it ignores the command harmlessly.
+            var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+            defer cmd.deinit();
+            const w = &cmd.writer;
+            w.writeAll("{\"op\":\"ext-changed\",\"ext\":") catch continue;
+            jsonStr(w, e.id) catch continue;
+            w.writeAll(",\"area\":\"local\",\"changes\":") catch continue;
+            w.writeAll(changes_json) catch continue;
+            w.writeByte('}') catch continue;
+            self.sendScript(v, cmd.written());
+        }
+    }
+
     // -- semantic layer ------------------------------------------------
 
     /// Hand one JSON command to the view's main frame, as a call into
@@ -2700,6 +3135,12 @@ pub const Host = struct {
 
         if (std.mem.eql(u8, op, "tree")) {
             self.onTree(v, rid, json);
+            return;
+        }
+        // WebExtensions traffic rides the same authenticated channel;
+        // route every `ext-*` op to the webext handler.
+        if (op.len > 4 and std.mem.eql(u8, op[0..4], "ext-")) {
+            self.onExtMessage(v, op, json);
             return;
         }
         var p = self.takePending(v, rid) orelse return;
@@ -4104,6 +4545,18 @@ fn typeText(v: *View, text: []const u8) void {
 }
 
 /// Append `s` as a JSON string literal, quotes included.
+/// Extract the value after the first `:` in a `{"result":X}` /
+/// `{"error":X}` object, dropping the trailing `}`. Used to forward a
+/// host dispatch result's inner value to the frame; the input is always
+/// helper-produced JSON, never page-authored.
+fn innerJson(obj: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, obj, ':') orelse return "null";
+    var inner = obj[colon + 1 ..];
+    if (inner.len > 0 and inner[inner.len - 1] == '}') inner = inner[0 .. inner.len - 1];
+    if (inner.len == 0) return "null";
+    return inner;
+}
+
 fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |ch| switch (ch) {
@@ -5189,6 +5642,8 @@ fn onAcceleratedPaint(
     if (ptype != cef.PET_VIEW) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    // A hidden background page is never announced to the client.
+    if (v.webext_bg) return;
     // `[*c]` field access leaks back into C-pointer land (`&x.*.planes`
     // is a pointer to the whole array), so bind a real Zig pointer once.
     const inf: *const cef.cef_accelerated_paint_info_t = @ptrCast(info orelse return);
@@ -5276,6 +5731,7 @@ fn onAddressChange(
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(url);
     defer s.free();
+    if (v.webext_bg) return;
     host.setUrl(v, s.slice());
     host.postNavState(v);
 }
@@ -5289,6 +5745,7 @@ fn onTitleChange(
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(title);
     defer s.free();
+    if (v.webext_bg) return;
     host.post(proto.EvTitle{ .view = v.id, .title = s.slice() });
 }
 
@@ -5299,6 +5756,7 @@ fn onFaviconChange(
 ) callconv(.c) void {
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    if (v.webext_bg) return;
     if (cef.cef_string_list_size(icon_urls) == 0) return;
     var first = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&first);
@@ -5461,6 +5919,7 @@ fn onLoadingStateChange(
 ) callconv(.c) void {
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    if (v.webext_bg) return;
     host.post(proto.EvNavState{
         .view = v.id,
         .can_back = if (can_back != 0) 1 else 0,
@@ -5479,6 +5938,9 @@ fn onLoadStart(
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    // A hidden background page never faces the client: no zoom, no load
+    // events. Its scripts arrive at load end.
+    if (v.webext_bg) return;
     // Chromium's zoom is per origin and resets across a navigation; in
     // accelerated mode the zoom IS the device scale factor, so a page
     // that lost it would render at logical resolution.
@@ -5486,6 +5948,9 @@ fn onLoadStart(
     // Cosmetic hiding, userstyles and userscripts go in per document,
     // as early as this path can put them (see `injectUserContent`).
     if (frame) |f| host.injectUserContent(v, f);
+    // document_start content scripts run before page scripts have done
+    // their work; load start is the earliest browser-process hook.
+    host.injectMatchingExtensions(v, .document_start);
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.started),
@@ -5502,13 +5967,24 @@ fn onLoadEnd(
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    if (v.webext_bg) {
+        // The background page's document is up: inject its scripts +
+        // the browser.* bridge. No client-facing load event.
+        if (host.webext.findByBgView(v.id)) |e| host.injectBackground(v, e);
+        return;
+    }
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.finished),
         .url = v.url,
     });
-    // The content script is already in: it goes in at context creation,
-    // before any page script, so by load end it is only re-armed.
+    // document_end / document_idle content scripts run now (the
+    // document is parsed; document_start ones went in at load start).
+    host.injectMatchingExtensions(v, .document_end);
+    host.injectMatchingExtensions(v, .document_idle);
+    // The semantic content script is already in: it goes in at context
+    // creation, before any page script, so by load end it is only
+    // re-armed.
     host.semRearm(v);
 }
 
@@ -5523,6 +5999,7 @@ fn onLoadError(
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    if (v.webext_bg) return;
     var url = Utf8.init(failed_url);
     defer url.free();
     var msg = Utf8.init(text);
