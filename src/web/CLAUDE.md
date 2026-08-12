@@ -200,6 +200,56 @@ attempt, and all four cost a live external dependency:
   not the same claim as "the video is visible in a pane", and only the
   second one is what a user gets.
 
+## WebExtensions (0xB0 block, capability "webext")
+
+MV2/Firefox-flavor extension host. The GUI owns the FILES (install an
+unpacked dir in place, or unpack an XPI under
+`$XDG_DATA_HOME/sketerm/webext/<id>/`; `src/ui/webext.zig` + its
+`registry.json`); the helper LOADS them and reports state. `webext_host`
+(`webext/host.zig`) owns the registry, `storage.local` persistence and
+the **`browser.*` dispatch seam** (`dispatchApi`, keyed on namespace —
+blocking webRequest is a later arm there, and the 0xB4-0xBF frame range
+is reserved for its held-request protocol; do NOT restructure the
+dispatch to add it).
+
+- **Content scripts and the `browser.*` bridge reuse the semantic
+  channel, they are NOT a second transport.** `semantic.js` gained an
+  `ext-*` sub-protocol; the browser process drives injection with
+  `execute_java_script` (the same `sendScript` path) and receives calls
+  over the same nonce-authenticated process message. Do not add a
+  separate V8 extension or secret for webext.
+- **This is NOT a true isolated world.** CEF's OSR/capi exposes no way
+  to create a content-script world, so each extension runs in its own
+  JS CLOSURE in the MAIN world (its own `browser`/`chrome`, its content
+  scripts run via `new Function`). The closure isolates the API surface
+  and keeps extensions from clobbering each other; it does NOT isolate
+  intrinsics, so page and content script still share globals/prototypes.
+  If a future CEF grows an isolated-world capi, move injection onto it;
+  until then this is the ceiling, pinned by smoke-web stage 33.
+- **Background pages are hidden 1x1 windowless browsers** (`View.webext_bg`):
+  no frame buffer, never announced to the client, marked `was_hidden`.
+  `injectBackground` runs their scripts at load end. `runtime.sendMessage`
+  from a content frame is routed content->browser-process->background and
+  the reply back, correlated by a process-global gid (`webext_routes`).
+- **A browser process that hosted a background page must `_exit`, not
+  return through libc.** MEASURED: after `cef_shutdown` returns cleanly
+  (openBrowsers == 0), the normal return-through-`main` exit HANGS
+  indefinitely in libc's atexit path — a CEF worker thread outlives
+  `cef_shutdown` and the join never returns. `main.zig` therefore runs
+  all teardown inside a block (its defers) and then calls `c._exit`.
+  This was invisible until background pages existed; do not revert to a
+  plain `return`.
+- `getManifest`/`getURL`/`i18n.getMessage` resolve SYNCHRONOUSLY in JS
+  from constants inlined into the `ext-inject` command (manifest bytes +
+  the `_locales/<default_locale>/messages.json` object); storage / tabs /
+  sendMessage are async (Promises), matching the Firefox `browser.*`
+  shape. `browser.tabs` is a stub (empty query) in this foundation.
+- Smoke-web stage 33 is the end-to-end proof (a committed fixture under
+  `webext/testdata/fixture`): content script injected at document_end
+  mutates the DOM + messages the background + `getMessage`; storage.local
+  survives a helper restart. It serves the page from a loopback HTTP
+  server because content scripts match `http://…`, never a `data:` url.
+
 ## Presentation belongs to GTK, not to us
 
 Frames are `GdkTexture`s on a `GtkPicture` (`webface.zig`). **Never

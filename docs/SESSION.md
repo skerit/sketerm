@@ -17029,3 +17029,49 @@ Help tail:
 `smoke-atspi` gained a stage that activates the hamburger over the a11y
 bridge (every rect reports 0,0 on Wayland, so there is no honest pixel
 to click) and asserts its rows are real accessible objects.
+## 2026-08-12: WebExtensions MV2 host foundation (stage 3 of the staged plan)
+
+The browser can now host targeted MV2/Firefox-flavor WebExtensions —
+the FOUNDATION of proposal stage 3, built to grow toward the curated
+tier-1 list (uBO etc.) without restructuring.
+
+- Pure modules (`src/web/webext/`, both test roots): MV2 match-pattern
+  engine (`match.zig` — `*` scheme means http/https/ws/wss only, `*.`
+  subdomain boundary, `<all_urls>`, query-stripped path glob), Manifest
+  V2 parser (`manifest.zig` — name/version/description/permissions/
+  content_scripts/background/browser_action/default_locale; MV3 is
+  REJECTED loudly), `storage.local` JSON model with `onChanged` deltas
+  (`storage.zig`), and a from-scratch ZIP/XPI reader on
+  `std.compress.flate` (`zip.zig` — central-directory driven, STORE +
+  DEFLATE; no zip reader existed in-tree).
+- Protocol: capability `webext`, tags 0xB0-0xB3 (`webext_set`,
+  `webext_remove`, `webext_list_req`, `ev_webext_state`); 0xB4-0xBF
+  reserved for the later blocking-webRequest held-request pair. The
+  `hello_ack` caps array is now `[19]`/`18`.
+- Helper: `webext/host.zig` owns the loaded-extension registry,
+  storage persistence under `$XDG_DATA_HOME/sketerm/webext/<id>/`, and
+  `dispatchApi` — THE seam a later wave extends for webRequest.
+  `cefhost.zig` hosts each background page as a hidden 1x1 windowless
+  browser (never announced, `was_hidden`), injects match-filtered
+  content scripts per `run_at` phase from the load handlers, and routes
+  `runtime.sendMessage` content->background->reply by gid.
+- The content-script bridge REUSES the authenticated semantic channel
+  (`semantic.js` gained the `ext-*` sub-protocol): per-extension
+  CLOSURES with their own promise-based `browser`/`chrome`
+  (runtime/storage.local/tabs/i18n). NOT a true isolated world — CEF's
+  OSR capi has none; documented as the ceiling in `src/web/CLAUDE.md`.
+- GUI: `src/ui/webext.zig` — registry persisted to `registry.json`,
+  republished to a fresh helper on connect, and a "Browser Extensions"
+  manager (web pane context menu -> "Extensions…", gated on the
+  capability): enable switches, Remove, "Load Unpacked…", "Load
+  Extension File…" (XPI unpacked via the zip reader).
+- Found + fixed: a browser process that ever hosted a background page
+  HANGS in libc's atexit path after a clean `cef_shutdown` (a CEF
+  worker outlives it); `web/main.zig` now runs teardown in a block and
+  `_exit`s.
+- Proof: smoke-web stage 33 with a committed fixture extension — run 1:
+  content script injected at document_end mutates the DOM, messages the
+  background and gets `{n:42}` back, `i18n.getMessage` resolves; run 2
+  (fresh helper, same XDG_DATA_HOME): `storage.local` round-trips
+  across the restart. Unit tests for match patterns, manifest parse,
+  storage JSON and the zip reader in both roots.
