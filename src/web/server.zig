@@ -79,6 +79,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_SITEDATA,
     proto.CAP_FRAMES_INLINE,
     proto.CAP_WEBEXT,
+    proto.CAP_WEBEXT_TABS,
 };
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -283,6 +284,10 @@ pub const Server = struct {
         // Nothing paints without a begin frame: keep a floor under every
         // visible view in case the client stopped asking for them.
         self.host.watchdog(cefhost.nowMs());
+        // An extension that asked to restart itself is restarted HERE,
+        // never inside the call that asked: `runtime.reload` destroys
+        // the very background page whose script is mid-call.
+        self.host.webextPump();
         // Dispatch queued blocking-webRequest holds BEFORE pumping, so
         // the command reaches the background renderer in the same
         // message-loop turn that will carry its answer back.
@@ -428,6 +433,7 @@ pub const Server = struct {
             .webext_remove => self.host.webextRemove((try proto.decode(proto.WebextRemove, frame.payload)).id),
             .webext_list_req => self.host.webextList(),
             .webext_wreq_stats_req => self.host.webrequestStats(),
+            .webext_tabs => self.host.webextTabs((try proto.decode(proto.WebextTabs, frame.payload)).tabs_json),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

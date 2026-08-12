@@ -31,4 +31,12 @@
 #include "include/capi/cef_process_message_capi.h"
 #include "include/capi/cef_v8_capi.h"
 #include "include/capi/cef_frame_capi.h"
+// WebExtensions: the `chrome-extension://<host>/` origin is a custom
+// scheme (registered from the app in EVERY process) served by our own
+// resource handler over the unpacked extension directory. Without a
+// real origin an ES-module background page cannot load at all — a
+// static `import` is a fetch, and nothing answers a url no scheme
+// handler serves.
+#include "include/capi/cef_scheme_capi.h"
+#include "include/capi/cef_resource_handler_capi.h"
 #include "include/cef_version.h"

@@ -357,6 +357,12 @@ pub fn setBgView(id: []const u8, view: u32) void {
 
 /// What one request needs from one extension. `none()` is the answer for
 /// the overwhelming majority of requests and costs no allocation.
+/// Matching listener ids carried per request. An extension with more
+/// than this many listeners matching ONE request is not a shape any real
+/// extension has (uBO's busiest event has two), and the overflow
+/// degrades by running fewer listeners, never by running wrong ones.
+pub const MAX_MATCHED = 16;
+
 pub const Need = struct {
     /// A listener matched at all (blocking or observational).
     matched: bool = false,
@@ -367,12 +373,26 @@ pub const Need = struct {
     /// only pays for header collection when somebody asked for it.
     want_request_headers: bool = false,
     want_response_headers: bool = false,
+    /// WHICH listeners matched.
+    ///
+    /// Not a detail: a `RequestFilter` belongs to ONE listener, and an
+    /// extension registers several with DIFFERENT filters. uBlock Origin
+    /// registers a guard on `onBeforeRequest` filtered to its own
+    /// `web_accessible_resources/*` that cancels anything reaching it
+    /// without a secret — so "this request matched SOME listener, run
+    /// them all" cancels every page on the web. Measured exactly that
+    /// way before these ids existed.
+    ids: [MAX_MATCHED]u32 = @splat(0),
+    n_ids: u8 = 0,
 
     pub fn none() Need {
         return .{};
     }
     pub fn isNone(self: Need) bool {
         return !self.matched;
+    }
+    pub fn idSlice(self: *const Need) []const u32 {
+        return self.ids[0..self.n_ids];
     }
 };
 
@@ -408,6 +428,10 @@ pub fn needFor(
         if (l.extra.blocking) need.blocking = true;
         if (l.extra.request_headers) need.want_request_headers = true;
         if (l.extra.response_headers) need.want_response_headers = true;
+        if (need.n_ids < MAX_MATCHED) {
+            need.ids[need.n_ids] = l.lid;
+            need.n_ids += 1;
+        }
     }
     return need;
 }

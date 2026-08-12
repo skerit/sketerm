@@ -137,6 +137,13 @@ pub const CAP_FRAMES_INLINE = "frames-inline";
 /// loads an extension and the helper hosts none.
 pub const CAP_WEBEXT = "webext";
 
+/// The helper accepts `webext_tabs` (0xB6): the client's whole tab list,
+/// which is what makes `browser.tabs` and `sender.tab` real instead of
+/// empty. Separate from `webext` because a client that hosts extensions
+/// need not own a tab set at all (`webdrive` does not), and an extension
+/// seeing NO tabs is honest where seeing invented ones is not.
+pub const CAP_WEBEXT_TABS = "webext-tabs";
+
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
@@ -224,7 +231,8 @@ pub const Tag = enum(u8) {
     ev_webext_state = 0xB3,
     webext_wreq_stats_req = 0xB4,
     ev_webext_wreq_stats = 0xB5,
-    // 0xB6-0xBF stay reserved for the WebExtensions block.
+    webext_tabs = 0xB6,
+    // 0xB7-0xBF stay reserved for the WebExtensions block.
     //
     // NOTE for anyone reading the 0xB4-0xBF reservation as originally
     // written: there is deliberately NO `webext_request` /
@@ -2147,6 +2155,27 @@ pub const EvWebextWreqStats = struct {
     samples: u32,
 };
 
+/// The client's WHOLE tab list, replacing whatever the helper held.
+///
+/// REPLACE-ALL, like `us_script_set`, and for the same reason: the
+/// helper DIFFS it to synthesise MV2's `onCreated`/`onUpdated`/
+/// `onRemoved`/`onActivated`, so the events an extension sees are
+/// derived from state rather than from a sequence a dropped frame could
+/// desynchronise. Post it whenever the tab set changes.
+///
+/// The payload is a JSON array rather than a repeated binary record,
+/// because this wire has no repeated-field encoding and adding one for a
+/// frame sent a few times a minute would be the wrong trade. Each
+/// element is
+/// `{id, view, windowId, index, active, focusedWindow, url, title, loading}`;
+/// `view` is the helper VIEW rendering that tab, or 0 for a tab that
+/// shows no web view at all (a terminal tab), which is how
+/// `sender.tab` is resolved.
+pub const WebextTabs = struct {
+    pub const tag: Tag = .webext_tabs;
+    tabs_json: []const u8,
+};
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -2626,6 +2655,12 @@ test "round-trip: webext frames" {
         .err = "",
     });
     try roundTrip(EvWebextState, .{ .id = "bad", .name = "", .version = "", .enabled = 0, .ok = 0, .err = "bad manifest" });
+    try roundTrip(WebextTabs, .{ .tabs_json = "[]" });
+    try roundTrip(WebextTabs, .{
+        .tabs_json =
+        \\[{"id":3,"view":1,"windowId":0,"index":0,"active":true,"focusedWindow":true,"url":"https://a.test/","title":"A","loading":false}]
+        ,
+    });
     try roundTrip(WebextWreqStatsReq, .{});
     try roundTrip(EvWebextWreqStats, .{
         .id = "abc123",

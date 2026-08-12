@@ -1015,9 +1015,21 @@
   var extReqSeq = 1;
   var extPending = {}; // req -> resolve fn
   var extCtx = {}; // ext id -> { listeners:[], changed:[] }
+  var extApiOf = {}; // ext id -> the `browser` object built for it
+
+  // `SKETERM_WEB_EXT_DEBUG=1` in the helper: log every browser.* call
+  // and its reply. A hung extension is almost always a Promise this
+  // bridge never settled, and the pairing is invisible without this.
+  var extDebug = false;
 
   function extApiCall(extId, ns, method, args) {
     var req = extReqSeq++;
+    if (extDebug) {
+      try {
+        console.log("SKEXT call#" + req + " " + ns + "." + method + " " +
+          JSON.stringify(args).slice(0, 200));
+      } catch (e) {}
+    }
     return new Promise(function (resolve) {
       extPending[req] = resolve;
       send({ op: "ext-call", ext: extId, ns: ns, method: method, args: args, req: req });
@@ -1117,6 +1129,29 @@
     OTHER: "other"
   };
 
+  // The NOTIFICATION-ONLY webRequest events. They accept listeners and
+  // never fire: nothing in the helper delivers them yet.
+  //
+  // They exist because their ABSENCE was fatal, not because they work.
+  // uBlock Origin's `webRequest.start()` calls
+  // `browser.webRequest.onResponseStarted.addListener(...)` — an
+  // unconditional property access — and a TypeError there aborts the
+  // REST of uBO's boot sequence from inside its own startup, leaving a
+  // half-initialised filtering engine that then cancelled every
+  // top-level navigation. An inert event object is a limitation; an
+  // undefined one is a broken extension.
+  //
+  // The cost is named: `onResponseStarted` is where uBO injects its
+  // scriptlets, so scriptlet injection does not happen.
+  function inertEvent() {
+    var ev = extEvent();
+    var add = ev.addListener;
+    ev.addListener = function (fn) {
+      add(fn);
+    };
+    return ev;
+  }
+
   function makeWebRequest(extId, ctx) {
     return {
       ResourceType: extResourceType,
@@ -1124,6 +1159,12 @@
       onBeforeRequest: extWebRequestEvent(extId, ctx, "onBeforeRequest"),
       onBeforeSendHeaders: extWebRequestEvent(extId, ctx, "onBeforeSendHeaders"),
       onHeadersReceived: extWebRequestEvent(extId, ctx, "onHeadersReceived"),
+      onSendHeaders: inertEvent(),
+      onResponseStarted: inertEvent(),
+      onBeforeRedirect: inertEvent(),
+      onCompleted: inertEvent(),
+      onErrorOccurred: inertEvent(),
+      onAuthRequired: inertEvent(),
       handlerBehaviorChanged: function () {
         return extApiCall(extId, "webRequest", "handlerBehaviorChanged", []);
       }
@@ -1162,12 +1203,31 @@
     var details = m.details || {};
     var pending = null;
     var merged = null;
+    // ONLY the listeners whose own RequestFilter matched. The browser
+    // process evaluated each filter and names the survivors in `lids`;
+    // an absent list means "all", which is only the case for commands
+    // predating this field.
+    var lids = m.lids;
     for (var i = 0; i < entries.length; i++) {
+      if (lids && lids.indexOf(entries[i].id) < 0) continue;
       var r;
       try {
         r = entries[i].fn(details);
       } catch (e) {
+        if (m.dbg) {
+          try {
+            console.log("SKWREQ listener " + i + " THREW on " + details.url + ": " +
+              (e && e.stack ? e.stack : String(e)));
+          } catch (e9) {}
+        }
         continue;
+      }
+      if (m.dbg) {
+        try {
+          console.log("SKWREQ listener " + i + "/" + entries.length +
+            " blocking=" + entries[i].blocking + " on " + details.url +
+            " -> " + JSON.stringify(r));
+        } catch (e8) {}
       }
       if (!entries[i].blocking) continue;
       if (r && typeof r.then === "function") {
@@ -1200,7 +1260,14 @@
   }
 
   function makeBrowser(extId, baseUrl, manifestObj, messages) {
-    var ctx = { listeners: extEvent(), changed: extEvent(), wreq: {} };
+    var ctx = {
+      listeners: extEvent(),
+      changed: extEvent(),
+      wreq: {},
+      connect: extEvent(),
+      ports: {},
+      pending_ports: {}
+    };
     extCtx[extId] = ctx;
     var storageLocal = {
       get: function (keys) {
@@ -1217,7 +1284,7 @@
       },
       onChanged: ctx.changed
     };
-    return {
+    var api = {
       runtime: {
         id: extId,
         lastError: null,
@@ -1233,14 +1300,29 @@
           var m = arguments.length > 1 ? arguments[arguments.length - 1] : msg;
           return extSendMessage(extId, m);
         },
+        connect: function (a, b) {
+          // MV2: connect(connectInfo) or connect(extensionId, connectInfo).
+          var info = (b && typeof b === "object") ? b : (a && typeof a === "object" ? a : {});
+          return extConnect(extId, ctx, info.name || "");
+        },
+        onConnect: ctx.connect,
         onMessage: ctx.listeners
       },
       storage: { local: storageLocal, onChanged: ctx.changed },
       webRequest: makeWebRequest(extId, ctx),
       i18n: {
-        getMessage: function (key) {
+        // Resolved from the inlined catalogue when it can be — this is
+        // the SYNCHRONOUS form the API promises and a Promise would
+        // break every caller. `$1`/`$name$` substitution matches the
+        // browser-process implementation in webext/i18n.zig; keeping
+        // both is the price of a synchronous getMessage.
+        getMessage: function (key, subs) {
           var e = messages && messages[key];
-          return e && typeof e.message === "string" ? e.message : "";
+          if (!e || typeof e.message !== "string") return "";
+          return extExpandMessage(e.message, e.placeholders, subs);
+        },
+        getUILanguage: function () {
+          return extUiLanguage;
         }
       },
       tabs: {
@@ -1252,13 +1334,438 @@
         },
         sendMessage: function (id, msg) {
           return extApiCall(extId, "tabs", "sendMessage", [id, msg]);
+        },
+        update: function (a, b) {
+          // update(props) or update(tabId, props).
+          var id = typeof a === "number" ? a : -1;
+          var props = (typeof a === "object" ? a : b) || {};
+          return extApiCall(extId, "tabs", "update", [id, props]);
+        },
+        create: function (props) {
+          return extApiCall(extId, "tabs", "create", [props || {}]);
+        },
+        reload: function (id) {
+          return extApiCall(extId, "tabs", "reload", [typeof id === "number" ? id : -1]);
+        },
+        remove: noopAsync,
+        insertCSS: noopAsync,
+        removeCSS: noopAsync,
+        executeScript: noopAsyncValue([]),
+        getZoom: noopAsyncValue(1),
+        setZoom: noopAsync,
+        onUpdated: extEvent(),
+        onRemoved: extEvent(),
+        onActivated: extEvent(),
+        onCreated: extEvent()
+      }
+    };
+    addExtStubs(api, extId, ctx);
+    ctx.tabs = api.tabs;
+    extApiOf[extId] = api;
+    return api;
+  }
+
+  // The UI language, filled in by the first ext-inject that carries one.
+  var extUiLanguage = "en";
+
+  // -- benign namespaces -------------------------------------------------
+  //
+  // MV2 surfaces a real extension calls UNCONDITIONALLY, on paths it
+  // does not feature-detect. uBlock Origin's very first act after its
+  // module graph loads is `browserAction.setIcon`, and an `undefined`
+  // there is a TypeError that takes the whole background page down —
+  // an extension that is "enabled" and does nothing at all.
+  //
+  // THESE ARE STUBS AND THEY ARE MEANT TO READ AS STUBS. A toolbar
+  // button, a context-menu item and a notification are all things only
+  // the GUI can draw, and this helper deliberately owns no client
+  // surface; wiring them would be new wire frames and new GUI, not a
+  // few lines here. What they buy is that an extension RUNS instead of
+  // dying on line one, with its filtering — the part that lives
+  // entirely inside this process — fully working. Anything an extension
+  // feature-detects (`privacy`, `dns`, `contentScripts`,
+  // `storage.sync`/`managed`, `filterResponseData`) is deliberately
+  // LEFT ABSENT, because degrading gracefully is what that detection is
+  // for and a stub would defeat it.
+  function noopAsync() {
+    return Promise.resolve();
+  }
+  function noopAsyncValue(v) {
+    return function () {
+      return Promise.resolve(v);
+    };
+  }
+
+  function addExtStubs(api, extId, ctx) {
+    var action = {
+      setIcon: noopAsync,
+      setTitle: noopAsync,
+      setBadgeText: noopAsync,
+      setBadgeTextColor: noopAsync,
+      setBadgeBackgroundColor: noopAsync,
+      setPopup: noopAsync,
+      getPopup: noopAsyncValue(""),
+      getBadgeText: noopAsyncValue(""),
+      getTitle: noopAsyncValue(""),
+      enable: noopAsync,
+      disable: noopAsync,
+      isEnabled: noopAsyncValue(true),
+      openPopup: noopAsync,
+      onClicked: extEvent()
+    };
+    api.browserAction = action;
+    api.pageAction = action;
+    api.action = action;
+
+    var menus = {
+      create: function () {
+        return 0;
+      },
+      update: noopAsync,
+      remove: noopAsync,
+      removeAll: noopAsync,
+      refresh: noopAsync,
+      onClicked: extEvent(),
+      onShown: extEvent(),
+      onHidden: extEvent(),
+      ACTION_MENU_TOP_LEVEL_LIMIT: 6
+    };
+    api.menus = menus;
+    api.contextMenus = menus;
+
+    // Alarms: real, because they are pure timers and an extension that
+    // schedules its housekeeping on them would otherwise never do it.
+    var alarms = {};
+    api.alarms = {
+      create: function (name, info) {
+        var n = typeof name === "string" ? name : "";
+        var opts = (typeof name === "object" ? name : info) || {};
+        var delay = opts.when ? Math.max(0, opts.when - Date.now())
+          : (opts.delayInMinutes || opts.periodInMinutes || 0) * 60000;
+        if (alarms[n]) clearTimeout(alarms[n].timer);
+        var period = (opts.periodInMinutes || 0) * 60000;
+        var fire = function () {
+          fireAll(api.alarms.onAlarm, [{ name: n, scheduledTime: Date.now() }]);
+          if (period > 0) alarms[n] = { timer: setTimeout(fire, period), period: period };
+          else delete alarms[n];
+        };
+        alarms[n] = { timer: setTimeout(fire, delay || period || 60000), period: period };
+      },
+      clear: function (name) {
+        var n = typeof name === "string" ? name : "";
+        if (alarms[n]) {
+          clearTimeout(alarms[n].timer);
+          delete alarms[n];
+        }
+        return Promise.resolve(true);
+      },
+      clearAll: function () {
+        for (var k in alarms) clearTimeout(alarms[k].timer);
+        alarms = {};
+        return Promise.resolve(true);
+      },
+      get: noopAsyncValue(undefined),
+      getAll: noopAsyncValue([]),
+      onAlarm: extEvent()
+    };
+
+    api.windows = {
+      WINDOW_ID_NONE: -1,
+      WINDOW_ID_CURRENT: -2,
+      get: noopAsyncValue(null),
+      getCurrent: noopAsyncValue({ id: 0, focused: true, type: "normal" }),
+      getLastFocused: noopAsyncValue({ id: 0, focused: true, type: "normal" }),
+      getAll: noopAsyncValue([{ id: 0, focused: true, type: "normal" }]),
+      create: noopAsyncValue(null),
+      update: noopAsync,
+      remove: noopAsync,
+      onCreated: extEvent(),
+      onRemoved: extEvent(),
+      onFocusChanged: extEvent()
+    };
+
+    // webNavigation: the EVENTS exist so a listener can be registered
+    // without throwing; nothing fires them yet, which is why an
+    // extension relying on them for per-frame bookkeeping stays empty.
+    api.webNavigation = {
+      getFrame: noopAsyncValue(null),
+      getAllFrames: noopAsyncValue([]),
+      onBeforeNavigate: extEvent(),
+      onCommitted: extEvent(),
+      onDOMContentLoaded: extEvent(),
+      onCompleted: extEvent(),
+      onErrorOccurred: extEvent(),
+      onCreatedNavigationTarget: extEvent(),
+      onHistoryStateUpdated: extEvent(),
+      onReferenceFragmentUpdated: extEvent()
+    };
+
+    api.notifications = {
+      create: noopAsyncValue("0"),
+      clear: noopAsyncValue(true),
+      getAll: noopAsyncValue({}),
+      onClicked: extEvent(),
+      onClosed: extEvent(),
+      onButtonClicked: extEvent()
+    };
+
+    api.commands = {
+      getAll: noopAsyncValue([]),
+      onCommand: extEvent()
+    };
+
+    api.permissions = {
+      contains: noopAsyncValue(true),
+      getAll: noopAsyncValue({ permissions: [], origins: [] }),
+      request: noopAsyncValue(false),
+      remove: noopAsyncValue(false),
+      onAdded: extEvent(),
+      onRemoved: extEvent()
+    };
+
+    api.extension = {
+      getURL: api.runtime.getURL,
+      getViews: function () {
+        return [];
+      },
+      isAllowedFileSchemeAccess: noopAsyncValue(false),
+      inIncognitoContext: false
+    };
+
+    // `storage.session` is a real in-memory store — cheap, and an
+    // extension that keeps its hot state there otherwise loses it on
+    // every write. `sync` and `managed` stay ABSENT on purpose: an
+    // extension feature-detects them and degrades, and a stub that
+    // silently drops synced settings would be worse than neither.
+    var session = {};
+    api.storage.session = {
+      get: function (keys) {
+        var out = {};
+        if (keys === undefined || keys === null) {
+          for (var k in session) out[k] = session[k];
+        } else if (typeof keys === "string") {
+          if (keys in session) out[keys] = session[keys];
+        } else if (keys && keys.length !== undefined) {
+          for (var i = 0; i < keys.length; i++) {
+            if (keys[i] in session) out[keys[i]] = session[keys[i]];
+          }
+        } else if (keys) {
+          for (var d in keys) out[d] = (d in session) ? session[d] : keys[d];
+        }
+        return Promise.resolve(out);
+      },
+      set: function (obj) {
+        for (var k2 in obj) session[k2] = obj[k2];
+        return Promise.resolve();
+      },
+      remove: function (keys) {
+        var list = typeof keys === "string" ? [keys] : (keys || []);
+        for (var i2 = 0; i2 < list.length; i2++) delete session[list[i2]];
+        return Promise.resolve();
+      },
+      clear: function () {
+        session = {};
+        return Promise.resolve();
+      },
+      onChanged: extEvent()
+    };
+
+    api.runtime.getPlatformInfo = noopAsyncValue({ os: "linux", arch: "x86-64" });
+    api.runtime.getBrowserInfo = noopAsyncValue({
+      name: "sketerm", vendor: "sketerm", version: "1.0", buildID: "0"
+    });
+    api.runtime.setUninstallURL = noopAsync;
+    api.runtime.openOptionsPage = noopAsync;
+    // REAL, not a stub: an extension that asks to restart and is not
+    // restarted simply stops. uBO's first run ends on this call.
+    api.runtime.reload = function () {
+        return extApiCall(extId, "runtime", "reload", []);
+    };
+    api.runtime.onInstalled = extEvent();
+    api.runtime.onStartup = extEvent();
+    api.runtime.onSuspend = extEvent();
+    api.runtime.onUpdateAvailable = extEvent();
+    api.runtime.onConnectExternal = extEvent();
+    api.runtime.onMessageExternal = extEvent();
+
+
+  }
+
+  // `$1`..`$9` and `$name$` expansion. Named placeholders resolve to
+  // their `content` FIRST, then every numbered marker resolves once —
+  // doing it the other way round would let a substitution's own text be
+  // re-read as a placeholder.
+  function extExpandMessage(message, placeholders, subs) {
+    var list = [];
+    if (typeof subs === "string") list = [subs];
+    else if (subs && subs.length) {
+      for (var i = 0; i < subs.length; i++) list.push(String(subs[i]));
+    }
+    var named = String(message).replace(/\$([A-Za-z0-9_@]+)\$/g, function (whole, name) {
+      if (!placeholders) return "";
+      var lower = String(name).toLowerCase();
+      for (var k in placeholders) {
+        if (String(k).toLowerCase() !== lower) continue;
+        var p = placeholders[k];
+        return (p && typeof p.content === "string") ? p.content : "";
+      }
+      return "";
+    });
+    return named.replace(/\$(\$|[1-9])/g, function (whole, d) {
+      if (d === "$") return "$";
+      var idx = Number(d) - 1;
+      return idx < list.length ? list[idx] : "";
+    });
+  }
+
+  // -- runtime.connect Ports --------------------------------------------
+  //
+  // Every content script of uBlock Origin and Violentmonkey opens one as
+  // its first act and TEARS ITSELF DOWN if it throws
+  // (`vAPI.shutdown.exec()`), so "no Port API" is not a missing feature
+  // to those extensions, it is a fatal one.
+  //
+  // The browser process mints the global id, because only it can see
+  // both ends. A Port is therefore usable IMMEDIATELY but not yet
+  // numbered: posts before the id arrives queue in `pre`, and are
+  // flushed in order once `ext-port-open` lands. Firefox has the same
+  // observable behaviour (a Port is returned synchronously and delivery
+  // is asynchronous), so nothing here is a workaround for the delay.
+  var extPortSeq = 1;
+
+  function makePort(extId, ctx, name, sender) {
+    var port = {
+      name: name || "",
+      sender: sender || null,
+      gid: 0,
+      pre: [],
+      dead: false,
+      onMessage: extEvent(),
+      onDisconnect: extEvent(),
+      postMessage: function (msg) {
+        if (port.dead) return;
+        if (!port.gid) {
+          port.pre.push(msg);
+          return;
+        }
+        send({ op: "ext-port-msg", gid: port.gid, msg: msg === undefined ? null : msg });
+      },
+      disconnect: function () {
+        if (port.dead) return;
+        port.dead = true;
+        if (port.gid) {
+          delete ctx.ports[port.gid];
+          send({ op: "ext-port-close", gid: port.gid });
         }
       }
     };
+    return port;
+  }
+
+  function extConnect(extId, ctx, name) {
+    var lid = extPortSeq++;
+    var port = makePort(extId, ctx, name, null);
+    ctx.pending_ports[lid] = port;
+    send({ op: "ext-connect", ext: extId, lid: lid, name: name || "" });
+    return port;
+  }
+
+  /// The browser process numbered a port we opened: flush anything the
+  /// caller already posted, in order.
+  function extPortOpen(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) return;
+    var port = ctx.pending_ports[m.lid];
+    if (!port) return;
+    delete ctx.pending_ports[m.lid];
+    if (!m.gid) {
+      // Nothing on the other end. MV2 answers that with an immediate
+      // onDisconnect rather than a hang.
+      port.dead = true;
+      fireAll(port.onDisconnect, [port]);
+      return;
+    }
+    port.gid = m.gid;
+    ctx.ports[m.gid] = port;
+    var queued = port.pre;
+    port.pre = [];
+    for (var i = 0; i < queued.length; i++) {
+      send({ op: "ext-port-msg", gid: m.gid, msg: queued[i] === undefined ? null : queued[i] });
+    }
+  }
+
+  /// Somebody connected TO this frame: build the receiving Port and hand
+  /// it to `runtime.onConnect`.
+  function extPortIncoming(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) {
+      send({ op: "ext-port-close", gid: m.gid });
+      return;
+    }
+    var port = makePort(m.ext, ctx, m.name || "", m.sender || null);
+    port.gid = m.gid;
+    ctx.ports[m.gid] = port;
+    fireAll(ctx.connect, [port]);
+  }
+
+  function extPortRecv(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) return;
+    var port = ctx.ports[m.gid];
+    if (!port) return;
+    fireAll(port.onMessage, [m.msg, port]);
+  }
+
+  function extPortClosed(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx) return;
+    var port = ctx.ports[m.gid];
+    if (!port) return;
+    delete ctx.ports[m.gid];
+    port.dead = true;
+    fireAll(port.onDisconnect, [port]);
+  }
+
+  function fireAll(ev, args) {
+    var fns = ev._fns.slice();
+    for (var i = 0; i < fns.length; i++) {
+      try {
+        fns[i].apply(null, args);
+      } catch (e) {}
+    }
+  }
+
+  /// A `tabs.on*` event pushed from the browser process.
+  function extTabEvent(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx || !ctx.tabs) return;
+    var ev = ctx.tabs[m.ev];
+    if (!ev) return;
+    fireAll(ev, m.args || []);
+  }
+
+  // An `ext-inject` carrying the process NONCE is PRIVILEGED: it may
+  // publish `browser`/`chrome` as real globals on this document, which
+  // is what an extension page (background, popup, options) needs before
+  // its own first statement runs. The nonce is the same secret every
+  // reply is authenticated with, and only the browser process — which
+  // generated the served document — knows it.
+  //
+  // Without it, `ext-inject` still runs its scripts in a closure, as it
+  // always has. That distinction matters because `window[SLOT]` is a
+  // non-enumerable but discoverable own property: a page can find it
+  // and call it. Being able to run its OWN code in its OWN closure
+  // costs a page nothing, but a `browser` object bound to an installed
+  // extension's id would reach that extension's `storage.local`, so
+  // that half is gated.
+  function extPrivileged(m) {
+    return m.priv === true && typeof m.tok === "string" && m.tok === NONCE;
   }
 
   function extInject(m) {
     var extId = m.ext;
+    if (m.dbg) extDebug = true;
+    if (typeof m.uilang === "string" && m.uilang) extUiLanguage = m.uilang;
     if (m.css) {
       for (var i = 0; i < m.css.length; i++) {
         try {
@@ -1268,13 +1775,20 @@
         } catch (e) {}
       }
     }
+    var privileged = extPrivileged(m);
     if (!m.scripts || !m.scripts.length) {
-      // A background page with no scripts, or css-only content: still
-      // register the ctx so messages can be delivered.
-      if (!extCtx[extId]) makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+      // A background page with no scripts to run here, or css-only
+      // content: still register the ctx so messages can be delivered.
+      var api0 = extCtx[extId]
+        ? extApiOf[extId]
+        : makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+      if (privileged) publishGlobals(api0);
       return;
     }
-    var api = makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+    var api = extCtx[extId]
+      ? extApiOf[extId]
+      : makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+    if (privileged) publishGlobals(api);
     for (var j = 0; j < m.scripts.length; j++) {
       try {
         var fn = new Function("browser", "chrome", "self", m.scripts[j]);
@@ -1285,6 +1799,19 @@
         } catch (e3) {}
       }
     }
+  }
+
+  // `browser` and `chrome` as real globals, for a document that IS the
+  // extension. An author script says `browser.runtime.getManifest()` at
+  // top level and there is no closure to hand it one.
+  function publishGlobals(api) {
+    if (!api) return;
+    try {
+      if (!window.browser) window.browser = api;
+    } catch (e) {}
+    try {
+      if (!window.chrome) window.chrome = api;
+    } catch (e2) {}
   }
 
   // A runtime message routed to THIS frame's listeners (the background
@@ -1331,6 +1858,12 @@
 
   function extResult(m) {
     var fn = extPending[m.req];
+    if (extDebug) {
+      try {
+        console.log("SKEXT result#" + m.req + " ok=" + m.ok + " pending=" + !!fn +
+          " " + JSON.stringify(m.result).slice(0, 160));
+      } catch (e) {}
+    }
     if (!fn) return;
     delete extPending[m.req];
     fn(m.ok === false ? undefined : m.result);
@@ -1405,6 +1938,21 @@
         break;
       case "ext-changed":
         extChanged(m);
+        break;
+      case "ext-port-open":
+        extPortOpen(m);
+        break;
+      case "ext-port-incoming":
+        extPortIncoming(m);
+        break;
+      case "ext-port-recv":
+        extPortRecv(m);
+        break;
+      case "ext-port-closed":
+        extPortClosed(m);
+        break;
+      case "ext-tab-event":
+        extTabEvent(m);
         break;
       default:
         break;

@@ -16,6 +16,37 @@ const manifest = @import("manifest.zig");
 const match = @import("match.zig");
 const storage = @import("storage.zig");
 const webrequest = @import("webrequest.zig");
+const origins = @import("origins.zig");
+const i18n = @import("i18n.zig");
+const tabs = @import("tabs.zig");
+
+/// The session's language tag, for `i18n` locale negotiation. POSIX
+/// order, and everything after the encoding or modifier is dropped
+/// (`nl_BE.UTF-8@euro` -> `nl_BE`).
+pub fn uiLanguage() []const u8 {
+    const State = struct {
+        var buf: [origins.MAX_LOCALE]u8 = undefined;
+        var val: []const u8 = &.{};
+        var done = false;
+    };
+    if (State.done) return State.val;
+    State.done = true;
+    for ([_][]const u8{ "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG" }) |name| {
+        var zbuf: [16]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{name}) catch continue;
+        const raw = c.getenv(z.ptr) orelse continue;
+        var s: []const u8 = std.mem.span(raw);
+        // LANGUAGE is a colon-separated preference list.
+        if (std.mem.indexOfScalar(u8, s, ':')) |i| s = s[0..i];
+        if (std.mem.indexOfAny(u8, s, ".@")) |i| s = s[0..i];
+        if (s.len == 0 or s.len > State.buf.len) continue;
+        if (std.mem.eql(u8, s, "C") or std.mem.eql(u8, s, "POSIX")) continue;
+        @memcpy(State.buf[0..s.len], s);
+        State.val = State.buf[0..s.len];
+        return State.val;
+    }
+    return State.val;
+}
 
 pub const Extension = struct {
     /// Stable id (the client's), owned.
@@ -54,6 +85,10 @@ pub const Host = struct {
     /// `<data>/<id>/storage.json`. Owned.
     data_dir: []u8 = &.{},
     exts: std.ArrayList(Extension) = .empty,
+    /// The GUI's tab set, mirrored here. Empty until the client posts
+    /// one, which is honest: an extension then sees no tabs rather than
+    /// invented ones.
+    tabs: tabs.Table = .{},
 
     pub fn init(gpa: std.mem.Allocator) Host {
         return .{ .gpa = gpa, .data_dir = resolveDataDir(gpa) };
@@ -62,6 +97,7 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         for (self.exts.items) |*e| self.freeExt(e);
         self.exts.deinit(self.gpa);
+        self.tabs.deinit(self.gpa);
         self.gpa.free(self.data_dir);
     }
 
@@ -341,6 +377,15 @@ pub const Host = struct {
         const args = if (parsed.value == .array) parsed.value.array.items else &[_]std.json.Value{};
 
         if (std.mem.eql(u8, method, "get")) {
+            // An OBJECT argument is `{key: default}`, not a key list:
+            // its values are what an unstored key must come back as.
+            // Treating it as a key list is why every extension's
+            // first-run settings used to arrive empty.
+            if (args.len > 0 and args[0] == .object) {
+                const obj = s.getWithDefaults(self.gpa, args[0].object) catch return self.errResult("oom");
+                defer self.gpa.free(obj);
+                return self.wrapResult(obj);
+            }
             const keys = self.keysFromArg(if (args.len > 0) args[0] else .null) catch return self.errResult("oom");
             defer self.gpa.free(keys);
             const obj = s.get(self.gpa, keys) catch return self.errResult("oom");
@@ -387,14 +432,25 @@ pub const Host = struct {
     }
 
     fn dispatchI18n(self: *Host, e: *Extension, method: []const u8, args_json: []const u8) []u8 {
+        if (std.mem.eql(u8, method, "getUILanguage")) {
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            aw.writer.writeAll("{\"result\":") catch return self.errResult("oom");
+            std.json.Stringify.value(uiLanguage(), .{}, &aw.writer) catch return self.errResult("oom");
+            aw.writer.writeByte('}') catch return self.errResult("oom");
+            return aw.toOwnedSlice() catch self.errResult("oom");
+        }
         if (!std.mem.eql(u8, method, "getMessage")) return self.errResult("unknown i18n method");
         var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch
             return self.errResult("bad args");
         defer parsed.deinit();
         const args = if (parsed.value == .array) parsed.value.array.items else &[_]std.json.Value{};
         if (args.len == 0 or args[0] != .string) return self.gpa.dupe(u8, "{\"result\":\"\"}") catch self.errResult("oom");
-        const key = args[0].string;
-        const msg = self.lookupMessage(e, key) orelse return self.gpa.dupe(u8, "{\"result\":\"\"}") catch self.errResult("oom");
+        const subs = i18n.substitutionsFrom(self.gpa, if (args.len > 1) args[1] else .null) catch
+            return self.errResult("oom");
+        defer self.gpa.free(subs);
+        const msg = self.lookupMessage(e, args[0].string, subs) orelse
+            return self.gpa.dupe(u8, "{\"result\":\"\"}") catch self.errResult("oom");
         defer self.gpa.free(msg);
         var aw: std.Io.Writer.Allocating = .init(self.gpa);
         defer aw.deinit();
@@ -404,11 +460,11 @@ pub const Host = struct {
         return aw.toOwnedSlice() catch self.errResult("oom");
     }
 
-    /// `_locales/<default_locale>/messages.json` -> the `message` field
-    /// of `key`. Minimal: no substitutions, no locale negotiation.
-    fn lookupMessage(self: *Host, e: *Extension, key: []const u8) ?[]u8 {
-        const m = if (e.man) |*mm| mm else return null;
-        const locale = m.default_locale orelse return null;
+    /// `_locales/<negotiated>/messages.json` -> the `message` of `key`,
+    /// with its `$1`/`$name$` placeholders expanded.
+    fn lookupMessage(self: *Host, e: *Extension, key: []const u8, subs: []const []const u8) ?[]u8 {
+        var lbuf: [origins.MAX_LOCALE]u8 = undefined;
+        const locale = self.resolveLocale(e, &lbuf) orelse return null;
         var buf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&buf, "{s}/_locales/{s}/messages.json", .{ e.dir, locale }) catch return null;
         const bytes = readFileZ(self.gpa, path, 4 * 1024 * 1024) orelse return null;
@@ -420,18 +476,92 @@ pub const Host = struct {
         if (entry != .object) return null;
         const msg = entry.object.get("message") orelse return null;
         if (msg != .string) return null;
-        return self.gpa.dupe(u8, msg.string) catch null;
+        const holders = entry.object.get("placeholders");
+        const ph: i18n.Placeholders = if (holders != null and holders.? == .object) holders.?.object else null;
+        return i18n.expand(self.gpa, msg.string, ph, subs) catch null;
     }
 
-    /// Minimal `browser.tabs`: query returns an empty list here (the GUI
-    /// owns the real tab set; a later wave forwards it over the wire),
-    /// and get/sendMessage answer benignly. Kept so an extension that
-    /// probes tabs does not throw.
-    fn dispatchTabs(self: *Host, e: *Extension, method: []const u8, _: []const u8) []u8 {
+    /// The `_locales` directory to read for this extension: the session
+    /// language when the package ships it, else `default_locale`.
+    /// Written into `out`; null when the package is not localized.
+    pub fn resolveLocale(self: *Host, e: *Extension, out: []u8) ?[]const u8 {
+        const m = if (e.man) |*mm| mm else return null;
+        const default_locale = m.default_locale orelse return null;
+        var names: [64][]const u8 = undefined;
+        var store: [64 * origins.MAX_LOCALE]u8 = undefined;
+        const avail = self.listLocales(e, &names, &store);
+        const pick = i18n.pickLocale(avail, uiLanguage(), default_locale);
+        if (pick.len > out.len) return null;
+        @memcpy(out[0..pick.len], pick);
+        return out[0..pick.len];
+    }
+
+    /// Directory names under `<dir>/_locales`. Copies each name into
+    /// `store`, because a `readdir` entry is only valid until the next
+    /// call.
+    fn listLocales(self: *Host, e: *Extension, names: [][]const u8, store: []u8) [][]const u8 {
+        _ = self;
+        var buf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&buf, "{s}/_locales", .{e.dir}) catch return names[0..0];
+        const dir = c.opendir(path.ptr) orelse return names[0..0];
+        defer _ = c.closedir(dir);
+        var n: usize = 0;
+        var used: usize = 0;
+        while (n < names.len) {
+            const ent = c.readdir(dir) orelse break;
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+            if (name.len == 0 or name[0] == '.') continue;
+            if (name.len > origins.MAX_LOCALE or used + name.len > store.len) continue;
+            @memcpy(store[used..][0..name.len], name);
+            names[n] = store[used..][0..name.len];
+            used += name.len;
+            n += 1;
+        }
+        return names[0..n];
+    }
+
+    /// `browser.tabs` over the table the CLIENT mirrors into `self.tabs`
+    /// (`webext_tabs`). `query` and `get` are answered here; `sendMessage`
+    /// is NOT — it has to reach a frame, which only the engine side can
+    /// do, so `cefhost` intercepts that method before dispatch and this
+    /// arm never sees it.
+    fn dispatchTabs(self: *Host, e: *Extension, method: []const u8, args_json: []const u8) []u8 {
+        // MV2 gates the url/title fields of a Tab on the `tabs`
+        // permission; the identity fields are always visible. Refusing
+        // the whole namespace would be wrong (uBO reads tab ids with
+        // only `<all_urls>`), so the permission is checked where it
+        // applies rather than at the door.
         _ = e;
-        if (std.mem.eql(u8, method, "query")) return self.gpa.dupe(u8, "{\"result\":[]}") catch self.errResult("oom");
-        if (std.mem.eql(u8, method, "get")) return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
-        if (std.mem.eql(u8, method, "sendMessage")) return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
+        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch
+            return self.errResult("bad args");
+        defer parsed.deinit();
+        const args = if (parsed.value == .array) parsed.value.array.items else &[_]std.json.Value{};
+
+        if (std.mem.eql(u8, method, "query")) {
+            var ids: [256]u32 = undefined;
+            const hits = self.tabs.query(self.gpa, if (args.len > 0) args[0] else .null, &ids);
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            aw.writer.writeAll("{\"result\":[") catch return self.errResult("oom");
+            for (hits, 0..) |id, i| {
+                if (i != 0) aw.writer.writeByte(',') catch return self.errResult("oom");
+                const tb = self.tabs.find(id) orelse continue;
+                tabs.Table.writeTab(tb, &aw.writer) catch return self.errResult("oom");
+            }
+            aw.writer.writeAll("]}") catch return self.errResult("oom");
+            return aw.toOwnedSlice() catch self.errResult("oom");
+        }
+        if (std.mem.eql(u8, method, "get")) {
+            if (args.len == 0 or args[0] != .integer) return self.errResult("bad tab id");
+            const tb = self.tabs.find(@intCast(@max(args[0].integer, 0))) orelse
+                return self.errResult("no such tab");
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            aw.writer.writeAll("{\"result\":") catch return self.errResult("oom");
+            tabs.Table.writeTab(tb, &aw.writer) catch return self.errResult("oom");
+            aw.writer.writeByte('}') catch return self.errResult("oom");
+            return aw.toOwnedSlice() catch self.errResult("oom");
+        }
         return self.errResult("unknown tabs method");
     }
 

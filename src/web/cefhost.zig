@@ -50,6 +50,10 @@ const webexthost = @import("webext/host.zig");
 const extmatch = @import("webext/match.zig");
 const extmanifest = @import("webext/manifest.zig");
 const webrequest = @import("webext/webrequest.zig");
+const extassets = @import("webext/assets.zig");
+const extorigins = @import("webext/origins.zig");
+const bgpage = @import("webext/bgpage.zig");
+const exttabs = @import("webext/tabs.zig");
 const manifestRunAt = extmanifest.RunAt;
 const manifestContentScript = extmanifest.ContentScript;
 
@@ -518,7 +522,52 @@ pub const View = struct {
     /// posts nothing for it.
     webext_bg: bool = false,
 
+    /// The background page was spawned AT its `chrome-extension://`
+    /// origin, so the engine loads its scripts and nothing is injected.
+    ///
+    /// A separate flag rather than a test on `url`, because `url` is
+    /// fed by `onAddressChange`, which deliberately ignores background
+    /// views (they face no client) and so leaves it empty forever.
+    webext_origin: bool = false,
+
+    /// CEF frame identifiers seen on this view, in the order seen. The
+    /// INDEX is MV2's `frameId`, so the main frame is 0 by construction
+    /// (it is always the first frame a view has). CEF's own identifier
+    /// is an opaque string and no use to an extension.
+    frame_ids: std.ArrayList([]u8) = .empty,
+
+    /// The frame the message being dispatched RIGHT NOW arrived on.
+    ///
+    /// Set by `onProcessMessage` immediately before `onScriptMessage`
+    /// and meaningless outside that call. The whole path is synchronous
+    /// and on one thread, so a field carries it; threading a frame id
+    /// through every `ext-*` handler's signature would buy nothing and
+    /// touch a dozen call sites.
+    cur_frame_id: u32 = 0,
+
     const PoolEntry = struct { ino: u64 = 0, id: u32 = 0, seen: u64 = 0 };
+
+    /// MV2 `frameId` for a CEF frame identifier, minting one on first
+    /// sight. Bounded: a page that mints frames forever gets `-1`-style
+    /// fallback 0 rather than an unbounded table.
+    fn frameIdFor(self: *View, gpa: std.mem.Allocator, ident: []const u8) u32 {
+        for (self.frame_ids.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f, ident)) return @intCast(i);
+        }
+        if (self.frame_ids.items.len >= 512) return 0;
+        const copy = gpa.dupe(u8, ident) catch return 0;
+        self.frame_ids.append(gpa, copy) catch {
+            gpa.free(copy);
+            return 0;
+        };
+        return @intCast(self.frame_ids.items.len - 1);
+    }
+
+    fn forgetFrames(self: *View, gpa: std.mem.Allocator) void {
+        for (self.frame_ids.items) |f| gpa.free(f);
+        self.frame_ids.deinit(gpa);
+        self.frame_ids = .empty;
+    }
 
     fn stride(self: *const View) u32 {
         return @as(u32, self.pw) * 4;
@@ -692,6 +741,11 @@ pub const Host = struct {
     /// can find its way home. Bounded — the oldest is dropped.
     webext_routes: std.ArrayList(MsgRoute) = .empty,
     webext_next_gid: u32 = 1,
+    webext_ports: std.ArrayList(Port) = .empty,
+    webext_next_port: u32 = 1,
+    /// Extension ids awaiting a `runtime.reload`, performed on the next
+    /// poll turn rather than inside the call that asked for it.
+    webext_reload: std.ArrayList([]u8) = .empty,
     /// Root cache directory (the `--cache-dir`), under which a persistent
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
@@ -721,6 +775,26 @@ pub const Host = struct {
     /// One in-flight `runtime.sendMessage` from a content frame awaiting
     /// its background's reply.
     const MsgRoute = struct { gid: u32, origin_view: u32, origin_req: u32 };
+
+    /// One `runtime.connect` Port, from the browser process's point of
+    /// view: two views and the extension they belong to.
+    ///
+    /// The browser process mints the id because it is the only side that
+    /// can see both ends. Frames key their own Port objects on the same
+    /// id, so a message needs no translation — just "send it to the
+    /// other view".
+    const Port = struct {
+        gid: u32,
+        ext: []u8,
+        a_view: u32,
+        b_view: u32,
+
+        fn peerOf(self: *const Port, view: u32) u32 {
+            if (self.a_view == view) return self.b_view;
+            if (self.b_view == view) return self.a_view;
+            return 0;
+        }
+    };
 
     /// One `print_pdf` in flight.
     const Print = struct { view: u32, path: []u8 };
@@ -791,6 +865,11 @@ pub const Host = struct {
         self.views.deinit(self.gpa);
         self.webext.deinit();
         self.webext_routes.deinit(self.gpa);
+        for (self.webext_ports.items) |p| self.gpa.free(p.ext);
+        self.webext_ports.deinit(self.gpa);
+        for (self.webext_reload.items) |p| self.gpa.free(p);
+        self.webext_reload.deinit(self.gpa);
+        extorigins.clear();
         for (self.prints.items) |p| self.gpa.free(p.path);
         self.prints.deinit(self.gpa);
         // destroyAll's dropBrowser sweep already cancelled and freed
@@ -987,6 +1066,9 @@ pub const Host = struct {
         // a page whose requests are held or a background page that was
         // going to answer them, nothing can answer once it is gone.
         wreqAbandonView(id);
+        // The same rule for Ports: a peer that is gone must produce an
+        // onDisconnect, never a Port that stays open forever.
+        self.portsAbandonView(id);
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
@@ -1522,6 +1604,7 @@ pub const Host = struct {
         self.dropBrowser(v, close);
         if (v.url.len != 0) self.gpa.free(v.url);
         v.pending.deinit(self.gpa);
+        v.forgetFrames(self.gpa);
         v.sem.deinit();
         self.gpa.destroy(v);
     }
@@ -2491,24 +2574,48 @@ pub const Host = struct {
             return;
         };
         if (e.enabled and e.ok) {
+            self.publishOrigin(e);
             self.ensureBackground(e);
             self.injectContentScriptsAll(e);
         } else {
             wreqAbandonExt(req.id);
+            self.portsAbandonExt(req.id);
             self.webext.clearListeners(e);
             self.teardownBackground(e);
+            self.unpublishOrigin(e.id);
         }
         self.postWebextState(e);
+    }
+
+    /// Make `chrome-extension://<host>/` resolve to this extension's
+    /// unpacked directory. The locale is negotiated HERE, on the main
+    /// thread, because the IO thread that serves the origin must not
+    /// scan a directory to work one out per request.
+    fn publishOrigin(self: *Host, e: *webexthost.Extension) void {
+        var host_buf: [16]u8 = undefined;
+        const host = extmanifest.originHost(e.id, &host_buf);
+        var loc_buf: [extorigins.MAX_LOCALE]u8 = undefined;
+        const locale = self.webext.resolveLocale(e, &loc_buf) orelse "";
+        const war: []const []const u8 = if (e.man) |*m| m.web_accessible_resources else &.{};
+        _ = extorigins.publish(host, e.id, e.dir, war, locale);
+    }
+
+    fn unpublishOrigin(self: *Host, id: []const u8) void {
+        _ = self;
+        var host_buf: [16]u8 = undefined;
+        extorigins.unpublish(extmanifest.originHost(id, &host_buf));
     }
 
     pub fn webextRemove(self: *Host, id: []const u8) void {
         // An enumerated exit: every request this extension was holding
         // is continued before its registry goes away.
         wreqAbandonExt(id);
+        self.portsAbandonExt(id);
         if (self.webext.find(id)) |e| {
             self.webext.clearListeners(e);
             self.teardownBackground(e);
         }
+        self.unpublishOrigin(id);
         self.webext.remove(id);
         // A removal has no dedicated frame; the client already dropped
         // the row. Nothing more to report.
@@ -2516,6 +2623,116 @@ pub const Host = struct {
 
     pub fn webextList(self: *Host) void {
         for (self.webext.exts.items) |*e| self.postWebextState(e);
+    }
+
+    /// `webext_tabs`: replace the mirrored tab list and turn the DIFF
+    /// into MV2 `tabs.on*` events for every enabled extension.
+    ///
+    /// Deriving the events from a replace-all diff rather than trusting
+    /// the client to send them is what makes a dropped or coalesced
+    /// update harmless: the table is the truth and the events are a
+    /// function of two consecutive tables.
+    pub fn webextTabs(self: *Host, tabs_json: []const u8) void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, tabs_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+
+        var incoming: std.ArrayList(exttabs.Incoming) = .empty;
+        defer incoming.deinit(self.gpa);
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const o = item.object;
+            incoming.append(self.gpa, .{
+                .id = jsonU32(o, "id"),
+                .view = jsonU32(o, "view"),
+                .window_id = jsonU32(o, "windowId"),
+                .index = jsonU32(o, "index"),
+                .active = jsonBool(o, "active"),
+                .focused_window = jsonBool(o, "focusedWindow"),
+                .url = jsonStrField(o, "url"),
+                .title = jsonStrField(o, "title"),
+                .loading = jsonBool(o, "loading"),
+            }) catch return;
+        }
+
+        var diff = self.webext.tabs.replace(self.gpa, incoming.items) catch return;
+        defer diff.deinit(self.gpa);
+        if (diff.empty()) return;
+
+        for (diff.created) |id| {
+            if (self.webext.tabs.find(id)) |tb| self.postTabEvent("onCreated", tb, null);
+        }
+        for (diff.updated) |ch| {
+            const tb = self.webext.tabs.find(ch.id) orelse continue;
+            self.postTabEvent("onUpdated", tb, ch);
+        }
+        if (diff.activated) |id| {
+            if (self.webext.tabs.find(id)) |tb| self.postTabEvent("onActivated", tb, null);
+        }
+        for (diff.removed) |id| self.postTabRemoved(id);
+    }
+
+    /// One `tabs.on*` event, to every enabled extension's background
+    /// page. Content frames do not get them: MV2 delivers `tabs` events
+    /// to extension pages only.
+    fn postTabEvent(self: *Host, ev: []const u8, tb: *const exttabs.Tab, change: ?exttabs.Change) void {
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok) continue;
+            const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
+            if (bg == null) continue;
+            var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+            defer cmd.deinit();
+            const w = &cmd.writer;
+            w.writeAll("{\"op\":\"ext-tab-event\",\"ext\":") catch continue;
+            jsonStr(w, e.id) catch continue;
+            w.writeAll(",\"ev\":") catch continue;
+            jsonStr(w, ev) catch continue;
+            w.writeAll(",\"args\":[") catch continue;
+            if (std.mem.eql(u8, ev, "onActivated")) {
+                w.print("{{\"tabId\":{d},\"windowId\":{d}}}", .{ tb.id, tb.window_id }) catch continue;
+            } else if (change) |ch| {
+                // MV2's onUpdated: (tabId, changeInfo, tab).
+                w.print("{d},{{", .{tb.id}) catch continue;
+                var first = true;
+                if (ch.url) {
+                    w.writeAll("\"url\":") catch continue;
+                    jsonStr(w, tb.url) catch continue;
+                    first = false;
+                }
+                if (ch.title) {
+                    if (!first) w.writeByte(',') catch continue;
+                    w.writeAll("\"title\":") catch continue;
+                    jsonStr(w, tb.title) catch continue;
+                    first = false;
+                }
+                if (ch.status) {
+                    if (!first) w.writeByte(',') catch continue;
+                    w.writeAll("\"status\":") catch continue;
+                    jsonStr(w, if (tb.loading) "loading" else "complete") catch continue;
+                }
+                w.writeAll("},") catch continue;
+                exttabs.Table.writeTab(tb, w) catch continue;
+            } else {
+                exttabs.Table.writeTab(tb, w) catch continue;
+            }
+            w.writeAll("]}") catch continue;
+            self.sendScript(bg.?, cmd.written());
+        }
+    }
+
+    fn postTabRemoved(self: *Host, id: u32) void {
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok) continue;
+            const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
+            if (bg == null) continue;
+            var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+            defer cmd.deinit();
+            const w = &cmd.writer;
+            w.writeAll("{\"op\":\"ext-tab-event\",\"ext\":") catch continue;
+            jsonStr(w, e.id) catch continue;
+            w.print(",\"ev\":\"onRemoved\",\"args\":[{d},{{\"windowId\":0,\"isWindowClosing\":false}}]}}", .{id}) catch continue;
+            self.sendScript(bg.?, cmd.written());
+        }
     }
 
     fn postWebextState(self: *Host, e: *webexthost.Extension) void {
@@ -2558,7 +2775,10 @@ pub const Host = struct {
         };
         e.bg_view = id;
         webrequest.setBgView(e.id, id);
-        self.spawnBackground(v) catch {
+        var url_buf: [512]u8 = undefined;
+        const url = self.backgroundUrl(e, &url_buf);
+        v.webext_origin = std.mem.startsWith(u8, url, ext_scheme ++ "://");
+        self.spawnBackground(v, url) catch {
             webrequest.setBgView(e.id, 0);
             self.destroyView(id);
             e.bg_view = 0;
@@ -2566,17 +2786,48 @@ pub const Host = struct {
         };
     }
 
+    /// Where a background page lives.
+    ///
+    /// With a working `chrome-extension://` scheme this is the AUTHOR's
+    /// document at the extension's own origin, which is the whole reason
+    /// the scheme exists: the engine then loads its `<script src>` in
+    /// document order, ES modules and all, and every relative url,
+    /// `fetch` and `import` inside resolves. `background.scripts` gets a
+    /// generated document at the same origin, so both forms end up with
+    /// one origin and one code path.
+    ///
+    /// Without the scheme (it was refused, or the extension declares no
+    /// background page) it falls back to the old `data:` document, and
+    /// `injectBackground` evaluates the scraped scripts instead — which
+    /// cannot run a module and says so in the log.
+    fn backgroundUrl(self: *Host, e: *webexthost.Extension, buf: []u8) []const u8 {
+        const fallback = "data:text/html,<!doctype html><title>bg</title>";
+        if (!ext_scheme_ok) return fallback;
+        const man = if (e.man) |*m| m else return fallback;
+        const bg = man.background orelse return fallback;
+        var host_buf: [16]u8 = undefined;
+        const host = extmanifest.originHost(e.id, &host_buf);
+        _ = self;
+        if (bg.page) |page| {
+            const clean = std.mem.trimStart(u8, page, "/");
+            return std.fmt.bufPrint(buf, ext_scheme ++ "://{s}/{s}", .{ host, clean }) catch fallback;
+        }
+        // `background.scripts`: a generated document at the same origin.
+        // The path is reserved and served by the scheme handler.
+        return std.fmt.bufPrint(buf, ext_scheme ++ "://{s}{s}", .{
+            host, extorigins.GENERATED_BG_PATH,
+        }) catch fallback;
+    }
+
     /// Like `spawnBrowser` but for a hidden background page: no frame
     /// buffer, so it never paints or is announced. The semantic bridge
     /// still injects at context creation, so `injectBackground` can send
     /// its scripts on load.
-    fn spawnBackground(self: *Host, v: *View) !void {
+    fn spawnBackground(self: *Host, v: *View, url_utf8: []const u8) !void {
         var winfo = windowlessInfo(v);
         var bsettings = windowlessSettings(v);
         var url = std.mem.zeroes(cef.cef_string_t);
-        // A minimal document so the main frame exists and the bridge
-        // injects; the background scripts arrive over the bridge.
-        setStr("data:text/html,<!doctype html><title>bg</title>", &url);
+        setStr(url_utf8, &url);
         defer cef.cef_string_utf16_clear(&url);
         self.pending = v;
         defer self.pending = null;
@@ -2611,7 +2862,11 @@ pub const Host = struct {
         for (self.views.items) |v| {
             if (v.webext_bg or v.discarded or v.browser == null) continue;
             if (v.url.len == 0) continue;
-            self.injectExtInto(v, e, null);
+            const b = v.browser orelse continue;
+            const gf = b.get_main_frame orelse continue;
+            const frame: *cef.cef_frame_t = gf(b) orelse continue;
+            defer release(&frame.base);
+            self.injectExtInto(frame, v.url, e, null);
         }
     }
 
@@ -2619,19 +2874,41 @@ pub const Host = struct {
     /// url. `only_phase` null runs every content script (load end / late
     /// enable); a specific phase runs only scripts whose `run_at` equals
     /// it (load start, for document_start scripts).
-    fn injectMatchingExtensions(self: *Host, v: *View, only_phase: ?manifestRunAt) void {
+    fn injectMatchingExtensions(
+        self: *Host,
+        v: *View,
+        frame: *cef.cef_frame_t,
+        only_phase: ?manifestRunAt,
+    ) void {
         if (v.webext_bg) return;
+        // A SUBFRAME's own url decides what matches there — an ad iframe
+        // on `ads.example` is not the page's origin, and `all_frames`
+        // exists precisely to reach it.
+        const main = isMainFrame(frame);
+        var url_buf: [2048]u8 = undefined;
+        const url = if (main) v.url else blk: {
+            const gu = frame.get_url orelse break :blk v.url;
+            const u = userfreeInto(gu(frame), &url_buf);
+            break :blk if (u.len != 0) u else v.url;
+        };
         for (self.webext.exts.items) |*e| {
             if (!e.enabled or !e.ok) continue;
-            self.injectExtInto(v, e, only_phase);
+            self.injectExtInto(frame, url, e, only_phase);
         }
     }
 
     /// Build and send one `ext-inject` for extension `e` into view `v`,
     /// including only content scripts whose match patterns accept the
     /// url and (when `only_phase` is set) whose run_at equals it.
-    fn injectExtInto(self: *Host, v: *View, e: *webexthost.Extension, only_phase: ?manifestRunAt) void {
+    fn injectExtInto(
+        self: *Host,
+        frame: *cef.cef_frame_t,
+        url: []const u8,
+        e: *webexthost.Extension,
+        only_phase: ?manifestRunAt,
+    ) void {
         const man = if (e.man) |*m| m else return;
+        const main = isMainFrame(frame);
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
@@ -2649,7 +2926,11 @@ pub const Host = struct {
             if (only_phase) |p| {
                 if (cs.run_at != p) continue;
             }
-            if (!self.contentScriptMatches(cs, v.url)) continue;
+            // `all_frames` was parsed and honoured by nothing: every
+            // injection went to the main frame. Honouring it is the
+            // whole point of ad-iframe filtering.
+            if (!main and !cs.all_frames) continue;
+            if (!self.contentScriptMatches(cs, url)) continue;
             any = true;
             for (cs.css) |rel| {
                 const bytes = self.webext.readAsset(e, rel) orelse continue;
@@ -2672,8 +2953,13 @@ pub const Host = struct {
         jsonStr(w, e.id) catch return;
         w.writeAll(",\"base\":") catch return;
         var base_buf: [256]u8 = undefined;
-        const base = std.fmt.bufPrint(&base_buf, "chrome-extension://{s}/", .{e.id}) catch "";
+        var host_buf: [16]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{
+            extmanifest.originHost(e.id, &host_buf),
+        }) catch "";
         jsonStr(w, base) catch return;
+        w.writeAll(",\"uilang\":") catch return;
+        jsonStr(w, webexthost.uiLanguage()) catch return;
         // manifest inline (small), for getManifest.
         w.writeAll(",\"manifest\":") catch return;
         self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
@@ -2684,7 +2970,7 @@ pub const Host = struct {
         w.writeAll("],\"scripts\":[") catch return;
         w.writeAll(js_buf.written()) catch return;
         w.writeAll("]}") catch return;
-        self.sendScript(v, cmd.written());
+        self.sendScriptToFrame(frame, cmd.written());
     }
 
     fn writeManifestJson(self: *Host, w: *std.Io.Writer, e: *webexthost.Extension) !void {
@@ -2700,11 +2986,8 @@ pub const Host = struct {
     /// `null`) so `browser.i18n.getMessage` resolves synchronously in
     /// the content script.
     fn writeMessagesJson(self: *Host, w: *std.Io.Writer, e: *webexthost.Extension) void {
-        const man = if (e.man) |*m| m else {
-            w.writeAll("null") catch {};
-            return;
-        };
-        const locale = man.default_locale orelse {
+        var loc_buf: [extorigins.MAX_LOCALE]u8 = undefined;
+        const locale = self.webext.resolveLocale(e, &loc_buf) orelse {
             w.writeAll("null") catch {};
             return;
         };
@@ -2730,19 +3013,34 @@ pub const Host = struct {
         return set.matchesUrl(url);
     }
 
-    /// Inject background scripts into the background page once its
-    /// document is up (called from the load handler).
+    /// Bring an extension's background page up once its document is
+    /// loaded (called from the load handler).
+    ///
+    /// On the ORIGIN path there is nothing to do: the served document
+    /// already carried the bootstrap and the engine already loaded the
+    /// author's scripts itself, in document order, modules included.
+    /// This function is therefore the FALLBACK — reached only when the
+    /// `chrome-extension` scheme was refused — and it evaluates the
+    /// scripts through the bridge instead.
     fn injectBackground(self: *Host, v: *View, e: *webexthost.Extension) void {
+        if (v.webext_origin) return;
         const man = if (e.man) |*m| m else return;
         const bg = man.background orelse return;
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
-        w.writeAll("{\"op\":\"ext-inject\",\"ext\":") catch return;
+        w.writeAll("{\"op\":\"ext-inject\",\"tok\":\"") catch return;
+        w.writeAll(&sem_secret.nonce) catch return;
+        w.writeAll("\",\"priv\":true,") catch return;
+        if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("\"dbg\":true,") catch return;
+        w.writeAll("\"ext\":") catch return;
         jsonStr(w, e.id) catch return;
         w.writeAll(",\"base\":") catch return;
         var base_buf: [256]u8 = undefined;
-        const base = std.fmt.bufPrint(&base_buf, "chrome-extension://{s}/", .{e.id}) catch "";
+        var host_buf: [16]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{
+            extmanifest.originHost(e.id, &host_buf),
+        }) catch "";
         jsonStr(w, base) catch return;
         w.writeAll(",\"manifest\":") catch return;
         self.writeManifestJson(w, e) catch w.writeAll("{}") catch return;
@@ -2750,6 +3048,14 @@ pub const Host = struct {
         self.writeMessagesJson(w, e);
         w.writeAll(",\"css\":[],\"scripts\":[") catch return;
         var first = true;
+        if (bg.page) |page| {
+            // `background.page`: read the document and run its scripts
+            // in source order. A MODULE cannot be run this way (a static
+            // import is a SyntaxError under `new Function`) so it is
+            // skipped with a diagnostic rather than thrown into the log
+            // as a mystery parse error.
+            self.writeBackgroundPageScripts(w, e, page, &first);
+        }
         for (bg.scripts) |rel| {
             const bytes = self.webext.readAsset(e, rel) orelse continue;
             defer self.gpa.free(bytes);
@@ -2759,6 +3065,41 @@ pub const Host = struct {
         }
         w.writeAll("]}") catch return;
         self.sendScript(v, cmd.written());
+    }
+
+    /// Append a `background.page` document's scripts, in source order,
+    /// to an `ext-inject` script array. FALLBACK PATH ONLY.
+    fn writeBackgroundPageScripts(
+        self: *Host,
+        w: *std.Io.Writer,
+        e: *webexthost.Extension,
+        page: []const u8,
+        first: *bool,
+    ) void {
+        const html = self.webext.readAsset(e, page) orelse return;
+        defer self.gpa.free(html);
+        var buf: [64]bgpage.Script = undefined;
+        for (bgpage.scan(html, &buf)) |s| {
+            if (s.is_module) {
+                self.post(proto.EvConsole{
+                    .view = 0,
+                    .level = 2,
+                    .msg = "[webext] background module skipped: no chrome-extension:// origin",
+                });
+                continue;
+            }
+            const src: []const u8 = if (s.src.len != 0) blk: {
+                // Resolve relative to the page's own directory, as the
+                // document itself would.
+                var rel_buf: [1024]u8 = undefined;
+                const rel = extassets.resolveRelative(page, s.src, &rel_buf) orelse continue;
+                break :blk self.webext.readAsset(e, rel) orelse continue;
+            } else s.body;
+            defer if (s.src.len != 0) self.gpa.free(src);
+            if (!first.*) w.writeByte(',') catch {};
+            first.* = false;
+            jsonStr(w, src) catch {};
+        }
     }
 
     /// Handle one `ext-*` message from a content or background frame
@@ -2772,6 +3113,12 @@ pub const Host = struct {
             self.wreqDecision(json);
         } else if (std.mem.eql(u8, op, "ext-reply")) {
             self.extRouteReply(json);
+        } else if (std.mem.eql(u8, op, "ext-connect")) {
+            self.extPortConnect(v, json);
+        } else if (std.mem.eql(u8, op, "ext-port-msg")) {
+            self.extPortMessage(v, json);
+        } else if (std.mem.eql(u8, op, "ext-port-close")) {
+            self.extPortClose(v, json);
         } else if (std.mem.eql(u8, op, "ext-error")) {
             const E = struct { ext: []const u8 = "", msg: []const u8 = "" };
             const e = std.json.parseFromSlice(E, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
@@ -2808,6 +3155,30 @@ pub const Host = struct {
         // its own — it has no idea which frame called.
         if (std.mem.eql(u8, r.ns, "webRequest") and !v.webext_bg) {
             self.extReplyErr(v, r.req);
+            return;
+        }
+        // `tabs.sendMessage` has to reach a FRAME, which the engine-free
+        // host cannot do; it is answered here instead and never reaches
+        // `dispatchApi`.
+        if (std.mem.eql(u8, r.ns, "runtime") and std.mem.eql(u8, r.method, "reload")) {
+            self.extRequestReload(r.ext);
+            var buf: [96]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{r.req}) catch return;
+            self.sendScript(v, cmd);
+            return;
+        }
+        if (std.mem.eql(u8, r.ns, "tabs") and std.mem.eql(u8, r.method, "sendMessage")) {
+            self.extTabsSendMessage(v, r.ext, r.req, r.args);
+            return;
+        }
+        // `tabs.update`/`reload` navigate a VIEW, which again only the
+        // engine side can do. uBO reaches for `update` to show its
+        // "blocked page" document, so a stub that silently dropped it
+        // would leave the user on a dead tab with no explanation.
+        if (std.mem.eql(u8, r.ns, "tabs") and
+            (std.mem.eql(u8, r.method, "update") or std.mem.eql(u8, r.method, "reload")))
+        {
+            self.extTabsNavigate(v, r.req, r.method, r.args);
             return;
         }
         // Re-serialize args as a JSON array string for the host.
@@ -2887,12 +3258,343 @@ pub const Host = struct {
         const w = &cmd.writer;
         w.print("{{\"op\":\"ext-message\",\"ext\":", .{}) catch return;
         jsonStr(w, r.ext) catch return;
-        w.print(",\"gid\":{d},\"sender\":{{\"id\":", .{gid}) catch return;
-        jsonStr(w, r.ext) catch return;
-        w.writeAll("},\"msg\":") catch return;
+        w.print(",\"gid\":{d},\"sender\":", .{gid}) catch return;
+        self.writeSender(w, v, r.ext) catch return;
+        w.writeAll(",\"msg\":") catch return;
         std.json.Stringify.value(r.msg, .{}, w) catch return;
         w.writeByte('}') catch return;
         self.sendScript(bg.?, cmd.written());
+    }
+
+    /// `browser.runtime.reload()` — restart ONE extension.
+    ///
+    /// Not a nicety. uBlock Origin's first run ends with
+    /// `vAPI.app.restart()` and a bare `return`: on a Chromium-flavoured
+    /// browser with no stored version it deliberately abandons the rest
+    /// of its boot and waits to be started again. With `reload` stubbed
+    /// out as a no-op, uBO therefore sat forever half-initialised —
+    /// enabled, listening, and filtering NOTHING, with no error anywhere.
+    ///
+    /// Deferred to the next poll turn (`webextPump`) because it destroys
+    /// the background page whose script is mid-call.
+    fn extRequestReload(self: *Host, id: []const u8) void {
+        for (self.webext_reload.items) |pending| {
+            if (std.mem.eql(u8, pending, id)) return;
+        }
+        const copy = self.gpa.dupe(u8, id) catch return;
+        self.webext_reload.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
+    }
+
+    /// Perform the deferred extension restarts. Once per poll turn.
+    pub fn webextPump(self: *Host) void {
+        if (self.webext_reload.items.len == 0) return;
+        const pending = self.webext_reload.toOwnedSlice(self.gpa) catch return;
+        defer {
+            for (pending) |p| self.gpa.free(p);
+            self.gpa.free(pending);
+        }
+        for (pending) |id| {
+            const e = self.webext.find(id) orelse continue;
+            if (!e.enabled or !e.ok) continue;
+            // A full down-and-up: the listeners, the Ports and the
+            // background page all belong to the instance going away.
+            wreqAbandonExt(id);
+            self.portsAbandonExt(id);
+            self.webext.clearListeners(e);
+            self.teardownBackground(e);
+            self.publishOrigin(e);
+            self.ensureBackground(e);
+            self.injectContentScriptsAll(e);
+        }
+    }
+
+    /// `browser.tabs.update({url})` / `tabs.reload()` — navigate the
+    /// view a tab is showing.
+    fn extTabsNavigate(self: *Host, v: *View, req: u32, method: []const u8, args: std.json.Value) void {
+        const items = if (args == .array) args.array.items else &[_]std.json.Value{};
+        const raw_id: i64 = if (items.len > 0 and items[0] == .integer) items[0].integer else -1;
+        // A negative id means "the active tab", MV2's default.
+        const tb = blk: {
+            if (raw_id >= 0) break :blk self.webext.tabs.find(@intCast(raw_id));
+            for (self.webext.tabs.tabs.items) |*t| {
+                if (t.active) break :blk t;
+            }
+            break :blk null;
+        } orelse {
+            self.extReplyErr(v, req);
+            return;
+        };
+        const target = if (tb.view != 0) self.find(tb.view) else null;
+        if (target == null) {
+            self.extReplyErr(v, req);
+            return;
+        }
+        var url: []const u8 = "";
+        if (std.mem.eql(u8, method, "update")) {
+            if (items.len > 1 and items[1] == .object) {
+                if (items[1].object.get("url")) |u| {
+                    if (u == .string) url = u.string;
+                }
+            }
+        }
+        if (c.getenv("SKETERM_WEB_WREQ_DEBUG") != null) {
+            std.debug.print("tabs.{s} tab {d} -> \"{s}\"\n", .{ method, tb.id, url });
+        }
+        if (url.len != 0) {
+            self.navigate(.{ .view = target.?.id, .url = url });
+        } else if (std.mem.eql(u8, method, "reload")) {
+            self.navAction(.{ .view = target.?.id, .action = @intFromEnum(proto.NavAct.reload) });
+        }
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{req}) catch return;
+        self.sendScript(v, cmd);
+    }
+
+    /// `browser.tabs.sendMessage(tabId, message)` — the direction that
+    /// did not exist: background -> a CONTENT frame.
+    ///
+    /// It cannot live in `webext/host.zig` with the rest of `tabs`,
+    /// because delivering it means finding a view and evaluating in its
+    /// frames, which is engine work. It reuses the `webext_routes`
+    /// table, just with the roles swapped: the background is the origin
+    /// awaiting a reply and the content frame answers with `ext-reply`.
+    fn extTabsSendMessage(self: *Host, v: *View, ext: []const u8, req: u32, args: std.json.Value) void {
+        const items = if (args == .array) args.array.items else &[_]std.json.Value{};
+        if (items.len < 1 or items[0] != .integer) {
+            self.extReplyErr(v, req);
+            return;
+        }
+        const tab_id: u32 = @intCast(@max(items[0].integer, 0));
+        const tb = self.webext.tabs.find(tab_id) orelse {
+            self.extReplyErr(v, req);
+            return;
+        };
+        const target = if (tb.view != 0) self.find(tb.view) else null;
+        if (target == null) {
+            self.extReplyErr(v, req);
+            return;
+        }
+        const gid = self.webext_next_gid;
+        self.webext_next_gid +%= 1;
+        if (self.webext_next_gid == 0) self.webext_next_gid = 1;
+        if (self.webext_routes.items.len >= 256) _ = self.webext_routes.orderedRemove(0);
+        self.webext_routes.append(self.gpa, .{
+            .gid = gid,
+            .origin_view = v.id,
+            .origin_req = req,
+        }) catch {
+            self.extReplyErr(v, req);
+            return;
+        };
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-message\",\"ext\":") catch return;
+        jsonStr(w, ext) catch return;
+        w.print(",\"gid\":{d},\"sender\":{{\"id\":", .{gid}) catch return;
+        jsonStr(w, ext) catch return;
+        w.writeAll("},\"msg\":") catch return;
+        const msg = if (items.len > 1) items[1] else std.json.Value.null;
+        std.json.Stringify.value(msg, .{}, w) catch return;
+        w.writeByte('}') catch return;
+        // Every frame of the tab, so a content script in an iframe is
+        // reachable too; the FIRST reply wins, which is what MV2's
+        // single-response contract already means.
+        self.sendScriptAllFrames(target.?, cmd.written());
+    }
+
+    // -- runtime.connect Ports ----------------------------------------
+
+    /// A frame opened a Port. Mint the id, remember both ends, tell the
+    /// opener its number and the far end that it has a connection.
+    ///
+    /// The far end is the extension's background page (MV2 routes a
+    /// content script's `connect` there). A connect with no background
+    /// listening is answered with `gid = 0`, which the JS side turns
+    /// into an immediate `onDisconnect` — never a silent hang, since a
+    /// content script that gets neither reply is a content script that
+    /// wedged.
+    fn extPortConnect(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { ext: []const u8 = "", lid: u32 = 0, name: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        const e = self.webext.find(r.ext);
+        const bg_view = if (e) |ex| ex.bg_view else 0;
+        // A background page cannot connect to itself.
+        const target = if (bg_view != 0 and bg_view != v.id) self.find(bg_view) else null;
+        if (e == null or target == null) {
+            self.sendPortOpen(v, r.ext, r.lid, 0);
+            return;
+        }
+        const gid = self.webext_next_port;
+        self.webext_next_port +%= 1;
+        if (self.webext_next_port == 0) self.webext_next_port = 1;
+        // A page that opens ports without bound must not grow the table
+        // without bound; the oldest is closed, exactly as `webext_routes`
+        // drops its oldest entry.
+        if (self.webext_ports.items.len >= 256) {
+            const old = self.webext_ports.orderedRemove(0);
+            self.notifyPortClosed(old.a_view, old.ext, old.gid);
+            self.notifyPortClosed(old.b_view, old.ext, old.gid);
+            self.gpa.free(old.ext);
+        }
+        const ext_copy = self.gpa.dupe(u8, r.ext) catch {
+            self.sendPortOpen(v, r.ext, r.lid, 0);
+            return;
+        };
+        self.webext_ports.append(self.gpa, .{
+            .gid = gid,
+            .ext = ext_copy,
+            .a_view = v.id,
+            .b_view = bg_view,
+        }) catch {
+            self.gpa.free(ext_copy);
+            self.sendPortOpen(v, r.ext, r.lid, 0);
+            return;
+        };
+        self.sendPortOpen(v, r.ext, r.lid, gid);
+
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-port-incoming\",\"ext\":") catch return;
+        jsonStr(w, r.ext) catch return;
+        w.print(",\"gid\":{d},\"name\":", .{gid}) catch return;
+        jsonStr(w, r.name) catch return;
+        w.writeAll(",\"sender\":") catch return;
+        self.writeSender(w, v, r.ext) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(target.?, cmd.written());
+    }
+
+    fn sendPortOpen(self: *Host, v: *View, ext: []const u8, lid: u32, gid: u32) void {
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-port-open\",\"ext\":") catch return;
+        jsonStr(w, ext) catch return;
+        w.print(",\"lid\":{d},\"gid\":{d}}}", .{ lid, gid }) catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    fn findPort(self: *Host, gid: u32) ?*Port {
+        for (self.webext_ports.items) |*p| {
+            if (p.gid == gid) return p;
+        }
+        return null;
+    }
+
+    fn extPortMessage(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { gid: u32 = 0, msg: std.json.Value = .null };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const p = self.findPort(parsed.value.gid) orelse return;
+        const peer_id = p.peerOf(v.id);
+        const peer = if (peer_id != 0) self.find(peer_id) else null;
+        if (peer == null) {
+            // The far end went away: tell the sender rather than
+            // dropping its message into nothing.
+            self.closePortByGid(parsed.value.gid);
+            return;
+        }
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-port-recv\",\"ext\":") catch return;
+        jsonStr(w, p.ext) catch return;
+        w.print(",\"gid\":{d},\"msg\":", .{parsed.value.gid}) catch return;
+        std.json.Stringify.value(parsed.value.msg, .{}, w) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(peer.?, cmd.written());
+    }
+
+    fn extPortClose(self: *Host, v: *View, json: []const u8) void {
+        _ = v;
+        const R = struct { gid: u32 = 0 };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        self.closePortByGid(parsed.value.gid);
+    }
+
+    /// Drop a port and tell BOTH ends. Telling the closer too is
+    /// deliberate: its own `disconnect()` already marked it dead, and a
+    /// close arriving from the other direction must reach it.
+    fn closePortByGid(self: *Host, gid: u32) void {
+        for (self.webext_ports.items, 0..) |p, i| {
+            if (p.gid != gid) continue;
+            const rec = self.webext_ports.orderedRemove(i);
+            self.notifyPortClosed(rec.a_view, rec.ext, rec.gid);
+            self.notifyPortClosed(rec.b_view, rec.ext, rec.gid);
+            self.gpa.free(rec.ext);
+            return;
+        }
+    }
+
+    fn notifyPortClosed(self: *Host, view: u32, ext: []const u8, gid: u32) void {
+        const v = self.find(view) orelse return;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-port-closed\",\"ext\":") catch return;
+        jsonStr(w, ext) catch return;
+        w.print(",\"gid\":{d}}}", .{gid}) catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    /// Every port either end of which was `view` is closed, and the
+    /// surviving end told. Called when a view goes away — a Port whose
+    /// peer is gone must disconnect, never wait forever.
+    pub fn portsAbandonView(self: *Host, view: u32) void {
+        var i: usize = 0;
+        while (i < self.webext_ports.items.len) {
+            const p = self.webext_ports.items[i];
+            if (p.a_view != view and p.b_view != view) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_ports.orderedRemove(i);
+            self.notifyPortClosed(rec.peerOf(view), rec.ext, rec.gid);
+            self.gpa.free(rec.ext);
+        }
+    }
+
+    /// Same, for every port of one extension (disabled, removed,
+    /// reparsed): the listener functions on both ends are going away.
+    fn portsAbandonExt(self: *Host, id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.webext_ports.items.len) {
+            const p = self.webext_ports.items[i];
+            if (!std.mem.eql(u8, p.ext, id)) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_ports.orderedRemove(i);
+            self.notifyPortClosed(rec.a_view, rec.ext, rec.gid);
+            self.notifyPortClosed(rec.b_view, rec.ext, rec.gid);
+            self.gpa.free(rec.ext);
+        }
+    }
+
+    /// The MV2 `MessageSender`. `{id}` alone was never enough: Dark
+    /// Reader keys its per-tab state on `sender.tab.id` and every
+    /// extension that answers a content script reads `sender.url`.
+    fn writeSender(self: *Host, w: *std.Io.Writer, v: *View, ext: []const u8) !void {
+        try w.writeAll("{\"id\":");
+        try jsonStr(w, ext);
+        try w.writeAll(",\"url\":");
+        try jsonStr(w, v.url);
+        // Frame identity: 0 is the main frame, matching MV2. Subframe
+        // ids are per-view sequence numbers assigned as frames are seen.
+        try w.print(",\"frameId\":{d}", .{v.cur_frame_id});
+        if (self.webext.tabs.findByView(v.id)) |tb| {
+            try w.writeAll(",\"tab\":");
+            try exttabs.Table.writeTab(tb, w);
+        }
+        try w.writeByte('}');
     }
 
     /// The background's reply to a routed message: deliver it to the
@@ -2949,6 +3651,8 @@ pub const Host = struct {
             method_len: u8,
             hdr: [HOLD_HDR_MAX]u8,
             hdr_len: u16,
+            lids: [webrequest.MAX_MATCHED]u32,
+            n_lids: u8,
         };
         var jobs: [MAX_HOLDS]Job = undefined;
         var njobs: usize = 0;
@@ -2984,6 +3688,8 @@ pub const Host = struct {
                     .method_len = h.method_len,
                     .hdr = h.hdr,
                     .hdr_len = h.hdr_len,
+                    .lids = h.lids[@intFromEnum(h.event)],
+                    .n_lids = h.n_lids[@intFromEnum(h.event)],
                 };
             }
         }
@@ -3026,17 +3732,55 @@ pub const Host = struct {
             w.writeAll(",\"type\":") catch continue;
             const rt: webrequest.RType = @enumFromInt(j.rtype);
             jsonStr(w, rt.toStr()) catch continue;
-            // `tabId` is a STUB: this helper has no tab identity of its
-            // own (the GUI owns tabs) and inventing one would make an
-            // extension's per-tab state silently wrong. -1 is MV2's
-            // documented "not associated with a tab".
-            w.print(",\"tabId\":-1,\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":{d}", .{now}) catch continue;
+            // THE TAB ID IS LOAD-BEARING, not decoration. MV2 defines
+            // -1 as "not associated with a tab", and uBlock Origin's
+            // `onBeforeRequest` reads exactly that: `if (tabId < 0)` it
+            // takes its BEHIND-THE-SCENE path, where a page it has no
+            // store for is handled by different rules — measured here as
+            // uBO cancelling the top-level navigation of every page.
+            // So the real tab is looked up from the client's mirrored
+            // list, and -1 survives only for a view no tab claims (a
+            // background page's own fetch, which IS tabless).
+            const tab_id: i64 = if (self.webext.tabs.findByView(j.view_id)) |tb|
+                @intCast(tb.id)
+            else
+                -1;
+            w.print(",\"tabId\":{d},\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":{d}", .{ tab_id, now }) catch continue;
+            // `documentUrl`/`originUrl` describe the document that CAUSED
+            // the request, and MV2 OMITS them for a top-level navigation
+            // — the document is the request. Sending the view's previous
+            // url there (`about:blank` on a fresh view) makes a page
+            // third-party to ITSELF, and uBO then strict-blocks the
+            // navigation: measured as every page failing ERR_ABORTED.
+            if (rt != .main_frame) {
+                const doc: []const u8 = if (self.webext.tabs.findByView(j.view_id)) |tb|
+                    tb.url
+                else if (self.find(j.view_id)) |pv| pv.url else "";
+                if (doc.len != 0) {
+                    w.writeAll(",\"documentUrl\":") catch continue;
+                    jsonStr(w, doc) catch continue;
+                    w.writeAll(",\"originUrl\":") catch continue;
+                    jsonStr(w, doc) catch continue;
+                }
+            }
             if (j.with_headers and j.hdr_len != 0) {
                 w.writeAll(",\"requestHeaders\":") catch continue;
                 w.writeAll(j.hdr[0..j.hdr_len]) catch continue;
             }
             if (observational) w.writeAll(",\"obs\":true") catch continue;
-            w.writeAll("}}") catch continue;
+            w.writeAll("}") catch continue;
+            // The listener ids whose own filter matched. The frame runs
+            // ONLY these.
+            w.writeAll(",\"lids\":[") catch continue;
+            for (j.lids[0..j.n_lids], 0..) |lid, li| {
+                if (li != 0) w.writeByte(',') catch continue;
+                w.print("{d}", .{lid}) catch continue;
+            }
+            w.writeByte(']') catch continue;
+            if (c.getenv("SKETERM_WEB_WREQ_DEBUG") != null) {
+                w.writeAll(",\"dbg\":true") catch continue;
+            }
+            w.writeByte('}') catch continue;
             self.sendScript(bg.?, cmd.written());
             // An OBSERVATIONAL notification is a mailbox drop, not a
             // question: the request continued long ago and no decision
@@ -3155,6 +3899,20 @@ pub const Host = struct {
         var dp = webrequest.parseDecision(self.gpa, dec_buf.written(), hdr_key) catch return;
         defer dp.deinit(self.gpa);
         const d = dp.decision;
+        // `SKETERM_WEB_WREQ_DEBUG=1` prints every decision with the url
+        // it applies to. Finding out WHY a real extension blocked
+        // something is otherwise guesswork: the verdict is computed in
+        // another process, inside minified extension code.
+        if (c.getenv("SKETERM_WEB_WREQ_DEBUG") != null) {
+            var url_buf: [512]u8 = undefined;
+            var url: []const u8 = "";
+            if (req) |r| {
+                if (r.get_url) |gu| url = userfreeInto(gu(r), &url_buf);
+            }
+            std.debug.print("wreq[{d}] {s} {s} -> {s}\n", .{
+                hid, event.toStr(), url, dec_buf.written(),
+            });
+        }
 
         const cancel = d.cancel;
         var redirected = false;
@@ -3288,8 +4046,27 @@ pub const Host = struct {
             w.writeAll(",\"area\":\"local\",\"changes\":") catch continue;
             w.writeAll(changes_json) catch continue;
             w.writeByte('}') catch continue;
-            self.sendScript(v, cmd.written());
+            self.sendScriptAllFrames(v, cmd.written());
         }
+    }
+
+    /// Whether a bridge payload is an `ext-*` op. The cheap prefix test
+    /// `onProcessMessage` uses to decide whether a SUBFRAME may be heard
+    /// at all, without parsing the JSON first.
+    fn payloadIsExt(self: *Host, raw: []const u8) bool {
+        _ = self;
+        // The payload is still NONCE-PREFIXED here — `onScriptMessage`
+        // is what strips and checks it — so the test has to skip the
+        // nonce first. Looking at the raw head instead silently answered
+        // "not an extension message" for everything, which is how the
+        // subframe half of `all_frames` stayed broken after the frames
+        // were already being injected.
+        if (raw.len <= sem_secret.nonce.len) return false;
+        const json = raw[sem_secret.nonce.len..];
+        // The script always emits `op` first, so this is a prefix test
+        // rather than a parse: `{"op":"ext-`.
+        const head = json[0..@min(json.len, 24)];
+        return std.mem.indexOf(u8, head, "\"op\":\"ext-") != null;
     }
 
     // -- semantic layer ------------------------------------------------
@@ -3307,6 +4084,12 @@ pub const Host = struct {
         const gf = b.get_main_frame orelse return;
         const frame: *cef.cef_frame_t = gf(b) orelse return;
         defer release(&frame.base);
+        self.sendScriptToFrame(frame, json);
+    }
+
+    /// Hand a command to ONE frame, main or not.
+    fn sendScriptToFrame(self: *Host, frame: *cef.cef_frame_t, json: []const u8) void {
+        if (!sem_secret.ok) return;
         var code: std.Io.Writer.Allocating = .init(self.gpa);
         defer code.deinit();
         const slot: []const u8 = &sem_secret.slot;
@@ -3314,6 +4097,43 @@ pub const Host = struct {
         jsonStr(&code.writer, json) catch return;
         code.writer.writeByte(')') catch return;
         runJs(frame, code.written());
+    }
+
+    /// Hand a command to every frame of a view.
+    ///
+    /// Frame identifiers are opaque STRINGS in this CEF, enumerated into
+    /// a `cef_string_list_t`; `get_frame_by_identifier` then takes a
+    /// reference we must release. Used for messages that address a TAB
+    /// rather than a document, where a content script in an ad iframe is
+    /// as much a recipient as the top one.
+    fn sendScriptAllFrames(self: *Host, v: *View, json: []const u8) void {
+        if (!sem_secret.ok) return;
+        const b = v.browser orelse return;
+        const gfi = b.get_frame_identifiers orelse {
+            self.sendScript(v, json);
+            return;
+        };
+        const list = cef.cef_string_list_alloc() orelse {
+            self.sendScript(v, json);
+            return;
+        };
+        defer cef.cef_string_list_free(list);
+        gfi(b, list);
+        const n = cef.cef_string_list_size(list);
+        if (n == 0) {
+            self.sendScript(v, json);
+            return;
+        }
+        const byid = b.get_frame_by_identifier orelse return;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var ident = std.mem.zeroes(cef.cef_string_t);
+            defer cef.cef_string_utf16_clear(&ident);
+            if (cef.cef_string_list_value(list, i, &ident) == 0) continue;
+            const frame: *cef.cef_frame_t = byid(b, &ident) orelse continue;
+            defer release(&frame.base);
+            self.sendScriptToFrame(frame, json);
+        }
     }
 
     /// Queue a request; the oldest is dropped when a page stops
@@ -4608,6 +5428,24 @@ fn rtypeOf(t: cef.cef_resource_type_t) filter.RType {
 }
 
 /// UTF-8 of a userfree CEF string result, into `buf` (truncated).
+fn jsonU32(o: std.json.ObjectMap, key: []const u8) u32 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| @intCast(@max(i, 0)),
+        else => 0,
+    };
+}
+
+fn jsonBool(o: std.json.ObjectMap, key: []const u8) bool {
+    const v = o.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+fn jsonStrField(o: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = o.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
 fn userfreeInto(raw: cef.cef_string_userfree_t, buf: []u8) []const u8 {
     if (raw == null) return "";
     defer cef.cef_string_userfree_utf16_free(raw);
@@ -4639,6 +5477,17 @@ fn onBeforeResourceLoad(
     var url_buf: [2048]u8 = undefined;
     const gu = req.get_url orelse return cef.RV_CONTINUE;
     const url_unf = userfreeInto(gu(req), &url_raw);
+
+    // AN EXTENSION'S OWN ORIGIN IS NEVER FILTERED. `filter.hostOf` sees
+    // a 16-hex-digit host it cannot know anything about, the seed engine
+    // has no rule for it — and yet the load came back
+    // ERR_BLOCKED_BY_CLIENT, because a `chrome-extension://` load is not
+    // web traffic and must not enter this path at all. Firefox draws the
+    // same line: webRequest never sees a `moz-extension://` load, and a
+    // filter list that could block an extension's own background page
+    // would disable the extension at random.
+    if (std.mem.startsWith(u8, url_unf, ext_scheme ++ "://")) return cef.RV_CONTINUE;
+
     const url = filter.foldUrl(&url_buf, url_unf);
     const host = filter.hostOf(url);
 
@@ -4749,16 +5598,19 @@ fn onResourceResponse(
     var ext_buf: [webrequest.MAX_ID]u8 = undefined;
     var ext_len: usize = 0;
     var bg_view: u32 = 0;
+    var need_hdr = webrequest.Need.none();
     {
         webrequest.acquire();
         defer webrequest.release();
         for (&webrequest.slots) |*s| {
             if (!s.used) continue;
             const reg = s.reg orelse continue;
-            if (webrequest.needFor(reg, .headers_received, url, rtype).isNone()) continue;
+            const nh = webrequest.needFor(reg, .headers_received, url, rtype);
+            if (nh.isNone()) continue;
             ext_len = s.id_len;
             @memcpy(ext_buf[0..ext_len], s.idSlice());
             bg_view = s.bg_view;
+            need_hdr = nh;
             break;
         }
     }
@@ -4796,6 +5648,7 @@ fn onResourceResponse(
             .want_request_headers = true,
             .rtype = @intFromEnum(rtype),
         };
+        setHoldLids(h, .headers_received, &need_hdr);
         g_wreq.next_hid +%= 1;
         if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
         h.url_len = @intCast(@min(url.len, h.url.len));
@@ -4995,6 +5848,16 @@ const Hold = struct {
     /// on that thread, same rule the intercept log follows).
     hdr_len: u16 = 0,
     hdr: [HOLD_HDR_MAX]u8 = @splat(0),
+    /// The listener ids whose OWN `RequestFilter` matched, PER EVENT
+    /// (indexed by `@intFromEnum(Event)`) — one hold can be dispatched
+    /// for `onBeforeRequest` and then again for `onBeforeSendHeaders`,
+    /// and the two have different listeners.
+    ///
+    /// Only these ids may run; see `webrequest.Need.ids` for why running
+    /// the others is not a small inaccuracy but a browser that loads no
+    /// pages at all.
+    lids: [3][webrequest.MAX_MATCHED]u32 = @splat(@splat(0)),
+    n_lids: [3]u8 = @splat(0),
 
     fn urlSlice(self: *const Hold) []const u8 {
         return self.url[0..self.url_len];
@@ -5316,6 +6179,8 @@ fn wreqConsider(
         h.event = .before_send_headers;
         h.want_request_headers = true;
     }
+    setHoldLids(h, .before_request, &need_before);
+    setHoldLids(h, .before_send_headers, &need_send);
 
     if (blocking) {
         h.cb = cb;
@@ -5328,6 +6193,12 @@ fn wreqConsider(
     g_wreq.release();
     wreqPoke();
     return blocking;
+}
+
+fn setHoldLids(h: *Hold, event: webrequest.Event, need: *const webrequest.Need) void {
+    const i: usize = @intFromEnum(event);
+    h.n_lids[i] = need.n_ids;
+    @memcpy(h.lids[i][0..need.n_ids], need.idSlice());
 }
 
 /// Answer every hold belonging to one extension. Main thread.
@@ -5741,6 +6612,488 @@ fn semPayload(message: [*c]cef.cef_process_message_t) ?Utf8 {
 }
 
 // ---------------------------------------------------------------------
+// chrome-extension:// — the WebExtensions origin
+// ---------------------------------------------------------------------
+//
+// An extension needs a real ORIGIN, not just a way to run scripts. Every
+// MV2 extension worth hosting reaches for one within its first few
+// lines: uBO's `js/start.js` is `type="module"` with twenty static
+// imports, each of which is a FETCH that only a scheme handler can
+// answer; `runtime.getURL` hands such urls to pages and to `fetch`;
+// popup and options pages are documents at that origin. Evaluating
+// scraped script text through `new Function` — which is all this host
+// could do before — cannot supply any of it, and a static `import` is
+// not even syntactically legal there.
+//
+// So: `chrome-extension` is registered as a CUSTOM SCHEME from the app,
+// in every process (Chromium requires the registration to agree
+// process-wide), and a factory serves it out of the unpacked directory.
+// The host component is NOT the extension id — see `manifest.originHost`
+// for why it cannot be — so the table is keyed on that derived host.
+//
+// EVERYTHING BELOW `create` RUNS ON CEF's IO THREAD. It reads the origin
+// table under `origins.lock` (copying by value, then releasing), and it
+// allocates through `std.heap.c_allocator` rather than the host's
+// DebugAllocator — malloc is unambiguously thread-safe and the host's
+// allocator belongs to the main thread's ownership story. The file read
+// is synchronous on that thread, which is what CEF's own samples do and
+// is bounded by `webext_max_asset`; an extension's assets are local
+// files, so this trades a bounded local read for not having to keep a
+// half-built response alive across a thread hop.
+
+/// The extension origin's scheme.
+///
+/// **NOT `chrome-extension`, and that is measured, not preference.**
+/// `cef_scheme_registrar_t::add_custom_scheme("chrome-extension")`
+/// returns **0** on CEF 151.3.16 (Arch `cef`, 2026-08-12): Chromium owns
+/// the name, so a client may not register it — and CEF's alloy runtime
+/// has the extensions component removed, so nothing else serves it
+/// either. `cef_register_scheme_handler_factory` still answers 1 for it,
+/// which is the trap: registration LOOKS fine and every load then fails
+/// `ERR_BLOCKED_BY_CLIENT` with the factory never once consulted.
+/// `SKETERM_WEB_SCHEME_DEBUG=1` prints both return values.
+///
+/// So the origin gets a name of our own, exactly as Firefox uses
+/// `moz-extension://` rather than Chrome's. Extensions cope: they build
+/// their urls with `runtime.getURL`. What does NOT cope is an extension
+/// that hard-codes the literal `chrome-extension:` — a real limitation,
+/// and the reason this constant is one place.
+const ext_scheme = "sketerm-extension";
+
+/// Set when `cef_register_scheme_handler_factory` accepted the scheme.
+/// When it did not, background pages fall back to running their scraped
+/// scripts inline (no modules), and `webextSchemeOk` says so out loud
+/// rather than leaving a silent half-working extension host.
+var ext_scheme_ok = false;
+
+pub fn webextSchemeOk() bool {
+    return ext_scheme_ok;
+}
+
+var scheme_factory: cef.cef_scheme_handler_factory_t = undefined;
+
+/// The one-line `<script src>` spliced into every extension HTML
+/// document we serve, ahead of every author script.
+const bootstrap_tag = "<script src=\"" ++ extorigins.BOOTSTRAP_PATH ++ "\"></script>";
+
+/// One in-flight `chrome-extension://` load.
+///
+/// REALLY refcounted, unlike the process-lifetime statics around it:
+/// CEF owns the reference `create` returns and releases it when the load
+/// ends, which is also this object's free. There is exactly one other
+/// refcounted client-side struct in this file (`CookieJob`) and it
+/// documents the same rule.
+const ExtResource = struct {
+    handler: cef.cef_resource_handler_t,
+    refs: std.atomic.Value(u32),
+    /// Response body, owned by `std.heap.c_allocator`. Empty for a 404.
+    data: []u8 = &.{},
+    offset: usize = 0,
+    status: c_int = 200,
+    mime: []const u8 = "text/plain",
+
+    fn fromSelf(self: [*c]cef.cef_resource_handler_t) ?*ExtResource {
+        if (self == null) return null;
+        const p: *cef.cef_resource_handler_t = @ptrCast(self);
+        return @fieldParentPtr("handler", p);
+    }
+};
+
+fn extResAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
+    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return));
+    const r: *ExtResource = @fieldParentPtr("handler", h);
+    _ = r.refs.fetchAdd(1, .monotonic);
+}
+
+fn extResRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
+    const r: *ExtResource = @fieldParentPtr("handler", h);
+    if (r.refs.fetchSub(1, .release) != 1) return 0;
+    _ = r.refs.load(.acquire);
+    if (r.data.len != 0) std.heap.c_allocator.free(r.data);
+    std.heap.c_allocator.destroy(r);
+    return 1;
+}
+
+fn extResHasOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
+    const r: *ExtResource = @fieldParentPtr("handler", h);
+    return if (r.refs.load(.acquire) == 1) 1 else 0;
+}
+
+/// IO THREAD. Resolve one `chrome-extension://` url to bytes.
+fn extSchemeCreate(
+    _: [*c]cef.cef_scheme_handler_factory_t,
+    _: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    _: [*c]const cef.cef_string_t,
+    request: [*c]cef.cef_request_t,
+) callconv(.c) [*c]cef.cef_resource_handler_t {
+    const req: *cef.cef_request_t = request orelse return null;
+    const gu = req.get_url orelse return null;
+    var url_buf: [2048]u8 = undefined;
+    const url = userfreeInto(gu(req), &url_buf);
+    if (url.len == 0) return null;
+
+    const host = extassets.urlHost(url);
+    const dbg = c.getenv("SKETERM_WEB_SCHEME_DEBUG") != null;
+    const slot = extorigins.lookup(host) orelse {
+        if (dbg) std.debug.print("sketerm-web: scheme create: no origin for host \"{s}\" ({s})\n", .{ host, url });
+        return null;
+    };
+    if (dbg) std.debug.print("sketerm-web: scheme create: {s}\n", .{url});
+
+    // The web_accessible_resources gate. An extension's OWN documents
+    // may read anything in their package; anybody else gets only what
+    // the manifest published. The initiator is identified by the
+    // requesting FRAME's url, which is the document doing the loading —
+    // a referrer would be wrong here, since a referrer policy is free to
+    // strip it and a stripped referrer must not silently open the gate.
+    const path = extassets.urlPath(url);
+    // NO FRAME means the load did not come from a document at all: a
+    // WEB WORKER's script, a `cef_urlrequest`, a fetch from a worker
+    // context. Such a load cannot be attributed, and refusing it is
+    // wrong in a way that is very hard to see — uBlock Origin
+    // (de)serializes its filter cache on a Worker, and a 403 on the
+    // worker script left `serializeAsync` pending FOREVER: uBO's boot
+    // stopped mid-sequence with no error anywhere, and it simply never
+    // filtered. A page cannot mint such a load for another origin, so
+    // treating it as the extension's own is both safe and necessary.
+    var same_origin = frame == null;
+    if (frame) |f| {
+        if (f.*.get_url) |fu| {
+            var fbuf: [2048]u8 = undefined;
+            const furl = userfreeInto(fu(f), &fbuf);
+            same_origin = std.mem.eql(u8, extassets.urlHost(furl), host);
+            // A top-level navigation TO the extension page reports the
+            // frame's previous url, so allow the document itself: this
+            // is how the background page, the popup and the options page
+            // load at all.
+            if (!same_origin and (furl.len == 0 or std.mem.startsWith(u8, furl, "about:"))) same_origin = true;
+        } else same_origin = true;
+    }
+    if (!same_origin) {
+        var pats: [32][]const u8 = undefined;
+        if (!extassets.webAccessible(slot.warPatterns(&pats), path)) {
+            return extResourceFor(&.{}, "text/plain", 403);
+        }
+    }
+
+    // The reserved paths are GENERATED, never read from the package —
+    // and they are checked before the file lookup so a package cannot
+    // shadow either with a file of its own.
+    if (std.mem.eql(u8, path, extorigins.BOOTSTRAP_PATH)) {
+        const js = buildExtBootstrap(&slot, host) orelse
+            return extResourceFor("", "text/javascript", 500);
+        return extResourceOwned(js, "text/javascript", 200);
+    }
+    if (std.mem.eql(u8, path, extorigins.GENERATED_BG_PATH)) {
+        const doc = buildGeneratedBackground(&slot) orelse
+            return extResourceFor("", "text/html", 500);
+        return extResourceOwned(doc, "text/html", 200);
+    }
+
+    var full_buf: [4096]u8 = undefined;
+    const full = extassets.resolve(slot.dirSlice(), path, &full_buf) catch {
+        return extResourceFor("", "text/plain", 404);
+    };
+
+    const bytes = readFileC(full, webext_max_asset) orelse
+        return extResourceFor("", "text/plain", 404);
+    const mime = extassets.mimeFor(full);
+
+    // An extension HTML document gets the bootstrap `<script src>`
+    // spliced in ahead of every author script; that script is what
+    // defines `browser`/`chrome` before the document's first statement
+    // uses one.
+    if (std.mem.eql(u8, mime, "text/html")) {
+        if (spliceBootstrapTag(bytes)) |s| {
+            std.heap.c_allocator.free(bytes);
+            return extResourceOwned(s, mime, 200);
+        }
+    }
+    return extResourceOwned(bytes, mime, 200);
+}
+
+/// Read a whole file into a `c_allocator` buffer. IO-thread safe.
+fn readFileC(path: []const u8, max: usize) ?[]u8 {
+    var zbuf: [4200]u8 = undefined;
+    if (path.len + 1 > zbuf.len) return null;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    const fd = c.open(@ptrCast(&zbuf), c.O_RDONLY);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) return null;
+    // A directory opens fine and then reads nothing; refuse it here so
+    // `chrome-extension://host/js` is a 404 rather than an empty 200.
+    if (st.st_mode & c.S_IFMT != c.S_IFREG) return null;
+    const size: usize = @intCast(@max(st.st_size, 0));
+    if (size > max) return null;
+    if (size == 0) return std.heap.c_allocator.alloc(u8, 0) catch null;
+    const buf = std.heap.c_allocator.alloc(u8, size) catch return null;
+    var got: usize = 0;
+    while (got < size) {
+        const n = c.read(fd, buf.ptr + got, size - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    if (got != size) {
+        std.heap.c_allocator.free(buf);
+        return null;
+    }
+    return buf;
+}
+
+/// Splice the bootstrap `<script src>` into an HTML document. Returns a
+/// new `c_allocator` buffer, or null when it could not be built (the
+/// original is then served unchanged).
+fn spliceBootstrapTag(html: []const u8) ?[]u8 {
+    const off = @min(bgpage.bootstrapOffset(html), html.len);
+    const out = std.heap.c_allocator.alloc(u8, html.len + bootstrap_tag.len) catch return null;
+    @memcpy(out[0..off], html[0..off]);
+    @memcpy(out[off..][0..bootstrap_tag.len], bootstrap_tag);
+    @memcpy(out[off + bootstrap_tag.len ..], html[off..]);
+    return out;
+}
+
+/// IO THREAD. The document a `background.scripts` extension gets: the
+/// bootstrap followed by one classic `<script src>` per declared script,
+/// in manifest order (MV2's own ordering).
+fn buildGeneratedBackground(slot: *const extorigins.Lookup) ?[]u8 {
+    var path_buf: [4096]u8 = undefined;
+    const mpath = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()}) catch return null;
+    const bytes = readFileC(mpath, webext_max_asset) orelse return null;
+    defer std.heap.c_allocator.free(bytes);
+    var man = extmanifest.parse(std.heap.c_allocator, bytes) catch return null;
+    defer man.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    w.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>background</title>") catch return null;
+    w.writeAll(bootstrap_tag) catch return null;
+    if (man.background) |bg| {
+        for (bg.scripts) |rel| {
+            const clean = std.mem.trimStart(u8, rel, "/");
+            w.writeAll("<script src=\"/") catch return null;
+            // The path goes into an HTML attribute; anything that could
+            // close it out is refused rather than escaped, because a
+            // manifest naming such a file is broken either way.
+            if (std.mem.indexOfAny(u8, clean, "\"'<>") != null) continue;
+            w.writeAll(clean) catch return null;
+            w.writeAll("\"></script>") catch return null;
+        }
+    }
+    w.writeAll("</head><body></body></html>") catch return null;
+    return out.toOwnedSlice() catch null;
+}
+
+/// IO THREAD. Build the extension API bootstrap script.
+///
+/// It calls the semantic bridge's own command entry point, which
+/// `on_context_created` has already installed on this frame, so
+/// `browser` exists SYNCHRONOUSLY before the document's first author
+/// statement. A command sent the usual way — `execute_java_script` from
+/// the browser process — would race that statement and lose.
+///
+/// Every input is a file on disk or a process-global secret; nothing
+/// here reads main-thread state.
+fn buildExtBootstrap(slot: *const extorigins.Lookup, host: []const u8) ?[]u8 {
+    if (!sem_secret.ok) return null;
+    var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    var path_buf: [4096]u8 = undefined;
+    const mpath = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()}) catch return null;
+    const man_bytes = readFileC(mpath, webext_max_asset);
+    defer if (man_bytes) |b| std.heap.c_allocator.free(b);
+
+    var msg_bytes: ?[]u8 = null;
+    defer if (msg_bytes) |b| std.heap.c_allocator.free(b);
+    if (slot.locale_len != 0) {
+        var lbuf: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&lbuf, "{s}/_locales/{s}/messages.json", .{
+            slot.dirSlice(), slot.localeSlice(),
+        })) |lpath| {
+            msg_bytes = readFileC(lpath, webext_max_asset);
+        } else |_| {}
+    }
+
+    w.writeAll("(function(){try{var f=window[\"") catch return null;
+    w.writeAll(&sem_secret.slot) catch return null;
+    w.writeAll("\"];if(!f)return;f(JSON.stringify({op:\"ext-inject\",tok:\"") catch return null;
+    w.writeAll(&sem_secret.nonce) catch return null;
+    w.writeAll("\",priv:true,") catch return null;
+    if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("dbg:true,") catch return null;
+    w.writeAll("ext:") catch return null;
+    jsonStr(w, slot.idSlice()) catch return null;
+    w.writeAll(",base:") catch return null;
+    var base_buf: [128]u8 = undefined;
+    const base = std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{host}) catch return null;
+    jsonStr(w, base) catch return null;
+    w.writeAll(",manifest:") catch return null;
+    w.writeAll(if (man_bytes) |b| b else "{}") catch return null;
+    w.writeAll(",messages:") catch return null;
+    w.writeAll(if (msg_bytes) |b| b else "null") catch return null;
+    // A bootstrap that fails silently is an extension that is enabled,
+    // loads, and does nothing at all — the exact failure mode this whole
+    // area kept producing. Say so instead.
+    w.writeAll(",scripts:[],css:[]}));}catch(e){try{console.error(" ++
+        "'[sketerm-webext] API bootstrap failed: '+(e&&e.stack||e));}catch(e2){}}})()") catch return null;
+    return out.toOwnedSlice() catch null;
+}
+
+fn extResourceFor(data: []const u8, mime: []const u8, status: c_int) [*c]cef.cef_resource_handler_t {
+    const copy = std.heap.c_allocator.dupe(u8, data) catch return null;
+    return extResourceOwned(copy, mime, status);
+}
+
+/// Wrap an owned buffer as a resource handler. Takes ownership of
+/// `data` on success AND on failure (nothing is leaked either way).
+fn extResourceOwned(data: []u8, mime: []const u8, status: c_int) [*c]cef.cef_resource_handler_t {
+    const r = std.heap.c_allocator.create(ExtResource) catch {
+        std.heap.c_allocator.free(data);
+        return null;
+    };
+    r.* = .{
+        .handler = std.mem.zeroes(cef.cef_resource_handler_t),
+        .refs = .init(1),
+        .data = data,
+        .status = status,
+        .mime = mime,
+    };
+    r.handler.base = .{
+        .size = @sizeOf(cef.cef_resource_handler_t),
+        .add_ref = extResAddRef,
+        .release = extResRelease,
+        .has_one_ref = extResHasOne,
+        .has_at_least_one_ref = extResHasOne,
+    };
+    r.handler.open = extResOpen;
+    r.handler.get_response_headers = extResHeaders;
+    r.handler.read = extResRead;
+    r.handler.cancel = extResCancel;
+    return &r.handler;
+}
+
+fn extResOpen(
+    self: [*c]cef.cef_resource_handler_t,
+    _: [*c]cef.cef_request_t,
+    handle_request: [*c]c_int,
+    _: [*c]cef.cef_callback_t,
+) callconv(.c) c_int {
+    _ = ExtResource.fromSelf(self) orelse return 0;
+    // The bytes are already in hand, so this is the synchronous form:
+    // handled immediately, no callback, no second thread.
+    if (handle_request) |hr| hr.* = 1;
+    return 1;
+}
+
+fn extResHeaders(
+    self: [*c]cef.cef_resource_handler_t,
+    response: [*c]cef.cef_response_t,
+    response_length: [*c]i64,
+    _: [*c]cef.cef_string_t,
+) callconv(.c) void {
+    const r = ExtResource.fromSelf(self) orelse return;
+    const resp: *cef.cef_response_t = response orelse return;
+    if (resp.set_status) |ss| ss(resp, r.status);
+    var mime = std.mem.zeroes(cef.cef_string_t);
+    setStr(r.mime, &mime);
+    defer cef.cef_string_utf16_clear(&mime);
+    if (resp.set_mime_type) |sm| sm(resp, &mime);
+    // Text formats are UTF-8; without saying so, a non-ASCII message
+    // catalogue or a UTF-8 source file is decoded as Latin-1.
+    if (std.mem.startsWith(u8, r.mime, "text/") or
+        std.mem.eql(u8, r.mime, "application/json"))
+    {
+        var cs = std.mem.zeroes(cef.cef_string_t);
+        setStr("utf-8", &cs);
+        defer cef.cef_string_utf16_clear(&cs);
+        if (resp.set_charset) |sc| sc(resp, &cs);
+    }
+    setResponseHeader(resp, "Access-Control-Allow-Origin", "*");
+    if (response_length) |rl| rl.* = @intCast(r.data.len);
+}
+
+fn setResponseHeader(resp: *cef.cef_response_t, name: []const u8, value: []const u8) void {
+    const set = resp.set_header_by_name orelse return;
+    var n = std.mem.zeroes(cef.cef_string_t);
+    setStr(name, &n);
+    defer cef.cef_string_utf16_clear(&n);
+    var v = std.mem.zeroes(cef.cef_string_t);
+    setStr(value, &v);
+    defer cef.cef_string_utf16_clear(&v);
+    set(resp, &n, &v, 1);
+}
+
+fn extResRead(
+    self: [*c]cef.cef_resource_handler_t,
+    data_out: ?*anyopaque,
+    bytes_to_read: c_int,
+    bytes_read: [*c]c_int,
+    _: [*c]cef.cef_resource_read_callback_t,
+) callconv(.c) c_int {
+    const r = ExtResource.fromSelf(self) orelse return 0;
+    if (bytes_read) |br| br.* = 0;
+    if (r.offset >= r.data.len) return 0;
+    const want: usize = @intCast(@max(bytes_to_read, 0));
+    const n = @min(want, r.data.len - r.offset);
+    if (n == 0) return 0;
+    const dst: [*]u8 = @ptrCast(data_out orelse return 0);
+    @memcpy(dst[0..n], r.data[r.offset..][0..n]);
+    r.offset += n;
+    if (bytes_read) |br| br.* = @intCast(n);
+    return 1;
+}
+
+fn extResCancel(_: [*c]cef.cef_resource_handler_t) callconv(.c) void {}
+
+/// Register the scheme. Called from the APP, in every process — the
+/// browser, the renderer and the network service must all agree that
+/// `chrome-extension` is a standard, secure, CORS- and fetch-enabled
+/// scheme, or a module import from an extension page is refused before
+/// any factory is consulted.
+fn onRegisterCustomSchemes(
+    _: [*c]cef.cef_app_t,
+    registrar: [*c]cef.cef_scheme_registrar_t,
+) callconv(.c) void {
+    const reg: *cef.cef_scheme_registrar_t = registrar orelse return;
+    const add = reg.add_custom_scheme orelse return;
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr(ext_scheme, &name);
+    defer cef.cef_string_utf16_clear(&name);
+    const ok = add(reg, &name, cef.CEF_SCHEME_OPTION_STANDARD |
+        cef.CEF_SCHEME_OPTION_SECURE |
+        cef.CEF_SCHEME_OPTION_CORS_ENABLED |
+        cef.CEF_SCHEME_OPTION_FETCH_ENABLED);
+    if (c.getenv("SKETERM_WEB_SCHEME_DEBUG") != null) {
+        std.debug.print("sketerm-web: add_custom_scheme({s}) = {d}\n", .{ ext_scheme, ok });
+    }
+}
+
+/// Browser process, after `cef_initialize`.
+fn registerExtSchemeFactory() void {
+    scheme_factory = std.mem.zeroes(cef.cef_scheme_handler_factory_t);
+    scheme_factory.base = staticBase(cef.cef_scheme_handler_factory_t);
+    scheme_factory.create = extSchemeCreate;
+    var name = std.mem.zeroes(cef.cef_string_t);
+    setStr(ext_scheme, &name);
+    defer cef.cef_string_utf16_clear(&name);
+    // A null domain matches every host of a STANDARD scheme, which is
+    // what we want: one factory, many extensions, dispatched on the host
+    // through the origin table.
+    ext_scheme_ok = cef.cef_register_scheme_handler_factory(&name, null, &scheme_factory) != 0;
+    if (!ext_scheme_ok) {
+        std.debug.print("sketerm-web: chrome-extension:// scheme refused; " ++
+            "background pages fall back to inline scripts (no ES modules)\n", .{});
+    }
+}
+
+// ---------------------------------------------------------------------
 // Static handler set
 // ---------------------------------------------------------------------
 //
@@ -5968,13 +7321,25 @@ fn onProcessMessage(
     _: cef.cef_process_id_t,
     message: [*c]cef.cef_process_message_t,
 ) callconv(.c) c_int {
-    // Subframes are injected but idle: only the main frame's walk maps
-    // onto a view's shadow tree (iframe traversal is a later feature).
-    if (!isMainFrame(frame)) return 0;
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     var payload = semPayload(message) orelse return 0;
     defer payload.free();
+    const main = isMainFrame(frame);
+    // A SUBFRAME may speak the `ext-*` sub-protocol — that is how a
+    // content script in an ad iframe calls `browser.*` at all — but not
+    // the semantic one: only the main frame's walk maps onto a view's
+    // shadow tree, and an unsolicited subframe walk would corrupt it.
+    if (!main and !host.payloadIsExt(payload.slice())) return 0;
+    v.cur_frame_id = if (main) 0 else blk: {
+        const f = frame orelse break :blk 0;
+        const gi = f.*.get_identifier orelse break :blk 0;
+        var ibuf: [128]u8 = undefined;
+        const ident = userfreeInto(gi(f), &ibuf);
+        if (ident.len == 0) break :blk 0;
+        break :blk v.frameIdFor(host.gpa, ident);
+    };
+    defer v.cur_frame_id = 0;
     host.onScriptMessage(v, payload.slice());
     return 1;
 }
@@ -7155,22 +8520,26 @@ fn onLoadStart(
     frame: [*c]cef.cef_frame_t,
     _: cef.cef_transition_type_t,
 ) callconv(.c) void {
-    if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     // A hidden background page never faces the client: no zoom, no load
-    // events. Its scripts arrive at load end.
+    // events. Its scripts arrive at load end (or, on the origin path,
+    // from the document itself).
     if (v.webext_bg) return;
+    const f = frame orelse return;
+    const main = isMainFrame(frame);
+    // A SUBFRAME reaches this hook too, and only for the extension
+    // injection: `all_frames` content scripts belong in it. Everything
+    // else below is per-DOCUMENT and stays main-frame-only.
+    host.injectMatchingExtensions(v, f, .document_start);
+    if (!main) return;
     // Chromium's zoom is per origin and resets across a navigation; in
     // accelerated mode the zoom IS the device scale factor, so a page
     // that lost it would render at logical resolution.
     applyZoom(v);
     // Cosmetic hiding, userstyles and userscripts go in per document,
     // as early as this path can put them (see `injectUserContent`).
-    if (frame) |f| host.injectUserContent(v, f);
-    // document_start content scripts run before page scripts have done
-    // their work; load start is the earliest browser-process hook.
-    host.injectMatchingExtensions(v, .document_start);
+    host.injectUserContent(v, f);
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.started),
@@ -7184,24 +8553,29 @@ fn onLoadEnd(
     frame: [*c]cef.cef_frame_t,
     _: c_int,
 ) callconv(.c) void {
-    if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     if (v.webext_bg) {
-        // The background page's document is up: inject its scripts +
-        // the browser.* bridge. No client-facing load event.
+        if (!isMainFrame(frame)) return;
+        // The background page's document is up. On the origin path the
+        // engine already loaded its scripts and `injectBackground` is a
+        // no-op; on the fallback path it evaluates them here.
         if (host.webext.findByBgView(v.id)) |e| host.injectBackground(v, e);
         return;
     }
+    const f = frame orelse return;
+    const main = isMainFrame(frame);
+    // document_end / document_idle content scripts run now (the
+    // document is parsed; document_start ones went in at load start).
+    // Subframes get this too, gated on `all_frames`.
+    host.injectMatchingExtensions(v, f, .document_end);
+    host.injectMatchingExtensions(v, f, .document_idle);
+    if (!main) return;
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.finished),
         .url = v.url,
     });
-    // document_end / document_idle content scripts run now (the
-    // document is parsed; document_start ones went in at load start).
-    host.injectMatchingExtensions(v, .document_end);
-    host.injectMatchingExtensions(v, .document_idle);
     // The semantic content script is already in: it goes in at context
     // creation, before any page script, so by load end it is only
     // re-armed.
@@ -7219,11 +8593,22 @@ fn onLoadError(
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
-    if (v.webext_bg) return;
     var url = Utf8.init(failed_url);
     defer url.free();
     var msg = Utf8.init(text);
     defer msg.free();
+    if (v.webext_bg) {
+        // A background page faces no client, so its load failures used
+        // to go nowhere at all — and "the extension is enabled but does
+        // nothing" is exactly the silent failure this whole area is
+        // full of. Surfaced as a console frame, which the client logs.
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "[webext] background load failed ({d}) {s}: {s}", .{
+            @as(i32, @intCast(code)), url.slice(), msg.slice(),
+        }) catch return;
+        host.post(proto.EvConsole{ .view = v.id, .level = 3, .msg = line });
+        return;
+    }
     host.post(proto.EvLoadError{
         .view = v.id,
         .code = @intCast(code),
@@ -7771,14 +9156,27 @@ fn onContextCreated(
     context: [*c]cef.cef_v8_context_t,
 ) callconv(.c) void {
     const ctx: *cef.cef_v8_context_t = context orelse return;
-    // Subframes get the transport taken away and nothing else: commands
-    // only ever go to the main frame, so an injected subframe could only
-    // post unsolicited walks of ITS document into the shadow tree.
-    if (!isMainFrame(frame)) {
+    if (!sem_secret.ok) {
+        // Without the secrets there is no authenticated channel, so the
+        // transport is taken away and nothing is injected.
         evalJs(ctx, disarm_js);
         return;
     }
-    if (!sem_secret.ok) return;
+    // SUBFRAMES ARE INJECTED TOO, since 'all_frames' content scripts
+    // must run in them and a content script needs the bridge to reach
+    // `browser.*`. The old invariant — "commands only ever go to the
+    // main frame, so an injected subframe could only post unsolicited
+    // walks of ITS document into the shadow tree" — is preserved on the
+    // OTHER side instead: `onProcessMessage` accepts only `ext-*` ops
+    // from a subframe and drops every semantic one, so a subframe still
+    // cannot put anything into the view's shadow tree.
+    //
+    // The cost is real and deliberate: every iframe of every page now
+    // parses the bridge, where before it evaluated only `disarm_js`.
+    // That is what a browser with extensions does, and the alternative
+    // (a second, smaller subframe script) is a copy that would have to
+    // stay in sync with this one.
+    _ = frame;
     evalJs(ctx, injectSource() orelse return);
 }
 
@@ -7899,6 +9297,12 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
     // Reached only in CEF's renderer subprocess, which is THIS binary
     // re-executed; the browser process never calls it.
     app.get_render_process_handler = getRenderProcessHandler;
+    // EVERY process, and it must agree in every one of them: the
+    // renderer decides whether a module import from a chrome-extension
+    // page is even allowed, and the network service decides whether the
+    // scheme is fetchable at all. Registering it only in the browser
+    // process leaves both answering "no" with no diagnostic.
+    app.on_register_custom_schemes = onRegisterCustomSchemes;
     const args = cef.cef_main_args_t{ .argc = argc, .argv = argv };
     const code = cef.cef_execute_process(&args, &app, null);
     if (code < 0) return null;
@@ -7925,7 +9329,10 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
     setStr(log_file, &settings.log_file);
     defer cef.cef_string_utf16_clear(&settings.root_cache_path);
     defer cef.cef_string_utf16_clear(&settings.log_file);
-    return cef.cef_initialize(&args, &settings, &app, null) == 1;
+    if (cef.cef_initialize(&args, &settings, &app, null) != 1) return false;
+    // Only valid after initialize, and only in the browser process.
+    registerExtSchemeFactory();
+    return true;
 }
 
 /// One iteration of CEF's message loop. Every handler above runs

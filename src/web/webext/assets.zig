@@ -107,6 +107,22 @@ fn percentDecode(s: []const u8, out: []u8) error{TooLong}![]const u8 {
     return out[0..n];
 }
 
+/// Resolve a document-relative `src` against the package-relative path
+/// of the document that named it, as the HTML parser would. A leading
+/// `/` means the package root. Returns a slice of `out`, or of `src`
+/// when it is already root-relative.
+pub fn resolveRelative(doc_path: []const u8, src: []const u8, out: []u8) ?[]const u8 {
+    if (src.len == 0) return null;
+    if (src[0] == '/') return src;
+    const clean_doc = std.mem.trimStart(u8, doc_path, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, clean_doc, '/');
+    const dir = if (slash) |i| clean_doc[0 .. i + 1] else "";
+    if (dir.len + src.len > out.len) return null;
+    @memcpy(out[0..dir.len], dir);
+    @memcpy(out[dir.len..][0..src.len], src);
+    return out[0 .. dir.len + src.len];
+}
+
 /// MIME type for an extension asset. Getting `text/javascript` right is
 /// load-bearing rather than cosmetic: Chromium REFUSES to evaluate a
 /// `<script type="module">` served with any other type, so a wrong
@@ -218,6 +234,18 @@ test "mimeFor: modules need text/javascript or Chromium refuses them" {
     try t.expectEqualStrings("text/css", mimeFor("/a.CSS"));
     try t.expectEqualStrings("application/octet-stream", mimeFor("/noext"));
     try t.expectEqualStrings("application/octet-stream", mimeFor("/a.unknownthing"));
+}
+
+test "resolveRelative follows the document's own directory" {
+    var buf: [256]u8 = undefined;
+    // Dark Reader: background/index.html names `index.js` next to it.
+    try t.expectEqualStrings("background/index.js", resolveRelative("background/index.html", "index.js", &buf).?);
+    // uBO: background.html sits at the root.
+    try t.expectEqualStrings("js/vapi.js", resolveRelative("background.html", "js/vapi.js", &buf).?);
+    // Stylus spells its scripts root-relative already.
+    try t.expectEqualStrings("/js/common.js", resolveRelative("background.html", "/js/common.js", &buf).?);
+    try t.expectEqualStrings("a/b/c.js", resolveRelative("/a/b/page.html", "c.js", &buf).?);
+    try t.expect(resolveRelative("x.html", "", &buf) == null);
 }
 
 test "webAccessible globs cross directory separators" {
