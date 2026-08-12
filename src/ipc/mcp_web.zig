@@ -61,6 +61,45 @@ var g_headless_alloc: ?std.mem.Allocator = null;
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 
+/// Session default verbosity for `web_snapshot` (0 terse / 1 normal /
+/// 2 long text). Passing `detail` on a call CHANGES it, exactly the way
+/// passing `pane` changes which view is current — one sticky default
+/// per session rather than a second tool to set it, and the reply says
+/// so when it moves, or a caller could not tell that a later call
+/// inherited an earlier one's verbosity.
+var g_detail: u32 = DETAIL_DEFAULT;
+const DETAIL_DEFAULT: u32 = 1;
+
+/// Resolve the detail for one call and update the session default when
+/// the caller named one.
+fn detailFor(args: std.json.Value) struct { detail: u32, changed: bool } {
+    const d = mcp.argInt(args, "detail") orelse return .{ .detail = g_detail, .changed = false };
+    const want: u32 = @intCast(std.math.clamp(d, 0, 2));
+    const changed = want != g_detail;
+    g_detail = want;
+    return .{ .detail = want, .changed = changed };
+}
+
+test "detail is per-request and sticky for the session" {
+    g_detail = DETAIL_DEFAULT;
+    defer g_detail = DETAIL_DEFAULT;
+    // No argument: the default, and it does not move.
+    const none = std.json.Value{ .null = {} };
+    try std.testing.expectEqual(@as(u32, 1), detailFor(none).detail);
+    try std.testing.expectEqual(false, detailFor(none).changed);
+    // An out-of-range request clamps rather than being refused.
+    g_detail = DETAIL_DEFAULT;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"detail\":7}", .{});
+    defer parsed.deinit();
+    const first = detailFor(parsed.value);
+    try std.testing.expectEqual(@as(u32, 2), first.detail);
+    try std.testing.expectEqual(true, first.changed);
+    // It stuck: a later call with no argument inherits it, and asking
+    // for the same value again is not reported as a change.
+    try std.testing.expectEqual(@as(u32, 2), detailFor(none).detail);
+    try std.testing.expectEqual(false, detailFor(parsed.value).changed);
+}
+
 /// Arm the headless fallback. `dir`/`instance` must outlive the server
 /// (they are the isolation dir strings, which do). The helper itself is
 /// spawned lazily on the first web tool call that needs it.
@@ -834,10 +873,8 @@ pub fn webTool(
             "history"
         else
             mcp.argStr(args, "mode") orelse "auto";
-        const detail: u32 = blk: {
-            const d = mcp.argInt(args, "detail") orelse 1;
-            break :blk @intCast(std.math.clamp(d, 0, 2));
-        };
+        const det = detailFor(args);
+        const detail: u32 = det.detail;
         const scope: ?u32 = blk: {
             const s = mcp.argInt(args, "scope") orelse break :blk null;
             break :blk if (s > 0) @intCast(s) else null;
@@ -858,6 +895,12 @@ pub fn webTool(
                 try out.field("kind", r.snapshot_kind);
                 try out.field("doc_gen", r.doc_gen);
                 try out.field("rev", r.rev);
+                // A sticky default that changed silently would make a
+                // later, argument-free call look like it ignored you.
+                if (det.changed) {
+                    try out.field("detail", detail);
+                    try out.field("detail_note", "detail is now the default for this session; pass it again to change it");
+                }
                 // A delta whose body is only its header means the page
                 // has not changed. Saying so beats handing back an
                 // almost-empty tree that reads as an empty PAGE.
