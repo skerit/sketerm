@@ -4368,14 +4368,21 @@ fn panelStage(
     defer allocator.free(before.png);
     const tw = app.winById(term_win) orelse return "the terminal window vanished";
     const ty = @as(f64, @floatFromInt(tw.h)) * 0.5;
-    // Not zoomed, so a drag anywhere on the surface moves the split.
-    app.drag(term_win, @as(f64, @floatFromInt(tw.w)) * 0.5, ty, @as(f64, @floatFromInt(tw.w)) * 0.2, ty, 1) catch
+    // Grab the panel's OWN split, located by its own colours (see
+    // compareSplitX) rather than assumed to be at the window midpoint.
+    const split_x = compareSplitX(allocator, app, term_win, @intFromFloat(ty)) orelse
+        return "could not find the compare panel's split in the frame";
+    app.drag(term_win, split_x, ty, split_x - 80, ty, 1) catch
         return "dragging the compare split failed";
     _ = app.waitVisualSettle(term_win, 400, 8_000, 0.002, null);
     const after = app.screenshotPng(term_win, 640, null, 0) catch return "screenshotting after the drag failed";
     defer allocator.free(after.png);
-    if (std.mem.eql(u8, before.png, after.png))
+    if (std.mem.eql(u8, before.png, after.png)) {
+        writePng("/tmp/sketerm-e2e-compare-before.png", before.png);
+        writePng("/tmp/sketerm-e2e-compare-after.png", after.png);
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: compare window %dx%d, dragged %.0f -> %.0f at y=%.0f\n", tw.w, tw.h, @as(f64, @floatFromInt(tw.w)) * 0.5, @as(f64, @floatFromInt(tw.w)) * 0.2, ty);
         return "dragging the image_compare split repainted nothing";
+    }
 
     // Refresh the SAME logical path, then immediately apply a title-only
     // patch while the delayed local read is still in flight. Both operations
@@ -6632,6 +6639,35 @@ fn kittyKbdStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
 /// The word motions are what make this worth a live stage: `w` and
 /// `e` have to agree about where a word begins and ends, and only the
 /// round trip proves the selection they produced was the right one.
+/// X of the image_compare panel's own split, found by its own pixels:
+/// the rightmost BLUE pixel on row `y` before the orange half begins.
+///
+/// The drag used to start at the window's horizontal midpoint, on the
+/// theory that "a drag anywhere on the surface moves the split". That
+/// is false whenever the panel shares the window with another pane —
+/// which it does here — because the midpoint is then the PANE divider,
+/// and dragging it moves the split between panes while the panel sits
+/// untouched and repaints nothing.
+fn compareSplitX(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, y: u32) ?f64 {
+    const shot = app.snapshotRgba(win_id, null) catch return null;
+    defer allocator.free(shot.px);
+    if (y >= shot.h) return null;
+    var last_blue: ?u32 = null;
+    var x: u32 = 0;
+    while (x < shot.w) : (x += 1) {
+        const i = (y * shot.w + x) * 4;
+        if (i + 2 >= shot.px.len) break;
+        const r = shot.px[i];
+        const g = shot.px[i + 1];
+        const b = shot.px[i + 2];
+        // The panel paints 0x2080ff; accept a wide band so a compositor
+        // colour tweak does not silently stop finding it.
+        if (b > 180 and r < 120 and g > 90 and g < 190) last_blue = x;
+    }
+    const lb = last_blue orelse return null;
+    return @floatFromInt(lb);
+}
+
 /// Every pane id in a `list` reply, in order. Cleanup that closes "the
 /// current tab" is not safe: after a few closes the selection can land
 /// on the tab the rig started with, and closing THAT takes pane 1 with
