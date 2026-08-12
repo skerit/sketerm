@@ -1835,10 +1835,104 @@ fn certStage(cl: *Client, dir: []const u8) void {
     }
     pass("stage 22g permission request (engine-denied; the client is never consulted yet)");
 
+    widevineStage(cl);
+
     // Leave the view on a data: page: everything after this stage
     // assumes no network is involved.
     cl.send(proto.Navigate{ .view = view_id, .url = red_page });
     _ = cl.drive(500, 120);
+}
+
+/// The DRM question the browser spike answered once by hand and nothing
+/// pinned afterwards: does the SHIPPED helper configuration grant
+/// `com.widevine.alpha` key-system access?
+///
+/// It runs inside `certStage` and not on its own, because EME is a
+/// secure-context API: the https page stage 22f proceeded past is the
+/// rig's only secure context, and a `data:` url would reject for the
+/// wrong reason and look like a missing CDM.
+///
+/// This is a CAPABILITY proof, not a playback proof — see
+/// `src/web/CLAUDE.md` for what a real playback proof would additionally
+/// need. What it does assert unconditionally is that the API ANSWERS:
+/// a hang, or an eval that reports failure, is a real regression even on
+/// a host with no CDM at all. A resolved access is reported as the pass;
+/// a rejection is reported distinctly, with the reason the engine gave,
+/// because "this host has no CDM" and "the helper stopped enabling
+/// Widevine" are different facts and only the second is a bug.
+fn widevineStage(cl: *Client) void {
+    // ClearKey is the CONTROL: Chromium implements it in-process, with
+    // no CDM to install, so it answers "yes" wherever EME works at all.
+    // Without it a Widevine refusal would be unreadable — a missing CDM
+    // and an EME-less page look identical from one probe.
+    var probe_bufs: [3][256]u8 = undefined;
+    const clearkey_webm = emeProbe(cl, "org.w3.clearkey", webm_caps, &probe_bufs[0]);
+    if (std.mem.indexOf(u8, clearkey_webm, "eme:ok") == null) {
+        std.debug.print("smoke-web: eval said {s}\n", .{clearkey_webm});
+        fail("stage 22l widevine: EME itself is unavailable here (ClearKey/WebM was refused) — " ++
+            "the page is not a secure context or the build dropped EME, and no Widevine " ++
+            "result from this stage would mean anything");
+    }
+
+    // Two codec families, because a refusal has two very different
+    // causes: upstream CEF ships WITHOUT proprietary codecs, so the
+    // mp4/avc1+aac probe can fail on a build whose Widevine CDM is
+    // perfectly present, while webm/vp9+opus is available in both the
+    // upstream and the distro build.
+    const wv_webm = emeProbe(cl, "com.widevine.alpha", webm_caps, &probe_bufs[1]);
+    const wv_mp4 = emeProbe(cl, "com.widevine.alpha", mp4_caps, &probe_bufs[2]);
+    const webm_ok = std.mem.indexOf(u8, wv_webm, "eme:ok") != null;
+    const mp4_ok = std.mem.indexOf(u8, wv_mp4, "eme:ok") != null;
+    std.debug.print(
+        "smoke-web: MEASURED widevine: webm/vp9 {s}, mp4/avc1 {s}\n",
+        .{ wv_webm, wv_mp4 },
+    );
+    if (webm_ok or mp4_ok) {
+        pass("stage 22l widevine (key system access granted, temporary sessions)");
+        return;
+    }
+    // Not a failure: the CDM is a downloaded component and this rig
+    // runs on a throwaway cache directory with no component updater
+    // pass. What the stage still proved is that EME answers and that
+    // the refusal is Widevine-specific, not a broken page.
+    pass("stage 22l widevine (no Widevine CDM in this cache/build: refused, ClearKey still granted)");
+}
+
+/// Capability sets for `emeProbe`. Written as JS object literals; the
+/// escaped quotes are what `contentType` requires around `codecs`.
+const webm_caps =
+    "initDataTypes:['webm']," ++
+    "audioCapabilities:[{contentType:'audio/webm;codecs=\\\"opus\\\"'}]," ++
+    "videoCapabilities:[{contentType:'video/webm;codecs=\\\"vp9\\\"'}]";
+const mp4_caps =
+    "initDataTypes:['cenc']," ++
+    "audioCapabilities:[{contentType:'audio/mp4;codecs=\\\"mp4a.40.2\\\"'}]," ++
+    "videoCapabilities:[{contentType:'video/mp4;codecs=\\\"avc1.42E01E\\\"'}]";
+
+/// One `requestMediaKeySystemAccess` for `key_system` with `caps`,
+/// asking for TEMPORARY sessions. Returns the eval's raw JSON, which
+/// carries either `eme:ok:<keySystem>` or `eme:no:<ErrorName>`. The
+/// answer is COPIED into `out` because the client keeps exactly one
+/// eval payload and the next probe overwrites it. A non-answer is fatal
+/// here rather than at every call site: a promise that never settles is
+/// the one outcome no caller can read.
+fn emeProbe(cl: *Client, key_system: []const u8, caps: []const u8, out: []u8) []const u8 {
+    var buf: [768]u8 = undefined;
+    const js = std.fmt.bufPrint(
+        &buf,
+        "navigator.requestMediaKeySystemAccess('{s}',[{{{s},sessionTypes:['temporary']}}])" ++
+            ".then(function(a){{return 'eme:ok:'+a.keySystem;}})" ++
+            ".catch(function(e){{return 'eme:no:'+e.name;}})",
+        .{ key_system, caps },
+    ) catch fail("stage 22l widevine: probe script did not fit");
+    const json = cl.evalWait(js, true, 30_000);
+    if (cl.eval_ok != 1 or std.mem.indexOf(u8, json, "eme:") == null) {
+        std.debug.print("smoke-web: eval said {s}\n", .{json});
+        fail("stage 22l widevine: requestMediaKeySystemAccess never answered");
+    }
+    const n = @min(json.len, out.len);
+    @memcpy(out[0..n], json[0..n]);
+    return out[0..n];
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {

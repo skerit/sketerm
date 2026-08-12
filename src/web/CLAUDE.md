@@ -161,6 +161,45 @@ callback carries no request id.
   with no CEF at all; in the GUI it is gated by `SKETERM_WEB_A11Y=1`
   until screen-reader detection lands.
 
+## DRM: what smoke-web pins, and what it cannot
+
+smoke-web stage 22l probes `navigator.requestMediaKeySystemAccess`
+inside `certStage`, on the https page stage 22f proceeded past — EME is
+a secure-context API and a `data:` url would reject for the wrong
+reason. It asks three times: ClearKey/WebM as the CONTROL (Chromium
+implements it in-process, so it answers "yes" wherever EME works at
+all), then `com.widevine.alpha` with webm/vp9+opus AND with
+mp4/avc1+aac, because upstream CEF ships without proprietary codecs and
+a mp4-only probe cannot tell a missing codec from a missing CDM.
+
+MEASURED here (2026-08, both the pinned upstream tarball and the Arch
+`cef` package): ClearKey is granted, Widevine is `NotSupportedError` for
+both codec families, and neither build ships a `WidevineCdm` directory
+next to `libcef.so`. **The CDM is a downloaded component**, so a grant
+depends on a user-data dir that a component-updater pass has populated —
+which a rig on a throwaway cache directory never has. The stage
+therefore reports the refusal distinctly and still passes; what it fails
+on is the API not answering, or ClearKey being refused (EME gone, or
+the page stopped being a secure context).
+
+A full PLAYBACK proof needs four things this stage deliberately does not
+attempt, and all four cost a live external dependency:
+
+- A real CDM on disk (bundle `WidevineCdm/` beside `libcef.so`, or run
+  a component-updater pass with network access) — until then every
+  Widevine result is about the CDM's absence, not about our config.
+- A licence server and an encrypted stream: `MediaKeys` +
+  `generateRequest` + a `message` event answered by a real licence, then
+  `setMediaKeys` on a `<video>` fed encrypted segments (the EME/MSE
+  reference streams, or Shaka's public test vectors).
+- Proprietary codecs, hence the DISTRO build: upstream's tarball cannot
+  decode the mp4/avc1+aac the commercial services use.
+- A pixel assertion that the decoded frames actually reach us. Widevine
+  L1 paths can hand back protected buffers that read back BLACK through
+  `on_paint`/`on_accelerated_paint`, so "the licence was accepted" is
+  not the same claim as "the video is visible in a pane", and only the
+  second one is what a user gets.
+
 ## Presentation belongs to GTK, not to us
 
 Frames are `GdkTexture`s on a `GtkPicture` (`webface.zig`). **Never
