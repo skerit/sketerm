@@ -222,6 +222,11 @@ pub const Action = enum {
     /// username-Tab-password (src/ui/secrets.zig). Fill only: nothing
     /// is ever saved to the keyring, and nothing fills on its own.
     web_fill_password,
+    /// Open the focused web pane's site-info popover
+    /// (src/ui/websiteinfo.zig): this site's identity, the decisions it
+    /// was given, and the cookies and storage it holds — with the way
+    /// to undo each. The padlock button's keyboard equivalent.
+    web_site_info,
     /// Open the browsing-history window (src/ui/webhistory.zig): the
     /// daemon web store's pages, searchable through the same ranking
     /// the address bar uses.
@@ -531,6 +536,7 @@ pub fn actionName(a: Action) []const u8 {
         .web_devtools => "web_devtools",
         .web_print_pdf => "web_print_pdf",
         .web_fill_password => "web_fill_password",
+        .web_site_info => "web_site_info",
         .web_history => "web_history",
         .web_bookmarks => "web_bookmarks",
         .close_pane => "close_pane",
@@ -635,6 +641,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .web_devtools => "Open DevTools for this web pane (in a split)",
         .web_print_pdf => "Print this web page to a PDF file",
         .web_fill_password => "Fill a saved login from the keyring into this web page",
+        .web_site_info => "Site information, permissions and stored data for this web page",
         .web_history => "Browsing history (search, open, forget pages)",
         .web_bookmarks => "Bookmarks (open, rename, reorder)",
         .close_pane => "Close the focused pane (un-split)",

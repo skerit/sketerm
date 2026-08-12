@@ -145,6 +145,8 @@ const ENTRIES = [_]Entry{
        .desc = "Save this web pane's page as a PDF file; the browser engine renders it.", .action = .web_print_pdf },
     .{ .icon = "dialog-password-symbolic", .title = "Fill Password (Web Pane)…",
        .desc = "Pick a login saved in your keyring for this page's site and type it in as username, Tab, password. Focus the username field first; nothing is ever saved back.", .action = .web_fill_password },
+    .{ .icon = "channel-secure-symbolic", .title = "Site Information (Web Pane)",
+       .desc = "What this site is, what it was allowed to do, and what it has stored — with the way to undo each.", .action = .web_site_info },
     .{ .icon = "document-open-recent-symbolic", .title = "History (Web)",
        .desc = "Search the pages this daemon remembers visiting; open, or forget, any of them.", .action = .web_history },
     .{ .icon = "starred-symbolic", .title = "Bookmarks (Web)",

@@ -205,6 +205,7 @@ const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
+const websiteinfo = @import("websiteinfo.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const omnibox = @import("omnibox.zig");
@@ -594,6 +595,11 @@ pub const Client = struct {
     /// daemon web store and pushes them; an older helper skips the
     /// frames and pages get no user content — silent degradation.
     cap_userscripts: bool = false,
+    /// The helper answers the cookie / site-data frames. An older one
+    /// advertises nothing, is sent none of them, and the site-info
+    /// popover hides that section — permissions and blocking, which
+    /// need no helper support at all, keep working.
+    cap_sitedata: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -1014,6 +1020,7 @@ pub const Client = struct {
                 self.cap_a11y = false;
                 self.cap_contexts = false;
                 self.cap_userscripts = false;
+                self.cap_sitedata = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1024,6 +1031,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
                 }
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
@@ -1174,6 +1182,15 @@ pub const Client = struct {
                     // that would ask is gone.
                     self.post(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" });
                 }
+            },
+            .ev_cookies => {
+                const ev = proto.EvCookies.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entries);
+                if (self.findFace(ev.view)) |face| face.onCookies(ev);
+            },
+            .ev_sitedata_done => {
+                const ev = proto.decode(proto.EvSitedataDone, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onSitedataDone(ev);
             },
             .ev_download_progress => {
                 const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
@@ -1866,6 +1883,20 @@ pub const WebFace = struct {
     /// app-level `web_popup_policy`.
     site_popup: enum { inherit, allow, block } = .inherit,
 
+    /// The padlock button left of the address entry and the popover it
+    /// opens (src/ui/websiteinfo.zig). The popover is built on first
+    /// use and owned by this face: severed at the prepare-destroy
+    /// choke point, freed in `deinit`.
+    site_btn: *c.GtkWidget = undefined,
+    site_info: ?*websiteinfo.SiteInfo = null,
+    /// The user accepted a certificate interstitial for the CURRENT
+    /// origin, so "https" no longer means what the padlock would
+    /// otherwise claim. Cleared on every origin change.
+    cert_exception: bool = false,
+    /// Correlation id for `cookies_req` / the mutating site-data
+    /// frames. Client-allocated, monotonic per face.
+    site_req_next: u32 = 1,
+
     // ---- attach / teardown ------------------------------------------
 
     /// Put a web face on `pane`. A pane already wearing one just gets
@@ -2001,6 +2032,10 @@ pub const WebFace = struct {
         // at the same choke point. The omnibox is the same shape.
         if (self.reader) |r| r.sever(self.widgets_dead);
         if (self.omni) |o| o.sever(self.widgets_dead);
+        // Same shape for the site-info popover: unparenting it destroys
+        // its rows, and so frees the row contexts their GDestroyNotify
+        // owns, before anything else lets go.
+        if (self.site_info) |si| si.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
         // pacing sources and the discard countdown, which carry this
         // face as user-data and are not signals, so the disconnect loop
@@ -2080,6 +2115,11 @@ pub const WebFace = struct {
             o.sever(self.widgets_dead);
             o.destroy();
             self.omni = null;
+        }
+        if (self.site_info) |si| {
+            si.sever(self.widgets_dead);
+            si.destroy();
+            self.site_info = null;
         }
         self.stopDiscardTimer();
         self.stopDlTimer();
@@ -2311,6 +2351,7 @@ pub const WebFace = struct {
         else
             std.fmt.bufPrintZ(&buf, "0", .{}) catch "0";
         c.gtk_label_set_text(@ptrCast(self.shield_label), txt.ptr);
+        self.refreshSiteInfo(false);
         var tip: [128]u8 = undefined;
         const t = std.fmt.bufPrintZ(&tip, "Content blocking: {s} ({d} blocked of {d} requests, {d} rules)", .{
             if (self.net_enabled) "on" else "off",
@@ -2319,6 +2360,167 @@ pub const WebFace = struct {
             self.net_rules,
         }) catch "Content blocking";
         c.gtk_widget_set_tooltip_text(self.shield_btn, t.ptr);
+    }
+
+    // ---- site info popover (permissions, cookies, site data) --------
+
+    fn onSiteInfo(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(WebFace, user);
+        self.showSiteInfo();
+    }
+
+    /// Build the popover if it does not exist yet, refresh it from the
+    /// live state and pop it up. A face whose widgets are gone does
+    /// nothing.
+    pub fn showSiteInfo(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        if (self.site_info == null)
+            self.site_info = websiteinfo.SiteInfo.create(self.allocator, self.view, self.site_btn);
+        const info = self.site_info orelse return;
+        self.refreshSiteInfo(true);
+        // The cookie count is asynchronous: the popover shows
+        // "counting" until the helper answers.
+        _ = info;
+        self.requestCookies();
+    }
+
+    /// Push the current state into an existing popover. `open` also
+    /// pops it up.
+    fn refreshSiteInfo(self: *WebFace, open: bool) void {
+        const info = self.site_info orelse return;
+        // Rebuilding the rows costs an allocation per row, so a closed
+        // popover is left alone: it is refreshed when it opens.
+        if (!open and !info.isOpen()) return;
+        // Fixed capacity: the store keys decisions by exact permission
+        // set, and a site with more than this many distinct sets is not
+        // a site anybody is auditing row by row.
+        var keys: [16][80]u8 = undefined;
+        var perms: [16]websiteinfo.State.Perm = undefined;
+        var n: usize = 0;
+        const origin = self.nav_origin orelse "";
+        if (origin.len != 0) {
+            for (self.site_settings.items) |s| {
+                if (n >= perms.len) break;
+                if (!std.mem.eql(u8, s.origin, origin)) continue;
+                const key = webstore.permKey(&keys[n], s.types) orelse continue;
+                perms[n] = .{ .name = key, .allow = s.allow };
+                n += 1;
+            }
+        }
+        info.refresh(.{
+            .origin = origin,
+            .tls = self.tlsState(),
+            .blocking = self.net_enabled,
+            .blocked = self.net_blocked,
+            .total = self.net_total,
+            .perms = perms[0..n],
+            .sitedata = client().cap_sitedata and self.view_live,
+        }, open);
+    }
+
+    fn tlsState(self: *const WebFace) websiteinfo.Tls {
+        const url = self.url orelse return .none;
+        if (std.mem.startsWith(u8, url, "https://"))
+            return if (self.cert_exception) .exception else .secure;
+        if (std.mem.startsWith(u8, url, "http://")) return .insecure;
+        return .none;
+    }
+
+    /// The padlock reflects the connection at a glance; the popover
+    /// spells it out.
+    fn updateSiteButton(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        const tls = self.tlsState();
+        const icon: [*:0]const u8 = switch (tls) {
+            .none => "text-x-generic-symbolic",
+            .insecure => "channel-insecure-symbolic",
+            .secure => "channel-secure-symbolic",
+            .exception => "dialog-warning-symbolic",
+        };
+        toolbtn.setIcon(self.site_btn, self.bar, icon, "Site");
+        self.refreshSiteInfo(false);
+    }
+
+    fn nextSiteReq(self: *WebFace) u32 {
+        const r = self.site_req_next;
+        self.site_req_next +%= 1;
+        if (self.site_req_next == 0) self.site_req_next = 1;
+        return r;
+    }
+
+    /// Ask the helper what this site has stored. Silently does nothing
+    /// on a helper without the capability — the popover hides the
+    /// section it would fill.
+    pub fn requestCookies(self: *WebFace) void {
+        const info = self.site_info orelse return;
+        if (!self.view_live or !client().cap_sitedata) return;
+        const req = self.nextSiteReq();
+        info.noteCookieRequest(req);
+        client().post(proto.CookiesReq{ .view = self.view, .req = req, .url = "" });
+    }
+
+    pub fn deleteCookie(self: *WebFace, name: []const u8) void {
+        if (!self.view_live or !client().cap_sitedata) return;
+        client().post(proto.CookieDelete{
+            .view = self.view,
+            .req = self.nextSiteReq(),
+            .url = "",
+            .name = name,
+        });
+    }
+
+    pub fn clearCookies(self: *WebFace) void {
+        if (!self.view_live or !client().cap_sitedata) return;
+        client().post(proto.CookiesClear{ .view = self.view, .req = self.nextSiteReq(), .url = "" });
+    }
+
+    /// Everything: cookies, the origin's script-visible storage, and
+    /// the HTTP cache. The helper reports what it could not do exactly
+    /// as asked in `EvSitedataDone.detail`.
+    pub fn clearSiteData(self: *WebFace) void {
+        if (!self.view_live or !client().cap_sitedata) return;
+        client().post(proto.SitedataClear{
+            .view = self.view,
+            .req = self.nextSiteReq(),
+            .url = "",
+            .what = proto.sitedata_cookies | proto.sitedata_storage | proto.sitedata_cache,
+        });
+    }
+
+    /// Forget one remembered permission decision, in this process AND
+    /// in the daemon store, so the next request prompts again.
+    pub fn forgetSitePermission(self: *WebFace, key: []const u8) void {
+        const origin = self.nav_origin orelse return;
+        const types = webstore.permTypes(key) orelse return;
+        var i: usize = 0;
+        while (i < self.site_settings.items.len) {
+            const s = self.site_settings.items[i];
+            if (s.types == types and std.mem.eql(u8, s.origin, origin)) {
+                self.allocator.free(s.origin);
+                _ = self.site_settings.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        webstore.siteSetPerm(self.allocator, origin, key, "");
+        self.refreshSiteInfo(false);
+    }
+
+    /// The popover's blocking switch: same decision as the toolbar
+    /// shield, so it stores the same override.
+    pub fn setBlockingForSite(self: *WebFace, on: bool) void {
+        self.setNetwork(on);
+        if (self.nav_origin) |origin|
+            webstore.siteSetBlock(self.allocator, origin, if (on) null else false);
+        self.refreshSiteInfo(false);
+    }
+
+    pub fn onCookies(self: *WebFace, ev: proto.EvCookies) void {
+        if (self.site_info) |info| info.onCookies(ev);
+    }
+
+    pub fn onSitedataDone(self: *WebFace, ev: proto.EvSitedataDone) void {
+        if (self.site_info) |info| info.onSitedataDone(ev);
     }
 
     /// Wheel scrolling through the ORDINARY input path, at the last
@@ -3018,6 +3220,18 @@ pub const WebFace = struct {
 
         self.reload_btn = toolbtn.barButton(bar, "view-refresh-symbolic", "Reload", "Reload", &onReload, self);
         self.track(self.reload_btn);
+
+        // Site button: the padlock every browser puts here, and the
+        // only way back to a decision this site was once given.
+        self.site_btn = toolbtn.barButton(
+            bar,
+            "channel-insecure-symbolic",
+            "Site",
+            "Site information, permissions and stored data",
+            &onSiteInfo,
+            self,
+        );
+        self.track(self.site_btn);
 
         self.entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(self.entry, 1);
@@ -4029,6 +4243,7 @@ pub const WebFace = struct {
         }
         self.noteNavigation(url);
         if (self.widgets_dead) return;
+        self.updateSiteButton();
         // A blank page has no address to show: browsers leave the bar
         // empty there, and writing "about:blank" into the bar of a tab
         // that opens focused would land the user's typing in front of
@@ -4067,6 +4282,9 @@ pub const WebFace = struct {
             if (std.mem.eql(u8, o, origin)) return;
             self.allocator.free(o);
         }
+        // A certificate the user accepted was accepted for the origin
+        // they were looking at, not for the next one.
+        self.cert_exception = false;
         self.nav_origin = self.allocator.dupe(u8, origin) catch null;
         _ = webstore.siteGet(self.allocator, origin, @ptrCast(self), &onSiteReply);
     }
@@ -4313,6 +4531,10 @@ pub const WebFace = struct {
         });
         if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
         if (proceed) {
+            // The padlock must stop claiming a verified identity the
+            // moment the user overrode the verification.
+            self.cert_exception = true;
+            self.updateSiteButton();
             self.promote();
             return;
         }
