@@ -16830,3 +16830,73 @@ Three "sketerm-shaped differentiators" from the proposal, one wire block
 - smoke-web stages 28 (cosmetic rule hides, sibling kept, shield
   gates), 29 (document-end userscript mutates DOM, replace-all clears),
   30 (userstyle instant apply, survives navigation, clear removes).
+
+## 2026-08-12: per-site cookie / site-data UI (the padlock popover)
+
+The last "table stakes" item from the browser proposal: a site-info
+popover on the web toolbar that shows what a site IS, what it was
+allowed to do, and what it has stored — with the way to undo each.
+Permissions already existed but could never be found again once
+answered, and cookies could not be seen at all.
+
+- `src/web/protocol.zig` (both test roots): new append-only 0xC8 block
+  — `cookies_req`/`ev_cookies`, `cookie_delete`, `cookies_clear`,
+  `sitedata_clear`/`ev_sitedata_done` — plus capability
+  `CAP_SITEDATA`. **Cookie VALUES never cross the wire**: an entry
+  carries name, domain, path, flags, SameSite, expiry and the value's
+  LENGTH. Shipping values would put every open tab's session tokens in
+  the GUI's address space for a panel that never renders them; stage 31
+  asserts the value byte string is absent from the frame.
+- `src/web/cefhost.zig`: `CookieJob`, the only really refcounted
+  client-side struct in the file. `visit_url_cookies` TAKES ownership
+  of the visitor reference (CEF's CToCpp wrappers transfer, never add)
+  and may drop it before returning when the manager refuses, so the job
+  is created with two references and one is released after the call —
+  the return value is still readable when the answer is composed, and
+  the final release is both the "visiting finished" signal and the free.
+  Deletion goes through the visitor with `deleteCookie = 1`, never
+  `delete_cookies(url, …)`, whose url-only form deliberately spares
+  DOMAIN cookies and would leave `.example.com` behind.
+- Two engine limits are REPORTED, not hidden, in
+  `EvSitedataDone.detail`: `clear_http_cache` is the only cache verb
+  the C API has and it clears the whole request context
+  (`cache-whole-context`), and localStorage/sessionStorage/IndexedDB/
+  Cache Storage have no browser-process API at all, so they are cleared
+  by running script in the document — which only works while the view
+  is still on that origin (`storage-skipped-origin`). Both documented
+  in `src/web/CLAUDE.md`.
+- `src/ui/websiteinfo.zig` (new): the popover. Origin, TLS state
+  (secure / not secure / certificate exception accepted), the
+  permission decisions remembered for the origin with a reset per row,
+  the content-blocking switch, the cookie count with an expandable
+  list, and Clear cookies / Clear site data behind `ui/confirm.zig`.
+  **Nothing here points at the face**: every callback carries the
+  view id and resolves it through `webface.faceByView`, so a face torn
+  down between a click and its handler resolves to null rather than to
+  freed memory. Row contexts own their strings and die with their row
+  (GDestroyNotify); the popover itself is severed at the face's
+  prepare-destroy choke point and freed in its deinit.
+- `src/ui/webface.zig`: padlock button left of the address entry,
+  `cap_sitedata`, the `ev_cookies`/`ev_sitedata_done` dispatch, and a
+  `cert_exception` flag so the padlock stops claiming a verified
+  identity once the user overrode an interstitial (cleared on every
+  origin change).
+- New bindable action `web_site_info` (palette entry + `sketerm cli
+  action`), which is also what made the popover drivable for the
+  runtime check below.
+- Verification: `zig build`, `web`, `test`, `test-core`, `smoke-web`
+  all green. New smoke-web **stage 31** serves ONE page over loopback
+  HTTP — a `data:` URL has an opaque origin and stores no cookie at all
+  — lets its script set one, enumerates it with scope/flags/value
+  length, clears, and re-enumerates to zero; it also checks that a
+  request naming an unknown view is ANSWERED rather than ignored.
+  Unit tests cover the new frames' round trips and the cookie subtitle
+  formatter. The GUI half was additionally driven for real through
+  `measure-web` (private daemon + display session + viewer attached
+  first): the padlock renders in the toolbar, `sketerm cli action
+  web_site_info` opens the popover, and the compositor log shows its
+  surface mapping and committing pixels.
+- Known limits: the popover's own pixels are an xdg_popup, i.e. a
+  separate Wayland surface, so an `appdrive` screenshot of the toplevel
+  does not contain them — the runtime evidence is the popup surface's
+  commit, not a picture of the rows.
