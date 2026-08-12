@@ -621,8 +621,8 @@ pub const Client = struct {
     /// silently eat every frame descriptor and the pane would stay
     /// black, so its absence is a described failure, never a hang.
     cap_frames_inline: bool = false,
-    /// The helper hosts WebExtensions (the 0xB0 block). Without it the
-    /// extensions manager stays unreachable and no extension loads.
+    /// The helper hosts MV2-flavor WebExtensions (the 0xB0 frame block).
+    /// Absent, the GUI loads no extension and the helper hosts none.
     cap_webext: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
