@@ -914,6 +914,11 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // as lsp: an old daemon would `.err` on the unknown
                 // frame, misattributable on a multiplexed connection.
                 .stream_open = true,
+                // Remote browser helper (web_helper_open/web_helper_reply).
+                // Capability, same reasoning as lsp — and its absence is
+                // the "daemon too old for remote browsing" described
+                // error the GUI shows instead of hanging.
+                .web_helper = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -997,6 +1002,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // NOT attach-scoped (like fs_op): served by whichever process
         // owns the client connection — the broker, in broker mode.
         .lsp_open => self.handleLspOpen(cl, frame.payload),
+        // NOT attach-scoped either: the helper renders on the daemon's
+        // host and belongs to the client connection, not to a session.
+        .web_helper_open => self.handleWebHelperOpen(cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

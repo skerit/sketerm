@@ -47,6 +47,7 @@ const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
 const lsp_proc = @import("../lsp/proc.zig");
 const lsp_servers = @import("../lsp/servers.zig");
+const webfindbin = @import("../web/findbin.zig");
 const shell_util = @import("shell.zig");
 const platform = @import("../util/platform.zig");
 const Pty = @import("../pty.zig").Pty;
@@ -1453,6 +1454,106 @@ test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on clo
         try t.expectEqual(@as(usize, 0), d.channels.items.len);
         try t.expectEqual(@as(usize, 0), d.lsp_reaps.items.len);
     }
+}
+
+test "web_helper_open: missing helper is a described refusal, a spawn bridges a channel" {
+    const t = std.testing;
+    const muxclient = @import("client.zig");
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-web-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+    var conn = try muxclient.Conn.connect(t.allocator, path);
+    defer conn.deinit();
+
+    // The env pin is authoritative (findbin); tests running inside a
+    // sketerm pane inherit real env, so save + restore it exactly.
+    const saved = if (c.getenv("SKETERM_WEB_BIN")) |v| std.mem.span(v) else null;
+    defer {
+        if (saved) |v| {
+            var buf: [4096:0]u8 = undefined;
+            const z = std.fmt.bufPrintZ(&buf, "{s}", .{v}) catch unreachable;
+            _ = c.setenv("SKETERM_WEB_BIN", z.ptr, 1);
+        } else _ = c.unsetenv("SKETERM_WEB_BIN");
+    }
+
+    const Pump = struct {
+        fn next(dm: *Daemon, cn: *muxclient.Conn) !muxclient.Conn.OwnedFrame {
+            var spins: usize = 0;
+            while (spins < 4000) : (spins += 1) {
+                try dm.tick(0);
+                if (!cn.fillAvailable()) return error.Disconnected;
+                if (try cn.takeFrame()) |f| return f;
+                _ = c.usleep(1000);
+            }
+            return error.Timeout;
+        }
+    };
+    const Reply = struct { req: u32 = 0, ok: bool = false, chan: u32 = 0, @"error": []const u8 = "" };
+
+    // 1. No helper on this host: described ok:false, no channel.
+    _ = c.setenv("SKETERM_WEB_BIN", "/no/such/sketerm-webengine-test", 1);
+    try conn.sendJson(.web_helper_open, .{ .req = @as(u32, 5) });
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.web_helper_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expectEqual(@as(u32, 5), parsed.value.req);
+        try t.expect(!parsed.value.ok);
+        try t.expect(std.mem.indexOf(u8, parsed.value.@"error", "not installed") != null);
+        try t.expectEqual(@as(usize, 0), d.channels.items.len);
+    }
+
+    // 2. An executable helper spawns: chan_open (kind web_helper) then
+    // the ok reply; the stand-in exits at once, so the channel EOFs and
+    // the daemon retires it (chan_close toward the client).
+    _ = c.setenv("SKETERM_WEB_BIN", "/bin/true", 1);
+    try conn.sendJson(.web_helper_open, .{ .req = @as(u32, 6) });
+    var chan_id: u32 = 0;
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.chan_open, f.ftype);
+        const co = wire.decodeChanOpen(f.payload).?;
+        try t.expectEqual(wire.ChannelKind.web_helper, co.kind);
+        chan_id = co.id;
+    }
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.web_helper_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expect(parsed.value.ok);
+        try t.expectEqual(@as(u32, 6), parsed.value.req);
+        try t.expectEqual(chan_id, parsed.value.chan);
+    }
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.chan_close, f.ftype);
+        try t.expectEqual(chan_id, wire.decodeChanId(f.payload).?);
+    }
+    // The dead child is reaped through the lsp grace path; nothing
+    // zombifies and no channel lingers.
+    var spins: usize = 0;
+    while (spins < 4000) : (spins += 1) {
+        try d.tick(0);
+        if (d.channels.items.len == 0 and d.lsp_reaps.items.len == 0) break;
+        _ = c.usleep(1000);
+    }
+    try t.expectEqual(@as(usize, 0), d.channels.items.len);
+    try t.expectEqual(@as(usize, 0), d.lsp_reaps.items.len);
 }
 
 pub const Native = struct {
@@ -5302,6 +5403,120 @@ pub const Daemon = struct {
         // No candidate installed here: the client degrades silently,
         // exactly like a missing local server.
         cl.queueJson(.lsp_reply, .{ .req = req.req, .ok = false });
+    }
+
+    const WebHelperReq = struct { req: u32 = 0 };
+
+    /// Spawn a `sketerm-webengine --frames-inline` on THIS host with its
+    /// client connection on a socketpair, and bridge that fd as an
+    /// ordinary byte channel — the remote-browsing primitive. The daemon
+    /// relays the raw helper-protocol bytes and never parses them; the
+    /// helper never gets a listening socket (no connect-retry, no stale
+    /// socket file) and dies with the channel exactly like an lsp child.
+    /// A missing binary is a DESCRIBED ok:false, never a hang: the GUI
+    /// shows the message on the pane.
+    pub fn handleWebHelperOpen(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(WebHelperReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad web_helper_open request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        var bin_buf: [4096:0]u8 = undefined;
+        const bin = webfindbin.find(&bin_buf) orelse {
+            cl.queueJson(.web_helper_reply, .{
+                .req = req.req,
+                .ok = false,
+                .@"error" = "sketerm-webengine is not installed on this host",
+            });
+            return;
+        };
+        var pair: [2]c_int = .{ -1, -1 };
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair) != 0) {
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "socketpair failed" });
+            return;
+        }
+        // Park both ends above the stdio range and mark OUR end
+        // cloexec: a daemonized parent can have fds 0-2 closed, and the
+        // child's stdio rewiring below must not clobber its own end.
+        for (&pair) |*fd| {
+            if (fd.* < 3) {
+                const moved = c.fcntl(fd.*, c.F_DUPFD, @as(c_int, 3));
+                _ = c.close(fd.*);
+                fd.* = if (moved < 0) -1 else moved;
+            }
+        }
+        if (pair[0] < 0 or pair[1] < 0) {
+            for (pair) |fd| if (fd >= 0) {
+                _ = c.close(fd);
+            };
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "socketpair failed" });
+            return;
+        }
+        _ = c.fcntl(pair[0], c.F_SETFD, c.FD_CLOEXEC);
+        // The child's argv, NUL-terminated before the fork (no
+        // allocation between fork and exec).
+        var fd_arg: [16:0]u8 = undefined;
+        const fd_str = std.fmt.bufPrintZ(&fd_arg, "{d}", .{pair[1]}) catch unreachable;
+        const pid = c.fork();
+        if (pid < 0) {
+            _ = c.close(pair[0]);
+            _ = c.close(pair[1]);
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "fork failed" });
+            return;
+        }
+        if (pid == 0) {
+            // Own process group, so channel teardown can kill CEF's
+            // whole subprocess tree (the lsp discipline).
+            _ = c.setpgid(0, 0);
+            const devnull = c.open("/dev/null", c.O_RDWR);
+            if (devnull >= 0) {
+                _ = c.dup2(devnull, 0);
+                _ = c.dup2(devnull, 1);
+                _ = c.dup2(devnull, 2);
+                if (devnull > 2) _ = c.close(devnull);
+            }
+            var argv: [6:null]?[*:0]const u8 = .{ bin, "--socket-fd", fd_str.ptr, "--frames-inline", null, null };
+            _ = c.execv(bin, @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        _ = c.close(pair[1]);
+        const ch = self.allocator.create(Channel) catch {
+            _ = c.close(pair[0]);
+            _ = c.kill(-pid, c.SIGKILL);
+            var st: c_int = 0;
+            _ = c.waitpid(pid, &st, 0);
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+            return;
+        };
+        const fl = c.fcntl(pair[0], c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(pair[0], c.F_SETFL, fl | c.O_NONBLOCK);
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = pair[0],
+            .session = null,
+            .client = cl,
+            .tcp = true,
+            .child_pid = pid,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.dead = true;
+            _ = c.kill(-pid, c.SIGKILL);
+            var st: c_int = 0;
+            _ = c.waitpid(pid, &st, 0);
+            ch.child_pid = -1;
+            ch.deinit();
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+            return;
+        };
+        log.debug("web_helper_open: pid {d} -> channel {d}", .{ pid, ch.id });
+        var ob: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .web_helper));
+        cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = true, .chan = ch.id });
     }
 
     const SearchReq = struct { pattern: []const u8, max: u32 = 50 };

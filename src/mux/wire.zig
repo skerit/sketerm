@@ -224,6 +224,21 @@ pub const FrameType = enum(u8) {
     /// (loopback-only, port-only) this reaches any host the daemon can.
     /// Only sent to daemons whose welcome advertises `stream_open:true`.
     stream_open = 33,
+    /// Spawn a `sketerm-webengine` browser helper ON the daemon's host
+    /// and bridge its protocol socket as a byte channel — the remote
+    /// browsing primitive: the helper renders where the daemon runs and
+    /// its frames ride the mux wire in-band (the helper is launched
+    /// with `--frames-inline`, so no descriptor ever needs to cross).
+    /// JSON { req }. Answered with `web_helper_reply` echoing `req`
+    /// and, on ok, preceded by a `chan_open` (kind web_helper) whose
+    /// chan_data is the raw helper protocol byte stream, 1:1 with the
+    /// requesting client. The helper DIES with the channel (client
+    /// disconnect included), exactly like an lsp child. NOT
+    /// attach-scoped: served by whichever process owns the client
+    /// connection. Only sent to daemons whose welcome advertises
+    /// `web_helper:true` — an old daemon would answer `.err`,
+    /// misattributable on a multiplexed connection.
+    web_helper_open = 34,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -356,6 +371,13 @@ pub const FrameType = enum(u8) {
     /// frame; ok:false carries the failure (bad request, DNS miss,
     /// connect refused) so a SOCKS bridge can answer its client.
     stream_reply = 97,
+    /// Answer to `web_helper_open`, ALWAYS echoing the request's `req`
+    /// (fs_op nonce discipline): JSON { req, ok, chan?, error? }. On
+    /// ok:true a `chan_open` (kind web_helper) for `chan` precedes this
+    /// frame; ok:false carries the failure ("sketerm-webengine is not
+    /// installed on this host", spawn failure) so the GUI can show a
+    /// described error instead of a hang.
+    web_helper_reply = 98,
     _,
 };
 
@@ -384,6 +406,12 @@ pub const ChannelKind = enum(u8) {
     /// cannot be re-attached mid-`initialize`, so a durable server
     /// process would only leak memory on the remote host.
     lsp = 6,
+    /// Browser-helper protocol bridge (answering `web_helper_open`):
+    /// chan_data carries the raw sketerm-web protocol byte stream of a
+    /// `sketerm-webengine --frames-inline` spawned on the daemon's
+    /// host; 1:1 with the requesting client, and the helper dies with
+    /// the channel (the lsp lifecycle).
+    web_helper = 7,
     _,
 };
 
@@ -882,6 +910,9 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 30), @intFromEnum(FrameType.play_control));
     try std.testing.expectEqual(@as(u8, 31), @intFromEnum(FrameType.panel_request));
     try std.testing.expectEqual(@as(u8, 32), @intFromEnum(FrameType.web_op));
+    try std.testing.expectEqual(@as(u8, 34), @intFromEnum(FrameType.web_helper_open));
+    try std.testing.expectEqual(@as(u8, 98), @intFromEnum(FrameType.web_helper_reply));
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));
     try std.testing.expectEqual(@as(u8, 95), @intFromEnum(FrameType.panel_reply));
