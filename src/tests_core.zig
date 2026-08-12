@@ -183,6 +183,7 @@ comptime {
     _ = @import("web/hints.zig");
     _ = @import("web/pace.zig");
     _ = @import("web/filter.zig");
+    _ = @import("web/userscript.zig");
     _ = @import("web/model.zig");
     _ = @import("web/axtree.zig");
     _ = @import("util/content.zig");
