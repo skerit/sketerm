@@ -2553,7 +2553,7 @@ pub const AppHost = struct {
             self.fetch_kinds.orderedRemove(0)
         else
             0;
-        clipmod.copyTextTo(if (kind == 1) gdkPrimary() else gdkClipboard(), bytes);
+        clipmod.copyTextTo(self.allocator, if (kind == 1) gdkPrimary() else gdkClipboard(), bytes);
     }
 
     /// App wants to paste: async-read the host clipboard; ALWAYS

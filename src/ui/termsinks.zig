@@ -76,7 +76,7 @@ pub fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) voi
 
 pub fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Window, ctx);
-    clipboard.copyText(self.app_window, text);
+    clipboard.copyText(self.allocator, self.app_window, text);
 }
 
 pub fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {

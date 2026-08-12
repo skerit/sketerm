@@ -1619,7 +1619,7 @@ fn onPlacesMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn onPlacesMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(PlacesMenuCtx, user);
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    clipboard.copyText(@ptrCast(@alignCast(ctx.view.places_list)), ctx.spec);
+    clipboard.copyText(ctx.allocator, @ptrCast(@alignCast(ctx.view.places_list)), ctx.spec);
     ctx.view.setStatus("location copied");
 }
 

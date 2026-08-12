@@ -125,14 +125,16 @@ pub fn pasteText(term: *Terminal, pasted: []const u8) void {
 
 /// Copy a plain (not necessarily 0-terminated) slice to the widget's
 /// display clipboard. GDK wants a C string, so short text rides a
-/// stack buffer and anything longer is duped; an OOM on the dupe
-/// drops the copy silently, matching every open-coded site this
-/// replaced.
-pub fn copyText(widget: *c.GtkWidget, text: []const u8) void {
-    copyTextTo(clipboardFor(widget, .clipboard), text);
+/// stack buffer and anything longer is duped through the CALLER's
+/// allocator — the same one the read path (`readFrom`) already takes,
+/// so one logical clipboard operation never straddles two heaps. An
+/// OOM on the dupe drops the copy silently, matching every open-coded
+/// site this replaced.
+pub fn copyText(allocator: std.mem.Allocator, widget: *c.GtkWidget, text: []const u8) void {
+    copyTextTo(allocator, clipboardFor(widget, .clipboard), text);
 }
 
-pub fn copyTextTo(clipboard_opt: ?*c.GdkClipboard, text: []const u8) void {
+pub fn copyTextTo(allocator: std.mem.Allocator, clipboard_opt: ?*c.GdkClipboard, text: []const u8) void {
     const clipboard = clipboard_opt orelse return;
     var stack: [512:0]u8 = undefined;
     if (text.len < stack.len) {
@@ -141,8 +143,8 @@ pub fn copyTextTo(clipboard_opt: ?*c.GdkClipboard, text: []const u8) void {
         c.gdk_clipboard_set_text(clipboard, &stack);
         return;
     }
-    const z = std.heap.c_allocator.dupeZ(u8, text) catch return;
-    defer std.heap.c_allocator.free(z);
+    const z = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(z);
     c.gdk_clipboard_set_text(clipboard, z.ptr);
 }
 

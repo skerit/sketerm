@@ -542,7 +542,7 @@ pub const Pane = struct {
                 const text = self.terminal.screen.extractSelection(self.allocator) catch return true;
                 defer self.allocator.free(text);
                 if (text.len == 0) return true;
-                clipboard.copyText(@ptrCast(self.surface.area), text);
+                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), text);
                 if (self.clear_select_on_copy) {
                     self.terminal.screen.selection.clear();
                     self.terminal.screen.dirty = true;
@@ -560,7 +560,7 @@ pub const Pane = struct {
                 const text = maybe orelse return true;
                 defer self.allocator.free(text);
                 if (text.len == 0) return true;
-                clipboard.copyText(@ptrCast(self.surface.area), text);
+                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), text);
                 return true;
             },
             .reset_terminal => {
@@ -570,7 +570,7 @@ pub const Pane = struct {
             .copy_link => {
                 const uri = self.menu_link_uri orelse return true;
                 if (uri.len == 0) return true;
-                clipboard.copyText(@ptrCast(self.surface.area), uri);
+                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), uri);
                 return true;
             },
             .open_link => {

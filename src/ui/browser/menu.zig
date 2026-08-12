@@ -933,7 +933,7 @@ pub fn onMenuMoveToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
     const path = ctx.path orelse return menuDone(ctx);
-    clipboard.copyText(@ptrCast(@alignCast(ctx.tab.colview)), path);
+    clipboard.copyText(ctx.allocator, @ptrCast(@alignCast(ctx.tab.colview)), path);
     menuDone(ctx);
 }
 

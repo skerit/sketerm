@@ -1113,7 +1113,7 @@ fn copySelection(ctx: *Ctx) void {
     if (text.len == 0) return;
 
     // Copy to system clipboard.
-    clipboard.copyText(ctx.widget, text);
+    clipboard.copyText(ctx.terminal.allocator, ctx.widget, text);
 
     if (ctx.clear_select_on_copy) {
         screen.selection.clear();
@@ -1128,7 +1128,7 @@ fn copyScreen(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    clipboard.copyText(ctx.widget, text);
+    clipboard.copyText(ctx.terminal.allocator, ctx.widget, text);
 }
 
 fn copyScrollback(ctx: *Ctx) void {
@@ -1137,7 +1137,7 @@ fn copyScrollback(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    clipboard.copyText(ctx.widget, text);
+    clipboard.copyText(ctx.terminal.allocator, ctx.widget, text);
 }
 
 fn copyCommandOutput(ctx: *Ctx) void {
@@ -1147,7 +1147,7 @@ fn copyCommandOutput(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 
-    clipboard.copyText(ctx.widget, text);
+    clipboard.copyText(ctx.terminal.allocator, ctx.widget, text);
 }
 
 /// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).

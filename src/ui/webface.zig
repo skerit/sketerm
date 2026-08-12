@@ -5249,9 +5249,7 @@ pub const WebFace = struct {
 
     fn copyText(self: *WebFace, text: []const u8) void {
         if (self.widgets_dead) return;
-        const z = self.allocator.dupeZ(u8, text) catch return;
-        defer self.allocator.free(z);
-        clipboard.copyToClipboard(self.root_box, z);
+        clipboard.copyText(self.allocator, self.root_box, text);
     }
 
     fn onMenuBack(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

@@ -5191,7 +5191,7 @@ pub const EditorView = struct {
         const text = vm.selectedText(self.allocator, &tab.doc, &tab.sels) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        clipboard.copyText(@ptrCast(self.area), text);
+        clipboard.copyText(self.allocator, @ptrCast(self.area), text);
     }
 
     fn cutSelection(self: *EditorView, tab: *ETab) void {
@@ -5209,7 +5209,7 @@ pub const EditorView = struct {
         // The Fence ref is the liveness guard: taken here, dropped in
         // onPasteRead (which always runs, text or not).
         self.fence.ref();
-        if (!clipboard.readText(std.heap.c_allocator, @ptrCast(self.area), onPasteRead, @ptrCast(self.fence)))
+        if (!clipboard.readText(self.allocator, @ptrCast(self.area), onPasteRead, @ptrCast(self.fence)))
             self.fence.unref();
     }
 
@@ -6172,7 +6172,7 @@ pub const EditorView = struct {
             .copy_line_number => {
                 var buf: [24:0]u8 = undefined;
                 const z = std.fmt.bufPrintZ(&buf, "{d}", .{line + 1}) catch return;
-                clipboard.copyText(@ptrCast(self.area), z);
+                clipboard.copyText(self.allocator, @ptrCast(self.area), z);
                 var msg: [48:0]u8 = undefined;
                 const m = std.fmt.bufPrintZ(&msg, "Copied line number {d}.", .{line + 1}) catch return;
                 self.setStatus(m.ptr);

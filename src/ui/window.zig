@@ -3496,7 +3496,7 @@ pub const Window = struct {
         const text = screen.extractScreen(self.allocator) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        clipboard.copyText(self.app_window, text);
+        clipboard.copyText(self.allocator, self.app_window, text);
     }
 
     /// Copy the focused pane's scrollback ring + active screen.
@@ -3506,7 +3506,7 @@ pub const Window = struct {
         const text = screen.extractScrollback(self.allocator) catch return;
         defer self.allocator.free(text);
         if (text.len == 0) return;
-        clipboard.copyText(self.app_window, text);
+        clipboard.copyText(self.allocator, self.app_window, text);
     }
 
     /// Open the focused pane's scrollback + screen in a pager tab.

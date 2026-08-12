@@ -1643,7 +1643,7 @@ const CardMenuItemCtx = struct {
 
 fn onCardCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *CardMenuItemCtx = @ptrCast(@alignCast(user.?));
-    clipboard.copyText(ctx.card, ctx.path);
+    clipboard.copyText(ctx.allocator, ctx.card, ctx.path);
 }
 
 fn cardMenuItem(root: *classicmenu.Root, m: classicmenu.Menu, ctx: *const CardMenuCtx, label: [*:0]const u8, path: []const u8) void {
