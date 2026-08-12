@@ -292,16 +292,11 @@ pub const Group = struct {
             try kept.append(arena, p.face);
         }
         // Second pass: a parent is only referable once every kept page
-        // has an index.
-        for (kept.items, 0..) |face, i| {
-            const parent = self.forest.parentOf(face) orelse continue;
-            for (kept.items, 0..) |other, j| {
-                if (other == parent) {
-                    out.items[i].parent = @intCast(j);
-                    break;
-                }
-            }
-        }
+        // has an index (Forest.parentIndices, shared with the window
+        // tab tree's own serialization and unit-tested there).
+        const parents = try arena.alloc(?u32, kept.items.len);
+        self.forest.parentIndices(kept.items, parents);
+        for (parents, 0..) |p, i| out.items[i].parent = if (p) |v| @intCast(v) else -1;
         if (out.items.len == 0) return .{};
         return .{
             .url = out.items[active_idx].url,

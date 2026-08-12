@@ -75,6 +75,8 @@ pub fn show(win: *Window, anchor: *c.GtkWidget) void {
     row(tree, win, .toggle_tab_sidebar, true);
     row(tree, win, .tab_collapse, has_pane);
     row(tree, win, .tab_expand, has_pane);
+    row(tree, win, .tab_tree_next, has_pane);
+    row(tree, win, .tab_tree_prev, has_pane);
 
     const panes = m.section();
     row(panes, win, .split_h, has_pane);

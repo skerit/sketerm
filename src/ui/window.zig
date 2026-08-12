@@ -3856,6 +3856,17 @@ pub const Window = struct {
     /// tab_collapse / tab_expand on the selected tab. Collapsing a
     /// tab without children is a no-op rather than a surprise.
     pub fn collapseCurrentTab(self: *Window, collapse: bool) void {
+        // Act on the tree the user can SEE. While the sidebar lists a
+        // browser's pages, folding the window's tab tree instead would
+        // move something invisible.
+        if (self.sidebarGroup()) |g| {
+            const face = g.active() orelse return;
+            if (g.forest.find(face) == null) return;
+            if (collapse and !g.forest.hasChildren(face)) return;
+            g.forest.setCollapsed(face, collapse);
+            if (self.tab_sidebar) |sb| sb.rebuild();
+            return;
+        }
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
         if (collapse and !self.tab_forest.hasChildren(page)) return;
         self.setTabCollapsed(page, collapse);
@@ -3864,6 +3875,14 @@ pub const Window = struct {
     /// tab_tree_next / tab_tree_prev: walk the VISIBLE tree order
     /// (collapsed subtrees skipped), wrapping at the ends.
     pub fn tabTreeStep(self: *Window, forward: bool) void {
+        // Same rule as collapseCurrentTab: step through whichever tree
+        // the sidebar is showing.
+        if (self.sidebarGroup()) |g| {
+            const face = g.active() orelse return;
+            const next = (g.forest.stepVisible(self.allocator, face, forward) catch return) orelse return;
+            g.setActive(next);
+            return;
+        }
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
         const next = (self.tab_forest.stepVisible(self.allocator, page, forward) catch return) orelse return;
         c.adw_tab_view_set_selected_page(self.tab_view, next);
@@ -4034,6 +4053,8 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .toggle_tab_sidebar => self.toggleTabSidebarVisibility(),
         .tab_collapse => self.collapseCurrentTab(true),
         .tab_expand => self.collapseCurrentTab(false),
+        .tab_tree_next => self.tabTreeStep(true),
+        .tab_tree_prev => self.tabTreeStep(false),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .files_browse_here => if (self.focusedPane()) |p| self.openBrowserHere(p, null) catch |err|

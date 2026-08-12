@@ -458,6 +458,13 @@ pub fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
 /// Caller must arena-free or otherwise track strings.
 pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout {
     var tabs: std.ArrayList(layout_mod.TabSpec) = .empty;
+    // Pages in the order they were SERIALIZED, which is what
+    // `tree_parent` indexes — the loop below skips tabs (no root
+    // widget, or a tab whose every pane is transient), so a view
+    // position is NOT a saved-array index. Writing one where the other
+    // is read nested restored children under the wrong parent.
+    var kept: std.ArrayList(*c.AdwTabPage) = .empty;
+    defer kept.deinit(arena);
     const n_pages = c.adw_tab_view_get_n_pages(self.tab_view);
     var i: c_int = 0;
     while (i < n_pages) : (i += 1) {
@@ -490,15 +497,19 @@ pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout
             .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
             .show_activity = tab_effects.tabSettings(page.?).show_activity,
             .warn_inactive = tab_effects.tabSettings(page.?).warn_inactive,
-            // Tree-style tabs: parent as a view-order index (the same
-            // order this loop serializes tabs in), collapse per tab.
-            .tree_parent = if (self.tab_forest.parentOf(page.?)) |parent| blk: {
-                const pos = c.adw_tab_view_get_page_position(self.tab_view, parent);
-                break :blk if (pos >= 0) @as(?u32, @intCast(pos)) else null;
-            } else null,
+            // Tree-style tabs: `tree_parent` is patched in below, once
+            // every kept tab has an index; a parent can sit AFTER its
+            // child in view order, so it cannot be resolved here.
+            .tree_parent = null,
             .collapsed = self.tab_forest.isCollapsed(page.?),
         });
+        try kept.append(arena, page.?);
     }
+    // Second pass: parent pointers become indices into `tabs` (see
+    // Forest.parentIndices for why a view position will not do).
+    const parents = try arena.alloc(?u32, kept.items.len);
+    self.tab_forest.parentIndices(kept.items, parents);
+    for (parents, 0..) |p, idx| tabs.items[idx].tree_parent = p;
     return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
 }
 

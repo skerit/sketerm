@@ -202,6 +202,34 @@ pub fn Forest(comptime Ref: type) type {
             return p.ref;
         }
 
+        /// Nesting of `kept`, expressed as INDICES INTO `kept` — how a
+        /// tree is serialized, since a pointer means nothing to the
+        /// next process. `out` must be `kept.len` long and is filled
+        /// with each entry's parent index, or null for a root.
+        ///
+        /// `kept` is deliberately the SERIALIZED order, not every ref
+        /// in the forest: both callers skip refs that persist to
+        /// nothing (a tab with no root widget, a DevTools-only page),
+        /// and using a position in some other order as the index is
+        /// exactly the bug this exists to prevent — it restored
+        /// children under whatever tab happened to sit at that index.
+        /// A ref whose parent was skipped comes back null, i.e. a root,
+        /// which is the honest answer: its nesting had nowhere to
+        /// attach.
+        pub fn parentIndices(self: *const Self, kept: []const Ref, out: []?u32) void {
+            for (kept, 0..) |ref, i| {
+                if (i >= out.len) return;
+                out[i] = null;
+                const parent = self.parentOf(ref) orelse continue;
+                for (kept, 0..) |other, j| {
+                    if (other == parent) {
+                        out[i] = @intCast(j);
+                        break;
+                    }
+                }
+            }
+        }
+
         /// Append `ref` + every descendant, DFS/tree order.
         pub fn appendSubtree(self: *const Self, allocator: std.mem.Allocator, ref: Ref, out: *std.ArrayList(Ref)) !void {
             const n = self.find(ref) orelse return error.NotFound;
@@ -386,4 +414,38 @@ test "appendSubtree + stepVisible wraps in tree order" {
     f.setCollapsed(1, true);
     try std.testing.expectEqual(@as(?u32, 4), try f.stepVisible(ta, 1, true));
     try std.testing.expectEqual(@as(?u32, null), try f.stepVisible(ta, 3, true)); // hidden ref
+}
+
+test "parentIndices maps nesting onto the SERIALIZED order, not the model's" {
+    var f = TF.init(ta);
+    defer f.deinit();
+    // View order 1,2,3,4 with 3 nested under 2 and 4 under 3.
+    _ = try f.add(1);
+    _ = try f.add(2);
+    _ = try f.addChild(3, 2, .last);
+    _ = try f.addChild(4, 3, .last);
+
+    // Nothing skipped: indices are the positions.
+    var out: [4]?u32 = undefined;
+    f.parentIndices(&.{ 1, 2, 3, 4 }, &out);
+    try std.testing.expectEqual(@as(?u32, null), out[0]);
+    try std.testing.expectEqual(@as(?u32, null), out[1]);
+    try std.testing.expectEqual(@as(?u32, 1), out[2]);
+    try std.testing.expectEqual(@as(?u32, 2), out[3]);
+
+    // Tab 1 is skipped (no root widget / all-transient): every later
+    // tab shifts down one. A position-based index would now name the
+    // WRONG parent — 3 would claim parent 1, which is tab 2's slot.
+    var out3: [3]?u32 = undefined;
+    f.parentIndices(&.{ 2, 3, 4 }, &out3);
+    try std.testing.expectEqual(@as(?u32, null), out3[0]);
+    try std.testing.expectEqual(@as(?u32, 0), out3[1]);
+    try std.testing.expectEqual(@as(?u32, 1), out3[2]);
+
+    // A skipped PARENT leaves its child a root rather than pointing at
+    // a stranger.
+    var out2: [2]?u32 = undefined;
+    f.parentIndices(&.{ 1, 4 }, &out2);
+    try std.testing.expectEqual(@as(?u32, null), out2[0]);
+    try std.testing.expectEqual(@as(?u32, null), out2[1]);
 }

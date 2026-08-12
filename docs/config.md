@@ -632,7 +632,15 @@ select_command_output interrupt_or_copy clear_and_scrollback
 clear_scrollback scrollback_page_up scrollback_page_down
 scrollback_top scrollback_bottom command_palette hints_open
 copy_mode zoom_pane
+toggle_tab_sidebar tab_collapse tab_expand tab_tree_next tab_tree_prev
 ```
+
+The five tree-style-tab actions ship UNBOUND — bind them yourself, e.g.
+`keybind.toggle_tab_sidebar = <Control><Shift>E`. They are also in the
+Tab menu, the window hamburger and the command palette. `tab_collapse`,
+`tab_expand`, `tab_tree_next` and `tab_tree_prev` act on whichever tree
+the sidebar is showing: the window's tabs normally, or the focused
+browser's pages when it is listing those.
 
 ### File browser
 
