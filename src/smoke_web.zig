@@ -51,6 +51,8 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const proto = @import("web/protocol.zig");
+const zpool = @import("wlhost/zpool.zig");
+const mux_wire = @import("mux/wire.zig");
 const webhints = @import("web/hints.zig");
 const socks5 = @import("ipc/socks5.zig");
 
@@ -318,6 +320,8 @@ const usc_source =
 // Cleanup state: `fail` may fire from anywhere, and the helper must
 // never be left running nor the temp dir behind. Killed by EXACT pid.
 var g_pid: c.pid_t = -1;
+/// The stage-28 private mux daemon, killed by EXACT pid.
+var g_mux_pid: c.pid_t = -1;
 var g_dir: [64]u8 = @splat(0);
 
 fn say(msg: []const u8) void {
@@ -331,6 +335,12 @@ fn cleanup() void {
         var status: c_int = 0;
         _ = c.waitpid(g_pid, &status, 0);
         g_pid = -1;
+    }
+    if (g_mux_pid > 0) {
+        _ = c.kill(g_mux_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(g_mux_pid, &status, 0);
+        g_mux_pid = -1;
     }
     if (g_dir[0] != 0) {
         removeTree(@ptrCast(&g_dir));
@@ -529,7 +539,7 @@ const ProxyProbe = struct {
 };
 
 /// A one-page HTTP server on loopback: the only real ORIGIN this rig
-/// serves, and the reason stage 28 can exist at all — a `data:` URL's
+/// serves, and the reason stage 32 can exist at all — a `data:` URL's
 /// origin is opaque, so `document.cookie` on one stores nothing and
 /// there would be no cookie to enumerate or clear.
 ///
@@ -818,6 +828,17 @@ const Client = struct {
     site_removed: u32 = 0,
     site_detail: [128]u8 = @splat(0),
     site_detail_len: usize = 0,
+    ack_frames_inline: bool = false,
+    /// Inline frame family (stage 32): pixels reassembled from
+    /// `frame_inline` payloads, plus what the assertions need — the
+    /// union area of the LAST frame's rects (damage economy) and
+    /// whether deflate encoding was ever used.
+    inline_pix: []u8 = &.{},
+    iw: u16 = 0,
+    ih: u16 = 0,
+    inline_seq: u32 = 0,
+    inline_last_area: u32 = 0,
+    inline_deflate_seen: bool = false,
     /// Accessibility stream: every `ev_a11y_tree` node rendered as one
     /// `[id] role "name"` line, so assertions can grep roles + names.
     ax_log: [64 * 1024]u8 = @splat(0),
@@ -827,6 +848,7 @@ const Client = struct {
     ax_event_seq: u32 = 0,
 
     fn deinit(self: *Client) void {
+        if (self.inline_pix.len != 0) self.gpa.free(self.inline_pix);
         self.unmap();
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
         if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
@@ -900,11 +922,32 @@ const Client = struct {
         };
     }
 
-    /// Paints seen on EITHER frame family: the software path reports
-    /// `frame_damage`, the GPU path `frame_dmabuf`, and the pacing
-    /// assertions care only that pixels happened.
+    /// Paints seen on ANY frame family: the software path reports
+    /// `frame_damage`, the GPU path `frame_dmabuf`, the remote path
+    /// `frame_inline` — the pacing assertions care only that pixels
+    /// happened.
     fn paintCount(self: *const Client) u32 {
-        return self.dmg_seq +% self.dma_seq;
+        return self.dmg_seq +% self.dma_seq +% self.inline_seq;
+    }
+
+    /// BGRA pixel of the reassembled INLINE surface.
+    fn inlinePixel(self: *Client, x: u32, y: u32) [4]u8 {
+        const off = (@as(usize, y) * @as(usize, self.iw) + @as(usize, x)) * 4;
+        if (off + 4 > self.inline_pix.len) fail("inline pixel outside the surface");
+        return .{ self.inline_pix[off], self.inline_pix[off + 1], self.inline_pix[off + 2], self.inline_pix[off + 3] };
+    }
+
+    /// Wait until the inline surface's centre matches `want` (BGR).
+    fn waitInlineCenter(self: *Client, want: [3]u8, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (self.iw != 0 and self.ih != 0) {
+                const px = self.inlinePixel(self.iw / 2, self.ih / 2);
+                if (px[0] == want[0] and px[1] == want[1] and px[2] == want[2]) return true;
+            }
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
     }
 
     /// Read whatever is available (up to `timeout_ms`) and fold it into
@@ -997,7 +1040,52 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
                 }
+            },
+            .frame_inline => {
+                const fi = proto.FrameInline.decodeAlloc(frame.payload, self.gpa) catch fail("frame_inline decode");
+                defer self.gpa.free(fi.rects);
+                if (fi.w == 0 or fi.h == 0) fail("frame_inline with a zero surface");
+                const size: usize = @as(usize, fi.w) * @as(usize, fi.h) * 4;
+                if (fi.w != self.iw or fi.h != self.ih) {
+                    if (self.inline_pix.len != 0) self.gpa.free(self.inline_pix);
+                    self.inline_pix = self.gpa.alloc(u8, size) catch fail("oom");
+                    @memset(self.inline_pix, 0);
+                    self.iw = fi.w;
+                    self.ih = fi.h;
+                }
+                var area: u32 = 0;
+                for (fi.rects) |r| {
+                    if (@as(u32, r.x) + r.w > fi.w or @as(u32, r.y) + r.h > fi.h)
+                        fail("frame_inline rect outside the surface");
+                    const raw_len: usize = @as(usize, r.w) * @as(usize, r.h) * 4;
+                    const row_bytes: usize = @as(usize, r.w) * 4;
+                    var decoded: []const u8 = undefined;
+                    var scratch: ?[]u8 = null;
+                    defer if (scratch) |sc| self.gpa.free(sc);
+                    switch (r.enc) {
+                        proto.inline_enc_raw => {
+                            if (r.data.len != raw_len) fail("frame_inline raw length mismatch");
+                            decoded = r.data;
+                        },
+                        proto.inline_enc_deflate => {
+                            const sc = self.gpa.alloc(u8, raw_len) catch fail("oom");
+                            scratch = sc;
+                            decoded = zpool.decompress(r.data, sc) catch fail("frame_inline deflate corrupt");
+                            self.inline_deflate_seen = true;
+                        },
+                        else => fail("frame_inline unknown encoding"),
+                    }
+                    var row: usize = 0;
+                    while (row < r.h) : (row += 1) {
+                        const off = (@as(usize, r.y) + row) * @as(usize, fi.w) * 4 + @as(usize, r.x) * 4;
+                        @memcpy(self.inline_pix[off..][0..row_bytes], decoded[row * row_bytes ..][0..row_bytes]);
+                    }
+                    area += @as(u32, r.w) * @as(u32, r.h);
+                }
+                self.inline_last_area = area;
+                self.inline_seq += 1;
             },
             .ev_a11y_tree => {
                 const ev = proto.decode(proto.EvA11yTree, frame.payload) catch fail("ev_a11y_tree decode");
@@ -1934,6 +2022,138 @@ fn emeProbe(cl: *Client, key_system: []const u8, caps: []const u8, out: []u8) []
     @memcpy(out[0..n], json[0..n]);
     return out[0..n];
 }
+
+// ── Stage 32 plumbing: a mini mux client + a byte bridge ──────────
+//
+// The stage drives the REAL remote path on one machine: a private
+// sketerm-mux spawns the helper via `web_helper_open` and the helper's
+// protocol bytes ride a mux byte channel; a thread pumps that channel
+// onto a socketpair whose other end the ordinary rig `Client` speaks —
+// exactly the GUI's webremote.Bridge shape.
+
+/// Minimal mux-wire client: framed send/recv on a blocking fd.
+const MuxLite = struct {
+    gpa: std.mem.Allocator,
+    fd: c_int,
+    in: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *MuxLite) void {
+        self.in.deinit(self.gpa);
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+    }
+
+    fn send(self: *MuxLite, ftype: mux_wire.FrameType, payload: []const u8) void {
+        var hdr: [5]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
+        hdr[4] = @intFromEnum(ftype);
+        writeAllFd(self.fd, &hdr);
+        writeAllFd(self.fd, payload);
+    }
+
+    /// Next complete frame (owned payload), or null on timeout.
+    fn next(self: *MuxLite, timeout_ms: i64) ?struct { ftype: mux_wire.FrameType, payload: []u8 } {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (mux_wire.peelFrame(self.in.items) catch fail("mux frame peel")) |p| {
+                const owned = self.gpa.dupe(u8, p.frame.payload) catch fail("oom");
+                mux_wire.compactConsumed(&self.in, p.consumed);
+                return .{ .ftype = p.frame.ftype, .payload = owned };
+            }
+            const left = deadline - nowMs();
+            if (left <= 0) return null;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, @intCast(@min(left, 100))) <= 0) continue;
+            var buf: [64 * 1024]u8 = undefined;
+            const n = c.read(self.fd, &buf, buf.len);
+            if (n == 0) fail("mux daemon closed the connection");
+            if (n < 0) {
+                const e = std.c._errno().*;
+                if (e == c.EINTR or e == c.EAGAIN) continue;
+                fail("mux read");
+            }
+            self.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch fail("oom");
+        }
+    }
+};
+
+fn writeAllFd(fd: c_int, data: []const u8) void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = c.write(fd, data.ptr + off, data.len - off);
+        if (n <= 0) {
+            if (n < 0 and std.c._errno().* == c.EINTR) continue;
+            fail("short write on the mux socket");
+        }
+        off += @intCast(n);
+    }
+}
+
+/// The rig's webremote.Bridge: pump chan_data <-> a socketpair end on a
+/// thread, so the ordinary `Client` can speak the helper protocol.
+const RigBridge = struct {
+    gpa: std.mem.Allocator,
+    mux: *MuxLite,
+    chan: u32,
+    fd: c_int,
+    thread: ?std.Thread = null,
+
+    fn spawn(self: *RigBridge) void {
+        self.thread = std.Thread.spawn(.{}, RigBridge.run, .{self}) catch fail("bridge thread");
+    }
+
+    fn run(self: *RigBridge) void {
+        while (true) {
+            var fds: [2]c.struct_pollfd = .{
+                .{ .fd = self.mux.fd, .events = c.POLLIN, .revents = 0 },
+                .{ .fd = self.fd, .events = c.POLLIN, .revents = 0 },
+            };
+            if (c.poll(&fds, fds.len, 200) < 0) {
+                if (std.c._errno().* == c.EINTR) continue;
+                return;
+            }
+            if (fds[1].revents & (c.POLLIN | c.POLLHUP) != 0) {
+                var buf: [32 * 1024]u8 = undefined;
+                const n = c.read(self.fd, &buf, buf.len);
+                if (n <= 0) return;
+                var msg: [4 + 32 * 1024]u8 = undefined;
+                std.mem.writeInt(u32, msg[0..4], self.chan, .little);
+                @memcpy(msg[4 .. 4 + @as(usize, @intCast(n))], buf[0..@intCast(n)]);
+                self.mux.send(.chan_data, msg[0 .. 4 + @as(usize, @intCast(n))]);
+            }
+            if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
+                const f = self.mux.next(1000) orelse continue;
+                defer self.gpa.free(f.payload);
+                switch (f.ftype) {
+                    .chan_data => {
+                        if (f.payload.len < 4) continue;
+                        if (std.mem.readInt(u32, f.payload[0..4], .little) != self.chan) continue;
+                        writeAllFd(self.fd, f.payload[4..]);
+                    },
+                    .chan_close => return,
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn stop(self: *RigBridge) void {
+        // Closing the socketpair end wakes the loop (read -> 0).
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+};
+
+/// A tiny 16x16 animating box on a red page: after the first full
+/// frame, steady-state damage must stay a small fraction of the
+/// surface — the "no full frames for cursor blinks" property.
+const small_anim_page =
+    "data:text/html,<body%20style=%22margin:0;background:%23ff0000%22>" ++
+    "<div%20id=d%20style=%22position:fixed;left:0;top:0;width:16px;height:16px%22></div>" ++
+    "<script>var%20i=0;function%20f(){i=(i+9)%25256;" ++
+    "d.style.background='rgb(0,'+i+',0)';requestAnimationFrame(f)}requestAnimationFrame(f);</script></body>";
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
@@ -3644,6 +3864,204 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // (the whole feature was just proven above). What still MUST hold
         // is that the process terminates rather than hangs.
         reapHelperTolerant(eg_pid, "stages 26/27 egress", 30_000);
+    }
+
+    // ── Stage 28: remote helper — inline frames over a mux channel ──
+    //
+    // The whole remote-browsing path on one machine: a PRIVATE
+    // sketerm-mux daemon is asked (`web_helper_open`) to spawn the
+    // helper with `--socket-fd`/`--frames-inline`; the helper protocol
+    // then rides a mux byte channel bridged onto a socketpair, and the
+    // ordinary rig Client proves frames arrive IN-BAND (no descriptor
+    // ever crosses), damage stays partial, and input works end to end.
+    if (argv.len >= 3) {
+        var msock_buf: [96]u8 = undefined;
+        const msock = std.fmt.bufPrintZ(&msock_buf, "{s}/m.sock", .{dir}) catch fail("mux socket path");
+        var cache5_buf: [128]u8 = undefined;
+        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-rmt", .{dir}) catch fail("cache path");
+        _ = cache5;
+        var state_buf: [128:0]u8 = undefined;
+        const state_dir = std.fmt.bufPrintZ(&state_buf, "{s}/state", .{dir}) catch fail("state path");
+        _ = c.mkdir(state_dir.ptr, 0o700);
+        {
+            const mpid = c.fork();
+            if (mpid < 0) fail("stage 32: fork mux");
+            if (mpid == 0) {
+                // The daemon resolves the helper through findbin; the
+                // env pin points it at the freshly built binary.
+                _ = c.setenv("SKETERM_WEB_BIN", exe, 1);
+                _ = c.setenv("XDG_STATE_HOME", state_dir.ptr, 1);
+                _ = c.setenv("SKETERM_MUX_NO_WAYLAND", "1", 1);
+                var vec: [4:null]?[*:0]const u8 = @splat(null);
+                vec[0] = argv[2];
+                vec[1] = "--socket";
+                vec[2] = msock.ptr;
+                _ = c.execv(argv[2], @ptrCast(@constCast(&vec)));
+                c._exit(127);
+            }
+            g_mux_pid = mpid;
+        }
+
+        // Connect with retry while the daemon binds.
+        var mux = MuxLite{ .gpa = gpa, .fd = -1 };
+        {
+            var addr = std.mem.zeroes(c.struct_sockaddr_un);
+            addr.sun_family = c.AF_UNIX;
+            @memcpy(addr.sun_path[0..msock.len], msock);
+            const deadline = nowMs() + 15_000;
+            while (mux.fd < 0) {
+                if (nowMs() > deadline) fail("stage 32: mux daemon never listened");
+                const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+                if (fd < 0) fail("socket");
+                if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0) {
+                    mux.fd = fd;
+                } else {
+                    _ = c.close(fd);
+                    _ = c.usleep(100_000);
+                }
+            }
+        }
+
+        // hello -> welcome, which must advertise the capability.
+        mux.send(.hello, "{\"proto\":6,\"min_proto\":1,\"negotiation\":1}");
+        {
+            const f = mux.next(10_000) orelse fail("stage 32: no welcome");
+            defer gpa.free(f.payload);
+            if (f.ftype != .welcome) fail("stage 32: first frame was not the welcome");
+            if (std.mem.indexOf(u8, f.payload, "\"web_helper\":true") == null)
+                fail("stage 32: welcome lacks web_helper:true");
+        }
+
+        // web_helper_open -> chan_open (kind web_helper) + ok reply.
+        mux.send(.web_helper_open, "{\"req\":9}");
+        var chan: u32 = 0;
+        var got_reply = false;
+        {
+            const deadline = nowMs() + 20_000;
+            while (!got_reply or chan == 0) {
+                if (nowMs() > deadline) fail("stage 32: no web_helper_reply");
+                const f = mux.next(1_000) orelse continue;
+                defer gpa.free(f.payload);
+                switch (f.ftype) {
+                    .chan_open => {
+                        const co = mux_wire.decodeChanOpen(f.payload) orelse fail("stage 32: bad chan_open");
+                        if (co.kind != .web_helper) fail("stage 32: wrong channel kind");
+                        chan = co.id;
+                    },
+                    .web_helper_reply => {
+                        if (std.mem.indexOf(u8, f.payload, "\"ok\":true") == null) {
+                            say(f.payload);
+                            fail("stage 32: web_helper_open refused");
+                        }
+                        got_reply = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Bridge the channel onto a socketpair and speak the helper
+        // protocol on the other end.
+        var pair: [2]c_int = .{ -1, -1 };
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair) != 0) fail("stage 32: socketpair");
+        var bridge = RigBridge{ .gpa = gpa, .mux = &mux, .chan = chan, .fd = pair[1] };
+        bridge.spawn();
+        var rc = Client{ .gpa = gpa, .fd = pair[0] };
+        rc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-remote" });
+        rc.send(proto.FrameMode{ .mode = proto.frame_mode_inline });
+        {
+            const deadline = nowMs() + 30_000;
+            while (rc.ack_proto == 0 and nowMs() < deadline) rc.pump(100);
+        }
+        if (rc.ack_proto != proto.PROTO_VERSION) fail("stage 32: no hello_ack over the bridge");
+        if (!rc.ack_frames_inline) fail("stage 32: hello_ack lacks the frames-inline capability");
+
+        // Paint: the red page must arrive as in-band pixels, with NO
+        // memfd announcement and NO descriptor ever crossing.
+        rc.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        rc.have_view = true;
+        rc.send(proto.Navigate{ .view = view_id, .url = red_page });
+        if (!rc.waitInlineCenter(.{ 0, 0, 255 }, 30_000)) fail("stage 32: no red inline frame");
+        if (rc.fb_seq != 0) fail("stage 32: a frame_buffer crossed the bridge (memfd family leaked through)");
+        if (rc.nfds != 0) fail("stage 32: a descriptor crossed the bridge");
+        if (!rc.inline_deflate_seen) fail("stage 32: a flat red page never compressed (deflate path unused)");
+        pass("stage 32a remote helper (inline frames over a mux byte channel, no descriptors)");
+
+        // Damage economy: after the small-box page settles, steady
+        // frames must cover a small fraction of the surface.
+        rc.send(proto.Navigate{ .view = view_id, .url = small_anim_page });
+        if (!rc.waitInlineCenter(.{ 0, 0, 255 }, 30_000)) fail("stage 32: the animating page never painted");
+        {
+            const deadline = nowMs() + 10_000;
+            var small_seen = false;
+            var settle_frames: u32 = 0;
+            const surface_area: u32 = @as(u32, rc.iw) * @as(u32, rc.ih);
+            while (nowMs() < deadline and !small_seen) {
+                const seq = rc.inline_seq;
+                rc.pump(100);
+                if (rc.inline_seq != seq) {
+                    settle_frames += 1;
+                    // Skip the first few (navigation repaints in full).
+                    if (settle_frames > 4 and rc.inline_last_area * 8 <= surface_area) small_seen = true;
+                }
+            }
+            if (!small_seen) fail("stage 32: every inline frame was (near-)full — damage economy lost");
+        }
+        pass("stage 32b inline damage economy (steady frames stay partial)");
+
+        // Input rides the bridge: a mousedown flips the page colour.
+        rc.send(proto.Navigate{ .view = view_id, .url = click_paint_page });
+        if (!rc.waitInlineCenter(.{ 0, 255, 0 }, 30_000)) fail("stage 32: click page never painted green");
+        rc.send(proto.InputPointer{
+            .view = view_id,
+            .kind = @intFromEnum(proto.PointerKind.down),
+            .x = 160,
+            .y = 120,
+            .button = 0,
+            .clicks = 1,
+            .mods = 0,
+        });
+        rc.send(proto.InputPointer{
+            .view = view_id,
+            .kind = @intFromEnum(proto.PointerKind.up),
+            .x = 160,
+            .y = 120,
+            .button = 0,
+            .clicks = 1,
+            .mods = 0,
+        });
+        if (!rc.waitInlineCenter(.{ 255, 0, 255 }, 15_000)) fail("stage 32: the click never repainted magenta");
+        pass("stage 32c input over the bridge (mousedown repaints)");
+
+        // Teardown: closing the protocol socket ends the channel; the
+        // daemon kills the helper (it dies with the channel) and the
+        // daemon itself goes by exact pid.
+        rc.have_view = false;
+        rc.deinit(); // closes pair[0]; the bridge sees EOF and exits
+        bridge.stop();
+        mux.deinit();
+        _ = c.kill(g_mux_pid, c.SIGTERM);
+        {
+            const deadline = nowMs() + 10_000;
+            var status: c_int = 0;
+            var reaped = false;
+            while (nowMs() < deadline) {
+                if (c.waitpid(g_mux_pid, &status, c.WNOHANG) == g_mux_pid) {
+                    reaped = true;
+                    break;
+                }
+                _ = c.usleep(50_000);
+            }
+            if (!reaped) {
+                _ = c.kill(g_mux_pid, c.SIGKILL);
+                _ = c.waitpid(g_mux_pid, &status, 0);
+                fail("stage 32: the private daemon did not exit on SIGTERM");
+            }
+            g_mux_pid = -1;
+        }
+        pass("stage 32 remote helper teardown (helper died with the channel, daemon reaped by pid)");
+    } else {
+        say("smoke-web: NOTE stage 32 skipped (no sketerm-mux path in argv[2])");
     }
 
     cleanup();
