@@ -13,6 +13,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const pathz = @import("../util/pathz.zig");
+const suggest = @import("../util/suggest.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -406,6 +407,16 @@ fn onSearchChanged(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     c.gtk_list_box_invalidate_filter(@ptrCast(self.listbox));
 }
 
+/// App visibility. The MATCHER is the shared one
+/// (`suggest.containsFold`); the ranking framework's `merge` is not
+/// used, because this is a GTK filter func returning a boolean and the
+/// order is `sortRow`'s recency-then-alphabetical, which a score sort
+/// would destroy.
+///
+/// The shared matcher also fixes a fail-open here: this used to
+/// lowercase into 256/512-byte stack buffers and return "matches" for
+/// any query or app name that overflowed them, so a long query showed
+/// every long-named app instead of none. `containsFold` has no ceiling.
 fn filterRow(row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Launcher, user);
     const query_c = c.gtk_editable_get_text(@ptrCast(self.search));
@@ -413,12 +424,7 @@ fn filterRow(row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) c.gboolean {
     if (query.len == 0) return 1;
     const name_c = c.g_object_get_data(@ptrCast(@alignCast(row)), "al-name") orelse return 1;
     const name = std.mem.span(@as([*:0]const u8, @ptrCast(name_c)));
-    var qbuf: [256]u8 = undefined;
-    var nbuf: [512]u8 = undefined;
-    if (query.len >= qbuf.len or name.len >= nbuf.len) return 1;
-    const ql = std.ascii.lowerString(qbuf[0..query.len], query);
-    const nl = std.ascii.lowerString(nbuf[0..name.len], name);
-    return if (std.mem.indexOf(u8, nl, ql) != null) 1 else 0;
+    return if (suggest.containsFold(name, query)) 1 else 0;
 }
 
 fn clearList(list: *c.GtkWidget) void {

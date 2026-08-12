@@ -750,6 +750,20 @@ fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
     selectFirstVisible(self);
 }
 
+/// Case-insensitive substring match over a row's joined title +
+/// subtitle.
+///
+/// This one deliberately does NOT go through `suggest.zig`, unlike the
+/// launcher, the bookmark list and the LSP popup. Two reasons, and the
+/// first is decisive: rows here are application and session names,
+/// which are routinely non-ASCII, and correct folding for them means
+/// `g_utf8_casefold` — GLib, which `suggest.zig` cannot use because it
+/// compiles into `sketerm-mux`'s test root. Swapping in the shared
+/// ASCII matcher would regress "Música" matching "MÚSICA" (there is a
+/// test for exactly that). Second, the result is a boolean feeding
+/// per-section visibility counters across FOUR separate list boxes, so
+/// the ranking framework's single global score sort has nothing to
+/// offer it either.
 fn matchesSearch(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     const folded_needle = c.g_utf8_casefold(needle.ptr, @intCast(needle.len)) orelse

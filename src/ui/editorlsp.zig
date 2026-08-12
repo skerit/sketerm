@@ -43,6 +43,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const clock = @import("../util/clock.zig");
+const suggest = @import("../util/suggest.zig");
 const editorview = @import("editorview.zig");
 const EditorView = editorview.EditorView;
 const ETab = editorview.ETab;
@@ -3573,11 +3574,23 @@ pub const Manager = struct {
         return self.hover.open;
     }
 
+    /// Narrow `shown` to the labels matching the typed filter.
+    ///
+    /// The MATCHER is the shared `suggest.subsequenceMatch` — this file
+    /// is where the codebase's only fuzzy matching lives, and the
+    /// framework carries a subsequence matcher precisely so it does not
+    /// have to be re-written here. The ranking framework's `merge` is
+    /// NOT used, and must not be: `shown` is a visibility index whose
+    /// ascending order IS the display order, and that order is the
+    /// server's ranking for completions (what servers put in sortText)
+    /// or document hierarchy for symbols, where the label indentation
+    /// only means anything while parents and children stay adjacent.
+    /// A score sort would scramble both.
     fn applyFilter(self: *Manager) void {
         self.list.shown.clearRetainingCapacity();
         const f = self.list.filter.items;
         for (self.list.items.items, 0..) |it, i| {
-            if (f.len == 0 or subsequenceFold(it.label, f)) {
+            if (suggest.subsequenceMatch(it.label, f)) {
                 self.list.shown.append(self.alloc, i) catch break;
             }
         }
@@ -4230,19 +4243,6 @@ fn wordStart(doc: *const Document, caret: usize) usize {
         i -= 1;
     }
     return from + i;
-}
-
-/// Case-insensitive subsequence match — the filtering every fuzzy
-/// picker in this codebase already uses.
-fn subsequenceFold(haystack: []const u8, needle: []const u8) bool {
-    var hi: usize = 0;
-    for (needle) |nc| {
-        const want = std.ascii.toLower(nc);
-        while (hi < haystack.len and std.ascii.toLower(haystack[hi]) != want) hi += 1;
-        if (hi == haystack.len) return false;
-        hi += 1;
-    }
-    return true;
 }
 
 /// LSP `CompletionItemKind` -> a word for the list's right column.

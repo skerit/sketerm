@@ -18,6 +18,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const suggest = @import("../util/suggest.zig");
 const webstore = @import("webstore.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const confirm = @import("confirm.zig");
@@ -503,17 +504,21 @@ fn folderHeader(row: *c.GtkListBoxRow, before: ?*c.GtkListBoxRow, _: ?*anyopaque
     c.gtk_list_box_row_set_header(row, lbl);
 }
 
+/// Bookmark visibility. The MATCHER is the shared one
+/// (`suggest.containsFold`), but the ranking framework's `merge` is
+/// deliberately not used here: this is a GTK filter func, so the result
+/// has to be a boolean, and the display order is folder grouping plus
+/// the user's own manual ordering (`folderBefore`) — a score sort would
+/// destroy both, along with the section headers that depend on adjacent
+/// rows sharing a folder. History needs none of this: it is re-queried
+/// and ranked daemon-side on every keystroke.
 fn filterRow(row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(List, user);
     const query = std.mem.span(c.gtk_editable_get_text(@ptrCast(self.search)));
     if (query.len == 0) return 1;
-    return if (containsIgnoreCase(rowStr(row, KEY_TITLE), query) or
-        containsIgnoreCase(rowStr(row, KEY_URL), query) or
-        containsIgnoreCase(rowStr(row, KEY_FOLDER), query)) 1 else 0;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return if (suggest.containsFold(rowStr(row, KEY_TITLE), query) or
+        suggest.containsFold(rowStr(row, KEY_URL), query) or
+        suggest.containsFold(rowStr(row, KEY_FOLDER), query)) 1 else 0;
 }
 
 // ── per-row context ─────────────────────────────────────────────
