@@ -73,6 +73,10 @@ fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 
 pub fn openManager(win: *Window) void {
     const allocator = win.allocator;
+    // Retry point: if the startup fetch failed (store not up yet, socket
+    // moved), this is where a user notices an empty list, so it is where
+    // a second attempt belongs. No-ops once a list has landed.
+    webface.loadContainers(allocator);
     const self = allocator.create(Manager) catch return;
     const window = c.gtk_window_new();
     self.* = .{
@@ -127,6 +131,10 @@ pub fn openManager(win: *Window) void {
 fn onManagerDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Manager, user);
     webstore.cancelFor(@ptrCast(self));
+    // The create round trip is registered under webface's own pending
+    // struct, so `cancelFor` above cannot reach it; without this the
+    // reply calls `onCreated` on this freed Manager.
+    webface.cancelStoredCreateFor(@ptrCast(self));
     self.allocator.destroy(self);
 }
 

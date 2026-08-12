@@ -1688,6 +1688,17 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
         gpa.free(dead.proxy);
         gpa.free(dead.egress_host);
         gpa.free(dead.remote_host);
+        // Sweep the per-site rules too, exactly as the daemon store
+        // does. Leaving them behind kept routing new tabs for those
+        // hosts into a destroyed identity: the helper silently falls
+        // back to the shared jar, the tab loses its accent colour, and
+        // the dead id gets written into the saved layout.
+        var k: usize = 0;
+        while (k < g_container_sites.items.len) {
+            if (g_container_sites.items[k].container == id) {
+                gpa.free(g_container_sites.orderedRemove(k).host);
+            } else k += 1;
+        }
         return true;
     }
     return false;
@@ -1844,7 +1855,13 @@ fn onStoreAck(_: ?*anyopaque, _: bool, _: []const u8) void {}
 /// (the same immortality that fences `clientForHost`), so there is no
 /// owner whose teardown a `webstore.cancelFor` would have to match.
 pub fn loadContainers(gpa: std.mem.Allocator) void {
-    if (g_containers_loading or g_containers_loaded) return;
+    // `g_containers_loaded` is the GATE (views waiting on the registry
+    // are released and it never closes again); `g_containers_fetched`
+    // is whether we actually have the list. They are separate because a
+    // FAILED fetch must still open the gate — a container-bound view
+    // would otherwise wait forever — while staying retryable. Collapsing
+    // them latched an empty registry for the whole session.
+    if (g_containers_loading or g_containers_fetched) return;
     g_containers_gpa = gpa;
     g_containers_loading = true;
     if (!webstore.containerList(gpa, null, &onContainerList)) {
@@ -1862,6 +1879,7 @@ fn onContainerList(_: ?*anyopaque, ok: bool, payload: []const u8) void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const rep = webstore.parseContainers(arena.allocator(), payload);
+    g_containers_fetched = true;
     for (rep.containers) |stored| {
         if (stored.id == 0 or stored.name.len == 0) continue;
         // Adopt the STORED id: it is the engine's jar path component.
@@ -1886,14 +1904,48 @@ fn onContainerList(_: ?*anyopaque, ok: bool, payload: []const u8) void {
 /// Open the gate: publish every container to every live helper, then
 /// let the faces that were waiting on it mint their views.
 fn markContainersReady(gpa: std.mem.Allocator) void {
-    _ = gpa;
     if (g_containers_loaded) return;
     g_containers_loaded = true;
     publishContexts(client());
     for (g_remote_clients.items) |cl| publishContexts(cl);
+    rehomeContainerFaces(gpa);
     for (client().faces.items) |f| f.ensureView();
     for (g_remote_clients.items) |cl| {
         for (cl.faces.items) |f| f.ensureView();
+    }
+}
+
+/// Move container-bound faces onto the Client their container names,
+/// now that the registry says which one that is.
+///
+/// `attachOpts` picks a face's Client at ATTACH time via
+/// `clientForContainer`, and a `--restore` runs the whole layout build
+/// synchronously BEFORE the stored registry lands — so `findContainer`
+/// returned null and every container-bound face fell back to the LOCAL
+/// helper. A container with a `remote_host` then browsed on this
+/// machine while the tab wore the container's name and colour: wrong
+/// egress, no error anywhere. Faces that already adopted a live view
+/// are left alone; only ones still waiting on the gate can move.
+fn rehomeContainerFaces(gpa: std.mem.Allocator) void {
+    // Collect first: re-homing mutates both clients' face lists.
+    var moving: std.ArrayList(*WebFace) = .empty;
+    defer moving.deinit(gpa);
+    for (g_client.faces.items) |f| {
+        if (f.container == 0 or f.attached or f.widgets_dead or f.view_live) continue;
+        const ctn = findContainer(f.container) orelse continue;
+        if (ctn.remote_host.len == 0) continue;
+        moving.append(gpa, f) catch return;
+    }
+    for (moving.items) |f| {
+        // Resolved here rather than in the scan above: this is what
+        // CREATES the per-host client, and doing that while walking
+        // `g_client.faces` would be a side effect mid-iteration.
+        const want = clientForContainer(gpa, f.container);
+        if (want == f.cl) continue;
+        f.cl.unregister(f);
+        f.cl = want;
+        want.ensure(gpa);
+        want.register(f);
     }
 }
 
@@ -1916,6 +1968,38 @@ const PendingCreate = struct {
         self.allocator.destroy(self);
     }
 };
+
+/// Live `PendingCreate`s, so a caller that goes away before its reply
+/// lands can be severed.
+///
+/// The webstore request is registered under the PendingCreate, NOT under
+/// the caller's ctx, so `webstore.cancelFor(caller)` cannot see it — the
+/// container manager closed while a create was in flight and the reply
+/// (or `failPending` on a dropped store connection) then called back
+/// into a freed Manager and drove GTK with its finalized widgets. The
+/// pending itself must STAY registered, because webstore still owns the
+/// reply and `onContainerAdded` is what frees it; only the callback is
+/// dropped.
+var pending_creates: std.ArrayList(*PendingCreate) = .empty;
+
+/// Sever the create callback for a caller that is being torn down.
+/// Idempotent, and safe to call for a ctx that has nothing pending.
+pub fn cancelStoredCreateFor(ctx: ?*anyopaque) void {
+    for (pending_creates.items) |p| {
+        if (p.ctx != ctx) continue;
+        p.cb = null;
+        p.ctx = null;
+    }
+}
+
+fn forgetPendingCreate(p: *PendingCreate) void {
+    for (pending_creates.items, 0..) |it, i| {
+        if (it == p) {
+            _ = pending_creates.swapRemove(i);
+            return;
+        }
+    }
+}
 
 /// Create a PERSISTENT container.
 ///
@@ -1960,8 +2044,15 @@ pub fn createStoredContainer(
             return false;
         },
     };
+    // Registered BEFORE the request, so a reply can never arrive for a
+    // pending the cancel list does not know about.
+    pending_creates.append(gpa, p) catch {
+        p.free();
+        return false;
+    };
     // The jar key starts equal to the name and never moves again.
     if (!webstore.containerAdd(gpa, name, name, color, egress_host, remote_host, @ptrCast(p), &onContainerAdded)) {
+        forgetPendingCreate(p);
         p.free();
         return false;
     }
@@ -1970,6 +2061,7 @@ pub fn createStoredContainer(
 
 fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
     const p: *PendingCreate = @ptrCast(@alignCast(user orelse return));
+    forgetPendingCreate(p);
     defer p.free();
     const gpa = p.allocator;
     var id: u32 = 0;
@@ -4407,18 +4499,26 @@ pub const WebFace = struct {
         const job = cast.userData(AxJob, user);
         const gpa = job.gpa;
         defer gpa.destroy(job);
+        // Resolve GLOBALLY. A face bound to a container with a
+        // `remote_host` lives on a per-host Client, not on `g_client`,
+        // so scanning only the local client never found it: the
+        // connected projection was discarded and `ax_connecting` stayed
+        // true forever, permanently disabling accessibility for that
+        // view and re-spawning a discarded bus probe on every later
+        // mint (job.ok was true, so the backoff never armed either).
         var adopt: ?*WebFace = null;
-        for (g_client.faces.items) |f| {
-            if (f == job.face and f.view == job.view and !f.widgets_dead) {
-                adopt = f;
-                break;
+        if (findFaceGlobal(job.view)) |f| {
+            if (f == job.face) {
+                // The attempt is over however it ends, so the flag comes
+                // off here rather than only on the adopted path.
+                f.ax_connecting = false;
+                if (!f.widgets_dead) adopt = f;
             }
         }
         const face = adopt orelse {
             job.discard();
             return 0;
         };
-        face.ax_connecting = false;
         if (!job.ok) {
             // No reader (or the bus refused us): back off so minting
             // views does not spawn a probe thread apiece, but let the

@@ -486,12 +486,6 @@ pub const Window = struct {
         const self = try allocator.create(Window);
         errdefer allocator.destroy(self);
 
-        // Pull the stored browser containers in before anything can
-        // restore a web pane: a face bound to a container holds its view
-        // back until the registry has landed, so the earlier this is
-        // kicked the less a restored browser tab waits. Idempotent.
-        @import("webface.zig").loadContainers(allocator);
-
         const app_window = c.adw_application_window_new(app);
         c.gtk_window_set_title(@ptrCast(app_window), "sketerm");
         // refreshWindowTitle re-applies once groupsend / etc. settle.
@@ -729,6 +723,19 @@ pub const Window = struct {
         // Which daemon holds history/bookmarks (empty = resolve at
         // connect time). Set before any face can issue a store request.
         @import("webstore.zig").setStoreSocket(self.config.web_store_socket);
+
+        // Pull the stored browser containers in before anything can
+        // restore a web pane: a face bound to a container holds its view
+        // back until the registry has landed. Idempotent.
+        //
+        // This MUST come after setStoreSocket, not before `self.config`
+        // exists: kicking it first sent container_list to whatever
+        // daemon was default, and the socket then moving underneath it
+        // killed the in-flight request — whose failure path opened the
+        // gate with an EMPTY registry, so for the rest of the session
+        // the manager listed nothing, every per-site rule was inert, and
+        // a restored container tab silently loaded in the shared jar.
+        @import("webface.zig").loadContainers(allocator);
 
         // Tree-style tabs: the strip hides pages inside a collapsed
         // subtree; the vertical sidebar renders the tree itself.

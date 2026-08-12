@@ -103,7 +103,7 @@ fn ensure(gpa: std.mem.Allocator) bool {
 /// default. See the header for the order and why there is no remote
 /// transport here. `buf` holds the returned slice.
 fn storeSocket(buf: []u8) ?[]const u8 {
-    if (g_store_socket) |p| {
+    if (storeSocketConfigured()) |p| {
         if (p.len > 0 and p.len < buf.len) {
             @memcpy(buf[0..p.len], p);
             return buf[0..p.len];
@@ -119,24 +119,36 @@ fn storeSocket(buf: []u8) ?[]const u8 {
     return null;
 }
 
-/// Config's `web_store_socket`, pointed at the live config arena by the
-/// Window on startup and on every `applyConfigChange` (config-arena
-/// slices are re-pointed there, never retained across a reload).
-var g_store_socket: ?[]const u8 = null;
+/// Config's `web_store_socket`, COPIED rather than aliased.
+///
+/// This is a process global but a Config arena is per-WINDOW, so
+/// borrowing the caller's slice made it outlive its owner: the last
+/// window to call this pins the pointer, and closing THAT window (not
+/// the last one) runs `Window.deinit` -> `config.deinit()` and frees the
+/// arena underneath it. Every later `storeSocket` then memcpy'd freed
+/// bytes into the connect path, so history, bookmarks and containers
+/// quietly dialled a garbage socket. A reload re-points config-arena
+/// slices; nothing was re-pointing this one.
+var g_store_socket_buf: [4096]u8 = undefined;
+var g_store_socket_len: usize = 0;
+
+fn storeSocketConfigured() ?[]const u8 {
+    return if (g_store_socket_len == 0) null else g_store_socket_buf[0..g_store_socket_len];
+}
 
 /// Called by the Window whenever the config is (re)applied. A change
 /// only takes effect on the next connection, so an already-open store
 /// is dropped when the target moves.
 pub fn setStoreSocket(path: []const u8) void {
-    const now: ?[]const u8 = if (path.len > 0) path else null;
+    // A path we cannot store is treated as "unset" rather than
+    // truncated: a truncated socket path names a DIFFERENT daemon.
+    const now: []const u8 = if (path.len > 0 and path.len <= g_store_socket_buf.len) path else "";
     const same = blk: {
-        if (g_store_socket == null and now == null) break :blk true;
-        if (g_store_socket) |a| {
-            if (now) |b| break :blk std.mem.eql(u8, a, b);
-        }
-        break :blk false;
+        const cur = storeSocketConfigured() orelse "";
+        break :blk std.mem.eql(u8, cur, now);
     };
-    g_store_socket = now;
+    if (now.len != 0) @memcpy(g_store_socket_buf[0..now.len], now);
+    g_store_socket_len = now.len;
     if (!same) reconnect();
 }
 
