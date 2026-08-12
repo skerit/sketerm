@@ -2085,13 +2085,16 @@ pub fn cancelStoredCreateFor(ctx: ?*anyopaque) void {
     }
 }
 
-fn forgetPendingCreate(p: *PendingCreate) void {
+/// Drop `p` from the live list. Returns whether it was actually there,
+/// which is how a caller learns the reply has NOT already consumed it.
+fn forgetPendingCreate(p: *PendingCreate) bool {
     for (pending_creates.items, 0..) |it, i| {
         if (it == p) {
             _ = pending_creates.swapRemove(i);
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 /// Create a PERSISTENT container.
@@ -2145,8 +2148,12 @@ pub fn createStoredContainer(
     };
     // The jar key starts equal to the name and never moves again.
     if (!webstore.containerAdd(gpa, name, name, color, egress_host, remote_host, @ptrCast(p), &onContainerAdded)) {
-        forgetPendingCreate(p);
-        p.free();
+        // A false return ALSO covers "the store connection died inside
+        // the send", where `failPending` already ran `onContainerAdded`
+        // — which forgot and freed `p`. Freeing again here was a double
+        // free of three slices plus the struct. Whether the entry is
+        // still listed is the one fact both paths agree on.
+        if (forgetPendingCreate(p)) p.free();
         return false;
     }
     return true;
@@ -2154,7 +2161,7 @@ pub fn createStoredContainer(
 
 fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
     const p: *PendingCreate = @ptrCast(@alignCast(user orelse return));
-    forgetPendingCreate(p);
+    _ = forgetPendingCreate(p);
     defer p.free();
     const gpa = p.allocator;
     var id: u32 = 0;
