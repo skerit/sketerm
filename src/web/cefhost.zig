@@ -38,6 +38,10 @@ const std = @import("std");
 const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
+// The raw-deflate codec pool updates on the native app pipe use
+// (src/wlhost/zpool.zig), mapped in as a named module because the
+// helper's module root is src/web/.
+const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
 const filter = @import("filter.zig");
@@ -474,6 +478,12 @@ pub const View = struct {
     pool: [max_pool]PoolEntry = @splat(.{}),
     next_buf_id: u32 = 0,
 
+    /// Inline mode only: damage accumulated since the last posted
+    /// `frame_inline`, as one union rect. Damage is unioned rather
+    /// than queued so a slow link coalesces bursts instead of
+    /// ballooning the outbox; the flush (`flushInlineView`) clears it.
+    inline_dirty: ?proto.Rect = null,
+
     const PoolEntry = struct { ino: u64 = 0, id: u32 = 0, seen: u64 = 0 };
 
     fn stride(self: *const View) u32 {
@@ -622,6 +632,14 @@ pub const Host = struct {
     /// names the view it came from, and `dropBrowser` cancels that
     /// view's entries when the browser goes.
     downloads: std.ArrayList(Dl) = .empty,
+
+    /// Inline frame mode (capability "frames-inline"): paint pixels ride
+    /// the protocol socket as `frame_inline` payloads and NO memfd or
+    /// dma-buf ever crosses it — the frame family a remote (bridged)
+    /// helper must use. Set by the client's `frame_mode` frame or forced
+    /// from spawn by `--frames-inline`; buffers allocated while it is on
+    /// are anonymous mappings and are never announced.
+    inline_mode: bool = false,
 
     /// Per-tab identity contexts (`context_create`). A view names one by
     /// id; id 0 is the shared default (a null request context) and never
@@ -1454,6 +1472,26 @@ pub const Host = struct {
             v.map = &.{};
         }
         const size: usize = v.stride() * @as(usize, v.ph);
+        if (self.inline_mode) {
+            // Inline mode: the buffer is helper-private (the client gets
+            // pixels in-band), so an anonymous mapping replaces the
+            // memfd and nothing is announced — the first frame_inline
+            // carries the new geometry instead.
+            const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+            if (addr == c.MAP_FAILED) return error.MmapFailed;
+            const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
+            v.map = bytes[0..size];
+            v.buf_unpainted = true;
+            v.buf_id +%= 1;
+            if (v.buf_id == 0) v.buf_id = 1;
+            v.inline_dirty = null;
+            if (!v.hidden) withHost(v, struct {
+                fn f(host: *cef.cef_browser_host_t) void {
+                    if (host.invalidate) |inv| inv(host, cef.PET_VIEW);
+                }
+            }.f);
+            return;
+        }
         const fd = memfd_create("sketerm-web-view", MFD_CLOEXEC);
         if (fd < 0) return error.MemfdFailed;
         var keep_fd = false;
@@ -1986,6 +2024,91 @@ pub const Host = struct {
     pub fn downloadCancel(self: *Host, req: proto.DownloadCancel) void {
         const d = self.findDl(req.view, req.id) orelse return;
         self.cancelDl(d);
+    }
+
+    /// Largest RAW band one `frame_inline` rect may describe. Bands keep
+    /// every message far under proto.MAX_FRAME (a 4K full frame is 33MB
+    /// raw) and bound the compressor's working set; a paint larger than
+    /// this simply arrives as several self-contained messages.
+    const inline_band_raw_max: usize = 2 << 20;
+
+    /// Client turned inline mode on (or spawn forced it). Never turned
+    /// back off mid-connection: existing anonymous buffers were never
+    /// announced, so a client flipping back would wait for a
+    /// `frame_buffer` nobody re-sends.
+    pub fn setInlineMode(self: *Host, on: bool) void {
+        if (!on or self.inline_mode) return;
+        self.inline_mode = true;
+    }
+
+    /// Post accumulated inline damage for every view — the drain-side
+    /// half of the union-and-flush backpressure. Called once per poll
+    /// iteration, like `flushInterceptStatus`.
+    pub fn flushInline(self: *Host) void {
+        if (!self.inline_mode) return;
+        for (self.views.items) |v| self.flushInlineView(v);
+    }
+
+    /// Encode `v.inline_dirty` (if any) into banded `frame_inline`
+    /// messages, unless the outbox is already backed up — then the
+    /// damage stays accumulated and a later flush ships the union.
+    fn flushInlineView(self: *Host, v: *View) void {
+        const d = v.inline_dirty orelse return;
+        if (v.map.len == 0) {
+            v.inline_dirty = null;
+            return;
+        }
+        if (self.out.pending() >= max_frame_backlog) return;
+        const stride: usize = v.stride();
+        // Clamp against the live buffer: a dirty rect can predate a
+        // resize by one poll iteration.
+        const x: u16 = @min(d.x, v.pw -| 1);
+        const y0: u16 = @min(d.y, v.ph -| 1);
+        const w: u16 = @min(d.w, v.pw - x);
+        const total_h: u16 = @min(d.h, v.ph - y0);
+        v.inline_dirty = null;
+        if (w == 0 or total_h == 0) return;
+        const row_bytes: usize = @as(usize, w) * 4;
+        const band_rows_max: u16 = @intCast(@min(
+            @as(usize, total_h),
+            @max(@as(usize, 1), inline_band_raw_max / row_bytes),
+        ));
+        // Scratch for one band: gathered raw rows + the deflate output.
+        const raw = self.gpa.alloc(u8, row_bytes * band_rows_max) catch return;
+        defer self.gpa.free(raw);
+        const zbuf = self.gpa.alloc(u8, row_bytes * band_rows_max) catch return;
+        defer self.gpa.free(zbuf);
+        var y: u16 = y0;
+        const y_end: u32 = @as(u32, y0) + total_h;
+        while (y < y_end) {
+            const rows: u16 = @intCast(@min(@as(u32, band_rows_max), y_end - y));
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                const src_off = (@as(usize, y) + r) * stride + @as(usize, x) * 4;
+                @memcpy(raw[r * row_bytes ..][0..row_bytes], v.map[src_off..][0..row_bytes]);
+            }
+            const band_raw = raw[0 .. row_bytes * rows];
+            var rect = proto.InlineRect{
+                .x = x,
+                .y = y,
+                .w = w,
+                .h = rows,
+                .enc = proto.inline_enc_raw,
+                .data = band_raw,
+            };
+            if (zpool.compress(band_raw, zbuf)) |z| {
+                rect.enc = proto.inline_enc_deflate;
+                rect.data = z;
+            }
+            self.post(proto.FrameInline{
+                .view = v.id,
+                .gen = v.gen,
+                .w = v.pw,
+                .h = v.ph,
+                .rects = &.{rect},
+            });
+            y = @intCast(@min(y_end, @as(u32, y) + rows));
+        }
     }
 
     /// Push a coalesced `ev_download_progress` for every download whose
@@ -5010,12 +5133,37 @@ fn onPaint(
     v.buf_unpainted = false;
     latStamp("paint");
     v.gen +%= 1;
+    if (host.inline_mode) {
+        // Union rather than queue: a slow bridge coalesces bursts into
+        // one damage rect instead of growing the outbox without bound.
+        for (list[0..n]) |r| unionDirty(v, r);
+        host.flushInlineView(v);
+        return;
+    }
     host.post(proto.FrameDamage{
         .view = v.id,
         .buf_id = v.buf_id,
         .gen = v.gen,
         .rects = list[0..n],
     });
+}
+
+/// Grow `v.inline_dirty` to cover `r`.
+fn unionDirty(v: *View, r: proto.Rect) void {
+    const d = v.inline_dirty orelse {
+        v.inline_dirty = r;
+        return;
+    };
+    const x0 = @min(d.x, r.x);
+    const y0 = @min(d.y, r.y);
+    const x1 = @max(@as(u32, d.x) + d.w, @as(u32, r.x) + r.w);
+    const y1 = @max(@as(u32, d.y) + d.h, @as(u32, r.y) + r.h);
+    v.inline_dirty = .{
+        .x = x0,
+        .y = y0,
+        .w = @intCast(x1 - x0),
+        .h = @intCast(y1 - y0),
+    };
 }
 
 /// A GPU frame: hand the engine's dma-buf planes straight to the client.

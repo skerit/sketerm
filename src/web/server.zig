@@ -56,6 +56,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_CONTEXTS,
     proto.CAP_USERSCRIPTS,
     proto.CAP_SITEDATA,
+    proto.CAP_FRAMES_INLINE,
 };
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -103,6 +104,13 @@ pub const Server = struct {
     profile_dir: []const u8 = "",
     /// Set once the client's `hello` is answered.
     greeted: bool = false,
+    /// `--frames-inline`: inline frame mode forced from spawn (the
+    /// remote-helper launch shape — the daemon bridges the socket over
+    /// the mux wire, where no descriptor can travel).
+    force_inline: bool = false,
+    /// `--socket-fd`: the client connection was handed to us pre-made
+    /// (a socketpair from the spawning daemon); no listen/accept.
+    preset_fd: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) Server {
         return .{ .gpa = gpa, .path = path, .out = proto.Outbox.init(gpa) };
@@ -148,6 +156,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
+        if (self.force_inline) self.host.setInlineMode(true);
         defer self.host.deinit();
         self.host.install();
         // Load the seed list + config filters dir before any view
@@ -155,7 +164,7 @@ pub const Server = struct {
         cefhost.interceptInit(self.gpa);
         defer cefhost.interceptDeinit(self.gpa);
 
-        try self.accept();
+        if (!self.preset_fd) try self.accept();
         while (self.client_fd >= 0) {
             self.step();
         }
@@ -170,6 +179,16 @@ pub const Server = struct {
             cefhost.pump();
             _ = c.usleep(2_000);
         }
+    }
+
+    /// Adopt a pre-connected client descriptor (`--socket-fd`): the
+    /// spawning daemon holds the other end of the socketpair. Marked
+    /// cloexec here so CEF's own subprocesses never inherit it.
+    pub fn adoptClientFd(self: *Server, fd: c_int) void {
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
+        self.client_fd = fd;
+        self.preset_fd = true;
     }
 
     /// Wait for the client, pumping CEF meanwhile (it has nothing to do
@@ -231,6 +250,9 @@ pub const Server = struct {
         // Same coalescing for download progress: at most one
         // `ev_download_progress` per download per iteration.
         self.host.flushDownloadProgress();
+        // Inline mode: ship damage the paint-time flush held back while
+        // the outbox was backed up (union-and-flush backpressure).
+        self.host.flushInline();
         if (!self.flush()) self.disconnect();
     }
 
@@ -316,6 +338,10 @@ pub const Server = struct {
             // state: one memfd per view, replaced on resize.
             .frame_release => _ = try proto.decode(proto.FrameRelease, frame.payload),
             .frame_request => self.host.beginFrame(try proto.decode(proto.FrameRequest, frame.payload)),
+            .frame_mode => {
+                const req = try proto.decode(proto.FrameMode, frame.payload);
+                self.host.setInlineMode(req.mode == proto.frame_mode_inline);
+            },
             .sem_snapshot_req => try self.host.semSnapshot(try proto.decode(proto.SemSnapshotReq, frame.payload)),
             .sem_act => try self.host.semAct(try proto.decode(proto.SemAction, frame.payload)),
             .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),

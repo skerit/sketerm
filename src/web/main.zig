@@ -22,6 +22,8 @@ const server = @import("server.zig");
 
 const USAGE =
     \\sketerm-web --socket PATH [--cache-dir PATH]
+    \\           (--socket-fd N and --frames-inline are the daemon's
+    \\            remote-helper launch shape)
     \\
     \\Browser helper for sketerm. Listens on PATH for one client (the
     \\sketerm GUI) and exits when that client disconnects.
@@ -68,12 +70,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var cache_buf: [4096]u8 = undefined;
     var socket_path: ?[]const u8 = null;
     var cache_dir: ?[]const u8 = null;
+    var socket_fd: c_int = -1;
+    var frames_inline = false;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
         if (std.mem.eql(u8, a, "--socket") and i + 1 < argv.len) {
             i += 1;
             socket_path = copyArg(&sock_buf, std.mem.span(argv[i]));
+        } else if (std.mem.eql(u8, a, "--socket-fd") and i + 1 < argv.len) {
+            // A pre-connected client descriptor from the spawning
+            // daemon (remote-helper launch): no listen/accept at all.
+            // The fd survived the LD_PRELOAD re-exec because nothing
+            // set CLOEXEC on it yet; the server sets it the moment it
+            // adopts the fd, before CEF spawns any subprocess.
+            i += 1;
+            socket_fd = std.fmt.parseInt(c_int, std.mem.span(argv[i]), 10) catch -1;
+        } else if (std.mem.eql(u8, a, "--frames-inline")) {
+            // Remote-helper mode: frames ride the socket in-band. The
+            // GPU path would hand out dma-buf descriptors the bridge
+            // cannot carry, so force the software path BEFORE the
+            // ozone decision below reads the environment.
+            frames_inline = true;
+            _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
             cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
@@ -102,7 +121,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const sock = socket_path orelse {
+    const sock = socket_path orelse blk: {
+        if (socket_fd >= 0) break :blk "";
         std.debug.print("sketerm-web: --socket PATH is required\n{s}", .{USAGE});
         return 2;
     };
@@ -124,8 +144,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var srv = server.Server.init(gpa, sock);
     srv.profile_dir = cache;
+    srv.force_inline = frames_inline;
     defer srv.deinit();
-    srv.listen() catch |e| {
+    if (socket_fd >= 0) {
+        srv.adoptClientFd(socket_fd);
+    } else srv.listen() catch |e| {
         std.debug.print("sketerm-web: listen on {s} failed: {s}\n", .{ sock, @errorName(e) });
         return 1;
     };

@@ -11,10 +11,12 @@ pub const HELPER_NAME = "sketerm-webengine";
 
 /// The helper next to our own executable (installed layout and
 /// `zig build` trees both), then the dev build tree, then the cwd.
-/// `$SKETERM_WEB_BIN` pins it outright, which is what test rigs use.
+/// `$SKETERM_WEB_BIN` pins it outright, which is what test rigs use —
+/// AUTHORITATIVELY: a set-but-unusable pin fails the lookup rather
+/// than silently falling through to a differently-built helper.
 pub fn find(buf: *[4096:0]u8) ?[*:0]const u8 {
     if (c.getenv("SKETERM_WEB_BIN")) |p| {
-        if (c.access(p, c.X_OK) == 0) return p;
+        return if (c.access(p, c.X_OK) == 0) p else null;
     }
     if (platform.exePathZ(buf)) |exe_path| {
         if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {

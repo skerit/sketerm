@@ -111,6 +111,16 @@ pub const CAP_CONTEXTS = "contexts";
 /// panel that never renders them.
 pub const CAP_SITEDATA = "sitedata";
 
+/// The helper accepts `frame_mode` and, in inline mode, delivers frames
+/// as `frame_inline` pixel payloads ON the protocol socket itself — no
+/// memfd, no dma-buf, no SCM_RIGHTS. This is the frame family a REMOTE
+/// helper uses: the socket may be bridged over a mux connection where a
+/// descriptor cannot travel. A client that needs inline frames and does
+/// not see this capability must fail loudly (an old helper would keep
+/// posting `frame_buffer` frames whose descriptors were silently eaten
+/// by the bridge, i.e. a black pane forever).
+pub const CAP_FRAMES_INLINE = "frames-inline";
+
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
@@ -199,6 +209,10 @@ pub const Tag = enum(u8) {
     cookies_clear = 0xCB,
     sitedata_clear = 0xCC,
     ev_sitedata_done = 0xCD,
+    // 0xD0-0xD7: inline (in-band) frame family, capability
+    // "frames-inline" — the remote-helper block.
+    frame_mode = 0xD0,
+    frame_inline = 0xD1,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -642,6 +656,93 @@ pub const FrameDmabuf = struct {
             p.offset = try cur.readU32();
         }
         return out;
+    }
+};
+
+/// Client -> helper: select the frame family (capability
+/// "frames-inline"). mode 0 = shm/dma-buf (the default), 1 = inline.
+/// Applies to every buffer allocated AFTER it lands, so a client that
+/// wants inline frames sends it right after `hello`, before any view
+/// exists. There is deliberately no per-view granularity: one client is
+/// either descriptor-capable or it is not.
+pub const FrameMode = struct {
+    pub const tag: Tag = .frame_mode;
+    mode: u8,
+};
+
+pub const frame_mode_shm: u8 = 0;
+pub const frame_mode_inline: u8 = 1;
+
+/// `InlineRect.enc`: raw BGRA rows (w*h*4 bytes), or a raw-deflate
+/// stream of exactly those bytes (`wlhost/zpool.zig`, the same codec
+/// pool updates on the native app pipe use). Append-only values.
+pub const inline_enc_raw: u8 = 0;
+pub const inline_enc_deflate: u8 = 1;
+
+/// One damaged rect of an inline frame, pixels included. `data` borrows
+/// from the decoded payload buffer.
+pub const InlineRect = struct {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    enc: u8,
+    data: []const u8,
+};
+
+/// Helper -> client, capability "frames-inline": damaged rects of a
+/// paint, pixels carried IN-BAND (`Text`-sized: a full frame is far
+/// beyond a `str`). w/h are the PHYSICAL surface size, rect coordinates
+/// are physical too — the same contract as `frame_buffer`/`frame_damage`
+/// with the memfd replaced by the payload. One paint may arrive as
+/// SEVERAL frame_inline messages (large damage is banded so no single
+/// frame approaches MAX_FRAME); each is self-contained and presentable
+/// on receipt. `gen` is the same monotonic per-view paint counter the
+/// other families carry.
+pub const FrameInline = struct {
+    pub const tag: Tag = .frame_inline;
+    view: u32,
+    gen: u32,
+    w: u16,
+    h: u16,
+    rects: []const InlineRect,
+
+    pub fn encodeTo(self: FrameInline, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.gen);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putU16(gpa, out, @intCast(self.rects.len));
+        for (self.rects) |r| {
+            try putU16(gpa, out, r.x);
+            try putU16(gpa, out, r.y);
+            try putU16(gpa, out, r.w);
+            try putU16(gpa, out, r.h);
+            try putU8(gpa, out, r.enc);
+            try putText(gpa, out, .{ .s = r.data });
+        }
+    }
+
+    /// Caller owns the returned `rects` slice; each rect's `data` still
+    /// borrows from `payload`.
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !FrameInline {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const gen = try cur.readU32();
+        const w = try cur.readU16();
+        const h = try cur.readU16();
+        const n = try cur.readU16();
+        const rects = try gpa.alloc(InlineRect, n);
+        errdefer gpa.free(rects);
+        for (rects) |*r| {
+            r.x = try cur.readU16();
+            r.y = try cur.readU16();
+            r.w = try cur.readU16();
+            r.h = try cur.readU16();
+            r.enc = try cur.readU8();
+            r.data = (try cur.readText()).s;
+        }
+        return .{ .view = view, .gen = gen, .w = w, .h = h, .rects = rects };
     }
 };
 
@@ -2825,6 +2926,41 @@ test "outbox drains in order with partial writes" {
     try std.testing.expectEqualSlices(i32, &[_]i32{7}, second.fdSlice());
     ob.advance(second.bytes.len);
     try std.testing.expect(ob.empty());
+}
+
+test "inline frame round-trips rects, encodings and pixel payloads" {
+    const gpa = std.testing.allocator;
+    try roundTrip(FrameMode, .{ .mode = frame_mode_inline });
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const px_a = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const px_b = [_]u8{ 0xAA, 0xBB };
+    const rects = [_]InlineRect{
+        .{ .x = 0, .y = 0, .w = 2, .h = 1, .enc = inline_enc_raw, .data = &px_a },
+        .{ .x = 10, .y = 20, .w = 30, .h = 40, .enc = inline_enc_deflate, .data = &px_b },
+    };
+    try encode(gpa, &buf, FrameInline{ .view = 7, .gen = 99, .w = 640, .h = 480, .rects = &rects });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.frame_inline, frame.tag);
+    const got = try FrameInline.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.rects);
+    try std.testing.expectEqual(@as(u32, 99), got.gen);
+    try std.testing.expectEqual(@as(u16, 640), got.w);
+    try std.testing.expectEqual(@as(usize, 2), got.rects.len);
+    try std.testing.expectEqualSlices(u8, &px_a, got.rects[0].data);
+    try std.testing.expectEqual(inline_enc_deflate, got.rects[1].enc);
+    try std.testing.expectEqual(@as(u16, 40), got.rects[1].h);
+    try std.testing.expectEqualSlices(u8, &px_b, got.rects[1].data);
+
+    // Truncated rect list errors instead of reading past the frame.
+    try std.testing.expectError(error.Truncated, FrameInline.decodeAlloc(frame.payload[0 .. frame.payload.len - 1], gpa));
+}
+
+test "inline frame family tags live in the 0xD0 block" {
+    try std.testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Tag.frame_mode));
+    try std.testing.expectEqual(@as(u8, 0xD1), @intFromEnum(Tag.frame_inline));
 }
 
 test "a dma-buf frame round-trips its planes" {
