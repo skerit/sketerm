@@ -25,3 +25,8 @@ dist/*.log
 
 # dpkg packages built by dist/install.sh on Debian/Ubuntu
 dist/*.deb
+
+# Design documents are never committed (see CLAUDE.md): proposals stay
+# untracked in the working tree. An agent committed the browser ones
+# once; this makes that impossible to repeat by accident.
+docs/proposal-*
