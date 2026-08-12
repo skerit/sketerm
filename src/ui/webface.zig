@@ -207,6 +207,7 @@ const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
 const websiteinfo = @import("websiteinfo.zig");
+const webext = @import("webext.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const urlhost = @import("../web/urlhost.zig");
@@ -628,6 +629,7 @@ pub const Client = struct {
     pub fn isRemote(self: *const Client) bool {
         return self.host_len != 0;
     }
+    cap_webext: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -861,6 +863,10 @@ pub const Client = struct {
         // (before hello_ack, like view_create) — an old helper skips the
         // unknown frames and every view shares the default jar.
         publishContexts(self);
+        // Extensions the user installed are pushed to the fresh helper
+        // the same way, before any view exists.
+        webext.ensureLoaded(self.gpa);
+        webext.publish(self);
         for (self.faces.items) |f| f.onClientReady();
         return true;
     }
@@ -1119,6 +1125,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1130,6 +1137,10 @@ pub const Client = struct {
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
                 self.refreshUserContent();
+            },
+            .ev_webext_state => {
+                const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
+                webext.onState(st);
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
@@ -5507,6 +5518,13 @@ pub const WebFace = struct {
         // Container / identity actions.
         const tabs = m.section();
         tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
+        tabs.itemIconEnabled(
+            "Extensions…",
+            .{ .name = "application-x-addon-symbolic" },
+            client().cap_webext,
+            &onMenuExtensions,
+            ctx,
+        );
         if (containers().len != 0) {
             const cont = tabs.submenu("New Tab in Container");
             for (containers()) |*ctn| {
@@ -5537,6 +5555,12 @@ pub const WebFace = struct {
     fn onMenuIncognito(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
         win.newIncognitoWebTab() catch {};
+    }
+
+    fn onMenuExtensions(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        webext.openManager(face.allocator, @ptrCast(@alignCast(win.app_window)));
     }
 
     fn onMenuOpenInContainer(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
