@@ -800,6 +800,17 @@ H.264/AAC) while the distro build enables them.
   Intra-document id carry (fingerprint match anchored to a matched
   parent) is what keeps a re-rendered identical row's id stable; the
   parent anchor is the safety property, do not loosen it.
+- **Truncation is VISIBLE, as a `more` node.** A list-ish container
+  (`LIST_TAGS` by tag, or an aria list/grid/tree role) past `LIST_CAP`
+  children describes its first 50 and then emits one node with role
+  `more` naming how many were left out; the global `MAX_NODES` stop
+  emits one at the root saying so. Both exist because a silent stop is
+  indistinguishable from "the element is not on the page", which is how
+  a caller concludes a control does not exist. The marker is NOT in
+  `byId` — there is no element behind it — so `web_act` on one answers
+  "unknown id" rather than acting on something arbitrary, and its id is
+  keyed on the CONTAINER element so a re-walk reuses it instead of
+  churning the delta stream with a remove+add every snapshot.
 - The injected bridge script is published at context-creation time,
   before any page script runs, then unpublished, with a per-request
   nonce authenticating replies. Page scripts otherwise win the race and

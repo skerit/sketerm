@@ -65,7 +65,20 @@
   var MAX_NODES = 4000;
   var VALUE_CLAMP = 200;
 
+  // How many children of ONE list-ish container get described before the
+  // rest collapse to a single marker. 500 table rows cost 450 rows of
+  // tokens to say what the first 50 already said.
+  var LIST_CAP = 50;
+  // Gated on tag OR aria role, and both are needed: a <table>'s rows are
+  // children of a role-less <tbody>, which reaches `descend` as a
+  // transparent "generic" container, so a role-only gate would miss the
+  // single biggest case.
+  var LIST_TAGS = { UL: 1, OL: 1, DL: 1, MENU: 1, TABLE: 1, TBODY: 1, SELECT: 1, DATALIST: 1 };
+  var LIST_ROLES = { list: 1, listbox: 1, table: 1, grid: 1, menu: 1, menubar: 1, tablist: 1, tree: 1, feed: 1, rowgroup: 1 };
+
   var ids = new WeakMap();
+  // Marker ids, keyed on the CONTAINER element so a re-walk reuses one.
+  var moreIds = new WeakMap();
   var nextId = 1;
   var byId = new Map(); // rebuilt by every walk: stale nodes drop out
   var detail = 1;
@@ -370,7 +383,36 @@
     // Open shadow roots are walked as part of the tree: a custom
     // element's real controls live there, and a walk that stopped at
     // the host would report a page of empty <pl-input> boxes.
-    function descend(el, parent, depth) {
+    // A synthetic "N more" marker. It stands for children the walk
+    // deliberately did NOT describe, so it is not registered in `byId`:
+    // there is no element behind it and `web_act` must refuse it rather
+    // than act on something arbitrary.
+    //
+    // Its id is keyed on the PARENT element, not minted per walk, or a
+    // re-walk would report the marker as removed-and-added every time
+    // and the delta stream would churn on a list that never changed.
+    function emitMore(el, parent, label) {
+      var id = moreIds.get(el);
+      if (!id) {
+        id = nextId++;
+        moreIds.set(el, id);
+      }
+      out.push({
+        id: id,
+        parent: parent,
+        role: "more",
+        name: label,
+        value: "",
+        states: 0,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        full: 0
+      });
+    }
+
+    function descend(el, parent, depth, role) {
       if (out.length >= MAX_NODES || depth > 64) return;
       var root = el.shadowRoot;
       if (root && root.children) {
@@ -379,10 +421,25 @@
           if (out.length >= MAX_NODES) return;
         }
       }
-      for (var i = 0; i < el.children.length; i++) {
-        visit(el.children[i], parent, depth + 1);
+      // Collapse a LONG LIST to its first `LIST_CAP` rows plus a
+      // marker. Gated on the container's role rather than applied to
+      // every element: a page body legitimately has many children and
+      // truncating it would hide the page, whereas a 500-row table
+      // describes its shape in the first 50 and costs tokens for the
+      // other 450. `role` is the emitted role of `el`; a transparent
+      // container arrives here as "generic" and is never collapsed.
+      var kids = el.children;
+      var stop = kids.length;
+      var omitted = 0;
+      if (stop > LIST_CAP && (LIST_TAGS[el.tagName] || LIST_ROLES[role])) {
+        omitted = stop - LIST_CAP;
+        stop = LIST_CAP;
+      }
+      for (var i = 0; i < stop; i++) {
+        visit(kids[i], parent, depth + 1);
         if (out.length >= MAX_NODES) return;
       }
+      if (omitted) emitMore(el, parent, "\u2026 and " + omitted + " more");
     }
 
     function visit(el, parent, depth) {
@@ -393,15 +450,22 @@
       if (!role || role === "generic") {
         // Transparent container: its children attach to the nearest
         // emitted ancestor, which is what keeps the tree compact.
-        descend(el, parent, depth);
+        descend(el, parent, depth, "generic");
         return;
       }
       var id = emit(el, role, parent);
-      descend(el, id, depth);
+      descend(el, id, depth, role);
     }
 
     var rootId = emit(rootEl, "document", 0);
-    descend(rootEl, rootId, 0);
+    descend(rootEl, rootId, 0, "document");
+    // The GLOBAL cap used to stop the walk with no trace, so a client
+    // could not tell a page that ends here from one truncated here —
+    // and "the element is not in the tree" reads as "it is not on the
+    // page". The count is unknown by construction (we stopped looking),
+    // so say that rather than invent one.
+    if (out.length >= MAX_NODES)
+      emitMore(rootEl, rootId, "\u2026 and more: the walk stopped at " + MAX_NODES + " nodes");
     return out;
   }
 
