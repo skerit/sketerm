@@ -3380,7 +3380,11 @@ pub const Host = struct {
         const raw_id: i64 = if (items.len > 0 and items[0] == .integer) items[0].integer else -1;
         // A negative id means "the active tab", MV2's default.
         const tb = blk: {
-            if (raw_id >= 0) break :blk self.webext.tabs.find(@intCast(raw_id));
+            // Range-checked, not narrowed: an out-of-range id must
+            // resolve to NO tab, not wrap onto a real one. In
+            // ReleaseFast `@intCast` truncates, so `tabs.update(2**32+1,
+            // {url})` navigated tab 1 — a tab the extension never named.
+            if (raw_id >= 0) break :blk if (exttabs.u32Of(items[0])) |id| self.webext.tabs.find(id) else null;
             for (self.webext.tabs.tabs.items) |*t| {
                 if (t.active) break :blk t;
             }
@@ -3429,7 +3433,11 @@ pub const Host = struct {
             self.extReplyErr(v, req);
             return;
         }
-        const tab_id: u32 = @intCast(@max(items[0].integer, 0));
+        const tab_id: u32 = exttabs.u32Of(items[0]) orelse {
+            // Same rule as extTabsNavigate: out of range names no tab.
+            self.extReplyErr(v, req);
+            return;
+        };
         const tb = self.webext.tabs.find(tab_id) orelse {
             self.extReplyErr(v, req);
             return;
@@ -3826,9 +3834,20 @@ pub const Host = struct {
             // third-party to ITSELF, and uBO then strict-blocks the
             // navigation: measured as every page failing ERR_ABORTED.
             if (rt != .main_frame) {
-                const doc: []const u8 = if (self.webext.tabs.findByView(j.view_id)) |tb|
-                    tb.url
-                else if (self.find(j.view_id)) |pv| pv.url else "";
+                // OUR OWN view's url wins over the client's mirrored tab.
+                // `v.url` is set in-process by `on_address_change`; the
+                // tab table is at minimum a full round trip behind it
+                // (helper -> socket -> GUI -> a coalescing idle -> back),
+                // so right after a navigation the mirror still names the
+                // PREVIOUS page. That made a page's own subresources
+                // third-party to itself, which is exactly what uBO
+                // strict-blocks. The mirror supplies IDENTITY (tabId),
+                // never the url. Before the GUI posted a tab list at all
+                // this could not bite, because the lookup always missed.
+                const doc: []const u8 = if (self.find(j.view_id)) |pv| blk: {
+                    if (pv.url.len != 0) break :blk pv.url;
+                    break :blk if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
+                } else if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
                 if (doc.len != 0) {
                     w.writeAll(",\"documentUrl\":") catch continue;
                     jsonStr(w, doc) catch continue;
@@ -6795,6 +6814,9 @@ fn extResHasOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
 }
 
 /// IO THREAD. Resolve one `chrome-extension://` url to bytes.
+/// One refusal is reported per process (see the branches that set it).
+var g_ext_refusal_logged = false;
+
 fn extSchemeCreate(
     _: [*c]cef.cef_scheme_handler_factory_t,
     _: [*c]cef.cef_browser_t,
@@ -6893,7 +6915,16 @@ fn extSchemeCreate(
             // load, and when it does the extension silently has no
             // `browser` at all — which reads as "the background page
             // never registered its listener" three layers away.
-            std.debug.print("sketerm-web: REFUSED bootstrap for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            // ONCE per process, not per request: this fires only for a
+            // load that should never happen, but the whole premise of
+            // the gate is that a HOSTILE page can trigger it at will,
+            // and an unbounded stderr write on CEF's IO thread is a
+            // free amplifier. One line still surfaces a real
+            // misconfiguration.
+            if (!g_ext_refusal_logged) {
+                g_ext_refusal_logged = true;
+                std.debug.print("sketerm-web: REFUSED bootstrap for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            }
             return extResourceFor(&.{}, "text/plain", 403);
         }
         const js = buildExtBootstrap(&slot, host) orelse
@@ -6905,7 +6936,10 @@ fn extSchemeCreate(
         // cannot require `strict`; it must still never be a subresource
         // another origin can read.
         if (!strict and !is_navigation) {
-            std.debug.print("sketerm-web: REFUSED generated bg for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            if (!g_ext_refusal_logged) {
+                g_ext_refusal_logged = true;
+                std.debug.print("sketerm-web: REFUSED generated bg for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            }
             return extResourceFor(&.{}, "text/plain", 403);
         }
         const doc = buildGeneratedBackground(&slot) orelse
