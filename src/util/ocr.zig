@@ -58,6 +58,8 @@ pub const Options = struct {
 
 /// Mean luma (0..255, Rec. 601) of a tightly packed RGBA image,
 /// sampled on a stride so a 4K window costs a fraction of a frame.
+/// Unlike `toGray` this IGNORES alpha, so a frame with transparent
+/// margins reads darker than it looks; nothing consumes it today.
 pub fn meanLuma(rgba: []const u8, w: u32, h: u32) u8 {
     const px = @as(usize, w) * h;
     if (px == 0 or rgba.len < px * 4) return 128;
@@ -79,18 +81,48 @@ pub fn meanLuma(rgba: []const u8, w: u32, h: u32) u8 {
 /// Luma below this counts as a dark image (diagnostics only).
 pub const DARK_LUMA: u8 = 110;
 
-/// Rec. 601 luma, one byte per pixel, tightly packed. The channel order
-/// of the SOURCE does not matter for text: our frames are B,G,R,A and
-/// the weights differ only in which of two near-equal greys a coloured
-/// pixel lands on, while glyphs are neutral.
+/// Rec. 601 luma over WHITE, one byte per pixel, tightly packed.
+///
+/// The source is straight R,G,B,A — verified by dumping a real window
+/// snapshot: a panel painted `rgb(51,31,31)` arrives with 51 in byte 0.
+/// It matters only for saturated colour (a pure red and a pure blue
+/// glyph would otherwise swap luma and could land on the wrong side of
+/// a threshold), since glyphs are usually neutral, but weighting byte 0
+/// as blue while `meanLuma` weights it as red made the two disagree
+/// about an identically laid-out buffer.
+///
+/// The alpha composite is NOT cosmetic. Window frames arrive as
+/// PREMULTIPLIED ARGB (Wayland's ARGB8888), and a real window is
+/// transparent wherever its shadow and rounded corners are — 7% of a
+/// measured 928x709 panel snapshot. Dropping alpha turns all of that
+/// into pure BLACK, which is not a colour anything on screen had, and
+/// tesseract's default global Otsu then splits "black vs the rest" and
+/// puts the actual text on the background side of the threshold. That
+/// is the whole reason a frame the tesseract CLI read perfectly came
+/// back as "- -" through this module: the PNG we dumped to compare
+/// against CARRIED its alpha, so leptonica blended it over white and
+/// the CLI never saw the fabricated black. Compositing here is that
+/// same blend, and it restores the CLI's exact reading.
+///
+/// Premultiplied means each channel is already <= alpha, so the add
+/// cannot overflow; it saturates anyway rather than trust the source.
 fn toGray(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) Error![]u8 {
     const px = @as(usize, w) * h;
     const out = allocator.alloc(u8, px) catch return Error.OutOfMemory;
     var i: usize = 0;
     while (i < px) : (i += 1) {
         const o = i * 4;
-        if (o + 2 >= rgba.len) break;
-        out[i] = @intCast((@as(u32, rgba[o]) * 29 + @as(u32, rgba[o + 1]) * 150 + @as(u32, rgba[o + 2]) * 77) >> 8);
+        // A short source leaves the tail WHITE (background), never the
+        // uninitialized bytes `alloc` hands back.
+        if (o + 3 >= rgba.len) {
+            @memset(out[i..], 0xff);
+            break;
+        }
+        const unlit = 255 - rgba[o + 3];
+        const r = rgba[o] +| unlit;
+        const g = rgba[o + 1] +| unlit;
+        const b = rgba[o + 2] +| unlit;
+        out[i] = @intCast((@as(u32, r) * 77 + @as(u32, g) * 150 + @as(u32, b) * 29) >> 8);
     }
     return out;
 }
@@ -266,23 +298,13 @@ pub fn recognize(
     // GRAYSCALE, 1 byte per pixel — not the raw RGBA.
     //
     // `TessBaseAPISetImage` with bytes_per_pixel = 4 documents its input
-    // as R,G,B,A in memory; ours arrives from the compositor as Wayland
-    // ARGB8888, i.e. B,G,R,A little-endian, and the 4bpp path also drags
-    // an alpha channel tesseract has no use for. MEASURED 2026-08-12:
-    // handing it the 4bpp buffer returned "- -" for a panel whose own
-    // pixels, written out and read by the tesseract CLI, give "cannot
-    // load /LEFTFAILURE cannot load /RIGHTFAILURE". Luma is what it
-    // thresholds anyway, so converting here removes the byte-order and
-    // alpha questions instead of guessing at them — and costs a quarter
-    // of the data.
-    //
-    // HONEST LIMIT: this did NOT fix that panel. Feeding the identical
-    // pixels through this binding still under-reads badly (psm 6 -> "- -",
-    // psm 11 -> nothing) where the tesseract CLI on the same file reads
-    // every word, and sweeping psm and ppi changes nothing. Something
-    // else in this binding is wrong and is not yet found; the change is
-    // kept because passing B,G,R,A to an API documented as R,G,B,A was a
-    // real defect regardless of whether it was THE defect.
+    // as R,G,B,A in memory and ignores the fourth byte entirely, so the
+    // 4bpp path cannot composite the alpha our frames carry (see
+    // `toGray` — that composite is what makes a real window frame
+    // readable at all). Luma is what tesseract thresholds anyway, so
+    // converting here settles the byte-order and alpha questions
+    // instead of leaving them to the library, and costs a quarter of
+    // the data.
     const gray = try toGray(allocator, rgba, w, h);
     defer allocator.free(gray);
     api.set_image(t, gray.ptr, @intCast(w), @intCast(h), 1, @intCast(w));
@@ -429,4 +451,34 @@ test "toGray collapses a frame to one byte per pixel" {
     try std.testing.expectEqual(@as(usize, 2), g.len);
     try std.testing.expect(g[0] > 240);
     try std.testing.expectEqual(@as(u8, 0), g[1]);
+}
+
+test "toGray composites premultiplied alpha over white, not over black" {
+    const a = std.testing.allocator;
+    // A window's transparent shadow, a half-covered edge pixel, and an
+    // opaque black glyph. Ignoring alpha would make the first TWO read
+    // as near-black, fabricating a huge dark region that pulls
+    // tesseract's global threshold off the real text.
+    const src = [_]u8{
+        0x00, 0x00, 0x00, 0x00, // fully transparent -> white
+        0x80, 0x80, 0x80, 0x80, // premultiplied white at 50% -> white
+        0x00, 0x00, 0x00, 0xff, // opaque black -> black
+    };
+    const g = try toGray(a, &src, 3, 1);
+    defer a.free(g);
+    try std.testing.expectEqual(@as(u8, 255), g[0]);
+    try std.testing.expectEqual(@as(u8, 255), g[1]);
+    try std.testing.expectEqual(@as(u8, 0), g[2]);
+}
+
+test "toGray leaves a short source white rather than uninitialized" {
+    const a = std.testing.allocator;
+    // One pixel of data, two claimed: the tail must be background, not
+    // whatever the allocator handed back.
+    const src = [_]u8{ 0x00, 0x00, 0x00, 0xff };
+    const g = try toGray(a, &src, 2, 1);
+    defer a.free(g);
+    try std.testing.expectEqual(@as(usize, 2), g.len);
+    try std.testing.expectEqual(@as(u8, 0), g[0]);
+    try std.testing.expectEqual(@as(u8, 255), g[1]);
 }
