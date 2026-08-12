@@ -115,6 +115,7 @@ comptime {
     // Toolkit-free UI models: the tab forest is generic over its Ref
     // and imports nothing but std, so it belongs in both roots.
     _ = @import("ui/tabforest.zig");
+    _ = @import("ui/commandcat.zig");
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
     _ = @import("ui/panel/assets.zig");

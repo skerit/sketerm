@@ -96,6 +96,11 @@ pub const Source = struct {
     query: QueryFn,
     /// Stamped onto every candidate this source emits.
     activate: ?ActivateFn = null,
+    /// What `activate` is handed. Defaults to `ctx` when null; set it
+    /// when dispatch needs a different object than the query does — a
+    /// command catalogue reads rows out of its own storage but has to
+    /// dispatch through the window that owns the surface.
+    activate_ctx: ?*anyopaque = null,
     /// Set only by sources whose data arrives asynchronously. `query`
     /// is still called synchronously on whatever data has landed so
     /// far, so an async source contributes nothing on the first
@@ -139,7 +144,7 @@ pub fn merge(
             // emitting several row species); only fill the default in.
             if (cand.activate == null) {
                 cand.activate = src.activate;
-                cand.activate_ctx = src.ctx;
+                cand.activate_ctx = src.activate_ctx orelse src.ctx;
             }
         }
     }

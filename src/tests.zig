@@ -88,6 +88,7 @@ comptime {
     _ = @import("ui/imhost.zig");
     _ = @import("ui/tree.zig");
     _ = @import("ui/tabforest.zig");
+    _ = @import("ui/commandcat.zig");
     _ = @import("ui/quake.zig");
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
