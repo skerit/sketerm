@@ -56,6 +56,21 @@ const mux_wire = @import("mux/wire.zig");
 const webhints = @import("web/hints.zig");
 const axtree = @import("web/axtree.zig");
 const socks5 = @import("ipc/socks5.zig");
+const zip = @import("web/webext/zip.zig");
+
+/// `SKETERM_SMOKE_WEB_CONSOLE=1` echoes every page console message.
+/// Off by default because 30-odd stages would drown in Chromium noise;
+/// on, it is the only window into a hidden background page.
+var g_echo_console = false;
+
+/// One tab as stage 35 describes it to the helper.
+const TabSpec = struct {
+    id: u32,
+    view: u32,
+    active: bool = false,
+    url: []const u8 = "",
+    title: []const u8 = "",
+};
 
 const view_id: u32 = 1;
 /// The stage-22b view, created directly at a url.
@@ -679,6 +694,7 @@ const Client = struct {
     ack_downloads: bool = false,
     ack_contexts: bool = false,
     ack_webext: bool = false,
+    ack_webext_tabs: bool = false,
 
     /// Last `ev_webext_state` observed (one extension in the stage).
     we_ok: u8 = 0xff,
@@ -1111,6 +1127,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
                 }
             },
             .frame_inline => {
@@ -1340,6 +1357,16 @@ const Client = struct {
                 self.wq_timed_out = st.timed_out;
                 self.wq_failed_open = st.failed_open;
             },
+            .ev_console => {
+                // Only echoed when asked for. A WebExtensions failure is
+                // almost always a page-console error inside the
+                // background page, which is otherwise invisible: the
+                // page is hidden and never announced.
+                if (g_echo_console) {
+                    const m = proto.decode(proto.EvConsole, frame.payload) catch return;
+                    std.debug.print("  [console v{d} l{d}] {s}\n", .{ m.view, m.level, m.msg });
+                }
+            },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
                 self.title_len = @min(t.title.len, self.title.len);
@@ -1404,8 +1431,11 @@ const Client = struct {
                 }
             },
             .ev_load_error => {
-                _ = proto.decode(proto.EvLoadError, frame.payload) catch fail("ev_load_error decode");
+                const e = proto.decode(proto.EvLoadError, frame.payload) catch fail("ev_load_error decode");
                 self.load_err_seq += 1;
+                if (g_echo_console) {
+                    std.debug.print("  [load-error v{d} code {d}] {s}: {s}\n", .{ e.view, e.code, e.url, e.msg });
+                }
             },
             .ev_cert_error => {
                 const e = proto.decode(proto.EvCertError, frame.payload) catch fail("ev_cert_error decode");
@@ -1487,6 +1517,23 @@ const Client = struct {
         });
         if (!self.waitSeq(&self.eval_seq, seq, timeout_ms)) fail("no sem_eval_result");
         return self.evalPayload();
+    }
+
+    /// Post the whole tab list (`webext_tabs`), the seam that makes
+    /// `browser.tabs` and `sender.tab` real. Replace-all by design.
+    fn sendTabs(self: *Client, tabs: []const TabSpec) void {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeByte('[') catch return;
+        for (tabs, 0..) |t, i| {
+            if (i != 0) w.writeByte(',') catch return;
+            w.print(
+                "{{\"id\":{d},\"view\":{d},\"windowId\":0,\"index\":{d},\"active\":{s},\"focusedWindow\":true,\"url\":\"{s}\",\"title\":\"{s}\",\"loading\":false}}",
+                .{ t.id, t.view, i, if (t.active) "true" else "false", t.url, t.title },
+            ) catch return;
+        }
+        w.writeByte(']') catch return;
+        self.send(proto.WebextTabs{ .tabs_json = buf[0..w.end] });
     }
 
     fn resetTitle(self: *Client) void {
@@ -2882,6 +2929,727 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Stage 35: real MV2 extensions
+// ─────────────────────────────────────────────────────────────────────
+//
+// Stage 33's fixture proves our own code paths run. It cannot prove that
+// a REAL extension runs, and the four tier-1 ones all failed on things a
+// fixture never exercises: an ES-module background page, a
+// `chrome-extension://` origin its own code fetches from, a
+// `runtime.connect` Port its content script tears itself down without.
+//
+// 35a is a fixture SHAPED LIKE uBO — module background page with a real
+// static import, a Port from the content script, storage defaults, i18n
+// placeholders, `all_frames` — so the machinery is proven with no
+// network and no third-party download.
+//
+// 35b is the real uBlock Origin, and the only thing that can answer the
+// question the stage exists to answer: does it block a request. It is
+// SKIPPED, loudly, when the pinned XPI is absent (`zig build
+// fetch-webext-fixtures`), because a smoke run must not download.
+
+/// A routing loopback server for stage 35: it can tell the page apart
+/// from the resource uBO should block, and COUNTS hits on the latter, so
+/// "blocked" means the network never saw it rather than merely that the
+/// page reported an error.
+const UboServer = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+    page: []const u8 = "",
+    frame: []const u8 = "",
+    thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// `/adspop.js` — matched by a generic path rule in uBO's OWN
+    /// bundled `assets/ublock/filters.min.txt`, which is always enabled
+    /// and needs no download. A rule with a `$domain=` option could
+    /// never match a loopback page.
+    ad_hits: std.atomic.Value(u32) = .init(0),
+    /// The control resource, which must still arrive: a stage where
+    /// EVERYTHING failed would also report the ad as blocked.
+    ok_hits: std.atomic.Value(u32) = .init(0),
+
+    fn start(self: *UboServer) bool {
+        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (lfd < 0) return false;
+        var one: c_int = 1;
+        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = std.mem.nativeToBig(u16, 0);
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 64) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        self.fd = lfd;
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        self.thread = std.Thread.spawn(.{}, UboServer.serve, .{self}) catch {
+            _ = c.close(lfd);
+            self.fd = -1;
+            return false;
+        };
+        return true;
+    }
+
+    fn serve(self: *UboServer) void {
+        while (!self.stop.load(.acquire)) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 100) <= 0) continue;
+            const afd = c.accept(self.fd, null, null);
+            if (afd < 0) continue;
+            self.handle(afd);
+            _ = c.close(afd);
+        }
+    }
+
+    fn handle(self: *UboServer, afd: c_int) void {
+        var req: [8192]u8 = undefined;
+        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) return;
+        const n = c.read(afd, &req, req.len);
+        if (n <= 0) return;
+        const raw = req[0..@intCast(n)];
+
+        var body: []const u8 = "ok";
+        var ctype: []const u8 = "text/plain";
+        if (std.mem.indexOf(u8, raw, "GET /p ") != null or std.mem.indexOf(u8, raw, "GET /p?") != null) {
+            body = self.page;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /sub") != null) {
+            body = self.frame;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /adspop.js") != null) {
+            _ = self.ad_hits.fetchAdd(1, .release);
+            body = "REACHED-THE-NETWORK";
+            ctype = "text/javascript";
+        } else if (std.mem.indexOf(u8, raw, "GET /control.js") != null) {
+            _ = self.ok_hits.fetchAdd(1, .release);
+            body = "CONTROL-OK";
+            ctype = "text/javascript";
+        }
+
+        var head: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(
+            &head,
+            "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+            .{ ctype, body.len },
+        ) catch return;
+        _ = c.write(afd, hdr.ptr, hdr.len);
+        _ = c.write(afd, body.ptr, body.len);
+    }
+
+    fn deinit(self: *UboServer) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+    }
+};
+
+// -- 35a fixture: uBlock Origin's LOADING SHAPE ------------------------
+
+const shape_manifest =
+    \\{"manifest_version":2,"name":"sketerm shape fixture","version":"1",
+    \\ "default_locale":"en",
+    \\ "browser_specific_settings":{"gecko":{"id":"shape@sketerm.test"}},
+    \\ "permissions":["storage","tabs","webRequest","webRequestBlocking","<all_urls>"],
+    \\ "web_accessible_resources":["/war/*"],
+    \\ "background":{"page":"background.html","persistent":true},
+    \\ "content_scripts":[{"matches":["http://*/*"],"js":["cs.js"],
+    \\   "all_frames":true,"run_at":"document_end"}]}
+;
+
+/// The document shape uBO uses: a classic script, then a MODULE with a
+/// static import. Neither could run before — the classic one was never
+/// read (only `background.scripts` was), and the module is a
+/// SyntaxError under `new Function` no matter what.
+const shape_bg_html =
+    \\<!DOCTYPE html>
+    \\<html><head><meta charset="utf-8"><title>shape bg</title></head>
+    \\<body>
+    \\<script src="lib/classic.js"></script>
+    \\<script src="js/start.js" type="module"></script>
+    \\</body></html>
+;
+
+const shape_classic_js =
+    \\self.__classicRan = 1;
+;
+
+/// A real ES module with a real static import, fetched over
+/// `chrome-extension://` — the thing `js/start.js` does 20 times.
+const shape_start_js =
+    \\import { mark, VALUE } from "./dep.js";
+    \\self.__moduleRan = 1;
+    \\self.__depValue = VALUE;
+    \\mark();
+    \\
+    \\// A fetch of our own package over the extension origin, which is
+    \\// how uBO reads its bundled filter lists.
+    \\self.__assetText = "";
+    \\fetch(browser.runtime.getURL("assets/list.txt"))
+    \\  .then(function (r) { return r.text(); })
+    \\  .then(function (t) { self.__assetText = t.trim(); })
+    \\  .catch(function () { self.__assetText = "FETCH-FAILED"; });
+    \\
+    \\self.__ports = 0;
+    \\self.__portMsg = "";
+    \\browser.runtime.onConnect.addListener(function (port) {
+    \\  self.__ports += 1;
+    \\  port.onMessage.addListener(function (m) {
+    \\    self.__portMsg = String(m);
+    \\    port.postMessage("pong:" + m);
+    \\  });
+    \\});
+    \\
+    \\// storage.local.get with OBJECT DEFAULTS, uBO's settings bootstrap.
+    \\self.__defaults = "";
+    \\browser.storage.local.get({ shapeSetting: "author-default", other: 7 })
+    \\  .then(function (o) {
+    \\    self.__defaults = String(o && o.shapeSetting) + "/" + String(o && o.other);
+    \\  });
+    \\
+    \\browser.runtime.onMessage.addListener(function (m) {
+    \\  if (m !== "report") return null;
+    \\  return Promise.resolve({
+    \\    classic: self.__classicRan || 0,
+    \\    module: self.__moduleRan || 0,
+    \\    dep: self.__depValue || "",
+    \\    marked: self.__marked || 0,
+    \\    asset: self.__assetText,
+    \\    ports: self.__ports,
+    \\    portMsg: self.__portMsg,
+    \\    defaults: self.__defaults,
+    \\    i18n: browser.i18n.getMessage("blockedCount", ["12", "example.com"]),
+    \\    frames: self.__frames || 0
+    \\  });
+    \\});
+;
+
+const shape_dep_js =
+    \\export const VALUE = "dep-loaded";
+    \\export function mark() { self.__marked = 1; }
+;
+
+const shape_asset_txt = "bundled-asset-body\n";
+
+/// The content script. Its FIRST act is `runtime.connect`, exactly as
+/// uBO's `js/vapi-client.js` does — and uBO calls `vAPI.shutdown.exec()`
+/// when that throws, which is why a missing Port API is fatal rather
+/// than merely limiting.
+const shape_cs_js =
+    \\(function () {
+    \\  var port;
+    \\  try {
+    \\    port = browser.runtime.connect({ name: "shape" });
+    \\  } catch (e) {
+    \\    document.title = "cs:connect-threw";
+    \\    return;
+    \\  }
+    \\  if (!port || typeof port.postMessage !== "function") {
+    \\    document.title = "cs:no-port";
+    \\    return;
+    \\  }
+    \\  var isTop = window.top === window;
+    \\  port.onMessage.addListener(function (m) {
+    \\    if (!isTop) return;
+    \\    window.__portReply = String(m);
+    \\  });
+    \\  port.postMessage(isTop ? "top" : "sub");
+    \\  if (!isTop) return;
+    \\  // The top frame reports once the background has seen both frames.
+    \\  var tries = 0;
+    \\  var timer = setInterval(function () {
+    \\    tries += 1;
+    \\    browser.runtime.sendMessage("report").then(function (r) {
+    \\      if (!r) return;
+    \\      if (r.ports < 2 && tries < 40) return;
+    \\      clearInterval(timer);
+    \\      document.title = "shape:" + r.classic + r.module +
+    \\        (r.dep === "dep-loaded" ? 1 : 0) + r.marked +
+    \\        (r.asset === "bundled-asset-body" ? 1 : 0) +
+    \\        (r.ports >= 2 ? 1 : 0) +
+    \\        (r.portMsg === "top" || r.portMsg === "sub" ? 1 : 0) +
+    \\        (r.defaults === "author-default/7" ? 1 : 0) +
+    \\        (r.i18n === "Blocked 12 requests on example.com" ? 1 : 0) +
+    \\        (window.__portReply && window.__portReply.indexOf("pong:") === 0 ? 1 : 0);
+    \\    });
+    \\  }, 250);
+    \\})();
+;
+
+const shape_messages =
+    \\{"blockedCount":{"message":"Blocked $count$ requests on $site$",
+    \\  "placeholders":{"count":{"content":"$1"},"site":{"content":"$2"}}}}
+;
+
+fn shapePage(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf,
+        \\<!doctype html><html><head><title>shape-start</title></head><body>
+        \\<iframe src="http://127.0.0.1:{d}/sub"></iframe>
+        \\</body></html>
+    , .{port}) catch fail("stage 35 shape page");
+}
+
+const shape_frame = "<!doctype html><html><body>sub</body></html>";
+
+fn writeShapeFixture(dir: []const u8) bool {
+    mkdirZ2(dir);
+    // Separate buffers: these slices all stay live to the end of the
+    // function, so one shared scratch buffer would leave every earlier
+    // path pointing at the last one written into it.
+    var lib_buf: [160]u8 = undefined;
+    var js_buf: [160]u8 = undefined;
+    var as_buf: [160]u8 = undefined;
+    var loc_buf: [160]u8 = undefined;
+    var en_buf: [160]u8 = undefined;
+    const lib = std.fmt.bufPrint(&lib_buf, "{s}/lib", .{dir}) catch return false;
+    const js = std.fmt.bufPrint(&js_buf, "{s}/js", .{dir}) catch return false;
+    const assets = std.fmt.bufPrint(&as_buf, "{s}/assets", .{dir}) catch return false;
+    const locales = std.fmt.bufPrint(&loc_buf, "{s}/_locales", .{dir}) catch return false;
+    const en = std.fmt.bufPrint(&en_buf, "{s}/_locales/en", .{dir}) catch return false;
+    mkdirZ2(lib);
+    mkdirZ2(js);
+    mkdirZ2(assets);
+    mkdirZ2(locales);
+    mkdirZ2(en);
+    return writeFile(dir, "manifest.json", shape_manifest) and
+        writeFile(dir, "background.html", shape_bg_html) and
+        writeFile(dir, "cs.js", shape_cs_js) and
+        writeFile(lib, "classic.js", shape_classic_js) and
+        writeFile(js, "start.js", shape_start_js) and
+        writeFile(js, "dep.js", shape_dep_js) and
+        writeFile(assets, "list.txt", shape_asset_txt) and
+        writeFile(en, "messages.json", shape_messages);
+}
+
+fn mkdirZ2(path: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    _ = c.mkdir(z.ptr, 0o700);
+}
+
+/// Stage 35a — the loading SHAPE of a real MV2 extension.
+fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/shdata", .{dir}) catch fail("stage 35a data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/shcache", .{dir}) catch fail("stage 35a cache path");
+    mkdirZ(cache_dir);
+    var ext_buf: [4096]u8 = undefined;
+    const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/shfix", .{dir}) catch fail("stage 35a ext path");
+    if (!writeShapeFixture(ext_dir)) fail("stage 35a: could not write the fixture");
+
+    var srv = UboServer{};
+    if (!srv.start()) fail("stage 35a: loopback HTTP server would not start");
+    defer srv.deinit();
+    var page_body: [512]u8 = undefined;
+    srv.page = shapePage(&page_body, srv.port);
+    srv.frame = shape_frame;
+    var url_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("url");
+
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sh.sock", .{dir}) catch fail("stage 35a sock");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (!cl.ack_webext) fail("stage 35a: hello_ack lacks the webext capability");
+    if (!cl.ack_webext_tabs) fail("stage 35a: hello_ack lacks the webext-tabs capability");
+
+    cl.send(proto.WebextSet{ .id = "shape@sketerm.test", .dir = ext_dir, .enabled = 1 });
+    {
+        const d = nowMs() + 5_000;
+        while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+    }
+    if (cl.we_ok != 1) {
+        std.debug.print("stage 35a: load error \"{s}\"\n", .{cl.we_err[0..cl.we_err_len]});
+        fail("stage 35a: the fixture failed to load");
+    }
+    {
+        const d = nowMs() + 2500;
+        while (nowMs() < d) cl.pump(50);
+    }
+
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 35a: no frame_buffer for the page view");
+
+    // Publish a tab for the view BEFORE navigating: `sender.tab` is what
+    // Dark Reader keys its per-tab state on, and it is only right if the
+    // client told us the mapping.
+    cl.sendTabs(&.{.{ .id = 77, .view = view_id, .active = true, .url = page_url, .title = "shape" }});
+
+    cl.resetTitle();
+    cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+    if (!cl.waitTitle("shape:", 40_000)) {
+        std.debug.print("stage 35a: title was \"{s}\"\n", .{cl.titleSlice()});
+        fail("stage 35a: the fixture never reported (background page did not run)");
+    }
+    const res = cl.titleSlice();
+    const want = "shape:1111111111";
+    if (!std.mem.eql(u8, res, want)) {
+        std.debug.print(
+            "stage 35a: expected \"{s}\", got \"{s}\"\n" ++
+                "  digits: classic module dep marked asset ports portMsg defaults i18n portReply\n",
+            .{ want, res },
+        );
+        fail("stage 35a: part of the real-extension loading shape does not work");
+    }
+    pass("stage 35a loading shape (module background page at its own origin, static import, " ++
+        "package fetch, Ports from two frames, storage defaults, i18n placeholders)");
+
+    cl.send(proto.WebextRemove{ .id = "shape@sketerm.test" });
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.have_view = false;
+    {
+        const d = nowMs() + 2500;
+        while (nowMs() < d) cl.pump(50);
+    }
+    cl.deinit();
+    reapHelperTolerant(pid, "stage 35a", 30_000);
+}
+
+fn uboPage(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf,
+        \\<!doctype html><html><head><title>ubo-start</title></head><body><script>
+        \\var B = "http://127.0.0.1:{d}";
+        \\async function t(u) {{
+        \\  try {{ var r = await fetch(u); return await r.text(); }} catch (e) {{ return "ERR"; }}
+        \\}}
+        \\(async function () {{
+        \\  var ad = await t(B + "/adspop.js");
+        \\  var ok = await t(B + "/control.js");
+        \\  document.title = "ubo:" + (ad === "ERR" ? 1 : 0) + (ok.indexOf("CONTROL-OK") >= 0 ? 1 : 0);
+        \\}})();
+        \\</script></body></html>
+    , .{port}) catch fail("stage 35 ubo page");
+}
+
+/// Stage 35b — the real uBlock Origin.
+///
+/// Skipped rather than failed when the pinned XPI is absent: a smoke run
+/// must not download, and `zig build fetch-webext-fixtures` is what puts
+/// it there. Reported either way, so a green run never hides the fact
+/// that the only real-extension assertion did not execute.
+fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinned_xpi: []const u8) void {
+    // A DEVELOPER escape hatch, not part of the gate: point the stage at
+    // any other MV2 XPI to see how far it gets. It then REPORTS instead
+    // of asserting, because "blocks /adspop.js" is a statement about
+    // uBlock Origin and nothing else.
+    const probe: ?[]const u8 = if (c.getenv("SKETERM_SMOKE_WEBEXT_XPI")) |p| std.mem.span(p) else null;
+    const probe_id: []const u8 = if (c.getenv("SKETERM_SMOKE_WEBEXT_ID")) |p| std.mem.span(p) else "probe@sketerm.test";
+    const xpi_path = probe orelse pinned_xpi;
+    if (xpi_path.len == 0 or c.access(xpi_path.ptr, c.R_OK) != 0) {
+        std.debug.print(
+            "smoke-web: SKIP stage 35b (real uBlock Origin): no XPI at \"{s}\"\n" ++
+                "           run `zig build fetch-webext-fixtures` to enable it\n",
+            .{xpi_path},
+        );
+        return;
+    }
+
+    const ext_id: []const u8 = if (probe != null) probe_id else "uBlock0@raymondhill.net";
+
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/ubdata", .{dir}) catch fail("stage 35b data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/ubcache", .{dir}) catch fail("stage 35b cache path");
+    mkdirZ(cache_dir);
+
+    var ext_buf: [4096]u8 = undefined;
+    const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/ubo", .{dir}) catch fail("stage 35b ext path");
+    mkdirZ2(ext_dir);
+    if (!unpackXpi(gpa, xpi_path, ext_dir)) fail("stage 35b: could not unpack the uBlock Origin XPI");
+    if (c.getenv("SKETERM_SMOKE_UBO_TRACE") != null) uboTrace(gpa, ext_dir);
+
+    // Seed uBO's OWN settings through the same `storage.local` file the
+    // helper persists, so the stage measures ONE named filter list
+    // rather than whatever the shipped EasyList copy happens to contain
+    // this month. It also keeps the assertion honest: the rule the page
+    // trips (`/adspop.js`) is in `ublock-filters`, the list selected
+    // here, and nothing else is loaded to accidentally block the page
+    // itself.
+    {
+        var sdir_buf: [4096]u8 = undefined;
+        const sdir = std.fmt.bufPrint(&sdir_buf, "{s}/sketerm/webext/{s}", .{ data_dir, ext_id }) catch
+            fail("stage 35b storage dir");
+        mkdirAllZ(sdir);
+        var spath_buf: [4096]u8 = undefined;
+        const spath = std.fmt.bufPrintZ(&spath_buf, "{s}/storage.json", .{sdir}) catch fail("stage 35b storage path");
+        if (!writeWholeFile(spath,
+            \\{"selectedFilterLists":["ublock-filters"],
+            \\ "userSettings":{"advancedUserEnabled":false},
+            \\ "hiddenSettings":{"cacheStorageAPI":"browser.storage.local"}}
+        )) fail("stage 35b: could not seed uBlock Origin's settings");
+    }
+
+    var srv = UboServer{};
+    if (!srv.start()) fail("stage 35b: loopback HTTP server would not start");
+    defer srv.deinit();
+    var page_body: [1024]u8 = undefined;
+    srv.page = uboPage(&page_body, srv.port);
+    srv.frame = shape_frame;
+    var url_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("url");
+
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ub.sock", .{dir}) catch fail("stage 35b sock");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (!cl.ack_webext) fail("stage 35b: hello_ack lacks the webext capability");
+
+    cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
+    {
+        const d = nowMs() + 10_000;
+        while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+    }
+    if (cl.we_ok != 1) {
+        std.debug.print("stage 35b: load error \"{s}\"\n", .{cl.we_err[0..cl.we_err_len]});
+        fail("stage 35b: uBlock Origin's manifest did not load");
+    }
+
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 35b: no frame_buffer for the page view");
+    // The tab's url must be CURRENT: it is what `documentUrl` reports
+    // for every subresource, and uBO decides first-vs-third party from
+    // it. A GUI client re-posts the list on every navigation.
+    cl.sendTabs(&.{.{ .id = 1, .view = view_id, .active = true, .url = page_url, .title = "ubo" }});
+
+    // uBO parses ~4MB of bundled filter lists before its first verdict.
+    // Poll rather than sleep a fixed time: the stage retries the page
+    // until the block takes effect or the budget runs out, so a slow
+    // machine costs time and never a false failure.
+    var blocked = false;
+    const budget = nowMs() + 120_000;
+    var attempts: u32 = 0;
+    while (nowMs() < budget and !blocked) {
+        attempts += 1;
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        if (!cl.waitTitle("ubo:", 30_000)) {
+            std.debug.print("stage 35b: attempt {d}: title was \"{s}\"\n", .{ attempts, cl.titleSlice() });
+            continue;
+        }
+        const res = cl.titleSlice();
+        if (std.mem.eql(u8, res, "ubo:11")) {
+            blocked = true;
+            break;
+        }
+        if (!std.mem.eql(u8, res, "ubo:01")) {
+            std.debug.print("stage 35b: attempt {d}: unexpected result \"{s}\"\n", .{ attempts, res });
+        }
+        const wait = nowMs() + 4000;
+        while (nowMs() < wait) cl.pump(50);
+    }
+
+    if (!blocked and probe != null) {
+        cl.wq_seen = false;
+        cl.send(proto.WebextWreqStatsReq{});
+        {
+            const d = nowMs() + 3000;
+            while (!cl.wq_seen and nowMs() < d) cl.pump(50);
+        }
+        std.debug.print(
+            "stage 35b PROBE \"{s}\": no block after {d} attempts " ++
+                "(helper: matched={d} held={d} cancelled={d} timed_out={d} failed_open={d})\n",
+            .{ ext_id, attempts, cl.wq_matched, cl.wq_held, cl.wq_cancelled, cl.wq_timed_out, cl.wq_failed_open },
+        );
+    } else if (!blocked) {
+        // The helper's own counters say WHICH half failed: no `matched`
+        // means uBO never registered a filter that saw the request; a
+        // `cancelled` on a page that stayed blank means it cancelled the
+        // wrong thing.
+        cl.wq_seen = false;
+        cl.send(proto.WebextWreqStatsReq{});
+        {
+            const d = nowMs() + 3000;
+            while (!cl.wq_seen and nowMs() < d) cl.pump(50);
+        }
+        std.debug.print(
+            "stage 35b: after {d} attempts uBO never blocked /adspop.js " ++
+                "(ad_hits={d}, control_hits={d}; helper: matched={d} held={d} " ++
+                "cancelled={d} redirected={d} timed_out={d} failed_open={d})\n",
+            .{
+                attempts,        srv.ad_hits.load(.acquire), srv.ok_hits.load(.acquire),
+                cl.wq_matched,   cl.wq_held,                 cl.wq_cancelled,
+                cl.wq_redirected, cl.wq_timed_out,           cl.wq_failed_open,
+            },
+        );
+        fail("stage 35b: real uBlock Origin did not block a request");
+    }
+    // A cancel must mean the request never reached the network. The
+    // LAST attempt is the one that blocked; earlier attempts may have
+    // let it through while uBO was still parsing, so what is asserted
+    // is that the blocking attempt added no hit.
+    const hits_at_block = srv.ad_hits.load(.acquire);
+    if (srv.ok_hits.load(.acquire) == 0) {
+        fail("stage 35b: the control resource never arrived either — the page, not uBO, failed");
+    }
+    std.debug.print(
+        "stage 35b: blocked on attempt {d} (ad reached the network {d} time(s) while uBO was still loading)\n",
+        .{ attempts, hits_at_block },
+    );
+    if (probe != null) {
+        std.debug.print("stage 35b PROBE \"{s}\": blocked on attempt {d}\n", .{ ext_id, attempts });
+    } else pass("stage 35b REAL uBlock Origin 1.73.0 blocks a request on a loopback page");
+
+    cl.send(proto.WebextRemove{ .id = ext_id });
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.have_view = false;
+    {
+        const d = nowMs() + 4000;
+        while (nowMs() < d) cl.pump(50);
+    }
+    cl.deinit();
+    reapHelperTolerant(pid, "stage 35b", 60_000);
+}
+
+/// Unpack an XPI into `dest`, refusing any entry that escapes it.
+fn unpackXpi(gpa: std.mem.Allocator, xpi_path: []const u8, dest: []const u8) bool {
+    const bytes = readWholeFile(gpa, xpi_path) orelse return false;
+    defer gpa.free(bytes);
+    var arc = zip.read(gpa, bytes) catch return false;
+    defer arc.deinit();
+    for (arc.entries) |entry| {
+        if (entry.is_dir) continue;
+        if (std.mem.indexOf(u8, entry.name, "..") != null) continue;
+        var full_buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrintZ(&full_buf, "{s}/{s}", .{ dest, entry.name }) catch continue;
+        if (std.fs.path.dirname(full)) |d| mkdirAllZ(d);
+        // A LOOPING write, not the rig's `writeFile`: uBO's EasyList
+        // copy is 2.2MB and a single `write()` is free to come back
+        // short, which read as "unpack failed" for the whole archive.
+        if (!writeWholeFile(full, entry.data)) return false;
+    }
+    return true;
+}
+
+fn writeWholeFile(path: [*:0]const u8, body: []const u8) bool {
+    const fd = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    var off: usize = 0;
+    while (off < body.len) {
+        const n = c.write(fd, body.ptr + off, body.len - off);
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
+}
+
+/// `SKETERM_SMOKE_UBO_TRACE=1`: splice `console.log` calls into the
+/// UNPACKED copy of uBO's traffic.js, so its own verdict shows up in the
+/// helper's console stream. Diagnostic only — never on by default, and
+/// it modifies the throwaway unpack, never the pinned XPI.
+fn uboTrace(gpa: std.mem.Allocator, ext_dir: []const u8) void {
+    // uBO narrates its own boot through `ubolog`, which is silenced
+    // unless a hidden setting turns it on. Making the SILENT arm log
+    // instead is the smallest possible patch that yields the whole
+    // startup sequence, and it is the fastest way to see exactly where
+    // an extension stops working under this host.
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/js/console.js", .{ext_dir}) catch return;
+    const src = readWholeFile(gpa, path) orelse return;
+    defer gpa.free(src);
+    // Two arms silence it: the "ignore" one after an explicit disable,
+    // and the initial BUFFERING one that never flushes unless enabled.
+    // Patching the buffer is what catches the whole boot.
+    const needle = "    const store = function(...args) {\n        pending.push(args);\n    };";
+    const at = std.mem.indexOf(u8, src, needle) orelse {
+        std.debug.print("ubo-trace: anchor not found in console.js\n", .{});
+        return;
+    };
+    const replacement =
+        \\    const store = function(...args) {
+        \\        pending.push(args);
+        \\        try { console.info('[uBO]', ...args); } catch(e){}
+        \\    };
+    ;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, src[0..at]) catch return;
+    out.appendSlice(gpa, replacement) catch return;
+    out.appendSlice(gpa, src[at + needle.len ..]) catch return;
+    // The OTHER silent arm: once uBO calls `ubologSet(false)` the whole
+    // narrative stops mid-boot, which reads exactly like a hang.
+    const ign = "function ubologIgnore() {\n}";
+    if (std.mem.indexOf(u8, out.items, ign)) |i| {
+        const repl = "function ubologIgnore(...args) { try { console.info('[uBO]', ...args); } catch(e){} }";
+        var out2: std.ArrayList(u8) = .empty;
+        defer out2.deinit(gpa);
+        out2.appendSlice(gpa, out.items[0..i]) catch return;
+        out2.appendSlice(gpa, repl) catch return;
+        out2.appendSlice(gpa, out.items[i + ign.len ..]) catch return;
+        _ = writeWholeFile(path, out2.items);
+        std.debug.print("ubo-trace: patched {s} (both arms)\n", .{path});
+        return;
+    }
+    _ = writeWholeFile(path, out.items);
+    std.debug.print("ubo-trace: patched {s}\n", .{path});
+}
+
+fn mkdirAllZ(path: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    if (path.len + 1 > buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and buf[i] != '/') continue;
+        const save = buf[i];
+        buf[i] = 0;
+        _ = c.mkdir(@ptrCast(&buf), 0o700);
+        buf[i] = save;
+    }
+}
+
+fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var zbuf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return null;
+    const fd = c.open(z.ptr, c.O_RDONLY);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) return null;
+    const size: usize = @intCast(@max(st.st_size, 0));
+    if (size == 0 or size > 64 * 1024 * 1024) return null;
+    const buf = gpa.alloc(u8, size) catch return null;
+    var got: usize = 0;
+    while (got < size) {
+        const n = c.read(fd, buf.ptr + got, size - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    if (got != size) {
+        gpa.free(buf);
+        return null;
+    }
+    return buf;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
     const argv = init.args.vector;
@@ -2891,6 +3659,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     const exe = argv[1];
     if (c.access(exe, c.X_OK) != 0) fail("sketerm-web binary is not executable");
+    // argv[3] is stage 35b's real-extension fixture: a PATH that may
+    // legitimately not exist (the stage then reports itself skipped).
+    const ubo_xpi: []const u8 = if (argv.len > 3) std.mem.span(argv[3]) else "";
+    g_echo_console = c.getenv("SKETERM_SMOKE_WEB_CONSOLE") != null;
 
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     const gpa = gpa_state.allocator();
@@ -5069,6 +5841,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 28: WebExtensions foundation ────────────────────────
     runWebextStage(gpa, exe, dir);
     runWebrequestStage(gpa, exe, dir);
+    // ── Stage 35: real MV2 extensions ─────────────────────────────
+    runShapeStage(gpa, exe, dir);
+    runUboStage(gpa, exe, dir, ubo_xpi);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {

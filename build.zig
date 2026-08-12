@@ -1001,6 +1001,20 @@ const CEF_VERSION = "151.3.16+gbe1e15d+chromium-151.0.7922.109";
 /// index.json publishes for the same file; bump both together.
 const CEF_SHA256 = "eaeb313e6039de464855893d287c4d5eb4ec7126978ea83c6164bf4a23dc017a";
 
+/// The REAL uBlock Origin build smoke-web stage 35 measures against.
+///
+/// A fixture of our own can only prove that our own code paths run;
+/// only the shipped extension can prove that uBO's module graph, its
+/// Port traffic and its filter engine survive contact with this host.
+/// Pinned by version AND checksum, and fetched by `zig build
+/// fetch-webext-fixtures` — never by `zig build smoke-web`, which must
+/// not touch the network. Stage 35b reports itself SKIPPED when the file
+/// is absent instead of failing, exactly as stage 24 reports a host with
+/// no GPU.
+const UBO_VERSION = "1.73.0";
+const UBO_URL = "https://addons.mozilla.org/firefox/downloads/file/4940584/ublock_origin-1.73.0.xpi";
+const UBO_SHA256 = "bccc51a773150af4af6e1fd62c7bfdeb7238b79ff2381b998fa9f2e38f64786a";
+
 /// Register the optional CEF acquisition step and the `sketerm-webengine`
 /// helper it feeds.
 ///
@@ -1111,6 +1125,46 @@ fn addCef(
     fetch.has_side_effects = true;
     const fetch_step = b.step("fetch-cef", b.fmt("Download the pinned CEF binary distribution ({s}) into the build cache", .{CEF_VERSION}));
     fetch_step.dependOn(&fetch.step);
+
+    // The real-extension fixture for smoke-web stage 35. Same shape as
+    // fetch-cef and for the same reasons: developer-invoked, checksum
+    // pinned, never reached by a plain build or by the smoke run itself.
+    const ubo_dir = if (b.graph.environ_map.get("XDG_CACHE_HOME")) |xdg|
+        b.fmt("{s}/sketerm/webext-fixtures", .{xdg})
+    else if (b.graph.environ_map.get("HOME")) |home|
+        b.fmt("{s}/.cache/sketerm/webext-fixtures", .{home})
+    else
+        b.fmt("{s}/.zig-cache/webext-fixtures", .{b.build_root.path orelse "."});
+    const ubo_xpi = b.fmt("{s}/ublock_origin-{s}.xpi", .{ ubo_dir, UBO_VERSION });
+    const fetch_ext = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\out="$1"; url="$2"; sum="$3"
+        \\if [ -e "$out" ]; then
+        \\  echo "webext-fixtures: already present at $out"
+        \\  exit 0
+        \\fi
+        \\mkdir -p "$(dirname "$out")"
+        \\echo "webext-fixtures: downloading $url"
+        \\curl -fL --retry 3 -o "$out.tmp" "$url"
+        \\echo "$sum  $out.tmp" | sha256sum -c - >/dev/null || {
+        \\  echo "webext-fixtures: SHA-256 mismatch, refusing to keep it" >&2
+        \\  rm -f "$out.tmp"; exit 1
+        \\}
+        \\mv "$out.tmp" "$out"
+        \\echo "webext-fixtures: installed $out"
+        ,
+        "sh",
+    });
+    fetch_ext.addArg(ubo_xpi);
+    fetch_ext.addArg(UBO_URL);
+    fetch_ext.addArg(UBO_SHA256);
+    fetch_ext.has_side_effects = true;
+    const fetch_ext_step = b.step(
+        "fetch-webext-fixtures",
+        b.fmt("Download the real uBlock Origin {s} XPI smoke-web stage 35 measures against", .{UBO_VERSION}),
+    );
+    fetch_ext_step.dependOn(&fetch_ext.step);
 
     const web_step = b.step("web", "Build sketerm-webengine, the CEF browser helper (needs `zig build fetch-cef`)");
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
@@ -1233,6 +1287,11 @@ fn addCef(
     // The remote-helper stage spawns a private sketerm-mux and asks IT
     // to launch the helper over a bridged byte channel.
     smoke_web_run.addArtifactArg(mux_exe);
+    // Stage 35b's real-extension fixture. Passed as a PATH, not a
+    // dependency: the file may legitimately be absent (the stage then
+    // reports itself skipped), and making the smoke step depend on the
+    // fetch would put a download in everybody's test run.
+    smoke_web_run.addArg(ubo_xpi);
     smoke_web_step.dependOn(&smoke_web_run.step);
 
     // Blocking-webRequest latency benchmark — `zig build bench-webreq`.
