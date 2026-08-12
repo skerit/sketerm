@@ -31,6 +31,12 @@ comptime {
     _ = @import("web/urlhost.zig");
     _ = @import("web/model.zig");
     _ = @import("web/axtree.zig");
+    // WebExtensions foundation: match patterns, MV2 manifest parse,
+    // storage.local JSON, and the XPI/zip reader — all pure std.
+    _ = @import("web/webext/match.zig");
+    _ = @import("web/webext/manifest.zig");
+    _ = @import("web/webext/storage.zig");
+    _ = @import("web/webext/zip.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");
