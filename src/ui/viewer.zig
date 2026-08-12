@@ -20,7 +20,7 @@ const input = @import("input.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const browser_open = @import("browser/open.zig");
 const format = @import("../filebrowser/format.zig");
-const actionButton = @import("widgets.zig").actionButton;
+const appmenu = @import("appmenu.zig");
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -524,8 +524,10 @@ pub const Content = union(enum) {
 };
 
 /// Number of header controls that only make sense for images and hide
-/// while a cast is showing.
-const IMAGE_CONTROL_COUNT = 10;
+/// while a cast is showing. The hamburger is deliberately NOT one of
+/// them: its rows either apply to any content or grey themselves out,
+/// and it is the only route to About / Keyboard Shortcuts.
+const IMAGE_CONTROL_COUNT = 9;
 
 pub const ViewerWindow = struct {
     /// Host policy for an embedding shell (the Files Quick Look host in
@@ -564,7 +566,10 @@ pub const ViewerWindow = struct {
     zoom_label: *c.GtkLabel,
     original_button: *c.GtkWidget,
     play_button: *c.GtkWidget,
-    metadata_label: *c.GtkLabel,
+    /// The metadata block the hamburger shows. TEXT, not a widget: the
+    /// menu is rebuilt per open, so the label cannot outlive a popup
+    /// and the window has to own the words instead.
+    metadata: [512:0]u8,
     prev_button: *c.GtkWidget,
     next_button: *c.GtkWidget,
     fullscreen: bool = false,
@@ -634,34 +639,11 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_sensitive(play_button, 0);
         const fullscreen_button = c.gtk_button_new_from_icon_name("view-fullscreen-symbolic").?;
         c.gtk_widget_set_tooltip_text(fullscreen_button, "Fullscreen (F11)");
-        const menu_button = c.gtk_menu_button_new().?;
-        c.gtk_menu_button_set_icon_name(@ptrCast(menu_button), "open-menu-symbolic");
-        c.gtk_widget_set_tooltip_text(menu_button, "Image Actions");
-        const action_popover = c.gtk_popover_new().?;
-        const action_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        c.gtk_widget_set_margin_start(action_box, 6);
-        c.gtk_widget_set_margin_end(action_box, 6);
-        c.gtk_widget_set_margin_top(action_box, 6);
-        c.gtk_widget_set_margin_bottom(action_box, 6);
-        const metadata_label = c.gtk_label_new("Image metadata appears here after loading").?;
-        c.gtk_label_set_xalign(@ptrCast(metadata_label), 0);
-        c.gtk_label_set_wrap(@ptrCast(metadata_label), 1);
-        c.gtk_label_set_selectable(@ptrCast(metadata_label), 1);
-        c.gtk_widget_set_size_request(metadata_label, 280, -1);
-        c.gtk_widget_set_margin_start(metadata_label, 8);
-        c.gtk_widget_set_margin_end(metadata_label, 8);
-        c.gtk_widget_set_margin_top(metadata_label, 4);
-        c.gtk_widget_set_margin_bottom(metadata_label, 6);
-        c.gtk_widget_add_css_class(metadata_label, "dim-label");
-        c.gtk_box_append(@ptrCast(action_box), metadata_label);
-        c.gtk_box_append(@ptrCast(action_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?);
-        const copy_button = actionButton(action_box, "Copy Image", "edit-copy-symbolic");
-        const open_with_button = actionButton(action_box, "Open With...", "document-open-symbolic");
-        const reveal_button = actionButton(action_box, "Show in Sketerm Files", "folder-open-symbolic");
-        if (!options.show_in_files_action) c.gtk_widget_set_visible(reveal_button, 0);
-        const reload_button = actionButton(action_box, "Reload", "view-refresh-symbolic");
-        c.gtk_popover_set_child(@ptrCast(action_popover), action_box);
-        c.gtk_menu_button_set_popover(@ptrCast(menu_button), action_popover);
+        // The hamburger: a flat button whose classic menu is built
+        // fresh per open, like every other hamburger in the suite. It
+        // is packed FIRST at the end so it lands END-MOST.
+        const menu_button = c.gtk_button_new_from_icon_name("open-menu-symbolic").?;
+        c.gtk_widget_set_tooltip_text(menu_button, "Main Menu");
         c.adw_header_bar_pack_end(@ptrCast(header), menu_button);
         c.adw_header_bar_pack_end(@ptrCast(header), fullscreen_button);
         c.adw_header_bar_pack_end(@ptrCast(header), play_button);
@@ -747,7 +729,7 @@ pub const ViewerWindow = struct {
             .zoom_label = @ptrCast(@alignCast(zoom_label)),
             .original_button = original,
             .play_button = play_button,
-            .metadata_label = @ptrCast(@alignCast(metadata_label)),
+            .metadata = undefined,
             .prev_button = prev_button,
             .next_button = next_button,
             .anim_bar = anim_bar,
@@ -758,9 +740,10 @@ pub const ViewerWindow = struct {
             .image_controls = .{
                 zoom_out,    @ptrCast(@alignCast(zoom_label)), zoom_in,     fit_button,
                 fill_button, actual_button,                    rotate_left, rotate_right,
-                play_button, menu_button,
+                play_button,
             },
         };
+        self.setMetadata("Image metadata appears here after loading");
         self.canvas.enableInput();
         self.canvas.on_zoom = &onCanvasZoom;
         self.canvas.zoom_ctx = @ptrCast(self);
@@ -789,10 +772,7 @@ pub const ViewerWindow = struct {
         _ = c.g_signal_connect_data(play_button, "clicked", @ptrCast(&onPlayPause), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(fullscreen_button, "clicked", @ptrCast(&onFullscreen), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(original, "clicked", @ptrCast(&onOriginal), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(copy_button, "clicked", @ptrCast(&onCopy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(open_with_button, "clicked", @ptrCast(&onOpenWith), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(reveal_button, "clicked", @ptrCast(&onReveal), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(reload_button, "clicked", @ptrCast(&onReload), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(menu_button, "clicked", @ptrCast(&onBurgerClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         const keys = c.gtk_event_controller_key_new();
         c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -807,15 +787,12 @@ pub const ViewerWindow = struct {
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(window, @ptrCast(drop));
 
-        // Right-click / Menu key on the image itself. Every row
-        // forwards to the header or hamburger button that already
-        // implements it, so the menu adds no second copy of any
-        // action and inherits each button's sensitivity.
+        // Right-click / Menu key on the image itself. Every row either
+        // forwards to the header button that already implements it or
+        // is one of the hamburger's own verbs, so the menu adds no
+        // second copy of any action and inherits each one's state.
         const all_menu_items = [_]CanvasMenuItem{
-            .{ .row = .{ .label = "Copy Image", .icon = "edit-copy-symbolic", .source = copy_button } },
-            .{ .row = .{ .label = "Open With…", .icon = "document-open-symbolic", .source = open_with_button } },
-            .{ .row = .{ .label = "Show in Sketerm Files", .icon = "folder-open-symbolic", .source = reveal_button } },
-            .{ .row = .{ .label = "Reload", .icon = "view-refresh-symbolic", .source = reload_button } },
+            .verbs,
             .separator,
             .{ .row = .{ .label = "Fit to Window", .icon = "zoom-fit-best-symbolic", .source = fit_button } },
             .{ .row = .{ .label = "Actual Size", .icon = "zoom-original-symbolic", .source = actual_button } },
@@ -832,16 +809,10 @@ pub const ViewerWindow = struct {
             .{ .row = .{ .label = "View Full Resolution", .icon = "zoom-in-symbolic", .source = original } },
             .{ .row = .{ .label = "Fullscreen", .icon = "view-fullscreen-symbolic", .source = fullscreen_button } },
         };
-        var menu_items: [all_menu_items.len]CanvasMenuItem = undefined;
-        var n_menu_items: usize = 0;
-        for (all_menu_items) |item| {
-            // A host that suppresses the Files action gets no dead
-            // context-menu row for it either.
-            if (!options.show_in_files_action and item == .row and item.row.source == reveal_button) continue;
-            menu_items[n_menu_items] = item;
-            n_menu_items += 1;
-        }
-        self.canvas_menu = try attachCanvasMenu(allocator, self.canvas.widget(), menu_items[0..n_menu_items]);
+        // A host that suppresses the Files action gets no dead row for
+        // it in either menu; `appendVerbRows` applies that rule once
+        // for both.
+        self.canvas_menu = try attachCanvasMenu(allocator, self, self.canvas.widget(), &all_menu_items);
 
         // Chorded keys resolve through the user's keybinding table
         // (Ctrl+= / Ctrl+- / Ctrl+0 by default); loaded once per
@@ -880,6 +851,15 @@ pub const ViewerWindow = struct {
         self.batch.deinit();
         if (self.bindings.len > 0) self.allocator.free(self.bindings);
         self.allocator.destroy(self);
+    }
+
+    /// Replace the metadata block the hamburger shows; truncates
+    /// rather than allocating (the buffer is a fixed part of the
+    /// window, and a metadata dump this long is already unreadable).
+    fn setMetadata(self: *ViewerWindow, text: []const u8) void {
+        const n = @min(text.len, self.metadata.len);
+        @memcpy(self.metadata[0..n], text[0..n]);
+        self.metadata[n] = 0;
     }
 
     fn current(self: *ViewerWindow) ?model.Resource {
@@ -929,7 +909,7 @@ pub const ViewerWindow = struct {
     fn showCast(self: *ViewerWindow, resource: model.Resource) void {
         // A still-running image load must not deliver into cast mode.
         self.target.cancel();
-        c.gtk_label_set_text(self.metadata_label, "Asciicast terminal recording");
+        self.setMetadata("Asciicast terminal recording");
         c.gtk_label_set_text(self.status, "Loading recording...");
         const box = castbox.CastPlayerBox.create(self.allocator, resource.spec, "sketerm view", .{
             .ctx = @ptrCast(self),
@@ -959,7 +939,7 @@ pub const ViewerWindow = struct {
         self.content = .text;
         self.setContentMode(.text);
         setTextViewContent(self, "");
-        c.gtk_label_set_text(self.metadata_label, "File contents (bounded head)");
+        self.setMetadata("File contents (bounded head)");
         c.gtk_label_set_text(self.status, "Loading file...");
         if (!self.target.start(resource.spec, .head)) c.gtk_label_set_text(self.status, "Could not start the file loader");
     }
@@ -970,7 +950,7 @@ pub const ViewerWindow = struct {
         self.session.clear();
         self.canvas.fit();
         c.gtk_widget_set_sensitive(self.play_button, 0);
-        c.gtk_label_set_text(self.metadata_label, "Loading image metadata...");
+        self.setMetadata("Loading image metadata...");
         c.gtk_widget_set_visible(self.original_button, 0);
         const resource = self.current() orelse {
             self.setContentMode(.image);
@@ -1106,7 +1086,67 @@ pub const CanvasMenuItem = union(enum) {
         icon: [*:0]const u8,
         source: *c.GtkWidget,
     },
+    /// Expanded to `VERB_ROWS` at popup time: the verbs that have no
+    /// toolbar button to mirror, listed here so the context menu and
+    /// the hamburger can never disagree about them.
+    verbs,
 };
+
+/// A verb with no header button of its own. These are the rows the
+/// hamburger used to build by hand as a popover of buttons; both menus
+/// now take them from this one table.
+const VerbRow = struct {
+    label: [*:0]const u8,
+    icon: [*:0]const u8,
+    cb: classicmenu.Handler,
+    /// Greyed out unless an image is showing (a cast has no bitmap to
+    /// put on the clipboard).
+    image_only: bool = false,
+    /// Suppressed entirely when the host turned the Files action off.
+    files_action: bool = false,
+};
+
+const VERB_ROWS = [_]VerbRow{
+    .{ .label = "Copy Image", .icon = "edit-copy-symbolic", .cb = @ptrCast(&onCopy), .image_only = true },
+    .{ .label = "Open With…", .icon = "document-open-symbolic", .cb = @ptrCast(&onOpenWith) },
+    .{ .label = "Show in Sketerm Files", .icon = "folder-open-symbolic", .cb = @ptrCast(&onReveal), .files_action = true },
+    .{ .label = "Reload", .icon = "view-refresh-symbolic", .cb = @ptrCast(&onReload) },
+};
+
+fn appendVerbRows(m: classicmenu.Menu, win: *ViewerWindow) void {
+    for (VERB_ROWS) |v| {
+        if (v.files_action and !win.options.show_in_files_action) continue;
+        const usable = !v.image_only or win.content == .image;
+        m.itemIconEnabled(v.label, .{ .name = v.icon }, usable, v.cb, @ptrCast(win));
+    }
+}
+
+fn onBurgerClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(ViewerWindow, user);
+    const anchor: *c.GtkWidget = @ptrCast(@alignCast(btn));
+    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const m = root.top();
+    // The metadata block is informational, not a row: a fresh label
+    // per popup, since the menu it lives in dies with the popover.
+    const info = c.gtk_label_new(&self.metadata).?;
+    c.gtk_label_set_xalign(@ptrCast(info), 0);
+    c.gtk_label_set_wrap(@ptrCast(info), 1);
+    c.gtk_label_set_selectable(@ptrCast(info), 1);
+    c.gtk_widget_set_size_request(info, 280, -1);
+    c.gtk_widget_set_margin_start(info, 8);
+    c.gtk_widget_set_margin_end(info, 8);
+    c.gtk_widget_set_margin_top(info, 4);
+    c.gtk_widget_set_margin_bottom(info, 6);
+    c.gtk_widget_add_css_class(info, "dim-label");
+    m.custom(info);
+    appendVerbRows(m.section(), self);
+    appmenu.appendHelp(m, self.allocator, @ptrCast(@alignCast(self.window)), .viewer);
+    _ = root.popup(
+        anchor,
+        @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)),
+        @floatFromInt(c.gtk_widget_get_height(anchor)),
+    );
+}
 
 /// The mirror list behind the canvas context menu. Owned by the
 /// right-click gesture's GDestroyNotify, which fires when the
@@ -1114,6 +1154,10 @@ pub const CanvasMenuItem = union(enum) {
 /// widget dies. Each popup builds a fresh classicmenu from it.
 const CanvasMenu = struct {
     allocator: std.mem.Allocator,
+    /// Dispatch target for `.verbs` rows. Borrowed: the gesture that
+    /// owns this dies with the canvas, i.e. before the window's own
+    /// finalize frees the ViewerWindow.
+    win: *ViewerWindow,
     host: *c.GtkWidget,
     items: []CanvasMenuItem,
 };
@@ -1130,6 +1174,7 @@ const CanvasRowCtx = struct {
 /// `items`.
 fn attachCanvasMenu(
     allocator: std.mem.Allocator,
+    win: *ViewerWindow,
     host: *c.GtkWidget,
     items: []const CanvasMenuItem,
 ) !*CanvasMenu {
@@ -1137,6 +1182,7 @@ fn attachCanvasMenu(
     errdefer allocator.destroy(menu);
     menu.* = .{
         .allocator = allocator,
+        .win = win,
         .host = host,
         .items = try allocator.dupe(CanvasMenuItem, items),
     };
@@ -1164,6 +1210,7 @@ fn showCanvasMenu(menu: *CanvasMenu, x: f64, y: f64) void {
     const top = root.top();
     for (menu.items) |item| switch (item) {
         .separator => _ = top.section(),
+        .verbs => appendVerbRows(top, menu.win),
         .row => |r| {
             const usable = c.gtk_widget_get_sensitive(r.source) != 0 and
                 c.gtk_widget_get_visible(r.source) != 0;
@@ -1270,7 +1317,7 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
         defer std.heap.c_allocator.free(dump);
         setTextViewContent(self, dump);
     }
-    c.gtk_label_set_text(self.metadata_label, if (binary) "Binary file (hex dump of the head)" else "Plain text file");
+    self.setMetadata(if (binary) "Binary file (hex dump of the head)" else "Plain text file");
     const kind: []const u8 = if (binary) "Binary (hex dump)" else "UTF-8 text";
     var status_buf: [256:0]u8 = undefined;
     var head_buf: [48:0]u8 = undefined;
@@ -1320,9 +1367,9 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const first = image.first();
     self.updatePlaybackButton();
     if (result.metadata_len > 0)
-        c.gtk_label_set_text(self.metadata_label, result.metadataText().ptr)
+        self.setMetadata(result.metadataText())
     else
-        c.gtk_label_set_text(self.metadata_label, "No embedded image metadata");
+        self.setMetadata("No embedded image metadata");
     var status: [256:0]u8 = undefined;
     const backend = switch (image.backend) {
         .glycin => "Glycin",

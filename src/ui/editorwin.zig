@@ -25,6 +25,8 @@ const editorview = @import("editorview.zig");
 const EditorView = editorview.EditorView;
 const ETab = editorview.ETab;
 const confirm = @import("confirm.zig");
+const classicmenu = @import("browser/classicmenu.zig");
+const appmenu = @import("appmenu.zig");
 
 const EDITOR_QDATA = "sketerm-editor-window";
 
@@ -146,23 +148,12 @@ pub const EditorWindow = struct {
         c.adw_header_bar_pack_start(@ptrCast(header), save_button);
         c.adw_header_bar_pack_start(@ptrCast(header), save_as_button);
 
-        const menu_button = c.gtk_menu_button_new().?;
-        c.gtk_menu_button_set_icon_name(@ptrCast(menu_button), "open-menu-symbolic");
-        c.gtk_widget_set_tooltip_text(menu_button, "Document Actions");
-        const popover = c.gtk_popover_new().?;
-        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        c.gtk_widget_set_margin_start(box, 6);
-        c.gtk_widget_set_margin_end(box, 6);
-        c.gtk_widget_set_margin_top(box, 6);
-        c.gtk_widget_set_margin_bottom(box, 6);
-        _ = self.actionButton(box, "Find...", "edit-find-symbolic", &onFind);
-        _ = self.actionButton(box, "Find and Replace...", "edit-find-replace-symbolic", &onReplace);
-        _ = self.actionButton(box, "Toggle Soft Wrap", "format-justify-left-symbolic", &onWrap);
-        c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?);
-        _ = self.actionButton(box, "Show in Sketerm Files", "folder-open-symbolic", &onReveal);
-        _ = self.actionButton(box, "Close Document", "window-close-symbolic", &onCloseDocument);
-        c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_menu_button_set_popover(@ptrCast(menu_button), popover);
+        // The hamburger: a flat button whose classic menu is built
+        // fresh per open, like every other hamburger in the suite, and
+        // END-MOST on the bar.
+        const menu_button = c.gtk_button_new_from_icon_name("open-menu-symbolic").?;
+        c.gtk_widget_set_tooltip_text(menu_button, "Main Menu");
+        _ = c.g_signal_connect_data(menu_button, "clicked", @ptrCast(&onBurgerClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.adw_header_bar_pack_end(@ptrCast(header), menu_button);
 
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar), header);
@@ -176,16 +167,29 @@ pub const EditorWindow = struct {
         _ = c.g_signal_connect_data(save_as_button, "clicked", @ptrCast(&onSaveAs), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     }
 
-    fn actionButton(
-        self: *EditorWindow,
-        box: *c.GtkWidget,
-        label: [*:0]const u8,
-        icon: [*:0]const u8,
-        cb: *const fn (*c.GtkButton, ?*anyopaque) callconv(.c) void,
-    ) *c.GtkWidget {
-        const button = @import("widgets.zig").actionButton(box, label, icon);
-        _ = c.g_signal_connect_data(button, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        return button;
+    /// The document verbs that have no header button of their own,
+    /// plus the suite's shared Help tail.
+    fn onBurgerClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(EditorWindow, user);
+        if (self.destroyed) return;
+        const anchor: *c.GtkWidget = @ptrCast(@alignCast(btn));
+        const root = classicmenu.Root.create(self.allocator) orelse return;
+        const m = root.top();
+        const has_doc = self.view.active != null;
+        m.itemIcon("Find…", .{ .name = "edit-find-symbolic" }, &onFind, @ptrCast(self));
+        m.itemIcon("Find and Replace…", .{ .name = "edit-find-replace-symbolic" }, &onReplace, @ptrCast(self));
+        m.itemIconEnabled("Toggle Soft Wrap", .{ .name = "format-justify-left-symbolic" }, has_doc, &onWrap, @ptrCast(self));
+        const doc = m.section();
+        // Only a SAVED document has a path to show or reveal.
+        const has_path = if (self.view.active) |t| t.spec != null else false;
+        doc.itemIconEnabled("Show in Sketerm Files", .{ .name = "folder-open-symbolic" }, has_path, &onReveal, @ptrCast(self));
+        doc.itemIconEnabled("Close Document", .{ .name = "window-close-symbolic" }, has_doc, &onCloseDocument, @ptrCast(self));
+        appmenu.appendHelp(m, self.allocator, @ptrCast(@alignCast(self.window)), .editor);
+        _ = root.popup(
+            anchor,
+            @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)),
+            @floatFromInt(c.gtk_widget_get_height(anchor)),
+        );
     }
 
     // ---- title -------------------------------------------------------
@@ -405,27 +409,27 @@ pub const EditorWindow = struct {
         if (self.view.active) |tab| self.view.saveTabAs(tab);
     }
 
-    fn onFind(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    fn onFind(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         cast.userData(EditorWindow, user).view.openFind(false);
     }
 
-    fn onReplace(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    fn onReplace(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         cast.userData(EditorWindow, user).view.openFind(true);
     }
 
-    fn onWrap(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    fn onWrap(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorWindow, user);
         if (self.view.active) |tab| self.view.toggleWrap(tab);
     }
 
-    fn onCloseDocument(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    fn onCloseDocument(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorWindow, user);
         if (self.view.active) |tab| self.view.requestCloseTab(tab);
     }
 
     /// Cross-identity handoff, the Viewer's "Show in Sketerm Files"
     /// precedent: spawn the sibling binary rather than invent IPC.
-    fn onReveal(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    fn onReveal(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorWindow, user);
         const tab = self.view.active orelse return;
         const spec = tab.spec orelse return;

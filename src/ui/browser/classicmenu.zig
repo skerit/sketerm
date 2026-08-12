@@ -423,6 +423,16 @@ pub const Menu = struct {
         return .{ .root = self.root, .box = sbox };
     }
 
+    /// A caller-built widget as a menu row: for the informational
+    /// content a row of label text cannot carry (the image viewer's
+    /// wrapped, selectable metadata block). It is a plain child of the
+    /// menu box, so it counts as an item for separator tidying and
+    /// dies with the popover like every other row — build it fresh per
+    /// popup, never hand in a widget you keep a pointer to.
+    pub fn custom(self: Menu, widget: *c.GtkWidget) void {
+        c.gtk_box_append(@ptrCast(self.box), widget);
+    }
+
     /// A separator-delimited group (same box; the separator is tidied
     /// by GMenu rules at popup time).
     pub fn section(self: Menu) Menu {
