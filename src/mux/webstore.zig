@@ -26,6 +26,9 @@ pub const MAX_URL: usize = 4096;
 pub const MAX_TITLE: usize = 512;
 /// Largest userscript source / userstyle CSS the store accepts.
 pub const MAX_SOURCE: usize = 2 << 20;
+pub const MAX_CONTAINER_NAME: usize = 128;
+/// Bound on an egress / remote-helper host and on a site-rule host.
+pub const MAX_HOST: usize = 256;
 
 /// The `scheme://host[:port]` prefix of `url`, lowercased into `buf`.
 /// Null for URLs with no authority (about:, data:, mailto:) or when
@@ -214,6 +217,44 @@ pub const UserStyle = struct {
     css: []u8,
 };
 
+/// A browser identity context (Firefox Multi-Account Containers shape).
+///
+/// EPHEMERAL containers are deliberately absent: incognito is a
+/// throwaway in-memory jar, and persisting one would resurrect it as a
+/// named identity the user never asked to keep.
+pub const Container = struct {
+    /// Stable across restarts, and the SAME number the engine receives
+    /// as `context_create.id` — the helper derives its on-disk jar path
+    /// from it, so re-minting ids would silently empty every container.
+    id: u32,
+    /// Display name; freely renameable.
+    name: []u8,
+    /// Immutable cache key handed to the engine as the context name.
+    /// Split from `name` precisely so a rename keeps the cookies.
+    jar: []u8,
+    color: [3]u8,
+    /// Egress host ("" = direct); mutually exclusive with `remote_host`.
+    egress_host: []u8,
+    /// Remote-helper host ("" = local); see `webface.Container`.
+    remote_host: []u8,
+};
+
+/// "Always open this host in container X".
+pub const ContainerSite = struct {
+    /// Lowercased, matched exactly.
+    host: []u8,
+    container: u32,
+};
+
+/// Fields to change on a container; null = leave as is. The jar key and
+/// the id are absent on purpose — neither may ever change.
+pub const ContainerUpdate = struct {
+    name: ?[]const u8 = null,
+    color: ?[3]u8 = null,
+    egress_host: ?[]const u8 = null,
+    remote_host: ?[]const u8 = null,
+};
+
 pub const WebStore = struct {
     allocator: std.mem.Allocator,
     dir: []u8,
@@ -226,6 +267,9 @@ pub const WebStore = struct {
     userscripts: std.ArrayList(UserScript) = .empty,
     next_userscript_id: u64 = 1,
     userstyles: std.ArrayList(UserStyle) = .empty,
+    containers: std.ArrayList(Container) = .empty,
+    next_container_id: u32 = 1,
+    container_sites: std.ArrayList(ContainerSite) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8) !WebStore {
         var self: WebStore = .{
@@ -238,6 +282,7 @@ pub const WebStore = struct {
         self.loadSites();
         self.loadUserScripts();
         self.loadUserStyles();
+        self.loadContainers();
         return self;
     }
 
@@ -266,6 +311,10 @@ pub const WebStore = struct {
             self.allocator.free(s.css);
         }
         self.userstyles.deinit(self.allocator);
+        for (self.containers.items) |ctn| self.freeContainer(ctn);
+        self.containers.deinit(self.allocator);
+        for (self.container_sites.items) |s| self.allocator.free(s.host);
+        self.container_sites.deinit(self.allocator);
         self.allocator.free(self.dir);
     }
 
@@ -1034,6 +1083,268 @@ pub const WebStore = struct {
         }
         return null;
     }
+
+    // ── containers ──────────────────────────────────────────────
+
+    const ContainersDoc = struct {
+        next_id: u32 = 1,
+        containers: []const ContainerDto = &.{},
+        sites: []const ContainerSiteDto = &.{},
+    };
+    const ContainerDto = struct {
+        id: u32 = 0,
+        name: []const u8 = "",
+        jar: []const u8 = "",
+        /// 0xRRGGBB. A u32 rather than a 3-element array so a truncated
+        /// or over-long array in a hand-edited file cannot half-parse.
+        color: u32 = 0,
+        egress_host: []const u8 = "",
+        remote_host: []const u8 = "",
+    };
+    const ContainerSiteDto = struct {
+        host: []const u8 = "",
+        container: u32 = 0,
+    };
+
+    fn loadContainers(self: *WebStore) void {
+        var pb: [4096]u8 = undefined;
+        const path = self.filePath(&pb, "containers.json") catch return;
+        const bytes = readFileAlloc(self.allocator, path, 16 << 20) orelse return;
+        defer self.allocator.free(bytes);
+        const parsed = std.json.parseFromSlice(ContainersDoc, self.allocator, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        self.next_container_id = @max(parsed.value.next_id, 1);
+        for (parsed.value.containers) |ctn| {
+            if (ctn.name.len == 0 or ctn.name.len > MAX_CONTAINER_NAME) continue;
+            if (ctn.jar.len > MAX_CONTAINER_NAME) continue;
+            if (ctn.egress_host.len > MAX_HOST or ctn.remote_host.len > MAX_HOST) continue;
+            // Egress and remote-helper are mutually exclusive (see
+            // `Container.remote_host`); a file claiming both is refused
+            // rather than silently resolved one way.
+            if (ctn.egress_host.len != 0 and ctn.remote_host.len != 0) continue;
+            const rec = self.dupeContainer(ctn) orelse continue;
+            if (rec.id >= self.next_container_id) self.next_container_id = rec.id + 1;
+            self.containers.append(self.allocator, rec) catch {
+                self.freeContainer(rec);
+                continue;
+            };
+        }
+        for (parsed.value.sites) |s| {
+            if (s.host.len == 0 or s.host.len > MAX_HOST or s.container == 0) continue;
+            const host = self.allocator.dupe(u8, s.host) catch continue;
+            for (host) |*ch| ch.* = std.ascii.toLower(ch.*);
+            self.container_sites.append(self.allocator, .{
+                .host = host,
+                .container = s.container,
+            }) catch self.allocator.free(host);
+        }
+    }
+
+    /// Owned copy of a parsed record, or null if any dupe failed (the
+    /// partial allocations are released, never a half-built container).
+    fn dupeContainer(self: *WebStore, dto: ContainerDto) ?Container {
+        const name = self.allocator.dupe(u8, dto.name) catch return null;
+        const jar = self.allocator.dupe(u8, if (dto.jar.len != 0) dto.jar else dto.name) catch {
+            self.allocator.free(name);
+            return null;
+        };
+        const eg = self.allocator.dupe(u8, dto.egress_host) catch {
+            self.allocator.free(name);
+            self.allocator.free(jar);
+            return null;
+        };
+        const rh = self.allocator.dupe(u8, dto.remote_host) catch {
+            self.allocator.free(name);
+            self.allocator.free(jar);
+            self.allocator.free(eg);
+            return null;
+        };
+        return .{
+            .id = if (dto.id != 0) dto.id else self.next_container_id,
+            .name = name,
+            .jar = jar,
+            .color = .{
+                @truncate(dto.color >> 16),
+                @truncate(dto.color >> 8),
+                @truncate(dto.color),
+            },
+            .egress_host = eg,
+            .remote_host = rh,
+        };
+    }
+
+    fn freeContainer(self: *WebStore, ctn: Container) void {
+        self.allocator.free(ctn.name);
+        self.allocator.free(ctn.jar);
+        self.allocator.free(ctn.egress_host);
+        self.allocator.free(ctn.remote_host);
+    }
+
+    fn saveContainers(self: *WebStore) !void {
+        var cdtos = try self.allocator.alloc(ContainerDto, self.containers.items.len);
+        defer self.allocator.free(cdtos);
+        for (self.containers.items, 0..) |ctn, i| cdtos[i] = .{
+            .id = ctn.id,
+            .name = ctn.name,
+            .jar = ctn.jar,
+            .color = (@as(u32, ctn.color[0]) << 16) |
+                (@as(u32, ctn.color[1]) << 8) | @as(u32, ctn.color[2]),
+            .egress_host = ctn.egress_host,
+            .remote_host = ctn.remote_host,
+        };
+        var sdtos = try self.allocator.alloc(ContainerSiteDto, self.container_sites.items.len);
+        defer self.allocator.free(sdtos);
+        for (self.container_sites.items, 0..) |s, i| sdtos[i] = .{
+            .host = s.host,
+            .container = s.container,
+        };
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(ContainersDoc{
+            .next_id = self.next_container_id,
+            .containers = cdtos,
+            .sites = sdtos,
+        }, .{}, &aw.writer) catch return error.WriteFailed;
+        var pb: [4096]u8 = undefined;
+        const path = try self.filePath(&pb, "containers.json");
+        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+    }
+
+    pub fn containerFind(self: *WebStore, id: u32) ?*Container {
+        for (self.containers.items) |*ctn| {
+            if (ctn.id == id) return ctn;
+        }
+        return null;
+    }
+
+    /// Create a container and return its id. `jar` is the stable cache
+    /// key handed to the engine; pass "" to seed it from `name`. It is
+    /// deliberately NOT derived from the display name at publish time —
+    /// the helper's on-disk jar path embeds it, so a rename would
+    /// otherwise point a container at a fresh, empty cookie jar.
+    pub fn containerAdd(
+        self: *WebStore,
+        name: []const u8,
+        jar: []const u8,
+        color: [3]u8,
+        egress_host: []const u8,
+        remote_host: []const u8,
+    ) !u32 {
+        if (name.len == 0 or name.len > MAX_CONTAINER_NAME) return error.BadContainer;
+        if (jar.len > MAX_CONTAINER_NAME) return error.BadContainer;
+        if (egress_host.len > MAX_HOST or remote_host.len > MAX_HOST) return error.BadContainer;
+        if (egress_host.len != 0 and remote_host.len != 0) return error.BadContainer;
+        const rec = self.dupeContainer(.{
+            .id = self.next_container_id,
+            .name = name,
+            .jar = if (jar.len != 0) jar else name,
+            .color = (@as(u32, color[0]) << 16) |
+                (@as(u32, color[1]) << 8) | @as(u32, color[2]),
+            .egress_host = egress_host,
+            .remote_host = remote_host,
+        }) orelse return error.OutOfMemory;
+        errdefer self.freeContainer(rec);
+        try self.containers.append(self.allocator, rec);
+        self.next_container_id = rec.id + 1;
+        try self.saveContainers();
+        return rec.id;
+    }
+
+    /// Rename / recolour / re-route an existing container. The jar key
+    /// is immutable, so a rename keeps the cookies.
+    pub fn containerUpdate(self: *WebStore, id: u32, upd: ContainerUpdate) !bool {
+        const ctn = self.containerFind(id) orelse return false;
+        if (upd.name) |n| {
+            if (n.len == 0 or n.len > MAX_CONTAINER_NAME) return error.BadContainer;
+        }
+        if (upd.egress_host) |h| {
+            if (h.len > MAX_HOST) return error.BadContainer;
+        }
+        if (upd.remote_host) |h| {
+            if (h.len > MAX_HOST) return error.BadContainer;
+        }
+        const next_eg = upd.egress_host orelse ctn.egress_host;
+        const next_rh = upd.remote_host orelse ctn.remote_host;
+        if (next_eg.len != 0 and next_rh.len != 0) return error.BadContainer;
+
+        if (upd.name) |n| {
+            const dup = try self.allocator.dupe(u8, n);
+            self.allocator.free(ctn.name);
+            ctn.name = dup;
+        }
+        if (upd.color) |rgb| ctn.color = rgb;
+        if (upd.egress_host) |h| {
+            const dup = try self.allocator.dupe(u8, h);
+            self.allocator.free(ctn.egress_host);
+            ctn.egress_host = dup;
+        }
+        if (upd.remote_host) |h| {
+            const dup = try self.allocator.dupe(u8, h);
+            self.allocator.free(ctn.remote_host);
+            ctn.remote_host = dup;
+        }
+        try self.saveContainers();
+        return true;
+    }
+
+    /// Forget a container and every site assigned to it. The engine's
+    /// on-disk jar is NOT removed here: the daemon does not own the
+    /// helper's profile directory (it may be on another host entirely).
+    pub fn containerRemove(self: *WebStore, id: u32) !bool {
+        for (self.containers.items, 0..) |ctn, i| {
+            if (ctn.id != id) continue;
+            self.freeContainer(self.containers.orderedRemove(i));
+            var k: usize = 0;
+            while (k < self.container_sites.items.len) {
+                if (self.container_sites.items[k].container == id) {
+                    self.allocator.free(self.container_sites.orderedRemove(k).host);
+                } else k += 1;
+            }
+            try self.saveContainers();
+            return true;
+        }
+        return false;
+    }
+
+    /// "Always open this host in container X". `container` 0 clears the
+    /// assignment; an unknown container id is refused so a stale rule
+    /// cannot silently send a site to the default jar.
+    pub fn containerSiteSet(self: *WebStore, host: []const u8, container: u32) !void {
+        if (host.len == 0 or host.len > MAX_HOST) return error.BadContainer;
+        if (container != 0 and self.containerFind(container) == null) return error.NoSuchContainer;
+        var hbuf: [MAX_HOST]u8 = undefined;
+        for (host, 0..) |ch, i| hbuf[i] = std.ascii.toLower(ch);
+        const key = hbuf[0..host.len];
+        for (self.container_sites.items, 0..) |*s, i| {
+            if (!std.mem.eql(u8, s.host, key)) continue;
+            if (container == 0) {
+                self.allocator.free(self.container_sites.orderedRemove(i).host);
+            } else s.container = container;
+            try self.saveContainers();
+            return;
+        }
+        if (container == 0) return; // clearing what is not there
+        const h = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(h);
+        try self.container_sites.append(self.allocator, .{ .host = h, .container = container });
+        try self.saveContainers();
+    }
+
+    /// Container assigned to exactly this host, or null. Matching is
+    /// exact on the lowercased host — no parent-domain fallback, so
+    /// "mail.example.com" is not governed by an "example.com" rule.
+    pub fn containerSiteFor(self: *WebStore, host: []const u8) ?u32 {
+        if (host.len == 0 or host.len > MAX_HOST) return null;
+        var hbuf: [MAX_HOST]u8 = undefined;
+        for (host, 0..) |ch, i| hbuf[i] = std.ascii.toLower(ch);
+        const key = hbuf[0..host.len];
+        for (self.container_sites.items) |s| {
+            if (std.mem.eql(u8, s.host, key)) return s.container;
+        }
+        return null;
+    }
 };
 
 // ── tests ───────────────────────────────────────────────────────
@@ -1048,7 +1359,7 @@ fn testDir(buf: *[64]u8) ?[]const u8 {
 
 fn rmTree(dir: []const u8) void {
     var pb: [4096:0]u8 = undefined;
-    for ([_][]const u8{ "history.jsonl", "bookmarks.json", "sites.json", "userscripts.json", "userstyles.json" }) |f| {
+    for ([_][]const u8{ "history.jsonl", "bookmarks.json", "sites.json", "userscripts.json", "userstyles.json", "containers.json" }) |f| {
         const p = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ dir, f }) catch continue;
         _ = c.unlink(p.ptr);
     }
@@ -1314,4 +1625,100 @@ test "webstore: site settings merge, clear and survive reload" {
     var store = try WebStore.init(t.allocator, dir);
     defer store.deinit();
     try t.expectEqual(@as(usize, 0), store.sites.count());
+}
+
+test "webstore: containers keep ids, jar keys and colours across reload" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+
+    var work: u32 = 0;
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        work = try store.containerAdd("Work", "", .{ 0x3b, 0x82, 0xf6 }, "", "");
+        _ = try store.containerAdd("Shopping", "", .{ 0x22, 0xc5, 0x5e }, "gate.example", "");
+        try t.expect(work != 0);
+    }
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        try t.expectEqual(@as(usize, 2), store.containers.items.len);
+        // The id is the engine's jar path component: it MUST come back
+        // unchanged or the container reopens on an empty cookie jar.
+        const c0 = store.containerFind(work) orelse return error.TestUnexpectedResult;
+        try t.expectEqualStrings("Work", c0.name);
+        try t.expectEqualStrings("Work", c0.jar);
+        try t.expectEqual(@as(u8, 0x3b), c0.color[0]);
+        try t.expectEqualStrings("gate.example", store.containers.items[1].egress_host);
+
+        // Renaming keeps the jar key, which is what keeps the cookies.
+        try t.expect(try store.containerUpdate(work, .{ .name = "Employer", .color = .{ 1, 2, 3 } }));
+    }
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+    const c0 = store.containerFind(work) orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("Employer", c0.name);
+    try t.expectEqualStrings("Work", c0.jar);
+    try t.expectEqual(@as(u8, 2), c0.color[1]);
+    // Ids never recycle, even after a removal.
+    try t.expect(try store.containerRemove(work));
+    try t.expect(store.containerFind(work) == null);
+    const fresh = try store.containerAdd("Later", "", .{ 0, 0, 0 }, "", "");
+    try t.expect(fresh > work);
+}
+
+test "webstore: a container refuses both egress and remote host" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+
+    try t.expectError(error.BadContainer, store.containerAdd("Both", "", .{ 0, 0, 0 }, "a.example", "b.example"));
+    const id = try store.containerAdd("Egress", "", .{ 0, 0, 0 }, "a.example", "");
+    // The exclusion also holds against an UPDATE that would create the
+    // combination one field at a time.
+    try t.expectError(error.BadContainer, store.containerUpdate(id, .{ .remote_host = "b.example" }));
+    try t.expect(try store.containerUpdate(id, .{ .egress_host = "" }));
+    try t.expect(try store.containerUpdate(id, .{ .remote_host = "b.example" }));
+}
+
+test "webstore: site assignment is exact, clears, and dies with its container" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+
+    var work: u32 = 0;
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        work = try store.containerAdd("Work", "", .{ 0, 0, 0 }, "", "");
+        try store.containerSiteSet("Example.COM", work);
+        // An unknown container must not become a silent default-jar rule.
+        try t.expectError(error.NoSuchContainer, store.containerSiteSet("other.example", 4242));
+    }
+    {
+        var store = try WebStore.init(t.allocator, dir);
+        defer store.deinit();
+        // Host keys are case-normalized on both write and read.
+        try t.expectEqual(@as(?u32, work), store.containerSiteFor("example.com"));
+        try t.expectEqual(@as(?u32, work), store.containerSiteFor("EXAMPLE.com"));
+        // Exact match only: no parent-domain fallback.
+        try t.expect(store.containerSiteFor("mail.example.com") == null);
+        try store.containerSiteSet("example.com", 0);
+        try t.expect(store.containerSiteFor("example.com") == null);
+
+        try store.containerSiteSet("example.com", work);
+        try t.expect(try store.containerRemove(work));
+        // Removing the container removes its rules, so nothing points at
+        // an id that no longer resolves.
+        try t.expect(store.containerSiteFor("example.com") == null);
+    }
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+    try t.expectEqual(@as(usize, 0), store.container_sites.items.len);
 }

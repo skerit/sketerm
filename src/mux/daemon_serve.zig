@@ -2887,7 +2887,22 @@ pub const WebOpReq = struct {
     /// `origin`: an empty origin is invalid there).
     host: []const u8 = "",
     css: []const u8 = "",
+    /// container_update/remove target, and the container a
+    /// container_site_set rule points at (0 clears the rule).
+    container: u32 = 0,
+    /// container_add stable jar key ("" = seed it from `name`).
+    jar: []const u8 = "",
+    /// Container accent as 0xRRGGBB; absent leaves it alone.
+    color: ?u32 = null,
+    /// Container routing; absent leaves the field alone, "" clears it.
+    /// The two are mutually exclusive — see `webstore.Container`.
+    egress_host: ?[]const u8 = null,
+    remote_host: ?[]const u8 = null,
 };
+
+fn rgbFromU32(v: u32) [3]u8 {
+    return .{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };
+}
 
 fn webReplyErr(cl: *Client, req: u32, msg: []const u8) void {
     cl.queueJson(.web_reply, .{ .req = req, .ok = false, .@"error" = msg });
@@ -3016,6 +3031,50 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         }
     } else if (std.mem.eql(u8, r.op, "userstyle_list")) {
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .styles = store.userstyles.items });
+    } else if (std.mem.eql(u8, r.op, "container_list")) {
+        // Containers and their site rules travel together: a rule is
+        // meaningless without the container it names, and the GUI
+        // resolves both in one pass at startup.
+        cl.queueJson(.web_reply, .{
+            .req = r.req,
+            .ok = true,
+            .containers = store.containers.items,
+            .sites = store.container_sites.items,
+        });
+    } else if (std.mem.eql(u8, r.op, "container_add")) {
+        const id = store.containerAdd(
+            r.name,
+            r.jar,
+            rgbFromU32(r.color orelse 0),
+            r.egress_host orelse "",
+            r.remote_host orelse "",
+        ) catch |err| return webReplyErr(cl, r.req, switch (err) {
+            error.BadContainer => "a container needs a name, and egress and remote host are exclusive",
+            else => "container write failed",
+        });
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
+    } else if (std.mem.eql(u8, r.op, "container_update")) {
+        const found = store.containerUpdate(r.container, .{
+            .name = if (r.name.len != 0) r.name else null,
+            .color = if (r.color) |v| rgbFromU32(v) else null,
+            .egress_host = r.egress_host,
+            .remote_host = r.remote_host,
+        }) catch |err| return webReplyErr(cl, r.req, switch (err) {
+            error.BadContainer => "egress and remote host are mutually exclusive",
+            else => "container write failed",
+        });
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .found = found });
+    } else if (std.mem.eql(u8, r.op, "container_remove")) {
+        const removed = store.containerRemove(r.container) catch
+            return webReplyErr(cl, r.req, "container write failed");
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .found = removed });
+    } else if (std.mem.eql(u8, r.op, "container_site_set")) {
+        store.containerSiteSet(r.host, r.container) catch |err| return webReplyErr(cl, r.req, switch (err) {
+            error.NoSuchContainer => "no such container",
+            error.BadContainer => "bad host",
+            else => "container write failed",
+        });
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
     } else {
         webReplyErr(cl, r.req, "unknown web op");
     }
