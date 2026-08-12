@@ -16900,3 +16900,102 @@ answered, and cookies could not be seen at all.
   separate Wayland surface, so an `appdrive` screenshot of the toplevel
   does not contain them — the runtime evidence is the popup surface's
   commit, not a picture of the rows.
+## 2026-08-12: remote browsing — the helper on the mux host, frames inline
+
+Remote-helper frames-inline (browser roadmap): a web pane can now be
+backed by a `sketerm-webengine` running on ANOTHER machine's mux
+daemon, with paint frames riding the wire in-band — the browser IS
+there (pages render, resolve DNS, and keep cookies on the remote host),
+not merely proxied through there as an egress container does.
+
+- `src/web/protocol.zig`: 0xD0 block, capability `frames-inline`.
+  `frame_mode` (0xD0, shm|inline, sent right after hello, applies to
+  buffers allocated afterwards, never turned back off) and
+  `frame_inline` (0xD1): per-rect physical-pixel payloads, enc 0 = raw
+  BGRA rows, enc 1 = raw-deflate of exactly those bytes via
+  `wlhost/zpool.zig` — the SAME codec pool updates on the native app
+  pipe use, no new dependency. Large damage is banded (~2MB raw per
+  rect) so no message approaches MAX_FRAME; each message is
+  self-contained and presentable on receipt.
+- `src/web/cefhost.zig` + `server.zig` + `main.zig`: inline mode
+  allocates the view buffer as an ANONYMOUS mapping (no memfd, nothing
+  announced, no SCM_RIGHTS ever), accumulates paint damage as one union
+  rect per view and flushes it only while the outbox is short
+  (union-and-flush: a slow wire coalesces bursts instead of ballooning
+  helper memory). `--frames-inline` forces the mode AND the software
+  path from spawn (dma-buf fds cannot cross a bridge); `--socket-fd N`
+  adopts a pre-connected socketpair end (cloexec'd at parse time so CEF
+  subprocesses never inherit it), skipping listen/accept entirely.
+  `findbin`'s `$SKETERM_WEB_BIN` pin is now authoritative: set-but-
+  unusable fails the lookup instead of silently falling through.
+- `src/mux/wire.zig` + `daemon.zig` + `daemon_serve.zig` (append-only):
+  `web_helper_open` = 34 / `web_helper_reply` = 98 /
+  `ChannelKind.web_helper` = 7, welcome capability `web_helper:true`.
+  The daemon spawns the helper with the socketpair on `--socket-fd`
+  (both ends parked above stdio — the detached-daemon fd-0 trap) and
+  bridges the raw protocol bytes as a tcp-style byte channel with the
+  LSP lifecycle: own process group, dies with the channel (client
+  disconnect included), SIGTERM->SIGKILL via `lsp_reaps`. Missing
+  binary = described `ok:false` ("sketerm-webengine is not installed on
+  this host"), never a hang. NOT attach-scoped (the fs_op/lsp shape),
+  so it works identically under the broker. `sketerm-mux` stays
+  libc-only (ldd re-checked) and `mux-portable` stays green.
+- `src/ui/webremote.zig` (new): the GUI bridge — a socketpair whose GUI
+  end a `webface.Client` adopts as its ordinary helper fd, and whose
+  other end a detached worker pumps to the remote daemon
+  (`mux_cli.muxConnect`, so ssh/udp/`sock:` hosts all work). Failure
+  reporting is by construction: the worker records a reason and closes
+  its end; the HUP is the notification and `Client.lost()` shows the
+  copied reason. No idle handback, nothing to fence.
+- `src/ui/webface.zig`: `Client` is no longer a singleton — a per-host
+  registry (`clientForHost`, never freed: that immortality is the
+  existing liveness fence) beside the local `g_client`; every `WebFace`
+  carries `cl: *Client` and view ids are minted from one process-wide
+  counter so id-only widget contexts resolve via `findFaceGlobal`.
+  Remote clients post `frame_mode inline` before any view and FAIL
+  LOUDLY (described, not black) when the daemon lacks `web_helper` or
+  the helper lacks `frames-inline`. `onInline` materialises the buffer
+  the memfd path would have mapped (anonymous mapping in the same
+  `MapRef` shape) and presents through the ordinary `onDamage` path, so
+  GSK still uploads only the damaged region. Containers gain
+  `remote_host` (`createRemoteContainer`; mutually exclusive with
+  egress); a container's proxy url is stripped when published to a
+  remote helper (its loopback is the wrong machine). Devtools splits
+  pin the SOURCE face's client. Input/navigation/find/zoom/semantic/
+  a11y ride the protocol unchanged over the bridge.
+- Surfacing: remote containers appear in the existing "New Tab in
+  Container" submenu; `web-container` (control socket: name, host,
+  remote:true, ephemeral) creates one and `web-open` grew `container=` —
+  the same scriptable surface the rest of the container feature has.
+- Degradation seams (documented, deliberate): downloads on a remote
+  helper are DECLINED with a toast and Print-to-PDF is greyed out —
+  both would write files on the helper's host at a local-looking path.
+  The fetch-back design (helper staging dir -> daemon `file_get` ->
+  local pick) plugs into `onDownloadOffer`'s `isRemote()` branch.
+- Tests: protocol round-trips for the 0xD0 block (both roots via
+  protocol.zig), wire append-only values, and a daemon unit test
+  (missing helper = described refusal; a spawn bridges chan_open +
+  reply and retires on child EOF, env pin saved/restored). Smoke:
+  stage 32 in `smoke-web` runs the WHOLE remote path on one machine —
+  a private `sketerm-mux` (spawned from argv[2], SKETERM_WEB_BIN
+  pinned, isolated XDG_STATE_HOME, killed by exact pid) serves
+  `web_helper_open`; the rig bridges the byte channel onto a socketpair
+  (the webremote shape) and asserts: inline frames arrive and the red
+  page's centre pixel is red with ZERO frame_buffer frames and ZERO
+  descriptors crossing (32a); deflate engaged; steady-state damage on a
+  16x16 animating box stays under 1/8 of the surface (32b — no full
+  frames for cursor blinks); a mousedown over the bridge repaints
+  (32c); helper dies with the channel and the daemon exits on SIGTERM.
+
+Verification: `zig build`, `zig build web`, `zig build test` (rc 0),
+`zig build test-core` (rc 0), `zig build mux-portable` + `ldd
+zig-out/bin/sketerm-mux` (libc/libm only), `zig build smoke-web` PASS
+including 32a/32b/32c/teardown. Tradeoff recorded: raw-deflate over
+banded damage rects was chosen over a video codec — it is in-tree,
+daemon-transparent (the bridge never parses pixels), and the damage
+economy already bounds steady-state cost; a video-encoded family can
+land later as ANOTHER capability without touching these tags. Known
+limitations: remote downloads/print-pdf (seam above), one bridge
+reconnect requires the pane's Reload (no auto-retry), and a remote
+helper's stderr goes to /dev/null on the daemon host (CEF refusal
+detail is only visible as the described channel failure).
