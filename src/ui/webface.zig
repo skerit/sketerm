@@ -621,6 +621,9 @@ pub const Client = struct {
     /// silently eat every frame descriptor and the pane would stay
     /// black, so its absence is a described failure, never a hang.
     cap_frames_inline: bool = false,
+    /// The helper hosts WebExtensions (the 0xB0 block). Without it the
+    /// extensions manager stays unreachable and no extension loads.
+    cap_webext: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -629,7 +632,6 @@ pub const Client = struct {
     pub fn isRemote(self: *const Client) bool {
         return self.host_len != 0;
     }
-    cap_webext: bool = false,
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client

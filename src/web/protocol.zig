@@ -1997,6 +1997,8 @@ pub const EvSitedataDone = struct {
     kind: u8,
     removed: u32,
     detail: []const u8,
+};
+
 // -- WebExtensions (0xB0 block, capability "webext") ------------------
 //
 // The GUI owns the extension FILES (it installs an unpacked dir or an

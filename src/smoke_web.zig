@@ -539,12 +539,16 @@ const ProxyProbe = struct {
 };
 
 /// A one-page HTTP server on loopback: the only real ORIGIN this rig
-/// serves, and the reason stage 32 can exist at all — a `data:` URL's
-/// origin is opaque, so `document.cookie` on one stores nothing and
-/// there would be no cookie to enumerate or clear.
+/// serves, and the reason stages 31 and 33 can exist at all. A `data:`
+/// URL's origin is opaque, so `document.cookie` on one stores nothing
+/// and there would be no cookie to enumerate or clear; content scripts
+/// likewise match `http://…` and never a `data:` url, which is where
+/// they run in a real browser.
 ///
-/// Every request gets the same document, favicon probes included, which
-/// keeps the server to one branch. It answers on its own thread and is
+/// One document answers every request, favicon probes included, which
+/// keeps the server to one branch. `body` is what that document is —
+/// the cookie page by default, the WebExtensions fixture page when
+/// stage 33 supplies its own. It answers on its own thread and is
 /// stopped by `shutdown`.
 const HttpProbe = struct {
     fd: c_int = -1,
@@ -554,6 +558,8 @@ const HttpProbe = struct {
     /// Requests answered, so a stage can tell "the engine never asked"
     /// apart from "the engine asked and the cookie did not stick".
     served: std.atomic.Value(u32) = .init(0),
+    /// The document served to every request.
+    body: []const u8 = page,
 
     /// Sets the probe cookie from SCRIPT (not from a Set-Cookie
     /// header): what a site's own JavaScript stores is exactly what a
@@ -565,19 +571,6 @@ const HttpProbe = struct {
         "document.title=\"cookie:\"+document.cookie;</script></body></html>";
 
     fn start(self: *HttpProbe) bool {
-/// A trivial loopback HTTP server for the WebExtensions stage: it serves
-/// ONE fixed HTML page on every request so a content script whose match
-/// pattern is `http://127.0.0.1/*` runs on a real (non-data:) url, which
-/// is where content scripts run in a real browser. Threaded like
-/// `ProxyProbe`; serves until stopped.
-const HttpServer = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
-    body: []const u8,
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
-
-    fn start(self: *HttpServer) bool {
         const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
         if (lfd < 0) return false;
         var one: c_int = 1;
@@ -599,7 +592,6 @@ const HttpServer = struct {
         self.fd = lfd;
         self.port = std.mem.bigToNative(u16, got.sin_port);
         self.thread = std.Thread.spawn(.{}, HttpProbe.serve, .{self}) catch {
-        self.thread = std.Thread.spawn(.{}, HttpServer.serve, .{self}) catch {
             _ = c.close(lfd);
             self.fd = -1;
             return false;
@@ -608,31 +600,19 @@ const HttpServer = struct {
     }
 
     fn serve(self: *HttpProbe) void {
-    fn serve(self: *HttpServer) void {
         while (!self.stop.load(.acquire)) {
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
             if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
             const afd = c.accept(self.fd, null, null);
             if (afd < 0) continue;
             self.handle(afd);
-            // Read (and discard) the request line so the client is not
-            // reset before our response is written.
-            var req: [2048]u8 = undefined;
-            _ = c.read(afd, &req, req.len);
-            var hdr_buf: [256]u8 = undefined;
-            const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{self.body.len}) catch {
-                _ = c.close(afd);
-                continue;
-            };
-            _ = c.write(afd, hdr.ptr, hdr.len);
-            _ = c.write(afd, self.body.ptr, self.body.len);
             _ = c.close(afd);
         }
     }
 
     fn handle(self: *HttpProbe, afd: c_int) void {
         // Read whatever the request is and ignore it: one document
-        // answers every path, which is all a cookie origin needs.
+        // answers every path, which is all these stages need.
         var buf: [4096]u8 = undefined;
         var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(@ptrCast(&pfd), 1, 2000) > 0) _ = c.read(afd, &buf, buf.len);
@@ -640,15 +620,14 @@ const HttpServer = struct {
         const hdr = std.fmt.bufPrint(
             &head,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-            .{page.len},
+            .{self.body.len},
         ) catch return;
         _ = c.write(afd, hdr.ptr, hdr.len);
-        _ = c.write(afd, page.ptr, page.len);
+        _ = c.write(afd, self.body.ptr, self.body.len);
         _ = self.served.fetchAdd(1, .release);
     }
 
     fn shutdown(self: *HttpProbe) void {
-    fn deinit(self: *HttpServer) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
         self.thread = null;
@@ -2268,9 +2247,9 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // child inherits this, and both runs share it so storage persists.
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
 
-    var srv = HttpServer{ .body = webext_page };
+    var srv = HttpProbe{ .body = webext_page };
     if (!srv.start()) fail("stage 33 webext: loopback HTTP server would not start");
-    defer srv.deinit();
+    defer srv.shutdown();
     var page_buf: [96]u8 = undefined;
     const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("webext url");
 
