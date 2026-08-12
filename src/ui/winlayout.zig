@@ -213,6 +213,8 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                         wstate.pages[0].zoom_level_x100
                     else
                         wstate.zoom_level_x100);
+                    if (wstate.pages.len > 0)
+                        wf.applyRestoredScroll(wstate.pages[0].scroll_x, wstate.pages[0].scroll_y);
                     if (@import("webgroup.zig").Group.fromPane(pane)) |g|
                         g.restorePages(wstate);
                 } else |err| {

@@ -298,6 +298,8 @@ pub const Group = struct {
                 .url = st.url,
                 .zoom_level_x100 = st.zoom_level_x100,
                 .container = p.face.container,
+                .scroll_x = p.face.scroll_x,
+                .scroll_y = p.face.scroll_y,
             });
             try kept.append(arena, p.face);
         }
@@ -339,6 +341,7 @@ pub const Group = struct {
             // into whichever container its parent happened to be in.
             const face = self.newPageIn(url, parent, ps.container) catch break;
             face.applyRestoredZoom(ps.zoom_level_x100);
+            face.applyRestoredScroll(ps.scroll_x, ps.scroll_y);
             built.append(self.allocator, face) catch break;
         }
         const want: usize = @intCast(state.active_page);

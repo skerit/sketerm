@@ -118,6 +118,10 @@ pub const CAP_CONTEXTS = "contexts";
 /// panel that never renders them.
 pub const CAP_SITEDATA = "sitedata";
 
+/// The helper reports `ev_scroll` and accepts `scroll_to` (0xC2 block),
+/// which is what lets session restore put a page back where it was.
+pub const CAP_SCROLL = "scroll";
+
 /// The helper accepts `frame_mode` and, in inline mode, delivers frames
 /// as `frame_inline` pixel payloads ON the protocol socket itself — no
 /// memfd, no dma-buf, no SCM_RIGHTS. This is the frame family a REMOTE
@@ -247,6 +251,8 @@ pub const Tag = enum(u8) {
     // asks for counters and gets them.
     us_script_set = 0xC0,
     us_style_set = 0xC1,
+    ev_scroll = 0xC2,
+    scroll_to = 0xC3,
     cookies_req = 0xC8,
     ev_cookies = 0xC9,
     cookie_delete = 0xCA,
@@ -1775,6 +1781,31 @@ pub const EvPrintPdfDone = struct {
     path: []const u8,
 };
 
+// -- scroll position (0xC2 block, capability "scroll") ----------------
+
+/// Where the document is scrolled, straight from Chromium's own
+/// `OnScrollOffsetChanged`. The units are whatever that callback
+/// reports and they are never interpreted on the way through: the same
+/// numbers go back out as `ScrollTo`, so a restore lands where the save
+/// happened by construction rather than by our arithmetic agreeing with
+/// the engine's.
+pub const EvScroll = struct {
+    pub const tag: Tag = .ev_scroll;
+    view: u32,
+    x: i32,
+    y: i32,
+};
+
+/// Put a page back where it was. Applied after the load settles, since
+/// a document still growing would clamp the offset to its current
+/// height and land short.
+pub const ScrollTo = struct {
+    pub const tag: Tag = .scroll_to;
+    view: u32,
+    x: i32,
+    y: i32,
+};
+
 // -- user content (0xC0 block, capability "userscripts") --------------
 
 /// One userscript: RAW source including its `==UserScript==` block.
@@ -2538,6 +2569,8 @@ test "round-trip: scalar and string frames" {
     try roundTrip(EvLoadError, .{ .view = 7, .code = -105, .url = "http://x/", .msg = "NAME_NOT_RESOLVED" });
     try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });
     try roundTrip(EvFavicon, .{ .view = 7, .url = "http://x/favicon.ico" });
+    try roundTrip(EvScroll, .{ .view = 3, .x = 0, .y = 1840 });
+    try roundTrip(ScrollTo, .{ .view = 3, .x = 12, .y = -1 });
     try roundTrip(EvNavState, .{ .view = 7, .can_back = 1, .can_fwd = 0, .loading = 0, .url = "http://x/" });
     try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 0, .user_gesture = 1 });
     try roundTrip(EvPopupRequest, .{ .view = 7, .url = "http://x/p", .disposition = 2, .user_gesture = 0 });

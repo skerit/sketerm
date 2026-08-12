@@ -633,6 +633,11 @@ pub const Client = struct {
     /// popover hides that section — permissions and blocking, which
     /// need no helper support at all, keep working.
     cap_sitedata: bool = false,
+    /// The helper reports `ev_scroll` and accepts `scroll_to`, which is
+    /// what makes a restored page come back where it was left. An older
+    /// helper restores the page at the top, silently — the alternative
+    /// would be refusing to restore at all.
+    cap_scroll: bool = false,
     /// The helper accepts `frame_mode` and can deliver `frame_inline`
     /// frames. A REMOTE client requires it: without it the bridge would
     /// silently eat every frame descriptor and the pane would stay
@@ -1132,6 +1137,7 @@ pub const Client = struct {
                 self.cap_contexts = false;
                 self.cap_userscripts = false;
                 self.cap_sitedata = false;
+                self.cap_scroll = false;
                 self.cap_frames_inline = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
@@ -1145,6 +1151,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SCROLL)) self.cap_scroll = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                 }
@@ -1335,6 +1342,13 @@ pub const Client = struct {
             .ev_download_progress => {
                 const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onDownloadProgress(ev);
+            },
+            .ev_scroll => {
+                const ev = proto.decode(proto.EvScroll, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    face.scroll_x = ev.x;
+                    face.scroll_y = ev.y;
+                }
             },
             else => {},
         }
@@ -2235,6 +2249,15 @@ pub const WebFace = struct {
     /// Helper-side view id, allocated once and kept across helper
     /// restarts (a fresh helper knows no ids at all).
     view: u32 = 0,
+    /// Where the page is scrolled, as the engine last reported it
+    /// (`ev_scroll`). Saved with the layout and handed straight back on
+    /// restore — the numbers are never interpreted here.
+    scroll_x: i32 = 0,
+    scroll_y: i32 = 0,
+    /// Scroll to apply once the restored page finishes loading. A
+    /// document still growing clamps an early scroll to its current
+    /// height and lands short, so this waits for the load to settle.
+    pending_scroll: ?struct { x: i32, y: i32 } = null,
     /// Identity context (container) this face's view lives in, 0 = the
     /// shared default. Assigned once at creation and immutable — a
     /// container is a private cookie jar / cache / egress, and the
@@ -5399,7 +5422,22 @@ pub const WebFace = struct {
             ev.state == @intFromEnum(proto.LoadState.failed))
         {
             self.load_seq +%= 1;
+            // A restored page is put back where it was only once the
+            // load has settled: scrolling a document that is still
+            // growing clamps to its current height and lands short.
+            if (self.pending_scroll) |want| {
+                self.pending_scroll = null;
+                if (self.view_live and self.cl.cap_scroll)
+                    self.cl.post(proto.ScrollTo{ .view = self.view, .x = want.x, .y = want.y });
+            }
         }
+    }
+
+    /// Re-apply a persisted scroll on restore. Held until the page
+    /// finishes loading (see `onLoad`).
+    pub fn applyRestoredScroll(self: *WebFace, x: i32, y: i32) void {
+        if (x == 0 and y == 0) return;
+        self.pending_scroll = .{ .x = x, .y = y };
     }
 
     pub fn onLoadError(self: *WebFace, ev: proto.EvLoadError) void {

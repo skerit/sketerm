@@ -392,6 +392,15 @@ fn physicalOf(logical: u16, scale_x1000: u16) u16 {
 /// One protocol view: a windowless browser plus its shared frame buffer.
 pub const View = struct {
     id: u32,
+    /// Latest scroll offset Chromium reported, and the last pair
+    /// actually posted — the difference is what the throttle owes the
+    /// client, so a scroll that STOPS still gets its resting position
+    /// out (see onScrollOffsetChanged / flushScroll).
+    scroll_x: i32 = 0,
+    scroll_y: i32 = 0,
+    scroll_sent_x: i32 = 0,
+    scroll_sent_y: i32 = 0,
+    scroll_posted_ms: i64 = 0,
     /// CEF's own browser id, the key callbacks are resolved through.
     cef_id: c_int = 0,
     /// Owned reference from create_browser_sync; released on destroy.
@@ -1527,6 +1536,35 @@ pub const Host = struct {
     /// every API involved is either synchronous or a promise nobody can
     /// await from the browser process, and a failure to clear one of
     /// them must not stop the others.
+    /// Flush a resting scroll position the throttle above held back. Called
+    /// from the same watchdog turn that services the other per-view timers.
+    pub fn flushScroll(self: *Host) void {
+        const now = nowMs();
+        for (self.views.items) |v| {
+            if (v.scroll_x == v.scroll_sent_x and v.scroll_y == v.scroll_sent_y) continue;
+            if (now - v.scroll_posted_ms < SCROLL_POST_MS) continue;
+            v.scroll_posted_ms = now;
+            v.scroll_sent_x = v.scroll_x;
+            v.scroll_sent_y = v.scroll_y;
+            self.post(proto.EvScroll{ .view = v.id, .x = v.scroll_x, .y = v.scroll_y });
+        }
+    }
+
+    /// Put a page back where it was. `window.scrollTo` rather than a CEF
+    /// call because the capi has no scroll setter at all; the numbers are
+    /// the engine's own from `EvScroll`, so no unit conversion happens on
+    /// either leg.
+    pub fn scrollTo(self: *Host, req: proto.ScrollTo) void {
+        const v = self.find(req.view) orelse return;
+        const b = v.browser orelse return;
+        const get_frame = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = get_frame(b) orelse return;
+        defer release(&frame.base);
+        var buf: [128]u8 = undefined;
+        const js = std.fmt.bufPrint(&buf, "window.scrollTo({d},{d});", .{ req.x, req.y }) catch return;
+        runJs(frame, js);
+    }
+
     fn clearPageStorage(_: *Host, v: *View) void {
         const b = v.browser orelse return;
         const get_frame = b.get_main_frame orelse return;
@@ -1784,6 +1822,9 @@ pub const Host = struct {
     /// `watchdog_ms`). Called once per poll iteration; a client pacing
     /// at anything above 4Hz never reaches the deadline.
     pub fn watchdog(self: *Host, now_ms: i64) void {
+        // A scroll that STOPPED left its resting position behind the
+        // throttle; this is where it gets out.
+        self.flushScroll();
         // An inspector the engine never created. Answering is not
         // optional: a client blocks a menu item on this reply.
         if (self.adopting) |v| {
@@ -7232,6 +7273,7 @@ fn installHandlers() void {
     // reset), at which point it silently goes back to `on_paint`. The
     // client handles both frame families for the same reason.
     render_handler.on_accelerated_paint = onAcceleratedPaint;
+    render_handler.on_scroll_offset_changed = onScrollOffsetChanged;
     render_handler.get_accessibility_handler = getAccessibilityHandler;
 
     accessibility_handler = std.mem.zeroes(cef.cef_accessibility_handler_t);
@@ -8118,6 +8160,35 @@ fn onRunContextMenu(
         .link_url = link.slice(),
     });
     return 1;
+}
+
+/// Chromium's own scroll offset, forwarded so a session restore can put
+/// the page back where it was.
+///
+/// THROTTLED: this fires per scroll step, which on a smooth wheel is
+/// every frame, and a client only ever needs the latest. The value is
+/// stashed on the view and posted at most every `SCROLL_POST_MS`; the
+/// final resting position is not lost, because a scroll that stops
+/// leaves the stashed value differing from the posted one and the next
+/// tick sends it.
+const SCROLL_POST_MS: i64 = 150;
+
+fn onScrollOffsetChanged(
+    _: [*c]cef.cef_render_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    x: f64,
+    y: f64,
+) callconv(.c) void {
+    const host = g_host orelse return;
+    const v = viewOf(browser) orelse return;
+    v.scroll_x = @intFromFloat(@max(-2_000_000.0, @min(2_000_000.0, x)));
+    v.scroll_y = @intFromFloat(@max(-2_000_000.0, @min(2_000_000.0, y)));
+    const now = nowMs();
+    if (now - v.scroll_posted_ms < SCROLL_POST_MS) return;
+    v.scroll_posted_ms = now;
+    v.scroll_sent_x = v.scroll_x;
+    v.scroll_sent_y = v.scroll_y;
+    host.post(proto.EvScroll{ .view = v.id, .x = v.scroll_x, .y = v.scroll_y });
 }
 
 fn onPaint(

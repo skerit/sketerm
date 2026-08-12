@@ -69,6 +69,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_INTERCEPT,
     proto.CAP_TLS,
     proto.CAP_PERMISSIONS,
+    proto.CAP_SCROLL,
     proto.CAP_DEVTOOLS,
     proto.CAP_PRINT_PDF,
     proto.CAP_DOWNLOADS,
@@ -423,6 +424,7 @@ pub const Server = struct {
                 defer self.gpa.free(req.styles);
                 self.host.usStyleSet(req);
             },
+            .scroll_to => self.host.scrollTo(try proto.decode(proto.ScrollTo, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
             .cookies_req => self.host.cookiesReq(try proto.decode(proto.CookiesReq, frame.payload)),

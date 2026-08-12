@@ -1,7 +1,12 @@
 //! GTK-free persisted state of a web pane face (layout.zig's
-//! `PaneSpec.web`). Scroll position is absent on purpose: the helper
-//! protocol reports no scroll offset, and inventing a frame for it is
-//! not this module's call.
+//! `PaneSpec.web`).
+//!
+//! Scroll used to be absent here because the helper protocol reported no
+//! offset. It does now (`ev_scroll` / `scroll_to`, capability `scroll`),
+//! straight from Chromium's own `OnScrollOffsetChanged`, and the numbers
+//! are carried through UNINTERPRETED: whatever the engine reported is
+//! what goes back, so a restore lands where the save happened without
+//! our arithmetic having to agree with the engine's units.
 
 const std = @import("std");
 
@@ -17,6 +22,11 @@ pub const PageState = struct {
     /// Index of this page's parent in the same array (tree-style
     /// nesting), or -1 for a root page.
     parent: i32 = -1,
+    /// Where the page was scrolled, in the engine's own units. Absent
+    /// (0,0) in a layout written before scroll was on the wire, which
+    /// restores at the top exactly as it used to.
+    scroll_x: i32 = 0,
+    scroll_y: i32 = 0,
     /// Identity container this page lives in, 0 = the shared default.
     ///
     /// The id is meaningful ACROSS runs only because the daemon store
@@ -99,6 +109,32 @@ test "web PaneState round-trips a nested page list" {
     try std.testing.expectEqual(@as(i32, -1), parsed.value.pages[0].parent);
     try std.testing.expectEqual(@as(i32, 0), parsed.value.pages[1].parent);
     try std.testing.expectEqual(@as(u32, 1), parsed.value.active_page);
+}
+
+test "web PageState carries a scroll offset and defaults to the top" {
+    const a = std.testing.allocator;
+    const pages = [_]PageState{.{ .url = "https://a/", .scroll_x = 4, .scroll_y = 900 }};
+    const state = PaneState{ .url = "https://a/", .pages = &pages };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try std.json.Stringify.value(state, .{}, &aw.writer);
+    const parsed = try std.json.parseFromSlice(PaneState, a, aw.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i32, 4), parsed.value.pages[0].scroll_x);
+    try std.testing.expectEqual(@as(i32, 900), parsed.value.pages[0].scroll_y);
+
+    // A page list written before scroll existed restores at the top.
+    const old_form = try std.json.parseFromSlice(
+        PaneState,
+        a,
+        "{\"pages\":[{\"url\":\"https://a/\"}]}",
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer old_form.deinit();
+    try std.testing.expectEqual(@as(i32, 0), old_form.value.pages[0].scroll_y);
 }
 
 // A layout written before pages existed must still restore its one
