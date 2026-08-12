@@ -40,6 +40,7 @@
 //! only ever swaps whole engines. Nothing here locks; the caller does.
 
 const std = @import("std");
+const urlhost = @import("urlhost.zig");
 
 /// Engine-agnostic resource classes, aligned with the wire's
 /// `NetResource` byte in protocol.zig.
@@ -648,20 +649,7 @@ pub fn foldUrl(buf: []u8, src: []const u8) []const u8 {
 
 /// Host part of an already-folded url ("" when there is none).
 pub fn hostOf(url: []const u8) []const u8 {
-    const sep = std.mem.indexOf(u8, url, "://") orelse return "";
-    var start = sep + 3;
-    if (std.mem.indexOfScalarPos(u8, url, start, '@')) |at| {
-        const path = std.mem.indexOfAnyPos(u8, url, start, "/?#") orelse url.len;
-        if (at < path) start = at + 1;
-    }
-    var end = start;
-    while (end < url.len) : (end += 1) {
-        switch (url[end]) {
-            '/', '?', '#', ':' => break,
-            else => {},
-        }
-    }
-    return url[start..end];
+    return urlhost.hostOf(url, urlhost.filtering);
 }
 
 // ---------------------------------------------------------------------

@@ -208,6 +208,7 @@ const webstore = @import("webstore.zig");
 const websiteinfo = @import("websiteinfo.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
+const urlhost = @import("../web/urlhost.zig");
 const omnibox = @import("omnibox.zig");
 const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
@@ -6708,11 +6709,7 @@ fn normalizeUrl(buf: []u8, spec: []const u8) ?[]const u8 {
 /// Host part of a url for a message that names a site. Falls back to
 /// the whole string, which is still better than naming nothing.
 fn hostOf(url: []const u8) []const u8 {
-    const start = if (std.mem.indexOf(u8, url, "//")) |i| i + 2 else 0;
-    var rest = url[start..];
-    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
-    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
-    return if (rest.len == 0) url else rest;
+    return urlhost.hostOf(url, urlhost.prose);
 }
 
 /// What a permission bitmask is called in a sentence. A prompt can

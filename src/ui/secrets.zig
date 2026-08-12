@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const urlhost = @import("../web/urlhost.zig");
 
 const SERVICE = "org.freedesktop.secrets";
 const SERVICE_PATH = "/org/freedesktop/secrets";
@@ -66,26 +67,7 @@ const USER_KEYS = [_][]const u8{
 /// Host part of `url`. A bare host is returned unchanged, so a keyring
 /// attribute holding `example.com` works as well as a full address.
 pub fn hostOf(url: []const u8) []const u8 {
-    var s = url;
-    if (std.mem.indexOf(u8, s, "://")) |i| s = s[i + 3 ..];
-    // Authority ends at the path, query or fragment.
-    for (s, 0..) |ch, i| {
-        if (ch == '/' or ch == '?' or ch == '#') {
-            s = s[0..i];
-            break;
-        }
-    }
-    // Userinfo, if any, is everything up to the LAST '@' (a password
-    // may legally contain one).
-    if (std.mem.lastIndexOfScalar(u8, s, '@')) |i| s = s[i + 1 ..];
-    // A bracketed IPv6 literal keeps its colons; anything else loses a
-    // trailing :port.
-    if (s.len != 0 and s[0] == '[') {
-        if (std.mem.indexOfScalar(u8, s, ']')) |i| return s[0 .. i + 1];
-        return s;
-    }
-    if (std.mem.lastIndexOfScalar(u8, s, ':')) |i| s = s[0..i];
-    return s;
+    return urlhost.hostOf(url, urlhost.site);
 }
 
 /// `www.` is not a site of its own — every password manager already
@@ -397,6 +379,14 @@ test "hostOf: scheme, port, path, userinfo, bare host" {
     try t.expectEqualStrings("example.com", hostOf("https://u:p@ss@example.com/x"));
     try t.expectEqualStrings("[::1]", hostOf("http://[::1]:8080/x"));
     try t.expectEqualStrings("", hostOf(""));
+    // The security property, end to end through the shared extractor:
+    // no attacker-shaped url may resolve to a host that matches the
+    // real site.
+    try t.expect(!hostsMatch(hostOf("https://evil-example.com/login"), "example.com"));
+    try t.expect(!hostsMatch(hostOf("https://example.com.evil.net/"), "example.com"));
+    try t.expect(!hostsMatch(hostOf("https://example.com@evil.net/"), "example.com"));
+    try t.expect(!hostsMatch(hostOf("https://evil.net/example.com"), "example.com"));
+    try t.expect(!hostsMatch(hostOf("https://evil.net?next=example.com"), "example.com"));
 }
 
 test "hostsMatch: www-insensitive, never a suffix rule" {
