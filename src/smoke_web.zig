@@ -670,6 +670,17 @@ const Client = struct {
     we_err: [256]u8 = @splat(0),
     we_err_len: usize = 0,
 
+    /// Last `ev_webext_wreq_stats` observed (stage 34).
+    wq_seen: bool = false,
+    wq_matched: u32 = 0,
+    wq_held: u32 = 0,
+    wq_cancelled: u32 = 0,
+    wq_redirected: u32 = 0,
+    wq_headers_modified: u32 = 0,
+    wq_hdr_recv_dropped: u32 = 0,
+    wq_timed_out: u32 = 0,
+    wq_failed_open: u32 = 0,
+
     fb: ?proto.FrameBuffer = null,
     fb_fd: c_int = -1,
     fb_seq: u32 = 0,
@@ -1247,6 +1258,18 @@ const Client = struct {
                 @memcpy(self.we_name[0..self.we_name_len], st.name[0..self.we_name_len]);
                 self.we_err_len = @min(st.err.len, self.we_err.len);
                 @memcpy(self.we_err[0..self.we_err_len], st.err[0..self.we_err_len]);
+            },
+            .ev_webext_wreq_stats => {
+                const st = proto.decode(proto.EvWebextWreqStats, frame.payload) catch fail("ev_webext_wreq_stats decode");
+                self.wq_seen = true;
+                self.wq_matched = st.matched;
+                self.wq_held = st.held;
+                self.wq_cancelled = st.cancelled;
+                self.wq_redirected = st.redirected;
+                self.wq_headers_modified = st.headers_modified;
+                self.wq_hdr_recv_dropped = st.headers_received_dropped;
+                self.wq_timed_out = st.timed_out;
+                self.wq_failed_open = st.failed_open;
             },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
@@ -2225,6 +2248,408 @@ fn writeFixture(ext_dir: []const u8) bool {
     if (!writeFile(ext_dir, "content.css", fx_css)) return false;
     if (!writeFile(en, "messages.json", fx_messages)) return false;
     return true;
+}
+
+
+// ---------------------------------------------------------------------
+// Stage 34: blocking webRequest (MV2)
+// ---------------------------------------------------------------------
+
+/// A router, unlike `HttpProbe`: stage 34 needs several distinguishable
+/// endpoints (a subresource to cancel, a redirect target, a header echo,
+/// a page) and one of the properties under test is which of them the
+/// browser actually asked for.
+const WreqServer = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+    page_a: []const u8 = "",
+    page_b: []const u8 = "",
+    page_c: []const u8 = "",
+    thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Set if `/blockme` was ever requested — a CANCEL must mean the
+    /// request never reached the network, not merely that the page saw
+    /// an error.
+    blockme_hits: std.atomic.Value(u32) = .init(0),
+
+    fn start(self: *WreqServer) bool {
+        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (lfd < 0) return false;
+        var one: c_int = 1;
+        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = std.mem.nativeToBig(u16, 0);
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 64) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        self.fd = lfd;
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        self.thread = std.Thread.spawn(.{}, WreqServer.serve, .{self}) catch {
+            _ = c.close(lfd);
+            self.fd = -1;
+            return false;
+        };
+        return true;
+    }
+
+    fn serve(self: *WreqServer) void {
+        while (!self.stop.load(.acquire)) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 100) <= 0) continue;
+            const afd = c.accept(self.fd, null, null);
+            if (afd < 0) continue;
+            self.handle(afd);
+            _ = c.close(afd);
+        }
+    }
+
+    fn handle(self: *WreqServer, afd: c_int) void {
+        var req: [8192]u8 = undefined;
+        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) return;
+        const n = c.read(afd, &req, req.len);
+        if (n <= 0) return;
+        const raw = req[0..@intCast(n)];
+
+        var body_buf: [8192]u8 = undefined;
+        var body: []const u8 = "ok";
+        var ctype: []const u8 = "text/plain";
+        if (std.mem.indexOf(u8, raw, "GET /pa") != null) {
+            body = self.page_a;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /pb") != null) {
+            body = self.page_b;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /pc") != null) {
+            body = self.page_c;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /blockme") != null) {
+            _ = self.blockme_hits.fetchAdd(1, .release);
+            body = "REACHED-THE-NETWORK";
+        } else if (std.mem.indexOf(u8, raw, "GET /redirdst") != null) {
+            body = "REDIRECTED";
+        } else if (std.mem.indexOf(u8, raw, "GET /redirme") != null) {
+            body = "ORIGINAL";
+        } else if (std.mem.indexOf(u8, raw, "GET /echo") != null) {
+            // Echo the request headers, lowercased, so the page can see
+            // whether the extension's added header really travelled.
+            var w = std.Io.Writer.fixed(&body_buf);
+            for (raw) |ch| w.writeByte(std.ascii.toLower(ch)) catch break;
+            body = body_buf[0..w.end];
+        }
+
+        var head: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(
+            &head,
+            "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nX-Stage: 34\r\nConnection: close\r\n\r\n",
+            .{ ctype, body.len },
+        ) catch return;
+        _ = c.write(afd, hdr.ptr, hdr.len);
+        _ = c.write(afd, body.ptr, body.len);
+    }
+
+    fn deinit(self: *WreqServer) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+    }
+};
+
+const wq_manifest =
+    \\{"manifest_version":2,"name":"sketerm wreq fixture","version":"1",
+    \\ "permissions":["webRequest","webRequestBlocking","<all_urls>"],
+    \\ "background":{"scripts":["bg.js"],"persistent":true}}
+;
+
+/// One extension exercising all three blocking events. `/hangme` and
+/// `/slowme` return a Promise that NEVER settles — the two ways a
+/// listener can fail to answer, which is what stages 34c and 34d are
+/// about.
+const wq_bg =
+    \\browser.webRequest.onBeforeRequest.addListener(function (d) {
+    \\  if (d.url.indexOf("/blockme") >= 0) return { cancel: true };
+    \\  if (d.url.indexOf("/redirme") >= 0) {
+    \\    return { redirectUrl: d.url.replace("/redirme", "/redirdst") };
+    \\  }
+    \\  if (d.url.indexOf("/hangme") >= 0 || d.url.indexOf("/slowme") >= 0) {
+    \\    return new Promise(function () {});
+    \\  }
+    \\  return {};
+    \\}, { urls: ["<all_urls>"] }, ["blocking"]);
+    \\
+    \\browser.webRequest.onBeforeSendHeaders.addListener(function (d) {
+    \\  if (d.url.indexOf("/echo") < 0) return {};
+    \\  var h = (d.requestHeaders || []).slice();
+    \\  h.push({ name: "X-Sketerm-Stage34", value: "yes" });
+    \\  return { requestHeaders: h };
+    \\}, { urls: ["<all_urls>"] }, ["blocking", "requestHeaders"]);
+    \\
+    \\browser.webRequest.onHeadersReceived.addListener(function (d) {
+    \\  var h = d.responseHeaders || [];
+    \\  for (var i = 0; i < h.length; i++) {
+    \\    if (String(h[i].name).toLowerCase() === "x-stage") self.__sawStageHeader = 1;
+    \\  }
+    \\  return {};
+    \\}, { urls: ["<all_urls>"] }, ["blocking", "responseHeaders"]);
+    \\
+    \\browser.runtime.onMessage.addListener(function (m) {
+    \\  if (m === "sawStageHeader") return Promise.resolve(self.__sawStageHeader || 0);
+    \\  return null;
+    \\});
+;
+
+fn wqPageA(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf,
+        \\<!doctype html><html><head><title>wq-a-start</title></head><body><script>
+        \\var B = "http://127.0.0.1:{d}";
+        \\async function t(u) {{
+        \\  try {{ var r = await fetch(u); return await r.text(); }} catch (e) {{ return "ERR"; }}
+        \\}}
+        \\(async function () {{
+        \\  var blocked = (await t(B + "/blockme")) === "ERR" ? 1 : 0;
+        \\  var red = (await t(B + "/redirme")).indexOf("REDIRECTED") >= 0 ? 1 : 0;
+        \\  var hdr = (await t(B + "/echo")).indexOf("x-sketerm-stage34") >= 0 ? 1 : 0;
+        \\  document.title = "wq-a:" + blocked + red + hdr;
+        \\}})();
+        \\</script></body></html>
+    , .{port}) catch fail("stage 34 page a");
+}
+
+fn wqPageHang(buf: []u8, port: u16, path: []const u8, tag: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf,
+        \\<!doctype html><html><head><title>{s}-start</title></head><body><script>
+        \\(async function () {{
+        \\  try {{ await fetch("http://127.0.0.1:{d}{s}"); }} catch (e) {{}}
+        \\  document.title = "{s}-done";
+        \\}})();
+        \\</script></body></html>
+    , .{ tag, port, path, tag }) catch fail("stage 34 hang page");
+}
+
+/// Stage 34: MV2 blocking webRequest, end to end against real CEF.
+///
+///   34a  a blocking listener CANCELS a subresource (and the network
+///        never saw it), REDIRECTS another, and a modified request
+///        header arrives at the server
+///   34b  a request held for a listener that never answers is released
+///        when the extension is REMOVED mid-flight
+///   34c  the same hold, left alone, is released by the TIMEOUT — and
+///        released OPEN, not cancelled
+///   34d  the measured `onHeadersReceived` ceiling: the listener runs
+///        and sees real response headers, and the helper reports the
+///        decision it could not apply
+fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/wqdata", .{dir}) catch fail("stage 34 data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/wqcache", .{dir}) catch fail("stage 34 cache path");
+    mkdirZ(cache_dir);
+
+    var ext_buf: [4096]u8 = undefined;
+    const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/wqfix", .{dir}) catch fail("stage 34 ext path");
+    mkdirZ(ext_dir);
+    if (!writeFile(ext_dir, "manifest.json", wq_manifest)) fail("stage 34: could not write the fixture manifest");
+    if (!writeFile(ext_dir, "bg.js", wq_bg)) fail("stage 34: could not write the fixture background");
+
+    var srv = WreqServer{};
+    if (!srv.start()) fail("stage 34: loopback HTTP server would not start");
+    defer srv.deinit();
+    var pa_buf: [2048]u8 = undefined;
+    var pb_buf: [1024]u8 = undefined;
+    var pc_buf: [1024]u8 = undefined;
+    srv.page_a = wqPageA(&pa_buf, srv.port);
+    srv.page_b = wqPageHang(&pb_buf, srv.port, "/hangme", "wq-b");
+    srv.page_c = wqPageHang(&pc_buf, srv.port, "/slowme", "wq-c");
+
+    var url_a: [96]u8 = undefined;
+    var url_b: [96]u8 = undefined;
+    var url_c: [96]u8 = undefined;
+    const page_a = std.fmt.bufPrint(&url_a, "http://127.0.0.1:{d}/pa", .{srv.port}) catch fail("url");
+    const page_b = std.fmt.bufPrint(&url_b, "http://127.0.0.1:{d}/pb", .{srv.port}) catch fail("url");
+    const page_c = std.fmt.bufPrint(&url_c, "http://127.0.0.1:{d}/pc", .{srv.port}) catch fail("url");
+
+    const ext_id = "wreqfixture01";
+
+    // ── Helper 1: a deliberately LONG fail-open deadline, so that in
+    // 34b it is unambiguously the REMOVAL, and not the timeout, that
+    // released the held request.
+    {
+        _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "20000", 1);
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq1.sock", .{dir}) catch fail("stage 34 sock");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        if (!cl.ack_webext) fail("stage 34: hello_ack lacks the webext capability");
+
+        cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_ok != 1) {
+            std.debug.print("stage 34: load error \"{s}\"\n", .{cl.we_err[0..cl.we_err_len]});
+            fail("stage 34: the fixture extension failed to load");
+        }
+        // The background page must be up and its three listeners
+        // registered before any request is made, or the stage would be
+        // measuring a race instead of the feature.
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage 34: no frame_buffer for the page view");
+
+        // -- 34a: cancel, redirect, header modification ---------------
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_a });
+        if (!cl.waitTitle("wq-a:", 30_000)) {
+            std.debug.print("stage 34a: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 34a: the page never reported its results");
+        }
+        const res = cl.titleSlice();
+        if (!std.mem.eql(u8, res, "wq-a:111")) {
+            std.debug.print("stage 34a: expected \"wq-a:111\" (cancel/redirect/header), got \"{s}\"\n", .{res});
+            fail("stage 34a: a blocking decision did not take effect");
+        }
+        if (srv.blockme_hits.load(.acquire) != 0) {
+            fail("stage 34a: the cancelled request still reached the network");
+        }
+
+        // -- 34d: the onHeadersReceived ceiling -----------------------
+        cl.wq_seen = false;
+        cl.send(proto.WebextWreqStatsReq{});
+        {
+            const d = nowMs() + 3000;
+            while (!cl.wq_seen and nowMs() < d) cl.pump(50);
+        }
+        if (!cl.wq_seen) fail("stage 34d: the helper never answered webext_wreq_stats");
+        if (cl.wq_held == 0) fail("stage 34d: no request was ever held");
+        if (cl.wq_cancelled == 0) fail("stage 34d: the cancel was not counted");
+        if (cl.wq_redirected == 0) fail("stage 34d: the redirect was not counted");
+        if (cl.wq_headers_modified == 0) fail("stage 34d: the header modification was not counted");
+        // The CANARY for the measured engine limitation: the
+        // onHeadersReceived listener ran (it saw the real X-Stage
+        // response header) but the helper counted its decision as
+        // undeliverable. If a future CEF grows an async response hook,
+        // this assertion is what will fail and say so.
+        if (cl.wq_hdr_recv_dropped == 0) {
+            fail("stage 34d: onHeadersReceived was never dispatched at all");
+        }
+        if (cl.wq_timed_out != 0 or cl.wq_failed_open != 0) {
+            fail("stage 34d: an ordinary page load should never fail a request open");
+        }
+        pass("stage 34a blocking webRequest (cancel never hits the network, redirect lands, header arrives)");
+        pass("stage 34d onHeadersReceived runs and sees real headers; its decision is counted, not applied");
+
+        // -- 34b: held request survives removal mid-flight ------------
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_b });
+        if (!cl.waitTitle("wq-b-start", 30_000)) fail("stage 34b: the hang page never loaded");
+        // Let the fetch actually start and be HELD (its listener returns
+        // a Promise that never settles).
+        {
+            const d = nowMs() + 1500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.send(proto.WebextRemove{ .id = ext_id });
+        // 20s deadline vs a 10s wait: only the removal can answer here.
+        if (!cl.waitTitle("wq-b-done", 10_000)) {
+            std.debug.print("stage 34b: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 34b: a request held by a removed extension never completed");
+        }
+        pass("stage 34b held request released when the extension is removed mid-flight");
+
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.deinit();
+        reapHelperTolerant(pid, "stage 34 helper 1", 30_000);
+    }
+
+    // ── Helper 2: a SHORT fail-open deadline, so the timeout itself is
+    // what releases the request — and releases it open.
+    {
+        _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "400", 1);
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq2.sock", .{dir}) catch fail("stage 34 sock2");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_ok != 1) fail("stage 34c: the fixture extension failed to load");
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage 34c: no frame_buffer");
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_c });
+        // The extension is untouched: only the deadline can answer, and
+        // it must answer CONTINUE — a fail-open. A cancel here would
+        // show up as the fetch rejecting, but the page reports done
+        // either way, so the counters below are the real assertion.
+        if (!cl.waitTitle("wq-c-done", 20_000)) {
+            std.debug.print("stage 34c: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 34c: a request held by a listener that never answers hung past its deadline");
+        }
+        cl.wq_seen = false;
+        cl.send(proto.WebextWreqStatsReq{});
+        {
+            const d = nowMs() + 3000;
+            while (!cl.wq_seen and nowMs() < d) cl.pump(50);
+        }
+        if (!cl.wq_seen) fail("stage 34c: the helper never answered webext_wreq_stats");
+        if (cl.wq_timed_out == 0) fail("stage 34c: the timeout path was never taken");
+        if (cl.wq_failed_open < cl.wq_timed_out) fail("stage 34c: a timeout must be counted as a fail-open");
+        if (cl.wq_cancelled != 0) fail("stage 34c: a timeout must never cancel a request");
+        pass("stage 34c a never-answering listener times out and fails OPEN, never cancels");
+
+        cl.send(proto.WebextRemove{ .id = ext_id });
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        {
+            const d = nowMs() + 2500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.deinit();
+        reapHelperTolerant(pid, "stage 34 helper 2", 30_000);
+    }
+    _ = c.unsetenv("SKETERM_WEB_WREQ_TIMEOUT_MS");
 }
 
 /// Stage 28: the WebExtensions foundation, end to end against real CEF.
@@ -4266,6 +4691,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     // ── Stage 28: WebExtensions foundation ────────────────────────
     runWebextStage(gpa, exe, dir);
+    runWebrequestStage(gpa, exe, dir);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {
