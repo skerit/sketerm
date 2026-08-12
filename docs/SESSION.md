@@ -17075,3 +17075,57 @@ tier-1 list (uBO etc.) without restructuring.
   (fresh helper, same XDG_DATA_HOME): `storage.local` round-trips
   across the restart. Unit tests for match patterns, manifest parse,
   storage JSON and the zip reader in both roots.
+
+## 2026-08-12: browser roadmap wave 3 integration notes
+
+Six parallel branches (userscripts/userstyles/cosmetic filtering, per-site
+cookie + site-data UI, the smalls batch, remote-helper frames-inline,
+hamburger-menu harmonization, the WebExtensions MV2 host) landed in one
+integration pass. Gate at `ced8ae6`: `zig build`, `web`, `test`,
+`test-core`, `mux-portable` (+`ldd`: libc/libm only) all exit 0, and
+smoke-web passes all 52 stages. What the merges themselves taught:
+
+- **The capability array stopped being a merge hazard.** For three waves
+  every branch touching `hello_ack` had to be hand-resolved, because
+  `src/web/server.zig` carried a fixed-size array plus a separate `ncaps`
+  count and a textual union keeps the entries while silently dropping the
+  size. The smalls batch replaced it with `unconditional_caps` + a
+  `CapList` whose capacity is comptime-derived from the number of `CAP_*`
+  decls in `protocol.zig`. The three merges that followed each proved it:
+  a new capability is now one appended line, with no size and no count to
+  keep in step.
+
+- **A teardown assertion that depends on scheduling passes its own gate
+  and then wedges the next run.** `smoke_web.zig`'s `RigBridge.stop()`
+  closed the bridge socketpair and then joined the pump thread, commented
+  as "closing the socketpair end wakes the loop". It does not: closing a
+  descriptor never wakes a `poll` already blocked on it in another thread,
+  and the `-1` left behind made every later `poll` ignore the socket
+  outright, so the only remaining exit was a `chan_close` an idle helper
+  never sends. The stage passed whenever the pump happened to observe the
+  client's EOF in the window before `stop()` ran — a coin flip that landed
+  heads on its merge gate and then deadlocked the suite for hours. It now
+  uses the flag/join/close order its two sibling probes in the same file
+  already used. The SHIPPING bridge in `src/ui/webremote.zig` was checked
+  and does not share the flaw (self-pipe wake, close after join).
+
+- **Do not resolve a conflict with a blanket textual union.** The
+  WebExtensions merge was unioned file-wide by regex and damaged three
+  files at once: `EvSitedataDone` lost the closing brace the appended
+  section was written over, `cap_webext` landed after `Client`'s methods
+  (a field between declarations), and both branches' loopback HTTP servers
+  were spliced into each other. Only the first was caught by the compiler
+  in the obvious place; `zig ast-check` PER FILE found the rest in
+  seconds. Run it on every file a merge touched before trusting a build.
+
+- **Two branches independently needed the same test fixture.** The
+  cookie stage and the webext stage each grew a loopback HTTP server,
+  differing only in the document served. They are now one `HttpProbe`
+  with a `body` field, which is what the no-duplication rule asks for and
+  what the collision made obvious.
+
+- **Smoke stage labels are a namespace shared across branches.** Three of
+  the six minted "stage 28". Current map: 28-30 cosmetic/userscripts, 31
+  site-data, 32 remote frames-inline (32a/32b/32c + teardown), 33 webext.
+  Grep `pass("stage` before naming, and remember a rename also has to
+  reach `src/web/CLAUDE.md` and this file.
