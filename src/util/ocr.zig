@@ -91,21 +91,25 @@ pub const DARK_LUMA: u8 = 110;
 /// as blue while `meanLuma` weights it as red made the two disagree
 /// about an identically laid-out buffer.
 ///
-/// The alpha composite is NOT cosmetic. Window frames arrive as
-/// PREMULTIPLIED ARGB (Wayland's ARGB8888), and a real window is
-/// transparent wherever its shadow and rounded corners are — 7% of a
-/// measured 928x709 panel snapshot. Dropping alpha turns all of that
-/// into pure BLACK, which is not a colour anything on screen had, and
-/// tesseract's default global Otsu then splits "black vs the rest" and
-/// puts the actual text on the background side of the threshold. That
-/// is the whole reason a frame the tesseract CLI read perfectly came
-/// back as "- -" through this module: the PNG we dumped to compare
-/// against CARRIED its alpha, so leptonica blended it over white and
-/// the CLI never saw the fabricated black. Compositing here is that
-/// same blend, and it restores the CLI's exact reading.
+/// The alpha composite is NOT cosmetic. A real window is transparent
+/// wherever its shadow and rounded corners are — 7% of a measured
+/// 928x709 panel snapshot. Dropping alpha turns all of that into pure
+/// BLACK, which is not a colour anything on screen had, and tesseract's
+/// default global Otsu then splits "black vs the rest" and puts the
+/// actual text on the background side of the threshold. That is the
+/// whole reason a frame the tesseract CLI read perfectly came back as
+/// "- -" through this module: the PNG we dumped to compare against
+/// CARRIED its alpha, so leptonica blended it over white and the CLI
+/// never saw the fabricated black. Compositing here is that same blend,
+/// and it restores the CLI's exact reading.
 ///
-/// Premultiplied means each channel is already <= alpha, so the add
-/// cannot overflow; it saturates anyway rather than trust the source.
+/// The input carries STRAIGHT alpha, not premultiplied: the compositor
+/// hands out premultiplied ARGB8888 but `png.shmToRgba` un-premultiplies
+/// on the way here, and it is the only producer for every caller. The
+/// blend is therefore `rgb*a/255 + (255-a)`, which cannot exceed 255. A
+/// premultiplied `rgb + (255-a)` agrees at a=0 and a=255 — the two cases
+/// the panel frame happened to contain — and over-brightens everything
+/// between, clipping a half-transparent overlay to white.
 fn toGray(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) Error![]u8 {
     const px = @as(usize, w) * h;
     const out = allocator.alloc(u8, px) catch return Error.OutOfMemory;
@@ -118,11 +122,12 @@ fn toGray(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) Error!
             @memset(out[i..], 0xff);
             break;
         }
-        const unlit = 255 - rgba[o + 3];
-        const r = rgba[o] +| unlit;
-        const g = rgba[o + 1] +| unlit;
-        const b = rgba[o + 2] +| unlit;
-        out[i] = @intCast((@as(u32, r) * 77 + @as(u32, g) * 150 + @as(u32, b) * 29) >> 8);
+        const a: u32 = rgba[o + 3];
+        const unlit: u32 = 255 - a;
+        const r = (@as(u32, rgba[o]) * a) / 255 + unlit;
+        const g = (@as(u32, rgba[o + 1]) * a) / 255 + unlit;
+        const b = (@as(u32, rgba[o + 2]) * a) / 255 + unlit;
+        out[i] = @intCast((r * 77 + g * 150 + b * 29) >> 8);
     }
     return out;
 }
@@ -453,21 +458,24 @@ test "toGray collapses a frame to one byte per pixel" {
     try std.testing.expectEqual(@as(u8, 0), g[1]);
 }
 
-test "toGray composites premultiplied alpha over white, not over black" {
+test "toGray composites STRAIGHT alpha over white, not over black" {
     const a = std.testing.allocator;
-    // A window's transparent shadow, a half-covered edge pixel, and an
-    // opaque black glyph. Ignoring alpha would make the first TWO read
-    // as near-black, fabricating a huge dark region that pulls
+    // A window's transparent shadow, a half-covered mid-grey pixel, and
+    // an opaque black glyph. Ignoring alpha would make the first two
+    // read as near-black, fabricating a huge dark region that pulls
     // tesseract's global threshold off the real text.
     const src = [_]u8{
         0x00, 0x00, 0x00, 0x00, // fully transparent -> white
-        0x80, 0x80, 0x80, 0x80, // premultiplied white at 50% -> white
+        0x80, 0x80, 0x80, 0x80, // 50% grey at 50% alpha over white
         0x00, 0x00, 0x00, 0xff, // opaque black -> black
     };
     const g = try toGray(a, &src, 3, 1);
     defer a.free(g);
     try std.testing.expectEqual(@as(u8, 255), g[0]);
-    try std.testing.expectEqual(@as(u8, 255), g[1]);
+    // 128*128/255 + 127 = 191. A PREMULTIPLIED blend would say 255 and
+    // clip this pixel to white — the reason the model matters even
+    // though both agree at the two extremes.
+    try std.testing.expectEqual(@as(u8, 191), g[1]);
     try std.testing.expectEqual(@as(u8, 0), g[2]);
 }
 
