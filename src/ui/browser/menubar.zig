@@ -6,8 +6,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const build_options = @import("build_options");
-const version = @import("../../version.zig");
+const appmenu = @import("../appmenu.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
@@ -156,6 +155,7 @@ const ItemCtx = struct {
         trash,
         add_bookmark,
         open_bookmark,
+        shortcuts,
         about,
     };
 
@@ -373,6 +373,7 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             }
         },
         .help => {
+            addItem(root, m, a, win, target_pane, "Keyboard Shortcuts", .{ .name = "preferences-desktop-keyboard-shortcuts-symbolic" }, .shortcuts);
             addItem(root, m, a, win, target_pane, "About Sketerm Files", .{ .name = "help-about-symbolic" }, .about);
         },
     }
@@ -453,7 +454,8 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             };
             v.navigateSpec(tab, buf[0..ctx.spec.len]);
         },
-        .about => showAbout(win),
+        .shortcuts => appmenu.showShortcuts(ctx.allocator, @ptrCast(@alignCast(win.app_window))),
+        .about => appmenu.showAbout(@ptrCast(@alignCast(win.app_window)), .files),
     }
 }
 
@@ -491,26 +493,3 @@ fn goTrash(v: *BrowserView) void {
     v.navigateSpec(tab, spec_buf[0..td.len]);
 }
 
-/// Help > About: version, commit and commit date from build time.
-fn showAbout(win: *Window) void {
-    const about = c.adw_about_window_new();
-    c.adw_about_window_set_application_name(@ptrCast(about), "Sketerm Files");
-    c.adw_about_window_set_application_icon(@ptrCast(about), "dev.sker.sketerm.files");
-    c.adw_about_window_set_developer_name(@ptrCast(about), "Jelle De Loecker");
-    c.adw_about_window_set_license_type(@ptrCast(about), c.GTK_LICENSE_GPL_3_0);
-    var vz: [192:0]u8 = undefined;
-    const ver = std.fmt.bufPrintZ(&vz, "{s} ({s}, {s})", .{
-        version.string,
-        build_options.commit,
-        build_options.commit_date,
-    }) catch "0";
-    c.adw_about_window_set_version(@ptrCast(about), ver.ptr);
-    var cz: [256:0]u8 = undefined;
-    const info = std.fmt.bufPrintZ(&cz, "Commit {s}, built from source dated {s}.", .{
-        build_options.commit,
-        build_options.commit_date,
-    }) catch "";
-    c.adw_about_window_set_comments(@ptrCast(about), info.ptr);
-    c.gtk_window_set_transient_for(@ptrCast(about), @ptrCast(@alignCast(win.app_window)));
-    c.gtk_window_present(@ptrCast(about));
-}

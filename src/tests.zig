@@ -287,6 +287,7 @@ comptime {
     _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
     _ = @import("ui/menu.zig");
+    _ = @import("ui/appmenu.zig");
     _ = @import("ui/palette.zig");
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");

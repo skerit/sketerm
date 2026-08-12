@@ -352,6 +352,13 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
         tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));
         tail.itemIcon("Preferences…", .{ .name = "preferences-system-symbolic" }, &onMenuPrefs, ctx);
     }
+    // The shared tail every identity's hamburger ends with.
+    @import("../appmenu.zig").appendHelp(
+        m,
+        self.allocator,
+        if (self.ownerWindow()) |w| @ptrCast(@alignCast(w.app_window)) else null,
+        .files,
+    );
 
     const popover = root.popup(anchor, @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)), @floatFromInt(c.gtk_widget_get_height(anchor)));
     ctx.popover = popover;
