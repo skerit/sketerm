@@ -1599,6 +1599,57 @@ fn webViewsOnPane(resp: []const u8, pane: u32) usize {
     return n;
 }
 
+/// View ids on `pane`, in `web-list` order (= the browser's page order).
+/// `out` is filled up to its length; the count is returned.
+fn webViewIds(resp: []const u8, pane: u32, out: []u32) usize {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"pane\":{d},", .{pane}) catch return 0;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, needle)) |at| {
+        from = at + needle.len;
+        if (n >= out.len) break;
+        // "view" is the field right after "pane" in WebViewInfo.
+        const vat = std.mem.indexOfPos(u8, resp, from, "\"view\":") orelse break;
+        const rest = resp[vat + 7 ..];
+        const end = std.mem.indexOfAny(u8, rest, ",}") orelse break;
+        out[n] = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// The view id of the page `pane` is SHOWING — the row that reports
+/// `"visible":true`. 0 when the reply names none.
+fn activeWebView(resp: []const u8, pane: u32) u32 {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"pane\":{d},", .{pane}) catch return 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, needle)) |at| {
+        from = at + needle.len;
+        // The row ends where the next one begins (or at the end).
+        const next = std.mem.indexOfPos(u8, resp, from, "{\"pane\":") orelse resp.len;
+        const row = resp[at..next];
+        if (std.mem.indexOf(u8, row, "\"visible\":true") == null) continue;
+        const vat = std.mem.indexOf(u8, row, "\"view\":") orelse continue;
+        const rest = row[vat + 7 ..];
+        const end = std.mem.indexOfAny(u8, rest, ",}") orelse continue;
+        return std.fmt.parseInt(u32, rest[0..end], 10) catch 0;
+    }
+    return 0;
+}
+
+/// Which window tab is selected, as its first pane id — enough to tell
+/// "the selection moved" from "it did not".
+fn selectedTabFirstPane(resp: []const u8) u32 {
+    const at = std.mem.indexOf(u8, resp, "\"selected\":true") orelse return 0;
+    const panes_at = std.mem.indexOfPos(u8, resp, at, "\"panes\":[") orelse return 0;
+    const idat = std.mem.indexOfPos(u8, resp, panes_at, "\"id\":") orelse return 0;
+    const rest = resp[idat + 5 ..];
+    const end = std.mem.indexOfAny(u8, rest, ",}") orelse return 0;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch 0;
+}
+
 fn countTabs(resp: []const u8) usize {
     var n: usize = 0;
     var from: usize = 0;
@@ -1713,6 +1764,87 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         defer allocator.free(r);
         if (countTabs(r) != tabs_with_sidebar)
             return "with the tree sidebar open, new_tab ALSO opened a window tab";
+    }
+
+    // ── the tree ACTIONS follow the sidebar, not the window ────
+    // tab_tree_next/tab_collapse used to walk the window's tab forest
+    // unconditionally, so in a browser they moved something invisible.
+    var ids: [8]u32 = undefined;
+    var parent_view: u32 = 0;
+    var child_view: u32 = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed before the tree-action checks";
+        defer allocator.free(r);
+        if (webViewIds(r, web_pane, &ids) < 2) return "the browser did not report two pages";
+        parent_view = ids[0];
+        child_view = ids[1];
+        if (activeWebView(r, web_pane) != child_view)
+            return "the newly opened page did not become the visible one";
+    }
+    const tab_before = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed";
+        defer allocator.free(r);
+        break :blk selectedTabFirstPane(r);
+    };
+
+    // Stepping the tree must move the PAGE...
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "tab_tree_prev roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed after tab_tree_prev";
+        defer allocator.free(r);
+        if (activeWebView(r, web_pane) != parent_view)
+            return "tab_tree_prev did not step to the other PAGE of the browser";
+    }
+    // ...and must NOT have moved the window's tab selection.
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed after tab_tree_prev";
+        defer allocator.free(r);
+        if (selectedTabFirstPane(r) != tab_before)
+            return "tab_tree_prev moved the WINDOW tab selection instead of the browser's pages";
+    }
+
+    // Collapsing the parent hides its child, so a step can no longer
+    // reach it and the active page stays put.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_collapse\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "tab_collapse roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_next\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "tab_tree_next roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed after collapse";
+        defer allocator.free(r);
+        if (activeWebView(r, web_pane) != parent_view)
+            return "a collapsed page subtree was still reachable by tab_tree_next";
+    }
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_expand\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "tab_expand roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_next\"}\n") orelse
+            return "tab_tree_next roundtrip failed after expand";
+        allocator.free(r);
+        _ = app.waitIdle(300, 5_000);
+        const r2 = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed after expand";
+        defer allocator.free(r2);
+        if (activeWebView(r2, web_pane) != child_view)
+            return "expanding did not make the child page reachable again";
     }
 
     // A PNG of the window with the sidebar showing its rows — the
