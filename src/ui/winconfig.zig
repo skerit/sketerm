@@ -959,6 +959,19 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.refreshOpaqueRegion();
     self.refreshBindings();
     c.gtk_widget_set_visible(self.tab_bar, if (self.config.show_tab_bar) 1 else 0);
+    // The tree sidebar follows its config keys live too — it used to
+    // need a restart, which made `reload_config` look broken for it.
+    // Width first: showing the sidebar re-asserts the paned position,
+    // and it must re-assert the NEW one.
+    if (self.tab_sidebar) |sb| {
+        const want_visible = self.config.show_tab_sidebar;
+        const visible_now = c.gtk_widget_get_visible(sb.root) != 0;
+        if (want_visible != visible_now) {
+            self.setTabSidebarVisible(want_visible);
+        } else if (visible_now) {
+            c.gtk_paned_set_position(@ptrCast(self.content_box), self.config.tab_sidebar_width);
+        }
+    }
     // Quake geometry: primary only, and a no-op while quake is off —
     // so a reload never resizes an ordinary window under the user.
     if (self.is_primary) self.applyQuakeGeometry();

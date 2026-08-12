@@ -7,9 +7,21 @@
 //!   watched with `g_unix_fd_add` and never read blocking. It owns the
 //!   handshake, view-id allocation and event routing; faces register in
 //!   it and are found by view id.
-//! - `WebFace`: one pane face = one view id. Chrome (address entry,
+//! - `WebFace`: one PAGE = one view id. Chrome (address entry,
 //!   back/forward/reload) plus a `GtkPicture` presenting the view's
 //!   frames as `GdkTexture`s in GTK's own scene graph.
+//!
+//! A pane holds SEVERAL pages, in a `WebGroup` (src/ui/webgroup.zig) —
+//! read its header before changing anything here that touches the pane.
+//! Two consequences for this file:
+//!
+//! - `Pane.web_ctx` is the GROUP, not a face. `fromPane` answers with
+//!   the group's ACTIVE page, which is what every pane-scoped verb
+//!   means by "the browser on this pane"; `face.group()` goes the other
+//!   way.
+//! - Anything that writes shared chrome — the window tab's title, the
+//!   pane titlebar — must be gated on `isActivePage`, or a background
+//!   page relabels what the user is actually looking at.
 //!
 //! ## Rendering (why a GdkTexture and not a GL pass)
 //!
@@ -215,6 +227,7 @@ const omnibox = @import("omnibox.zig");
 const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
 const webremote = @import("webremote.zig");
+const webgroup = @import("webgroup.zig");
 const zpool = @import("../wlhost/zpool.zig");
 const Pane = @import("pane.zig").Pane;
 
@@ -2152,14 +2165,45 @@ pub const WebFace = struct {
         /// Pinned client for an existing view (the SOURCE face's — a
         /// devtools view lives on the helper of the page it inspects).
         on_client: ?*Client = null,
+        /// Add a PAGE to the pane's existing group instead of answering
+        /// with the page already there. Set only by `attachPage`.
+        as_page: bool = false,
+        /// Page this one was opened from, for the group's tree nesting.
+        opener: ?*WebFace = null,
     };
 
+    /// Add a page to an existing group — the in-pane equivalent of
+    /// opening a new tab. `opener` nests it under the page that asked.
+    pub fn attachPage(
+        allocator: std.mem.Allocator,
+        g: *webgroup.Group,
+        url: ?[]const u8,
+        opener: ?*WebFace,
+    ) !*WebFace {
+        return attachOpts(allocator, g.pane, .{
+            .url = url,
+            .as_page = true,
+            .opener = opener,
+            // A new page inherits the container of the page it was
+            // opened from: a link followed inside a container stays in
+            // that container, which is the whole point of one.
+            .container = if (opener) |op| op.container else blk: {
+                const cur = g.active() orelse break :blk 0;
+                break :blk cur.container;
+            },
+        });
+    }
+
     fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
-        if (fromPane(pane)) |existing| {
-            if (opts.url) |u| existing.navigate(u);
-            pane.setWebVisible(true);
-            return existing;
+        if (!opts.as_page) {
+            if (fromPane(pane)) |existing| {
+                if (opts.url) |u| existing.navigate(u);
+                pane.setWebVisible(true);
+                return existing;
+            }
         }
+        // The pane holds a GROUP of pages; a first attach mints it.
+        const grp = try webgroup.Group.ensure(allocator, pane);
         const self = try allocator.create(WebFace);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator };
@@ -2170,14 +2214,18 @@ pub const WebFace = struct {
 
         self.buildUi();
         if (opts.existing_view != 0) c.gtk_widget_set_visible(self.bar, 0);
-        if (!pane.attachWeb(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb)) {
+        c.gtk_widget_set_vexpand(self.root_box, 1);
+        c.gtk_widget_set_hexpand(self.root_box, 1);
+        grp.adopt(self, opts.opener, grp.childInsertPos()) catch {
             // The box never reached a parent, so its floating reference
             // is still the only one.
             _ = c.g_object_ref_sink(@ptrCast(self.root_box));
             c.g_object_unref(@ptrCast(self.root_box));
+            if (self.pending_url) |u| allocator.free(u);
             allocator.destroy(self);
             return error.PaneHasNoWrapper;
-        }
+        };
+        pane.setWebVisible(true);
 
         // Link hints dispatch (input.zig `web_hints` / `hints_open`).
         // The fn is stateless — it resolves this face from the Pane on
@@ -2215,10 +2263,38 @@ pub const WebFace = struct {
         return self;
     }
 
-    /// The face on `pane`, if any.
+    /// The ACTIVE page of the browser on `pane`, if any. A pane holds
+    /// a `WebGroup` of pages (src/ui/webgroup.zig); "the web face of
+    /// this pane" is the one the group is showing, which is what every
+    /// pane-scoped verb — navigate, zoom, find, screenshot, the MCP
+    /// tools — means by it.
     pub fn fromPane(pane: *Pane) ?*WebFace {
-        const ctx = pane.web_ctx orelse return null;
-        return @ptrCast(@alignCast(ctx));
+        const grp = webgroup.Group.fromPane(pane) orelse return null;
+        return grp.active();
+    }
+
+    /// The group this face is a page of, if it still has a pane.
+    pub fn group(self: *WebFace) ?*webgroup.Group {
+        const pane = self.pane orelse return null;
+        return webgroup.Group.fromPane(pane);
+    }
+
+    /// Open `url` in a new tab FROM this page — a popup, a hint with
+    /// the new-tab modifier, "Open Link in New Tab".
+    ///
+    /// Where that tab lands is the tree-sidebar rule: while the sidebar
+    /// is the browser's tab surface it becomes a PAGE of this browser,
+    /// nested under the page that opened it; otherwise it becomes a
+    /// window tab nested under this one, as it always did.
+    pub fn openInNewTab(self: *WebFace, url: ?[]const u8) void {
+        const win = self.ownerWindow() orelse return;
+        if (win.browserPagesInSidebar()) {
+            if (self.group()) |g| {
+                _ = g.newPage(url, self) catch {};
+                return;
+            }
+        }
+        win.newWebTabFrom(url, self.ownerPage()) catch {};
     }
 
     /// Snapshot for layout persistence. The address falls back to the
@@ -2240,8 +2316,11 @@ pub const WebFace = struct {
         self.setZoomLevel(std.math.clamp(@as(i32, zoom_level_x100), zoom_min_x100, zoom_max_x100));
     }
 
-    fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
-        const self: *WebFace = @ptrCast(@alignCast(ctx));
+    /// Phase one of the face teardown: sever everything that could
+    /// still call into this face. Public because a face is now a PAGE
+    /// of a `WebGroup` (src/ui/webgroup.zig), and the group — not the
+    /// Pane — is what runs the two-phase teardown for each of them.
+    pub fn prepareDestroy(self: *WebFace, widgets_dead: bool) void {
         self.widgets_dead = self.widgets_dead or widgets_dead;
         self.cancelHints();
         // Owned reference: safe from any teardown path, dead widgets
@@ -2288,16 +2367,10 @@ pub const WebFace = struct {
         self.widgets_dead = true;
     }
 
-    fn destroyCb(ctx: *anyopaque) void {
-        const self: *WebFace = @ptrCast(@alignCast(ctx));
-        self.deinit();
-    }
-
     /// Raising the face focuses the page — except on a blank tab,
     /// where the address bar is the only useful target (what every
     /// browser does with a new tab).
-    fn focusCb(ctx: *anyopaque) void {
-        const self: *WebFace = @ptrCast(@alignCast(ctx));
+    pub fn focusFace(self: *WebFace) void {
         if (self.widgets_dead) return;
         // Raising a pane whose page was discarded brings it back before
         // the user has to ask twice.
@@ -2316,6 +2389,16 @@ pub const WebFace = struct {
             return;
         }
         _ = c.gtk_widget_grab_focus(self.view_area);
+    }
+
+    /// This page became the group's current one: it now owns the pane
+    /// titlebar and the window tab's title, both of which were showing
+    /// the page being left behind.
+    pub fn onRaised(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        self.applyPaneFaceTitle();
+        self.applyTabTitle();
+        self.focusFace();
     }
 
     pub fn deinit(self: *WebFace) void {
@@ -2989,8 +3072,8 @@ pub const WebFace = struct {
         }
         self.cancelHints();
         if (new_tab and url.len > 0) {
-            if (self.ownerWindow()) |win| {
-                win.newWebTabFrom(url, self.ownerPage()) catch {};
+            if (self.ownerWindow() != null) {
+                self.openInNewTab(url);
                 return;
             }
         }
@@ -4500,10 +4583,22 @@ pub const WebFace = struct {
         }
         self.applyTabTitle();
         self.applyPaneFaceTitle();
+        // The strip label and the tree sidebar row name this PAGE, and
+        // do so whether or not it is the active one.
+        if (self.group()) |g| g.noteTitle(self);
         // The accessibility desktop lists the page by its title.
         if (self.ax_proj) |p| {
             if (title.len > 0) p.setAppName(title);
         }
+    }
+
+    /// True when this page is the one its group is showing. A
+    /// background page must never write the pane titlebar or the
+    /// window tab — those belong to whatever is actually on screen.
+    fn isActivePage(self: *WebFace) bool {
+        const g = self.group() orelse return true;
+        const cur = g.active() orelse return true;
+        return cur == self;
     }
 
     /// The pane's inner titlebar wears the page title too, but only
@@ -4512,6 +4607,7 @@ pub const WebFace = struct {
     fn applyPaneFaceTitle(self: *WebFace) void {
         const pane = self.pane orelse return;
         if (!pane.webFaceVisible()) return;
+        if (!self.isActivePage()) return;
         const title = self.title orelse return;
         pane.setFaceTitle(title);
     }
@@ -4519,10 +4615,15 @@ pub const WebFace = struct {
     /// The pane's tab wears the page title while a web face is on it.
     fn applyTabTitle(self: *WebFace) void {
         if (self.widgets_dead) return;
+        if (!self.isActivePage()) return;
         const pane = self.pane orelse return;
         const win = self.ownerWindow() orelse return;
         const page = @import("window.zig").tabPageForPane(win, pane) orelse return;
-        const title = self.title orelse return;
+        // The same name the page wears in the strip and the tree
+        // sidebar, so one page is not called two different things —
+        // notably a blank page, which reports "about:blank" as its
+        // title and reads as "New Tab" everywhere else.
+        const title = webgroup.Group.pageTitle(self);
         @import("termsinks.zig").setTabPageTitleFromUtf8(self.allocator, page, title);
     }
 
@@ -4552,6 +4653,12 @@ pub const WebFace = struct {
             self.pending_url = null;
         }
         self.noteNavigation(url);
+        // A page that has not answered with a title yet is named by its
+        // host everywhere, so a navigation renames it.
+        if (self.title == null) {
+            if (self.group()) |g| g.noteTitle(self);
+            self.applyTabTitle();
+        }
         if (self.widgets_dead) return;
         self.updateSiteButton();
         // A blank page has no address to show: browsers leave the bar
@@ -5025,10 +5132,10 @@ pub const WebFace = struct {
             },
         };
         if (open) {
-            const win = self.ownerWindow() orelse return;
-            // Tree-style tabs: the popup nests under the tab that
-            // opened it (opener -> child, the TST relationship).
-            win.newWebTabFrom(url, self.ownerPage()) catch {};
+            // Tree-style tabs: the popup nests under whatever opened it
+            // (opener -> child, the TST relationship) — a page of this
+            // browser, or a window tab, per `openInNewTab`.
+            self.openInNewTab(url);
             return;
         }
         self.toastBlockedPopup(url);
@@ -5095,6 +5202,8 @@ pub const WebFace = struct {
         if (@import("window.zig").tabPageForPane(win, pane)) |page|
             c.adw_tab_view_set_selected_page(win.tab_view, page);
         pane.setWebVisible(true);
+        // The pane may be showing a DIFFERENT page of the same browser.
+        if (self.group()) |g| g.setActive(self);
         self.reviveNow();
         _ = c.gtk_widget_grab_focus(self.view_area);
     }
@@ -5601,8 +5710,7 @@ pub const WebFace = struct {
     fn onMenuOpenLink(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(MenuCtx, user);
         const link = ctx.link orelse return;
-        const win = ctx.face.ownerWindow() orelse return;
-        win.newWebTabFrom(link, ctx.face.ownerPage()) catch {};
+        ctx.face.openInNewTab(link);
     }
 
     fn onMenuBookmark(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -7233,8 +7341,7 @@ const PopupCtx = struct {
 fn onPopupToastOpen(_: *c.AdwToast, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(PopupCtx, user);
     const face = g_client.findFace(ctx.view) orelse return;
-    const win = face.ownerWindow() orelse return;
-    win.newWebTabAt(ctx.url) catch {};
+    face.openInNewTab(ctx.url);
 }
 
 fn freePopupCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {

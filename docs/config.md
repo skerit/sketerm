@@ -437,7 +437,10 @@ They are still accepted and ignored, so old files do not warn; use
 | `tab_position` | enum | `top` | `top`, `bottom` |
 | `close_button_on_tab` | bool | `true` | |
 | `show_tab_bar` | bool | `true` | Start with the AdwTabBar hidden by setting false; the `toggle_tab_bar` action flips it at runtime. |
-| `show_tab_sidebar` | bool | `false` | Start with the vertical tree-style tab sidebar shown. The `toggle_tab_sidebar` action (Tab menu, hamburger, palette) flips it at runtime; `tab_collapse` / `tab_expand` fold a tab's children. |
+| `show_tab_sidebar` | bool | `false` | Start with the vertical tree-style tab sidebar shown. The `toggle_tab_sidebar` action (Tab menu, hamburger, palette) flips it at runtime; `tab_collapse` / `tab_expand` fold a tab's children. While it is shown it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser rather than mirroring the window's tabs, and "new tab" opens a page there. Hide it and a browser goes back to its own in-pane tab strip, with new tabs becoming window tabs again. |
+| `tab_sidebar_width` | int | `240` | Width of that sidebar in logical px, 120..800. Dragging its divider writes this back. |
+| `tab_close_parent` | enum | `promote` | Closing a tab that has child tabs: `promote` lifts the children one level (TST's default) or `close-subtree` closes them with it. Applies to browser pages too. |
+| `tab_child_insert` | enum | `last` | Where a new child tab lands among its siblings: `last` or `first`. |
 | `always_on_top` | bool | `false` | |
 | `new_tab_after_current` | bool | `false` | Insert new tabs after the focused one instead of appending. |
 | `confirm_close` | enum | `multiple` | `never`, `multiple` (only when more than one pane is being lost), `always` |

@@ -574,6 +574,9 @@ pub fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
     refreshWindowTitleTemplate(self);
     const page = tabPageForPane(self, pane) orelse return;
     if (Window.tabTreeOf(page)) |t| t.last_focused = pane;
+    // The tree sidebar shows the FOCUSED pane's browser pages when that
+    // pane is a browser, so moving focus can change what it lists.
+    self.sidebarRefresh();
 }
 
 /// A pane's visible grid changed (true content change, not just bytes).

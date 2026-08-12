@@ -1292,6 +1292,9 @@ pub const Config = struct {
     /// Show the vertical tree-style tab sidebar at startup. Off by
     /// default; toggleable at runtime via toggle_tab_sidebar.
     show_tab_sidebar: bool = false,
+    /// Width of that sidebar in logical px. Written back when the user
+    /// drags the divider, so the key exists mainly to persist it.
+    tab_sidebar_width: u16 = 240,
     /// Tree-style tabs: what closing a tab with child tabs does —
     /// promote the children one level up (default, TST-style) or
     /// close the whole subtree with it.
@@ -1977,6 +1980,8 @@ pub const Config = struct {
             try w.print("window_title_template = {s}\n", .{self.window_title_template});
         if (!self.show_tab_bar) try w.writeAll("show_tab_bar = false\n");
         if (self.show_tab_sidebar) try w.writeAll("show_tab_sidebar = true\n");
+        if (self.tab_sidebar_width != 240)
+            try w.print("tab_sidebar_width = {d}\n", .{self.tab_sidebar_width});
         if (self.tab_close_parent != .promote) try w.writeAll("tab_close_parent = close-subtree\n");
         if (self.tab_child_insert != .last) try w.writeAll("tab_child_insert = first\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
@@ -3162,6 +3167,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.show_tab_bar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "show_tab_sidebar")) {
         cfg.show_tab_sidebar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "tab_sidebar_width")) {
+        const w = try parseU16(value);
+        if (w < 120 or w > 800) return error.BadTabSidebarWidth;
+        cfg.tab_sidebar_width = w;
     } else if (std.mem.eql(u8, key, "tab_close_parent")) {
         cfg.tab_close_parent = if (std.mem.eql(u8, value, "promote"))
             .promote
@@ -3921,6 +3930,7 @@ test "config: tree-style tab keys round-trip" {
     cfg.show_tab_sidebar = true; // default false → emitted
     cfg.tab_close_parent = .close_subtree; // default promote → emitted
     cfg.tab_child_insert = .first; // default last → emitted
+    cfg.tab_sidebar_width = 310; // default 240 → emitted
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
@@ -3928,12 +3938,14 @@ test "config: tree-style tab keys round-trip" {
     try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_sidebar = true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tab_close_parent = close-subtree") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tab_child_insert = first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tab_sidebar_width = 310") != null);
 
     var parsed = try Config.loadFromBytes(std.testing.allocator, out);
     defer parsed.deinit();
     try std.testing.expectEqual(true, parsed.show_tab_sidebar);
     try std.testing.expectEqual(TabCloseParent.close_subtree, parsed.tab_close_parent);
     try std.testing.expectEqual(TabChildInsert.first, parsed.tab_child_insert);
+    try std.testing.expectEqual(@as(u16, 310), parsed.tab_sidebar_width);
 
     // Defaults are not emitted.
     const def = Config{};
@@ -3944,6 +3956,7 @@ test "config: tree-style tab keys round-trip" {
     try std.testing.expect(std.mem.indexOf(u8, out2, "show_tab_sidebar") == null);
     try std.testing.expect(std.mem.indexOf(u8, out2, "tab_close_parent") == null);
     try std.testing.expect(std.mem.indexOf(u8, out2, "tab_child_insert") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "tab_sidebar_width") == null);
 }
 
 test "config: ~ expansion in path-valued keys" {

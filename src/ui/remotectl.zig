@@ -897,19 +897,26 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         const all: []const *Window = if (wins.len > 0) wins else &[_]*Window{self};
         for (all) |win| {
             for (win.panes.items) |p| {
-                const face = webface.WebFace.fromPane(p) orelse continue;
-                try views.append(arena, .{
-                    .pane = p.id,
-                    .view = face.view,
-                    .url = if (face.url) |u| try arena.dupe(u8, u) else "",
-                    .title = if (face.title) |t| try arena.dupe(u8, t) else "",
-                    .loading = face.loading,
-                    .can_back = face.can_back,
-                    .can_fwd = face.can_fwd,
-                    .focused = focused == p,
-                    .visible = p.webFaceVisible(),
-                    .load_seq = face.load_seq,
-                });
+                // A browser pane holds SEVERAL pages; every one of them
+                // is a view a client can drive, so all are listed and
+                // only the current one reports `visible`.
+                const g = @import("webgroup.zig").Group.fromPane(p) orelse continue;
+                const cur = g.active();
+                for (g.pages.items) |pg| {
+                    const face = pg.face;
+                    try views.append(arena, .{
+                        .pane = p.id,
+                        .view = face.view,
+                        .url = if (face.url) |u| try arena.dupe(u8, u) else "",
+                        .title = if (face.title) |t| try arena.dupe(u8, t) else "",
+                        .loading = face.loading,
+                        .can_back = face.can_back,
+                        .can_fwd = face.can_fwd,
+                        .focused = focused == p and cur == face,
+                        .visible = p.webFaceVisible() and cur == face,
+                        .load_seq = face.load_seq,
+                    });
+                }
             }
         }
         const cl = webface.client();

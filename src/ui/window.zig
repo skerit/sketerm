@@ -40,6 +40,13 @@ pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
 const tabforest_mod = @import("tabforest.zig");
 const tabsidebar_mod = @import("tabsidebar.zig");
+const webgroup = @import("webgroup.zig");
+
+/// Drag limits for the tree-sidebar divider. Wider than the config
+/// key's own range check on purpose: the clamp that matters is the one
+/// that stops a stray position from being SAVED.
+const SIDEBAR_MIN_PX: c_int = 120;
+const SIDEBAR_MAX_PX: c_int = 800;
 
 /// Toolkit-free tab-forest model — window-level tree-style-tabs
 /// nesting (parent/child + collapse per AdwTabPage), one per Window.
@@ -238,6 +245,9 @@ pub const Window = struct {
     /// creation failed; visibility follows Config.show_tab_sidebar +
     /// the toggle_tab_sidebar action.
     tab_sidebar: ?*tabsidebar_mod.Sidebar = null,
+    /// Debounce for writing a dragged sidebar width back to the config
+    /// file: a drag emits notify::position per pixel.
+    sidebar_save_timer: c.guint = 0,
     /// HBox holding [sidebar | toast_overlay] as the toolbar content.
     content_box: *c.GtkWidget,
     /// Opener page consumed by the NEXT page-attached, so a web popup /
@@ -514,10 +524,18 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(toast_overlay, 1);
         c.gtk_widget_set_hexpand(toast_overlay, 1);
         c.adw_toast_overlay_set_child(@ptrCast(@alignCast(toast_overlay)), @ptrCast(@alignCast(tab_view_w)));
-        // Content hbox: the (initially absent/hidden) tree-style tab
-        // sidebar is prepended here after `self` is initialized.
-        const content_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
-        c.gtk_box_append(@ptrCast(content_box), toast_overlay);
+        // Content splitter: the (initially absent/hidden) tree-style
+        // tab sidebar becomes the start child after `self` is
+        // initialized. A GtkPaned rather than a box so the sidebar is
+        // draggable; with no start child it lays out exactly like the
+        // box did, and a hidden start child draws no handle either.
+        const content_box = c.gtk_paned_new(c.GTK_ORIENTATION_HORIZONTAL);
+        c.gtk_widget_add_css_class(content_box, "sketerm-tst-paned");
+        c.gtk_paned_set_end_child(@ptrCast(content_box), toast_overlay);
+        // The tab area absorbs window resizes; the sidebar keeps the
+        // width the user gave it (the file-browser places-sidebar rule).
+        c.gtk_paned_set_resize_end_child(@ptrCast(content_box), 1);
+        c.gtk_paned_set_shrink_end_child(@ptrCast(content_box), 0);
         c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), content_box);
 
         // Scrollback search bar — bottom of the window. Hidden by
@@ -708,7 +726,18 @@ pub const Window = struct {
         self.tabbar.is_hidden = tabForestHiddenHook;
         if (tabsidebar_mod.Sidebar.create(allocator, self)) |sb| {
             self.tab_sidebar = sb;
-            c.gtk_box_prepend(@ptrCast(content_box), sb.root);
+            c.gtk_paned_set_start_child(@ptrCast(content_box), sb.root);
+            c.gtk_paned_set_resize_start_child(@ptrCast(content_box), 0);
+            c.gtk_paned_set_shrink_start_child(@ptrCast(content_box), 0);
+            c.gtk_paned_set_position(@ptrCast(content_box), self.config.tab_sidebar_width);
+            _ = c.g_signal_connect_data(
+                content_box,
+                "notify::position",
+                @ptrCast(&onSidebarPosition),
+                @ptrCast(self),
+                null,
+                c.G_CONNECT_DEFAULT,
+            );
             c.gtk_widget_set_visible(sb.root, @intFromBool(self.config.show_tab_sidebar));
         } else |err| {
             std.debug.print("sketerm: tab sidebar init failed: {s}\n", .{@errorName(err)});
@@ -1044,6 +1073,10 @@ pub const Window = struct {
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
         if (self.si_bash_shim) |s| self.allocator.free(s);
+        if (self.sidebar_save_timer != 0) {
+            _ = c.g_source_remove(self.sidebar_save_timer);
+            self.sidebar_save_timer = 0;
+        }
         if (self.tab_sidebar) |sb| sb.deinit();
         self.tab_sidebar = null;
         self.tab_forest.deinit();
@@ -2206,6 +2239,9 @@ pub const Window = struct {
         // Not in disownPane: adoption (cross-window tab drag) also
         // disowns, but there the pane lives on and must keep its faces.
         pane.severFaces();
+        // A severed web face frees its page group, and the tree sidebar
+        // may have been listing that group's pages.
+        self.sidebarRefresh();
         const term = pane.terminal;
         term.clearSinks();
         schedulePaneTeardown(pane, term);
@@ -3050,6 +3086,7 @@ pub const Window = struct {
         // be severed BEFORE the destroy, or its still-connected
         // handlers fire against the dangling GLArea in the gap.
         old.severFaces();
+        self.sidebarRefresh();
         if (is_paned) {
             if (c.gtk_paned_get_start_child(@ptrCast(parent)) == old_w) {
                 c.gtk_paned_set_start_child(@ptrCast(parent), pane.widget());
@@ -3437,6 +3474,7 @@ pub const Window = struct {
         // so nothing (IM commit/preedit, browser fd watch, editor
         // shortcut restore) fires against dead widgets in that gap.
         pane.severFaces();
+        self.sidebarRefresh();
 
         // Detach sibling from paned.
         if (start == w) {
@@ -3693,9 +3731,126 @@ pub const Window = struct {
     pub fn toggleTabSidebarVisibility(self: *Window) void {
         const sb = self.tab_sidebar orelse return;
         const visible = c.gtk_widget_get_visible(sb.root) != 0;
-        c.gtk_widget_set_visible(sb.root, @intFromBool(!visible));
-        // Rows are not rebuilt while hidden; catch up on reveal.
-        if (!visible) sb.rebuild();
+        self.setTabSidebarVisible(!visible);
+    }
+
+    /// The sidebar's visibility is also its MODE switch: while it is
+    /// showing, a browser's pages live in it and new tabs go there;
+    /// while it is hidden, a browser falls back to its own in-pane tab
+    /// strip and new tabs are window tabs. So every show/hide has to
+    /// re-ask each browser to redraw its chrome.
+    pub fn setTabSidebarVisible(self: *Window, show: bool) void {
+        const sb = self.tab_sidebar orelse return;
+        c.gtk_widget_set_visible(sb.root, @intFromBool(show));
+        if (show) {
+            // A GtkPaned forgets a position set while its start child
+            // was hidden (the file browser's places sidebar hit this
+            // too) — re-assert the saved width as it comes back.
+            c.gtk_paned_set_position(@ptrCast(self.content_box), self.config.tab_sidebar_width);
+            // Rows are not rebuilt while hidden; catch up on reveal.
+            sb.rebuild();
+        }
+        self.refreshWebGroupChrome();
+    }
+
+    /// True while the tree sidebar is the tab surface for browsers:
+    /// pages of a browser are listed there, and "new tab" inside a
+    /// browser means a new page rather than a new window tab.
+    pub fn browserPagesInSidebar(self: *Window) bool {
+        const sb = self.tab_sidebar orelse return false;
+        return c.gtk_widget_get_visible(sb.root) != 0;
+    }
+
+    /// The pane the selected tab is focused on — which face the sidebar
+    /// and the new-tab action are talking about. `last_focused` is
+    /// validated the way tabchrome does it: a closed pane's address can
+    /// be reused, so the pointer must still be a live pane of THIS tab.
+    pub fn selectedTabPane(self: *Window) ?*Pane {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return null;
+        const child = c.adw_tab_page_get_child(page) orelse return null;
+        if (tabTreeOf(page)) |t| {
+            if (t.last_focused) |lf| {
+                for (self.panes.items) |p| {
+                    if (p == lf and widgetIsAncestor(@ptrCast(child), p.widget())) return p;
+                }
+            }
+        }
+        for (self.panes.items) |p| {
+            if (widgetIsAncestor(@ptrCast(child), p.widget())) return p;
+        }
+        return null;
+    }
+
+    /// The browser whose pages the sidebar should be listing, or null
+    /// when the selected tab is not a browser (then the sidebar shows
+    /// the window's own tab tree, as before).
+    pub fn sidebarGroup(self: *Window) ?*webgroup.Group {
+        if (self.destroying) return null;
+        if (self.tab_sidebar == null) return null;
+        const pane = self.selectedTabPane() orelse return null;
+        if (!pane.webFaceVisible()) return null;
+        return webgroup.Group.fromPane(pane);
+    }
+
+    /// Is `g` the group the sidebar is currently listing? A group that
+    /// is answers with rows in the sidebar and hides its own strip.
+    pub fn sidebarListsGroup(self: *Window, g: *webgroup.Group) bool {
+        if (!self.browserPagesInSidebar()) return false;
+        const cur = self.sidebarGroup() orelse return false;
+        return cur == g;
+    }
+
+    /// A browser's page list changed (page opened, closed, reordered).
+    pub fn webGroupChanged(self: *Window, g: *webgroup.Group) void {
+        if (self.destroying) return;
+        if (self.sidebarListsGroup(g)) {
+            if (self.tab_sidebar) |sb| sb.rebuild();
+        }
+        g.refreshChrome();
+    }
+
+    /// Re-resolve what the sidebar should be showing. Called when the
+    /// selected tab or the focused pane changes — either can swap the
+    /// sidebar between the window tree and a browser's pages.
+    pub fn sidebarRefresh(self: *Window) void {
+        if (self.destroying) return;
+        const sb = self.tab_sidebar orelse return;
+        if (c.gtk_widget_get_visible(sb.root) == 0) return;
+        sb.rebuild();
+        self.refreshWebGroupChrome();
+    }
+
+    pub fn sidebarRefreshSelection(self: *Window) void {
+        if (self.destroying) return;
+        const sb = self.tab_sidebar orelse return;
+        if (c.gtk_widget_get_visible(sb.root) == 0) return;
+        sb.refreshSelection();
+    }
+
+    /// One page's title changed: update just its row rather than
+    /// rebuilding the list under the user's pointer.
+    pub fn sidebarNoteWebTitle(self: *Window, face: *@import("webface.zig").WebFace) void {
+        if (self.destroying) return;
+        const sb = self.tab_sidebar orelse return;
+        if (c.gtk_widget_get_visible(sb.root) == 0) return;
+        sb.noteWebTitle(face);
+    }
+
+    /// Every browser in this window re-decides whether to draw its own
+    /// tab strip (it does when the sidebar is not listing it).
+    fn refreshWebGroupChrome(self: *Window) void {
+        for (self.panes.items) |p| {
+            if (webgroup.Group.fromPane(p)) |g| g.refreshChrome();
+        }
+    }
+
+    /// "New tab" while a browser owns the sidebar means a new PAGE in
+    /// that browser. Answers true when it handled the request.
+    pub fn newTabInBrowser(self: *Window) bool {
+        if (!self.browserPagesInSidebar()) return false;
+        const g = self.sidebarGroup() orelse return false;
+        _ = g.newPage(null, g.active()) catch return false;
+        return true;
     }
 
     /// tab_collapse / tab_expand on the selected tab. Collapsing a
@@ -3727,7 +3882,9 @@ pub const Window = struct {
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
     const self = cast.userData(Window, ctx);
     switch (action) {
-        .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
+        // A browser owning the sidebar takes "new tab" for itself.
+        .new_tab => if (!self.newTabInBrowser())
+            self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .close_tab => self.closeCurrentTab(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
@@ -3794,7 +3951,8 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
-        .new_web_tab => self.newWebTab() catch |err| logActionError("new_web_tab", err),
+        .new_web_tab => if (!self.newTabInBrowser())
+            self.newWebTab() catch |err| logActionError("new_web_tab", err),
         .new_web_split => self.newWebSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_web_split", err),
         .new_incognito_web_tab => self.newIncognitoWebTab() catch |err| logActionError("new_incognito_web_tab", err),
         // Only reached when the focused pane shows NO web face (the
@@ -3856,7 +4014,9 @@ pub fn dispatchAction(window: *Window, action: @import("input.zig").Action) void
 fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     const self = cast.userData(Window, ctx);
     switch (action) {
-        .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
+        // A browser owning the sidebar takes "new tab" for itself.
+        .new_tab => if (!self.newTabInBrowser())
+            self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .new_tab_as_profile => self.openProfilePicker(),
         .apply_profile => self.openApplyProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
@@ -4220,6 +4380,7 @@ fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callc
         };
         return;
     }
+    if (self.newTabInBrowser()) return;
     self.newShellTab(null) catch |err| {
         std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
     };
@@ -4774,12 +4935,40 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             // detached page drops its last ref, before the deferred
             // Pane.deinit idle runs.
             pane.severFaces();
+            self.sidebarRefresh();
             term.clearSinks();
             schedulePaneTeardown(pane, term);
             continue;
         }
         i += 1;
     }
+}
+
+/// The sidebar divider moved. A drag emits this per pixel, so the
+/// config write is debounced — one save per resize, not hundreds.
+/// A position reported while the sidebar is hidden is meaningless
+/// (GtkPaned gives the whole width to the visible child) and must not
+/// be mistaken for a preference.
+fn onSidebarPosition(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    if (self.destroying) return;
+    const sb = self.tab_sidebar orelse return;
+    if (c.gtk_widget_get_visible(sb.root) == 0) return;
+    const pos = c.gtk_paned_get_position(@ptrCast(self.content_box));
+    if (pos < SIDEBAR_MIN_PX or pos > SIDEBAR_MAX_PX) return;
+    const w: u16 = @intCast(pos);
+    if (w == self.config.tab_sidebar_width) return;
+    self.config.tab_sidebar_width = w;
+    if (self.sidebar_save_timer != 0) _ = c.g_source_remove(self.sidebar_save_timer);
+    self.sidebar_save_timer = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+}
+
+fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Window, user);
+    self.sidebar_save_timer = 0;
+    if (self.destroying) return 0; // G_SOURCE_REMOVE
+    @import("winconfig.zig").persistConfig(self);
+    return 0; // G_SOURCE_REMOVE
 }
 
 pub fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {

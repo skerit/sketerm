@@ -192,9 +192,20 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
             // still gets the face back, with its address bar focused.
             if (p.web) |wstate| {
                 const webface = @import("webface.zig");
-                const url: ?[]const u8 = if (wstate.url.len > 0) wstate.url else null;
-                if (webface.WebFace.attach(self.allocator, pane, url)) |wf| {
-                    wf.applyRestoredZoom(wstate.zoom_level_x100);
+                // A browser can hold several pages; page 0 is attached
+                // the ordinary way and the group rebuilds the rest with
+                // their nesting. A layout from before pages existed has
+                // an empty list and falls back to the single address.
+                const first: ?[]const u8 = if (wstate.pages.len > 0)
+                    (if (wstate.pages[0].url.len > 0) wstate.pages[0].url else null)
+                else if (wstate.url.len > 0) wstate.url else null;
+                if (webface.WebFace.attach(self.allocator, pane, first)) |wf| {
+                    wf.applyRestoredZoom(if (wstate.pages.len > 0)
+                        wstate.pages[0].zoom_level_x100
+                    else
+                        wstate.zoom_level_x100);
+                    if (@import("webgroup.zig").Group.fromPane(pane)) |g|
+                        g.restorePages(wstate);
                 } else |err| {
                     std.debug.print("sketerm: web restore failed: {s}\n", .{@errorName(err)});
                 }
@@ -633,8 +644,12 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
             // Web face: address + zoom (no scroll offset — the helper
             // protocol reports none).
             const web_state = blk: {
-                const wf = @import("webface.zig").WebFace.fromPane(p) orelse break :blk null;
-                break :blk try wf.paneState(arena);
+                const g = @import("webgroup.zig").Group.fromPane(p) orelse break :blk null;
+                const st = try g.paneState(arena);
+                // Every page was transient (a lone DevTools inspector):
+                // nothing to restore, same as having no web face.
+                if (st.pages.len == 0) break :blk null;
+                break :blk st;
             };
             const editor_state = blk: {
                 const ev = @import("editorview.zig").EditorView.fromPane(p) orelse break :blk null;
