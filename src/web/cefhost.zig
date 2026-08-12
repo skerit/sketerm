@@ -2971,6 +2971,7 @@ pub const Host = struct {
         for (jobs[0..njobs]) |*j| {
             var ext_buf: [webrequest.MAX_ID]u8 = undefined;
             var ext_len: usize = 0;
+            var observational = false;
             {
                 g_wreq.acquire();
                 defer g_wreq.release();
@@ -2978,6 +2979,7 @@ pub const Host = struct {
                     ext_len = s.id_len;
                     @memcpy(ext_buf[0..ext_len], s.idSlice());
                 }
+                if (wreqFind(j.hid)) |h| observational = h.cb == null;
             }
             const bg = self.find(j.bg_view);
             if (ext_len == 0 or bg == null) {
@@ -3013,8 +3015,15 @@ pub const Host = struct {
                 w.writeAll(",\"requestHeaders\":") catch continue;
                 w.writeAll(j.hdr[0..j.hdr_len]) catch continue;
             }
+            if (observational) w.writeAll(",\"obs\":true") catch continue;
             w.writeAll("}}") catch continue;
             self.sendScript(bg.?, cmd.written());
+            // An OBSERVATIONAL notification is a mailbox drop, not a
+            // question: the request continued long ago and no decision
+            // is coming back. Retire the slot the moment the command is
+            // out, so a page full of non-blocking notifications never
+            // occupies the hold table or keeps the loop spinning.
+            if (observational) self.wreqRetire(j.hid);
         }
 
         for (expired[0..nexpired]) |hid| {
@@ -3031,6 +3040,19 @@ pub const Host = struct {
             // not its ability to load pages.
             self.wreqFailOpen(hid);
         }
+    }
+
+    /// Drop a slot that needs no answer (an observational mailbox that
+    /// has been delivered). Distinct from `wreqFailOpen` only in that
+    /// there is nothing to continue.
+    fn wreqRetire(self: *Host, hid: u32) void {
+        _ = self;
+        g_wreq.acquire();
+        defer g_wreq.release();
+        const h = wreqFind(hid) orelse return;
+        if (h.cb != null) return; // not ours to retire
+        h.* = .{};
+        _ = g_wreq.outstanding.fetchSub(1, .release);
     }
 
     /// Let a held request through, unfiltered, and free its slot. THE

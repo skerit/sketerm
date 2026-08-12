@@ -30,6 +30,19 @@ const idle_timeout_ms: c_int = 50;
 /// short-lived and a busy spin would burn a core for it.
 const wreq_timeout_ms: c_int = 1;
 
+/// `SKETERM_WEB_WREQ_SPIN=1` drops that 1ms to 0, i.e. busy-pumps CEF
+/// while a decision is outstanding. It measurably removes most of the
+/// hold's added latency and costs a whole core while it is doing so,
+/// which is why it is a knob for measurement and not the default —
+/// `zig build bench-webreq` reports both numbers.
+var wreq_spin: bool = false;
+
+fn readWreqSpin() void {
+    const v = c.getenv("SKETERM_WEB_WREQ_SPIN") orelse return;
+    const s = std.mem.span(v);
+    wreq_spin = s.len != 0 and !std.mem.eql(u8, s, "0");
+}
+
 /// Wall-clock budget for CEF to finish closing every browser after the
 /// client goes away. `close_browser` is asynchronous renderer IPC —
 /// iterations alone are not time — and `cef_shutdown` with a live
@@ -162,6 +175,7 @@ pub const Server = struct {
     /// Accept the single client, serve it until it disconnects, then
     /// tear every view down. Returns when the client is gone.
     pub fn run(self: *Server) !void {
+        readWreqSpin();
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
         if (self.force_inline) self.host.setInlineMode(true);
@@ -244,7 +258,7 @@ pub const Server = struct {
         const timeout: c_int = if (cefhost.webrequestBusy())
             // Already holding something: the answer arrives through
             // CEF's message loop, which only turns when we pump.
-            wreq_timeout_ms
+            (if (wreq_spin) 0 else wreq_timeout_ms)
         else if (self.host.viewCount() > 0)
             busy_timeout_ms
         else

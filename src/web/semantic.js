@@ -1137,9 +1137,14 @@
   // request open on a timeout anyway, and answering promptly is better.
   function extWebRequest(m) {
     var answered = false;
+    // An "obs" notification is a mailbox drop: the browser process has
+    // already continued the request and retired its slot, so answering
+    // would name a hold that no longer exists.
+    var wantAnswer = m.obs !== true;
     function answer(d) {
       if (answered) return;
       answered = true;
+      if (!wantAnswer) return;
       try {
         send({ op: "ext-wreq-decision", hid: m.hid, d: d || {} });
       } catch (e) {}

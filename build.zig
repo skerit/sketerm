@@ -1114,6 +1114,7 @@ fn addCef(
 
     const web_step = b.step("web", "Build sketerm-webengine, the CEF browser helper (needs `zig build fetch-cef`)");
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
+    const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
 
     // Probe the two halves separately: a split system install has no
     // Release dir at all, and a header-only hit would fail at link.
@@ -1130,6 +1131,7 @@ fn addCef(
         ));
         web_step.dependOn(&missing.step);
         smoke_web_step.dependOn(&missing.step);
+        bench_wreq_step.dependOn(&missing.step);
         return;
     }
 
@@ -1232,6 +1234,26 @@ fn addCef(
     // to launch the helper over a bridged byte channel.
     smoke_web_run.addArtifactArg(mux_exe);
     smoke_web_step.dependOn(&smoke_web_run.step);
+
+    // Blocking-webRequest latency benchmark — `zig build bench-webreq`.
+    // Same shape as the smoke rig (a real helper on a private short
+    // socket) because the number that matters is an END-TO-END one: a
+    // microbenchmark of the registry would measure the wrong half.
+    const bench_wreq_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_webreq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_wreq_mod.addImport("cbindings", core_cbindings_mod);
+    const bench_wreq = b.addExecutable(.{
+        .name = "sketerm-bench-webreq",
+        .root_module = bench_wreq_mod,
+        .use_lld = use_lld,
+    });
+    const bench_wreq_run = b.addRunArtifact(bench_wreq);
+    bench_wreq_run.addArtifactArg(web_exe);
+    bench_wreq_step.dependOn(&bench_wreq_run.step);
 }
 
 /// Set up the out-of-process TranslateC step that turns
