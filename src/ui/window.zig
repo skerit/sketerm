@@ -1480,11 +1480,15 @@ pub const Window = struct {
     /// anywhere, and splitting the wrong pane would put DevTools
     /// beside a page it does not inspect.
     pub fn openDevToolsSplit(self: *Window, source: *Pane, view: u32) !void {
+        // The inspector view lives on the SOURCE face's helper (which
+        // may be a remote one); the new face must attach to that same
+        // client or its frames would never find it.
+        const src_face = @import("webface.zig").WebFace.fromPane(source) orelse return error.NoWebFace;
         const before = self.panes.items.len;
         try self.splitPane(source, @intCast(c.GTK_ORIENTATION_HORIZONTAL));
         if (self.panes.items.len <= before) return error.SplitFailed;
         const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachView(self.allocator, pane, view) catch |err| {
+        _ = @import("webface.zig").WebFace.attachView(self.allocator, pane, view, src_face.cl) catch |err| {
             logActionError("web_devtools attach", err);
             return err;
         };

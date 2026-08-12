@@ -50,6 +50,14 @@ pub const Request = struct {
     /// without ever driving; `control` = force a takeover.
     read_only: bool = false,
     control: bool = false,
+    /// web-container: the container's views RUN on `host` (a remote
+    /// helper spawned by that host's daemon) instead of `host` being an
+    /// egress proxy.
+    remote: bool = false,
+    /// web-container: throwaway cache/cookies (the incognito shape).
+    ephemeral: bool = false,
+    /// web-open: open the tab inside this identity container.
+    container: ?u32 = null,
 
     // ---- panel-* (declarative UI panels, src/ui/panel) ----------------
     /// Panel name. Panels are keyed by (session, name): showing a name

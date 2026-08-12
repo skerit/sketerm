@@ -920,12 +920,36 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         });
     }
 
+    if (eql(u8, req.cmd, "web-container")) {
+        // Create an identity container. remote:true = the container's
+        // views RUN on `host` (a sketerm-webengine spawned by that
+        // host's daemon, frames inline over the wire); otherwise a
+        // non-empty host is the egress (SOCKS-proxied) shape. The
+        // container is process-wide state, so it takes the WINDOW's
+        // long-lived allocator, never the per-request one.
+        const name = req.name orelse
+            return ipc_protocol.writeErr(out, allocator, "web-container requires a name");
+        const host_arg = req.host orelse "";
+        const id = if (req.remote) blk: {
+            if (host_arg.len == 0)
+                return ipc_protocol.writeErr(out, allocator, "web-container remote:true requires a host");
+            break :blk webface.createRemoteContainer(self.allocator, name, req.ephemeral, host_arg);
+        } else webface.createContainer(self.allocator, name, req.ephemeral, host_arg);
+        if (id == 0)
+            return ipc_protocol.writeErr(out, allocator, "container creation failed");
+        return ipc_protocol.writeOkFlat(out, allocator, .{ .container = id });
+    }
+
     if (eql(u8, req.cmd, "web-open")) {
         const where = req.target orelse "tab";
         const win = activeOrSelf(self);
         var host = win;
         const before = win.panes.items.len;
-        if (eql(u8, where, "split")) {
+        if (req.container) |ctn| {
+            if (webface.findContainer(ctn) == null)
+                return ipc_protocol.writeErr(out, allocator, "no such container (web-container creates one)");
+            try win.newWebTabInContainer(ctn, null);
+        } else if (eql(u8, where, "split")) {
             try win.newWebSplit(c.GTK_ORIENTATION_HORIZONTAL);
         } else if (eql(u8, where, "window")) {
             host = try win.openWebWindow(&.{});

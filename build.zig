@@ -987,7 +987,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod);
+    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro, linux64). SINGLE
@@ -1019,6 +1019,7 @@ fn addCef(
     strip: bool,
     use_lld: bool,
     core_cbindings_mod: *std.Build.Module,
+    mux_exe: *std.Build.Step.Compile,
 ) void {
     // Default cache location, XDG-correct: $XDG_CACHE_HOME/sketerm/cef/
     // <version>/ (~/.cache/... when unset). Version-scoped so several
@@ -1158,6 +1159,14 @@ fn addCef(
     // this module also carries are never referenced, so nothing extra
     // links.
     web_mod.addImport("cbindings", core_cbindings_mod);
+    // Raw-deflate codec for inline frames (frames-inline): the same
+    // pure-std module pool updates on the native app pipe use. A named
+    // module because src/wlhost/ sits outside the helper's module root.
+    web_mod.addImport("zpool", b.createModule(.{
+        .root_source_file = b.path("src/wlhost/zpool.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     // `cef_release_dir` is what the LD_PRELOAD re-exec points at — the
     // helper must preload the SAME libcef.so it linked against, so the
     // path belongs to the build, not to a runtime search.
@@ -1219,6 +1228,9 @@ fn addCef(
     });
     const smoke_web_run = b.addRunArtifact(smoke_web);
     smoke_web_run.addArtifactArg(web_exe);
+    // The remote-helper stage spawns a private sketerm-mux and asks IT
+    // to launch the helper over a bridged byte channel.
+    smoke_web_run.addArtifactArg(mux_exe);
     smoke_web_step.dependOn(&smoke_web_run.step);
 }
 

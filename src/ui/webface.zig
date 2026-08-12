@@ -212,6 +212,8 @@ const urlhost = @import("../web/urlhost.zig");
 const omnibox = @import("omnibox.zig");
 const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
+const webremote = @import("webremote.zig");
+const zpool = @import("../wlhost/zpool.zig");
 const Pane = @import("pane.zig").Pane;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
@@ -553,6 +555,18 @@ pub const Client = struct {
     pid: c.pid_t = -1,
     sock_path: [108]u8 = undefined,
     sock_len: usize = 0,
+    /// Remote helper host ("" = the local helper this GUI spawns). A
+    /// remote client's `fd` is one end of a socketpair whose other end
+    /// a `webremote.Bridge` worker pumps to a helper the REMOTE mux
+    /// daemon spawned (`web_helper_open`); such a helper runs
+    /// `--frames-inline`, so every frame arrives in-band and no
+    /// SCM_RIGHTS descriptor ever needs to cross.
+    host: [256]u8 = undefined,
+    host_len: usize = 0,
+    bridge: ?*webremote.Bridge = null,
+    /// Storage for a formatted (non-static) unavailable reason; stable
+    /// because clients are never freed.
+    reason_buf: [256]u8 = undefined,
     in: std.ArrayList(u8) = .empty,
     out: proto.Outbox = undefined,
     /// Descriptors received through SCM_RIGHTS, in arrival order. A
@@ -563,7 +577,6 @@ pub const Client = struct {
     write_watch: c.guint = 0,
     connect_timer: c.guint = 0,
     connect_tries: u32 = 0,
-    next_view: u32 = 1,
     faces: std.ArrayList(*WebFace) = .empty,
     /// The helper advertised `discard` (protocol `CAP_DISCARD`). An
     /// older helper without it never sees a `view_discard` and every
@@ -601,6 +614,19 @@ pub const Client = struct {
     /// popover hides that section — permissions and blocking, which
     /// need no helper support at all, keep working.
     cap_sitedata: bool = false,
+    /// The helper accepts `frame_mode` and can deliver `frame_inline`
+    /// frames. A REMOTE client requires it: without it the bridge would
+    /// silently eat every frame descriptor and the pane would stay
+    /// black, so its absence is a described failure, never a hang.
+    cap_frames_inline: bool = false,
+
+    fn hostSlice(self: *const Client) []const u8 {
+        return self.host[0..self.host_len];
+    }
+
+    pub fn isRemote(self: *const Client) bool {
+        return self.host_len != 0;
+    }
 
     /// Bring the helper up if it is not already. Never blocks: a
     /// missing binary or a helper that never answers leaves the client
@@ -611,6 +637,10 @@ pub const Client = struct {
             self.gpa = gpa;
             self.out = proto.Outbox.init(gpa);
             self.initialized = true;
+        }
+        if (self.isRemote()) {
+            self.ensureRemote();
+            return;
         }
 
         var bin_buf: [4096:0]u8 = undefined;
@@ -659,6 +689,42 @@ pub const Client = struct {
         self.connect_timer = c.g_timeout_add(CONNECT_INTERVAL_MS, @ptrCast(&onConnectTick), self);
     }
 
+    /// Remote helper: adopt the bridge's socketpair end as the protocol
+    /// socket and let the worker connect the mux transport behind it.
+    /// The Client goes `.ready` immediately — outbound frames buffer in
+    /// the socketpair until the bridge comes up, and a bridge failure
+    /// surfaces as a HUP whose reason `lost()` collects. The inline
+    /// frame family is REQUIRED on this path; `hello_ack` enforces it.
+    fn ensureRemote(self: *Client) void {
+        const br = webremote.Bridge.create(self.gpa, self.hostSlice()) orelse {
+            self.fail("Could not create the remote browser bridge.");
+            return;
+        };
+        const fd = br.guiFd();
+        if (fd < 0) {
+            br.stop();
+            self.fail("Could not create the remote browser bridge.");
+            return;
+        }
+        _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
+        self.bridge = br;
+        self.fd = fd;
+        self.state = .ready;
+        self.read_watch = c.g_unix_fd_add(
+            fd,
+            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&onReadable),
+            self,
+        );
+        br.spawn();
+        self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "sketerm-gui" });
+        // Before any view exists (the frame-mode contract): everything
+        // this helper ever paints must arrive in-band.
+        self.post(proto.FrameMode{ .mode = proto.frame_mode_inline });
+        publishContexts(self);
+        for (self.faces.items) |f| f.onClientReady();
+    }
+
     /// Drop everything and allow a later `ensure` to start over. The
     /// crashed/lost overlay's Reload button is the user-facing route.
     pub fn restart(self: *Client) void {
@@ -705,6 +771,11 @@ pub const Client = struct {
         // Capabilities belong to the CONNECTION, not to the client: a
         // restart may land on a different helper build.
         self.cap_discard = false;
+        self.cap_frames_inline = false;
+        if (self.bridge) |br| {
+            self.bridge = null;
+            br.stop();
+        }
         for (self.fds.items) |fd| _ = c.close(fd);
         self.fds.clearRetainingCapacity();
         self.in.clearRetainingCapacity();
@@ -794,10 +865,22 @@ pub const Client = struct {
     }
 
     /// The connection died (helper crash, protocol error). Faces show
-    /// the "helper stopped" overlay; a Reload starts a fresh one.
+    /// the "helper stopped" overlay; a Reload starts a fresh one. A
+    /// remote bridge records WHY it died before closing its end, so
+    /// that reason (copied — teardown destroys the bridge) wins over
+    /// the generic message.
     fn lost(self: *Client) void {
         if (self.state == .unavailable) return;
         self.reap();
+        if (self.bridge) |br| {
+            const why = br.takeReason();
+            if (why.len != 0) {
+                const n = @min(why.len, self.reason_buf.len);
+                @memcpy(self.reason_buf[0..n], why[0..n]);
+                self.fail(self.reason_buf[0..n]);
+                return;
+            }
+        }
         self.fail(LOST_MSG);
     }
 
@@ -1022,6 +1105,7 @@ pub const Client = struct {
                 self.cap_contexts = false;
                 self.cap_userscripts = false;
                 self.cap_sitedata = false;
+                self.cap_frames_inline = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1033,6 +1117,14 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
+                }
+                // A remote helper without inline frames would keep
+                // posting memfd frames whose descriptors the bridge
+                // silently ate: a black pane forever. Fail loudly now.
+                if (self.isRemote() and !self.cap_frames_inline) {
+                    self.fail("The browser helper on the remote host is too old for remote browsing (no frames-inline capability).");
+                    return;
                 }
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
@@ -1062,6 +1154,12 @@ pub const Client = struct {
                 defer self.gpa.free(dmg.rects);
                 const face = self.findFace(dmg.view) orelse return;
                 face.onDamage(dmg);
+            },
+            .frame_inline => {
+                const fi = proto.FrameInline.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(fi.rects);
+                const face = self.findFace(fi.view) orelse return;
+                face.onInline(fi);
             },
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
@@ -1202,13 +1300,70 @@ pub const Client = struct {
     }
 };
 
-/// The one helper connection of this GUI process. Module-level and
-/// never freed — see the lifetime notes at the top of the file.
+/// The one LOCAL helper connection of this GUI process. Module-level
+/// and never freed — see the lifetime notes at the top of the file.
 var g_client: Client = .{};
 
 pub fn client() *Client {
     return &g_client;
 }
+
+/// Per-host remote helper clients, minted on first use and — like the
+/// local one — NEVER freed: that immortality is the liveness fence for
+/// every non-widget callback that carries a Client pointer.
+var g_remote_clients: std.ArrayList(*Client) = .empty;
+
+/// The client serving `host` ("" = the local one), created on demand.
+/// Null only on allocation failure or an over-long host string.
+pub fn clientForHost(gpa: std.mem.Allocator, host: []const u8) ?*Client {
+    if (host.len == 0) return &g_client;
+    for (g_remote_clients.items) |cl| {
+        if (std.mem.eql(u8, cl.hostSlice(), host)) return cl;
+    }
+    const cl = gpa.create(Client) catch return null;
+    cl.* = .{};
+    if (host.len > cl.host.len) {
+        gpa.destroy(cl);
+        return null;
+    }
+    @memcpy(cl.host[0..host.len], host);
+    cl.host_len = host.len;
+    g_remote_clients.append(gpa, cl) catch {
+        gpa.destroy(cl);
+        return null;
+    };
+    return cl;
+}
+
+/// The client a face in `container` belongs on: a container with a
+/// remote host gets that host's client, everything else the local one.
+fn clientForContainer(gpa: std.mem.Allocator, container: u32) *Client {
+    if (container != 0) {
+        if (findContainer(container)) |ctn| {
+            if (ctn.remote_host.len != 0) {
+                if (clientForHost(gpa, ctn.remote_host)) |cl| return cl;
+            }
+        }
+    }
+    return &g_client;
+}
+
+/// Resolve a view id across every client — for widget callbacks whose
+/// context carries only the id (download rows, print dialogs). View ids
+/// are minted from ONE process-wide counter (`g_next_view`), so a
+/// client-created view resolves unambiguously; only helper-minted
+/// devtools ids could ever collide across helpers, and the local client
+/// wins that lookup by order.
+fn findFaceGlobal(view: u32) ?*WebFace {
+    if (g_client.findFace(view)) |f| return f;
+    for (g_remote_clients.items) |cl| {
+        if (cl.findFace(view)) |f| return f;
+    }
+    return null;
+}
+
+/// Process-wide view-id mint (see `findFaceGlobal`).
+var g_next_view: u32 = 1;
 
 // ---------------------------------------------------------------------
 // Containers — per-tab identity contexts (private cookie jar / cache,
@@ -1241,6 +1396,11 @@ pub const Container = struct {
     /// Egress host this container routes through ("" = none), shown in
     /// the UI.
     egress_host: []u8,
+    /// Remote-helper host ("" = local): faces in this container run on
+    /// a `sketerm-webengine` spawned by THAT host's mux daemon, frames
+    /// inline over the wire — the browser IS there rather than proxied
+    /// through there. Mutually exclusive with `egress_host`.
+    remote_host: []u8,
     /// The live SOCKS5->mux bridge for an egress container, else null.
     egress: ?*socksbridge.Egress = null,
 };
@@ -1276,6 +1436,29 @@ pub fn createContainer(
     ephemeral: bool,
     egress_host: []const u8,
 ) u32 {
+    return createContainerFull(gpa, name, ephemeral, egress_host, "");
+}
+
+/// Container whose views RUN on `remote_host`: the helper is spawned by
+/// that host's mux daemon (`web_helper_open`) and its frames arrive
+/// inline over the wire — pages render, resolve and store cookies THERE.
+/// The stronger sibling of an egress container, which only proxies.
+pub fn createRemoteContainer(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    ephemeral: bool,
+    remote_host: []const u8,
+) u32 {
+    return createContainerFull(gpa, name, ephemeral, "", remote_host);
+}
+
+fn createContainerFull(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    ephemeral: bool,
+    egress_host: []const u8,
+    remote_host: []const u8,
+) u32 {
     const id = g_next_container_id;
     const color = if (ephemeral)
         container_palette[container_palette.len - 1]
@@ -1287,9 +1470,15 @@ pub fn createContainer(
         gpa.free(name_owned);
         return 0;
     };
+    const remote_owned = gpa.dupe(u8, remote_host) catch {
+        gpa.free(name_owned);
+        gpa.free(host_owned);
+        return 0;
+    };
     var proxy_owned: []u8 = gpa.dupe(u8, "") catch {
         gpa.free(name_owned);
         gpa.free(host_owned);
+        gpa.free(remote_owned);
         return 0;
     };
     var egress: ?*socksbridge.Egress = null;
@@ -1311,6 +1500,7 @@ pub fn createContainer(
         .ephemeral = ephemeral,
         .proxy = proxy_owned,
         .egress_host = host_owned,
+        .remote_host = remote_owned,
         .egress = egress,
     }) catch {
         if (egress) |eg| {
@@ -1319,13 +1509,15 @@ pub fn createContainer(
         }
         gpa.free(name_owned);
         gpa.free(host_owned);
+        gpa.free(remote_owned);
         gpa.free(proxy_owned);
         return 0;
     };
     g_next_container_id += 1;
-    // Publish to a live helper at once; a helper that starts later gets
-    // the whole set replayed by `publishContexts` on connect.
+    // Publish to every live helper at once; a helper that starts later
+    // gets the whole set replayed by `publishContexts` on connect.
     publishOne(client(), &g_containers.items[g_containers.items.len - 1]);
+    for (g_remote_clients.items) |cl| publishOne(cl, &g_containers.items[g_containers.items.len - 1]);
     return id;
 }
 
@@ -1340,7 +1532,11 @@ fn publishOne(cl: *Client, ctn: *const Container) void {
         .id = ctn.id,
         .ephemeral = if (ctn.ephemeral) 1 else 0,
         .name = ctn.name,
-        .proxy = ctn.proxy,
+        // An egress proxy url names a LOOPBACK bridge port of THIS
+        // machine; on a remote helper that loopback is the remote host's
+        // own, so the proxy is stripped there (a remote container's
+        // egress IS the remote host).
+        .proxy = if (cl.isRemote()) "" else ctn.proxy,
     });
 }
 
@@ -1600,6 +1796,11 @@ const SiteSetting = struct {
 pub const WebFace = struct {
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
+    /// The helper connection this face's view lives on: the process's
+    /// local client, or a per-host remote client when the face's
+    /// container names a remote host. Fixed at attach (the container is
+    /// immutable) and always valid — clients are never freed.
+    cl: *Client = undefined,
     /// Helper-side view id, allocated once and kept across helper
     /// restarts (a fresh helper knows no ids at all).
     view: u32 = 0,
@@ -1921,8 +2122,8 @@ pub const WebFace = struct {
     /// it, and every frame this face sends or receives rides the socket
     /// the source face already uses. Nothing is shared BETWEEN faces,
     /// so there is no ownership to hand over.
-    pub fn attachView(allocator: std.mem.Allocator, pane: *Pane, view: u32) !*WebFace {
-        return attachOpts(allocator, pane, .{ .existing_view = view });
+    pub fn attachView(allocator: std.mem.Allocator, pane: *Pane, view: u32, on: *Client) !*WebFace {
+        return attachOpts(allocator, pane, .{ .existing_view = view, .on_client = on });
     }
 
     const Opts = struct {
@@ -1932,6 +2133,9 @@ pub const WebFace = struct {
         /// Identity context (container) to create the view in, 0 =
         /// default. Immutable once the face exists.
         container: u32 = 0,
+        /// Pinned client for an existing view (the SOURCE face's — a
+        /// devtools view lives on the helper of the page it inspects).
+        on_client: ?*Client = null,
     };
 
     fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
@@ -1970,7 +2174,8 @@ pub const WebFace = struct {
         if (opts.existing_view == 0)
             self.omni = omnibox.Omnibox.create(allocator, self, self.entry) catch null;
 
-        const cl = client();
+        const cl = opts.on_client orelse clientForContainer(allocator, opts.container);
+        self.cl = cl;
         cl.ensure(allocator);
         if (opts.existing_view != 0) {
             // The view already exists on the CURRENT connection: adopt
@@ -1983,8 +2188,8 @@ pub const WebFace = struct {
             if (cl.state != .ready) self.onDevToolsLost();
             return self;
         }
-        self.view = cl.next_view;
-        cl.next_view += 1;
+        self.view = g_next_view;
+        g_next_view += 1;
         cl.register(self);
         switch (cl.state) {
             .ready => self.onClientReady(),
@@ -2098,7 +2303,7 @@ pub const WebFace = struct {
     }
 
     pub fn deinit(self: *WebFace) void {
-        const cl = client();
+        const cl = self.cl;
         if (self.view_live) cl.post(proto.ViewDestroy{ .view = self.view });
         cl.unregister(self);
         // Web-store replies resolve through this face: the deinit
@@ -2246,7 +2451,7 @@ pub const WebFace = struct {
     pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
         const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
         self.promote();
-        client().post(proto.SemSnapshotReq{
+        self.cl.post(proto.SemSnapshotReq{
             .view = self.view,
             .mode = mode,
             .detail = detail,
@@ -2257,7 +2462,7 @@ pub const WebFace = struct {
 
     pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.act, false) orelse return null;
-        client().post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+        self.cl.post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
         // The helper synthesizes real input for this; the paints it
         // causes still need somebody asking for frames.
         self.promote();
@@ -2266,25 +2471,25 @@ pub const WebFace = struct {
 
     pub fn autoExpand(self: *WebFace, id: u32, off: u32, len: u32) ?u32 {
         const token = self.autoBegin(.expand, false) orelse return null;
-        client().post(proto.SemExpand{ .view = self.view, .id = id, .off = off, .len = len });
+        self.cl.post(proto.SemExpand{ .view = self.view, .id = id, .off = off, .len = len });
         return token;
     }
 
     pub fn autoQuery(self: *WebFace, kind: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.query, false) orelse return null;
-        client().post(proto.SemQueryReq{ .view = self.view, .kind = kind, .arg = arg });
+        self.cl.post(proto.SemQueryReq{ .view = self.view, .kind = kind, .arg = arg });
         return token;
     }
 
     pub fn autoRead(self: *WebFace) ?u32 {
         const token = self.autoBegin(.read, false) orelse return null;
-        client().post(proto.SemRead{ .view = self.view });
+        self.cl.post(proto.SemRead{ .view = self.view });
         return token;
     }
 
     pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32) ?u32 {
         const token = self.autoBegin(.eval, false) orelse return null;
-        client().post(proto.SemEval{
+        self.cl.post(proto.SemEval{
             .view = self.view,
             .flags = if (want_await) proto.eval_flag_await else 0,
             .timeout_ms = timeout_ms,
@@ -2297,7 +2502,7 @@ pub const WebFace = struct {
     /// through the same token/`web-result` path the semantic ops use.
     pub fn autoNetworkLog(self: *WebFace, since: u32, max: u16) ?u32 {
         const token = self.autoBegin(.network, false) orelse return null;
-        client().post(proto.InterceptLogReq{ .view = self.view, .since = since, .max = max });
+        self.cl.post(proto.InterceptLogReq{ .view = self.view, .since = since, .max = max });
         return token;
     }
 
@@ -2307,7 +2512,7 @@ pub const WebFace = struct {
     pub fn setNetwork(self: *WebFace, enabled: bool) void {
         if (!self.view_live) return;
         self.net_enabled = enabled;
-        client().post(proto.InterceptSet{ .view = self.view, .enabled = if (enabled) 1 else 0 });
+        self.cl.post(proto.InterceptSet{ .view = self.view, .enabled = if (enabled) 1 else 0 });
         self.updateShield();
     }
 
@@ -2528,7 +2733,7 @@ pub const WebFace = struct {
     /// pointer position — the same frame an interactive scroll sends.
     pub fn autoScroll(self: *WebFace, dx: i32, dy: i32) bool {
         if (!self.view_live) return false;
-        client().post(proto.InputScroll{
+        self.cl.post(proto.InputScroll{
             .view = self.view,
             .x = self.last_x,
             .y = self.last_y,
@@ -2580,7 +2785,7 @@ pub const WebFace = struct {
         const vh: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(self.sent_h)) / f));
         var buf: [32]u8 = undefined;
         const arg = std.fmt.bufPrint(&buf, "{d} {d}", .{ vw, vh }) catch return true;
-        client().post(proto.SemQueryReq{
+        self.cl.post(proto.SemQueryReq{
             .view = self.view,
             .kind = @intFromEnum(proto.SemQuery.visible),
             .arg = arg,
@@ -2870,7 +3075,7 @@ pub const WebFace = struct {
     /// Ask the helper for one frame, now.
     fn requestFrame(self: *WebFace) void {
         if (!self.view_live or !self.on_screen) return;
-        client().post(proto.FrameRequest{ .view = self.view, .flags = 0 });
+        self.cl.post(proto.FrameRequest{ .view = self.view, .flags = 0 });
         if (g_stats.enabled()) g_stats.reqs += 1;
         if (g_lat.mode != .off and g_lat.pending and g_lat.req_us == 0)
             g_lat.req_us = c.g_get_monotonic_time();
@@ -2887,7 +3092,7 @@ pub const WebFace = struct {
         const want = self.pacer.effectiveFps();
         if (want == self.sent_max_fps) return;
         self.sent_max_fps = want;
-        client().post(proto.ViewMaxFps{ .view = self.view, .fps = want });
+        self.cl.post(proto.ViewMaxFps{ .view = self.view, .fps = want });
     }
 
     /// Go active: what every input, navigation and geometry change does.
@@ -3005,7 +3210,7 @@ pub const WebFace = struct {
             // recreates the browser and the buffer it announces lands
             // on a face that is no longer dimmed.
             self.noteRevived();
-            if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
+            if (self.view_live) self.cl.post(proto.ViewShow{ .view = self.view });
             self.startIdleTimer();
             self.startLatProbe();
             // A tab coming forward must show its current content at
@@ -3013,7 +3218,7 @@ pub const WebFace = struct {
             self.promote();
             return;
         }
-        if (self.view_live) client().post(proto.ViewHide{ .view = self.view });
+        if (self.view_live) self.cl.post(proto.ViewHide{ .view = self.view });
         self.cancelHints();
         self.stopPacing();
         self.armDiscardTimer();
@@ -3028,7 +3233,7 @@ pub const WebFace = struct {
     fn armDiscardTimer(self: *WebFace) void {
         if (self.discard_timer != 0 or self.discarded) return;
         if (g_discard_minutes == 0 or self.on_screen) return;
-        if (!self.view_live or !client().cap_discard) return;
+        if (!self.view_live or !self.cl.cap_discard) return;
         const ms: u64 = @as(u64, g_discard_minutes) * 60 * 1000;
         self.discard_timer = c.g_timeout_add(
             @intCast(@min(ms, std.math.maxInt(c_uint))),
@@ -3065,7 +3270,7 @@ pub const WebFace = struct {
     /// own, so the pixels survive the memfd going away helper-side.
     pub fn discardNow(self: *WebFace) bool {
         if (self.discarded or !self.view_live) return false;
-        const cl = client();
+        const cl = self.cl;
         if (!cl.cap_discard) return false;
         self.stopDiscardTimer();
         cl.post(proto.ViewDiscard{ .view = self.view });
@@ -3098,7 +3303,7 @@ pub const WebFace = struct {
     fn reviveNow(self: *WebFace) void {
         if (!self.discarded) return;
         self.noteRevived();
-        if (self.view_live) client().post(proto.ViewShow{ .view = self.view });
+        if (self.view_live) self.cl.post(proto.ViewShow{ .view = self.view });
         self.promote();
     }
 
@@ -3183,7 +3388,7 @@ pub const WebFace = struct {
         if (scale == self.sent_scale) return;
         self.sent_scale = scale;
         if (!self.view_live or self.sent_w == 0 or self.sent_h == 0) return;
-        client().post(proto.ViewResize{
+        self.cl.post(proto.ViewResize{
             .view = self.view,
             .w = self.sent_w,
             .h = self.sent_h,
@@ -3580,7 +3785,7 @@ pub const WebFace = struct {
         if (self.ax_proj != null) {
             // A fresh helper connection knows nothing of the earlier
             // enable; the projection itself survives helper restarts.
-            client().post(proto.A11yEnable{ .view = self.view, .enabled = 1 });
+            self.cl.post(proto.A11yEnable{ .view = self.view, .enabled = 1 });
             return;
         }
         if (self.ax_connecting) return;
@@ -3650,7 +3855,7 @@ pub const WebFace = struct {
             face,
         );
         if (face.title) |t| job.proj.setAppName(t);
-        client().post(proto.A11yEnable{ .view = face.view, .enabled = 1 });
+        face.cl.post(proto.A11yEnable{ .view = face.view, .enabled = 1 });
         return 0;
     }
 
@@ -3677,7 +3882,7 @@ pub const WebFace = struct {
             self.ax_watch = 0;
         }
         if (self.ax_proj) |p| {
-            client().post(proto.A11yEnable{ .view = self.view, .enabled = 0 });
+            self.cl.post(proto.A11yEnable{ .view = self.view, .enabled = 0 });
             p.deinit();
             self.allocator.destroy(p);
             self.ax_proj = null;
@@ -3779,7 +3984,7 @@ pub const WebFace = struct {
     }
 
     fn ensureView(self: *WebFace) void {
-        const cl = client();
+        const cl = self.cl;
         // An attached view is created by whoever asked for it (the
         // inspector's source page), never here.
         if (self.attached) return;
@@ -3908,7 +4113,7 @@ pub const WebFace = struct {
         self.buf_w = fb.w;
         self.buf_h = fb.h;
         self.buf_stride = fb.stride;
-        if (old_id != 0) client().post(proto.FrameRelease{ .view = self.view, .buf_id = old_id });
+        if (old_id != 0) self.cl.post(proto.FrameRelease{ .view = self.view, .buf_id = old_id });
         self.noteBufferGeometry(fb.w, fb.h);
         // A fresh buffer holds nothing yet: ask for the repaint that
         // fills it rather than waiting for the idle floor.
@@ -4097,6 +4302,88 @@ pub const WebFace = struct {
         if (self.dmabuf_tex[slot].tex) |old| c.g_object_unref(@ptrCast(old));
         self.dmabuf_tex[slot] = .{ .buf_id = f.buf_id, .tex = tex };
         return tex;
+    }
+
+    /// An inline frame (capability "frames-inline", remote helpers):
+    /// pixels arrived in-band, so the face materialises the buffer the
+    /// memfd path would have mapped — an anonymous mapping in the SAME
+    /// `MapRef` shape — decodes the damaged rects into it, and then
+    /// takes the ordinary `onDamage` presentation path (GSK uploads
+    /// only the damaged region, exactly as for shm frames).
+    pub fn onInline(self: *WebFace, fi: proto.FrameInline) void {
+        if (self.widgets_dead) return;
+        if (fi.w == 0 or fi.h == 0) return;
+        const stride: u32 = @as(u32, fi.w) * 4;
+        const size: usize = @as(usize, stride) * @as(usize, fi.h);
+        const need_new = self.map == null or self.buf_w != fi.w or self.buf_h != fi.h;
+        if (need_new) {
+            const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+            if (addr == c.MAP_FAILED) return;
+            const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
+            const mref = self.allocator.create(MapRef) catch {
+                _ = c.munmap(bytes, size);
+                return;
+            };
+            mref.* = .{ .ptr = bytes, .len = size, .refs = 1, .allocator = self.allocator };
+            self.dropMap();
+            self.map = mref;
+            self.buf_w = fi.w;
+            self.buf_h = fi.h;
+            self.buf_stride = stride;
+            // Local id only — the helper never announced this buffer, so
+            // no frame_release goes back for it either.
+            self.buf_id +%= 1;
+            if (self.buf_id == 0) self.buf_id = 1;
+            self.noteBufferGeometry(fi.w, fi.h);
+        }
+        const m = self.map orelse return;
+        var rects_buf: [32]proto.Rect = undefined;
+        var n: usize = 0;
+        for (fi.rects) |r| {
+            if (r.w == 0 or r.h == 0) continue;
+            // Bounds are the peer's claim; a rect outside the surface is
+            // a desynchronised stream and is dropped, never written.
+            if (@as(u32, r.x) + r.w > fi.w or @as(u32, r.y) + r.h > fi.h) continue;
+            const raw_len: usize = @as(usize, r.w) * @as(usize, r.h) * 4;
+            const row_bytes: usize = @as(usize, r.w) * 4;
+            var decoded: []const u8 = undefined;
+            var scratch: ?[]u8 = null;
+            defer if (scratch) |sc| self.allocator.free(sc);
+            switch (r.enc) {
+                proto.inline_enc_raw => {
+                    if (r.data.len != raw_len) continue;
+                    decoded = r.data;
+                },
+                proto.inline_enc_deflate => {
+                    const sc = self.allocator.alloc(u8, raw_len) catch continue;
+                    scratch = sc;
+                    decoded = zpool.decompress(r.data, sc) catch continue;
+                },
+                else => continue,
+            }
+            var row: usize = 0;
+            while (row < r.h) : (row += 1) {
+                const dst_off = (@as(usize, r.y) + row) * stride + @as(usize, r.x) * 4;
+                @memcpy(m.ptr[dst_off..][0..row_bytes], decoded[row * row_bytes ..][0..row_bytes]);
+            }
+            if (n < rects_buf.len) {
+                rects_buf[n] = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+                n += 1;
+            }
+        }
+        if (n == 0) return;
+        // A fresh buffer has undefined pixels outside this frame's
+        // rects; present the WHOLE surface once so nothing stale shows.
+        if (need_new) {
+            rects_buf[0] = .{ .x = 0, .y = 0, .w = fi.w, .h = fi.h };
+            n = 1;
+        }
+        self.onDamage(.{
+            .view = fi.view,
+            .buf_id = self.buf_id,
+            .gen = fi.gen,
+            .rects = rects_buf[0..n],
+        });
     }
 
     /// A software damage batch: wrap the mapping as a `GdkMemoryTexture`
@@ -4316,7 +4603,7 @@ pub const WebFace = struct {
         if (zoom != self.zoom_x100) {
             self.zoom_x100 = zoom;
             if (self.view_live)
-                client().post(proto.SetZoom{ .view = self.view, .level_x100 = zoom });
+                self.cl.post(proto.SetZoom{ .view = self.view, .level_x100 = zoom });
         }
 
         // An origin with no override follows the defaults, which is not
@@ -4526,7 +4813,7 @@ pub const WebFace = struct {
         self.cert_cancelled = !proceed;
         // A helper without the capability never sent the event, so it
         // can only be a decision for a request nobody holds.
-        if (client().has_tls) client().post(proto.CertDecision{
+        if (self.cl.has_tls) self.cl.post(proto.CertDecision{
             .view = self.view,
             .proceed = if (proceed) 1 else 0,
         });
@@ -4545,7 +4832,7 @@ pub const WebFace = struct {
         if (self.can_back) {
             self.navAction(.back);
         } else {
-            client().post(proto.Navigate{ .view = self.view, .url = "about:blank" });
+            self.cl.post(proto.Navigate{ .view = self.view, .url = "about:blank" });
         }
     }
 
@@ -4583,8 +4870,8 @@ pub const WebFace = struct {
     }
 
     fn postPermission(self: *WebFace, prompt: u64, allow: bool) void {
-        if (!client().has_permissions) return;
-        client().post(proto.PermissionDecision{
+        if (!self.cl.has_permissions) return;
+        self.cl.post(proto.PermissionDecision{
             .view = self.view,
             .prompt = prompt,
             .allow = if (allow) 1 else 0,
@@ -4813,7 +5100,7 @@ pub const WebFace = struct {
         self.pending_url = self.allocator.dupe(u8, url) catch null;
         self.crashed = false;
         self.clearStatus();
-        const cl = client();
+        const cl = self.cl;
         if (cl.state == .unavailable) {
             cl.restart();
             return;
@@ -4836,7 +5123,7 @@ pub const WebFace = struct {
         if (!self.view_live) return;
         // Same as a navigation: `nav_action` revives helper-side.
         self.noteRevived();
-        client().post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
+        self.cl.post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
         self.promote();
     }
 
@@ -4853,7 +5140,7 @@ pub const WebFace = struct {
         c.gtk_widget_set_visible(self.find_bar, 0);
         c.gtk_label_set_text(@ptrCast(self.find_count), "");
         if (self.view_live)
-            client().post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
+            self.cl.post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
         _ = c.gtk_widget_grab_focus(self.view_area);
     }
 
@@ -4870,10 +5157,10 @@ pub const WebFace = struct {
         const q = self.findQuery();
         if (q.len == 0) {
             c.gtk_label_set_text(@ptrCast(self.find_count), "");
-            client().post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
+            self.cl.post(proto.FindStop{ .view = self.view, .clear_selection = 1 });
             return;
         }
-        client().post(proto.Find{
+        self.cl.post(proto.Find{
             .view = self.view,
             .forward = 1,
             .match_case = 0,
@@ -4888,7 +5175,7 @@ pub const WebFace = struct {
         if (self.widgets_dead or !self.view_live) return;
         const q = self.findQuery();
         if (q.len == 0) return;
-        client().post(proto.Find{
+        self.cl.post(proto.Find{
             .view = self.view,
             .forward = if (forward) 1 else 0,
             .match_case = 0,
@@ -5082,7 +5369,7 @@ pub const WebFace = struct {
         // daemon so the origin comes back at this zoom (0 clears).
         if (self.nav_origin) |o| webstore.siteSetZoom(self.allocator, o, level_x100);
         if (!self.view_live) return;
-        client().post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
+        self.cl.post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
         self.promote();
     }
 
@@ -5182,12 +5469,14 @@ pub const WebFace = struct {
         );
         // A helper too old for either verb greys the row out rather
         // than hiding it: what a browser pane CAN do stays visible.
-        const cl = client();
+        const cl = self.cl;
         const tools = m.section();
         tools.itemIconEnabled(
             "Print to PDF…",
             .{ .name = "document-print-symbolic" },
-            self.view_live and cl.cap_print_pdf,
+            // A remote helper would write the PDF on ITS host; greyed
+            // out until the remote fetch path exists.
+            self.view_live and cl.cap_print_pdf and !cl.isRemote(),
             &onMenuPrintPdf,
             ctx,
         );
@@ -5509,13 +5798,13 @@ pub const WebFace = struct {
         // An inspector cannot inspect itself.
         if (self.attached) return;
         if (!self.view_live) return;
-        if (!client().cap_devtools) {
+        if (!self.cl.cap_devtools) {
             self.toast("This browser helper is too old for DevTools.");
             return;
         }
         if (self.devtools_pending) return;
         self.devtools_pending = true;
-        client().post(proto.DevToolsShow{ .view = self.view, .x = 0, .y = 0 });
+        self.cl.post(proto.DevToolsShow{ .view = self.view, .x = 0, .y = 0 });
     }
 
     /// The helper's answer: split this pane and give the new one a face
@@ -5536,17 +5825,17 @@ pub const WebFace = struct {
             return;
         }
         const pane = self.pane orelse {
-            client().post(proto.ViewDestroy{ .view = dev_view });
+            self.cl.post(proto.ViewDestroy{ .view = dev_view });
             return;
         };
         const win = self.ownerWindow() orelse {
-            client().post(proto.ViewDestroy{ .view = dev_view });
+            self.cl.post(proto.ViewDestroy{ .view = dev_view });
             return;
         };
         // A view nobody presents is a browser nobody can close: every
         // failure below hands it straight back.
         win.openDevToolsSplit(pane, dev_view) catch {
-            client().post(proto.ViewDestroy{ .view = dev_view });
+            self.cl.post(proto.ViewDestroy{ .view = dev_view });
             self.toast("Could not open a pane for DevTools.");
         };
     }
@@ -5567,7 +5856,7 @@ pub const WebFace = struct {
     /// path on THIS machine.
     pub fn printToPdf(self: *WebFace) void {
         if (!self.view_live) return;
-        if (!client().cap_print_pdf) {
+        if (!self.cl.cap_print_pdf) {
             self.toast("This browser helper is too old to print to PDF.");
             return;
         }
@@ -5611,7 +5900,7 @@ pub const WebFace = struct {
     fn onPdfPathPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
         const ctx: *PrintCtx = @ptrCast(@alignCast(user.?));
         defer ctx.allocator.destroy(ctx);
-        const self = client().findFace(ctx.view) orelse return;
+        const self = findFaceGlobal(ctx.view) orelse return;
         const res = result orelse return;
         if (res.specs.len == 0) return;
         const win: ?*c.GtkWindow = if (self.ownerWindow()) |w| @ptrCast(w.app_window) else null;
@@ -5623,7 +5912,7 @@ pub const WebFace = struct {
             "The browser engine writes the PDF itself, on this machine — pick a local path.",
         ) orelse return;
         if (!self.view_live) return;
-        client().post(proto.PrintPdf{
+        self.cl.post(proto.PrintPdf{
             .view = self.view,
             // Background graphics ON: a page saved without them looks
             // broken, which is not what "print this page" means here.
@@ -5694,13 +5983,27 @@ pub const WebFace = struct {
         return null;
     }
 
+    /// Static — callable from contexts whose face may be gone; the
+    /// decision goes to whichever client owns the view (a held decision
+    /// must always be answered).
     fn declineDownload(view: u32, id: u32) void {
-        client().post(proto.DownloadDecide{ .view = view, .id = id, .path = "" });
+        const cl = if (findFaceGlobal(view)) |f| f.cl else client();
+        cl.post(proto.DownloadDecide{ .view = view, .id = id, .path = "" });
     }
 
     fn onDownloadOffer(self: *WebFace, ev: proto.EvDownloadOffer) void {
         if (self.widgets_dead) {
             declineDownload(ev.view, ev.id);
+            return;
+        }
+        // A remote helper would write the picked path on ITS host, not
+        // here — silently dropping files on the wrong machine. Decline
+        // with a visible reason until the remote download path (helper
+        // staging dir -> daemon file_get -> local pick) is designed;
+        // this branch is the seam it plugs into.
+        if (self.cl.isRemote()) {
+            declineDownload(ev.view, ev.id);
+            self.toast("Downloads are not yet supported in a remote-browser container");
             return;
         }
         const name = if (ev.name.len != 0) ev.name else "download";
@@ -5772,7 +6075,7 @@ pub const WebFace = struct {
         }
         // The face may have died while the dialog was up; the held
         // decision still has to be answered (the client is immortal).
-        const self = client().findFace(ctx.view) orelse {
+        const self = findFaceGlobal(ctx.view) orelse {
             declineDownload(ctx.view, ctx.id);
             return;
         };
@@ -5860,7 +6163,7 @@ pub const WebFace = struct {
             return;
         };
         self.buildDlRow(d);
-        client().post(proto.DownloadDecide{ .view = self.view, .id = id, .path = d.path });
+        self.cl.post(proto.DownloadDecide{ .view = self.view, .id = id, .path = d.path });
     }
 
     fn buildDlRow(self: *WebFace, d: *Download) void {
@@ -6099,12 +6402,12 @@ pub const WebFace = struct {
 
     fn onDlCancelClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
-        const self = client().findFace(ctx.view) orelse return;
+        const self = findFaceGlobal(ctx.view) orelse return;
         const d = self.findDownload(ctx.id) orelse return;
         switch (d.state) {
             .downloading => {
                 d.canceled = true;
-                client().post(proto.DownloadCancel{ .view = ctx.view, .id = ctx.id });
+                self.cl.post(proto.DownloadCancel{ .view = ctx.view, .id = ctx.id });
             },
             .uploading => {
                 d.canceled = true;
@@ -6122,7 +6425,7 @@ pub const WebFace = struct {
 
     fn onDlOpenClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
-        const self = client().findFace(ctx.view) orelse return;
+        const self = findFaceGlobal(ctx.view) orelse return;
         const d = self.findDownload(ctx.id) orelse return;
         if (d.remote_host.len != 0) return;
         var uri: [4700:0]u8 = undefined;
@@ -6132,7 +6435,7 @@ pub const WebFace = struct {
 
     fn onDlRevealClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
-        const self = client().findFace(ctx.view) orelse return;
+        const self = findFaceGlobal(ctx.view) orelse return;
         const d = self.findDownload(ctx.id) orelse return;
         var spec: [4700]u8 = undefined;
         const s = if (d.remote_host.len != 0)
@@ -6202,7 +6505,7 @@ pub const WebFace = struct {
     /// when it is gone, else just reload the page.
     fn onRetry(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
-        const cl = client();
+        const cl = self.cl;
         if (cl.state == .unavailable) {
             cl.restart();
             return;
@@ -6471,7 +6774,7 @@ pub const WebFace = struct {
             self.ensureView();
             return;
         }
-        client().post(proto.ViewResize{
+        self.cl.post(proto.ViewResize{
             .view = self.view,
             .w = nw,
             .h = nh,
@@ -6522,7 +6825,7 @@ pub const WebFace = struct {
         }
         // GTK reports wheel notches (1.0 per click); Chromium's unit is
         // 120 per notch.
-        client().post(proto.InputScroll{
+        self.cl.post(proto.InputScroll{
             .view = self.view,
             .x = self.last_x,
             .y = self.last_y,
@@ -6577,14 +6880,14 @@ pub const WebFace = struct {
     fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         if (!self.view_live) return;
-        client().post(proto.InputFocus{ .view = self.view, .focused = 1 });
+        self.cl.post(proto.InputFocus{ .view = self.view, .focused = 1 });
         self.promote();
     }
 
     fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         if (!self.view_live) return;
-        client().post(proto.InputFocus{ .view = self.view, .focused = 0 });
+        self.cl.post(proto.InputFocus{ .view = self.view, .focused = 0 });
     }
 
     fn sendPointer(self: *WebFace, kind: proto.PointerKind, x: f64, y: f64, button: u8, clicks: u8, mods: u32) void {
@@ -6596,7 +6899,7 @@ pub const WebFace = struct {
             self.last_x = @max(0, @as(i32, @intFromFloat(@round(x))) - @as(i32, self.snap_dx));
             self.last_y = @max(0, @as(i32, @intFromFloat(@round(y))) - @as(i32, self.snap_dy));
         }
-        client().post(proto.InputPointer{
+        self.cl.post(proto.InputPointer{
             .view = self.view,
             .kind = @intFromEnum(kind),
             .x = self.last_x,
@@ -6629,7 +6932,7 @@ pub const WebFace = struct {
                 text = text_buf[0..n];
             }
         }
-        client().post(proto.InputKey{
+        self.cl.post(proto.InputKey{
             .view = self.view,
             .kind = @intFromEnum(kind),
             .keyval = keyval,
