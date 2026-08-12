@@ -403,7 +403,12 @@
         role: "more",
         name: label,
         value: "",
-        states: 0,
+        // A STRING, like every other node's: `statesOf` returns
+        // `join(",")` and the Zig side declares `states: []const u8`.
+        // Emitting 0 here made the whole snapshot payload fail to parse,
+        // so the frame was dropped and the client waited forever — a
+        // hang that only appeared once a list crossed the cap.
+        states: "",
         x: 0,
         y: 0,
         w: 0,

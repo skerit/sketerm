@@ -3973,6 +3973,69 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 13 sem_query");
 
+    // ── Stage 38: a truncated list SAYS it was truncated ───────────
+    //
+    // The walk used to stop with no trace, and a caller cannot tell
+    // "described in full" from "cut off here" — which is how it
+    // concludes a control is not on the page. Three assertions, and the
+    // middle one is what makes this stage fail if the feature is
+    // removed: without the cap every row is described.
+    // Built STATICALLY rather than by a script in a data: url — the
+    // point of the stage is the walk, and a page whose content depends
+    // on script execution adds a second thing that can fail.
+    const listPage = struct {
+        fn build(buf: []u8, rows: u32) []const u8 {
+            var w = std.Io.Writer.fixed(buf);
+            w.writeAll("data:text/html,<body><ul>") catch fail("stage 38: page buffer");
+            var n: u32 = 1;
+            while (n <= rows) : (n += 1) w.print("<li>row{d}</li>", .{n}) catch fail("stage 38: page buffer");
+            w.writeAll("</ul></body>") catch fail("stage 38: page buffer");
+            return buf[0..w.end];
+        }
+    }.build;
+
+    // BELOW the cap first. It is the control: it proves the page shape
+    // and the snapshot path are fine, so a failure on the long list
+    // below is about the collapsing and nothing else.
+    var rows_buf: [4096]u8 = undefined;
+    const p20 = listPage(&rows_buf, 20);
+    cl.navigate(p20);
+    cl.resetSem();
+    {
+        const sq = cl.sem_seq;
+        cl.send(proto.SemSnapshotReq{ .view = view_id, .mode = @intFromEnum(proto.SnapMode.full), .detail = 1, .scope = 0 });
+        if (!cl.waitSeq(&cl.sem_seq, sq, 20_000)) {
+            std.debug.print("stage 38: NO snapshot for the 20-row page ({d} bytes of url)\n", .{p20.len});
+            fail("stage 38 truncation: no snapshot for the short list");
+        }
+    }
+    if (!cl.waitSem("\"row20\"", 20_000)) fail("stage 38 truncation: the short list never reached the snapshot");
+    // The page URL is echoed in the snapshot header and contains every
+    // row verbatim, so assert on the NODE form (names render quoted)
+    // rather than on the raw substring.
+    if (std.mem.indexOf(u8, cl.semLog(), " more") != null)
+        fail("stage 38 truncation: a list UNDER the cap was collapsed");
+
+    var rows_buf2: [4096]u8 = undefined;
+    cl.navigate(listPage(&rows_buf2, 60));
+    cl.resetSem();
+    {
+        const sq = cl.sem_seq;
+        cl.send(proto.SemSnapshotReq{ .view = view_id, .mode = @intFromEnum(proto.SnapMode.full), .detail = 1, .scope = 0 });
+        if (!cl.waitSeq(&cl.sem_seq, sq, 20_000)) fail("stage 38 truncation: no snapshot for the long list");
+    }
+    if (!cl.waitSem("\"row50\"", 20_000)) fail("stage 38 truncation: the long list never reached the snapshot");
+    {
+        const log = cl.semLog();
+        if (std.mem.indexOf(u8, log, "\"row60\"") != null)
+            fail("stage 38 truncation: a row PAST the cap was described — nothing was collapsed");
+        if (std.mem.indexOf(u8, log, "and 10 more") == null) {
+            std.debug.print("smoke-web: snapshot was:\n{s}\n", .{log});
+            fail("stage 38 truncation: the omitted rows were not reported as a `more` node");
+        }
+    }
+    pass("stage 38 a truncated list reports the omitted count");
+
     // ── Stage 13c: link hints (`visible` query = fresh rects + urls) ─
     // The GUI's hint overlay is widget-side and not smokeable here;
     // what this proves is the whole data path it consumes: the query
@@ -4011,6 +4074,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!press) fail("stage 13c hints: the button is missing");
     }
     pass("stage 13c link hints (fresh rects, urls, viewport clip)");
+
 
     // ── Stage 13b: spontaneous churn coalesces into ONE delta ──────
     // A page that rebuilds identical rows and blinks a popup on a
